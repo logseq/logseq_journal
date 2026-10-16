@@ -400,8 +400,7 @@ let open_favorite
       (item : Logseq_db_worker.Protocol.v2_favorite_item)
   =
   match item.target with
-  | V2_favorite_page _ -> t, None
-  | V2_favorite_block { uuid; _ } ->
+  | V2_favorite_page { uuid; _ } | V2_favorite_block { uuid; _ } ->
     let block_id = Logseq_db_types.Graph_types.Uuid.to_string uuid in
     ( open_detail t ~block_id ~request_generation
     , Some

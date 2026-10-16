@@ -1025,6 +1025,18 @@ let scope_output t owner output =
     { output with responses }
 ;;
 
+(* A page is a detail root, never an outline mutation target. Its identity
+   (uuid = page) survives the existing model projection and child ownership. *)
+let page_root_member (page : Graph.page) revision : Projection.block_member =
+  { revision
+  ; block =
+      { uuid = page.uuid; page = page.uuid; parent = page.uuid; order = "page"
+      ; title = page.title; created_at_ms = page.created_at_ms
+      ; updated_at_ms = page.updated_at_ms; refs = []; tags = page.tags
+      ; properties = page.properties }
+  }
+;;
+
 let submit_unowned t (request : Journal_graph_request.t) =
   match request with
   | Load_favorites request ->
@@ -1103,7 +1115,11 @@ let submit_unowned t (request : Journal_graph_request.t) =
                 ; after =
                     Option.bind after (fun cursor -> cursor.Projection.protocol_cursor)
                 })
-             (Protocol.V2_get_outline_block { block; revision = None })
+             (if Hashtbl.mem t.graph_pages block_id
+                 || (match Hashtbl.find_opt t.favorite_targets block_id with
+                     | Some (V2_favorite_page _) -> true | _ -> false)
+              then Protocol.V2_get_page { page = block; revision = None }
+              else Protocol.V2_get_outline_block { block; revision = None })
          ])
   | Find_block block_id ->
     (match parse_uuid "block UUID" block_id with
@@ -1237,7 +1253,10 @@ let submit_unowned t (request : Journal_graph_request.t) =
                            [ { uuid = child; title = command.source; children = [] } ]
                        ; preconditions =
                            preconditions
-                             ~blocks:[ parent, command.expected_parent_revision ]
+                             ~blocks:(if Graph.Uuid.equal parent page.uuid then []
+                               else [ parent, command.expected_parent_revision ])
+                             ~pages:(if Graph.Uuid.equal parent page.uuid
+                               then [ page.uuid, command.expected_parent_revision ] else [])
                              ~scopes:[ scope_revision ]
                              ()
                        })
@@ -2018,11 +2037,16 @@ let hydration_for_changes t ~request_generation windows =
     Hashtbl.to_seq_values t.children_interests
     |> Seq.exists (fun interest -> Graph.Uuid.equal interest.page.uuid page)
   in
+  let refreshed_pages = Hashtbl.create 16 in
   let point_reads =
     List.filter_map
       (fun block ->
          let block_id = Graph.Uuid.to_string block in
-         match page_by_block t block_id with
+         if Hashtbl.mem t.graph_pages block_id && owns_detail_page block then (
+           Hashtbl.replace refreshed_pages block_id ();
+           Some (read t (Changed_detail_page block)
+             (Protocol.V2_get_page {page=block;revision=None})))
+         else match page_by_block t block_id with
          | Some page ->
            Some
              (read
@@ -2078,6 +2102,7 @@ let hydration_for_changes t ~request_generation windows =
     List.filter_map
       (fun page ->
          if owns_detail_page page
+            && not (Hashtbl.mem refreshed_pages (Graph.Uuid.to_string page))
          then
            Some
              (read
@@ -2208,6 +2233,8 @@ let rehydrate_current_interests t ~request_generation ~generation =
   in
   let detail_roots =
     Hashtbl.to_seq_values t.children_interests
+    |> Seq.filter (fun (interest : children_interest) ->
+      not (Graph.Uuid.equal interest.root.block.uuid interest.page.uuid))
     |> Seq.map (fun (interest : children_interest) ->
       let block_id = Graph.Uuid.to_string interest.root.block.uuid in
       read
@@ -2303,16 +2330,41 @@ let read_child t command page =
 ;;
 
 let read_child_parent t command page child =
+  let parent = Graph.Uuid.of_string command.Projection.parent_block_id |> Result.get_ok in
   requests
-    [ read
-        t
-        (Child_parent (command, page, child))
-        (Protocol.V2_get_outline_block
-           { block =
-               Graph.Uuid.of_string command.Projection.parent_block_id |> Result.get_ok
-           ; revision = None
-           })
-    ]
+    [ read t (Child_parent (command, page, child))
+        (if Graph.Uuid.equal parent page.Graph.uuid
+         then Protocol.V2_get_page { page = parent; revision = None }
+         else Protocol.V2_get_outline_block { block = parent; revision = None }) ]
+;;
+
+let complete_child t (command : Projection.create_child) (page : Graph.page)
+      (child : Projection.block_member) (parent : Projection.block_member) =
+  if Graph.Uuid.to_string parent.block.uuid <> command.parent_block_id
+     || Graph.Uuid.to_string child.block.uuid <> command.block_id
+     || not (Graph.Uuid.equal child.block.parent parent.block.uuid)
+     || not (Graph.Uuid.equal child.block.page page.uuid)
+     || not (Graph.Uuid.equal parent.block.page page.uuid)
+  then reject "The append completion does not match the selected parent."
+  else match projection_time_context t with
+  | Error message -> reject message
+  | Ok time_context ->
+    let old_count = Hashtbl.find_opt t.projected_blocks command.parent_block_id
+      |> Option.map Journal_model.child_count |> Option.value ~default:0 in
+    match
+      (Projection.block_on_page ~page ~revision:parent.revision
+         ~child_count:(old_count + 1) ~time_context parent.block,
+       Projection.block_on_page ~page ~revision:child.revision ~child_count:0
+         ~time_context child.block) with
+    | Ok parent, Ok child ->
+      Hashtbl.replace t.projected_blocks command.parent_block_id parent;
+      let completion = response (Child_created {child;parent;timeline_entry_update=None}) in
+      let refresh = match page_by_uuid t page.uuid with
+        | None -> empty
+        | Some page -> match page_tree t (Changed_page_tree page) page Protocol.maximum_page_size with
+          | Ok request -> requests [request] | Error _ -> empty in
+      {refresh with responses=completion::refresh.responses}
+    | Error message,_ | _,Error message -> reject message
 ;;
 
 let operation_name = function
@@ -2812,6 +2864,19 @@ let receive_response t (protocol_response : Protocol.response) =
              else
                complete_reference_read t ~source_epoch ~block_id ~depth
                  (Some page.title))
+        | V2_present_page {page;revision}, Detail_block {generation;block_id;limit;after}
+          when Graph.Uuid.to_string page.uuid = block_id && not page.recycled ->
+          remember_page_revision t page.uuid revision;
+          Hashtbl.replace t.graph_pages block_id page;
+          detail_children t ~generation ~page ~root:(page_root_member page revision) ~limit ~after
+        | (V2_missing_page _ | V2_present_page _), Detail_block {generation;block_id;_} ->
+          responses [response (Detail_failed {request_generation=generation;block_id;
+            missing=true;stale_cursor=false;failure=Projection_failure "This page is unavailable."})]
+        | V2_present_page {page;revision}, Child_parent (command,_,child)
+          when Graph.Uuid.to_string page.uuid = command.parent_block_id && not page.recycled ->
+          remember_page_revision t page.uuid revision;
+          Hashtbl.replace t.graph_pages command.parent_block_id page;
+          complete_child t command page child (page_root_member page revision)
         | _, Favorite_dependency { epoch; _ } when epoch <> t.favorite_epoch -> empty
         | _, Favorite_dependency { uuid; seen; page; _ }
           when Hashtbl.mem t.favorite_dirty (Graph.Uuid.to_string uuid) ->
@@ -2846,7 +2911,7 @@ let receive_response t (protocol_response : Protocol.response) =
           then responses [ response Favorites_invalidated ]
           else empty
         | V2_missing_page _, Favorite_page_candidate _ -> empty
-        | V2_present_page { page; revision }, Changed_detail_page _ ->
+        | V2_present_page { page; revision }, Changed_detail_page _ when not page.recycled ->
           Hashtbl.replace t.graph_pages (Graph.Uuid.to_string page.uuid) page;
           remember_page_revision t page.uuid revision;
           let reconciled = ref [] in
@@ -2854,7 +2919,9 @@ let receive_response t (protocol_response : Protocol.response) =
             (fun key (interest : children_interest) ->
                if Graph.Uuid.equal interest.page.uuid page.uuid
                then (
-                 let interest = { interest with page } in
+                 let root = if Graph.Uuid.equal interest.root.block.uuid page.uuid
+                   then page_root_member page revision else interest.root in
+                 let interest = { interest with page; root } in
                  Option.iter
                    (fun children ->
                       match projection_time_context t with
@@ -2881,7 +2948,8 @@ let receive_response t (protocol_response : Protocol.response) =
                Some (if Graph.Uuid.equal old.Graph.uuid page.uuid then page else old))
             t.detail_pages;
           responses (List.rev !reconciled)
-        | V2_missing_page { uuid; _ }, Changed_detail_page _ ->
+        | (V2_missing_page { uuid; _ }
+          | V2_present_page {page={uuid;recycled=true;_};_}), Changed_detail_page _ ->
           responses
             (Hashtbl.to_seq_values t.children_interests
              |> Seq.filter_map (fun (interest : children_interest) ->
@@ -3168,17 +3236,10 @@ let receive_response t (protocol_response : Protocol.response) =
                    (Detail_page { generation; root; limit; after })
                    (Protocol.V2_get_page { page = value.block.page; revision = None })
                ])
-        | V2_missing_block _, Detail_block { generation; block_id; _ } ->
-          responses
-            [ response
-                (Detail_failed
-                   { request_generation = generation
-                   ; block_id
-                   ; missing = true
-                   ; stale_cursor = false
-                   ; failure = Projection_failure "This block is unavailable."
-                   })
-            ]
+        | V2_missing_block {uuid;_}, Detail_block { generation; block_id; limit; after }
+          when Graph.Uuid.to_string uuid = block_id ->
+          requests [read t (Detail_block {generation;block_id;limit;after})
+            (Protocol.V2_get_page {page=uuid;revision=None})]
         | V2_present_block { value; revision }, Child_read (command, page) ->
           remember_block_revision t value.block.uuid revision;
           let child = Projection.{ block = value.block; revision } in
@@ -3201,49 +3262,7 @@ let receive_response t (protocol_response : Protocol.response) =
               ]
         | V2_present_block { value; revision }, Child_parent (command, page, child) ->
           remember_block_revision t value.block.uuid revision;
-          (match projection_time_context t with
-           | Error message -> reject message
-           | Ok time_context ->
-             let old_count =
-               Hashtbl.find_opt t.projected_blocks command.parent_block_id
-               |> Option.map Journal_model.child_count
-               |> Option.value ~default:0
-             in
-             (match
-                ( Projection.block_on_page
-                    ~page
-                    ~revision
-                    ~child_count:(old_count + 1)
-                    ~time_context
-                    value.block
-                , Projection.block_on_page
-                    ~page
-                    ~revision:child.revision
-                    ~child_count:0
-                    ~time_context
-                    child.block )
-              with
-              | Ok parent, Ok child ->
-                Hashtbl.replace t.projected_blocks command.parent_block_id parent;
-                let completion =
-                  response (Child_created { child; parent; timeline_entry_update = None })
-                in
-                let refresh =
-                  match page_by_uuid t page.uuid with
-                  | None -> empty
-                  | Some page ->
-                    (match
-                       page_tree
-                         t
-                         (Changed_page_tree page)
-                         page
-                         Protocol.maximum_page_size
-                     with
-                     | Ok request -> requests [ request ]
-                     | Error _ -> empty)
-                in
-                { refresh with responses = completion :: refresh.responses }
-              | Error message, _ | _, Error message -> reject message))
+          complete_child t command page child Projection.{block=value.block;revision}
         | (V2_present_block _ | V2_missing_block _),
           Reference_read { block_id; depth; lookup = Outline_lookup } ->
           let source =
@@ -3926,6 +3945,7 @@ module Copy = struct
   type phase =
     | Before
     | Root
+    | Page_root
     | Children
     | After
 
@@ -4057,6 +4077,15 @@ module Copy = struct
            ; frames = [ current ]
            }
            current)
+    | Root, V2_block_outcome (V2_missing_block {uuid;_}) when Graph.Uuid.equal uuid job.root ->
+      read t {job with phase=Page_root} (Protocol.V2_get_page {page=job.root;revision=None})
+    | Page_root, V2_page_outcome (V2_present_page {page;_})
+      when Graph.Uuid.equal page.uuid job.root && not page.recycled ->
+      (match add_text job page.title with
+       | Error message -> fail t message
+       | Ok job -> let current=frame job.root 1 in
+         read_children t {job with page=Some page.uuid;phase=Children;frames=[current]} current)
+    | Page_root, V2_page_outcome _ -> fail t "The selected page is unavailable."
     | Children, V2_children_outcome result ->
       (match job.frames with
        | current :: parents

@@ -105,7 +105,11 @@ let matching_child pending ~root_id ~child ~parent =
     command.block_id = Journal_model.id child
     && command.parent_block_id = Journal_model.id parent
     && command.parent_block_id = root_id
-    && Journal_model.parent_id child = Some root_id
+    && Journal_model.page_id child = Journal_model.page_id parent
+    && (Journal_model.parent_id child = Some root_id
+        || (Journal_model.id parent = Journal_model.page_id parent
+            && Journal_model.page_id child = root_id
+            && Journal_model.parent_id child = None))
   | _ -> false
 ;;
 

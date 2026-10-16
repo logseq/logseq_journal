@@ -390,6 +390,7 @@ let run_favorites_native_visibility
       ?(check_detail_wait = false)
       ?(check_copy = false)
       ?(check_navigation = false)
+      ?(check_favorite_targets = false)
       ?(check_detail_row_action = false)
       ?(check_covered_update = false)
       ?calendar_change
@@ -1286,21 +1287,8 @@ let run_favorites_native_visibility
     wait label (fun () -> Option.is_some (find "text" "Fixture 48"));
     if Option.is_none (find "text" "Fixture 64")
     then (
-      let rec list_ancestor id =
-        if
-          List.assoc_opt
-            "_extension"
-            (Option.value (Hashtbl.find_opt props id) ~default:[])
-          = Some (`String "journal-list")
-        then id
-        else list_ancestor (Hashtbl.find parents id)
-      in
-      let list_node = list_ancestor (Option.get (find "text" "Fixture 48")) in
-      hooks.extension_event
-        list_node
-        "event"
-        {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":38,\"last\":50}"}|}
-      |> consume);
+      let list_node = Option.get (find "accessibility-identifier" "favorites-native-list") in
+      dispatch (Lui_protocol.VisibleRange (list_node,38,50)));
     wait "second Favorite page loaded" (fun () ->
       Option.is_some (find "text" "Fixture 64"))
   in
@@ -2226,17 +2214,18 @@ let run_favorites_native_visibility
          dispatch
            (Lui_protocol.Press (Option.get (find "accessibility-label" "Favorites")));
          load_all_favorites "copy Favorites loaded";
-         let list = Option.get (find "_extension" "journal-list") in
-         check_copy_text list (G.Uuid.to_string (uuid 1001)) "Timeline fixture 1";
          clipboard_requests := [];
-         send_copy list (G.Uuid.to_string (uuid 1000));
-         for _ = 1 to 5 do
-           hooks.pump () |> consume
-         done;
-         Alcotest.(check int)
-           "page favorite has no Copy"
-           0
-           (List.length !clipboard_requests);
+         let favorite_row_node=Option.get (find "accessibility-identifier"
+           ("favorite-open:" ^ G.Uuid.to_string (uuid 1001))) in
+         let rec below id node = id=node || match Hashtbl.find_opt parents node with
+           | Some parent->below id parent | None->false in
+         let copy=Option.get (find ~accept:(below favorite_row_node) "text" "Copy") in
+         dispatch (Lui_protocol.Press copy);
+         wait "LUI Favorites menu reaches clipboard" (fun () -> !clipboard_requests<>[]);
+         let page_row=Option.get (find "accessibility-identifier"
+           ("favorite-open:" ^ G.Uuid.to_string (uuid 1000))) in
+         Alcotest.(check bool) "page favorite has no Copy menu" false
+           (Option.is_some (find ~accept:(below page_row) "text" "Copy"));
          dispatch
            (Lui_protocol.Press (Option.get (find "accessibility-label" "Journals")));
          let root_list = Option.get (find "_extension" "journal-list") in
@@ -3523,6 +3512,13 @@ let run_favorites_native_visibility
              | Some current ->
                current <> previous && Option.is_some (find "text" "Timeline fixture 2")
              | None -> false));
+         if check_favorite_targets then
+           Alcotest.(check bool) "Timeline root retains Capture" true
+             (Option.is_some (find "accessibility-identifier" "journal-capture-open"));
+         (* A retained draft starts through the Journals opener; Favorites no longer
+            has a Capture opener of its own. *)
+         if check_draft then
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
          let favorites = Option.get (find "accessibility-label" "Favorites") in
          if check_visible
          then (
@@ -3541,6 +3537,34 @@ let run_favorites_native_visibility
          dispatch (Lui_protocol.Press favorites);
          load_all_favorites "Favorites loaded";
          settle_worker ();
+         if check_favorite_targets then (
+           Alcotest.(check bool) "Favorites root omits Capture" true
+             (Option.is_none (find "accessibility-identifier" "journal-capture-open"));
+           let original=Option.get (find "accessibility-identifier" "favorites-native-list") in
+           List.iter (fun n ->
+             let row=Option.get (find "accessibility-identifier"
+               ("favorite-open:" ^ G.Uuid.to_string (uuid (1000+n)))) in
+             dispatch (Lui_protocol.Press row);
+             wait "Favorites opens exact page or outline target" (fun () ->
+               Option.is_some (find "accessibility-identifier"
+                 ("detail-block:" ^ G.Uuid.to_string (favorite_target_uuid n))));
+             Alcotest.(check bool) "Favorites page and outline detail retain Capture" true
+               (Option.is_some (find "accessibility-identifier" "journal-detail-capture-open"));
+             let navigator=Option.get (find "_extension" "navigation-stack") in
+             List.iter (fun event ->
+               let revision=List.assoc "revision" (Hashtbl.find props navigator)
+                 |> Yojson.Safe.Util.to_int in
+               hooks.extension_event navigator event (Yojson.Safe.to_string
+                 (`Assoc ["revision",`Int revision;"length",`Int 0])) |> consume)
+               ["path-changed";"settled"];
+             wait "native Back returns to Favorites" (fun () ->
+               find "accessibility-identifier" "favorites-native-list" = Some original);
+             Alcotest.(check bool) "Back to Favorites still omits root Capture" true
+               (Option.is_none (find "accessibility-identifier" "journal-capture-open"))) [0;1];
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Journals")));
+           wait "Timeline Capture returns after native Back" (fun () ->
+             Option.is_some (find "accessibility-identifier" "journal-capture-open"));
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Favorites"))));
          if check_chrome
          then (
            Hashtbl.clear regions;
@@ -3558,8 +3582,6 @@ let run_favorites_native_visibility
              (Option.value (Hashtbl.find_opt regions "timeline") ~default:0);
          if check_draft
          then (
-           let capture = Option.get (find "accessibility-label" "Capture") in
-           dispatch (Lui_protocol.Press capture);
            let editor = Option.get (find "style-class" "composer-input") in
            Hashtbl.clear regions;
            dispatch (Lui_protocol.TextChanged (editor, "first"));
@@ -3632,56 +3654,15 @@ let run_favorites_native_visibility
              (Option.value (Hashtbl.find_opt regions "detail") ~default:0));
          if (not check_detail) && not check_generation
          then (
-           let show n =
-             let text = Option.get (find "text" (favorite_label n)) in
-             dispatch (Lui_protocol.Appear (ancestor_property text "appear-enabled"))
-           in
-           for n = 0 to 63 do
-             show n;
-             wait (Printf.sprintf "root %d query completed" n) (fun () ->
-               List.mem (favorite_target_uuid n) (Atomic.get queried));
-             (* Drain the response as well, so the next root is not query-concurrency limited. *)
-             for _ = 1 to 3 do
-               hooks.pump () |> consume;
-               Unix.sleepf 0.001
-             done
-           done;
-           let list_node = Option.get (find "_extension" "journal-list") in
-           (* The native list extension callback converts Visible_range to Int64_pair. *)
-           hooks.extension_event
-             list_node
-             "event"
-             (Yojson.Safe.to_string
-                (`Assoc
-                    [ "id", `Int 1
-                    ; "payload", `String {|{"type":"visible_range","first":64,"last":65}|}
-                    ]))
-           |> consume;
-           show 64;
-           wait "65th root admitted after real Favorites Int64_pair event" (fun () ->
-             List.mem (favorite_target_uuid 64) (Atomic.get queried));
-           let list_node = Option.get (find "_extension" "journal-list") in
-           hooks.extension_event
-             list_node
-             "event"
-             (Yojson.Safe.to_string
-                (`Assoc
-                    [ "id", `Int 1
-                    ; "payload", `String {|{"type":"visible_range","first":64,"last":65}|}
-                    ]))
-           |> consume;
-           show 64;
-           for _ = 1 to 3 do
-             hooks.pump () |> consume;
-             Unix.sleepf 0.001
-           done;
-           Alcotest.(check int)
-             "same visible page root does not refetch"
-             1
-             (List.length
-                (List.filter
-                   (G.Uuid.equal (favorite_target_uuid 64))
-                   (Atomic.get queried))))))))
+           let before=Atomic.get queried in
+           let list_node=Option.get (find "accessibility-identifier" "favorites-native-list") in
+           dispatch (Lui_protocol.VisibleRange (list_node,64,65));
+           for _=1 to 5 do hooks.pump () |> consume done;
+           Alcotest.(check int) "Favorites has no media body or lease acquisition" 0
+             (if Option.is_some (find "path" "/tmp/targeted-media.png") then 1 else 0);
+           Alcotest.(check bool) "Favorites visible range does not hydrate media roots" true
+             (Atomic.get queried=before))))))
+
 ;;
 
 (* The root reducer has no Worker accepted-ID/terminal-event boundary. This
@@ -4260,6 +4241,75 @@ let with_chrome_payloads initial build run =
     Alcotest.(check bool) "chrome mounts" true (Lui_app.start app);
     ignore (Lui_app.flush app);
     run app payloads)
+;;
+
+let test_favorites_compact_shared_titles () =
+  let module G=Logseq_db_types.Graph_types in
+  let module P=Logseq_db_worker.Protocol in
+  let id n=G.Uuid.of_string (Printf.sprintf "85000000-0000-4000-8000-%012d" n) |> Result.get_ok in
+  let items=List.init 2 (fun n ->
+    {P.membership_uuid=id (n+1);membership_order=string_of_int n;membership_revision="m";
+     target=(if n=0 then V2_favorite_page {uuid=id 10;title="Page";revision="p"}
+       else V2_favorite_block {uuid=id 11;title="**Favorite** [[Named page]]";revision="b";task_status=Some V2_todo})}) in
+  let ops=ref [] in
+  let backend : Lui_protocol.backend =
+    {backend_profile=Lui_protocol.profile IOS SwiftUIHost;
+     apply_batch=(fun batch->ops:=List.rev_append batch.Lui_protocol.ops !ops;true)} in
+  let app=Lui_app.create_with_extensions backend Journal_lui_native.registry () (fun () ()->())
+    (fun _ _ _ -> Journal_view.mount (Application.For_testing.favorites_page items)) in
+  Fun.protect ~finally:(fun ()->ignore(Lui_app.dispose app)) (fun () ->
+    Alcotest.(check bool) "Favorites mounts" true (Lui_app.start app);
+    ignore(Lui_app.flush app);
+    let has prop value=List.exists (function Lui_protocol.SetProp(_,p,v)->p=prop && v=value|_->false) !ops in
+    Alcotest.(check bool) "shared mldoc title is plain text" true
+      (has TextValue (StringValue "Favorite [[Named page]]"));
+    Alcotest.(check int) "both title nodes use existing single-line policy" 2
+      (List.length (List.filter (function
+        | Lui_protocol.SetProp (_,StyleClass,StringValue "single-line") -> true
+        | _ -> false) !ops));
+    Alcotest.(check bool) "status is omitted" false (has TextValue (StringValue "Todo"));
+    Alcotest.(check bool) "page icon" true (has IconName (StringValue "app:doc-text"));
+    Alcotest.(check bool) "block icon" true (has IconName (StringValue "app:circle"));
+    Alcotest.(check bool) "no trailing arrow" false (has IconName (StringValue "app:chevron-right"));
+    Alcotest.(check int) "uses LUI list" 1 (List.length(List.filter (function Lui_protocol.CreateNode(_,ListContainer)->true|_->false) !ops));
+    Alcotest.(check bool) "no Journal list extension" false
+      (List.exists (function Lui_protocol.CreateExtension(_,"journal-list",_)->true|_->false) !ops))
+;;
+
+(* Header control placement has no public reducer event/state; exercise the
+   public OCaml header mount, including disabled and enabled capture gates. *)
+let test_root_capture_placement () =
+  List.iter (fun platform ->
+    List.iter (fun favorites ->
+      List.iter (fun capture_enabled ->
+        let ops = ref [] in
+        let backend : Lui_protocol.backend =
+          { backend_profile = Lui_protocol.profile IOS SwiftUIHost
+          ; apply_batch = (fun batch -> ops := batch.Lui_protocol.ops @ !ops; true) } in
+        let noop = Journal_view.Event.Handler.create (fun _ -> ()) in
+        let app = Lui_app.create_with_extensions backend Journal_lui_native.registry ()
+          (fun () () -> ()) (fun _ _ _ ->
+            Journal_view.mount (Journal_header.view
+              ~key:(Journal_view.Key.string "capture-placement") ~platform
+              ~context:(if favorites then Journal_header.Context.favorites else Journal_header.Context.journals)
+              ~sync_phase:None ~sync_error:None ~on_error_info:None ~on_account_action:None
+              ~local_deletion_available:false ~on_journals:noop ~on_favorites:noop
+              ~on_capture:noop ~capture_enabled ~capture_expanded:None
+              ~body:(Journal_view.View.text "Root body"))) in
+        Fun.protect ~finally:(fun () -> ignore (Lui_app.dispose app)) (fun () ->
+          Alcotest.(check bool) "root header mounts" true (Lui_app.start app);
+          ignore (Lui_app.flush app);
+          let has key value = List.exists (function
+            | Lui_protocol.SetProp (_,p,Lui_protocol.StringValue text) -> p=key && text=value
+            | _ -> false) !ops in
+          Alcotest.(check bool) "Capture is only mounted in Journals root" (not favorites)
+            (has AccessibilityIdentifier "journal-capture-open");
+          Alcotest.(check bool) "Favorites has no Capture action/semantics" (not favorites)
+            (has AccessibilityLabel "Capture");
+          List.iter (fun destination ->
+            Alcotest.(check bool) "destination navigation remains mounted" true
+              (has AccessibilityLabel destination)) ["Journals";"Favorites"])) [false;true])
+      [false;true]) ["ios";"macos"]
 ;;
 
 let test_timeline_relative_date_headers () =
@@ -5294,6 +5344,7 @@ let () =
     [ ( "status list", List.map (fun scenario ->
         Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~status_scenario:scenario ()))
         ["expanded"; "none"; "now"; "waiting"; "later"; "select"; "clear"; "dismiss"; "failure"; "duplicate"])
+    ; ("Favorites compact title",[Alcotest.test_case "root Capture only in Journals" `Quick test_root_capture_placement; Alcotest.test_case "LUI titles icons and no arrow" `Quick test_favorites_compact_shared_titles; Alcotest.test_case "page outline click and native Back" `Quick (fun () -> run_favorites_native_visibility ~check_favorite_targets:true ())])
     ; ( "graph picker", [
         Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);
         Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);

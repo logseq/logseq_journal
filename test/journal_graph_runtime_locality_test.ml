@@ -3077,11 +3077,10 @@ let copy_expect_failure state effects outcome =
 
 let test_copy_rejects_missing_failed_or_changed_graph () =
   let state, effects = copy_start block_uuid in
-  copy_expect_failure
-    state
-    effects
-    (Protocol.V2_block_outcome
-       (V2_missing_block { uuid = block_uuid; revision = "missing" }));
+  let missing_state, missing_effects = copy_reply state effects
+    (Protocol.V2_block_outcome (V2_missing_block {uuid=block_uuid;revision="missing"})) in
+  copy_expect_failure missing_state missing_effects
+    (Protocol.V2_page_outcome (V2_missing_page {uuid=block_uuid;revision="missing"}));
   let state, effects = copy_root state effects "Root" in
   copy_expect_failure
     state
@@ -5385,10 +5384,181 @@ let test_dirty_abandon_keeps_reference_retryable () =
     ignore (reference_feed runtime reference |> fun output->expect_reference_page output target_uuid)) [false;true]
 ;;
 
+(* Root dispatch and mutation confirmation are owned by Runtime; no public pure
+   reducer emits these protocol reads. Test only its public submit/receive boundary. *)
+let page_detail_seed runtime children =
+  set_calendar runtime;
+  let out = Runtime.submit runtime (Journal_graph_request.Load_detail
+    {block_id=Graph.Uuid.to_string page_uuid; after=None; limit=128; request_generation=801L}) in
+  let root = only "page root lookup" out.requests in
+  let root = match root.command with
+    | V2_get_page {page=id;_} when Graph.Uuid.equal id page_uuid -> root
+    | V2_get_outline_block _ ->
+      Runtime.receive runtime (response root (Protocol.V2_block_outcome
+        (V2_missing_block {uuid=page_uuid; revision="absent-outline"})))
+      |> fun out -> only "outline miss must resolve page" out.requests
+    | _ -> Alcotest.fail "unexpected root lookup" in
+  Alcotest.(check bool) "page root is resolved as a page" true
+    (root.command = V2_get_page {page=page_uuid; revision=None});
+  let child_read = Runtime.receive runtime (response root (Protocol.V2_page_outcome
+    (V2_present_page {page; revision="page-1"})))
+    |> fun out -> only "page root children" out.requests in
+  (match child_read.command with
+   | V2_get_children {parent;limit=128;_} when Graph.Uuid.equal parent page_uuid -> ()
+   | _ -> Alcotest.fail "page children escaped selected page");
+  let out = Runtime.receive runtime (response child_read (copy_children page_uuid children)) in
+  out.responses |> List.find_map (fun r -> match r.Runtime.payload with
+    | Detail_loaded {detail;_} -> Some detail | _ -> None) |> Option.get
+;;
+
+let test_page_detail_root_and_append () =
+  List.iter (fun children ->
+    let runtime=Runtime.create () in
+    let detail=page_detail_seed runtime children in
+    Alcotest.(check string) "page root title" page.title (Journal_model.source detail.root);
+    Alcotest.(check string) "page root page identity" (Graph.Uuid.to_string page_uuid)
+      (Journal_model.page_id detail.root);
+    Alcotest.(check int) "page children" (List.length children) (List.length detail.children.blocks);
+    let command : Journal_graph_projection.create_child =
+      {mutation_id=Graph.Uuid.to_string unrelated_uuid; calendar_generation=1L;
+       block_id=Graph.Uuid.to_string unrelated_uuid; parent_block_id=Graph.Uuid.to_string page_uuid;
+       expected_parent_revision=Journal_model.revision detail.root; sibling_order="z";
+       source="Append only here";task_state=No_status;creation_time=Journal_model.creation_time detail.root} in
+    let request=Runtime.submit runtime (Create_child command) |> fun out->only "page append" out.requests in
+    (match request.command with
+     | V2_insert_blocks {parent;preconditions;_} ->
+       Alcotest.(check bool) "exact page parent" true (Graph.Uuid.equal parent page_uuid);
+       Alcotest.(check bool) "page revision, never outline revision" true
+         (preconditions = {Protocol.blocks=[];pages=[page_uuid,"page-1"];
+           scopes=[V2_children_scope page_uuid,"children-1"]})
+     | _->Alcotest.fail "page append failed to issue scoped insert");
+    let child_read=Runtime.receive runtime (response request (Protocol.V2_mutation_committed
+      {mutation_id=unrelated_uuid;status=V2_applied;generation="graph-1";
+       before_projection_revision="projection-1";after_projection_revision="projection-2"}))
+      |> fun out->only "read inserted page child" out.requests in
+    let child=copy_child unrelated_uuid page_uuid command.source in
+    let parent_read=Runtime.receive runtime (response child_read (Protocol.V2_block_outcome
+      (V2_present_block {value=child.value;revision=child.revision})))
+      |> fun out->only "confirm selected page parent" out.requests in
+    Alcotest.(check bool) "confirm page through page API" true
+      (parent_read.command=V2_get_page {page=page_uuid;revision=None});
+    let done_=Runtime.receive runtime (response parent_read (Protocol.V2_page_outcome
+      (V2_present_page {page;revision="page-2"}))) in
+    let child,parent=done_.responses |> List.find_map (fun r -> match r.Runtime.payload with
+      | Child_created {child;parent;_}->Some(child,parent) | _->None) |> Option.get in
+    Alcotest.(check string) "completed child page" (Graph.Uuid.to_string page_uuid) (Journal_model.page_id child);
+    Alcotest.(check string) "completed parent is page" (Graph.Uuid.to_string page_uuid) (Journal_model.id parent))
+    [[]; [copy_child block_uuid page_uuid "First child"]]
+;;
+
+let test_recycled_page_root_is_removed () =
+  let runtime=Runtime.create () in
+  ignore (page_detail_seed runtime []);
+  let request=changed runtime (window ~pages:[page_uuid] ())
+    |> fun out->only "page recycle refresh" (hydration_requests out) in
+  let out=Runtime.receive runtime (response request (Protocol.V2_page_outcome
+    (V2_present_page {page={page with recycled=true};revision="recycled"}))) in
+  Alcotest.(check bool) "recycled page root becomes unavailable" true
+    (List.exists (fun r->match r.Runtime.payload with
+      | Block_removed {block_id}->block_id=Graph.Uuid.to_string page_uuid | _->false) out.responses)
+;;
+
+let test_page_root_block_change_uses_page_identity () =
+  let runtime=Runtime.create () in
+  ignore (page_detail_seed runtime []);
+  let out=changed runtime (window ~blocks:[page_uuid] ()) in
+  Alcotest.(check bool) "page root point change is not an outline lookup" false
+    (List.exists (fun (r:Protocol.request)->r.command=V2_get_outline_block {block=page_uuid;revision=None}) out.requests);
+  Alcotest.(check bool) "page root point change refreshes page" true
+    (List.exists (fun (r:Protocol.request)->r.command=V2_get_page {page=page_uuid;revision=None}) out.requests)
+;;
+
+let test_page_root_refresh_and_resync () =
+  let runtime=Runtime.create () in
+  ignore (page_detail_seed runtime []);
+  let fresh=changed runtime (window ~pages:[page_uuid] ())
+    |> fun out->only "one owned page refresh" (hydration_requests out) in
+  let result=Runtime.receive runtime (response fresh (Protocol.V2_page_outcome
+    (V2_present_page {page={page with title="Renamed page"};revision="page-2"}))) in
+  let detail=result.responses |> List.find_map (fun r-> match r.Runtime.payload with
+    | Children_reconciled detail -> Some detail | _->None) |> Option.get in
+  Alcotest.(check string) "renamed page root reconciles" "Renamed page" (Journal_model.source detail.root);
+  Alcotest.(check string) "page revision reconciles" "page-2" (Journal_model.revision detail.root);
+  let out=Runtime.reconcile_push runtime ~request_generation:12L
+    (Protocol.V2_resync_required_push {api_version=Protocol.api_version;generation="generation-2";reason="overflow"}) in
+  Alcotest.(check bool) "page root is never rehydrated as outline" false
+    (List.exists (fun (r:Protocol.request)->r.command=V2_get_outline_block {block=page_uuid;revision=None}) out.requests)
+;;
+
+let favorites_reference_source runtime title =
+  let request : Journal_graph_request.favorites_request =
+    {graph_generation=1;request_generation=802L;limit=50;cursor=None} in
+  let read=Runtime.submit runtime (Load_favorites request) |> fun out->only "favorite list" out.requests in
+  Runtime.receive runtime (response read (Protocol.V2_favorites_outcome
+    {favorites_page=None;generation="g";projection_revision="p";next_cursor=None;
+     items=[{membership_uuid;membership_order="a";membership_revision="m";
+       target=V2_favorite_block {uuid=block_uuid;title;task_status=None;revision="b"}}]}))
+;;
+
+let test_favorites_share_reference_cache () =
+  let runtime=Runtime.create () in
+  set_calendar runtime;
+  let out=favorites_reference_source runtime (reference ^ " " ^ reference) in
+  let page_read=out.requests |> List.filter (fun (r:Protocol.request)->
+    r.command=V2_get_page {page=target_uuid;revision=None}) |> only "duplicate favorite reference uses one page read" in
+  let out=Runtime.receive runtime (reference_page_response page_read
+    (Graph.Journal_page {journal_day=20260901}) "Tuesday, September 1st, 2026") in
+  Alcotest.(check (option string)) "favorite journal page keeps actual date title"
+    (Some "Tuesday, September 1st, 2026")
+    (List.assoc_opt target_id (reference_updates out) |> Option.join);
+  let duplicate=favorites_reference_source runtime reference in
+  Alcotest.(check int) "favorite reload shares positive reference cache" 0
+    (List.length (List.filter (fun (r:Protocol.request)->r.command=V2_get_page {page=target_uuid;revision=None}) duplicate.requests));
+  let late_runtime=Runtime.create () in
+  let old=favorites_reference_source late_runtime reference in
+  let old_read=old.requests |> List.find (fun (r:Protocol.request)->r.command=V2_get_page {page=target_uuid;revision=None}) in
+  Runtime.reset late_runtime;
+  let late=Runtime.receive late_runtime (reference_page_response old_read Ordinary_page "Old graph") in
+  Alcotest.(check int) "late Favorites reference is fenced by graph reset" 0 (List.length late.responses)
+;;
+
+let test_favorites_outline_and_missing_reference () =
+  List.iter (fun missing ->
+    let runtime=Runtime.create () in
+    let out=favorites_reference_source runtime (reference ^ reference) in
+    let page_read=out.requests |> List.find (fun (r:Protocol.request)->
+      r.command=V2_get_page {page=target_uuid;revision=None}) in
+    let fallback=missing_reference_page runtime page_read target_uuid in
+    let outline=expect_reference_outline fallback target_uuid in
+    let out=Runtime.receive runtime (if missing then response outline (Protocol.V2_block_outcome
+      (V2_missing_block {uuid=target_uuid;revision="absent"})) else target_response outline "Outline title") in
+    Alcotest.(check (option string)) "Favorites shares outline and missing source results"
+      (if missing then None else Some "Outline title")
+      (List.assoc_opt target_id (reference_updates out) |> Option.join)) [false;true]
+;;
+
+let test_copy_page_root () =
+  List.iter (fun populated ->
+    let state,effects=copy_start page_uuid in
+    let state,effects=copy_reply state effects (Protocol.V2_block_outcome
+      (V2_missing_block {uuid=page_uuid;revision="no-outline"})) in
+    Alcotest.(check bool) "copy resolves exact page" true
+      (snd(copy_read effects)=V2_get_page {page=page_uuid;revision=None});
+    let state,effects=copy_reply state effects (Protocol.V2_page_outcome
+      (V2_present_page {page;revision="page-1"})) in
+    copy_parent effects page_uuid;
+    let state,effects=copy_reply state effects (copy_children page_uuid
+      (if populated then [copy_child block_uuid page_uuid "Child"] else [])) in
+    let state,effects=if populated then copy_reply state effects (copy_children block_uuid []) else state,effects in
+    let _,effects=copy_reply state effects (graph_info_outcome ~journal_title_format:None) in
+    Alcotest.(check bool) "page title and exact descendants copied" true
+      (effects=[Copy.Copied (page.title ^ if populated then "\n  - Child" else "")])) [false;true]
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ( "review reference ownership", [
+    [ ("Favorites page detail", [Alcotest.test_case "page root and scoped append" `Quick test_page_detail_root_and_append; Alcotest.test_case "copy page root and empty page" `Quick test_copy_page_root; Alcotest.test_case "recycled page is unavailable" `Quick test_recycled_page_root_is_removed; Alcotest.test_case "page point-change identity" `Quick test_page_root_block_change_uses_page_identity; Alcotest.test_case "page root refresh and resync" `Quick test_page_root_refresh_and_resync; Alcotest.test_case "Favorites share page-first reference cache" `Quick test_favorites_share_reference_cache; Alcotest.test_case "Favorites outline and absent references" `Quick test_favorites_outline_and_missing_reference]); ( "review reference ownership", [
         Alcotest.test_case "typed metadata retains newer fence" `Quick test_typed_metadata_preserves_newer_reference_fence;
         Alcotest.test_case "dirty abandon remains retryable" `Quick test_dirty_abandon_keeps_reference_retryable;
         Alcotest.test_case "failed lookup retains epoch fence" `Quick test_reference_failed_read_retains_epoch_fence;

@@ -2093,62 +2093,32 @@ module Favorites_list = struct
     let rows =
       List.map2
         (fun key label ->
-           let label =
-             if Keys.mem key block_keys
-             then
-               V.Navigation_link.create
-                 ~key:(Ui.Key.string ("favorite-open:" ^ key))
-                 ~activation_id:key
-                 ~enabled:actions_enabled
-                 ~on_activate:
-                   (Ui.Event.Handler.create (fun _ ->
-                      Ui.Event.Handler.Private.invoke on_open (Ui.Event.Payload.Text key)))
-                 ~label
-                 ()
-             else label
-           in
-           let context_menu =
-             if Keys.mem key block_keys
-             then
-               Some
-                 (V.Context_menu.create
-                    ~actions:
-                      [ V.Context_menu.action
-                          ~key:(Ui.Key.string "copy")
-                          ~enabled:actions_enabled
-                          ~title:"Copy"
-                          ~symbol:"doc.on.doc"
-                          ~on_press:
-                            (Ui.Event.Handler.create (fun _ ->
-                               Ui.Event.Handler.Private.invoke
-                                 on_copy
-                                 (Ui.Event.Payload.Text key)))
-                          ()
-                      ]
-                    ())
-             else None
-           in
-           V.Native_list.row
-             ~key:(Ui.Key.string key)
-             ~separator:Hidden
-             ?context_menu
-             label)
-        keys
-        children
+           let menu = if Keys.mem key block_keys then
+             [Lui_elements.context_menu
+               [Lui_elements.menu_item ~text:"Copy" ~icon:(`app "doc-on-doc")
+                  ~disabled:(not actions_enabled)
+                  ~on_press:(fun _ -> Ui.Event.Handler.Private.invoke on_copy
+                    (Ui.Event.Payload.Text key)) []]]
+             else [] in
+           Lui_elements.list_item ~key ~separator:`hidden
+             ~accessibility_identifier:("favorite-open:" ^ key)
+             ~disabled:(not actions_enabled)
+             ~on_press:(fun _ -> Ui.Event.Handler.Private.invoke on_open
+               (Ui.Event.Payload.Text key))
+             (Ui.mount label :: menu))
+        keys children
     in
-    V.Native_list.vertical
-      ~key:(Ui.Key.string "favorites-native-list")
-      ~style:Plain
-      ~on_visible_range
-      [ V.Native_list.section
-          ~key:(Ui.Key.string "favorites")
-          ~separator:Hidden
-          ~footer
-          rows
-      ]
-    |> V.Viewport.Vertical.with_test_id (Ui.Test_id.string "favorites-native-list")
-    |> V.Body.Vertical.fill
-    |> fun content -> V.Body.Vertical.create [ content ]
+    V.of_lui (Lui_elements.list ~key:"favorites-native-list" ~style:`plain ~grow:1.
+      ~accessibility_identifier:"favorites-native-list" ~track_visible_range:true
+      ~on_visible_range:(function
+        | Lui_protocol.VisibleRange (_,first,last) ->
+          Ui.Event.Handler.Private.invoke on_visible_range
+            (Ui.Event.Payload.Visible_range {first_index=Int64.of_int first;
+              last_exclusive=Int64.of_int last})
+        | _ -> ())
+      [Lui_elements.list_section ~key:"favorites" ~separator:`hidden
+        ~footer:(Ui.mount footer) rows])
+    |> V.Body.static
   ;;
 end
 
@@ -2162,8 +2132,7 @@ let render_title state =
 ;;
 
 let favorites_view
-      ~render_source
-      ~render_media
+      ~render_title
       ~state
       ~actions_enabled
       ~on_visible_range
@@ -2213,32 +2182,17 @@ let favorites_view
              (fun value ->
                 let favorite = Journal_graph_projection.favorite value in
                 let key = favorite.membership_id in
-                let text =
-                  V.text
-                    (match favorite.target with
-                     | Page _ -> favorite.title
-                     | Block _ -> render_source favorite.title)
-                in
-                let label =
-                  if favorite.task_state = Journal_model.No_status
-                  then text
-                  else
-                    V.column
-                      [ text; V.text (Journal_model.status_name favorite.task_state) ]
-                in
-                let row =
-                  match favorite.target with
-                  | Page _ -> V.label ~title:label ~icon:(V.symbol ~name:"doc.text" ()) ()
-                  | Block _ -> label
-                in
-                let root =
-                  match favorite.target with
-                  | Page id | Block id -> id
-                in
-                ( key
-                , V.column
-                    ~key:(Ui.Key.string key)
-                    [ render_media ~title:favorite.title ~root row ] ))
+                let title = match favorite.target with
+                  | Page _ -> Journal_model.Title.render favorite.title
+                  | Block _ -> render_title favorite.title in
+                let icon = match favorite.target with
+                  | Page _ -> "doc.text"
+                  | Block _ -> "circle" in
+                let label = V.label
+                  ~title:(V.of_lui (Lui_elements.text ~grow:1. ~text_alignment:`start
+                    ~style_class:"single-line" ~value:(Journal_model.Title.plain title) []))
+                  ~icon:(V.symbol ~name:icon ()) () in
+                key, label)
              rows)
       in
       let footer =
@@ -2487,7 +2441,6 @@ let timeline_page
       ~on_region
       ~render_source
       ~render_title
-      ~render_media
       ~render_row_media
       ~platform
       ~graph_generation
@@ -2565,8 +2518,7 @@ let timeline_page
     then (
       on_region "favorites";
       favorites_view
-        ~render_source
-        ~render_media
+        ~render_title
         ~state:favorites
         ~actions_enabled:interaction_enabled
         ~on_visible_range:on_favorites_visible_range
@@ -2930,7 +2882,7 @@ module Detail_list = struct
             let context_menu =
               V.Context_menu.create
                 ~actions:
-                  ([ V.Context_menu.action
+                  ((if id = Journal_model.page_id block then [] else [ V.Context_menu.action
                       ~key:(Ui.Key.string "open")
                       ~title:"Open block"
                       ~symbol:"arrow.up.right.square"
@@ -2944,7 +2896,7 @@ module Detail_list = struct
                       ~symbol:"trash"
                       ~on_press:delete
                       ()
-                  ; V.Context_menu.action
+                  ]) @ [ V.Context_menu.action
                       ~key:(Ui.Key.string "copy")
                       ~enabled
                       ~title:"Copy"
@@ -5749,18 +5701,8 @@ let start
       in
       let first_index = bounded first_index in
       let last_exclusive = max first_index (bounded last_exclusive) in
-      let roots =
-        Rrbvec.subvec snapshot.favorites_media_roots first_index last_exclusive
-        |> Option.get
-        |> Rrbvec.to_list
-      in
-      Journal_media_runtime.retain_visible_roots
-        ~owner:(media_presentation_scope snapshot ~detail:false)
-        media_runtime
-        roots;
-      Effect.bind (flush_media set_state) ~f:(fun () ->
-        update (fun state ->
-          favorites_event state (Visible { first_index; last_exclusive })))
+      update (fun state ->
+        favorites_event state (Visible { first_index; last_exclusive }))
     | Native_payload (Ui.Event.Payload.Visible_range _)
       when Journal_routes.destination snapshot.routes = Journal_routes.Favorites ->
       Effect.ignore
@@ -6913,8 +6855,6 @@ let start
             ~on_region:on_view_region
             ~render_source:(render_source state)
             ~render_title:(render_title state)
-            ~render_media:
-              (media_label ~store:media_store ~on_region:on_view_region state dispatch)
             ~render_row_media:(fun ~title ~root ~image_children child ->
               on_view_region "timeline-row";
               row_media_label
@@ -7622,11 +7562,6 @@ module For_testing = struct
       ~on_region:(fun _ -> ())
       ~render_source:(render_source initial_state)
       ~render_title:(render_title initial_state)
-      ~render_media:
-        (media_label
-           ~store:(Journal_media_view.Store.create ())
-           initial_state
-           (ignore_dispatch handler))
       ~render_row_media:
         (row_media_label
            ~store:(Journal_media_view.Store.create ())
