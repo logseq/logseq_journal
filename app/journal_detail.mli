@@ -6,7 +6,6 @@ type mode =
   | Failed of string
 
 type t
-type staged_delete
 
 type row =
   | Block of
@@ -101,15 +100,11 @@ val reconcile_children : t -> Journal_graph_projection.detail -> t
     Existing nodes are not charged twice; consumed counters never decrease. *)
 val account_initial_update : previous:t -> t -> t
 
-(** Fence cancelled initial completions without refunding budgets or reusing
-    their generations. Restored branches can admit fresh bounded reads. *)
-val cancel_initial_reads : t -> t
 val apply_child_created : t -> child:Journal_model.t -> parent:Journal_model.t -> t
 
-(** With [fence_reads], initial deletion fences only removed branch tickets, including in
-    Undo state; unrelated pending reads continue without a duplicate request. *)
-val stage_delete : ?fence_reads:bool -> t -> block_id:string -> (t * staged_delete) option
-val undo_delete : t -> staged_delete -> t
+(** Remove a committed subtree from the materialized outline. Unrelated pending
+    reads retain their ownership; removed branches cannot accept completions. *)
+val remove_block : t -> block_id:string -> t option
 
 (** Only composer ownership is retained; reopening loads a fresh outline projection. *)
 type retained_composer

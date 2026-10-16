@@ -147,19 +147,7 @@ module Admission_refresh = struct
   let observation state = state.observation
 end
 
-type delete_phase =
-  | Undoable
-  | Committing
-
-type pending_delete =
-  { mutation_id : string
-  ; block_id : string
-  ; expected_revision : string
-  ; staged : Journal_timeline_state.staged_delete option
-  ; detail_staged : Journal_routes.staged_delete option
-  ; deadline : Core.Time_ns.t
-  ; phase : delete_phase
-  }
+type pending_delete = Journal_graph_projection.delete_subtree
 
 type pending_status =
   { mutation_id : string
@@ -169,7 +157,6 @@ type pending_status =
   }
 
 type timeline_notice =
-  | Delete_undo
   | Delete_failed of string
   | Status_failed of string
   | Copy_failed of string
@@ -180,7 +167,7 @@ let operation_failure ?(can_retry_imports = false) = function
     Some
       ( "Delete failed"
       , message
-      , "The block has been restored. Review it before trying Delete again." )
+      , "The block is kept. Review it before trying Delete again." )
   | Some (Status_failed message) ->
     Some
       ( "Status not changed"
@@ -198,7 +185,7 @@ let operation_failure ?(can_retry_imports = false) = function
         else
           "Your journal entry and other attachments are kept. Select the file again to \
            retry." )
-  | None | Some Delete_undo -> None
+  | None -> None
 ;;
 
 type feed_projection_context =
@@ -855,46 +842,15 @@ let capture_failure_message = function
   | Local_capture_failure message -> message
 ;;
 
-let restore_deleted state (pending : pending_delete) =
-  let timeline =
-    Option.fold
-      ~none:state.timeline
-      ~some:(Journal_timeline_state.undo_delete state.timeline)
-      pending.staged
-  in
-  let routes =
-    Option.fold
-      ~none:state.routes
-      ~some:(Journal_routes.undo_delete state.routes)
-      pending.detail_staged
-  in
-  favorites_event { state with timeline; routes } (Reveal_target pending.block_id)
-;;
-
-let hide_deleted state (pending : pending_delete) =
-  let timeline, staged =
-    match
-      Journal_timeline_state.stage_delete state.timeline ~block_id:pending.block_id
-    with
-    | None -> state.timeline, pending.staged
-    | Some (timeline, staged) -> timeline, Some staged
-  in
-  let routes, detail_staged =
-    let routes, staged =
-      Journal_routes.stage_delete state.routes ~block_id:pending.block_id
-    in
-    ( routes
-    , match staged with
-      | Some _ -> staged
-      | None -> pending.detail_staged )
-  in
+let commit_deleted state block_id =
+  let routes, released = Journal_routes.commit_delete state.routes ~block_id in
+  List.iter Journal_asset_import.discard_staged_file released;
   favorites_event
     { state with
-      timeline
-    ; routes
-    ; pending_delete = Some { pending with staged; detail_staged }
+      routes
+    ; timeline = Journal_timeline_state.remove_block state.timeline ~block_id
     }
-    (Hide_target pending.block_id)
+    (Hide_target block_id)
 ;;
 
 let terminal_graph_state state graph_error =
@@ -1034,7 +990,7 @@ let back_state state =
   { state with routes; timeline }
 ;;
 
-let apply_worker_response_unstaged state (response : Journal_graph_runtime.response) =
+let apply_worker_response state (response : Journal_graph_runtime.response) =
   match response.payload with
   | Projection_changes _ | Projection_resync -> state
   | Reference_sources_changed updates ->
@@ -1289,11 +1245,7 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
           ~some:(Journal_timeline_state.replace_timeline_entry state.timeline)
           timeline_entry_update
     }
-  | Block_removed { block_id } ->
-    { state with
-      timeline = Journal_timeline_state.remove_block state.timeline ~block_id
-    ; routes = fst (Journal_routes.stage_delete state.routes ~block_id)
-    }
+  | Block_removed { block_id } -> commit_deleted state block_id
   | Page_tree_reconciled { page; value } ->
     { state with
       timeline =
@@ -1370,11 +1322,9 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
   | Subtree_deleted { block_id; parent; timeline_entry_update; _ } ->
     (match state.pending_delete with
      | Some pending when String.equal pending.block_id block_id ->
-       let routes, released = Journal_routes.commit_delete state.routes ~block_id in
-       List.iter Journal_asset_import.discard_staged_file released;
+       let state = commit_deleted state block_id in
        { state with
-         routes
-       ; timeline =
+         timeline =
            Option.fold
              ~none:
                (Option.fold
@@ -1390,8 +1340,7 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
   | Delete_conflict latest ->
     (match state.pending_delete with
      | None -> state
-     | Some pending ->
-       let state = restore_deleted state pending in
+     | Some _ ->
        let state =
          { state with
            routes =
@@ -1448,7 +1397,7 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
        (match state.pending_delete with
         | Some pending
           when pending.mutation_id = mutation_id && pending.block_id = block_id ->
-          { (restore_deleted state pending) with
+          { state with
             pending_delete = None
           ; timeline_notice = Some (Delete_failed message)
           }
@@ -1461,16 +1410,6 @@ let apply_worker_response_unstaged state (response : Journal_graph_runtime.respo
       (match failure with
        | Worker_failure _ -> Worker_sync_failure (latest_worker_error state)
        | Projection_failure message -> Non_worker_sync_failure message)
-;;
-
-let apply_worker_response state (response : Journal_graph_runtime.response) =
-  match state.pending_delete, response.payload with
-  | None, _ | Some _, Subtree_deleted _ -> apply_worker_response_unstaged state response
-  | Some pending, _ ->
-    let state = apply_worker_response_unstaged (restore_deleted state pending) response in
-    (match state.pending_delete with
-     | None -> state
-     | Some pending -> hide_deleted state pending)
 ;;
 
 module Root_navigation = struct
@@ -1721,7 +1660,6 @@ type command =
   | Sign_out
   | Submit_e2ee_password
   | Request_local_cache_reset
-  | Delete_undo
   | Detail_retry
   | Asset_settings of string
   | Import_asset of string
@@ -5372,7 +5310,6 @@ let start
          (Effect.of_thunk (fun () -> sync_media !state_ref))
          ~f:(fun () -> flush_media set_state))
   in
-  let delete_timer_generation = ref 0 in
   let schedule_after span thunk =
     ignore
       (Thread.create
@@ -5405,37 +5342,6 @@ let start
             ~entry_id ~request_generation ~elapsed in
           if routes == state.routes then state else { state with routes })))
   in
-  let arm_delete_timer mutation_id deadline =
-    incr delete_timer_generation;
-    let generation = !delete_timer_generation in
-    let remaining = Core.Time_ns.(Span.to_sec (diff deadline (now ()))) in
-    schedule_after remaining (fun () ->
-      if !delete_timer_generation = generation
-      then
-        Effect.run
-          (set_state_and_effect (fun state ->
-             match state.pending_delete with
-             | Some ({ phase = Undoable; _ } as pending)
-               when String.equal pending.mutation_id mutation_id ->
-               let request : Journal_graph_projection.delete_subtree =
-                 { mutation_id = pending.mutation_id
-                 ; block_id = pending.block_id
-                 ; expected_revision = pending.expected_revision
-                 }
-               in
-               ( { state with
-                   pending_delete = Some { pending with phase = Committing }
-                 ; timeline_notice = None
-                 }
-               , send (Journal_graph_request.Delete_subtree request) )
-             | None | Some _ -> state, Effect.ignore)))
-  in
-  let delete_timer_key state =
-    match state.pending_delete with
-    | Some { mutation_id; deadline; phase = Undoable; _ } -> Some (mutation_id, deadline)
-    | Some _ | None -> None
-  in
-  let prev_delete_timer_key = ref (delete_timer_key initial_state) in
   let sync_error_timer_generation = ref 0 in
   let arm_sync_error_timer sequence =
     incr sync_error_timer_generation;
@@ -5457,7 +5363,6 @@ let start
   in
   let handle_dispatch payload =
     let snapshot = !state_ref in
-    let current_time : Core.Time_ns.t Effect.t = fun () -> Core.Time_ns.now () in
     let update f = set_state f in
     let with_request next request =
       Effect.many [ update (fun _ -> next); send request ]
@@ -6050,7 +5955,7 @@ let start
         | Some (Delete_failed _ | Status_failed _ | Copy_failed _ | Import_failed _) ->
           discard_import_batches state.failed_capture_imports;
           { state with timeline_notice = None; failed_capture_imports = [] }
-        | None | Some Delete_undo -> state)
+        | None -> state)
     | Close_error_info -> update (fun state -> { state with modal = No_modal })
     | Switch_graph ->
       cancel_copy ();
@@ -6132,15 +6037,6 @@ let start
           ~f:(fun () -> send_manager (Graph_service.Submit_e2ee_password password)))
     | Request_local_cache_reset ->
       update (fun state -> { state with graph_picker_open = true; modal = No_modal })
-    | Delete_undo ->
-      update (fun state ->
-        match state.pending_delete with
-        | Some ({ phase = Undoable; _ } as pending) ->
-          { (restore_deleted state pending) with
-            pending_delete = None
-          ; timeline_notice = None
-          }
-        | None | Some { phase = Committing; _ } -> state)
     | Timeline_retry value ->
       (match int_of_string_opt value with
        | None -> Effect.ignore
@@ -6318,22 +6214,15 @@ let start
          if saving
          then Effect.ignore
          else (
-           let duration =
-             if snapshot.environment.accessible_navigation then 10. else 5.
+           let request : Journal_graph_projection.delete_subtree =
+             { mutation_id = fresh_identity ()
+             ; block_id
+             ; expected_revision = Journal_model.revision block
+             }
            in
-           Effect.bind current_time ~f:(fun now ->
-             let pending =
-               { mutation_id = fresh_identity ()
-               ; block_id
-               ; expected_revision = Journal_model.revision block
-               ; staged = None
-               ; detail_staged = None
-               ; deadline = Core.Time_ns.add now (Core.Time_ns.Span.of_sec duration)
-               ; phase = Undoable
-               }
-             in
-             update (fun state ->
-               hide_deleted { state with timeline_notice = Some Delete_undo } pending)))
+           with_direct_request
+             { snapshot with pending_delete = Some request; timeline_notice = None }
+             (Journal_graph_request.Delete_subtree request))
        | _ -> Effect.ignore)
     | Copy_block block_id ->
       let exists =
@@ -6386,42 +6275,6 @@ let start
                in
                if timeline == state.timeline then state else { state with timeline }))))
   in
-  let notice_token_sequence = ref 0L in
-  let notice_cancellation : int64 option ref = ref None in
-  let cancel_notice token =
-    emit_platform_request (Journal_platform.notice_cancel_request ~token)
-  in
-  let notice_callback ((undo_available, _capture_error), accessible_navigation) =
-    Option.iter cancel_notice !notice_cancellation;
-    notice_cancellation := None;
-    (* Composer failures are laid out above its controls. Only Undo uses
-       the platform notice, so an error never covers draft actions. *)
-    match undo_available with
-    | false -> ()
-    | true ->
-      let token = Int64.succ !notice_token_sequence in
-      notice_token_sequence := token;
-      notice_cancellation := Some token;
-      let message, action_label, duration_ms =
-        ( "Block and descendants removed"
-        , Some "Undo"
-        , if accessible_navigation then 10_000 else 5_000 )
-      in
-      emit_platform_request
-        (Journal_platform.show_notice_request ~token ~message ~action_label ~duration_ms)
-        ~k:(fun result ->
-          match result with
-          | Error _ -> ()
-          | Ok payload ->
-            (match Journal_platform.decode_notice_response ~token payload with
-             | Ok Notice_action -> dispatch.send Delete_undo
-             | Ok (Notice_dismiss | Notice_swipe | Notice_timeout) | Error _ -> ()))
-  in
-  let notice_key state =
-    ( (state.graph_ready && state.timeline_notice = Some Delete_undo, state.capture_error)
-    , state.environment.accessible_navigation )
-  in
-  let prev_notice_key = ref (notice_key initial_state) in
   (* Every [Edge.on_change] of the bonsai version becomes a post-update key
      comparison: the key is recomputed from the new model and the callback
      fires when it differs from the previous post-update value. *)
@@ -6502,30 +6355,6 @@ let start
                (List.filter_map Fun.id rows))
           roots;
         Effect.run (flush_media set_state)));
-    (let key = notice_key model in
-     if
-       not
-         ((fun (left_notice, left_accessible) (right_notice, right_accessible) ->
-             left_notice = right_notice && Bool.equal left_accessible right_accessible)
-            !prev_notice_key
-            key)
-     then (
-       prev_notice_key := key;
-       notice_callback key));
-    (let key = delete_timer_key model in
-     if
-       not
-         (Option.equal
-            (fun (left_id, left_deadline) (right_id, right_deadline) ->
-               String.equal left_id right_id
-               && Core.Time_ns.equal left_deadline right_deadline)
-            !prev_delete_timer_key
-            key)
-     then (
-       prev_delete_timer_key := key;
-       match key with
-       | None -> incr delete_timer_generation
-       | Some (mutation_id, deadline) -> arm_delete_timer mutation_id deadline));
     (let key = model.capture_imports in
      if not (Option.equal ( == ) !prev_capture_imports_key key)
      then (

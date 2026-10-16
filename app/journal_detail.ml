@@ -56,14 +56,6 @@ type t =
   ; reveal_outcome : Ui.View.Native_list.outcome option
   }
 
-type staged_delete =
-  { root_id : string
-  ; blocks : Journal_model.t Blocks.t
-  ; branches : branch Blocks.t
-  ; parent_id : string option
-  ; was_appended : bool
-  }
-
 type event =
   | Observe_visible_range of int64 * int64
   | Load_next
@@ -747,7 +739,7 @@ let apply_child_created (t : t) ~child ~parent =
   else t
 ;;
 
-let stage_delete ?(fence_reads = false) (t : t) ~block_id =
+let remove_block (t : t) ~block_id =
   match Blocks.find_opt block_id t.blocks with
   | None -> None
   | Some block ->
@@ -766,15 +758,6 @@ let stage_delete ?(fence_reads = false) (t : t) ~block_id =
         | None -> false)
     in
     let removed = Blocks.filter (fun id _ -> descendant [] id) t.blocks in
-    let removed_branches = Blocks.filter (fun id _ -> Blocks.mem id removed) t.branches in
-    let removed_branches =
-      if fence_reads
-      then
-        Blocks.map
-          (fun (branch : branch) -> { branch with pending = None })
-          removed_branches
-      else removed_branches
-    in
     let branches =
       Blocks.filter_map
         (fun id (branch : branch) ->
@@ -804,63 +787,7 @@ let stage_delete ?(fence_reads = false) (t : t) ~block_id =
           blocks
       | None -> blocks
     in
-    Some
-      ( invalidate_rows { t with blocks; branches }
-      , { root_id = block_id
-        ; blocks = removed
-        ; branches = removed_branches
-        ; parent_id = Journal_model.parent_id block
-        ; was_appended =
-            Option.fold
-              ~none:false
-              ~some:(fun parent -> List.mem block_id (branch t parent).appended)
-              (Journal_model.parent_id block)
-        } )
-;;
-
-let undo_delete (t : t) (staged : staged_delete) =
-  let blocks = Blocks.union (fun _ current _ -> Some current) t.blocks staged.blocks in
-  let branches =
-    Blocks.union (fun _ current _ -> Some current) t.branches staged.branches
-  in
-  let branches, blocks =
-    match staged.parent_id with
-    | None -> branches, blocks
-    | Some id ->
-      let current = Option.value (Blocks.find_opt id branches) ~default:empty_branch in
-      if List.mem staged.root_id current.children
-      then branches, blocks
-      else (
-        let children =
-          staged.root_id :: current.children
-          |> List.sort (fun a b ->
-            match Blocks.find_opt a blocks, Blocks.find_opt b blocks with
-            | Some a, Some b ->
-              String.compare
-                (Journal_model.sibling_order a)
-                (Journal_model.sibling_order b)
-            | _ -> String.compare a b)
-        in
-        ( Blocks.add
-            id
-            { current with
-              children
-            ; appended =
-                (if staged.was_appended
-                 then staged.root_id :: current.appended
-                 else current.appended)
-            }
-            branches
-        , Blocks.update
-            id
-            (Option.map (fun parent ->
-               Journal_model.with_child_count
-                 parent
-                 ~child_count:(Journal_model.child_count parent + 1)
-               |> Result.get_ok))
-            blocks ))
-  in
-  invalidate_rows { t with blocks; branches }
+    Some (invalidate_rows { t with blocks; branches })
 ;;
 
 let reveal_outcome t = t.reveal_outcome

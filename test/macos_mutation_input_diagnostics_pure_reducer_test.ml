@@ -322,52 +322,8 @@ let test_detail_reload_after_session_replacement () =
   equal routes unchanged "reload rejects the previous detail request completion"
 ;;
 
-let test_undo_keeps_reconciled_sibling () =
-  let module Timeline = Journal_timeline_state in
-  let retained_slots state =
-    Timeline.fold_slots (fun slots slot -> slot :: slots) [] state |> List.rev
-  in
-  let target = block () in
-  let sibling_id = "70000000-0000-4000-a000-000000000002" in
-  let sibling = block ~id:sibling_id () in
-  let entry block : Journal_graph_projection.timeline_entry =
-    { block; child_summaries = [] }
-  in
-  let initial =
-    Timeline.empty ~today:20260901
-    |> fun state ->
-    Timeline.prepend_timeline_entry state (entry sibling)
-    |> fun state -> Timeline.prepend_timeline_entry state (entry target)
-  in
-  let staged, backup =
-    Timeline.stage_delete initial ~block_id:(Journal_model.id target) |> Option.get
-  in
-  let latest =
-    block ~id:sibling_id ~source:"Reconciled sibling" ~revision:"sibling-2" ()
-  in
-  let current = Timeline.replace_block staged latest in
-  let restored = Timeline.undo_delete current backup in
-  let blocks =
-    retained_slots restored
-    |> List.filter_map (function
-      | Timeline.Top_level entry -> Some entry.block
-      | _ -> None)
-  in
-  equal 2 (List.length blocks) "Undo restores only the deleted target";
-  let actual = List.find (fun block -> Journal_model.id block = sibling_id) blocks in
-  equal
-    "sibling-2"
-    (Journal_model.revision actual)
-    "Undo restored an obsolete sibling revision";
-  equal
-    "Reconciled sibling"
-    (Journal_model.source actual)
-    "Undo discarded reconciled sibling text"
-;;
-
 let cases =
-  [ "M03 Undo keeps reconciled sibling", test_undo_keeps_reconciled_sibling
-  ; "M05 reload after replacement session", test_detail_reload_after_session_replacement
+  [ "M05 reload after replacement session", test_detail_reload_after_session_replacement
   ; "M06 reopened request correlation", test_admission_reopen_fence
   ; "M05 Capture full-value pipeline", test_capture_pipeline
   ; "M05 Detail append and retry pipeline", test_detail_pipeline

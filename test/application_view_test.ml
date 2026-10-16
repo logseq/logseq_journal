@@ -402,6 +402,7 @@ let run_favorites_native_visibility
       ?(check_capture_imports = false)
       ?detail_capture
       ?status_scenario
+      ?delete_scenario
       ?(on_initialized = fun () -> ())
       ?media_rows
       ?(shared_media = false)
@@ -420,6 +421,9 @@ let run_favorites_native_visibility
     | Some ("now" | "waiting" | "later" as value) -> Some value
     | Some _ -> Some "doing"
     | None -> None) in
+  let delete_writes = Atomic.make 0 in
+  let delete_release = Atomic.make false in
+  let delete_notices = ref 0 in
   let status_writes = Atomic.make [] in
   let status_revision () = if Atomic.get status_writes = [] then "root" else "status-updated" in
   let status_release = Atomic.make (status_scenario <> Some "duplicate") in
@@ -775,6 +779,20 @@ let run_favorites_native_visibility
           in
           let outcome =
             match request.command with
+            | P.V2_delete_blocks { root; mutation_id; preconditions } when Option.is_some delete_scenario ->
+              Alcotest.(check string) "delete keeps target UUID"
+                (G.Uuid.to_string (uuid 1)) (G.Uuid.to_string root);
+              Alcotest.(check (list (pair string string))) "delete preserves revision preconditions"
+                [ G.Uuid.to_string root, "root" ]
+                (List.map (fun (id, revision) -> G.Uuid.to_string id, revision) preconditions.blocks);
+              Atomic.incr delete_writes;
+              while not (Atomic.get delete_release) do
+                Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
+              done;
+              if delete_scenario = Some "failure" then
+                P.V2_failed { code = Logseq_db_worker.Error.code_string Invalid_request; message = "Fixture delete failed" }
+              else P.V2_mutation_committed { mutation_id; status = V2_applied; generation = "g"
+                ; before_projection_revision = "p"; after_projection_revision = "p2" }
             | V2_set_task_status { mutation_id; block; status; _ } when Option.is_some status_scenario ->
               let value = match status with
                 | P.V2_todo -> "todo" | V2_doing -> "doing" | V2_in_review -> "in-review"
@@ -1180,6 +1198,7 @@ let run_favorites_native_visibility
       ?calendar_sampler
       ~on_client:(fun value -> client := Some value)
       ~on_platform_request:(fun request ->
+        if Bytes.length request >= 32 && Bytes.get_uint16_le request 6 = 25 then incr delete_notices;
         if Bytes.length request >= 32 && Bytes.get_uint16_le request 6 = 28
         then clipboard_requests := request :: !clipboard_requests)
       ~on_view_region:(fun name ->
@@ -1315,6 +1334,7 @@ let run_favorites_native_visibility
   in
   Fun.protect
     ~finally:(fun () ->
+      Atomic.set delete_release true;
       Atomic.set status_release true;
       Atomic.set child_release true;
       Atomic.set calendar_feed_release true;
@@ -1350,6 +1370,50 @@ let run_favorites_native_visibility
        wait "Journals mounted" (fun () ->
          Option.is_some (find "accessibility-label" "Favorites")
          && Option.is_some (find "text" "Timeline fixture 2"));
+       (* Delete admission is private to Application, absent from Root_navigation's
+          public pure events. Use its existing public bridge and controlled Worker
+          fixture to execute the actual UI admission/completion boundary. *)
+       Option.iter (fun scenario ->
+         let send_delete () =
+           let list = Option.get (find "_extension" "journal-list") in
+           let row_payload = Yojson.Safe.to_string (`Assoc
+             [ "key", `String "delete"; "row", `String ("block:" ^ G.Uuid.to_string (uuid 1)) ]) in
+           let event = Yojson.Safe.to_string (`Assoc
+             [ "type", `String "row_event"; "payload", `String row_payload ]) in
+           hooks.extension_event list "event" (Yojson.Safe.to_string
+             (`Assoc [ "id", `Int 1; "payload", `String event ])) |> consume
+         in
+         send_delete ();
+         Alcotest.(check bool) "pending delete keeps content until commit" true
+           (Option.is_some (find "text" "Timeline fixture 0"));
+         Alcotest.(check int) "delete never requests an Undo notice" 0 !delete_notices;
+         let immediate_deadline = Unix.gettimeofday () +. 0.5 in
+         while Atomic.get delete_writes = 0 && Unix.gettimeofday () < immediate_deadline do
+           hooks.pump () |> consume; Unix.sleepf 0.001
+         done;
+         Alcotest.(check int) "delete reaches Worker immediately without an Undo deadline" 1
+           (Atomic.get delete_writes);
+         send_delete ();
+         Alcotest.(check int) "repeated pending row action sends once" 1 (Atomic.get delete_writes);
+         Atomic.set delete_release true;
+         wait "delete completion updates content or shows failure" (fun () ->
+           if scenario = "failure" then Option.is_some (find "text" "Delete failed")
+           else Option.is_none (find "text" "Timeline fixture 0"));
+         Alcotest.(check bool) "failure preserves block; success removes it" (scenario = "failure")
+           (Option.is_some (find "text" "Timeline fixture 0"));
+         Alcotest.(check int) "completion cannot leave an Undo notice" 0 !delete_notices;
+         if scenario = "failure" then (
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Details")));
+           wait "failure details explain recovery" (fun () ->
+             Option.is_some (find "text" "The block is kept. Review it before trying Delete again."));
+           Alcotest.(check bool) "failure includes worker reason" true
+             (Option.is_some (find "text" "Fixture delete failed"));
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-identifier" "journal-error-info-close")));
+           send_delete ();
+           wait "failure releases admission for explicit retry" (fun () -> Atomic.get delete_writes = 2))
+         else (
+           send_delete ();
+           Alcotest.(check int) "deleted identity cannot submit again" 1 (Atomic.get delete_writes))) delete_scenario;
        Option.iter (fun scenario ->
          let option tag = find "accessibility-identifier" ("journal-status-sheet-option:" ^ tag) in
          let close () = Option.get (find "accessibility-identifier" "journal-status-close") in
@@ -1416,7 +1480,7 @@ let run_favorites_native_visibility
          if List.mem scenario ["expanded"; "dismiss"; "none"; "now"; "waiting"; "later"] then (
            Alcotest.(check bool) "closing removes status UI" true (Option.is_none (option "doing"));
            Alcotest.(check int) "closing never submits" 0 (List.length (Atomic.get status_writes)))) status_scenario;
-       if Option.is_none status_scenario then (
+       if Option.is_none status_scenario && Option.is_none delete_scenario then (
        if Option.is_some calendar_change then (
          let label () = Hashtbl.fold (fun _ values found ->
            match List.assoc_opt "payload" values with
@@ -5424,7 +5488,10 @@ let () =
     Journal_bridge.register hooks)
   else Alcotest.run
     "application view"
-    [ ( "status list", List.map (fun scenario ->
+    [ ( "direct delete", List.map (fun scenario ->
+        Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~delete_scenario:scenario ()))
+        ["success"; "failure"])
+    ; ( "status list", List.map (fun scenario ->
         Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~status_scenario:scenario ()))
         ["expanded"; "none"; "now"; "waiting"; "later"; "select"; "clear"; "dismiss"; "failure"; "duplicate"])
     ; ("Favorites compact title",[Alcotest.test_case "page property values keep name without duplication" `Quick test_detail_page_property_value_presentation; Alcotest.test_case "root Capture only in Journals" `Quick test_root_capture_placement; Alcotest.test_case "LUI titles icons and no arrow" `Quick test_favorites_compact_shared_titles; Alcotest.test_case "page outline click and native Back" `Quick (fun () -> run_favorites_native_visibility ~check_favorite_targets:true ())])

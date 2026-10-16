@@ -56,11 +56,6 @@ val retry_detail_at
 
 val map_details : t -> f:(Journal_detail.t -> Journal_detail.t) -> t
 
-type staged_delete
-
-val stage_delete : t -> block_id:string -> t * staged_delete option
-val undo_delete : t -> staged_delete -> t
-
 val apply_detail_response
   :  t
   -> request_generation:int64
@@ -105,8 +100,8 @@ val map_child_capture_at
   -> f:(Journal_capture.t -> Journal_capture.t)
   -> t
 
-(** Retire committed root drafts and return their files to the application for cleanup.
-    Staging a delete and Undo do not retire them. *)
+(** Remove a committed subtree from all owned routes, retire its root drafts, and
+    return their files to the application for cleanup. *)
 val commit_delete : t -> block_id:string -> t * Journal_asset_import.staged list
 
 val child_attachment_imports

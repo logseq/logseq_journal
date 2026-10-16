@@ -1550,7 +1550,6 @@ let () =
     ; "Lui_app.create_with_extensions"
     ; "application_theme"
     ; "V.Sheet.create"
-    ; "Journal_platform.show_notice_request"
     ; "V.button"
     ; "local-cache-reset-confirmation"
     ; "journal-detail-route"

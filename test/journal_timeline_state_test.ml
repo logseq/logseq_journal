@@ -548,244 +548,7 @@ let test_prepend_first_today_entry_before_older_days () =
   | _ -> fail "first today Capture was inserted outside the visible day ordering"
 ;;
 
-let require_staged state block_id =
-  match Timeline.stage_delete state ~block_id with
-  | Some value -> value
-  | None -> fail "expected %s to stage" block_id
-;;
-
-let test_stage_delete_and_exact_undo () =
-  let parent = block ~child_count:3 500 in
-  let sibling = block ~order:"z" 501 in
-  let initial =
-    Timeline.empty ~today:20260809
-    |> begin_and_apply_feed
-         ~generation:1L
-         ~before_day:None
-         (feed [ day_feed 20260809 "Today" [ sibling; parent ] ])
-  in
-  let staged_collapsed, collapsed_backup =
-    require_staged initial (Journal_model.id parent)
-  in
-  require_equal_string_list
-    (slot_keys staged_collapsed)
-    [ "block:" ^ Journal_model.id sibling ]
-    "collapsed delete removed unrelated slots";
-  require
-    (Timeline.total_count staged_collapsed = Timeline.total_count initial - 1)
-    "collapsed delete did not repair total count";
-  require_equal_string_list
-    (slot_keys (Timeline.undo_delete staged_collapsed collapsed_backup))
-    (slot_keys initial)
-    "collapsed Undo did not restore exact slots";
-  let loaded = initial in
-  let loaded = Timeline.observe_visible_range loaded ~first_index:0 ~last_exclusive:3 in
-  require
-    (Timeline.next_request loaded = None)
-    "static More exposed an automatic paging request";
-  let staged, backup = require_staged loaded (Journal_model.id parent) in
-  require_equal_string_list
-    (slot_keys staged)
-    [ "block:" ^ Journal_model.id sibling ]
-    "expanded delete retained projected descendants or removed a sibling";
-  require (Timeline.pending_request staged = None) "staging did not fence pending paging";
-  let restored = Timeline.undo_delete staged backup in
-  require_equal_string_list
-    (slot_keys restored)
-    (slot_keys loaded)
-    "Undo changed slot keys";
-  require (Timeline.pending_request restored = None) "Undo restored a stale request";
-  require
-    (Timeline.total_count restored = Timeline.total_count loaded)
-    "Undo changed total count"
-;;
-
-let test_undo_preserves_current_hidden_day_membership () =
-  let placeholder = block ~day:20260808 ~source:"" 520 in
-  let target = block ~day:20260808 ~order:"b" 521 in
-  let initial =
-    Timeline.empty ~today:20260809
-    |> begin_and_apply_feed
-         ~generation:1L
-         ~before_day:None
-         (feed [ day_feed 20260808 "Saturday" [ placeholder; target ] ])
-  in
-  let deleted, backup = require_staged initial (Journal_model.id target) in
-  let current = Timeline.remove_block deleted ~block_id:(Journal_model.id placeholder) in
-  let restored = Timeline.undo_delete current backup in
-  require_equal_string_list
-    (slot_keys restored)
-    [ "day:20260808"; "block:" ^ Journal_model.id target ]
-    "Undo resurrected an intervening deletion of the hidden sibling";
-  require
-    (Timeline.find_block restored ~block_id:(Journal_model.id placeholder) = None)
-    "Undo retained the deleted hidden sibling";
-  require (Timeline.total_count restored = 2) "Undo counted a deleted hidden sibling"
-;;
-
-let test_undo_uses_current_day_order_when_old_anchor_is_gone () =
-  let target = block ~day:20260808 530 in
-  let older = block ~day:20260807 531 in
-  let initial =
-    Timeline.empty ~today:20260809
-    |> begin_and_apply_feed
-         ~generation:1L
-         ~before_day:None
-         (feed
-            [ day_feed 20260808 "Saturday" [ target ]
-            ; day_feed 20260807 "Friday" [ older ]
-            ])
-  in
-  let deleted, backup = require_staged initial (Journal_model.id target) in
-  let replacement = block ~day:20260807 ~source:"Refreshed older day" 532 in
-  let current =
-    Timeline.replace_timeline_entry_page
-      deleted
-      ~page:(page 20260807 "Friday")
-      (timeline_page [ replacement ])
-    |> fun state ->
-    Timeline.prepend_timeline_entry state (entry (block 533))
-    |> fun state ->
-    Timeline.observe_visible_range state ~first_index:2 ~last_exclusive:3
-    |> fun state ->
-    Timeline.begin_request state ~generation:9L (Feed { before_day = Some 20260807 })
-  in
-  let anchor =
-    Timeline.retained_slot current (Timeline.first_visible_index current)
-    |> Option.get
-    |> Timeline.slot_key
-  in
-  let restored = Timeline.undo_delete current backup in
-  require_equal_string_list
-    (slot_keys restored)
-    [ "block:" ^ id "block" 533
-    ; "day:20260808"
-    ; "block:" ^ id "block" 530
-    ; "day:20260807"
-    ; "block:" ^ id "block" 532
-    ]
-    "Undo appended the restored day after newer pagination content";
-  require
-    (Timeline.retained_slot restored (Timeline.first_visible_index restored)
-     |> Option.map Timeline.slot_key
-     = Some anchor)
-    "Undo moved the current visible anchor";
-  require (Timeline.pending_request restored = None) "Undo retained a pending request";
-  require
-    (Timeline.scroll_target restored = Timeline.scroll_target current)
-    "Undo replaced the intervening Capture scroll command"
-;;
-
-let test_undo_keeps_reappeared_target_and_current_pagination () =
-  let target = block ~order:"b" 540 in
-  let initial =
-    Timeline.empty ~today:20260809
-    |> begin_and_apply_feed
-         ~generation:1L
-         ~before_day:None
-         (feed ~more:true [ day_feed ~more:true 20260809 "Today" [ target ] ])
-  in
-  let deleted, backup = require_staged initial (Journal_model.id target) in
-  let cursor = continuation_of_entries ~more:true [ entry target ] in
-  let sibling = block ~order:"c" 541 in
-  let current =
-    Timeline.begin_request deleted ~generation:2L (Day { day = 20260809; after = cursor })
-    |> fun state ->
-    Timeline.apply_timeline_entry_page state ~generation:2L (timeline_page [ sibling ])
-  in
-  let restored = Timeline.undo_delete current backup in
-  require_equal_string_list
-    (slot_keys restored)
-    [ "block:" ^ id "block" 540; "block:" ^ id "block" 541; "feed-continuation:20260809" ]
-    "Undo lost current page rows or restored a retired continuation";
-  let changed_target = block ~order:"b" ~source:"Reappeared target" 540 in
-  let duplicate = Timeline.prepend_timeline_entry current (entry changed_target) in
-  let unchanged = Timeline.undo_delete duplicate backup in
-  require_equal_string_list
-    (slot_keys unchanged)
-    (slot_keys duplicate)
-    "Undo inserted a duplicate stable key";
-  require
-    (Timeline.find_block unchanged ~block_id:(id "block" 540)
-     |> Option.map Journal_model.source
-     = Some "Reappeared target")
-    "Undo overwrote the newer same-key target"
-;;
-
-let test_undo_keeps_reappeared_hidden_target () =
-  let target = block ~day:20260808 550 in
-  let initial =
-    Timeline.empty ~today:20260809
-    |> begin_and_apply_feed
-         ~generation:1L
-         ~before_day:None
-         (feed [ day_feed 20260808 "Saturday" [ target ] ])
-  in
-  let deleted, backup = require_staged initial (Journal_model.id target) in
-  let placeholder = block ~day:20260808 ~source:"" 550 in
-  let current = Timeline.prepend_timeline_entry deleted (entry placeholder) in
-  require_equal_string_list (slot_keys current) [] "same-key placeholder is not hidden";
-  let restored = Timeline.undo_delete current backup in
-  require_equal_string_list
-    (slot_keys restored)
-    []
-    "Undo exposed a newer same-key hidden target";
-  require
-    (Timeline.find_block restored ~block_id:(id "block" 550)
-     |> Option.map Journal_model.source
-     = Some "")
-    "Undo overwrote the newer hidden target"
-;;
-
-let test_undo_orders_target_among_intervening_siblings () =
-  let target = block ~order:"b" 560 in
-  let sibling = block ~order:"d" 561 in
-  let initial =
-    Timeline.empty ~today:20260809
-    |> begin_and_apply_feed
-         ~generation:1L
-         ~before_day:None
-         (feed [ day_feed 20260809 "Today" [ target; sibling ] ])
-  in
-  let deleted, backup = require_staged initial (Journal_model.id target) in
-  let current = Timeline.prepend_timeline_entry deleted (entry (block ~order:"c" 562)) in
-  let restored = Timeline.undo_delete current backup in
-  require_equal_string_list
-    (slot_keys restored)
-    [ "block:" ^ id "block" 560; "block:" ^ id "block" 562; "block:" ^ id "block" 561 ]
-    "Undo placed the target after an intervening later sibling"
-;;
-
-let test_undo_retains_deleted_day_context_beyond_hidden_budget () =
-  let target = block ~day:20260808 570 in
-  let incomplete_days =
-    List.init 513 (fun index ->
-      let year = 2025 - (index / 336) in
-      let month = (index mod 336 / 28) + 1 in
-      let day = (index mod 28) + 1 in
-      { Journal_graph_projection.page =
-          page ((year * 10_000) + (month * 100) + day) "Older incomplete day"
-      ; entries = []
-      ; has_more_entries = true
-      ; continuation = None
-      })
-  in
-  let initial =
-    Timeline.empty ~today:20260809
-    |> begin_and_apply_feed
-         ~generation:1L
-         ~before_day:None
-         (feed (day_feed 20260808 "Saturday" [ target ] :: incomplete_days))
-  in
-  let deleted, backup = require_staged initial (Journal_model.id target) in
-  let restored = Timeline.undo_delete deleted backup in
-  require_equal_string_list
-    (slot_keys restored)
-    (slot_keys initial)
-    "Undo lost the deleted day's context when hidden knowledge was pruned"
-;;
-
-let test_static_child_cannot_stage_delete_and_parent_delete_repairs_heading () =
+let test_static_child_delete_is_ignored_and_parent_delete_repairs_heading () =
   let parent = block ~day:20260808 ~child_count:1 510 in
   let state =
     Timeline.empty ~today:20260809
@@ -798,8 +561,8 @@ let test_static_child_cannot_stage_delete_and_parent_delete_repairs_heading () =
     block ~day:20260808 ~parent_id:(Journal_model.id parent) ~source:"Visible child" 511
   in
   require
-    (Timeline.stage_delete state ~block_id:(Journal_model.id child) = None)
-    "static child preview exposed a stage-delete path";
+    (slot_keys (Timeline.remove_block state ~block_id:(Journal_model.id child)) = slot_keys state)
+    "static child preview exposed a delete path";
   (match retained_slots state with
    | Timeline.Day_heading _ :: Timeline.Top_level entry :: _ ->
      require
@@ -813,11 +576,11 @@ let test_static_child_cannot_stage_delete_and_parent_delete_repairs_heading () =
          ~before_day:None
          (feed [ day_feed 20260808 "Older" [ parent ] ])
   in
-  let deleted, _ = require_staged root_only (Journal_model.id parent) in
+  let deleted = Timeline.remove_block root_only ~block_id:(Journal_model.id parent) in
   require_equal_string_list (slot_keys deleted) [] "last dated row left an orphan heading";
   require
-    (Timeline.stage_delete deleted ~block_id:"forged" = None)
-    "forged delete ID was staged"
+    (slot_keys (Timeline.remove_block deleted ~block_id:"forged") = slot_keys deleted)
+    "forged delete ID changed the timeline"
 ;;
 
 let paginating_day () =
@@ -1228,7 +991,7 @@ let test_capture_converges_with_later_pagination () =
   require (!failures = []) "%s" (String.concat "\n" (List.rev !failures))
 ;;
 
-let test_persistent_point_updates_and_undo () =
+let test_persistent_point_updates_and_delete () =
   let blocks = List.init 512 (fun n -> block ~order:(Printf.sprintf "%012d" n) n) in
   let initial =
     Timeline.empty ~today:20260809
@@ -1244,12 +1007,10 @@ let test_persistent_point_updates_and_undo () =
   Gc.full_major ();
   let retained_words = (Gc.stat ()).live_words - live_before in
   require (slot_keys initial = slot_keys updated) "point update changed slot ordering";
-  let staged, backup = require_staged initial (id "block" 256) in
-  let changed = Timeline.replace_block staged replacement in
+  let deleted = Timeline.remove_block initial ~block_id:(id "block" 256) in
+  let changed = Timeline.replace_block deleted replacement in
   let inserted = block ~order:"000000000600" 600 |> entry in
-  let restored =
-    Timeline.undo_delete (Timeline.prepend_timeline_entry changed inserted) backup
-  in
+  let current = Timeline.prepend_timeline_entry changed inserted in
   let find_source state block_id =
     retained_slots state
     |> List.find_map (function
@@ -1261,17 +1022,17 @@ let test_persistent_point_updates_and_undo () =
     (find_source initial (id "block" 511) = Some "Journal entry")
     "persistent update mutated the retained old state";
   require
-    (find_source restored (id "block" 511) = Some "Updated sibling")
-    "undo discarded an intervening point update";
+    (find_source current (id "block" 511) = Some "Updated sibling")
+    "delete discarded an intervening point update";
   require
-    (find_source restored (id "block" 600) = Some "Journal entry")
-    "undo discarded an intervening insertion";
+    (find_source current (id "block" 600) = Some "Journal entry")
+    "delete discarded an intervening insertion";
   require
-    (find_source restored (id "block" 256) = Some "Journal entry")
-    "undo did not restore the deleted target";
+    (find_source current (id "block" 256) = None)
+    "committed deletion restored the deleted target";
   require
-    (Timeline.retained_slot_count restored = 513)
-    "Undo discarded a loaded sibling to enforce an obsolete retention cap";
+    (Timeline.retained_slot_count current = 512)
+    "Delete discarded a loaded sibling to enforce an obsolete retention cap";
   require
     (retained_words < 600)
     "one point update retained %d new words; expected less than 600 with structural \
@@ -1317,7 +1078,7 @@ let test_empty_day_visibility_boundaries () =
     visible
 ;;
 
-let test_empty_day_mutations_and_undo () =
+let test_empty_day_mutations_and_delete () =
   let placeholder = block ~day:20260808 ~source:" " 1 in
   let sibling = block ~day:20260808 ~order:"b" 2 in
   let older = block ~day:20260807 3 in
@@ -1358,21 +1119,18 @@ let test_empty_day_mutations_and_undo () =
   let hidden = Timeline.replace_block child placeholder in
   let two = Timeline.prepend_timeline_entry hidden (entry sibling) in
   require (Timeline.total_count two = 4) "creation restored an empty sibling";
-  let deleted, backup =
-    Option.get (Timeline.stage_delete two ~block_id:(Journal_model.id sibling))
-  in
+  let deleted = Timeline.remove_block two ~block_id:(Journal_model.id sibling) in
   require_equal_string_list
     (slot_keys deleted)
     older_keys
     "delete failed to hide remaining placeholder";
   let changed = Timeline.replace_block deleted content in
-  let undone = Timeline.undo_delete changed backup in
-  require (Timeline.total_count undone = 5) "undo did not restore complete section";
+  require (Timeline.total_count changed = 4) "later edit lost its section";
   require
     (Journal_model.source
-       (Option.get (Timeline.find_block undone ~block_id:(Journal_model.id placeholder)))
+       (Option.get (Timeline.find_block changed ~block_id:(Journal_model.id placeholder)))
      = "Written later")
-    "undo overwrote a later edit to a hidden sibling";
+    "delete overwrote a later edit to a hidden sibling";
   let removed = Timeline.remove_block hidden ~block_id:(Journal_model.id placeholder) in
   require
     (Timeline.find_block removed ~block_id:(Journal_model.id placeholder) = None)
@@ -1867,19 +1625,6 @@ let test_partial_day_parent_restore () =
 let () =
   test_partial_day_parent_restore ();
   test_parent_only_cards_and_point_updates ();
-  let failures = ref [] in
-  List.iter
-    (fun test ->
-       try test () with
-       | Failure message -> failures := message :: !failures)
-    [ test_undo_orders_target_among_intervening_siblings
-    ; test_undo_keeps_reappeared_hidden_target
-    ; test_undo_preserves_current_hidden_day_membership
-    ; test_undo_uses_current_day_order_when_old_anchor_is_gone
-    ; test_undo_keeps_reappeared_target_and_current_pagination
-    ; test_undo_retains_deleted_day_context_beyond_hidden_budget
-    ];
-  require (!failures = []) "%s" (String.concat "\n" (List.rev !failures));
   test_capture_converges_with_later_pagination ();
   test_capture_scroll_commands_are_explicit ();
   test_capture_scroll_terminal_ownership ();
@@ -1887,10 +1632,10 @@ let () =
   test_parent_insertion_preserves_all_loaded_rows ();
   test_hidden_day_restoration_orders_siblings ();
   test_empty_day_visibility_boundaries ();
-  test_empty_day_mutations_and_undo ();
+  test_empty_day_mutations_and_delete ();
   test_empty_day_pagination_and_failure ();
   test_empty_day_retained_fragment_and_anchor ();
-  test_persistent_point_updates_and_undo ();
+  test_persistent_point_updates_and_delete ();
   test_capture_identity_converges_with_reconciliation ();
   test_stale_day_rebuild_is_atomic_and_generation_owned ();
   test_repeated_staleness_stops_until_retry_and_does_not_block_feed ();
@@ -1909,6 +1654,5 @@ let () =
   test_populated_feed_refresh_preserves_position ();
   test_initial_feed_refresh_supersedes_pending_pagination ();
   test_prepend_first_today_entry_before_older_days ();
-  test_stage_delete_and_exact_undo ();
-  test_static_child_cannot_stage_delete_and_parent_delete_repairs_heading ()
+  test_static_child_delete_is_ignored_and_parent_delete_repairs_heading ()
 ;;
