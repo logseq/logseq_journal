@@ -164,6 +164,7 @@ let test_ios_capsules_mount_outside_toolbars () =
   let module V = Ui.View in
   List.iter
     (fun context ->
+       let has_capture = context = Journal_header.Context.journals in
        List.iter
          (fun (capture_enabled, capture_expanded, account_available, error_available) ->
             let batches = ref [] in
@@ -241,7 +242,8 @@ let test_ios_capsules_mount_outside_toolbars () =
                  in
                  require
                    (List.length surfaces
-                    = (if Option.is_none capture_expanded then 2 else 0)
+                    = (if Option.is_none capture_expanded
+                       then (if has_capture then 2 else 1) else 0)
                       + if account_available || error_available then 1 else 0)
                    "Each buttons composite must supply exactly one glass surface";
                  let rec in_toolbar node =
@@ -263,9 +265,11 @@ let test_ios_capsules_mount_outside_toolbars () =
                           ops
                         |> List.sort_uniq Int.compare
                       in
-                      match capture_expanded, nodes with
-                      | Some _, [] -> ()
-                      | None, [ node ] ->
+                      let visible = Option.is_none capture_expanded
+                        && (label <> "Capture" || has_capture) in
+                      match visible, nodes with
+                      | false, [] -> ()
+                      | true, [ node ] ->
                         require
                           (not (in_toolbar node))
                           "%s must render outside toolbar glass"
@@ -294,7 +298,7 @@ let test_ios_capsules_mount_outside_toolbars () =
                           label
                       | _ ->
                         failwith
-                          (label ^ " must occur exactly once while Capture is closed"))
+                          (label ^ " has incorrect visibility for this header context"))
                    [ "Journals"; "Favorites"; "Capture" ];
                  if error_available
                  then (

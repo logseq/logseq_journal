@@ -1113,7 +1113,10 @@ let test_favorite_target_origin_and_undo () =
   let untouched, request =
     Journal_routes.open_favorite origin ~request_generation:91L page_item
   in
-  require (untouched = origin && request = None) "page favorite gained block navigation";
+  require (Journal_routes.route untouched = Detail_loading && Option.is_some request)
+    "page favorite did not enter shared detail";
+  require (Journal_routes.destination (Journal_routes.back untouched) = Favorites)
+    "page favorite Back lost origin";
   let selected, requests = F.step (F.create ~graph_generation:1) (Select true) in
   let request =
     match requests with
@@ -3858,8 +3861,34 @@ let test_initial_staging_refresh_and_delete () =
     (String.concat ", " (List.rev !failures))
 ;;
 
+let test_page_detail_append_matches_exact_page () =
+  let page_id = "75000000-0000-4000-8000-000000000002" in
+  let make id page_id source =
+    Journal_model.create_on_page ~id ~page_id ~journal_day:None ~parent_id:None
+      ~sibling_order:"a" ~source ~task_state:No_status ~child_count:0
+      ~creation_time:(creation_time 540) ~revision:"page-1"
+      ~last_mutation_id:"00000000-0000-0000-0000-000000000000" |> Result.get_ok in
+  let root = make page_id page_id "Empty page" in
+  let child_id = "75000000-0000-4000-8000-000000000004" in
+  let owner = Journal_detail.create ~session_number:80L (detail ~root ())
+    |> fun t -> Journal_detail.update_child_source t "New page child" in
+  let saving, request = Journal_detail.admit_child owner ~mutation_id:"mutation"
+    ~calendar_generation:1L ~block_id:child_id ~sibling_order:"z"
+    ~creation_time:(creation_time 550) in
+  require (Option.is_some request) "page cannot admit child";
+  let child = make child_id page_id "New page child" in
+  let wrong = make child_id "75000000-0000-4000-8000-000000000099" "Wrong page" in
+  require (Journal_detail.apply_child_created saving ~child:wrong ~parent:root == saving)
+    "append completion accepted another page";
+  let completed = Journal_detail.apply_child_created saving ~child ~parent:root in
+  require (Journal_detail.mode completed = Reading && Journal_detail.child_capture completed = None)
+    "page append did not complete its exact owner";
+  require (List.map Journal_model.id (Journal_detail.children completed) = [child_id])
+    "page append went to another root"
+;;
+
 let tests =
-  [ "Initial staging refresh and delete review regressions", test_initial_staging_refresh_and_delete ] @
+  [ "Page append exact page ownership", test_page_detail_append_matches_exact_page; "Initial staging refresh and delete review regressions", test_initial_staging_refresh_and_delete ] @
   [ "Detail bounded initial nested body staging", test_detail_initial_nested_body_staging ] @
   [ "Detail initial loading delay and ownership", test_detail_initial_loading_delay_and_ownership ] @
   [ "Unicode blank Capture admission", test_unicode_blank_capture_admission
