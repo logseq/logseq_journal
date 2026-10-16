@@ -1119,8 +1119,8 @@ let () =
 ;;
 
 (* Runtime owns the imported receipt lease and the handoff to a normal media
-   controller; neither the pure media nor transfer reducer owns this lease. *)
-let () =
+   controller and open-preview references; neither pure reducer owns these. *)
+let test_import_handoff preview =
   let sent = Queue.create ()
   and views = Hashtbl.create 1 in
   let runtime =
@@ -1200,6 +1200,16 @@ let () =
     ((List.hd (Hashtbl.find views root).items).presentation
      = Journal_media.File "/staged/original.png")
     "handoff keeps preview while acquisition is pending";
+  let preview_token = (List.hd (Hashtbl.find views root).items).token in
+  let show owner =
+    R.preview_visible runtime ~owner ~slot:"selected-import" ~root ~asset:preview_token true
+  and close owner =
+    R.preview_visible runtime ~owner ~slot:"selected-import" ~root ~asset:preview_token false
+  in
+  (match preview with
+   | `None -> ()
+   | `Close | `Prune | `Multiple -> show "row");
+  if preview = `Multiple then show "detail";
   Queue.clear sent;
   let consumer = Option.get consumer in
   R.notice
@@ -1217,6 +1227,35 @@ let () =
     runtime
     (Option.get ticket)
     (Asset_file (Some ("normal-lease", "/cache/original.png")));
+  let release_count () =
+    Queue.to_seq sent
+    |> Seq.filter (function
+      | _, S.Release_asset_file { handle = "staged-lease"; _ } -> true
+      | _ -> false)
+    |> Seq.length
+  in
+  let preview_is_retained () =
+    let item = List.hd (Hashtbl.find views root).items in
+    check
+      (item.token = preview_token
+       && item.presentation = Journal_media.File "/staged/original.png"
+       && release_count () = 0)
+      "an open import preview keeps its token, path and lease during cache handoff"
+  in
+  (match preview with
+   | `None -> ()
+   | `Close ->
+     preview_is_retained ();
+     close "row";
+     close "row"
+   | `Prune ->
+     preview_is_retained ();
+     R.retain_owners runtime [ "default" ]
+   | `Multiple ->
+     preview_is_retained ();
+     close "row";
+     preview_is_retained ();
+     close "detail");
   let items = (Hashtbl.find views root).items in
   check
     (List.length items = 1
@@ -1232,6 +1271,7 @@ let () =
          | _ -> false)
        (Queue.to_seq sent |> List.of_seq))
     "normal acquisition releases staged preview";
+  check (release_count () = 1) "handoff or final preview close releases its lease once";
   Queue.clear sent;
   R.reset runtime ~graph_generation:None;
   check
@@ -1242,6 +1282,15 @@ let () =
             | _ -> false)
           (Queue.to_seq sent |> List.of_seq)))
     "handoff releases staged preview only once"
+;;
+
+let () =
+  run_cases
+    [ "import handoff without preview", (fun () -> test_import_handoff `None)
+    ; "open import preview survives handoff", (fun () -> test_import_handoff `Close)
+    ; "import preview owner cleanup", (fun () -> test_import_handoff `Prune)
+    ; "import handoff waits for final preview", (fun () -> test_import_handoff `Multiple)
+    ]
 ;;
 
 let () =

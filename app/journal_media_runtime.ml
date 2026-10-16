@@ -322,7 +322,11 @@ let handoff_imports t g =
   let completed, pending =
     List.partition
       (fun (receipt : Logseq_db_worker.import_receipt) ->
-         List.exists
+         let token = "import:" ^ G.Uuid.to_string receipt.operation in
+         not
+           (Hashtbl.to_seq_values t.previews
+            |> Seq.exists (fun (_, root, asset) -> root = g.root && asset = token))
+         && List.exists
            (fun c ->
               c.asset.uuid = receipt.asset.uuid
               && c.asset.current_checksum = receipt.asset.current_checksum
@@ -497,8 +501,11 @@ let retain_owners t owners =
        Owners.iter
          (fun owner ->
             if not (Owners.mem owner retained) then root_visible ~owner t ~root false)
-         g.owners)
-    t.groups
+         g.owners;
+       handoff_imports t g;
+       notify t g)
+    t.groups;
+  pump t
 ;;
 
 let asset_visible ?(owner = "default") t ~root ~asset visible =
@@ -539,7 +546,16 @@ let preview_visible t ~owner ~slot ~root ~asset visible =
   if (not visible) || current <> Some selected
   then (
     Hashtbl.remove t.previews preview;
-    Option.iter (fun (_, root, _) -> root_visible ~owner:preview t ~root false) current);
+    Option.iter
+      (fun (_, root, _) ->
+         root_visible ~owner:preview t ~root false;
+         Option.iter
+           (fun g ->
+              handoff_imports t g;
+              notify t g)
+           (Hashtbl.find_opt t.groups root))
+      current;
+    pump t);
   if visible
   then (
     match Hashtbl.find_opt t.groups root with
