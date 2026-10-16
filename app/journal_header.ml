@@ -453,7 +453,9 @@ let view_impl
     bottom_controls
       ~key:"journal-bottom-controls"
       ~controls:
-        (V.row ~spacing:16. [ destinations; V.spacer (); capture ]
+        (V.row ~spacing:16.
+           ([ destinations; V.spacer () ]
+            @ (match context with Context.Journals -> [ capture ] | Favorites -> []))
          |> test_id "journal-bottom-controls")
       body
   else body
