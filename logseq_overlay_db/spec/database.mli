@@ -160,23 +160,25 @@ val cancel_snapshot_activation : prepared_snapshot_activation -> unit
 
 (** {2 Maintaining a closed mirror}
 
-    Destructive maintenance consumes the generation recorded by an inspection.
-    It therefore applies only while the mirror is closed and still denotes the
-    filesystem object that was inspected. *)
+    Destructive maintenance applies only while the mirror is closed. Deletion
+    captures the canonical graph directory independently of database contents and
+    fences replacement through its recorded filesystem generation. *)
 
 (** A deletion transaction identity, distinct from a graph UUID. *)
 type retirement_id = Graph.Retirement_id.t
 val retirement_id_of_string : string -> (retirement_id, string) result
 val retirement_id_to_string : retirement_id -> string
 
-(** Holds exclusive ownership of the inspected generation until commit/cancel.
-    Preparing does not delete data. Replaying the same identity recovers its
-    durable commit receipt, including after a replacement mirror was created. *)
+(** Holds exclusive ownership of the canonical graph directory until commit/cancel
+    and returns its captured generation. Preparation does not read database
+    contents, schema or checkpoint and does not delete data. Replaying the same
+    identity recovers its durable commit receipt after a replacement was created. *)
 type prepared_mirror_deletion
 val prepare_mirror_deletion
-  :  mirror_inspection
+  :  application_support_directory:string
+  -> graph_id:Graph.Uuid.t
   -> retirement:retirement_id
-  -> (prepared_mirror_deletion, Types.mirror_delete_error) result
+  -> (prepared_mirror_deletion * Types.mirror_generation, Types.mirror_delete_error) result
 
 (** Whether this exact retirement has durable commit evidence. An unrelated
     missing or replaced canonical mirror is never commit evidence. *)
