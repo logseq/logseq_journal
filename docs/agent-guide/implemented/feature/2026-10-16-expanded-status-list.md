@@ -38,4 +38,4 @@ These were presented as B and C in the design comparison; the user selected A. P
 
 ## Questions
 
-None. Design A and local implementation/testing are authorized; push, PR, merge and phone operations are excluded.
+None. Design A and local implementation/testing were approved first. After PR81 merged, the user additionally authorized publishing a formal PR and independent exact-head review. Merge and phone operations remain excluded.
