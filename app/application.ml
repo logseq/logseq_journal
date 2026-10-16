@@ -5955,7 +5955,9 @@ let start
              if Option.bind snapshot.manager (fun value -> value.selected_graph) = Some graph_id
              then Effect.ignore
              else send_manager (Graph_service.Select_graph graph_id)))
-    | Refresh_catalog -> send_manager Graph_service.Refresh_catalog
+    | Refresh_catalog ->
+      Effect.bind (update (fun state -> { state with local_copy_message = None }))
+        ~f:(fun () -> send_manager Graph_service.Refresh_catalog)
     | Begin_online_recovery -> send_manager Graph_service.Begin_online_recovery
     | Open_capture
       when snapshot.write_enabled

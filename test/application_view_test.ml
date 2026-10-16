@@ -4931,7 +4931,7 @@ let test_graph_picker_controls scenario () =
               ~finally:(fun () -> Atomic.set automatic_inspection_returned true)
               (fun () -> while not (Atomic.get release_automatic_inspection) do Eio.Fiber.yield () done));
           Ok (Service.Local_copy_inspected (request,
-            if scenario = `Presence_failure then Error "Synthetic presence read failed. Try again."
+            if scenario = `Presence_failure || scenario = `Refresh_after_presence_failure then Error "Synthetic presence read failed. Try again."
             else Ok (if scenario = `Visible then Service.Not_downloaded else Service.Downloaded)))
         | Service.Delete_local_copy request ->
           Atomic.set deletions (request :: Atomic.get deletions);
@@ -4952,7 +4952,7 @@ let test_graph_picker_controls scenario () =
            | Return_to_graph_picker ->
              publish { previous with snapshot = { previous.snapshot with selected_graph = None
                ; startup = { previous.snapshot.startup with awaiting_selection = true } } }
-           | Refresh_catalog when scenario = `Refresh_failure ->
+           | Refresh_catalog when scenario = `Refresh_failure || scenario = `Refresh_after_presence_failure ->
              publish { previous with snapshot = { previous.snapshot with
                last_error = Some "Synthetic catalog refresh failed. Try again." } }
            | Select_graph id ->
@@ -5078,15 +5078,19 @@ let test_graph_picker_controls scenario () =
         press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
         wait "name selection reaches worker" (fun () ->
           List.exists (function Service.Select_graph id -> id = second | _ -> false) (Atomic.get commands))
-      | (`Delete_menu | `Cancel | `Confirm | `Reopen | `Failure_select | `Presence_failure | `During_delete | `Late_presence) ->
+      | (`Delete_menu | `Cancel | `Confirm | `Reopen | `Failure_select | `Presence_failure | `Refresh_after_presence_failure | `During_delete | `Late_presence) ->
         let stable_select = node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second) in
         if scenario = `Failure_select then retained_select := Some stable_select;
         ignore (node ("graph-picker-options:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
         wait "row action is exposed" (fun () -> Option.is_some (find "text" "Delete local copy"));
         press (node ("graph-picker-delete:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
-        if scenario = `Presence_failure then (
+        if scenario = `Presence_failure || scenario = `Refresh_after_presence_failure then (
           wait "presence failure is visible" (fun () -> Option.is_some (find "text" "Synthetic presence read failed. Try again."));
-          Alcotest.(check int) "one bounded presence request" 1 (Atomic.get inspections))
+          Alcotest.(check int) "one bounded presence request" 1 (Atomic.get inspections);
+          if scenario = `Refresh_after_presence_failure then (
+            press (node "graph-picker-refresh");
+            wait "refresh failure replaces previous local-copy message" (fun () ->
+              Option.is_some (find "text" "Synthetic catalog refresh failed. Try again."))))
         else (
         wait "confirm names data loss" (fun () ->
           Hashtbl.fold (fun _ values found -> found || List.exists (fun (_, value) ->
@@ -5166,6 +5170,7 @@ let () =
   else Alcotest.run
     "application view"
     [ ( "graph picker", [
+        Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);
         Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);
         Alcotest.test_case "current marker and long names" `Quick (test_graph_picker_controls `Current);
         Alcotest.test_case "close retains current session" `Quick (test_graph_picker_controls `Close);
