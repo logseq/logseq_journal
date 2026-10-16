@@ -973,7 +973,12 @@ let issue_request : type a. t -> a runner_request -> t * runner_effect =
   fun core request ->
   let ticket =
     { id = core.next_effect_id
-    ; scope = scope_of_request request
+    ; scope =
+        (match request, core.snapshot_scope with
+         | (Fetch_e2ee_user_keys _ | Unlock_private_key _), Some graph ->
+           (* Shared account material is requested for this graph's challenge. *)
+           effect_scope_of_graph graph
+         | _ -> scope_of_request request)
     ; kind = request_kind request
     }
   in
@@ -1139,7 +1144,7 @@ let authenticate_new_account core user_id =
 
 let clear_reconciliation_failure (snapshot : snapshot) =
   match snapshot.startup.failure with
-  | Some During_local_restore -> snapshot
+  | Some (During_local_restore | During_e2ee) -> snapshot
   | None | Some _ ->
     { snapshot with
       startup = { snapshot.startup with failure = None }
@@ -1295,6 +1300,16 @@ let graph_in_catalog graphs graph_id =
     graphs
 ;;
 
+let is_graph_key_access (Pending_effect ticket) =
+  match ticket.kind with
+  | Load_and_unlock_graph_key_kind
+  | Fetch_e2ee_graph_key_kind
+  | Fetch_e2ee_user_keys_kind
+  | Unlock_private_key_kind
+  | Fetch_and_unlock_graph_key_kind -> true
+  | _ -> false
+;;
+
 let select_graph_transition core ~persist graph_id =
   match core.user_id, graph_in_catalog core.public_state.snapshot.catalog graph_id with
   | Some user_id, Some graph ->
@@ -1324,6 +1339,7 @@ let select_graph_transition core ~persist graph_id =
       set_snapshot
         { core with
           cached_selected_graph = Some graph_id
+        ; pending_effects = List.filter (fun pending -> not (is_graph_key_access pending)) core.pending_effects
         ; selected_graph_value = Some graph
         ; current_graph_scope = Some scope
         ; graph_key = None
@@ -2564,7 +2580,10 @@ let consume_completion core = function
                }
                During_catalog
                message
-           | Load_and_unlock_graph_key_kind -> fail core During_local_restore message
+           | Load_and_unlock_graph_key_kind ->
+             (match core.current_graph_scope with
+              | Some scope -> begin_e2ee_key_access core scope
+              | None -> unchanged core)
            | Unlock_private_key_kind ->
              (* A rejected password leaves the encrypted challenge available for
              another attempt. No password or unlocked key is retained. *)
@@ -2849,6 +2868,9 @@ let step core event =
       (match core.current_graph_scope, core.public_state.snapshot.startup.failure with
        | Some scope, Some During_bootstrap when core.sync_view = None ->
          select_graph_transition core ~persist:false scope.graph_id
+       | Some _, _
+         when core.public_state.snapshot.startup.awaiting_e2ee_password
+              || List.exists is_graph_key_access core.pending_effects -> unchanged core
        | Some scope, Some (During_local_restore | During_e2ee)
          when not core.public_state.snapshot.startup.awaiting_e2ee_password ->
          let startup =

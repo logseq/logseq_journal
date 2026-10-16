@@ -588,16 +588,13 @@ let test_cached_wrapped_key_unlock_failure_is_fail_closed () =
         in
         Alcotest.check
           Alcotest.bool
-          "unlock failure waits for explicit E2EE recovery"
+          "unusable cached key starts bounded online preparation"
           true
-          ((Core.state failed.next).snapshot.startup.failure
-           = Some Core.During_local_restore
-           && failed.effects
-              = [ Core.Publish (Core.State_changed (Core.state failed.next)) ]);
-        let recovery = Core.step failed.next Core.Online_recovery_requested in
+          ((Core.state failed.next).snapshot.startup.failure = None);
+        let recovery = failed in
         Alcotest.check
           Alcotest.bool
-          "explicit recovery requests E2EE authorization"
+          "automatic recovery requests E2EE authorization"
           true
           (List.exists
              (function
@@ -771,7 +768,7 @@ let private_key_unlock_and_sign_out () =
       missing.effects
     |> Option.get
   in
-  let recovery = Core.step failed.next Online_recovery_requested in
+  let recovery = failed in
   let user_key_fetch =
     List.find_map
       (function
