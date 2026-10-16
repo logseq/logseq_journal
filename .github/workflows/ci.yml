@@ -105,6 +105,9 @@ jobs:
         run: opam install . --deps-only --with-test --locked --ignore-pin-depends --yes
       - name: Verify build and cache helper boundaries
         env:
+          # Apple CLI boundary fixtures deliberately reject ambient pkg-config.
+          # The CI identity fixture selects its own explicit providers.
+          PKG_CONFIG_PATH: ''
           JOURNAL_TEST_SWITCH: ${{ github.workspace }}
           PYTHONDONTWRITEBYTECODE: 1
         run: python3 .agents/skills/journal-build/scripts/test_journal_build.py
