@@ -29,16 +29,35 @@ type availability =
       ; retry_scheduled : bool
       }
 
-type ticket = private
+type lookup_source =
+  | Local_checksum of string
+  | Remote_version of Asset.version
+  | Local_and_remote of
+      { current_checksum : string
+      ; remote_version : Asset.version
+      }
+
+type lookup_ticket = private
+  { id : int
+  ; scope : Core.graph_scope
+  ; asset : Logseq_db_types.Graph_types.Uuid.t
+  ; source : lookup_source
+  }
+
+type fetch_ticket = private
   { id : int
   ; scope : Core.graph_scope
   ; asset : Logseq_db_types.Graph_types.Uuid.t
   ; version : Asset.version
   }
 
+type ticket =
+  | Lookup of lookup_ticket
+  | Download of fetch_ticket
+
 type instruction =
-  | Check_cache of ticket
-  | Fetch of ticket
+  | Check_cache of lookup_ticket
+  | Fetch of fetch_ticket
   | Cancel of ticket
   | Release_handle of handle
   | Retry_after of
@@ -61,8 +80,8 @@ type event =
       }
   | Release of string
   | Descriptor_changed of Asset.t
-  | Cache_checked of ticket * (handle option, failure) result
-  | Downloaded of ticket * (handle, failure) result
+  | Cache_checked of lookup_ticket * (handle option, failure) result
+  | Downloaded of fetch_ticket * (handle, failure) result
   | Retry of Logseq_db_types.Graph_types.Uuid.t
   | Retry_elapsed of int
   | Network_changed of bool

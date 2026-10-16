@@ -2190,3 +2190,83 @@ let scenarios = scenarios @ [Alcotest.test_case
 
 let scenarios = scenarios @ [Alcotest.test_case
   "asset retirement restore conflict is retryable" `Quick test_asset_retirement_restore_conflict]
+
+(* Cache publication owns verification, atomic residency, and lease lifetime;
+   the worker regression separately owns when an import requests publication. *)
+let test_cache_publish_staged_original () =
+  with_local_asset_cache (fun support request ->
+    let source = Filename.concat support "picker.bin" in
+    Out_channel.with_open_bin source (fun out -> output_string out "file");
+    let file, checksum, _ = cache_stage request ~file_type:"pdf" source in
+    let version =
+      Logseq_db_types.Asset_descriptor.version ~checksum ~file_type:"pdf" |> Result.get_ok
+    in
+    let staged_lease, staged_path =
+      request (Core.Retain_staged_file file) |> retained_value
+    in
+    cache_unit
+      (request (Core.Publish_staged_asset { asset = graph_id (); version; file }));
+    let handle =
+      match request (Core.Check_asset_cache (graph_id (), version)) with
+      | Ok (Core.Asset_cached (Some handle)) -> handle
+      | _ -> fail "published original missing from ordinary cache"
+    in
+    let lease, path = request (Core.Retain_asset_file handle) |> retained_value in
+    cache_bool
+      "ordinary cache keeps document extension"
+      true
+      (Filename.check_suffix path ".pdf");
+    Alcotest.(check string)
+      "published original bytes"
+      "file"
+      (In_channel.with_open_bin path In_channel.input_all);
+    cache_unit (request (Core.Release_staged_file file));
+    cache_bool
+      "publication preserves native staging lease"
+      true
+      (Sys.file_exists staged_path);
+    cache_unit (request (Core.Release_asset_file staged_lease));
+    cache_bool "last staging lease permits cleanup" false (Sys.file_exists staged_path);
+    cache_bool "normal renderer survives staging cleanup" true (Sys.file_exists path);
+    cache_unit (request (Core.Release_asset_file lease));
+    cache_unit (request (Core.Release_asset_file handle));
+    cache_unit (request Core.Close_asset_scope);
+    let restored =
+      match request (Core.Check_asset_cache (graph_id (), version)) with
+      | Ok (Core.Asset_cached (Some handle)) -> handle
+      | _ -> fail "published original must survive cache reopen"
+    in
+    cache_unit (request (Core.Release_asset_file restored));
+    let file, _, _ = cache_stage request source in
+    let wrong =
+      Logseq_db_types.Asset_descriptor.version
+        ~checksum:(String.make 64 'a')
+        ~file_type:"bin"
+      |> Result.get_ok
+    in
+    cache_bool
+      "wrong checksum cannot publish"
+      true
+      (request (Core.Publish_staged_asset { asset = graph_id (); version = wrong; file })
+       = Error Core.Asset_checksum_mismatch);
+    let held, held_path = request (Core.Retain_staged_file file) |> retained_value in
+    cache_bool "failed publication preserves source" true (Sys.file_exists held_path);
+    cache_bool
+      "foreign filename is rejected"
+      true
+      (request
+         (Core.Publish_staged_asset
+            { asset = graph_id (); version; file = "../picker.bin" })
+       = Error Core.Asset_missing_source);
+    cache_unit (request (Core.Release_asset_file held));
+    cache_unit (request (Core.Release_staged_file file)))
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "publish staged original into cache"
+        `Quick
+        test_cache_publish_staged_original
+    ]
+;;

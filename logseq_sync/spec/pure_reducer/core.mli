@@ -239,6 +239,11 @@ type asset_action =
       ; file : string
       ; maximum_plaintext_bytes : int
       }
+  | Publish_staged_asset of
+      { asset : Logseq_db_types.Graph_types.Uuid.t
+      ; version : Logseq_db_types.Asset_descriptor.version
+      ; file : string
+      }
   | Retain_asset_file of string
   | Retain_staged_file of string
   | Release_asset_file of string

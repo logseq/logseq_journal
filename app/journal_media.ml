@@ -247,7 +247,12 @@ let step t = function
      | Some old
        when old.graph_generation = graph_generation
             && old.consumer = consumer
-            && old.asset.uuid = asset.uuid -> { t with selection = Some selected }, []
+            && old.asset.uuid = asset.uuid
+            && (match t.status with
+                | File _ -> true
+                | _ -> old.asset.source = asset.source
+                       && old.asset.current_checksum = asset.current_checksum) ->
+       { t with selection = Some selected }, []
      | _ ->
        let effects =
          release_file t @ release t @ if managed asset then [ demand selected ] else []

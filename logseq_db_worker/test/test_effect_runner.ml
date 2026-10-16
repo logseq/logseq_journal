@@ -1020,6 +1020,7 @@ let test_upload_checkpoint_io () =
         let bridge_outputs = ref 0 in
         let io_runner = ref None in
         let fixture_output = ref None in
+        let transfer_ticket = ref None in
         let submit_sync = ref (fun _ -> failwith "sync interpreter not initialized") in
         let post = function
           | Core.Sync_event event ->
@@ -1081,7 +1082,7 @@ let test_upload_checkpoint_io () =
             ~post
             ~recovery_current:(fun _ -> false)
             ~upload_current:(fun ticket -> !current && U.ticket_current state ticket)
-            ~asset_current:(fun _ -> false)
+            ~asset_current:(fun ticket -> !transfer_ticket = Some ticket)
           |> Result.get_ok
         in
         active_runner := Some runner;
@@ -1191,6 +1192,46 @@ let test_upload_checkpoint_io () =
           "import is durable before success"
           true
           (durable = Some prepared && prepared.phase = I.Prepared);
+        (* Worker import owns publishing the staged original. This exercises its
+           public prepare operation and the sealed Core/runner bridge. *)
+        let normal_handle =
+          match fixture_asset (Sync.Check_asset_cache (prepared.asset, prepared.version)) with
+          | Sync.Asset_cached (Some handle) -> handle
+          | _ -> Alcotest.fail "imported original must be in normal cache before upload"
+        in
+        let normal_lease, normal_path =
+          match fixture_asset (Sync.Retain_asset_file normal_handle) with
+          | Sync.Asset_retained (Some file) -> file
+          | _ -> Alcotest.fail "normal imported original must be retainable"
+        in
+        Alcotest.(check string) "normal cache contains the original" "file"
+          (In_channel.with_open_bin normal_path In_channel.input_all);
+        ignore (fixture_asset (Sync.Release_asset_file normal_lease));
+        ignore (fixture_asset (Sync.Release_asset_file normal_handle));
+        let local_descriptor = Logseq_db_types.Asset_descriptor.create
+          ~uuid:prepared.asset ~source:(Managed None)
+          ~current_checksum:(Some prepared.version.checksum) ~size:None ~dimensions:None
+          |> Result.get_ok in
+        let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
+        let transfer = Transfer.create
+          (Transfer.config ~active:2 ~foreground_reserved:1 ~pending:3 ~retries:0 |> Result.get_ok)
+          ~scope ~online:false ~unlocked:false in
+        let _, instructions = Transfer.step transfer
+          (Replace { consumer = "local-original"; priority = Foreground; assets = [local_descriptor] }) in
+        let lookup = List.find_map (function Transfer.Check_cache ticket -> Some ticket | _ -> None) instructions |> Option.get in
+        transfer_ticket := Some (Transfer.Lookup lookup);
+        posted := [];
+        Runner.submit runner (Core.Run_asset (context, Transfer.Check_cache lookup));
+        let local_handle = List.find_map (function
+          | Core.Asset_completed (actual, Transfer.Cache_checked (_, Ok (Some handle))) when actual = scope -> Some handle
+          | _ -> None) !posted |> Option.get in
+        ignore (fixture_asset (Sync.Release_asset_file local_handle));
+        posted := [];
+        let before_wrong_scope = !bridge_requests in
+        Runner.submit runner (Core.Run_asset ({ context with scope = { scope with graph_id = uuid 90 } }, Transfer.Check_cache lookup));
+        Alcotest.(check int) "mismatched transfer context performs no asset IO" before_wrong_scope !bridge_requests;
+        Alcotest.(check bool) "mismatched transfer context has no completion" true (!posted = []);
+        transfer_ticket := None;
         let lease, preview =
           match Runner.retain_imported_file runner ~scope ~operation:source.operation with
           | Some preview -> preview
@@ -1318,10 +1359,18 @@ let test_upload_checkpoint_io () =
             ~post
             ~recovery_current:(fun _ -> false)
             ~upload_current:(fun _ -> false)
-            ~asset_current:(fun _ -> false)
+            ~asset_current:(fun ticket -> !transfer_ticket = Some ticket)
           |> Result.get_ok
         in
         active_runner := Some restarted;
+        transfer_ticket := Some (Transfer.Lookup lookup);
+        posted := [];
+        Runner.submit restarted (Core.Run_asset (context, Transfer.Check_cache lookup));
+        let cold_handle = List.find_map (function
+          | Core.Asset_completed (actual, Transfer.Cache_checked (_, Ok (Some handle))) when actual = scope -> Some handle
+          | _ -> None) !posted |> Option.get in
+        ignore (fixture_asset (Sync.Release_asset_file cold_handle));
+        transfer_ticket := None;
         let restored_import =
           Runner.prepare_import restarted ~context source ~current:(fun () -> true)
           |> Result.get_ok

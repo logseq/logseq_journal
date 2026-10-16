@@ -366,6 +366,7 @@ type t =
   ; mutable next_asset_operation : int64
   ; upload_staging_lock : Eio.Mutex.t
   ; mutable staging_reconciled : Sync.graph_scope option
+  ; local_imports : (Graph.Uuid.t * string, Graph.Uuid.t) Hashtbl.t
   ; recovery_current : Core.upload_recovery_ticket -> bool
   ; upload_current : Upload.ticket -> bool
   ; asset_current : Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool
@@ -403,6 +404,7 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; next_asset_operation = 0L
     ; upload_staging_lock = Eio.Mutex.create ()
     ; staging_reconciled = None
+    ; local_imports = Hashtbl.create 32
     ; databases = Hashtbl.create 4
     ; inspections = Hashtbl.create 4
     ; waiters = Hashtbl.create 32
@@ -572,6 +574,7 @@ let reconcile_staging t (scope : Sync.graph_scope) ~current =
   else if t.staging_reconciled = Some scope
   then Ok ()
   else (
+    Hashtbl.clear t.local_imports;
     let keep =
       with_upload_store t (fun db ->
         let rec read after reversed =
@@ -590,7 +593,11 @@ let reconcile_staging t (scope : Sync.graph_scope) ~current =
                  let reversed =
                    List.fold_left
                      (fun files intent ->
-                        intent.Logseq_db_types.Asset_upload_intent.staged_file :: files)
+                        let module I = Logseq_db_types.Asset_upload_intent in
+                        if intent.I.phase <> I.Cancelled then
+                          Hashtbl.replace t.local_imports
+                            (intent.asset, intent.version.checksum) intent.operation_id;
+                        intent.staged_file :: files)
                      reversed
                      intents
                  in
@@ -1920,7 +1927,30 @@ let run_upload t (context : Sync.asset_context) instruction =
   | Upload.Cancel_operation _ -> ()
   | Release_staging intent ->
     (match
-       asset_unit t ~scope:context.scope (Sync.Release_staged_file intent.staged_file)
+       let can_release =
+         if intent.Logseq_db_types.Asset_upload_intent.phase = Cancelled
+         then Ok ()
+         else (
+           match
+             asset_call
+               t
+               ~scope:context.scope
+               (Sync.Check_asset_cache (intent.asset, intent.version))
+           with
+           | Ok (Sync.Asset_cached (Some handle)) ->
+             asset_unit t ~scope:context.scope (Sync.Release_asset_file handle)
+           | _ ->
+             asset_unit
+               t
+               ~scope:context.scope
+               (Sync.Publish_staged_asset
+                  { asset = intent.asset
+                  ; version = intent.version
+                  ; file = intent.staged_file
+                  }))
+       in
+       Result.bind can_release (fun () ->
+         asset_unit t ~scope:context.scope (Sync.Release_staged_file intent.staged_file))
      with
      | Ok () -> ()
      | Error message -> t.dependencies.publish (Core.Diagnostic message))
@@ -2041,13 +2071,74 @@ let transfer_failure = function
   | Asset_invalid_content message -> Invalid_content message
 ;;
 
+let local_import t ~(scope : Sync.graph_scope) ~asset ~checksum ~current =
+  with_staging_lock t (fun () ->
+    let ( let* ) = Result.bind in
+    let* () = reconcile_staging t scope ~current in
+    match Hashtbl.find_opt t.local_imports (asset, checksum) with
+    | None -> Ok None
+    | Some operation ->
+      let* intent =
+        with_upload_store t (fun db ->
+          Logseq_db_storage.Asset_upload_store.read db ~operation)
+      in
+      Ok
+        (Option.bind intent (fun (i : Logseq_db_types.Asset_upload_intent.t) ->
+           if
+             current ()
+             && (not t.stopped)
+             && i.origin = Uri.to_string scope.account.managed_sync_origin
+             && i.account = scope.account.user_id
+             && i.graph = scope.graph_id
+             && i.asset = asset
+             && i.version.checksum = checksum
+             && i.phase <> Logseq_db_types.Asset_upload_intent.Cancelled
+           then Some i
+           else None)))
+;;
+
+let lookup_local_asset t ~scope ~asset ~checksum ~current call =
+  match local_import t ~scope ~asset ~checksum ~current with
+  | Error _ -> Error Sync.Asset_cancelled
+  | Ok None -> Ok (Sync.Asset_cached None)
+  | Ok (Some intent) ->
+    (match call (Sync.Check_asset_cache (asset, intent.version)) with
+     | Ok (Sync.Asset_cached (Some _) as value) -> Ok value
+     | Error _ as error -> error
+     | Ok _ ->
+       (match call (Sync.Retain_staged_file intent.staged_file) with
+        | Ok (Sync.Asset_retained (Some (lease, _))) ->
+          let published =
+            call
+              (Sync.Publish_staged_asset
+                 { asset; version = intent.version; file = intent.staged_file })
+          in
+          (match published with
+           | Error Sync.Asset_storage_full -> Ok (Sync.Asset_cached (Some lease))
+           | _ ->
+             ignore (call (Sync.Release_asset_file lease));
+             (match published with
+              | Ok Sync.Asset_unit ->
+                call (Sync.Check_asset_cache (asset, intent.version))
+              | Error (Sync.Asset_missing_source | Asset_checksum_mismatch) ->
+                Ok (Sync.Asset_cached None)
+              | Error _ as error -> error
+              | Ok _ ->
+                Error (Sync.Asset_invalid_content "Unexpected publication completion")))
+        | Ok _ -> Ok (Sync.Asset_cached None)
+        | Error _ as error -> error))
+;;
+
 let run_asset t (context : Sync.asset_context) instruction =
   let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
   let perform ticket action success =
-    if
-      (not t.stopped)
-      && t.asset_current ticket
-      && not (Hashtbl.mem t.asset_operations ticket)
+    let scope =
+      match ticket with
+      | Transfer.Lookup ticket -> ticket.scope
+      | Download ticket -> ticket.scope
+    in
+    let valid () = (not t.stopped) && scope = context.scope && t.asset_current ticket in
+    if valid () && not (Hashtbl.mem t.asset_operations ticket)
     then (
       Hashtbl.add t.asset_operations ticket "";
       t.dependencies.runtime.fork ~sw:t.sw (fun () ->
@@ -2055,7 +2146,7 @@ let run_asset t (context : Sync.asset_context) instruction =
           ~finally:(fun () -> Hashtbl.remove t.asset_operations ticket)
           (fun () ->
              let result =
-               if t.stopped || not (t.asset_current ticket)
+               if not (valid ())
                then Error Sync.Asset_cancelled
                else
                  asset_call
@@ -2063,9 +2154,9 @@ let run_asset t (context : Sync.asset_context) instruction =
                      Hashtbl.replace t.asset_operations ticket operation)
                    t
                    ~scope:context.scope
-                   action
+                 |> action
              in
-             if (not t.stopped) && t.asset_current ticket
+             if valid ()
              then
                t.post
                  (Core.Asset_completed
@@ -2082,9 +2173,27 @@ let run_asset t (context : Sync.asset_context) instruction =
   in
   match instruction with
   | Transfer.Check_cache ticket ->
+    let work = Transfer.Lookup ticket in
     perform
-      ticket
-      (Sync.Check_asset_cache (ticket.asset, ticket.version))
+      work
+      (fun call ->
+         let local checksum =
+           lookup_local_asset
+             t
+             ~scope:context.scope
+             ~asset:ticket.asset
+             ~checksum
+             ~current:(fun () -> t.asset_current work)
+             call
+         in
+         match ticket.source with
+         | Transfer.Local_checksum checksum -> local checksum
+         | Remote_version version -> call (Sync.Check_asset_cache (ticket.asset, version))
+         | Local_and_remote { current_checksum; remote_version } ->
+           (match local current_checksum with
+            | Ok (Sync.Asset_cached None) ->
+              call (Sync.Check_asset_cache (ticket.asset, remote_version))
+            | result -> result))
       (fun result ->
          Transfer.Cache_checked
            ( ticket
@@ -2093,12 +2202,14 @@ let run_asset t (context : Sync.asset_context) instruction =
                | _ -> Error (Transfer.Invalid_content "Unexpected cache completion")) ))
   | Fetch ticket ->
     perform
-      ticket
-      (Sync.Fetch_asset
-         { asset = ticket.asset
-         ; version = ticket.version
-         ; maximum_plaintext_bytes = 8 * 1024 * 1024
-         })
+      (Transfer.Download ticket)
+      (fun call ->
+         call
+           (Sync.Fetch_asset
+              { asset = ticket.asset
+              ; version = ticket.version
+              ; maximum_plaintext_bytes = 8 * 1024 * 1024
+              }))
       (fun result ->
          Transfer.Downloaded
            ( ticket
@@ -2346,8 +2457,27 @@ let prepare_import_unlocked
       result
 ;;
 
-let prepare_import t ~context request ~current =
-  with_staging_lock t (fun () -> prepare_import_unlocked t ~context request ~current)
+let prepare_import t ~(context : Sync.asset_context) request ~current =
+  with_staging_lock t (fun () ->
+    Result.map
+      (fun (intent : Logseq_db_types.Asset_upload_intent.t) ->
+         Hashtbl.replace
+           t.local_imports
+           (intent.asset, intent.version.checksum)
+           intent.operation_id;
+         if intent.phase <> Logseq_db_types.Asset_upload_intent.Cancelled && current ()
+         then
+           ignore
+             (asset_unit
+                t
+                ~scope:context.Sync.scope
+                (Sync.Publish_staged_asset
+                   { asset = intent.asset
+                   ; version = intent.version
+                   ; file = intent.staged_file
+                   }));
+         intent)
+      (prepare_import_unlocked t ~context request ~current))
 ;;
 
 let retain_imported_file t ~(scope : Sync.graph_scope) ~operation =
