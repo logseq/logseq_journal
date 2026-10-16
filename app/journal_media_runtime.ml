@@ -326,15 +326,18 @@ let handoff_imports t g =
          not
            (Hashtbl.to_seq_values t.previews
             |> Seq.exists (fun (_, root, asset) -> root = g.root && asset = token))
-         && List.exists
-           (fun c ->
-              c.asset.uuid = receipt.asset.uuid
-              && c.asset.current_checksum = receipt.asset.current_checksum
-              &&
-              match P.presentation c.state with
-              | P.File _ -> true
-              | _ -> false)
-           g.controllers)
+         (* Hidden controllers already released their File. Without a view
+            owner, the durable intent/cache owns the bytes, not this UI lease. *)
+         && ((not g.visible)
+             || List.exists
+                  (fun c ->
+                     c.asset.uuid = receipt.asset.uuid
+                     && c.asset.current_checksum = receipt.asset.current_checksum
+                     &&
+                     match P.presentation c.state with
+                     | P.File _ -> true
+                     | _ -> false)
+                  g.controllers))
       g.local
   in
   g.local <- pending;

@@ -1208,7 +1208,7 @@ let test_import_handoff preview =
   in
   (match preview with
    | `None -> ()
-   | `Close | `Prune | `Multiple -> show "row");
+   | `Close | `Prune | `Multiple | `Hidden_close | `Hidden_prune -> show "row");
   if preview = `Multiple then show "detail";
   Queue.clear sent;
   let consumer = Option.get consumer in
@@ -1255,15 +1255,25 @@ let test_import_handoff preview =
      preview_is_retained ();
      close "row";
      preview_is_retained ();
-     close "detail");
+     close "detail"
+   | `Hidden_close | `Hidden_prune ->
+     R.root_visible runtime ~root false;
+     preview_is_retained ();
+     if preview = `Hidden_close then close "row" else R.retain_owners runtime [];
+     check
+       (release_count () = 1
+        && (List.hd (Hashtbl.find views root).items).token <> preview_token)
+       "the final preview owner releases its import even after the row is hidden");
   let items = (Hashtbl.find views root).items in
-  check
-    (List.length items = 1
-     && (List.hd items).presentation = Journal_media.File "/cache/original.png")
-    "normal file replaces staged preview without duplicate items";
-  check
-    ((List.hd items).file_type = "png")
-    "pending local image keeps its type after handoff";
+  if preview <> `Hidden_close && preview <> `Hidden_prune
+  then (
+    check
+      (List.length items = 1
+       && (List.hd items).presentation = Journal_media.File "/cache/original.png")
+      "normal file replaces staged preview without duplicate items";
+    check
+      ((List.hd items).file_type = "png")
+      "pending local image keeps its type after handoff");
   check
     (List.exists
        (function
@@ -1290,6 +1300,8 @@ let () =
     ; "open import preview survives handoff", (fun () -> test_import_handoff `Close)
     ; "import preview owner cleanup", (fun () -> test_import_handoff `Prune)
     ; "import handoff waits for final preview", (fun () -> test_import_handoff `Multiple)
+    ; "hidden import preview close", (fun () -> test_import_handoff `Hidden_close)
+    ; "hidden import preview owner cleanup", (fun () -> test_import_handoff `Hidden_prune)
     ]
 ;;
 
