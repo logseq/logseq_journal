@@ -868,12 +868,9 @@ let test_outline_branches_append_and_delete () =
       request_generation
     | _ -> assert false
   in
-  let removed_append, append_delete =
-    D.stage_delete created ~block_id:(Journal_model.id new_child) |> Option.get
-  in
-  let restored_append = D.undo_delete removed_append append_delete in
+
   let restarted, _ =
-    D.step restored_append (Load_failed (pending_generation, true, "Cursor changed"))
+    D.step created (Load_failed (pending_generation, true, "Cursor changed"))
   in
   let restarted, requests = D.step restarted (Load_more root_id) in
   let restart_generation =
@@ -893,7 +890,7 @@ let test_outline_branches_append_and_delete () =
     (List.mem
        (Journal_model.id new_child)
        (List.map Journal_model.id (D.children restarted)))
-    "cursor restart lost an appended child restored by Undo";
+    "cursor restart lost an appended child after creation";
   let paging, requests = D.step restarted (Load_more root_id) in
   let paging_generation =
     match requests with
@@ -925,18 +922,16 @@ let test_outline_branches_append_and_delete () =
   require
     (List.length row_keys = List.length (List.sort_uniq String.compare row_keys))
     "native outline received duplicate row identities";
-  let deleted, staged = D.stage_delete created ~block_id:child_id |> Option.get in
+  let deleted = D.remove_block created ~block_id:child_id |> Option.get in
   require
     (D.find_block deleted ~block_id:child_id = None)
-    "staged subtree remained visible";
+    "committed subtree remained visible";
   require
     (D.find_block deleted ~block_id:(Journal_model.id grandchild) = None)
-    "staged descendant remained visible";
-  let restored = D.undo_delete deleted staged in
-  require (List.exists (function D.Block { block; _ } -> Journal_model.id block = Journal_model.id grandchild | _ -> false) (D.rows restored)) "Undo lost visible descendant";
+    "committed descendant remained visible";
   require
-    (Option.is_some (D.find_block restored ~block_id:(Journal_model.id new_child)))
-    "Undo discarded unrelated appended child";
+    (Option.is_some (D.find_block deleted ~block_id:(Journal_model.id new_child)))
+    "delete discarded unrelated appended child";
   require (D.request_back created = `Close) "reading Back was blocked"
 ;;
 
@@ -1071,7 +1066,7 @@ let test_favorites_state_isolates_requests_and_refreshes () =
     "inactive current completion was discarded"
 ;;
 
-let test_favorite_target_origin_and_undo () =
+let test_favorite_target_origin_and_delete () =
   let module P = Logseq_db_worker.Protocol in
   let module G = Logseq_db_types.Graph_types in
   let module F = Journal_routes.Favorites in
@@ -1139,8 +1134,7 @@ let test_favorite_target_origin_and_undo () =
   require
     (List.length (F.items hidden) = 1)
     "delete did not hide only the matching block favorite";
-  let restored, _ = F.step hidden (Reveal_target (G.Uuid.to_string target)) in
-  require (F.items restored = F.items loaded) "Undo did not restore favorite membership"
+
 ;;
 
 let load_parent routes parent generation =
@@ -2187,7 +2181,7 @@ let test_typed_covered_failure_missing_and_branch () =
     "covered missing result changed the top entry"
 ;;
 
-let test_typed_shared_data_delete_undo_and_drafts () =
+let test_typed_shared_data_delete_and_drafts () =
   let module R = Journal_routes in
   let parent = block () in
   let first = load_parent (R.create ()) parent 900L in
@@ -2225,37 +2219,15 @@ let test_typed_shared_data_delete_undo_and_drafts () =
     (Journal_capture.source
        (Option.get (Journal_detail.child_capture (entry_detail shared first_id))))
     "first independent draft after graph update";
-  let staged, undo = R.stage_delete shared ~block_id:(Journal_model.id parent) in
+  let deleted, _ = R.commit_delete shared ~block_id:(Journal_model.id parent) in
   List.iter
-    (fun id ->
-       require
-         (R.route (entry staged id) = Missing_detail)
-         "delete left a matching live root visible")
+    (fun id -> require (R.route (entry deleted id) = Missing_detail)
+        "delete left a matching live root visible")
     [ first_id; second_id ];
-  let deleted_reopened = R.pop_to_root staged |> fun t -> load_parent t parent 925L in
-  require_string
-    "Second retained"
-    (Journal_capture.source
-       (Option.get
-          (Journal_detail.child_capture (Option.get (R.detail deleted_reopened)))))
-    "deleted root kept its independent retained composer";
-  let restored = R.undo_delete staged (Option.get undo) in
-  List.iter
-    (fun id ->
-       require
-         (R.route (entry restored id) = Detail)
-         "aggregate Undo did not restore a live owner")
-    [ first_id; second_id ];
-  require_string
-    "Second retained"
-    (Journal_capture.source
-       (Option.get (Journal_detail.child_capture (entry_detail restored second_id))))
-    "second independent draft after Undo";
-  let popped = R.back staged |> fun t -> R.undo_delete t (Option.get undo) in
-  require
-    (R.at_entry popped ~entry_id:second_id = None && path_ids popped = [ first_id ])
-    "Undo revived a popped owner";
-  let detached = R.pop_to_root restored in
+  let deleted_reopened = R.pop_to_root deleted |> fun t -> load_parent t parent 925L in
+  require (Journal_detail.child_capture (Option.get (R.detail deleted_reopened)) = None)
+    "committed deletion retained a root draft";
+  let detached = R.pop_to_root shared in
   let reopened = load_parent detached parent 920L in
   require_string
     "Second retained"
@@ -2603,16 +2575,8 @@ let test_retained_detail_picker_owner_and_terminal_delete () =
           == updated)
          "stale picker generation modified a retained draft";
        let reopened = load_parent updated root 990L in
-       let staged, undo = R.stage_delete reopened ~block_id:(Journal_model.id root) in
-       require
-         (List.length (R.pending_attachments staged) = 1)
-         "Undo staging retired the attachment too early";
-       let restored = R.undo_delete staged (Option.get undo) in
-       require
-         (List.length (R.pending_attachments restored) = 1)
-         "Undo failed to restore the attachment";
        let committed, released =
-         R.commit_delete staged ~block_id:(Journal_model.id root)
+         R.commit_delete reopened ~block_id:(Journal_model.id root)
        in
        require
          (List.length released = 1 && R.pending_attachments committed = [])
@@ -3131,17 +3095,10 @@ let test_followup_snapshot_invalidation_and_owner_isolation () =
     "block attributes did not invalidate rows";
   require (D.rows old_owner == rows) "derived outline overwrote retained snapshot cache";
   let rows = D.rows owner in
-  let owner, staged =
-    D.stage_delete owner ~block_id:(Journal_model.id child) |> Option.get
-  in
+  let owner = D.remove_block owner ~block_id:(Journal_model.id child) |> Option.get in
   require
     (D.rows owner != rows && fst (followup_counts owner) = 1)
     "delete retained stale rows";
-  let deleted = D.rows owner in
-  let owner = D.undo_delete owner staged in
-  require
-    (D.rows owner != deleted && fst (followup_counts owner) = 2)
-    "Undo retained deleted rows";
   let owner = D.reconcile_children owner (followup_page root [] None) in
   require (fst (followup_counts owner) = 1) "authoritative refresh retained removed rows";
   let owner = D.update_child_source owner "Appended QA block" in
@@ -3583,109 +3540,25 @@ let test_initial_staging_refresh_and_delete () =
              && R.initial_load !current = None
              && List.length (ids !current) = 129)
             "refresh resets attempts or charges unchanged root" )
-    ; ( "attempt-cap root Undo publishes immediately without refunding budgets"
-      , fun () ->
-          let run routes generation expected_draft =
-            let branches = children 128 (id 0) 100 in
-            let leaf = node ~parent:(id 100) 500 in
-            let pending, _, _ = admit (start ~routes ~generation branches) in
-            let current = ref (refresh pending (List.hd branches) [ leaf ]) in
-            let pending, _, _ = admit !current in
-            current := refresh pending leaf [];
-            for number = 101 to 225 do
-              let pending, parent, _ = admit !current in
-              require_string (id number) parent "spent initial attempt";
-              current := refresh pending (List.nth branches (number - 100)) []
-            done;
-            let pending, parent, old = admit !current in
-            require_string (id 226) parent "128th pending initial read";
-            let missing, undo = R.stage_delete pending ~block_id:(id 0) in
-            let restored = R.undo_delete missing (Option.get undo) in
-            require
-              (R.route restored = Detail && Option.is_some (R.detail restored))
-              "attempt-exhausted Undo leaves ready data in Loading";
-            require
-              (List.length (ids restored) = 130
-               && R.initial_load restored = None
-               && R.load_initial restored = (restored, []))
-              "Undo resets budgets or loses bounded rows";
-            require
-              (R.apply_detail_response
-                 restored
-                 ~request_generation:old
-                 (page (List.nth branches 126) [])
-               == restored)
-              "exhausted Undo accepts cancelled read";
-            let timed =
-              R.observe_loading_delay
-                restored
-                ~entry_id:(entry_id restored)
-                ~request_generation:generation
-                ~elapsed:0.1
-            in
-            require
-              (timed == restored && not (R.loading_indicator timed))
-              "Undo hangs after 100ms";
-            let outline = observe_outline (Option.get (R.detail restored)) in
-            require (D.next_automatic_load outline = None) "Undo refunds spent attempts";
-            require
-              (List.length (snd (D.step outline (Load_more (id 227)))) = 1)
-              "attempt-cap Undo loses explicit continuation";
-            require
-              (Option.map Journal_capture.source (D.child_capture outline)
-               = expected_draft)
-              "attempt-cap settlement loses the exact retained draft"
-          in
-          let failures = ref [] in
-          let check name test =
-            try test () with
-            | error ->
-              Printf.eprintf "ATTEMPT_CAP_RED %s: %s\n%!" name (Printexc.to_string error);
-              failures := name :: !failures
-          in
-          check "without draft" (fun () -> run (R.create ()) 500L None);
-          check "retained draft" (fun () ->
-            let prior = start [] in
-            let edited =
-              D.update_child_source (Option.get (R.detail prior)) "Ready-at-cap draft"
-            in
-            let detached = R.back (R.update_detail prior edited) in
-            run detached 800L (Some "Ready-at-cap draft"));
-          require
-            (!failures = [])
-            "Attempt-cap Undo variants: %s"
-            (String.concat ", " !failures) )
-    ; ( "root deletion fences pending completion and Undo uses fresh generation"
+    ; ( "root deletion fences pending completion"
       , fun () ->
           let pending, _, old = admit (start [ child ]) in
-          let missing, undo = R.stage_delete pending ~block_id:(id 0) in
+          let missing, _ = R.commit_delete pending ~block_id:(id 0) in
           require
             (R.route missing = Missing_detail
-             && Option.is_some undo
              && not (R.loading_indicator missing))
-            "staged root deletion is ignored";
+            "committed root deletion is ignored";
           require
             (R.apply_detail_response missing ~request_generation:old (page child [])
              == missing)
-            "deleted root is republished by late completion";
-          let restored = R.undo_delete missing (Option.get undo) in
-          let pending, _, fresh = admit restored in
-          require (fresh <> old) "Undo reuses cancelled initial generation";
-          require
-            (R.apply_detail_response pending ~request_generation:old (page child [])
-             == pending)
-            "Undo accepts cancelled completion";
-          let ready =
-            R.apply_detail_response pending ~request_generation:fresh (page child [])
-          in
-          require (ids ready = [ id 0; id 1 ]) "Undo cannot finish fresh initial body" )
+            "deleted root is republished by late completion" )
     ; ( "sibling deletion preserves an unaffected pending initial read"
       , fun () ->
           let tail = node ~parent:(id 0) 2 in
           let pending, _, generation = admit (start [ child; tail ]) in
-          let hidden, undo = R.stage_delete pending ~block_id:(id 2) in
+          let hidden, _ = R.commit_delete pending ~block_id:(id 2) in
           require
-            (Option.is_some undo && R.initial_load hidden = None && R.detail hidden = None)
+            (R.initial_load hidden = None && R.detail hidden = None)
             "sibling deletion cancels and repeats an unrelated read";
           let ready =
             R.apply_detail_response hidden ~request_generation:generation (page child [])
@@ -3693,7 +3566,7 @@ let test_initial_staging_refresh_and_delete () =
           require
             (ids ready = [ id 0; id 1 ])
             "unaffected completion cannot publish the surviving body" )
-    ; ( "descendant deletion removes subtree and Undo fences its old read"
+    ; ( "descendant deletion removes subtree and fences its old read"
       , fun () ->
           let tail = node ~parent:(id 0) 2
           and grandchild = node ~parent:(id 1) 3 in
@@ -3706,145 +3579,16 @@ let test_initial_staging_refresh_and_delete () =
           in
           let pending, parent, old = admit staged in
           require_string (id 3) parent "grandchild read";
-          let hidden, undo = R.stage_delete pending ~block_id:(id 1) in
+          let hidden, _ = R.commit_delete pending ~block_id:(id 1) in
           require
-            (Option.is_some undo && Option.map snd (R.initial_load hidden) = Some (id 2))
+            (Option.map snd (R.initial_load hidden) = Some (id 2))
             "deletion leaves subtree read pending";
           require
             (R.apply_detail_response hidden ~request_generation:old (page grandchild [])
              == hidden)
             "removed subtree is revived";
           let ready = finish hidden in
-          require (ids ready = [ id 0; id 2 ]) "deleted subtree remains in published text";
-          let restored = R.undo_delete hidden (Option.get undo) in
-          let pending, _, fresh = admit restored in
-          require
-            (fresh <> old
-             && R.apply_detail_response
-                  pending
-                  ~request_generation:old
-                  (page grandchild [])
-                == pending)
-            "descendant Undo accepts old read";
-          let ready =
-            finish
-              (R.apply_detail_response
-                 pending
-                 ~request_generation:fresh
-                 (page grandchild []))
-          in
-          require
-            (ids ready = [ id 0; id 1; id 3; id 2 ])
-            "Undo loses subtree or siblings" )
-    ; ( "descendant Undo cannot restore a subsequently deleted staged root"
-      , fun () ->
-          let tail = node ~parent:(id 0) 2 in
-          let pending, _, old = admit (start [ child; tail ]) in
-          let hidden, child_undo = R.stage_delete pending ~block_id:(id 1) in
-          let missing, root_undo = R.stage_delete hidden ~block_id:(id 0) in
-          require
-            (R.route missing = Missing_detail
-             && Option.is_some child_undo
-             && Option.is_some root_undo)
-            "delete sequence lacks owned Undo targets";
-          require
-            (R.undo_delete missing (Option.get child_undo) == missing)
-            "descendant Undo revives a deleted root through same entry generation";
-          let restored =
-            R.undo_delete missing (Option.get root_undo)
-            |> fun t -> R.undo_delete t (Option.get child_undo)
-          in
-          let pending, _, fresh = admit restored in
-          require
-            (fresh <> old
-             && R.apply_detail_response pending ~request_generation:old (page child [])
-                == pending)
-            "ordered root/subtree Undo accepts cancelled read";
-          let ready =
-            finish
-              (R.apply_detail_response pending ~request_generation:fresh (page child []))
-          in
-          require
-            (ids ready = [ id 0; id 1; id 2 ])
-            "ordered Undo cannot restore the surviving body" )
-    ; ( "delete Undo respects covered entry Back graph and retry identities"
-      , fun () ->
-          let pending, _, old = admit (start [ child ]) in
-          let target = node 90 in
-          let covered =
-            R.open_detail pending ~block_id:(id 90) ~request_generation:600L
-            |> fun t ->
-            R.apply_detail_response t ~request_generation:600L (page target [])
-          in
-          let hidden, undo = R.stage_delete covered ~block_id:(id 0) in
-          require
-            (ids hidden = [ id 90 ] && R.route (R.back hidden) = Missing_detail)
-            "covered deletion replaces active entry or leaves deleted root";
-          require
-            (R.apply_detail_response hidden ~request_generation:old (page child [])
-             == hidden)
-            "covered deleted read is accepted";
-          let absent = R.pop_to_root hidden in
-          require
-            (R.undo_delete absent (Option.get undo) == absent)
-            "Undo revives popped owner";
-          let absent = R.graph_unavailable hidden in
-          require
-            (R.undo_delete absent (Option.get undo) == absent)
-            "Undo revives owner from prior graph";
-          let missing = R.back hidden in
-          let retry, _ = R.retry_detail missing ~request_generation:700L in
-          require
-            (R.undo_delete retry (Option.get undo) == retry)
-            "old Undo replaces fresh initial retry";
-          require
-            (R.apply_detail_response retry ~request_generation:old (page child [])
-             == retry)
-            "deleted read contaminates retry" )
-    ; ( "missing staged root preserves the detached draft through Retry and Undo"
-      , fun () ->
-          let prior = start [] in
-          let edited =
-            D.update_child_source
-              (Option.get (R.detail prior))
-              "Retained across staged deletion"
-          in
-          let detached = R.back (R.update_detail prior edited) in
-          let pending, _, old =
-            admit (start ~routes:detached ~generation:800L [ child ])
-          in
-          let missing, undo = R.stage_delete pending ~block_id:(id 0) in
-          require
-            (R.route missing = Missing_detail && Option.is_some undo)
-            "draft owner root deletion is ignored";
-          let retry, _ = R.retry_detail missing ~request_generation:801L in
-          let ready =
-            finish
-              (R.apply_detail_response
-                 retry
-                 ~request_generation:801L
-                 (page root [ child ]))
-          in
-          require_string
-            "Retained across staged deletion"
-            (Journal_capture.source
-               (Option.get (D.child_capture (Option.get (R.detail ready)))))
-            "missing Retry loses original draft";
-          let restored = finish (R.undo_delete missing (Option.get undo)) in
-          require_string
-            "Retained across staged deletion"
-            (Journal_capture.source
-               (Option.get (D.child_capture (Option.get (R.detail restored)))))
-            "root Undo loses original draft";
-          require
-            (R.apply_detail_response restored ~request_generation:old (page child [])
-             == restored)
-            "restored draft accepts stale initial completion";
-          let committed, _ = R.commit_delete missing ~block_id:(id 0) in
-          let reopened = start ~routes:(R.pop_to_root committed) ~generation:802L [] in
-          require
-            (D.child_capture (Option.get (R.detail reopened)) = None)
-            "terminal deletion retains retired draft" )
+          require (ids ready = [ id 0; id 2 ]) "deleted subtree remains in published text" )
     ]
   in
   let failures = ref [] in
@@ -3884,7 +3628,21 @@ let test_page_detail_append_matches_exact_page () =
   require (Journal_detail.mode completed = Reading && Journal_detail.child_capture completed = None)
     "page append did not complete its exact owner";
   require (List.map Journal_model.id (Journal_detail.children completed) = [child_id])
-    "page append went to another root"
+    "page append went to another root";
+  let drafted = Journal_detail.update_child_source completed "Surviving page draft" in
+  let deleted = Journal_detail.remove_block drafted ~block_id:child_id |> Option.get in
+  require (Journal_model.id (Journal_detail.root deleted) = page_id
+           && Journal_detail.children deleted = [])
+    "deleting an outline child removed its enclosing page detail";
+  require (Journal_capture.source (Option.get (Journal_detail.child_capture deleted))
+           = "Surviving page draft")
+    "child deletion retired the enclosing page composer";
+  let routes = load_parent (Journal_routes.create ()) root 8080L
+    |> fun routes -> Journal_routes.update_detail routes drafted in
+  let deleted, released = Journal_routes.commit_delete routes ~block_id:child_id in
+  require (Journal_routes.route deleted = Detail && released = []
+           && Journal_detail.children (Option.get (Journal_routes.detail deleted)) = [])
+    "route deletion confused a page owner with the deleted outline child"
 ;;
 
 let tests =
@@ -3908,7 +3666,7 @@ let tests =
     , test_multiselect_rejected_resource_ownership )
   ; "multiselect graph owner and cancel", test_multiselect_graph_owner_and_cancel
   ; "typed covered failure and branch", test_typed_covered_failure_missing_and_branch
-  ; "typed shared data and aggregate Undo", test_typed_shared_data_delete_undo_and_drafts
+  ; "typed shared data and committed deletion", test_typed_shared_data_delete_and_drafts
   ; "typed duplicate detached mutations", test_typed_detached_duplicate_pending_mutations
   ; "public nested detail owners", test_public_nested_detail_owners
   ; ( "normal attachment pick without replacement metadata"
@@ -3936,7 +3694,7 @@ let tests =
     , test_graph_interruption_preserves_capture_attempt )
   ; "Append drafts follow parent navigation", test_append_drafts_follow_parent_navigation
   ; "detached Append completion and failure", test_detached_append_completion_and_failure
-  ; "favorite target identity, origin and Undo", test_favorite_target_origin_and_undo
+  ; "favorite target identity, origin and deletion", test_favorite_target_origin_and_delete
   ; ( "detail rejects another root even with matching generation"
     , fun () ->
         let routes =

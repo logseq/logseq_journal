@@ -15,7 +15,6 @@ type slot =
   | Feed_continuation of { before_day : int }
 
 type t
-type staged_delete
 
 val empty : today:int -> t
 val reset : t -> today:int -> t
@@ -41,8 +40,6 @@ val replace_timeline_entry_page
   -> t
 
 val prepend_timeline_entry : t -> Journal_graph_projection.timeline_entry -> t
-val stage_delete : t -> block_id:string -> (t * staged_delete) option
-val undo_delete : t -> staged_delete -> t
 
 (** Equality of the rendered slots, date/error presentation and scroll command.
     Demand windows and recovery bookkeeping do not affect this comparison. *)

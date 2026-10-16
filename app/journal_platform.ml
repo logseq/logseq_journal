@@ -107,11 +107,6 @@ module Json = struct
   type sign_out = { signedOut : bool } [@@deriving yojson]
   type ready = { ready : bool } [@@deriving yojson]
   type presented = { presented : bool } [@@deriving yojson]
-  type notice =
-    { token : int64; message : string; actionLabel : string option [@default None]; durationMs : int }
-  [@@deriving yojson]
-  type notice_result = { token : int64; result : string } [@@deriving yojson]
-  type cancel = { token : int64 } [@@deriving yojson]
   type text = { text : string } [@@deriving yojson]
   type copied = { copied : bool } [@@deriving yojson]
 end
@@ -205,8 +200,6 @@ let decode_termination_ready_response bytes =
   if wire.ready then Ok () else Error "termination-ready response fields are invalid"
 ;;
 
-type notice_result = Notice_action | Notice_dismiss | Notice_swipe | Notice_timeout
-
 let decode_environment_event bytes =
   Result.bind (decode_envelope [24] bytes) (fun payload ->
     match Yojson.Basic.from_string (Bytes.to_string payload) |> Journal_environment.decode_json with
@@ -216,29 +209,6 @@ let decode_environment_event bytes =
 ;;
 
 let is_environment_event bytes = Result.is_ok (decode_envelope [24] bytes)
-
-let show_notice_request ~token ~message ~action_label ~duration_ms =
-  json_request 25 Json.notice_to_yojson
-    { token; message; actionLabel = action_label; durationMs = duration_ms }
-  |> Result.get_ok
-;;
-
-let decode_notice_response ~token bytes =
-  let ( let* ) = Result.bind in
-  let* payload = decode_envelope [26] bytes in
-  let* wire = decode_json "notice response" Json.notice_result_of_yojson payload in
-  if wire.token <> token then Error "notice response token is unsolicited"
-  else match wire.result with
-    | "action" -> Ok Notice_action
-    | "dismiss" -> Ok Notice_dismiss
-    | "swipe" -> Ok Notice_swipe
-    | "timeout" -> Ok Notice_timeout
-    | _ -> Error "notice response result is unsupported"
-;;
-
-let notice_cancel_request ~token =
-  json_request 27 Json.cancel_to_yojson { token } |> Result.get_ok
-;;
 
 let copy_text_request ~text =
   if not (Journal_validation.is_valid_utf_8 text)

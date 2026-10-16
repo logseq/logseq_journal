@@ -51,13 +51,6 @@ type t =
   ; day_failures : (int * string) list
   }
 
-(* The entry's stable (day, sibling_order, id) position is its restore anchor.
-   Only the day context hidden by this deletion is retained, not the old timeline. *)
-type staged_delete =
-  { entry : Journal_graph_projection.timeline_entry
-  ; day_after_delete : day_knowledge option
-  }
-
 let maximum_hidden_days = 512
 let maximum_recovery_entries = 512
 let initial_visible_count = 40
@@ -1130,7 +1123,22 @@ let prepend_timeline_entry (state : t) (entry : Journal_graph_projection.timelin
   }
 ;;
 
-let stage_delete (state : t) ~block_id =
+let remove_block (state : t) ~block_id =
+  let state =
+    { state with
+      days =
+        Days.map
+          (fun knowledge ->
+             match knowledge.hidden_entry with
+             | Some entry when String.equal (Journal_model.id entry.block) block_id ->
+               { knowledge with
+                 hidden_entry = None
+               ; block_count = max 0 (knowledge.block_count - 1)
+               }
+             | _ -> knowledge)
+          state.days
+    }
+  in
   let position =
     find_slot_index
       (fun slot ->
@@ -1162,91 +1170,8 @@ let stage_delete (state : t) ~block_id =
         }
       |> preserve_anchor state
     in
-    Some
-      ( prune_days deleted
-      , { entry
-        ; day_after_delete = Days.find_opt (Journal_model.journal_day block) deleted.days
-        } )
-  | None | Some (_, (Day_heading _ | Day_continuation _ | Feed_continuation _)) -> None
-;;
-
-let remove_block (state : t) ~block_id =
-  let state =
-    { state with
-      days =
-        Days.map
-          (fun knowledge ->
-             match knowledge.hidden_entry with
-             | Some entry when String.equal (Journal_model.id entry.block) block_id ->
-               { knowledge with
-                 hidden_entry = None
-               ; block_count = max 0 (knowledge.block_count - 1)
-               }
-             | _ -> knowledge)
-          state.days
-    }
-  in
-  match stage_delete state ~block_id with
-  | Some (state, _) -> state
-  | None -> state
-;;
-
-let undo_delete (state : t) staged =
-  let block = staged.entry.Journal_graph_projection.block in
-  let block_id = Journal_model.id block in
-  let day = Journal_model.journal_day block in
-  let current_day = Days.find_opt day state.days in
-  let target_present =
-    Option.fold
-      ~none:false
-      ~some:(fun knowledge ->
-        Option.fold
-          ~none:false
-          ~some:(fun (entry : Journal_graph_projection.timeline_entry) ->
-            String.equal (Journal_model.id entry.block) block_id)
-          knowledge.hidden_entry)
-      current_day
-    || Rrbvec.exists
-         (function
-           | Top_level entry -> String.equal (Journal_model.id entry.block) block_id
-           | _ -> false)
-         state.slots
-  in
-  if target_present
-  then state
-  else (
-    let knowledge =
-      match current_day with
-      | Some knowledge -> { knowledge with block_count = knowledge.block_count + 1 }
-      | None ->
-        let previous =
-          Option.value
-            ~default:
-              { page =
-                  { id = Journal_model.page_id block; day; title = string_of_int day }
-              ; block_count = 0
-              ; complete = false
-              ; hidden = true
-              ; hidden_entry = None
-              }
-            staged.day_after_delete
-        in
-        (* Absent current days regain only this deletion's footprint. Historical
-           siblings/continuations removed by a later refresh are not resurrected. *)
-        let hidden_entry = if previous.hidden then previous.hidden_entry else None in
-        { previous with
-          block_count = (1 + if Option.is_some hidden_entry then 1 else 0)
-        ; hidden = true
-        ; hidden_entry
-        }
-    in
-    let restored =
-      { state with days = Days.add day knowledge state.days } |> normalize_days
-    in
-    (* Reuse the current ordering, including intervening Capture/page entries.
-       normalize_days reveals a surviving hidden sibling using its latest value. *)
-    let slots = insert_entry restored.slots staged.entry in
-    { restored with slots; pending = None } |> finish_change state)
+    prune_days deleted
+  | None | Some (_, (Day_heading _ | Day_continuation _ | Feed_continuation _)) -> state
 ;;
 
 let observe_visible_range (state : t) ~first_index ~last_exclusive =

@@ -105,42 +105,6 @@ final class JournalIPhoneAcceptance: XCTestCase {
     record("All children after partial-page Append", app)
   }
 
-  @MainActor func testChildDeleteUndoAndPersistence() {
-    continueAfterFailure = false
-    let app = application(relaunch: true)
-    let parent = row("Graph 1 — Encrypted offline Journal", in: app)
-    XCTAssertTrue(parent.waitForExistence(timeout: 25))
-    parent.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Graph 1 — Encrypted offline Journal")).firstMatch.tap()
-    let first = app.staticTexts["Native child 01 — nested content"]
-    XCTAssertTrue(first.waitForExistence(timeout: 10))
-    first.press(forDuration: 1)
-    XCTAssertTrue(app.buttons["Delete block and descendants"].waitForExistence(timeout: 3))
-    app.buttons["Delete block and descendants"].tap()
-    XCTAssertTrue(app.buttons["Undo"].waitForExistence(timeout: 3))
-    app.buttons["Undo"].tap()
-    XCTAssertTrue(first.waitForExistence(timeout: 5))
-    record("Child deletion canceled by timed Undo", app)
-    let second = app.staticTexts["Native child 02 — nested content"]
-    XCTAssertTrue(second.exists)
-    second.press(forDuration: 1)
-    XCTAssertTrue(app.buttons["Delete block and descendants"].waitForExistence(timeout: 3))
-    app.buttons["Delete block and descendants"].tap()
-    XCTAssertTrue(app.buttons["Undo"].waitForExistence(timeout: 3))
-    let expired = expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: app.buttons["Undo"])
-    wait(for: [expired], timeout: 12)
-    XCTAssertTrue(first.exists)
-    XCTAssertFalse(second.exists)
-    record("Only second child deleted", app)
-    app.terminate()
-    app.launch()
-    XCTAssertTrue(parent.waitForExistence(timeout: 25))
-    parent.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Graph 1 — Encrypted offline Journal")).firstMatch.tap()
-    XCTAssertTrue(first.waitForExistence(timeout: 10))
-    XCTAssertFalse(second.exists)
-    XCTAssertTrue(app.staticTexts["Native child 03 — nested content"].exists)
-    record("Child deletion survives restart", app)
-  }
-
   @MainActor func testInspectNativeOutline() {
     continueAfterFailure = false
     let app = application(relaunch: true)

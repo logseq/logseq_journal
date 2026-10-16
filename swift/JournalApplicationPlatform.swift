@@ -63,7 +63,6 @@ import AppKit
   @ObservationIgnored private var shutdown: JournalApplicationShutdown?
   @ObservationIgnored private var lastEnvironment: JournalEnvironmentSample?
   @ObservationIgnored private(set) var connected = false
-  @ObservationIgnored let notices = JournalNotices()
   /// Test observation hooks (apple-tests): every decoded LJP2 request and
   /// each connect/disconnect transition, in delivery order on the main actor.
   @ObservationIgnored var requestObserver: ((JournalPlatformWire.Request) -> Void)?
@@ -78,7 +77,6 @@ import AppKit
     self.runtime = runtime
     connected = true
     pending.connect()
-    notices.setActive(true)
     connectionObserver?(true)
     observeAuthentication()
     // Re-deliver the latest environment sample after a reconnect.
@@ -98,8 +96,6 @@ import AppKit
     shutdown?.cancel()
     shutdown = nil
     pending.disconnect()
-    notices.setActive(false)
-    notices.cancelAll()
     connectionObserver?(false)
     connected = false
     runtime = nil
@@ -136,7 +132,7 @@ import AppKit
       pending.clearAuthentication()
     }
     if pending.terminating, request != .terminationReady { return nil }
-    // Notice requests resolve through the presenter, not platform services.
+    // Clipboard access belongs to the main-actor application host.
     switch request {
     case .copyText(let text):
       guard connected, connection == identity else { return nil }
@@ -149,16 +145,6 @@ import AppKit
       return nil
       #endif
       return try? JournalPlatformWire.encodeResponse(.textCopied)
-    case .cancelNotice(let token):
-      notices.cancel(token: token)
-      return nil
-    case .showNotice(let token, let message, let actionLabel, let durationMs):
-      let close = await notices.show(
-        token: token, message: message, actionLabel: actionLabel,
-        durationMs: durationMs)
-      guard connected else { return nil }
-      return try? JournalPlatformWire.encodeResponse(
-        .notice(token: token, result: close.result.rawValue))
     default:
       break
     }

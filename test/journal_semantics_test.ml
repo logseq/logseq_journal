@@ -1049,19 +1049,83 @@ let test_empty_media_has_no_attachment_chrome () =
       "empty media created attachment layout")
 ;;
 
+(* Status/tag rendering has no pure reducer owner; the public mounted row is
+   the narrowest boundary that executes native metadata presentation. *)
 let test_status_and_tags_mount () =
-  let block =
-    Journal_model.with_tag_titles (block ~task_state:Doing ()) ~tag_titles:[ "阅读"; "工作" ]
+  let cases =
+    [ [], None
+    ; [ "阅读" ], Some "#阅读"
+    ; [ "阅读"; "工作"; "旅行" ], Some "#阅读  #工作  #旅行"
+    ; [ "阅读"; "工作"; "旅行"; "hidden" ], Some "#阅读  #工作  #旅行  +1"
+    ; List.init 9 (fun i -> "tag" ^ string_of_int i), Some "#tag0  #tag1  #tag2  +6"
+    ; ( [ "重复"; "重复"; "非常长的标签名称没有空格并保留完整文字"; "隐藏" ]
+      , Some "#重复  #重复  #非常长的标签名称没有空格并保留完整文字  +1" )
+    ]
   in
-  let view =
-    Journal_row.view
-      ~show_timestamp:false
-      ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child)
-      { Journal_graph_projection.block; child_summaries = [] }
+  List.iter
+    (fun task_state ->
+       List.iter
+         (fun (titles, expected) ->
+            let block =
+              Journal_model.with_tag_titles (block ~task_state ()) ~tag_titles:titles
+            in
+            let view =
+              Journal_row.view
+                ~show_timestamp:false
+                ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child)
+                { Journal_graph_projection.block; child_summaries = [] }
+            in
+            with_mounted view (fun _ ops ->
+              let ops = ops () in
+              require
+                (has_text ops "Doing" = (task_state = Journal_model.Doing))
+                "status presence changed with tags";
+              let tag_nodes =
+                List.filter_map
+                  (function
+                    | Lui_protocol.SetProp (node, TextValue, StringValue value)
+                      when String.starts_with ~prefix:"#" value -> Some (node, value)
+                    | _ -> None)
+                  ops
+              in
+              match expected, tag_nodes with
+              | None, [] -> ()
+              | Some expected, [ (node, actual) ] ->
+                require
+                  (actual = expected)
+                  "tags must keep the first three titles and exact remaining count: %s"
+                  actual;
+                require
+                  (List.exists
+                     (function
+                       | Lui_protocol.SetProp (id, TextAlignment, StringValue "end") ->
+                         id = node
+                       | _ -> false)
+                     ops)
+                  "tags must align to the trailing edge, with and without status";
+                require
+                  (not
+                     (List.exists
+                        (function
+                          | Lui_protocol.SetProp (id, StyleClass, StringValue value) ->
+                            id = node
+                            && (String.equal value "single-line"
+                                || String.equal value "line-clamp-3")
+                          | _ -> false)
+                        ops))
+                  "tags must retain native multiline wrapping"
+              | _ -> fail "unexpected tags rendering"))
+         cases)
+    [ Journal_model.No_status; Doing ];
+  let detail =
+    Journal_model.with_tag_titles (block ()) ~tag_titles:[ "one"; "two"; "three"; "four" ]
   in
-  with_mounted view (fun _ ops ->
-    require (has_text (ops ()) "Doing") "status must mount using supported LUI nodes";
-    require (has_text (ops ()) "#阅读  #工作") "named tags must accompany status")
+  with_mounted
+    (V.column (Journal_row.metadata detail))
+    (fun _ ops ->
+       require
+         (has_text (ops ()) "#one  #two  #three  #four")
+         "Timeline tag limit must not truncate Detail metadata")
 ;;
 
 (* Title layout is owned by the mounted view, outside the pure reducers. *)

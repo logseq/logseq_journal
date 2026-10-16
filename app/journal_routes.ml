@@ -288,20 +288,6 @@ let map_child_capture_at t ~entry_id ~request_generation ~f =
      | _ -> t)
 ;;
 
-let commit_delete t ~block_id =
-  let retired, kept =
-    Drafts.partition (fun _ draft -> draft.block_id = block_id) t.drafts
-  in
-  let files =
-    Drafts.fold
-      (fun _ draft files ->
-         List.rev_append (Journal_detail.retained_attachments draft.composer) files)
-      retired
-      []
-  in
-  if Drafts.is_empty retired then t, [] else { t with drafts = kept }, files
-;;
-
 let child_attachment_imports t ~child ~parent =
   let found =
     Drafts.fold
@@ -705,110 +691,67 @@ let runtime_replaced t =
   t
 ;;
 
-type staged_delete = (string * int64 * view * string * Journal_detail.staged_delete) list
-
-let stage_delete t ~block_id =
-  (* A missing root no longer carries its composer. Preserve it before changing
-     phase, in path order, so pop/Undo cannot lose an independent pending draft. *)
+let commit_delete t ~block_id =
   let t =
-    List.fold_left
-      (fun t (entry : detail_route Lui_navigation.entry) ->
-         match Owners.find_opt entry.id t.owners with
-         | Some (Detail_view owner)
-           when Journal_model.id (Journal_detail.root owner.detail) = block_id ->
-           retain_owner t entry.id
-         | _ -> t)
-      t
-      (Path.entries t.path)
-  in
-  let t, staged =
     Owners.fold
-      (fun entry_id view (t, staged) ->
+      (fun entry_id view t ->
          match view with
-         | Detail_view owner ->
-           (match Journal_detail.stage_delete owner.detail ~block_id with
-            | None -> t, staged
-            | Some (hidden, undo) ->
-              let next =
-                if Journal_model.id (Journal_detail.root owner.detail) = block_id
-                then
-                  Missing_detail_view
+         | Detail_view owner when owner.block_id = block_id -> retain_owner t entry_id
+         | _ -> t)
+      t.owners
+      t
+  in
+  let t =
+    Owners.fold
+      (fun entry_id view t ->
+         match view with
+         | Detail_view owner when owner.block_id = block_id ->
+           { t with
+             owners =
+               Owners.add
+                 entry_id
+                 (Missing_detail_view
                     { block_id = owner.block_id
                     ; request_generation = owner.request_generation
-                    ; draft_owner =
-                        (if Drafts.mem entry_id t.drafts then Some entry_id else None)
-                    }
-                else Detail_view { owner with detail = hidden }
-              in
-              ( { t with owners = Owners.add entry_id next t.owners }
-              , (entry_id, owner.request_generation, view, block_id, undo) :: staged ))
-         | Detail_loading_view ({ staged_detail = Some detail; _ } as owner) ->
-           let root_removed = Journal_model.id (Journal_detail.root detail) = block_id in
-           (match Journal_detail.stage_delete ~fence_reads:true detail ~block_id with
-            | None -> t, staged
-            | Some (hidden, undo) ->
-              let before =
-                if root_removed
-                then
-                  Detail_loading_view
-                    { owner with
-                      staged_detail = Some (Journal_detail.cancel_initial_reads detail)
-                    }
-                else view
-              in
-              let next =
-                if root_removed
-                then
-                  { t with
-                    owners =
-                      Owners.add
-                        entry_id
-                        (Missing_detail_view
-                           { block_id = owner.block_id
-                           ; request_generation = owner.request_generation
-                           ; draft_owner = owner.draft_owner
-                           })
-                        t.owners
-                  }
-                else update_detail_at t ~entry_id hidden
-              in
-              next, (entry_id, owner.request_generation, before, block_id, undo) :: staged)
-         | _ -> t, staged)
-      t.owners
-      (t, [])
-  in
-  t, if staged = [] then None else Some staged
-;;
-
-let undo_delete t staged =
-  List.fold_left
-    (fun t (entry_id, generation, before, deleted_id, undo) ->
-       match Owners.find_opt entry_id t.owners with
-       | ( Some (Detail_view { detail; _ })
-         | Some (Detail_loading_view { staged_detail = Some detail; _ }) ) as current
-         when Option.fold
-                ~none:false
-                ~some:(fun view -> view_generation view = generation)
-                current ->
-         update_detail_at t ~entry_id (Journal_detail.undo_delete detail undo)
-       | Some (Missing_detail_view owner)
-         when owner.request_generation = generation
-              &&
-              match before with
-              | Detail_loading_view _ -> owner.block_id = deleted_id
-              | _ -> true ->
-         settle_initial
-           { t with
-             owners = Owners.add entry_id before t.owners
-           ; drafts =
-               (match before with
-                | Detail_loading_view _ -> t.drafts
-                | _ -> Drafts.remove entry_id t.drafts)
+                    ; draft_owner = None
+                    })
+                 t.owners
            }
-           ~entry_id
-       | _ -> t)
-    t
-    staged
+         | Detail_loading_view owner when owner.block_id = block_id ->
+           { t with
+             owners =
+               Owners.add
+                 entry_id
+                 (Missing_detail_view
+                    { block_id = owner.block_id
+                    ; request_generation = owner.request_generation
+                    ; draft_owner = None
+                    })
+                 t.owners
+           }
+         | Detail_view owner ->
+           (match Journal_detail.remove_block owner.detail ~block_id with
+            | None -> t
+            | Some detail -> update_detail_at t ~entry_id detail)
+         | Detail_loading_view { staged_detail = Some detail; _ } ->
+           (match Journal_detail.remove_block detail ~block_id with
+            | None -> t
+            | Some detail -> update_detail_at t ~entry_id detail)
+         | _ -> t)
+      t.owners
+      t
+  in
+  let retired, kept =
+    Drafts.partition (fun _ draft -> draft.block_id = block_id) t.drafts
+  in
+  let files =
+    Drafts.fold
+      (fun _ draft files ->
+         List.rev_append (Journal_detail.retained_attachments draft.composer) files)
+      retired
+      []
+  in
+  if Drafts.is_empty retired then t, [] else { t with drafts = kept }, files
 ;;
 
 module Favorites = struct
@@ -819,7 +762,6 @@ module Favorites = struct
     | Select of bool
     | Invalidate
     | Hide_target of string
-    | Reveal_target of string
     | Retry
     | Visible of
         { first_index : int
@@ -926,15 +868,6 @@ module Favorites = struct
           { t with hidden_targets = id :: t.hidden_targets; revision = t.revision + 1 }
         in
         start_if_needed next)
-    | Reveal_target id ->
-      if not (List.mem id t.hidden_targets)
-      then t, []
-      else
-        ( { t with
-            hidden_targets = List.filter (( <> ) id) t.hidden_targets
-          ; revision = t.revision + 1
-          }
-        , [] )
     | Retry -> if t.pending = None then refresh t else t, []
     | Visible { first_index = _; last_exclusive } ->
       let visible = visible_items t in
