@@ -135,9 +135,14 @@ let notify t g =
                { token = c.consumer
                ; asset = c.asset
                ; file_type =
-                   (match c.asset.source with
-                    | Managed (Some v) -> v.file_type
-                    | _ -> "")
+                   (match P.presentation c.state with
+                    | File path when Filename.extension path <> "" ->
+                      let extension = Filename.extension path in
+                      String.sub extension 1 (String.length extension - 1)
+                    | _ ->
+                      (match c.asset.source with
+                       | Managed (Some v) -> v.file_type
+                       | _ -> ""))
                ; presentation = P.presentation c.state
                })
             (List.filter
@@ -313,6 +318,32 @@ let release_import t (receipt : Logseq_db_worker.import_receipt) =
     receipt.preview
 ;;
 
+let handoff_imports t g =
+  let completed, pending =
+    List.partition
+      (fun (receipt : Logseq_db_worker.import_receipt) ->
+         let token = "import:" ^ G.Uuid.to_string receipt.operation in
+         not
+           (Hashtbl.to_seq_values t.previews
+            |> Seq.exists (fun (_, root, asset) -> root = g.root && asset = token))
+         (* Hidden controllers already released their File. Without a view
+            owner, the durable intent/cache owns the bytes, not this UI lease. *)
+         && ((not g.visible)
+             || List.exists
+                  (fun c ->
+                     c.asset.uuid = receipt.asset.uuid
+                     && c.asset.current_checksum = receipt.asset.current_checksum
+                     &&
+                     match P.presentation c.state with
+                     | P.File _ -> true
+                     | _ -> false)
+                  g.controllers))
+      g.local
+  in
+  g.local <- pending;
+  List.iter (release_import t) completed
+;;
+
 let clear t g =
   List.iter (release_import t) g.local;
   g.local <- [];
@@ -473,8 +504,11 @@ let retain_owners t owners =
        Owners.iter
          (fun owner ->
             if not (Owners.mem owner retained) then root_visible ~owner t ~root false)
-         g.owners)
-    t.groups
+         g.owners;
+       handoff_imports t g;
+       notify t g)
+    t.groups;
+  pump t
 ;;
 
 let asset_visible ?(owner = "default") t ~root ~asset visible =
@@ -515,7 +549,16 @@ let preview_visible t ~owner ~slot ~root ~asset visible =
   if (not visible) || current <> Some selected
   then (
     Hashtbl.remove t.previews preview;
-    Option.iter (fun (_, root, _) -> root_visible ~owner:preview t ~root false) current);
+    Option.iter
+      (fun (_, root, _) ->
+         root_visible ~owner:preview t ~root false;
+         Option.iter
+           (fun g ->
+              handoff_imports t g;
+              notify t g)
+           (Hashtbl.find_opt t.groups root))
+      current;
+    pump t);
   if visible
   then (
     match Hashtbl.find_opt t.groups root with
@@ -1080,7 +1123,17 @@ let receive t ticket response =
             g.controllers <- controllers;
             g.cursor <- next_cursor;
             if not g.dependency_failed then g.error <- None;
-            List.iter (fun c -> Hashtbl.replace t.consumers c.consumer (g, c)) controllers
+            List.iter (fun c ->
+              Hashtbl.replace t.consumers c.consumer (g, c);
+              if g.visible && not c.shown
+                 && List.exists (fun (receipt : Logseq_db_worker.import_receipt) ->
+                      receipt.asset.uuid = c.asset.uuid) g.local
+              then match t.generation with
+                | None -> ()
+                | Some graph_generation ->
+                  c.shown <- true;
+                  c.owners <- g.owners;
+                  dispatch t g c (P.Show { graph_generation; consumer = c.consumer; asset = c.asset })) controllers
           | _ -> g.error <- Some "Unable to load attachments. Retry.");
         notify t g
       | _ -> ())
@@ -1095,6 +1148,7 @@ let receive t ticket response =
         (match List.find_opt (fun c -> c.consumer = consumer) g.controllers with
          | Some c ->
            dispatch t g c (Acquired (ticket, result));
+           handoff_imports t g;
            notify t g
          | None -> release_stale t ticket result)
       | _ -> release_stale t ticket result));
@@ -1111,6 +1165,20 @@ let notice t scope = function
        notify t g;
        pump t
      | _ -> ())
+  | Upload_status { operation; target; status = Cancelled; _ } ->
+    Option.iter
+      (fun g ->
+         let cancelled, pending =
+           List.partition
+             (fun (receipt : Logseq_db_worker.import_receipt) ->
+                receipt.operation = operation && receipt.scope = scope)
+             g.local
+         in
+         g.local <- pending;
+         List.iter (release_import t) cancelled;
+         notify t g;
+         pump t)
+      (Hashtbl.find_opt t.groups (G.Uuid.to_string target))
   | Upload_status _ -> ()
   | Asset_capacity_available ->
     Hashtbl.iter (fun _ (g, c) -> dispatch t g c P.Capacity_available) t.consumers;

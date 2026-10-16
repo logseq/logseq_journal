@@ -23,14 +23,14 @@ let scope : C.graph_scope =
   }
 ;;
 
-let asset ?(checksum = String.make 64 'a') ?(remote = true) n =
+let asset ?(checksum = String.make 64 'a') ?(remote = true) ?current_checksum n =
   get
     (A.create
        ~uuid:(uuid n)
        ~source:
          (Managed
             (if remote then Some (get (A.version ~checksum ~file_type:"png")) else None))
-       ~current_checksum:None
+       ~current_checksum
        ~size:None
        ~dimensions:None)
 ;;
@@ -250,7 +250,7 @@ let lock_and_network () =
   let t, e = T.step t (Cache_checked (only (checks e), Ok None)) in
   let old = only (fetches e) in
   let t, e = T.step t (Unlock_changed false) in
-  Alcotest.(check bool) "lock cancels IO" true (List.mem (T.Cancel old) e);
+  Alcotest.(check bool) "lock cancels IO" true (List.mem (T.Cancel (T.Download old)) e);
   let t, e = T.step t (Downloaded (old, Ok "stale")) in
   Alcotest.(check bool) "lock fences bytes" true (release_present e);
   let t, _ = T.step t (Network_changed false) in
@@ -301,12 +301,12 @@ let duplicate_retry_while_loading () =
   let local = only (checks effects) in
   let t, effects = T.step t (Retry (uuid 2)) in
   check "retry while checking has no effects" 0 (List.length effects);
-  Alcotest.(check bool) "local lookup stays current" true (T.ticket_current t local);
+  Alcotest.(check bool) "local lookup stays current" true (T.ticket_current t (T.Lookup local));
   let t, effects = T.step t (Cache_checked (local, Ok None)) in
   let download = only (fetches effects) in
   let t, effects = T.step t (Retry (uuid 2)) in
   check "retry while fetching has no effects" 0 (List.length effects);
-  Alcotest.(check bool) "download stays current" true (T.ticket_current t download)
+  Alcotest.(check bool) "download stays current" true (T.ticket_current t (T.Download download))
 ;;
 
 let ready_does_not_refresh () =
@@ -369,12 +369,12 @@ let manual_retry_fences_old_work () =
   Alcotest.(check bool)
     "fresh local ticket survives stale completion"
     true
-    (T.ticket_current t local);
+    (T.ticket_current t (T.Lookup local));
   let t, effects = T.step t (Release "visible") in
   Alcotest.(check bool)
     "release cancels local lookup"
     true
-    (List.mem (T.Cancel local) effects);
+    (List.mem (T.Cancel (T.Lookup local)) effects);
   let t, effects = T.step t (Cache_checked (local, Ok (Some "stale"))) in
   Alcotest.(check bool)
     "released completion cleans resource"
@@ -400,6 +400,41 @@ let manual_retry_fences_old_work () =
   check "old scope cannot create demand" 0 (T.pending_count fresh)
 ;;
 
+let local_before_remote () =
+  let a = asset ~remote:false ~current_checksum:(String.make 64 'a') 2 in
+  let t, effects = replace (initial ~online:false ()) "visible" Foreground [ a ] in
+  check "pending local original is checked offline" 1 (List.length (checks effects));
+  let t, effects = T.step t (Cache_checked (only (checks effects), Ok (Some "original"))) in
+  Alcotest.(check bool) "local original is Ready before upload" true (ready t "visible");
+  check "local original never downloads" 0 (List.length (fetches effects))
+;;
+
+let local_miss_waits_for_publication () =
+  let a = asset ~remote:false ~current_checksum:(String.make 64 'a') 2 in
+  let t, effects = replace (initial ()) "visible" Foreground [ a ] in
+  check "pending original gets one lookup" 1 (List.length (checks effects));
+  let t, effects = T.step t (Cache_checked (only (checks effects), Ok None)) in
+  check "missing local original does not GET" 0 (List.length (fetches effects));
+  Alcotest.(check bool) "missing local waits for remote version" true
+    (T.availability t ~consumer:"visible" = [ uuid 2, T.Waiting_remote ]);
+  let t, effects = T.step t (Network_changed true) in
+  check "network cannot manufacture remote version" 0 (List.length (checks effects) + List.length (fetches effects));
+  let _, effects = T.step t (Descriptor_changed (asset 2)) in
+  check "publication starts fresh lookup" 1 (List.length (checks effects))
+;;
+
+let local_checksum_fences_lookup () =
+  let local c = asset ~remote:false ~current_checksum:(String.make 64 c) 2 in
+  let t, effects = replace (initial ()) "visible" Foreground [ local 'a' ] in
+  check "local checksum starts lookup" 1 (List.length (checks effects));
+  let old = only (checks effects) in
+  let t, effects = T.step t (Descriptor_changed (local 'b')) in
+  check "new local checksum starts fresh lookup" 1 (List.length (checks effects));
+  let t, effects = T.step t (Cache_checked (old, Ok (Some "stale"))) in
+  Alcotest.(check bool) "old local completion releases lease" true (release_present effects);
+  Alcotest.(check bool) "old local completion cannot become Ready" false (ready t "visible")
+;;
+
 let () =
   Alcotest.run
     "asset transfer"
@@ -414,6 +449,9 @@ let () =
           ; "foreground reserve", foreground
           ; "backpressure", backpressure
           ; "offline cache", offline
+          ; "local before upload offline", local_before_remote
+          ; "local miss waits for publication", local_miss_waits_for_publication
+          ; "local checksum fences lookup", local_checksum_fences_lookup
           ; "bounded 404 retry", retry_limit
           ; "duplicate completion", duplicate
           ; "pending foreground capacity", foreground_queue_capacity

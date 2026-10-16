@@ -1117,3 +1117,261 @@ let () =
             "real membership removal releases the retained File lease" )
     ]
 ;;
+
+(* Runtime owns the imported receipt lease and the handoff to a normal media
+   controller and open-preview references; neither pure reducer owns these. *)
+let test_import_handoff preview =
+  let sent = Queue.create ()
+  and views = Hashtbl.create 1 in
+  let runtime =
+    R.create
+      ~send:(fun ticket request ->
+        Queue.add (ticket, request) sent;
+        true)
+      ~changed:(fun root view -> Hashtbl.replace views root view)
+  in
+  R.reset runtime ~graph_generation:(Some 1);
+  let root = G.Uuid.to_string (uuid 1) in
+  let scope : S.asset_scope =
+    { account =
+        { managed_sync_origin = Uri.of_string "https://fixture.invalid"
+        ; user_id = "fixture"
+        ; account_generation = 1
+        ; presentation_generation = 1
+        ; lifecycle_generation = 1L
+        }
+    ; graph_id = uuid 3
+    ; graph_generation = 1
+    }
+  in
+  let asset =
+    A.create
+      ~uuid:(uuid 2)
+      ~source:(Managed None)
+      ~current_checksum:(Some (String.make 64 'a'))
+      ~size:None
+      ~dimensions:None
+    |> Result.get_ok
+  in
+  let receipt : Logseq_db_worker.import_receipt =
+    { operation = uuid 8
+    ; graph_generation = 1
+    ; scope
+    ; target = uuid 1
+    ; asset
+    ; file_type = "png"
+    ; preview = Some ("staged-lease", "/staged/original.png")
+    }
+  in
+  R.imported runtime ~current:true receipt;
+  R.root_visible runtime ~root true;
+  let ticket, request = Queue.take sent in
+  let request_id =
+    match request with
+    | S.Graph_request q -> q.request_id
+    | _ -> failwith "query"
+  in
+  R.receive
+    runtime
+    (Option.get ticket)
+    (Graph_response
+       (P.V2_response
+          { api_version = 2
+          ; request_id
+          ; outcome =
+              V2_assets_outcome
+                { generation = "g"
+                ; projection_revision = "p"
+                ; items = [ asset ]
+                ; next_cursor = None
+                }
+          }));
+  let requests = Queue.to_seq sent |> List.of_seq in
+  let consumer =
+    List.find_map
+      (function
+        | _, S.Asset_command { command = S.Replace_asset_demand { consumer; _ }; _ } ->
+          Some consumer
+        | _ -> None)
+      requests
+  in
+  check (Option.is_some consumer) "imported metadata must start normal local demand";
+  check
+    ((List.hd (Hashtbl.find views root).items).presentation
+     = Journal_media.File "/staged/original.png")
+    "handoff keeps preview while acquisition is pending";
+  let preview_token = (List.hd (Hashtbl.find views root).items).token in
+  let show owner =
+    R.preview_visible runtime ~owner ~slot:"selected-import" ~root ~asset:preview_token true
+  and close owner =
+    R.preview_visible runtime ~owner ~slot:"selected-import" ~root ~asset:preview_token false
+  in
+  (match preview with
+   | `None -> ()
+   | `Close | `Prune | `Multiple | `Hidden_close | `Hidden_prune -> show "row");
+  if preview = `Multiple then show "detail";
+  Queue.clear sent;
+  let consumer = Option.get consumer in
+  R.notice
+    runtime
+    scope
+    (Asset_availability
+       { consumer; asset = asset.uuid; availability = Ready "normal-cache" });
+  let ticket, request = Queue.take sent in
+  check
+    (match request with
+     | S.Acquire_asset_file _ -> true
+     | _ -> false)
+    "normal file is acquired";
+  R.receive
+    runtime
+    (Option.get ticket)
+    (Asset_file (Some ("normal-lease", "/cache/original.png")));
+  let release_count () =
+    Queue.to_seq sent
+    |> Seq.filter (function
+      | _, S.Release_asset_file { handle = "staged-lease"; _ } -> true
+      | _ -> false)
+    |> Seq.length
+  in
+  let preview_is_retained () =
+    let item = List.hd (Hashtbl.find views root).items in
+    check
+      (item.token = preview_token
+       && item.presentation = Journal_media.File "/staged/original.png"
+       && release_count () = 0)
+      "an open import preview keeps its token, path and lease during cache handoff"
+  in
+  (match preview with
+   | `None -> ()
+   | `Close ->
+     preview_is_retained ();
+     close "row";
+     close "row"
+   | `Prune ->
+     preview_is_retained ();
+     R.retain_owners runtime [ "default" ]
+   | `Multiple ->
+     preview_is_retained ();
+     close "row";
+     preview_is_retained ();
+     close "detail"
+   | `Hidden_close | `Hidden_prune ->
+     R.root_visible runtime ~root false;
+     preview_is_retained ();
+     if preview = `Hidden_close then close "row" else R.retain_owners runtime [];
+     check
+       (release_count () = 1
+        && (List.hd (Hashtbl.find views root).items).token <> preview_token)
+       "the final preview owner releases its import even after the row is hidden");
+  let items = (Hashtbl.find views root).items in
+  if preview <> `Hidden_close && preview <> `Hidden_prune
+  then (
+    check
+      (List.length items = 1
+       && (List.hd items).presentation = Journal_media.File "/cache/original.png")
+      "normal file replaces staged preview without duplicate items";
+    check
+      ((List.hd items).file_type = "png")
+      "pending local image keeps its type after handoff");
+  check
+    (List.exists
+       (function
+         | _, S.Release_asset_file { handle = "staged-lease"; _ } -> true
+         | _ -> false)
+       (Queue.to_seq sent |> List.of_seq))
+    "normal acquisition releases staged preview";
+  check (release_count () = 1) "handoff or final preview close releases its lease once";
+  Queue.clear sent;
+  R.reset runtime ~graph_generation:None;
+  check
+    (not
+       (List.exists
+          (function
+            | _, S.Release_asset_file { handle = "staged-lease"; _ } -> true
+            | _ -> false)
+          (Queue.to_seq sent |> List.of_seq)))
+    "handoff releases staged preview only once"
+;;
+
+let () =
+  run_cases
+    [ "import handoff without preview", (fun () -> test_import_handoff `None)
+    ; "open import preview survives handoff", (fun () -> test_import_handoff `Close)
+    ; "import preview owner cleanup", (fun () -> test_import_handoff `Prune)
+    ; "import handoff waits for final preview", (fun () -> test_import_handoff `Multiple)
+    ; "hidden import preview close", (fun () -> test_import_handoff `Hidden_close)
+    ; "hidden import preview owner cleanup", (fun () -> test_import_handoff `Hidden_prune)
+    ]
+;;
+
+let () =
+  let sent = Queue.create ()
+  and views = Hashtbl.create 1 in
+  let runtime =
+    R.create
+      ~send:(fun ticket request ->
+        Queue.add (ticket, request) sent;
+        true)
+      ~changed:(fun root view -> Hashtbl.replace views root view)
+  in
+  R.reset runtime ~graph_generation:(Some 1);
+  let scope : S.asset_scope =
+    { account =
+        { managed_sync_origin = Uri.of_string "https://fixture.invalid"
+        ; user_id = "fixture"
+        ; account_generation = 1
+        ; presentation_generation = 1
+        ; lifecycle_generation = 1L
+        }
+    ; graph_id = uuid 3
+    ; graph_generation = 1
+    }
+  in
+  let asset =
+    A.create
+      ~uuid:(uuid 2)
+      ~source:(Managed None)
+      ~current_checksum:(Some (String.make 64 'a'))
+      ~size:None
+      ~dimensions:None
+    |> Result.get_ok
+  in
+  let receipt : Logseq_db_worker.import_receipt =
+    { operation = uuid 8
+    ; graph_generation = 1
+    ; scope
+    ; target = uuid 1
+    ; asset
+    ; file_type = "png"
+    ; preview = Some ("cancelled-preview", "/staged/original.png")
+    }
+  in
+  let root = G.Uuid.to_string receipt.target in
+  let notice =
+    S.Upload_status
+      { operation = receipt.operation
+      ; asset = asset.uuid
+      ; target = receipt.target
+      ; title = "fixture"
+      ; status = Cancelled
+      }
+  in
+  R.imported runtime ~current:true receipt;
+  R.notice runtime { scope with graph_id = uuid 90 } notice;
+  check
+    (List.length (Hashtbl.find views root).items = 1 && Queue.is_empty sent)
+    "foreign scope cannot cancel imported preview";
+  R.notice runtime scope notice;
+  check ((Hashtbl.find views root).items = []) "cancelled unpublished preview disappears";
+  check
+    (List.exists
+       (function
+         | _, S.Release_asset_file { handle = "cancelled-preview"; _ } -> true
+         | _ -> false)
+       (Queue.to_seq sent |> List.of_seq))
+    "cancellation releases its staged preview";
+  Queue.clear sent;
+  R.notice runtime scope notice;
+  check (Queue.is_empty sent) "duplicate cancellation releases no second lease"
+;;

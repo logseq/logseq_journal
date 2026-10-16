@@ -112,6 +112,19 @@ let () =
       incr failed;
       Printf.printf "FAIL %s: %s\n%!" name (Printexc.to_string exn)
   in
+  run "pending same-UUID metadata refreshes demand" (fun () ->
+    let local checksum = A.create ~uuid:(uuid 1) ~source:(Managed None)
+      ~current_checksum:(Some (String.make 64 checksum)) ~size:None ~dimensions:None
+      |> Result.get_ok in
+    let pending, _ = P.step P.empty (show (local 'a')) in
+    let _, unchanged = P.step pending (show (local 'a')) in
+    check (unchanged = []) "unchanged pending descriptor is inert";
+    let _, effects = P.step pending (show (asset 'a')) in
+    check (List.exists (function P.Demand _ -> true | _ -> false) effects)
+      "published version refreshes pending demand";
+    let _, effects = P.step pending (show (local 'b')) in
+    check (List.exists (function P.Demand _ -> true | _ -> false) effects)
+      "changed current checksum refreshes pending demand");
   run "typed local readiness shows Loading until acquisition" (fun () ->
     let waiting, _ = P.step P.empty (show (asset 'a')) in
     let pending, effects = ready waiting "local" in

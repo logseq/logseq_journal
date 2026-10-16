@@ -4699,7 +4699,7 @@ let start
       let completion =
         let current =
           match pending with
-          | Some (generation, _, owner) ->
+          | Some (generation, operation, owner) ->
             let snapshot = !state_ref in
             generation = snapshot.graph_state.generation
             &&
@@ -4714,11 +4714,14 @@ let start
                      then Some routes
                      else None))
             in
-            (match result, Option.bind routes Journal_routes.detail with
-             | Ok receipt, Some detail ->
+            (match result, owner, Option.bind routes Journal_routes.detail with
+             | Ok receipt, None, _ ->
+               Logseq_db_types.Graph_types.Uuid.to_string receipt.operation = operation
+               && receipt.graph_generation = generation
+             | Ok receipt, Some _, Some detail ->
                Journal_model.id (Journal_detail.root detail)
                = Logseq_db_types.Graph_types.Uuid.to_string receipt.target
-             | Error _, _ -> true
+             | Error _, _, _ -> true
              | _ -> false)
           | None -> false
         in

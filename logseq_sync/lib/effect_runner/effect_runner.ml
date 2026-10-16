@@ -1867,6 +1867,25 @@ let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
          ~maximum_plaintext_bytes
          ~current
        |> map_unit)
+  | Publish_staged_asset { asset; version; file } ->
+    let ( let* ) = Result.bind in
+    cache (fun cache ->
+      match Asset_cache.retain_staged cache ~file with
+      | None -> Error Core.Asset_missing_source
+      | Some lease ->
+        Fun.protect
+          ~finally:(fun () -> Asset_cache.release cache lease)
+          (fun () ->
+             match Asset_cache.staged_path cache ~file with
+             | None -> Error Core.Asset_missing_source
+             | Some source_file ->
+               let* plaintext = read_upload_source
+                 ~maximum_plaintext_bytes:t.dependencies.local_store.asset_maximum_file_bytes
+                 source_file in
+               let* handle = Asset_cache.publish cache ~asset ~version ~current ~plaintext
+                 |> Result.map_error asset_cache_failure in
+               Asset_cache.release cache handle;
+               Ok Core.Asset_unit))
   | Retain_asset_file handle ->
     Ok (Core.Asset_retained (retain_asset_file t ~scope ~handle))
   | Retain_staged_file file ->
@@ -2062,6 +2081,7 @@ let cleanup_asset_action = function
   | Fetch_asset _
   | Stage_asset_file _
   | Put_asset_file _
+  | Publish_staged_asset _
   | Retain_asset_file _
   | Retain_staged_file _
   | Prune_asset_staging _

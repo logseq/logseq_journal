@@ -463,6 +463,7 @@ let run_favorites_native_visibility
   let import_probe = Atomic.make false in
   let import_probed = Atomic.make false in
   let staged_paths = ref [] in
+  let durable_paths = Atomic.make [] in
   let detail_captures = Atomic.make [] in
   let child_attempts = Atomic.make 0 in
   let child_release =
@@ -734,19 +735,14 @@ let run_favorites_native_visibility
             else Ok (Service.Asset_imported (Error "Fixture first attachment failed")))
           else
             let module A = Logseq_db_types.Asset_descriptor in
+            let durable_path = source.source_file ^ ".durable" in
+            let bytes = "synthetic local attachment" in
+            Out_channel.with_open_bin durable_path (fun out -> output_string out bytes);
+            Atomic.set durable_paths (durable_path :: Atomic.get durable_paths);
             let asset =
-              A.create
-                ~uuid:source.asset
-                ~source:
-                  (Managed
-                     (Some
-                        (A.version
-                           ~checksum:(String.make 64 'a')
-                           ~file_type:source.file_type
-                         |> Result.get_ok)))
-                ~current_checksum:None
-                ~size:None
-                ~dimensions:None
+              A.create ~uuid:source.asset ~source:(Managed None)
+                ~current_checksum:(Some (Logseq_sync_effect_runner.Asset_codec.checksum bytes))
+                ~size:(Some (Int64.of_int (String.length bytes))) ~dimensions:None
               |> Result.get_ok
             in
             Atomic.incr imports_finished;
@@ -759,7 +755,7 @@ let run_favorites_native_visibility
                     ; target = source.target
                     ; asset
                     ; file_type = source.file_type
-                    ; preview = None
+                    ; preview = Some ("synthetic-capture-local-lease", durable_path)
                     }))
         | Import_asset _ -> Error "unexpected import"
         | Graph_request request ->
@@ -1327,7 +1323,7 @@ let run_favorites_native_visibility
       Atomic.set acquire_release true;
       ignore (hooks.dispose ());
       Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client;
-      List.iter (fun path -> if Sys.file_exists path then Sys.remove path) !staged_paths;
+      List.iter (fun path -> if Sys.file_exists path then Sys.remove path) (!staged_paths @ Atomic.get durable_paths);
       check_fixture_worker_idle ())
     (fun () ->
        hooks.init 2 2 startup |> consume;
@@ -3356,6 +3352,15 @@ let run_favorites_native_visibility
              match !staged_paths with
              | [failed; successful] -> Sys.file_exists failed && not (Sys.file_exists successful)
              | _ -> false);
+           settle_worker ();
+           Alcotest.(check bool) "durable original remains present" true
+             (List.for_all Sys.file_exists (Atomic.get durable_paths));
+           (* Application owns async owner admission. A pure navigation/media
+              test cannot execute this completion gate; returning a valid receipt
+              through the public Worker service reproduces it without injecting
+              an incorrect current flag. No upload or network operation exists. *)
+           Alcotest.(check int) "Capture retains local lease before any upload" 0
+             (Atomic.get released_files);
            Alcotest.(check (list string))
              "batch preserves picker order"
              [ "First attachment"; "Second attachment" ]

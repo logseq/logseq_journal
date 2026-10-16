@@ -29,16 +29,35 @@ type availability =
       ; retry_scheduled : bool
       }
 
-type ticket =
+type lookup_source =
+  | Local_checksum of string
+  | Remote_version of Asset.version
+  | Local_and_remote of
+      { current_checksum : string
+      ; remote_version : Asset.version
+      }
+
+type lookup_ticket =
+  { id : int
+  ; scope : Core.graph_scope
+  ; asset : Logseq_db_types.Graph_types.Uuid.t
+  ; source : lookup_source
+  }
+
+type fetch_ticket =
   { id : int
   ; scope : Core.graph_scope
   ; asset : Logseq_db_types.Graph_types.Uuid.t
   ; version : Asset.version
   }
 
+type ticket =
+  | Lookup of lookup_ticket
+  | Download of fetch_ticket
+
 type instruction =
-  | Check_cache of ticket
-  | Fetch of ticket
+  | Check_cache of lookup_ticket
+  | Fetch of fetch_ticket
   | Cancel of ticket
   | Release_handle of handle
   | Retry_after of
@@ -61,8 +80,8 @@ type event =
       }
   | Release of string
   | Descriptor_changed of Asset.t
-  | Cache_checked of ticket * (handle option, failure) result
-  | Downloaded of ticket * (handle, failure) result
+  | Cache_checked of lookup_ticket * (handle option, failure) result
+  | Downloaded of fetch_ticket * (handle, failure) result
   | Retry of Logseq_db_types.Graph_types.Uuid.t
   | Retry_elapsed of int
   | Network_changed of bool
@@ -82,8 +101,8 @@ type config =
 
 type phase =
   | Pending
-  | Checking of ticket
-  | Fetching of ticket
+  | Checking of lookup_ticket
+  | Fetching of fetch_ticket
   | Cached of handle
   | Rejected of failure * int option
 
@@ -130,6 +149,21 @@ let create config ~scope ~online ~unlocked =
   }
 ;;
 
+let lookup_source (asset : Asset.t) =
+  match asset.source, asset.current_checksum with
+  | Managed None, Some checksum -> Some (Local_checksum checksum)
+  | Managed (Some version), None -> Some (Remote_version version)
+  | Managed (Some remote_version), Some current_checksum ->
+    Some (Local_and_remote { current_checksum; remote_version })
+  | Managed None, None | External _, _ -> None
+;;
+
+let remote_version (asset : Asset.t) =
+  match asset.source with
+  | Managed version -> version
+  | External _ -> None
+;;
+
 let status t entry =
   match entry.phase with
   | Cached handle -> Ready handle
@@ -139,17 +173,20 @@ let status t entry =
   | Rejected (failure, retry) ->
     Failed { failure; attempts = entry.attempts; retry_scheduled = Option.is_some retry }
   | Pending ->
-    (match entry.descriptor.source with
-     | Managed None -> Waiting_remote
-     | External _ -> Waiting_remote
-     | Managed (Some _) ->
-       if not entry.checked
-       then Queued
-       else if not t.online
-       then Waiting_network
-       else if not t.unlocked
-       then Waiting_unlock
-       else Queued)
+    if (not entry.checked) && Option.is_some (lookup_source entry.descriptor)
+    then Queued
+    else (
+      match entry.descriptor.source with
+      | Managed None -> Waiting_remote
+      | External _ -> Waiting_remote
+      | Managed (Some _) ->
+        if not entry.checked
+        then Queued
+        else if not t.online
+        then Waiting_network
+        else if not t.unlocked
+        then Waiting_unlock
+        else Queued)
 ;;
 
 let availability t ~consumer =
@@ -175,7 +212,8 @@ let pending_count t =
 
 let cleanup entry =
   match entry.phase with
-  | Checking ticket | Fetching ticket -> [ Cancel ticket ]
+  | Checking ticket -> [ Cancel (Lookup ticket) ]
+  | Fetching ticket -> [ Cancel (Download ticket) ]
   | Cached handle -> [ Release_handle handle ]
   | Pending | Rejected _ -> []
 ;;
@@ -201,9 +239,14 @@ let active entry =
   | _ -> false
 ;;
 
-let fresh t asset version =
+let fresh_lookup t asset source =
   let id = t.serial + 1 in
-  { t with serial = id }, { id; scope = t.scope; asset; version }
+  { t with serial = id }, ({ id; scope = t.scope; asset; source } : lookup_ticket)
+;;
+
+let fresh_fetch t asset version =
+  let id = t.serial + 1 in
+  { t with serial = id }, ({ id; scope = t.scope; asset; version } : fetch_ticket)
 ;;
 
 let pump t =
@@ -219,9 +262,9 @@ let pump t =
     |> List.filter (fun (_, e) ->
       e.phase = Pending
       &&
-      match e.descriptor.source with
-      | Managed (Some _) -> (not e.checked) || (t.online && t.unlocked)
-      | Managed None | External _ -> false)
+      if e.checked
+      then Option.is_some (remote_version e.descriptor) && t.online && t.unlocked
+      else Option.is_some (lookup_source e.descriptor))
     |> List.stable_sort (fun (_, a) (_, b) -> Bool.compare (foreground b) (foreground a))
   in
   let t, _, _, effects =
@@ -233,20 +276,28 @@ let pump t =
            || ((not fg) && background >= t.config.active - t.config.foreground_reserved)
          then t, count, background, effects
          else (
-           match entry.descriptor.source with
-           | Managed (Some version) ->
-             let t, ticket = fresh t uuid version in
-             let phase, instruction =
-               if entry.checked
-               then Fetching ticket, Fetch ticket
-               else Checking ticket, Check_cache ticket
-             in
-             let entry = { entry with phase } in
-             ( { t with entries = Assets.add uuid entry t.entries }
+           let work =
+             if entry.checked
+             then
+               Option.map
+                 (fun version ->
+                    let t, ticket = fresh_fetch t uuid version in
+                    t, Fetching ticket, Fetch ticket)
+                 (remote_version entry.descriptor)
+             else
+               Option.map
+                 (fun source ->
+                    let t, ticket = fresh_lookup t uuid source in
+                    t, Checking ticket, Check_cache ticket)
+                 (lookup_source entry.descriptor)
+           in
+           match work with
+           | None -> t, count, background, effects
+           | Some (t, phase, instruction) ->
+             ( { t with entries = Assets.add uuid { entry with phase } t.entries }
              , count + 1
              , (background + if fg then 0 else 1)
-             , instruction :: effects )
-           | Managed None | External _ -> t, count, background, effects))
+             , instruction :: effects )))
       (t, count, background, [])
       candidates
   in
@@ -255,7 +306,8 @@ let pump t =
 
 let same_version a b =
   match a.Asset.source, b.Asset.source with
-  | Managed a, Managed b -> a = b
+  | Managed a_source, Managed b_source ->
+    a_source = b_source && a.current_checksum = b.current_checksum
   | External a, External b -> a = b
   | _ -> false
 ;;
@@ -345,9 +397,17 @@ let replace t consumer priority descriptors =
   else candidate, effects
 ;;
 
-let valid_ticket t (ticket : ticket) expected =
-  ticket.scope = t.scope && ticket = expected
+let ticket_asset = function
+  | Lookup t -> t.asset
+  | Download t -> t.asset
 ;;
+
+let ticket_scope = function
+  | Lookup t -> t.scope
+  | Download t -> t.scope
+;;
+
+let valid_ticket t ticket expected = ticket_scope ticket = t.scope && ticket = expected
 
 let stale_handle t handle =
   if Assets.exists (fun _ entry -> entry.phase = Cached handle) t.entries
@@ -371,13 +431,14 @@ let fail t entry failure =
   else t, { entry with attempts; phase = Rejected (failure, None) }, []
 ;;
 
-let completed t ticket result cache =
+let completed t ticket result =
+  let asset = ticket_asset ticket in
   let matching =
-    match Assets.find_opt ticket.asset t.entries with
+    match Assets.find_opt asset t.entries with
     | Some ({ phase = Checking expected; _ } as entry)
-      when cache && valid_ticket t ticket expected -> Some entry
+      when valid_ticket t ticket (Lookup expected) -> Some entry
     | Some ({ phase = Fetching expected; _ } as entry)
-      when (not cache) && valid_ticket t ticket expected -> Some entry
+      when valid_ticket t ticket (Download expected) -> Some entry
     | _ -> None
   in
   match matching with
@@ -393,7 +454,7 @@ let completed t ticket result cache =
       | Ok None -> t, { entry with phase = Pending; checked = true }, []
       | Error failure -> fail t entry failure
     in
-    { t with entries = Assets.add ticket.asset entry t.entries }, effects
+    { t with entries = Assets.add asset entry t.entries }, effects
 ;;
 
 let resume_entry entry =
@@ -407,9 +468,9 @@ let raw_step t = function
     if t.stopped then t, [] else replace t consumer priority assets
   | Release consumer -> release t consumer
   | Descriptor_changed descriptor -> update_descriptor t descriptor
-  | Cache_checked (ticket, result) -> completed t ticket result true
+  | Cache_checked (ticket, result) -> completed t (Lookup ticket) result
   | Downloaded (ticket, result) ->
-    completed t ticket (Result.map Option.some result) false
+    completed t (Download ticket) (Result.map Option.some result)
   | Retry uuid ->
     (match Assets.find_opt uuid t.entries with
      | Some ({ phase = Rejected _; _ } as entry) ->
@@ -440,7 +501,7 @@ let raw_step t = function
            let entry, effects =
              match entry.phase with
              | Fetching ticket when not online ->
-               { entry with phase = Pending }, Cancel ticket :: effects
+               { entry with phase = Pending }, Cancel (Download ticket) :: effects
              | _ -> entry, effects
            in
            Assets.add uuid entry entries, effects)
@@ -455,7 +516,7 @@ let raw_step t = function
            let entry, effects =
              match entry.phase with
              | Fetching ticket when not unlocked ->
-               { entry with phase = Pending }, Cancel ticket :: effects
+               { entry with phase = Pending }, Cancel (Download ticket) :: effects
              | Rejected (Locked, _) when unlocked -> resume_entry entry, effects
              | _ -> entry, effects
            in
@@ -505,11 +566,10 @@ let step t event =
   next, effects @ scheduled @ notifications t next @ capacity
 ;;
 
-let ticket_current t (ticket : ticket) =
-  (not t.stopped)
-  &&
-  match Assets.find_opt ticket.asset t.entries with
-  | Some { phase = Checking expected; _ } | Some { phase = Fetching expected; _ } ->
-    ticket = expected
-  | _ -> false
+let ticket_current t ticket =
+  (not t.stopped) && ticket_scope ticket = t.scope
+  && match Assets.find_opt (ticket_asset ticket) t.entries with
+     | Some { phase = Checking expected; _ } -> ticket = Lookup expected
+     | Some { phase = Fetching expected; _ } -> ticket = Download expected
+     | _ -> false
 ;;

@@ -334,6 +334,11 @@ type asset_action =
       ; file : string
       ; maximum_plaintext_bytes : int
       }
+  | Publish_staged_asset of
+      { asset : Logseq_db_types.Graph_types.Uuid.t
+      ; version : Logseq_db_types.Asset_descriptor.version
+      ; file : string
+      }
   | Retain_asset_file of string
   | Retain_staged_file of string
   | Release_asset_file of string
@@ -3051,6 +3056,7 @@ let asset_cleanup_action = function
   | Fetch_asset _
   | Stage_asset_file _
   | Put_asset_file _
+  | Publish_staged_asset _
   | Retain_asset_file _
   | Retain_staged_file _
   | Prune_asset_staging _
@@ -3088,6 +3094,7 @@ let asset_result_matches (request : asset_io_request) = function
      | Fetch_asset _, Asset_downloaded _
      | Stage_asset_file _, Asset_staged _
      | Put_asset_file _, Asset_unit
+     | Publish_staged_asset _, Asset_unit
      | Retain_asset_file _, Asset_retained _
      | Retain_staged_file _, Asset_retained _
      | Release_asset_file _, Asset_unit
