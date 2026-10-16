@@ -2186,12 +2186,14 @@ let favorites_view
                   | Page _ -> Journal_model.Title.render favorite.title
                   | Block _ -> render_title favorite.title in
                 let icon = match favorite.target with
-                  | Page _ -> "doc.text"
-                  | Block _ -> "circle" in
+                  | Page _ -> V.symbol ~name:"doc.text" ()
+                  | Block _ ->
+                    V.stack [ Journal_symbols.create ~size:6. Dot ]
+                    |> V.frame ~width:18. ~height:18. in
                 let label = V.label
                   ~title:(V.of_lui (Lui_elements.text ~grow:1. ~text_alignment:`start
                     ~style_class:"single-line" ~value:(Journal_model.Title.plain title) []))
-                  ~icon:(V.symbol ~name:icon ()) () in
+                  ~icon () in
                 key, label)
              rows)
       in

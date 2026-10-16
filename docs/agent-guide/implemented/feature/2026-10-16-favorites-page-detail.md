@@ -10,11 +10,11 @@ Keep the public Load_detail request and existing route, staging, grace timer, tr
 
 The Favorites root omits the bottom-right Capture opener; Journals keeps its root opener and page/outline detail keeps its own Capture. This is a context-based rendering choice in the existing OCaml header, without another state or interface. No public pure reducer owns whether a header control mounts; test that missing boundary through the public header/Application rendering interface.
 
-Favorites use one native list with page/block leading symbols, whole-row LUI list items, no trailing chevron, no status/media/summary, and single-line tail truncation. Favorites titles use the shared Title.render lookup and Title.plain output in ordinary LUI text; UUID references remain non-clickable, and ordinary URLs retain the prior Favorites text behavior. The list uses only Lui_elements.list/list_item, label, text and icons; no Journal Swift extension implements the list. Keep the existing page-first UUID reference reader, cache, deduplication, epochs and graph reset. Preserve ordinary URL semantics and deprecated double-parenthesis behavior.
+Favorites use one native list with the existing page document symbol and a small solid bullet for outline blocks, whole-row LUI list items, no trailing chevron, no status/media/summary, and single-line tail truncation. Favorites titles use the shared Title.render lookup and Title.plain output in ordinary LUI text; UUID references remain non-clickable, and ordinary URLs retain the prior Favorites text behavior. The list uses only Lui_elements.list/list_item, label, text and icons; no Journal Swift extension implements the list. Keep the existing page-first UUID reference reader, cache, deduplication, epochs and graph reset. Preserve ordinary URL semantics and deprecated double-parenthesis behavior.
 
 ## Decision
 
-Use the shared detail flow for both Favorite target kinds, with one internal page-root adapter and exact page-aware mutation confirmation. Use the existing LUI list and single-line text policy, reuse mldoc/reference caches, and omit Capture only for the Favorites root context.
+Use the shared detail flow for both Favorite target kinds, with one internal page-root adapter and exact page-aware mutation confirmation. Use the existing LUI list and single-line text policy, reuse mldoc/reference caches, and omit Capture only for the Favorites root context. Outline rows use the existing Dot symbol at 6pt inside an 18pt icon slot, preserving alignment with unchanged page icons and avoiding a task-control appearance.
 
 ## Alternatives considered
 
@@ -41,7 +41,7 @@ Rejected because known root identity and a single fallback avoid duplicate reads
 
 ## Validation
 
-The current native source hashes match the isolated run-2_x07chr probe. Public tests pass: 139 runtime, 104 mounted Application and 45 route/detail cases. The dedicated ECFF synthetic Simulator passed A/B (list, both entries/Back, empty page, ten-level body and 128 continuation) and C/D (slow body with usable header/Back, switching while the slow request is pending, exact page/outline text append and clipboard subtree). The list omits Capture while page/outline detail retains it. The controlled fixture validates page versus block preconditions and logs exact parent/page identities. Repeated UUID references use one page-first lookup per launch. Earlier fixture inconsistencies and test-selector failures were corrected; final accepted runs have zero failures.
+The pre-bullet commit 10a8d59 passed 139 runtime, 104 mounted Application and 45 route/detail cases, with native source hashes bound to isolated run-2_x07chr. The later icon-only change passed the narrow public render regression (RED then GREEN) and a single final-source native list screenshot case using run-ipiiemd4; the full interaction matrix was intentionally not repeated. The dedicated ECFF synthetic Simulator passed A/B (list, both entries/Back, empty page, ten-level body and 128 continuation) and C/D (slow body with usable header/Back, switching while the slow request is pending, exact page/outline text append and clipboard subtree). The list omits Capture while page/outline detail retains it. The controlled fixture validates page versus block preconditions and logs exact parent/page identities. Repeated UUID references use one page-first lookup per launch. Earlier fixture inconsistencies and test-selector failures were corrected; final accepted runs have zero failures.
 
 ## Consequences
 
@@ -49,4 +49,4 @@ The implementation reuses the existing state owners, bounded traversal and cache
 
 ## Questions
 
-None. The user selected single-line truncation, replacing the two-line proposal, and explicitly removed the Favorites root Capture opener. The user also authorized updating only the dedicated ECFF synthetic Simulator on 2026-10-16 at 07:07:23 UTC. That installation retry was approved; final current-source acceptance is complete. No push, PR, phone/production install or real graph/cloud writes were authorized or performed.
+None. The user selected single-line truncation, replacing the two-line proposal, and explicitly removed the Favorites root Capture opener. The user subsequently requested a small solid bullet instead of the hollow outline icon at 2026-10-16 07:28:59 UTC. The user also authorized updating only the dedicated ECFF synthetic Simulator on 2026-10-16 at 07:07:23 UTC. That installation retry was approved; final current-source acceptance is complete. No push, PR, phone/production install or real graph/cloud writes were authorized or performed.

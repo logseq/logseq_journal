@@ -4269,7 +4269,20 @@ let test_favorites_compact_shared_titles () =
         | _ -> false) !ops));
     Alcotest.(check bool) "status is omitted" false (has TextValue (StringValue "Todo"));
     Alcotest.(check bool) "page icon" true (has IconName (StringValue "app:doc-text"));
-    Alcotest.(check bool) "block icon" true (has IconName (StringValue "app:circle"));
+    let bullet = List.find_map (function
+      | Lui_protocol.SetProp (id,IconName,StringValue "app:circle-fill") -> Some id
+      | _ -> None) !ops in
+    Alcotest.(check bool) "block uses a solid text bullet" true (Option.is_some bullet);
+    let bullet = Option.get bullet in
+    List.iter (fun key ->
+      let size = List.find_map (function
+        | Lui_protocol.SetProp (id,p,Lui_protocol.IntValue value)
+          when id=bullet && p=key -> Some value
+        | _ -> None) !ops in
+      Alcotest.(check bool) "bullet is smaller than a task control" true
+        (Option.fold ~none:false ~some:(fun value -> value>0 && value<=8) size))
+      [Lui_protocol.WidthValue;HeightValue];
+    Alcotest.(check bool) "no hollow task-like circle" false (has IconName (StringValue "app:circle"));
     Alcotest.(check bool) "no trailing arrow" false (has IconName (StringValue "app:chevron-right"));
     Alcotest.(check int) "uses LUI list" 1 (List.length(List.filter (function Lui_protocol.CreateNode(_,ListContainer)->true|_->false) !ops));
     Alcotest.(check bool) "no Journal list extension" false
