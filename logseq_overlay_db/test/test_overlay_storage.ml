@@ -208,6 +208,64 @@ let snapshot_input_validation_is_fail_closed () =
       "invalid snapshot input allocated staging resources")
 ;;
 
+(* Admission has no reducer boundary: exercise the public preparation operation
+   on a real synthetic framed snapshot rather than injecting a parse error. *)
+let snapshot_rejection_preserves_schema_versions () =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let module Session = Logseq_db_storage.Storage_session in
+  List.iter (fun (major, minor) ->
+    T.with_temp_directory "overlay-old-schema-" (fun root ->
+      let source = Filename.concat root "source" in
+      Unix.mkdir source 0o700;
+      let database_path = T.seed_mirror source in
+      let connection = Storage.open_database database_path |> T.require_ok ~behavior:"open synthetic schema" in
+      let db = Storage.restore_database connection |> T.require_ok ~behavior:"restore synthetic schema" in
+      let session = Session.create ~tail:(Datascript.Storage.restore_tail_groups (Storage.datascript_storage connection))
+          ~callbacks:(Storage.connection_callbacks connection) in
+      Fun.protect ~finally:(fun () -> ignore (Session.close session)) (fun () ->
+        let staged = Session.stage_transact session ~authoritative_before:db
+            [Datascript.Add (Ident "logseq.kv/schema-version", "kv/value",
+              Map [Keyword "major", Int64 (Int64.of_int major); Keyword "minor", Int64 (Int64.of_int minor)])]
+            |> T.require_ok ~behavior:"stage old synthetic schema" in
+        Session.commit_staged session staged |> T.require_ok ~behavior:"commit old synthetic schema");
+      let path = Filename.concat root "snapshot.transit" in
+      let expected_rows = T.write_snapshot_from_database ~database_path ~snapshot_path:path in
+      let support = Filename.concat root "target" in
+      Unix.mkdir support 0o700;
+      let dependencies, _, inspection = absent_inspection ~behavior:"old schema admission" support in
+      match Database.prepare_snapshot_activation dependencies inspection ~path
+          ~applied_server_cursor:(server_cursor 0) ~expected_checksum:None ~expected_rows with
+      | Error (Snapshot_parse_error message) ->
+        Alcotest.(check string) "version evidence preserved at admission boundary"
+          (Printf.sprintf "Graph schema %d.%d is not supported. Journal requires schema 65.33 or later." major minor)
+          message
+      | Error _ -> Alcotest.fail "old schema returned a different error category"
+      | Ok prepared -> Database.cancel_snapshot_activation prepared;
+        Alcotest.fail "unsupported schema was admitted"))
+    [65, 29; 64, 200]
+;;
+
+let snapshot_import_error_does_not_disclose_payload () =
+  T.with_temp_directory "overlay-invalid-payload-" (fun root ->
+    let support = Filename.concat root "target" in
+    Unix.mkdir support 0o700;
+    let dependencies, _, inspection = absent_inspection ~behavior:"safe import rejection" support in
+    let path = Filename.concat root "snapshot.transit" in
+    let payload = {|{"SENSITIVE-synthetic-body":invalid}|} in
+    let header = Bytes.create 4 in
+    Bytes.set_int32_be header 0 (Int32.of_int (String.length payload));
+    Out_channel.with_open_bin path (fun channel ->
+      output_bytes channel header; output_string channel payload);
+    match Database.prepare_snapshot_activation dependencies inspection ~path
+        ~applied_server_cursor:(server_cursor 0) ~expected_checksum:None ~expected_rows:1 with
+    | Error (Snapshot_parse_error message) ->
+      Alcotest.(check string) "raw parser payload is not user-facing"
+        "The downloaded graph snapshot could not be imported." message
+    | Error _ -> Alcotest.fail "malformed snapshot returned another category"
+    | Ok prepared -> Database.cancel_snapshot_activation prepared;
+      Alcotest.fail "malformed snapshot was admitted")
+;;
+
 let snapshot_activation_installs_queryable_mirror () =
   let behavior = "snapshot activation installs one queryable mirror" in
   T.with_temp_directory "overlay-snapshot-activation-" (fun root ->
@@ -2706,6 +2764,14 @@ let cases =
       "snapshot input validation is fail closed"
       `Quick
       snapshot_input_validation_is_fail_closed
+  ; Alcotest.test_case
+      "snapshot rejection preserves actual and minimum versions"
+      `Quick
+      snapshot_rejection_preserves_schema_versions
+  ; Alcotest.test_case
+      "snapshot import error excludes raw payload"
+      `Quick
+      snapshot_import_error_does_not_disclose_payload
   ; Alcotest.test_case
       "snapshot activation installs a queryable mirror"
       `Quick

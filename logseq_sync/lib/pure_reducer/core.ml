@@ -1303,6 +1303,9 @@ let select_graph_transition core ~persist graph_id =
       { core.public_state.snapshot.startup with
         awaiting_selection = false
       ; restoring_local = true
+      ; bootstrapping = false
+      ; awaiting_e2ee_password = false
+      ; failure = None
       ; graph_generation
       }
     in
@@ -1310,6 +1313,8 @@ let select_graph_transition core ~persist graph_id =
       { core.public_state.snapshot with
         selected_graph = Some graph_id
       ; applied_server_t = None
+      ; sync_phase = Offline
+      ; last_error = None
       ; startup
       }
     in
@@ -2842,6 +2847,8 @@ let step core event =
          { next; effects = [ Run request ] })
     | Online_recovery_requested ->
       (match core.current_graph_scope, core.public_state.snapshot.startup.failure with
+       | Some scope, Some During_bootstrap when core.sync_view = None ->
+         select_graph_transition core ~persist:false scope.graph_id
        | Some scope, Some (During_local_restore | During_e2ee)
          when not core.public_state.snapshot.startup.awaiting_e2ee_password ->
          let startup =

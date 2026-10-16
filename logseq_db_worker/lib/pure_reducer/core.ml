@@ -458,6 +458,13 @@ let step state event =
         | Error error ->
           let message = Logseq_db_worker_contract.Error.message error in
           (match worker_effect with
+           | Some (Sync.Activate_snapshot request) ->
+             translate_sync
+               (Sync.step
+                  state.sync_core
+                  (Sync.Snapshot_activation_failed
+                     { scope = Sync.effect_scope_of_graph request.scope; message }))
+               state
            | Some (Sync.Apply_authoritative_batch request) ->
              let transitioned =
                translate_sync

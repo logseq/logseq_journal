@@ -14,7 +14,10 @@ type observed =
   }
 
 type error =
-  | Unsupported_schema
+  | Unsupported_schema of
+      { actual : Graph_types.schema_version
+      ; minimum : Graph_types.schema_version
+      }
   | Remote_graph
   | Ambiguous_sync_state
   | Unsupported_value
