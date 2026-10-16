@@ -119,9 +119,18 @@ let inspect_database database_path graph_id =
             ~storage_schema:startup.schema
         with
         | Ok admitted -> Ok (database, admitted.schema, callbacks)
-        | Error _ ->
+        | Error error ->
           ignore (Storage.close callbacks);
-          Error "snapshot graph admission failed")
+          Error
+            (match error with
+             | Unsupported_schema { actual; minimum } ->
+               Printf.sprintf
+                 "Graph schema %d.%d is not supported. Journal requires schema %d.%d or later."
+                 actual.major actual.minor minimum.major minimum.minor
+             | Remote_graph -> "The downloaded graph has an unexpected remote identity."
+             | Ambiguous_sync_state -> "The downloaded graph has an invalid synchronization identity."
+             | Unsupported_value -> "The downloaded graph contains unsupported values."
+             | Corrupt_storage -> "The downloaded graph storage is corrupt."))
      | Error _, _ | _, Error _ ->
        ignore (Storage.close callbacks);
        Error "snapshot SQLite storage is corrupt")
@@ -137,7 +146,7 @@ let stage ~root ~graph_id ~snapshot_path ~expected_rows =
     Error message
   in
   match import_snapshot_rows ~snapshot_path ~expected_rows database_path with
-  | Error message -> cleanup message
+  | Error _ -> cleanup "The downloaded graph snapshot could not be imported."
   | Ok () ->
     (match inspect_database database_path graph_id with
      | Error message -> cleanup message

@@ -410,7 +410,8 @@ let protected_run runner ~tasks ~posted core operation scope action =
   | _ -> fail "protected request did not resolve through Core output"
 ;;
 
-let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption () =
+let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
+      ?(malformed_plaintext = false) ?(decryption_failure = false) () =
   with_support (fun support ->
     Eio_main.run (fun environment ->
       Eio.Switch.run (fun sw ->
@@ -447,7 +448,11 @@ let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption () =
               Error "encryption was not expected")
             ~decrypt_aes_gcm:(fun ~key ~iv:_ ~ciphertext:_ ->
               if String.equal key raw_key
-              then
+              then if decryption_failure
+                then Error "SENSITIVE-synthetic-crypto-error"
+                else if malformed_plaintext
+                then Ok {|"~XSENSITIVE-synthetic-body"|}
+                else
                 Ok
                   (Transit_native.Transit.Json.to_string
                      (Transit_core.Json.String "plaintext"))
@@ -502,18 +507,23 @@ let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption () =
           | [ event ] -> (Core.step before.next event).next
           | _ -> fail "missing key completion"
         in
-        Alcotest.(check bool)
-          "returned handle decrypts with the raw graph key"
-          true
-          (protected_run
+        let result = protected_run
              runner
              ~tasks
              ~posted
              unlocked
              "decrypt-cached"
              (Core.graph_key_handle_scope handle)
-             (Core.Decrypt_value (handle, ciphertext))
-           = Ok (Core.Decrypted_value "plaintext")))))
+             (Core.Decrypt_value (handle, ciphertext)) in
+        if decryption_failure then
+          Alcotest.(check bool) "crypto error excludes sensitive detail" true
+            (result = Error (Core.Effect_failed "The graph value could not be decrypted."))
+        else if malformed_plaintext then
+          Alcotest.(check bool) "decrypted parser error excludes plaintext" true
+            (result = Error (Core.Effect_failed "The decrypted graph value is not valid Transit."))
+        else
+          Alcotest.(check bool) "returned handle decrypts with the raw graph key" true
+            (result = Ok (Core.Decrypted_value "plaintext")))))
 ;;
 
 let test_cached_wrapped_key_unlock_failure_is_fail_closed () =
@@ -578,16 +588,13 @@ let test_cached_wrapped_key_unlock_failure_is_fail_closed () =
         in
         Alcotest.check
           Alcotest.bool
-          "unlock failure waits for explicit E2EE recovery"
+          "unusable cached key starts bounded online preparation"
           true
-          ((Core.state failed.next).snapshot.startup.failure
-           = Some Core.During_local_restore
-           && failed.effects
-              = [ Core.Publish (Core.State_changed (Core.state failed.next)) ]);
-        let recovery = Core.step failed.next Core.Online_recovery_requested in
+          ((Core.state failed.next).snapshot.startup.failure = None);
+        let recovery = failed in
         Alcotest.check
           Alcotest.bool
-          "explicit recovery requests E2EE authorization"
+          "automatic recovery requests E2EE authorization"
           true
           (List.exists
              (function
@@ -761,7 +768,7 @@ let private_key_unlock_and_sign_out () =
       missing.effects
     |> Option.get
   in
-  let recovery = Core.step failed.next Online_recovery_requested in
+  let recovery = failed in
   let user_key_fetch =
     List.find_map
       (function
@@ -931,7 +938,18 @@ let scenarios =
   ; Alcotest.test_case
       "cached wrapped key is unlocked before AES"
       `Quick
-      test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
+      (test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
+         ~malformed_plaintext:false)
+  ; Alcotest.test_case
+      "decrypted parser error excludes plaintext"
+      `Quick
+      (test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
+         ~malformed_plaintext:true)
+  ; Alcotest.test_case
+      "crypto error excludes sensitive detail"
+      `Quick
+      (test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
+         ~decryption_failure:true)
   ; Alcotest.test_case
       "cached wrapped key unlock failure is fail-closed"
       `Quick

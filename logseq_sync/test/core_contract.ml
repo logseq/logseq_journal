@@ -603,7 +603,7 @@ let warm_encrypted_graph_online_recovery_attaches_existing_mirror () =
       inspected.effects
     |> Option.get
   in
-  let recovery = Core.step failed.next Core.Online_recovery_requested in
+  let recovery = failed in
   let user_key_fetch =
     List.find_map
       (function
@@ -690,7 +690,7 @@ let e2ee_password_retry_recovers_after_failed_unlock () =
       missing.effects
     |> Option.get
   in
-  let recovery = Core.step failed_cache.next Core.Online_recovery_requested in
+  let recovery = failed_cache in
   let user_key_fetch =
     List.find_map
       (function
@@ -879,7 +879,7 @@ let encrypted_graph_recovery_fetches_and_unlocks_key_before_bootstrap () =
       missing.effects
     |> Option.get
   in
-  let recovery = Core.step failed.next Core.Online_recovery_requested in
+  let recovery = failed in
   let user_key_fetch =
     List.find_map
       (function
@@ -5053,7 +5053,7 @@ let e2ee_preparation_fixture () =
       Some (Core.step absent.next (Core.Runner_completed (Core.Completion
         (ticket, Error (Core.Effect_failed "synthetic absent cache")))))
     | _ -> None) absent.effects |> Option.get in
-  Core.step cached.next Core.Online_recovery_requested, scope
+  cached, scope
 ;;
 
 let e2ee_finish_graph_fetch preparation (result : (string, Core.effect_error) result) =
@@ -5179,4 +5179,114 @@ let scenarios =
         `Quick
         snapshot_metadata_open_fields_keep_declared_constraints
     ]
+;;
+
+
+(* A missing wrapped-key cache is a valid local-access failure. Core owns whether
+   to fetch the challenge or advertise a terminal failure; no runner/UI replica. *)
+let e2ee_auto_preparation () =
+  let selected, scope = selected_graph encrypted_graph in
+  let absent = Core.step selected.next (Core.Mirror_inspected (Mirror_absent scope)) in
+  let completion = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
+      Some (Core.Runner_completed (Core.Completion
+        (ticket, Error (Core.Effect_failed "wrappedGraphKeyUnavailable"))))
+    | _ -> None) absent.effects |> Option.get in
+  Core.step absent.next completion, scope, completion
+;;
+
+let e2ee_missing_cache_prepares_without_retry () =
+  let preparation, scope, missing = e2ee_auto_preparation () in
+  let snapshot = (Core.state preparation.next).snapshot in
+  Alcotest.(check bool) "cache miss is not a terminal UI failure" true
+    (snapshot.startup.failure = None && snapshot.last_error = None);
+  Alcotest.(check bool) "no password prompt before materials exist" false
+    snapshot.startup.awaiting_e2ee_password;
+  Alcotest.(check int) "one automatic graph-key fetch" 1
+    (List.length (List.filter (function
+       | Core.Run (Core.Request (_, Core.Fetch_e2ee_graph_key actual)) -> actual = scope
+       | _ -> false) preparation.effects));
+  let repeated = Core.step preparation.next Core.Online_recovery_requested in
+  Alcotest.(check int) "recovery during preparation is inert" 0
+    (List.length repeated.effects);
+  let duplicate = Core.step preparation.next missing in
+  Alcotest.(check int) "duplicate cache completion starts no work" 0
+    (List.length duplicate.effects);
+  let user_fetch = e2ee_finish_graph_fetch preparation (Ok "wrapped") in
+  Alcotest.(check bool) "graph key alone cannot advertise password" false
+    (Core.state user_fetch.next).snapshot.startup.awaiting_e2ee_password;
+  let prompt = e2ee_finish_user_fetch user_fetch (Ok "private-package") in
+  Alcotest.(check bool) "both materials directly advertise password" true
+    (Core.state prompt.next).snapshot.startup.awaiting_e2ee_password;
+  Alcotest.(check bool) "password prompt has no obsolete failure" true
+    ((Core.state prompt.next).snapshot.startup.failure = None)
+;;
+
+let e2ee_auto_preparation_failure_is_bounded fetch_user message () =
+  let preparation, _, _ = e2ee_auto_preparation () in
+  let failed = if fetch_user then
+    e2ee_finish_user_fetch (e2ee_finish_graph_fetch preparation (Ok "wrapped"))
+      (Error (Core.Effect_failed message))
+    else e2ee_finish_graph_fetch preparation (Error (Core.Effect_failed message)) in
+  let snapshot = (Core.state failed.next).snapshot in
+  Alcotest.(check bool) "remote error is visible" true
+    (snapshot.startup.failure = Some Core.During_e2ee && snapshot.last_error = Some message);
+  Alcotest.(check bool) "missing challenge never shows password" false
+    snapshot.startup.awaiting_e2ee_password;
+  Alcotest.(check bool) "failure does not automatically retry" false
+    (List.exists (function Core.Run _ -> true | _ -> false) failed.effects);
+  let blocked = Core.step failed.next (Core.E2ee_password_submitted "unused") in
+  Alcotest.(check int) "no unusable password submission" 0 (List.length blocked.effects);
+  let retry = Core.step failed.next Core.Online_recovery_requested in
+  Alcotest.(check bool) "explicit Retry can reacquire materials" true
+    (List.exists (function Core.Run (Core.Request (_, Core.Fetch_e2ee_graph_key _)) -> true
+      | _ -> false) retry.effects);
+  let picker = Core.step failed.next Core.Graph_picker_requested in
+  Alcotest.(check bool) "failure can return to graph selection" true
+    (Core.state picker.next).snapshot.startup.awaiting_selection
+;;
+
+let e2ee_late_preparation_cannot_reopen_challenge stage cancel result () =
+  let preparation, scope, _ = e2ee_auto_preparation () in
+  let flight, complete =
+    if stage = 0 then preparation, (fun origin ->
+      let finished = e2ee_finish_graph_fetch { preparation with next = origin } result in
+      finished)
+    else let user_fetch = e2ee_finish_graph_fetch preparation (Ok "old-wrapped") in
+      if stage = 1 then user_fetch, (fun origin ->
+        e2ee_finish_user_fetch { user_fetch with next = origin } result)
+      else let prompt = e2ee_finish_user_fetch user_fetch (Ok "old-package") in
+        let unlocking = Core.step prompt.next (Core.E2ee_password_submitted "synthetic") in
+        let completion = List.find_map (function
+          | Core.Run (Core.Request (ticket, Core.Unlock_private_key _)) ->
+            Some (Core.Runner_completed (Core.Completion (ticket,
+              match result with Ok _ -> Ok () | Error e -> Error e)))
+          | _ -> None) unlocking.effects |> Option.get in
+        unlocking, (fun origin -> Core.step origin completion)
+  in
+  let left = Core.step flight.next
+    (if cancel then Core.Graph_picker_requested else Core.Graph_selected scope.graph_id) in
+  let before = Core.state left.next in
+  let late = complete left.next in
+  Alcotest.(check bool) "late completion preserves current public state" true
+    (before = Core.state late.next);
+  Alcotest.(check int) "late completion starts no next phase" 0 (List.length late.effects);
+  let submit = Core.step late.next (Core.E2ee_password_submitted "abandoned") in
+  Alcotest.(check int) "obsolete challenge cannot submit" 0 (List.length submit.effects)
+;;
+
+let scenarios = scenarios @
+  [ Alcotest.test_case "E2EE missing cache auto-prepares without Retry" `Quick
+      e2ee_missing_cache_prepares_without_retry
+  ; Alcotest.test_case "E2EE automatic graph-key network failure is bounded" `Quick
+      (e2ee_auto_preparation_failure_is_bounded false "synthetic network unavailable")
+  ; Alcotest.test_case "E2EE automatic user-key authentication failure is bounded" `Quick
+      (e2ee_auto_preparation_failure_is_bounded true "synthetic authentication required")
+  ] @ List.concat_map (fun stage -> List.concat_map (fun cancel ->
+      List.map (fun success -> Alcotest.test_case
+        (Printf.sprintf "E2EE late stage %d %s %s is fenced" stage
+          (if cancel then "cancel" else "reentry") (if success then "success" else "error"))
+        `Quick (e2ee_late_preparation_cannot_reopen_challenge stage cancel
+          (if success then Ok "late-material" else Error (Core.Effect_failed "late error"))))
+        [true; false]) [true; false]) [0;1;2]
 ;;

@@ -979,10 +979,121 @@ let test_upload_recovery_failure () =
     (Core.upload_recovery_current stale.next fresh)
 ;;
 
+(* The worker owns translating its runner's terminal result into Sync state.
+   Drive a complete cold bootstrap using only public events and issued tickets. *)
+let snapshot_activation () =
+  let graph : Sync.graph =
+    { graph_id = uuid "71111111-1111-4111-8111-111111111111"
+    ; name = "Synthetic schema fixture"
+    ; schema = { major = 65; minor = 29; exact = true }
+    ; encrypted = false
+    }
+  in
+  let auth = Core.step (initial ())
+      (Sync_event (Sync.Account_authenticated { user_id = Some "synthetic" })) in
+  let catalog = List.find_map (function
+    | Core.Run_sync (Sync.Request (ticket, Sync.Fetch_catalog _)) ->
+      Some (Core.step auth.next (Sync_event
+        (Sync.Runner_completed (Sync.Completion (ticket, Ok [graph])))))
+    | _ -> None) auth.effects |> Option.get in
+  let selected = Core.step catalog.next (Sync_event (Sync.Graph_selected graph.graph_id)) in
+  let missing, scope = List.find_map (function
+    | Core.Run_worker (Core.Request (ticket,
+        Core.Handle_sync_worker_effect (Sync.Inspect_mirror request))) ->
+      Some (Core.step selected.next (Runner_completed
+        (Sync_worker_effect_completed (ticket, Ok
+          { event = Some (Sync.Mirror_inspected (Mirror_absent request.scope))
+          ; lifecycle = Lifecycle_unchanged }))), request.scope)
+    | _ -> None) selected.effects |> Option.get in
+  let baseline = List.find_map (function
+    | Core.Run_sync (Sync.Request (ticket, Sync.Fetch_snapshot_baseline _)) ->
+      Some (Core.step missing.next (Sync_event (Sync.Runner_completed
+        (Sync.Completion (ticket, Ok {|{"type":"pull/ok","t":42}|})))))
+    | _ -> None) missing.effects |> Option.get in
+  let download = List.find_map (function
+    | Core.Run_sync (Sync.Request (ticket, Sync.Fetch_snapshot_metadata _)) ->
+      Some (Core.step baseline.next (Sync_event (Sync.Runner_completed
+        (Sync.Completion (ticket, Ok {|{"ok":true,"url":"https://example.invalid/snapshot"}|})))))
+    | _ -> None) baseline.effects |> Option.get in
+  let activation = List.find_map (function
+    | Core.Run_sync (Sync.Request (ticket, Sync.Download_snapshot _)) ->
+      let artifact = Sync.staged_artifact ~id:"synthetic" ~scope
+          ~path:"/tmp/synthetic-schema.snapshot" ~expected_rows:1 in
+      Some (Core.step download.next (Sync_event (Sync.Runner_completed
+        (Sync.Completion (ticket, Ok artifact)))))
+    | _ -> None) download.effects |> Option.get in
+  let error = Logseq_db_worker.Error.create ~code:Closed_session
+      ~message:"Graph schema 65.29 is not supported. Journal requires schema 65.33 or later."
+      ~details:[] |> Result.get_ok in
+  let failure, success = List.find_map (function
+    | Core.Run_worker (Core.Request (ticket,
+        Core.Handle_sync_worker_effect (Sync.Activate_snapshot request))) ->
+      Some (Core.Runner_completed (Sync_worker_effect_completed (ticket, Error error)),
+        Core.Runner_completed (Sync_worker_effect_completed (ticket, Ok
+          { event = Some (Sync.Snapshot_activated {scope = request.scope})
+          ; lifecycle = Lifecycle_unchanged })))
+    | _ -> None) activation.effects |> Option.get in
+  activation, failure, success, Logseq_db_worker.Error.message error
+;;
+
+let test_snapshot_failure_is_terminal_and_retryable () =
+  let activation, failure, _, message = snapshot_activation () in
+  let failed = Core.step activation.next failure in
+  let snapshot = (Core.view failed.next).sync.snapshot in
+  Alcotest.(check bool) "failure terminates bootstrap" true
+    (snapshot.startup.failure = Some Sync.During_bootstrap && snapshot.sync_phase = Sync.Failed);
+  Alcotest.(check (option string)) "specific reason retained" (Some message) snapshot.last_error;
+  Alcotest.(check bool) "failure published to UI" true
+    (List.exists (function Core.Publish (Sync_output (Sync.State_changed state)) ->
+      state.snapshot.last_error = Some message | _ -> false) failed.effects);
+  let duplicate = Core.step failed.next failure in
+  Alcotest.(check bool) "duplicate completion inert" true
+    (Core.equal_view (Core.view failed.next) (Core.view duplicate.next) && duplicate.effects = []);
+  let retry = Core.step failed.next (Sync_event Sync.Online_recovery_requested) in
+  Alcotest.(check (option string)) "explicit retry clears failure" None
+    (Core.view retry.next).sync.snapshot.last_error;
+  let late = Core.step retry.next failure in
+  Alcotest.(check bool) "old failure cannot poison retry" true
+    (Core.equal_view (Core.view retry.next) (Core.view late.next) && late.effects = [])
+;;
+
+let test_snapshot_success_and_late_switch_completions () =
+  let activation, failure, success, _ = snapshot_activation () in
+  let succeeded = Core.step activation.next success in
+  let attaching = List.find_map (function
+    | Core.Run_worker (Core.Request (ticket,
+        Core.Handle_sync_worker_effect (Sync.Inspect_mirror request))) ->
+      Some (Core.step succeeded.next (Runner_completed (Sync_worker_effect_completed
+        (ticket, Ok { event = Some (Sync.Mirror_inspected (Mirror_available request))
+                   ; lifecycle = Lifecycle_unchanged }))))
+    | _ -> None) succeeded.effects |> Option.get in
+  Alcotest.(check bool) "success proceeds to attachment" true
+    (List.exists (function Core.Run_worker (Core.Request (_,
+      Core.Handle_sync_worker_effect (Sync.Attach_graph _))) -> true | _ -> false) attaching.effects);
+  Alcotest.(check (option string)) "success has no failure" None
+    (Core.view succeeded.next).sync.snapshot.last_error;
+  let switched = Core.step activation.next (Sync_event Sync.Graph_picker_requested) in
+  List.iter (fun completion ->
+    let late = Core.step switched.next completion in
+    Alcotest.(check bool) "retired graph keeps selected state" true
+      ((Core.view switched.next).sync = (Core.view late.next).sync);
+    Alcotest.(check bool) "retired graph keeps lifecycle" true
+      ((Core.view switched.next).graph = (Core.view late.next).graph);
+    let work = List.filter (function
+      | Core.Run_worker (Core.Request (_, Core.Handle_sync_worker_effect (Sync.Detach_graph _))) -> false
+      | _ -> true) late.effects in
+    Alcotest.(check (list string)) "retired graph emits only pending close cleanup" []
+      (List.map Core.instruction_diagnostic work))
+    [failure; success]
+;;
+
 let () =
   Alcotest.run
     "logseq db worker pure reducer"
-    [ ( "asset session"
+    [ ( "snapshot failure", [
+        Alcotest.test_case "terminal failure and explicit retry" `Quick test_snapshot_failure_is_terminal_and_retryable;
+        Alcotest.test_case "success and late graph switch completions" `Quick test_snapshot_success_and_late_switch_completions ])
+    ; ( "asset session"
       , [ Alcotest.test_case "bounded upload recovery" `Quick test_upload_recovery
         ; Alcotest.test_case
             "upload recovery backpressure"
