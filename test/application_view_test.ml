@@ -400,6 +400,7 @@ let run_favorites_native_visibility
       ?(check_ios_capture = false)
       ?(check_capture_imports = false)
       ?detail_capture
+      ?status_scenario
       ?(on_initialized = fun () -> ())
       ?media_rows
       ?(shared_media = false)
@@ -413,6 +414,14 @@ let run_favorites_native_visibility
     G.Uuid.of_string (Printf.sprintf "82000000-0000-4000-8000-%012d" n) |> Result.get_ok
   in
   let roots = List.init 65 (fun n -> uuid (n + 1)) in
+  let status_value = Atomic.make (match status_scenario with
+    | Some "none" -> None
+    | Some ("now" | "waiting" | "later" as value) -> Some value
+    | Some _ -> Some "doing"
+    | None -> None) in
+  let status_writes = Atomic.make [] in
+  let status_revision () = if Atomic.get status_writes = [] then "root" else "status-updated" in
+  let status_release = Atomic.make (status_scenario <> Some "duplicate") in
   let graph_generation = Atomic.make 1 in
   let client = ref None in
   let worker_context = ref None in
@@ -498,9 +507,25 @@ let run_favorites_native_visibility
         ; updated_at_ms = 1_788_192_000_000L
         ; refs = []
         ; tags = []
-        ; properties = []
+        ; properties = (match Atomic.get status_value with
+            | None -> []
+            | Some value ->
+              [ { G.ident = "logseq.property/status"; uuid = uuid 90001; title = "Status"
+                ; schema = { property_type = Default; cardinality = One; hidden = false; public = false }
+                ; values = [ Default_value ("logseq.property/status." ^ value) ]
+                ; values_truncated = false } ])
         }
-    ; task_status = None
+    ; task_status = (match Atomic.get status_value with
+        | Some "doing" -> Some P.V2_doing
+        | Some "now" -> Some P.V2_now
+        | Some "waiting" -> Some P.V2_waiting
+        | Some "later" -> Some P.V2_later
+        | Some "done" -> Some P.V2_done
+        | Some "todo" -> Some P.V2_todo
+        | Some "backlog" -> Some P.V2_backlog
+        | Some "in-review" -> Some P.V2_in_review
+        | Some "canceled" -> Some P.V2_canceled
+        | Some _ | None -> None)
     ; rendered_page_title = page.title
     ; tag_titles = []
     }
@@ -545,7 +570,7 @@ let run_favorites_native_visibility
                { uuid = favorite_target_uuid n
                ; title = favorite_label n
                ; task_status = None
-               ; revision = "root"
+               ; revision = status_revision ()
                })
       })
   in
@@ -737,8 +762,30 @@ let run_favorites_native_visibility
                     }))
         | Import_asset _ -> Error "unexpected import"
         | Graph_request request ->
+          let commit_status mutation_id block value =
+            Alcotest.(check string) "status mutation keeps target UUID"
+              (G.Uuid.to_string (uuid 1)) (G.Uuid.to_string block);
+            Atomic.set status_writes (Atomic.get status_writes @ [ value ]);
+            while not (Atomic.get status_release) do
+              Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
+            done;
+            if status_scenario = Some "failure"
+            then P.V2_failed { code = "invalid-request"; message = "Fixture status write failed" }
+            else (
+              Atomic.set status_value value;
+              P.V2_mutation_committed { mutation_id; status = V2_applied; generation = "g"
+                ; before_projection_revision = "p"; after_projection_revision = "p2" })
+          in
           let outcome =
             match request.command with
+            | V2_set_task_status { mutation_id; block; status; _ } when Option.is_some status_scenario ->
+              let value = match status with
+                | P.V2_todo -> "todo" | V2_doing -> "doing" | V2_in_review -> "in-review"
+                | V2_now -> "now" | V2_done -> "done" | V2_canceled -> "canceled"
+                | V2_backlog -> "backlog" | V2_waiting -> "waiting" | V2_later -> "later" in
+              commit_status mutation_id block (Some value)
+            | V2_clear_task_status { mutation_id; block; _ } when Option.is_some status_scenario ->
+              commit_status mutation_id block None
             | P.V2_graph_info ->
               P.V2_graph_info_outcome
                 { graph_uuid = uuid 900
@@ -775,7 +822,7 @@ let run_favorites_native_visibility
                 ; items =
                     List.init (Option.value media_rows ~default:timeline_rows) (fun n ->
                       { P.value = timeline_block n
-                      ; revision = "root"
+                      ; revision = status_revision ()
                       ; depth = 0
                       ; parent = page.uuid
                       })
@@ -830,8 +877,15 @@ let run_favorites_native_visibility
                  | None ->
                    (match List.find_index (G.Uuid.equal block) roots with
                     | Some n ->
-                      V2_present_block { value = timeline_block n; revision = "root" }
+                      V2_present_block { value = timeline_block n; revision = status_revision () }
                     | None -> V2_missing_block { uuid = block; revision = "p" }))
+            | V2_get_outline_block_summary { block; _ } when Option.is_some status_scenario ->
+              let n = List.find_index (G.Uuid.equal block) roots |> Option.get in
+              V2_block_summary_outcome
+                { lookup = V2_present_block { value = timeline_block n; revision = status_revision () }
+                ; page = Some (V2_present_page { page; revision = "p" })
+                ; items = []; next_cursor = None; scope_revision = "children"
+                ; generation = "g"; projection_revision = "p2" }
             | V2_get_outline_block_summary { block; _ } when check_capture_imports ->
               let root = Atomic.get capture_root |> Option.get in
               let page = Atomic.get capture_page |> Option.get in
@@ -1277,6 +1331,7 @@ let run_favorites_native_visibility
   in
   Fun.protect
     ~finally:(fun () ->
+      Atomic.set status_release true;
       Atomic.set child_release true;
       Atomic.set calendar_feed_release true;
       Atomic.set detail_wait_release true;
@@ -1311,6 +1366,73 @@ let run_favorites_native_visibility
        wait "Journals mounted" (fun () ->
          Option.is_some (find "accessibility-label" "Favorites")
          && Option.is_some (find "text" "Timeline fixture 2"));
+       Option.iter (fun scenario ->
+         let option tag = find "accessibility-identifier" ("journal-status-sheet-option:" ^ tag) in
+         let close () = Option.get (find "accessibility-identifier" "journal-status-close") in
+         let send_status () =
+           let list = Option.get (find "_extension" "journal-list") in
+           let row_payload = Yojson.Safe.to_string (`Assoc
+             [ "key", `String "status"; "row", `String ("block:" ^ G.Uuid.to_string (uuid 1)) ]) in
+           let event = Yojson.Safe.to_string (`Assoc
+             [ "type", `String "row_event"; "payload", `String row_payload ]) in
+           hooks.extension_event list "event" (Yojson.Safe.to_string
+             (`Assoc [ "id", `Int 1; "payload", `String event ])) |> consume
+         in
+         let open_status () =
+           send_status ();
+           wait "status sheet opens from actual row action" (fun () -> Option.is_some (option "doing"))
+         in
+         open_status ();
+         let tags = ["backlog"; "todo"; "doing"; "in-review"; "done"; "canceled"; "clear"] in
+         List.iter (fun tag ->
+           let node = Option.get (option tag) in
+           Alcotest.(check bool) "every status is a direct pressable list row" true
+             (List.assoc_opt "_kind" (Hashtbl.find props node) = Some (`String "list-item"));
+           Alcotest.(check bool) "whole status row has a native press action" true
+             (List.assoc_opt "press-enabled" (Hashtbl.find props node) = Some (`Bool true));
+           let expected = match Atomic.get status_value with None -> tag = "clear" | Some value -> tag = value in
+           Alcotest.(check bool) "current option is selected without aliasing other statuses" expected
+             (List.assoc_opt "selected" (Hashtbl.find props node) = Some (`Bool true))) tags;
+         let current = match Atomic.get status_value with
+           | None -> "Current · No status" | Some "doing" -> "Current · Doing"
+           | Some "now" -> "Current · Now" | Some "waiting" -> "Current · Waiting"
+           | Some "later" -> "Current · Later" | Some value -> value in
+         Alcotest.(check bool) "exact current state is visible" true (Option.is_some (find "text" current));
+         let apply tag = dispatch (Lui_protocol.Press (Option.get (option tag))) in
+         (match scenario with
+          | "expanded" ->
+            apply "doing";
+            Alcotest.(check int) "current status never writes" 0 (List.length (Atomic.get status_writes));
+            Alcotest.(check bool) "current status leaves sheet open" true (Option.is_some (option "doing"));
+            dispatch (Lui_protocol.Press (close ()))
+          | "dismiss" -> dispatch (Lui_protocol.Dismiss (Option.get (find "_kind" "sheet")))
+          | "none" | "now" | "waiting" | "later" -> dispatch (Lui_protocol.Press (close ()))
+          | "failure" | "duplicate" | "clear" | "select" ->
+            let old = Option.get (option (if scenario = "clear" then "clear" else "done")) in
+            dispatch (Lui_protocol.Press old);
+            Alcotest.(check bool) "selection closes immediately before completion" true (Option.is_none (option "doing"));
+            dispatch (Lui_protocol.Press old);
+            wait "one real status mutation reaches Worker" (fun () -> Atomic.get status_writes <> []);
+            if scenario = "duplicate" then (
+              send_status ();
+              Alcotest.(check bool) "pending status cannot reopen another operation" true (Option.is_none (option "doing"));
+              Atomic.set status_release true);
+            wait "status operation completes" (fun () ->
+              if scenario = "failure" then Option.is_some (find "text" "Status not changed")
+              else Atomic.get status_value = (if scenario = "clear" then None else Some "done"));
+            wait "status owner accepts another menu after completion" (fun () ->
+              if Option.is_none (option "doing") then send_status ();
+              Option.is_some (option "doing"));
+            Alcotest.(check int) "stale duplicate press submits once" 1 (List.length (Atomic.get status_writes));
+            let expected = if scenario = "failure" then "doing" else if scenario = "clear" then "clear" else "done" in
+            Alcotest.(check bool) "reopened menu shows the committed status or retains it on failure" true
+              (List.assoc_opt "selected" (Hashtbl.find props (Option.get (option expected))) = Some (`Bool true));
+            dispatch (Lui_protocol.Press (close ()))
+          | _ -> Alcotest.fail "unknown status scenario");
+         if List.mem scenario ["expanded"; "dismiss"; "none"; "now"; "waiting"; "later"] then (
+           Alcotest.(check bool) "closing removes status UI" true (Option.is_none (option "doing"));
+           Alcotest.(check int) "closing never submits" 0 (List.length (Atomic.get status_writes)))) status_scenario;
+       if Option.is_none status_scenario then (
        if Option.is_some calendar_change then (
          let label () = Hashtbl.fold (fun _ values found ->
            match List.assoc_opt "payload" values with
@@ -3559,7 +3681,7 @@ let run_favorites_native_visibility
              (List.length
                 (List.filter
                    (G.Uuid.equal (favorite_target_uuid 64))
-                   (Atomic.get queried)))))))
+                   (Atomic.get queried))))))))
 ;;
 
 (* The root reducer has no Worker accepted-ID/terminal-event boundary. This
@@ -5169,7 +5291,10 @@ let () =
     Journal_bridge.register hooks)
   else Alcotest.run
     "application view"
-    [ ( "graph picker", [
+    [ ( "status list", List.map (fun scenario ->
+        Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~status_scenario:scenario ()))
+        ["expanded"; "none"; "now"; "waiting"; "later"; "select"; "clear"; "dismiss"; "failure"; "duplicate"])
+    ; ( "graph picker", [
         Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);
         Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);
         Alcotest.test_case "current marker and long names" `Quick (test_graph_picker_controls `Current);

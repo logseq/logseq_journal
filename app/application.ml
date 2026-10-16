@@ -1836,54 +1836,61 @@ let status_sheet_options =
 ;;
 
 let status_sheet_page ~tokens ~block dispatch =
-  let options =
-    List.mapi
-      (fun index (tag, state) -> Int64.of_int index, tag, state)
-      status_sheet_options
+  let current = Journal_model.task_state block in
+  let status_icon state =
+    let palette = Journal_visual_tokens.status_colors tokens state in
+    Journal_symbols.create
+      ~color:(if state = Journal_model.No_status then palette.foreground else palette.background)
+      (Journal_symbols.for_task_state state)
+    |> Ui.mount
   in
-  let selected_id =
-    List.find_opt (fun (_, _, state) -> state = Journal_model.task_state block) options
-    |> Option.map (fun (id, _, _) -> id)
+  let option (tag, state) =
+    let selected = state = current in
+    let title = if state = Journal_model.No_status then "Clear" else Journal_model.status_name state in
+    let label =
+      if selected then title ^ ", current status"
+      else if state = Journal_model.No_status then "Clear status"
+      else "Set status to " ^ title
+    in
+    V.of_lui
+      (Lui_elements.list_item
+         ~key:("status:" ^ tag)
+         ~selected
+         ~min_height:44
+         ~padding_horizontal:12
+         ~padding_vertical:4
+         ~corner_radius:12
+         ~separator:`hidden
+         ~on_press:(fun _ -> dispatch.send (Status_sheet_select tag))
+         [ Lui_elements.row ~grow:1.0 ~gap:12
+             ([ status_icon state; Lui_elements.text ~value:title ~grow:1.0 ~text_alignment:`start [] ]
+              @ if selected then [ Lui_elements.icon ~name:`check ~foreground:"primary" [] ] else []) ])
+    |> V.with_test_id (Ui.Test_id.string ("journal-status-sheet-option:" ^ tag))
+    |> V.semantics ~properties:(Ui.Semantics.create ~label ())
+    |> Ui.mount
   in
-  let picker =
-    V.Picker.create
-      ~label:"Task status"
-      ~style:Inline
-      ~selected_id
-      ~on_select:
-        (Ui.Event.Handler.create (function
-           | Ui.Event.Payload.Int64 id ->
-             List.find_opt (fun (candidate, _, _) -> candidate = id) options
-             |> Option.iter (fun (_, tag, _) -> dispatch.send (Status_sheet_select tag))
-           | _ -> ()))
-      (List.map
-         (fun (id, tag, state) ->
-            let palette = Journal_visual_tokens.status_colors tokens state in
-            let icon_tint =
-              if state = Journal_model.No_status
-              then palette.foreground
-              else palette.background
-            in
-            let title =
-              if state = Journal_model.No_status
-              then "Clear"
-              else Journal_model.status_name state
-            in
-            let label =
-              V.label
-                ~title:(V.text title)
-                ~icon:
-                  (Journal_symbols.create
-                     ~color:icon_tint
-                     (Journal_symbols.for_task_state state))
-                ()
-              |> V.with_test_id (Ui.Test_id.string ("journal-status-sheet-option:" ^ tag))
-            in
-            V.Picker.option ~id ~label ())
-         options)
-      ()
+  let choices =
+    List.map (fun ((_, state) as choice) ->
+      if state = Journal_model.No_status then
+        Lui_elements.column ~cross:`stretch ~gap:6
+          [ Lui_elements.separator ~orientation:`horizontal ~margin_horizontal:10 []
+          ; option choice ]
+      else option choice) status_sheet_options
   in
-  Presentation.form [ picker ]
+  V.of_lui
+    (Lui_elements.scroll ~orientation:`vertical ~padding:20
+       [ Lui_elements.column ~cross:`stretch ~gap:18
+           [ Lui_elements.column ~cross:`start ~gap:7
+               [ Lui_elements.text ~value:"TASK STATUS" ~style_class:"caption" ~foreground:"secondary" []
+               ; Lui_elements.text ~value:"Choose a status" ~style_class:"title2 semibold" []
+               ; Lui_elements.text ~value:"Tap a different status to apply." ~foreground:"secondary" [] ]
+           ; Lui_elements.row ~gap:10 ~padding:12 ~background:"secondary" ~corner_radius:12
+               [ status_icon current
+               ; Lui_elements.text ~value:("Current · " ^ Journal_model.status_name current) [] ]
+           ; Lui_elements.card ~padding:6 ~corner_radius:18 ~border_width:0 ~background:"secondary"
+               [ Lui_elements.column ~cross:`stretch ~gap:0 choices ]
+           ; Lui_elements.text ~value:"Clear removes the status from this block."
+               ~style_class:"caption" ~foreground:"secondary" [] ] ])
   |> dismiss_toolbar ~test_id:"journal-status-close" ~command:Close_status dispatch
   |> V.Body.with_test_id
        (Ui.Test_id.string ("journal-status-sheet-page:" ^ Journal_model.id block))
