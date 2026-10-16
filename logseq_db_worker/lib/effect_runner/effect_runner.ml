@@ -1674,7 +1674,7 @@ let handle_sync_worker_effect t = function
     let ( let* ) = Result.bind in
     let current () = deletion_current t request in
     let scope : Sync.graph_scope = {account=request.account;graph_id=request.graph_id;graph_generation=0} in
-    let result =
+    let result = try
       let* () = if current () then Ok () else Error "The graph account is no longer current." in
       let* () = match t.attached with
         | Some (_, actual) when actual.graph_id = request.graph_id -> Error "Switch to another graph before deleting."
@@ -1740,6 +1740,9 @@ let handle_sync_worker_effect t = function
              with _ -> ());
             Hashtbl.remove t.inspections (Graph.Uuid.to_string request.graph_id);
             Ok ())))
+      with
+      | Eio.Cancel.Cancelled _ as cancelled -> raise cancelled
+      | _ -> Error "The local copy could not be deleted. Check available storage and try again."
     in
     Ok (sync_result ~event:(Sync.Mirror_deleted (request, result)) ())
   | Attach_graph request ->

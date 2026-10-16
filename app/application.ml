@@ -3311,7 +3311,14 @@ let manager_page ?picker_signal state dispatch =
       | Some _, _, _ -> "Deleting local copy…"
       | _, Some _, _ -> "Checking local copy…"
       | _, _, Some message -> message
-      | _ -> "" in
+      | _ ->
+        (match current.manager with
+         | Some manager ->
+           (match manager.last_error with
+            | Some message -> message
+            | None when manager.startup.catalog_loading -> "Refreshing graphs…"
+            | None -> "")
+         | None -> "") in
     let status = V.of_lui (fun context parent ->
       Lui_elements.text ~value:(status_text state)
         ?value_signal:(projected context status_text)
@@ -6647,6 +6654,8 @@ let start
           | Some left, Some right -> left.catalog == right.catalog
             && left.selected_graph = right.selected_graph
             && left.startup.account_generation = right.startup.account_generation
+            && left.startup.catalog_loading = right.startup.catalog_loading
+            && left.last_error = right.last_error
           | _ -> false)
     else if (not left.graph_ready) || not right.graph_ready
     then left == right

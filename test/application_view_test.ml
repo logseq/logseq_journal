@@ -4952,6 +4952,9 @@ let test_graph_picker_controls scenario () =
            | Return_to_graph_picker ->
              publish { previous with snapshot = { previous.snapshot with selected_graph = None
                ; startup = { previous.snapshot.startup with awaiting_selection = true } } }
+           | Refresh_catalog when scenario = `Refresh_failure ->
+             publish { previous with snapshot = { previous.snapshot with
+               last_error = Some "Synthetic catalog refresh failed. Try again." } }
            | Select_graph id ->
              let generation = previous.snapshot.startup.graph_generation + 1 in
              publish { previous with snapshot = { previous.snapshot with selected_graph = Some id
@@ -5042,6 +5045,12 @@ let test_graph_picker_controls scenario () =
           {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":1,\"last\":2}"}|});
         wait "automatic inspection is held in flight" (fun () -> Atomic.get inspections = 1));
       match scenario with
+      | `Refresh_failure ->
+        press (node "graph-picker-refresh");
+        wait "catalog refresh failure is visible" (fun () ->
+          Option.is_some (find "text" "Synthetic catalog refresh failed. Try again."));
+        Alcotest.(check bool) "catalog rows remain available after refresh failure" true
+          (Option.is_some (find "text" long_name))
       | `Visible ->
         let before = !root_renders in
         let list = Option.get (find "_extension" "journal-list") in
@@ -5157,6 +5166,7 @@ let () =
   else Alcotest.run
     "application view"
     [ ( "graph picker", [
+        Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);
         Alcotest.test_case "current marker and long names" `Quick (test_graph_picker_controls `Current);
         Alcotest.test_case "close retains current session" `Quick (test_graph_picker_controls `Close);
         Alcotest.test_case "name switches graph" `Quick (test_graph_picker_controls `Select);

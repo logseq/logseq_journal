@@ -1347,7 +1347,7 @@ let test_upload_checkpoint_io () =
         Runner.shutdown restarted)))
 ;;
 
-let deletion_runtime_fixture ~busy () =
+let deletion_runtime_fixture ?(journal_failure = false) ~busy () =
   let module Db = Logseq_db_worker in
   let module G = Logseq_db_types.Graph_types in
   T.with_managed (fun fixture ->
@@ -1458,7 +1458,17 @@ let deletion_runtime_fixture ~busy () =
             snapshot.selected_graph = Some second && (Db.graph_state db).phase = Db.Graph_open
             && not snapshot.startup.bootstrapping && not snapshot.startup.restoring_local);
           let generation = (Db.view db).sync.snapshot.startup.account_generation in
-          if busy then (
+          if journal_failure then (
+            let blocked = Filename.concat worker_root "local-copy-retirements" in
+            Out_channel.with_open_bin blocked (fun output -> output_string output "synthetic mkdir fault");
+            Alcotest.(check bool) "journal IO failure returns a deletion error" true
+              (Result.is_error (Db.delete_local_copy db ~account_generation:generation ~graph_id:first));
+            Alcotest.(check int) "journal failure never retires assets" 0 !destructive_requests;
+            Alcotest.(check bool) "journal failure preserves target mirror" true (Sys.file_exists first_database_path);
+            Alcotest.(check bool) "current graph Worker stays open" true ((Db.graph_state db).phase = Db.Graph_open);
+            post Sync.Catalog_refresh_requested;
+            wait (fun () -> (Db.view db).sync.snapshot.catalog <> []))
+          else if busy then (
             let lock = Sqlite3.db_open (Filename.concat directory ".logseq-overlay-owner.sqlite") in
             Fun.protect ~finally:(fun () -> ignore (Sqlite3.exec lock "ROLLBACK"); ignore (Sqlite3.db_close lock)) (fun () ->
               Sqlite3.Rc.check (Sqlite3.exec lock "BEGIN IMMEDIATE");
@@ -1487,6 +1497,7 @@ let deletion_runtime_fixture ~busy () =
 
 let test_catalog_refresh_cannot_complete_another_deletion () = deletion_runtime_fixture ~busy:false ()
 let test_deletion_checks_ownership_before_assets () = deletion_runtime_fixture ~busy:true ()
+let test_deletion_journal_failure_preserves_worker () = deletion_runtime_fixture ~journal_failure:true ~busy:false ()
 
 let () =
   Alcotest.run
@@ -1565,6 +1576,8 @@ let () =
             test_catalog_refresh_cannot_complete_another_deletion
         ; Alcotest.test_case "busy mirror preserves attachment sources" `Quick
             test_deletion_checks_ownership_before_assets
+        ; Alcotest.test_case "journal IO failure preserves current Worker" `Quick
+            test_deletion_journal_failure_preserves_worker
         ] )
     ]
 ;;
