@@ -4243,6 +4243,71 @@ let with_chrome_payloads initial build run =
     run app payloads)
 ;;
 
+(* Property naming/deduplication is owned by the renderer, with no public pure
+   reducer presentation boundary. Mount that renderer using public route/model
+   values; page children intentionally retain their canonical parent_id=None. *)
+let test_detail_page_property_value_presentation () =
+  let module G = Logseq_db_types.Graph_types in
+  let id n = Printf.sprintf "86000000-0000-4000-8000-%012d" n in
+  let uuid n = G.Uuid.of_string (id n) |> Result.get_ok in
+  let property : G.property_summary =
+    { ident="user.property/summary"; uuid=uuid 4; title="Summary"
+    ; schema={property_type=Node;cardinality=One;hidden=false;public=false}
+    ; values=[Entity_value (uuid 3)]; values_truncated=false } in
+  let marker : G.property_summary =
+    { property with ident="logseq.property/created-from-property"
+    ; schema={property.schema with hidden=true}; values=[Entity_value (uuid 4)] } in
+  let make n ~parent_id ~source ~properties ~child_count =
+    Journal_model.create_on_page ~id:(id n) ~page_id:(id 1) ~journal_day:None
+      ~parent_id ~sibling_order:"a" ~source ~task_state:No_status ~child_count
+      ~revision:"r1" ~last_mutation_id:(id 9)
+      ~creation_time:(Journal_time.create ~instant_unix_ms:0L ~local_day:20260908
+        ~local_minute_of_day:0 |> Result.get_ok)
+    |> Result.get_ok |> fun block -> Journal_model.with_properties block ~properties in
+  List.iter (fun page_root ->
+    let root_id = if page_root then 1 else 2 in
+    let root=make root_id ~parent_id:None ~source:"Selected root"
+      ~properties:[property] ~child_count:1 in
+    let child=make 3 ~parent_id:(if page_root then None else Some (id root_id))
+      ~source:"Property value body" ~properties:[marker] ~child_count:0 in
+    let routes=Journal_routes.open_detail (Journal_routes.create ())
+      ~block_id:(id root_id) ~request_generation:1L
+      |> fun routes -> Journal_routes.apply_detail_response routes ~request_generation:1L
+        {root;children={blocks=[child];continuation=None}} in
+    let routes, reads=Journal_routes.load_initial routes in
+    let routes=List.fold_left (fun routes -> function
+      | Journal_graph_request.Load_detail request ->
+        Alcotest.(check string) "prepare the property's complete leaf body"
+          (id 3) request.block_id;
+        Journal_routes.apply_detail_response routes ~request_generation:request.request_generation
+          {root=child;children={blocks=[];continuation=None}}
+      | _ -> Alcotest.fail "unexpected initial detail request") routes reads in
+    Alcotest.(check bool) "initial body is prepared before rendering" true
+      (Option.is_some (Journal_routes.detail routes));
+    let texts=Hashtbl.create 16 in
+    let track=track_wire_teardown (Hashtbl.remove texts) in
+    let backend : Lui_protocol.backend =
+      {backend_profile=Lui_protocol.profile IOS SwiftUIHost
+      ;apply_batch=(fun batch -> List.iter (fun op -> track op; match op with
+        | Lui_protocol.SetProp(id,TextValue,StringValue text) -> Hashtbl.replace texts id text
+        | Lui_protocol.SetExtensionProp(id,"payload",StringValue json) ->
+          (match Yojson.Safe.Util.member "text" (Yojson.Safe.from_string json) with
+           | `String text -> Hashtbl.replace texts id text | _ -> ())
+        | _ -> ()) batch.Lui_protocol.ops; true)} in
+    let app=Lui_app.create_with_extensions backend Journal_lui_native.registry ()
+      (fun () () -> ()) (fun _ _ _ -> Application.For_testing.detail_page
+        ~routes ~write_enabled:false (fun _ -> ())
+        |> Journal_view.View.Body.Private.to_widget |> Journal_view.mount) in
+    Fun.protect ~finally:(fun () -> ignore (Lui_app.dispose app)) (fun () ->
+      Alcotest.(check bool) "property detail mounts" true (Lui_app.start app);
+      ignore (Lui_app.flush app);
+      let count text=Hashtbl.fold (fun _ value n -> if text=value then n+1 else n) texts 0 in
+      Alcotest.(check int) "owned value keeps its property name" 0 (count "Property");
+      Alcotest.(check int) "owned value appears under one named field" 1 (count "Summary");
+      Alcotest.(check int) "property value body appears once" 1 (count "Property value body")))
+    [true;false]
+;;
+
 let test_favorites_compact_shared_titles () =
   let module G=Logseq_db_types.Graph_types in
   let module P=Logseq_db_worker.Protocol in
@@ -5357,7 +5422,7 @@ let () =
     [ ( "status list", List.map (fun scenario ->
         Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~status_scenario:scenario ()))
         ["expanded"; "none"; "now"; "waiting"; "later"; "select"; "clear"; "dismiss"; "failure"; "duplicate"])
-    ; ("Favorites compact title",[Alcotest.test_case "root Capture only in Journals" `Quick test_root_capture_placement; Alcotest.test_case "LUI titles icons and no arrow" `Quick test_favorites_compact_shared_titles; Alcotest.test_case "page outline click and native Back" `Quick (fun () -> run_favorites_native_visibility ~check_favorite_targets:true ())])
+    ; ("Favorites compact title",[Alcotest.test_case "page property values keep name without duplication" `Quick test_detail_page_property_value_presentation; Alcotest.test_case "root Capture only in Journals" `Quick test_root_capture_placement; Alcotest.test_case "LUI titles icons and no arrow" `Quick test_favorites_compact_shared_titles; Alcotest.test_case "page outline click and native Back" `Quick (fun () -> run_favorites_native_visibility ~check_favorite_targets:true ())])
     ; ( "graph picker", [
         Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);
         Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);

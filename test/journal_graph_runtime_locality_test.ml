@@ -5490,6 +5490,38 @@ let test_page_root_refresh_and_resync () =
     (List.exists (fun (r:Protocol.request)->r.command=V2_get_outline_block {block=page_uuid;revision=None}) out.requests)
 ;;
 
+let test_page_property_refresh_discovers_references () =
+  List.iter (fun page_root ->
+    let runtime=Runtime.create () in
+    if page_root then ignore (page_detail_seed runtime [])
+    else seed_children_interest runtime;
+    let property : Graph.property_summary =
+      {ident="user.property/page";uuid=block_uuid;title="Linked page"
+      ;schema={property_type=Page;cardinality=Many;hidden=false;public=false}
+      ;values=[Page_value target_uuid;Page_value target_uuid];values_truncated=false} in
+    let hidden={property with ident="user.property/hidden";uuid=unrelated_uuid;
+      schema={property.schema with hidden=true};values=[Page_value unrelated_uuid]} in
+    let refresh () = changed runtime (window ~pages:[page_uuid] ())
+      |> fun out -> hydration_requests out
+      |> List.filter (fun (request:Protocol.request) ->
+        request.command = V2_get_page {page=page_uuid;revision=None})
+      |> only "one owning page refresh" in
+    let complete request = Runtime.receive runtime (response request (Protocol.V2_page_outcome
+      (V2_present_page {page={page with properties=[property;hidden]};revision="page-2"}))) in
+    let out=complete (refresh ()) in
+    if page_root then (
+      let reference=expect_reference_page out target_uuid in
+      Alcotest.(check int) "duplicate values share one read; hidden properties have no demand"
+        1 (List.length out.requests);
+      let resolved=Runtime.receive runtime (reference_page_response reference Ordinary_page "Linked title") in
+      Alcotest.(check (option string)) "new page property reference resolves"
+        (Some "Linked title") (List.assoc_opt target_id (reference_updates resolved) |> Option.join);
+      Alcotest.(check int) "unchanged property reuses shared cache" 0
+        (List.length (complete (refresh ())).requests))
+    else Alcotest.(check int) "outline detail does not demand undisplayed page properties"
+      0 (List.length out.requests)) [true;false]
+;;
+
 let favorites_reference_source runtime title =
   let request : Journal_graph_request.favorites_request =
     {graph_generation=1;request_generation=802L;limit=50;cursor=None} in
@@ -5558,7 +5590,7 @@ let test_copy_page_root () =
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ("Favorites page detail", [Alcotest.test_case "page root and scoped append" `Quick test_page_detail_root_and_append; Alcotest.test_case "copy page root and empty page" `Quick test_copy_page_root; Alcotest.test_case "recycled page is unavailable" `Quick test_recycled_page_root_is_removed; Alcotest.test_case "page point-change identity" `Quick test_page_root_block_change_uses_page_identity; Alcotest.test_case "page root refresh and resync" `Quick test_page_root_refresh_and_resync; Alcotest.test_case "Favorites share page-first reference cache" `Quick test_favorites_share_reference_cache; Alcotest.test_case "Favorites outline and absent references" `Quick test_favorites_outline_and_missing_reference]); ( "review reference ownership", [
+    [ ("Favorites page detail", [Alcotest.test_case "page property refresh discovers references" `Quick test_page_property_refresh_discovers_references; Alcotest.test_case "page root and scoped append" `Quick test_page_detail_root_and_append; Alcotest.test_case "copy page root and empty page" `Quick test_copy_page_root; Alcotest.test_case "recycled page is unavailable" `Quick test_recycled_page_root_is_removed; Alcotest.test_case "page point-change identity" `Quick test_page_root_block_change_uses_page_identity; Alcotest.test_case "page root refresh and resync" `Quick test_page_root_refresh_and_resync; Alcotest.test_case "Favorites share page-first reference cache" `Quick test_favorites_share_reference_cache; Alcotest.test_case "Favorites outline and absent references" `Quick test_favorites_outline_and_missing_reference]); ( "review reference ownership", [
         Alcotest.test_case "typed metadata retains newer fence" `Quick test_typed_metadata_preserves_newer_reference_fence;
         Alcotest.test_case "dirty abandon remains retryable" `Quick test_dirty_abandon_keeps_reference_retryable;
         Alcotest.test_case "failed lookup retains epoch fence" `Quick test_reference_failed_read_retains_epoch_fence;

@@ -3799,6 +3799,10 @@ let receive t (protocol_response : Protocol.response) =
         | ( (Changed_detail_block { block_id; _ } | Changed_block { block_id; _ })
           , V2_block_outcome (V2_present_block { value; _ }) )
           when Hashtbl.mem t.detail_pages block_id -> Seq.return value.block
+        | Changed_detail_page _, V2_page_outcome (V2_present_page {page;revision})
+          when not page.recycled
+            && Hashtbl.mem t.detail_pages (Graph.Uuid.to_string page.uuid) ->
+          Seq.return (page_root_member page revision).block
         | _ -> Seq.empty
       in
       let known_pages = ref Rrbvec.empty in

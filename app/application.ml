@@ -3009,10 +3009,18 @@ let detail_page
             | Any_value (Internal_uuid uuid) -> Some (Graph.Uuid.to_string uuid)
             | _ -> None
           in
+          let property_parent_id block =
+            match Journal_model.parent_id block with
+            | Some _ as parent -> parent
+            | None when Journal_model.id block <> Journal_model.page_id block ->
+              Some (Journal_model.page_id block)
+            | None -> None
+          in
           let owned_value property_uuid value =
             Option.fold ~none:false ~some:(fun id ->
               match Journal_detail.find_block detail ~block_id:id with
-              | Some child -> Journal_model.parent_id child = Some (Journal_model.id block)
+              | Some child -> property_parent_id child = Some (Journal_model.id block)
+                && Journal_model.page_id child = Journal_model.page_id block
                 && Option.fold ~none:false ~some:(Graph.Uuid.equal property_uuid) (created_from child)
               | None -> false) (value_id value)
           in
@@ -3024,7 +3032,7 @@ let detail_page
           in
           let property_name =
             Option.bind (created_from block) (fun property_uuid ->
-              Option.bind (Journal_model.parent_id block) (fun parent_id ->
+              Option.bind (property_parent_id block) (fun parent_id ->
                 Option.bind (Journal_detail.find_block detail ~block_id:parent_id) (fun parent ->
                   List.find_map (fun (p : Graph.property_summary) ->
                     if Graph.Uuid.equal p.uuid property_uuid
