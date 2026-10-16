@@ -3628,7 +3628,21 @@ let test_page_detail_append_matches_exact_page () =
   require (Journal_detail.mode completed = Reading && Journal_detail.child_capture completed = None)
     "page append did not complete its exact owner";
   require (List.map Journal_model.id (Journal_detail.children completed) = [child_id])
-    "page append went to another root"
+    "page append went to another root";
+  let drafted = Journal_detail.update_child_source completed "Surviving page draft" in
+  let deleted = Journal_detail.remove_block drafted ~block_id:child_id |> Option.get in
+  require (Journal_model.id (Journal_detail.root deleted) = page_id
+           && Journal_detail.children deleted = [])
+    "deleting an outline child removed its enclosing page detail";
+  require (Journal_capture.source (Option.get (Journal_detail.child_capture deleted))
+           = "Surviving page draft")
+    "child deletion retired the enclosing page composer";
+  let routes = load_parent (Journal_routes.create ()) root 8080L
+    |> fun routes -> Journal_routes.update_detail routes drafted in
+  let deleted, released = Journal_routes.commit_delete routes ~block_id:child_id in
+  require (Journal_routes.route deleted = Detail && released = []
+           && Journal_detail.children (Option.get (Journal_routes.detail deleted)) = [])
+    "route deletion confused a page owner with the deleted outline child"
 ;;
 
 let tests =

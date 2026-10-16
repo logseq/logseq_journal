@@ -25,7 +25,7 @@ Rejected because the user explicitly requires removing the complete feature and 
 
 ## Risks
 
-- The user approved the exact three-interface proposal on 2026-10-16 at 08:55:13 UTC (Sentinel_a55c41c2006881918699ecad3290877e). Application, Timeline, Detail and Routes no longer stage or restore deletions. Final cleanup additionally requires approval to remove the unused Journal_platform notice API and Favorites.Reveal_target event; these protected edits remain unapplied.
+- The user approved the exact three-interface proposal on 2026-10-16 at 08:55:13 UTC (Sentinel_a55c41c2006881918699ecad3290877e). Application, Timeline, Detail and Routes no longer stage or restore deletions. The user additionally approved removal of the notice API and Favorites.Reveal_target on 2026-10-16 at 09:11 UTC (Sentinel_e1cc9f8dab808191abd16e0f60c651dd). Both interfaces and their sole-purpose implementations and obsolete tests are removed.
 - Rendering has no pure reducer owner; existing public mounted-view tests are its narrowest boundary. Delete admission is private to Application and needs its existing public mounted Worker fixture unless an existing public pure boundary can reproduce it.
 - Host-restamped Simulator objects do not establish full iOS cross-compilation or ABI acceptance.
 
@@ -35,7 +35,7 @@ Rejected because the user explicitly requires removing the complete feature and 
 - Delete mounted boundary: old optimistic staging fails the retained-content assertion; success and failure now pass immediate submission, revision preconditions, duplicate suppression, failure Details/retry and absence of notice requests.
 - Full local dune runtest passes 860 Alcotest cases plus custom tests and source/package boundary checks with loopback permission for synthetic peers. The restricted run was stopped after its peer bind was denied; its logs are preserved separately.
 - The old macOS toplevel runner cannot load dllapp_stubs because caml_startup is absent. The registered pure and Worker runtime sources pass as native executables linked against the current public compiled interfaces and existing Dune link inputs.
-- Final native/Apple build and Simulator acceptance remain pending final notice API cleanup, avoiding a repeated large GUI build.
+- The branch is rebased onto the PR84 merge 1e38f64644cdd49081004722cd9dd43759b2aaaf. Existing Favorites page/outline, Copy, Capture and list semantics remain; the public page owner also verifies child deletion preserves the page and its composer. Final source checks and one Simulator build run after this integration.
 
 ## Questions
 
