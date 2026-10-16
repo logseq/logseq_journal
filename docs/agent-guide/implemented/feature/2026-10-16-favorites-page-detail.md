@@ -33,7 +33,7 @@ Rejected because known root identity and a single fallback avoid duplicate reads
 - Page append and copy use the selected page identity, including empty pages and journal pages; stale navigation/graph completions cannot publish elsewhere.
 - Favorites references resolve journal page date titles and outline titles through the shared resolver; repeated targets share reads, absent targets and obsolete results retain existing fences.
 - Run the public pure owner tests first, preserving red evidence before implementation; verify Simulator with independent synthetic data/device and report its compilation and coverage boundaries.
-- No protected spec, Dune or lock edits; no push, PR, production install or real graph/cloud writes.
+- No protected spec, Dune or lock edits; no production install or real graph/cloud writes. Publication follows the user's later explicit PR authorization.
 
 ## Risks
 
@@ -43,10 +43,12 @@ Rejected because known root identity and a single fallback avoid duplicate reads
 
 The pre-bullet commit 10a8d59 passed 139 runtime, 104 mounted Application and 45 route/detail cases, with native source hashes bound to isolated run-2_x07chr. The later icon-only change passed the narrow public render regression (RED then GREEN) and a single final-source native list screenshot case using run-ipiiemd4; the full interaction matrix was intentionally not repeated. The dedicated ECFF synthetic Simulator passed A/B (list, both entries/Back, empty page, ten-level body and 128 continuation) and C/D (slow body with usable header/Back, switching while the slow request is pending, exact page/outline text append and clipboard subtree). The list omits Capture while page/outline detail retains it. The controlled fixture validates page versus block preconditions and logs exact parent/page identities. Repeated UUID references use one page-first lookup per launch. Earlier fixture inconsistencies and test-selector failures were corrected; final accepted runs have zero failures.
 
+After PR81 merged at e87eb28, the independent branch rebased without conflicts and passed all 139 runtime, 104 Application and 45 route/detail cases again. Production runtime source bytes match the accepted pre-rebase native source; upstream changed build/CI paths. The original native manifests remain intact as pre-rebase evidence, without claiming a new Apple build or GUI run.
+
 ## Consequences
 
 The implementation reuses the existing state owners, bounded traversal and cache. Page roots are display adapters identified by id equal to page_id, with page revision/scoped append confirmation; outline-only actions are omitted for them. No protected spec, Dune, lock or Swift source changes are needed. Native evidence uses in-memory protocol responses, not persisted graph data or cloud writes. Text Capture/Copy was exercised; native picker/assets and complete iOS ABI are outside this probe. The exact loading threshold and negative traversal/ownership paths remain covered by public owner tests. Host ARM64 restamping remains experimental with cross_abi_validated=false and production_source_validated=false.
 
 ## Questions
 
-None. The user selected single-line truncation, replacing the two-line proposal, and explicitly removed the Favorites root Capture opener. The user subsequently requested a small solid bullet instead of the hollow outline icon at 2026-10-16 07:28:59 UTC. The user also authorized updating only the dedicated ECFF synthetic Simulator on 2026-10-16 at 07:07:23 UTC. That installation retry was approved; final current-source acceptance is complete. No push, PR, phone/production install or real graph/cloud writes were authorized or performed.
+None. The user selected single-line truncation, replacing the two-line proposal, and explicitly removed the Favorites root Capture opener. The user subsequently requested a small solid bullet instead of the hollow outline icon at 2026-10-16 07:28:59 UTC. The user also authorized updating only the dedicated ECFF synthetic Simulator on 2026-10-16 at 07:07:23 UTC. That installation retry was approved; final current-source acceptance is complete. At 07:43:14 UTC the user authorized a formal PR after PR81 merged, with an independent review session and CI follow-up. Merge, phone/production install and real graph/cloud writes remain outside this task.
