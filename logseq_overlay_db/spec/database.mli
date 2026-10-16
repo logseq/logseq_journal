@@ -164,11 +164,35 @@ val cancel_snapshot_activation : prepared_snapshot_activation -> unit
     It therefore applies only while the mirror is closed and still denotes the
     filesystem object that was inspected. *)
 
-(** Deletes the inspected mirror if its generation is current and no process owns
-    it. *)
-val delete_mirror
+(** A deletion transaction identity, distinct from a graph UUID. *)
+type retirement_id = Graph.Retirement_id.t
+val retirement_id_of_string : string -> (retirement_id, string) result
+val retirement_id_to_string : retirement_id -> string
+
+(** Holds exclusive ownership of the inspected generation until commit/cancel.
+    Preparing does not delete data. Replaying the same identity recovers its
+    durable commit receipt, including after a replacement mirror was created. *)
+type prepared_mirror_deletion
+val prepare_mirror_deletion
   :  mirror_inspection
+  -> retirement:retirement_id
+  -> (prepared_mirror_deletion, Types.mirror_delete_error) result
+
+(** Whether this exact retirement has durable commit evidence. An unrelated
+    missing or replaced canonical mirror is never commit evidence. *)
+val mirror_deletion_committed : prepared_mirror_deletion -> bool
+
+(** Revalidates the generation and atomically retires this mirror namespace.
+    Success denotes the namespace commit, not completion of physical collection.
+    A durable receipt precedes collection; failed collection is retried by the
+    producer against only the exclusive retired namespace. Replay is idempotent. *)
+val commit_mirror_deletion
+  :  prepared_mirror_deletion
   -> (Types.mirror_delete, Types.mirror_delete_error) result
+
+(** Releases an uncommitted preparation. Idempotent; a committed retirement is
+    never restored, and its durable receipt is retained for coordinated recovery. *)
+val cancel_mirror_deletion : prepared_mirror_deletion -> unit
 
 (** Collects eligible durable garbage without removing mutation receipts needed
     to classify late synchronization responses. *)

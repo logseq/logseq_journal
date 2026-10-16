@@ -59,6 +59,15 @@ let feedback ~key ~top ~visible ~compact ~expanded body =
   feedback_with_visibility ~key ~top ~visible ~compact ~expanded body
 ;;
 
+let graph_picker ~leading ~controls body =
+  Ui.Native_widget.widget chrome
+    ~key:(Ui.Key.string "graph-picker-chrome")
+    ~props:(props ~mode:"graph-picker" ~connecting:false ~controls:true ())
+    ~on_event:(fun _ -> ())
+    ~children:[V.Body.Private.to_widget body; controls; V.column []; leading] ()
+  |> V.Body.static
+;;
+
 let date_header ?relative_label ~title () =
   Ui.Native_widget.widget
     chrome
@@ -241,7 +250,7 @@ let view_impl
           parent)
   in
   let cluster_for presentation =
-    let local_deletion_available = presentation.local_deletion_available in
+    let _ = presentation.local_deletion_available in
     let on_error_info = if presentation.error_available then on_error_info else None in
     let account_action =
       Option.map
@@ -259,15 +268,6 @@ let view_impl
                , Switch_graph
                , V.Button_role.Normal )
              ]
-             @ (if local_deletion_available
-                then
-                  [ ( 3L
-                    , "Delete local graph copy"
-                    , "trash"
-                    , Request_local_cache_reset
-                    , V.Button_role.Destructive )
-                  ]
-                else [])
              @ [ ( 4L
                  , "Sign out"
                  , "rectangle.portrait.and.arrow.right"

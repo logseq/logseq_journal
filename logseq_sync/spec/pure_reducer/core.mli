@@ -37,8 +37,10 @@ type startup_facts =
   ; presentation_generation : presentation_generation
   }
 
-(** Non-resumable cleanup of the normally open selected graph. Success removes
-    this status only after Save_catalog acknowledges the cleared selection. *)
+(** Cleanup of an authorized, non-current graph's local copy. The host must
+    obtain explicit confirmation that unsynchronized content will be discarded.
+    The selected graph and catalog entry are retained. Completion or failure
+    releases the deletion flight so selection and retry remain available. *)
 type local_deletion_stage =
   | Closing_graph
   | Deleting_mirror
@@ -206,6 +208,18 @@ type asset_context =
   ; key : graph_key_handle option
   }
 
+(** A transaction identity, never the target graph UUID. *)
+type retirement_id = Logseq_db_types.Graph_types.Retirement_id.t
+val retirement_id_of_string : string -> (retirement_id, string) result
+val retirement_id_to_string : retirement_id -> string
+
+(** A scoped reference to one durable, exclusive retired asset namespace.
+    Construction grants no access; execution validates the producer journal. *)
+type asset_deletion
+val asset_deletion_reference : scope:graph_scope -> retirement:retirement_id -> asset_deletion
+val asset_deletion_scope : asset_deletion -> graph_scope
+val asset_deletion_retirement : asset_deletion -> retirement_id
+
 (** Business inputs carry identities and resource references, never asset bytes. *)
 type asset_action =
   | Check_asset_cache of graph_id * Logseq_db_types.Asset_descriptor.version
@@ -231,7 +245,15 @@ type asset_action =
   | Release_staged_file of string
   | Prune_asset_staging of string list
   | Close_asset_scope
-  | Delete_graph_assets
+  (** Cancels every target generation and waits for operations/native leases.
+      New target work remains blocked until its terminal action; lease release
+      remains available. Preparing retires files without unlinking their bytes.
+      The worker journals the mirror identity and frozen upload intents first. *)
+  | Prepare_graph_asset_deletion of retirement_id
+  (** Collects only this captured namespace. Both terminal actions are replayable;
+      committed work is never restored, and a replacement cache is never swept. *)
+  | Commit_graph_asset_deletion of asset_deletion
+  | Cancel_graph_asset_deletion of asset_deletion
   | Delete_account_assets
   | Asset_retry_after of float
   | Cancel_asset_operation of string
@@ -259,6 +281,7 @@ type asset_value =
       ; size : int64
       }
   | Asset_retained of (string * string) option
+  | Asset_deletion_prepared of asset_deletion
   | Asset_pruned of int
   | Asset_retry_elapsed
 

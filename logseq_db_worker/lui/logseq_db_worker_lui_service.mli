@@ -147,7 +147,16 @@ type asset_command =
   | Retry_asset of Logseq_db_types.Graph_types.Uuid.t
   | Retry_upload of Logseq_db_types.Graph_types.Uuid.t
 
+type local_copy_presence = Downloaded | Not_downloaded
+
+type local_copy_request =
+  { graph_id : graph_id
+  ; account_generation : int
+  }
+
 type request =
+  | Inspect_local_copy of local_copy_request
+  | Delete_local_copy of local_copy_request
   | Import_asset of
       { graph_generation : int
       ; source : Logseq_db_types.Asset_import.t
@@ -173,6 +182,8 @@ type request =
       }
 
 type response =
+  | Local_copy_inspected of local_copy_request * (local_copy_presence, string) result
+  | Local_copy_deleted of local_copy_request * (unit, string) result
   | Asset_imported of (Logseq_db_worker.import_receipt, string) result
   | Client_command_completed
   | Asset_file of (string * string) option

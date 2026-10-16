@@ -23,6 +23,19 @@ type mirror_inspection =
   ; presence : Types.mirror_presence
   }
 
+type retirement_id = Graph.Retirement_id.t
+let retirement_id_of_string = Graph.Retirement_id.of_string
+let retirement_id_to_string = Graph.Retirement_id.to_string
+
+type prepared_mirror_deletion =
+  { deletion_inspection : mirror_inspection
+  ; deletion_retirement : retirement_id
+  ; mutable deletion_ownership : Ownership.t option
+  ; mutable deletion_committed : Types.mirror_delete option
+  ; mutable deletion_cancelled : bool
+  ; mutable deletion_durable : bool
+  }
+
 type prepared_snapshot_activation =
   { snapshot_dependencies : dependencies
   ; snapshot_inspection : mirror_inspection
@@ -267,12 +280,24 @@ let mirror_generation value =
   token Types.Mirror_generation.of_string ("mirror-generation:v1:" ^ value)
 ;;
 
-let mirror_generation_for_path path =
+let mirror_generation_for_path_as ~identity_path path =
   let stat = Unix.stat path in
+  let owner_path = Filename.concat (Filename.dirname path) ".journal-local-owner.json" in
+  let owner_identity =
+    try
+      let owner = Unix.lstat owner_path in
+      if owner.st_kind <> Unix.S_REG || owner.st_nlink <> 1 || owner.st_size > 4096
+      then "invalid-owner"
+      else In_channel.with_open_bin owner_path In_channel.input_all
+        |> Digestif.SHA256.digest_string |> Digestif.SHA256.to_hex
+    with Unix.Unix_error (Unix.ENOENT, _, _) -> "no-owner" in
   mirror_generation
     (Digestif.SHA256.digest_string
-       (Printf.sprintf "%s:%d:%d" path stat.st_dev stat.st_ino)
+       (Printf.sprintf "%s:%d:%d:%s" identity_path stat.st_dev stat.st_ino owner_identity)
      |> Digestif.SHA256.to_hex)
+;;
+
+let mirror_generation_for_path path = mirror_generation_for_path_as ~identity_path:path path
 ;;
 
 let absent_mirror_generation path =
@@ -698,34 +723,192 @@ let rec remove_mirror_tree path =
   | _ -> Unix.unlink path
 ;;
 
-let delete_mirror inspection =
-  let path = inspection.location.database_path in
-  match inspection.presence with
-  | Types.Absent _ -> Error Types.Mirror_delete_stale
-  | Available { generation = expected; _ } ->
-    (match inspect_durable_mirror inspection.location with
-     | Error _ | Ok { presence = Absent _; _ } -> Error Types.Mirror_delete_stale
-     | Ok { presence = Available { generation = current; _ }; _ }
-       when not (Types.Mirror_generation.equal expected current) ->
-       Error Types.Mirror_delete_stale
-     | Ok { presence = Available _; _ } ->
-       let graph_directory = Filename.dirname path in
-       (match Ownership.acquire ~graph_directory with
-        | Error Ownership.Already_owned -> Error Types.Mirror_delete_busy
-        | Error (Unavailable message) -> Error (Types.Mirror_delete_failed message)
-        | Ok ownership ->
-          (try
-             remove_mirror_tree graph_directory;
-             ignore (Ownership.release ownership);
-             Ok
-               { Types.graph_uuid = Some inspection.location.graph_id
-               ; previous_generation = expected
-               ; absent_generation = absent_mirror_generation path
-               }
-           with
-           | exn ->
-             ignore (Ownership.release ownership);
-             Error (Types.Mirror_delete_failed (Printexc.to_string exn)))))
+let sync_deletion_directory directory =
+  let fd = Unix.openfile directory [ Unix.O_RDONLY ] 0 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> Unix.fsync fd)
+;;
+
+let rec ensure_retirement_directory path =
+  if not (Sys.file_exists path) then (
+    ensure_retirement_directory (Filename.dirname path);
+    Unix.mkdir path 0o700;
+    sync_deletion_directory (Filename.dirname path))
+;;
+
+let mirror_deletion_directory inspection =
+  Filename.concat
+    (Filename.concat (Filename.dirname (Filename.dirname inspection.location.database_path)) ".mirror-deletions")
+    (Graph.Uuid.to_string inspection.location.graph_id)
+;;
+
+let mirror_deletion_paths inspection retirement =
+  let root = mirror_deletion_directory inspection in
+  let id = retirement_id_to_string retirement in
+  root, Filename.concat (Filename.concat root "states") (id ^ ".json"),
+  Filename.concat (Filename.concat root "pending") (id ^ ".data")
+;;
+
+let write_deletion_receipt path (result : Types.mirror_delete) committed =
+  let data = Yojson.Safe.to_string (`Assoc
+    [ "version", `Int 1
+    ; "graph", Graph.Uuid.to_yojson (Option.get result.graph_uuid)
+    ; "retirement", `String (Filename.chop_suffix (Filename.basename path) ".json")
+    ; "previous", `String (Types.Mirror_generation.to_string result.previous_generation)
+    ; "absent", `String (Types.Mirror_generation.to_string result.absent_generation)
+    ; "committed", `Bool committed ]) in
+  let temporary = path ^ ".part" in
+  let fd = Unix.openfile temporary [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o600 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
+    let rec write offset = if offset < String.length data then
+      let count = Unix.write_substring fd data offset (String.length data - offset) in
+      if count = 0 then failwith "receipt write stalled" else write (offset + count) in
+    write 0; Unix.fsync fd);
+  Unix.rename temporary path;
+  sync_deletion_directory (Filename.dirname path)
+;;
+
+let read_deletion_receipt inspection receipt_path =
+  let open Yojson.Safe.Util in
+  if not (is_regular_single_link receipt_path) || (Unix.stat receipt_path).st_size > 4096
+  then failwith "invalid retirement receipt";
+  let json = Yojson.Safe.from_file receipt_path in
+  if json |> member "version" |> to_int <> 1 then failwith "unsupported retirement receipt";
+  if json |> member "graph" |> to_string <> Graph.Uuid.to_string inspection.location.graph_id
+     || json |> member "retirement" |> to_string <> Filename.chop_suffix (Filename.basename receipt_path) ".json"
+  then failwith "retirement receipt identity mismatch";
+  let generation name = json |> member name |> to_string
+    |> Types.Mirror_generation.of_string |> Result.get_ok in
+  ({ Types.graph_uuid = Some inspection.location.graph_id
+   ; previous_generation = generation "previous"; absent_generation = generation "absent" },
+   json |> member "committed" |> to_bool)
+;;
+
+let collect_retired_mirrors inspection =
+  let root = Filename.concat (mirror_deletion_directory inspection) "pending" in
+  if Sys.file_exists root then
+    Sys.readdir root |> Array.iter (fun name ->
+      if Filename.check_suffix name ".data" then
+        try
+          let id = String.sub name 0 (String.length name - 5) |> retirement_id_of_string |> Result.get_ok in
+          let _, receipt, data = mirror_deletion_paths inspection id in
+          let _, committed = read_deletion_receipt inspection receipt in
+          if committed && Sys.file_exists data then (
+            match Ownership.acquire ~graph_directory:data with
+            | Error _ -> ()
+            | Ok owner -> Fun.protect ~finally:(fun () -> ignore (Ownership.release owner))
+                (fun () -> remove_mirror_tree data; sync_deletion_directory root))
+        with _ -> ())
+;;
+
+let prepare_mirror_deletion inspection ~retirement =
+  let _root, receipt, data = mirror_deletion_paths inspection retirement in
+  try
+    let existing = if Sys.file_exists receipt then Some (read_deletion_receipt inspection receipt) else None in
+    match existing with
+    | Some (result, committed) when committed || Sys.file_exists data ->
+      (* The exact retired destination is commit evidence even if the process died
+         before persisting its committed flag. Never infer this from canonical. *)
+      if not committed then (
+        let database = Filename.concat data "db.sqlite" in
+        if (Unix.lstat data).st_kind <> Unix.S_DIR || not (is_regular_single_link database)
+           || not (Types.Mirror_generation.equal result.previous_generation
+                (mirror_generation_for_path_as ~identity_path:inspection.location.database_path database))
+        then failwith "retired mirror identity mismatch");
+      sync_deletion_directory (Filename.dirname data);
+      sync_deletion_directory (Filename.dirname (Filename.dirname inspection.location.database_path));
+      write_deletion_receipt receipt result true;
+      Ok { deletion_inspection = inspection; deletion_retirement = retirement
+         ; deletion_ownership = None; deletion_committed = Some result; deletion_cancelled = false; deletion_durable = true }
+    | _ ->
+      (match inspection.presence with
+       | Types.Absent _ -> Error Types.Mirror_delete_stale
+       | Available { generation = expected; _ } ->
+         if not (Sys.file_exists inspection.location.database_path) then Error Types.Mirror_delete_stale else
+         let graph_directory = Filename.dirname inspection.location.database_path in
+         match Ownership.acquire ~graph_directory with
+         | Error Ownership.Already_owned -> Error Types.Mirror_delete_busy
+         | Error (Unavailable _) when not (Sys.file_exists graph_directory) -> Error Types.Mirror_delete_stale
+         | Error (Unavailable message) -> Error (Types.Mirror_delete_failed message)
+         | Ok owner ->
+           let fail error = ignore (Ownership.release owner); Error error in
+           match inspect_durable_mirror inspection.location with
+           | Ok { presence = Available { generation = actual; _ }; _ }
+             when Types.Mirror_generation.equal actual expected ->
+             (try
+                ensure_retirement_directory (Filename.dirname receipt);
+                ensure_retirement_directory (Filename.dirname data);
+                let result = { Types.graph_uuid = Some inspection.location.graph_id
+                  ; previous_generation = expected
+                  ; absent_generation = absent_mirror_generation inspection.location.database_path } in
+                (match existing with
+                 | Some (old, _) when not (Types.Mirror_generation.equal old.previous_generation expected) ->
+                   fail Types.Mirror_delete_stale
+                 | _ ->
+                   write_deletion_receipt receipt result false;
+                   Ok { deletion_inspection = inspection; deletion_retirement = retirement
+                      ; deletion_ownership = Some owner; deletion_committed = None; deletion_cancelled = false; deletion_durable = false })
+              with exn -> fail (Types.Mirror_delete_failed (Printexc.to_string exn)))
+           | _ -> fail Types.Mirror_delete_stale)
+  with exn -> Error (Types.Mirror_delete_failed (Printexc.to_string exn))
+;;
+
+let mirror_deletion_committed preparation = preparation.deletion_durable
+
+let cancel_mirror_deletion preparation =
+  Option.iter (fun owner -> ignore (Ownership.release owner)) preparation.deletion_ownership;
+  preparation.deletion_ownership <- None;
+  if preparation.deletion_committed = None then preparation.deletion_cancelled <- true
+;;
+
+let commit_mirror_deletion preparation =
+  let inspection = preparation.deletion_inspection in
+  let _root, receipt, data = mirror_deletion_paths inspection preparation.deletion_retirement in
+  let durable =
+    try
+      let result, committed = read_deletion_receipt inspection receipt in
+      if committed then Some result else None
+    with _ -> None in
+  match preparation.deletion_committed, durable with
+  | Some result, _ | _, Some result ->
+    preparation.deletion_committed <- Some result;
+    (try
+       sync_deletion_directory (Filename.dirname data);
+       sync_deletion_directory (Filename.dirname (Filename.dirname inspection.location.database_path));
+       write_deletion_receipt receipt result true;
+       preparation.deletion_durable <- true;
+       collect_retired_mirrors inspection
+     with _ -> ());
+    Ok result
+  | None, None when preparation.deletion_cancelled -> Error Types.Mirror_delete_stale
+  | None, None ->
+    match inspection.presence, inspect_durable_mirror inspection.location with
+    | Types.Available { generation = expected; _ },
+      Ok { presence = Available { generation = actual; _ }; _ }
+      when preparation.deletion_ownership <> None && Types.Mirror_generation.equal expected actual ->
+      let renamed =
+        try
+          if Sys.file_exists data then failwith "retirement destination is occupied";
+          let result, _ = read_deletion_receipt inspection receipt in
+          Unix.rename (Filename.dirname inspection.location.database_path) data;
+          Ok result
+        with exn -> Error (Types.Mirror_delete_failed (Printexc.to_string exn)) in
+      (match renamed with
+       | Error _ as error -> error
+       | Ok result ->
+         (* Every operation after rename is post-commit maintenance. An error may
+            retain bytes, but can never authorize restoring partially purged data. *)
+         preparation.deletion_committed <- Some result;
+         (try Option.iter (fun owner -> ignore (Ownership.release owner)) preparation.deletion_ownership with _ -> ());
+         preparation.deletion_ownership <- None;
+         (try
+            sync_deletion_directory (Filename.dirname data);
+            sync_deletion_directory (Filename.dirname (Filename.dirname inspection.location.database_path));
+            write_deletion_receipt receipt result true;
+            preparation.deletion_durable <- true;
+            collect_retired_mirrors inspection
+          with _ -> ());
+         Ok result)
+    | _ -> Error Types.Mirror_delete_stale
 ;;
 
 let validate_receipts sqlite =
@@ -5270,6 +5453,7 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
 ;;
 
 let open_ ~sw dependencies inspection ~graph_name =
+  (try collect_retired_mirrors inspection with _ -> ());
   if String.trim graph_name = ""
   then Error Types.Invalid_graph_name
   else (

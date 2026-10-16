@@ -90,3 +90,25 @@ CAMLprim value logseq_journal_crypto_binary_call(
 }
 
 #include "transport_dns_stubs.h"
+
+/* Restore a retired directory without overwriting a concurrently created copy. */
+#include <errno.h>
+#include <stdio.h>
+#include <fcntl.h>
+#ifdef __linux__
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
+CAMLprim value logseq_journal_rename_exclusive(value source, value target) {
+  CAMLparam2(source, target);
+  int rc;
+#ifdef __APPLE__
+  rc = renameatx_np(AT_FDCWD, String_val(source), AT_FDCWD, String_val(target), RENAME_EXCL);
+#elif defined(__linux__) && defined(SYS_renameat2)
+  rc = syscall(SYS_renameat2, AT_FDCWD, String_val(source), AT_FDCWD, String_val(target), 1);
+#else
+  errno = ENOTSUP;
+  rc = -1;
+#endif
+  CAMLreturn(Val_int(rc == 0 ? 0 : errno));
+}

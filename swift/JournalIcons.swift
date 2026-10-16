@@ -25,6 +25,7 @@ let journalIconNames: [String] = [
     "exclamationmark.circle",
     "exclamationmark.triangle",
     "folder",
+    "icloud.and.arrow.down",
     "lock.doc",
     "lock.shield",
     "minus.circle",

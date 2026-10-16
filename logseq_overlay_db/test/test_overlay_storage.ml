@@ -3,6 +3,13 @@ let server_cursor_of_int value =
 ;;
 
 module Database = Logseq_overlay_db.Database
+
+let retirement_sequence = Atomic.make 0
+let next_retirement () =
+  Database.retirement_id_of_string
+    (Printf.sprintf "97000000-0000-4000-8000-%012d" (Atomic.fetch_and_add retirement_sequence 1))
+  |> Result.get_ok
+;;
 module T = Test_support
 module Types = Logseq_overlay_db.Types
 open Types
@@ -683,16 +690,111 @@ let stale_snapshot_commit_can_be_canceled () =
     | Ok _ -> Alcotest.fail "canceled persisted preparation was committed")
 ;;
 
+let stale_delete_cannot_remove_rebound_owner () =
+  let behavior = "mirror owner identity changed after inspection" in
+  T.with_temp_directory "overlay-owner-rebind-" (fun support ->
+    let database_path = T.seed_mirror support in
+    let owner = Filename.concat (Filename.dirname database_path) ".journal-local-owner.json" in
+    Out_channel.with_open_bin owner (fun output -> output_string output "account-A");
+    let _, _, inspection = location_and_inspection support behavior in
+    Out_channel.with_open_bin owner (fun output -> output_string output "account-B");
+    (match (match Database.prepare_mirror_deletion inspection ~retirement:(next_retirement ()) with
+      | Error _ as error -> error
+      | Ok preparation -> Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion preparation)
+          (fun () -> Database.commit_mirror_deletion preparation)) with
+     | Error Mirror_delete_stale -> ()
+     | _ -> Alcotest.fail "an old observation deleted the rebound account's mirror");
+    Alcotest.(check bool) "new owner's mirror is retained" true (Sys.file_exists database_path))
+;;
+
 let stale_delete_cannot_remove_replacement () =
   let behavior = "stale mirror delete is rejected" in
   T.with_temp_directory "overlay-stale-delete-" (fun support ->
     ignore (T.seed_mirror support);
     let _dependencies, _location, inspection = location_and_inspection support behavior in
-    ignore (Database.delete_mirror inspection |> T.require_ok ~behavior);
-    match Database.delete_mirror inspection with
+    ignore ((match Database.prepare_mirror_deletion inspection ~retirement:(next_retirement ()) with
+      | Error _ as error -> error
+      | Ok preparation -> Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion preparation)
+          (fun () -> Database.commit_mirror_deletion preparation)) |> T.require_ok ~behavior);
+    match (match Database.prepare_mirror_deletion inspection ~retirement:(next_retirement ()) with
+      | Error _ as error -> error
+      | Ok preparation -> Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion preparation)
+          (fun () -> Database.commit_mirror_deletion preparation)) with
     | Error Mirror_delete_stale -> ()
     | Error _ -> Alcotest.fail "stale delete returned the wrong typed error"
     | Ok _ -> Alcotest.fail "stale inspection deleted a mirror twice")
+;;
+
+let retired_cleanup_retries_without_touching_a_new_mirror () =
+  let behavior = "committed retirement survives cleanup failure" in
+  T.with_temp_directory "overlay-retired-cleanup-" (fun support ->
+    let database_path = T.seed_mirror support in
+    let blocked_name = "synthetic-cleanup-blocked" in
+    let blocked = Filename.concat (Filename.dirname database_path) blocked_name in
+    Unix.mkdir blocked 0o700;
+    Out_channel.with_open_bin (Filename.concat blocked "pending") (fun out -> output_string out "synthetic");
+    let rec blocked_paths path =
+      match Unix.lstat path with
+      | { Unix.st_kind = Unix.S_DIR; _ } ->
+        let children = Sys.readdir path |> Array.to_list
+          |> List.concat_map (fun name -> blocked_paths (Filename.concat path name)) in
+        if Filename.basename path = blocked_name then path :: children else children
+      | _ -> []
+      | exception Unix.Unix_error (Unix.ENOENT, _, _) -> [] in
+    let unblock () = List.iter (fun path -> Unix.chmod path 0o700) (blocked_paths support) in
+    Fun.protect ~finally:unblock (fun () ->
+      let dependencies, _, inspection = location_and_inspection support behavior in
+      Unix.chmod blocked 0o500;
+      ignore ((match Database.prepare_mirror_deletion inspection ~retirement:(next_retirement ()) with
+      | Error _ as error -> error
+      | Ok preparation -> Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion preparation)
+          (fun () -> Database.commit_mirror_deletion preparation)) |> T.require_ok ~behavior);
+      Alcotest.(check bool) "canonical copy was committed absent" false (Sys.file_exists database_path);
+      Alcotest.(check bool) "failed purge remains durably retryable" true (blocked_paths support <> []);
+      ignore (T.seed_mirror support);
+      Out_channel.with_open_bin (Filename.concat (Filename.dirname database_path) ".journal-local-owner.json")
+        (fun out -> output_string out "new synthetic owner");
+      unblock ();
+      let fresh = inspect_mirror support behavior in
+      Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
+        let database = Database.open_ ~sw dependencies fresh ~graph_name:"New synthetic copy"
+            |> T.require_ok ~behavior in
+        ignore (Database.close database |> T.require_ok ~behavior)));
+      Alcotest.(check bool) "new live copy survives retired cleanup" true (Sys.file_exists database_path);
+      Alcotest.(check bool) "ordinary producer lifecycle retries retired purge" true (blocked_paths support = [])))
+;;
+
+let mirror_preparation_cancel_and_commit_replay () =
+  let behavior = "mirror preparation ownership and durable replay" in
+  T.with_temp_directory "overlay-deletion-protocol-" (fun support ->
+    let database_path = T.seed_mirror support in
+    let dependencies, _, inspection = location_and_inspection support behavior in
+    let retirement = next_retirement () in
+    let prepared = Database.prepare_mirror_deletion inspection ~retirement |> T.require_ok ~behavior in
+    Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
+      match Database.open_ ~sw dependencies inspection ~graph_name:"Busy synthetic mirror" with
+      | Error Ownership_conflict -> ()
+      | _ -> Alcotest.fail "preparation did not hold exclusive ownership"));
+    Database.cancel_mirror_deletion prepared;
+    Database.cancel_mirror_deletion prepared;
+    Alcotest.(check bool) "cancel retains canonical mirror" true (Sys.file_exists database_path);
+    Alcotest.(check bool) "cancelled preparation cannot commit" true
+      (Result.is_error (Database.commit_mirror_deletion prepared));
+    let committed_retirement = next_retirement () in
+    let prepared = Database.prepare_mirror_deletion inspection ~retirement:committed_retirement |> T.require_ok ~behavior in
+    let committed_id = prepared in
+    ignore (Database.commit_mirror_deletion prepared |> T.require_ok ~behavior);
+    Database.cancel_mirror_deletion prepared;
+    Alcotest.(check bool) "commit has durable evidence" true (Database.mirror_deletion_committed prepared);
+    ignore (T.seed_mirror support);
+    let _, _, fresh = location_and_inspection support behavior in
+    let replay = Database.prepare_mirror_deletion fresh ~retirement:committed_retirement |> T.require_ok ~behavior in
+    Alcotest.(check bool) "fresh handle recovers durable commit" true (Database.mirror_deletion_committed replay);
+    ignore (Database.commit_mirror_deletion replay |> T.require_ok ~behavior);
+    Database.cancel_mirror_deletion replay;
+    ignore (Database.commit_mirror_deletion committed_id |> T.require_ok ~behavior);
+    Database.cancel_mirror_deletion committed_id;
+    Alcotest.(check bool) "late commit/cancel preserves new canonical mirror" true (Sys.file_exists database_path))
 ;;
 
 let corrupt_outbox_fails_closed () =
@@ -2832,6 +2934,9 @@ let () =
             `Quick
             sqlite_full_int64_checkpoint
         ] )
-    ; "mirror and durability", cases
+    ; "mirror and durability", cases @
+        [Alcotest.test_case "owner rebind invalidates deletion" `Quick stale_delete_cannot_remove_rebound_owner;
+         Alcotest.test_case "retired cleanup preserves new mirror" `Quick retired_cleanup_retries_without_touching_a_new_mirror;
+         Alcotest.test_case "mirror preparation cancel and commit replay" `Quick mirror_preparation_cancel_and_commit_replay]
     ]
 ;;

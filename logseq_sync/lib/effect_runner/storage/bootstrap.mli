@@ -63,10 +63,21 @@ module Asset_cache : sig
     -> account:Logseq_sync_pure_reducer.Core.account_scope
     -> (unit, error) result
 
-  val delete_graph
-    :  root:string
-    -> account:Logseq_sync_pure_reducer.Core.account_scope
-    -> graph_id:Logseq_db_types.Graph_types.Uuid.t
+  val graph_deletion_terminal
+    : root:string -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+    -> retirement:Logseq_sync_pure_reducer.Core.retirement_id
+    -> ([ `Committed | `Aborted ] option, error) result
+
+  val prepare_graph_deletion
+    : root:string
+    -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+    -> retirement:Logseq_sync_pure_reducer.Core.retirement_id
+    -> (unit, error) result
+
+  val finish_graph_deletion
+    : root:string
+    -> deletion:Logseq_sync_pure_reducer.Core.asset_deletion
+    -> commit:bool
     -> (unit, error) result
 
   type staged = private

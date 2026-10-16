@@ -83,3 +83,10 @@ val detail
 (** Stable native startup surface; action remains reachable during waiting. *)
 val startup : loading:bool -> initial:bool -> active:bool -> ?value:float
   -> message:string -> Journal_view.View.t -> Journal_view.View.Body.t
+
+(** Full-canvas native list with floating close and catalog controls. *)
+val graph_picker
+  :  leading:Journal_view.View.t
+  -> controls:Journal_view.View.t
+  -> Journal_view.View.Body.t
+  -> Journal_view.View.Body.t

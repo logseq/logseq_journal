@@ -202,7 +202,7 @@ let worker_open_graph () =
   ready.Core.next, scope
 ;;
 
-let test_local_deletion_drains_worker_operations () =
+let test_current_deletion_preserves_work_until_retirement () =
   let ready, scope = worker_open_graph () in
   let request = graph_info_request () in
   let executing =
@@ -245,15 +245,24 @@ let test_local_deletion_drains_worker_operations () =
       inspecting.effects
     |> Option.get
   in
-  let deleting =
+  let protected =
     Core.step
       inspecting.next
       (Sync_event (Sync.Local_cache_deletion_requested scope.graph_id))
   in
   Alcotest.(check bool)
-    "graph closes admission immediately"
+    "current-copy deletion preserves the open graph and executing work"
     true
-    ((Core.view deleting.next).graph.phase = Core.Graph_closing);
+    ((Core.view protected.next).graph.phase = Core.Graph_open
+     && (Core.view protected.next).sync.snapshot.local_deletion = None
+     && protected.effects = []);
+  let retiring =
+    Core.step protected.next (Sync_event Sync.Graph_picker_requested)
+  in
+  Alcotest.(check bool)
+    "actual graph retirement closes admission immediately"
+    true
+    ((Core.view retiring.next).graph.phase = Core.Graph_closing);
   let has_close effects =
     List.exists
       (function
@@ -266,21 +275,21 @@ let test_local_deletion_drains_worker_operations () =
   Alcotest.(check bool)
     "close waits for executing work"
     false
-    (has_close deleting.effects);
+    (has_close retiring.effects);
   let edit =
     { request with
       Protocol.command =
         Protocol.V2_save_block
           { mutation_id = uuid "20000000-0000-4000-8000-000000000001"
           ; block = uuid "30000000-0000-4000-8000-000000000001"
-          ; title = "Must not be saved after deletion admission"
+          ; title = "Must not be saved after graph retirement admission"
           ; preconditions = { blocks = []; pages = []; scopes = [] }
           }
     }
   in
   let rejected =
     Core.step
-      deleting.next
+      retiring.next
       (Core.Graph_request { id = Core.request_id_of_int64 12L; request = edit })
   in
   Alcotest.(check bool)
@@ -334,10 +343,10 @@ let test_local_deletion_drains_worker_operations () =
   in
   let failed = Core.step drained.next close_failure in
   Alcotest.(check bool)
-    "worker forwards close failure to owner"
+    "ordinary retirement failure cannot authorize local deletion"
     true
     ((Core.view failed.next).sync.snapshot.local_deletion
-     = Some (Sync.Deletion_failed Sync.Closing_graph));
+     = None);
   Alcotest.(check bool)
     "close failure never deletes"
     false
@@ -1021,9 +1030,9 @@ let () =
             `Quick
             test_sync_instructions_are_translated_in_order
         ; Alcotest.test_case
-            "deletion drains executing work"
+            "current deletion preserves work until retirement"
             `Quick
-            test_local_deletion_drains_worker_operations
+            test_current_deletion_preserves_work_until_retirement
         ; Alcotest.test_case "deterministic replay" `Quick test_replay_is_deterministic
         ] )
     ]

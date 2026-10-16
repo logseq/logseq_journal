@@ -373,6 +373,9 @@ type t =
   ; asset_byte_reservation_lock : Eio.Semaphore.t
   ; secret_lock : Eio.Mutex.t
   ; asset_caches : (Core.graph_scope, Asset_cache.t) Hashtbl.t
+  ; asset_leases : ((Core.graph_scope * string), unit) Hashtbl.t
+  ; asset_retirements : ((string * string * string), Core.retirement_id) Hashtbl.t
+  ; preparing_retirements : ((string * string * string), Core.retirement_id) Hashtbl.t
   ; mutable closed : bool
   }
 
@@ -394,6 +397,9 @@ let create ~sw dependencies ~post =
     ; asset_byte_reservation_lock = Eio.Semaphore.make 1
     ; secret_lock = Eio.Mutex.create ()
     ; asset_caches = Hashtbl.create 4
+    ; asset_leases = Hashtbl.create 16
+    ; asset_retirements = Hashtbl.create 4
+    ; preparing_retirements = Hashtbl.create 4
     ; closed = false
     }
 ;;
@@ -402,6 +408,13 @@ let asset_root t =
   Filename.concat
     t.dependencies.local_store.application_support_directory
     "logseq-db-worker/assets"
+;;
+
+let asset_target (scope : Core.graph_scope) =
+  Uri.to_string scope.account.managed_sync_origin, scope.account.user_id,
+  Graph_types.Uuid.to_string scope.graph_id
+;;
+let asset_blocked t scope = Hashtbl.mem t.asset_retirements (asset_target scope)
 ;;
 
 let delete_account_assets ?except_id t (account : Core.account_scope) =
@@ -427,6 +440,13 @@ let delete_account_assets ?except_id t (account : Core.account_scope) =
        else Some cache)
     t.asset_caches;
   Asset_cache.delete_account ~root:(asset_root t) ~account
+  |> Result.map (fun () ->
+    let origin = Uri.to_string account.managed_sync_origin in
+    Hashtbl.filter_map_inplace (fun (actual_origin, user, _) retirement ->
+      if actual_origin=origin && user=account.user_id then None else Some retirement) t.asset_retirements;
+    Hashtbl.filter_map_inplace (fun ((scope : Core.graph_scope), _) () ->
+      if Uri.equal scope.account.managed_sync_origin account.managed_sync_origin
+         && scope.account.user_id=account.user_id then None else Some ()) t.asset_leases)
 ;;
 
 let catalog_root local_store =
@@ -1506,25 +1526,26 @@ let scoped_asset_cache t scope =
 ;;
 
 let retain_asset_file t ~scope ~handle =
-  if t.closed
+  if t.closed || asset_blocked t scope
   then None
   else
     Option.bind (Hashtbl.find_opt t.asset_caches scope) (fun cache ->
       Option.bind (Asset_cache.retain cache handle) (fun lease ->
         match Asset_cache.path cache lease with
-        | Some path -> Some (lease, path)
+        | Some path -> Hashtbl.replace t.asset_leases (scope, lease) (); Some (lease, path)
         | None ->
           Asset_cache.release cache lease;
           None))
 ;;
 
 let release_asset_file t ~scope ~handle =
+  Hashtbl.remove t.asset_leases (scope, handle);
   Option.iter
     (fun cache -> Asset_cache.release cache handle)
     (Hashtbl.find_opt t.asset_caches scope)
 ;;
 
-let delete_graph_assets ?except_id t (request : Core.mirror_deletion) =
+let cancel_graph_asset_operations ?except_id t (request : Core.mirror_deletion) =
   Hashtbl.iter
     (fun id (operation : operation) ->
        match operation.asset_identity with
@@ -1538,27 +1559,50 @@ let delete_graph_assets ?except_id t (request : Core.mirror_deletion) =
          operation.cancelled <- true;
          operation.cancel ()
        | Some _ | None -> ())
-    t.operations;
-  let scopes =
-    Hashtbl.fold
-      (fun (scope : Core.graph_scope) _ acc ->
-         if
-           scope.graph_id = request.graph_id
-           && scope.account.user_id = request.account.user_id
-           && Uri.equal
-                scope.account.managed_sync_origin
-                request.account.managed_sync_origin
-         then scope :: acc
-         else acc)
-      t.asset_caches
-      []
-  in
-  List.iter (close_asset_scope ?except_id t) scopes;
-  Asset_cache.delete_graph
-    ~root:(asset_root t)
-    ~account:request.account
-    ~graph_id:request.graph_id
-  |> Result.map_error (fun _ -> "The graph asset cache could not be removed.")
+    t.operations
+;;
+
+let prepare_graph_asset_deletion ?except_id t (scope : Core.graph_scope) retirement ~current =
+  match Asset_cache.graph_deletion_terminal ~root:(asset_root t) ~scope ~retirement with
+  | Error error -> Error (asset_cache_failure error)
+  | Ok (Some `Committed) -> Ok (Core.Asset_deletion_prepared (Core.asset_deletion_reference ~scope ~retirement))
+  | Ok (Some `Aborted) -> Error Core.Asset_cancelled
+  | Ok None ->
+  let request : Core.mirror_deletion =
+    { account = scope.account; graph_id = scope.graph_id; scope = Core.effect_scope_of_graph scope } in
+  cancel_graph_asset_operations ?except_id t request;
+  let same_target scope' = asset_target scope' = asset_target scope in
+  let busy () =
+    Hashtbl.fold (fun id (operation : operation) busy ->
+      busy || (Some id <> except_id && Option.fold ~none:false
+        ~some:(fun (scope, _) -> same_target scope) operation.asset_identity)) t.operations false
+    || Hashtbl.fold (fun (scope, _) () busy -> busy || same_target scope) t.asset_leases false in
+  let rec wait attempts =
+    if not (current ()) || Hashtbl.find_opt t.asset_retirements (asset_target scope) <> Some retirement
+    then Error Core.Asset_cancelled
+    else if not (busy ()) then Ok ()
+    else if attempts = 0 then Error (Core.Asset_invalid_content "Attachment resources are still in use.")
+    else (t.dependencies.runtime.sleep 0.005; wait (attempts - 1)) in
+  let result = Result.bind (wait 1000) (fun () ->
+    Hashtbl.fold (fun scope _ scopes -> if same_target scope then scope :: scopes else scopes)
+      t.asset_caches [] |> List.iter (close_asset_scope ?except_id t);
+    Asset_cache.prepare_graph_deletion ~root:(asset_root t) ~scope ~retirement
+    |> Result.map_error asset_cache_failure
+    |> Result.map (fun () -> Core.Asset_deletion_prepared (Core.asset_deletion_reference ~scope ~retirement))) in
+  (* A failed preparation may already own a durable rename. Its coordinating
+     journal will cancel it; keep the barrier until that exact terminal action. *)
+  result
+;;
+
+let finish_graph_asset_deletion t deletion ~commit =
+  let scope = Core.asset_deletion_scope deletion in
+  let retirement = Core.asset_deletion_retirement deletion in
+  Asset_cache.finish_graph_deletion ~root:(asset_root t) ~deletion ~commit
+  |> Result.map_error asset_cache_failure
+  |> Result.map (fun () ->
+    if Hashtbl.find_opt t.asset_retirements (asset_target scope) = Some retirement
+    then Hashtbl.remove t.asset_retirements (asset_target scope);
+    Core.Asset_unit)
 ;;
 
 let read_upload_source ~maximum_plaintext_bytes source_file =
@@ -1752,7 +1796,7 @@ let retain_staged_file t ~scope ~file =
     | Ok cache ->
       Option.bind (Asset_cache.retain_staged cache ~file) (fun lease ->
         match Asset_cache.path cache lease with
-        | Some path -> Some (lease, path)
+        | Some path -> Hashtbl.replace t.asset_leases (scope, lease) (); Some (lease, path)
         | None ->
           Asset_cache.release cache lease;
           None))
@@ -1769,6 +1813,11 @@ let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
       (scoped_asset_cache t scope |> Result.map_error asset_cache_failure)
       action
   in
+  let permitted = match request.action with
+    | Core.Release_asset_file _ | Cancel_asset_operation _ | Prepare_graph_asset_deletion _
+    | Commit_graph_asset_deletion _ | Cancel_graph_asset_deletion _ | Delete_account_assets -> true
+    | _ -> not (asset_blocked t scope) in
+  if not permitted then Error Core.Asset_cancelled else
   match request.action with
   | Core.Check_asset_cache (asset, version) ->
     cache (fun cache ->
@@ -1833,14 +1882,10 @@ let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
   | Close_asset_scope ->
     close_asset_scope ?except_id t scope;
     Ok Core.Asset_unit
-  | Delete_graph_assets ->
-    let deletion : Core.mirror_deletion =
-      { account = scope.account
-      ; graph_id = scope.graph_id
-      ; scope = Core.effect_scope_of_graph scope
-      }
-    in
-    delete_graph_assets ?except_id t deletion |> storage_result |> map_unit
+  | Prepare_graph_asset_deletion retirement ->
+    prepare_graph_asset_deletion ?except_id t scope retirement ~current
+  | Commit_graph_asset_deletion deletion -> finish_graph_asset_deletion t deletion ~commit:true
+  | Cancel_graph_asset_deletion deletion -> finish_graph_asset_deletion t deletion ~commit:false
   | Delete_account_assets ->
     delete_account_assets ?except_id t scope.account
     |> Result.map_error asset_cache_failure
@@ -1887,6 +1932,29 @@ let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
   in
   if claim_operation t instruction
   then (
+    let busy = match request.action with
+      | Core.Prepare_graph_asset_deletion retirement ->
+        let key = asset_target request.context.scope in
+        Hashtbl.mem t.preparing_retirements key
+        || (match Hashtbl.find_opt t.asset_retirements key with Some other -> other <> retirement | None -> false)
+      | _ -> false in
+    if busy then t.post (Core.Runner_completed (Core.Asset_completion (ticket,
+      Error (Core.Asset_invalid_content "Attachment retirement is already in progress."))))
+    else (
+    (match request.action with
+     | Core.Prepare_graph_asset_deletion retirement ->
+       let scope = request.context.scope in
+       (match Asset_cache.graph_deletion_terminal ~root:(asset_root t) ~scope ~retirement with
+        | Ok None ->
+          Hashtbl.replace t.preparing_retirements (asset_target scope) retirement;
+          (match Hashtbl.find_opt t.asset_retirements (asset_target scope) with
+           | None -> Hashtbl.add t.asset_retirements (asset_target scope) retirement
+           | Some _ -> ());
+          if Hashtbl.find_opt t.asset_retirements (asset_target scope) = Some retirement then
+            cancel_graph_asset_operations t
+              { Core.account = scope.account; graph_id = scope.graph_id; scope = Core.effect_scope_of_graph scope }
+        | _ -> ())
+     | _ -> ());
     let cancelled, resolve_cancelled = Eio.Promise.create () in
     let operation =
       { scope = Core.effect_scope_of_graph request.context.scope
@@ -1900,7 +1968,14 @@ let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
       let current () = (not t.closed) && not operation.cancelled in
       let result =
         Fun.protect
-          ~finally:(fun () -> Hashtbl.remove t.operations id)
+          ~finally:(fun () ->
+            Hashtbl.remove t.operations id;
+            match request.action with
+            | Core.Prepare_graph_asset_deletion retirement ->
+              let key = asset_target request.context.scope in
+              if Hashtbl.find_opt t.preparing_retirements key = Some retirement
+              then Hashtbl.remove t.preparing_retirements key
+            | _ -> ())
           (fun () ->
              try
                Eio.Fiber.first
@@ -1916,7 +1991,7 @@ let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
       in
       (* A completed resource must reach the reducer even after cancellation.
          The reducer owns acceptance and issues cleanup for stale resources. *)
-      t.post (Core.Runner_completed (Core.Asset_completion (ticket, result)))))
+      t.post (Core.Runner_completed (Core.Asset_completion (ticket, result))))))
 ;;
 
 let execute_protected t (request : Core.protected_request) =
@@ -1978,7 +2053,9 @@ let cleanup_asset_action = function
   | Core.Release_asset_file _
   | Release_staged_file _
   | Close_asset_scope
-  | Delete_graph_assets
+  | Prepare_graph_asset_deletion _
+  | Commit_graph_asset_deletion _
+  | Cancel_graph_asset_deletion _
   | Delete_account_assets
   | Cancel_asset_operation _ -> true
   | Check_asset_cache _
@@ -1993,6 +2070,12 @@ let cleanup_asset_action = function
 
 let submit t instruction =
   match instruction with
+  | Core.Asset_io (ticket, ({ action = Core.Prepare_graph_asset_deletion _; _ } as request)) ->
+    (* Deletion may wait for native leases. It must not block the event consumer
+       that delivers their release, and shutdown must revoke its execution. *)
+    if t.closed
+    then t.post (Core.Runner_completed (Core.Asset_completion (ticket, Error Core.Asset_cancelled)))
+    else submit_asset_io t instruction ticket request
   | Core.Asset_io (ticket, request) ->
     if cleanup_asset_action request.action
     then (

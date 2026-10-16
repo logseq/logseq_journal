@@ -1758,6 +1758,7 @@ module View = struct
           ?key
           ~activation_id:_
           ?(enabled = true)
+          ?enabled_signal
           ?(disclosure = true)
           ~on_activate
           ~label
@@ -1765,10 +1766,15 @@ module View = struct
       =
       element
         ?key
-        (Lui_elements.list_item
-           ~disabled:(not enabled)
+        (fun context parent ->
+         let disabled_signal = Option.map (fun source ->
+           let mapped = Signal.map not source in
+           Signal.on_dispose context.Lui_ui.ui_scope (fun () -> Signal.dispose_signal mapped);
+           mapped) enabled_signal in
+         Lui_elements.list_item
+           ~disabled:(not enabled) ?disabled_signal
            ?on_press:
-             (if enabled
+             (if enabled || Option.is_some enabled_signal
               then Some (fun _ -> invoke on_activate Event.Payload.Unit)
               else None)
              (* Callers choose whether the native list item carries a disclosure icon. *)
@@ -1776,7 +1782,7 @@ module View = struct
            ~icon_placement:`trailing
            (* A list-item must carry text or children; mount the label as the
               item content so composite labels render too. *)
-           [ label.mount ])
+           [ label.mount ] context parent)
     ;;
   end
 
@@ -1965,24 +1971,31 @@ module View = struct
       ; title : string
       ; icon : string option
       ; enabled : bool
+      ; enabled_signal : bool Signal.signal option
       ; role : Button_role.t
+      ; test_id : Test_id.t option
       }
 
-    let action ~id ~title ?icon ?(enabled = true) ?(role = Button_role.Normal) () =
-      { id; title; icon; enabled; role }
+    let action ~id ~title ?icon ?(enabled = true) ?enabled_signal ?(role = Button_role.Normal) ?test_id () =
+      { id; title; icon; enabled; enabled_signal; role; test_id }
     ;;
 
     let to_elements ~on_select entries =
       List.map
-        (fun entry ->
+        (fun entry context parent ->
+           let disabled_signal = Option.map (fun source ->
+             let mapped = Signal.map not source in
+             Signal.on_dispose context.Lui_ui.ui_scope (fun () -> Signal.dispose_signal mapped);
+             mapped) entry.enabled_signal in
            Lui_elements.menu_item
              ~key:(Int64.to_string entry.id)
+             ?accessibility_identifier:entry.test_id
              ~text:(if String.length entry.title = 0 then " " else entry.title)
              ?icon:(Option.map journal_icon entry.icon)
-             ~disabled:(not entry.enabled)
+             ~disabled:(not entry.enabled) ?disabled_signal
              ?variant:(Button_role.lui_variant entry.role)
              ~on_press:(fun _ -> invoke on_select (Event.Payload.Int64 entry.id))
-             [])
+             [] context parent)
         entries
     ;;
   end

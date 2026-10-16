@@ -296,6 +296,8 @@ let shutdown_id_token_cache cache =
       clear_id_token_cache cache "ID token cache is stopped."))
 ;;
 
+module Authorized_graphs = Set.Make (String)
+
 type runtime =
   { fork : sw:Eio.Switch.t -> (unit -> unit) -> unit
   ; sleep : float -> unit
@@ -374,6 +376,9 @@ type t =
   ; mutable attached : (string * Sync.graph_scope) option
   ; mutable next_database_id : int64
   ; mutable stopped : bool
+  ; mutable latest_snapshot : Sync.snapshot option
+  ; mutable authorized_graphs : Authorized_graphs.t
+  ; mutable deletion_owner : Sync.mirror_deletion option
   }
 
 let runtime ~fork ~sleep = Ok { fork; sleep }
@@ -405,6 +410,9 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; attached = None
     ; next_database_id = 0L
     ; stopped = false
+    ; latest_snapshot = None
+    ; authorized_graphs = Authorized_graphs.empty
+    ; deletion_owner = None
     }
 ;;
 
@@ -446,6 +454,7 @@ let reclaim_asset_output t (output : Sync.asset_output) =
   let action =
     match output.result with
     | Ok (Sync.Asset_staged { file; _ }) -> Some (Sync.Release_staged_file file)
+    | Ok (Sync.Asset_deletion_prepared deletion) -> Some (Sync.Cancel_graph_asset_deletion deletion)
     | Ok
         ( Asset_retained (Some (handle, _))
         | Asset_cached (Some handle)
@@ -1430,9 +1439,159 @@ let authoritative_transition_error = function
     "authoritative commit fatal state: " ^ message
 ;;
 
+let mirror_directory t graph_id =
+  Filename.concat t.dependencies.config.application_support_directory
+    ("logseq-db-worker/synced-graphs/" ^ Graph.Uuid.to_string graph_id)
+;;
+
+let local_owner (account : Sync.account_scope) graph_id =
+  Yojson.Safe.sort (`Assoc
+    ["user_id", `String account.user_id; "origin", `String (Uri.to_string account.managed_sync_origin)
+    ; "graph_id", `String (Graph.Uuid.to_string graph_id)])
+;;
+
+let check_local_owner t (account : Sync.account_scope) graph_id ~bind =
+  let directory = mirror_directory t graph_id in
+  let path = Filename.concat directory ".journal-local-owner.json" in
+  try
+    let expected = local_owner account graph_id in
+    if Sys.file_exists path then (
+      let stat = Unix.lstat path in
+      if stat.st_kind <> Unix.S_REG || stat.st_nlink <> 1 || stat.st_size > 4096
+      then Error "The local copy ownership could not be verified."
+      else if Yojson.Safe.sort (Yojson.Safe.from_file path) = expected then Ok ()
+      else Error "This local copy belongs to another account.")
+    else if not bind then Error "Open this graph once, then switch to another graph before deleting."
+    else (
+      let temporary, output = Filename.open_temp_file ~temp_dir:directory ".journal-owner-" ".tmp" in
+      Fun.protect ~finally:(fun () -> close_out_noerr output;
+        if Sys.file_exists temporary then Sys.remove temporary)
+        (fun () -> output_string output (Yojson.Safe.to_string expected); flush output;
+          Unix.fsync (Unix.descr_of_out_channel output); close_out output; Unix.rename temporary path);
+      Ok ())
+  with _ -> Error "The local copy ownership could not be verified."
+;;
+
+let open_owned_database t (request : Sync.mirror_request) inspection =
+  match Database.open_ ~sw:t.sw t.dependencies.overlay inspection ~graph_name:request.graph.name with
+  | Error _ as error -> error
+  | Ok database ->
+    (match check_local_owner t request.scope.account request.scope.graph_id ~bind:true with
+     | Ok () -> Ok database
+     | Error message -> ignore (Database.close database); Error (Overlay.Open_resource_failed message))
+;;
+
+let deletion_authorized t (request : Sync.mirror_deletion) =
+  match t.latest_snapshot with
+  | Some snapshot ->
+    snapshot.startup.authenticated
+    && snapshot.startup.account_generation = request.account.account_generation
+    && snapshot.selected_graph <> Some request.graph_id
+    && snapshot.local_deletion = Some (Sync.Deletion_in_progress Sync.Deleting_mirror)
+    && Authorized_graphs.mem (Graph.Uuid.to_string request.graph_id) t.authorized_graphs
+  | None -> false
+;;
+
+let deletion_current t request =
+  not t.stopped && t.deletion_owner = Some request && deletion_authorized t request
+;;
+
+let sync_retirement_directory path =
+  let fd = Unix.openfile path [Unix.O_RDONLY] 0 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> Unix.fsync fd)
+;;
+
+let rec make_retirement_directory path =
+  if not (Sys.file_exists path) then (
+    make_retirement_directory (Filename.dirname path);
+    Unix.mkdir path 0o700; sync_retirement_directory (Filename.dirname path))
+;;
+
+let local_retirement_directory t (scope : Sync.graph_scope) =
+  let identity = Digest.to_hex (Digest.string
+    (Uri.to_string scope.account.managed_sync_origin ^ "\000" ^ scope.account.user_id)) in
+  Filename.concat t.dependencies.config.application_support_directory
+    (Filename.concat "logseq-db-worker/local-copy-retirements"
+       (Filename.concat identity (Graph.Uuid.to_string scope.graph_id)))
+;;
+
+let fresh_retirement () =
+  let bytes = In_channel.with_open_bin "/dev/urandom" (fun input -> really_input_string input 16) in
+  let hex = String.concat "" (List.init 16 (fun n -> Printf.sprintf "%02x" (Char.code bytes.[n]))) in
+  Sync.retirement_id_of_string (Printf.sprintf "%s-%s-4%s-8%s-%s"
+    (String.sub hex 0 8) (String.sub hex 8 4) (String.sub hex 13 3)
+    (String.sub hex 17 3) (String.sub hex 20 12)) |> Result.get_ok
+;;
+
+let write_local_retirement path expected captured =
+  let json = `Assoc ["version",`Int 1
+    ; "expected", `String (Overlay.Mirror_generation.to_string expected)
+    ; "uploads", Logseq_db_storage.Asset_upload_store.captured_graph_to_yojson captured] |> Yojson.Safe.to_string in
+  let temporary = path ^ ".part" in
+  let fd = Unix.openfile temporary [Unix.O_WRONLY;Unix.O_CREAT;Unix.O_TRUNC] 0o600 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
+    let rec write offset = if offset < String.length json then
+      let n = Unix.write_substring fd json offset (String.length json-offset) in
+      if n=0 then failwith "retirement journal write stalled" else write (offset+n) in
+    write 0; Unix.fsync fd);
+  Unix.rename temporary path; sync_retirement_directory (Filename.dirname path)
+;;
+
+let remove_local_retirement path =
+  Unix.unlink path; sync_retirement_directory (Filename.dirname path)
+;;
+
+let finish_local_retirement t scope deletion captured ~commit =
+  let ( let* ) = Result.bind in
+  let* () = if commit then with_upload_store t (fun db -> Logseq_db_storage.Asset_upload_store.delete_captured_graph db captured) else Ok () in
+  asset_unit t ~scope
+    (if commit then Sync.Commit_graph_asset_deletion deletion else Sync.Cancel_graph_asset_deletion deletion)
+;;
+
+let recover_local_retirements t (scope : Sync.graph_scope) =
+  let ( let* ) = Result.bind in
+  let directory = local_retirement_directory t scope in
+  if not (Sys.file_exists directory) then Ok () else
+  Array.fold_left (fun result name ->
+    let* () = result in
+    if not (Filename.check_suffix name ".json") then Ok () else
+    try
+      let journal_path = Filename.concat directory name in
+      let retirement = String.sub name 0 (String.length name - 5) |> Sync.retirement_id_of_string |> Result.get_ok in
+      let open Yojson.Safe.Util in
+      let json = Yojson.Safe.from_file journal_path in
+      if json |> member "version" |> to_int <> 1 then failwith "Unsupported retirement journal";
+      let expected = json |> member "expected" |> to_string |> Overlay.Mirror_generation.of_string |> Result.get_ok in
+      let captured = json |> member "uploads" |> Logseq_db_storage.Asset_upload_store.captured_graph_of_yojson |> Result.get_ok in
+      if not (Logseq_db_storage.Asset_upload_store.captured_graph_matches captured
+        ~origin:(Uri.to_string scope.account.managed_sync_origin) ~account:scope.account.user_id ~graph:scope.graph_id)
+      then failwith "Retirement journal account mismatch";
+      let* inspection = Database.inspect_mirror
+        ~application_support_directory:t.dependencies.config.application_support_directory ~graph_id:scope.graph_id
+        |> Result.map_error (fun _ -> "Retirement recovery could not inspect the mirror.") in
+      let* prepared = Database.prepare_mirror_deletion inspection ~retirement
+        |> Result.map_error (fun _ -> "Retirement recovery is blocked by mirror ownership or an unknown commit state.") in
+      Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion prepared) (fun () ->
+        let committed = Database.mirror_deletion_committed prepared in
+        let original = match Database.mirror_presence inspection with
+          | Overlay.Available {generation;_} -> Overlay.Mirror_generation.equal generation expected
+          | Absent _ -> false in
+        if not committed && not original then Error "Retirement recovery conflict; the captured resources were preserved."
+        else
+          let deletion = Sync.asset_deletion_reference ~scope ~retirement in
+          let* () = finish_local_retirement t scope deletion captured ~commit:committed in
+          (if committed then (try remove_local_retirement journal_path with _ -> ())
+           else remove_local_retirement journal_path);
+          Ok ())
+    with _ -> Error "Local copy recovery is incomplete; its resources were preserved.") (Ok ()) (Sys.readdir directory)
+;;
+
 let handle_sync_worker_effect t = function
   | Sync.Inspect_mirror request ->
-    (match
+    let recovery = with_staging_lock t (fun () -> recover_local_retirements t request.scope) in
+    (match recovery with
+     | Error message -> Error (effect_error message)
+     | Ok () -> match
        Database.inspect_mirror
          ~application_support_directory:
            t.dependencies.config.application_support_directory
@@ -1512,36 +1671,80 @@ let handle_sync_worker_effect t = function
                          ~event:(Sync.Snapshot_activated { scope = request.scope })
                          ())))))
   | Delete_mirror request ->
-    let key = Graph.Uuid.to_string request.graph_id in
-    (match Hashtbl.find_opt t.inspections key with
-     | None -> Error (effect_error "The mirror deletion inspection is unavailable.")
-     | Some inspection ->
-       (match
-          Result.bind
-            (Result.bind
-               (with_upload_store t (fun db ->
-                  Logseq_db_storage.Asset_upload_store.delete_graph
-                    db
-                    ~origin:(Uri.to_string request.account.managed_sync_origin)
-                    ~account:request.account.user_id
-                    ~graph:request.graph_id))
-               (fun () ->
-                  asset_unit
-                    t
-                    ~scope:
-                      { Sync.account = request.account
-                      ; graph_id = request.graph_id
-                      ; graph_generation = 0
-                      }
-                    Sync.Delete_graph_assets)
-             |> Result.map_error (fun _ -> ()))
-            (fun () ->
-               Database.delete_mirror inspection |> Result.map_error (fun _ -> ()))
-        with
-        | Error _ -> Error (effect_error "The overlay mirror could not be deleted.")
-        | Ok _ ->
-          Hashtbl.remove t.inspections key;
-          Ok (sync_result ~event:(Sync.Mirror_deleted (request, Ok ())) ())))
+    let ( let* ) = Result.bind in
+    let current () = deletion_current t request in
+    let scope : Sync.graph_scope = {account=request.account;graph_id=request.graph_id;graph_generation=0} in
+    let result = try
+      let* () = if current () then Ok () else Error "The graph account is no longer current." in
+      let* () = match t.attached with
+        | Some (_, actual) when actual.graph_id = request.graph_id -> Error "Switch to another graph before deleting."
+        | _ -> Ok () in
+      let* () = with_staging_lock t (fun () -> recover_local_retirements t scope) in
+      let* inspection = Database.inspect_mirror
+        ~application_support_directory:t.dependencies.config.application_support_directory ~graph_id:request.graph_id
+        |> Result.map_error (fun _ -> "The local copy could not be inspected.") in
+      let* () = check_local_owner t request.account request.graph_id ~bind:false in
+      let retirement = fresh_retirement () in
+      (* Ownership is acquired before any asset retirement or intent mutation. *)
+      let* prepared = Database.prepare_mirror_deletion inspection ~retirement
+        |> Result.map_error (function
+          | Overlay.Mirror_delete_busy -> "The local copy is still in use. Close attachment previews and try again."
+          | _ -> "The local copy changed. Refresh and try again.") in
+      Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion prepared) (fun () ->
+        let same_target (actual : Sync.graph_scope) = actual.graph_id=scope.graph_id
+          && actual.account.user_id=scope.account.user_id
+          && Uri.equal actual.account.managed_sync_origin scope.account.managed_sync_origin in
+        Hashtbl.iter (fun (ticket : Upload.ticket) resolve ->
+          if same_target ticket.scope then ignore (Eio.Promise.try_resolve resolve () : bool)) t.upload_operations;
+        let rec drain attempts =
+          if not (current ()) then Error "The graph account is no longer current."
+          else if not (Hashtbl.fold (fun (ticket : Upload.ticket) _ busy -> busy || same_target ticket.scope) t.upload_operations false)
+          then Ok ()
+          else if attempts=0 then Error "The local copy is still in use. Try again."
+          else (t.dependencies.runtime.sleep 0.005; drain (attempts-1)) in
+        let* () = drain 1000 in
+        with_staging_lock t (fun () ->
+          let* () = if current () then Ok () else Error "The graph account is no longer current." in
+          let* captured = with_upload_store t (fun db -> Logseq_db_storage.Asset_upload_store.capture_graph db
+            ~origin:(Uri.to_string request.account.managed_sync_origin) ~account:request.account.user_id ~graph:request.graph_id) in
+          let expected = match Database.mirror_presence inspection with
+            | Overlay.Available {generation;_} -> generation | Absent _ -> assert false in
+          let directory = local_retirement_directory t scope in
+          make_retirement_directory directory;
+          let path = Filename.concat directory (Sync.retirement_id_to_string retirement ^ ".json") in
+          write_local_retirement path expected captured;
+          let deletion = Sync.asset_deletion_reference ~scope ~retirement in
+          let committed = ref false in
+          let abort () =
+            if not !committed then
+              match finish_local_retirement t scope deletion captured ~commit:false with
+              | Ok () -> remove_local_retirement path
+              | Error _ -> () in
+          Fun.protect ~finally:abort (fun () ->
+            let* () = match asset_call t ~scope (Sync.Prepare_graph_asset_deletion retirement) with
+              | Ok (Sync.Asset_deletion_prepared actual) when actual=deletion -> Ok ()
+              | Error error -> Error (asset_failure_message error)
+              | _ -> Error "Unexpected attachment retirement response." in
+            let* () = if current () then Ok () else Error "The graph account is no longer current." in
+            let* () = check_local_owner t request.account request.graph_id ~bind:false in
+            let* _ = Database.commit_mirror_deletion prepared
+              |> Result.map_error (fun _ -> "Local deletion did not commit; its resources were preserved.") in
+            committed := true;
+            (* The mirror receipt is the durable commit authority. Cleanup failure
+               retains this coordinator journal for exact replay, not a broad sweep. *)
+            (try
+               if Database.mirror_deletion_committed prepared then
+                 match finish_local_retirement t scope deletion captured ~commit:true with
+                 | Ok () -> remove_local_retirement path
+                 | Error _ -> ()
+             with _ -> ());
+            Hashtbl.remove t.inspections (Graph.Uuid.to_string request.graph_id);
+            Ok ())))
+      with
+      | Eio.Cancel.Cancelled _ as cancelled -> raise cancelled
+      | _ -> Error "The local copy could not be deleted. Check available storage and try again."
+    in
+    Ok (sync_result ~event:(Sync.Mirror_deleted (request, result)) ())
   | Attach_graph request ->
     ignore (close_attached t);
     let key = Graph.Uuid.to_string request.graph.graph_id in
@@ -1549,11 +1752,7 @@ let handle_sync_worker_effect t = function
      | None -> Error (effect_error "The graph attachment inspection is stale.")
      | Some inspection ->
        (match
-          Database.open_
-            ~sw:t.sw
-            t.dependencies.overlay
-            inspection
-            ~graph_name:request.graph.name
+          open_owned_database t request inspection
         with
         | Error _ -> Error (effect_error "The overlay graph could not be opened.")
         | Ok database ->
@@ -2016,6 +2215,9 @@ let submit t = function
   | Core.Run_asset (context, instruction) ->
     if not t.stopped then run_asset t context instruction
   | Close_asset_scope scope -> send_asset t ~scope Sync.Close_asset_scope
+  | Core.Run_worker (Core.Request (_, Core.Handle_sync_worker_effect (Sync.Delete_mirror deletion)) as request) ->
+    if deletion_authorized t deletion then t.deletion_owner <- Some deletion;
+    if not t.stopped then t.dependencies.runtime.fork ~sw:t.sw (fun () -> complete t request)
   | Core.Run_worker request ->
     if not t.stopped
     then t.dependencies.runtime.fork ~sw:t.sw (fun () -> complete t request)
@@ -2040,6 +2242,14 @@ let submit t = function
     t.dependencies.sync_runner.submit sync_effect
   | Run_sync sync_effect ->
     if not t.stopped then t.dependencies.sync_runner.submit sync_effect
+  | Publish (Core.Sync_output (Sync.State_changed state) as output) ->
+    if not (Option.fold ~none:false ~some:(fun old -> old.Sync.catalog == state.snapshot.catalog) t.latest_snapshot)
+    then t.authorized_graphs <- List.fold_left (fun ids (graph : Sync.graph) ->
+      Authorized_graphs.add (Graph.Uuid.to_string graph.graph_id) ids) Authorized_graphs.empty state.snapshot.catalog;
+    t.latest_snapshot <- Some state.snapshot;
+    if not (Option.fold ~none:false ~some:(deletion_authorized t) t.deletion_owner)
+    then t.deletion_owner <- None;
+    if not t.stopped then t.dependencies.publish output
   | Publish output -> if not t.stopped then t.dependencies.publish output
 ;;
 

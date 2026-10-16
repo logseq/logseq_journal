@@ -30,6 +30,12 @@ module Uuid = struct
   let of_yojson json = Result.bind (of_yojson json) of_string
 end
 
+module Retirement_id = struct
+  type t = Retirement_id of Uuid.t
+  let of_string value = Result.map (fun uuid -> Retirement_id uuid) (Uuid.of_string value)
+  let to_string (Retirement_id uuid) = Uuid.to_string uuid
+end
+
 module Cursor = struct
   type t = string [@@deriving yojson]
 

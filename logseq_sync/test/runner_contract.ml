@@ -1,4 +1,12 @@
 module Core = Logseq_sync_pure_reducer.Core
+
+let retire_cache request =
+  let retirement = Core.retirement_id_of_string "96000000-0000-4000-8000-000000000001" |> Result.get_ok in
+  match request (Core.Prepare_graph_asset_deletion retirement) with
+  | Ok (Core.Asset_deletion_prepared deletion) -> request (Core.Commit_graph_asset_deletion deletion)
+  | Error _ as error -> error
+  | _ -> Error (Core.Asset_invalid_content "Expected prepared retirement")
+;;
 module Runner = Logseq_sync_effect_runner.Effect_runner
 
 let fail format = Printf.ksprintf (fun message -> Alcotest.fail message) format
@@ -1064,7 +1072,7 @@ let test_asset_local_lifecycle_uses_completion_outputs () =
         Alcotest.(check bool)
           "graph deletion completes"
           true
-          (request "delete-graph" Core.Delete_graph_assets = Ok Core.Asset_unit);
+          (retire_cache (fun action -> request "delete-graph" action) = Ok Core.Asset_unit);
         Alcotest.(check bool)
           "account deletion completes"
           true
@@ -1484,6 +1492,82 @@ let test_cache_durable_staging () =
       (request (Core.Retain_staged_file file) = Ok (Core.Asset_retained None)))
 ;;
 
+let test_cache_deletion_waits_for_native_lease () =
+  with_local_asset_cache (fun support request ->
+    let source = Filename.concat support "preview.bin" in
+    Out_channel.with_open_bin source (fun output -> output_string output "preview");
+    let file, _, _ = cache_stage request source in
+    let lease, path = request (Core.Retain_staged_file file) |> retained_value in
+    cache_bool "deletion waits or reports resources in use" true
+      (Result.is_error (retire_cache request));
+    cache_bool "live preview keeps its file" true (Sys.file_exists path);
+    cache_unit (request (Core.Release_asset_file lease));
+    (match retire_cache request with
+     | Ok Core.Asset_unit -> ()
+     | Error (Core.Asset_invalid_content message) -> Alcotest.fail message
+     | Error Core.Asset_cancelled -> Alcotest.fail "cleanup unexpectedly cancelled"
+     | _ -> Alcotest.fail "cleanup returned another result");
+    cache_bool "retry removes released file" false (Sys.file_exists path))
+;;
+
+let test_asset_retirement_cancel_and_replacement () =
+  with_local_asset_cache (fun support request ->
+    let source = Filename.concat support "retirement-source.bin" in
+    Out_channel.with_open_bin source (fun output -> output_string output "source");
+    let file, _, _ = cache_stage request source in
+    let lease, original = request (Core.Retain_staged_file file) |> retained_value in
+    cache_unit (request (Core.Release_asset_file lease));
+    let id text = Core.retirement_id_of_string text |> Result.get_ok in
+    let retirement = id "96000000-0000-4000-8000-000000000011" in
+    let deletion = match request (Core.Prepare_graph_asset_deletion retirement) with
+      | Ok (Core.Asset_deletion_prepared deletion) -> deletion
+      | _ -> Alcotest.fail "retirement did not prepare" in
+    cache_bool "prepared source is only retired" false (Sys.file_exists original);
+    cache_unit (request (Core.Cancel_graph_asset_deletion deletion));
+    cache_bool "cancel restores exact source" true (Sys.file_exists original);
+    cache_unit (request (Core.Commit_graph_asset_deletion deletion));
+    cache_bool "late commit cannot delete aborted source" true (Sys.file_exists original);
+    let retirement = id "96000000-0000-4000-8000-000000000012" in
+    let deletion = match request (Core.Prepare_graph_asset_deletion retirement) with
+      | Ok (Core.Asset_deletion_prepared deletion) -> deletion
+      | _ -> Alcotest.fail "second retirement did not prepare" in
+    cache_unit (request (Core.Commit_graph_asset_deletion deletion));
+    cache_bool "committed old source removed" false (Sys.file_exists original);
+    let fresh_file, _, _ = cache_stage request source in
+    let lease, fresh_path = request (Core.Retain_staged_file fresh_file) |> retained_value in
+    cache_unit (request (Core.Cancel_graph_asset_deletion deletion));
+    cache_unit (request (Core.Commit_graph_asset_deletion deletion));
+    cache_bool "old terminal replay preserves replacement source" true (Sys.file_exists fresh_path);
+    cache_unit (request (Core.Release_asset_file lease)))
+;;
+
+let test_asset_retirement_restore_conflict () =
+  with_local_asset_cache (fun support request ->
+    let source = Filename.concat support "restore-source.bin" in
+    Out_channel.with_open_bin source (fun output -> output_string output "source");
+    let file, _, _ = cache_stage request source in
+    let lease, original = request (Core.Retain_staged_file file) |> retained_value in
+    cache_unit (request (Core.Release_asset_file lease));
+    let retirement = Core.retirement_id_of_string "96000000-0000-4000-8000-000000000013" |> Result.get_ok in
+    let deletion = match request (Core.Prepare_graph_asset_deletion retirement) with
+      | Ok (Core.Asset_deletion_prepared deletion) -> deletion
+      | _ -> Alcotest.fail "retirement did not prepare" in
+    let rec first_missing_ancestor location =
+      let parent = Filename.dirname location in
+      if Sys.file_exists parent then location else first_missing_ancestor parent in
+    let canonical = first_missing_ancestor (Filename.dirname original) in
+    Unix.mkdir canonical 0o700;
+    let sentinel = Filename.concat canonical "new-synthetic-copy" in
+    Out_channel.with_open_bin sentinel (fun output -> output_string output "replacement");
+    cache_bool "restore conflict is reported" true
+      (Result.is_error (request (Core.Cancel_graph_asset_deletion deletion)));
+    cache_bool "restore does not overwrite replacement" true (Sys.file_exists sentinel);
+    Sys.remove sentinel; Unix.rmdir canonical;
+    cache_unit (request (Core.Cancel_graph_asset_deletion deletion));
+    cache_bool "retry restores original bytes" true
+      (In_channel.with_open_bin original In_channel.input_all = "source"))
+;;
+
 let test_cache_staging_limits () =
   with_local_asset_cache ~pending_budget:4L (fun support request ->
     let source = Filename.concat support "picker.bin" in
@@ -1526,7 +1610,7 @@ let test_cache_staging_limits () =
     let lease, path = request (Core.Retain_staged_file file) |> retained_value in
     cache_bool "failed staging leaves original intact" true (Sys.file_exists path);
     cache_unit (request (Core.Release_asset_file lease));
-    cache_unit (request Core.Delete_graph_assets);
+    cache_unit (retire_cache request);
     cache_bool "graph deletion removes staging" false (Sys.file_exists path))
 ;;
 
@@ -1638,6 +1722,7 @@ let test_cache_staged_preview () =
 
 let scenarios =
   scenarios
+  @ [ Alcotest.test_case "graph deletion waits for native preview lease" `Quick test_cache_deletion_waits_for_native_lease ]
   @ List.map
       (fun (name, test) -> Alcotest.test_case name `Quick test)
       [ "cache durable staging via submit", test_cache_durable_staging
@@ -1883,7 +1968,7 @@ let test_graph_asset_deletion_cancels_queued_fetch_before_cache_open () =
             (Core.Asset_requested
                { scope
                ; operation = "delete-before-cache"
-               ; action = Core.Delete_graph_assets
+               ; action = Core.Prepare_graph_asset_deletion (Core.retirement_id_of_string "96000000-0000-4000-8000-000000000002" |> Result.get_ok)
                })
         in
         List.iter
@@ -2099,3 +2184,9 @@ let scenarios =
         test_legacy_manifest_is_rejected_without_cleanup
     ]
 ;;
+
+let scenarios = scenarios @ [Alcotest.test_case
+  "asset retirement cancel and replacement isolation" `Quick test_asset_retirement_cancel_and_replacement]
+
+let scenarios = scenarios @ [Alcotest.test_case
+  "asset retirement restore conflict is retryable" `Quick test_asset_retirement_restore_conflict]

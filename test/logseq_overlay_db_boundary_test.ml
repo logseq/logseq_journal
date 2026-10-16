@@ -149,7 +149,9 @@ let test_canonical_modules root =
     ; "type authoritative_application =\n\
       \  | Authoritative_applied of Types.authoritative_commit\n\
       \  | Authoritative_deferred of Types.authoritative_defer"
-    ; "val delete_mirror\n  :  mirror_inspection"
+    ; "val prepare_mirror_deletion\n  :  mirror_inspection"
+    ; "val commit_mirror_deletion"
+    ; "val cancel_mirror_deletion"
     ; "val collect_garbage\n  :  mirror_inspection"
     ; "val inspect_mirror\n\
       \  :  application_support_directory:string\n\

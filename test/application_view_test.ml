@@ -610,6 +610,7 @@ let run_favorites_native_visibility
         Ok ())
       ~handle:(fun context () request ->
         match request with
+        | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
           if Atomic.get import_probe then Atomic.set import_probed true;
           if Atomic.exchange publish_block false
@@ -3661,6 +3662,7 @@ let test_reference_outer_terminals cancel =
                   }))
         in
         match request with
+        | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
           if Atomic.exchange refresh false
           then
@@ -4312,9 +4314,9 @@ let test_reactive_header_current_controls () =
        ignore (Lui_app.flush app);
        Alcotest.(check int) "Capture consults current disabled gate" 0 !capture_count;
        Alcotest.(check bool)
-         "current cache capability exposes menu action"
+         "current graph cannot be deleted from the account menu"
          true
-         (Option.is_some (find TextValue "Delete local graph copy"));
+         (Option.is_none (find TextValue "Delete local graph copy"));
        ignore
          (Lui_app.dispatch_event
             app
@@ -4456,6 +4458,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) () =
             (Service.Client_state_changed value)
         in
         match request with
+        | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
           if queue_full && Atomic.fetch_and_add graph_reads 1 > 0 then (
             while not (Atomic.get release) do
@@ -4880,6 +4883,285 @@ let test_application_token_control ~saturated ~failure () =
          !token_error)
 ;;
 
+(* Picker presentation and native controls are owned by Application; Root_navigation
+   has no public picker event. Exercise its mounted public hooks and worker lane. *)
+let test_graph_picker_controls scenario () =
+  let module W = Logseq_db_worker_lui.Journal_worker in
+  let module P = Logseq_db_worker.Protocol in
+  let uuid n = Logseq_db_types.Graph_types.Uuid.of_string
+      (Printf.sprintf "94000000-0000-4000-8000-%012d" n) |> Result.get_ok in
+  let first = uuid 1 and second = uuid 2 in
+  let long_name = "Synthetic very long graph name — 工作笔记 and attachments across multiple lines" in
+  let graph graph_id name : Service.graph =
+    { graph_id; name; schema = { major = 65; minor = 33; exact = true }; encrypted = false } in
+  let manager : Service.state =
+    { snapshot =
+        { sync_phase = Current; catalog = [graph first "Current synthetic graph"; graph second long_name]
+        ; selected_graph = Some first; applied_server_t = Some (server_cursor_of_int 0)
+        ; timeline_presentation_pending = false
+        ; startup = { authenticated = true; catalog_loading = false; awaiting_selection = false
+          ; restoring_local = false; bootstrapping = false; awaiting_e2ee_password = false
+          ; failure = None; account_generation = 1; graph_generation = 1; presentation_generation = 1 }
+        ; last_error = None; local_deletion = None }
+    ; diagnostics = { groups = [] } } in
+  let current = Atomic.make manager and commands = Atomic.make [] in
+  let inspections = Atomic.make 0 and deletions = Atomic.make [] in
+  let finish_deletion = Atomic.make false in
+  let deletion_terminal = ref false in
+  let release_automatic_inspection = Atomic.make false in
+  let automatic_inspection_returned = Atomic.make false in
+  let inspection_terminals = ref 0 in
+  let graph_opens = Atomic.make 0 in
+  let root_renders = ref 0 in
+  let client = ref None in
+  let service = W.Service.create ~push_topic_count:6
+      ~concurrency:(if scenario = `Late_presence then Concurrent { max_in_flight = 2 } else Serial)
+      ~init:(fun context _ ->
+        W.Session_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed manager);
+        Ok ())
+      ~handle:(fun context () request ->
+        let publish value =
+          Atomic.set current value;
+          W.Request_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed value) in
+        match request with
+        | Service.Inspect_local_copy request ->
+          let index = Atomic.fetch_and_add inspections 1 in
+          if scenario = `Late_presence && index = 0 then (
+            Fun.protect
+              ~finally:(fun () -> Atomic.set automatic_inspection_returned true)
+              (fun () -> while not (Atomic.get release_automatic_inspection) do Eio.Fiber.yield () done));
+          Ok (Service.Local_copy_inspected (request,
+            if scenario = `Presence_failure || scenario = `Refresh_after_presence_failure then Error "Synthetic presence read failed. Try again."
+            else Ok (if scenario = `Visible then Service.Not_downloaded else Service.Downloaded)))
+        | Service.Delete_local_copy request ->
+          Atomic.set deletions (request :: Atomic.get deletions);
+          if scenario = `During_delete then (
+            let previous = Atomic.get current in
+            publish { previous with snapshot = { previous.snapshot with
+              local_deletion = Some (Deletion_in_progress Deleting_mirror) } };
+            while not (Atomic.get finish_deletion) do Unix.sleepf 0.001 done);
+          Ok (Service.Local_copy_deleted (request, if scenario = `Failure_select then Error "Synthetic delete failed. Try again." else Ok ()))
+        | Service.Get_graph_state ->
+          let value = Atomic.get current in
+          Ok (Service.Graph_state { generation = value.snapshot.startup.graph_generation
+            ; graph_id = value.snapshot.selected_graph; phase = Graph_open; error = None })
+        | Client_command command ->
+          Atomic.set commands (command :: Atomic.get commands);
+          let previous = Atomic.get current in
+          (match command with
+           | Return_to_graph_picker ->
+             publish { previous with snapshot = { previous.snapshot with selected_graph = None
+               ; startup = { previous.snapshot.startup with awaiting_selection = true } } }
+           | Refresh_catalog when scenario = `Refresh_failure || scenario = `Refresh_after_presence_failure ->
+             publish { previous with snapshot = { previous.snapshot with
+               last_error = Some "Synthetic catalog refresh failed. Try again." } }
+           | Select_graph id ->
+             let generation = previous.snapshot.startup.graph_generation + 1 in
+             publish { previous with snapshot = { previous.snapshot with selected_graph = Some id
+               ; startup = { previous.snapshot.startup with awaiting_selection = false; graph_generation = generation } } };
+             W.Request_context.emit context ~topic:Service.graph_state_topic
+               (Service.Graph_state_changed { generation; graph_id = Some id; phase = Graph_open; error = None })
+           | _ -> ());
+          Ok Service.Client_command_completed
+        | Asset_command _ | Release_asset_file _ -> Ok Service.Client_command_completed
+        | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
+        | Graph_request request ->
+          let outcome = match request.P.command with
+            | V2_graph_info -> Atomic.incr graph_opens; P.V2_graph_info_outcome
+                { graph_uuid = Option.get (Atomic.get current).snapshot.selected_graph
+                ; graph_name = "Synthetic"; schema = { major = 65; minor = 33 }
+                ; admission_facts = []; journal_title_format = None
+                ; limits = { response_budget_bytes = P.maximum_response_bytes
+                  ; outbox_max_records = 4096; outbox_max_bytes = 8388608
+                  ; change_max_items = 4096; change_max_bytes = 1048576
+                  ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 }
+                ; generation = "g"; projection_revision = "p" }
+            | V2_list_journals _ -> P.V2_journals_outcome { items = []; next_cursor = None }
+            | V2_get_asset_descriptors _ | V2_list_assets _ ->
+              P.V2_assets_outcome { generation = "g"; projection_revision = "p"; items = []; next_cursor = None }
+            | _ -> P.V2_failed { code = "UnusedFixtureRead"; message = "Unused graph-picker fixture read" } in
+          Ok (Service.Graph_response (P.V2_response
+            { api_version = P.api_version; request_id = request.request_id; outcome }))
+        | Import_asset _ -> Error "Unused graph-picker fixture import")
+      ~shutdown:(fun () -> ()) () in
+  let hooks = Application.For_testing.app_with_service
+    ~on_view_region:(fun region -> if region = "root" then incr root_renders)
+    ~on_client:(fun value ->
+      client := Some value;
+      W.on_event value (function
+        | W.Response { outcome = Completed (Service.Local_copy_deleted _); _ } ->
+          deletion_terminal := true
+        | W.Response { outcome = Completed (Service.Local_copy_inspected _) | Cancelled; _ } ->
+          incr inspection_terminals
+        | _ -> ())) service in
+  let props = Hashtbl.create 128 in
+  let retained_select = ref None and select_detached = ref false in
+  let teardown = track_json_wire_teardown (fun id ->
+    if !retained_select = Some id then select_detached := true;
+    Hashtbl.remove props id) in
+  let consume source =
+    if source <> "" then
+      let open Yojson.Safe.Util in
+      Yojson.Safe.from_string source |> member "ops" |> to_list |> List.iter (fun op ->
+        teardown op;
+        match member "op" op |> to_string with
+        | "create-node" | "create-extension" ->
+          Hashtbl.replace props (member "id" op |> to_int) ["__kind", member "kind" op; "_extension", member "identifier" op]
+        | "set-prop" | "set-extension-prop" ->
+          let id = member "id" op |> to_int in
+          let key = member "property" op |> to_string in
+          let old = Option.value (Hashtbl.find_opt props id) ~default:[] in
+          Hashtbl.replace props id ((key, member "value" op) :: List.remove_assoc key old)
+        | _ -> ()) in
+  let find key value = Hashtbl.fold (fun id values found ->
+    if List.assoc_opt key values = Some (`String value) then Some id else found) props None in
+  let node name = match find "accessibility-identifier" name with
+    | Some id -> id | None -> failwith ("Missing " ^ name) in
+  let press id = consume (hooks.dispatch (Lui_protocol.Press id)) in
+  let wait label predicate =
+    let deadline = Unix.gettimeofday () +. 3. in
+    while not (predicate ()) && Unix.gettimeofday () < deadline do
+      consume (hooks.pump ()); Unix.sleepf 0.001
+    done;
+    Alcotest.(check bool) label true (predicate ()) in
+  let config = Logseq_db_worker.Config.create
+      ~application_support_directory:"/tmp/journal-graph-picker-synthetic"
+      ~target:(Managed_sync { base_url = "https://example.invalid" })
+      ~compatibility_profile:Logseq_65_33_or_newer
+      ~response_budget_bytes:P.maximum_response_bytes ~default_page_size:P.default_page_size
+      |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
+  Fun.protect ~finally:(fun () ->
+    Atomic.set finish_deletion true;
+    Atomic.set release_automatic_inspection true;
+    ignore (hooks.dispose ()); Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client)
+    (fun () ->
+      consume (hooks.init 2 2 config);
+      wait "Switch graph action mounts" (fun () -> Option.is_some (find "text" "Switch graph"));
+      press (Option.get (find "text" "Switch graph"));
+      wait "graph list mounts" (fun () -> Option.is_some (find "accessibility-identifier" "graph-picker-list"));
+      if scenario = `Late_presence then (
+        let list = Option.get (find "_extension" "journal-list") in
+        consume (hooks.extension_event list "event"
+          {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":1,\"last\":2}"}|});
+        wait "automatic inspection is held in flight" (fun () -> Atomic.get inspections = 1));
+      match scenario with
+      | `Refresh_failure ->
+        press (node "graph-picker-refresh");
+        wait "catalog refresh failure is visible" (fun () ->
+          Option.is_some (find "text" "Synthetic catalog refresh failed. Try again."));
+        Alcotest.(check bool) "catalog rows remain available after refresh failure" true
+          (Option.is_some (find "text" long_name))
+      | `Visible ->
+        let before = !root_renders in
+        let list = Option.get (find "_extension" "journal-list") in
+        let range () = consume (hooks.extension_event list "event"
+          {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":0,\"last\":9223372036854775807}"}|}) in
+        range ();
+        wait "visible rows are inspected" (fun () -> Atomic.get inspections = 2
+          && Option.is_some (find "text" "Not downloaded"));
+        for _ = 1 to 10 do range (); consume (hooks.pump ()) done;
+        Alcotest.(check int) "same viewport reuses presence observations" 2 (Atomic.get inspections);
+        Alcotest.(check int) "presence does not reconstruct the graph catalog" before !root_renders
+      | `Current ->
+        Alcotest.(check bool) "current marker stays in catalog row" true
+          (Option.is_some (find "text" "Current graph"));
+        Alcotest.(check bool) "long name is preserved" true (Option.is_some (find "text" long_name));
+        Alcotest.(check bool) "opening picker keeps selected graph" true
+          ((Atomic.get current).snapshot.selected_graph = Some first)
+      | `Close ->
+        press (node "graph-picker-close");
+        wait "close returns to retained graph" (fun () ->
+          Option.is_none (find "accessibility-identifier" "graph-picker-list"));
+        Alcotest.(check bool) "picker never detaches current graph" false
+          (List.exists (function Service.Return_to_graph_picker -> true | _ -> false) (Atomic.get commands))
+      | `Select ->
+        press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        wait "name selection reaches worker" (fun () ->
+          List.exists (function Service.Select_graph id -> id = second | _ -> false) (Atomic.get commands))
+      | (`Delete_menu | `Cancel | `Confirm | `Reopen | `Failure_select | `Presence_failure | `Refresh_after_presence_failure | `During_delete | `Late_presence) ->
+        let stable_select = node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second) in
+        if scenario = `Failure_select then retained_select := Some stable_select;
+        ignore (node ("graph-picker-options:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        wait "row action is exposed" (fun () -> Option.is_some (find "text" "Delete local copy"));
+        press (node ("graph-picker-delete:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        if scenario = `Presence_failure || scenario = `Refresh_after_presence_failure then (
+          wait "presence failure is visible" (fun () -> Option.is_some (find "text" "Synthetic presence read failed. Try again."));
+          Alcotest.(check int) "one bounded presence request" 1 (Atomic.get inspections);
+          if scenario = `Refresh_after_presence_failure then (
+            press (node "graph-picker-refresh");
+            wait "refresh failure replaces previous local-copy message" (fun () ->
+              Option.is_some (find "text" "Synthetic catalog refresh failed. Try again."))))
+        else (
+        wait "confirm names data loss" (fun () ->
+          Hashtbl.fold (fun _ values found -> found || List.exists (fun (_, value) ->
+            match value with `String text -> String.starts_with ~prefix:"Remove “" text
+              && String.contains text '\n' | _ -> false) values) props false);
+        Alcotest.(check bool) "requesting confirmation does not delete" false
+          (List.exists (function Service.Delete_local_cache _ -> true | _ -> false) (Atomic.get commands));
+        let expected_inspections = if scenario = `Late_presence then 2 else 1 in
+        wait "bounded presence request completes" (fun () -> Atomic.get inspections = expected_inspections);
+        for _ = 1 to 8 do consume (hooks.pump ()) done;
+        Alcotest.(check int) "rendering never repeats presence IO" expected_inspections (Atomic.get inspections);
+        if scenario = `Cancel then (
+          press (Option.get (find "text" "Cancel"));
+          Alcotest.(check int) "Cancel sends no deletion" 0 (List.length (Atomic.get deletions)))
+        else if scenario = `Confirm || scenario = `Reopen || scenario = `Failure_select || scenario = `During_delete || scenario = `Late_presence then (
+          let confirm = Hashtbl.fold (fun id values found ->
+            if List.assoc_opt "text" values = Some (`String "Delete local copy")
+              && List.assoc_opt "__kind" values <> Some (`String "menu-item")
+            then Some id else found) props None |> Option.get in
+          press confirm;
+          wait "confirmed delete reaches account-scoped worker request" (fun () -> Atomic.get deletions <> []);
+          let deleted = List.hd (Atomic.get deletions) in
+          Alcotest.(check bool) "deletion identity is exact" true
+            (deleted.graph_id = second && deleted.account_generation = 1);
+          if scenario = `During_delete then (
+            wait "worker publishes deletion in flight" (fun () ->
+              (Atomic.get current).snapshot.local_deletion <> None);
+            for _ = 1 to 8 do consume (hooks.pump ()) done;
+            press (node "graph-picker-close");
+            wait "Timeline is reachable while another graph deletes" (fun () ->
+              Option.is_some (find "accessibility-label" "Capture"));
+            press (Option.get (find "accessibility-label" "Capture"));
+            wait "current graph Capture responds during noncurrent deletion" (fun () ->
+              Option.is_some (find "accessibility-identifier" "journal-capture-composer"));
+            Atomic.set finish_deletion true;
+            wait "noncurrent deletion reaches its terminal" (fun () -> !deletion_terminal);
+            Alcotest.(check bool) "deletion completion preserves current graph composer" true
+              (Option.is_some (find "accessibility-identifier" "journal-capture-composer")))
+          else if scenario = `Failure_select then (
+            wait "delete failure is visible" (fun () -> Option.is_some (find "text" "Synthetic delete failed. Try again."));
+            Alcotest.(check bool) "native List retains live interactive row during operation status changes" false !select_detached;
+            press stable_select;
+            wait "existing row callback retains its graph after failure" (fun () ->
+              List.exists (function Service.Select_graph id -> id = second | _ -> false) (Atomic.get commands)))
+          else wait "deleted graph stays available to download" (fun () -> Option.is_some (find "text" "Not downloaded"));
+          if scenario = `Late_presence then (
+            Atomic.set release_automatic_inspection true;
+            wait "automatic inspection retires" (fun () ->
+              Atomic.get automatic_inspection_returned && !inspection_terminals = 2);
+            Alcotest.(check bool) "late pre-delete inspection cannot restore Downloaded" true
+              (Option.is_some (find "text" "Not downloaded")));
+          if scenario = `Reopen then (
+            let switch id =
+              let before = Atomic.get graph_opens in
+              press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string id));
+              wait "reopened graph becomes current" (fun () -> (Atomic.get current).snapshot.selected_graph = Some id);
+              wait "reopened graph handshake runs" (fun () -> Atomic.get graph_opens > before);
+              wait "reopened graph presents timeline" (fun () -> Option.is_none (find "accessibility-identifier" "graph-picker-list")
+                && Option.is_some (find "text" "Switch graph"));
+              press (Option.get (find "text" "Switch graph"));
+              wait "picker returns after reopening" (fun () -> Option.is_some (find "accessibility-identifier" "graph-picker-list")) in
+            switch second;
+            switch first;
+            Alcotest.(check bool) "reopened copy does not keep the stale not-downloaded label" true
+              (Option.is_none (find "text" "Not downloaded")))))
+      | `Current_menu ->
+        ignore (node ("graph-picker-options:" ^ Logseq_db_types.Graph_types.Uuid.to_string first));
+        Alcotest.(check bool) "current protection explains switching first" true
+          (Option.is_some (find "text" "Switch graphs first.")))
+;;
+
 let () =
   if Sys.getenv_opt "JOURNAL_UNLOCK_SYNTHETIC_HOST" = Some "1"
   then (
@@ -4887,7 +5169,23 @@ let () =
     Journal_bridge.register hooks)
   else Alcotest.run
     "application view"
-    [ ( "relative date chrome", [
+    [ ( "graph picker", [
+        Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);
+        Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);
+        Alcotest.test_case "current marker and long names" `Quick (test_graph_picker_controls `Current);
+        Alcotest.test_case "close retains current session" `Quick (test_graph_picker_controls `Close);
+        Alcotest.test_case "name switches graph" `Quick (test_graph_picker_controls `Select);
+        Alcotest.test_case "row deletion confirmation" `Quick (test_graph_picker_controls `Delete_menu);
+        Alcotest.test_case "current row deletion protection" `Quick (test_graph_picker_controls `Current_menu);
+        Alcotest.test_case "cancel deletion keeps local copy" `Quick (test_graph_picker_controls `Cancel);
+        Alcotest.test_case "confirmed deletion preserves downloadable row" `Quick (test_graph_picker_controls `Confirm);
+        Alcotest.test_case "presence failure is bounded and visible" `Quick (test_graph_picker_controls `Presence_failure);
+        Alcotest.test_case "visible presence is bounded and cached" `Quick (test_graph_picker_controls `Visible);
+        Alcotest.test_case "reopened copy invalidates absence observation" `Quick (test_graph_picker_controls `Reopen);
+        Alcotest.test_case "deletion failure keeps live row callback identity" `Quick (test_graph_picker_controls `Failure_select);
+        Alcotest.test_case "noncurrent deletion keeps current Timeline interactive" `Quick (test_graph_picker_controls `During_delete);
+        Alcotest.test_case "late inspection cannot overwrite deletion" `Quick (test_graph_picker_controls `Late_presence)])
+    ; ( "relative date chrome", [
         Alcotest.test_case "calendar boundaries and date updates" `Quick test_timeline_relative_date_headers;
         Alcotest.test_case "empty Detail navigation title" `Quick test_detail_empty_navigation_title;
         Alcotest.test_case "foreground day updates before delayed or failed feed" `Quick
