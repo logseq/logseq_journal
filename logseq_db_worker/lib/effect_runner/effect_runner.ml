@@ -1588,6 +1588,7 @@ let handle_sync_worker_effect t = function
             ~expected_checksum:None
             ~expected_rows:(Sync.staged_artifact_expected_rows request.artifact)
         with
+        | Error (Overlay.Snapshot_parse_error message) -> Error (effect_error message)
         | Error _ -> Error (effect_error "The snapshot activation could not start.")
         | Ok prepared ->
           Fun.protect

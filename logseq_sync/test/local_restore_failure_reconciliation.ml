@@ -34,15 +34,15 @@ let complete core ticket result =
   Core.step core (Core.Runner_completed (Core.Completion (ticket, result)))
 ;;
 
-let check_local_failure label core =
+let check_preparation_failure label core =
   let snapshot = (Core.state core).snapshot in
   Alcotest.(check bool)
-    (label ^ ": local restore failure")
+    (label ^ ": E2EE preparation failure")
     true
-    (snapshot.startup.failure = Some Core.During_local_restore);
+    (snapshot.startup.failure = Some Core.During_e2ee);
   Alcotest.(check (option string))
     (label ^ ": diagnostic")
-    (Some "wrappedGraphKeyUnavailable")
+    (Some "synthetic key preparation offline")
     snapshot.last_error;
   Alcotest.(check bool)
     (label ^ ": selected graph")
@@ -67,10 +67,9 @@ let check_catalog_only label effects =
        effects)
 ;;
 
-(* A warm restore can fail before same-account authentication completes.
-   Authentication and catalog success must preserve the local restore failure:
-   neither event retries key loading or opens the graph. Clearing the failure
-   leaves startup waiting indefinitely and removes the explicit recovery action. *)
+(* A warm cache miss starts online preparation automatically. If it fails before
+   same-account authentication completes, reconciliation must preserve that visible
+   failure and its explicit recovery action rather than leave startup waiting. *)
 let preserves_local_restore_failure_during_reconciliation () =
   let user_id = "cached-account" in
   let restoring = Core.step (initial ()) (Core.Restore_local_account { user_id }) in
@@ -108,14 +107,19 @@ let preserves_local_restore_failure_during_reconciliation () =
       key_ticket
       (Error (Core.Effect_failed "wrappedGraphKeyUnavailable"))
   in
-  check_local_failure "key load failed" failed.next;
+  let graph_key_ticket = require_instruction "automatic E2EE recovery"
+    (function Core.Run (Core.Request (ticket, Core.Fetch_e2ee_graph_key _)) -> Some (ticket : string Core.effect_ticket)
+      | _ -> None) failed.effects in
+  let failed = complete failed.next graph_key_ticket
+    (Error (Core.Effect_failed "synthetic key preparation offline")) in
+  check_preparation_failure "remote preparation failed" failed.next;
   let authenticated =
     Core.step failed.next (Core.Account_authenticated { user_id = Some user_id })
   in
   let startup = (Core.state authenticated.next).snapshot.startup in
   Alcotest.(check bool) "same account authenticated" true startup.authenticated;
   Alcotest.(check bool) "catalog reconciliation started" true startup.catalog_loading;
-  check_local_failure "same-account authentication" authenticated.next;
+  check_preparation_failure "same-account authentication" authenticated.next;
   check_catalog_only "authentication" authenticated.effects;
   let fetch_ticket =
     require_instruction
@@ -131,7 +135,7 @@ let preserves_local_restore_failure_during_reconciliation () =
   let snapshot = (Core.state refreshed.next).snapshot in
   Alcotest.(check bool) "catalog loading finished" false snapshot.startup.catalog_loading;
   Alcotest.(check bool) "catalog refreshed" true (snapshot.catalog = [ graph ]);
-  check_local_failure "catalog success" refreshed.next;
+  check_preparation_failure "catalog success" refreshed.next;
   check_catalog_only "catalog success" refreshed.effects;
   let recovery = Core.step refreshed.next Core.Online_recovery_requested in
   let recovery_scope =
@@ -160,7 +164,7 @@ let preserves_local_restore_failure_during_reconciliation () =
 
 let scenario =
   Alcotest.test_case
-    "local restore failure survives same-account reconciliation"
+    "E2EE preparation failure survives same-account reconciliation"
     `Quick
     preserves_local_restore_failure_during_reconciliation
 ;;

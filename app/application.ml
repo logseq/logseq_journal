@@ -2560,6 +2560,7 @@ let diagnostic_phase_rows ~snapshot ~(graph : Logseq_db_worker.graph_state) =
     ; "Startup phase", startup_phase_name startup.phase
     ; "Graph phase", graph_phase_name graph.phase
     ]
+    @ Option.fold ~none:[] ~some:(fun message -> [ "Last error", message ]) snapshot.last_error
 ;;
 
 let format_bytes bytes =

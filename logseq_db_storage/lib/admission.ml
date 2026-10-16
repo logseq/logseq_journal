@@ -14,7 +14,10 @@ type observed =
   }
 
 type error =
-  | Unsupported_schema
+  | Unsupported_schema of
+      { actual : Graph_types.schema_version
+      ; minimum : Graph_types.schema_version
+      }
   | Remote_graph
   | Ambiguous_sync_state
   | Unsupported_value
@@ -83,7 +86,7 @@ let synced_facts graph_id (observed : observed) =
 
 let admit ~target (observed : observed) =
   if not (schema_is_supported observed.schema)
-  then Error Unsupported_schema
+  then Error (Unsupported_schema { actual = observed.schema; minimum = minimum_schema })
   else if not observed.codec_lossless
   then Error Unsupported_value
   else if not observed.required_schema_present

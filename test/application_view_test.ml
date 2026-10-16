@@ -117,6 +117,26 @@ let test_missing_snapshot_keeps_graph_lifecycle_visible () =
     (Application.diagnostic_phase_rows ~snapshot:None ~graph)
 ;;
 
+let test_diagnostic_phase_rows_retain_current_error () =
+  let message = "Graph schema 65.29 is not supported. Journal requires schema 65.33 or later." in
+  let snapshot : Service.snapshot =
+    { sync_phase = Failed; catalog = []; selected_graph = None; applied_server_t = None
+    ; timeline_presentation_pending = false; local_deletion = None; last_error = Some message
+    ; startup = { authenticated = true; catalog_loading = false; awaiting_selection = false
+        ; restoring_local = false; bootstrapping = true; awaiting_e2ee_password = false
+        ; failure = Some During_bootstrap; account_generation = 1; graph_generation = 1
+        ; presentation_generation = 1 } } in
+  let graph : Logseq_db_worker.graph_state =
+    { generation = 1; graph_id = None; phase = Graph_closed; error = None } in
+  let rows = Application.diagnostic_phase_rows ~snapshot:(Some snapshot) ~graph in
+  Alcotest.(check (option string)) "current error visible without diagnostic groups"
+    (Some message) (List.assoc_opt "Last error" rows);
+  let cleared = Application.diagnostic_phase_rows
+      ~snapshot:(Some {snapshot with last_error = None}) ~graph in
+  Alcotest.(check bool) "retry does not retain obsolete error" false
+    (List.mem_assoc "Last error" cleared)
+;;
+
 let admission_inspection : Logseq_db_worker.Protocol.v2_admission_inspection =
   { active_records = 3
   ; active_bytes = 1536
@@ -5488,7 +5508,8 @@ let () =
     Journal_bridge.register hooks)
   else Alcotest.run
     "application view"
-    [ ( "direct delete", List.map (fun scenario ->
+    [ ( "diagnostic failure", [ Alcotest.test_case "current error and clearing" `Quick test_diagnostic_phase_rows_retain_current_error ])
+    ; ( "direct delete", List.map (fun scenario ->
         Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~delete_scenario:scenario ()))
         ["success"; "failure"])
     ; ( "status list", List.map (fun scenario ->

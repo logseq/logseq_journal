@@ -3902,7 +3902,7 @@ let unlock_classification_effect origin =
       Some (Core.step absent.next (Core.Runner_completed (Core.Completion
         (ticket, Error (Core.Effect_failed "synthetic cached key absent")))))
     | _ -> None) absent.effects |> Option.get in
-  let keys = Core.step cached.next Core.Online_recovery_requested in
+  let keys = cached in
   let request = List.find_map (function
     | Core.Run (Core.Request (_, Core.Fetch_e2ee_graph_key _) as request) -> Some request
     | _ -> None) keys.effects |> Option.get in
