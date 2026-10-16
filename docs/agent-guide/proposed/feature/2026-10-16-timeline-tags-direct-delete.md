@@ -33,10 +33,10 @@ Rejected because the user explicitly requires removing the complete feature and 
 
 - Tags mounted semantics: RED on the old alignment, GREEN after the OCaml-only Timeline change; 50 semantics cases pass, including unchanged complete Detail tags.
 - Delete mounted boundary: old optimistic staging fails the retained-content assertion; success and failure now pass immediate submission, revision preconditions, duplicate suppression, failure Details/retry and absence of notice requests.
-- Full local dune runtest passes 860 Alcotest cases plus custom tests and source/package boundary checks with loopback permission for synthetic peers. The restricted run was stopped after its peer bind was denied; its logs are preserved separately.
+- Full local dune runtest after PR83 integration passes 876 Alcotest cases plus 87 custom PASS checks and source/package boundary checks with loopback permission for synthetic peers. The restricted run was stopped after its peer bind was denied; its logs are preserved separately.
 - The old macOS toplevel runner cannot load dllapp_stubs because caml_startup is absent. The registered pure and Worker runtime sources pass as native executables linked against the current public compiled interfaces and existing Dune link inputs.
-- The branch is rebased onto the PR84 merge 1e38f64644cdd49081004722cd9dd43759b2aaaf. Existing Favorites page/outline, Copy, Capture and list semantics remain; the public page owner also verifies child deletion preserves the page and its composer. Final source checks and one Simulator build run after this integration.
+- The branch is rebased onto main bb2b9fbd8d0e090e90b5ab7f1b0e990ce0e09169 after PR83, PR84 and PR85 integration. PR85 changes only CI/build documentation and tests; all native-source hashes remain identical to the completed 876-case run. Existing Favorites page/outline, Copy, Capture and list semantics remain; the public page owner also verifies child deletion preserves the page and its composer. Final source checks and one Simulator build run after this integration.
 
 ## Questions
 
-None for tags: the user's design is explicit. Protected interface edits remain a separate approval gate and have not been applied.
+None. Both exact protected interface proposals were explicitly approved and applied within that scope.
