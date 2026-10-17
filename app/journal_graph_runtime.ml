@@ -295,10 +295,14 @@ type failure_owner =
       ; block_id : string
       }
 
+type request_delivery = Planned | Queued | Dispatched
+
 type pending_operation =
   { operation : operation
   ; source_epoch : int64
   ; failure_owner : failure_owner option
+  ; mutable background : bool
+  ; mutable delivery : request_delivery
   }
 
 type t =
@@ -482,19 +486,29 @@ let request_uuid t =
 
 let uuid value = Graph.Uuid.of_string value
 
-let make_request ?source_epoch t operation command =
+let make_request ?source_epoch ?(background = false) t operation command =
   let source_epoch = Option.value source_epoch ~default:t.next_request in
   let request_id = request_uuid t in
   Hashtbl.replace
     t.pending
     (Graph.Uuid.to_string request_id)
-    { operation; source_epoch; failure_owner = None };
+    { operation; source_epoch; failure_owner = None; background; delivery = Planned };
   Protocol.{ api_version; request_id; command }
 ;;
 
 let read = make_request
 let mutate = make_request
-let start t = read t Graph_info Protocol.V2_graph_info
+(* Only a public output boundary issues a demand. Internal completions never
+   reserve a hydration slot or return an already dispatched request. *)
+let issue_request t (request : Protocol.request) =
+  let key = Graph.Uuid.to_string request.request_id in
+  let pending = Hashtbl.find t.pending key in
+  pending.delivery <- Dispatched;
+  if pending.background then Hashtbl.replace t.hydration_active key ();
+  request
+;;
+
+let start t = issue_request t (read t Graph_info Protocol.V2_graph_info)
 
 let remember_page t (page : Projection.page) =
   t.pages
@@ -1279,7 +1293,7 @@ let submit_unowned t (request : Journal_graph_request.t) =
      | Error message, _ | _, Error message -> reject message)
 ;;
 
-let submit t (request : Journal_graph_request.t) =
+let plan_request t (request : Journal_graph_request.t) =
   let owner =
     match request with
     | Capture { command; _ } ->
@@ -1630,27 +1644,55 @@ let registered_children t uuid =
 (* Keep reconciliation bursts below the worker budget without delaying foreground reads. *)
 let maximum_active_hydration = 4
 
+let favorite_request_current t pending =
+  match pending.operation with
+  | Favorite_dependency { epoch; _ } | Favorite_memberships { epoch; _ } ->
+    epoch = t.favorite_epoch
+  | _ -> true
+;;
+
 let drain_hydration t =
   let rec drain reversed =
-    if
-      Hashtbl.length t.hydration_active >= maximum_active_hydration
-      || Queue.is_empty t.hydration_queue
+    if Hashtbl.length t.hydration_active >= maximum_active_hydration
+       || Queue.is_empty t.hydration_queue
     then List.rev reversed
     else (
       let request = Queue.pop t.hydration_queue in
       let key = Graph.Uuid.to_string request.Protocol.request_id in
-      if not (Hashtbl.mem t.pending key)
-      then drain reversed
-      else (
-        Hashtbl.replace t.hydration_active key ();
-        drain (request :: reversed)))
+      match Hashtbl.find_opt t.pending key with
+      | Some pending when pending.delivery = Queued ->
+        if favorite_request_current t pending
+        then drain (issue_request t request :: reversed)
+        else (Hashtbl.remove t.pending key; drain reversed)
+      | None | Some _ -> drain reversed)
   in
   drain []
 ;;
 
-let schedule_hydration t output =
-  List.iter (fun request -> Queue.push request t.hydration_queue) output.requests;
-  { output with requests = drain_hydration t }
+let background_demands t output =
+  List.iter (fun (request : Protocol.request) ->
+    match Hashtbl.find_opt t.pending (Graph.Uuid.to_string request.request_id) with
+    | Some pending when pending.delivery = Planned -> pending.background <- true
+    | None | Some _ -> ()) output.requests;
+  output
+;;
+
+(* One dispatch per public transition. Delivery state makes queued/active
+   ownership exclusive and suppresses repeated demand identities. *)
+let dispatch_output t output =
+  let foreground = List.filter_map (fun (request : Protocol.request) ->
+    match Hashtbl.find_opt t.pending (Graph.Uuid.to_string request.request_id) with
+    | Some pending when pending.delivery = Planned ->
+      if pending.background then (
+        pending.delivery <- Queued;
+        Queue.push request t.hydration_queue;
+        None)
+      else Some (issue_request t request)
+    | None | Some _ -> None) output.requests in
+  { output with requests = foreground @ drain_hydration t }
+;;
+
+let submit t request = dispatch_output t (plan_request t request)
 ;;
 
 (* Session bounds keep adversarial reference chains/bursts finite. Unresolved
@@ -1695,7 +1737,7 @@ let recheck_dirty_favorite_dependency t ~uuid ~seen ~page =
   Hashtbl.remove t.favorite_pending key;
   (* The held response predates an owned change. Retire its single slot and
      replace it with a current point read before considering its old snapshot. *)
-  schedule_hydration
+  background_demands
     t
     { requests =
         Option.to_list (favorite_dependency_read ~refresh:true t ~page ~seen uuid)
@@ -1842,7 +1884,7 @@ let reference_read ?(lookup = Page_lookup) ?source_epoch t block_id depth =
     Hashtbl.replace t.reference_pending block_id ();
     let uuid = Graph.Uuid.of_string block_id |> Result.get_ok in
     Some
-      (read ?source_epoch t (Reference_read { block_id; depth; lookup })
+      (read ?source_epoch ~background:true t (Reference_read { block_id; depth; lookup })
          (match lookup with
           | Page_lookup -> Protocol.V2_get_page { page = uuid; revision = None }
           | Outline_lookup ->
@@ -2139,7 +2181,7 @@ let hydration_for_changes t ~request_generation windows =
     match journal_changed, t.initial_feed with
     | true, Some feed ->
       let output =
-        submit
+        plan_request
           t
           (Journal_graph_request.Load_feed
              { before_day = None
@@ -2155,7 +2197,7 @@ let hydration_for_changes t ~request_generation windows =
       }
     | false, _ | true, None -> empty
   in
-  schedule_hydration
+  background_demands
     t
     { requests =
         point_reads
@@ -2178,7 +2220,7 @@ let rehydrate_current_interests t ~request_generation ~generation =
     | None -> empty
     | Some feed ->
       let output =
-        submit
+        plan_request
           t
           (Journal_graph_request.Load_feed
              { before_day = None
@@ -2257,7 +2299,7 @@ let rehydrate_current_interests t ~request_generation ~generation =
       read t (Changed_detail_page page) (Protocol.V2_get_page { page; revision = None }))
     |> List.of_seq
   in
-  schedule_hydration
+  background_demands
     t
     { requests =
         (graph_info :: journal.requests)
@@ -2730,7 +2772,7 @@ let receive_response t (protocol_response : Protocol.response) =
                  ]
                | _ -> []
              in
-             schedule_hydration
+             background_demands
                t
                { requests = dependencies @ memberships
                ; responses = [ response (Favorites_loaded (request, result)) ]
@@ -3205,7 +3247,7 @@ let receive_response t (protocol_response : Protocol.response) =
                   parent
               in
               let output =
-                schedule_hydration
+                background_demands
                   t
                   { requests = Option.to_list request
                   ; responses =
@@ -3449,7 +3491,7 @@ let receive_response t (protocol_response : Protocol.response) =
                     (favorite_membership_key page)
                     (reject "Favorite membership cursor exceeds the bounded read limit.")
                 else
-                  schedule_hydration
+                  background_demands
                     t
                     { output with
                       requests =
@@ -3709,7 +3751,10 @@ let receive t (protocol_response : Protocol.response) =
   let (Protocol.V2_response { request_id; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
   let pending = Hashtbl.find_opt t.pending key in
-  let owned = Option.is_some pending in
+  let owned = match pending with
+    | Some { delivery = Dispatched; _ } -> true
+    | None | Some _ -> false in
+  if not owned then empty else (
   let background = Hashtbl.mem t.hydration_active key in
   Hashtbl.remove t.hydration_active key;
   let output =
@@ -3721,6 +3766,7 @@ let receive t (protocol_response : Protocol.response) =
   let references =
     match pending, protocol_response with
     | None, _ | Some { operation = Reference_read _; _ }, _ -> empty
+    | Some pending, _ when not (favorite_request_current t pending) -> empty
     | Some { operation = Target_summary summary; source_epoch; _ }, _
       when Hashtbl.find_opt t.target_read_epochs summary.block_id <> Some source_epoch ->
       empty
@@ -3753,7 +3799,15 @@ let receive t (protocol_response : Protocol.response) =
                   (fun (item : Protocol.v2_child_member) -> block item.value)
                   (Rrbvec.append_list retained items))
         | V2_page_outcome (V2_present_page { page; _ })
-          when Hashtbl.mem t.reference_pages (Graph.Uuid.to_string page.uuid) ->
+          when Hashtbl.mem t.reference_pages (Graph.Uuid.to_string page.uuid)
+               || (match operation with
+                   | Detail_block { block_id; _ } ->
+                     block_id = Graph.Uuid.to_string page.uuid
+                   | Changed_detail_page _ ->
+                     Hashtbl.mem t.detail_pages (Graph.Uuid.to_string page.uuid)
+                   | _ -> false) ->
+          if Hashtbl.length t.reference_pages < maximum_reference_targets
+          then Hashtbl.replace t.reference_pages (Graph.Uuid.to_string page.uuid) ();
           [ ( Graph.Uuid.to_string page.uuid
             , if page.recycled then None else Some page.title )
           ]
@@ -3777,7 +3831,10 @@ let receive t (protocol_response : Protocol.response) =
                  (fun values item ->
                     let favorite = Projection.favorite item in
                     match favorite.target with
-                    | Page _ -> values
+                    | Page id ->
+                      if Hashtbl.length t.reference_pages < maximum_reference_targets
+                      then Hashtbl.replace t.reference_pages id ();
+                      (id, Some favorite.title) :: values
                     | Block id -> (id, Some favorite.title) :: values)
                  values
                  result.items
@@ -3875,14 +3932,8 @@ let receive t (protocol_response : Protocol.response) =
         values
   in
   let output = { output with responses = output.responses @ references.responses } in
-  if background
-  then
-    schedule_hydration t { output with requests = output.requests @ references.requests }
-  else if owned
-  then (
-    List.iter (fun request -> Queue.push request t.hydration_queue) references.requests;
-    { output with requests = output.requests @ drain_hydration t })
-  else output
+  if background then ignore (background_demands t output);
+  dispatch_output t { output with requests = output.requests @ references.requests })
 ;;
 
 (* Route accepted Worker terminal failures through the same owner as protocol
@@ -3930,7 +3981,7 @@ let reconcile_push t ~request_generation push =
     | V2_resync_required_push { generation; _ } ->
       rehydrate_current_interests t ~request_generation ~generation
   in
-  output
+  dispatch_output t output
 ;;
 
 module Copy = struct

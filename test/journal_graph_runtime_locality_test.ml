@@ -5569,6 +5569,216 @@ let test_favorites_outline_and_missing_reference () =
       (List.assoc_opt target_id (reference_updates out) |> Option.join)) [false;true]
 ;;
 
+(* The scheduler is owned by Runtime, so use only its public demands and
+   completions. Every Present value below describes the requested entity. *)
+let scheduling_uuid family n =
+  uuid (Printf.sprintf "a8000000-0000-4000-%04d-%012d" family n)
+;;
+
+let scheduling_block n : Protocol.v2_block_record =
+  let parent = scheduling_uuid 8000 n in
+  { record with
+    block =
+      { block with
+        uuid = scheduling_uuid 9000 n
+      ; parent
+      ; page = parent
+      ; title = if n = 0 then "Favorite " ^ reference else "Favorite block"
+      }
+  }
+;;
+
+let scheduling_favorites runtime count generation =
+  let request : Journal_graph_request.favorites_request =
+    { graph_generation = 1; request_generation = generation; limit = 50; cursor = None }
+  in
+  let read = Runtime.submit runtime (Load_favorites request)
+    |> fun out -> only "Favorite list demand" out.requests in
+  Runtime.receive runtime (response read (Protocol.V2_favorites_outcome
+    { favorites_page = None; generation = "g"; projection_revision = "p"
+    ; next_cursor = None
+    ; items = List.init count (fun n ->
+        let value = scheduling_block n in
+        { Protocol.membership_uuid = scheduling_uuid 7000 n
+        ; membership_order = string_of_int n; membership_revision = "m"
+        ; target = V2_favorite_block
+            { uuid = value.block.uuid; title = value.block.title
+            ; task_status = None; revision = "b" } }) }))
+;;
+
+let scheduling_reply (request : Protocol.request) =
+  match request.command with
+  | V2_get_outline_block { block = requested; _ } ->
+    let n = List.find (fun n -> Graph.Uuid.equal requested (scheduling_uuid 9000 n))
+      (List.init 12 Fun.id) in
+    response request (Protocol.V2_block_outcome
+      (V2_present_block { value = scheduling_block n; revision = "b" }))
+  | V2_get_page { page = requested; _ } ->
+    response request (Protocol.V2_page_outcome (V2_present_page
+      { page = { page with uuid = requested; kind = Ordinary_page
+          ; title = if Graph.Uuid.equal requested target_uuid then "Resolved" else "Parent" }
+      ; revision = "p" }))
+  | _ -> Alcotest.fail "unexpected scheduling demand"
+;;
+
+let drain_scheduling ?(cancel_count = 0) runtime output =
+  let issued = Hashtbl.create 32 in
+  let target_reads = ref 0 and updates = ref [] in
+  let collect (output : Runtime.output) =
+    updates := reference_updates output @ !updates;
+    List.iter (fun (request : Protocol.request) ->
+      let key = Graph.Uuid.to_string request.request_id in
+      Alcotest.(check bool) "one delivery per request ID" false (Hashtbl.mem issued key);
+      Hashtbl.add issued key ();
+      if request.command = V2_get_page { page = target_uuid; revision = None }
+      then incr target_reads) output.requests
+  in
+  collect output;
+  let rec loop completed outstanding =
+    check_hydration_bound outstanding;
+    match outstanding with
+    | [] -> ()
+    | request :: rest ->
+      let next = if completed < cancel_count then
+          Runtime.fail_request runtime request ~message:"Worker cancelled"
+        else Runtime.receive runtime (scheduling_reply request) in
+      let duplicate = Runtime.receive runtime (scheduling_reply request) in
+      Alcotest.(check int) "late or repeated completion cannot dispatch" 0
+        (List.length duplicate.requests);
+      Alcotest.(check int) "late or repeated completion cannot publish" 0
+        (List.length duplicate.responses);
+      collect next;
+      loop (completed + 1) (rest @ next.requests)
+  in
+  loop 0 output.requests;
+  Alcotest.(check int) "queued target page is delivered exactly once" 1 !target_reads;
+  Alcotest.(check (option string)) "target response reaches shared cache"
+    (Some "Resolved") (List.assoc_opt target_id !updates |> Option.join);
+  let fresh = scheduling_favorites runtime 4 902L in
+  Alcotest.(check int) "all four slots are free after draining" 4
+    (List.length fresh.requests);
+  Alcotest.(check (list string)) "no earlier queued identity leaks into a fresh window"
+    (List.init 4 (fun n -> Graph.Uuid.to_string (scheduling_uuid 9000 n)) |> List.sort String.compare)
+    (List.map (fun (request : Protocol.request) -> match request.command with
+      | V2_get_outline_block { block; _ } -> Graph.Uuid.to_string block
+      | _ -> Alcotest.fail "fresh window returned a leftover request") fresh.requests
+     |> List.sort String.compare)
+;;
+
+let test_favorite_dependencies_drain_once () =
+  List.iter (fun count ->
+    let runtime = Runtime.create () in
+    set_calendar runtime;
+    drain_scheduling runtime (scheduling_favorites runtime count 900L)) [4; 8]
+;;
+
+let test_favorite_cancel_releases_slot () =
+  List.iter (fun cancel_count ->
+    let runtime = Runtime.create () in
+    set_calendar runtime;
+    drain_scheduling ~cancel_count runtime (scheduling_favorites runtime 8 900L)) [1; 4]
+;;
+
+let test_favorite_scope_discards_queued_reads () =
+  let runtime = Runtime.create () in
+  set_calendar runtime;
+  let old = scheduling_favorites runtime 8 900L in
+  Runtime.reset runtime;
+  List.iter (fun request ->
+    let late = Runtime.receive runtime (scheduling_reply request) in
+    Alcotest.(check int) "old scope cannot dispatch queued reads" 0
+      (List.length late.requests);
+    Alcotest.(check int) "old scope cannot publish sources" 0
+      (List.length late.responses)) old.requests;
+  drain_scheduling runtime (scheduling_favorites runtime 8 901L)
+;;
+
+let test_favorite_epoch_preserves_new_queue () =
+  let runtime = Runtime.create () in
+  set_calendar runtime;
+  let old = scheduling_favorites runtime 8 900L in
+  let current = scheduling_favorites runtime 8 901L in
+  Alcotest.(check int) "new epoch shares the outstanding window" 0
+    (List.length current.requests);
+  let resumed = List.fold_left (fun (out : Runtime.output) request ->
+    let next = Runtime.receive runtime (scheduling_reply request) in
+    { Runtime.requests = out.requests @ next.requests
+    ; responses = out.responses @ next.responses }) current old.requests in
+  drain_scheduling runtime resumed
+;;
+
+(* Worker admission belongs to transport. Test only that missing boundary,
+   with a real Runtime output; do not duplicate DB/effect-runner coverage. *)
+let test_rejected_delivery_retires_unsent_queue () =
+  List.iter (fun refusal ->
+    let runtime = Runtime.create () in
+    set_calendar runtime;
+    let output = scheduling_favorites runtime 8 900L in
+    let attempts = ref 0 in
+    let delivery = Journal_graph_transport.deliver ~runtime
+      ~send:(fun _ -> incr attempts; refusal) output in
+    Alcotest.(check int) "refusal is never retried" 1 !attempts;
+    Alcotest.(check bool) "refusal remains explicit" true (Option.is_some delivery.error);
+    List.iter (fun request ->
+      let late = Runtime.receive runtime (scheduling_reply request) in
+      Alcotest.(check int) "rejected request cannot publish late response" 0
+        (List.length late.responses)) output.requests;
+    drain_scheduling runtime (scheduling_favorites runtime 8 901L))
+    Journal_graph_transport.[Full; Not_ready; Stopping]
+;;
+
+let test_favorite_page_title_discovers_reference () =
+  let runtime = Runtime.create () in
+  set_calendar runtime;
+  let request : Journal_graph_request.favorites_request =
+    { graph_generation = 1; request_generation = 903L; limit = 50; cursor = None } in
+  let read = Runtime.submit runtime (Load_favorites request)
+    |> fun out -> only "Favorite page list" out.requests in
+  let out = Runtime.receive runtime (response read (Protocol.V2_favorites_outcome
+    { favorites_page = None; generation = "g"; projection_revision = "p"
+    ; next_cursor = None
+    ; items = [{ Protocol.membership_uuid; membership_order = "a"; membership_revision = "m"
+        ; target = V2_favorite_page { uuid = page_uuid; title = reference; revision = "p" } }] })) in
+  let reference_read = out.requests |> List.filter (fun (r : Protocol.request) ->
+    r.command = V2_get_page { page = target_uuid; revision = None })
+    |> only "Favorite page title demands page-first reference" in
+  let resolved = Runtime.receive runtime
+    (reference_page_response reference_read Ordinary_page "Resolved") in
+  Alcotest.(check (option string)) "Favorite page source is accepted" (Some "Resolved")
+    (List.assoc_opt target_id (reference_updates resolved) |> Option.join)
+;;
+
+let test_page_detail_root_title_discovers_reference () =
+  let runtime = Runtime.create () in
+  set_calendar runtime;
+  let root = Runtime.submit runtime (Load_detail
+    { block_id = Graph.Uuid.to_string page_uuid; after = None
+    ; limit = 50; request_generation = 904L })
+    |> fun out -> only "detail root" out.requests in
+  let page_read = Runtime.receive runtime (response root (Protocol.V2_block_outcome
+    (V2_missing_block { uuid = page_uuid; revision = "no-outline" })))
+    |> fun out -> only "detail page fallback" out.requests in
+  let out = Runtime.receive runtime (response page_read (Protocol.V2_page_outcome
+    (V2_present_page { page = { page with kind = Ordinary_page; title = reference }
+    ; revision = "p" }))) in
+  let children = out.requests |> List.find (fun (r : Protocol.request) ->
+    match r.command with V2_get_children _ -> true | _ -> false) in
+  let loaded = Runtime.receive runtime (response children (Protocol.V2_children_outcome
+    { parent = page_uuid; revision_scope = V2_children_revision page_uuid
+    ; scope_revision = "c"; items = []; next_cursor = None })) in
+  let refs = out.requests @ loaded.requests |> List.filter (fun (r : Protocol.request) ->
+    r.command = V2_get_page { page = target_uuid; revision = None }) in
+  let ref_read = only "empty page detail root demands reference" refs in
+  let resolved = Runtime.receive runtime
+    (reference_page_response ref_read Ordinary_page "Resolved") in
+  let lookup id = List.assoc_opt id (reference_updates resolved) |> Option.join in
+  let runs = Journal_model.Title.render ~lookup reference in
+  Alcotest.(check string) "page root displays the shared result" "Resolved"
+    (Journal_model.Title.plain runs);
+  Alcotest.(check bool) "reference expansion is not clickable" true
+    (List.for_all (fun (run : Journal_model.Title.run) -> run.url = None) runs)
+;;
+
 let test_copy_page_root () =
   List.iter (fun populated ->
     let state,effects=copy_start page_uuid in
@@ -5590,7 +5800,16 @@ let test_copy_page_root () =
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ("Favorites page detail", [Alcotest.test_case "page property refresh discovers references" `Quick test_page_property_refresh_discovers_references; Alcotest.test_case "page root and scoped append" `Quick test_page_detail_root_and_append; Alcotest.test_case "copy page root and empty page" `Quick test_copy_page_root; Alcotest.test_case "recycled page is unavailable" `Quick test_recycled_page_root_is_removed; Alcotest.test_case "page point-change identity" `Quick test_page_root_block_change_uses_page_identity; Alcotest.test_case "page root refresh and resync" `Quick test_page_root_refresh_and_resync; Alcotest.test_case "Favorites share page-first reference cache" `Quick test_favorites_share_reference_cache; Alcotest.test_case "Favorites outline and absent references" `Quick test_favorites_outline_and_missing_reference]); ( "review reference ownership", [
+    [ ("unified request scheduling", [
+        Alcotest.test_case "four and eight Favorites drain exactly once" `Quick test_favorite_dependencies_drain_once;
+        Alcotest.test_case "cancelled dependency releases capacity" `Quick test_favorite_cancel_releases_slot;
+        Alcotest.test_case "scope reset discards old queue" `Quick test_favorite_scope_discards_queued_reads;
+        Alcotest.test_case "Favorite epoch preserves new queue" `Quick test_favorite_epoch_preserves_new_queue;
+        Alcotest.test_case "refused delivery settles all unsent demands" `Quick test_rejected_delivery_retires_unsent_queue;
+        Alcotest.test_case "Favorite page discovers title reference" `Quick test_favorite_page_title_discovers_reference;
+        Alcotest.test_case "empty page detail discovers root reference" `Quick test_page_detail_root_title_discovers_reference
+      ]);
+      ("Favorites page detail", [Alcotest.test_case "page property refresh discovers references" `Quick test_page_property_refresh_discovers_references; Alcotest.test_case "page root and scoped append" `Quick test_page_detail_root_and_append; Alcotest.test_case "copy page root and empty page" `Quick test_copy_page_root; Alcotest.test_case "recycled page is unavailable" `Quick test_recycled_page_root_is_removed; Alcotest.test_case "page point-change identity" `Quick test_page_root_block_change_uses_page_identity; Alcotest.test_case "page root refresh and resync" `Quick test_page_root_refresh_and_resync; Alcotest.test_case "Favorites share page-first reference cache" `Quick test_favorites_share_reference_cache; Alcotest.test_case "Favorites outline and absent references" `Quick test_favorites_outline_and_missing_reference]); ( "review reference ownership", [
         Alcotest.test_case "typed metadata retains newer fence" `Quick test_typed_metadata_preserves_newer_reference_fence;
         Alcotest.test_case "dirty abandon remains retryable" `Quick test_dirty_abandon_keeps_reference_retryable;
         Alcotest.test_case "failed lookup retains epoch fence" `Quick test_reference_failed_read_retains_epoch_fence;

@@ -4397,6 +4397,119 @@ let test_detail_page_property_value_presentation () =
     [true;false]
 ;;
 
+(* The public Favorites mount has no shared-lookup input. Exercise the narrow
+   Application ownership/renderer boundary with a real Worker and correct page
+   data; Runtime discovery itself is covered by its pure owner regressions. *)
+let test_favorite_page_uses_shared_reference_lookup () =
+  let module W = Logseq_db_worker_lui.Journal_worker in
+  let module P = Logseq_db_worker.Protocol in
+  let module G = Logseq_db_types.Graph_types in
+  let uuid n = G.Uuid.of_string
+    (Printf.sprintf "86000000-0000-4000-8000-%012d" n) |> Result.get_ok in
+  let token = "[[" ^ G.Uuid.to_string (uuid 3) ^ "]]" in
+  let page : G.page =
+    { uuid = uuid 1; name = "favorite"; title = "Page " ^ token; kind = Ordinary_page
+    ; created_at_ms = 0L; updated_at_ms = 0L; recycled = false; tags = []; properties = [] } in
+  let block : G.block =
+    { uuid = uuid 2; title = "Block " ^ token; parent = page.uuid; page = page.uuid
+    ; order = "a"; created_at_ms = 0L; updated_at_ms = 0L; refs = []; tags = []; properties = [] } in
+  let manager : Service.state =
+    { snapshot =
+        { sync_phase = Current; catalog = []; selected_graph = Some (uuid 9)
+        ; applied_server_t = Some (server_cursor_of_int 0); timeline_presentation_pending = false
+        ; startup = { authenticated = true; catalog_loading = false; awaiting_selection = false
+            ; restoring_local = false; bootstrapping = false; awaiting_e2ee_password = false
+            ; failure = None; account_generation = 1; graph_generation = 1; presentation_generation = 1 }
+        ; last_error = None; local_deletion = None }
+    ; diagnostics = { groups = [] } } in
+  let target_reads = Atomic.make 0 in
+  let service = W.Service.create ~push_topic_count:6 ~concurrency:(Concurrent { max_in_flight = 2 })
+    ~init:(fun context _ ->
+      W.Session_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed manager);
+      Ok ())
+    ~handle:(fun _ () -> function
+      | Service.Get_graph_state -> Ok (Service.Graph_state
+          { generation = 1; graph_id = Some (uuid 9); phase = Graph_open; error = None })
+      | Client_command _ -> Ok Service.Client_command_completed
+      | Graph_request request ->
+        let open P in
+        let outcome = match request.command with
+          | V2_graph_info -> V2_graph_info_outcome
+              { graph_uuid = uuid 9; graph_name = "Fixture"; schema = { major = 65; minor = 33 }
+              ; admission_facts = []; journal_title_format = None; generation = "g"; projection_revision = "p"
+              ; limits = { response_budget_bytes = maximum_response_bytes; outbox_max_records = 4096
+                  ; outbox_max_bytes = 8388608; change_max_items = 4096; change_max_bytes = 1048576
+                  ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 } }
+          | V2_list_journals _ -> V2_journals_outcome { items = []; next_cursor = None }
+          | V2_list_favorites _ -> V2_favorites_outcome
+              { favorites_page = None; generation = "g"; projection_revision = "p"; next_cursor = None
+              ; items =
+                  [{ membership_uuid = uuid 10; membership_order = "a"; membership_revision = "m"
+                   ; target = V2_favorite_page { uuid = page.uuid; title = page.title; revision = "p" } }
+                  ;{ membership_uuid = uuid 11; membership_order = "b"; membership_revision = "m"
+                   ; target = V2_favorite_block
+                       { uuid = block.uuid; title = block.title; task_status = None; revision = "b" } }] }
+          | V2_get_page { page = requested; _ } ->
+            if G.Uuid.equal requested (uuid 3) then Atomic.incr target_reads;
+            V2_page_outcome (V2_present_page
+              { page = if G.Uuid.equal requested page.uuid then page
+                  else { page with uuid = requested; title = "Resolved"; name = "resolved" }
+              ; revision = "p" })
+          | V2_get_outline_block { block = requested; _ } when G.Uuid.equal requested block.uuid ->
+            V2_block_outcome (V2_present_block
+              { value = { block; task_status = None; rendered_page_title = page.title; tag_titles = [] }
+              ; revision = "b" })
+          | V2_list_assets _ -> V2_assets_outcome
+              { generation = "g"; projection_revision = "p"; items = []; next_cursor = None }
+          | _ -> V2_failed { code = "InvalidRequest"; message = "Unused fixture operation" }
+        in
+        Ok (Service.Graph_response (V2_response
+          { api_version; request_id = request.request_id; outcome }))
+      | _ -> Error "Unused fixture service operation")
+    ~shutdown:(fun () -> ()) () in
+  let client = ref None in
+  let hooks = Application.For_testing.app_with_service
+    ~on_client:(fun c -> client := Some c)
+    ~calendar_sampler:(Journal_calendar.Sampler.create
+      ~clock:(fun () -> 1_788_192_000.) ~localtime:Unix.gmtime ()) service in
+  let props = Hashtbl.create 64 in
+  let track = track_json_wire_teardown (Hashtbl.remove props) in
+  let consume encoded = if encoded <> "" then (
+    let open Yojson.Safe.Util in
+    Yojson.Safe.from_string encoded |> member "ops" |> to_list |> List.iter (fun op ->
+      track op;
+      match member "op" op |> to_string with
+      | "set-prop" | "set-extension-prop" ->
+        let id = member "id" op |> to_int in
+        let key = member "property" op |> to_string in
+        let old = Hashtbl.find_opt props id |> Option.value ~default:[] in
+        Hashtbl.replace props id ((key, member "value" op) :: List.remove_assoc key old)
+      | _ -> ())) in
+  let find key text = Hashtbl.fold (fun id pairs found ->
+    if List.assoc_opt key pairs = Some (`String text) then Some id else found) props None in
+  let wait label predicate =
+    let deadline = Unix.gettimeofday () +. 3. in
+    while not (predicate ()) && Unix.gettimeofday () < deadline do
+      consume (hooks.pump ()); Unix.sleepf 0.001
+    done;
+    Alcotest.(check bool) label true (predicate ()) in
+  Fun.protect ~finally:(fun () ->
+    ignore (hooks.dispose ()); Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client)
+    (fun () ->
+      let startup = Logseq_db_worker.Config.create
+        ~application_support_directory:"/tmp/journal-favorite-page-reference-fixture"
+        ~target:(Managed_sync { base_url = "https://example.invalid" })
+        ~compatibility_profile:Logseq_65_33_or_newer
+        ~response_budget_bytes:P.maximum_response_bytes ~default_page_size:P.default_page_size
+        |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
+      consume (hooks.init 2 2 startup);
+      wait "Favorites navigation mounts" (fun () -> Option.is_some (find "accessibility-label" "Favorites"));
+      consume (hooks.dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Favorites"))));
+      wait "block proves shared lookup is populated" (fun () -> Option.is_some (find "text" "Block Resolved"));
+      wait "Favorite Page uses the same populated lookup" (fun () -> Option.is_some (find "text" "Page Resolved"));
+      Alcotest.(check int) "shared target is queried once" 1 (Atomic.get target_reads))
+;;
+
 let test_favorites_compact_shared_titles () =
   let module G=Logseq_db_types.Graph_types in
   let module P=Logseq_db_worker.Protocol in
@@ -5515,7 +5628,7 @@ let () =
     ; ( "status list", List.map (fun scenario ->
         Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~status_scenario:scenario ()))
         ["expanded"; "none"; "now"; "waiting"; "later"; "select"; "clear"; "dismiss"; "failure"; "duplicate"])
-    ; ("Favorites compact title",[Alcotest.test_case "page property values keep name without duplication" `Quick test_detail_page_property_value_presentation; Alcotest.test_case "root Capture only in Journals" `Quick test_root_capture_placement; Alcotest.test_case "LUI titles icons and no arrow" `Quick test_favorites_compact_shared_titles; Alcotest.test_case "page outline click and native Back" `Quick (fun () -> run_favorites_native_visibility ~check_favorite_targets:true ())])
+    ; ("Favorites compact title",[Alcotest.test_case "Favorite Page uses shared reference lookup" `Quick test_favorite_page_uses_shared_reference_lookup; Alcotest.test_case "page property values keep name without duplication" `Quick test_detail_page_property_value_presentation; Alcotest.test_case "root Capture only in Journals" `Quick test_root_capture_placement; Alcotest.test_case "LUI titles icons and no arrow" `Quick test_favorites_compact_shared_titles; Alcotest.test_case "page outline click and native Back" `Quick (fun () -> run_favorites_native_visibility ~check_favorite_targets:true ())])
     ; ( "graph picker", [
         Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);
         Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);
