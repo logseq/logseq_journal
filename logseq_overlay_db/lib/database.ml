@@ -7636,59 +7636,33 @@ let replan_queued_ordinary database authoritative_database records =
          Int.compare left.sequence right.sequence)
       records
   in
-  let add_indexed_record ~empty ~append records index select (record : outbox_record) =
-    ( List.fold_left
-        (fun index uuid ->
-           let key = Graph.Uuid.to_string uuid in
-           let preceding = Uuid_map.find_opt key index |> Option.value ~default:empty in
-           Uuid_map.add key (append preceding record) index)
-        index
-        (select (record.effect_footprint : effect_footprint))
-    , record :: records )
+  let add_indexed_record index select (record : outbox_record) =
+    List.fold_left
+      (fun index uuid ->
+         let key = Graph.Uuid.to_string uuid in
+         let preceding =
+           Uuid_map.find_opt key index |> Option.value ~default:Rrbvec.empty
+         in
+         Uuid_map.add key (Rrbvec.push_back preceding record) index)
+      index
+      (select (record.effect_footprint : effect_footprint))
   in
-  let add_record records block_effects page_effects children_effects record =
+  let add_record records block_effects page_effects record =
     if not (record_is_logically_active record)
-    then records, block_effects, page_effects, children_effects
+    then records, block_effects, page_effects
     else (
-      let block_effects, records =
-        add_indexed_record
-          ~empty:Rrbvec.empty
-          ~append:Rrbvec.push_back
-          records
-          block_effects
-          (fun value -> value.block_uuids)
-          record
+      let block_effects =
+        add_indexed_record block_effects (fun value -> value.block_uuids) record
       in
-      let page_effects, _ =
-        add_indexed_record
-          ~empty:Rrbvec.empty
-          ~append:Rrbvec.push_back
-          []
-          page_effects
-          (fun value -> value.page_uuids)
-          record
+      let page_effects =
+        add_indexed_record page_effects (fun value -> value.page_uuids) record
       in
-      let children_effects, _ =
-        add_indexed_record
-          ~empty:[]
-          ~append:(fun records record -> records @ [ record ])
-          []
-          children_effects
-          (fun value ->
-             List.filter_map
-               (function
-                 | Types.Children_interest parent -> Some parent
-                 | Page_tree_interest _ | Journal_index_interest -> None)
-               value.structure_interests)
-          record
-      in
-      records, block_effects, page_effects, children_effects)
+      record :: records, block_effects, page_effects)
   in
   let rec loop
             accumulated
             block_effects
             page_effects
-            children_effects
             unavailable
             replanned
             no_change
@@ -7698,20 +7672,20 @@ let replan_queued_ordinary database authoritative_database records =
     | (record : outbox_record) :: rest ->
       (match record.transport_state, record.mutation with
        | Types.Queued, (Types.Delete_blocks _ as _mutation) ->
-         let accumulated, block_effects, page_effects, children_effects =
-           add_record accumulated block_effects page_effects children_effects record
+         let accumulated, block_effects, page_effects =
+           add_record accumulated block_effects page_effects record
          in
          loop
            accumulated
            block_effects
            page_effects
-           children_effects
            unavailable
            replanned
            no_change
            blocked
            rest
        | Types.Queued, mutation ->
+         (* Replanning only performs point reads; structural roots are not captured. *)
          let snapshot =
            { owner = database
            ; version =
@@ -7719,10 +7693,10 @@ let replan_queued_ordinary database authoritative_database records =
                ; projection_revision = projection_revision database.projection
                }
            ; authoritative_database = Some authoritative_database
-           ; outbox = Some (List.rev accumulated)
+           ; outbox = None
            ; block_effects = Some block_effects
            ; page_effects = Some page_effects
-           ; children_effects = Some children_effects
+           ; children_effects = None
            ; released = false
            ; active_reads = 0
            ; drain_waiters = []
@@ -7734,7 +7708,6 @@ let replan_queued_ordinary database authoritative_database records =
              accumulated
              block_effects
              page_effects
-             children_effects
              unavailable
              replanned
              (record :: no_change)
@@ -7759,7 +7732,6 @@ let replan_queued_ordinary database authoritative_database records =
                (record :: accumulated)
                block_effects
                page_effects
-               children_effects
                unavailable
                replanned
                no_change
@@ -7786,14 +7758,13 @@ let replan_queued_ordinary database authoritative_database records =
                ; protected_transaction = None
                }
              in
-             let accumulated, block_effects, page_effects, children_effects =
-               add_record accumulated block_effects page_effects children_effects record
+             let accumulated, block_effects, page_effects =
+               add_record accumulated block_effects page_effects record
              in
              loop
                accumulated
                block_effects
                page_effects
-               children_effects
                unavailable
                (record :: replanned)
                no_change
@@ -7810,7 +7781,6 @@ let replan_queued_ordinary database authoritative_database records =
            (record :: accumulated)
            block_effects
            page_effects
-           children_effects
            unavailable
            replanned
            no_change
@@ -7820,21 +7790,20 @@ let replan_queued_ordinary database authoritative_database records =
            | Accepted_pending_authoritative _
            | Stale_rejected_pending_authoritative _ )
          , _ ) ->
-         let accumulated, block_effects, page_effects, children_effects =
-           add_record accumulated block_effects page_effects children_effects record
+         let accumulated, block_effects, page_effects =
+           add_record accumulated block_effects page_effects record
          in
          loop
            accumulated
            block_effects
            page_effects
-           children_effects
            unavailable
            replanned
            no_change
            blocked
            rest)
   in
-  loop [] Uuid_map.empty Uuid_map.empty Uuid_map.empty [] [] [] [] records
+  loop [] Uuid_map.empty Uuid_map.empty [] [] [] [] records
 ;;
 
 let settle_stale_records ~checkpoint ~origins records =
