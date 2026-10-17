@@ -1049,6 +1049,22 @@ while True: time.sleep(1)
                      and record['argv'][0] == str(f.compiler)]
             self.assertEqual(len(links), 1, 'hot producer unexpectedly linked again')
 
+    def test_producer_reuses_native_bytes_after_a_documentation_commit(self):
+        self.assertTrue(hasattr(self.build.Build, 'produce_native'), 'producer-only entry is missing')
+        with self.native_dune_producer() as f:
+            envelope = f.build.produce_native(f.original_native, f.workspace)
+            doc = self.build.ROOT / 'README.md'
+            doc.write_text('documentation-only successor\n')
+            subprocess.run(['git', '-C', self.build.ROOT, 'add', doc], check=True, capture_output=True)
+            subprocess.run(['git', '-C', self.build.ROOT, '-c', 'user.name=Build test',
+                            '-c', 'user.email=build@example.invalid', 'commit', '-qm', 'documentation'],
+                           check=True, capture_output=True)
+            f.build.report['source_sha'] = subprocess.check_output(
+                ['git', '-C', self.build.ROOT, 'rev-parse', 'HEAD'], text=True).strip()
+            self.assertEqual(f.build.inputs['source'], self.build.source_inputs())
+            self.assertEqual(f.build.produce_native(f.original_native, f.workspace), envelope)
+            self.assertFalse(f.build.report['producer']['link_executed'])
+
     def test_producer_refuses_a_rule_with_unbound_linker_inputs_before_running_it(self):
         self.assertTrue(hasattr(self.build.Build, 'produce_native'), 'producer-only entry is missing')
         with self.native_dune_producer() as f:
