@@ -3,7 +3,7 @@
 
 Identity includes source, actual dependency ABI inputs, toolchain/SDK, flags and target. Identical inputs reuse incremental state; changed inputs select another namespace. Every run leaves external phase logs and `run-*/manifest.json`. The cache has a nonblocking lock; native Dune builds also hold the switch read lock. A busy lock belongs to its active owner: coordinate or wait. Preserve existing output/rollback apps and choose a new `--app-dir`; nothing is cleared automatically.
 
-For failure, read `failed_phase`, `error` and that phase's log. Correct target/environment or select matching prepared inputs. Source/configuration/pin/current-input mismatch requires matching provenance; a historical archive change alone can use the validated receipt contract above. Missing mldoc/XMLm retention requires linker-rule review; protected Dune/spec/lock edits still follow the repository's authorization rules. Legacy object-injecting Dune aliases remain refused; probe helpers use the isolated mode above.
+For failure, read `failed_phase`, `error` and that phase's log. Correct target/environment or select matching prepared inputs. Source/configuration/pin/current-input mismatch requires matching provenance; a historical archive change alone can use the validated receipt contract above. Missing runtime/mldoc or unresolved XMLm references require linker-rule review. Schema 2 permits an unused XMLm unit to be omitted while retaining strict locked input identity; schema 1 keeps its original force-link checks. Protected Dune/spec/lock edits still follow the repository's authorization rules. Legacy object-injecting Dune aliases remain refused; probe helpers use the isolated mode above.
 
 ## Reuse dependency and build state
 

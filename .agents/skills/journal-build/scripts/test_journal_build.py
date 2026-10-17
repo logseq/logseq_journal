@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Small build-boundary checks; no device, dependency install or large build."""
 import importlib.util
+import hashlib
 from contextlib import contextmanager
 from functools import partial
 import json
@@ -11,6 +12,7 @@ import re
 import subprocess
 import tempfile
 import signal
+import shutil
 import sys
 import threading
 import time
@@ -783,6 +785,301 @@ while True: time.sleep(1)
             self.assertIn(str(f.history), imported['historical_inputs'])
             f.history.unlink()
             f.build.imported_native(f.source)
+
+    @contextmanager
+    def ordinary_producer_fixture(self, *, entry=None, relative=False, warnings=False):
+        """Actual OCaml link: unused Xmlm archive supplied, unit legally omitted."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, package, effect = root / 'repo', root / 'package', root / 'effect'
+            (repo / 'app').mkdir(parents=True)
+            platform = repo / 'logseq_sync/lib/effect_runner/platform'
+            platform.mkdir(parents=True)
+            for name in ('platform_crypto_stubs.c', 'platform_crypto_stubs.h'):
+                (platform / name).write_text('/* target source */\n')
+            compiler = Path(shutil.which('ocamlopt')).resolve()
+            runtime = Path(subprocess.check_output([compiler, '-where'], text=True).strip())
+            effect.mkdir()
+            (effect / 'effect.ml').write_text('let value = 1\n')
+            def run(*argv, cwd=root):
+                subprocess.run(list(map(str, argv)), cwd=cwd, check=True, capture_output=True)
+            run(compiler, '-c', effect / 'effect.ml')
+            effect_archive = effect / 'logseq_sync_effect_runner_impl.cmxa'
+            run(compiler, '-a', '-o', effect_archive, effect / 'effect.cmx')
+            (effect / 'stub.c').write_text('int harmless_stub;\n')
+            run('xcrun', 'clang', '-c', effect / 'stub.c', '-o', effect / 'stub.o')
+            stub = effect / 'liblogseq_sync_effect_runner_impl_stubs.a'
+            run('ar', 'rcs', stub, effect / 'stub.o')
+            provenance = {}
+            for name, source in [('mldoc', 'let parse text = String.length text\n'),
+                                 ('xmlm', 'let make_input text = text\n')]:
+                checkout = root / (name + '-source')
+                checkout.mkdir()
+                (checkout / (name + '.ml')).write_text(source)
+                run('git', 'init', '-q', checkout)
+                run('git', '-C', checkout, 'add', '.')
+                run('git', '-C', checkout, '-c', 'user.name=Build test', '-c', 'user.email=build@example.invalid',
+                    'commit', '-qm', name)
+                pinned = subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip()
+                lib = package / 'lib' / name
+                lib.mkdir(parents=True)
+                (lib / (name + '.ml')).write_text(source)
+                run(compiler, '-c', lib / (name + '.ml'))
+                archive = lib / (name + '.cmxa')
+                run(compiler, '-a', '-o', archive, lib / (name + '.cmx'))
+                object_bytes = subprocess.check_output(['ar', '-p', str(archive.with_suffix('.a')), name + '.o'])
+                provenance[name] = dict(pinned_commit=pinned, source_checkout=str(checkout),
+                    installed_archive=str(archive), archive_sha256=self.build.sha(archive),
+                    static_archive_sha256=self.build.sha(archive.with_suffix('.a')),
+                    installed_sources_matched_to_pinned_git={name + '.ml': dict(
+                        sha256=self.build.sha(lib / (name + '.ml')), git_path=name + '.ml')},
+                    original_unit=dict(cmx_sha256=self.build.sha(lib / (name + '.cmx')),
+                                       object_sha256=hashlib.sha256(object_bytes).hexdigest()))
+            (repo / 'app/unit.ml').write_text(entry or 'let () = ignore (Sys.opaque_identity Mldoc.parse)\n')
+            run(compiler, '-I', package / 'lib/mldoc', '-c', repo / 'app/unit.ml')
+            native = root / 'host.o'
+            command = list(map(str, [compiler, '-output-complete-obj', '-o', native, effect_archive,
+                package / 'lib/xmlm/xmlm.cmxa', package / 'lib/mldoc/mldoc.cmxa', repo / 'app/unit.cmx']))
+            if relative:
+                command = [command[0]] + [os.path.relpath(arg, root) if arg.startswith(str(root) + '/') else arg
+                                          for arg in command[1:]]
+            if warnings:
+                command[1:1] = ['-w', '@1..3']
+            run(*command)
+            pins = dict(lui='1' * 40, signal='2' * 40, datascript='3' * 40)
+            lock_names = dict(signal='ocaml-signal', datascript='datascript-ocaml-native')
+            all_pins = {**pins, **{name: item['pinned_commit'] for name, item in provenance.items()}}
+            (repo / 'logseq_journal.opam.locked').write_text('\n'.join(
+                f'"{lock_names.get(name, name)}.dev" "git+https://example.invalid/{name}#{commit}"'
+                for name, commit in all_pins.items()))
+            run('git', 'init', '-q', repo)
+            run('git', '-C', repo, 'add', 'app/unit.ml', 'logseq_journal.opam.locked', 'logseq_sync')
+            run('git', '-C', repo, '-c', 'user.name=Build test', '-c', 'user.email=build@example.invalid',
+                'commit', '-qm', 'producer')
+            commit = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+            with patch.object(self.build, 'ROOT', repo):
+                source = self.build.source_inputs()
+                pre = dict(commit=commit, **pins, production_native_object=str(native),
+                    production_native_object_sha256=self.build.sha(native),
+                    native_source_sha256={'app/unit.ml': self.build.sha(repo / 'app/unit.ml')},
+                    installed_lui_source_sha256={})
+                inputs = [effect_archive, effect_archive.with_suffix('.a'), stub,
+                    repo / 'app/unit.cmx', repo / 'app/unit.o']
+                for item in provenance.values():
+                    archive = Path(item['installed_archive'])
+                    inputs.extend([archive, archive.with_suffix('.a')])
+                link = dict(command=command, working_directory=str(root), compiler_sha256=self.build.sha(compiler),
+                    compiler_version=subprocess.check_output([compiler, '-version'], text=True).strip(),
+                    production_host_sha256=self.build.sha(native),
+                    direct_native_input_sha256={str(p): self.build.sha(p) for p in inputs},
+                    device_c_source_sha256={p.name: self.build.sha(p) for p in platform.iterdir()},
+                    patched_host_stub_archive_sha256=self.build.sha(stub), new_dependency_provenance=provenance)
+                envelope = dict(schema_version=2)
+                path = root / 'input.json'
+                def save():
+                    for name, value in [('source', pre), ('link', link)]:
+                        record = root / (name + '.json')
+                        record.write_text(json.dumps(value))
+                        envelope[name] = dict(path=str(record), sha256=self.build.sha(record))
+                    path.write_text(json.dumps(envelope))
+                save()
+                build = self.build.Build(SimpleNamespace(native_manifest=path, experimental_host_restamp=True,
+                    link_only=False, platform='ios-simulator'), root)
+                build.run = partial(build.run, cwd=repo)
+                build.report['source_sha'], build.lui_sha = commit, pins['lui']
+                yield SimpleNamespace(build=build, source=source, link=link, pre=pre, native=native,
+                    envelope=envelope, path=path, root=root, save=save, runtime=runtime, provenance=provenance)
+
+    def test_ordinary_xmlm_input_allows_dead_code_elimination(self):
+        with self.ordinary_producer_fixture() as f:
+            imported = f.build.imported_native(f.source)
+            self.assertEqual(imported['ocaml_units'], dict(runtime=True, mldoc=True, xmlm=False))
+            self.assertEqual(imported['schema_version'], 2)
+            archive = f.provenance['xmlm']['installed_archive']
+            self.assertEqual(imported['files'][archive], f.provenance['xmlm']['archive_sha256'])
+
+    def test_ordinary_producer_accepts_real_warning_and_relative_argv(self):
+        for option in ('warnings', 'relative'):
+            with self.subTest(option=option), self.ordinary_producer_fixture(**{option: True}) as f:
+                self.assertEqual(f.build.imported_native(f.source)['ocaml_units']['xmlm'], False)
+
+    def test_ordinary_producer_rejects_unbound_source_and_linker_arguments(self):
+        with self.ordinary_producer_fixture() as f:
+            f.build.imported_native(f.source)
+            original = list(f.link['command'])
+            for args in ([str(f.root / 'unbound.ml')], [str(f.root / 'unbound.c')],
+                         ['-cclib', '-lunbound'], ['-ccopt', str(f.root / 'unbound.o')]):
+                with self.subTest(args=args):
+                    f.link['command'] = original + args
+                    f.save()
+                    with self.assertRaisesRegex(ValueError, 'input|argument|unsupported|library'):
+                        f.build.imported_native(f.source)
+
+    def test_ordinary_producer_rejects_conflicting_companion_identity(self):
+        with self.ordinary_producer_fixture() as f:
+            f.build.imported_native(f.source)
+            archive = Path(f.provenance['xmlm']['installed_archive']).with_suffix('.a')
+            f.link['direct_native_input_sha256'][str(archive)] = 'f' * 64
+            f.save()
+            with self.assertRaisesRegex(ValueError, 'conflict|hash|identity'):
+                f.build.imported_native(f.source)
+
+    def test_ordinary_producer_rejects_split_cclib_input(self):
+        with self.ordinary_producer_fixture() as f:
+            f.build.imported_native(f.source)
+            extra = f.root / 'unrecorded.o'
+            shutil.copyfile(f.root / 'effect/stub.o', extra)
+            f.link['command'].extend(['-cclib', '-L' + str(f.root) + ' ' + str(extra)])
+            subprocess.run(f.link['command'], cwd=f.root, check=True, capture_output=True)
+            f.pre['production_native_object_sha256'] = self.build.sha(f.native)
+            f.link['production_host_sha256'] = self.build.sha(f.native)
+            f.save()
+            with self.assertRaisesRegex(ValueError, 'input|argument|token'):
+                f.build.imported_native(f.source)
+
+    def test_ordinary_producer_rejects_cclib_option_disguised_as_object(self):
+        with self.ordinary_producer_fixture() as f:
+            f.build.imported_native(f.source)
+            extra = f.root / 'extra.o'
+            shutil.copyfile(f.root / 'effect/stub.o', extra)
+            decoy = f.root / '-lextra.o'
+            decoy.write_bytes(b'not the object selected by Darwin ld\n')
+            f.link['direct_native_input_sha256'][str(decoy)] = self.build.sha(decoy)
+            f.link['command'].extend(['-cclib', '-L' + str(f.root), '-cclib', '-lextra.o'])
+            subprocess.run(f.link['command'], cwd=f.root, check=True, capture_output=True)
+            f.pre['production_native_object_sha256'] = self.build.sha(f.native)
+            f.link['production_host_sha256'] = self.build.sha(f.native)
+            f.save()
+            with self.assertRaisesRegex(ValueError, 'input|argument|unsupported'):
+                f.build.imported_native(f.source)
+
+    def test_ordinary_receipt_survives_removed_historical_cmx_symlink(self):
+        with self.ordinary_producer_fixture() as f:
+            cmx = Path(f.provenance['xmlm']['installed_archive']).with_suffix('.cmx')
+            saved = f.root / 'historical-xmlm.cmx'
+            cmx.rename(saved)
+            cmx.symlink_to(saved)
+            imported = f.build.imported_native(f.source)
+            receipt = dict(status='built', mode='experimental-host-restamp', source_sha=f.pre['commit'],
+                production_link=dict(ocaml_units=imported['ocaml_units'], cross_abi_validated=False),
+                inputs=dict(dependencies=imported))
+            path = f.root / 'receipt.json'
+            path.write_text(json.dumps(receipt))
+            f.envelope['validated_build'] = dict(path=str(path), sha256=self.build.sha(path))
+            f.path.write_text(json.dumps(f.envelope))
+            f.build.imported_native(f.source)
+            cmx.unlink()
+            imported = f.build.imported_native(f.source)
+            self.assertNotIn(str(cmx), imported['files'])
+            self.assertIn(str(cmx), imported['historical_inputs'])
+
+    def test_ordinary_producer_rejects_changed_dependency_and_actual_inputs(self):
+        with self.ordinary_producer_fixture() as f:
+            f.build.imported_native(f.source)  # Prove the valid baseline first.
+            original = json.loads(json.dumps(f.link))
+            cases = ('pin', 'compiler', 'archive', 'static_archive', 'cmx', 'object', 'source',
+                     'source_git_path', 'linked_archive', 'unrecorded_input', 'extra_input')
+            for case in cases:
+                with self.subTest(case=case):
+                    f.link.clear(); f.link.update(json.loads(json.dumps(original)))
+                    item = f.link['new_dependency_provenance']['xmlm']
+                    if case == 'pin': item['pinned_commit'] = 'f' * 40
+                    elif case == 'compiler': f.link['compiler_sha256'] = 'f' * 64
+                    elif case == 'archive': item['archive_sha256'] = 'f' * 64
+                    elif case == 'static_archive': item['static_archive_sha256'] = 'f' * 64
+                    elif case in ('cmx', 'object'): item['original_unit'][case + '_sha256'] = 'f' * 64
+                    elif case == 'source': item['installed_sources_matched_to_pinned_git']['xmlm.ml']['sha256'] = 'f' * 64
+                    elif case == 'source_git_path': item['installed_sources_matched_to_pinned_git']['xmlm.ml']['git_path'] = 'missing.ml'
+                    elif case == 'linked_archive':
+                        f.link['command'].remove(item['installed_archive'])
+                    elif case == 'unrecorded_input':
+                        f.link['direct_native_input_sha256'].pop(item['installed_archive'])
+                    else:
+                        other = f.root / 'unrecorded.cmxa'
+                        shutil.copyfile(item['installed_archive'], other)
+                        f.link['command'].append(str(other))
+                    f.save()
+                    with self.assertRaisesRegex((ValueError, RuntimeError), 'commit|compiler|hash|XMLm|input|archive|unit|source|path'):
+                        f.build.imported_native(f.source)
+
+    def test_ordinary_producer_still_requires_used_mldoc(self):
+        with self.ordinary_producer_fixture(entry='let () = ()\n') as f:
+            with self.assertRaisesRegex(ValueError, 'mldoc|Mldoc'):
+                f.build.imported_native(f.source)
+
+    def test_ordinary_producer_rejects_missing_runtime_and_unresolved_xmlm(self):
+        with self.ordinary_producer_fixture() as f:
+            f.build.imported_native(f.source)
+            for case in ('runtime', 'unresolved Xmlm'):
+                with self.subTest(case=case):
+                    c = f.root / 'invalid.c'
+                    c.write_text('int camlMldoc;\n' + ('' if case == 'runtime' else
+                        'void caml_startup(void) {}\nextern int camlXmlm; int *reference = &camlXmlm;\n'))
+                    subprocess.run(['xcrun', 'clang', '-c', c, '-o', f.native], check=True, capture_output=True)
+                    f.pre['production_native_object_sha256'] = self.build.sha(f.native)
+                    f.link['production_host_sha256'] = self.build.sha(f.native)
+                    f.save()
+                    with self.assertRaisesRegex(ValueError, 'runtime|unresolved|XMLm|Xmlm'):
+                        f.build.imported_native(f.source)
+
+    def test_ordinary_final_link_reports_xmlm_absence_without_all_retained_claim(self):
+        with self.ordinary_producer_fixture() as f:
+            f.build.imported_native(f.source)
+            f.build.target_c = f.root / 'target.o'
+            c = f.root / 'target.c'
+            c.write_text('void logseq_transport_dns_start(void) {}\n'
+                'void logseq_journal_crypto_call(void) {}\nint main(void) { return 0; }\n')
+            subprocess.run(['xcrun', 'clang', '-c', c, '-o', f.build.target_c], check=True, capture_output=True)
+            product = f.root / 'JournalApp'
+            f.build.link_map = f.root / 'link-map.txt'
+            subprocess.run(['xcrun', 'clang', f.native, f.build.target_c, '-o', product,
+                '-Wl,-map,' + str(f.build.link_map)], check=True, capture_output=True)
+            objects = f.root / 'JournalApp.product'
+            objects.mkdir()
+            (objects / 'Objects.LinkFileList').write_text('')
+            f.build.verify_production_link(product)
+            observed = f.build.report['production_link']
+            self.assertEqual(observed['ocaml_units'], dict(runtime=True, mldoc=True, xmlm=False))
+            self.assertNotIn('runtime_mldoc_xmlm_retained', observed)
+            self.assertIs(observed['cross_abi_validated'], False)
+
+    def test_ordinary_receipt_records_actual_retention_and_keeps_history(self):
+        with self.ordinary_producer_fixture() as f:
+            imported = f.build.imported_native(f.source)
+            expected_units = dict(imported['ocaml_units'])
+            receipt = dict(status='built', mode='experimental-host-restamp', source_sha=f.pre['commit'],
+                production_link=dict(ocaml_units=imported['ocaml_units'], cross_abi_validated=False),
+                inputs=dict(dependencies=imported))
+            receipt_path = f.root / 'receipt.json'
+            def save_receipt():
+                receipt_path.write_text(json.dumps(receipt))
+                f.envelope['validated_build'] = dict(path=str(receipt_path), sha256=self.build.sha(receipt_path))
+                f.path.write_text(json.dumps(f.envelope))
+            save_receipt()
+            accepted = f.build.imported_native(f.source)
+            self.assertEqual(accepted['ocaml_units']['xmlm'], False)
+            receipt['production_link']['ocaml_units'] = dict(runtime=True, mldoc=True, xmlm=True)
+            save_receipt()
+            with self.assertRaisesRegex(ValueError, 'receipt|retention|unit'):
+                f.build.imported_native(f.source)
+            receipt['inputs']['dependencies']['ocaml_units'] = dict(runtime=True, mldoc=True, xmlm=True)
+            save_receipt()
+            with self.assertRaisesRegex(ValueError, 'receipt|retention|unit'):
+                f.build.imported_native(f.source)
+            receipt['production_link'].pop('ocaml_units')
+            receipt['production_link']['runtime_mldoc_xmlm_retained'] = True
+            save_receipt()
+            with self.assertRaisesRegex(ValueError, 'receipt|retention|unit'):
+                f.build.imported_native(f.source)
+            receipt['production_link'].pop('runtime_mldoc_xmlm_retained')
+            receipt['production_link']['ocaml_units'] = dict(expected_units)
+            receipt['inputs']['dependencies']['ocaml_units'] = dict(expected_units)
+            save_receipt()
+            archive = Path(f.provenance['xmlm']['installed_archive'])
+            archive.unlink()
+            accepted = f.build.imported_native(f.source)
+            self.assertIn(str(archive), accepted['historical_inputs'])
+            self.assertNotIn(str(archive), accepted['files'])
 
     def test_builder_only_commit_keeps_exact_native_source_identity(self):
         with self.producer_fixture() as f:
