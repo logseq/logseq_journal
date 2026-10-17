@@ -372,7 +372,7 @@ let select_destination state destination =
 ;;
 
 let feed_day_limit = 7
-let sync_error_card_lifetime = Core.Time_ns.Span.of_sec 5.
+let sync_error_card_lifetime = 5.
 
 let initial_state =
   { favorites = Journal_routes.Favorites.create ~graph_generation:(-1)
@@ -5284,9 +5284,9 @@ let start
   let startup_loading_key state = Journal_startup.Presentation.loading_request state.startup_presentation in
   let prev_startup_loading_key = ref None in
   let arm_startup_loading_timer key =
-    let started = Core.Time_ns.now () in
+    let started = Mtime_clock.counter () in
     schedule_after 0.1 (fun () -> Effect.run (set_state (fun state ->
-      let elapsed = Core.Time_ns.(Span.to_sec (diff (now ()) started)) in
+      let elapsed = Mtime.Span.to_float_ns (Mtime_clock.count started) *. 1e-9 in
       let next = Journal_startup.Presentation.step state.startup_presentation (Elapsed(key,elapsed)) in
       if next == state.startup_presentation then state else {state with startup_presentation=next})))
   in
@@ -5295,12 +5295,12 @@ let start
   in
   let prev_detail_loading_key = ref (detail_loading_key initial_state) in
   let arm_detail_loading_timer graph_generation entry_id request_generation =
-    let started = Core.Time_ns.now () in
+    let started = Mtime_clock.counter () in
     schedule_after 0.1 (fun () ->
       Effect.run (set_state (fun state ->
         if state.graph_state.generation <> graph_generation then state
         else
-          let elapsed = Core.Time_ns.(Span.to_sec (diff (now ()) started)) in
+          let elapsed = Mtime.Span.to_float_ns (Mtime_clock.count started) *. 1e-9 in
           let routes = Journal_routes.observe_loading_delay state.routes
             ~entry_id ~request_generation ~elapsed in
           if routes == state.routes then state else { state with routes })))
@@ -5309,7 +5309,7 @@ let start
   let arm_sync_error_timer sequence =
     incr sync_error_timer_generation;
     let generation = !sync_error_timer_generation in
-    schedule_after (Core.Time_ns.Span.to_sec sync_error_card_lifetime) (fun () ->
+    schedule_after sync_error_card_lifetime (fun () ->
       if !sync_error_timer_generation = generation
       then
         send_action

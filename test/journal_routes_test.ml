@@ -3175,9 +3175,12 @@ let test_detail_initial_loading_delay_and_ownership () =
       let id = entry_id t in
       require (not (R.loading_indicator t)) "slow route starts with a spinner";
       require (R.observe_loading_delay t ~entry_id:id ~request_generation:9001L ~elapsed:(-1.) == t) "negative elapsed time changes owner";
+      require (R.observe_loading_delay t ~entry_id:id ~request_generation:9001L ~elapsed:nan == t) "NaN elapsed time changes owner";
       require (R.observe_loading_delay t ~entry_id:id ~request_generation:9001L ~elapsed:0.099 == t) "early callback changes owner";
+      require (R.observe_loading_delay t ~entry_id:id ~request_generation:9001L ~elapsed:0.099999999 == t) "one nanosecond before 100ms shows loading";
       let slow = R.observe_loading_delay t ~entry_id:id ~request_generation:9001L ~elapsed:0.1 in
       require (R.loading_indicator slow) "100ms pending route has no indicator";
+      require (R.loading_indicator (R.observe_loading_delay t ~entry_id:id ~request_generation:9001L ~elapsed:3600.)) "suspended pending route loses its elapsed loading delay";
       require (R.detail slow = None) "pending route exposes a partial root";
       require (R.observe_loading_delay slow ~entry_id:id ~request_generation:9001L ~elapsed:0.2 == slow) "duplicate delay republishes owner");
     "failure and retry", (fun () ->

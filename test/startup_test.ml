@@ -254,6 +254,8 @@ let test_stable_startup_presentation () =
       let key=timer t in
       let early=P.step t (Elapsed(key,0.099)) in
       require (not(P.loading_indicator early)) "99ms shows loading";
+      require (P.step early (Elapsed(key,0.099999999))==early)
+        "one nanosecond before 100ms shows loading";
       let t=observe ~manager:(startup_snapshot ~restoring_local:true ()) early in
       require (timer t=key) "busy phase restarts grace";
       let slow=P.step t (Elapsed(key,0.1)) in
@@ -325,7 +327,12 @@ let test_stable_startup_presentation () =
         "background keeps an active loading timer";
       let resumed=P.step inactive (Foreground true) in
       require (timer resumed<>old && not(P.loading_indicator resumed)) "resume reuses old grace";
-      require (P.step resumed (Elapsed(old,1.))==resumed) "late background timer changes resume");
+      require (P.step resumed (Elapsed(old,3600.))==resumed) "late background timer changes resume";
+      let key=timer resumed in
+      require (P.step resumed (Elapsed(key,0.099999999))==resumed)
+        "resume counts suspended time towards its fresh grace";
+      require (P.loading_indicator (P.step resumed (Elapsed(key,0.1))))
+        "resume does not show loading after its fresh 100ms grace");
     "negative/NaN elapsed and explicit signout are safe",(fun () ->
       let t=observe ~manager:(startup_snapshot ~restoring_local:true ()) (P.create ()) in
       let key=timer t in
