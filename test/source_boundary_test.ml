@@ -158,12 +158,24 @@ let test_sync_error_card_is_temporary_and_error_only root =
       (fun required ->
          if not (contains application required)
          then fail "sync-error timeout behavior is missing %S" required)
-      [ "let sync_error_card_lifetime = Core.Time_ns.Span.of_sec 5."
+      [ "let sync_error_card_lifetime = 5."
       ; "let arm_sync_error_timer sequence ="
       ; "let sync_error_timer_generation = ref 0 in"
-      ; "schedule_after (Core.Time_ns.Span.to_sec sync_error_card_lifetime)"
+      ; "schedule_after sync_error_card_lifetime"
       ; "!sync_error_timer_generation = generation"
       ]
+;;
+
+let test_no_jane_street_core_or_base_dependency root =
+  forbid_text root "app/application.ml" [ "Core.Time_ns" ];
+  forbid_text root "app/dune" [ "\n  core\n"; "\n  base\n" ];
+  require_text root "app/dune" [ "\n  mtime.clock\n" ];
+  forbid_text root "dune-project" [ "(core ("; "(base (" ];
+  require_text root "dune-project" [ "(mtime (= 2.1.0))" ];
+  List.iter (fun relative -> forbid_text root relative [ "\"core\" {"; "\"base\" {" ])
+    [ "logseq_journal.opam"; "logseq_journal.opam.locked"
+    ; "logseq_db_worker.opam.locked" ];
+  require_text root "logseq_journal.opam" [ "\"mtime\" {= \"2.1.0\"}" ]
 ;;
 
 let contains_dune_internal_module_path contents =
@@ -1120,6 +1132,7 @@ let () =
   test_repository_local_runtime_tests root;
   test_sync_transport_is_websocket_only root;
   test_sync_error_card_is_temporary_and_error_only root;
+  test_no_jane_street_core_or_base_dependency root;
   require_exact_dependency root "logseq_journal.opam" ~package:"lui" ~version:"0.1.0";
   require_exact_dependency
     root

@@ -39,8 +39,7 @@
   journal_symbols)
  (libraries
   rrbvec
-  base
-  core
+  mtime.clock
   mldoc
   lui
   ocaml-signal

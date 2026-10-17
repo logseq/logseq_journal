@@ -17,9 +17,8 @@ depends: [
   "logseq_sync" {= "0.1.0"}
   "lui" {= "0.1.0"}
   "ocaml-signal" {= "0.1.0"}
-  "base" {= "v0.17.3"}
   "bigstringaf" {= "0.10.0"}
-  "core" {= "v0.17.2"}
+  "mtime" {= "2.1.0"}
   "mldoc" {= "dev"}
   "ca-certs-nss" {= "3.126"}
   "cstruct" {= "6.2.0"}
