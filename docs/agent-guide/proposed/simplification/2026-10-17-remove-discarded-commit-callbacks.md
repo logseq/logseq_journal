@@ -25,6 +25,11 @@ changes are required. The user authorized implementing both audited
 simplifications, testing and opening a PR on 2026-10-17
 (Sentinel_b66872b73d108191964dce936fc35406).
 
+## Decision
+
+Adopt the proposal as authorized. The implementation is confined to the private
+overlay implementation; the existing behavioral contracts remain unchanged.
+
 ## Alternatives considered
 
 ### Keep a callback snapshot at commit time

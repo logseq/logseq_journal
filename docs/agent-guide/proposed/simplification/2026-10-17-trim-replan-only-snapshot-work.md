@@ -19,7 +19,8 @@ consumers elsewhere and remain required.
 ## Proposal
 
 Remove this function's children-index construction and threaded accumulator.
-Use empty values for the two unused fields of its private temporary snapshot.
+Leave `outbox` and `children_effects` uncaptured (`None`) in this private
+temporary snapshot, so an unexpected future structural read fails explicitly.
 Preserve the actual final outbox accumulator, stable sequence order, block/page
 effect buckets, active dependency shadows, tombstones, asset checks, normalized
 transactions and result classifications. Do not redesign the shared snapshot or
@@ -28,6 +29,11 @@ modify its public interface, protected spec, Dune files or dependencies.
 The user authorized implementing both audited simplifications, testing and
 opening a PR on 2026-10-17
 (Sentinel_b66872b73d108191964dce936fc35406).
+
+## Decision
+
+Adopt the proposal as authorized. The implementation is confined to the private
+overlay implementation; the existing behavioral contracts remain unchanged.
 
 ## Alternatives considered
 
