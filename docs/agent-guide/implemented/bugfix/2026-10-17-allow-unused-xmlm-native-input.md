@@ -12,6 +12,10 @@ Preserve schema 1 force-link producers and their immutable receipts unchanged. A
 
 Change only the existing build owner, its narrow boundary tests and guidance. Do not change Dune, native_embed, dependency pins, protected interfaces, phones or graphs. Coordinate compilation and GUI with the Timeline owner before executing tests/builds.
 
+## Decision
+
+Add schema 2 for ordinary original archives and keep schema 1 unchanged. Bind expanded object-only argv, compiler, original archive companions, unit/object bytes and pinned Git source identities. Require runtime/mldoc retention and reject unresolved XMLm symbols, while permitting unused XMLm elimination. Record the actual three-unit boolean map in schema-2 imports and final links instead of the legacy all-retained claim.
+
 ## Alternatives considered
 
 ### Retain XMLm with an application anchor
@@ -21,6 +25,12 @@ Rejected: this adds unused production reachability to satisfy a check without a 
 ### Delete only the macOS symbol check
 
 Rejected: experimental import, final product checks and receipt validation would still enforce the old force-link contract, while manifest fields could misreport actual retention.
+
+## Consequences
+
+Unknown compiler/linker inputs, split or disguised -cclib options, response files, conflicting input hashes and output-as-input identities are refused. Relative argv uses its recorded working directory. Absolute historical input names are stable lexical identities, so removing an installation symlink after a valid receipt does not change the identity being checked. Current source, object, runtime headers and evidence remain live checks; only receipt-bound consumed inputs can become historical.
+
+No production anchor, forced archive, Dune/spec edit or shared dependency repair is needed. Experimental Host restamping remains explicitly outside full iOS ABI validation.
 
 ## Acceptance criteria
 
@@ -37,3 +47,11 @@ Rejected: experimental import, final product checks and receipt validation would
 ## Questions
 
 - None. The user approved this exact direction; no protected Dune/spec edit is needed.
+
+## Verification
+
+Real tiny compiler/linker fixtures first reproduced the new contract and seven independent review findings as RED cases. After the corrections all 46 build-owner tests pass with no skips, including legacy producer/receipt cases and the installed SQLite runtime boundary. A separate read-only journal-code-review session confirmed the seven findings closed and no further evidence-backed contract issues; this does not replace the later whole-PR review.
+
+The formal native macOS phase for revision 6ab0ead succeeded with runtime=true, mldoc=true and xmlm=false. The macOS App subsequently failed on the pre-existing JournalChrome listSectionSpacing API being unavailable on macOS, so no macOS App success is claimed. Fresh source/link records use that completed native phase's actual Dune argv and current input hashes; the old failed overall manifest is not a successful receipt.
+
+The formal Simulator build 1.5877.34 completed input revalidation, target C/Swift compilation, final symbol/provider checks and signing with accurate schema-2 unit observations. A135 read-only Lambda RTC Favorites/detail acceptance then passed. The artifact remains experimental-host-restamp with cross_abi_validated=false.
