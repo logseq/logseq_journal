@@ -61,6 +61,13 @@ without moving complexity into another API.
   required index. Current call-chain review must include nested asset/tombstone
   reads; the general snapshot producers must not be changed.
 
+## Consequences
+
+Ordinary replan no longer builds a children-effect map or repeatedly reverses
+its retained prefix for an unread temporary snapshot field. Real block/page
+effect buckets and the final retained record order remain authoritative. General
+journal and structure snapshot producers retain their required roots.
+
 ## Questions
 
 None. The implementation and PR are explicitly authorized; no new product or

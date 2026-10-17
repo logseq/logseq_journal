@@ -55,6 +55,13 @@ dispatcher and unlisten semantics. The existing stream owner remains authoritati
 - Mechanical tuple edits must not change a branch result or the real dispatcher.
   These are private implementation tuples, not a public contract cutover.
 
+## Consequences
+
+Commit paths no longer allocate discarded subscriber lists or carry an unused
+private tuple component. Dispatcher capacity, notification streams and callback
+lifecycle remain the sole delivery mechanism. No interface or persistence
+format changes are introduced.
+
 ## Questions
 
 None. The implementation and PR are explicitly authorized; no new product or
