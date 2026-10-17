@@ -105,6 +105,22 @@ class BuildBoundaryTests(unittest.TestCase):
             self.assertIn("exists", result.stderr)
             self.assertEqual(sentinel.read_text(), "keep")
 
+    def test_producer_only_is_an_explicit_native_macos_mode(self):
+        for args in [('ios-simulator', '--link-only'),
+                     ('macos', '--link-only'),
+                     ('macos', '--probe-native-object', '/tmp/probe.o'),
+                     ('macos', '--experimental-host-restamp', '--native-manifest', '/tmp/input.json'),
+                     ('macos', '--switch', 'unused', '--app-dir', '/tmp/unused-producer.app'),
+                     ('macos', '--switch', 'unused', '--sign-identity', 'unused')]:
+            with self.subTest(args=args):
+                result = self.cli(*args, '--producer-only', '--preflight')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('producer-only requires', result.stderr)
+        result = self.cli('macos', '--producer-only', '--preflight')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('--switch', result.stderr)
+
+
 
 class CacheBoundaryTests(unittest.TestCase):
     @classmethod
@@ -529,6 +545,25 @@ class CacheBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'native'):
                 build.verify_inputs()
 
+    def test_producer_final_verification_rechecks_the_selected_compiler(self):
+        with self.pinned_switch() as f:
+            build = f.build
+            build.args.producer_only = True
+            compiler = self.compiler_fixture(build.prefix)
+            build.swift_dir, build.lui, build.entitlements = (f.root / name for name in ('swift', 'lui', 'entitlements'))
+            for path in (build.swift_dir, build.lui, build.entitlements):
+                path.mkdir()
+            build.plist = f.root / 'Info.plist'
+            build.plist.write_bytes(b'plist fixture')
+            build.tools = {}
+            build.inputs = dict(source=self.build.source_inputs(), swift={}, lui={}, entitlements={},
+                plist=self.build.sha(build.plist), signing={}, dependencies=build.dependencies(),
+                toolchain=dict(hashes={}, sdk_identity={'settings': {}}, **self.build.opam_identity(build.opam)))
+            build.verify_inputs()
+            compiler.write_text(compiler.read_text() + '# compiler changed during native phase\n')
+            with self.assertRaisesRegex(RuntimeError, 'compiler|toolchain'):
+                build.verify_inputs()
+
     def test_probe_helper_preflight_supports_stub_and_platform_matched_objects(self):
         sys.path.insert(0, str(SCRIPTS))
         import lui_probe_host
@@ -899,6 +934,155 @@ while True: time.sleep(1)
                 build.report['source_sha'], build.lui_sha = commit, pins['lui']
                 yield SimpleNamespace(build=build, source=source, link=link, pre=pre, native=native,
                     envelope=envelope, path=path, root=root, save=save, runtime=runtime, provenance=provenance)
+
+    @contextmanager
+    def native_dune_producer(self):
+        """A real Dune complete-object rule, including removable host C providers."""
+        with self.ordinary_producer_fixture() as f:
+            repo = self.build.ROOT
+            original_compiler = Path(f.link['command'][0])
+            compiler = f.root / 'package/bin/ocamlopt.opt'
+            compiler.parent.mkdir(exist_ok=True)
+            compiler.symlink_to(original_compiler)
+            (f.root / 'package/lib/ocaml').symlink_to(f.runtime)
+            switch = os.environ.get('JOURNAL_TEST_SWITCH')
+            dune = (Path(subprocess.check_output(['opam', 'var', '--safe', '--switch', switch, 'bin'],
+                                                text=True).strip()) / 'dune') if switch else Path(shutil.which('dune'))
+            effect = repo / 'logseq_sync/lib/effect_runner'
+            effect.mkdir(exist_ok=True)
+            original = f.root / 'effect'
+            for path in original.glob('*'):
+                if path.is_file():
+                    shutil.copyfile(path, effect / path.name)
+            c = effect / 'platform_crypto_stubs.c'
+            c.write_text('int logseq_transport_dns_start(void) { return 1; }\n'
+                         'int logseq_journal_crypto_call(void) { return 1; }\n')
+            obj = c.with_suffix('.o')
+            subprocess.run(['xcrun', 'clang', '-c', c, '-o', obj], check=True, capture_output=True)
+            stub = effect / 'liblogseq_sync_effect_runner_impl_stubs.a'
+            subprocess.run(['ar', 'rcs', stub, obj], check=True, capture_output=True)
+            archive = effect / 'logseq_sync_effect_runner_impl.cmxa'
+            subprocess.run([compiler, '-a', '-o', archive, effect / 'effect.cmx',
+                            '-cclib', '-llogseq_sync_effect_runner_impl_stubs'], check=True, capture_output=True)
+            # The fixture rule is opaque to the builder: it must read actual Dune argv.
+            command = [str(compiler), '-output-complete-obj', '-w', '@1..3', '-o', 'app/native_embed.exe.o',
+                       '-I', 'logseq_sync/lib/effect_runner', 'logseq_sync/lib/effect_runner/' + archive.name,
+                       f.provenance['xmlm']['installed_archive'], f.provenance['mldoc']['installed_archive'],
+                       'app/unit.cmx']
+            def atom(value):
+                return json.dumps(str(value))
+            (repo / 'dune-project').write_text('(lang dune 3.0)\n')
+            (repo / 'app/dune').write_text('(rule (target native_embed.exe.o) (deps libgmp.a unit.cmx unit.o '
+                + ' '.join(atom('../logseq_sync/lib/effect_runner/' + path.name)
+                           for path in effect.iterdir() if path.suffix in ('.cmxa', '.a'))
+                + ') (action (chdir .. (run ' + ' '.join(map(atom, command)) + '))))\n')
+            shutil.copyfile(stub, repo / 'app/libgmp.a')
+            workspace = f.root / 'workspace'
+            workspace.mkdir()
+            dune_dir = workspace / 'dune'
+            def opam(*argv):
+                self.assertEqual(argv[:3], ('exec', '--', 'dune'))
+                return f.build.run(dune, *argv[3:])
+            f.build.opam = opam
+            f.build.args = SimpleNamespace(platform='macos', configuration='release', jobs=1,
+                producer_only=True, link_only=False, experimental_host_restamp=False,
+                native_manifest=None, probe_native_object=None)
+            f.build.report['mode'] = 'native-producer'
+            f.build.tools = {'swift': '/unexpected-swift-command'}
+            f.build.prefix = f.root / 'package'
+            subprocess.run(['git', '-C', repo, 'add', '.'], check=True, capture_output=True)
+            subprocess.run(['git', '-C', repo, '-c', 'user.name=Build test', '-c', 'user.email=build@example.invalid',
+                            'commit', '-qm', 'native rule'], check=True, capture_output=True)
+            f.build.report['source_sha'] = subprocess.check_output(['git', '-C', repo, 'rev-parse', 'HEAD'], text=True).strip()
+            f.build.inputs = dict(source=self.build.source_inputs(), lui_sha=f.pre['lui'],
+                toolchain=dict(compiler_sha256=self.build.sha(compiler),
+                               opam_prefix=str(f.build.prefix)),
+                dependencies=dict(pins={name + ('.0.1.0' if name == 'ocaml-signal' else '.dev'): dict(resolved_sha=commit,
+                    checkout=f.provenance[name]['source_checkout'] if name in f.provenance else str(repo))
+                    for name, commit in [('mldoc', f.provenance['mldoc']['pinned_commit']),
+                                         ('xmlm', f.provenance['xmlm']['pinned_commit']),
+                                         ('ocaml-signal', f.pre['signal']),
+                                         ('datascript-ocaml-native', f.pre['datascript'])]}))
+            f.build.opam('exec', '--', 'dune', 'build', '--root', repo, '--no-config',
+                         '--cache=disabled', '--build-dir', dune_dir, '--profile', 'release',
+                         '-j', '1', 'app/native_embed.exe.o')
+            native = dune_dir / 'default/app/native_embed.exe.o'
+            f.build.report['native_object'] = dict(path=str(native), sha256=self.build.sha(native), mode='native-producer')
+            yield SimpleNamespace(**vars(f), workspace=workspace, original_native=native, compiler=compiler)
+
+    def test_producer_uses_current_dune_rule_even_after_a_noop_build(self):
+        self.assertTrue(hasattr(self.build.Build, 'produce_native'), 'producer-only entry is missing')
+        with self.native_dune_producer() as f:
+            for attempt in range(2):
+                if attempt:
+                    f.build.opam('exec', '--', 'dune', 'build', '--root', self.build.ROOT, '--no-config',
+                        '--cache=disabled', '--build-dir', f.workspace / 'dune', '--profile', 'release',
+                        '-j', '1', 'app/native_embed.exe.o')
+                envelope_path = f.build.compile(f.workspace)
+                envelope = json.loads(envelope_path.read_text())
+                self.assertEqual(envelope['schema_version'], 2)
+                self.assertNotIn('validated_build', envelope)
+                source = self.build.read_evidence(envelope['source'], envelope_path.parent)
+                link = self.build.read_evidence(envelope['link'], envelope_path.parent)
+                self.assertEqual(link['compiler_sha256'], self.build.sha(f.compiler))
+                self.assertEqual(self.build.sha(f.original_native), f.build.report['native_object']['sha256'])
+                self.assertNotEqual(source['production_native_object'], str(f.original_native))
+                f.build.args.native_manifest = envelope_path
+                imported = f.build.imported_native(f.build.inputs['source'])
+                f.build.args.native_manifest = None
+                self.assertEqual(imported['ocaml_units'], dict(runtime=True, mldoc=True, xmlm=False))
+                inputs = imported['files']
+                for name, digest in link['direct_native_input_sha256'].items():
+                    self.assertEqual(inputs[name], digest)
+                self.assertNotIn('artifact', f.build.report)
+                self.assertFalse(f.build.report['cross_abi_validated'])
+                self.assertFalse(f.build.report['runtime_acceptance'])
+                self.assertEqual(f.build.report['producer']['envelope']['sha256'], self.build.sha(envelope_path))
+                if not attempt:
+                    first_path = envelope_path
+                    first_bytes = envelope_path.read_bytes()
+                    first_mtime = envelope_path.stat().st_mtime_ns
+            self.assertEqual(first_path, envelope_path)
+            self.assertEqual(first_bytes, envelope_path.read_bytes())
+            self.assertEqual(first_mtime, envelope_path.stat().st_mtime_ns, 'immutable producer records were overwritten')
+            links = [record for record in f.build.report['commands'] if record['phase'] == 'producer-link'
+                     and record['argv'][0] == str(f.compiler)]
+            self.assertEqual(len(links), 1, 'hot producer unexpectedly linked again')
+
+    def test_producer_refuses_a_rule_with_unbound_linker_inputs_before_running_it(self):
+        self.assertTrue(hasattr(self.build.Build, 'produce_native'), 'producer-only entry is missing')
+        with self.native_dune_producer() as f:
+            path = self.build.ROOT / 'app/dune'
+            path.write_text(path.read_text().replace('"-w"', '"-ccopt" "@unbound.rsp" "-w"'))
+            f.build.inputs['source'] = self.build.source_inputs()
+            with self.assertRaisesRegex(ValueError, 'unsupported|native.*argument'):
+                f.build.produce_native(f.original_native, f.workspace)
+            self.assertNotIn('producer', f.build.report)
+
+    def test_producer_reuse_rechecks_original_object_and_immutable_records(self):
+        self.assertTrue(hasattr(self.build.Build, 'produce_native'), 'producer-only entry is missing')
+        for changed in ('original-object', 'evidence'):
+            with self.subTest(changed=changed), self.native_dune_producer() as f:
+                envelope = f.build.produce_native(f.original_native, f.workspace)
+                if changed == 'original-object':
+                    f.original_native.write_bytes(f.original_native.read_bytes() + b'changed')
+                else:
+                    record = json.loads(envelope.read_text())['link']
+                    Path(record['path']).write_text('{}')
+                with self.assertRaisesRegex((RuntimeError, ValueError), 'hash|changed|identity'):
+                    f.build.produce_native(f.original_native, f.workspace)
+
+    def test_producer_only_receipt_cannot_authorize_historical_target_inputs(self):
+        with self.ordinary_producer_fixture() as f:
+            imported = f.build.imported_native(f.source)
+            receipt = dict(status='native-produced', mode='native-producer', source_sha=f.pre['commit'],
+                inputs=dict(dependencies=imported), production_link=dict(ocaml_units=imported['ocaml_units']))
+            receipt_path = f.root / 'producer-receipt.json'
+            receipt_path.write_text(json.dumps(receipt))
+            f.envelope['validated_build'] = dict(path=str(receipt_path), sha256=self.build.sha(receipt_path))
+            f.save()
+            with self.assertRaisesRegex(ValueError, 'receipt'):
+                f.build.imported_native(f.source)
 
     def test_ordinary_xmlm_input_allows_dead_code_elimination(self):
         with self.ordinary_producer_fixture() as f:

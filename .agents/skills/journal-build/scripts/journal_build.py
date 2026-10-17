@@ -118,7 +118,8 @@ class Build:
         # They must not affect the explicit target SDK or switch in subprocesses.
         ignored = {name: self.env.pop(name) for name in ("SDKROOT", "CPATH", "LIBRARY_PATH",
                    "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH") if name in self.env}
-        mode = ("probe-object" if getattr(args, "probe_native_object", None) else
+        mode = ("native-producer" if getattr(args, "producer_only", False) else
+                "probe-object" if getattr(args, "probe_native_object", None) else
                 "experimental-host-restamp" if args.experimental_host_restamp else "link-only" if args.link_only else "native")
         self.report = {"status": "running", "started": datetime.now(timezone.utc).isoformat(),
                        "commands": [], "mode": mode, "cross_abi_validated": False,
@@ -466,7 +467,9 @@ class Build:
             raise ValueError("host object still provides DNS/crypto; target C must provide them")
         self.host_object, self.native_files = host, inputs
         self.report["native_source_sha"] = pre["commit"]
-        self.report["abi_limit"] = "EXPERIMENTAL: host ARM64 OCaml/runtime restamped; full iOS runtime ABI is not validated"
+        self.report["abi_limit"] = ("Host ARM64 producer only; no Apple App or iOS ABI validation"
+            if getattr(self.args, "producer_only", False) else
+            "EXPERIMENTAL: host ARM64 OCaml/runtime restamped; full iOS runtime ABI is not validated")
         print(self.report["abi_limit"], file=sys.stderr)
         return {"schema_version": version, "ocaml_units": units,
                 "producer": envelope, "files": inputs, "historical_inputs": historical,
@@ -679,12 +682,184 @@ class Build:
         self.inputs = {"source": source, "swift": files(self.swift_dir), "lui": files(self.lui),
                        "lui_sha": lui_sha, "plist": sha(self.plist), "entitlements": files(self.entitlements),
                        "dependencies": dependencies, "toolchain": toolchain, "target": triple,
-                       "signing": signing, "flags": {"configuration": a.configuration, "mode": self.report["mode"],
+                       "signing": signing, "flags": {"configuration": a.configuration,
+                                 "mode": "native" if getattr(a, "producer_only", False) else self.report["mode"],
                                  "info": self.info, "sign_identity": a.sign_identity}}
         self.inputs["flags"]["teams"] = {name: self.env.get(name) for name in ("JOURNAL_IOS_TEAM_ID", "JOURNAL_MACOS_TEAM_ID")}
         self.report.update(inputs=self.inputs, target=triple, sdk_name=sdk_name, architecture="arm64",
                            cache_key=fingerprint(self.inputs))
         self.save()
+
+    def native_link_rule(self, workspace):
+        """Read the current rule even when Dune's incremental build ran no linker."""
+        rules = json.loads(self.opam("exec", "--", "dune", "rules", "--root", ROOT, "--no-config",
+            "--cache=disabled", "--build-dir", workspace / "dune", "--profile",
+            "dev" if self.args.configuration == "debug" else "release", "--format=json", "app/native_embed.exe.o"))
+        if len(rules) != 1:
+            raise ValueError("producer needs exactly one native Dune link rule")
+        action, cwd = rules[0]["action"], ROOT
+        while isinstance(action, list) and len(action) == 3 and action[0] == "chdir":
+            cwd = Path(os.path.abspath(cwd / action[1]))
+            action = action[2]
+        if (not isinstance(action, list) or len(action) < 2 or action[0] != "run"
+                or not all(isinstance(arg, str) for arg in action[1:])
+                or cwd != workspace / "dune/default"):
+            raise ValueError("unsupported native Dune action; expected one complete-object compiler command")
+        command = action[1:]
+        command[0] = os.path.abspath(cwd / command[0])
+        compiler = self.prefix / "bin/ocamlopt.opt"
+        if command[0] != str(compiler) or sha(compiler) != self.inputs["toolchain"]["compiler_sha256"]:
+            raise ValueError("Dune producer compiler identity differs from preflight")
+        return cwd, command
+
+    def producer_pin(self, name):
+        pins = [pin for package, pin in self.inputs["dependencies"]["pins"].items()
+                if package.split(".", 1)[0] == name]
+        if len(pins) != 1:
+            raise ValueError(f"producer needs one resolved {name} pin")
+        return pins[0]
+
+    def producer_dependency(self, name, archive):
+        pin = self.producer_pin(name)
+        checkout, commit = Path(pin["checkout"]), pin["resolved_sha"]
+        tracked = self.run("git", "-C", checkout, "ls-files", "-z").split("\0")
+        originals = {}
+        for path in tracked:
+            if Path(path).suffix in {".ml", ".mli"}:
+                blob = subprocess.check_output(["git", "-C", str(checkout), "show", commit + ":" + path])
+                originals.setdefault((Path(path).name, hashlib.sha256(blob).hexdigest()), []).append(path)
+        sources = {}
+        for path in sorted(archive.parent.iterdir()):
+            if path.suffix in {".ml", ".mli"}:
+                digest = sha(path)
+                matches = originals.get((path.name, digest), [])
+                if len(matches) == 1:
+                    sources[path.name] = {"sha256": digest, "git_path": matches[0]}
+        if name + ".ml" not in sources:
+            raise ValueError(f"{name} installed source does not match its pinned Git bytes")
+        member = subprocess.check_output(["ar", "-p", str(archive.with_suffix(".a")), name + ".o"])
+        return {"pinned_commit": commit, "source_checkout": str(checkout), "installed_archive": str(archive),
+                "archive_sha256": sha(archive), "static_archive_sha256": sha(archive.with_suffix(".a")),
+                "installed_sources_matched_to_pinned_git": sources,
+                "original_unit": {"cmx_sha256": sha(archive.with_suffix(".cmx")),
+                                  "object_sha256": hashlib.sha256(member).hexdigest()}}
+
+    def produce_native(self, native, workspace):
+        """Produce immutable schema-2 evidence, without claiming a built Apple App."""
+        self.phase = "producer-prepare"
+        if sha(native) != self.report["native_object"]["sha256"]:
+            raise ValueError("original native object hash changed before production")
+        self.verify_target(native, "MACOS")
+        cwd, original = self.native_link_rule(workspace)
+        directory = workspace / "native-producer"
+        envelope_path = directory / "native-input.json"
+        rule = {"working_directory": str(cwd), "command": original,
+                "original_object": {"path": str(native), "sha256": sha(native)},
+                "source_sha": self.report["source_sha"]}
+        reused = directory.exists()
+        if reused:
+            if not envelope_path.is_file() or json.loads((directory / "dune-rule.json").read_text()) != rule:
+                raise ValueError("producer cache rule/object identity changed or is incomplete; choose a fresh cache")
+        else:
+            directory.mkdir()
+            def dump(name, value):
+                path = directory / name
+                with path.open("x") as stream:
+                    stream.write(json.dumps(value, indent=2) + "\n")
+                return {"path": str(path), "sha256": sha(path)}
+            def absolute(arg):
+                return Path(os.path.abspath(cwd / arg))
+            effects = [absolute(arg) for arg in original if arg.endswith("/logseq_sync_effect_runner_impl.cmxa")]
+            if len(effects) != 1:
+                raise ValueError("producer needs one original effect-runner archive")
+            effect = effects[0].parent
+            copied = directory / "host-stubs"
+            copied.mkdir()
+            inputs = {}
+            def record(path):
+                path = absolute(path)
+                self.bind_native_inputs(inputs, {str(path): sha(path)})
+            for name in ("logseq_sync_effect_runner_impl.cmxa", "logseq_sync_effect_runner_impl.a"):
+                record(effect / name)
+                shutil.copyfile(effect / name, copied / name)
+            stub_name = "liblogseq_sync_effect_runner_impl_stubs.a"
+            patched = copied / stub_name
+            shutil.copyfile(effect / stub_name, patched)
+            if self.run("ar", "-t", patched).splitlines().count("platform_crypto_stubs.o") != 1:
+                raise ValueError("producer needs exactly one original host DNS/crypto C member")
+            self.run("ar", "-d", patched, "platform_crypto_stubs.o", env=dict(self.env, ZERO_AR_DATE="1"))
+            if "platform_crypto_stubs.o" in self.run("ar", "-t", patched).splitlines():
+                raise ValueError("host DNS/crypto member was not removed from the owned archive copy")
+            command, includes = [original[0]], []
+            for index, arg in enumerate(original[1:], 1):
+                previous = original[index - 1]
+                if previous == "-o":
+                    arg = str(directory / "production-host.o")
+                elif previous == "-I":
+                    path = absolute(arg)
+                    arg = str(copied if path == effect else path)
+                    includes.append(Path(arg))
+                elif previous == "-cclib" and arg.startswith("-L") and len(arg) > 2:
+                    arg = "-L" + str(absolute(arg[2:]))
+                elif previous not in {"-w", "-warn-error"} and not arg.startswith("-") and Path(arg).suffix in {".cmxa", ".cmx", ".a", ".o"}:
+                    path = absolute(arg)
+                    path = copied / path.name if path == effects[0] else path
+                    arg = str(path)
+                    record(path)
+                    if path.suffix in {".cmxa", ".cmx"}:
+                        record(path.with_suffix(".a" if path.suffix == ".cmxa" else ".o"))
+                command.append(arg)
+            runtime = Path(self.run(original[0], "-where"))
+            if runtime.resolve() != (self.prefix / "lib/ocaml").resolve():
+                raise ValueError("producer compiler runtime differs from the selected switch")
+            # These include-search candidates bind implicit C/runtime providers as well as explicit inputs.
+            for include in includes + [runtime]:
+                for archive in sorted(include.glob("*.a")):
+                    record(archive)
+            dependencies = {}
+            for name in ("mldoc", "xmlm"):
+                archives = [Path(arg) for arg in command if Path(arg).name == name + ".cmxa"]
+                if len(archives) != 1:
+                    raise ValueError(f"producer needs one original {name} archive in the actual link command")
+                dependencies[name] = self.producer_dependency(name, archives[0])
+            pre = {"commit": self.report["source_sha"], "lui": self.lui_sha,
+                "signal": self.producer_pin("ocaml-signal")["resolved_sha"],
+                "datascript": self.producer_pin("datascript-ocaml-native")["resolved_sha"],
+                "native_source_sha256": {name: digest for name, digest in self.inputs["source"].items()
+                    if Path(name).suffix in {".ml", ".mli", ".c", ".h"}
+                    and not {"tool", "test", "apple-tests"}.intersection(Path(name).parts)},
+                "installed_lui_source_sha256": {str(p): sha(p) for p in (self.prefix / "lib/lui").rglob("*")
+                    if p.is_file() and p.suffix in {".ml", ".mli"}},
+                "production_native_object": str(directory / "production-host.o")}
+            link = {"command": command, "working_directory": str(cwd), "direct_native_input_sha256": inputs,
+                "compiler_sha256": self.inputs["toolchain"]["compiler_sha256"],
+                "compiler_version": self.run(original[0], "-version"), "new_dependency_provenance": dependencies,
+                "patched_host_stub_archive_sha256": sha(patched),
+                "device_c_source_sha256": {p.name: sha(p) for p in
+                    (ROOT / "logseq_sync/lib/effect_runner/platform").glob("platform_crypto_stubs.*")}}
+            # Reject unbound/unknown command forms before executing the current Dune-derived relink.
+            self.ordinary_native_inputs(pre, link)
+            link["command"] = self.ordinary_command
+            self.phase = "producer-link"
+            self.run(*link["command"], cwd=cwd)
+            if any(sha(path) != digest for path, digest in inputs.items()):
+                raise ValueError("native link input hash changed during production")
+            pre["production_native_object_sha256"] = link["production_host_sha256"] = sha(pre["production_native_object"])
+            envelope = {"schema_version": 2, "source": dump("source.json", pre), "link": dump("link.json", link),
+                        "dune_rule": dump("dune-rule.json", rule)}
+            dump("native-input.json", envelope)
+        self.phase = "verify-producer"
+        previous = self.args.native_manifest
+        try:
+            self.args.native_manifest = envelope_path
+            imported = self.imported_native(self.inputs["source"])
+        finally:
+            self.args.native_manifest = previous
+        self.native_files[str(native)] = rule["original_object"]["sha256"]
+        self.report["producer"] = {"envelope": {"path": str(envelope_path), "sha256": sha(envelope_path)},
+            "object": {"path": str(self.host_object), "sha256": sha(self.host_object)},
+            "ocaml_units": imported["ocaml_units"], "link_executed": not reused}
+        return envelope_path
 
     def compile(self, workspace):
         a = self.args
@@ -714,7 +889,7 @@ class Build:
             self.env.update(DUNE_CACHE_ROOT=str(workspace / "dune-cache"),
                             XDG_CACHE_HOME=str(workspace / "xdg-cache"))
             self.opam("exec", "--", "dune", "build", "--root", ROOT, "--no-config", "--cache=disabled",
-                      "--build-dir", dune_dir,
+                      "--build-dir", dune_dir, "--trace-file", self.run_dir / "native-trace.json",
                       "--profile", "dev" if a.configuration == "debug" else "release",
                       "-j", str(a.jobs), "app/native_embed.exe.o")
             native = dune_dir / "default/app/native_embed.exe.o"
@@ -724,6 +899,8 @@ class Build:
         self.report["native_object"] = {"path": str(native), "sha256": sha(native), "mode": self.report["mode"]}
         if native_units is not None:
             self.report["native_object"]["ocaml_units"] = native_units
+        if getattr(a, "producer_only", False):
+            return self.produce_native(native, workspace)
         self.phase = "swift"
         scratch = workspace / "swift"
         native_inputs = [native, self.target_c] if a.native_manifest else [native]
@@ -904,6 +1081,10 @@ class Build:
             raise RuntimeError("imported native/signing inputs changed during build; artifact is not accepted")
         a = self.args
         if not (a.link_only or a.native_manifest or getattr(a, "probe_native_object", None)):
+            if getattr(a, "producer_only", False):
+                current = opam_identity(self.opam)
+                if any(self.inputs["toolchain"].get(name) != value for name, value in current.items()):
+                    raise RuntimeError("OCaml compiler changed during build; producer is not accepted")
             if self.dependencies() != self.inputs["dependencies"]:
                 raise RuntimeError("switch changed during build; artifact is not accepted")
 
@@ -916,6 +1097,7 @@ def arguments():
     parser.add_argument("--switch", help="explicit pre-provisioned opam switch (native macOS only)")
     parser.add_argument("--lui-package", type=Path, help="local LUI platform/apple package")
     parser.add_argument("--preflight", action="store_true", help="check inputs without compiling")
+    parser.add_argument("--producer-only", action="store_true", help="native macOS producer evidence only; no Swift, App packaging or signing")
     parser.add_argument("--link-only", action="store_true", help="explicit stub build; not runnable acceptance")
     parser.add_argument("--experimental-host-restamp", action="store_true", help="explicit existing host ARM64 compatibility route; full iOS ABI unverified")
     parser.add_argument("--native-manifest", type=Path, help="hash-verified source/link/XMLm producer evidence envelope")
@@ -930,6 +1112,10 @@ def arguments():
     parser.add_argument("--provisioning-profile", type=Path, help="existing device profile; never downloaded")
     parser.add_argument("--sign-entitlements", type=Path, help="existing device signing entitlements")
     a = parser.parse_args()
+    if a.producer_only and (a.platform != "macos" or a.link_only or a.native_manifest or a.experimental_host_restamp
+                           or a.probe_native_object or a.app_dir or a.app_directory or a.sign_identity != "-"
+                           or a.provisioning_profile or a.sign_entitlements):
+        parser.error("producer-only requires native macOS --switch inputs without App output/import/signing modes")
     if a.probe_native_object and (a.platform == "ios-device" or a.switch or a.link_only or a.native_manifest or a.experimental_host_restamp):
         parser.error("probe mode is isolated macOS/Simulator object import, separate from production/stub modes")
     for name in ("JOURNAL_OCAML_OBJECT", "JOURNAL_EXTRA_OBJECTS", "JOURNAL_NATIVE_LINK_INPUTS"):
@@ -995,12 +1181,13 @@ def main():
                 build.report["cache_reused"] = (workspace / "inputs.json").exists()
                 (workspace / "inputs.json").write_text(json.dumps(build.inputs, indent=2) + "\n")
                 product = build.compile(workspace)
-                build.assemble(product, a.app_dir or run_dir / "LogseqJournal.app")
+                if not a.producer_only:
+                    build.assemble(product, a.app_dir or run_dir / "LogseqJournal.app")
                 build.verify_inputs()
-            build.report["status"] = "preflight-passed" if a.preflight else "built"
+            build.report["status"] = "preflight-passed" if a.preflight else "native-produced" if a.producer_only else "built"
             build.report["finished"] = datetime.now(timezone.utc).isoformat()
             build.save()
-            print(build.report.get("artifact", {}).get("app", "preflight passed"))
+            print(build.report.get("artifact", {}).get("app", "preflight passed") if a.preflight or not a.producer_only else product)
             print(f"manifest: {run_dir / 'manifest.json'}", file=sys.stderr)
         except (RuntimeError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, KeyboardInterrupt) as error:
             build.report.update(status="failed", failed_phase=build.phase, error=str(error))
