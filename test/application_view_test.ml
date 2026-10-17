@@ -5363,11 +5363,16 @@ let test_graph_picker_controls scenario () =
   let release_automatic_inspection = Atomic.make false in
   let automatic_inspection_returned = Atomic.make false in
   let inspection_terminals = ref 0 in
+  let graph_read_started = Atomic.make false and graph_read_finished = Atomic.make false in
+  let release_graph_read = Atomic.make false and graph_read_cancellations = ref 0 in
+  let graph_read_cancelling = Atomic.make false and release_graph_terminal = Atomic.make false in
+  let graph_read_worker = Atomic.make None in
   let graph_opens = Atomic.make 0 in
   let root_renders = ref 0 in
   let client = ref None in
   let service = W.Service.create ~push_topic_count:6
-      ~concurrency:(if scenario = `Late_presence then Concurrent { max_in_flight = 2 } else Serial)
+      ~concurrency:(if scenario = `Late_presence || scenario = `Late_graph_cancel
+                    then Concurrent { max_in_flight = 2 } else Serial)
       ~init:(fun context _ ->
         W.Session_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed manager);
         Ok ())
@@ -5429,6 +5434,21 @@ let test_graph_picker_controls scenario () =
                   ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 }
                 ; generation = "g"; projection_revision = "p" }
             | V2_list_journals _ -> P.V2_journals_outcome { items = []; next_cursor = None }
+            | V2_list_favorites _ when scenario = `Late_graph_cancel
+                && (Atomic.get current).snapshot.selected_graph = Some first ->
+              Fun.protect ~finally:(fun () ->
+                Atomic.set graph_read_cancelling true;
+                Eio.Cancel.protect (fun () ->
+                  while not (Atomic.get release_graph_terminal) do Eio.Fiber.yield () done);
+                Atomic.set graph_read_finished true) (fun () ->
+                Atomic.set graph_read_worker (Some (W.Request_context.request_id context));
+                Atomic.set graph_read_started true;
+                while not (Atomic.get release_graph_read) do Eio.Fiber.yield () done;
+                P.V2_favorites_outcome { favorites_page = None; generation = "g"
+                  ; projection_revision = "p"; items = []; next_cursor = None })
+            | V2_list_favorites _ when scenario = `Late_graph_cancel -> P.V2_favorites_outcome
+                { favorites_page = None; generation = "g"
+                ; projection_revision = "p"; items = []; next_cursor = None }
             | V2_get_asset_descriptors _ | V2_list_assets _ ->
               P.V2_assets_outcome { generation = "g"; projection_revision = "p"; items = []; next_cursor = None }
             | _ -> P.V2_failed { code = "UnusedFixtureRead"; message = "Unused graph-picker fixture read" } in
@@ -5443,7 +5463,10 @@ let test_graph_picker_controls scenario () =
       W.on_event value (function
         | W.Response { outcome = Completed (Service.Local_copy_deleted _); _ } ->
           deletion_terminal := true
-        | W.Response { outcome = Completed (Service.Local_copy_inspected _) | Cancelled; _ } ->
+        | W.Response { request_id; outcome = Cancelled; _ } ->
+          incr inspection_terminals;
+          if Atomic.get graph_read_worker = Some request_id then incr graph_read_cancellations
+        | W.Response { outcome = Completed (Service.Local_copy_inspected _); _ } ->
           incr inspection_terminals
         | _ -> ())) service in
   let props = Hashtbl.create 128 in
@@ -5485,10 +5508,16 @@ let test_graph_picker_controls scenario () =
   Fun.protect ~finally:(fun () ->
     Atomic.set finish_deletion true;
     Atomic.set release_automatic_inspection true;
+    Atomic.set release_graph_read true;
+    Atomic.set release_graph_terminal true;
     ignore (hooks.dispose ()); Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client)
     (fun () ->
       consume (hooks.init 2 2 config);
       wait "Switch graph action mounts" (fun () -> Option.is_some (find "text" "Switch graph"));
+      if scenario = `Late_graph_cancel then (
+        wait "Favorites action mounts" (fun () -> Option.is_some (find "accessibility-label" "Favorites"));
+        press (Option.get (find "accessibility-label" "Favorites"));
+        wait "old graph Favorite read is genuinely in flight" (fun () -> Atomic.get graph_read_started));
       press (Option.get (find "text" "Switch graph"));
       wait "graph list mounts" (fun () -> Option.is_some (find "accessibility-identifier" "graph-picker-list"));
       if scenario = `Late_presence then (
@@ -5530,6 +5559,22 @@ let test_graph_picker_controls scenario () =
         press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
         wait "name selection reaches worker" (fun () ->
           List.exists (function Service.Select_graph id -> id = second | _ -> false) (Atomic.get commands))
+      | `Late_graph_cancel ->
+        press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        wait "new graph is visible while old cancellation cleanup is held" (fun () ->
+          Atomic.get graph_read_cancelling
+          && Atomic.get graph_opens >= 2
+          && Option.is_some (find "accessibility-label" "Favorites"));
+        Alcotest.(check int) "old cancellation has not been delivered yet" 0 !graph_read_cancellations;
+        press (Option.get (find "accessibility-label" "Favorites"));
+        Atomic.set release_graph_terminal true;
+        wait "real old Worker cancellation is delivered after scope switch" (fun () ->
+          Atomic.get graph_read_finished && !graph_read_cancellations > 0);
+        consume (hooks.pump ());
+        Alcotest.(check bool) "selected scope is current" true
+          ((Atomic.get current).snapshot.selected_graph = Some second);
+        Alcotest.(check bool) "old graph cancellation does not publish a current sync error" true
+          (Option.is_none (find "text" "Worker unavailable"))
       | (`Delete_menu | `Cancel | `Confirm | `Reopen | `Failure_select | `Presence_failure | `Refresh_after_presence_failure | `During_delete | `Late_presence) ->
         let stable_select = node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second) in
         if scenario = `Failure_select then retained_select := Some stable_select;
@@ -5635,6 +5680,8 @@ let () =
         Alcotest.test_case "current marker and long names" `Quick (test_graph_picker_controls `Current);
         Alcotest.test_case "close retains current session" `Quick (test_graph_picker_controls `Close);
         Alcotest.test_case "name switches graph" `Quick (test_graph_picker_controls `Select);
+        Alcotest.test_case "old graph cancellation cannot publish a new-scope error" `Quick
+          (test_graph_picker_controls `Late_graph_cancel);
         Alcotest.test_case "row deletion confirmation" `Quick (test_graph_picker_controls `Delete_menu);
         Alcotest.test_case "current row deletion protection" `Quick (test_graph_picker_controls `Current_menu);
         Alcotest.test_case "cancel deletion keeps local copy" `Quick (test_graph_picker_controls `Cancel);

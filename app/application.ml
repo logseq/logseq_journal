@@ -3678,6 +3678,11 @@ let response_tag = function
   | tag -> tag
 ;;
 
+type graph_worker_lease =
+  { protocol_request : Logseq_db_worker.Protocol.request
+  ; mutable retired : bool
+  }
+
 let start
       ~on_view_region
       ~on_platform_request
@@ -3763,23 +3768,29 @@ let start
       match Worker.send client request with
       | Accepted worker_id as accepted ->
         Option.iter (fun protocol ->
-          Hashtbl.add admitted_graph_requests worker_id protocol;
+          Hashtbl.add admitted_graph_requests worker_id
+            { protocol_request = protocol; retired = false };
           Hashtbl.add admitted_protocol_ids protocol.Logseq_db_worker.Protocol.request_id worker_id;
           if observe_projection then !projection_request_accepted protocol) protocol;
         accepted
       | (Full | Not_ready | Stopping) as refused -> refused
   in
   let retire_worker_lease worker_id =
-    Option.iter (fun request ->
-      Hashtbl.remove admitted_protocol_ids request.Logseq_db_worker.Protocol.request_id)
-      (Hashtbl.find_opt admitted_graph_requests worker_id);
-    Hashtbl.remove admitted_graph_requests worker_id
+    match Hashtbl.find_opt admitted_graph_requests worker_id with
+    | None -> false
+    | Some lease ->
+      let protocol_id = lease.protocol_request.request_id in
+      if Hashtbl.find_opt admitted_protocol_ids protocol_id = Some worker_id then
+        Hashtbl.remove admitted_protocol_ids protocol_id;
+      Hashtbl.remove admitted_graph_requests worker_id;
+      lease.retired
   in
   let cancel_graph_leases () =
-    Hashtbl.iter (fun worker_id request ->
-      !projection_request_finished request.Logseq_db_worker.Protocol.request_id;
-      Worker.cancel client ~request_id:worker_id) admitted_graph_requests;
-    Hashtbl.clear admitted_graph_requests;
+    Hashtbl.iter (fun worker_id lease ->
+      if not lease.retired then (
+        lease.retired <- true;
+        !projection_request_finished lease.protocol_request.request_id;
+        Worker.cancel client ~request_id:worker_id)) admitted_graph_requests;
     Hashtbl.clear admitted_protocol_ids
   in
   let cancel_copy () =
@@ -4402,8 +4413,9 @@ let start
         ])
   in
   let handle_worker_event event =
-    (match event with Worker.Response { request_id; _ } -> retire_worker_lease request_id
-     | _ -> ());
+    let retired = match event with
+      | Worker.Response { request_id; _ } -> retire_worker_lease request_id
+      | _ -> false in
     Journal_asset_runtime.pump asset_runtime;
     sync_media !state_ref;
     Journal_media_runtime.pump media_runtime;
@@ -4540,6 +4552,9 @@ let start
         else (
           forget_projection_request protocol_id;
           Journal_asset_runtime.reject asset_runtime ~request_id:protocol_id);
+      Effect.ignore
+    | Worker.Response { outcome = Completed (Graph_service.Graph_response _); _ }
+      when retired ->
       Effect.ignore
     | Worker.Response
         { request_id
@@ -4813,6 +4828,8 @@ let start
               | None -> state
               | Some message when Option.is_some state.feed_refresh -> fail_feed_transport state message
               | Some message -> fail_graph_transport state message)))
+    | Worker.Response { outcome = Failed _ | Cancelled | Shutdown; _ } when retired ->
+      Effect.ignore
     | Worker.Response { outcome = Failed error; _ } ->
       set_state (fun state ->
         let worker_error = service_error ~operation:"handleRequest" error in
