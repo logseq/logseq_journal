@@ -53,4 +53,4 @@ Raw argv, sanitized actual process events, phase logs, native/envelope/receipt/p
 
 ## Questions
 
-None. Scope, protected-file exclusions and measurement constraints were explicitly authorized in the delegated user request; routine implementation choices remain within that scope. Formal timing still waits for the coordinated exclusive Mac window.
+None. Scope, protected-file exclusions and measurement constraints were explicitly authorized in the delegated user request; routine implementation choices remain within that scope. Formal timing completed in the coordinated exclusive Mac window; its bounded results and limitations are recorded above.
