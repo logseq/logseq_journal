@@ -14,7 +14,7 @@ compiler, pins, target C and complete-object identities retain the checks below.
 The link record adds an absolute `working_directory` and records the actual,
 expanded `-output-complete-obj` argv, including its output. Every explicit native
 input and its `.a`/`.o` companion must occur by absolute path in `direct_native_input_sha256`.
-Both original mldoc and XMLm archives must occur in that argv with the recorded
+The maintained producer also binds the runtime headers at production time, so a first target import rejects header changes after handoff. Both original mldoc and XMLm archives must occur in that argv with the recorded
 archive hash; response-file commands and output-as-input identities are refused.
 Recorded argv is inspected as data, never executed by the importer.
 

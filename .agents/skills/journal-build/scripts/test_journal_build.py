@@ -1049,6 +1049,24 @@ while True: time.sleep(1)
                      and record['argv'][0] == str(f.compiler)]
             self.assertEqual(len(links), 1, 'hot producer unexpectedly linked again')
 
+    def test_producer_binds_runtime_headers_before_target_handoff(self):
+        with self.native_dune_producer() as f:
+            envelope = f.build.produce_native(f.original_native, f.workspace)
+            headers = f.build.prefix / 'lib/ocaml'
+            original = {path.relative_to(headers): path.read_bytes() for path in headers.rglob('*.h')}
+            self.assertIn(Path('caml/memory.h'), original)
+            # Replace only the fixture's symlink with private header copies.
+            headers.unlink()
+            for relative, data in original.items():
+                path = headers / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+            changed = headers / 'caml/memory.h'
+            changed.write_bytes(changed.read_bytes() + b'\n/* changed after producer handoff */\n')
+            f.build.args.native_manifest = envelope
+            with self.assertRaisesRegex(ValueError, 'header|hash|conflicting'):
+                f.build.imported_native(f.build.inputs['source'])
+
     def test_producer_reuses_native_bytes_after_a_documentation_commit(self):
         self.assertTrue(hasattr(self.build.Build, 'produce_native'), 'producer-only entry is missing')
         with self.native_dune_producer() as f:
@@ -1062,7 +1080,11 @@ while True: time.sleep(1)
             f.build.report['source_sha'] = subprocess.check_output(
                 ['git', '-C', self.build.ROOT, 'rev-parse', 'HEAD'], text=True).strip()
             self.assertEqual(f.build.inputs['source'], self.build.source_inputs())
-            self.assertEqual(f.build.produce_native(f.original_native, f.workspace), envelope)
+            try:
+                reused = f.build.produce_native(f.original_native, f.workspace)
+            except ValueError as error:
+                self.fail(f'documentation-only commit rejected identical native inputs: {error}')
+            self.assertEqual(reused, envelope)
             self.assertFalse(f.build.report['producer']['link_executed'])
 
     def test_producer_refuses_a_rule_with_unbound_linker_inputs_before_running_it(self):
@@ -1081,6 +1103,7 @@ while True: time.sleep(1)
             with self.subTest(changed=changed), self.native_dune_producer() as f:
                 envelope = f.build.produce_native(f.original_native, f.workspace)
                 if changed == 'original-object':
+                    f.original_native.chmod(f.original_native.stat().st_mode | 0o200)
                     f.original_native.write_bytes(f.original_native.read_bytes() + b'changed')
                 else:
                     record = json.loads(envelope.read_text())['link']

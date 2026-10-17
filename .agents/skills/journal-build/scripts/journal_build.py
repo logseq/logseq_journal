@@ -754,8 +754,7 @@ class Build:
         directory = workspace / "native-producer"
         envelope_path = directory / "native-input.json"
         rule = {"working_directory": str(cwd), "command": original,
-                "original_object": {"path": str(native), "sha256": sha(native)},
-                "source_sha": self.report["source_sha"]}
+                "original_object": {"path": str(native), "sha256": sha(native)}}
         reused = directory.exists()
         if reused:
             if not envelope_path.is_file() or json.loads((directory / "dune-rule.json").read_text()) != rule:
@@ -816,6 +815,13 @@ class Build:
             for include in includes + [runtime]:
                 for archive in sorted(include.glob("*.a")):
                     record(archive)
+            # Bind headers now: the first target import must reject later header changes,
+            # rather than adopting whatever bytes happen to be installed at handoff.
+            headers = list((self.prefix / "lib/ocaml").rglob("*.h"))
+            if not headers:
+                raise ValueError("producer OCaml runtime headers are missing")
+            for header in headers:
+                record(header)
             dependencies = {}
             for name in ("mldoc", "xmlm"):
                 archives = [Path(arg) for arg in command if Path(arg).name == name + ".cmxa"]

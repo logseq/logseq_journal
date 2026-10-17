@@ -6,7 +6,7 @@ Simulator host-restamp evidence currently requires the native Dune phase of a ma
 
 ## Proposal
 
-The user explicitly authorized a minimal producer-only entry, accurate receipts, controlled timing and a PR. Add macOS `--producer-only` to the existing Apple builder: retain prepared-switch/cache locks and complete preflight, build native_embed, derive schema-2 producer inputs from the current Dune rule, remove host DNS/crypto only from an owned archive copy, link the fixed host object, validate it through the existing importer, and recheck all live inputs before accepting `status: native-produced`. Return its native-input envelope. Do not run macOS Swift/package/sign or grant historical-input privileges from this receipt. Simulator uses the ordinary explicit experimental importer and retains target C/Swift/provider/signing checks.
+The user explicitly authorized a minimal producer-only entry, accurate receipts, controlled timing and a PR. Add macOS `--producer-only` to the existing Apple builder: retain prepared-switch/cache locks and complete preflight, build native_embed, derive schema-2 producer inputs from the current Dune rule, remove host DNS/crypto only from an owned archive copy, link the fixed host object, validate it through the existing importer, bind runtime headers before target handoff, and recheck all live inputs before accepting `status: native-produced`. Return its native-input envelope. Do not run macOS Swift/package/sign or grant historical-input privileges from this receipt. Simulator uses the ordinary explicit experimental importer and retains target C/Swift/provider/signing checks.
 
 The build tools own this boundary; pure application reducer events cannot run Dune, observe filesystem input mutation or represent build phase completion. Tests belong in the existing build-owner Python suite, with a tiny real compiler/Dune fixture and CLI rejection checks.
 
@@ -31,7 +31,7 @@ Rejected: keep PR90 schema-2 identity, runtime/mldoc retention, XMLm unresolved-
 
 - Host ARM64 restamping remains experimental with cross_abi_validated=false; this producer proves neither a macOS App nor full OCaml iOS ABI.
 - New source or dependency bytes require fresh evidence. Producer receipts keep consumed files live until a successful target receipt validates them.
-- PR90 is unmerged and under review; stack only committed code and update the dependency base when it stabilizes.
+- PR90 is unmerged; the independent branch now stacks on its pushed, reviewed and CI-green fec63d8 commit. Do not merge the parent PR.
 
 ## Questions
 
