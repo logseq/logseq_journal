@@ -948,6 +948,9 @@ while True: time.sleep(1)
             switch = os.environ.get('JOURNAL_TEST_SWITCH')
             dune = (Path(subprocess.check_output(['opam', 'var', '--safe', '--switch', switch, 'bin'],
                                                 text=True).strip()) / 'dune') if switch else Path(shutil.which('dune'))
+            # Mirror opam exec's selected compiler PATH; omit ambient OCaml fallback even locally.
+            compiler_bin = dune.parent if switch else original_compiler.parent
+            f.build.env['PATH'] = str(compiler_bin) + os.pathsep + os.defpath
             effect = repo / 'logseq_sync/lib/effect_runner'
             effect.mkdir(exist_ok=True)
             original = f.root / 'effect'
