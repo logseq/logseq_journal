@@ -72,6 +72,8 @@ The approved implementation passes startup, route and source-boundary targeted t
 
 ## Consequences
 
+### Core-only validation checkpoint
+
 - Implementation commit `45f845cdd704ead5be09e6b79eca9810363daa50` changes six production/config/dependency files and three existing test files. No `.mli`, `spec/`, upstream source or scheduling change was made.
 - Dependency-boundary checks failed before Core/Base removal and passed afterwards. Targeted startup/routes/source-boundary tests, the complete source build and full test suite passed with Release profile and the original prepared switch. The final source verification was run once; subsequent changes are documentation only.
 - The native link command now uses 85 `.cmxa` archives instead of 136 and has no Core/Base archive input. Candidate Simulator and iPhoneOS binaries each contain zero Core/Base defined or undefined symbols. Installed Core/Base packages in the shared switch were not uninstalled and are not evidence of final retention.
@@ -83,3 +85,33 @@ The approved implementation passes startup, route and source-boundary targeted t
 - The task document validates. Full decision-document validation still reports three unchanged historical documents missing required sections; no unrelated documentation repair was made. No push, PR or merge was performed.
 
 External task evidence includes `completion-report.txt`, `final-artifact-comparison.json`, `target-builds.json`, `targeted-tests.json`, `full-checks.json`, `exact-dependency-closure.json`, `simulator-acceptance.json`, `1446-original-fixture-preserved.json` and `independent-review.txt`.
+
+
+## PR publication scope and evidence
+
+On 2026-10-17 the user explicitly requested publishing the Core cleanup PR as a regular, non-draft PR. This
+supersedes the initial no-push/no-PR restriction for this branch only; no merge or
+physical iPhone installation is authorized. The fetched latest main is still
+`87d0cccd0d65e77958a090d4181c7b9c9bd5fb94`, so no source rebase or rebuild is needed.
+The final PR contains only Core/Mtime and the authorized unused Base cleanup,
+three existing test files and this decision document. Every non-Markdown source,
+test and dependency input remains identical to verified implementation `45f845c`.
+
+Core-only full build and forced tests passed: 21 Alcotest suites and 907 cases,
+with 115 named running checks reported separately. The Core-only target receipts
+and measured sizes above remain applicable; later documentation commits do not
+change their native inputs. Detailed records remain in external `full-checks.json`,
+`full-checks.log`, `target-builds.json` and `final-artifact-comparison.json`.
+
+The later local-restoration repair is preserved only on the separate local branch
+`codex/fix-local-restore-auth-order-20261017` at `e5b9b2b`; none of its production
+changes, Application tests or decision document belongs to this PR. Its 915-case
+suite and successful encrypted startup/detail/foreground UI acceptance are not
+validation results for this Core-only branch. Core-only production Simulator
+sign-in succeeded, but synthetic detail and resume acceptance remains incomplete
+as documented at the checkpoint. The initial fixture and baseline restoration
+issues were investigated separately; this PR does not repair them.
+
+Publishing reuses verified evidence without another heavy build or Simulator run,
+preserving the current Timeline performance resource window. A fresh independent
+journal-code-review session must review the published PR's final head and scope.
