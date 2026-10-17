@@ -351,10 +351,7 @@ import Observation
       guard let properties else { return }
       let targetID: String
       if request.target.row_path.isEmpty {
-        guard properties.sections.first?.key == request.target.section else {
-          completeScroll(token, "missing_target")
-          return
-        }
+        // Top is the list edge even when future dates precede Today.
         targetID = request.target.section
       } else {
         guard let row = resolveTarget(request.target), positions[row.key] != nil else {

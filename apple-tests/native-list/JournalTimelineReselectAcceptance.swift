@@ -2,10 +2,10 @@ import XCTest
 
 /// Run only on the isolated scroll-top probe with synthetic long/image fixtures.
 final class JournalTimelineReselectAcceptance: XCTestCase {
-  @MainActor private func launch(reduceMotion: Bool = false) -> XCUIApplication {
+  @MainActor private func launch(reduceMotion: Bool = false, futureDates: Bool = false) -> XCUIApplication {
     continueAfterFailure = false
     let app = XCUIApplication(bundleIdentifier: "org.logseq.journal.scroll-top-probe")
-    if reduceMotion { app.launchArguments = ["--reduce-motion"] }
+    app.launchArguments = (reduceMotion ? ["--reduce-motion"] : []) + (futureDates ? ["--future-days"] : [])
     app.launch()
     XCTAssertTrue(control(app, "Journals").waitForExistence(timeout: 15))
     return app
@@ -66,6 +66,22 @@ final class JournalTimelineReselectAcceptance: XCTestCase {
     let settled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: first(app))
     XCTAssertEqual(XCTWaiter.wait(for: [settled], timeout: 5), .completed)
     record("Timeline tap returns to top after navigation")
+  }
+
+  @MainActor func testFutureAndTodayDatesReturnToActualTop() {
+    let app = launch(futureDates: true)
+    let future = app.staticTexts["Future-dated synthetic row"]
+    let today = app.staticTexts["Today synthetic row"]
+    XCTAssertTrue(future.waitForExistence(timeout: 10))
+    XCTAssertTrue(today.waitForExistence(timeout: 10))
+    let initialY = future.frame.minY
+    XCTAssertLessThan(initialY, today.frame.minY, "future date is the real first section")
+    for _ in 0..<6 { app.collectionViews.firstMatch.swipeUp(velocity: .fast) }
+    control(app, "Journals").tap()
+    let settled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: future)
+    XCTAssertEqual(XCTWaiter.wait(for: [settled], timeout: 5), .completed)
+    XCTAssertEqual(future.frame.minY, initialY, accuracy: 2)
+    record("Future date before Today returns to true top")
   }
 
   @MainActor func testReduceMotionTop() {
