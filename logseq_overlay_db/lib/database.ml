@@ -5641,29 +5641,29 @@ let serialize_commit database operation =
 
 let commit_local database ~expected mutation =
   serialize_commit database (fun () ->
-    let callbacks, change, outcome =
+    let change, outcome =
       Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
         if database.closed
-        then [], None, Error Types.Local_database_closed
+        then None, Error Types.Local_database_closed
         else (
           match Overlay_planner.validate mutation with
-          | Error message -> [], None, Error (Types.Invalid_local_mutation message)
+          | Error message -> None, Error (Types.Invalid_local_mutation message)
           | Ok () ->
             let id = mutation_id mutation in
             let fingerprint = fingerprint mutation in
             (match existing_mutation database id fingerprint with
-             | Ok (Some existing) -> [], None, Ok (Types.Local_existing existing)
-             | Error () -> [], None, Error Types.Mutation_identity_conflict
+             | Ok (Some existing) -> None, Ok (Types.Local_existing existing)
+             | Error () -> None, Error Types.Mutation_identity_conflict
              | Ok None ->
                let context = read_context (snapshot_of_database database) in
                (match required_preconditions expected mutation with
-                | Error error -> [], None, Error error
+                | Error error -> None, Error error
                 | Ok () when not (preconditions_match context expected) ->
-                  [], None, Error Types.Target_precondition_conflict
+                  None, Error Types.Target_precondition_conflict
                 | Ok () ->
                   let intent_time_ms = database.dependencies.epoch_ms () in
                   (match planned_effect database context ~now:intent_time_ms mutation with
-                   | Error error -> [], None, Error error
+                   | Error error -> None, Error error
                    | Ok (effect_footprint, delete_artifacts) ->
                      let candidate_record =
                        local_candidate_record
@@ -5676,7 +5676,7 @@ let commit_local database ~expected mutation =
                          mutation
                      in
                      if not (local_candidate_fits database candidate_record)
-                     then [], None, Error Types.Planner_limit_exceeded
+                     then None, Error Types.Planner_limit_exceeded
                      else (
                        let previous_projection = database.projection in
                        let previous_receipts = database.receipts in
@@ -5723,12 +5723,12 @@ let commit_local database ~expected mutation =
                          database.receipts <- previous_receipts;
                          database.outbox <- previous_outbox;
                          database.sync_revision <- previous_sync_revision;
-                         [], None, Error (Types.Local_commit_persistence_failed message)
+                         None, Error (Types.Local_commit_persistence_failed message)
                        | Ok () ->
                          if applied then refresh_queryable_outbox database;
                          database.receipts <- [];
                          if not applied
-                         then [], None, Ok (Types.Local_committed commit)
+                         then None, Ok (Types.Local_committed commit)
                          else (
                            let change =
                              match summary with
@@ -5749,16 +5749,8 @@ let commit_local database ~expected mutation =
                                  }
                              | No_logical_change -> assert false
                            in
-                           let callbacks =
-                             database.subscriptions
-                             |> List.filter_map (fun (subscription : subscription) ->
-                               match subscription.lifecycle, subscription.notify with
-                               | Active, Some callback -> Some callback
-                               | Active, None | Unlistened, _ -> None)
-                           in
-                           callbacks, Some change, Ok (Types.Local_committed commit))))))))
+                           Some change, Ok (Types.Local_committed commit))))))))
     in
-    ignore callbacks;
     change, outcome)
 ;;
 
@@ -7979,19 +7971,19 @@ let add_commit_receipts database ~status records receipts =
 
 let apply_outbox_transition database preparation ~encrypted =
   serialize_commit database (fun () ->
-    let callbacks, change, outcome =
+    let change, outcome =
       Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
         if preparation.transition_owner != database
-        then [], None, Error Types.Outbox_commit_generation_invalidated
+        then None, Error Types.Outbox_commit_generation_invalidated
         else if database.closed
-        then [], None, Error Types.Outbox_commit_database_closed
+        then None, Error Types.Outbox_commit_database_closed
         else if preparation.transition_consumed
-        then [], None, Error Types.Outbox_preparation_consumed
+        then None, Error Types.Outbox_preparation_consumed
         else (
           match outbox_submission_batch preparation ~encrypted with
-          | Error error -> [], None, Error error
+          | Error error -> None, Error error
           | Ok _ when database.sync_revision <> preparation.transition_revision ->
-            [], None, Error Types.Outbox_commit_token_conflict
+            None, Error Types.Outbox_commit_token_conflict
           | Ok submission_batch ->
             preparation.transition_consumed <- true;
             Option.iter
@@ -8000,8 +7992,7 @@ let apply_outbox_transition database preparation ~encrypted =
             if preparation.plan = Duplicate_plan
             then (
               let revision = projection_revision database.projection in
-              ( []
-              , None
+              ( None
               , Ok
                   { Types.generation = database.generation
                   ; before_projection_revision = revision
@@ -8280,7 +8271,7 @@ let apply_outbox_transition database preparation ~encrypted =
                      <- stale_earliest_conflict_cursor;
                      record.stale_conflicts <- stale_conflicts)
                   previous_records;
-                [], None, Error (Types.Outbox_commit_persistence_failed message)
+                None, Error (Types.Outbox_commit_persistence_failed message)
               | Ok () ->
                 refresh_queryable_outbox database;
                 database.receipts <- [];
@@ -8295,18 +8286,7 @@ let apply_outbox_transition database preparation ~encrypted =
                     ~after_revision:after_projection_revision
                     logical_change_summary
                 in
-                let callbacks =
-                  match change with
-                  | None -> []
-                  | Some _ ->
-                    database.subscriptions
-                    |> List.filter_map (fun (subscription : subscription) ->
-                      match subscription.lifecycle, subscription.notify with
-                      | Active, Some callback -> Some callback
-                      | Active, None | Unlistened, _ -> None)
-                in
-                ( callbacks
-                , change
+                ( change
                 , Ok
                     { Types.generation = database.generation
                     ; before_projection_revision
@@ -8318,7 +8298,6 @@ let apply_outbox_transition database preparation ~encrypted =
                     ; submission_batch
                     } ))))
     in
-    ignore callbacks;
     change, outcome)
 ;;
 
@@ -8744,15 +8723,15 @@ let replay_authoritative database prepared =
 
 let commit_authoritative_candidate database prepared =
   serialize_commit database (fun () ->
-    let callbacks, change, outcome =
+    let change, outcome =
       Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
         let preparation = prepared.authoritative_preparation in
         if preparation.authoritative_owner != database
-        then [], None, Error Types.Authoritative_commit_generation_invalidated
+        then None, Error Types.Authoritative_commit_generation_invalidated
         else if database.closed
-        then [], None, Error Types.Authoritative_commit_database_closed
+        then None, Error Types.Authoritative_commit_database_closed
         else if database.sync_revision <> preparation.authoritative_revision
-        then [], None, Error Types.Authoritative_commit_token_conflict
+        then None, Error Types.Authoritative_commit_token_conflict
         else (
           match
             Logseq_db_storage.Storage_session.stage_transact_batch
@@ -8761,8 +8740,7 @@ let commit_authoritative_candidate database prepared =
               prepared.authoritative_transactions
           with
           | Error error ->
-            ( []
-            , None
+            ( None
             , Error
                 (Types.Authoritative_commit_persistence_failed
                    (storage_session_error error)) )
@@ -9196,8 +9174,7 @@ let commit_authoritative_candidate database prepared =
                  (List.map Persistence_receipt_v1.encode_terminal_batch terminal_batches)
              with
              | Error error ->
-               ( []
-               , None
+               ( None
                , Error
                    (Types.Authoritative_commit_persistence_failed
                       (storage_session_error error)) )
@@ -9210,7 +9187,7 @@ let commit_authoritative_candidate database prepared =
                (match replay_authoritative database prepared with
                 | Error message ->
                   database.closed <- true;
-                  [], None, Error (Types.Authoritative_commit_fatal_state message)
+                  None, Error (Types.Authoritative_commit_fatal_state message)
                 | Ok () ->
                   database.outbox <- candidate_outbox;
                   database.receipts <- [];
@@ -9271,18 +9248,7 @@ let commit_authoritative_candidate database prepared =
                       ~after_revision
                       logical_change_summary
                   in
-                  let callbacks =
-                    match change with
-                    | None -> []
-                    | Some _ ->
-                      database.subscriptions
-                      |> List.filter_map (fun (subscription : subscription) ->
-                        match subscription.lifecycle, subscription.notify with
-                        | Active, Some callback -> Some callback
-                        | Active, None | Unlistened, _ -> None)
-                  in
-                  ( callbacks
-                  , change
+                  ( change
                   , Ok
                       { Types.generation = database.generation
                       ; before_projection_revision = before_revision
@@ -9305,7 +9271,6 @@ let commit_authoritative_candidate database prepared =
                       ; logical_change_summary
                       } )))))
     in
-    ignore callbacks;
     change, outcome)
 ;;
 
