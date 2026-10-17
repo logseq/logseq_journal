@@ -797,7 +797,17 @@ while True: time.sleep(1)
             platform.mkdir(parents=True)
             for name in ('platform_crypto_stubs.c', 'platform_crypto_stubs.h'):
                 (platform / name).write_text('/* target source */\n')
-            compiler = Path(shutil.which('ocamlopt')).resolve()
+            switch = os.environ.get('JOURNAL_TEST_SWITCH')
+            if switch:
+                bindir = subprocess.check_output(
+                    ['opam', 'var', '--safe', '--switch', switch, 'bin'], text=True).strip()
+                compiler = Path(bindir) / 'ocamlopt.opt'
+            else:
+                selected = shutil.which('ocamlopt')
+                if selected is None:
+                    self.fail('set JOURNAL_TEST_SWITCH to a prepared switch or expose ocamlopt on PATH')
+                compiler = Path(selected)
+            compiler = compiler.resolve()
             runtime = Path(subprocess.check_output([compiler, '-where'], text=True).strip())
             effect.mkdir()
             (effect / 'effect.ml').write_text('let value = 1\n')
