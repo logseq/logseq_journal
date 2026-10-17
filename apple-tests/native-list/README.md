@@ -115,3 +115,10 @@ reported as an actual system preference toggle. Normal acceptance uses the exact
 production Swift files. Performance evidence must distinguish display-link delivery,
 UIKit offsets, recorded images and actual compositor metrics; unsupported or absent
 hitch measurements are unavailable, not zero.
+
+XCTest waits for app quiescence before taps. The navigation test therefore covers
+settled scrolling and return retention; its swipe followed by tap does not prove
+a tap during active deceleration. For that boundary, record an independent normal
+UI tap while the native swipe is in flight and align its timestamp with passive
+`dragging`/`decelerating` samples from the same App process. Do not count a tap
+after deceleration or one against a previous App process as overlap acceptance.

@@ -43,7 +43,7 @@ final class JournalTimelineReselectAcceptance: XCTestCase {
     record("Repeated Timeline taps return to true top")
   }
 
-  @MainActor func testTopDuringMomentumAndNavigationRetention() {
+  @MainActor func testNavigationRetentionAndTopAfterScroll() {
     let app = launch()
     for _ in 0..<4 { app.collectionViews.firstMatch.swipeUp(velocity: .fast) }
     let rows = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "Scroll row"))
@@ -65,7 +65,7 @@ final class JournalTimelineReselectAcceptance: XCTestCase {
     control(app, "Journals").tap()
     let settled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: first(app))
     XCTAssertEqual(XCTWaiter.wait(for: [settled], timeout: 5), .completed)
-    record("Momentum Timeline tap returns to top")
+    record("Timeline tap returns to top after navigation")
   }
 
   @MainActor func testReduceMotionTop() {
