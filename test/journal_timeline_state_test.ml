@@ -1368,7 +1368,7 @@ let test_capture_scroll_commands_are_explicit () =
     "Capture did not reset pagination visibility to the top";
   require
     (Timeline.scroll_target captured
-     = Some (Timeline.scroll_generation captured, 20260809, "block:" ^ id "block" 0))
+     = Some (Timeline.Row { token = Timeline.scroll_generation captured; day = 20260809; row = "block:" ^ id "block" 0 }))
     "Capture must target the first Journal row, not its chronologically later insertion";
   let observed =
     Timeline.observe_visible_range captured ~first_index:0 ~last_exclusive:10

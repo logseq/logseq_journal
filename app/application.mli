@@ -132,6 +132,7 @@ module Root_navigation : sig
   val create : graph_generation:int -> t
   val step : t -> event -> t
   val destination : t -> Journal_routes.destination
+  val timeline : t -> Journal_timeline_state.t
   val capture_presented : t -> bool
   val capture : t -> Journal_capture.t option
   val favorites : t -> Journal_routes.Favorites.t

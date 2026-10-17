@@ -431,7 +431,7 @@ let test_timeline_has_no_chevron () =
       ~key:(Ui.Key.string "test-list")
       ~test_id:(Ui.Test_id.string "test-list")
       ~rows:[ row ]
-      ~scroll_target:None
+      ~scroll_request:None
       ~on_scroll_completed:handler
       ~actions_enabled:true
       ~on_visible_range:handler
@@ -510,7 +510,7 @@ let timeline_action_view ~enabled received =
         ; block_id = Some block_id
         }
       ]
-    ~scroll_target:None
+    ~scroll_request:None
     ~on_scroll_completed:ignore_event
     ~actions_enabled:enabled
     ~on_visible_range:ignore_event

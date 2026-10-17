@@ -18,7 +18,7 @@ let view
       ~key
       ~test_id
       ~rows
-      ~scroll_target
+      ~scroll_request
       ~on_scroll_completed
       ~actions_enabled
       ~on_visible_range
@@ -137,21 +137,7 @@ let view
                 }))
       | _ -> ())
   in
-  let scroll_request =
-    Option.map
-      (fun (token, section, row) ->
-         V.Native_list.scroll_request
-           ~token
-           ~target:
-             (V.Native_list.target
-                ~section:(Ui.Key.string section)
-                ~row_path:[ Ui.Key.string row ])
-           ~anchor:Top
-           ~animated:false
-           ())
-      scroll_target
-  in
-  V.Native_list.vertical
+  let content = V.Native_list.vertical
     ~key
     ~style:Plain
     ?scroll_request
@@ -159,17 +145,14 @@ let view
     ~on_visible_range
     sections
   |> V.Viewport.Vertical.with_test_id test_id
-  |> V.Viewport.Vertical.overlay
-       ~key:(Ui.Key.string "journal-empty-presentation")
-       ~overlay:
-         (if rows = []
-          then
-            V.content_unavailable
-              ~label:
-                (V.label
-                   ~title:(V.text "No journal entries yet")
-                   ~icon:(V.symbol ~name:"book" ())
-                   ())
-              ()
-          else V.empty ())
+  in
+  if rows <> [] then content
+  else
+    V.Viewport.Vertical.overlay
+      ~key:(Ui.Key.string "journal-empty-presentation")
+      ~overlay:
+        (V.content_unavailable
+           ~label:(V.label ~title:(V.text "No journal entries yet")
+             ~icon:(V.symbol ~name:"book" ()) ()) ())
+      content
 ;;

@@ -12,7 +12,7 @@ val view
   :  key:Ui.Key.t
   -> test_id:Ui.Test_id.t
   -> rows:row list
-  -> scroll_target:(int64 * string * string) option
+  -> scroll_request:Ui.View.Native_list.scroll_request option
   -> on_scroll_completed:Ui.Event.Handler.t
   -> actions_enabled:bool
   -> on_visible_range:Ui.Event.Handler.t

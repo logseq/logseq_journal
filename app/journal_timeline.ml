@@ -23,6 +23,30 @@ let should_show_timestamp ~today ~previous_slot = function
   | Top_level _ | Day_heading _ | Day_continuation _ | Feed_continuation _ -> false
 ;;
 
+let scroll_parameters = function
+  | Timeline.Row { token; day; row } -> token, day, [ row ], false
+  | Timeline.Top { token; day } -> token, day, [], true
+;;
+
+(* Command-only payloads update the mounted native List without resubmitting
+   its rows/children, which would invalidate native self-sizing mid-scroll. *)
+let scroll_command target =
+  let request =
+    match target with
+    | None -> `Null
+    | Some target ->
+      let token, day, row_path, animated = scroll_parameters target in
+      `Assoc
+        [ "token", `Intlit (Int64.to_string token)
+        ; "target", `Assoc [ "section", `String (string_of_int day)
+                           ; "row_path", `List (List.map (fun key -> `String key) row_path) ]
+        ; "anchor", `String "top"
+        ; "animated", `Bool animated
+        ]
+  in
+  Yojson.Safe.to_string (`Assoc [ "command", `String "scroll"; "scroll_request", request ])
+;;
+
 module Store = struct
   type row =
     { entry : Journal_graph_projection.timeline_entry
@@ -44,10 +68,11 @@ module Store = struct
     ; listeners : (string, (int, listener) Hashtbl.t) Hashtbl.t
     ; observe : string -> unit
     ; mutable last : Timeline.t option
-    ; mutable shape : (int * (int64 * int * string) option * shape list) option
+    ; mutable shape : (int * shape list) option
     ; mutable revision : int
     ; mutable epoch : int
     ; mutable serial : int
+    ; scroll_listeners : (int, listener) Hashtbl.t
     }
 
   let create ?(observe = fun _ -> ()) () =
@@ -59,6 +84,7 @@ module Store = struct
     ; revision = 0
     ; epoch = 0
     ; serial = 0
+    ; scroll_listeners = Hashtbl.create 1
     }
   ;;
 
@@ -85,6 +111,16 @@ module Store = struct
         if Hashtbl.length bucket = 0 then Hashtbl.remove t.listeners block_id)
   ;;
 
+  let subscribe_scroll t callback =
+    t.serial <- t.serial + 1;
+    let id = t.serial in
+    let listener = { epoch = t.epoch; active = true; callback } in
+    Hashtbl.add t.scroll_listeners id listener;
+    fun () -> listener.active <- false; Hashtbl.remove t.scroll_listeners id
+  ;;
+
+  let scroll_target t = Option.bind t.last Timeline.scroll_target
+
   let notify t block_id =
     Option.iter
       (fun bucket ->
@@ -105,8 +141,12 @@ module Store = struct
     let same =
       Option.fold
         ~none:false
-        ~some:(fun old -> Timeline.equal_presentation old state)
+        ~some:(fun old -> Timeline.equal_content old state)
         t.last
+    in
+    let scroll_changed =
+      Option.fold ~none:(Option.is_some (Timeline.scroll_target state))
+        ~some:(fun old -> Timeline.scroll_target old <> Timeline.scroll_target state) t.last
     in
     t.last <- Some state;
     if not same
@@ -158,13 +198,22 @@ module Store = struct
           []
       in
       List.iter (Hashtbl.remove t.rows) removed;
-      let shape = Some (Timeline.today state, Timeline.scroll_target state, shape) in
+      let shape = Some (Timeline.today state, shape) in
       if t.shape <> shape
       then (
         t.shape <- shape;
         t.revision <- t.revision + 1;
         t.observe "timeline-structure-change");
       List.iter (notify t) (List.rev_append !changes removed));
+    if scroll_changed then
+      if same then
+        Hashtbl.iter (fun _ listener ->
+          if listener.active && listener.epoch = t.epoch then listener.callback ())
+          t.scroll_listeners
+      else
+        (* A real content change (including Capture) still submits its complete
+           row projection together with the command, as before. *)
+        t.revision <- t.revision + 1;
     t.revision
   ;;
 
@@ -172,7 +221,8 @@ module Store = struct
     t.epoch <- t.epoch + 1;
     t.last <- None;
     t.shape <- None;
-    Hashtbl.clear t.rows
+    Hashtbl.clear t.rows;
+    Hashtbl.clear t.scroll_listeners
   ;;
 end
 
@@ -317,13 +367,18 @@ let view
     else presented
   in
   let rows, children = List.split presented in
-  Journal_native_collection.view
+  let content = Journal_native_collection.view
     ~key:(Ui.Key.string "journal-timeline-list")
     ~test_id:(Ui.Test_id.string "journal-timeline")
     ~rows
-    ~scroll_target:
+    ~scroll_request:
       (Option.map
-         (fun (token, day, row) -> token, string_of_int day, row)
+         (fun target ->
+            let token, day, row_path, animated = scroll_parameters target in
+            let row_path = List.map Ui.Key.string row_path in
+            V.Native_list.scroll_request ~token
+              ~target:(V.Native_list.target ~section:(Ui.Key.string (string_of_int day)) ~row_path)
+              ~anchor:Top ~animated ())
          (Timeline.scroll_target state))
     ~on_scroll_completed
     ~actions_enabled:(delete_enabled && actions_enabled)
@@ -333,6 +388,20 @@ let view
     ~on_delete
     ~on_copy
     ~children
+  in
+  let content =
+    match store with
+    | None -> content
+    | Some store ->
+      V.of_lui (fun context parent ->
+        let node = Ui.mount content context parent in
+        let unsubscribe = Store.subscribe_scroll store (fun () ->
+          Lui_ui.extension_property context node "payload"
+            (Lui_protocol.StringValue (scroll_command (Store.scroll_target store)))) in
+        Signal.on_dispose context.Lui_ui.ui_scope unsubscribe;
+        node)
+  in
+  content
   |> V.Body.Vertical.fill
   |> fun content -> V.Body.Vertical.create [ content ]
 ;;

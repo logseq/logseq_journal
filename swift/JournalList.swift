@@ -71,6 +71,11 @@ import Observation
     var payload: String? = nil
   }
 
+  private struct ScrollCommand: Decodable {
+    let command: String
+    let scroll_request: ScrollRequest?
+  }
+
   struct Properties: Decodable {
     let style: String
     let sections: [SectionModel]
@@ -115,6 +120,7 @@ import Observation
 
   @MainActor final class PreparedState: ObservableObject {
     @Published private(set) var snapshot: Snapshot?
+    @Published private(set) var scrollRequest: ScrollRequest?
     private var context: LUIAppleExtensionViewContext?
     private var instance = UUID()
     private var rowIncarnations: [String: UUID] = [:]
@@ -201,12 +207,19 @@ import Observation
       if case let .string(json) = value { nextPayload = json } else { nextPayload = nil }
       if nextPayload != payload {
         payload = nextPayload
-        snapshot = nextPayload.flatMap(Snapshot.init)
-        let positions = snapshot?.positions ?? [:]
-        rowIncarnations = positions.reduce(into: [:]) { result, entry in
-          result[entry.key] = rowIncarnations[entry.key] ?? UUID()
+        if let json = nextPayload,
+          let command = try? JSONDecoder().decode(ScrollCommand.self, from: Data(json.utf8)),
+          command.command == "scroll" {
+          scrollRequest = command.scroll_request
+        } else {
+          snapshot = nextPayload.flatMap(Snapshot.init)
+          scrollRequest = snapshot?.properties.scroll_request
+          let positions = snapshot?.positions ?? [:]
+          rowIncarnations = positions.reduce(into: [:]) { result, entry in
+            result[entry.key] = rowIncarnations[entry.key] ?? UUID()
+          }
+          visible = visible.intersection(positions.keys)
         }
-        visible = visible.intersection(positions.keys)
       }
       dirty = false
       let pending = queued
@@ -260,12 +273,23 @@ import Observation
     }
   }
 
+  private enum NativeAnchor: Hashable { case top }
+
   struct View: SwiftUI.View {
     let context: LUIAppleExtensionViewContext
     @StateObject private var prepared: PreparedState
     @State private var handledScrollToken: Int64 = 0
     @State private var scrollProxy: ScrollViewProxy?
-    @State private var pendingScroll: (id: String, anchor: UnitPoint)?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private struct PendingScroll {
+      let token: Int64
+      let id: String
+      let anchor: UnitPoint
+      let animated: Bool
+      let trackCompletion: Bool
+      let topEdge: Bool
+    }
+    @State private var pendingScroll: PendingScroll?
 
     init(context: LUIAppleExtensionViewContext) {
       self.context = context
@@ -325,15 +349,16 @@ import Observation
       }
       handledScrollToken = token
       guard let properties else { return }
-      guard let row = resolveTarget(request.target) else {
-        completeScroll(request.token, "missing_target")
-        return
-      }
-      // A row hidden by a collapsed ancestor cannot be scrolled to; the OCaml
-      // decoder has no hidden_target variant, so report missing_target.
-      guard positions[row.key] != nil else {
-        completeScroll(request.token, "missing_target")
-        return
+      let targetID: String
+      if request.target.row_path.isEmpty {
+        // Top is the list edge even when future dates precede Today.
+        targetID = request.target.section
+      } else {
+        guard let row = resolveTarget(request.target), positions[row.key] != nil else {
+          completeScroll(token, "missing_target")
+          return
+        }
+        targetID = row.key
       }
       let anchor: UnitPoint =
         switch request.anchor {
@@ -341,16 +366,25 @@ import Observation
         case "bottom": .bottom
         default: .top
         }
-      pendingScroll = (id: row.key, anchor: anchor)
-      if properties.track_scroll_completion == true {
-        completeScroll(request.token, "succeeded")
-      }
+      pendingScroll = PendingScroll(token: token, id: targetID, anchor: anchor,
+        animated: request.animated == true && !reduceMotion,
+        trackCompletion: properties.track_scroll_completion == true,
+        topEdge: request.target.row_path.isEmpty)
     }
 
     private func performPendingScroll() {
       guard let pending = pendingScroll, let proxy = scrollProxy else { return }
       pendingScroll = nil
-      proxy.scrollTo(pending.id, anchor: pending.anchor)
+      if pending.animated {
+        withAnimation(.smooth(duration: 0.45), completionCriteria: .logicallyComplete) {
+          proxy.scrollTo(pending.topEdge ? AnyHashable(NativeAnchor.top) : AnyHashable(pending.id), anchor: pending.anchor)
+        } completion: {
+          if pending.trackCompletion { completeScroll(pending.token, "succeeded") }
+        }
+      } else {
+        proxy.scrollTo(pending.topEdge ? AnyHashable(NativeAnchor.top) : AnyHashable(pending.id), anchor: pending.anchor)
+        if pending.trackCompletion { completeScroll(pending.token, "succeeded") }
+      }
     }
 
     private func separatorVisibility(_ name: String?) -> Visibility {
@@ -455,6 +489,12 @@ import Observation
     var body: some SwiftUI.View {
       ScrollViewReader { proxy in
         List {
+          Color.clear.frame(height: 0)
+            .listRowInsets(EdgeInsets())
+            .environment(\.defaultMinListRowHeight, 0)
+            .listRowSeparator(.hidden)
+            .accessibilityHidden(true)
+            .id(NativeAnchor.top)
           ForEach(properties?.sections ?? []) { section in
             Section {
               ForEach(section.rows) { row in
@@ -477,9 +517,9 @@ import Observation
           prepared.bind(context)
           scrollProxy = proxy
           performPendingScroll()
-          if let request = properties?.scroll_request { applyScrollRequest(request) }
+          if let request = prepared.scrollRequest { applyScrollRequest(request) }
         }
-        .onChange(of: pendingScroll?.id) { _, _ in performPendingScroll() }
+        .onChange(of: pendingScroll?.token) { _, _ in performPendingScroll() }
       }
       .onDisappear {
         prepared.suspend()
@@ -491,10 +531,10 @@ import Observation
         handledScrollToken = 0
         pendingScroll = nil
         prepared.bind(context)
-        if let request = properties?.scroll_request { applyScrollRequest(request) }
+        if let request = prepared.scrollRequest { applyScrollRequest(request) }
       }
-      .onChange(of: properties?.scroll_request?.token) { _, _ in
-        if let request = properties?.scroll_request { applyScrollRequest(request) }
+      .onChange(of: prepared.scrollRequest?.token) { _, _ in
+        if let request = prepared.scrollRequest { applyScrollRequest(request) }
       }
     }
   }
@@ -512,7 +552,7 @@ import Observation
         } else {
         #if os(macOS)
         if style == .plain {
-          content.listStyle(.plain)
+          content.listStyle(.plain).environment(\.defaultMinListRowHeight, 0)
         } else {
           // inset_grouped has no macOS equivalent — the inset style is the
           // closest native presentation.
@@ -520,7 +560,7 @@ import Observation
         }
         #else
         if style == .plain {
-          content.listStyle(.plain)
+          content.listStyle(.plain).environment(\.defaultMinListRowHeight, 0)
         } else {
           content.listStyle(.insetGrouped)
         }
