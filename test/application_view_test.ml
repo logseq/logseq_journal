@@ -4397,6 +4397,119 @@ let test_detail_page_property_value_presentation () =
     [true;false]
 ;;
 
+(* The public Favorites mount has no shared-lookup input. Exercise the narrow
+   Application ownership/renderer boundary with a real Worker and correct page
+   data; Runtime discovery itself is covered by its pure owner regressions. *)
+let test_favorite_page_uses_shared_reference_lookup () =
+  let module W = Logseq_db_worker_lui.Journal_worker in
+  let module P = Logseq_db_worker.Protocol in
+  let module G = Logseq_db_types.Graph_types in
+  let uuid n = G.Uuid.of_string
+    (Printf.sprintf "86000000-0000-4000-8000-%012d" n) |> Result.get_ok in
+  let token = "[[" ^ G.Uuid.to_string (uuid 3) ^ "]]" in
+  let page : G.page =
+    { uuid = uuid 1; name = "favorite"; title = "Page " ^ token; kind = Ordinary_page
+    ; created_at_ms = 0L; updated_at_ms = 0L; recycled = false; tags = []; properties = [] } in
+  let block : G.block =
+    { uuid = uuid 2; title = "Block " ^ token; parent = page.uuid; page = page.uuid
+    ; order = "a"; created_at_ms = 0L; updated_at_ms = 0L; refs = []; tags = []; properties = [] } in
+  let manager : Service.state =
+    { snapshot =
+        { sync_phase = Current; catalog = []; selected_graph = Some (uuid 9)
+        ; applied_server_t = Some (server_cursor_of_int 0); timeline_presentation_pending = false
+        ; startup = { authenticated = true; catalog_loading = false; awaiting_selection = false
+            ; restoring_local = false; bootstrapping = false; awaiting_e2ee_password = false
+            ; failure = None; account_generation = 1; graph_generation = 1; presentation_generation = 1 }
+        ; last_error = None; local_deletion = None }
+    ; diagnostics = { groups = [] } } in
+  let target_reads = Atomic.make 0 in
+  let service = W.Service.create ~push_topic_count:6 ~concurrency:(Concurrent { max_in_flight = 2 })
+    ~init:(fun context _ ->
+      W.Session_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed manager);
+      Ok ())
+    ~handle:(fun _ () -> function
+      | Service.Get_graph_state -> Ok (Service.Graph_state
+          { generation = 1; graph_id = Some (uuid 9); phase = Graph_open; error = None })
+      | Client_command _ -> Ok Service.Client_command_completed
+      | Graph_request request ->
+        let open P in
+        let outcome = match request.command with
+          | V2_graph_info -> V2_graph_info_outcome
+              { graph_uuid = uuid 9; graph_name = "Fixture"; schema = { major = 65; minor = 33 }
+              ; admission_facts = []; journal_title_format = None; generation = "g"; projection_revision = "p"
+              ; limits = { response_budget_bytes = maximum_response_bytes; outbox_max_records = 4096
+                  ; outbox_max_bytes = 8388608; change_max_items = 4096; change_max_bytes = 1048576
+                  ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 } }
+          | V2_list_journals _ -> V2_journals_outcome { items = []; next_cursor = None }
+          | V2_list_favorites _ -> V2_favorites_outcome
+              { favorites_page = None; generation = "g"; projection_revision = "p"; next_cursor = None
+              ; items =
+                  [{ membership_uuid = uuid 10; membership_order = "a"; membership_revision = "m"
+                   ; target = V2_favorite_page { uuid = page.uuid; title = page.title; revision = "p" } }
+                  ;{ membership_uuid = uuid 11; membership_order = "b"; membership_revision = "m"
+                   ; target = V2_favorite_block
+                       { uuid = block.uuid; title = block.title; task_status = None; revision = "b" } }] }
+          | V2_get_page { page = requested; _ } ->
+            if G.Uuid.equal requested (uuid 3) then Atomic.incr target_reads;
+            V2_page_outcome (V2_present_page
+              { page = if G.Uuid.equal requested page.uuid then page
+                  else { page with uuid = requested; title = "Resolved"; name = "resolved" }
+              ; revision = "p" })
+          | V2_get_outline_block { block = requested; _ } when G.Uuid.equal requested block.uuid ->
+            V2_block_outcome (V2_present_block
+              { value = { block; task_status = None; rendered_page_title = page.title; tag_titles = [] }
+              ; revision = "b" })
+          | V2_list_assets _ -> V2_assets_outcome
+              { generation = "g"; projection_revision = "p"; items = []; next_cursor = None }
+          | _ -> V2_failed { code = "InvalidRequest"; message = "Unused fixture operation" }
+        in
+        Ok (Service.Graph_response (V2_response
+          { api_version; request_id = request.request_id; outcome }))
+      | _ -> Error "Unused fixture service operation")
+    ~shutdown:(fun () -> ()) () in
+  let client = ref None in
+  let hooks = Application.For_testing.app_with_service
+    ~on_client:(fun c -> client := Some c)
+    ~calendar_sampler:(Journal_calendar.Sampler.create
+      ~clock:(fun () -> 1_788_192_000.) ~localtime:Unix.gmtime ()) service in
+  let props = Hashtbl.create 64 in
+  let track = track_json_wire_teardown (Hashtbl.remove props) in
+  let consume encoded = if encoded <> "" then (
+    let open Yojson.Safe.Util in
+    Yojson.Safe.from_string encoded |> member "ops" |> to_list |> List.iter (fun op ->
+      track op;
+      match member "op" op |> to_string with
+      | "set-prop" | "set-extension-prop" ->
+        let id = member "id" op |> to_int in
+        let key = member "property" op |> to_string in
+        let old = Hashtbl.find_opt props id |> Option.value ~default:[] in
+        Hashtbl.replace props id ((key, member "value" op) :: List.remove_assoc key old)
+      | _ -> ())) in
+  let find key text = Hashtbl.fold (fun id pairs found ->
+    if List.assoc_opt key pairs = Some (`String text) then Some id else found) props None in
+  let wait label predicate =
+    let deadline = Unix.gettimeofday () +. 3. in
+    while not (predicate ()) && Unix.gettimeofday () < deadline do
+      consume (hooks.pump ()); Unix.sleepf 0.001
+    done;
+    Alcotest.(check bool) label true (predicate ()) in
+  Fun.protect ~finally:(fun () ->
+    ignore (hooks.dispose ()); Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client)
+    (fun () ->
+      let startup = Logseq_db_worker.Config.create
+        ~application_support_directory:"/tmp/journal-favorite-page-reference-fixture"
+        ~target:(Managed_sync { base_url = "https://example.invalid" })
+        ~compatibility_profile:Logseq_65_33_or_newer
+        ~response_budget_bytes:P.maximum_response_bytes ~default_page_size:P.default_page_size
+        |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
+      consume (hooks.init 2 2 startup);
+      wait "Favorites navigation mounts" (fun () -> Option.is_some (find "accessibility-label" "Favorites"));
+      consume (hooks.dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Favorites"))));
+      wait "block proves shared lookup is populated" (fun () -> Option.is_some (find "text" "Block Resolved"));
+      wait "Favorite Page uses the same populated lookup" (fun () -> Option.is_some (find "text" "Page Resolved"));
+      Alcotest.(check int) "shared target is queried once" 1 (Atomic.get target_reads))
+;;
+
 let test_favorites_compact_shared_titles () =
   let module G=Logseq_db_types.Graph_types in
   let module P=Logseq_db_worker.Protocol in
@@ -5250,11 +5363,16 @@ let test_graph_picker_controls scenario () =
   let release_automatic_inspection = Atomic.make false in
   let automatic_inspection_returned = Atomic.make false in
   let inspection_terminals = ref 0 in
+  let graph_read_started = Atomic.make false and graph_read_finished = Atomic.make false in
+  let release_graph_read = Atomic.make false and graph_read_cancellations = ref 0 in
+  let graph_read_cancelling = Atomic.make false and release_graph_terminal = Atomic.make false in
+  let graph_read_worker = Atomic.make None in
   let graph_opens = Atomic.make 0 in
   let root_renders = ref 0 in
   let client = ref None in
   let service = W.Service.create ~push_topic_count:6
-      ~concurrency:(if scenario = `Late_presence then Concurrent { max_in_flight = 2 } else Serial)
+      ~concurrency:(if scenario = `Late_presence || scenario = `Late_graph_cancel
+                    then Concurrent { max_in_flight = 2 } else Serial)
       ~init:(fun context _ ->
         W.Session_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed manager);
         Ok ())
@@ -5316,6 +5434,21 @@ let test_graph_picker_controls scenario () =
                   ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 }
                 ; generation = "g"; projection_revision = "p" }
             | V2_list_journals _ -> P.V2_journals_outcome { items = []; next_cursor = None }
+            | V2_list_favorites _ when scenario = `Late_graph_cancel
+                && (Atomic.get current).snapshot.selected_graph = Some first ->
+              Fun.protect ~finally:(fun () ->
+                Atomic.set graph_read_cancelling true;
+                Eio.Cancel.protect (fun () ->
+                  while not (Atomic.get release_graph_terminal) do Eio.Fiber.yield () done);
+                Atomic.set graph_read_finished true) (fun () ->
+                Atomic.set graph_read_worker (Some (W.Request_context.request_id context));
+                Atomic.set graph_read_started true;
+                while not (Atomic.get release_graph_read) do Eio.Fiber.yield () done;
+                P.V2_favorites_outcome { favorites_page = None; generation = "g"
+                  ; projection_revision = "p"; items = []; next_cursor = None })
+            | V2_list_favorites _ when scenario = `Late_graph_cancel -> P.V2_favorites_outcome
+                { favorites_page = None; generation = "g"
+                ; projection_revision = "p"; items = []; next_cursor = None }
             | V2_get_asset_descriptors _ | V2_list_assets _ ->
               P.V2_assets_outcome { generation = "g"; projection_revision = "p"; items = []; next_cursor = None }
             | _ -> P.V2_failed { code = "UnusedFixtureRead"; message = "Unused graph-picker fixture read" } in
@@ -5330,7 +5463,10 @@ let test_graph_picker_controls scenario () =
       W.on_event value (function
         | W.Response { outcome = Completed (Service.Local_copy_deleted _); _ } ->
           deletion_terminal := true
-        | W.Response { outcome = Completed (Service.Local_copy_inspected _) | Cancelled; _ } ->
+        | W.Response { request_id; outcome = Cancelled; _ } ->
+          incr inspection_terminals;
+          if Atomic.get graph_read_worker = Some request_id then incr graph_read_cancellations
+        | W.Response { outcome = Completed (Service.Local_copy_inspected _); _ } ->
           incr inspection_terminals
         | _ -> ())) service in
   let props = Hashtbl.create 128 in
@@ -5372,10 +5508,16 @@ let test_graph_picker_controls scenario () =
   Fun.protect ~finally:(fun () ->
     Atomic.set finish_deletion true;
     Atomic.set release_automatic_inspection true;
+    Atomic.set release_graph_read true;
+    Atomic.set release_graph_terminal true;
     ignore (hooks.dispose ()); Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client)
     (fun () ->
       consume (hooks.init 2 2 config);
       wait "Switch graph action mounts" (fun () -> Option.is_some (find "text" "Switch graph"));
+      if scenario = `Late_graph_cancel then (
+        wait "Favorites action mounts" (fun () -> Option.is_some (find "accessibility-label" "Favorites"));
+        press (Option.get (find "accessibility-label" "Favorites"));
+        wait "old graph Favorite read is genuinely in flight" (fun () -> Atomic.get graph_read_started));
       press (Option.get (find "text" "Switch graph"));
       wait "graph list mounts" (fun () -> Option.is_some (find "accessibility-identifier" "graph-picker-list"));
       if scenario = `Late_presence then (
@@ -5417,6 +5559,22 @@ let test_graph_picker_controls scenario () =
         press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
         wait "name selection reaches worker" (fun () ->
           List.exists (function Service.Select_graph id -> id = second | _ -> false) (Atomic.get commands))
+      | `Late_graph_cancel ->
+        press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        wait "new graph is visible while old cancellation cleanup is held" (fun () ->
+          Atomic.get graph_read_cancelling
+          && Atomic.get graph_opens >= 2
+          && Option.is_some (find "accessibility-label" "Favorites"));
+        Alcotest.(check int) "old cancellation has not been delivered yet" 0 !graph_read_cancellations;
+        press (Option.get (find "accessibility-label" "Favorites"));
+        Atomic.set release_graph_terminal true;
+        wait "real old Worker cancellation is delivered after scope switch" (fun () ->
+          Atomic.get graph_read_finished && !graph_read_cancellations > 0);
+        consume (hooks.pump ());
+        Alcotest.(check bool) "selected scope is current" true
+          ((Atomic.get current).snapshot.selected_graph = Some second);
+        Alcotest.(check bool) "old graph cancellation does not publish a current sync error" true
+          (Option.is_none (find "text" "Worker unavailable"))
       | (`Delete_menu | `Cancel | `Confirm | `Reopen | `Failure_select | `Presence_failure | `Refresh_after_presence_failure | `During_delete | `Late_presence) ->
         let stable_select = node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second) in
         if scenario = `Failure_select then retained_select := Some stable_select;
@@ -5515,13 +5673,15 @@ let () =
     ; ( "status list", List.map (fun scenario ->
         Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~status_scenario:scenario ()))
         ["expanded"; "none"; "now"; "waiting"; "later"; "select"; "clear"; "dismiss"; "failure"; "duplicate"])
-    ; ("Favorites compact title",[Alcotest.test_case "page property values keep name without duplication" `Quick test_detail_page_property_value_presentation; Alcotest.test_case "root Capture only in Journals" `Quick test_root_capture_placement; Alcotest.test_case "LUI titles icons and no arrow" `Quick test_favorites_compact_shared_titles; Alcotest.test_case "page outline click and native Back" `Quick (fun () -> run_favorites_native_visibility ~check_favorite_targets:true ())])
+    ; ("Favorites compact title",[Alcotest.test_case "Favorite Page uses shared reference lookup" `Quick test_favorite_page_uses_shared_reference_lookup; Alcotest.test_case "page property values keep name without duplication" `Quick test_detail_page_property_value_presentation; Alcotest.test_case "root Capture only in Journals" `Quick test_root_capture_placement; Alcotest.test_case "LUI titles icons and no arrow" `Quick test_favorites_compact_shared_titles; Alcotest.test_case "page outline click and native Back" `Quick (fun () -> run_favorites_native_visibility ~check_favorite_targets:true ())])
     ; ( "graph picker", [
         Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);
         Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);
         Alcotest.test_case "current marker and long names" `Quick (test_graph_picker_controls `Current);
         Alcotest.test_case "close retains current session" `Quick (test_graph_picker_controls `Close);
         Alcotest.test_case "name switches graph" `Quick (test_graph_picker_controls `Select);
+        Alcotest.test_case "old graph cancellation cannot publish a new-scope error" `Quick
+          (test_graph_picker_controls `Late_graph_cancel);
         Alcotest.test_case "row deletion confirmation" `Quick (test_graph_picker_controls `Delete_menu);
         Alcotest.test_case "current row deletion protection" `Quick (test_graph_picker_controls `Current_menu);
         Alcotest.test_case "cancel deletion keeps local copy" `Quick (test_graph_picker_controls `Cancel);

@@ -2120,9 +2120,7 @@ let favorites_view
              (fun value ->
                 let favorite = Journal_graph_projection.favorite value in
                 let key = favorite.membership_id in
-                let title = match favorite.target with
-                  | Page _ -> Journal_model.Title.render favorite.title
-                  | Block _ -> render_title favorite.title in
+                let title = render_title favorite.title in
                 let icon = match favorite.target with
                   | Page _ -> V.symbol ~name:"doc.text" ()
                   | Block _ ->
@@ -3680,6 +3678,11 @@ let response_tag = function
   | tag -> tag
 ;;
 
+type graph_worker_lease =
+  { protocol_request : Logseq_db_worker.Protocol.request
+  ; mutable retired : bool
+  }
+
 let start
       ~on_view_region
       ~on_platform_request
@@ -3751,6 +3754,45 @@ let start
   let copy_worker_requests = Hashtbl.create 2 in
   let projection_request_accepted = ref (fun _ -> ()) in
   let projection_request_finished = ref (fun _ -> ()) in
+  (* Own admission once for every DB Worker API consumer. Business reducers
+     keep their tickets; this registry owns only delivery and scope lifetime. *)
+  let admitted_graph_requests = Hashtbl.create 32 in
+  let admitted_protocol_ids = Hashtbl.create 32 in
+  let dispatch_worker ?(observe_projection = false) request =
+    let protocol = match request with
+      | Graph_service.Graph_request request -> Some request
+      | _ -> None in
+    let duplicate = Option.fold ~none:false ~some:(fun request ->
+      Hashtbl.mem admitted_protocol_ids request.Logseq_db_worker.Protocol.request_id) protocol in
+    if duplicate then Worker.Full else
+      match Worker.send client request with
+      | Accepted worker_id as accepted ->
+        Option.iter (fun protocol ->
+          Hashtbl.add admitted_graph_requests worker_id
+            { protocol_request = protocol; retired = false };
+          Hashtbl.add admitted_protocol_ids protocol.Logseq_db_worker.Protocol.request_id worker_id;
+          if observe_projection then !projection_request_accepted protocol) protocol;
+        accepted
+      | (Full | Not_ready | Stopping) as refused -> refused
+  in
+  let retire_worker_lease worker_id =
+    match Hashtbl.find_opt admitted_graph_requests worker_id with
+    | None -> false
+    | Some lease ->
+      let protocol_id = lease.protocol_request.request_id in
+      if Hashtbl.find_opt admitted_protocol_ids protocol_id = Some worker_id then
+        Hashtbl.remove admitted_protocol_ids protocol_id;
+      Hashtbl.remove admitted_graph_requests worker_id;
+      lease.retired
+  in
+  let cancel_graph_leases () =
+    Hashtbl.iter (fun worker_id lease ->
+      if not lease.retired then (
+        lease.retired <- true;
+        !projection_request_finished lease.protocol_request.request_id;
+        Worker.cancel client ~request_id:worker_id)) admitted_graph_requests;
+    Hashtbl.clear admitted_protocol_ids
+  in
   let cancel_copy () =
     let state, _ = Journal_graph_runtime.Copy.step !copy_state Cancel in
     copy_state := state;
@@ -3825,9 +3867,8 @@ let start
                  ; command
                  }
              in
-             match Worker.send client (Graph_service.Graph_request request) with
+             match dispatch_worker ~observe_projection:true (Graph_service.Graph_request request) with
              | Accepted request_id ->
-               !projection_request_accepted request;
                Hashtbl.replace
                  copy_worker_requests
                  request_id
@@ -3886,7 +3927,7 @@ let start
   let media_runtime =
     Journal_media_runtime.create
       ~send:(fun ticket request ->
-        match Worker.send client request with
+        match dispatch_worker request with
         | Accepted id ->
           Option.iter
             (fun ticket -> Hashtbl.replace media_worker_requests id ticket)
@@ -3944,7 +3985,7 @@ let start
                   | Some _ -> state)))
           !set_state_ref)
       ~send:(fun request ->
-        match Worker.send client request with
+        match dispatch_worker request with
         | Worker.Accepted worker_id ->
           (match request with
            | Graph_service.Graph_request request ->
@@ -4000,7 +4041,7 @@ let start
   let send_manager command =
     Effect.of_thunk (fun () ->
       let owner = unlock_owner !state_ref in
-      let result = Worker.send client (Graph_service.Client_command command) in
+      let result = dispatch_worker (Graph_service.Client_command command) in
       (match command with
        | Graph_service.Submit_e2ee_password _ ->
          (match result with
@@ -4033,7 +4074,7 @@ let start
           Hashtbl.remove local_copy_requests id;
           Worker.cancel client ~request_id:id) superseded);
       let command = if deleting then Graph_service.Delete_local_copy request else Inspect_local_copy request in
-      match Worker.send client command with
+      match dispatch_worker command with
       | Worker.Accepted id -> Hashtbl.replace local_copy_requests id (request, deleting, confirm)
       | Full | Not_ready | Stopping ->
         set_state (fun state ->
@@ -4092,9 +4133,8 @@ let start
     Journal_graph_transport.deliver
       ~runtime:graph_runtime
       ~send:(fun request ->
-        match Worker.send client (Graph_service.Graph_request request) with
+        match dispatch_worker ~observe_projection:true (Graph_service.Graph_request request) with
         | Accepted worker_id ->
-          observe_projection_request request;
           Hashtbl.replace graph_worker_requests worker_id request;
           Journal_graph_transport.Accepted
         | Full -> Full
@@ -4102,40 +4142,38 @@ let start
         | Stopping -> Stopping)
       output
   in
-  let admission_worker_requests = Hashtbl.create 4 in
-  let favorites_worker_requests = Hashtbl.create 2 in
-  let rec run_admission_directive set_state_and_effect = function
+  let retire_graph_scope () =
+    cancel_graph_leases ();
+    Hashtbl.clear graph_worker_requests;
+    Journal_graph_runtime.reset graph_runtime
+  in
+  let rec apply_graph_responses set_state_and_effect responses =
+    set_state_and_effect (fun state ->
+      let state, effects = List.fold_left (fun (state, effects) response ->
+        let completion = match response.Journal_graph_runtime.payload with
+          | Admission_inspected { request; observation } ->
+            Some (request, Admission_refresh.Inspected observation)
+          | Admission_unavailable request ->
+            Some (request, Admission_refresh.Inspection_unavailable)
+          | _ -> None in
+        match completion with
+        | None -> Root_navigation.step state (Completed response), effects
+        | Some (request, result) ->
+          let admission_refresh, directive = Admission_refresh.complete
+            state.admission_refresh ~request ~result in
+          { state with admission_refresh },
+          run_admission_directive set_state_and_effect directive :: effects)
+        (state, []) responses in
+      state, Effect.many (List.rev effects))
+  and run_admission_directive set_state_and_effect = function
     | Admission_refresh.No_request -> Effect.ignore
     | Request request ->
-      Effect.bind
+      if request.graph_generation <> (!state_ref).graph_state.generation
+      then Effect.ignore
+      else Effect.bind
         (Effect.of_thunk (fun () ->
-           let output = submit (Journal_graph_request.Inspect_admission request) in
-           Journal_graph_transport.deliver
-             ~runtime:graph_runtime
-             ~send:(fun protocol_request ->
-               match
-                 Worker.send client (Graph_service.Graph_request protocol_request)
-               with
-               | Accepted worker_request_id ->
-                 observe_projection_request protocol_request;
-                 Hashtbl.replace
-                   admission_worker_requests
-                   worker_request_id
-                   (request, protocol_request);
-                 Journal_graph_transport.Accepted
-               | Full -> Full
-               | Not_ready -> Not_ready
-               | Stopping -> Stopping)
-             output))
-        ~f:(fun delivery ->
-          match delivery.Journal_graph_transport.error with
-          | None -> Effect.ignore
-          | Some _ ->
-            update_admission set_state_and_effect (fun state ->
-              Admission_refresh.complete
-                state.admission_refresh
-                ~request
-                ~result:Inspection_unavailable))
+           deliver_output (submit (Journal_graph_request.Inspect_admission request))))
+        ~f:(fun delivery -> apply_graph_responses set_state_and_effect delivery.responses)
   and update_admission set_state_and_effect transition =
     set_state_and_effect (fun state ->
       let admission_refresh, directive = transition state in
@@ -4239,10 +4277,7 @@ let start
         then Effect.ignore
         else (
           started_graph_generation := Some (graph_key, graph_state.generation);
-          Journal_graph_runtime.reset graph_runtime;
-          Hashtbl.clear graph_worker_requests;
-          Hashtbl.clear favorites_worker_requests;
-          Hashtbl.clear admission_worker_requests;
+          retire_graph_scope ();
           let current = !state_ref in
           let graph_info = Journal_graph_runtime.start graph_runtime in
           let feed_generation = current.next_request_generation in
@@ -4306,6 +4341,7 @@ let start
               ~f:(fun delivery ->
                 set_state (fun state -> apply_delivery_responses state delivery))))
       | Graph_closed | Graph_opening | Graph_closing | Graph_failed ->
+        retire_graph_scope ();
         started_graph_generation := None;
         Journal_asset_runtime.shutdown asset_runtime;
         Effect.ignore
@@ -4327,6 +4363,15 @@ let start
       manager.startup.graph_generation) (!state_ref).manager in
     if previous_owner <> Some (manager.startup.account_generation, manager.startup.graph_generation)
     then cancel_local_copy_checks ();
+    let owner_changed = previous_owner <> None
+      && previous_owner <> Some (manager.startup.account_generation, manager.startup.graph_generation) in
+    let graph_already_current =
+      (!state_ref).graph_state.generation = manager.startup.graph_generation
+      && (!state_ref).graph_state.graph_id = manager.selected_graph in
+    (* Graph_state and manager pushes may arrive in either order. A manager
+       update must not cancel work already started for its new graph scope. *)
+    if not manager.startup.authenticated || (owner_changed && not graph_already_current)
+    then (retire_graph_scope (); started_graph_generation := None);
     if not manager.startup.authenticated then cancel_copy ();
     let update = set_state (fun state -> apply_manager_state state manager_state) in
     let sign_out =
@@ -4368,6 +4413,9 @@ let start
         ])
   in
   let handle_worker_event event =
+    let retired = match event with
+      | Worker.Response { request_id; _ } -> retire_worker_lease request_id
+      | _ -> false in
     Journal_asset_runtime.pump asset_runtime;
     sync_media !state_ref;
     Journal_media_runtime.pump media_runtime;
@@ -4505,20 +4553,15 @@ let start
           forget_projection_request protocol_id;
           Journal_asset_runtime.reject asset_runtime ~request_id:protocol_id);
       Effect.ignore
+    | Worker.Response { outcome = Completed (Graph_service.Graph_response _); _ }
+      when retired ->
+      Effect.ignore
     | Worker.Response
         { request_id
         ; outcome = Worker.Completed (Graph_service.Graph_response response)
         ; _
         } ->
-      let expected =
-        match Hashtbl.find_opt graph_worker_requests request_id with
-        | Some request -> Some request
-        | None ->
-          (match Hashtbl.find_opt admission_worker_requests request_id with
-           | Some (_, request) -> Some request
-           | None ->
-             Option.map snd (Hashtbl.find_opt favorites_worker_requests request_id))
-      in
+      let expected = Hashtbl.find_opt graph_worker_requests request_id in
       let (Logseq_db_worker.Protocol.V2_response { request_id = actual; _ }) = response in
       let owned =
         match expected with
@@ -4532,8 +4575,6 @@ let start
         | None -> false
       in
       Hashtbl.remove graph_worker_requests request_id;
-      Hashtbl.remove admission_worker_requests request_id;
-      Hashtbl.remove favorites_worker_requests request_id;
       let output =
         if owned
         then Journal_graph_runtime.receive graph_runtime response
@@ -4549,43 +4590,13 @@ let start
       Effect.bind
         (Effect.of_thunk (fun () -> deliver_output output))
         ~f:(fun delivery ->
-          let update =
-            set_state_and_effect (fun state ->
-              let state, effects =
-                List.fold_left
-                  (fun (state, effects) response ->
-                     let completion =
-                       match response.Journal_graph_runtime.payload with
-                       | Admission_inspected { request; observation } ->
-                         Some (request, Admission_refresh.Inspected observation)
-                       | Admission_unavailable request ->
-                         Some (request, Admission_refresh.Inspection_unavailable)
-                       | _ -> None
-                     in
-                     match completion with
-                     | None -> Root_navigation.step state (Completed response), effects
-                     | Some (request, result) ->
-                       let admission_refresh, directive =
-                         Admission_refresh.complete
-                           state.admission_refresh
-                           ~request
-                           ~result
-                       in
-                       ( { state with admission_refresh }
-                       , run_admission_directive set_state_and_effect directive :: effects
-                       ))
-                  (state, [])
-                  delivery.responses
-              in
-              let state =
-                match delivery.error with
-                | None -> state
-                | Some message when Option.is_some state.feed_refresh ->
-                  fail_feed_transport state message
-                | Some message -> fail_graph_transport state message
-              in
-              state, Effect.many (List.rev effects))
-          in
+          let update = Effect.bind
+            (apply_graph_responses set_state_and_effect delivery.responses)
+            ~f:(fun () -> set_state (fun state ->
+              match delivery.error with
+              | None -> state
+              | Some message when Option.is_some state.feed_refresh -> fail_feed_transport state message
+              | Some message -> fail_graph_transport state message)) in
           Effect.bind update ~f:(fun () ->
             let refresh_after_worker_event =
               let (Logseq_db_worker.Protocol.V2_response { outcome; _ }) = response in
@@ -4794,27 +4805,6 @@ let start
         forget_projection_request protocol_id;
         Journal_asset_runtime.reject asset_runtime ~request_id:protocol_id);
       Effect.ignore
-    | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
-      when Hashtbl.mem favorites_worker_requests request_id ->
-      let request, protocol_request = Hashtbl.find favorites_worker_requests request_id in
-      forget_projection_request protocol_request.request_id;
-      Journal_graph_runtime.abandon graph_runtime protocol_request;
-      Hashtbl.remove favorites_worker_requests request_id;
-      set_state (fun state ->
-        favorites_event
-          state
-          (Failed (request, false, "Favorites read was interrupted. Try again.")))
-    | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
-      when Hashtbl.mem admission_worker_requests request_id ->
-      let request, protocol_request = Hashtbl.find admission_worker_requests request_id in
-      forget_projection_request protocol_request.request_id;
-      Journal_graph_runtime.abandon graph_runtime protocol_request;
-      Hashtbl.remove admission_worker_requests request_id;
-      update_admission set_state_and_effect (fun state ->
-        Admission_refresh.complete
-          state.admission_refresh
-          ~request
-          ~result:Inspection_unavailable)
     | Worker.Response
         { request_id; outcome = (Failed _ | Cancelled | Shutdown) as outcome; _ }
       when Hashtbl.mem graph_worker_requests request_id ->
@@ -4832,13 +4822,14 @@ let start
       Effect.bind
         (Effect.of_thunk (fun () -> deliver_output output))
         ~f:(fun delivery ->
-          set_state (fun state ->
-            let state = List.fold_left apply_worker_response state delivery.responses in
-            match delivery.error with
-            | None -> state
-            | Some message when Option.is_some state.feed_refresh ->
-              fail_feed_transport state message
-            | Some message -> fail_graph_transport state message))
+          Effect.bind (apply_graph_responses set_state_and_effect delivery.responses)
+            ~f:(fun () -> set_state (fun state ->
+              match delivery.error with
+              | None -> state
+              | Some message when Option.is_some state.feed_refresh -> fail_feed_transport state message
+              | Some message -> fail_graph_transport state message)))
+    | Worker.Response { outcome = Failed _ | Cancelled | Shutdown; _ } when retired ->
+      Effect.ignore
     | Worker.Response { outcome = Failed error; _ } ->
       set_state (fun state ->
         let worker_error = service_error ~operation:"handleRequest" error in
@@ -5100,35 +5091,8 @@ let start
       else
         Effect.bind
           (Effect.of_thunk (fun () ->
-             let output = submit (Journal_graph_request.Load_favorites request) in
-             Journal_graph_transport.deliver
-               ~runtime:graph_runtime
-               ~send:(fun protocol_request ->
-                 match
-                   Worker.send client (Graph_service.Graph_request protocol_request)
-                 with
-                 | Accepted worker_request_id ->
-                   observe_projection_request protocol_request;
-                   Hashtbl.replace
-                     favorites_worker_requests
-                     worker_request_id
-                     (request, protocol_request);
-                   Journal_graph_transport.Accepted
-                 | Full -> Full
-                 | Not_ready -> Not_ready
-                 | Stopping -> Stopping)
-               output))
-          ~f:(fun delivery ->
-            set_state (fun state ->
-              let state =
-                List.fold_left
-                  (fun state response -> Root_navigation.step state (Completed response))
-                  state
-                  delivery.responses
-              in
-              match delivery.error with
-              | None -> state
-              | Some message -> favorites_event state (Failed (request, false, message))))
+             deliver_output (submit (Journal_graph_request.Load_favorites request))))
+          ~f:(fun delivery -> apply_graph_responses set_state_and_effect delivery.responses)
     in
     Effect.bind
       (set_state (fun state ->
@@ -5231,9 +5195,7 @@ let start
         then Some "The destination is no longer ready for imports."
         else (
           match
-            Worker.send
-              client
-              (Graph_service.Import_asset
+            dispatch_worker (Graph_service.Import_asset
                  { graph_generation = generation
                  ; source = Journal_asset_import.to_import staged ~target
                  })
@@ -5541,7 +5503,7 @@ let start
                Journal_uploads.sync current.uploads (upload_context current)
              in
              Option.iter
-               (fun request -> ignore (Worker.send client request : Worker.send_result))
+               (fun request -> ignore (dispatch_worker request : Worker.send_result))
                (Journal_uploads.retry uploads operation))
        | Some (Days settings) ->
          Effect.of_thunk (fun () ->
@@ -5785,9 +5747,7 @@ let start
                   then Some "The destination is not ready for imports"
                   else (
                     match
-                      Worker.send
-                        client
-                        (Graph_service.Import_asset { graph_generation; source })
+                      dispatch_worker (Graph_service.Import_asset { graph_generation; source })
                     with
                     | Accepted id ->
                       Hashtbl.replace
@@ -6002,6 +5962,8 @@ let start
         | _ -> state, Effect.ignore)
     | Sign_out ->
       cancel_copy ();
+      retire_graph_scope ();
+      started_graph_generation := None;
       sign_out_in_flight := true;
       Effect.many
         [ update (fun state -> let state=Root_navigation.step state Account_cleared in
@@ -7138,7 +7100,7 @@ let start
     { app; pump; client; send_action; apply_platform; running; release_staging }
   in
   current_app := Some context;
-  ignore (Worker.send client Graph_service.Get_graph_state : Worker.send_result);
+  ignore (dispatch_worker Graph_service.Get_graph_state : Worker.send_result);
   Worker.on_event client (fun event ->
     Journal_pump.enqueue pump (fun () -> Effect.run (handle_worker_event event)));
   (* The worker fires the wakeup on its own domain whenever output lands;

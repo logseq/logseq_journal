@@ -250,14 +250,158 @@ class Build:
         self.report["dependencies"]["installed_lib_hashes"] = files(self.prefix / "lib", native_only=True)
         return self.report["dependencies"]
 
+    @staticmethod
+    def valid_ocaml_units(units):
+        return (isinstance(units, dict) and set(units) == {"runtime", "mldoc", "xmlm"}
+                and all(type(value) is bool for value in units.values())
+                and units["runtime"] and units["mldoc"])
+
+    def verify_ocaml_units(self, product, *, require_xmlm):
+        symbols = self.run("nm", "-j", "-U", product)
+        def present(unit):
+            return bool(re.search(r"^_caml" + unit + r"(?:__|_|\$|$)", symbols, re.MULTILINE))
+        units = {"runtime": "_caml_startup" in symbols.splitlines(),
+                 "mldoc": present("Mldoc"), "xmlm": present("Xmlm")}
+        if not self.valid_ocaml_units(units) or (require_xmlm and not units["xmlm"]):
+            raise ValueError("native object must retain OCaml runtime and mldoc"
+                             + (" and legacy XMLm" if require_xmlm else ""))
+        undefined = self.run("nm", "-j", "-u", product)
+        if re.search(r"^_camlXmlm(?:__|_|\$|$)", undefined, re.MULTILINE):
+            raise ValueError("native object contains unresolved XMLm references")
+        return units
+
+    @staticmethod
+    def native_input_name(name):
+        path = Path(name)
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"native input identity needs an absolute path without parent traversal: {name}")
+        # The recorded pathname is historical identity. Resolving a symlink
+        # again after its removal/retargeting would change that identity.
+        return os.path.normpath(str(path))
+
+    @staticmethod
+    def bind_native_inputs(inputs, additions):
+        for name, digest in additions.items():
+            path = Build.native_input_name(name)
+            if path in inputs and inputs[path] != digest:
+                raise ValueError(f"conflicting native input hash identity: {path}")
+            inputs[path] = digest
+
+    def ordinary_native_inputs(self, pre, link):
+        """Bind the expanded producer argv to hashed real inputs, without executing it."""
+        command = link["command"]
+        cwd = Path(link["working_directory"])
+        if (not command or not all(isinstance(arg, str) for arg in command)
+                or not cwd.is_absolute() or not Path(command[0]).is_absolute()
+                or "-output-complete-obj" not in command or command.count("-o") != 1):
+            raise ValueError("ordinary producer needs an expanded complete-object command and absolute compiler/cwd")
+        def absolute(arg):
+            path = Path(arg)
+            return self.native_input_name(path if path.is_absolute() else cwd / path)
+        output_index = command.index("-o") + 1
+        if output_index == len(command) or absolute(command[output_index]) != self.native_input_name(pre["production_native_object"]):
+            raise ValueError("native command output differs from the producer object")
+        recorded = link["direct_native_input_sha256"]
+        if (any(not Path(path).is_absolute() for path in recorded)
+                or any(not re.fullmatch(r"[0-9a-f]{64}", digest) for digest in recorded.values())):
+            raise ValueError("native input digest is invalid")
+        canonical = {absolute(path): digest for path, digest in recorded.items()}
+        if len(canonical) != len(recorded) or absolute(command[output_index]) in canonical:
+            raise ValueError("native input identities alias each other or the output")
+        actual, normalized = set(), [command[0]]
+        def native_input(arg, suffixes):
+            suffix = Path(arg).suffix
+            if arg.startswith(("@", "-")) or suffix not in suffixes:
+                raise ValueError(f"unsupported native input argument: {arg}")
+            path = absolute(arg)
+            actual.add(path)
+            required = {path}
+            if suffix in {".cmxa", ".cmx"}:
+                required.add(str(Path(path).with_suffix(".a" if suffix == ".cmxa" else ".o")))
+            if not required.issubset(canonical):
+                raise ValueError(f"actual native link input is not hash-bound: {arg}")
+            return path
+        # Object-only Dune argv. Unknown compiler/linker flags cannot introduce
+        # source, plugins, response files or unrecorded -l providers.
+        switches = {"-output-complete-obj", "-g", "-strict-sequence", "-strict-formats",
+                    "-short-paths", "-keep-locs"}
+        index = 1
+        while index < len(command):
+            arg = command[index]
+            if arg in switches:
+                normalized.append(arg); index += 1
+            elif arg in {"-w", "-warn-error", "-I", "-o", "-cclib"}:
+                if index + 1 == len(command):
+                    raise ValueError(f"native argument needs a value: {arg}")
+                value = command[index + 1]
+                if arg in {"-I", "-o"}:
+                    value = absolute(value)
+                elif arg == "-cclib":
+                    if re.search(r"[\s'\"\\]", value):
+                        raise ValueError("native -cclib input must be one unquoted token")
+                    if value.startswith("-L") and len(value) > 2:
+                        value = "-L" + absolute(value[2:])
+                    else:
+                        value = native_input(value, {".a", ".o"})
+                normalized.extend([arg, value]); index += 2
+            elif arg.startswith("-"):
+                raise ValueError(f"unsupported native compiler/linker argument: {arg}")
+            else:
+                normalized.append(native_input(arg, {".cmxa", ".cmx", ".a", ".o"})); index += 1
+        self.ordinary_command = normalized
+        for name in ("mldoc", "xmlm"):
+            dependency = link["new_dependency_provenance"][name]
+            archive = absolute(dependency["installed_archive"])
+            if archive not in actual or canonical.get(archive) != dependency["archive_sha256"]:
+                raise ValueError(f"original {name} archive is not the declared actual link input")
+            if canonical.get(str(Path(archive).with_suffix(".a"))) != dependency["static_archive_sha256"]:
+                raise ValueError(f"conflicting {name} companion archive hash identity")
+
+    def ordinary_dependency_files(self, name, dependency):
+        archive = Path(dependency["installed_archive"])
+        unit = dependency["original_unit"]
+        cmx = archive.with_suffix(".cmx")
+        if sha(cmx) != unit["cmx_sha256"]:
+            raise ValueError(f"{name} original unit cmx hash differs")
+        member = subprocess.check_output(["ar", "-p", str(archive.with_suffix(".a")), name + ".o"])
+        if hashlib.sha256(member).hexdigest() != unit["object_sha256"]:
+            raise ValueError(f"{name} original unit object hash differs")
+        checkout = Path(dependency["source_checkout"])
+        commit = dependency["pinned_commit"]
+        if (not checkout.is_absolute() or not (checkout / ".git").exists()
+                or self.run("git", "-C", checkout, "rev-parse", "HEAD") != commit
+                or self.run("git", "-C", checkout, "status", "--porcelain", "--untracked-files=no")):
+            raise ValueError(f"{name} source checkout differs from its pinned commit")
+        sources = dependency["installed_sources_matched_to_pinned_git"]
+        if not sources:
+            raise ValueError(f"{name} installed source identity is missing")
+        inputs = {str(cmx): unit["cmx_sha256"]}
+        for filename, record in sources.items():
+            git_path = record["git_path"]
+            if any(Path(path).is_absolute() or ".." in Path(path).parts for path in (filename, git_path)):
+                raise ValueError(f"{name} source path must stay within its recorded root")
+            try:
+                data = subprocess.check_output(["git", "-C", str(checkout), "show", commit + ":" + git_path],
+                                               stderr=subprocess.PIPE)
+            except subprocess.CalledProcessError as error:
+                raise ValueError(f"{name} pinned source path is missing: {git_path}") from error
+            if hashlib.sha256(data).hexdigest() != record["sha256"]:
+                raise ValueError(f"{name} installed source hash differs from pinned Git bytes: {filename}")
+            inputs[str(checkout / git_path)] = record["sha256"]
+        return inputs
+
     def imported_native(self, source):
         """Read producer records as data; never execute their recorded commands."""
         envelope = json.loads(self.args.native_manifest.read_text())
-        if envelope["schema_version"] != 1:
+        version = envelope.get("schema_version")
+        if type(version) is not int or version not in (1, 2):
             raise ValueError("unsupported native manifest schema_version")
+        self.native_schema_version = version
         directory = self.args.native_manifest.resolve().parent
-        pre, link, xmlm = [read_evidence(envelope[name], directory)
-                           for name in ("source", "link", "xmlm_force_link")]
+        pre, link = [read_evidence(envelope[name], directory) for name in ("source", "link")]
+        xmlm = read_evidence(envelope["xmlm_force_link"], directory) if version == 1 else None
+        if version == 2 and "xmlm_force_link" in envelope:
+            raise ValueError("ordinary-archive schema must not reinterpret a legacy XMLm force-link proof")
         if pre["lui"] != self.lui_sha:
             raise ValueError("producer LUI SHA differs from this checkout")
         # Build/tool/docs commits may advance HEAD; native bytes/configuration below must still match exactly.
@@ -293,13 +437,19 @@ class Build:
             expected = re.search(r'"' + name + r'\.dev"\s*"git\+[^"#]+#([0-9a-f]{40})"', lock).group(1)
             if link["new_dependency_provenance"][name]["pinned_commit"] != expected:
                 raise ValueError(f"producer {name} differs from locked commit")
+        if version == 2:
+            self.ordinary_native_inputs(pre, link)
         if "validated_build" in envelope:
             inputs, historical = self.validated_native(envelope, directory, pre, link)
         else:
-            inputs = self.producer_files(pre, link, xmlm)
+            inputs = self.producer_files(pre, link, xmlm, version=version)
             historical = {}
-        inputs.update({str(host): link["production_host_sha256"],
-                       str(self.args.native_manifest.resolve()): sha(self.args.native_manifest)})
+        additions = {str(host): link["production_host_sha256"],
+                     str(self.args.native_manifest.resolve()): sha(self.args.native_manifest)}
+        if version == 2:
+            self.bind_native_inputs(inputs, additions)
+        else:
+            inputs.update(additions)
         for record in envelope.values():
             if isinstance(record, dict) and "path" in record:
                 inputs[str((directory / record["path"]).resolve())] = record["sha256"]
@@ -308,38 +458,70 @@ class Build:
             if sha(path) != digest:
                 raise ValueError(f"native input hash mismatch: {path}")
         self.verify_target(host, "MACOS")
+        units = self.verify_ocaml_units(host, require_xmlm=version == 1)
+        if version == 2 and "validated_build" in envelope and units != self.receipt_ocaml_units:
+            raise ValueError("receipt unit retention differs from the fixed host object")
         symbols = self.run("nm", "-j", "-U", host)
-        if not all(name in symbols for name in ("_caml_startup", "_camlMldoc", "_camlXmlm")):
-            raise ValueError("host complete object must retain runtime, mldoc and XMLm")
         if any(name in symbols for name in ("_logseq_transport_dns_start", "_logseq_journal_crypto_call")):
             raise ValueError("host object still provides DNS/crypto; target C must provide them")
         self.host_object, self.native_files = host, inputs
         self.report["native_source_sha"] = pre["commit"]
         self.report["abi_limit"] = "EXPERIMENTAL: host ARM64 OCaml/runtime restamped; full iOS runtime ABI is not validated"
         print(self.report["abi_limit"], file=sys.stderr)
-        return {"producer": envelope, "files": inputs, "historical_inputs": historical,
+        return {"schema_version": version, "ocaml_units": units,
+                "producer": envelope, "files": inputs, "historical_inputs": historical,
                 "compiler_version": link["compiler_version"], "producer_command": link["command"],
                 "source_sha": pre["commit"], "pins": {key: pre[key] for key in ("lui", "signal", "datascript")},
-                "xmlm": "single-unit force-link; original cmx/object bytes verified"}
+                "xmlm": ("single-unit force-link; original cmx/object bytes verified" if version == 1 else
+                         "ordinary archive; original cmx/object bytes verified")}
 
     def validated_native(self, envelope, directory, pre, link):
         """Reuse a fixed complete object, with a hash-bound prior validation receipt."""
         receipt = read_evidence(envelope["validated_build"], directory)
         previous = receipt["inputs"]["dependencies"]
+        version = envelope["schema_version"]
         if (receipt["status"] != "built" or receipt["mode"] != "experimental-host-restamp"
                 or previous.get("source_sha", receipt["source_sha"]) != pre["commit"]
-                or not receipt["production_link"]["runtime_mldoc_xmlm_retained"]
-                or previous["compiler_version"] != link["compiler_version"]
-                or previous["xmlm"] != "single-unit force-link; original cmx/object bytes verified"):
+                or previous["compiler_version"] != link["compiler_version"]):
             raise ValueError("validated build receipt does not prove this producer object")
-        for name in ("source", "link", "xmlm_force_link"):
+        if version == 1:
+            if (not receipt["production_link"].get("runtime_mldoc_xmlm_retained")
+                    or previous["xmlm"] != "single-unit force-link; original cmx/object bytes verified"):
+                raise ValueError("legacy receipt does not prove runtime/mldoc/XMLm retention")
+        else:
+            units = previous.get("ocaml_units")
+            if (previous.get("schema_version") != 2 or not self.valid_ocaml_units(units)
+                    or receipt["production_link"].get("ocaml_units") != units
+                    or "runtime_mldoc_xmlm_retained" in receipt["production_link"]
+                    or previous.get("xmlm") != "ordinary archive; original cmx/object bytes verified"):
+                raise ValueError("receipt does not prove ordinary-archive unit retention")
+            self.receipt_ocaml_units = units
+        evidence_names = ("source", "link", "xmlm_force_link") if version == 1 else ("source", "link")
+        if previous["producer"].get("schema_version") != version:
+            raise ValueError("receipt producer schema differs")
+        for name in evidence_names:
             if previous["producer"][name] != envelope[name]:
                 raise ValueError(f"validated build receipt producer evidence differs: {name}")
         verified = {**previous.get("historical_inputs", {}), **previous["files"]}
-        expected = {**link["direct_native_input_sha256"],
-                    pre["production_native_object"]: link["production_host_sha256"],
-                    link["command"][0]: link["compiler_sha256"]}
-        for name in ("source", "link", "xmlm_force_link"):
+        expected = {} if version == 2 else dict(link["direct_native_input_sha256"])
+        def add_expected(values):
+            if version == 2:
+                self.bind_native_inputs(expected, values)
+            else:
+                expected.update(values)
+        if version == 2:
+            add_expected(link["direct_native_input_sha256"])
+        add_expected({pre["production_native_object"]: link["production_host_sha256"],
+                      link["command"][0]: link["compiler_sha256"]})
+        if version == 2:
+            for name, dependency in link["new_dependency_provenance"].items():
+                archive = Path(dependency["installed_archive"])
+                add_expected({str(archive): dependency["archive_sha256"],
+                    str(archive.with_suffix(".a")): dependency["static_archive_sha256"],
+                    str(archive.with_suffix(".cmx")): dependency["original_unit"]["cmx_sha256"]})
+                add_expected({str(archive.parent / filename): record["sha256"]
+                    for filename, record in dependency["installed_sources_matched_to_pinned_git"].items()})
+        for name in evidence_names:
             record = envelope[name]
             expected[str((directory / record["path"]).resolve())] = record["sha256"]
         if any(verified.get(path) != digest for path, digest in expected.items()):
@@ -354,22 +536,50 @@ class Build:
             "consumed_inputs": "historical hash proof only; old archive paths are not live build inputs"}
         return headers, verified
 
-    def producer_files(self, pre, link, xmlm):
+    def producer_files(self, pre, link, xmlm, *, version=1):
         """First import verifies still-present producer inputs and XMLm bytes in full."""
-        inputs = dict(link["direct_native_input_sha256"])
+        inputs = {} if version == 2 else dict(link["direct_native_input_sha256"])
+        def add(values):
+            if version == 2:
+                self.bind_native_inputs(inputs, values)
+            else:
+                inputs.update(values)
+        if version == 2:
+            add(link["direct_native_input_sha256"])
         compiler = Path(link["command"][0])
         if sha(compiler) != link["compiler_sha256"]:
             raise ValueError("producer compiler hash mismatch")
-        inputs[str(compiler)] = link["compiler_sha256"]
-        inputs.update(pre["installed_lui_source_sha256"])
+        add({str(compiler): link["compiler_sha256"]})
+        add(pre["installed_lui_source_sha256"])
         for name in ("mldoc", "xmlm"):
             dependency = link["new_dependency_provenance"][name]
             archive = Path(dependency["installed_archive"])
-            inputs[str(archive)] = dependency["archive_sha256"]
-            inputs[str(archive.with_suffix(".a"))] = dependency["static_archive_sha256"]
+            add({str(archive): dependency["archive_sha256"],
+                 str(archive.with_suffix(".a")): dependency["static_archive_sha256"]})
             for filename, record in dependency["installed_sources_matched_to_pinned_git"].items():
-                inputs[str(archive.parent / filename)] = record["sha256"]
-        # Only XMLm's original unit receives force-link metadata. Never broad -linkall.
+                add({str(archive.parent / filename): record["sha256"]})
+        if version == 2:
+            for name in ("mldoc", "xmlm"):
+                add(self.ordinary_dependency_files(name, link["new_dependency_provenance"][name]))
+        else:
+            add(self.forced_xmlm_files(compiler, link, xmlm))
+        # The producer removed only host DNS/crypto from a local archive copy.
+        command = self.ordinary_command if version == 2 else link["command"]
+        effect = next(Path(p).parent for p in command if p.endswith("/logseq_sync_effect_runner_impl.cmxa"))
+        for name in ("logseq_sync_effect_runner_impl.cmxa", "logseq_sync_effect_runner_impl.a"):
+            original_path = next(p for p in inputs if Path(p).name == name)
+            add({str(effect / name): inputs[original_path]})
+        patched = effect / "liblogseq_sync_effect_runner_impl_stubs.a"
+        add({str(patched): link["patched_host_stub_archive_sha256"]})
+        if "platform_crypto_stubs.o" in self.run("ar", "-t", patched):
+            raise ValueError("producer host DNS/crypto C member was not excluded")
+        add({str(p): sha(p) for p in self.native_include.rglob("*.h")})
+        if self.run(compiler, "-version") != link["compiler_version"]:
+            raise ValueError("producer OCaml compiler version differs")
+        return inputs
+
+    def forced_xmlm_files(self, compiler, link, xmlm):
+        # Legacy schema: only XMLm's original unit receives force-link metadata.
         command = xmlm["command"]
         if len(command) != 6 or command[:4] != [str(compiler), "-a", "-linkall", "-o"]:
             raise ValueError("XMLm proof must describe a single-unit -a -linkall archive")
@@ -386,21 +596,8 @@ class Build:
         info_tool = compiler.with_name("ocamlobjinfo")
         if "Force link: YES" not in self.run(info_tool, forced):
             raise ValueError("XMLm archive lacks force-link metadata")
-        inputs.update({str(cmx): xmlm["original_cmx_sha256"], str(original.parent / "xmlm.cmx"): xmlm["original_cmx_sha256"],
-                       str(info_tool): sha(info_tool)})
-        # The producer removed only host DNS/crypto from a local archive copy.
-        effect = next(Path(p).parent for p in link["command"] if p.endswith("/logseq_sync_effect_runner_impl.cmxa"))
-        for name in ("logseq_sync_effect_runner_impl.cmxa", "logseq_sync_effect_runner_impl.a"):
-            original_path = next(p for p in inputs if Path(p).name == name)
-            inputs[str(effect / name)] = inputs[original_path]
-        patched = effect / "liblogseq_sync_effect_runner_impl_stubs.a"
-        inputs[str(patched)] = link["patched_host_stub_archive_sha256"]
-        if "platform_crypto_stubs.o" in self.run("ar", "-t", patched):
-            raise ValueError("producer host DNS/crypto C member was not excluded")
-        inputs.update({str(p): sha(p) for p in self.native_include.rglob("*.h")})
-        if self.run(compiler, "-version") != link["compiler_version"]:
-            raise ValueError("producer OCaml compiler version differs")
-        return inputs
+        return {str(cmx): xmlm["original_cmx_sha256"], str(original.parent / "xmlm.cmx"): xmlm["original_cmx_sha256"],
+                str(info_tool): sha(info_tool)}
 
     def preflight(self):
         a = self.args
@@ -492,6 +689,7 @@ class Build:
     def compile(self, workspace):
         a = self.args
         self.phase = "native"
+        native_units = None
         if a.link_only:
             source = workspace / "ocaml_stub.c"
             source.write_text(STUB)
@@ -522,12 +720,10 @@ class Build:
             native = dune_dir / "default/app/native_embed.exe.o"
             self.native_gmp = dune_dir / "default/app/libgmp.a"
             self.report["linked_gmp"] = {"path": str(self.native_gmp), "sha256": sha(self.native_gmp)}
-            symbols = self.run("nm", "-U", native)
-            for library in ("Mldoc", "Xmlm"):
-                if not re.search(r"caml" + library + r"(?:__|_)", symbols):
-                    raise RuntimeError(f"native object does not retain {library}; linker rule needs review. "
-                                       "Do not reuse a historical link argv or edit protected Dune without approval.")
+            native_units = self.verify_ocaml_units(native, require_xmlm=False)
         self.report["native_object"] = {"path": str(native), "sha256": sha(native), "mode": self.report["mode"]}
+        if native_units is not None:
+            self.report["native_object"]["ocaml_units"] = native_units
         self.phase = "swift"
         scratch = workspace / "swift"
         native_inputs = [native, self.target_c] if a.native_manifest else [native]
@@ -569,9 +765,8 @@ class Build:
             raise RuntimeError(f"wrong Mach-O platform, expected {platform}: {product}")
 
     def verify_production_link(self, product):
-        symbols = self.run("nm", "-j", "-U", product)
-        if not all(name in symbols for name in ("_caml_startup", "_camlMldoc", "_camlXmlm")):
-            raise ValueError("final product dropped OCaml runtime, mldoc or XMLm")
+        version = self.native_schema_version
+        units = self.verify_ocaml_units(product, require_xmlm=version == 1)
         text = self.link_map.read_text()
         objects = {int(m[1]): m[2].strip() for line in text.splitlines()
                    if (m := re.match(r"^\[\s*(\d+)\]\s+(.+)$", line))}
@@ -590,7 +785,9 @@ class Build:
             raise ValueError("product links a non-system dynamic library")
         self.report["production_link"] = {"link_map": str(self.link_map), "link_map_sha256": sha(self.link_map),
             "target_c": {"path": str(self.target_c), "sha256": sha(self.target_c)}, "swift_objects": swift_objects,
-            "runtime_mldoc_xmlm_retained": True, "cross_abi_validated": False}
+            "ocaml_units": units, "cross_abi_validated": False}
+        if version == 1:
+            self.report["production_link"]["runtime_mldoc_xmlm_retained"] = True
 
     def device_signing(self):
         a = self.args
