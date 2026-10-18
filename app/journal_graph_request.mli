@@ -11,6 +11,7 @@ type admission_request =
   }
 
 type t =
+  | Load_task_statuses
   | Load_favorites of favorites_request
   | Inspect_admission of admission_request
   | Capture of

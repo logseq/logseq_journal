@@ -423,6 +423,76 @@ let with_snapshot ~behavior f =
       (fun () -> f database snapshot))
 ;;
 
+(* Synthetic authoritative transactions for catalog lifecycle tests. *)
+let apply_test_transaction database ~cursor operations =
+  let behavior = "apply synthetic catalog transaction" in
+  let transaction =
+    Transit_native.Transit.Json.to_string
+      ~mode:Verbose
+      (Transit_core.Json.Array operations)
+    |> encoded_transaction_of_string ~maximum_bytes:262144
+    |> require_ok ~behavior
+  in
+  let cursor = server_cursor_of_int cursor in
+  let batch =
+    authoritative_batch
+      ~maximum_count:16
+      ~maximum_bytes:262144
+      ~transactions:[ authoritative_transaction ~cursor ~transaction ]
+      ~through:cursor
+      ~checksum:None
+    |> require_ok ~behavior
+  in
+  let sync = Database.inspect_sync database |> require_ok ~behavior in
+  let preparation, crypto =
+    Database.begin_authoritative database ~expected:(sync_view_token sync) batch
+    |> require_ok ~behavior
+  in
+  let decrypted =
+    Option.map (fun request -> request, Database.unprotection_ciphertexts request) crypto
+  in
+  match
+    Database.apply_authoritative database preparation ~decrypted |> require_ok ~behavior
+  with
+  | Database.Authoritative_applied _ -> ()
+  | Authoritative_deferred _ -> fail "synthetic catalog transaction deferred"
+;;
+
+let status_uuid ordinal =
+  uuid (Printf.sprintf "b1000000-0000-4000-8000-%012d" (ordinal + 100))
+;;
+
+let builtin_todo_uuid = uuid "00000002-1615-5853-7700-000000000000"
+
+let status_lookup uuid =
+  Transit_core.Json.Array [ Keyword "block/uuid"; Uuid (Graph.Uuid.to_string uuid) ]
+;;
+
+let status_add entity attribute value =
+  Transit_core.Json.Array [ Keyword "db/add"; entity; Keyword attribute; value ]
+;;
+
+let seed_task_statuses database =
+  let module J = Transit_core.Json in
+  let property = J.Keyword "logseq.property/status" in
+  let choices =
+    List.concat
+      (List.init 12 (fun n ->
+         let e = J.Int (90000 + n) in
+         [ status_add e "block/uuid" (Uuid (Graph.Uuid.to_string (status_uuid n)))
+         ; status_add
+             e
+             "block/title"
+             (String (if n < 2 then "Duplicate name" else Printf.sprintf "状态 %d" n))
+         ; status_add e "block/order" (String (Printf.sprintf "c%04d" n))
+         ; status_add e "block/parent" property
+         ; status_add e "block/page" property
+         ; status_add e "logseq.property/created-from-property" property
+         ]))
+  in
+  apply_test_transaction database ~cursor:1 choices
+;;
+
 let empty_precondition ~behavior =
   Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> require_ok ~behavior
 ;;
@@ -470,7 +540,13 @@ let delete_precondition database ~block ~behavior =
 ;;
 
 let commit_mutation database ~expected mutation ~behavior =
-  Database.commit_local database ~expected mutation |> require_ok ~behavior
+  match Database.commit_local database ~expected mutation with
+  | Ok value -> value
+  | Error
+      ( Local_commit_persistence_failed message
+      | Local_commit_fatal_state message
+      | Invalid_local_mutation message ) -> fail "%s: %s" behavior message
+  | Error _ -> fail "missing overlay behavior: %s" behavior
 ;;
 
 let save_block ?(ordinal = 1) ?(title = "Edited") () =
@@ -501,7 +577,10 @@ let create_journal_page ?(ordinal = 4) () =
 
 let set_task_status ?(ordinal = 5) () =
   Types.Set_task_status
-    { mutation_id = mutation_uuid ordinal; block = block_uuid; status = Todo }
+    { mutation_id = mutation_uuid ordinal
+    ; block = block_uuid
+    ; status = Status_uuid builtin_todo_uuid
+    }
 ;;
 
 let clear_task_status ?(ordinal = 6) () =

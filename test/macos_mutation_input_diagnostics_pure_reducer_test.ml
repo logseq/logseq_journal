@@ -26,7 +26,7 @@ let block
     ~parent_id
     ~sibling_order:"a"
     ~source
-    ~task_state:Journal_model.Todo
+    ~task_state:(Journal_model.Status "00000002-1615-5853-7700-000000000000")
     ~child_count:0
     ~creation_time
     ~revision

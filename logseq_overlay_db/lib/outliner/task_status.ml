@@ -1,18 +1,11 @@
 module Graph = Logseq_db_types.Graph_types
 
 let name = function
-  | Types.Todo -> "todo"
-  | Doing -> "doing"
-  | In_review -> "in-review"
-  | Now -> "now"
-  | Done -> "done"
-  | Canceled -> "canceled"
-  | Backlog -> "backlog"
-  | Waiting -> "waiting"
-  | Later -> "later"
+  | Types.Status_uuid uuid -> Graph.Uuid.to_string uuid
+  | Legacy_status_ident ident ->
+    let prefix = "logseq.property/status." in
+    String.sub ident (String.length prefix) (String.length ident - String.length prefix)
 ;;
-
-let ident status = "logseq.property/status." ^ name status
 
 let set_identity ~mutation_id ~block ~status =
   Printf.sprintf

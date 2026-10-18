@@ -27,7 +27,7 @@ let block
       ?(id = block_id)
       ?parent_id
       ?(source = "Literal #journal @person 👩🏽‍💻")
-      ?(task_state = Journal_model.Done)
+      ?(task_state = Journal_model.Status "00000002-1827-5820-8200-000000000000")
       ?(child_count = 3)
       ()
   =
@@ -764,7 +764,11 @@ let test_timeline_body_four_lines () =
     ; String.concat "\n" (List.init 8 (Printf.sprintf "English line %d"))
     ; String.concat "" (List.init 30 (fun _ -> "中文多行内容👩🏽‍💻"))
     ; String.make 500 'x'
-    ; "**bold** [link](https://example.com/very/long/path) `code`\nsecond\nthird\nfourth\nfifth"
+    ; "**bold** [link](https://example.com/very/long/path) `code`\n\
+       second\n\
+       third\n\
+       fourth\n\
+       fifth"
     ; String.concat " " (List.init 80 (fun _ -> "wrapped words"))
     ]
   in
@@ -1071,6 +1075,7 @@ let test_status_and_tags_mount () =
             in
             let view =
               Journal_row.view
+                ~status_name:(Journal_model.status_name ~lookup:(fun _ -> Some "Doing"))
                 ~show_timestamp:false
                 ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child)
                 { Journal_graph_projection.block; child_summaries = [] }
@@ -1078,7 +1083,9 @@ let test_status_and_tags_mount () =
             with_mounted view (fun _ ops ->
               let ops = ops () in
               require
-                (has_text ops "Doing" = (task_state = Journal_model.Doing))
+                (has_text ops "Doing"
+                 = (task_state
+                    = Journal_model.Status "00000002-1840-1229-0800-000000000000"))
                 "status presence changed with tags";
               let tag_nodes =
                 List.filter_map
@@ -1116,7 +1123,9 @@ let test_status_and_tags_mount () =
                   "tags must retain native multiline wrapping"
               | _ -> fail "unexpected tags rendering"))
          cases)
-    [ Journal_model.No_status; Doing ];
+    [ Journal_model.No_status
+    ; Journal_model.Status "00000002-1840-1229-0800-000000000000"
+    ];
   let detail =
     Journal_model.with_tag_titles (block ()) ~tag_titles:[ "one"; "two"; "three"; "four" ]
   in
@@ -1140,7 +1149,15 @@ let test_rich_title_references_are_not_links () =
     List.iter (fun run ->
       require (not (List.mem_assoc "reference" (Yojson.Basic.Util.to_assoc run)))
         "plain UUID label retained reference action metadata") runs;
-    let node=List.find_map (function Lui_protocol.CreateExtension (node,name,_) when name=Journal_lui_native.chrome_identifier -> Some node | _->None) (ops ()) |> Option.get in
+       let node =
+         List.find_map
+           (function
+             | Lui_protocol.CreateExtension (node, name, _)
+               when name = Journal_lui_native.chrome_identifier -> Some node
+             | _ -> None)
+           (ops ())
+         |> Option.get
+       in
     let properties=Lui_protocol.String_map.empty
       |> Lui_protocol.String_map.add "id" (Lui_protocol.IntValue 1)
       |> Lui_protocol.String_map.add "payload" (Lui_protocol.StringValue
@@ -1165,7 +1182,11 @@ let test_mldoc_titles_share_runs () =
       require (List.length payloads = List.length expected_lines) "missing rich title surface";
       List.iter2 (fun payload lines ->
         require (Yojson.Basic.Util.member "maxLines" payload = lines) "rich title line policy changed";
-        let runs = match Yojson.Basic.Util.member "runs" payload with `List runs -> runs | _ -> [] in
+           let runs =
+             match Yojson.Basic.Util.member "runs" payload with
+             | `List runs -> runs
+             | _ -> []
+           in
         require (runs <> []) "title did not use shared mldoc runs";
         let text = String.concat "" (List.map (fun run -> Yojson.Basic.Util.member "text" run |> Yojson.Basic.Util.to_string) runs) in
         require (text = "普通文本 bold nested code https://example.com 标签") "AST title labels/styles were flattened incorrectly";
@@ -1297,8 +1318,15 @@ let test_property_values_are_not_timeline_children () =
   let value = { (graph_node ~order:"0" ~id:value_id ~parent:block_id "https://example.com/value") with properties=[marker] } in
   let ordinary n title = graph_node ~order:(string_of_int n)
       ~id:(Printf.sprintf "20000000-0000-4000-a000-%012d" n) ~parent:block_id title in
-  let entry = projected_entry ([0,root;1,value] @ List.init 4 (fun n ->
-      1,ordinary (n+20) (if n=0 then "GitHub URL" else "Ordinary child " ^ string_of_int n))) in
+  let entry =
+    projected_entry
+      ([ 0, root; 1, value ]
+       @ List.init 4 (fun n ->
+         ( 1
+         , ordinary
+             (n + 20)
+             (if n = 0 then "GitHub URL" else "Ordinary child " ^ string_of_int n) )))
+  in
   require (List.map (fun (c:Journal_graph_projection.child_summary)->c.source) entry.child_summaries =
       ["GitHub URL";"Ordinary child 1";"Ordinary child 2"])
     "semantic property value displaced an ordinary child preview";
@@ -1330,7 +1358,12 @@ let test_detail_preserves_named_properties_and_independent_status () =
     let root = { (graph_node ~id:block_id ~parent:page_id "Full parent body") with properties=
       [p "user.property/repro" prop_id "Reproducible?" Checkbox [Checkbox_value yes]
       ;p "user.property/url" url_prop_id "GitHub URL" Url [Any_value (Internal_uuid (Graph.Uuid.of_string value_id |> require_ok))]
-      ;p "logseq.property/status" mutation_id "Status" Default [Default_value "logseq.property/status.in-review"]
+             ; p
+                 "logseq.property/status"
+                 mutation_id
+                 "Status"
+                 Default
+                 [ Default_value "00000002-1870-0014-4300-000000000000" ]
       ;p ~hidden:true "user.property/secret" "20000000-0000-4000-9000-000000000012" "Hidden field" String [String_value "hidden value"]
       ;p "logseq.property/priority" "20000000-0000-4000-9000-000000000015" "Priority" Default
         [Default_value "logseq.property/priority.high"]
@@ -1355,7 +1388,18 @@ let test_detail_preserves_named_properties_and_independent_status () =
     let body=Application.For_testing.detail_page ~routes ~write_enabled:true ignore in
     with_mounted (V.Body.Private.to_widget body) (fun _ ops ->
       List.iter (fun text->require (has_text (ops ()) text) "Detail lost named property/status %S" text)
-        ["When";"1969-12-31 16:00";"Reproducible?";(if yes then "Yes" else "No");"GitHub URL";"https://example.com/issue";"In review";"Priority";"High";"Related note";("See [[" ^ value_id ^ "]] for context")];
+           [ "When"
+           ; "1969-12-31 16:00"
+           ; "Reproducible?"
+           ; (if yes then "Yes" else "No")
+           ; "GitHub URL"
+           ; "https://example.com/issue"
+           ; Journal_model.status_name (Status "00000002-1870-0014-4300-000000000000")
+           ; "Priority"
+           ; "High"
+           ; "Related note"
+           ; "See [[" ^ value_id ^ "]] for context"
+           ];
       require (not (has_text (ops ()) "Property")) "typed URL reference lost its owning property name";
       require (not (has_text (ops ()) "hidden value")) "Detail exposes hidden property";
       require (not (has_text (ops ()) ("[[" ^ mutation_id ^ "]]")))
@@ -2834,16 +2878,108 @@ let test_detail_known_image_reserves_initial_slot () =
     require (current_text (ops ()) "Waiting for file") "known slot does not explain pending media")
 ;;
 
+let test_status_property_identity_preserved () =
+  let module G = Logseq_db_types.Graph_types in
+  let module P = Journal_graph_projection in
+  let uuid n =
+    G.Uuid.of_string (Printf.sprintf "b1000000-0000-4000-8000-%012d" n) |> Result.get_ok
+  in
+  let page : G.page =
+    { uuid = uuid 1
+    ; name = "Synthetic"
+    ; title = "Synthetic"
+    ; kind = Ordinary_page
+    ; created_at_ms = 1788192000000L
+    ; updated_at_ms = 1788192000000L
+    ; recycled = false
+    ; tags = []
+    ; properties = []
+    }
+  in
+  let property value : G.property_summary =
+    { uuid = uuid 2
+    ; ident = "logseq.property/status"
+    ; title = "Status"
+    ; schema =
+        { property_type = Default; cardinality = One; hidden = false; public = false }
+    ; values = [ Default_value value ]
+    ; values_truncated = false
+    }
+  in
+  let context : P.time_context = { localtime = Unix.gmtime } in
+  let member n properties : P.block_member =
+    { revision = "synthetic"
+    ; block =
+        { uuid = uuid n
+        ; title = "Long **rich text** ((b1000000-0000-4000-8000-000000000080))"
+        ; parent = page.uuid
+        ; page = page.uuid
+        ; order = string_of_int n
+        ; created_at_ms = 1788192000000L
+        ; updated_at_ms = 1788192000000L
+        ; refs = [ uuid 80 ]
+        ; tags = []
+        ; properties
+        }
+    }
+  in
+  (* Projection is the narrow public pure owner: exercise actual legal property
+     values, without injecting an already-failed Worker result into routes. *)
+  List.iter
+    (fun target ->
+       let properties = [ property target ] in
+       let root = member 3 properties in
+       let children = List.init 10 (fun n -> member (n + 4) properties) in
+       let detail =
+         P.detail_on_page
+           ~page
+           ~time_context:context
+           ~root
+           { G.items = children; continuation = None }
+       in
+       let detail =
+         match detail with
+         | Ok x -> x
+         | Error e -> failwith e
+       in
+       require
+         (List.length detail.children.blocks = 10)
+         "status discarded detail siblings";
+       List.iter
+         (fun model ->
+            require
+              (Journal_model.task_state model <> No_status)
+              "selected status became absent";
+            require
+              (Journal_model.properties model = properties)
+              "status property reference changed";
+            require
+              (String.length (Journal_model.source model) > 0)
+              "status discarded rich source")
+         (detail.root :: detail.children.blocks))
+    [ G.Uuid.to_string (uuid 99); G.Uuid.to_string (uuid 100) ]
+;;
+
 let tests =
-  [ "Typed properties omitted from Timeline", test_property_values_are_not_timeline_children
-  ; "Detail named properties and status", test_detail_preserves_named_properties_and_independent_status ] @
-  [ "Detail initial blank preserves chrome", test_detail_initial_blank_preserves_chrome
-  ; "Detail known image initial slot", test_detail_known_image_reserves_initial_slot ] @
-  [ "Feedback native inset visibility and events", test_feedback_reuses_lui_inset_and_keeps_control_events
-  ; "Bottom native inset retains Capture", test_bottom_controls_reuse_lui_inset_and_keep_capture
-  ] @
-  [ "Detail three typography tiers and deep flat rows", test_detail_three_tiers_keep_deep_order_and_plain_rows
-  ; "Detail flat branch removes collapse", test_detail_flat_branch_has_no_collapse_action
+  [ ( "Database status identity preserves complete detail"
+    , test_status_property_identity_preserved )
+  ; ( "Typed properties omitted from Timeline"
+    , test_property_values_are_not_timeline_children )
+  ; ( "Detail named properties and status"
+    , test_detail_preserves_named_properties_and_independent_status )
+  ]
+  @ [ "Detail initial blank preserves chrome", test_detail_initial_blank_preserves_chrome
+    ; "Detail known image initial slot", test_detail_known_image_reserves_initial_slot
+    ]
+  @ [ ( "Feedback native inset visibility and events"
+      , test_feedback_reuses_lui_inset_and_keeps_control_events )
+    ; ( "Bottom native inset retains Capture"
+      , test_bottom_controls_reuse_lui_inset_and_keep_capture )
+    ]
+  @ [ ( "Detail three typography tiers and deep flat rows"
+      , test_detail_three_tiers_keep_deep_order_and_plain_rows )
+    ; ( "Detail flat branch removes collapse"
+      , test_detail_flat_branch_has_no_collapse_action )
   ] @
   [ "Detail shared Capture control", test_detail_uses_shared_capture_control
   ; ( "timeline asset child preview title"
@@ -2863,7 +2999,8 @@ let tests =
     , test_gallery_preview_filters_unavailable_and_closes_on_retirement )
   ; ( "native status Picker contracts"
     , test_status_picker_keeps_accessible_group_and_selection )
-  ; "independent mounted input revisions", test_mounted_input_revisions_remain_independent
+    ; ( "independent mounted input revisions"
+      , test_mounted_input_revisions_remain_independent )
   ; ( "Timeline native Status/Delete callbacks"
     , test_timeline_native_status_delete_callbacks )
   ; ( "native action rejection"
@@ -2878,7 +3015,8 @@ let tests =
     , test_reactive_media_subscription_disposal_and_epoch )
   ; ( "detail media without asset actions"
     , test_detail_media_preserves_rendering_without_asset_actions )
-  ; "native list nested content bindings", test_native_list_payload_binds_nested_contents
+    ; ( "native list nested content bindings"
+      , test_native_list_payload_binds_nested_contents )
   ; "known single image stable slot", test_known_single_slot_survives_availability
   ; "known root image stable slot", test_known_root_slot_survives_availability
   ; "known gallery stable slots", test_known_gallery_slots_survive_separate_arrivals

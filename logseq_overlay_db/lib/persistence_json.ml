@@ -1,16 +1,40 @@
 module Graph = Logseq_db_types.Graph_types
 
-type task_status = Types.task_status =
-  | Todo
-  | Doing
-  | In_review
-  | Now
-  | Done
-  | Canceled
-  | Backlog
-  | Waiting
-  | Later
-[@@deriving yojson]
+let legacy_status_names =
+  [ "Todo", "todo"
+  ; "Doing", "doing"
+  ; "In_review", "in-review"
+  ; "Now", "now"
+  ; "Done", "done"
+  ; "Canceled", "canceled"
+  ; "Backlog", "backlog"
+  ; "Waiting", "waiting"
+  ; "Later", "later"
+  ]
+;;
+
+type task_status = Types.task_status
+
+let task_status_to_yojson = function
+  | Types.Status_uuid uuid -> `List [ `String "Status_uuid"; Graph.Uuid.to_yojson uuid ]
+  | Legacy_status_ident ident ->
+    let prefix = "logseq.property/status." in
+    let name =
+      String.sub ident (String.length prefix) (String.length ident - String.length prefix)
+    in
+    `List
+      [ `String (List.find (fun (_, value) -> value = name) legacy_status_names |> fst) ]
+;;
+
+let task_status_of_yojson = function
+  | `List [ `String "Status_uuid"; value ] ->
+    Result.map (fun uuid -> Types.Status_uuid uuid) (Graph.Uuid.of_yojson value)
+  | `List [ `String tag ] ->
+    (match List.assoc_opt tag legacy_status_names with
+     | Some name -> Ok (Types.Legacy_status_ident ("logseq.property/status." ^ name))
+     | None -> Error "unknown legacy status tag")
+  | _ -> Error "invalid task status reference"
+;;
 
 type block_reason = Types.block_reason =
   | Rejected

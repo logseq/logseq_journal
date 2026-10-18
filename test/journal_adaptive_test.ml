@@ -135,15 +135,15 @@ let test_every_exact_status_maps_to_the_decided_rail_category () =
          "exact status %s maps to the wrong rail category"
          (status_name status))
     [ No_status, None
-    ; Todo, Some Todo_category
-    ; Doing, Some Doing_category
-    ; In_review, Some Doing_category
-    ; Now, Some Doing_category
-    ; Done, Some Done_category
-    ; Canceled, Some Done_category
-    ; Backlog, Some Later_category
-    ; Waiting, Some Later_category
-    ; Later, Some Later_category
+    ; Journal_model.Status "00000002-1615-5853-7700-000000000000", Some Todo_category
+    ; Journal_model.Status "00000002-1840-1229-0800-000000000000", Some Todo_category
+    ; Journal_model.Status "00000002-1870-0014-4300-000000000000", Some Todo_category
+    ; Journal_model.Status "b1000000-0000-4000-8000-000000000091", Some Todo_category
+    ; Journal_model.Status "00000002-1827-5820-8200-000000000000", Some Todo_category
+    ; Journal_model.Status "00000002-7526-4326-2000-000000000000", Some Todo_category
+    ; Journal_model.Status "00000002-7233-3491-0000-000000000000", Some Todo_category
+    ; Journal_model.Status "b1000000-0000-4000-8000-000000000092", Some Todo_category
+    ; Journal_model.Status "b1000000-0000-4000-8000-000000000093", Some Todo_category
     ]
 ;;
 
@@ -243,7 +243,8 @@ let test_ios_capsules_mount_outside_toolbars () =
                  require
                    (List.length surfaces
                     = (if Option.is_none capture_expanded
-                       then (if has_capture then 2 else 1) else 0)
+                       then if has_capture then 2 else 1
+                       else 0)
                       + if account_available || error_available then 1 else 0)
                    "Each buttons composite must supply exactly one glass surface";
                  let rec in_toolbar node =
@@ -386,7 +387,17 @@ let test_status_palette_contrast () =
   let minimum_increased = ref Float.infinity in
   let statuses =
     Journal_model.
-      [ No_status; Todo; Doing; In_review; Now; Done; Canceled; Backlog; Waiting; Later ]
+      [ No_status
+      ; Journal_model.Status "00000002-1615-5853-7700-000000000000"
+      ; Journal_model.Status "00000002-1840-1229-0800-000000000000"
+      ; Journal_model.Status "00000002-1870-0014-4300-000000000000"
+      ; Journal_model.Status "b1000000-0000-4000-8000-000000000091"
+      ; Journal_model.Status "00000002-1827-5820-8200-000000000000"
+      ; Journal_model.Status "00000002-7526-4326-2000-000000000000"
+      ; Journal_model.Status "00000002-7233-3491-0000-000000000000"
+      ; Journal_model.Status "b1000000-0000-4000-8000-000000000092"
+      ; Journal_model.Status "b1000000-0000-4000-8000-000000000093"
+      ]
   in
   List.iter
     (fun (brightness, surfaces) ->

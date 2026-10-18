@@ -96,6 +96,8 @@ let () =
           ; "V2_get_asset_descriptors"
           ; "V2_list_assets"
           ; "V2_get_outline_block_summary"
+          ; "V2_list_task_statuses"
+          ; "V2_get_task_status_definitions"
           ]
           (strings "read_operations" commands);
         require_exact
@@ -166,7 +168,7 @@ let () =
           ])
     ; T.case "v2 command catalog is the executable protocol catalog" (fun () ->
         let expected = command_types commands in
-        T.require (List.length expected = 20) "unexpected v2 request count";
+        T.require (List.length expected = 22) "unexpected v2 request count";
         List.iter
           (fun request ->
              match Logseq_db_worker.Protocol.request_of_yojson request with

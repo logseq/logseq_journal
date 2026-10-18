@@ -17,7 +17,8 @@ let unlock_log format =
          try
            if count < 256 then Printf.eprintf "[journal-unlock] source=ui %s\n%!" fields
            else if count = 256 then Printf.eprintf "[journal-unlock] source=ui limit=reached\n%!"
-         with _ -> ()))
+         with
+         | _ -> ()))
     format
 ;;
 
@@ -293,6 +294,13 @@ type state =
   ; asset_offline : (Journal_asset_policy.offline * Journal_asset_policy.offline) option
   ; uploads : Journal_uploads.t
   ; asset_settings_open : bool
+  ; task_statuses : Logseq_db_types.Graph_types.task_status_definition Rrbvec.t
+  ; task_status_definitions :
+      Logseq_db_types.Graph_types.task_status_definition Reference_sources.t
+  ; task_default_status : Logseq_db_types.Graph_types.Uuid.t option
+  ; task_status_page : int
+  ; task_statuses_complete : bool
+  ; task_statuses_error : string option
   ; reference_sources : string Reference_sources.t
   ; import_completion : (string * string option) option
   ; asset_import_request : int
@@ -392,6 +400,12 @@ let initial_state =
   ; asset_offline = None
   ; uploads = Journal_uploads.empty
   ; asset_settings_open = false
+  ; task_statuses = Rrbvec.empty
+  ; task_status_definitions = Reference_sources.empty
+  ; task_default_status = None
+  ; task_status_page = 0
+  ; task_statuses_complete = false
+  ; task_statuses_error = None
   ; reference_sources = Reference_sources.empty
   ; import_completion = None
   ; asset_import_request = 0
@@ -589,6 +603,12 @@ let clear_graph_surface ?(discard_capture = true) state =
   ; routes = Journal_routes.create ()
   ; timeline = Journal_timeline_state.empty ~today:0
   ; feed_loaded = false
+  ; task_statuses = Rrbvec.empty
+  ; task_status_definitions = Reference_sources.empty
+  ; task_default_status = None
+  ; task_status_page = 0
+  ; task_statuses_complete = false
+  ; task_statuses_error = None
   ; reference_sources = Reference_sources.empty
   ; direct_capture = None
   ; pending_delete = None
@@ -803,7 +823,10 @@ let apply_manager_state state (manager_state : Graph_service.state) =
     }
   in
   if state.e2ee_submission_pending <> e2ee_submission_was_pending
-  then unlock_log "phase=state pending=%b challenge_advertised=%b failure=%s account_generation=%d graph_generation=%d"
+  then
+    unlock_log
+      "phase=state pending=%b challenge_advertised=%b failure=%s account_generation=%d \
+       graph_generation=%d"
     state.e2ee_submission_pending is_awaiting_password (unlock_failure snapshot.startup.failure)
     snapshot.startup.account_generation snapshot.startup.graph_generation;
   match snapshot.last_error with
@@ -993,6 +1016,31 @@ let back_state state =
 let apply_worker_response state (response : Journal_graph_runtime.response) =
   match response.payload with
   | Projection_changes _ | Projection_resync -> state
+  | Task_statuses_changed { items; default_status; complete; error } ->
+    if
+      Seq.equal ( = ) (Rrbvec.to_seq state.task_statuses) (Rrbvec.to_seq items)
+      && state.task_default_status = default_status
+      && state.task_statuses_complete = complete
+      && state.task_statuses_error = error
+    then state
+    else (
+      let names =
+        Rrbvec.fold_left
+          (fun names (d : Logseq_db_types.Graph_types.task_status_definition) ->
+             Reference_sources.add
+               (Logseq_db_types.Graph_types.Uuid.to_string d.uuid)
+               d
+               names)
+          Reference_sources.empty
+          items
+      in
+      { state with
+        task_statuses = items
+      ; task_status_definitions = names
+      ; task_default_status = default_status
+      ; task_statuses_complete = complete
+      ; task_statuses_error = error
+      })
   | Reference_sources_changed updates ->
     let reference_sources =
       List.fold_left
@@ -1445,6 +1493,12 @@ module Root_navigation = struct
     ; pending_delete = None
     ; pending_status = None
     ; timeline = Journal_timeline_state.empty ~today:0
+    ; task_statuses = Rrbvec.empty
+    ; task_status_definitions = Reference_sources.empty
+    ; task_default_status = None
+    ; task_status_page = 0
+    ; task_statuses_complete = false
+    ; task_statuses_error = None
     ; reference_sources = Reference_sources.empty
     ; graph_state = { state.graph_state with generation }
     ; graph_ready = false
@@ -1582,11 +1636,26 @@ module Root_navigation = struct
          | None -> state
          | Some capture ->
            let next =
-             if Journal_capture.task_state capture = Journal_model.Todo = selected
+             if Journal_capture.task_state capture <> Journal_model.No_status = selected
              then capture
-             else Journal_capture.toggle_task_intent capture
+             else if selected
+             then (
+               match state.task_default_status with
+               | Some uuid ->
+                 Journal_capture.with_task_state
+                   capture
+                   (Journal_model.Status (Logseq_db_types.Graph_types.Uuid.to_string uuid))
+               | None -> capture)
+             else Journal_capture.with_task_state capture Journal_model.No_status
            in
-           if next == capture then state else { state with direct_capture = Some next })
+           if
+             selected
+             && state.task_default_status = None
+             && Journal_capture.task_state capture = No_status
+           then { state with modal = Status_sheet "capture-draft" }
+           else if next == capture
+           then state
+           else { state with direct_capture = Some next })
       | Capture_edited source ->
         let state = set_composer_error state Timeline_composer None in
         let capture, next_local_sequence =
@@ -1673,6 +1742,8 @@ type command =
   | Detail_task_intent of string
   | Detail_submit of string
   | Timeline_status of string
+  | Status_catalog_retry
+  | Status_catalog_page of int
   | Status_sheet_select of string
   | Timeline_delete of string
   | Detail_delete of string
@@ -1762,29 +1833,44 @@ let dismiss_toolbar ~test_id ~command dispatch body =
     body
 ;;
 
-let status_sheet_options =
-  [ "backlog", Journal_model.Backlog
-  ; "todo", Todo
-  ; "doing", Doing
-  ; "in-review", In_review
-  ; "done", Done
-  ; "canceled", Canceled
-  ; "clear", No_status
-  ]
+let task_status_name state =
+  Journal_model.status_name ~lookup:(fun id ->
+    Option.map
+      (fun (d : Logseq_db_types.Graph_types.task_status_definition) -> d.title)
+      (Reference_sources.find_opt id state.task_status_definitions))
 ;;
 
-let status_sheet_page ~tokens ~block dispatch =
-  let current = Journal_model.task_state block in
+let status_sheet_options state =
+  Rrbvec.to_seq state.task_statuses
+  |> Seq.drop
+       (min state.task_status_page (max 0 ((Rrbvec.length state.task_statuses - 1) / 100))
+        * 100)
+  |> Seq.take 100
+  |> Seq.map (fun (definition : Logseq_db_types.Graph_types.task_status_definition) ->
+    let uuid = Logseq_db_types.Graph_types.Uuid.to_string definition.uuid in
+    uuid, Journal_model.Status uuid)
+  |> List.of_seq
+  |> fun choices -> choices @ [ "clear", Journal_model.No_status ]
+;;
+
+let status_sheet_page ~state:snapshot ~tokens ~current ~id dispatch =
   let status_icon state =
     let palette = Journal_visual_tokens.status_colors tokens state in
     Journal_symbols.create
       ~color:(if state = Journal_model.No_status then palette.foreground else palette.background)
-      (Journal_symbols.for_task_state state)
+      (match state with
+       | Journal_model.Status uuid ->
+         (match Reference_sources.find_opt uuid snapshot.task_status_definitions with
+          | Some { checkbox_state = Some true; _ } -> Journal_symbols.Done
+          | _ -> Journal_symbols.for_task_state state)
+       | _ -> Journal_symbols.for_task_state state)
     |> Ui.mount
   in
   let option (tag, state) =
     let selected = state = current in
-    let title = if state = Journal_model.No_status then "Clear" else Journal_model.status_name state in
+    let title =
+      if state = Journal_model.No_status then "Clear" else task_status_name snapshot state
+    in
     let label =
       if selected then title ^ ", current status"
       else if state = Journal_model.No_status then "Clear status"
@@ -1813,7 +1899,42 @@ let status_sheet_page ~tokens ~block dispatch =
         Lui_elements.column ~cross:`stretch ~gap:6
           [ Lui_elements.separator ~orientation:`horizontal ~margin_horizontal:10 []
           ; option choice ]
-      else option choice) status_sheet_options
+         else option choice)
+      (status_sheet_options snapshot)
+  in
+  let page =
+    min
+      snapshot.task_status_page
+      (max 0 ((Rrbvec.length snapshot.task_statuses - 1) / 100))
+  in
+  let page_control id label command =
+    Lui_elements.button
+      ~key:id
+      ~accessibility_identifier:id
+      ~on_press:(fun _ -> dispatch.send command)
+      [ Lui_elements.text ~value:label [] ]
+  in
+  let pagination =
+    (if page > 0
+     then
+       [ page_control
+           "journal-status-previous"
+           "Previous statuses"
+           (Status_catalog_page (page - 1))
+       ]
+     else [])
+    @ (if (page + 1) * 100 < Rrbvec.length snapshot.task_statuses
+       then
+         [ page_control
+             "journal-status-next"
+             "More statuses"
+             (Status_catalog_page (page + 1))
+         ]
+       else [])
+    @
+    if snapshot.task_statuses_error <> None
+    then [ page_control "journal-status-retry" "Retry statuses" Status_catalog_retry ]
+    else []
   in
   V.of_lui
     (Lui_elements.scroll ~orientation:`vertical ~padding:20
@@ -1824,14 +1945,31 @@ let status_sheet_page ~tokens ~block dispatch =
                ; Lui_elements.text ~value:"Tap a different status to apply." ~foreground:"secondary" [] ]
            ; Lui_elements.row ~gap:10 ~padding:12 ~background:"secondary" ~corner_radius:12
                [ status_icon current
-               ; Lui_elements.text ~value:("Current · " ^ Journal_model.status_name current) [] ]
-           ; Lui_elements.card ~padding:6 ~corner_radius:18 ~border_width:0 ~background:"secondary"
+               ; Lui_elements.text
+                   ~value:("Current · " ^ task_status_name snapshot current)
+                   []
+               ]
+           ; Lui_elements.text
+               ~value:
+                 (match snapshot.task_statuses_error with
+                  | Some error -> error
+                  | None when not snapshot.task_statuses_complete -> "Loading statuses…"
+                  | None when Rrbvec.is_empty snapshot.task_statuses ->
+                    "This graph has no available task statuses."
+                  | None -> "")
+               ~foreground:"secondary"
+               []
+           ; Lui_elements.card
+               ~padding:6
+               ~corner_radius:18
+               ~border_width:0
+               ~background:"secondary"
                [ Lui_elements.column ~cross:`stretch ~gap:0 choices ]
+           ; Lui_elements.row ~gap:12 pagination
            ; Lui_elements.text ~value:"Clear removes the status from this block."
                ~style_class:"caption" ~foreground:"secondary" [] ] ])
   |> dismiss_toolbar ~test_id:"journal-status-close" ~command:Close_status dispatch
-  |> V.Body.with_test_id
-       (Ui.Test_id.string ("journal-status-sheet-page:" ^ Journal_model.id block))
+  |> V.Body.with_test_id (Ui.Test_id.string ("journal-status-sheet-page:" ^ id))
 ;;
 
 let live_region_text value =
@@ -2196,7 +2334,7 @@ let composer_content
   =
   let ignored = Ui.Event.Handler.create (fun _ -> ()) in
   let can_submit = composer_can_submit ~capture ~saving ~enabled in
-  let task_selected = Journal_capture.task_state capture = Journal_model.Todo in
+  let task_selected = Journal_capture.task_state capture <> Journal_model.No_status in
   let task =
     (* Circular icon capsule matching the composer actions row — buttons has
        no disabled state, so the guard lives in the handler. *)
@@ -2221,7 +2359,9 @@ let composer_content
     match assets with
     | None -> []
     | Some assets ->
-      let disabled = not (enabled && not saving && Journal_capture.can_attach capture) in
+      let disabled =
+        not (enabled && (not saving) && Journal_capture.can_attach capture)
+      in
       (* The shared buttons composite has no disabled state. Native leaf buttons
          retain the same glass capsule and 44-point hit areas. *)
       let action ~label ~icon source =
@@ -2285,6 +2425,22 @@ let composer_content
     else []
   in
   let composer =
+    if Journal_capture.retry_identity_locked capture
+    then
+      V.column
+        ~spacing:12.
+        ([ V.text (Journal_capture.source capture)
+         ; live_region_text
+             "The entry may already be saved. Choose a status and retry to confirm it \
+              before editing."
+         ; V.row
+             ~spacing:8.
+             [ task
+             ; V.button ~enabled:can_submit ~child:(V.text "Retry") ~on_press:on_save ()
+             ]
+         ]
+         @ List.map live_region_text (Option.to_list error))
+    else
     V.composer
       ~key:(Ui.Key.string (scope ^ "-composer"))
       ~accessibility_identifier:(scope ^ "-composer")
@@ -2374,6 +2530,7 @@ let composer_page
 ;;
 
 let timeline_page
+      ~status_name
       ~header_signal
       ~timeline_store
       ~on_region
@@ -2431,6 +2588,7 @@ let timeline_page
       |> V.Body.static
     | None ->
       Journal_timeline.view
+        ~status_name
         ?current_day
         ?store:timeline_store
         ~on_region
@@ -2766,9 +2924,10 @@ module Cache_confirmation = struct
              ~title:"Delete local copy?"
              ~message:
                (Printf.sprintf
-                  "Remove “%s” from this device only.\n\nUnsynced changes, drafts, and \
-                   attachments on this device will be lost.\n\nYour cloud copy will be \
-                   kept. You can download it again."
+                  "Remove “%s” from this device only.\n\n\
+                   Unsynced changes, drafts, and attachments on this device will be \
+                   lost.\n\n\
+                   Your cloud copy will be kept. You can download it again."
                   graph_name)
              [ V.Confirmation.action ~key:"cancel" ~title:"Cancel" ~role:Cancel ()
              ; V.Confirmation.action
@@ -2937,7 +3096,11 @@ let detail_page
           let created_from block =
             List.find_map (fun (p : Graph.property_summary) ->
               if p.ident = "logseq.property/created-from-property" then
-                List.find_map (function Graph.Entity_value uuid -> Some uuid | _ -> None) p.values
+                   List.find_map
+                     (function
+                       | Graph.Entity_value uuid -> Some uuid
+                       | _ -> None)
+                     p.values
               else None) (Journal_model.properties block)
           in
           let value_id = function
@@ -2991,7 +3154,8 @@ let detail_page
           let fields = List.map (fun (name, value) ->
             field ~key:("detail-property:" ^ Journal_model.id block ^ ":" ^ name) name value) named_sources in
           V.column ~spacing:8. ~alignment:Leading
-            (text :: Journal_row.metadata block @ fields)
+            ((text :: Journal_row.metadata ~status_name:(task_status_name state) block)
+             @ fields)
           |> V.with_test_id (Ui.Test_id.string id)
           |> media_label
                ~store:media_store
@@ -3243,12 +3407,16 @@ let manager_page ?picker_signal state dispatch =
             if current then "Current graph"
             else if Option.fold ~none:false ~some:(fun request -> request.Graph_service.graph_id = graph.graph_id) owner.local_copy_deleting
             then "Deleting local copy…"
-            else match presence owner with
+                 else (
+                   match presence owner with
               | Some (Ok Graph_service.Not_downloaded) -> "Not downloaded"
               | Some (Error _) -> "Unable to check local copy"
-              | _ -> "" in
+                   | _ -> "")
+               in
           let selection_enabled owner = owner.local_copy_deleting = None in
-          let deletion_enabled owner = not current && owner.local_copy_check = None
+               let deletion_enabled owner =
+                 (not current)
+                 && owner.local_copy_check = None
             && owner.local_copy_deleting = None && presence owner <> Some (Ok Graph_service.Not_downloaded) in
           (* Native List cells retain their interactive children. Property signals
              update status and enabled state without replacing callback owners. *)
@@ -3764,7 +3932,9 @@ let start
       | _ -> None in
     let duplicate = Option.fold ~none:false ~some:(fun request ->
       Hashtbl.mem admitted_protocol_ids request.Logseq_db_worker.Protocol.request_id) protocol in
-    if duplicate then Worker.Full else
+    if duplicate
+    then Worker.Full
+    else (
       match Worker.send client request with
       | Accepted worker_id as accepted ->
         Option.iter (fun protocol ->
@@ -3773,7 +3943,7 @@ let start
           Hashtbl.add admitted_protocol_ids protocol.Logseq_db_worker.Protocol.request_id worker_id;
           if observe_projection then !projection_request_accepted protocol) protocol;
         accepted
-      | (Full | Not_ready | Stopping) as refused -> refused
+      | (Full | Not_ready | Stopping) as refused -> refused)
   in
   let retire_worker_lease worker_id =
     match Hashtbl.find_opt admitted_graph_requests worker_id with
@@ -4042,7 +4212,7 @@ let start
     Effect.of_thunk (fun () ->
       let owner = unlock_owner !state_ref in
       let result = dispatch_worker (Graph_service.Client_command command) in
-      (match command with
+      match command with
        | Graph_service.Submit_e2ee_password _ ->
          (match result with
           | Worker.Accepted request_id ->
@@ -4052,7 +4222,7 @@ let start
           | Full -> unlock_log "phase=queue result=full"; reject_unlock owner ()
           | Not_ready -> unlock_log "phase=queue result=not-ready"; reject_unlock owner ()
           | Stopping -> unlock_log "phase=queue result=stopping"; reject_unlock owner ())
-       | _ -> ()))
+      | _ -> ())
   in
   let local_copy_requests = Hashtbl.create 2 in
   let visible_copy_queue = Queue.create () in
@@ -4067,7 +4237,9 @@ let start
     Effect.of_thunk (fun () ->
       if confirm then (
         let superseded = Hashtbl.fold (fun id (previous, pending_delete, _) ids ->
-          if not pending_delete && previous.Graph_service.graph_id = request.graph_id
+               if
+                 (not pending_delete)
+                 && previous.Graph_service.graph_id = request.graph_id
              && previous.account_generation = request.account_generation
           then id :: ids else ids) local_copy_requests [] in
         List.iter (fun id ->
@@ -4085,12 +4257,15 @@ let start
               (Logseq_db_types.Graph_types.Uuid.to_string request.graph_id)
               (Error "Unable to check the local copy. Try again.") state.local_copies }) ())
   in
-  drain_visible_copies := (fun () ->
+  (drain_visible_copies
+   := fun () ->
     Effect.of_thunk (fun () ->
       let automatic_in_flight = Hashtbl.fold
-          (fun _ (_, deleting, confirm) active -> active || (not deleting && not confirm))
+              (fun _ (_, deleting, confirm) active ->
+                 active || ((not deleting) && not confirm))
           local_copy_requests false in
-      if not automatic_in_flight && Hashtbl.length local_copy_requests < 2 then (
+          if (not automatic_in_flight) && Hashtbl.length local_copy_requests < 2
+          then (
         let rec next () = match Queue.take_opt visible_copy_queue with
           | None -> ()
           | Some (request : Graph_service.local_copy_request) ->
@@ -4159,16 +4334,17 @@ let start
         match completion with
         | None -> Root_navigation.step state (Completed response), effects
         | Some (request, result) ->
-          let admission_refresh, directive = Admission_refresh.complete
-            state.admission_refresh ~request ~result in
-          { state with admission_refresh },
-          run_admission_directive set_state_and_effect directive :: effects)
+               let admission_refresh, directive =
+                 Admission_refresh.complete state.admission_refresh ~request ~result
+               in
+               ( { state with admission_refresh }
+               , run_admission_directive set_state_and_effect directive :: effects ))
         (state, []) responses in
       state, Effect.many (List.rev effects))
   and run_admission_directive set_state_and_effect = function
     | Admission_refresh.No_request -> Effect.ignore
     | Request request ->
-      if request.graph_generation <> (!state_ref).graph_state.generation
+      if request.graph_generation <> !state_ref.graph_state.generation
       then Effect.ignore
       else Effect.bind
         (Effect.of_thunk (fun () ->
@@ -4359,18 +4535,24 @@ let start
   let termination_in_flight = ref false in
   let apply_manager_transition set_state set_state_and_effect manager_state =
     let manager = manager_state.Graph_service.snapshot in
-    let previous_owner = Option.map (fun manager -> manager.Graph_service.startup.account_generation,
-      manager.startup.graph_generation) (!state_ref).manager in
+    let previous_owner =
+      Option.map
+        (fun manager ->
+           ( manager.Graph_service.startup.account_generation
+           , manager.startup.graph_generation ))
+        !state_ref.manager
+    in
     if previous_owner <> Some (manager.startup.account_generation, manager.startup.graph_generation)
     then cancel_local_copy_checks ();
     let owner_changed = previous_owner <> None
       && previous_owner <> Some (manager.startup.account_generation, manager.startup.graph_generation) in
     let graph_already_current =
-      (!state_ref).graph_state.generation = manager.startup.graph_generation
-      && (!state_ref).graph_state.graph_id = manager.selected_graph in
+      !state_ref.graph_state.generation = manager.startup.graph_generation
+      && !state_ref.graph_state.graph_id = manager.selected_graph
+    in
     (* Graph_state and manager pushes may arrive in either order. A manager
        update must not cancel work already started for its new graph scope. *)
-    if not manager.startup.authenticated || (owner_changed && not graph_already_current)
+    if (not manager.startup.authenticated) || (owner_changed && not graph_already_current)
     then (retire_graph_scope (); started_graph_generation := None);
     if not manager.startup.authenticated then cancel_copy ();
     let update = set_state (fun state -> apply_manager_state state manager_state) in
@@ -4427,7 +4609,10 @@ let start
       Effect.bind (set_state (fun state ->
         let owned = match state.manager with
           | Some manager -> manager.startup.account_generation = request.Graph_service.account_generation
-            && (if deleting then state.local_copy_deleting = Some request else (not confirm || state.local_copy_check = Some request))
+               &&
+               if deleting
+               then state.local_copy_deleting = Some request
+               else (not confirm) || state.local_copy_check = Some request
           | None -> false in
         if not owned then state
         else if deleting then (
@@ -4450,13 +4635,18 @@ let start
           let state = { state with local_copy_check = (if confirm then None else state.local_copy_check)
             ; local_copies = Local_copies.add (Logseq_db_types.Graph_types.Uuid.to_string request.graph_id)
                 result state.local_copies } in
-          if not confirm || not visible || manager.selected_graph = Some request.graph_id then state
-          else match result with
+             if
+               (not confirm)
+               || (not visible)
+               || manager.selected_graph = Some request.graph_id
+             then state
+             else (
+               match result with
             | Ok Graph_service.Downloaded -> { state with modal = Cache_reset_confirmation request.graph_id
                 ; confirmation_sequence = Int64.succ state.confirmation_sequence
                 ; local_copy_message = None }
             | Ok Not_downloaded -> { state with local_copy_message = Some "No local copy on this device." }
-            | Error message -> { state with local_copy_message = Some message })))
+               | Error message -> { state with local_copy_message = Some message }))))
         ~f:(fun () -> !drain_visible_copies ())
     | Worker.Response { request_id; outcome; _ }
       when Hashtbl.mem copy_worker_requests request_id ->
@@ -4763,7 +4953,7 @@ let start
       when Option.fold ~none:false ~some:(fun (owned, _) -> owned = request_id) !unlock_request ->
       let _, owner = Option.get !unlock_request in
       unlock_request := None;
-      if owner = unlock_owner !state_ref && (!state_ref).e2ee_submission_pending
+      if owner = unlock_owner !state_ref && !state_ref.e2ee_submission_pending
       then Effect.of_thunk (reject_unlock owner)
       else Effect.ignore
     | Worker.Response { outcome = Completed (Asset_file _); _ } -> Effect.ignore
@@ -4905,15 +5095,19 @@ let start
   let apply_authenticated_user ?ticket payload =
     let key = Option.value ticket ~default:(Journal_startup.Presentation.account_ticket !state_ref.startup_presentation) in
     if key <> Journal_startup.Presentation.account_ticket !state_ref.startup_presentation then Effect.ignore
-    else match Journal_platform.decode_authenticated_user payload with
+    else (
+      match Journal_platform.decode_authenticated_user payload with
     | Error _ -> set_state (fun state -> {state with startup_presentation=
         Journal_startup.Presentation.step state.startup_presentation (Account_error key)})
     | Ok user_id ->
-      (match user_id with None -> sign_out_in_flight := true | Some _ -> ());
+        (match user_id with
+         | None -> sign_out_in_flight := true
+         | Some _ -> ());
       Effect.bind (set_state (fun state -> {state with startup_presentation=
         Journal_startup.Presentation.step state.startup_presentation
           (Account(key,if user_id=None then No_user else User))}))
-        ~f:(fun () -> send_manager (Graph_service.Reconcile_authenticated_user { user_id }))
+          ~f:(fun () ->
+            send_manager (Graph_service.Reconcile_authenticated_user { user_id })))
   in
   let apply_local_account_binding ticket result =
     match result with
@@ -5151,14 +5345,14 @@ let start
   let detail_drain_key state =
     if not state.graph_ready
     then None
-    else
+    else (
       match Journal_routes.initial_load state.routes with
       | Some key -> Some (`Initial key)
       | None ->
         Option.bind (Journal_routes.detail state.routes) (fun detail ->
           Option.map
             (fun block_id -> `Visible (Journal_detail.session_id detail, block_id))
-            (Journal_detail.next_automatic_load detail))
+            (Journal_detail.next_automatic_load detail)))
   in
   let prev_detail_drain_key = ref (detail_drain_key initial_state) in
   let detail_drain_callback = function
@@ -5166,9 +5360,9 @@ let start
     | Some (`Initial key) ->
       set_state_and_effect (fun state ->
         if state.graph_ready && Journal_routes.initial_load state.routes = Some key
-        then
+        then (
           let routes, requests = Journal_routes.load_initial state.routes in
-          { state with routes }, Effect.many (List.map send requests)
+          { state with routes }, Effect.many (List.map send requests))
         else state, Effect.ignore)
     | Some (`Visible (session, block_id)) ->
       set_state_and_effect (fun state ->
@@ -5176,8 +5370,8 @@ let start
         | Some detail when state.graph_ready && Journal_detail.session_id detail = session
             && Journal_detail.next_automatic_load detail = Some block_id ->
           let detail, requests = Journal_detail.step detail Load_next in
-          { state with routes = Journal_routes.update_detail state.routes detail },
-          Effect.many (List.map send requests)
+          ( { state with routes = Journal_routes.update_detail state.routes detail }
+          , Effect.many (List.map send requests) )
         | _ -> state, Effect.ignore)
   in
   let prev_capture_imports_key = ref initial_state.capture_imports in
@@ -5299,11 +5493,11 @@ let start
     schedule_after 0.1 (fun () ->
       Effect.run (set_state (fun state ->
         if state.graph_state.generation <> graph_generation then state
-        else
+           else (
           let elapsed = Mtime.Span.to_float_ns (Mtime_clock.count started) *. 1e-9 in
           let routes = Journal_routes.observe_loading_delay state.routes
             ~entry_id ~request_generation ~elapsed in
-          if routes == state.routes then state else { state with routes })))
+             if routes == state.routes then state else { state with routes }))))
   in
   let sync_error_timer_generation = ref 0 in
   let arm_sync_error_timer sequence =
@@ -5396,10 +5590,35 @@ let start
           | None -> state
           | Some detail ->
             let detail = Journal_detail.update_child_source detail source in
-            let detail =
-              if toggle then Journal_detail.toggle_child_task detail else detail
+            let selecting =
+              toggle
+              && Option.fold
+                   ~none:true
+                   ~some:(fun capture ->
+                     Journal_capture.task_state capture = Journal_model.No_status)
+                   (Journal_detail.child_capture detail)
             in
-            { state with routes = Journal_routes.update_detail state.routes detail })
+            let detail =
+              if not toggle
+              then detail
+              else if selecting
+              then (
+                match state.task_default_status with
+                | Some uuid ->
+                  Journal_detail.set_child_task
+                    detail
+                    (Journal_model.Status
+                       (Logseq_db_types.Graph_types.Uuid.to_string uuid))
+                | None -> detail)
+              else Journal_detail.set_child_task detail Journal_model.No_status
+            in
+            { state with
+              routes = Journal_routes.update_detail state.routes detail
+            ; modal =
+                (if selecting && state.task_default_status = None
+                 then Status_sheet "append-draft"
+                 else state.modal)
+            })
     in
     let admit_direct_capture source =
       match
@@ -5532,9 +5751,14 @@ let start
                   && state.local_copy_deleting = None
                   && List.exists (fun (graph : Graph_service.graph) -> graph.graph_id = graph_id) manager.catalog ->
                 let request : Graph_service.local_copy_request =
-                  { graph_id; account_generation = manager.startup.account_generation } in
-                { state with modal = No_modal; local_copy_deleting = Some request; local_copy_message = None },
-                local_copy_request ~deleting:true request
+                  { graph_id; account_generation = manager.startup.account_generation }
+                in
+                ( { state with
+                    modal = No_modal
+                  ; local_copy_deleting = Some request
+                  ; local_copy_message = None
+                  }
+                , local_copy_request ~deleting:true request )
               | _ -> { state with modal = No_modal }, Effect.ignore)
            | Action "cancel" | Dismissed -> { state with modal = No_modal }, Effect.ignore
            | Action _ -> state, Effect.ignore)
@@ -5864,6 +6088,8 @@ let start
     | Close_status ->
       update (fun state ->
         match state.modal with
+        | Status_sheet "capture-draft" -> { state with modal = Capture_sheet }
+        | Status_sheet "append-draft" -> { state with modal = Append_sheet }
         | Status_sheet _ -> { state with modal = No_modal }
         | _ -> state)
     | Open_diagnostics ->
@@ -5937,7 +6163,8 @@ let start
               let key = Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id in
               let in_flight = Hashtbl.fold (fun _ (request, _, _) found ->
                 found || request.Graph_service.graph_id = graph.graph_id) local_copy_requests false in
-              if not (Local_copies.mem key state.local_copies) && not in_flight then
+               if (not (Local_copies.mem key state.local_copies)) && not in_flight
+               then
                 Queue.add Graph_service.{ graph_id = graph.graph_id
                   ; account_generation = manager.startup.account_generation } visible_copy_queue
             done
@@ -5956,9 +6183,10 @@ let start
             && state.local_copy_check = None && state.local_copy_deleting = None
             && List.exists (fun (graph : Graph_service.graph) -> graph.graph_id = graph_id) manager.catalog ->
           let request : Graph_service.local_copy_request =
-            { graph_id; account_generation = manager.startup.account_generation } in
-          { state with local_copy_check = Some request; local_copy_message = None },
-          local_copy_request ~deleting:false request
+            { graph_id; account_generation = manager.startup.account_generation }
+          in
+          ( { state with local_copy_check = Some request; local_copy_message = None }
+          , local_copy_request ~deleting:false request )
         | _ -> state, Effect.ignore)
     | Sign_out ->
       cancel_copy ();
@@ -6105,14 +6333,19 @@ let start
          , block_in_timeline snapshot.timeline block_id )
        with
        | true, None, None, Some _ ->
-         update (fun state -> { state with modal = Status_sheet block_id })
+         update (fun state ->
+           { state with modal = Status_sheet block_id; task_status_page = 0 })
        | false, _, _, _
        | true, Some _, _, _
        | true, None, Some _, _
        | true, None, None, None -> Effect.ignore)
+    | Status_catalog_retry ->
+      with_request snapshot Journal_graph_request.Load_task_statuses
+    | Status_catalog_page page ->
+      update (fun state -> { state with task_status_page = max 0 page })
     | Status_sheet_select value ->
       let tag = value in
-      let task_state = List.assoc_opt tag status_sheet_options in
+      let task_state = List.assoc_opt tag (status_sheet_options snapshot) in
       (match
          ( snapshot.modal
          , snapshot.write_enabled
@@ -6120,6 +6353,27 @@ let start
          , snapshot.pending_status
          , task_state )
        with
+       | Status_sheet "capture-draft", true, None, None, Some task_state ->
+         update (fun state ->
+           { state with
+             modal = Capture_sheet
+           ; direct_capture =
+               Option.map
+                 (fun capture -> Journal_capture.with_task_state capture task_state)
+                 state.direct_capture
+           })
+       | Status_sheet "append-draft", true, None, None, Some task_state ->
+         update (fun state ->
+           { state with
+             modal = Append_sheet
+           ; routes =
+               (match Journal_routes.detail state.routes with
+                | None -> state.routes
+                | Some detail ->
+                  Journal_routes.update_detail
+                    state.routes
+                    (Journal_detail.set_child_task detail task_state))
+           })
        | Status_sheet block_id, true, None, None, Some task_state ->
          (match block_in_timeline snapshot.timeline block_id with
           | None -> update (fun state -> { state with modal = No_modal })
@@ -6406,13 +6660,14 @@ let start
       ~some:(fun manager -> manager.Graph_service.startup.awaiting_selection) state.manager in
     if picker left || picker right then
       picker left = picker right && left.graph_picker_open = right.graph_picker_open
-      && (match left.manager, right.manager with
+      &&
+      match left.manager, right.manager with
           | Some left, Some right -> left.catalog == right.catalog
             && left.selected_graph = right.selected_graph
             && left.startup.account_generation = right.startup.account_generation
             && left.startup.catalog_loading = right.startup.catalog_loading
             && left.last_error = right.last_error
-          | _ -> false)
+      | _ -> false
     else if (not left.graph_ready) || not right.graph_ready
     then left == right
     else
@@ -6422,6 +6677,7 @@ let start
       && Journal_routes.destination left.routes = Journal_routes.destination right.routes
       && same_actions left right
       && left.reference_sources == right.reference_sources
+      && left.task_status_definitions == right.task_status_definitions
       && left.feed_loaded = right.feed_loaded
       && left.graph_error == right.graph_error
       && (Option.is_none left.graph_error
@@ -6450,6 +6706,7 @@ let start
          (Journal_routes.detail right.routes)
     && same_actions left right
     && left.reference_sources == right.reference_sources
+    && left.task_status_definitions == right.task_status_definitions
     && left.import_completion = right.import_completion
     && left.asset_import_request = right.asset_import_request
     && left.asset_import_owner = right.asset_import_owner
@@ -6566,7 +6823,8 @@ let start
                  (Ui.Event.Handler.create (function
                     | Ui.Event.Payload.Bool selected
                       when selected
-                           <> (Journal_capture.task_state capture = Journal_model.Todo) ->
+                           <> (Journal_capture.task_state capture
+                               <> Journal_model.No_status) ->
                       dispatch.send
                         (Detail_action
                            ( Detail_outline.scope state.routes
@@ -6655,6 +6913,7 @@ let start
         | Waiting | Interaction _ | Account_failure -> manager_page ~picker_signal:model_signal state dispatch
         | Timeline ->
           timeline_page
+            ~status_name:(task_status_name state)
             ~header_signal:(Some header_signal)
             ~timeline_store:(Some timeline_store)
             ~on_region:on_view_region
@@ -6922,10 +7181,18 @@ let start
         append_composer
           state
           ~render:(composer_page ~on_close:(bind_action dispatch Close_composer))
-      | Status_sheet block_id ->
+      | Status_sheet id ->
+        let current =
+          match id with
+          | "capture-draft" -> Option.map Journal_capture.task_state state.direct_capture
+          | "append-draft" ->
+            Option.bind (Journal_routes.detail state.routes) (fun detail ->
+              Option.map Journal_capture.task_state (Journal_detail.child_capture detail))
+          | _ -> Option.map Journal_model.task_state (block_in_timeline state.timeline id)
+        in
         Option.map
-          (fun block -> status_sheet_page ~tokens ~block dispatch)
-          (block_in_timeline state.timeline block_id)
+          (fun current -> status_sheet_page ~state ~tokens ~current ~id dispatch)
+          current
       | Cache_reset_confirmation _ -> None
       | Diagnostics ->
         Some
@@ -7362,6 +7629,7 @@ module For_testing = struct
     in
     let handler = Ui.Event.Handler.create ~name:"root-visual-fixture" (fun _ -> ()) in
     timeline_page
+      ~status_name:(task_status_name initial_state)
       ~header_signal:None
       ~timeline_store:None
       ~on_region:(fun _ -> ())

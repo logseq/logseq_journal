@@ -201,14 +201,15 @@ type property_definition =
   ; closed_values : block_uuid list
   }
 
-type task_state =
-  | Todo
-  | Doing
-  | Done
-  | Cancelled
-  | Waiting
-  | Now
-  | Later
+type task_status_definition =
+  { uuid : Uuid.t
+  ; title : string
+  ; ident : qualified_ident option
+  ; order : string
+  ; checkbox_state : bool option
+  }
+
+type task_state = Uuid.t
 
 type task =
   { block : block
@@ -284,3 +285,8 @@ val block_to_yojson : block -> Yojson.Safe.t
 val block_of_yojson : Yojson.Safe.t -> (block, string) result
 val page_to_yojson : page -> Yojson.Safe.t
 val page_of_yojson : Yojson.Safe.t -> (page, string) result
+val task_status_definition_to_yojson : task_status_definition -> Yojson.Safe.t
+
+val task_status_definition_of_yojson
+  :  Yojson.Safe.t
+  -> (task_status_definition, string) result

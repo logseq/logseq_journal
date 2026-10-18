@@ -666,7 +666,7 @@ let deterministic_model_projection_matches_naive_oracle database =
         ( Types.Set_task_status
             { mutation_id = T.mutation_uuid (1_000 + ordinal)
             ; block = target.uuid
-            ; status = Types.Todo
+            ; status = Status_uuid T.builtin_todo_uuid
             }
         , block_precondition database target.uuid behavior )
       | 2 ->
@@ -1076,8 +1076,92 @@ let orders_survive_reopen_and_outbox_drain () =
             (order_of database (order_uuid 603))))))
 ;;
 
+let custom_status_writes_exact_reference database =
+  let behavior = "custom status writes exact UUID and preserves properties" in
+  T.seed_task_statuses database;
+  let command n status =
+    Set_task_status
+      { mutation_id = T.mutation_uuid n
+      ; block = T.authoritative_block_uuid
+      ; status = Status_uuid status
+      }
+  in
+  let expected = block_precondition database T.authoritative_block_uuid behavior in
+  List.iter
+    (fun status ->
+       match Database.commit_local database ~expected (command 890 status) with
+       | Error (Invalid_local_mutation _) -> ()
+       | _ -> Alcotest.fail "missing or wrong-property status was selectable")
+    [ T.missing_block_uuid; T.default_value_uuid; T.page_uuid ];
+  let mutation = command 891 (T.status_uuid 1) in
+  ignore (T.commit_mutation database ~expected mutation ~behavior);
+  (match T.commit_mutation database ~expected mutation ~behavior with
+   | Local_existing _ -> ()
+   | _ -> Alcotest.fail "status same-id retry changed identity");
+  current_snapshot database behavior (fun snapshot ->
+    match
+      Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
+      |> T.require_ok ~behavior
+    with
+    | [ Present_block { value; _ } ] ->
+      T.require
+        (value.task_status = Some (Status_uuid (T.status_uuid 1)))
+        "custom status not retained";
+      let property =
+        List.find
+          (fun (p : Graph.property_summary) -> p.ident = "logseq.property/status")
+          value.block.properties
+      in
+      T.require
+        (property.values = [ Default_value (Graph.Uuid.to_string (T.status_uuid 1)) ])
+        "saved property reference differs from chosen UUID";
+      T.require (value.block.title = "Authoritative block") "status changed block source"
+    | _ -> Alcotest.fail "status mutation removed block");
+  let expected = block_precondition database T.authoritative_block_uuid behavior in
+  ignore
+    (T.commit_mutation
+       database
+       ~expected
+       (Clear_task_status
+          { mutation_id = T.mutation_uuid 892; block = T.authoritative_block_uuid })
+       ~behavior);
+  current_snapshot database behavior (fun snapshot ->
+    match
+      Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
+      |> T.require_ok ~behavior
+    with
+    | [ Present_block { value; _ } ] ->
+      T.require (value.task_status = None) "explicit clear failed"
+    | _ -> Alcotest.fail "cleared block missing");
+  T.apply_test_transaction
+    database
+    ~cursor:2
+    [ T.status_add
+        (T.status_lookup (T.status_uuid 2))
+        "block/closed-value-property"
+        (Transit_core.Json.Keyword "logseq.property/status")
+    ];
+  ignore
+    (T.commit_mutation
+       database
+       ~expected:(delete_precondition database (T.status_uuid 2) behavior)
+       (Delete_blocks { mutation_id = T.mutation_uuid 893; root = T.status_uuid 2 })
+       ~behavior);
+  match
+    Database.commit_local
+      database
+      ~expected:(block_precondition database T.authoritative_block_uuid behavior)
+      (command 894 (T.status_uuid 2))
+  with
+  | Error (Invalid_local_mutation _) -> ()
+  | _ -> Alcotest.fail "locally deleted status remained selectable"
+;;
+
 let cases =
   [ T.database_case
+      "custom status UUID mutation and explicit clear"
+      custom_status_writes_exact_reference
+  ; T.database_case
       "delete rejects changed root revision"
       delete_rejects_a_changed_root_revision
   ; T.database_case

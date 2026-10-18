@@ -1,14 +1,8 @@
 type task_state =
   | No_status
-  | Todo
-  | Doing
-  | In_review
-  | Now
-  | Done
-  | Canceled
-  | Backlog
-  | Waiting
-  | Later
+  | Status of string
+  | Default_status
+  | Invalid_status of string
 
 type status_category =
   | Todo_category
@@ -17,24 +11,19 @@ type status_category =
   | Later_category
 
 let status_category = function
-  | No_status -> None
-  | Todo -> Some Todo_category
-  | Doing | In_review | Now -> Some Doing_category
-  | Done | Canceled -> Some Done_category
-  | Backlog | Waiting | Later -> Some Later_category
+  | No_status | Invalid_status _ -> None
+  | Status _ | Default_status -> Some Todo_category
 ;;
 
-let status_name = function
+let status_name ?(lookup = fun _ -> None) = function
   | No_status -> "No status"
-  | Todo -> "Todo"
-  | Doing -> "Doing"
-  | In_review -> "In review"
-  | Now -> "Now"
-  | Done -> "Done"
-  | Canceled -> "Canceled"
-  | Backlog -> "Backlog"
-  | Waiting -> "Waiting"
-  | Later -> "Later"
+  | Default_status -> "Default task status"
+  | Invalid_status value -> "Invalid status: " ^ value
+  | Status uuid ->
+    (match lookup uuid with
+     | Some title when String.trim title <> "" -> title
+     | Some _ -> "Unnamed status"
+     | None -> "Unavailable status (" ^ uuid ^ ")")
 ;;
 
 type t =
@@ -181,13 +170,17 @@ let datetime_source ~localtime unix_ms =
 let property_source ~localtime = function
   | Graph.Checkbox_value value -> if value then "Yes" else "No"
   | Default_value value ->
-    (match Graph.Uuid.of_string value with Ok uuid -> reference uuid | Error _ -> value)
+    (match Graph.Uuid.of_string value with
+     | Ok uuid -> reference uuid
+     | Error _ -> value)
   | String_value value | Url_value value | Number_value value | Raw_number_value value
   | Keyword_value value | Property_value value | Json_value value -> value
   | Node_value uuid | Asset_value uuid | Entity_value uuid | Class_value uuid
   | Page_value uuid -> reference uuid
   | Date_value {journal_day} -> Printf.sprintf "%04d-%02d-%02d"
-      (journal_day / 10000) ((journal_day / 100) mod 100) (journal_day mod 100)
+      (journal_day / 10000)
+      (journal_day / 100 mod 100)
+      (journal_day mod 100)
   | Datetime_value {unix_ms} ->
     datetime_source ~localtime unix_ms
   | Any_value value -> internal_source value
@@ -198,7 +191,7 @@ let property_source ~localtime = function
 let property_sources ?(localtime = Unix.localtime) properties =
   List.filter_map (fun (p : Graph.property_summary) ->
     if p.schema.hidden || p.ident = "logseq.property/status" || p.ident = "block/tags" || p.values = [] then None
-    else
+       else (
       let render = function
         | Graph.Default_value "logseq.property/priority.low" when p.ident = "logseq.property/priority" -> "Low"
         | Default_value "logseq.property/priority.medium" when p.ident = "logseq.property/priority" -> "Medium"
@@ -208,7 +201,10 @@ let property_sources ?(localtime = Unix.localtime) properties =
       in
       let values = List.map render p.values |> List.filter (fun s -> String.trim s <> "") in
       if values = [] then None
-      else Some (p.title, String.concat ", " values ^ if p.values_truncated then " …" else "")) properties
+         else
+           Some
+             (p.title, String.concat ", " values ^ if p.values_truncated then " …" else "")))
+    properties
 ;;
 
 let source value =
@@ -216,7 +212,10 @@ let source value =
   List.find_map (fun (p : Graph.property_summary) ->
     if p.ident = "logseq.property/value" then
       Some (String.concat ", " (List.map (property_source ~localtime:Unix.localtime) p.values)) else None)
-    value.display_properties |> Option.value ~default:value.source
+      value.display_properties
+    |> Option.value ~default:value.source
+;;
+
 let properties value = value.properties
 let display_properties value = value.display_properties
 let with_properties ?(localtime = Unix.localtime) value ~properties =

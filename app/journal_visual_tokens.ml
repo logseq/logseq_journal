@@ -13,9 +13,6 @@ module Color_exceptions = struct
   type status_palette =
     { no_status : status_colors
     ; todo : status_colors
-    ; doing : status_colors
-    ; done_ : status_colors
-    ; backlog : status_colors
     }
 
   let rgb red green blue = Ui.Style.Color.rgb ~red ~green ~blue
@@ -24,36 +21,24 @@ module Color_exceptions = struct
   let light_status =
     { no_status = { background = transparent; foreground = rgb 0 38 47 }
     ; todo = { background = rgb 88 92 126; foreground = rgb 255 255 255 }
-    ; doing = { background = rgb 0 103 124; foreground = rgb 255 255 255 }
-    ; done_ = { background = rgb 0 107 87; foreground = rgb 255 255 255 }
-    ; backlog = { background = rgb 124 58 237; foreground = rgb 255 255 255 }
     }
   ;;
 
   let dark_status =
     { no_status = { background = transparent; foreground = rgb 167 184 188 }
     ; todo = { background = rgb 192 196 235; foreground = rgb 42 46 80 }
-    ; doing = { background = rgb 134 209 233; foreground = rgb 0 54 66 }
-    ; done_ = { background = rgb 131 214 189; foreground = rgb 0 56 43 }
-    ; backlog = { background = rgb 191 159 255; foreground = rgb 42 12 82 }
     }
   ;;
 
   let light_increased_status =
     { no_status = { background = transparent; foreground = rgb 0 0 0 }
     ; todo = { background = rgb 58 60 91; foreground = rgb 255 255 255 }
-    ; doing = { background = rgb 0 75 90; foreground = rgb 255 255 255 }
-    ; done_ = { background = rgb 0 78 62; foreground = rgb 255 255 255 }
-    ; backlog = { background = rgb 90 33 175; foreground = rgb 255 255 255 }
     }
   ;;
 
   let dark_increased_status =
     { no_status = { background = transparent; foreground = rgb 255 255 255 }
     ; todo = { background = rgb 224 225 255; foreground = rgb 42 46 80 }
-    ; doing = { background = rgb 179 235 255; foreground = rgb 0 54 66 }
-    ; done_ = { background = rgb 174 244 215; foreground = rgb 0 56 43 }
-    ; backlog = { background = rgb 224 205 255; foreground = rgb 42 12 82 }
     }
   ;;
 
@@ -68,11 +53,8 @@ module Color_exceptions = struct
   let status_colors ~presentation ~high_contrast =
     let palette = status_palette ~presentation ~high_contrast in
     function
-    | Journal_model.No_status -> palette.no_status
-    | Todo -> palette.todo
-    | Doing | In_review | Now -> palette.doing
-    | Done | Canceled -> palette.done_
-    | Backlog | Waiting | Later -> palette.backlog
+    | Journal_model.No_status | Invalid_status _ -> palette.no_status
+    | Status _ | Default_status -> palette.todo
   ;;
 end
 

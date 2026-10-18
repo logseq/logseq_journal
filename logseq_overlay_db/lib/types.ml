@@ -130,16 +130,21 @@ type admission_inspection =
   ; maximum_bytes : int
   }
 
+(** Current selections use database UUIDs. Legacy idents exist only for durable
+    pre-UUID replay and retain their original mutation fingerprints. *)
+
 type task_status =
-  | Todo
-  | Doing
-  | In_review
-  | Now
-  | Done
-  | Canceled
-  | Backlog
-  | Waiting
-  | Later
+  | Status_uuid of Graph.Uuid.t
+  | Legacy_status_ident of string
+
+type task_status_catalog_result =
+  { property_uuid : Graph.Uuid.t option
+  ; default_status : Graph.Uuid.t option
+  ; items : Graph.task_status_definition list
+  ; next_cursor : Graph.Cursor.t option
+  }
+
+type task_status_lookup = Graph.task_status_definition option
 
 type block_record =
   { block : Graph.block

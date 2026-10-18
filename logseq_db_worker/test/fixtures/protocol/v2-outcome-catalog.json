@@ -35,9 +35,7 @@
                   {
                     "uuid": "74000000-0000-4000-8000-000000000097",
                     "title": "Favorite task",
-                    "task_status": [
-                      "V2_doing"
-                    ],
+                    "task_status": "00000002-1840-1229-0800-000000000000",
                     "revision": "block:v1:1"
                   }
                 ]
@@ -210,9 +208,7 @@
                   "tags": [],
                   "properties": []
                 },
-                "task_status": [
-                  "V2_todo"
-                ],
+                "task_status": "00000002-1615-5853-7700-000000000000",
                 "rendered_page_title": "Sep 2nd, 2026",
                 "tag_titles": []
               },
@@ -268,9 +264,7 @@
                     "tags": [],
                     "properties": []
                   },
-                  "task_status": [
-                    "V2_todo"
-                  ],
+                  "task_status": "00000002-1615-5853-7700-000000000000",
                   "rendered_page_title": "Sep 2nd, 2026",
                   "tag_titles": []
                 },
@@ -307,9 +301,7 @@
                     "tags": [],
                     "properties": []
                   },
-                  "task_status": [
-                    "V2_todo"
-                  ],
+                  "task_status": "00000002-1615-5853-7700-000000000000",
                   "rendered_page_title": "Sep 2nd, 2026",
                   "tag_titles": []
                 },
@@ -466,9 +458,7 @@
                     "tags": [],
                     "properties": []
                   },
-                  "task_status": [
-                    "V2_todo"
-                  ],
+                  "task_status": "00000002-1615-5853-7700-000000000000",
                   "rendered_page_title": "Sep 2nd, 2026",
                   "tag_titles": []
                 },
@@ -512,9 +502,7 @@
                     "tags": [],
                     "properties": []
                   },
-                  "task_status": [
-                    "V2_todo"
-                  ],
+                  "task_status": "00000002-1615-5853-7700-000000000000",
                   "rendered_page_title": "Sep 2nd, 2026",
                   "tag_titles": []
                 },
@@ -559,6 +547,50 @@
             ],
             "next_cursor": null
           }
+        ]
+      }
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000024",
+        "outcome": [
+          "V2_task_statuses_outcome",
+          {
+            "property_uuid": null,
+            "default_status": null,
+            "items": [
+              {
+                "uuid": "b1000000-0000-4000-8000-000000000099",
+                "title": "Custom \u6570\u636e\u5e93\u72b6\u6001",
+                "ident": null,
+                "order": "b10",
+                "checkbox_state": null
+              }
+            ],
+            "next_cursor": null
+          }
+        ]
+      }
+    ],
+    [
+      "V2_response",
+      {
+        "api_version": 2,
+        "request_id": "00000000-0000-4000-8000-000000000025",
+        "outcome": [
+          "V2_task_status_definitions_outcome",
+          [
+            {
+              "uuid": "b1000000-0000-4000-8000-000000000099",
+              "title": "Custom \u6570\u636e\u5e93\u72b6\u6001",
+              "ident": null,
+              "order": "b10",
+              "checkbox_state": null
+            },
+            null
+          ]
         ]
       }
     ]

@@ -1,23 +1,98 @@
 {
   "api_version": 2,
   "reads": {
-    "listFavorites": {"interest":"logicalProjection","revision":"projectionRevision"},
-    "graphInfo": {"interest":"graphInfo","revision":"generation"},
-    "inspectAdmission": {"interest":"outboxAdmission","revision":"none"},
-    "listJournals": {"interest":"journalIndex","revision":"pageRevision"},
-    "getPage": {"interest":"pageUuid","revision":"pageRevision"},
-    "getBlock": {"interest":"blockUuid","revision":"blockRevision"},
-    "getChildren": {"interest":"childrenScope","revision":"structureRevision"},
-    "getPageTree": {"interest":"pageTreeDepth","revision":"blockRevision"}
+    "listFavorites": {
+      "interest": "logicalProjection",
+      "revision": "projectionRevision"
+    },
+    "graphInfo": {
+      "interest": "graphInfo",
+      "revision": "generation"
+    },
+    "inspectAdmission": {
+      "interest": "outboxAdmission",
+      "revision": "none"
+    },
+    "listJournals": {
+      "interest": "journalIndex",
+      "revision": "pageRevision"
+    },
+    "getPage": {
+      "interest": "pageUuid",
+      "revision": "pageRevision"
+    },
+    "getBlock": {
+      "interest": "blockUuid",
+      "revision": "blockRevision"
+    },
+    "getChildren": {
+      "interest": "childrenScope",
+      "revision": "structureRevision"
+    },
+    "getPageTree": {
+      "interest": "pageTreeDepth",
+      "revision": "blockRevision"
+    },
+    "listTaskStatuses": {
+      "interest": "statusProperty",
+      "revision": "projectionRevision"
+    },
+    "getTaskStatusDefinitions": {
+      "interest": "statusUuidBatch",
+      "revision": "projectionRevision"
+    }
   },
   "mutations": {
-    "saveBlock": {"target":"blockUuid","requiredPreconditions":["block"]},
-    "insertBlocks": {"target":"appendToParent","requiredPreconditions":["childrenScope"]},
-    "deleteBlocks": {"target":"singleRoot","requiredPreconditions":["block"]},
-    "createJournalPage": {"target":"journalDayAndPageUuid","requiredPreconditions":["page"]},
-    "setTaskStatus": {"target":"blockUuid","requiredPreconditions":["block"]},
-    "clearTaskStatus": {"target":"blockUuid","requiredPreconditions":["block"]}
+    "saveBlock": {
+      "target": "blockUuid",
+      "requiredPreconditions": [
+        "block"
+      ]
+    },
+    "insertBlocks": {
+      "target": "appendToParent",
+      "requiredPreconditions": [
+        "childrenScope"
+      ]
+    },
+    "deleteBlocks": {
+      "target": "singleRoot",
+      "requiredPreconditions": [
+        "block"
+      ]
+    },
+    "createJournalPage": {
+      "target": "journalDayAndPageUuid",
+      "requiredPreconditions": [
+        "page"
+      ]
+    },
+    "setTaskStatus": {
+      "target": "blockUuid",
+      "requiredPreconditions": [
+        "block"
+      ]
+    },
+    "clearTaskStatus": {
+      "target": "blockUuid",
+      "requiredPreconditions": [
+        "block"
+      ]
+    }
   },
-  "identity": {"fields":["mutationId","canonicalIntent"],"forbiddenFields":["expectedBasis"]},
-  "delivery": {"mode":"cumulativeUnacknowledgedWindows","ack":"explicit","overflow":"resync","generationChange":"mandatoryResync"}
+  "identity": {
+    "fields": [
+      "mutationId",
+      "canonicalIntent"
+    ],
+    "forbiddenFields": [
+      "expectedBasis"
+    ]
+  },
+  "delivery": {
+    "mode": "cumulativeUnacknowledgedWindows",
+    "ack": "explicit",
+    "overflow": "resync",
+    "generationChange": "mandatoryResync"
+  }
 }

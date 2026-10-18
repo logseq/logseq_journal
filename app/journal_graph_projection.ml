@@ -35,6 +35,7 @@ type capture =
   ; sibling_order : string
   ; source : string
   ; task_state : Journal_model.task_state
+  ; status_confirmation : bool
   ; creation_time : Journal_time.t
   ; children : capture_child list
   }
@@ -48,6 +49,7 @@ type create_child =
   ; sibling_order : string
   ; source : string
   ; task_state : Journal_model.task_state
+  ; status_confirmation : bool
   ; creation_time : Journal_time.t
   }
 
@@ -144,49 +146,27 @@ let page_of_summary (summary : Graph.page_summary) =
 ;;
 
 let task_state (block : Graph.block) =
-  let status =
+  match
     List.find_opt
-      (fun (property : Graph.property_summary) ->
-         String.equal property.ident "logseq.property/status")
+      (fun (p : Graph.property_summary) -> p.ident = "logseq.property/status")
       block.properties
-  in
-  let status_ident =
-    Option.bind status (fun property ->
-      List.find_map
-        (function
-          | Graph.Default_value value -> Some value
-          | Number_value _
-          | Date_value _
-          | Datetime_value _
-          | Checkbox_value _
-          | Url_value _
-          | Node_value _
-          | Asset_value _
-          | Keyword_value _
-          | Map_value _
-          | Collection_value _
-          | Any_value _
-          | Entity_value _
-          | Class_value _
-          | Page_value _
-          | Property_value _
-          | String_value _
-          | Json_value _
-          | Raw_number_value _ -> None)
-        property.values)
-  in
-  match status_ident with
+  with
   | None -> Ok Journal_model.No_status
-  | Some "logseq.property/status.todo" -> Ok Journal_model.Todo
-  | Some "logseq.property/status.doing" -> Ok Journal_model.Doing
-  | Some "logseq.property/status.in-review" -> Ok Journal_model.In_review
-  | Some "logseq.property/status.now" -> Ok Journal_model.Now
-  | Some "logseq.property/status.done" -> Ok Journal_model.Done
-  | Some "logseq.property/status.canceled" -> Ok Journal_model.Canceled
-  | Some "logseq.property/status.backlog" -> Ok Journal_model.Backlog
-  | Some "logseq.property/status.waiting" -> Ok Journal_model.Waiting
-  | Some "logseq.property/status.later" -> Ok Journal_model.Later
-  | Some ident -> Error ("Unknown Logseq block status: " ^ ident)
+  | Some { values = []; _ } -> Ok Journal_model.No_status
+  | Some { values = [ Graph.Default_value value ]; _ } -> Ok (Journal_model.Status value)
+  | Some { values = [ (Node_value uuid | Entity_value uuid) ]; _ } ->
+    Ok (Journal_model.Status (Graph.Uuid.to_string uuid))
+  | Some property ->
+    Ok
+      (Journal_model.Invalid_status
+         (Journal_model.property_sources
+            [ { property with
+                ident = "invalid-status"
+              ; schema = { property.schema with hidden = false }
+              }
+            ]
+          |> List.map snd
+          |> String.concat ", "))
 ;;
 
 let creation_time (context : time_context) instant_unix_ms =
@@ -448,17 +428,10 @@ let favorite (item : Logseq_db_worker.Protocol.v2_favorite_item) =
       Page (id uuid), title, Journal_model.No_status
     | V2_favorite_block { uuid; title; task_status; _ } ->
       let status =
-        match task_status with
-        | None -> Journal_model.No_status
-        | Some P.V2_todo -> Todo
-        | Some V2_doing -> Doing
-        | Some V2_in_review -> In_review
-        | Some V2_now -> Now
-        | Some V2_done -> Done
-        | Some V2_canceled -> Canceled
-        | Some V2_backlog -> Backlog
-        | Some V2_waiting -> Waiting
-        | Some V2_later -> Later
+        Option.fold
+          ~none:Journal_model.No_status
+          ~some:(fun uuid -> Journal_model.Status (id uuid))
+          task_status
       in
       Block (id uuid), title, status
   in

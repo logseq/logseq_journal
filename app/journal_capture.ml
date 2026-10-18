@@ -101,6 +101,7 @@ type t =
   ; task_state : Journal_model.task_state
   ; phase : phase
   ; pending : Journal_graph_request.t option
+  ; retry_identity_locked : bool
   ; pending_attachments : Journal_asset_import.staged list
   }
 
@@ -109,6 +110,7 @@ let create ~session_number ~source =
   ; task_state = Journal_model.No_status
   ; phase = Editing
   ; pending = None
+  ; retry_identity_locked = false
   ; pending_attachments = []
   }
 ;;
@@ -133,6 +135,9 @@ let rebind t ~session_number =
 ;;
 
 let phase t = t.phase
+let retry_identity_locked t = t.retry_identity_locked
+let lock_for_retry t = { t with retry_identity_locked = true }
+
 (* Unicode White_Space, shared by button admission and attachment-only naming.
    Do not trim meaningful drafts or treat format characters as whitespace. *)
 let source_is_blank source =
@@ -146,11 +151,11 @@ let source_is_blank source =
   in
   let rec loop offset =
     if offset = String.length source then true
-    else
+    else (
       let decoded = String.get_utf_8_uchar source offset in
       Uchar.utf_decode_is_valid decoded
       && whitespace (Uchar.to_int (Uchar.utf_decode_uchar decoded))
-      && loop (offset + Uchar.utf_decode_length decoded)
+      && loop (offset + Uchar.utf_decode_length decoded))
   in
   loop 0
 ;;
@@ -169,7 +174,9 @@ let attachment_limit = 9
 let pending_attachments t = t.pending_attachments
 
 let can_attach t =
-  t.phase <> Saving && List.length t.pending_attachments < attachment_limit
+  (not t.retry_identity_locked)
+  && t.phase <> Saving
+  && List.length t.pending_attachments < attachment_limit
 ;;
 
 let submission_source t =
@@ -216,31 +223,44 @@ let clear_attachments t =
 ;;
 
 let update_source t ~source:new_source =
-  if t.phase = Saving || String.equal (source t) new_source
+  if t.retry_identity_locked || t.phase = Saving || String.equal (source t) new_source
   then t
   else (
     let t = replace_attempt t in
     { t with editor = Editor.replace t.editor ~source:new_source })
 ;;
 
-let toggle_task_intent t =
-  match t.phase with
-  | Saving -> t
-  | Editing | Failed _ ->
-    let t = replace_attempt t in
-    let task_state =
-      match t.task_state with
-      | Journal_model.No_status -> Journal_model.Todo
-      | Todo -> No_status
-      | Doing | In_review | Now | Done | Canceled | Backlog | Waiting | Later ->
-        invalid_arg "Capture task intent must be No_status or Todo"
+let with_task_state t task_state =
+  if t.phase = Saving || t.task_state = task_state
+  then t
+  else if t.retry_identity_locked
+  then (
+    let pending =
+      Option.map
+        (function
+          | Journal_graph_request.Capture capture ->
+            Journal_graph_request.Capture
+              { capture with command = { capture.command with task_state } }
+          | request -> request)
+        t.pending
     in
-    { t with task_state }
+    { t with task_state; pending })
+  else (
+    let t = replace_attempt t in
+    { t with task_state })
+;;
+
+let toggle_task_intent t =
+  with_task_state
+    t
+    (match t.task_state with
+     | Journal_model.No_status -> Journal_model.Default_status
+     | Status _ | Default_status | Invalid_status _ -> No_status)
 ;;
 
 let apply_text_edit t edit =
   match Editor.apply_text_edit t.editor edit with
-  | Some editor when t.phase <> Saving ->
+  | Some editor when t.phase <> Saving && not t.retry_identity_locked ->
     { t with editor; phase = Editing; pending = None }
   | Some _ -> t
   | None -> t
@@ -260,6 +280,7 @@ let admit_save t ~mutation_id ~block_id ~sibling_order ~calendar_generation ~cre
       ; sibling_order
       ; source
       ; task_state = t.task_state
+      ; status_confirmation = t.task_state <> Journal_model.No_status
       ; creation_time
       ; children = []
       }
@@ -270,7 +291,12 @@ let admit_save t ~mutation_id ~block_id ~sibling_order ~calendar_generation ~cre
 
 let fail t ~message =
   match t.pending with
-  | Some _ -> { t with phase = Failed message }
+  | Some _ ->
+    { t with
+      phase = Failed message
+    ; retry_identity_locked =
+        t.retry_identity_locked || t.task_state <> Journal_model.No_status
+    }
   | None -> t
 ;;
 

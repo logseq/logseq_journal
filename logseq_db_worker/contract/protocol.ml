@@ -30,6 +30,11 @@ and command =
       ; limit : int
       ; cursor : Cursor.t option
       }
+  | V2_list_task_statuses of
+      { limit : int
+      ; cursor : Cursor.t option
+      }
+  | V2_get_task_status_definitions of { statuses : Uuid.t list }
   | V2_list_favorites of
       { limit : int
       ; cursor : Cursor.t option
@@ -122,16 +127,7 @@ and command =
 
 and v2_scope = V2_children_scope of Uuid.t
 
-and v2_task_status =
-  | V2_todo
-  | V2_doing
-  | V2_in_review
-  | V2_now
-  | V2_done
-  | V2_canceled
-  | V2_backlog
-  | V2_waiting
-  | V2_later
+and v2_task_status = Uuid.t
 
 and v2_preconditions =
   { blocks : (block_uuid * string) list
@@ -268,6 +264,13 @@ and v2_outcome =
       ; generation : string
       ; projection_revision : string
       }
+  | V2_task_statuses_outcome of
+      { property_uuid : Uuid.t option
+      ; default_status : Uuid.t option
+      ; items : task_status_definition list
+      ; next_cursor : Cursor.t option
+      }
+  | V2_task_status_definitions_outcome of task_status_definition option list
   | V2_favorites_outcome of v2_favorites_result
   | V2_assets_outcome of
       { generation : string
@@ -391,9 +394,11 @@ let valid_tree roots =
 ;;
 
 let validate_command = function
+  | V2_get_task_status_definitions { statuses = assets }
   | V2_get_asset_descriptors { assets } -> List.length assets <= maximum_page_size
   | V2_list_assets { roots; limit; _ } ->
     List.length roots <= maximum_filter_values && valid_limit limit
+  | V2_list_task_statuses { limit; _ }
   | V2_list_favorites { limit; _ }
   | V2_list_journals { limit; _ }
   | V2_get_outline_block_summary { limit; _ }
@@ -444,6 +449,15 @@ let valid_block_lookup = function
 ;;
 
 let validate_outcome = function
+  | V2_task_statuses_outcome { items; _ } ->
+    List.length items <= maximum_page_size
+    && List.for_all (fun (d : task_status_definition) -> valid_title d.title) items
+  | V2_task_status_definitions_outcome items ->
+    List.length items <= maximum_page_size
+    && List.for_all
+         (Option.fold ~none:true ~some:(fun (d : task_status_definition) ->
+            valid_title d.title))
+         items
   | V2_favorites_outcome { items; _ } ->
     List.length items <= maximum_page_size
     && List.for_all

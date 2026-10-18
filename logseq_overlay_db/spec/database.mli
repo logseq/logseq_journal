@@ -260,6 +260,22 @@ val get_outline_blocks
   -> Graph.block_uuid list
   -> (Types.block_lookup list, Types.read_error) result
 
+(** Reads active status choices owned by the status property in database order.
+    Limit is 1..200. Cursors bind to one captured projection. Empty placeholders
+    and recycled choices are excluded. No per-block reads or graph writes occur. *)
+val get_task_statuses
+  :  snapshot
+  -> limit:int
+  -> cursor:Graph.Cursor.t option
+  -> (Types.task_status_catalog_result, Types.read_error) result
+
+(** Resolves up to 200 status UUIDs in input order. Missing, recycled and
+    wrong-property entities return [None], retaining the caller's input identity. *)
+val get_task_status_definitions
+  :  snapshot
+  -> Graph.Uuid.t list
+  -> (Types.task_status_lookup list, Types.read_error) result
+
 (** Looks up pages by UUID in the captured projection. *)
 val get_pages
   :  snapshot

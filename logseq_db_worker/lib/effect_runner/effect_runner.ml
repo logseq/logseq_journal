@@ -653,28 +653,11 @@ let response request outcome =
 ;;
 
 let task_status_to_protocol = function
-  | Overlay.Todo -> Protocol.V2_todo
-  | Doing -> V2_doing
-  | In_review -> V2_in_review
-  | Now -> V2_now
-  | Done -> V2_done
-  | Canceled -> V2_canceled
-  | Backlog -> V2_backlog
-  | Waiting -> V2_waiting
-  | Later -> V2_later
+  | Overlay.Status_uuid uuid -> uuid
+  | Legacy_status_ident _ -> invalid_arg "legacy intent escaped durable replay"
 ;;
 
-let task_status_of_protocol = function
-  | Protocol.V2_todo -> Overlay.Todo
-  | V2_doing -> Doing
-  | V2_in_review -> In_review
-  | V2_now -> Now
-  | V2_done -> Done
-  | V2_canceled -> Canceled
-  | V2_backlog -> Backlog
-  | V2_waiting -> Waiting
-  | V2_later -> Later
-;;
+let task_status_of_protocol uuid = Overlay.Status_uuid uuid
 
 let block_record ?(tag_titles = []) (value : Overlay.block_record)
   : Protocol.v2_block_record
@@ -842,6 +825,8 @@ let local_mutation = function
   | V2_inspect_admission
   | V2_get_asset_descriptors _
   | V2_list_assets _
+  | V2_list_task_statuses _
+  | V2_get_task_status_definitions _
   | V2_list_favorites _
   | V2_list_journals _
   | V2_get_page _
@@ -986,6 +971,23 @@ let read_snapshot database request command =
                    }))
          | V2_inspect_admission ->
            failure request Invalid_request "The command is not a snapshot read."
+         | V2_list_task_statuses { limit; cursor } ->
+           (match Database.get_task_statuses snapshot ~limit ~cursor with
+            | Error error -> read_failure request error
+            | Ok result ->
+              response
+                request
+                (Protocol.V2_task_statuses_outcome
+                   { property_uuid = result.property_uuid
+                   ; default_status = result.default_status
+                   ; items = result.items
+                   ; next_cursor = result.next_cursor
+                   }))
+         | V2_get_task_status_definitions { statuses } ->
+           (match Database.get_task_status_definitions snapshot statuses with
+            | Error error -> read_failure request error
+            | Ok result ->
+              response request (Protocol.V2_task_status_definitions_outcome result))
          | V2_list_favorites { limit; cursor } ->
            (match Database.get_favorites snapshot ~limit ~cursor with
             | Error error -> read_failure request error
@@ -1458,7 +1460,7 @@ let deletion_authorized t (request : Sync.mirror_deletion) =
 ;;
 
 let deletion_current t request =
-  not t.stopped && t.deletion_owner = Some request && deletion_authorized t request
+  (not t.stopped) && t.deletion_owner = Some request && deletion_authorized t request
 ;;
 
 let sync_retirement_directory path =
@@ -1498,9 +1500,14 @@ let write_local_retirement path expected captured =
   let temporary = path ^ ".part" in
   let fd = Unix.openfile temporary [Unix.O_WRONLY;Unix.O_CREAT;Unix.O_TRUNC] 0o600 in
   Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
-    let rec write offset = if offset < String.length json then
+       let rec write offset =
+         if offset < String.length json
+         then (
       let n = Unix.write_substring fd json offset (String.length json-offset) in
-      if n=0 then failwith "retirement journal write stalled" else write (offset+n) in
+           if n = 0
+           then failwith "retirement journal write stalled"
+           else write (offset + n))
+       in
     write 0; Unix.fsync fd);
   Unix.rename temporary path; sync_retirement_directory (Filename.dirname path)
 ;;
@@ -1522,7 +1529,9 @@ let recover_local_retirements t (scope : Sync.graph_scope) =
   if not (Sys.file_exists directory) then Ok () else
   Array.fold_left (fun result name ->
     let* () = result in
-    if not (Filename.check_suffix name ".json") then Ok () else
+         if not (Filename.check_suffix name ".json")
+         then Ok ()
+         else (
     try
       let journal_path = Filename.concat directory name in
       let retirement = String.sub name 0 (String.length name - 5) |> Sync.retirement_id_of_string |> Result.get_ok in
@@ -1537,18 +1546,33 @@ let recover_local_retirements t (scope : Sync.graph_scope) =
       let* prepared, generation = Database.prepare_mirror_deletion
         ~application_support_directory:t.dependencies.config.application_support_directory
         ~graph_id:scope.graph_id ~retirement
-        |> Result.map_error (fun _ -> "Retirement recovery is blocked by mirror ownership or an unknown commit state.") in
+               |> Result.map_error (fun _ ->
+                 "Retirement recovery is blocked by mirror ownership or an unknown \
+                  commit state.")
+             in
       Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion prepared) (fun () ->
         let committed = Database.mirror_deletion_committed prepared in
         let original = Overlay.Mirror_generation.equal generation expected in
-        if not committed && not original then Error "Retirement recovery conflict; the captured resources were preserved."
-        else
+                  if (not committed) && not original
+                  then
+                    Error
+                      "Retirement recovery conflict; the captured resources were \
+                       preserved."
+                  else (
           let deletion = Sync.asset_deletion_reference ~scope ~retirement in
-          let* () = finish_local_retirement t scope deletion captured ~commit:committed in
-          (if committed then (try remove_local_retirement journal_path with _ -> ())
-           else remove_local_retirement journal_path);
-          Ok ())
-    with _ -> Error "Local copy recovery is incomplete; its resources were preserved.") (Ok ()) (Sys.readdir directory)
+                    let* () =
+                      finish_local_retirement t scope deletion captured ~commit:committed
+                    in
+                    if committed
+                    then (
+                      try remove_local_retirement journal_path with
+                      | _ -> ())
+                    else remove_local_retirement journal_path;
+                    Ok ()))
+           with
+           | _ -> Error "Local copy recovery is incomplete; its resources were preserved."))
+      (Ok ())
+      (Sys.readdir directory)
 ;;
 
 let handle_sync_worker_effect t = function
@@ -1556,7 +1580,8 @@ let handle_sync_worker_effect t = function
     let recovery = with_staging_lock t (fun () -> recover_local_retirements t request.scope) in
     (match recovery with
      | Error message -> Error (effect_error message)
-     | Ok () -> match
+     | Ok () ->
+       (match
        Database.inspect_mirror
          ~application_support_directory:
            t.dependencies.config.application_support_directory
@@ -1572,7 +1597,7 @@ let handle_sync_worker_effect t = function
         | Overlay.Absent _ ->
           Ok (sync_result ~event:(Sync.Mirror_inspected (Mirror_absent request.scope)) ())
         | Available _ ->
-          Ok (sync_result ~event:(Sync.Mirror_inspected (Mirror_available request)) ())))
+             Ok (sync_result ~event:(Sync.Mirror_inspected (Mirror_available request)) ()))))
   | Activate_snapshot request ->
     let key = Graph.Uuid.to_string request.scope.graph_id in
     (match Hashtbl.find_opt t.inspections key with
@@ -1678,10 +1703,12 @@ let handle_sync_worker_effect t = function
           let deletion = Sync.asset_deletion_reference ~scope ~retirement in
           let committed = ref false in
           let abort () =
-            if not !committed then
+                 if not !committed
+                 then (
               match finish_local_retirement t scope deletion captured ~commit:false with
               | Ok () -> remove_local_retirement path
-              | Error _ -> () in
+                   | Error _ -> ())
+               in
           Fun.protect ~finally:abort (fun () ->
             let* () = match asset_call t ~scope (Sync.Prepare_graph_asset_deletion retirement) with
               | Ok (Sync.Asset_deletion_prepared actual) when actual=deletion -> Ok ()
@@ -1694,11 +1721,13 @@ let handle_sync_worker_effect t = function
             (* The mirror receipt is the durable commit authority. Cleanup failure
                retains this coordinator journal for exact replay, not a broad sweep. *)
             (try
-               if Database.mirror_deletion_committed prepared then
+                    if Database.mirror_deletion_committed prepared
+                    then (
                  match finish_local_retirement t scope deletion captured ~commit:true with
                  | Ok () -> remove_local_retirement path
-                 | Error _ -> ()
-             with _ -> ());
+                      | Error _ -> ())
+                  with
+                  | _ -> ());
             Hashtbl.remove t.inspections (Graph.Uuid.to_string request.graph_id);
             Ok ())))
       with

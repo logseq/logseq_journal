@@ -66,6 +66,13 @@ let fingerprint mutation =
 ;;
 
 let validate = function
+  | Types.Set_task_status { status = Legacy_status_ident ident; _ } ->
+    if
+      List.exists
+        (fun (_, name) -> ident = "logseq.property/status." ^ name)
+        Persistence_json.legacy_status_names
+    then Ok ()
+    else Error "invalid legacy status identity"
   | Types.Insert_blocks { tree; asset; _ } ->
     (match asset with
      | Some asset when tree.children <> [] || asset.size < 0L || asset.size > 104857600L
