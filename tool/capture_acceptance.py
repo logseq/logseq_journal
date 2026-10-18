@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Fail-closed Simulator acceptance capture. See docs/acceptance-capture.md.
 
-No external runtime identity bridge exists yet. The CLI deliberately blocks at
-that boundary; the injected Simulator boundary is exercised with synthetic tests.
+The runtime observer is Simulator-only and explicitly enabled by its owner.
+Absent, unready or unauthenticated observers block capture; no identity file or
+caller-supplied actual UUID can substitute for the live process.
 """
 import argparse
+import ctypes
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -13,6 +15,8 @@ from pathlib import Path, PurePosixPath
 import plistlib
 import re
 import shutil
+import socket
+import stat
 import subprocess
 import struct
 import zlib
@@ -131,12 +135,63 @@ class Simulator:
         return path
 
     def observe(self, identity, challenge):
-        # Do not read persisted selection, DBs, arbitrary JSON, log text, secrets or
-        # a caller-supplied actual UUID. A supported App-owned bridge is required.
-        raise Rejected('runtime-identity-unavailable')
+        executable = self.container(identity) / 'JournalApp'
+        path = Path('/tmp') / ('lj-identity-' + str(os.geteuid()) + '-' + identity['udid'].lower()) / 'identity.sock'
+        return query_identity_socket(path, executable, challenge)
 
     def screenshot(self, udid, path):
         command(['xcrun', 'simctl', 'io', udid, 'screenshot', str(path)])
+
+
+def query_identity_socket(path, executable, challenge, *, timeout=2):
+    """Authenticate the kernel peer before reading any identity claim."""
+    try:
+        parent = path.parent.lstat()
+        endpoint = path.lstat()
+        require(stat.S_ISDIR(parent.st_mode) and parent.st_uid == os.geteuid()
+                and stat.S_IMODE(parent.st_mode) == 0o700
+                and stat.S_ISSOCK(endpoint.st_mode) and endpoint.st_uid == os.geteuid()
+                and stat.S_IMODE(endpoint.st_mode) == 0o600, 'runtime-peer-mismatch')
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.settimeout(timeout)
+            peer.connect(str(path))
+            pid = struct.unpack('i', peer.getsockopt(0, 2, 4))[0]  # Darwin SOL_LOCAL/LOCAL_PEERPID
+            uid, gid = ctypes.c_uint(), ctypes.c_uint()
+            libc = ctypes.CDLL(None)
+            libc.getpeereid.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)]
+            libc.getpeereid.restype = ctypes.c_int
+            require(pid > 0 and libc.getpeereid(peer.fileno(), ctypes.byref(uid), ctypes.byref(gid)) == 0
+                    and uid.value == os.geteuid(), 'runtime-peer-mismatch')
+            libproc = ctypes.CDLL('/usr/lib/libproc.dylib')
+            libproc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+            libproc.proc_pidpath.restype = ctypes.c_int
+            image = ctypes.create_string_buffer(4096)
+            require(libproc.proc_pidpath(pid, image, len(image)) > 0
+                    and Path(os.fsdecode(image.value)).resolve() == executable.resolve(), 'runtime-peer-mismatch')
+            executable_hash = sha(executable)
+            peer.sendall(json.dumps({'schema_version': 1, 'challenge': challenge}).encode() + b'\n')
+            data = b''
+            while len(data) <= 4096 and not data.endswith(b'\n'):
+                block = peer.recv(min(4097 - len(data), 1024))
+                if not block:
+                    break
+                data += block
+            require(len(data) <= 4096 and data.endswith(b'\n'), 'runtime-identity-mismatch')
+            value = json.loads(data)
+            if value == {'status': 'unavailable'}:
+                raise Rejected('runtime-identity-unavailable')
+            require(isinstance(value, dict) and set(value) == OBSERVED_KEYS
+                    and value['pid'] == pid and value['challenge'] == challenge
+                    and value['executable_sha256'] == executable_hash, 'runtime-identity-mismatch')
+            # Confirm that the authenticated process is still the same image.
+            again = ctypes.create_string_buffer(4096)
+            require(libproc.proc_pidpath(pid, again, len(again)) > 0 and again.value == image.value
+                    and sha(executable) == executable_hash, 'runtime-peer-mismatch')
+            return value
+    except (FileNotFoundError, ConnectionRefusedError, TimeoutError, PermissionError):
+        raise Rejected('runtime-identity-unavailable') from None
+    except (OSError, ValueError, TypeError, UnicodeError):
+        raise Rejected('runtime-identity-mismatch') from None
 
 
 def validate_expected(expected):

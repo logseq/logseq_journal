@@ -25,6 +25,8 @@ struct JournalRuntimeHost: View {
     Group {
       if let runtime, let rootID = runtime.rootID {
         LUISwiftUIRoot(backend: runtime.backend, rootID: rootID)
+          .onAppear { runtime.setAcceptanceRootMounted(true) }
+          .onDisappear { runtime.setAcceptanceRootMounted(false) }
       } else if failure != nil {
         ContentUnavailableView {
           Label("Unable to open journal", systemImage: "exclamationmark.folder")

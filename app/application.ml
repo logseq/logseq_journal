@@ -3727,6 +3727,15 @@ let start
     fun () -> send_action (Update transition)
   in
   let state_ref = ref initial_state in
+  let acceptance_owner = ref (Journal_startup.Acceptance.create ()) in
+  let acceptance_probe = ref None in
+  let acceptance_observe state =
+    acceptance_owner := Journal_startup.Acceptance.observe !acceptance_owner
+      {manager=state.manager;graph=state.graph_state;graph_ready=state.graph_ready;
+       feed_loaded=state.feed_loaded;password_pending=state.e2ee_submission_pending;
+       graph_error=Option.is_some state.graph_error}
+      ~presentation:state.startup_presentation
+  in
   let set_state_ref = ref None in
   set_state_ref := Some set_state;
   (* Platform requests are fire-and-forget: the host replies on the
@@ -6352,6 +6361,11 @@ let start
     | Environment_changed snapshot ->
       prepare_presentation (sync_startup_presentation { model with environment = snapshot })
   in
+  let update model action =
+    let next = update model action in
+    acceptance_observe next;
+    next
+  in
   (* These subscriptions use complete presentation dependencies. They compare
      persistent owners rather than walking retained rows on every input event. *)
   let same_actions left right =
@@ -7099,10 +7113,42 @@ let start
   let context =
     { app; pump; client; send_action; apply_platform; running; release_staging }
   in
+  acceptance_observe (Lui_app.model app);
+  let acceptance_reply fresh =
+    let state = Lui_app.model app in
+    acceptance_observe state;
+    let epoch=Journal_startup.Acceptance.epoch !acceptance_owner in
+    match Journal_startup.Acceptance.sample !acceptance_owner ~fresh with
+    | Some identity -> Yojson.Safe.to_string (`Assoc
+        ["status",`String "ready";"epoch",`Int identity.epoch;
+         "graph_id",`String (Logseq_db_types.Graph_types.Uuid.to_string identity.graph_id);
+         "worker_generation",`Int identity.worker_generation;
+         "root_node",`Int (Lui_app.root_node app)])
+    | None -> Yojson.Safe.to_string (`Assoc ["status",`String "unavailable";"epoch",`Int epoch])
+  in
+  Journal_bridge.set_acceptance_reader (fun request ->
+    if not !running then "{\"status\":\"unavailable\"}"
+    else if request="snapshot" then acceptance_reply (Lui_app.model app).graph_state
+    else match Logseq_db_types.Graph_types.Uuid.of_string request with
+      | Error _ -> "{\"status\":\"unavailable\"}"
+      | Ok _ ->
+        match !acceptance_probe with
+        | Some (nonce,_,Some fresh) when nonce=request -> acceptance_reply fresh
+        | Some (nonce,_,None) when nonce=request -> "{\"status\":\"pending\"}"
+        | _ ->
+          match Worker.send client Graph_service.Get_graph_state with
+          | Accepted id -> acceptance_probe:=Some(request,id,None); "{\"status\":\"pending\"}"
+          | Full | Not_ready | Stopping -> "{\"status\":\"unavailable\"}");
   current_app := Some context;
   ignore (dispatch_worker Graph_service.Get_graph_state : Worker.send_result);
   Worker.on_event client (fun event ->
-    Journal_pump.enqueue pump (fun () -> Effect.run (handle_worker_event event)));
+    Journal_pump.enqueue pump (fun () ->
+      Effect.run (handle_worker_event event);
+      match event,!acceptance_probe with
+      | Worker.Response {request_id;outcome=Completed(Graph_state fresh);_},Some(nonce,id,_)
+        when request_id=id -> acceptance_probe:=Some(nonce,id,Some fresh)
+      | Worker.Response {request_id;_},Some(_,id,_) when request_id=id -> acceptance_probe:=None
+      | _ -> ()));
   (* The worker fires the wakeup on its own domain whenever output lands;
      enqueueing hops through the host wakeup onto the UI thread. An OCaml
      Condition waiter thread would deadlock against the worker domain (the
@@ -7258,6 +7304,7 @@ let create
     (match !current_app with
      | Some context ->
        context.running := false;
+       Journal_bridge.set_acceptance_reader (fun _ -> "{\"status\":\"unavailable\"}");
        Worker.Private.request_stop context.client;
        context.release_staging ();
        ignore (Lui_app.dispose context.app);

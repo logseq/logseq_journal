@@ -41,6 +41,10 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: 1
         run: python3 tool/test_capture_acceptance.py
+      - name: Verify Simulator identity IPC with synthetic Swift processes
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
+        run: python3 tool/test_acceptance_ipc.py
       - name: Verify Apple app icon packaging
         run: python3 .agents/skills/journal-build/scripts/test_apple_app_icon.py
       - name: Prepare native system libraries before cache lookup
@@ -115,6 +119,20 @@ jobs:
           JOURNAL_TEST_SWITCH: ${{ github.workspace }}
           PYTHONDONTWRITEBYTECODE: 1
         run: python3 .agents/skills/journal-build/scripts/test_journal_build.py
+      - name: Verify native identity callback and event bridge
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, pathlib, subprocess
+          records = json.loads(pathlib.Path('.ci-reports/dependencies.json').read_text())
+          lui = next(row for row in records if row['package'] == 'lui.dev')
+          environment = dict(os.environ,
+              JOURNAL_LUI_PACKAGE_PATH=str(pathlib.Path(lui['checkout']).resolve() / 'platform/apple'),
+              JOURNAL_LUI_TEST_SCRATCH=str(pathlib.Path(os.environ['RUNNER_TEMP']) / 'journal-native-identity'))
+          subprocess.run(['opam', 'exec', '--', 'python3', 'tool/test_lui_native_events.py'],
+                         env=environment, check=True)
+          PYTHON
       - name: Record installed package versions
         if: always()
         run: opam list --installed --columns=name,installed-version --short --color=never > .ci-reports/packages.txt

@@ -293,3 +293,38 @@ module Presentation = struct
     in
     if next=t then t else next
 end
+
+module Acceptance = struct
+  type identity = { graph_id : Logseq_db_types.Graph_types.Uuid.t; worker_generation : int; epoch : int }
+  type signature =
+    Logseq_db_types.Graph_types.Uuid.t option * int * Logseq_db_worker.graph_phase
+    * bool * bool * bool * bool * bool * Logseq_db_types.Graph_types.Uuid.t option * int
+    * Presentation.screen * bool
+  type t = { epoch : int; signature : signature option; current : identity option }
+  let create () = { epoch=0; signature=None; current=None }
+  let epoch t = t.epoch
+  let observe t (o : Presentation.observation) ~presentation =
+    let selected = Option.bind o.manager (fun m -> m.Graph_service.selected_graph) in
+    let generation = Option.fold ~none:(-1)
+      ~some:(fun m -> m.Graph_service.startup.graph_generation) o.manager in
+    let screen = Presentation.screen presentation in
+    let foreground = Presentation.foreground presentation in
+    let signature = (o.graph.graph_id,o.graph.generation,o.graph.phase,o.graph_ready,
+      o.feed_loaded,o.password_pending,o.graph_error,Option.is_some o.graph.error,selected,generation,screen,foreground) in
+    if t.signature=Some signature then t else
+      let epoch=t.epoch+1 in
+      let current = match o.manager,o.graph.graph_id with
+        | Some manager,Some graph_id
+          when screen=Presentation.Timeline && foreground && o.graph_ready && o.feed_loaded
+            && not o.password_pending && not o.graph_error && o.graph.error=None
+            && o.graph.phase=Logseq_db_worker.Graph_open && graph_matches manager o.graph ->
+          Some {graph_id;worker_generation=o.graph.generation;epoch}
+        | _ -> None in
+      {epoch;signature=Some signature;current}
+  let sample t ~(fresh : Logseq_db_worker.graph_state) =
+    match t.current with
+    | Some identity when fresh.graph_id=Some identity.graph_id
+        && fresh.generation=identity.worker_generation
+        && fresh.phase=Logseq_db_worker.Graph_open && fresh.error=None -> Some identity
+    | _ -> None
+end

@@ -80,3 +80,7 @@ let () =
     ; root_node = (fun () -> 42)
     }
 ;;
+
+let () = Journal_bridge.set_acceptance_reader (fun challenge ->
+  Gc.full_major ();
+  Printf.sprintf "{\"challenge\":\"%s\"}" challenge)

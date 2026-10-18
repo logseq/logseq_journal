@@ -22,9 +22,13 @@ Apply this checklist **before target-dependent UI actions and acceptance capture
    the installed App container fresh, never reuse a previous installation path.
 4. Use **`python3 tool/capture_acceptance.py`** as the single acceptance screenshot
    entry point. Follow [the complete command and protocol](../../../docs/acceptance-capture.md).
-   There is currently **no external App runtime identity bridge**. The production
-   command returns `runtime-identity-unavailable`; do not substitute a hand-edited
+   The observer exists only in Simulator builds and requires explicit launch
+   environment `SIMCTL_CHILD_JOURNAL_ACCEPTANCE=1` after owner coordination.
+   Re-launching/installing a matching App needs the authorized device window;
+   this tool never does it automatically. An absent/unready or unauthenticated
+   observer returns `runtime-identity-unavailable`; do not substitute a hand-edited
    JSON file, manual actual UUID, screenshots or a direct database/secret read.
+   Real App/socket/presentation integration remains an acceptance gate beyond CI.
 5. Deliver the generated `acceptance.json` together with `screenshot.png` only
    when the command succeeds. It binds expected and observed identities, source,
    installed executable and manifest hashes, before/after runtime generations,

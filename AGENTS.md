@@ -28,8 +28,10 @@ owner's device to work around a failed check.
 Use [testing-ios-simulator](.agents/skills/testing-ios-simulator/SKILL.md) for the
 checklist and `python3 tool/capture_acceptance.py --help` as the unified Simulator
 acceptance entry point. Read [the evidence contract](docs/acceptance-capture.md).
-The current App lacks an external runtime graph-identity bridge: the tool blocks
-with `runtime-identity-unavailable` and cannot yet produce real accepted screenshots.
+The runtime observer is Simulator-only and must be explicitly enabled with
+`JOURNAL_ACCEPTANCE=1` on the authorized matching App. An absent, unauthenticated
+or unready observer blocks with `runtime-identity-unavailable`; fixtures/green CI
+do not establish a verified real capture.
 Do not replace that boundary with constants or database/secret reads. Coordinate
 shared Simulator ownership; Simulator/experimental host-restamp evidence never
 proves real-device or cross-ABI acceptance. Keep evidence private and external;

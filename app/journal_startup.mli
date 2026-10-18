@@ -88,3 +88,12 @@ module Presentation : sig
   val equal_presentation : t -> t -> bool
   val step : t -> event -> t
 end
+
+module Acceptance : sig
+  type identity = { graph_id : Logseq_db_types.Graph_types.Uuid.t; worker_generation : int; epoch : int }
+  type t
+  val create : unit -> t
+  val observe : t -> Presentation.observation -> presentation:Presentation.t -> t
+  val epoch : t -> int
+  val sample : t -> fresh:Logseq_db_worker.graph_state -> identity option
+end

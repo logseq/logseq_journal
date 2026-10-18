@@ -26,6 +26,18 @@ private func platformResponse(_ bytes: UnsafePointer<UInt8>?, _ length: Int32)
 @_silgen_name("journal_ocaml_platform_failure")
 private func platformFailure(_ bytes: UnsafePointer<UInt8>?, _ length: Int32)
 
+@_silgen_name("journal_ocaml_read_acceptance")
+private func readAcceptance(_ challenge: UnsafePointer<CChar>?, _ length: Int32,
+                            _ callback: PatchCallback?) -> Int32
+nonisolated(unsafe) private var identityReply: String?
+private let receiveIdentity: PatchCallback = { source in
+  guard let source else { return }
+  let before = String(cString: source)
+  if rootNode() != 42 { callbackFailure = "identity query held runtime during callback" }
+  identityReply = before
+  if String(cString: source) != before { callbackFailure = "identity bytes changed" }
+}
+
 nonisolated(unsafe) private var patches: [String] = []
 nonisolated(unsafe) private var callbackFailure: String?
 nonisolated(unsafe) private var reenter = false
@@ -59,6 +71,14 @@ private let receivePatch: PatchCallback = { source in
   static func main() throws {
     try check("{}".withCString { start(receivePatch, 2, 2, $0, 2) } == 1, "runtime failed to start")
     try check(patches.count == 1 && callbackFailure == nil, "startup callback failed")
+    let identityChallenge = "44444444-4444-4444-8444-444444444444"
+    let patchCount = patches.count
+    try check(identityChallenge.withCString { readAcceptance($0, Int32(identityChallenge.utf8.count), receiveIdentity) } == 1,
+              "read-only identity callback failed")
+    let identity = try JSONSerialization.jsonObject(with: Data((identityReply ?? "").utf8)) as? [String: String]
+    try check(identity?["challenge"] == identityChallenge && patches.count == patchCount && callbackFailure == nil,
+              "identity callback mutated UI or lost challenge")
+    try check(readAcceptance(nil, 36, receiveIdentity) == 0, "nil identity challenge was accepted")
     let node = (1 << 40) + 7
     let payload = "{\"token\":11,\"files\":[{\"name\":\"日记📓.md\"}]}"
     let cases: [(LUIEvent, String)] = [

@@ -360,7 +360,44 @@ let test_e2ee_recovery_requires_a_prepared_challenge () =
       = Some expected) "E2EE recovery offers password without a prepared challenge") [false;true]
 ;;
 
+let test_acceptance_runtime_identity () =
+  let module P = Journal_startup.Presentation in
+  let module A = Journal_startup.Acceptance in
+  let observation : P.observation = {manager=Some(startup_snapshot ());graph=graph_state ();
+    graph_ready=true;feed_loaded=true;password_pending=false;graph_error=false} in
+  let ready = P.step (P.create ()) (Observe observation) in
+  let opened = A.observe (A.create ()) observation ~presentation:ready in
+  let identity = A.sample opened ~fresh:(graph_state ()) in
+  require (Option.is_some identity) "matching fresh Worker and presented graph was rejected";
+  let identity = Option.get identity in
+  require (identity.graph_id=graph_id && identity.worker_generation=7)
+    "acceptance identity lost stable Worker graph";
+  let unchanged = A.observe opened observation ~presentation:ready in
+  require (A.epoch unchanged=A.epoch opened) "unchanged observations advance epoch";
+  List.iter (fun fresh -> require (A.sample opened ~fresh=None)
+    "stale/unknown fresh Worker state was accepted")
+    [graph_state ~generation:8 ();graph_state ~phase:Graph_opening ();
+     {(graph_state ()) with graph_id=None};
+     {(graph_state ()) with graph_id=Some(Logseq_db_types.Graph_types.Uuid.of_string
+       "20000000-0000-4000-8000-000000000003" |> Result.get_ok)}];
+  List.iter (fun invalid ->
+    let blocked=A.observe opened invalid ~presentation:(P.step ready (Observe invalid)) in
+    require (A.sample blocked ~fresh:(graph_state ())=None) "unready presentation was accepted";
+    let returned=A.observe blocked observation ~presentation:ready in
+    require (A.epoch returned>A.epoch opened) "away-and-back transition reused old identity epoch")
+    [{observation with graph_ready=false};{observation with feed_loaded=false};
+     {observation with password_pending=true};{observation with graph_error=true};
+     {observation with manager=None};{observation with graph=graph_state ~phase:Graph_closed ()};
+     {observation with graph=graph_state ~error:(worker_error "synthetic failure") ()};
+     {observation with manager=Some{(startup_snapshot ()) with selected_graph=None}}];
+  let background=A.observe opened observation ~presentation:(P.step ready (Foreground false)) in
+  require (A.sample background ~fresh:(graph_state ())=None) "background identity was accepted";
+  let foreground=A.observe background observation ~presentation:ready in
+  require (A.epoch foreground>A.epoch opened) "background/foreground reused old epoch"
+;;
+
 let () =
+  test_acceptance_runtime_identity ();
   test_e2ee_recovery_requires_a_prepared_challenge ();
   test_stable_startup_presentation ();
   test_noncurrent_deletion_keeps_active_graph_ready ();

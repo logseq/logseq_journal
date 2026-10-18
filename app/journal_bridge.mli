@@ -51,3 +51,8 @@ external wakeup : unit -> unit = "journal_ml_wakeup"
 (* Forwards one LJP2 request envelope to the host platform bridge (the host
     answers asynchronously through [platform_response]). *)
 external platform_request : string -> unit = "journal_ml_platform_request"
+
+(** Install the App-owned read-only identity query. Only the Simulator native
+    host enables an external transport. Replies are bounded metadata, never
+    graph content, persisted catalog state or credentials. *)
+val set_acceptance_reader : (string -> string) -> unit

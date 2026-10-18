@@ -13,6 +13,11 @@ type hooks =
 external wakeup : unit -> unit = "journal_ml_wakeup"
 external platform_request : string -> unit = "journal_ml_platform_request"
 
+let acceptance_reader = ref (fun _ -> "{\"status\":\"unavailable\"}")
+let set_acceptance_reader reader = acceptance_reader := reader
+let read_acceptance request =
+  try !acceptance_reader request with _ -> "{\"status\":\"unavailable\"}"
+
 let current : hooks option ref = ref None
 
 let hooks () =
@@ -83,6 +88,7 @@ let root_node () = (hooks ()).root_node ()
 
 let register hooks =
   current := Some hooks;
+  Callback.register "journal_ocaml_acceptance_identity" read_acceptance;
   Callback.register "lui_ocaml_init" initialize;
   Callback.register "lui_ocaml_appear" appear;
   Callback.register "lui_ocaml_press" press;

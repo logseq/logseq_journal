@@ -397,3 +397,32 @@ CAMLprim value journal_ml_platform_request(value payload) {
   }
   return Val_unit;
 }
+
+/* Main-thread read-only identity query; never deliver metadata as a UI patch.
+   Own bytes across runtime release/reentry, and suppress exception details. */
+LUI_EXPORT int32_t journal_ocaml_read_acceptance(
+    const char *request, int32_t length, lui_patch_callback callback) {
+  if (!runtime_started || request == NULL || callback == NULL || length < 1 || length > 64)
+    return 0;
+  caml_leave_blocking_section();
+  const value *reader = caml_named_value("journal_ocaml_acceptance_identity");
+  if (reader == NULL) { caml_enter_blocking_section(); return 0; }
+  CAMLparam0();
+  CAMLlocal2(input, result);
+  input = copy_bytes(request, length);
+  result = caml_callback_exn(*reader, input);
+  patch_response response = {0, NULL, callback};
+  if (!Is_exception_result(result)) {
+    size_t size = caml_string_length(result);
+    if (size > 0 && size <= 4096) {
+      response.json = malloc(size + 1);
+      if (response.json != NULL) {
+        memcpy(response.json, String_val(result), size);
+        response.json[size] = '\0';
+        response.accepted = 1;
+      }
+    }
+  }
+  CAMLdrop;
+  return release_and_deliver(response);
+}

@@ -8,6 +8,12 @@ assumption instead of observing the running application.
 
 ## Decision
 
+This records the initial preflight commit ca21d6c. The subsequently authorized
+Simulator runtime bridge is specified separately in
+`docs/agent-guide/implemented/architecture/2026-10-18-simulator-runtime-identity-bridge.md`.
+The working implementation now adds that opt-in observer; real App/socket/display
+integration remains unverified until a coordinated synthetic capture succeeds.
+
 Use tool/capture_acceptance.py as the sole acceptance capture entry point. Compare
 explicit expected Simulator UDID, device type, bundle, version/build, source commit
 and graph UUID with fresh system/build evidence. Verify the maintained builder's
@@ -15,7 +21,7 @@ successful manifest against source files, packaged files and the freshly resolve
 installed bundle. Reject unknown or inconsistent identities and suppress raw
 command output. Keep evidence outside the repository.
 
-The current App has an internal Get_graph_state query but no supported external
+At the initial commit, the App had an internal Get_graph_state query but no external
 running-process bridge. The production observer therefore fails closed with
 runtime-identity-unavailable. A documented challenge/response contract defines
 that follow-up interface; fixture injection exists only in tests, never as a CLI
@@ -41,7 +47,7 @@ are outside the permitted observation boundary.
 
 ## Consequences
 
-- Runtime bridge is deliberately absent: this tool cannot yet produce a real
+- At that initial commit the runtime bridge was absent: this tool cannot yet produce a real
   accepted screenshot. The follow-up must bind Worker graph state to the mounted
   foreground presentation, process instance and monotonically changing generation.
 - Local build manifests are provenance receipts, not cryptographic attestations
