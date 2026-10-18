@@ -68,7 +68,7 @@ socket under its existing Simulator environment, stop and report that boundary.
   graph-error-state/epoch regression failed before its fix.
 - Native producer compilation and Swift/C/OCaml callback tests pass using the
   coordinated prepared switch and immutable resolution records with jobs=1.
-- 30 capture fixtures and 9 real Swift Unix-process tests pass. Independent review
+- 31 capture fixtures and 9 real Swift Unix-process tests pass. Independent review
   found and verified fixes for a slow-client/close stall and DispatchSource fd
   cancellation ordering. No App install/launch, graph change or screenshot was
   performed; only approved read-only Simulator/container metadata was inspected.
@@ -78,6 +78,9 @@ socket under its existing Simulator environment, stop and report that boundary.
   screenshot evidence.
 - The existing link-only stub symbol test caught a missing identity callback;
   the stub now returns unavailable and the original failing test passes.
+- A regression reproduced acceptance of staged Swift/plist/entitlements with an
+  otherwise matching committed source map. Those separate builder inputs must now
+  match the checkout byte for byte; all three mismatches fail closed.
 - The owner released the synthetic Simulator window. Approved read-only inventory
   and fresh installed-container checks succeeded in this execution environment.
   Its old visible component fixture is not a mounted Journal Worker graph, and

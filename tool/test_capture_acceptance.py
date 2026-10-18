@@ -41,6 +41,9 @@ class AcceptanceTests(unittest.TestCase):
         self.source = self.base / 'source'
         self.source.mkdir()
         self.source_files = {'app/application.ml': b'(* synthetic source *)\n',
+                             'swift/App.swift': b'// synthetic Swift source\n',
+                             'apple/Info.plist': b'synthetic source plist',
+                             'config/entitlements/fixture.entitlements': b'synthetic entitlements',
                              '.agents/skills/journal-build/scripts/journal_build.py': b'# synthetic builder\n'}
         for name, data in self.source_files.items():
             path = self.source / name
@@ -60,6 +63,9 @@ class AcceptanceTests(unittest.TestCase):
                          JournalSourceRevision=sha, JournalBuildMode='experimental-host-restamp',
                          JournalCrossABIValidated=False, JournalOCamlRuntimeOrigin='host-arm64-restamp')
         self.inputs = dict(source={n: digest(b) for n, b in self.source_files.items()},
+                           swift={'App.swift': digest(self.source_files['swift/App.swift'])},
+                           plist=digest(self.source_files['apple/Info.plist']),
+                           entitlements={'fixture.entitlements': digest(self.source_files['config/entitlements/fixture.entitlements'])},
                            target='arm64-apple-ios26.0-simulator', flags={'mode': 'experimental-host-restamp'})
         self.native_input = self.base / 'production-host.o'
         self.native_input.write_bytes(b'synthetic host object')
@@ -191,6 +197,19 @@ class AcceptanceTests(unittest.TestCase):
         deps['producer']['source']['sha256'] = new_hash
         self.reseal()
         self.rejects('build-evidence-mismatch')
+
+    def test_staged_compile_inputs_must_match_committed_source(self):
+        for key, value in [('swift', {'App.swift': 'a' * 64}),
+                           ('plist', 'a' * 64),
+                           ('entitlements', {'fixture.entitlements': 'a' * 64})]:
+            with self.subTest(key=key):
+                self.output = self.base / ('evidence-' + key)
+                old = self.manifest['inputs'][key]
+                self.manifest['inputs'][key] = value
+                self.reseal()
+                self.rejects('build-evidence-mismatch')
+                self.manifest['inputs'][key] = old
+                self.reseal()
 
     def test_capture_binds_bytes_graph_and_limits(self):
         record = self.capture()

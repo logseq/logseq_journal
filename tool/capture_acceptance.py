@@ -220,6 +220,9 @@ def build_evidence(manifest_path, source_root, expected):
         actual_source = source_files(source_root)
         require('app/application.ml' in actual_source and BUILDER + '/journal_build.py' in actual_source
                 and actual_source == m['inputs']['source'], code)
+        require(tree_files(source_root / 'swift') == m['inputs']['swift']
+                and sha(source_root / 'apple/Info.plist') == m['inputs']['plist']
+                and tree_files(source_root / 'config/entitlements') == m['inputs']['entitlements'], code)
         artifact = m['artifact']
         app = Path(artifact['app'])
         require(app.is_absolute() and app.is_dir() and app == app.resolve(), code)

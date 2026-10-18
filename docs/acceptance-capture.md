@@ -47,6 +47,8 @@ The preflight checks:
 - Clean Git checkout and actual source bytes, with complete source coverage in
   the same scope as the builder; expected commit, bundle, version/build and build
   input digest. Dirty builds require a clean committed rebuild for this workflow.
+  The actual Swift, source plist and entitlements input maps must also match the
+  committed checkout; a separately staged host cannot borrow its source identity.
 - Hash-bound original producer source/link records and retained native inputs;
   the native source map must match current compiled source. Final native object,
   target C, Swift object and link-map bytes must match the successful receipt.
