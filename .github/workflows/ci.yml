@@ -126,7 +126,9 @@ jobs:
           python3 - <<'PYTHON'
           import json, os, pathlib, subprocess
           records = json.loads(pathlib.Path('.ci-reports/dependencies.json').read_text())
-          lui = next(row for row in records if row['package'] == 'lui.dev')
+          matches = [row for row in records if row['package'].split('.', 1)[0] == 'lui']
+          assert len(matches) == 1, 'expected one resolved LUI package'
+          lui = matches[0]
           environment = dict(os.environ,
               JOURNAL_LUI_PACKAGE_PATH=str(pathlib.Path(lui['checkout']).resolve() / 'platform/apple'),
               JOURNAL_LUI_TEST_SCRATCH=str(pathlib.Path(os.environ['RUNNER_TEMP']) / 'journal-native-identity'))
