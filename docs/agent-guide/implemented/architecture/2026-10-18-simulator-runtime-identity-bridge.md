@@ -2,7 +2,7 @@
 
 ## Problem
 
-PR95 currently blocks all real captures because the running App has no external
+The initial PR95 preflight blocked all real captures without an external runtime
 identity observer. Build provenance and synthetic capture tests cannot replace a
 fresh Worker graph observation bound to the foreground native process.
 
@@ -70,11 +70,22 @@ socket under its existing Simulator environment, stop and report that boundary.
   coordinated prepared switch and immutable resolution records with jobs=1.
 - 30 capture fixtures and 9 real Swift Unix-process tests pass. Independent review
   found and verified fixes for a slow-client/close stall and DispatchSource fd
-  cancellation ordering. No real Simulator or graph has been operated.
+  cancellation ordering. No App install/launch, graph change or screenshot was
+  performed; only approved read-only Simulator/container metadata was inspected.
 - Full iOS Simulator App compilation, linking, target checking, icon packaging
-  and signing verification pass with status built. The compile-only artifact was
-  made before committing and is not itself accepted source-clean runtime evidence.
-- Real synthetic capture remains pending the active owner releasing the device.
+  and signing verification pass with status built, including a clean committed
+  source build. These artifacts have not been installed or accepted as runtime
+  screenshot evidence.
+- The existing link-only stub symbol test caught a missing identity callback;
+  the stub now returns unavailable and the original failing test passes.
+- The owner released the synthetic Simulator window. Approved read-only inventory
+  and fresh installed-container checks succeeded in this execution environment.
+  Its old visible component fixture is not a mounted Journal Worker graph, and
+  externally generated graph IDs have never been installed there. The owner
+  confirmed no independent expected ordinary-App synthetic graph UUID exists.
+  Adding or switching graphs is outside this task's scope, so actual App socket,
+  displayed-frame and successful capture integration remain blocked. No device
+  permission rejection or missing implementation is claimed as this blocker.
 
 ## Questions
 
@@ -83,5 +94,6 @@ socket under its existing Simulator environment, stop and report that boundary.
 - Resolved: the original host bind was refused by the default execution sandbox,
   not an approval reviewer. A supported escalated synthetic probe succeeded in
   peer PID, executable lookup, uid and nonce checks; no policy bypass occurred.
-- Resolved: active status owner retains the real Simulator window; request for a
-  later synthetic-device window has been sent, and fixtures may proceed meanwhile.
+- Resolved: the synthetic-device window is released. A coordinated ordinary-App
+  synthetic graph with an independent expected UUID is still needed for the real
+  integration gate; the original graph and iPhone47 must remain untouched.
