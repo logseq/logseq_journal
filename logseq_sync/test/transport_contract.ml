@@ -567,6 +567,33 @@ let check_retired report =
     rows
 ;;
 
+let captured_request_headers row =
+  let encoded = Yojson.Basic.Util.(row |> member "request" |> to_string) in
+  let request =
+    String.init (String.length encoded / 2) (fun n ->
+      Char.chr (int_of_string ("0x" ^ String.sub encoded (2 * n) 2)))
+  in
+  let rec headers = function
+    | [] | "" :: _ -> []
+    | line :: rest -> line :: headers rest
+  in
+  String.split_on_char '\n' request
+  |> List.tl
+  |> List.map (fun line -> String.lowercase_ascii (String.trim line))
+  |> headers
+;;
+
+let check_default_connection report =
+  Yojson.Basic.Util.to_list report
+  |> List.iter (fun row ->
+    Alcotest.(check bool)
+      "ordinary request omits Connection"
+      false
+      (List.exists
+         (String.starts_with ~prefix:"connection:")
+         (captured_request_headers row)))
+;;
+
 let http_test
       ~download
       ~success
@@ -623,7 +650,8 @@ let http_test
                  (read_file (Filename.concat staging name))));
          Runner.shutdown t)
   in
-  check_retired report
+  check_retired report;
+  check_default_connection report
 ;;
 
 let frame ?(fin = true) opcode payload =
@@ -708,6 +736,13 @@ let ws_test ?(extra = "") ?(segment = 16384) ~messages ~terminal wire () =
          Runner.shutdown t)
   in
   check_retired report;
+  Yojson.Basic.Util.to_list report
+  |> List.iter (fun row ->
+    let headers = captured_request_headers row in
+    Alcotest.(check bool) "WebSocket keeps Connection Upgrade" true
+      (List.mem "connection: upgrade" headers);
+    Alcotest.(check bool) "WebSocket keeps Upgrade websocket" true
+      (List.mem "upgrade: websocket" headers));
   if not terminal
   then (
     let frames =
@@ -1917,6 +1952,7 @@ let asset_upload ~status ~refresh () =
       Runner.shutdown runner)
   in
   check_retired report;
+  check_default_connection report;
   Yojson.Basic.Util.to_list report
   |> List.iter (fun row ->
     let encoded = Yojson.Basic.Util.(row |> member "request" |> to_string) in
@@ -4213,4 +4249,34 @@ let scenarios =
            ~success:false
            {|{"graphs":[{"graph-id":"11111111-1111-4111-8111-111111111111","graph-name":null,"graph-ready-for-use?":true,"future":true}]}|})
     ]
+;;
+
+let test_default_connection_sequence () =
+  let wire =
+    response ~headers:"Content-Length: 3\r\nConnection: keep-alive\r\n" "abc"
+  in
+  let report =
+    with_peer [ case wire; case wire ] (fun ~environment ~sw ~support ~origin ->
+      let posted = ref [] and invalidations = ref 0 in
+      let t = runner ~environment ~sw ~support ~posted ~invalidations () in
+      Fun.protect ~finally:(fun () -> Runner.shutdown t) (fun () ->
+        List.iter (fun download ->
+          posted := [];
+          Runner.submit t (operation ~download origin);
+          wait (Eio.Stdenv.clock environment) (fun () ->
+            Option.is_some (completed !posted));
+          Alcotest.(check bool) "response completes without waiting for peer EOF" true
+            (Result.is_ok (Option.get (completed !posted))))
+          [ false; true ]))
+  in
+  Alcotest.(check int) "same Runner opens two separate connections" 2
+    (List.length (Yojson.Basic.Util.to_list report));
+  check_retired report;
+  check_default_connection report
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case "HTTP default connection retires between requests"
+        `Quick test_default_connection_sequence ]
 ;;

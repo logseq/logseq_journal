@@ -173,7 +173,6 @@ let with_attempt ~sw ~authenticator ~network ~clock ~response_budget request ~co
                      let headers =
                        Httpun.Headers.of_list
                          (("host", host_header)
-                          :: ("connection", "close")
                           :: request_headers)
                      in
                      let target = Uri.path_and_query request.uri in
