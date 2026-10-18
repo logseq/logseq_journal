@@ -37,6 +37,10 @@ jobs:
       OPAMPRECISETRACKING: 1
     steps:
       - uses: actions/checkout@v4
+      - name: Verify acceptance identity boundaries with synthetic fixtures
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
+        run: python3 tool/test_capture_acceptance.py
       - name: Verify Apple app icon packaging
         run: python3 .agents/skills/journal-build/scripts/test_apple_app_icon.py
       - name: Prepare native system libraries before cache lookup

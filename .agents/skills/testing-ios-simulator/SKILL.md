@@ -5,6 +5,42 @@ description: How to build, sign, install, and drive the logseq_journal iOS app o
 
 # Testing logseq_journal on the iOS Simulator
 
+## Required identity preflight and handoff
+
+Apply this checklist **before target-dependent UI actions and acceptance capture**:
+
+1. Coordinate the active owner; record the expected explicit Simulator UDID and
+   exact device type. `booted`, a device name, or a phone UDID is not sufficient.
+   Do not operate iPhone47, boot/create devices or change graphs without scope.
+2. Obtain the expected stable graph UUID from authorized read-only catalog
+   evidence. Compare it with the running, foreground App's open graph through a
+   supported read-only observer; similar names, list position and disk selection
+   are not proof. Unknown/mismatch means stop and report the missing evidence.
+3. Keep the successful maintained builder manifest and its original producer/link
+   records. Verify a clean source checkout at the expected commit, source byte
+   hashes, actual installed bundle/version/build and executable bytes. Resolve
+   the installed App container fresh, never reuse a previous installation path.
+4. Use **`python3 tool/capture_acceptance.py`** as the single acceptance screenshot
+   entry point. Follow [the complete command and protocol](../../../docs/acceptance-capture.md).
+   There is currently **no external App runtime identity bridge**. The production
+   command returns `runtime-identity-unavailable`; do not substitute a hand-edited
+   JSON file, manual actual UUID, screenshots or a direct database/secret read.
+5. Deliver the generated `acceptance.json` together with `screenshot.png` only
+   when the command succeeds. It binds expected and observed identities, source,
+   installed executable and manifest hashes, before/after runtime generations,
+   capture time and screenshot hash. A blocked run supplies a fixed reason and
+   produces no accepted screenshot. Keep private evidence outside the repository;
+   public tests/examples use synthetic identities, never graph content/credentials.
+6. State the platform and limits explicitly: `experimental-host-restamp`,
+   `cross_abi_validated=false`, Simulator only. A stub, preflight-only build or
+   caller-supplied probe is not production runtime acceptance. None proves phone
+   or full iOS ABI acceptance.
+
+This checklist supersedes historical diagnostic recipes below. Raw `simctl`
+screenshots/videos are troubleshooting artifacts, not accepted evidence. Existing
+owner authorization is required for any install, launch, graph selection or
+recovery operation described below.
+
 ## Build environment
 
 Use [journal-build](../journal-build/SKILL.md) and its `scripts/build_journal_apple.sh`

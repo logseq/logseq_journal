@@ -13,3 +13,24 @@
 ## Build
 
 Use `bash .agents/skills/journal-build/scripts/build_journal_apple.sh --help` as the Apple build entry point. Read [journal-build](.agents/skills/journal-build/SKILL.md) for target selection, prerequisites, cache/provenance, failure handling and acceptance limits.
+
+## UI operations and acceptance evidence
+
+Before operating a device or taking acceptance screenshots, verify the explicitly
+expected device UDID/type and platform, stable graph UUID, and the installed App's
+bundle/version/build, executable hash and source/build evidence. Re-resolve the
+installed container each time. Names, graph-picker position, persisted selection,
+old screenshots, manually filled actual fields and build labels alone are not
+identity proof. Unknown or mismatched identity blocks acceptance and target-dependent
+UI operations; do not switch graphs, reinstall, create devices or touch another
+owner's device to work around a failed check.
+
+Use [testing-ios-simulator](.agents/skills/testing-ios-simulator/SKILL.md) for the
+checklist and `python3 tool/capture_acceptance.py --help` as the unified Simulator
+acceptance entry point. Read [the evidence contract](docs/acceptance-capture.md).
+The current App lacks an external runtime graph-identity bridge: the tool blocks
+with `runtime-identity-unavailable` and cannot yet produce real accepted screenshots.
+Do not replace that boundary with constants or database/secret reads. Coordinate
+shared Simulator ownership; Simulator/experimental host-restamp evidence never
+proves real-device or cross-ABI acceptance. Keep evidence private and external;
+public fixtures must contain only synthetic identities and no credentials/content.
