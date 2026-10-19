@@ -319,7 +319,8 @@ let dependencies
 ;;
 
 type operation =
-  { scope : Core.effect_scope
+  { network : bool
+  ; scope : Core.effect_scope
   ; asset_identity : (Core.graph_scope * string) option
   ; mutable cancelled : bool
   ; cancel : unit -> unit
@@ -901,7 +902,7 @@ let field_matches expected actual =
   | Some expected -> Some expected = actual
 ;;
 
-let scope_matches expected actual =
+let scope_matches (expected : Core.effect_scope) (actual : Core.effect_scope) =
   field_matches expected.Core.account_generation actual.Core.account_generation
   && field_matches expected.graph_generation actual.graph_generation
   && field_matches expected.connection_generation actual.connection_generation
@@ -955,15 +956,15 @@ let retire_websocket_owner ?(abort = false) t scope =
       if not t.closed then t.post (Core.Websocket_retired scope))
 ;;
 
-let cancel_scope t scope =
+let cancel_scope ?(network_only = false) t scope =
   Hashtbl.iter
     (fun _ (operation : operation) ->
-       if scope_matches scope operation.scope
+       if scope_matches scope operation.scope && (not network_only || operation.network)
        then (
          operation.cancelled <- true;
          operation.cancel ()))
     t.operations;
-  Hashtbl.filter_map_inplace
+  if not network_only then Hashtbl.filter_map_inplace
     (fun _ (entry : key_entry) ->
        let entry_scope = Core.effect_scope_of_graph entry.scope in
        if scope_matches scope entry_scope
@@ -1024,6 +1025,14 @@ let unlock_result : type a. (a, Core.effect_error) result -> string = function
 
 exception Runner_cancelled
 
+let network_request : type a. a Core.runner_request -> bool = function
+  | Fetch_catalog _ | Fetch_snapshot_baseline _ | Fetch_snapshot_metadata _
+  | Download_snapshot _ | Fetch_e2ee_graph_key _ | Fetch_e2ee_user_keys _ -> true
+  | Load_catalog _ | Save_catalog _ | Load_and_unlock_graph_key _
+  | Fetch_and_unlock_graph_key _ | Unlock_private_key _ | Delete_account_secrets _
+  | Encrypt_protected_values _ | Decrypt_protected_values _ -> false
+;;
+
 let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request -> unit =
   fun t ticket request ->
   let id = Core.effect_ticket_id ticket |> Core.effect_id_to_string in
@@ -1037,7 +1046,8 @@ let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request 
   Option.iter (fun kind -> unlock_log "op=%s request=%s phase=begin" id kind) diagnostic_kind;
   let cancelled, resolve_cancelled = Eio.Promise.create () in
   let operation =
-    { scope = Core.effect_ticket_scope ticket
+    { network = network_request request
+    ; scope = Core.effect_ticket_scope ticket
     ; asset_identity = None
     ; cancelled = false
     ; cancel = (fun () -> ignore (Eio.Promise.try_resolve resolve_cancelled () : bool))
@@ -1104,11 +1114,13 @@ let submit_nonasset t instruction =
       invalid_arg "Effect requires its dedicated interpreter"
     | Core.Request (ticket, request) -> submit_request t ticket request
     | Cancel_effects scope -> cancel_scope t scope
+    | Cancel_network_effects scope -> cancel_scope ~network_only:true t scope
     | Schedule_timer request ->
       let id = Core.runner_effect_diagnostic instruction in
       let cancelled, resolve_cancelled = Eio.Promise.create () in
       let operation =
-        { scope = request.scope
+        { network = true
+        ; scope = request.scope
         ; asset_identity = None
         ; cancelled = false
         ; cancel =
@@ -1145,7 +1157,8 @@ let submit_nonasset t instruction =
          let finished, resolve_finished = Eio.Promise.create () in
          let pending = ref None in
          let operation =
-           { scope = Core.runner_effect_scope instruction
+           { network = true
+           ; scope = Core.runner_effect_scope instruction
            ; asset_identity = None
            ; cancelled = false
            ; cancel =
@@ -1971,7 +1984,10 @@ let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
      | _ -> ());
     let cancelled, resolve_cancelled = Eio.Promise.create () in
     let operation =
-      { scope = Core.effect_scope_of_graph request.context.scope
+      { network = (match request.action with
+          | Core.Fetch_asset _ | Put_asset_file _ | Asset_retry_after _ -> true
+          | _ -> false)
+      ; scope = Core.effect_scope_of_graph request.context.scope
       ; asset_identity = Some (request.context.scope, request.operation)
       ; cancelled = false
       ; cancel = (fun () -> ignore (Eio.Promise.try_resolve resolve_cancelled () : bool))
@@ -2035,7 +2051,8 @@ let submit_protected t instruction ticket (request : Core.protected_request) =
   then (
     let cancelled, resolve_cancelled = Eio.Promise.create () in
     let operation =
-      { scope = Core.effect_scope_of_graph request.protected_scope
+      { network = false
+      ; scope = Core.effect_scope_of_graph request.protected_scope
       ; asset_identity = None
       ; cancelled = false
       ; cancel = (fun () -> ignore (Eio.Promise.try_resolve resolve_cancelled () : bool))

@@ -67,9 +67,8 @@ let check_catalog_only label effects =
        effects)
 ;;
 
-(* A warm cache miss starts online preparation automatically. If it fails before
-   same-account authentication completes, reconciliation must preserve that visible
-   failure and its explicit recovery action rather than leave startup waiting. *)
+(* Explicit online recovery can fail before authentication reconciliation; the
+   existing error must survive catalog reconciliation rather than leave loading. *)
 let preserves_local_restore_failure_during_reconciliation () =
   let user_id = "cached-account" in
   let restoring = Core.step (initial ()) (Core.Restore_local_account { user_id }) in
@@ -107,10 +106,13 @@ let preserves_local_restore_failure_during_reconciliation () =
       key_ticket
       (Error (Core.Effect_failed "wrappedGraphKeyUnavailable"))
   in
-  let graph_key_ticket = require_instruction "automatic E2EE recovery"
+  let permission=Core.step failed.next (Core.Sign_in_requested (Core_contract.startup_scope failed.next)) in
+  let permission=Core.step permission.next (Core.Account_authenticated {user_id=Some user_id}) in
+  let recovery=permission in
+  let graph_key_ticket = require_instruction "explicit E2EE recovery"
     (function Core.Run (Core.Request (ticket, Core.Fetch_e2ee_graph_key _)) -> Some (ticket : string Core.effect_ticket)
-      | _ -> None) failed.effects in
-  let failed = complete failed.next graph_key_ticket
+      | _ -> None) recovery.effects in
+  let failed = complete recovery.next graph_key_ticket
     (Error (Core.Effect_failed "synthetic key preparation offline")) in
   check_preparation_failure "remote preparation failed" failed.next;
   let authenticated =
@@ -137,7 +139,7 @@ let preserves_local_restore_failure_during_reconciliation () =
   Alcotest.(check bool) "catalog refreshed" true (snapshot.catalog = [ graph ]);
   check_preparation_failure "catalog success" refreshed.next;
   check_catalog_only "catalog success" refreshed.effects;
-  let recovery = Core.step refreshed.next Core.Online_recovery_requested in
+  let recovery = Core.step refreshed.next (Core.Online_recovery_requested (Core_contract.timeline_scope refreshed.next)) in
   let recovery_scope =
     require_instruction
       "explicit E2EE recovery request"

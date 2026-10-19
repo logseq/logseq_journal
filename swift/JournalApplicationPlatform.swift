@@ -58,6 +58,9 @@ import AppKit
   @ObservationIgnored private weak var runtime: JournalRuntime?
   @ObservationIgnored private var connection = UUID()
   @ObservationIgnored private var refresh: Task<Void, Never>?
+  @ObservationIgnored private var onlineWaiter: CheckedContinuation<Void, Error>?
+  @ObservationIgnored private var startupScope = JournalPlatformWire.StartupScope.initial
+  @ObservationIgnored private var signInScope: JournalPlatformWire.StartupScope?
   @ObservationIgnored private var pending = JournalPlatformEvents()
   @ObservationIgnored private var authListener: NSObjectProtocol?
   @ObservationIgnored private var shutdown: JournalApplicationShutdown?
@@ -99,6 +102,8 @@ import AppKit
     connectionObserver?(false)
     connected = false
     runtime = nil
+    onlineWaiter?.resume(throwing:CancellationError()); onlineWaiter=nil
+    startupScope = .initial; signInScope=nil
     services.invalidateConnection()
   }
 
@@ -125,6 +130,11 @@ import AppKit
       FileHandle.standardError.write(
         Data("logseq_journal: decodeRequest failed bytes=\(bytes.count)\n".utf8))
       return nil
+    }
+    if [.timelinePresented,.onlineRequested,.onlineCancelled].contains(request) {
+      guard let scope=try? JournalPlatformWire.startupScope(bytes), scope>=startupScope else {return nil}
+      if request != .onlineCancelled, !pending.acceptsOnlinePermission(scope) { return nil }
+      if scope != startupScope { services.cancelAuthenticationPreparation(); startupScope=scope }
     }
     requestObserver?(request)
     if request == .signOut {
@@ -158,10 +168,18 @@ import AppKit
         authenticationRequired = true
         localAccountAvailable = false
       case .localAccount: localAccountAvailable = true
-      case .noLocalAccount: localAccountAvailable = false
+      case .noLocalAccount: localAccountAvailable = false; authenticationRequired=true
       default: break
       }
       let encoded = try JournalPlatformWire.encodeResponse(response)
+      if request == .onlineCancelled {
+        refresh?.cancel()
+        onlineWaiter?.resume(throwing:CancellationError());onlineWaiter=nil
+      }
+      if request == .onlineRequested {
+        onlineWaiter?.resume(); onlineWaiter=nil
+        refreshAuthentication()
+      }
       if request == .timelinePresented { refreshAuthentication() }
       if request == .terminationReady { shutdown?.complete() }
       return encoded
@@ -185,9 +203,9 @@ import AppKit
 
   /// Called after the first local timeline frame or successful native sign-in.
   func refreshAuthentication() {
-    guard !pending.terminating, !accountAuthenticationPresented else { return }
+    guard !pending.terminating, !accountAuthenticationPresented, services.onlineAllowed else { return }
     refresh?.cancel()
-    let identity = connection
+    let identity = connection, scope=startupScope
     refresh = Task { [weak self] in
       guard let self else { return }
       do {
@@ -196,7 +214,7 @@ import AppKit
         guard connection == identity, connected else { return }
         accountIssue = services.accountIssue
         if case .authenticatedUser(let user) = response { authenticationRequired = user == nil }
-        pending.authenticated(try JournalPlatformWire.encodeResponse(response))
+        pending.authenticated(try JournalPlatformWire.authenticatedEvent(response,scope:scope))
         deliverEvents()
       } catch JournalPlatformServices.Failure.authenticationRequired {
         if connection == identity {
@@ -224,11 +242,42 @@ import AppKit
     }
   }
 
-  func cancelAccountPreparation() { services.cancelAuthenticationPreparation() }
+  func beginOnline() async throws {
+    try Task.checkCancellation()
+    guard connected, !pending.terminating else {throw CancellationError()}
+    if services.onlineAllowed {return}
+    guard onlineWaiter == nil, pending.acceptsOnlinePermission(startupScope) else {
+      throw JournalPlatformServices.Failure.unavailable
+    }
+    signInScope=startupScope
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        onlineWaiter=continuation
+        pending.requestOnline(JournalPlatformWire.onlineRequested(startupScope))
+        deliverEvents()
+      }
+      try Task.checkCancellation()
+    } onCancel: { Task {@MainActor [weak self] in self?.cancelAccountPreparation()} }
+  }
+
+  func cancelAccountPreparation() {
+    onlineWaiter?.resume(throwing:CancellationError()); onlineWaiter=nil
+    guard let scope=signInScope,scope==startupScope else {return}
+    services.cancelAuthenticationPreparation()
+    pending.requestOnline(JournalPlatformWire.onlineCancelled(scope))
+    deliverEvents()
+  }
+
+  func retryOnline() {
+    Task { [weak self] in
+      guard let self else {return}
+      do {try await beginOnline(); refreshAuthentication()} catch {}
+    }
+  }
 
   /// Browser success is not UI success until the verified binding is ready.
   func prepareAccount() async throws {
-    let identity = connection
+    let identity = connection, scope=startupScope
     do {
       let response = try await services.response(for: .authenticatedUser)
       try Task.checkCancellation()
@@ -240,7 +289,7 @@ import AppKit
       }
       authenticationRequired = false
       localAccountAvailable = true
-      pending.authenticated(try JournalPlatformWire.encodeResponse(response))
+      pending.authenticated(try JournalPlatformWire.authenticatedEvent(response,scope:scope))
       deliverEvents()
     } catch {
       if connection == identity, !(error is CancellationError) {

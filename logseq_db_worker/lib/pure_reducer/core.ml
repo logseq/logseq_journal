@@ -458,6 +458,21 @@ let step state event =
         | Error error ->
           let message = Logseq_db_worker_contract.Error.message error in
           (match worker_effect with
+           | Some (Sync.Inspect_mirror request) ->
+             let changed=translate_sync
+               (Sync.step state.sync_core (Sync.Graph_attachment_failed
+                  {scope=Sync.effect_scope_of_graph request.scope;message})) state in
+             {changed with effects=Publish(Diagnostic "worker.inspectMirror")::changed.effects}
+           | Some (Sync.Attach_graph request) ->
+             let changed=translate_sync
+               (Sync.step state.sync_core (Sync.Graph_attachment_failed
+                  {scope=Sync.effect_scope_of_graph request.scope;message})) state in
+             {changed with effects=Publish(Diagnostic "worker.attachGraph")::changed.effects}
+           | Some (Sync.Inspect_sync scope) ->
+             let changed=translate_sync
+               (Sync.step state.sync_core (Sync.Graph_attachment_failed
+                  {scope=Sync.effect_scope_of_graph scope;message})) state in
+             {changed with effects=Publish(Diagnostic "worker.inspectSync")::changed.effects}
            | Some (Sync.Activate_snapshot request) ->
              translate_sync
                (Sync.step
@@ -581,6 +596,8 @@ let asset_scope state =
 
 let asset_online state =
   state.foreground
+  && (let f=(Sync.state state.sync_core).snapshot.startup in
+      f.authenticated && f.network_phase<>Sync.Local_only)
   &&
   match (Sync.state state.sync_core).snapshot.sync_phase with
   | Offline | Paused | Failed -> false
@@ -913,7 +930,7 @@ let step state event =
          ( { state with recovery = Some (ticket.scope, ticket.after, true) }
          , [ Publish (Diagnostic "Upload recovery could not read a valid checkpoint page")
            ] ))
-    | Sync_event Sync.Online_recovery_requested ->
+    | Sync_event (Sync.Online_recovery_requested _) ->
       (match asset_scope state with
        | None -> state, []
        | Some context ->

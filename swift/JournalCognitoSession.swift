@@ -23,8 +23,10 @@ import OSLog
   private var tokens: JournalCognitoTokens?
   private var loaded = false
   private var generation: UInt64 = 0
+  private var networkGeneration: UInt64 = 0
   private var signInID: UUID?
   private var refresh: (id: UUID, task: Task<JournalCognitoTokens, Error>)?
+  private var networkRequests: [UUID: Task<(Data, HTTPURLResponse), Error>] = [:]
   private var signingOut = false
 
   init(configuration: JournalCognitoConfiguration, storage: JournalCognitoStorage,
@@ -33,14 +35,15 @@ import OSLog
     self.configuration = configuration; self.storage = storage
     self.browser = browser; self.transport = transport; self.now = now
   }
-  private func check(_ version: UInt64) throws {
+  private func check(_ version: UInt64, network: UInt64) throws {
     try Task.checkCancellation()
-    guard generation == version, !signingOut else { throw CancellationError() }
+    guard generation == version, networkGeneration == network, !signingOut else { throw CancellationError() }
   }
   private func restore() async throws {
     guard !loaded else { return }
-    let version = generation, value = try await storage.load()
-    try check(version)
+    let version = generation, network = networkGeneration
+    let value = try await storage.load()
+    try check(version, network: network)
     if let value {
       guard value.issuer == configuration.issuer, value.clientID == configuration.clientID,
         !value.userID.isEmpty, !value.idToken.isEmpty, !value.accessToken.isEmpty, !value.refreshToken.isEmpty
@@ -50,16 +53,19 @@ import OSLog
     if !loaded { tokens = value; loaded = true }
   }
   func currentUserID() async throws -> String? {
+    let version = generation, network = networkGeneration
     try await restore()
+    try check(version, network: network)
     guard tokens != nil else { return nil }
     _ = try await freshIDToken()
     return tokens?.userID
   }
   func freshIDToken() async throws -> String {
+    let version = generation, network = networkGeneration
     try await restore()
+    try check(version, network: network)
     guard !signingOut, let current = tokens else { throw JournalPlatformServices.Failure.authenticationRequired }
     guard current.expiresAt.timeIntervalSince(now()) <= 60 else { return current.idToken }
-    let version = generation
     let operation: (id: UUID, task: Task<JournalCognitoTokens, Error>)
     if let refresh { operation = refresh }
     else {
@@ -68,18 +74,18 @@ import OSLog
         do {
           let response = try await requestTokens(["grant_type": "refresh_token", "client_id": configuration.clientID,
             "refresh_token": current.refreshToken])
-          try check(version)
+          try check(version, network: network)
           let updated = try await validate(response, nonce: nil, previous: current)
-          try check(version)
+          try check(version, network: network)
           try await storage.save(updated)
-          try check(version)
+          try check(version, network: network)
           tokens = updated
           return updated
         } catch JournalCognitoError.invalidGrant {
-          try check(version)
+          try check(version, network: network)
           tokens = nil; loaded = true
           try await storage.clear()
-          try check(version)
+          try check(version, network: network)
           NotificationCenter.default.post(name: Self.changed, object: self)
           throw JournalPlatformServices.Failure.authenticationRequired
         }
@@ -88,21 +94,21 @@ import OSLog
     }
     defer { if refresh?.id == operation.id { refresh = nil } }
     let result = try await operation.task.value
-    try check(version)
+    try check(version, network: network)
     return result.idToken
   }
   func signIn() async throws {
     guard signInID == nil, !signingOut else { throw JournalCognitoError.unavailable }
-    let version = generation, id = UUID(), started = now()
+    let version = generation, network = networkGeneration, id = UUID(), started = now()
     signInID = id
     defer { if signInID == id { signInID = nil } }
     try await restore()
-    try check(version)
+    try check(version, network: network)
     guard signInID == id else { throw CancellationError() }
     let state = try JournalCognitoOAuth.random(), verifier = try JournalCognitoOAuth.random(), nonce = try JournalCognitoOAuth.random()
     let url = try JournalCognitoOAuth.authorization(configuration, state: state, verifier: verifier, nonce: nonce)
     func admitted() throws {
-      try check(version)
+      try check(version, network: network)
       guard signInID == id else { throw CancellationError() }
       guard now().timeIntervalSince(started) <= 300 else { throw JournalCognitoError.expired }
     }
@@ -126,7 +132,7 @@ import OSLog
       else { try await storage.clear() }
       throw CancellationError()
     }
-    try check(savingVersion)
+    try check(savingVersion, network: network)
     guard signInID == id else { throw CancellationError() }
     tokens = updated; loaded = true
     signInID = nil
@@ -135,8 +141,15 @@ import OSLog
       Logger(subsystem: "com.logseq.journal", category: "account")
         .error("Legacy credential cleanup is pending (account.retireLegacy.failed)")
     }
-    try check(savingVersion)
+    try check(savingVersion, network: network)
     NotificationCenter.default.post(name: Self.changed, object: self)
+  }
+  func cancelNetworkOperations() {
+    networkGeneration &+= 1
+    refresh?.task.cancel()
+    refresh = nil
+    for request in networkRequests.values { request.cancel() }
+    cancelSignIn()
   }
   func cancelSignIn() {
     guard signInID != nil else { return }
@@ -162,13 +175,23 @@ import OSLog
     if let previous {
       // Local cleanup succeeds offline. Revocation is bounded and best effort.
       do {
-        _ = try await transport(request(path: "/oauth2/revoke", values: ["client_id": configuration.clientID,
+        _ = try await performTransport(request(path: "/oauth2/revoke", values: ["client_id": configuration.clientID,
           "token": previous.refreshToken]))
       } catch {
         Logger(subsystem: "com.logseq.journal", category: "account")
           .error("Remote sign-out could not finish (account.revoke.failed)")
       }
     }
+  }
+  private func performTransport(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+    try Task.checkCancellation()
+    let id = UUID()
+    let task = Task { try await transport(request) }
+    networkRequests[id] = task
+    defer { networkRequests[id] = nil }
+    return try await withTaskCancellationHandler {
+      try await task.value
+    } onCancel: { task.cancel() }
   }
   private func request(path: String, values: [String: String]) -> URLRequest {
     var request = URLRequest(url: URL(string: "https://\(configuration.domain)\(path)")!)
@@ -181,7 +204,7 @@ import OSLog
 
   private func requestTokens(_ values: [String: String]) async throws -> JournalCognitoTokenResponse {
     let request = request(path: "/oauth2/token", values: values)
-    let (data, response) = try await transport(request)
+    let (data, response) = try await performTransport(request)
     guard response.url == request.url, data.count <= 131072 else { throw JournalCognitoError.request }
     guard response.statusCode == 200 else {
       let error = (try? JSONDecoder().decode(TokenFailure.self, from: data))?.error
@@ -194,7 +217,7 @@ import OSLog
   private func validate(_ response: JournalCognitoTokenResponse, nonce: String?, previous: JournalCognitoTokens?) async throws -> JournalCognitoTokens {
     var request = URLRequest(url: URL(string: configuration.issuer + "/.well-known/jwks.json")!)
     request.timeoutInterval = 15
-    let (data, http) = try await transport(request)
+    let (data, http) = try await performTransport(request)
     guard http.statusCode == 200, http.url == request.url else { throw JournalCognitoError.request }
     return try JournalCognitoTokenValidator(jwks: data).validate(response, configuration: configuration,
       nonce: nonce, previous: previous, now: now())

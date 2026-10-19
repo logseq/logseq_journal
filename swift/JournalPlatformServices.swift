@@ -42,6 +42,11 @@ struct JournalAccountIssue: Error, Equatable, Sendable, LocalizedError {
   func currentUserID() async throws -> String?
   func freshIDToken() async throws -> String
   func signOut() async throws
+  func cancelNetworkOperations()
+}
+
+extension JournalAuthCapability {
+  func cancelNetworkOperations() {}
 }
 
 struct JournalLocalAccount: Equatable, Sendable {
@@ -104,6 +109,7 @@ struct JournalLocalAccount: Equatable, Sendable {
   let account: JournalAccountStore
   let managedSyncOrigin: String
   private(set) var timelinePresented = false
+  private(set) var onlineAllowed = false
   private var authenticationGeneration: UInt64 = 0
   private var signingOut = false
   private(set) var accountIssue: JournalAccountIssue?
@@ -132,7 +138,15 @@ struct JournalLocalAccount: Equatable, Sendable {
       guard let binding else { return .noLocalAccount }
       preparedUserID = binding.userID
       return .localAccount(userID: binding.userID, origin: binding.managedSyncOrigin)
+    case .onlineRequested:
+      onlineAllowed = true
+      return .onlineRequested
+    case .onlineCancelled:
+      if onlineAllowed { authenticationGeneration &+= 1; auth.cancelNetworkOperations() }
+      onlineAllowed = false
+      return .onlineCancelled
     case .timelinePresented:
+      onlineAllowed = true
       timelinePresented = true
       return .timelinePresented
     case .authenticatedUser:
@@ -235,6 +249,7 @@ struct JournalLocalAccount: Equatable, Sendable {
       // requesting runtime has gone away. The bridge fences the eventual reply.
       try await account.clear()
       timelinePresented = false
+      onlineAllowed = false
       preparedUserID = nil
       accountIssue = nil
       return .signedOut
@@ -248,11 +263,17 @@ struct JournalLocalAccount: Equatable, Sendable {
   }
 
   func invalidateConnection() {
+    auth.cancelNetworkOperations()
     authenticationGeneration &+= 1
     timelinePresented = false
+    onlineAllowed = false
     preparedUserID = nil
   }
-  func cancelAuthenticationPreparation() { authenticationGeneration &+= 1 }
+  func cancelAuthenticationPreparation() {
+    auth.cancelNetworkOperations()
+    authenticationGeneration &+= 1
+    onlineAllowed = false
+  }
 
   private func validateGraphAccount(_ user: String) throws {
     if timelinePresented, let current = preparedUserID, current != user {
@@ -273,6 +294,7 @@ struct JournalLocalAccount: Equatable, Sendable {
   private func admitAuthentication(_ generation: UInt64) async throws {
     try Task.checkCancellation()
     guard !signingOut else { throw Failure.unavailable }
+    guard onlineAllowed else { throw Failure.unavailable }
     // Account binding is advisory; native credentials remain independently usable.
     try validateCompletion(generation)
   }

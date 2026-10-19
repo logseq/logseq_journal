@@ -64,13 +64,24 @@ let limits () =
   |> Result.get_ok
 ;;
 
-let initial () =
+let raw_initial () =
   Core.config
     ~managed_sync_origin:(Uri.of_string "https://api.logseq.io")
     ~limits:(limits ())
   |> Result.get_ok
   |> Core.initial
   |> Result.get_ok
+;;
+
+let startup_scope core : Core.startup_scope =
+  let f = (Core.state core).snapshot.startup in
+  { account_generation=f.account_generation;presentation_generation=f.presentation_generation }
+;;
+let timeline_scope core : Core.timeline_scope =
+  let s=(Core.state core).snapshot in
+  {startup=startup_scope core;graph_id=Option.get s.selected_graph;graph_generation=s.startup.graph_generation}
+;;
+let initial () = (Core.step (raw_initial ()) (Core.Sign_in_requested (startup_scope (raw_initial ())))).next
 ;;
 
 let graph_id =
@@ -178,7 +189,7 @@ let has_catalog_request effects =
 ;;
 
 let refresh_catalog core graphs =
-  let requested = Core.step core Core.Catalog_refresh_requested in
+  let requested = Core.step core (Core.Catalog_refresh_requested (startup_scope core)) in
   Core.step requested.next (fetch_catalog_completion requested.effects graphs)
 ;;
 
@@ -295,7 +306,7 @@ let same_account_authentication_preserves_pending_warm_restore () =
   Alcotest.(check bool)
     "pending warm restore survives same-account authentication"
     true
-    (snapshot.startup.authenticated
+    ((not snapshot.startup.authenticated)
      && (not snapshot.startup.awaiting_selection)
      && Option.equal
           Logseq_db_types.Graph_types.Uuid.equal
@@ -303,8 +314,8 @@ let same_account_authentication_preserves_pending_warm_restore () =
           (Some graph_id));
   ignore (inspect_mirror_request restored.effects);
   Alcotest.(check bool)
-    "remote reconciliation begins only after local admission"
-    true
+    "local admission alone does not authorize remote reconciliation"
+    false
     (has_catalog_request restored.effects)
 ;;
 
@@ -1544,6 +1555,8 @@ let canonical_overlay_happy_path () =
   let authenticated_startup =
     { initial_state.snapshot.startup with
       authenticated = true
+    ; local_access = Core.Local_pending
+    ; network_phase = Core.Online_by_user
     ; catalog_loading = true
     ; account_generation = 1
     ; presentation_generation = 1
@@ -1620,13 +1633,14 @@ let canonical_overlay_happy_path () =
       [ Core.Publish (Core.State_changed catalogued_state); save_catalog_effect ]
   in
   let graph_scope : Core.graph_scope =
-    { account = account_scope; graph_id; graph_generation = 1 }
+    { account = {account_scope with presentation_generation=2}; graph_id; graph_generation = 1 }
   in
   let selected_startup =
     { catalogued_startup with
       awaiting_selection = false
     ; restoring_local = true
     ; graph_generation = 1
+    ; presentation_generation = 2
     }
   in
   let selected_state =
@@ -1651,7 +1665,7 @@ let canonical_overlay_happy_path () =
       ]
       when (request = Core.{ graph; scope = graph_scope })
            && state = selected_state
-           && account = account_scope
+           && account = graph_scope.account
            && Core.catalog_cache_user_id cache = "user"
            && Core.catalog_cache_graphs cache = [ graph ]
            && Core.catalog_cache_selected_graph cache = Some graph_id ->
@@ -1684,7 +1698,7 @@ let canonical_overlay_happy_path () =
     Overlay.sync_view ~token:sync_token0 ~checkpoint:cursor0 ~submissions:[]
   in
   let attached_startup =
-    { selected_startup with restoring_local = false; bootstrapping = false }
+    { selected_startup with restoring_local = false; bootstrapping = false; local_access=Core.Local_available }
   in
   let attached_state =
     { selected_state with
@@ -1766,7 +1780,7 @@ let canonical_overlay_happy_path () =
     match hp09_preview.effects with
     | [ Core.Delegate (Core.Apply_authoritative_batch request) ]
       when request.scope = connection
-           && request.presentation_generation = 1
+           && request.presentation_generation = 2
            && request.lifecycle_generation = 0L
            && request.key = None
            && Overlay.Server_cursor.to_int64
@@ -2047,7 +2061,7 @@ let canonical_overlay_happy_path () =
     match hp16_preview.effects with
     | [ Core.Delegate (Core.Apply_authoritative_batch request) ]
       when request.scope = connection
-           && request.presentation_generation = 1
+           && request.presentation_generation = 2
            && request.lifecycle_generation = 0L
            && request.key = None
            && Overlay.Server_cursor.to_int64
@@ -2300,10 +2314,9 @@ let sign_out_cleanup_completion_is_inert_and_sanitized () =
     "cleanup failure does not restore authentication"
     false
     failed_state.snapshot.startup.authenticated;
+  let login=Core.step signed_out_again.next (Core.Sign_in_requested (startup_scope signed_out_again.next)) in
   let replacement =
-    Core.step
-      signed_out_again.next
-      (Core.Account_authenticated { user_id = Some "new-user" })
+    Core.step login.next (Core.Account_authenticated { user_id = Some "new-user" })
   in
   let late_failure = Core.step replacement.next failure in
   Alcotest.(check int)
@@ -2440,7 +2453,7 @@ let deletion_ready_graph encrypted =
   in
   let sync = Overlay.sync_view ~token ~checkpoint ~submissions:[] in
   let attached = Core.step attaching.next (Core.Graph_attached { scope; sync }) in
-  let ready = Core.step attached.next Core.Timeline_presented in
+  let ready = Core.step attached.next (Core.Timeline_presented (timeline_scope attached.next)) in
   ready.next, scope, sync, selected.effects
 ;;
 
@@ -2487,17 +2500,17 @@ let check_no_work core events =
     events
 ;;
 
-let deletion_blocked_events scope sync =
+let deletion_blocked_events (scope : Core.graph_scope) sync =
   [ Core.Local_cache_deletion_requested graph_id
   ; Core.Local_cache_deletion_requested other_graph_id
   ; Core.Graph_selected graph_id
   ; Core.Graph_selected other_graph_id
   ; Core.Graph_picker_requested
-  ; Core.Online_recovery_requested
+  ; Core.Online_recovery_requested {startup={account_generation=scope.account.account_generation;presentation_generation=scope.account.presentation_generation};graph_id=scope.graph_id;graph_generation=scope.graph_generation}
   ; Core.Local_outbox_changed
   ; Core.Local_feed_acknowledged
-  ; Core.Timeline_presented
-  ; Core.Catalog_refresh_requested
+  ; Core.Timeline_presented {startup={account_generation=scope.account.account_generation;presentation_generation=scope.account.presentation_generation};graph_id=scope.graph_id;graph_generation=scope.graph_generation}
+  ; Core.Catalog_refresh_requested {account_generation=scope.account.account_generation;presentation_generation=scope.account.presentation_generation}
   ; Core.Account_authenticated { user_id = Some "user" }
   ; Core.E2ee_password_submitted "ignored"
   ; Core.Foreground_changed { foreground = true; lifecycle_generation = 98L }
@@ -2522,7 +2535,7 @@ let deletion_noncurrent core =
   let token = Overlay.sync_token_of_string "sync-token:v1:noncurrent" |> Result.get_ok in
   let sync = Overlay.sync_view ~token ~checkpoint:(server_cursor_of_int 0) ~submissions:[] in
   let attached = Core.step inspected.next (Core.Graph_attached { scope = request.scope; sync }) in
-  let ready = Core.step attached.next Core.Timeline_presented in
+  let ready = Core.step attached.next (Core.Timeline_presented (timeline_scope attached.next)) in
   ready.next, request.scope, sync, selected.effects
 ;;
 
@@ -2560,8 +2573,9 @@ let local_deletion_orders_cleanup encrypted () =
     ((Core.state restored.next).snapshot.selected_graph = Some other_graph_id);
   let selected = Core.step removed.next (Core.Graph_selected graph_id) in
   let mirror = inspect_mirror_request selected.effects in
-  let absent = Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent mirror.scope)) in
-  Alcotest.(check bool) "deleted graph uses normal absent-mirror download" true
+  let requested=Core.step selected.next (Core.Online_recovery_requested (timeline_scope selected.next)) in
+  let absent = Core.step requested.next (Core.Mirror_inspected (Core.Mirror_absent mirror.scope)) in
+  Alcotest.(check bool) "explicit download of deleted graph uses normal absent-mirror flow" true
     (List.exists (function
        | Core.Run (Core.Request (_, Core.Fetch_snapshot_baseline _)) -> not encrypted
        | Core.Run (Core.Request (_, Core.Load_and_unlock_graph_key _)) -> encrypted
@@ -2651,8 +2665,10 @@ let restore_recovery_core sync =
   let attached =
     Core.step inspected.next (Core.Graph_attached { scope = mirror.scope; sync })
   in
-  let connection = recovery_connection attached.effects in
-  let opened = Core.step attached.next (Core.Websocket_opened connection) in
+  let shown=Core.step attached.next (Core.Timeline_presented (timeline_scope attached.next)) in
+  let authenticated=Core.step shown.next (Core.Account_authenticated {user_id=Some "user"}) in
+  let connection = recovery_connection authenticated.effects in
+  let opened = Core.step authenticated.next (Core.Websocket_opened connection) in
   opened.next, connection
 ;;
 
@@ -5099,7 +5115,7 @@ let e2ee_preparation_failure_retries fetch_user () =
     (Core.state rejected.next).snapshot.startup.awaiting_e2ee_password;
   Alcotest.(check int) "password without challenge starts no work" 0
     (List.length rejected.effects);
-  let retry = Core.step rejected.next Core.Online_recovery_requested in
+  let retry = Core.step rejected.next (Core.Online_recovery_requested (timeline_scope rejected.next)) in
   let fetched = List.filter (function
     | Core.Run (Core.Request (_, Core.Fetch_e2ee_graph_key actual)) -> actual = scope
     | _ -> false) retry.effects in
@@ -5118,7 +5134,7 @@ let e2ee_invalidated_challenge_is_not_advertised () =
   let preparation, _ = e2ee_preparation_fixture () in
   let prompt = e2ee_finish_user_fetch
     (e2ee_finish_graph_fetch preparation (Ok "wrapped")) (Ok "package") in
-  let refresh = Core.step prompt.next Core.Catalog_refresh_requested in
+  let refresh = Core.step prompt.next (Core.Catalog_refresh_requested (startup_scope prompt.next)) in
   let failed = List.find_map (function
     | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
       Some (Core.step refresh.next (Core.Runner_completed (Core.Completion
@@ -5222,7 +5238,7 @@ let e2ee_missing_cache_prepares_without_retry () =
     (List.length (List.filter (function
        | Core.Run (Core.Request (_, Core.Fetch_e2ee_graph_key actual)) -> actual = scope
        | _ -> false) preparation.effects));
-  let repeated = Core.step preparation.next Core.Online_recovery_requested in
+  let repeated = Core.step preparation.next (Core.Online_recovery_requested (timeline_scope preparation.next)) in
   Alcotest.(check int) "recovery during preparation is inert" 0
     (List.length repeated.effects);
   let duplicate = Core.step preparation.next missing in
@@ -5253,7 +5269,7 @@ let e2ee_auto_preparation_failure_is_bounded fetch_user message () =
     (List.exists (function Core.Run _ -> true | _ -> false) failed.effects);
   let blocked = Core.step failed.next (Core.E2ee_password_submitted "unused") in
   Alcotest.(check int) "no unusable password submission" 0 (List.length blocked.effects);
-  let retry = Core.step failed.next Core.Online_recovery_requested in
+  let retry = Core.step failed.next (Core.Online_recovery_requested (timeline_scope failed.next)) in
   Alcotest.(check bool) "explicit Retry can reacquire materials" true
     (List.exists (function Core.Run (Core.Request (_, Core.Fetch_e2ee_graph_key _)) -> true
       | _ -> false) retry.effects);
@@ -5305,4 +5321,230 @@ let scenarios = scenarios @
         `Quick (e2ee_late_preparation_cannot_reopen_challenge stage cancel
           (if success then Ok "late-material" else Error (Core.Effect_failed "late error"))))
         [true; false]) [true; false]) [0;1;2]
+;;
+
+(* Startup policy is owned by Sync; these use the raw cold-start state rather
+   than the explicit-online fixture used by the older synchronization tests. *)
+let cold_start () =
+  Core.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits:(limits ())
+  |> Result.get_ok |> Core.initial |> Result.get_ok
+;;
+let startup_ticket core : Core.startup_scope =
+  let f = (Core.state core).snapshot.startup in
+  { account_generation=f.account_generation; presentation_generation=f.presentation_generation }
+;;
+let timeline_ticket core : Core.timeline_scope =
+  let s = (Core.state core).snapshot in
+  { startup=startup_ticket core; graph_id=Option.get s.selected_graph
+  ; graph_generation=s.startup.graph_generation }
+;;
+let local_selected ?(encrypted=false) () =
+  let restoring = Core.step (cold_start ()) (Core.Restore_local_account {user_id="user"}) in
+  let g = if encrypted then encrypted_graph else graph in
+  let cache = Core.catalog_cache ~user_id:"user" ~graphs:[g] ~selected_graph:(Some graph_id) in
+  let selected = Core.step restoring.next (load_catalog_completion restoring.effects (Some cache)) in
+  selected, inspect_mirror_request selected.effects
+;;
+let local_attached () =
+  let selected, request = local_selected () in
+  let attaching = Core.step selected.next (Core.Mirror_inspected (Core.Mirror_available request)) in
+  let token = Overlay.sync_token_of_string "sync-token:v1:local-startup" |> Result.get_ok in
+  let sync = Overlay.sync_view ~token ~checkpoint:(server_cursor_of_int 0) ~submissions:[] in
+  Core.step attaching.next (Core.Graph_attached {scope=request.scope;sync})
+;;
+let no_network message effects =
+  Alcotest.(check bool) message false (List.exists (function
+    | Core.Run (Core.Start_websocket _) -> true
+    | Core.Run (Core.Request (_, (Core.Fetch_catalog _ | Core.Fetch_snapshot_baseline _
+      | Core.Fetch_e2ee_graph_key _ | Core.Fetch_e2ee_user_keys _))) -> true
+    | _ -> false) effects)
+;;
+let local_startup_has_no_network () =
+  let cold = cold_start () in
+  no_network "authentication notification cannot authorize cold-start networking"
+    (Core.step cold (Core.Account_authenticated {user_id=Some "user"})).effects;
+  let attached = local_attached () in
+  no_network "attachment stays local" attached.effects;
+  Alcotest.(check bool) "local access does not forge online credentials" false
+    (Core.state attached.next).snapshot.startup.authenticated;
+  Alcotest.(check bool) "local attachment is usable" true
+    ((Core.state attached.next).snapshot.startup.local_access = Core.Local_available);
+  no_network "feed completion does not authorize networking"
+    (Core.step attached.next Core.Local_feed_acknowledged).effects;
+  no_network "foreground does not authorize networking"
+    (Core.step attached.next (Core.Foreground_changed {foreground=true;lifecycle_generation=1L})).effects
+;;
+let missing_local_data_stops_loading () =
+  let selected, request = local_selected () in
+  let absent = Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent request.scope)) in
+  no_network "no automatic snapshot download" absent.effects;
+  let f = (Core.state absent.next).snapshot.startup in
+  Alcotest.(check bool) "missing mirror is terminal and accurate" true
+    (not f.restoring_local && not f.bootstrapping && f.local_access=Core.Local_unavailable Core.Local_mirror_unavailable);
+  let selected, request = local_selected ~encrypted:true () in
+  let keys = Core.step selected.next (Core.Mirror_inspected (Core.Mirror_available request)) in
+  let missing = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
+      Some (Core.Runner_completed (Core.Completion (ticket, Error (Core.Effect_failed "local key absent"))))
+    | _ -> None) keys.effects |> Option.get in
+  let failed = Core.step keys.next missing in
+  no_network "no automatic remote key recovery" failed.effects;
+  Alcotest.(check bool) "key failure stops loading" true
+    ((Core.state failed.next).snapshot.startup.local_access=Core.Local_unavailable Core.Local_key_unavailable);
+  let restoring = Core.step (cold_start ()) (Core.Restore_local_account {user_id="user"}) in
+  let absent = Core.step restoring.next (load_catalog_completion restoring.effects None) in
+  Alcotest.(check bool) "missing catalog stops loading" true
+    ((Core.state absent.next).snapshot.startup.local_access=Core.Local_unavailable Core.Local_catalog_unavailable)
+;;
+let appearance_is_scoped_and_authentication_is_required () =
+  let attached = local_attached () in
+  let ticket = timeline_ticket attached.next in
+  let stale = {ticket with startup={ticket.startup with presentation_generation=ticket.startup.presentation_generation+1}} in
+  let ignored = Core.step attached.next (Core.Timeline_presented stale) in
+  Alcotest.(check bool) "stale appearance leaves gate closed" true
+    ((Core.state ignored.next).snapshot.startup.network_phase=Core.Local_only);
+  let shown = Core.step attached.next (Core.Timeline_presented ticket) in
+  no_network "appearance authorizes authentication, not anonymous sync" shown.effects;
+  Alcotest.(check bool) "current appearance opens phase" true
+    ((Core.state shown.next).snapshot.startup.network_phase=Core.Online_after_timeline);
+  let online = Core.step shown.next (Core.Account_authenticated {user_id=Some "user"}) in
+  Alcotest.(check bool) "verified authentication starts websocket" true
+    (List.exists (function Core.Run (Core.Start_websocket _) -> true | _ -> false) online.effects);
+  let stopped=Core.step online.next (Core.Online_cancelled (startup_ticket online.next)) in
+  Alcotest.(check bool) "closing permission retires its socket owner" true
+    (List.exists (function Core.Run (Core.Close_websocket _) -> true | _ -> false) stopped.effects);
+  let connection=List.find_map (function Core.Run(Core.Start_websocket request)->Some request.scope|_->None) online.effects |> Option.get in
+  let retry=Core.step stopped.next (Core.Sign_in_requested (startup_ticket stopped.next)) in
+  let retry=Core.step retry.next (Core.Account_authenticated {user_id=Some "user"}) in
+  let retired=Core.step retry.next (Core.Websocket_retired connection) in
+  Alcotest.(check bool) "retry while old socket retires is resumed after retirement" true
+    (List.exists (function Core.Run(Core.Start_websocket _)->true|_->false) retired.effects);
+  let duplicate = Core.step online.next (Core.Timeline_presented ticket) in
+  Alcotest.(check int) "duplicate appearance is inert" 0 (List.length duplicate.effects);
+  let changed = Core.step shown.next (Core.Graph_selected graph_id) in
+  let stale_permission=Core.step changed.next (Core.Sign_in_requested ticket.startup) in
+  Alcotest.(check bool) "old presentation cannot authorize a replacement graph" true
+    ((Core.state stale_permission.next).snapshot.startup.network_phase=Core.Local_only);
+  let late = Core.step changed.next (Core.Timeline_presented ticket) in
+  Alcotest.(check bool) "old graph cannot open replacement gate" true
+    ((Core.state late.next).snapshot.startup.network_phase=Core.Local_only);
+  let cancelled = Core.step shown.next (Core.Online_cancelled (startup_ticket shown.next)) in
+  no_network "late authentication after cancellation is inert"
+    (Core.step cancelled.next (Core.Account_authenticated {user_id=Some "user"})).effects;
+  let first = cold_start () in
+  let missing = Core.step first (Core.Local_account_unavailable (startup_ticket first, Core.No_local_account)) in
+  Alcotest.(check bool) "first installation has a terminal local result" true
+    ((Core.state missing.next).snapshot.startup.local_access=Core.Local_unavailable Core.No_local_account);
+  let granted = Core.step missing.next (Core.Sign_in_requested (startup_ticket missing.next)) in
+  let authenticated = Core.step granted.next (Core.Account_authenticated {user_id=Some "new-user"}) in
+  Alcotest.(check bool) "explicit sign-in still fetches catalog" true (has_catalog_request authenticated.effects)
+;;
+let cancelled_local_key_crypto_still_completes () =
+  let preparation, scope = e2ee_preparation_fixture () in
+  let prompt = e2ee_finish_user_fetch (e2ee_finish_graph_fetch preparation (Ok "wrapped")) (Ok "private-package") in
+  let unlocking = Core.step prompt.next (Core.E2ee_password_submitted "synthetic") in
+  let finish_private (result : (unit, Core.effect_error) result) core = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Unlock_private_key _)) ->
+      Some (Core.step core (Core.Runner_completed (Core.Completion (ticket, result))))
+    | _ -> None) unlocking.effects |> Option.get in
+  let cancelled = Core.step unlocking.next (Core.Online_cancelled (startup_ticket unlocking.next)) in
+  let failed = finish_private (Error (Core.Effect_failed "synthetic failure")) cancelled.next in
+  Alcotest.(check bool) "cancelled private-key failure cannot reopen unusable prompt" false
+    (Core.state failed.next).snapshot.startup.awaiting_e2ee_password;
+  let key = finish_private (Ok ()) cancelled.next in
+  let loaded = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Fetch_and_unlock_graph_key _)) ->
+      let cancelled = Core.step key.next (Core.Online_cancelled (startup_ticket key.next)) in
+      Some (Core.step cancelled.next (Core.Runner_completed (Core.Completion
+        (ticket, Ok (Core.graph_key_handle ~id:"recovered-local-key" ~scope)))))
+    | _ -> None) key.effects |> Option.get in
+  no_network "local key completion cannot begin remote snapshot after cancellation" loaded.effects;
+  Alcotest.(check bool) "local wrapped-key unlock result remains usable" true
+    (Option.fold ~none:false ~some:(fun (context : Core.asset_context) -> Option.is_some context.key) (Core.asset_context loaded.next))
+;;
+let local_staged_asset_publication_is_available_offline () =
+  let attached = local_attached () in
+  let scope = Core.admitted_graph_scope attached.next |> Option.get in
+  let issued = Core.step attached.next (Core.Asset_requested
+    {scope; operation="offline-publish";
+     action=Core.Publish_staged_asset {asset=graph_id; version=asset_version; file="synthetic-staged-reference"}}) in
+  Alcotest.(check bool) "local staged content can enter local cache while offline" true
+    (List.exists (function Core.Run (Core.Asset_io (_, {action=Core.Publish_staged_asset _; _})) -> true | _ -> false) issued.effects)
+;;
+let cancellation_fences_deferred_catalog_and_snapshot () =
+  let restoring = Core.step (cold_start ()) (Core.Restore_local_account {user_id="user"}) in
+  let granted = Core.step restoring.next (Core.Sign_in_requested (startup_ticket restoring.next)) in
+  let verified = Core.step granted.next (Core.Account_authenticated {user_id=Some "user"}) in
+  let cancelled = Core.step verified.next (Core.Online_cancelled (startup_ticket verified.next)) in
+  let cache = Core.catalog_cache ~user_id:"user" ~graphs:[graph] ~selected_graph:(Some graph_id) in
+  let loaded = Core.step cancelled.next (load_catalog_completion restoring.effects (Some cache)) in
+  no_network "deferred authentication cannot restart catalog after cancellation" loaded.effects;
+  Alcotest.(check bool) "local completion cannot restore online authentication" false
+    (Core.state loaded.next).snapshot.startup.authenticated;
+  let requested, _ = begin_snapshot_bootstrap () in
+  let metadata = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_baseline _)) ->
+      Some (Core.step requested.next (Core.Runner_completed
+        (Core.Completion (ticket, Ok {|{"type":"pull/ok","t":42}|}))))
+    | _ -> None) requested.effects |> Option.get in
+  let cancelled = Core.step metadata.next (Core.Online_cancelled (startup_ticket metadata.next)) in
+  let facts = (Core.state cancelled.next).snapshot.startup in
+  Alcotest.(check bool) "cancelled metadata has a terminal local result" true
+    (match facts.local_access with Core.Local_unavailable _ -> true | _ -> false)
+;;
+let online_cancellation_preserves_local_restore () =
+  let restoring = Core.step (cold_start ()) (Core.Restore_local_account {user_id="user"}) in
+  let cancelled = Core.step restoring.next (Core.Online_cancelled (startup_ticket restoring.next)) in
+  let facts = (Core.state cancelled.next).snapshot.startup in
+  Alcotest.(check bool) "local catalog load remains pending" true
+    (facts.restoring_local && facts.local_access = Core.Local_pending);
+  Alcotest.(check bool) "online cancellation does not retire local resources" false
+    (List.exists (function Core.Run (Core.Cancel_effects _) -> true | _ -> false) cancelled.effects);
+  let cache = Core.catalog_cache ~user_id:"user" ~graphs:[graph] ~selected_graph:(Some graph_id) in
+  let loaded = Core.step cancelled.next (load_catalog_completion restoring.effects (Some cache)) in
+  ignore (inspect_mirror_request loaded.effects);
+  let selected, request = local_selected ~encrypted:true () in
+  let keys = Core.step selected.next (Core.Mirror_inspected (Core.Mirror_available request)) in
+  let cancelled = Core.step keys.next (Core.Online_cancelled (startup_ticket keys.next)) in
+  let completion = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key scope)) ->
+      let key = Core.graph_key_handle ~id:"retained-local-key" ~scope in
+      Some (Core.Runner_completed (Core.Completion (ticket, Ok key)))
+    | _ -> None) keys.effects |> Option.get in
+  let loaded = Core.step cancelled.next completion in
+  Alcotest.(check bool) "pending local key completion still attaches graph" true
+    (List.exists (function Core.Delegate (Core.Attach_graph _) -> true | _ -> false) loaded.effects)
+;;
+(* The pure owner can reproduce authenticated Local_only by public timeline,
+   identity and graph-selection events; no native-result forgery is required. *)
+let authenticated_local_catalog_refresh_waits_for_permission () =
+  let attached=local_attached () in
+  let shown=Core.step attached.next (Core.Timeline_presented (timeline_ticket attached.next)) in
+  let verified=Core.step shown.next (Core.Account_authenticated {user_id=Some "user"}) in
+  let selected=Core.step verified.next (Core.Graph_selected graph_id) in
+  let startup=(Core.state selected.next).snapshot.startup in
+  Alcotest.(check bool) "graph switch preserves identity while returning local" true
+    (startup.authenticated && startup.network_phase=Core.Local_only);
+  let refresh=Core.step selected.next (Core.Catalog_refresh_requested (startup_ticket selected.next)) in
+  no_network "catalog refresh waits for native permission and identity round-trip" refresh.effects;
+  Alcotest.(check bool) "native permission phase is published" true
+    (List.exists (function Core.Publish (Core.State_changed state) ->
+      state.snapshot.startup.network_phase=Core.Online_by_user | _ -> false) refresh.effects);
+  let duplicate=Core.step refresh.next (Core.Catalog_refresh_requested (startup_ticket refresh.next)) in
+  no_network "repeated refresh cannot bypass pending native permission" duplicate.effects;
+  let confirmed=Core.step duplicate.next (Core.Account_authenticated {user_id=Some "user"}) in
+  Alcotest.(check bool) "confirmed identity starts catalog refresh" true
+    (has_catalog_request confirmed.effects);
+  let repeated=Core.step confirmed.next (Core.Catalog_refresh_requested (startup_ticket confirmed.next)) in
+  Alcotest.(check bool) "already online refresh remains direct" true (has_catalog_request repeated.effects)
+;;
+let scenarios = scenarios @
+  [ Alcotest.test_case "authenticated local catalog refresh waits for permission" `Quick authenticated_local_catalog_refresh_waits_for_permission
+  ; Alcotest.test_case "cancelled local key crypto completes without reopening password" `Quick cancelled_local_key_crypto_still_completes
+  ; Alcotest.test_case "local staged asset publishes offline" `Quick local_staged_asset_publication_is_available_offline
+  ; Alcotest.test_case "cancellation fences deferred catalog and snapshot metadata" `Quick cancellation_fences_deferred_catalog_and_snapshot
+  ; Alcotest.test_case "online cancellation retains pending local restoration" `Quick online_cancellation_preserves_local_restore
+  ; Alcotest.test_case "local startup emits zero network work" `Quick local_startup_has_no_network
+  ; Alcotest.test_case "local insufficiency stops loading without network fallback" `Quick missing_local_data_stops_loading
+  ; Alcotest.test_case "native appearance and explicit online permissions are scoped" `Quick appearance_is_scoped_and_authentication_is_required ]
 ;;

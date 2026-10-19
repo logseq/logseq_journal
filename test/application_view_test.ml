@@ -124,7 +124,7 @@ let test_diagnostic_phase_rows_retain_current_error () =
   let snapshot : Service.snapshot =
     { sync_phase = Failed; catalog = []; selected_graph = None; applied_server_t = None
     ; timeline_presentation_pending = false; local_deletion = None; last_error = Some message
-    ; startup = { authenticated = true; catalog_loading = false; awaiting_selection = false
+    ; startup = { authenticated = true; local_access=Service.Local_available; network_phase=Service.Online_by_user; catalog_loading = false; awaiting_selection = false
         ; restoring_local = false; bootstrapping = true; awaiting_e2ee_password = false
         ; failure = Some During_bootstrap; account_generation = 1; graph_generation = 1
         ; presentation_generation = 1 } } in
@@ -150,7 +150,8 @@ let test_diagnostic_identity_comes_from_worker () =
     ; startup = { authenticated = true; catalog_loading = false
         ; awaiting_selection = false; restoring_local = false; bootstrapping = false
         ; awaiting_e2ee_password = false; failure = None; account_generation = 1
-        ; graph_generation = 7; presentation_generation = 1 } }
+        ; graph_generation = 7; presentation_generation = 1
+        ; local_access = Local_available; network_phase = Online_after_timeline } }
   in
   let graph : Logseq_db_worker.graph_state =
     { generation = 7; graph_id = Some actual; phase = Graph_open; error = None }
@@ -694,7 +695,7 @@ let run_favorites_native_visibility
         ; applied_server_t = Some (server_cursor_of_int 0)
         ; timeline_presentation_pending = false
         ; startup =
-            { authenticated = true
+            { authenticated = true; local_access=Service.Local_available; network_phase=Service.Online_by_user
             ; catalog_loading = false
             ; awaiting_selection = false
             ; restoring_local = false
@@ -4013,7 +4014,7 @@ let test_reference_outer_terminals cancel =
         ; applied_server_t = Some (server_cursor_of_int 0)
         ; timeline_presentation_pending = false
         ; startup =
-            { authenticated = true
+            { authenticated = true; local_access=Service.Local_available; network_phase=Service.Online_by_user
             ; catalog_loading = false
             ; awaiting_selection = false
             ; restoring_local = false
@@ -4617,7 +4618,7 @@ let test_favorite_page_uses_shared_reference_lookup () =
     { snapshot =
         { sync_phase = Current; catalog = []; selected_graph = Some (uuid 9)
         ; applied_server_t = Some (server_cursor_of_int 0); timeline_presentation_pending = false
-        ; startup = { authenticated = true; catalog_loading = false; awaiting_selection = false
+        ; startup = { authenticated = true; local_access=Service.Local_available; network_phase=Service.Online_by_user; catalog_loading = false; awaiting_selection = false
             ; restoring_local = false; bootstrapping = false; awaiting_e2ee_password = false
             ; failure = None; account_generation = 1; graph_generation = 1; presentation_generation = 1 }
         ; last_error = None; local_deletion = None }
@@ -5091,7 +5092,7 @@ let test_fixture_exception_cleanup exception_ =
 
 (* Application owns password admission and UI. No public pure root event exists
    for E2EE; this fixture exercises mounted Application through its public hooks. *)
-let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init = false) () =
+let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init = false) ?(cold_start = false) ?on_platform_request ?(on_auth_classified = fun _ -> ()) () =
   let module W = Logseq_db_worker_lui.Journal_worker in
   let graph_id =
     Logseq_db_types.Graph_types.Uuid.of_string "00000000-0000-0000-0000-000000000901"
@@ -5111,7 +5112,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
         ; applied_server_t = None
         ; timeline_presentation_pending = false
         ; startup =
-            { authenticated = true
+            { authenticated = true; local_access=Service.Local_available; network_phase=Service.Online_by_user
             ; catalog_loading = false
             ; awaiting_selection = false
             ; restoring_local = false
@@ -5128,6 +5129,11 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
     ; diagnostics = { groups = [] }
     }
   in
+  let manager = if cold_start then
+    { manager with snapshot = { manager.snapshot with startup =
+      { manager.snapshot.startup with authenticated = false; local_access = Service.Local_pending
+      ; network_phase = Service.Local_only; awaiting_e2ee_password = false } } }
+    else manager in
   let graph_reads = Atomic.make 0 in
   let current = Atomic.make manager in
   let submissions = Atomic.make [] in
@@ -5138,6 +5144,13 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
       ~push_topic_count:6
       ~merge_push:Service.coalesce_push
       ~concurrency:Serial
+      ~control_topic_count:2
+      ~classify_control:(function
+        | Service.Client_command (Reconcile_authenticated_user {user_id}) ->
+          on_auth_classified user_id;
+          Some (W.Latest {topic=1; key=Option.value user_id ~default:"none"; invalidates=Some 0})
+        | _ -> None)
+      ~handle_control:(fun () _ -> ())
       ~init:(fun context _ ->
         W.Session_context.emit
           context
@@ -5217,6 +5230,13 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
                 }
             };
           Ok Service.Client_command_completed
+        | Client_command (Request_sign_in scope) ->
+          let value = Atomic.get current in
+          let startup = value.snapshot.startup in
+          if scope.account_generation = startup.account_generation
+             && scope.presentation_generation = startup.presentation_generation
+          then publish value;
+          Ok Service.Client_command_completed
         | Client_command (Select_graph _) ->
           publish manager;
           Ok Service.Client_command_completed
@@ -5231,6 +5251,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
   let hooks =
     Application.For_testing.app_with_service
       ~on_client:(fun value -> client := Some value; if fail_init then failwith "synthetic init failure")
+      ?on_platform_request
       worker
   in
   hooks, submissions, release, client
@@ -5251,6 +5272,169 @@ let test_failed_init_disposes_context () =
       let failed = try ignore(hooks.init 2 2 startup); false with Failure _ -> true in
       Alcotest.(check bool) "init exception reaches native boundary" true failed;
       Alcotest.(check int) "failed startup releases its mounted context" 0 (hooks.root_node ()))
+;;
+
+let test_repeated_native_sign_in_intent_receives_permission () =
+  let requests = ref [] in
+  let hooks, _, release, client =
+    unlock_fixture ~on_platform_request:(fun bytes -> requests := Bytes.copy bytes :: !requests) ()
+  in
+  let permit_count () =
+    List.fold_left (fun count bytes ->
+      if Bytes.length bytes >= 8 && Bytes.get_uint16_le bytes 6 = 30 then count + 1 else count)
+      0 !requests
+  in
+  let wait label predicate =
+    let deadline = Unix.gettimeofday () +. 2. in
+    while not (predicate ()) && Unix.gettimeofday () < deadline do
+      ignore (hooks.pump ());
+      Unix.sleepf 0.001
+    done;
+    Alcotest.(check bool) label true (predicate ())
+  in
+  let startup =
+    Logseq_db_worker.Config.create
+      ~application_support_directory:"/tmp/journal-online-permission-synthetic"
+      ~target:(Managed_sync { base_url = "https://example.invalid" })
+      ~compatibility_profile:Logseq_65_33_or_newer
+      ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
+      ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+    |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string
+  in
+  let send_intent ?(tag = 34) account_generation presentation_generation =
+    let scope : Service.startup_scope = { account_generation; presentation_generation } in
+    let bytes = Journal_platform.scoped_online_requested_request scope |> Bytes.copy in
+    Bytes.set_uint16_le bytes 6 tag;
+    hooks.platform_event (Bytes.to_string bytes)
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      Atomic.set release true;
+      ignore (hooks.dispose ());
+      Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client)
+    (fun () ->
+      ignore (hooks.init 2 2 startup);
+      wait "initial Online_by_user permission" (fun () -> permit_count () >= 1);
+      requests := [];
+      send_intent 1 1;
+      wait "same-phase sign-in receives permission" (fun () -> permit_count () >= 1);
+      send_intent 1 1;
+      wait "reopened sign-in receives permission" (fun () -> permit_count () >= 2);
+      let before = permit_count () in
+      send_intent 0 0;
+      for _ = 1 to 100 do ignore (hooks.pump ()); Unix.sleepf 0.001 done;
+      Alcotest.(check int) "stale startup intent cannot grant permission" before (permit_count ());
+      send_intent ~tag:35 1 1;
+      send_intent 1 1;
+      for _ = 1 to 100 do ignore (hooks.pump ()); Unix.sleepf 0.001 done;
+      Alcotest.(check int) "queued cancellation fences old-scope retry" before (permit_count ()))
+;;
+
+(* Local-account completion and request continuations belong to Application,
+   not Root_navigation. Drive a genuine failed platform request and its Retry. *)
+let test_local_account_failure_retries_local_discovery () =
+  let requests = ref [] in
+  let hooks, _, release, client = unlock_fixture ~cold_start:true
+      ~on_platform_request:(fun bytes -> requests := !requests @ [Bytes.copy bytes]) () in
+  let props = Hashtbl.create 32 in
+  let teardown=track_json_wire_teardown (Hashtbl.remove props) in
+  let consume patch = if patch <> "" then
+    let open Yojson.Safe.Util in
+    Yojson.Safe.from_string patch |> member "ops" |> to_list |> List.iter (fun op ->
+      teardown op;
+      match member "op" op |> to_string with
+      | "create-node" | "create-extension" -> Hashtbl.replace props (member "id" op |> to_int) []
+      | "set-prop" | "set-extension-prop" ->
+        let id=member "id" op |> to_int in
+        let key=member "property" op |> to_string in
+        let old=Option.value (Hashtbl.find_opt props id) ~default:[] in
+        Hashtbl.replace props id ((key,member "value" op)::List.remove_assoc key old)
+      | _ -> ()) in
+  let find name = Hashtbl.fold (fun id props found ->
+    if List.assoc_opt "accessibility-identifier" props = Some (`String name) then Some id else found) props None in
+  let local_requests () = List.filter (fun bytes -> Bytes.get_uint16_le bytes 6 = 20) !requests in
+  let wait label predicate =
+    let deadline=Unix.gettimeofday () +. 2. in
+    while not (predicate ()) && Unix.gettimeofday () < deadline do consume (hooks.pump ()); Unix.sleepf 0.001 done;
+    Alcotest.(check bool) label true (predicate ()) in
+  let config=Logseq_db_worker.Config.create ~application_support_directory:"/tmp/journal-local-retry-synthetic"
+      ~target:(Managed_sync {base_url="https://example.invalid"}) ~compatibility_profile:Logseq_65_33_or_newer
+      ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
+      ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+      |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
+  Fun.protect ~finally:(fun () -> Atomic.set release true; ignore(hooks.dispose ());
+      Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client) (fun () ->
+    consume (hooks.init 2 2 config);
+    wait "local discovery requested" (fun () -> local_requests () <> []);
+    hooks.platform_failure (Bytes.to_string (List.hd (local_requests ())));
+    wait "transient local failure retains a local Retry" (fun () -> Option.is_some (find "journal-startup-retry"));
+    let before=List.length (local_requests ()) in
+    consume (hooks.dispatch (Lui_protocol.Press (Option.get (find "journal-startup-retry"))));
+    wait "Retry reissues local discovery" (fun () -> List.length (local_requests ()) = before+1);
+    Alcotest.(check bool) "local retry requests no online permission" false
+      (List.exists (fun bytes -> Bytes.get_uint16_le bytes 6 = 30) !requests))
+;;
+
+(* The App owns deferred admission; public Worker delivery lets a newer native
+   event run before a capacity-release callback, without replacing either owner. *)
+let test_pending_auth_never_replays_older_identity ~newer_accepted () =
+  let module W = Logseq_db_worker_lui.Journal_worker in
+  let observed = ref [] in
+  let ready = ref false in
+  let hooks, _, release, client = unlock_fixture ~queue_full:true
+      ~on_platform_request:(fun bytes -> if Bytes.length bytes >= 8 && Bytes.get_uint16_le bytes 6 = 30 then ready := true)
+      ~on_auth_classified:(fun user -> observed := !observed @ [user]) () in
+  let wait label predicate =
+    let deadline = Unix.gettimeofday () +. 2. in
+    while not (predicate ()) && Unix.gettimeofday () < deadline do Unix.sleepf 0.001 done;
+    Alcotest.(check bool) label true (predicate ())
+  in
+  let payload user =
+    let json = Yojson.Safe.to_string (`Assoc ["userId",`String user;
+      "startupScope",`Assoc ["accountGeneration",`Int 1;"presentationGeneration",`Int 1]]) |> Bytes.of_string in
+    let bytes = Bytes.make (32 + Bytes.length json) '\000' in
+    Bytes.blit_string "LJP2" 0 bytes 0 4;
+    Bytes.set_uint16_le bytes 4 2; Bytes.set_uint16_le bytes 6 7;
+    Bytes.set_int32_le bytes 24 (Int32.of_int (Bytes.length json));
+    Bytes.blit json 0 bytes 32 (Bytes.length json);
+    Bytes.to_string bytes
+  in
+  let idle client =
+    let metrics = W.Private.metrics (W.Private.pack_client client) in
+    metrics.queued_requests = 0 && metrics.active_request_fibers = 0
+    && W.For_testing.pending_output_count client = 0
+  in
+  let startup = Logseq_db_worker.Config.create
+    ~application_support_directory:"/tmp/journal-auth-order-synthetic"
+    ~target:(Managed_sync {base_url="https://example.invalid"})
+    ~compatibility_profile:Logseq_65_33_or_newer
+    ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
+    ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+    |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
+  Fun.protect ~finally:(fun () -> Atomic.set release true; ignore (hooks.dispose ());
+    Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client) (fun () ->
+    ignore (hooks.init 2 2 startup);
+    wait "initial manager available" (fun () -> ignore (hooks.pump ());
+      !ready && (match !client with Some c -> idle c | None -> false));
+    let client = Option.get !client in
+    let rec fill remaining = if remaining = 0 then failwith "fixture did not fill" else
+      match W.send client Service.Get_graph_state with
+      | Accepted _ -> fill (remaining - 1) | Full -> () | _ -> failwith "fixture stopped" in
+    fill 128;
+    hooks.platform_event (payload "A"); ignore (hooks.pump ());
+    Alcotest.(check bool) "older native identity reached Full admission" true (List.mem (Some "A") !observed);
+    hooks.platform_event (payload "B");
+    if newer_accepted then (
+      Atomic.set release true;
+      wait "response can release capacity" (fun () -> W.For_testing.pending_output_count client > 0);
+      W.Private.deliver client ~max_events:1);
+    ignore (hooks.pump ());
+    Alcotest.(check bool) "newer native identity reached admission" true (List.mem (Some "B") !observed);
+    Atomic.set release true;
+    wait "deferred commands drained" (fun () -> ignore (hooks.pump ()); idle client);
+    let rec after_newer = function [] -> [] | Some "B" :: rest -> rest | _ :: rest -> after_newer rest in
+    Alcotest.(check bool) "older identity never re-enters Latest after newer verification" false
+      (List.mem (Some "A") (after_newer !observed)))
 ;;
 
 let capture_unlock_logs run =
@@ -5546,11 +5730,12 @@ let test_application_token_control ~saturated ~failure () =
          (patch <> "" && hooks.root_node () <> 0);
        let client = Option.get !client_ref in
        let challenge = ref None
+       and manager = ref None
        and token_error = ref None in
        W.on_event client (function
          | W.Push { payload = S.Need_id_token value; _ } -> challenge := Some value
          | W.Push { payload = S.Client_state_changed state; _ } ->
-           token_error := state.snapshot.last_error
+           token_error := state.snapshot.last_error; manager := Some state.snapshot.startup
          | _ -> ());
        let send request =
          match W.send client request with
@@ -5559,6 +5744,15 @@ let test_application_token_control ~saturated ~failure () =
        in
        send
          (S.Client_command (Restore_local_account { user_id = "synthetic-probe-user" }));
+       wait "local account scope admitted" (fun () ->
+         ignore (hooks.pump ());
+         Option.fold ~none:false ~some:(fun (startup : S.startup_facts) -> startup.account_generation > 0) !manager);
+       let startup = Option.get !manager in
+       send (S.Client_command (Request_sign_in
+         {account_generation=startup.account_generation; presentation_generation=startup.presentation_generation}));
+       wait "explicit online permission admitted" (fun () ->
+         ignore (hooks.pump ());
+         Option.fold ~none:false ~some:(fun (startup : S.startup_facts) -> startup.network_phase = S.Online_by_user) !manager);
        send
          (S.Client_command
             (Reconcile_authenticated_user { user_id = Some "synthetic-probe-user" }));
@@ -5630,7 +5824,7 @@ let test_graph_picker_controls scenario () =
         { sync_phase = Current; catalog = [graph first "Current synthetic graph"; graph second long_name]
         ; selected_graph = Some first; applied_server_t = Some (server_cursor_of_int 0)
         ; timeline_presentation_pending = false
-        ; startup = { authenticated = true; catalog_loading = false; awaiting_selection = false
+        ; startup = { authenticated = scenario <> `Offline; local_access=Service.Local_available; network_phase=(if scenario = `Offline then Service.Local_only else Service.Online_by_user); catalog_loading = false; awaiting_selection = false
           ; restoring_local = false; bootstrapping = false; awaiting_e2ee_password = false
           ; failure = None; account_generation = 1; graph_generation = 1; presentation_generation = 1 }
         ; last_error = None; local_deletion = None }
@@ -5692,7 +5886,10 @@ let test_graph_picker_controls scenario () =
            | Return_to_graph_picker ->
              publish { previous with snapshot = { previous.snapshot with selected_graph = None
                ; startup = { previous.snapshot.startup with awaiting_selection = true } } }
-           | Refresh_catalog when scenario = `Refresh_failure || scenario = `Refresh_after_presence_failure ->
+           | Refresh_catalog _ when scenario = `Offline ->
+             publish { previous with snapshot = { previous.snapshot with startup =
+               { previous.snapshot.startup with authenticated = not previous.snapshot.startup.authenticated } } }
+           | Refresh_catalog _ when scenario = `Refresh_failure || scenario = `Refresh_after_presence_failure ->
              publish { previous with snapshot = { previous.snapshot with
                last_error = Some "Synthetic catalog refresh failed. Try again." } }
            | Select_graph id ->
@@ -5809,6 +6006,26 @@ let test_graph_picker_controls scenario () =
           {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":1,\"last\":2}"}|});
         wait "automatic inspection is held in flight" (fun () -> Atomic.get inspections = 1));
       match scenario with
+      | `Offline ->
+        let delete = node ("graph-picker-delete:" ^ Logseq_db_types.Graph_types.Uuid.to_string second) in
+        Alcotest.(check (option bool)) "offline deletion is disabled" (Some false)
+          (Option.map Yojson.Safe.Util.to_bool (List.assoc_opt "enabled" (Hashtbl.find props delete)));
+        Alcotest.(check bool) "offline deletion explains authentication" true
+          (Option.is_some (find "text" "Connect your account to manage local copies."));
+        (* Authentication is the only changed public manager field. Renderer
+           ownership cannot be reproduced by a pure navigation reducer. *)
+        press (node "graph-picker-refresh");
+        wait "authenticated menu enables deletion" (fun () ->
+          let delete=node ("graph-picker-delete:" ^ Logseq_db_types.Graph_types.Uuid.to_string second) in
+          List.assoc_opt "enabled" (Hashtbl.find props delete) = Some (`Bool true));
+        Alcotest.(check bool) "authenticated menu removes stale connection explanation" false
+          (Option.is_some (find "text" "Connect your account to manage local copies."));
+        press (node "graph-picker-refresh");
+        wait "offline transition restores its explanation" (fun () ->
+          Option.is_some (find "text" "Connect your account to manage local copies."));
+        let delete=node ("graph-picker-delete:" ^ Logseq_db_types.Graph_types.Uuid.to_string second) in
+        Alcotest.(check (option bool)) "offline transition disables deletion again" (Some false)
+          (Option.map Yojson.Safe.Util.to_bool (List.assoc_opt "enabled" (Hashtbl.find props delete)))
       | `Refresh_failure ->
         press (node "graph-picker-refresh");
         wait "catalog refresh failure is visible" (fun () ->
@@ -6120,7 +6337,9 @@ let () =
             ; "pagination"
             ] )
     ; ("Favorites compact title",[Alcotest.test_case "Favorite Page uses shared reference lookup" `Quick test_favorite_page_uses_shared_reference_lookup; Alcotest.test_case "page property values keep name without duplication" `Quick test_detail_page_property_value_presentation; Alcotest.test_case "root Capture only in Journals" `Quick test_root_capture_placement; Alcotest.test_case "LUI titles icons and no arrow" `Quick test_favorites_compact_shared_titles; Alcotest.test_case "page outline click and native Back" `Quick (fun () -> run_favorites_native_visibility ~check_favorite_targets:true ())])
+    ; ( "local account retry", [Alcotest.test_case "transient failure retries local discovery" `Quick test_local_account_failure_retries_local_discovery])
     ; ( "graph picker", [
+        Alcotest.test_case "offline deletion is disabled with explanation" `Quick (test_graph_picker_controls `Offline);
         Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);
         Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);
         Alcotest.test_case "current marker and long names" `Quick (test_graph_picker_controls `Current);
@@ -6163,6 +6382,14 @@ let () =
             `Quick
             (test_application_token_control ~saturated:false ~failure:true)
         ] )
+    ; ( "native auth admission"
+      , [ Alcotest.test_case "Full older auth is superseded by accepted newer auth" `Quick
+            (fun () -> test_pending_auth_never_replays_older_identity ~newer_accepted:true ())
+        ; Alcotest.test_case "Full auth retains only latest identity" `Quick
+            (fun () -> test_pending_auth_never_replays_older_identity ~newer_accepted:false ()) ] )
+    ; ( "native online permission"
+      , [ Alcotest.test_case "same-phase sign-in acknowledges every current intent" `Quick
+            test_repeated_native_sign_in_intent_receives_permission ] )
     ; ( "E2EE input"
       , [ Alcotest.test_case "Application admission and recovery" `Quick test_unlock_application
         ; Alcotest.test_case "Application unlock worker failure releases pending" `Quick

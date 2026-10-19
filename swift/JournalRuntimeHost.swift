@@ -182,7 +182,8 @@ struct JournalHost: View {
             if platform.authenticationRequired || platform.accountIssue != nil {
               JournalAccountRecoveryView(issue: platform.accountIssue,
                 signInAvailable: platform.authenticationRequired || platform.accountIssue?.offersSignIn == true,
-                signIn: { signInPresented = true }, retry: { platform.refreshAuthentication() })
+                signIn: { signInPresented = true },
+                retry: platform.accountIssue?.stage == .bindingRead ? nil : { platform.retryOnline() })
             }
           }
       }
@@ -209,6 +210,7 @@ struct JournalHost: View {
       NavigationStack {
         JournalAuthenticationView(api: JournalPreparedAuthentication(api: authentication,
           prepare: { try await platform.prepareAccount() },
+          authorize: { try await platform.beginOnline() },
           cancelPreparation: { platform.cancelAccountPreparation() },
           preparationMessage: {
             platform.accountIssue.map { ($0.errorDescription ?? "") + "\n" + $0.diagnostic }
