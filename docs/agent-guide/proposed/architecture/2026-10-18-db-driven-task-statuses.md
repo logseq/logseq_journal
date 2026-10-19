@@ -284,5 +284,77 @@ An existing independent local-restoration repair is preserved on
 `codex/fix-local-restore-auth-order-20261017` at `e5b9b2b`, and the separate
 Graph-restoration task is implementing the startup dependency. Neither repair
 has been copied into this status branch. All temporary observers, logs and
-synthetic data remain outside this product worktree. Actual Simulator acceptance
-and exact-head CI remain required before a formal PR.
+synthetic data remain outside this product worktree. At that checkpoint actual
+Simulator acceptance and exact-head CI were still pending.
+
+
+### Combined-source Simulator acceptance on October 19
+
+The final independent startup repair is PR97 at
+`cd25b81fc5512413398d66ee9f85491bc75eaad6`; its owner reports exact-head CI
+39204306865 completed successfully. The separate diagnostics repair is PR96 at
+`900326be3009b39103cd6fb8ed5d8f5396d0a765`. Both remain independent, unmerged
+PRs. Neither dependency was copied into this status branch.
+
+A local acceptance worktree combines this status branch at `939a149`, all five
+PR96 commits and the final PR97 commit. It preserves PR96 failure reporting and
+PR97 typed startup failures/network-owned cancellation. Two compile fixes add a
+snapshot type annotation and the new startup fields to the status identity test.
+The resulting clean integration commit is
+`4e0a425e6d8e8cfe31033ca43258829267564f80`. The corresponding source passes
+`@all` and forced full `runtest`: 21 reported Alcotest suites / 939 cases,
+including Sync 295 and Application 131, plus standalone programs. That local run
+preceded committing the two fixes; byte comparison binds its source to the final
+commit. It is not exact-head remote CI proof. Independent final-source review
+found no remaining issue.
+
+The maintained producer/importer built and strictly verified the matching
+isolated Simulator App. Its installed executable SHA-256 is
+`e11267dff149a0416f1608b3bfd6944b70f66eca4b0d128faab8301b722e34aa`.
+The native object is production code without overrides; the Swift entry is the
+unmodified existing warm-start fixture, with the remaining Swift files matching
+production. Authentication is deliberately blocked by that fixture. This remains
+experimental host restamping with `cross_abi_validated=false`, and does not
+establish real authentication, server synchronization or ordinary App acceptance.
+
+On existing Simulator 1446, only the separate
+`org.logseq.journal.db-status-runtime-probe` bundle and fresh synthetic directories
+were used. Production Diagnostics reported Ready/Open, actual graph UUID
+`60000000-0000-4000-8000-000000000001` / generation 1; after graph selection it
+reported graph `...0002` / generation 2. Restart restored graph 2 at generation 1
+in the new process. The host's first Timeline observation recorded zero token
+requests. These are manual UI identity checks, not authenticated IPC capture.
+
+Actual native interactions and public Overlay API readback confirm:
+
+- 17 available database choices, stable UUID option identifiers, long CJK labels,
+  applying a long custom status and clearing it without changing block content.
+- Capture and Append in graph 1 use its configured default UUID `...0100`.
+  Graph 2 has no default, opens the explicit chooser, and its Capture retains the
+  selected UUID `...0102`. Readback contains exactly one of each created block,
+  no cross-graph leakage, and the expected six/two local outbox records.
+- Fresh metadata variants show a renamed status, exclude recycled choices, show
+  an empty title as Unnamed status, and admit an added UUID `...0112`. A newly
+  captured task uses that changed database default, exactly once.
+- An empty catalog retains an existing recycled UUID as Unavailable status,
+  explicitly reports no available choices, and offers Clear. Clearing it creates
+  one local outbox record and readback confirms no remaining block status.
+- The ten-level synthetic tree, rich Markdown/reference/link content, properties,
+  detail navigation, link return, Append, light mode and dark maximum window
+  Dynamic Type were exercised. All fixture changes use public APIs and complete
+  WAL packages; no real graph was read for examples or mutated.
+
+Nine actual screenshots and hash-bound manifests/readbacks are retained outside
+Git under the task evidence directory `db-status/integration-20261019`. Maximum
+Dynamic Type visual inspection passed for visible content, but the UI tool's
+scroll/drag calls returned windowNotFoundAtPosition. Full list scrolling at that
+size and high-contrast/VoiceOver behavior remain unverified. Metadata variants
+verify restart loading, not live server metadata delivery; reducer/runtime tests
+cover incremental invalidation and generation fencing. A135 was not changed in
+this round and its original page acceptance is still pending. Phone 47 was not
+touched. The independent probe is stopped and Simulator 1446 has been released.
+
+The status PR keeps this status-only source and names PR96/97 as integration
+prerequisites. Its exact-head remote CI remains a separate release gate; the
+combined acceptance commit must not be represented as the status-only PR head.
+No PR is merged or configured for automatic merge by this work.
