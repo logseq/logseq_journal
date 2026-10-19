@@ -454,6 +454,7 @@ let run_favorites_native_visibility
       ?(check_generation = false)
       ?(check_chrome = false)
       ?(check_error_control = false)
+      ?malformed_native_event
       ?(check_ios_capture = false)
       ?(check_capture_imports = false)
       ?detail_capture
@@ -1486,6 +1487,29 @@ let run_favorites_native_visibility
        wait "Journals mounted" (fun () ->
          Option.is_some (find "accessibility-label" "Favorites")
          && Option.is_some (find "text" "Timeline fixture 2"));
+       (* OCaml event decoding belongs to the mounted view adapter, outside
+          Root_navigation's public reducer events. Exercise the real decoder. *)
+       Option.iter (fun mode ->
+         let identifier, payload, operation = match mode with
+           | `List -> "journal-list", "private-malformed-event", "decodeListEvent"
+           | `Row -> "journal-list", {|{"type":"row_event","payload":"private-malformed-event"}|}, "decodeListRowEvent"
+           | `Extension -> "journal-chrome", "private-malformed-event", "decodeExtensionEvent" in
+         let native = if mode<>`Extension then Option.get (find "_extension" identifier)
+           else Hashtbl.fold (fun id values found ->
+             match List.assoc_opt "_extension" values, List.assoc_opt "payload" values with
+             | Some (`String "journal-chrome"), Some (`String payload) ->
+               if Yojson.Safe.Util.member "mode" (Yojson.Safe.from_string payload)=`String "page"
+               then Some id else found
+             | _ -> found) props None |> Option.get in
+         consume (hooks.extension_event native "event" (Yojson.Safe.to_string
+           (`Assoc ["id", `Int 1; "payload", `String payload])));
+         dispatch (Lui_protocol.Press (Option.get (find "text" "Diagnostics")));
+         wait "actual mounted decoder reports to Diagnostics" (fun () ->
+           Option.is_some (find "text" operation));
+         Alcotest.(check bool) "raw event never becomes diagnostic text" true
+           (Option.is_none (find "text" "private-malformed-event"));
+         dispatch (Lui_protocol.Press (Option.get
+           (find "accessibility-identifier" "journal-diagnostics-close")))) malformed_native_event;
        (* Delete admission is private to Application, absent from Root_navigation's
           public pure events. Use its existing public bridge and controlled Worker
           fixture to execute the actual UI admission/completion boundary. *)
@@ -5067,7 +5091,7 @@ let test_fixture_exception_cleanup exception_ =
 
 (* Application owns password admission and UI. No public pure root event exists
    for E2EE; this fixture exercises mounted Application through its public hooks. *)
-let unlock_fixture ?(worker_failure = false) ?(queue_full = false) () =
+let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init = false) () =
   let module W = Logseq_db_worker_lui.Journal_worker in
   let graph_id =
     Logseq_db_types.Graph_types.Uuid.of_string "00000000-0000-0000-0000-000000000901"
@@ -5206,10 +5230,27 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) () =
   in
   let hooks =
     Application.For_testing.app_with_service
-      ~on_client:(fun value -> client := Some value)
+      ~on_client:(fun value -> client := Some value; if fail_init then failwith "synthetic init failure")
       worker
   in
   hooks, submissions, release, client
+;;
+
+let test_failed_init_disposes_context () =
+  (* Startup failure belongs to the public native hook, outside Root_navigation. *)
+  let hooks, _, release, client = unlock_fixture ~fail_init:true () in
+  let startup = Logseq_db_worker.Config.create
+      ~application_support_directory:"/tmp/journal-init-synthetic"
+      ~target:(Managed_sync {base_url="https://example.invalid"})
+      ~compatibility_profile:Logseq_65_33_or_newer
+      ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
+      ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+      |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
+  Fun.protect ~finally:(fun () -> Atomic.set release true; ignore(hooks.dispose());
+    Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client) (fun () ->
+      let failed = try ignore(hooks.init 2 2 startup); false with Failure _ -> true in
+      Alcotest.(check bool) "init exception reaches native boundary" true failed;
+      Alcotest.(check int) "failed startup releases its mounted context" 0 (hooks.root_node ()))
 ;;
 
 let capture_unlock_logs run =
@@ -5234,7 +5275,7 @@ let capture_unlock_logs run =
 ;;
 
 let run_unlock_application ?(worker_failure = false) ?(queue_full = false)
-    ?(stopping = false) () =
+    ?(stopping = false) ?(check_diagnostics = false) ?(native_report = false) ?malformed_platform () =
   let hooks, submissions, release, client = unlock_fixture ~worker_failure ~queue_full () in
   let props = Hashtbl.create 64 in
   let track_teardown = track_json_wire_teardown (Hashtbl.remove props) in
@@ -5334,7 +5375,24 @@ let run_unlock_application ?(worker_failure = false) ?(queue_full = false)
          wait "worker failure releases unlock pending" (fun () ->
            property (node "e2ee-password-editor") "enabled" = Some (`Bool true));
          Alcotest.(check int) "failure bypasses no crypto service" 0
-           (List.length (Atomic.get submissions)))
+           (List.length (Atomic.get submissions));
+         if native_report then (
+           let extension = Hashtbl.fold (fun id values found ->
+             if List.mem_assoc "payload" values then Some id else found) props None |> Option.get in
+           consume (hooks.extension_event extension "event"
+             {|{"id":-1,"payload":"diagnostic.nativePropsDecode"}|}));
+         Option.iter (fun kind ->
+           (if kind="response" then hooks.platform_response else hooks.platform_failure) "short";
+           consume(hooks.pump())) malformed_platform;
+         if check_diagnostics || native_report || Option.is_some malformed_platform then (
+           dispatch (Lui_protocol.Press (node "journal-startup-diagnostics"));
+           wait "current failure is retained in existing Diagnostics" (fun () ->
+             Option.is_some (find "text" (match malformed_platform with
+               | Some "response" -> "decodePlatformResponse"
+               | Some _ -> "decodePlatformFailure"
+               | None -> if native_report then "decodeNativeProps" else "submitE2eePassword")));
+           Alcotest.(check bool) "diagnostic excludes submitted password" true
+             (Option.is_none (find "text" " synthetic-only "))))
        else (
        wait "Return reaches worker" (fun () -> List.length (Atomic.get submissions) = 1);
        Alcotest.(check string)
@@ -5914,6 +5972,106 @@ let test_graph_picker_controls scenario () =
           (Option.is_some (find "text" "Switch graphs first.")))
 ;;
 
+(* Compose the production runtime's public completions with the Application
+   reducer. The injected clock is a host capability, not an injected issue. *)
+let test_detail_reconciliation_diagnostics mode =
+  let module G = Logseq_db_types.Graph_types in
+  let module P = Logseq_db_worker.Protocol in
+  let module R = Journal_graph_runtime in
+  let module A = Application.Root_navigation in
+  let uuid s = G.Uuid.of_string s |> Result.get_ok in
+  let page_id = uuid "f1000000-0000-4000-8000-000000000001" in
+  let block_id = uuid "f1000000-0000-4000-9000-000000000001" in
+  let fail_clock = ref false in
+  let runtime = R.create ~localtime:(fun instant ->
+    let tm = Unix.gmtime instant in
+    if !fail_clock then {tm with tm_mday=0} else tm) () in
+  let calendar = Journal_calendar.Sampler.create ~clock:(fun () -> 1_788_192_000.)
+    ~localtime:Unix.gmtime () |> Journal_calendar.Sampler.sample |> Result.get_ok in
+  if mode <> `Calendar then R.set_calendar runtime calendar;
+  let page : G.page = {uuid=page_id; name="private-page-sentinel"; title="private-page-sentinel";
+    kind=Ordinary_page; created_at_ms=1_788_192_000_000L; updated_at_ms=1_788_192_000_000L;
+    recycled=false; tags=[]; properties=[]} in
+  let block : G.block = {uuid=block_id; title="private-block-sentinel"; parent=page_id;
+    page=page_id; order="a"; created_at_ms=1_788_192_000_000L;
+    updated_at_ms=1_788_192_000_000L; refs=[]; tags=[]; properties=[]} in
+  let one label = function [x] -> x | _ -> Alcotest.fail label in
+  let reply request outcome = P.V2_response {api_version=P.api_version;
+    request_id=request.P.request_id; outcome} in
+  let step request outcome = R.receive runtime (reply request outcome) in
+  let read = R.submit runtime (Journal_graph_request.Load_detail
+    {block_id=G.Uuid.to_string block_id; after=None; limit=32; request_generation=9L})
+    |> fun o -> one "root read" o.requests in
+  let read = step read (P.V2_block_outcome (V2_present_block
+    {value={block; task_status=None; rendered_page_title=page.title; tag_titles=[]}; revision="r1"}))
+    |> fun o -> one "page read" o.requests in
+  let read = step read (P.V2_page_outcome (V2_present_page {page; revision="p1"}))
+    |> fun o -> one "children read" o.requests in
+  ignore(step read (P.V2_children_outcome {parent=block_id;
+    revision_scope=V2_children_revision block_id; scope_revision="c1"; items=[]; next_cursor=None}));
+  let pull = R.reconcile_push runtime ~request_generation:10L
+    (P.V2_changes_available {api_version=P.api_version; generation="g"; through="p2"})
+    |> fun o -> one "changes read" o.requests in
+  let output = step pull (P.V2_changes {generation="g"; from_exclusive=None; through="p2";
+    next=None; windows=[{id="w"; predecessor="p1"; successor="p2"; block_uuids=[];
+      page_uuids=[page_id]; structure_interests=[]}]}) in
+  let read = List.find (fun (r:P.request) -> match r.command with
+    | V2_get_page _ -> true | _ -> false) output.requests in
+  if mode=`Projection then fail_clock:=true;
+  if mode=`Retired then R.reset runtime;
+  let completed = step read (P.V2_page_outcome (V2_present_page {page; revision="p2"})) in
+  let state = A.create ~graph_generation:7 |> fun s -> A.step s (Capture_edited "retained draft") in
+  let apply state = List.fold_left (fun s response -> A.step s (Completed response)) state completed.responses in
+  let state = apply state in
+  let rows = A.diagnostic_rows state in
+  if mode=`Healthy || mode=`Retired then
+    Alcotest.(check (list (pair string string))) "no false current issue" [] rows
+  else (
+    let operation = if mode=`Calendar then "reconcileDetailCalendar" else "reconcileDetail" in
+    Alcotest.(check (option string)) "actual producer reaches Diagnostics operation"
+      (Some operation) (List.assoc_opt "Operation" rows);
+    Alcotest.(check (option string)) "presentation phase" (Some "presentation")
+      (List.assoc_opt "Stage" rows);
+    Alcotest.(check (option string)) "current graph scope" (Some "graph generation=7")
+      (List.assoc_opt "Scope" rows);
+    Alcotest.(check (option string)) "specific safe failure reason"
+      (Some (if mode=`Calendar then "The host calendar is unavailable, so this detail refresh could not finish."
+        else "The entry time could not be converted to a valid local date and time."))
+      (List.assoc_opt "Reason" rows);
+    Alcotest.(check bool) "usable recovery" true (Option.is_some(List.assoc_opt "Recovery" rows));
+    Alcotest.(check bool) "no content" false (List.exists (fun (_,s) -> s=page.title || s=block.title) rows);
+    Alcotest.(check (list (pair string string))) "active issue deduplicated" rows
+      (A.diagnostic_rows (apply state));
+    Alcotest.(check (list (pair string string))) "account change clears issues" []
+      (A.diagnostic_rows (A.step state Account_cleared)));
+  Alcotest.(check string) "nonfatal completion retains draft" "retained draft"
+    (A.capture state |> Option.get |> Journal_capture.source);
+  Alcotest.(check int) "duplicate completion remains retired" 0
+    (List.length (step read (P.V2_page_outcome (V2_present_page {page; revision="p2"}))).responses)
+;;
+
+(* Root_navigation owns acceptance of feed completions and its issue ledger.
+   Generate the failure through the real graph runtime, then retire its owner. *)
+let test_retired_feed_failure_does_not_publish_diagnostics projection =
+  let module R = Journal_graph_runtime in
+  let module A = Application.Root_navigation in
+  let runtime = R.create () in
+  let output = R.submit runtime (Journal_graph_request.Load_feed
+    {before_day=None; day_limit=(if projection then 0 else 7);
+     blocks_per_day=32; slot_limit=64; request_generation=9L}) in
+  let responses = if projection then output.responses else
+    match output.requests with
+    | [request] -> (R.fail_request runtime request ~message:"Retired transport failed.").responses
+    | _ -> Alcotest.fail "expected admitted feed request" in
+  Alcotest.(check int) "real producer emitted one failure" 1 (List.length responses);
+  let state = A.create ~graph_generation:7
+    |> fun state -> A.step state (Capture_edited "retained draft") in
+  let state = A.step state (Graph_replaced {generation=8; graph_id=None}) in
+  let state = List.fold_left (fun state response -> A.step state (Completed response)) state responses in
+  Alcotest.(check (list (pair string string))) "retired feed cannot create a current issue" []
+    (A.diagnostic_rows state)
+;;
+
 let () =
   if Sys.getenv_opt "JOURNAL_UNLOCK_SYNTHETIC_HOST" = Some "1"
   then (
@@ -5922,7 +6080,27 @@ let () =
   else Alcotest.run
     "application view"
     [ ( "diagnostic identity", [ Alcotest.test_case "actual worker identity" `Quick test_diagnostic_identity_comes_from_worker ])
-    ; ( "diagnostic failure", [ Alcotest.test_case "current error and clearing" `Quick test_diagnostic_phase_rows_retain_current_error ])
+    ; ( "diagnostic failure", [
+      Alcotest.test_case "retired feed Worker failure is ignored" `Quick
+        (fun () -> test_retired_feed_failure_does_not_publish_diagnostics false);
+      Alcotest.test_case "retired feed projection failure is ignored" `Quick
+        (fun () -> test_retired_feed_failure_does_not_publish_diagnostics true);
+      Alcotest.test_case "mounted malformed list reaches Diagnostics" `Quick (fun () -> run_favorites_native_visibility ~malformed_native_event:`List ());
+      Alcotest.test_case "mounted malformed row reaches Diagnostics" `Quick (fun () -> run_favorites_native_visibility ~malformed_native_event:`Row ());
+      Alcotest.test_case "mounted malformed extension reaches Diagnostics" `Quick (fun () -> run_favorites_native_visibility ~malformed_native_event:`Extension ());
+      Alcotest.test_case "reconcile calendar producer to ledger" `Quick (fun () -> test_detail_reconciliation_diagnostics `Calendar);
+      Alcotest.test_case "reconcile projection producer to ledger" `Quick (fun () -> test_detail_reconciliation_diagnostics `Projection);
+      Alcotest.test_case "healthy reconciliation has no issue" `Quick (fun () -> test_detail_reconciliation_diagnostics `Healthy);
+      Alcotest.test_case "retired reconciliation has no issue" `Quick (fun () -> test_detail_reconciliation_diagnostics `Retired);
+ Alcotest.test_case "failed init disposes context" `Quick test_failed_init_disposes_context; Alcotest.test_case "current error and clearing" `Quick test_diagnostic_phase_rows_retain_current_error
+        ; Alcotest.test_case "current admission failure reaches Diagnostics" `Quick
+            (fun () -> run_unlock_application ~queue_full:true ~check_diagnostics:true ())
+        ; Alcotest.test_case "native extension failure reaches Diagnostics" `Quick
+            (fun () -> run_unlock_application ~worker_failure:true ~native_report:true ())
+        ; Alcotest.test_case "short platform response reaches Diagnostics" `Quick
+            (fun () -> run_unlock_application ~worker_failure:true ~malformed_platform:"response" ())
+        ; Alcotest.test_case "short platform failure reaches Diagnostics" `Quick
+            (fun () -> run_unlock_application ~worker_failure:true ~malformed_platform:"failure" ()) ])
     ; ( "direct delete", List.map (fun scenario ->
         Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~delete_scenario:scenario ()))
         ["success"; "failure"])

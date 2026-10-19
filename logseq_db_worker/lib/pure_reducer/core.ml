@@ -475,7 +475,7 @@ let step state event =
                  state
              in
              { next = transitioned.next
-             ; effects = Publish (Diagnostic message) :: transitioned.effects
+             ; effects = Publish (Diagnostic "worker.applyAuthoritative") :: transitioned.effects
              }
            | Some (Sync.Apply_outbox_transition request) ->
              let transitioned =
@@ -486,7 +486,7 @@ let step state event =
                  state
              in
              { transitioned with
-               effects = Publish (Diagnostic message) :: transitioned.effects
+               effects = Publish (Diagnostic "worker.applyOutbox") :: transitioned.effects
              }
            | Some (Sync.Detach_graph scope) ->
              translate_sync
@@ -500,7 +500,15 @@ let step state event =
                   state.sync_core
                   (Sync.Mirror_deleted (request, Error "Mirror deletion failed.")))
                state
-           | Some _ | None -> { next = state; effects = [ Publish (Diagnostic message) ] })
+           | Some _ | None ->
+             let code = match worker_effect with
+               | Some (Sync.Inspect_mirror _) -> "worker.inspectMirror"
+               | Some (Sync.Attach_graph _) -> "worker.attachGraph"
+               | Some (Sync.Inspect_sync _) -> "worker.inspectSync"
+               | Some (Sync.Reset_managed_account _) -> "worker.resetAccount"
+               | Some _ | None -> "worker.operation"
+             in
+             { next = state; effects = [ Publish (Diagnostic code) ] })
         | Ok result ->
           let state, lifecycle_effects =
             match state.graph.phase, worker_effect with

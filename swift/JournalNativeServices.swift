@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 @MainActor enum JournalNativeServices {
   static let managedSyncOrigin = "https://api.logseq.io"
@@ -83,7 +84,13 @@ private final class JournalNativeAccountStorage: Sendable {
         Task { @MainActor in
           let done = try await Self.access.acquire(respectCancellation: false)
           defer { done() }
-          if Self.acceptedRecovery == recovery.id { try? await self.repairIfNeeded() }
+          if Self.acceptedRecovery == recovery.id {
+            do { try await self.repairIfNeeded() }
+            catch {
+              Logger(subsystem: "com.logseq.journal", category: "account")
+                .error("Account binding cleanup is pending (account.bindingCleanup.failed)")
+            }
+          }
         }
       }, rollback: {
         defer { release() }

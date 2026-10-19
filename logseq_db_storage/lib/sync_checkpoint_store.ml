@@ -210,7 +210,7 @@ let read_path path =
   try
     let db = Sqlite3.db_open ~mode:`READONLY path in
     Fun.protect
-      ~finally:(fun () -> ignore (Sqlite3.db_close db))
+      ~finally:(fun () -> (if not (Sqlite3.db_close db) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ))
       (fun () -> read_database db)
   with
   | exn -> Error (Printexc.to_string exn)

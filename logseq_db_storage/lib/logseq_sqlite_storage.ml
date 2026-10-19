@@ -296,7 +296,7 @@ let open_database path =
     Sqlite3.Rc.check (Sqlite3.exec sqlite "PRAGMA locking_mode=NORMAL");
     (match verify_writable_pragmas sqlite with
      | Error error ->
-       ignore (Sqlite3.db_close sqlite);
+       (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" );
        raise
          (Failure
             (match error with
@@ -317,7 +317,7 @@ let open_database path =
     in
     if normalized_columns <> expected
     then (
-      ignore (Sqlite3.db_close sqlite);
+      (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" );
       Error (Pragma_mismatch "unexpected kvs table contract"))
     else (
       let invalid_address = ref None in
@@ -329,7 +329,7 @@ let open_database path =
            ~cb:(fun row _ -> invalid_address := row.(0)));
       match !invalid_address with
       | Some address ->
-        ignore (Sqlite3.db_close sqlite);
+        (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" );
         Error (Pragma_mismatch ("invalid kvs integer address: " ^ address))
       | None ->
         let capture : (string, Datascript.storage_payload) Hashtbl.t option ref =

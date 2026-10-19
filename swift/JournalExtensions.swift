@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import SwiftUI
 import LUIAppleBackend
 
@@ -97,8 +98,31 @@ enum JournalExtensionFingerprint {
   ) -> Properties? {
     guard case let .string(json) = context.property("payload"),
       let value = try? JSONDecoder().decode(type, from: Data(json.utf8))
-    else { return nil }
+    else {
+      report(context: context, code: "diagnostic.nativePropsDecode")
+      return nil
+    }
     return value
+  }
+
+  /// Reuse the registered event envelope for fixed diagnostic codes. The OCaml
+  /// adapter checks the mounted node and coalesces repeat reports in its scope.
+  static func report(context: LUIAppleExtensionViewContext, code: String) {
+    let revision = context.revision
+    guard revision >= 0 else { return } // Unmounted/retired context.
+    // Decoding may run in SwiftUI.body. Deliver after that render and discard
+    // the report if its node has changed or disappeared in the meantime.
+    Task { @MainActor in
+      guard context.revision == revision else { return }
+      do {
+        try context.emit(name: "event", values: ["id": .int(-1), "payload": .string(code)])
+      } catch {
+        if context.revision == revision {
+          Logger(subsystem: "com.logseq.journal", category: "native")
+            .error("Native diagnostic delivery failed (native.report.failed)")
+        }
+      }
+    }
   }
 
   /// Forwards one journal event on the `"event"` schema, matching the old
@@ -108,12 +132,15 @@ enum JournalExtensionFingerprint {
     context: LUIAppleExtensionViewContext, id: Int = 1, payload: Data
   ) -> Bool {
     guard context.isUserInteractionEnabled else { return false }
-    return (try? context.emit(
-      name: "event",
-      values: [
-        "id": .int(id),
-        "payload": .string(String(decoding: payload, as: UTF8.self)),
-      ])) != nil
+    do {
+      try context.emit(name: "event", values: [
+        "id": .int(id), "payload": .string(String(decoding: payload, as: UTF8.self)),
+      ])
+      return true
+    } catch {
+      report(context: context, code: "diagnostic.nativeEventDelivery")
+      return false
+    }
   }
 
   private static func journalExtension(

@@ -1,9 +1,19 @@
 import Foundation
+import OSLog
 import ImageIO
 import UniformTypeIdentifiers
 
 /// An exact, operation-owned copy; no image decoding/re-encoding or resizing.
 enum JournalPhotoSaveFile {
+  private static func discard(_ directory: URL) {
+    do { try FileManager.default.removeItem(at: directory) }
+    catch let error as CocoaError where error.code == .fileNoSuchFile { } // Idempotent cleanup.
+    catch {
+      Logger(subsystem: "com.logseq.journal", category: "cleanup")
+        .error("Temporary photo cleanup could not finish (photoSave.cleanup.failed)")
+    }
+  }
+
   static func stage(_ source: URL) throws -> JournalPhotoSave.FileLease {
     guard source.isFileURL else { throw JournalPhotoSave.StageError.notImage }
     guard try source.checkResourceIsReachable() else { throw CocoaError(.fileReadNoSuchFile) }
@@ -23,7 +33,7 @@ enum JournalPhotoSaveFile {
     // Prefer the detected format to a cache filename's arbitrary extension.
     let staged = directory.appendingPathComponent("image").appendingPathExtension(type.preferredFilenameExtension ?? source.pathExtension)
     do { try manager.copyItem(at: source, to: staged) }
-    catch { try? manager.removeItem(at: directory); throw error }
-    return JournalPhotoSave.FileLease(url: staged) { try? manager.removeItem(at: directory) }
+    catch { discard(directory); throw error }
+    return JournalPhotoSave.FileLease(url: staged) { discard(directory) }
   }
 }

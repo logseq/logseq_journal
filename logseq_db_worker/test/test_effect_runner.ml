@@ -963,7 +963,9 @@ let test_db_shutdown_accepts_late_staging_completion () =
              Eio.Fiber.yield ()))))
 ;;
 
-let test_upload_checkpoint_io () =
+(* Pure reducers cannot execute filesystem cleanup or warning-output failures.
+   Reuse real public Runner staging cleanup with an unwritable stderr capability. *)
+let test_upload_checkpoint_io ?(closed_stderr = false) () =
   let module U = Logseq_db_worker_pure_reducer.Asset_upload in
   let module I = Logseq_db_types.Asset_upload_intent in
   let module Store = Logseq_db_storage.Asset_upload_store in
@@ -1330,7 +1332,16 @@ let test_upload_checkpoint_io () =
         Fun.protect
           ~finally:(fun () -> Unix.chmod staging_directory 0o700)
           (fun () ->
-             Runner.submit runner (Core.Run_upload (context, restore_terminal ()));
+             Runner.submit runner (Core.Publish (Core.Sync_output (Sync.State_changed (Sync.state !sync_state))));
+             let terminal_cleanup = restore_terminal () in
+             let cleanup () = Runner.submit runner (Core.Run_upload (context, terminal_cleanup)) in
+             if not closed_stderr then cleanup () else (
+               flush stderr;
+               let saved = Unix.dup Unix.stderr in
+               let read_only = Unix.openfile "/dev/null" [Unix.O_RDONLY] 0 in
+               Fun.protect ~finally:(fun () ->
+                 Unix.dup2 saved Unix.stderr; Unix.close saved; Unix.close read_only)
+                 (fun () -> Unix.dup2 read_only Unix.stderr; cleanup ()));
              Alcotest.(check bool)
                "unavailable cache retains pending source"
                true
@@ -1343,6 +1354,12 @@ let test_upload_checkpoint_io () =
                     | Core.Diagnostic _ -> true
                     | _ -> false)
                   !published);
+             let signed_out = Sync.step !sync_state (Sync.Account_authenticated {user_id=None}) in
+             Runner.submit runner (Core.Publish (Core.Sync_output (Sync.State_changed (Sync.state signed_out.next))));
+             published := [];
+             Runner.submit runner (Core.Run_upload (context, restore_terminal ()));
+             Alcotest.(check bool) "old scope cleanup cannot create a current diagnostic" false
+               (List.exists (function Core.Diagnostic _ -> true | _ -> false) !published);
              Runner.shutdown runner);
         sync_state := admitted;
         io_runner
@@ -1396,7 +1413,8 @@ let test_upload_checkpoint_io () =
         Runner.shutdown restarted)))
 ;;
 
-let deletion_runtime_fixture ?deletion_case ?(journal_failure = false) ~busy () =
+let deletion_runtime_fixture ?deletion_case ?(journal_failure = false)
+      ?(confirmation_failure = false) ~busy () =
   let module Db = Logseq_db_worker in
   let module G = Logseq_db_types.Graph_types in
   T.with_managed (fun fixture ->
@@ -1458,6 +1476,7 @@ let deletion_runtime_fixture ?deletion_case ?(journal_failure = false) ~busy () 
       ignore (Sqlite3.db_close sqlite);
       let worker = ref None and refreshed = ref false and held_cleanup = ref None in
       let destructive_requests = ref 0 in
+      let published = ref [] and blocked_states = ref None in
       let post event = Db.post (Option.get !worker) (Core.Sync_event event) in
       let sync_runner = Runner.sync_runner ~submit:(function
         | Sync.Request (ticket, Sync.Load_catalog _) ->
@@ -1476,7 +1495,18 @@ let deletion_runtime_fixture ?deletion_case ?(journal_failure = false) ~busy () 
         | Sync.Asset_io (ticket, { context; action = Sync.Prepare_graph_asset_deletion retirement; _ }) ->
           incr destructive_requests;
           let deletion = Sync.asset_deletion_reference ~scope:context.scope ~retirement in
-          if busy || Option.is_some deletion_case then post (Sync.Runner_completed (Sync.Asset_completion (ticket, Ok (Sync.Asset_deletion_prepared deletion))))
+          if confirmation_failure then (
+            (* Preparation has already written the uncommitted receipt. Keep
+               it readable so the canonical rename can commit, but prevent
+               the receipt rewrite that confirms durability afterwards. *)
+            let states = Filename.concat mirrors
+                (Filename.concat ".mirror-deletions"
+                   (Filename.concat (G.Uuid.to_string first) "states")) in
+            Unix.chmod states 0o500;
+            blocked_states := Some states;
+            post (Sync.Runner_completed (Sync.Asset_completion
+              (ticket, Ok (Sync.Asset_deletion_prepared deletion)))))
+          else if busy || Option.is_some deletion_case then post (Sync.Runner_completed (Sync.Asset_completion (ticket, Ok (Sync.Asset_deletion_prepared deletion))))
           else held_cleanup := Some (ticket, deletion)
         | Sync.Asset_io (ticket, _) ->
           post (Sync.Runner_completed (Sync.Asset_completion (ticket, Ok Sync.Asset_unit)))
@@ -1484,7 +1514,8 @@ let deletion_runtime_fixture ?deletion_case ?(journal_failure = false) ~busy () 
       let dependencies = Runner.dependencies
           ~runtime:(Runner.runtime ~fork:(fun ~sw task -> Eio.Fiber.fork ~sw task)
               ~sleep:(Eio.Time.sleep (Eio.Stdenv.clock env)) |> Result.get_ok)
-          ~config:fixture.config ~overlay:fixture.overlay ~sync_runner ~publish:(fun _ -> ())
+          ~config:fixture.config ~overlay:fixture.overlay ~sync_runner
+          ~publish:(fun output -> published := output :: !published)
           |> Result.get_ok in
       let limits = Sync.limits ~maximum_response_bytes:1024 ~maximum_artifact_bytes:1024
           ~submission_batch_size:1 |> Result.get_ok in
@@ -1506,6 +1537,7 @@ let deletion_runtime_fixture ?deletion_case ?(journal_failure = false) ~busy () 
             (Option.is_some snapshot.startup.failure)
             (Option.value snapshot.last_error ~default:"none") in
       Fun.protect ~finally:(fun () ->
+        Option.iter (fun states -> Unix.chmod states 0o700) !blocked_states;
         Option.iter (fun (ticket, _) -> post (Sync.Runner_completed
           (Sync.Asset_completion (ticket, Error Sync.Asset_cancelled)))) !held_cleanup;
         Db.shutdown db)
@@ -1517,7 +1549,24 @@ let deletion_runtime_fixture ?deletion_case ?(journal_failure = false) ~busy () 
             snapshot.selected_graph = Some second && (Db.graph_state db).phase = Db.Graph_open
             && not snapshot.startup.bootstrapping && not snapshot.startup.restoring_local);
           let generation = (Db.view db).sync.snapshot.startup.account_generation in
-          if Option.is_some deletion_case then (
+          if confirmation_failure then (
+            published := [];
+            ignore (Db.delete_local_copy db ~account_generation:generation ~graph_id:first);
+            Alcotest.(check bool) "canonical deletion reached the caught confirmation fault" false
+              (Sys.file_exists directory);
+            Alcotest.(check bool) "current other graph stays open" true
+              ((Db.graph_state db).phase = Db.Graph_open);
+            let states = Option.get !blocked_states in
+            let receipts = Sys.readdir states |> Array.to_list in
+            Alcotest.(check bool) "unconfirmed receipt remains replayable" true
+              (List.exists (fun name -> Filename.check_suffix name ".json"
+                 && not (T.read_json (Filename.concat states name)
+                    |> Yojson.Safe.Util.member "committed" |> Yojson.Safe.Util.to_bool)) receipts);
+            Alcotest.(check bool) "caught current confirmation failure publishes Diagnostic" true
+              (List.exists (function
+                | Core.Diagnostic "worker.confirmMirrorRetirement" -> true
+                | _ -> false) !published))
+          else if Option.is_some deletion_case then (
             let result = Db.delete_local_copy db ~account_generation:generation ~graph_id:first in
             (match result with Ok () -> () | Error message -> Alcotest.failf "unopened local copy must delete: %s" message);
             Alcotest.(check bool) "selected target directory is absent" false (Sys.file_exists directory);
@@ -1569,6 +1618,8 @@ let deletion_runtime_fixture ?deletion_case ?(journal_failure = false) ~busy () 
 let test_catalog_refresh_cannot_complete_another_deletion () = deletion_runtime_fixture ~busy:false ()
 let test_deletion_checks_ownership_before_assets () = deletion_runtime_fixture ~busy:true ()
 let test_deletion_journal_failure_preserves_worker () = deletion_runtime_fixture ~journal_failure:true ~busy:false ()
+let test_deletion_confirmation_failure_reports () =
+  deletion_runtime_fixture ~confirmation_failure:true ~busy:false ()
 
 let () =
   Alcotest.run
@@ -1637,6 +1688,8 @@ let () =
             "durable upload checkpoint IO"
             `Quick
             test_upload_checkpoint_io
+        ; Alcotest.test_case "staging cleanup survives unavailable warning output" `Quick
+            (test_upload_checkpoint_io ~closed_stderr:true)
         ; Alcotest.test_case
             "sync and publish delegation"
             `Quick
@@ -1649,6 +1702,8 @@ let () =
             test_deletion_checks_ownership_before_assets
         ; Alcotest.test_case "journal IO failure preserves current Worker" `Quick
             test_deletion_journal_failure_preserves_worker
+        ; Alcotest.test_case "caught retirement confirmation failure reports Diagnostic" `Quick
+            test_deletion_confirmation_failure_reports
         ; Alcotest.test_case "delete never-opened legacy copy" `Quick
             (deletion_runtime_fixture ~deletion_case:`Legacy ~busy:false)
         ; Alcotest.test_case "delete non-SQLite copy" `Quick

@@ -60,6 +60,11 @@ let dispatch = function
   | ExtensionEvent _ -> failwith "extension bypassed its host hook"
 ;;
 
+let receive_platform bytes =
+  if bytes = "raise" then failwith "SENSITIVE platform fixture text";
+  pending_platform := Some bytes
+;;
+
 let () =
   Journal_bridge.register
     { init = (fun _ _ _ -> start_worker (); patch 42 "init")
@@ -67,15 +72,18 @@ let () =
     ; extension_event =
         (fun node name payload -> patch node ("extension:" ^ name ^ ":" ^ payload))
     ; pump = (fun () ->
+        if !pending_platform = Some "pump-raise" then (
+          pending_platform := None;
+          failwith "SENSITIVE pump fixture text");
         let text = Option.fold ~none:"pump" ~some:(fun bytes ->
           let buffer = Buffer.create (String.length bytes * 2) in
           String.iter (fun byte -> Buffer.add_string buffer (Printf.sprintf "%02x" (Char.code byte))) bytes;
           "platform:" ^ Buffer.contents buffer) !pending_platform in
         pending_platform := None;
         patch 42 text)
-    ; platform_event = (fun bytes -> pending_platform := Some bytes)
-    ; platform_response = (fun bytes -> pending_platform := Some bytes)
-    ; platform_failure = (fun bytes -> pending_platform := Some bytes)
+    ; platform_event = receive_platform
+    ; platform_response = receive_platform
+    ; platform_failure = receive_platform
     ; dispose = (fun () -> stop_worker (); patch 42 "dispose")
     ; root_node = (fun () -> 42)
     }

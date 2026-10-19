@@ -1,6 +1,7 @@
 import CryptoKit
 import LUIAppleBackend
 import Observation
+import OSLog
 import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
@@ -11,6 +12,15 @@ import UIKit
 private actor JournalAssetStaging {
   static let shared = JournalAssetStaging()
 
+  nonisolated static func discard(_ file: URL) {
+    do { try FileManager.default.removeItem(at: file) }
+    catch let error as CocoaError where error.code == .fileNoSuchFile { } // Idempotent cleanup.
+    catch {
+      Logger(subsystem: "com.logseq.journal", category: "cleanup")
+        .error("Temporary attachment cleanup could not finish (assetImport.cleanup.failed)")
+    }
+  }
+
   func copy(_ source: URL) -> URL? {
     let scoped = source.startAccessingSecurityScopedResource()
     defer { if scoped { source.stopAccessingSecurityScopedResource() } }
@@ -18,13 +28,13 @@ private actor JournalAssetStaging {
     let name = "journal-import-" + UUID().uuidString.lowercased() + (ext.isEmpty ? "" : "." + ext)
     let dest = FileManager.default.temporaryDirectory.appendingPathComponent(name)
     do { try FileManager.default.copyItem(at: source, to: dest); return dest }
-    catch { try? FileManager.default.removeItem(at: dest); return nil }
+    catch { Self.discard(dest); return nil }
   }
 
   func write(_ data: Data, ext: String) -> URL? {
     let dest = FileManager.default.temporaryDirectory.appendingPathComponent("journal-import-" + UUID().uuidString.lowercased() + "." + ext)
     do { try data.write(to: dest); return dest }
-    catch { try? FileManager.default.removeItem(at: dest); return nil }
+    catch { Self.discard(dest); return nil }
   }
 }
 
@@ -182,7 +192,7 @@ private actor JournalAssetStaging {
     }
 
     private func discard(_ items: [Pick]) {
-      for item in items { try? FileManager.default.removeItem(atPath: item.path) }
+      for item in items { JournalAssetStaging.discard(URL(fileURLWithPath: item.path)) }
     }
 
     private func emitBatch(_ items: [Pick], failures: Int, request: Request, epoch: Int) {
@@ -219,7 +229,7 @@ private actor JournalAssetStaging {
         guard !Task.isCancelled, isCurrent(request, epoch: epoch) else { discard(items); return }
         guard let copy = await JournalAssetStaging.shared.copy(source) else { failures += 1; continue }
         guard !Task.isCancelled, isCurrent(request, epoch: epoch) else {
-          try? FileManager.default.removeItem(at: copy); discard(items); return
+          JournalAssetStaging.discard(copy); discard(items); return
         }
         items.append(pick(path: copy.path(percentEncoded: false), title: source.lastPathComponent,
                           type: source.pathExtension.lowercased(), identity: identity))

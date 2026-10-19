@@ -1184,10 +1184,65 @@ let test_local_copy_presence mode () =
       | _ -> T.fail "presence request returned another response"))
 ;;
 
+(* The missing owner boundary is the production service publisher: the pure
+   reducer already emits Diagnostic. Corrupt only a synthetic mirror, then
+   observe the real service's existing Client_state_changed/Diagnostics push. *)
+let test_restore_error_reaches_diagnostics () =
+  let module Core = Logseq_sync_pure_reducer.Core in
+  let module G = Logseq_db_types.Graph_types in
+  T.with_managed (fun fixture ->
+    let root = fixture.config.Logseq_db_worker.Config.application_support_directory in
+    let graph_id = G.Uuid.of_string "94000000-0000-4000-8000-000000000909" |> Result.get_ok in
+    let graph : Core.graph = { graph_id; name="sensitive-synthetic-title"; encrypted=false
+      ; schema={major=65;minor=33;exact=true} } in
+    let user = "diagnostic-synthetic-user" in
+    let worker = Filename.concat root "logseq-db-worker" in
+    Unix.mkdir worker 0o700;
+    let catalogs = Filename.concat worker "sync-catalogs" in
+    Unix.mkdir catalogs 0o700;
+    let name = Digestif.SHA256.digest_string (user ^ "\000https://api.logseq.io") |> Digestif.SHA256.to_hex in
+    let cache = Core.catalog_cache ~user_id:user ~graphs:[graph] ~selected_graph:(Some graph_id) in
+    Out_channel.with_open_bin (Filename.concat catalogs (name ^ ".json"))
+      (fun out -> output_string out (Core.encode_catalog_cache cache));
+    let mirrors = Filename.concat worker "synced-graphs" in
+    Unix.mkdir mirrors 0o700;
+    let mirror = Filename.concat mirrors (G.Uuid.to_string graph_id) in
+    Unix.mkdir mirror 0o700;
+    Out_channel.with_open_bin (Filename.concat mirror "db.sqlite")
+      (fun out -> output_string out "sensitive-synthetic-broken-sqlite");
+    with_client fixture.config (fun client ->
+      ignore (Worker.send client (Service.Client_command (Restore_local_account {user_id=user})) |> accepted);
+      let found = ref None in
+      let drain () = Worker.For_testing.drain_events client ~max_events:64 |> List.iter (function
+        | Worker.Push {payload=Service.Client_state_changed state;_} ->
+          if List.exists (fun (g:Service.diagnostic_group) -> g.title="Worker errors" && g.entries<>[]) state.diagnostics.groups
+          then found:=Some state
+        | _ -> ()) in
+      control_wait "restore failure reaches production Diagnostics push" (fun () -> drain (); Option.is_some !found);
+      let state = Option.get !found in
+      let rows = List.concat_map (fun (g:Service.diagnostic_group) -> g.entries) state.diagnostics.groups in
+      let text = String.concat "\n" (List.concat_map (fun (k,v)->[k;v]) rows) in
+      let contains needle =
+        let rec loop i = i+String.length needle<=String.length text &&
+          (String.sub text i (String.length needle)=needle || loop (i+1)) in loop 0 in
+      T.require (contains "inspectMirror") "diagnostic retains fixed operation";
+      List.iter (fun sensitive -> T.require (not (contains sensitive)) "diagnostic excludes sensitive source")
+        [root;user;graph.name;"sensitive-synthetic-broken-sqlite"];
+      ignore (Worker.send client (Service.Client_command (Restore_local_account {user_id="another-synthetic-user"})) |> accepted);
+      let cleared = ref false in
+      control_wait "account replacement clears old diagnostic scope" (fun () ->
+        Worker.For_testing.drain_events client ~max_events:64 |> List.iter (function
+          | Worker.Push {payload=Service.Client_state_changed next;_}
+            when next.snapshot.startup.account_generation<>state.snapshot.startup.account_generation ->
+            cleared := not (List.exists (fun (g:Service.diagnostic_group)->g.title="Worker errors" && g.entries<>[]) next.diagnostics.groups)
+          | _ -> ()); !cleared)))
+;;
+
 let () =
   T.run
     "lui worker service"
-    [ T.case "local copy confirmed deletion awaits physical removal" (test_local_copy_presence "delete")
+    [ T.case "ignored restore failure reaches scoped safe Diagnostics" test_restore_error_reaches_diagnostics
+    ; T.case "local copy confirmed deletion awaits physical removal" (test_local_copy_presence "delete")
     ; T.case "local copy busy failure recovers" (test_local_copy_presence "busy")
     ; T.case "local copy absent metadata" (test_local_copy_presence "absent")
     ; T.case "local copy downloaded without body decoding" (test_local_copy_presence "downloaded")
