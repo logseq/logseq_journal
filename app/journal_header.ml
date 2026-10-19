@@ -130,9 +130,17 @@ let bounded_text ~child title =
 ;;
 
 let detail_row ~depth body =
-  Ui.Native_widget.widget chrome
-    ~props:(props ~mode:"detail-row" ~level:(min 2 depth) ())
-    ~on_event:(fun _ -> ()) ~children:[ body ] ()
+  let depth = max 0 (min 9 depth) in
+  (* Keep real depth visible, reducing each step so deep text retains width.
+     Typography is independently capped by detail_text. *)
+  let inset =
+    if depth <= 2 then depth * 16
+    else 32 + (min 4 depth - 2) * 8 + max 0 (depth - 4) * 5
+  in
+  V.of_lui
+    (Lui_elements.column ~gap:0 ~cross:`start ~grow:1.0
+       ~margin_left:inset ~margin_top:(if depth = 1 then 16 else 4)
+       ~margin_bottom:4 [ Ui.mount body ])
 ;;
 
 let detail ~capture_enabled ~on_capture ~copy_enabled ~on_copy ~copy_feedback body =

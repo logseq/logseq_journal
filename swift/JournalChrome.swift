@@ -29,7 +29,6 @@ struct JournalSheetDismissButton: SwiftUI.View {
     case toolbarControl = "toolbar-control"
     case detailText = "detail-text"
     case boundedText = "bounded-text"
-    case detailRow = "detail-row"
   }
 
   private struct Properties: Decodable {
@@ -82,6 +81,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
   private struct DetailText: SwiftUI.View {
     let text: AttributedString
     let id: String
+    let level: Int
     @ScaledMetric(relativeTo: .body) private var size: CGFloat = 17
     @ScaledMetric(relativeTo: .body) private var targetLineHeight: CGFloat = 27
 
@@ -89,8 +89,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
       self.text = text
       self.id = id
       let tier = min(2, max(0, level))
-      _size = ScaledMetric(wrappedValue: [24, 19, 15][tier], relativeTo: .body)
-      _targetLineHeight = ScaledMetric(wrappedValue: [31, 25, 20][tier], relativeTo: .body)
+      self.level = tier
+      _size = ScaledMetric(wrappedValue: [28, 19, 17][tier], relativeTo: .body)
+      _targetLineHeight = ScaledMetric(wrappedValue: [35, 26, 25][tier], relativeTo: .body)
     }
 
     private var lineSpacing: CGFloat {
@@ -103,28 +104,13 @@ struct JournalSheetDismissButton: SwiftUI.View {
 
     var body: some SwiftUI.View {
       Text(text)
-        .font(.system(size: size, weight: .regular))
+        .font(.system(size: size, weight: level == 0 ? .bold : level == 1 ? .semibold : .regular))
         .foregroundStyle(.primary)
         .lineSpacing(lineSpacing)
         .multilineTextAlignment(.leading)
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityIdentifier(id)
-    }
-  }
-
-  private struct DetailRow: SwiftUI.View {
-    let content: AnyView
-    @ScaledMetric(relativeTo: .body) private var paragraphGap: CGFloat = 12
-
-    init(content: AnyView, level: Int) {
-      self.content = content
-      _paragraphGap = ScaledMetric(wrappedValue: [24, 20, 18][min(2, max(0, level))], relativeTo: .body)
-    }
-
-    var body: some SwiftUI.View {
-      content.frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.bottom, paragraphGap)
     }
   }
 
@@ -311,10 +297,6 @@ struct JournalSheetDismissButton: SwiftUI.View {
         if let properties, let text = properties.text, let id = properties.id,
           let level = properties.level, context.childIDs.isEmpty {
           DetailText(text: JournalChrome.attributed(properties.runs, fallback: text), id: id, level: level)
-        }
-      case .detailRow:
-        if let level = properties?.level, context.childIDs.count == 1 {
-          DetailRow(content: child(0), level: level)
         }
       case .toolbarControl:
         if context.childIDs.count == 1 {

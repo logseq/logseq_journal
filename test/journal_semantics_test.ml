@@ -2700,8 +2700,11 @@ let test_detail_three_tiers_keep_deep_order_and_plain_rows () =
   let child = block ~id:(id 2) ~parent_id:block_id ~source:"出发前的准备" () in
   let grandchild = block ~id:(id 3) ~parent_id:(id 2) ~source:"带上雨衣和充电宝\n下载离线地图" () in
   let deep = block ~id:(id 4) ~parent_id:(id 3) ~source:"更深一层，完整保留中文内容" () in
-  let deeper = block ~id:(id 5) ~parent_id:(id 4) ~source:"第四层以下仍然可以阅读" ~child_count:0 () in
-  let sibling = block ~id:(id 6) ~parent_id:block_id ~source:"沿途记录" ~child_count:0 () in
+  let deeper = block ~id:(id 5) ~parent_id:(id 4) ~source:"第四层以下仍然可以阅读" () in
+  let tail = List.init 5 (fun n -> block ~id:(id (n + 6)) ~parent_id:(id (n + 5))
+    ~source:("深层正文 " ^ String.concat " " (List.init 40 (fun _ -> "Long readable text")))
+    ~child_count:(if n = 4 then 0 else 1) ()) in
+  let sibling = block ~id:(id 11) ~parent_id:block_id ~source:"沿途记录" ~child_count:0 () in
   let projection root children : Journal_graph_projection.detail =
     { root; children = { blocks = children; continuation = None } }
   in
@@ -2711,7 +2714,9 @@ let test_detail_three_tiers_keep_deep_order_and_plain_rows () =
   in
   let pages =
     [ projection child [grandchild]; projection grandchild [deep]
-    ; projection deep [deeper]; projection deeper []; projection sibling [] ] in
+    ; projection deep [deeper]; projection deeper [List.hd tail]; projection sibling [] ]
+    @ List.mapi (fun index root -> projection root
+        (if index = 4 then [] else [List.nth tail (index + 1)])) tail in
   let rec complete routes =
     match Journal_routes.initial_load routes with
     | None -> routes
@@ -2731,20 +2736,67 @@ let test_detail_three_tiers_keep_deep_order_and_plain_rows () =
       | _ -> None) (ops ()) in
     let list = List.find (fun p -> Yojson.Basic.Util.member "sections" p <> `Null) payloads in
     let rows = Yojson.Basic.Util.(list |> member "sections" |> to_list |> List.hd |> member "rows" |> to_list) in
-    require (List.length rows = 6) "Detail flattens only visual layout, preserving all loaded descendants and order";
+    require (List.length rows = 11) "Detail flattens only visual layout, preserving all loaded descendants and order";
     require (List.map (Yojson.Basic.Util.member "key") rows =
       List.map (fun b -> `String ("block:" ^ Journal_model.id b))
-        [ root; child; grandchild; deep; deeper; sibling ]) "Detail changes owner traversal order";
+        ([ root; child; grandchild; deep; deeper ] @ tail @ [ sibling ])) "Detail changes owner traversal order";
     List.iter (fun row ->
       require (Yojson.Basic.Util.member "type" row = `String "row") "Detail retains disclosure nesting";
       require (Yojson.Basic.Util.member "separator" row = `String "hidden") "Detail retains hierarchy separators") rows;
     let labels = List.filter (fun p -> Yojson.Basic.Util.member "mode" p = `String "detail-text") payloads in
     require (has_text (ops ()) "#周末  #trip") "Detail drops owned tags";
-    let expected = [ root, 0; child, 1; grandchild, 2; deep, 2; deeper, 2; sibling, 1 ] in
+    let expected = [ root, 0; child, 1; grandchild, 2; deep, 2; deeper, 2; sibling, 1 ]
+      @ List.map (fun block -> block, 2) tail in
     List.iter (fun (block, level) ->
       let label = List.find (fun p -> Yojson.Basic.Util.member "id" p = `String ("detail-block:" ^ Journal_model.id block)) labels in
       require (Yojson.Basic.Util.member "level" label = `Int level) "Detail loses the three-level typography cap";
       require (Yojson.Basic.Util.member "text" label <> `Null) "Detail drops long or Chinese text") expected)
+;;
+
+(* Row typography/layout have no reducer owner. Mount the public row boundary
+   to verify all ten levels without a graph or an Apple host. *)
+let test_detail_lui_shallow_indentation_keeps_content_and_actions () =
+  let depths = List.init 10 Fun.id @ [ -1; max_int ] in
+  let insets = List.map (fun depth ->
+    let pressed = ref false in
+    let body = V.button
+      ~on_press:(Ui.Event.Handler.create (fun _ -> pressed := true))
+      ~child:(V.text "完整正文 bold link reference\nLong body remains available") ()
+      |> V.with_test_id (Ui.Test_id.string "detail-layout-body") in
+    with_mounted (Journal_header.detail_row ~depth body) (fun app ops ->
+      let body_node = mounted_node (ops ()) AccessibilityIdentifier (StringValue "detail-layout-body") in
+      let parent = List.find_map (function
+        | Lui_protocol.InsertChild (parent, child, _) when child = body_node -> Some parent
+        | _ -> None) (ops ()) |> Option.get in
+      let prop key = List.find_map (function
+        | Lui_protocol.SetProp (node, name, value) when node = parent && name = key -> Some value
+        | _ -> None) (ops ()) in
+      require (List.exists (function
+        | Lui_protocol.CreateNode (node, Column) when node = parent -> true
+        | _ -> false) (ops ())) "Detail row layout must be owned by an existing LUI column";
+      let integer key = match prop key with
+        | Some (IntValue value) -> value
+        | _ -> fail "Detail row is missing explicit paragraph layout" in
+      let inset = integer MarginLeft in
+      require (inset >= 0 && inset <= 73) "Detail indentation consumes the body width";
+      require (prop CrossAlignment = Some (StringValue "start")) "Detail body must stay leading aligned";
+      require (prop BackgroundValue = None && prop BorderWidth = None) "Detail adds card or hierarchy chrome";
+      require (integer MarginTop = (if depth = 1 then 16 else 4)) "Detail primary branches need more space than parent-child rows";
+      require (integer MarginBottom = 4) "Detail row paragraph spacing changes across deep body levels";
+      require (current_text (ops ()) "完整正文 bold link reference\nLong body remains available") "Detail row loses its content";
+      ignore (Lui_app.dispatch_event app (Press body_node));
+      ignore (Lui_app.flush app);
+      require !pressed "Detail row intercepts its child action";
+      inset)) depths in
+  let rec monotonic = function
+    | left :: (right :: _ as rest) -> require (left < right) "Detail flattens distinct real depths"; monotonic rest
+    | _ -> () in
+  let ten = List.filteri (fun index _ -> index < 10) insets in
+  monotonic ten;
+  require (ten = [ 0; 16; 32; 40; 48; 53; 58; 63; 68; 73 ])
+    "Detail should increase each level while preserving deep mobile body width";
+  require (List.nth insets 10 = List.hd insets) "Negative depth must use root layout";
+  require (List.nth insets 11 = List.nth insets 9) "Out-of-range depth must stay bounded"
 ;;
 
 let test_detail_flat_branch_has_no_collapse_action () =
@@ -2976,7 +3028,9 @@ let tests =
     ; ( "Bottom native inset retains Capture"
       , test_bottom_controls_reuse_lui_inset_and_keep_capture )
     ]
-  @ [ ( "Detail three typography tiers and deep flat rows"
+  @ [ ( "Detail LUI shallow indentation and child events"
+      , test_detail_lui_shallow_indentation_keeps_content_and_actions )
+    ; ( "Detail three typography tiers and deep flat rows"
       , test_detail_three_tiers_keep_deep_order_and_plain_rows )
     ; ( "Detail flat branch removes collapse"
       , test_detail_flat_branch_has_no_collapse_action )
