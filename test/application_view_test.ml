@@ -5031,7 +5031,7 @@ let capture_unlock_logs run =
 ;;
 
 let run_unlock_application ?(worker_failure = false) ?(queue_full = false)
-    ?(stopping = false) ?(check_diagnostics = false) ?(native_report = false) () =
+    ?(stopping = false) ?(check_diagnostics = false) ?(native_report = false) ?malformed_platform () =
   let hooks, submissions, release, client = unlock_fixture ~worker_failure ~queue_full () in
   let props = Hashtbl.create 64 in
   let track_teardown = track_json_wire_teardown (Hashtbl.remove props) in
@@ -5136,10 +5136,16 @@ let run_unlock_application ?(worker_failure = false) ?(queue_full = false)
              if List.mem_assoc "payload" values then Some id else found) props None |> Option.get in
            consume (hooks.extension_event extension "event"
              {|{"id":-1,"payload":"diagnostic.nativePropsDecode"}|}));
-         if check_diagnostics || native_report then (
+         Option.iter (fun kind ->
+           (if kind="response" then hooks.platform_response else hooks.platform_failure) "short";
+           consume(hooks.pump())) malformed_platform;
+         if check_diagnostics || native_report || Option.is_some malformed_platform then (
            dispatch (Lui_protocol.Press (node "journal-startup-diagnostics"));
-           wait "queue refusal is retained in existing Diagnostics" (fun () ->
-             Option.is_some (find "text" (if native_report then "decodeNativeProps" else "submitE2eePassword")));
+           wait "current failure is retained in existing Diagnostics" (fun () ->
+             Option.is_some (find "text" (match malformed_platform with
+               | Some "response" -> "decodePlatformResponse"
+               | Some _ -> "decodePlatformFailure"
+               | None -> if native_report then "decodeNativeProps" else "submitE2eePassword")));
            Alcotest.(check bool) "diagnostic excludes submitted password" true
              (Option.is_none (find "text" " synthetic-only "))))
        else (
@@ -5698,7 +5704,11 @@ let () =
         ; Alcotest.test_case "current admission failure reaches Diagnostics" `Quick
             (fun () -> run_unlock_application ~queue_full:true ~check_diagnostics:true ())
         ; Alcotest.test_case "native extension failure reaches Diagnostics" `Quick
-            (fun () -> run_unlock_application ~worker_failure:true ~native_report:true ()) ])
+            (fun () -> run_unlock_application ~worker_failure:true ~native_report:true ())
+        ; Alcotest.test_case "short platform response reaches Diagnostics" `Quick
+            (fun () -> run_unlock_application ~worker_failure:true ~malformed_platform:"response" ())
+        ; Alcotest.test_case "short platform failure reaches Diagnostics" `Quick
+            (fun () -> run_unlock_application ~worker_failure:true ~malformed_platform:"failure" ()) ])
     ; ( "direct delete", List.map (fun scenario ->
         Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~delete_scenario:scenario ()))
         ["success"; "failure"])

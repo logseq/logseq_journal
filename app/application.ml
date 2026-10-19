@@ -7328,6 +7328,9 @@ let create
         let tag = Bytes.get_uint16_le bytes 6 in
         Journal_pump.enqueue pump (fun () ->
           send_action (Platform_response (tag, Ok bytes))))
+      else Journal_pump.enqueue pump (fun () ->
+        send_action (Update (fun state ->
+          report_ui_error state ~operation:"decodePlatformResponse" ~phase:"native", Effect.ignore)))
     | None -> ()
   in
   let platform_failure payload =
@@ -7340,6 +7343,9 @@ let create
         Journal_pump.enqueue pump (fun () ->
           send_action
             (Platform_response (tag, Error "application platform request failed"))))
+      else Journal_pump.enqueue pump (fun () ->
+        send_action (Update (fun state ->
+          report_ui_error state ~operation:"decodePlatformFailure" ~phase:"native", Effect.ignore)))
     | None -> ()
   in
   let dispose () =
