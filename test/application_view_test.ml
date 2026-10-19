@@ -5602,6 +5602,9 @@ let test_graph_picker_controls scenario () =
            | Return_to_graph_picker ->
              publish { previous with snapshot = { previous.snapshot with selected_graph = None
                ; startup = { previous.snapshot.startup with awaiting_selection = true } } }
+           | Refresh_catalog _ when scenario = `Offline ->
+             publish { previous with snapshot = { previous.snapshot with startup =
+               { previous.snapshot.startup with authenticated = not previous.snapshot.startup.authenticated } } }
            | Refresh_catalog _ when scenario = `Refresh_failure || scenario = `Refresh_after_presence_failure ->
              publish { previous with snapshot = { previous.snapshot with
                last_error = Some "Synthetic catalog refresh failed. Try again." } }
@@ -5724,7 +5727,21 @@ let test_graph_picker_controls scenario () =
         Alcotest.(check (option bool)) "offline deletion is disabled" (Some false)
           (Option.map Yojson.Safe.Util.to_bool (List.assoc_opt "enabled" (Hashtbl.find props delete)));
         Alcotest.(check bool) "offline deletion explains authentication" true
-          (Option.is_some (find "text" "Connect your account to manage local copies."))
+          (Option.is_some (find "text" "Connect your account to manage local copies."));
+        (* Authentication is the only changed public manager field. Renderer
+           ownership cannot be reproduced by a pure navigation reducer. *)
+        press (node "graph-picker-refresh");
+        wait "authenticated menu enables deletion" (fun () ->
+          let delete=node ("graph-picker-delete:" ^ Logseq_db_types.Graph_types.Uuid.to_string second) in
+          List.assoc_opt "enabled" (Hashtbl.find props delete) = Some (`Bool true));
+        Alcotest.(check bool) "authenticated menu removes stale connection explanation" false
+          (Option.is_some (find "text" "Connect your account to manage local copies."));
+        press (node "graph-picker-refresh");
+        wait "offline transition restores its explanation" (fun () ->
+          Option.is_some (find "text" "Connect your account to manage local copies."));
+        let delete=node ("graph-picker-delete:" ^ Logseq_db_types.Graph_types.Uuid.to_string second) in
+        Alcotest.(check (option bool)) "offline transition disables deletion again" (Some false)
+          (Option.map Yojson.Safe.Util.to_bool (List.assoc_opt "enabled" (Hashtbl.find props delete)))
       | `Refresh_failure ->
         press (node "graph-picker-refresh");
         wait "catalog refresh failure is visible" (fun () ->

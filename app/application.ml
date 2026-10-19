@@ -6484,6 +6484,7 @@ let start
           | Some left, Some right -> left.catalog == right.catalog
             && left.selected_graph = right.selected_graph
             && left.startup.account_generation = right.startup.account_generation
+            && left.startup.authenticated = right.startup.authenticated
             && left.startup.catalog_loading = right.startup.catalog_loading
             && left.last_error = right.last_error
           | _ -> false)
