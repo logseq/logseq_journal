@@ -16,10 +16,11 @@ extension JournalAuthenticationAPI {
 @MainActor struct JournalPreparedAuthentication: JournalAuthenticationAPI {
   let api: any JournalAuthenticationAPI
   let prepare: () async throws -> Void
+  var authorize: () async throws -> Void = {}
   var cancelPreparation: () -> Void = { }
   var preparationMessage: () -> String? = { nil }
   var accountPreparationMessage: String? { preparationMessage() }
-  func signIn() async throws { try await api.signIn() }
+  func signIn() async throws { try await authorize(); try await api.signIn() }
   func cancelSignIn() { api.cancelSignIn(); cancelPreparation() }
   func prepareAccount() async throws { try await prepare() }
 }

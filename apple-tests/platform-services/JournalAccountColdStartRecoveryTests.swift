@@ -61,7 +61,7 @@ enum JournalLocalAccountBindingStore {
       _ = try await owner.response(for:.localAccount)
       let gate=DispatchSemaphore(value:0)
       JournalLocalAccountBindingStore.gate.withLock { $0=gate }
-      let pending=Task { try await owner.response(for:.authenticatedUser) }
+      let pending=Task { try await owner.explicitOnlineResponse(for:.authenticatedUser) }
       let replacement=try JournalLocalAccountBindingStore.encode(userID:"replacement-user",managedSyncOrigin:origin)
       let deadline=ContinuousClock.now + .seconds(3)
       while try JournalLocalAccountBindingStore.loadData() != replacement {
@@ -95,5 +95,13 @@ enum JournalLocalAccountBindingStore {
       precondition(bytes == (absent ? nil : original))
       print("PASS cold retry restores original bytes or original absence")
     }
+  }
+}
+
+// The existing storage/undo scenarios exercise user-authorized online recovery.
+@MainActor private extension JournalPlatformServices {
+  func explicitOnlineResponse(for request:JournalPlatformWire.Request) async throws -> JournalPlatformWire.Response {
+    _ = try await response(for:.onlineRequested)
+    return try await response(for:request)
   }
 }

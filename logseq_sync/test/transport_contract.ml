@@ -201,6 +201,7 @@ let bootstrap ?(mirror_absent = true) ?(user_id = "fixture") origin =
     |> Result.get_ok
     |> Core.initial
     |> Result.get_ok
+    |> fun core -> (Core.step core (Core.Sign_in_requested {account_generation=0;presentation_generation=0})).next
   in
   let auth = Core.step initial (Core.Account_authenticated { user_id = Some user_id }) in
   let catalog =
@@ -347,7 +348,7 @@ let websocket_send (scope : Core.connection_scope) checkpoint =
   |> Option.get
 ;;
 
-let cancellation_effect scope =
+let cancellation_effect ?(network_only = false) scope =
   let core =
     Core.config
       ~managed_sync_origin:(Uri.of_string "https://localhost")
@@ -355,15 +356,20 @@ let cancellation_effect scope =
     |> Result.get_ok
     |> Core.initial
     |> Result.get_ok
+    |> fun core -> (Core.step core (Core.Sign_in_requested {account_generation=0;presentation_generation=0})).next
   in
   let core =
     (Core.step core (Core.Account_authenticated { user_id = Some "fixture" })).next
   in
-  let transition = Core.step core Core.Shutdown in
+  let transition = if network_only then (
+    let startup = (Core.state core).snapshot.startup in
+    Core.step core (Core.Online_cancelled {account_generation=startup.account_generation;
+      presentation_generation=startup.presentation_generation}))
+    else Core.step core Core.Shutdown in
   ignore scope;
   List.find_map
     (function
-      | Core.Run (Core.Cancel_effects _ as runnable) -> Some runnable
+      | Core.Run ((Core.Cancel_effects _ | Core.Cancel_network_effects _) as runnable) -> Some runnable
       | _ -> None)
     transition.effects
   |> Option.get
@@ -1541,7 +1547,7 @@ let delayed_network ?(destination = Fun.id) network before_connect =
   Eio.Resource.T ((network, before_connect), Eio.Net.Pi.network (module Network))
 ;;
 
-let test_stalled_tcp ~cancel () =
+let test_stalled_tcp ?(network_only = false) ~cancel () =
   let report =
     with_peer
       (if cancel then [] else [ case (response "x") ])
@@ -1578,7 +1584,7 @@ let test_stalled_tcp ~cancel () =
          let started = Eio.Time.now clock in
          if cancel
          then (
-           Runner.submit t (cancellation_effect (Core.runner_effect_scope op));
+           Runner.submit t (cancellation_effect ~network_only (Core.runner_effect_scope op));
            wait clock (fun () -> !released);
            Alcotest.(check bool)
              "TCP cancellation is prompt"
@@ -1643,6 +1649,10 @@ let test_artifact_publication_failure () =
 let scenarios =
   scenarios
   @ [ Alcotest.test_case
+        "network-only cancellation aborts in-flight TCP setup"
+        `Quick
+        (test_stalled_tcp ~network_only:true ~cancel:true)
+    ; Alcotest.test_case
         "HTTP stalled TCP cancellation"
         `Quick
         (test_stalled_tcp ~cancel:true)
@@ -2669,6 +2679,7 @@ let cache_selection ?(user = "fixture") ?(selected_graph : Core.graph = graph) o
     |> Result.get_ok
     |> Core.initial
     |> Result.get_ok
+    |> fun core -> (Core.step core (Core.Sign_in_requested {account_generation=0;presentation_generation=0})).next
   in
   let authenticated =
     Core.step initial (Core.Account_authenticated { user_id = Some user })
@@ -3923,7 +3934,8 @@ let scenarios =
    issue opaque production tickets; a TLS peer originates HTTP/decode failures. *)
 let unlock_classification_effect origin =
   let initial = Core.config ~managed_sync_origin:origin ~limits:(Core_contract.limits ())
-    |> Result.get_ok |> Core.initial |> Result.get_ok in
+    |> Result.get_ok |> Core.initial |> Result.get_ok
+    |> fun core -> (Core.step core (Core.Sign_in_requested {account_generation=0;presentation_generation=0})).next in
   let encrypted = { graph with encrypted = true } in
   let auth = Core.step initial (Core.Account_authenticated {user_id=Some "LOG_SECRET_USER"}) in
   let catalog = List.find_map (function
@@ -4140,6 +4152,7 @@ let test_external_http_contract kind ~success body () =
             |> Result.get_ok
             |> Core.initial
             |> Result.get_ok
+            |> fun core -> (Core.step core (Core.Sign_in_requested {account_generation=0;presentation_generation=0})).next
           in
           let request =
             match kind with

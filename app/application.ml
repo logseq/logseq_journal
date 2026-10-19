@@ -3176,7 +3176,7 @@ let manager_page ?picker_signal state dispatch =
     Option.fold
       ~none:false
       ~some:(fun (snapshot : Graph_service.snapshot) ->
-        snapshot.startup.authenticated
+        (snapshot.startup.authenticated || snapshot.startup.local_access=Graph_service.Local_available || snapshot.catalog<>[])
         && Option.is_some snapshot.selected_graph
         && Option.is_none snapshot.local_deletion)
       state.manager
@@ -3502,11 +3502,19 @@ let manager_page ?picker_signal state dispatch =
                ~command:Refresh_catalog
                "Retry"
                "arrow.clockwise"
-           | Some Begin_online_recovery | Some Retry_graph_open ->
+           | Some Retry_graph_open ->
+             (match snapshot.selected_graph with
+              | None -> V.empty ()
+              | Some graph_id -> capsule ~id:"graph-picker-retry"
+                  ~command:(Select_graph (Logseq_db_types.Graph_types.Uuid.to_string graph_id)) "Retry local open" "arrow.clockwise")
+           | Some Begin_online_recovery ->
              capsule
                ~id:"graph-picker-retry"
                ~command:Begin_online_recovery
-               "Retry"
+               (match snapshot.startup.local_access with
+                | Graph_service.Local_unavailable Local_mirror_unavailable -> "Download graph"
+                | Local_unavailable Local_key_unavailable -> "Recover encryption key"
+                | _ -> "Retry")
                "arrow.clockwise"
            | Some Submit_e2ee_password | Some Sign_in | None -> V.empty ()
          in
@@ -3666,6 +3674,16 @@ let decode_extension_values payload =
 
 (* Platform request tags map to the tag carried by their response envelope;
    continuations are registered under the response tag. *)
+let startup_scope state : Graph_service.startup_scope =
+  match state.manager with
+  | Some m -> {account_generation=m.startup.account_generation;presentation_generation=m.startup.presentation_generation}
+  | None -> {account_generation=0;presentation_generation=0}
+;;
+let timeline_scope state : Graph_service.timeline_scope option =
+  Option.bind state.manager (fun m -> Option.map (fun graph_id ->
+    ({startup=startup_scope state;graph_id;graph_generation=m.startup.graph_generation} : Graph_service.timeline_scope)) m.selected_graph)
+;;
+
 let response_tag = function
   | 6 -> 7
   | 8 -> 9
@@ -3675,6 +3693,8 @@ let response_tag = function
   | 22 -> 23
   | 25 -> 26
   | 28 -> 29
+  | 30 -> 31
+  | 32 -> 33
   | tag -> tag
 ;;
 
@@ -4038,8 +4058,17 @@ let start
           e2ee_submission_pending = false
         ; e2ee_submission_error = Some "Unable to unlock the graph. Try again."
         }) () in
+  let pending_startup_commands = ref [] in
   let send_manager command =
     Effect.of_thunk (fun () ->
+      (match command with
+       | Graph_service.Reconcile_authenticated_user _ ->
+         let scope = startup_scope !state_ref in
+         pending_startup_commands := List.filter (fun (owner, pending) ->
+           owner <> scope || match pending with
+           | Graph_service.Reconcile_authenticated_user _ -> false
+           | _ -> true) !pending_startup_commands
+       | _ -> ());
       let owner = unlock_owner !state_ref in
       let result = dispatch_worker (Graph_service.Client_command command) in
       (match command with
@@ -4052,7 +4081,21 @@ let start
           | Full -> unlock_log "phase=queue result=full"; reject_unlock owner ()
           | Not_ready -> unlock_log "phase=queue result=not-ready"; reject_unlock owner ()
           | Stopping -> unlock_log "phase=queue result=stopping"; reject_unlock owner ())
+       | (Graph_service.Restore_local_account _ | Local_account_unavailable _ | Reconcile_authenticated_user _ | Request_sign_in _
+         | Cancel_online _ | Acknowledge_timeline_presented _ | Refresh_catalog _ | Begin_online_recovery _) ->
+         (match result with
+          | Worker.Full | Not_ready ->
+            let scope=startup_scope !state_ref in
+            let current=List.filter (fun (owner,_) -> owner=scope) !pending_startup_commands in
+            if not (List.mem (scope,command) current) then
+              pending_startup_commands := current @ [scope,command]
+          | Accepted _ | Stopping -> ())
        | _ -> ()))
+  in
+  let drain_startup_commands () =
+    let commands= !pending_startup_commands in pending_startup_commands:=[];
+    Effect.many (List.filter_map (fun (owner,command) ->
+      if owner=startup_scope !state_ref then Some (send_manager command) else None) commands)
   in
   let local_copy_requests = Hashtbl.create 2 in
   let visible_copy_queue = Queue.create () in
@@ -4370,7 +4413,7 @@ let start
       && (!state_ref).graph_state.graph_id = manager.selected_graph in
     (* Graph_state and manager pushes may arrive in either order. A manager
        update must not cancel work already started for its new graph scope. *)
-    if not manager.startup.authenticated || (owner_changed && not graph_already_current)
+    if (manager.startup.local_access=Graph_service.Local_pending && not manager.startup.restoring_local && not manager.startup.authenticated) || (owner_changed && not graph_already_current)
     then (retire_graph_scope (); started_graph_generation := None);
     if not manager.startup.authenticated then cancel_copy ();
     let update = set_state (fun state -> apply_manager_state state manager_state) in
@@ -4905,6 +4948,7 @@ let start
   let apply_authenticated_user ?ticket payload =
     let key = Option.value ticket ~default:(Journal_startup.Presentation.account_ticket !state_ref.startup_presentation) in
     if key <> Journal_startup.Presentation.account_ticket !state_ref.startup_presentation then Effect.ignore
+    else if Journal_platform.decode_authenticated_scope payload <> Ok (startup_scope !state_ref) then Effect.ignore
     else match Journal_platform.decode_authenticated_user payload with
     | Error _ -> set_state (fun state -> {state with startup_presentation=
         Journal_startup.Presentation.step state.startup_presentation (Account_error key)})
@@ -4916,22 +4960,44 @@ let start
         ~f:(fun () -> send_manager (Graph_service.Reconcile_authenticated_user { user_id }))
   in
   let apply_local_account_binding ticket result =
-    match result with
-    | Error _ -> Effect.ignore
-    | Ok payload ->
-      (match Journal_platform.decode_local_account_binding payload with
-       | Error _ | Ok None -> set_state (fun state -> {state with startup_presentation=
-           Journal_startup.Presentation.step state.startup_presentation (Account(ticket,No_local))})
-       | Ok (Some binding) ->
-         if String.equal binding.managed_sync_origin !managed_sync_origin
-            && ticket = Journal_startup.Presentation.account_ticket !state_ref.startup_presentation
-         then Effect.bind (set_state (fun state -> {state with startup_presentation=
-           Journal_startup.Presentation.step state.startup_presentation (Account(ticket,Local))}))
-           ~f:(fun () -> send_manager (Graph_service.Restore_local_account { user_id = binding.user_id }))
-         else Effect.ignore)
+    let unavailable () =
+      Effect.bind (set_state (fun state -> {state with startup_presentation=
+        Journal_startup.Presentation.step state.startup_presentation (Account(ticket,No_local))}))
+        ~f:(fun () -> send_manager (Graph_service.Local_account_unavailable (startup_scope !state_ref,No_local_account))) in
+    match Result.bind result Journal_platform.decode_local_account_binding with
+    | Error _ | Ok None -> unavailable ()
+    | Ok (Some binding) ->
+      if String.equal binding.managed_sync_origin !managed_sync_origin
+         && ticket = Journal_startup.Presentation.account_ticket !state_ref.startup_presentation
+      then Effect.bind (set_state (fun state -> {state with startup_presentation=
+        Journal_startup.Presentation.step state.startup_presentation (Account(ticket,Local))}))
+        ~f:(fun () -> send_manager (Graph_service.Restore_local_account {user_id=binding.user_id}))
+      else unavailable ()
   in
+  let revoked_online_scope = ref None in
   let apply_platform payload =
-    if Journal_platform.is_prepare_to_terminate_event payload
+    match Journal_platform.decode_online_event payload with
+    | Ok (true, scope) ->
+      let current = !state_ref in
+      let already_permitted =
+        scope = startup_scope current
+        && !revoked_online_scope <> Some scope
+        && Option.exists
+             (fun manager ->
+                manager.Graph_service.startup.network_phase = Graph_service.Online_by_user)
+             current.manager
+      in
+      if already_permitted
+      then
+        platform_request (Journal_platform.scoped_online_requested_request scope)
+          ~f:(fun _ -> Effect.ignore)
+      else send_manager (Graph_service.Request_sign_in scope)
+    | Ok (false, scope) ->
+      Effect.bind
+        (Effect.of_thunk (fun () ->
+           if scope = startup_scope !state_ref then revoked_online_scope := Some scope))
+        ~f:(fun () -> send_manager (Graph_service.Cancel_online scope))
+    | Error _ -> if Journal_platform.is_prepare_to_terminate_event payload
     then
       if local_deletion_active !state_ref
       then
@@ -4946,14 +5012,10 @@ let start
       | Error _ -> apply_authenticated_user payload)
   in
   let managed_startup : unit Effect.t = fun () ->
-    let ticket = Journal_startup.Presentation.account_ticket !state_ref.startup_presentation in
+    let ticket=Journal_startup.Presentation.account_ticket !state_ref.startup_presentation in
     Effect.run (platform_request Journal_platform.local_account_binding_request ~f:(fun binding ->
-      if ticket <> Journal_startup.Presentation.account_ticket !state_ref.startup_presentation then Effect.ignore
-      else Effect.bind (apply_local_account_binding ticket binding) ~f:(fun () ->
-        platform_request Journal_platform.authenticated_user_request ~f:(function
-          | Error _ -> set_state (fun state -> {state with startup_presentation=
-              Journal_startup.Presentation.step state.startup_presentation (Account_error ticket)})
-          | Ok payload -> apply_authenticated_user ~ticket payload))))
+      if ticket <> Journal_startup.Presentation.account_ticket !state_ref.startup_presentation
+      then Effect.ignore else apply_local_account_binding ticket binding))
   in
   let calendar_startup =
     Effect.bind (sample_calendar ()) ~f:(function
@@ -5065,22 +5127,17 @@ let start
               | None -> state)))
   in
   let timeline_presentation_key state =
-    match state.feed_loaded, state.manager with
-    | true, Some snapshot when snapshot.timeline_presentation_pending ->
-      Some (snapshot.selected_graph, snapshot.applied_server_t)
-    | false, _ | true, None | true, Some _ -> None
+    Option.map (fun m -> startup_scope state,m.Graph_service.startup.graph_generation,m.startup.network_phase) state.manager
   in
   let prev_timeline_presentation_key = ref (timeline_presentation_key initial_state) in
   let timeline_presentation_callback = function
     | None -> Effect.ignore
-    | Some _ ->
-      Effect.bind (send_manager Graph_service.Acknowledge_local_feed) ~f:(fun () ->
-        platform_request Journal_platform.timeline_presented_request ~f:(function
-          | Error _ -> Effect.ignore
-          | Ok payload ->
-            (match Journal_platform.decode_timeline_presented payload with
-             | Error _ -> Effect.ignore
-             | Ok () -> send_manager Graph_service.Acknowledge_timeline_presented)))
+    | Some (scope,_,phase) ->
+      let request=match phase with
+        | Graph_service.Local_only -> Journal_platform.scoped_online_cancelled_request scope
+        | Online_after_timeline -> Journal_platform.scoped_timeline_presented_request scope
+        | Online_by_user -> Journal_platform.scoped_online_requested_request scope in
+      platform_request request ~f:(fun _ -> Effect.ignore)
   in
   let favorites_drain_key state = state.favorites_requests in
   let prev_favorites_drain_key = ref (favorites_drain_key initial_state) in
@@ -5780,13 +5837,21 @@ let start
          Effect.bind (update (fun state -> { state with graph_picker_open = false
            ; local_copy_check = None; local_copy_message = None; modal = No_modal }))
            ~f:(fun () ->
-             if Option.bind snapshot.manager (fun value -> value.selected_graph) = Some graph_id
+             if Option.fold ~none:false ~some:(fun value ->
+               value.Graph_service.selected_graph=Some graph_id && value.startup.local_access=Graph_service.Local_available) snapshot.manager
              then Effect.ignore
              else send_manager (Graph_service.Select_graph graph_id)))
     | Refresh_catalog ->
       Effect.bind (update (fun state -> { state with local_copy_message = None }))
-        ~f:(fun () -> send_manager Graph_service.Refresh_catalog)
-    | Begin_online_recovery -> send_manager Graph_service.Begin_online_recovery
+        ~f:(fun () ->
+          let already_online=Option.fold ~none:false ~some:(fun m -> m.Graph_service.startup.network_phase<>Local_only) snapshot.manager in
+          Effect.bind (send_manager (Graph_service.Refresh_catalog (startup_scope snapshot))) ~f:(fun () ->
+            if already_online then platform_request (Journal_platform.scoped_online_requested_request (startup_scope snapshot)) ~f:(fun _->Effect.ignore) else Effect.ignore))
+    | Begin_online_recovery ->
+      (match timeline_scope snapshot with None->Effect.ignore | Some scope ->
+        let already_online=Option.fold ~none:false ~some:(fun m -> m.Graph_service.startup.network_phase<>Local_only) snapshot.manager in
+        Effect.bind (send_manager (Graph_service.Begin_online_recovery scope)) ~f:(fun () ->
+          if already_online then platform_request (Journal_platform.scoped_online_requested_request (startup_scope snapshot)) ~f:(fun _->Effect.ignore) else Effect.ignore))
     | Open_capture
       when snapshot.write_enabled
            && snapshot.pending_delete = None
@@ -5961,6 +6026,7 @@ let start
           local_copy_request ~deleting:false request
         | _ -> state, Effect.ignore)
     | Sign_out ->
+      pending_startup_commands:=[];
       cancel_copy ();
       retire_graph_scope ();
       started_graph_generation := None;
@@ -6731,7 +6797,11 @@ let start
             ~on_error_info:(bind_action dispatch Open_error_info)
             ~account_menu_available:true
             ~on_account_action:dispatch
-            ~cache_reset_available:(local_deletion_available state))
+            ~cache_reset_available:(local_deletion_available state)
+          |> fun content -> V.of_lui (Lui_elements.stack ~grow:1.
+              ~on_appear:(fun _ -> Option.iter (fun scope ->
+                Effect.run (send_manager (Graph_service.Acknowledge_timeline_presented scope))) (timeline_scope state))
+              [Ui.mount content]))
     in
     let capture_adapter =
       region "capture-import" ~equal:equal_capture_presentation (fun current ->
@@ -7102,7 +7172,8 @@ let start
   current_app := Some context;
   ignore (dispatch_worker Graph_service.Get_graph_state : Worker.send_result);
   Worker.on_event client (fun event ->
-    Journal_pump.enqueue pump (fun () -> Effect.run (handle_worker_event event)));
+    Journal_pump.enqueue pump (fun () -> Effect.run
+      (Effect.bind (handle_worker_event event) ~f:drain_startup_commands)));
   (* The worker fires the wakeup on its own domain whenever output lands;
      enqueueing hops through the host wakeup onto the UI thread. An OCaml
      Condition waiter thread would deadlock against the worker domain (the

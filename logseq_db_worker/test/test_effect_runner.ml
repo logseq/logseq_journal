@@ -95,6 +95,7 @@ let test_unlock_runner_logging () =
         let config = Sync.config ~managed_sync_origin:(Uri.of_string "https://example.invalid")
           ~limits |> Result.get_ok in
         let state = Sync.initial config |> Result.get_ok in
+        let state = (Sync.step state (Sync.Sign_in_requested {account_generation=0; presentation_generation=0})).next in
         let transition = Sync.step state (Sync.Account_authenticated {user_id=Some "LOG_SECRET_USER"}) in
         let request = List.find_map (function
           | Sync.Run (Sync.Request (_, Sync.Fetch_catalog _) as request) -> Some request
@@ -510,6 +511,7 @@ let admitted_asset_state graph_id =
     ; encrypted = false
     }
   in
+  let initial = (Sync.step initial (Sync.Sign_in_requested {account_generation=0; presentation_generation=0})).next in
   let authenticated =
     Sync.step initial (Sync.Account_authenticated { user_id = Some "user-1" })
   in
@@ -906,6 +908,7 @@ let test_db_shutdown_accepts_late_staging_completion () =
         Fun.protect
           ~finally:(fun () -> Db.shutdown worker)
           (fun () ->
+             Db.post worker (Core.Sync_event (Sync.Sign_in_requested {account_generation=0; presentation_generation=0}));
              Db.post
                worker
                (Core.Sync_event (Sync.Account_authenticated { user_id = Some "user-1" }));
@@ -1510,6 +1513,7 @@ let deletion_runtime_fixture ?deletion_case ?(journal_failure = false) ~busy () 
           (Sync.Asset_completion (ticket, Error Sync.Asset_cancelled)))) !held_cleanup;
         Db.shutdown db)
         (fun () ->
+          post (Sync.Sign_in_requested {account_generation=0; presentation_generation=0});
           post (Sync.Account_authenticated { user_id = Some "user-1" });
           wait (fun () -> (Db.view db).sync.snapshot.catalog <> []);
           post (Sync.Graph_selected second);
@@ -1537,7 +1541,9 @@ let deletion_runtime_fixture ?deletion_case ?(journal_failure = false) ~busy () 
             Alcotest.(check int) "journal failure never retires assets" 0 !destructive_requests;
             Alcotest.(check bool) "journal failure preserves target mirror" true (Sys.file_exists first_database_path);
             Alcotest.(check bool) "current graph Worker stays open" true ((Db.graph_state db).phase = Db.Graph_open);
-            post Sync.Catalog_refresh_requested;
+            post (Sync.Catalog_refresh_requested
+              (let f=(Db.view db).sync.snapshot.startup in
+               {account_generation=f.account_generation;presentation_generation=f.presentation_generation}));
             wait (fun () -> (Db.view db).sync.snapshot.catalog <> []))
           else if busy then (
             let lock = Sqlite3.db_open (Filename.concat directory ".logseq-overlay-owner.sqlite") in
@@ -1553,7 +1559,9 @@ let deletion_runtime_fixture ?deletion_case ?(journal_failure = false) ~busy () 
             (Db.delete_local_copy db ~account_generation:generation ~graph_id:first));
           wait (fun () -> Option.is_some !held_cleanup);
           refreshed := true;
-          post Sync.Catalog_refresh_requested;
+          post (Sync.Catalog_refresh_requested
+              (let f=(Db.view db).sync.snapshot.startup in
+               {account_generation=f.account_generation;presentation_generation=f.presentation_generation}));
           wait (fun () -> (Db.view db).sync.snapshot.selected_graph = None);
           Alcotest.(check bool) "catalog refresh cannot report deletion success" true
             (match Eio.Promise.peek result with Some (Ok ()) -> false | _ -> true);

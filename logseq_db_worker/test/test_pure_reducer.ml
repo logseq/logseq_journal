@@ -27,12 +27,23 @@ let sync_config () =
   |> Result.get_ok
 ;;
 
-let initial () =
+let raw_initial () =
   Core.config ~worker:(worker_config ()) ~sync:(sync_config ())
   |> Core.initial
   |> Result.get_ok
 ;;
 
+let startup_scope state : Sync.startup_scope =
+  let f=(Core.view state).sync.snapshot.startup in
+  {account_generation=f.account_generation;presentation_generation=f.presentation_generation}
+;;
+let timeline_scope state : Sync.timeline_scope =
+  let s=(Core.view state).sync.snapshot in
+  {startup=startup_scope state;graph_id=Option.get s.selected_graph;graph_generation=s.startup.graph_generation}
+;;
+let initial () = let s=raw_initial () in
+  (Core.step s (Sync_event (Sync.Sign_in_requested (startup_scope s)))).next
+;;
 let graph_info_request () =
   Protocol.
     { api_version
@@ -965,7 +976,7 @@ let test_upload_recovery_failure () =
     "recovery failure cannot spin"
     true
     (recovery_instruction failed = None);
-  let retried = Core.step failed.next (Sync_event Sync.Online_recovery_requested) in
+  let retried = Core.step failed.next (Sync_event (Sync.Online_recovery_requested (timeline_scope failed.next))) in
   Alcotest.(check bool)
     "explicit recovery retries failed enumeration"
     true
@@ -1049,7 +1060,7 @@ let test_snapshot_failure_is_terminal_and_retryable () =
   let duplicate = Core.step failed.next failure in
   Alcotest.(check bool) "duplicate completion inert" true
     (Core.equal_view (Core.view failed.next) (Core.view duplicate.next) && duplicate.effects = []);
-  let retry = Core.step failed.next (Sync_event Sync.Online_recovery_requested) in
+  let retry = Core.step failed.next (Sync_event (Sync.Online_recovery_requested (timeline_scope failed.next))) in
   Alcotest.(check (option string)) "explicit retry clears failure" None
     (Core.view retry.next).sync.snapshot.last_error;
   let late = Core.step retry.next failure in
@@ -1085,6 +1096,39 @@ let test_snapshot_success_and_late_switch_completions () =
     Alcotest.(check (list string)) "retired graph emits only pending close cleanup" []
       (List.map Core.instruction_diagnostic work))
     [failure; success]
+;;
+
+let test_local_restore_worker_failures_are_terminal () =
+  let error = Logseq_db_worker_contract.Error.create
+    ~code:Logseq_db_worker_contract.Error.Closed_session ~message:"synthetic local IO failure" ~details:[] |> Result.get_ok in
+  let make () =
+    let restored = Core.step (initial ()) (Sync_event (Sync.Restore_local_account {user_id="local-user"})) in
+    let graph : Sync.graph = {graph_id=uuid "11111111-1111-4111-8111-111111111111";
+      name="Synthetic";schema={major=1;minor=0;exact=true};encrypted=false} in
+    let cache = Sync.catalog_cache ~user_id:"local-user" ~graphs:[graph] ~selected_graph:(Some graph.graph_id) in
+    let event = List.find_map (function
+      | Core.Run_sync (Sync.Request (ticket, Sync.Load_catalog _)) ->
+        Some (Core.Sync_event (Sync.Runner_completed (Sync.Completion(ticket,Ok (Some cache)))))
+      | _ -> None) restored.effects |> Option.get in
+    Core.step restored.next event in
+  List.iter (fun attach ->
+    let selected = make () in
+    let ticket,request = List.find_map (function
+      | Core.Run_worker (Core.Request(ticket,Core.Handle_sync_worker_effect(Sync.Inspect_mirror request))) ->Some(ticket,request)
+      | _->None) selected.effects |> Option.get in
+    let flight,ticket = if not attach then selected,ticket else
+      let attaching = Core.step selected.next (Runner_completed (Sync_worker_effect_completed(ticket,
+        Ok {Core.event=Some(Sync.Mirror_inspected(Mirror_available request));lifecycle=Lifecycle_unchanged}))) in
+      let ticket = List.find_map (function
+        | Core.Run_worker (Core.Request(ticket,Core.Handle_sync_worker_effect(Sync.Attach_graph _)))->Some ticket
+        | _->None) attaching.effects |> Option.get in attaching,ticket in
+    let failed = Core.step flight.next (Runner_completed (Sync_worker_effect_completed(ticket,Error error))) in
+    let f = (Core.view failed.next).sync.snapshot.startup in
+    Alcotest.(check bool) "worker IO failure releases startup loading" true
+      (not f.restoring_local && f.failure=Some Sync.During_local_restore);
+    let duplicate = Core.step failed.next (Runner_completed (Sync_worker_effect_completed(ticket,Error error))) in
+    Alcotest.(check int) "duplicate failure is inert" 0 (List.length duplicate.effects)
+  ) [false;true]
 ;;
 
 let () =
@@ -1128,7 +1172,8 @@ let () =
             test_asset_manual_retry_is_unlimited
         ] )
     ; ( "managed lifecycle"
-      , [ Alcotest.test_case
+      , [ Alcotest.test_case "local restore IO failures terminate loading" `Quick test_local_restore_worker_failures_are_terminal
+        ; Alcotest.test_case
             "start has no local open"
             `Quick
             test_managed_worker_starts_without_local_open

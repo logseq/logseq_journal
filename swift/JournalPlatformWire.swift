@@ -4,17 +4,37 @@ import Foundation
 enum JournalPlatformWire {
   enum Failure: Error { case invalidPacket }
   enum Request: Equatable {
-    case authenticatedUser, signOut, terminationReady, localAccount, timelinePresented
+    case authenticatedUser, signOut, terminationReady, localAccount, timelinePresented, onlineRequested, onlineCancelled
     case idToken(challengeID: String)
     case copyText(String)
   }
   enum Response: Equatable {
     case authenticatedUser(String?)
     case idToken(challengeID: String, token: String)
-    case signedOut, terminationReady, timelinePresented
+    case signedOut, terminationReady, timelinePresented, onlineRequested, onlineCancelled
     case localAccount(userID: String, origin: String)
     case noLocalAccount
     case textCopied
+  }
+  struct StartupScope: Codable, Equatable, Comparable, Sendable {
+    let accountGeneration: Int64
+    let presentationGeneration: Int64
+    static let initial = Self(accountGeneration:0,presentationGeneration:0)
+    static func < (left:Self,right:Self) -> Bool {
+      left.accountGeneration == right.accountGeneration
+        ? left.presentationGeneration < right.presentationGeneration
+        : left.accountGeneration < right.accountGeneration
+    }
+  }
+  private struct ScopedUser: Encodable {
+    let userId:String?
+    let startupScope:StartupScope
+    private enum CodingKeys:String,CodingKey {case userId,startupScope}
+    func encode(to encoder:Encoder) throws {
+      var fields=encoder.container(keyedBy:CodingKeys.self)
+      try fields.encode(userId,forKey:.userId)
+      try fields.encode(startupScope,forKey:.startupScope)
+    }
   }
   enum Lifecycle: UInt16 { case backgrounded = 1, foregroundResumed = 2 }
 
@@ -61,13 +81,16 @@ enum JournalPlatformWire {
     let payload = Data(packet[headerSize...])
     let tag = integer(packet, at: 6, count: 2)
     switch tag {
-    case 6, 10, 13, 20, 22:
-      guard payload.isEmpty else { throw Failure.invalidPacket }
+    case 6, 10, 13, 20, 22, 30, 32:
+      if [22,30,32].contains(tag) { _ = try startupScope(bytes) }
+      else { guard payload.isEmpty else { throw Failure.invalidPacket } }
       switch tag {
       case 6: return .authenticatedUser
       case 10: return .signOut
       case 13: return .terminationReady
       case 20: return .localAccount
+      case 30: return .onlineRequested
+      case 32: return .onlineCancelled
       default: return .timelinePresented
       }
     case 8:
@@ -102,6 +125,8 @@ enum JournalPlatformWire {
       return try json(tag: 21, Account(userId: nil, managedSyncOrigin: nil))
     case .timelinePresented:
       return try json(tag: 23, Presented(presented: true))
+    case .onlineRequested: return try frame(tag:31,payload:Data())
+    case .onlineCancelled: return try frame(tag:33,payload:Data())
     case .textCopied:
       return try json(tag: 29, Copied(copied: true))
 
@@ -112,6 +137,22 @@ enum JournalPlatformWire {
   /// Journal_environment.decode_json's required fields.
   static func environment<Value: Encodable>(_ sample: Value) throws -> Data {
     try json(tag: 24, sample)
+  }
+
+  static func startupScope(_ bytes:Data) throws -> StartupScope {
+    guard bytes.count >= headerSize else {throw Failure.invalidPacket}
+    let payload=Data(bytes.dropFirst(headerSize))
+    if payload.isEmpty {return .initial}
+    let scope=try decode(StartupScope.self,payload)
+    guard scope.accountGeneration>=0,scope.presentationGeneration>=0 else {throw Failure.invalidPacket}
+    return scope
+  }
+  static func onlineRequested(_ scope:StartupScope) -> Data {try! json(tag:34,scope)}
+  static func onlineCancelled(_ scope:StartupScope) -> Data {try! json(tag:35,scope)}
+  static func authenticatedEvent(_ response:Response,scope:StartupScope) throws -> Data {
+    guard case .authenticatedUser(let user)=response else {throw Failure.invalidPacket}
+    if let user {try validate(user,maximum:512)}
+    return try json(tag:7,ScopedUser(userId:user,startupScope:scope))
   }
 
   static func prepareToTerminate() -> Data {

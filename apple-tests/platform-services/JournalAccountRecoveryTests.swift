@@ -74,7 +74,8 @@ import Security
       let auth = RecoveryAuth(), store = RecoveryStore(bytes)
       let services = JournalPlatformServices(auth: auth, account: store.capability, managedSyncOrigin: origin)
       do {
-        let response = try await services.response(for: .authenticatedUser)
+        _ = try await services.response(for: .onlineRequested)
+        let response = try await services.explicitOnlineResponse(for: .authenticatedUser)
         check(response == .authenticatedUser("verified-user"), name + ": verified identity returned")
       } catch { failures.append(name + ": valid OAuth blocked by invalid binding") }
       check(auth.calls == 1, name + ": identity lookup runs")
@@ -83,28 +84,28 @@ import Security
         check(value["userId"] as? String == "verified-user", name + ": never reuse previous identity")
       } else { failures.append(name + ": current binding decodes") }
       store.bytes = bytes; store.writes = 0; auth.user = nil
-      do { _ = try await services.response(for: .authenticatedUser); failures.append(name + ": missing identity must require sign-in") }
+      do { _ = try await services.explicitOnlineResponse(for: .authenticatedUser); failures.append(name + ": missing identity must require sign-in") }
       catch JournalPlatformServices.Failure.authenticationRequired { }
       catch { failures.append(name + ": missing identity must reach sign-in instead of decode failure") }
       check(store.bytes == bytes && store.writes == 0 && store.clears == 0, name + ": retain record until verified sign-in")
       auth.user = "verified-user" // A verified identity after the user's browser sign-in.
-      do { _ = try await services.response(for: .authenticatedUser) }
+      do { _ = try await services.explicitOnlineResponse(for: .authenticatedUser) }
       catch { failures.append(name + ": successful sign-in cannot rebuild") }
       check(store.writes == 1, name + ": successful sign-in commits binding")
       store.bytes = bytes; store.writes = 0
       store.saveFailure = NSError(domain: NSOSStatusErrorDomain, code: Int(errSecNotAvailable))
-      do { _ = try await services.response(for: .authenticatedUser); failures.append(name + ": failed rebuild must remain retryable") }
+      do { _ = try await services.explicitOnlineResponse(for: .authenticatedUser); failures.append(name + ": failed rebuild must remain retryable") }
       catch { }
       check(store.bytes == bytes && store.writes == 0, name + ": failed save retains original record")
       store.saveFailure = nil
-      do { _ = try await services.response(for: .authenticatedUser) }
+      do { _ = try await services.explicitOnlineResponse(for: .authenticatedUser) }
       catch { failures.append(name + ": retry after failed save") }
     }
     for code in [errSecInteractionNotAllowed, errSecNotAvailable, errSecAuthFailed] {
       let auth = RecoveryAuth(), store = RecoveryStore(legacy)
       store.loadFailure = NSError(domain: NSOSStatusErrorDomain, code: Int(code))
       let services = JournalPlatformServices(auth: auth, account: store.capability, managedSyncOrigin: origin)
-      do { _ = try await services.response(for: .authenticatedUser); failures.append("temporary storage failure accepted") }
+      do { _ = try await services.explicitOnlineResponse(for: .authenticatedUser); failures.append("temporary storage failure accepted") }
       catch { }
       check(auth.calls == 1 && store.writes == 0 && store.clears == 0 && store.bytes == legacy,
         "temporary storage failure must query identity but never replace inaccessible binding")
@@ -112,12 +113,12 @@ import Security
     let auth = RecoveryAuth(), store = RecoveryStore(legacy)
     let services = JournalPlatformServices(auth: auth, account: store.capability, managedSyncOrigin: origin)
     auth.failure = URLError(.notConnectedToInternet)
-    do { _ = try await services.response(for: .authenticatedUser); failures.append("offline request accepted") }
+    do { _ = try await services.explicitOnlineResponse(for: .authenticatedUser); failures.append("offline request accepted") }
     catch is URLError { }
     catch { failures.append("network failure hidden by old binding") }
     check(store.bytes == legacy && store.writes == 0 && store.clears == 0, "network failure preserves record")
     auth.failure = nil; auth.suspended = true
-    let stale = Task { try await services.response(for: .authenticatedUser) }
+    let stale = Task { try await services.explicitOnlineResponse(for: .authenticatedUser) }
     let staleDeadline = ContinuousClock.now + .seconds(3)
     while auth.held == nil && ContinuousClock.now < staleDeadline {
       try await Task.sleep(for: .milliseconds(1))
@@ -130,7 +131,7 @@ import Security
     } else { stale.cancel(); _ = try? await stale.value; failures.append("stale case never reached identity lookup") }
     check(store.bytes == legacy && store.writes == 0, "retired completion retains old record")
     auth.held = nil
-    let retiredFailure = Task { try await services.response(for: .authenticatedUser) }
+    let retiredFailure = Task { try await services.explicitOnlineResponse(for: .authenticatedUser) }
     while auth.held == nil { await Task.yield() }
     services.invalidateConnection()
     auth.held!.resume(throwing: URLError(.notConnectedToInternet))
@@ -142,24 +143,24 @@ import Security
     auth.suspended = false; auth.user = "original-user"
     store.bytes = try JournalLocalAccountBindingStore.encode(userID: "original-user", managedSyncOrigin: origin)
     _ = try await services.response(for: .localAccount)
-    _ = try await services.response(for: .authenticatedUser)
+    _ = try await services.explicitOnlineResponse(for: .authenticatedUser)
     _ = try await services.response(for: .timelinePresented)
     let retained = store.bytes, previousWrites = store.writes
     auth.user = "different-user"
-    do { _ = try await services.response(for: .authenticatedUser); failures.append("active graph account was replaced") }
+    do { _ = try await services.explicitOnlineResponse(for: .authenticatedUser); failures.append("active graph account was replaced") }
     catch { }
     check(store.bytes == retained && store.writes == previousWrites && store.clears == 0,
       "different identity must leave active graph account and pending work intact")
     services.cancelAuthenticationPreparation()
-    do { _ = try await services.response(for: .idToken(challengeID: "retained-graph")); failures.append("foreign account token released to active graph") }
+    do { _ = try await services.explicitOnlineResponse(for: .idToken(challengeID: "retained-graph")); failures.append("foreign account token released to active graph") }
     catch { }
     check(store.bytes == retained && store.writes == previousWrites,
       "cancel cannot remove active graph identity protection")
     auth.user = "original-user"
-    do { _ = try await services.response(for: .authenticatedUser) }
+    do { _ = try await services.explicitOnlineResponse(for: .authenticatedUser) }
     catch { failures.append("original account cannot recover the active graph session") }
     store.bytes = nil; auth.user = nil
-    do { _ = try await services.response(for: .authenticatedUser); failures.append("missing advisory record signed out an active graph") }
+    do { _ = try await services.explicitOnlineResponse(for: .authenticatedUser); failures.append("missing advisory record signed out an active graph") }
     catch JournalPlatformServices.Failure.authenticationRequired { }
     catch { failures.append("missing active account must offer reconnection") }
     check(store.clears == 0, "missing session must not clear a presented account")
@@ -171,12 +172,12 @@ import Security
       _ = try await owner.response(for: .localAccount)
       delayedAuth.user = "replacement-user"
       delayedStore.suspendSave = true
-      let lookup = Task { try await owner.response(for: .authenticatedUser) }
+      let lookup = Task { try await owner.explicitOnlineResponse(for: .authenticatedUser) }
       while delayedStore.heldSave == nil { await Task.yield() }
       _ = try await owner.response(for: .timelinePresented)
       if retired {
         owner.cancelAuthenticationPreparation()
-        do { _ = try await owner.response(for: .idToken(challengeID: "newer-error")); failures.append("newer foreign token accepted") }
+        do { _ = try await owner.explicitOnlineResponse(for: .idToken(challengeID: "newer-error")); failures.append("newer foreign token accepted") }
         catch { }
         check(owner.accountIssue?.kind == .accountChangeBlocked, "newer error recorded before old save completes")
       }
@@ -198,7 +199,7 @@ import Security
       _ = try await owner.response(for: .localAccount)
       delayedAuth.user = user
       delayedAuth.suspendedToken = true
-      let lookup = Task { try await owner.response(for: .idToken(challengeID: "graph-presented-during-token")) }
+      let lookup = Task { try await owner.explicitOnlineResponse(for: .idToken(challengeID: "graph-presented-during-token")) }
       let deadline = ContinuousClock.now + .seconds(3)
       while delayedAuth.heldToken == nil && ContinuousClock.now < deadline {
         try await Task.sleep(for: .milliseconds(1))
@@ -223,7 +224,7 @@ import Security
     _ = try await logoutOwner.response(for: .localAccount)
     _ = try await logoutOwner.response(for: .timelinePresented)
     logoutAuth.user = "different-user"
-    do { _ = try await logoutOwner.response(for: .authenticatedUser); failures.append("logout fixture never rejected foreign account") }
+    do { _ = try await logoutOwner.explicitOnlineResponse(for: .authenticatedUser); failures.append("logout fixture never rejected foreign account") }
     catch { }
     check(logoutOwner.accountIssue?.kind == .accountChangeBlocked, "logout fixture has prior recovery issue")
     check(try await logoutOwner.response(for: .signOut) == .signedOut, "explicit synthetic sign-out completes")
@@ -234,5 +235,13 @@ import Security
       exit(1)
     }
     print("PASS rejected binding rebuild, sign-in, retry, temporary storage, network and stale completion")
+  }
+}
+
+// The existing storage/undo scenarios exercise user-authorized online recovery.
+@MainActor private extension JournalPlatformServices {
+  func explicitOnlineResponse(for request:JournalPlatformWire.Request) async throws -> JournalPlatformWire.Response {
+    _ = try await response(for:.onlineRequested)
+    return try await response(for:request)
   }
 }

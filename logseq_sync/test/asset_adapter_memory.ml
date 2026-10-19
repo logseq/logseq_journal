@@ -20,8 +20,10 @@ let key_request () =
     get
       (C.config ~managed_sync_origin:(Uri.of_string "https://asset-test.invalid") ~limits)
   in
+  let initial = get (C.initial config) in
+  let initial = (C.step initial (C.Sign_in_requested {account_generation=0; presentation_generation=0})).next in
   let authenticated =
-    C.step (get (C.initial config)) (C.Account_authenticated { user_id = Some "fixture" })
+    C.step initial (C.Account_authenticated { user_id = Some "fixture" })
   in
   let graph : C.graph =
     { graph_id

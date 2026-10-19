@@ -97,7 +97,7 @@ let with_worker
                 post
                   (Core.Sync_event
                      (Sync.Runner_completed (Sync.Asset_completion (ticket, result))))
-              | Cancel_effects _ | Start_websocket _ | Close_websocket _ -> ()
+              | Cancel_effects _ | Cancel_network_effects _ | Start_websocket _ | Close_websocket _ -> ()
               | effect_ ->
                 failwith
                   ("unexpected sync effect: " ^ Sync.runner_effect_diagnostic effect_))

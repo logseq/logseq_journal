@@ -54,6 +54,16 @@ let test_auth_capability_envelopes_are_bounded_and_protocol_free () =
   require (String.equal token "fresh-id-token") "fresh ID token response changed"
 ;;
 
+let test_scoped_authentication_preserves_identity () =
+  let packet = envelope 7 (Bytes.of_string
+    {|{"userId":"synthetic-user","startupScope":{"accountGeneration":1,"presentationGeneration":2}}|}) in
+  require (Journal_platform.decode_authenticated_user packet = Ok (Some "synthetic-user"))
+    "native scoped authentication loses its verified user";
+  require (Journal_platform.decode_authenticated_scope packet =
+    Ok {Logseq_sync_pure_reducer.Core.account_generation=1; presentation_generation=2})
+    "native scoped authentication loses its startup identity"
+;;
+
 let test_sign_out_capability_is_bounded_and_acknowledged () =
   require
     (Bytes.length Journal_platform.sign_out_request = 32
@@ -251,7 +261,8 @@ let test_account_fields_are_required () =
 ;;
 
 let tests =
-  [ "required account fields", test_account_fields_are_required
+  [ "scoped authenticated identity", test_scoped_authentication_preserves_identity
+  ; "required account fields", test_account_fields_are_required
   ; "generated native decoders", test_generated_native_decoders_reject_untyped_payloads
   ; "generated environment roundtrip", test_generated_environment_roundtrip
   ; "generated picker UUIDs", test_generated_picker_preserves_uuid_validation

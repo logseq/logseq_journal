@@ -96,12 +96,52 @@ let decode_network_lifecycle bytes =
 
 let authenticated_user_request = encode_envelope 6 Bytes.empty |> Result.get_ok
 let local_account_binding_request = encode_envelope 20 Bytes.empty |> Result.get_ok
+let online_requested_request = encode_envelope 30 Bytes.empty |> Result.get_ok
+let online_cancelled_request = encode_envelope 32 Bytes.empty |> Result.get_ok
+let scope_json (scope : Graph_service.startup_scope) =
+  `Assoc ["accountGeneration",`Int scope.account_generation;"presentationGeneration",`Int scope.presentation_generation]
+;;
+let decode_scope = function
+  | `Assoc fields ->
+    (match List.assoc_opt "accountGeneration" fields,List.assoc_opt "presentationGeneration" fields with
+     | Some (`Int account_generation),Some (`Int presentation_generation) when account_generation>=0 && presentation_generation>=0 ->
+       Ok ({account_generation;presentation_generation} : Graph_service.startup_scope)
+     | _ -> Error "Invalid startup scope")
+  | _ -> Error "Invalid startup scope"
+;;
+let scoped_request tag scope =
+  encode_envelope tag (Bytes.of_string (Yojson.Safe.to_string (scope_json scope))) |> Result.get_ok
+;;
+let scoped_online_requested_request = scoped_request 30
+let scoped_online_cancelled_request = scoped_request 32
+let scoped_timeline_presented_request = scoped_request 22
+let decode_online_event bytes =
+  Result.bind (decode_versioned_envelope bytes) (fun (tag,_,_,payload) ->
+    if tag<>34 && tag<>35 then Error "Not an online intent" else
+    try Result.map (fun scope -> tag=34,scope) (decode_scope (Yojson.Safe.from_string (Bytes.to_string payload)))
+    with Yojson.Json_error _ -> Error "Invalid online intent")
+;;
+let decode_authenticated_scope bytes =
+  Result.bind (decode_envelope [7] bytes) (fun payload ->
+    try match Yojson.Safe.from_string (Bytes.to_string payload) with
+      | `Assoc fields -> (match List.assoc_opt "startupScope" fields with
+          | Some scope -> decode_scope scope | None -> Error "Missing authentication scope")
+      | _ -> Error "Invalid authentication scope"
+    with Yojson.Json_error _ -> Error "Invalid authentication scope")
+;;
+
 let timeline_presented_request = encode_envelope 22 Bytes.empty |> Result.get_ok
 
 module Json = struct
   type account = { userId : string option; managedSyncOrigin : string option }
   [@@deriving yojson]
-  type user = { userId : string option } [@@deriving yojson]
+  type startup_scope = { accountGeneration : int; presentationGeneration : int }
+  [@@deriving yojson]
+  type user =
+    { userId : string option
+    ; startupScope : startup_scope option [@default None]
+    }
+  [@@deriving yojson]
   type challenge = { challengeId : string } [@@deriving yojson]
   type token = { challengeId : string; token : string } [@@deriving yojson]
   type sign_out = { signedOut : bool } [@@deriving yojson]

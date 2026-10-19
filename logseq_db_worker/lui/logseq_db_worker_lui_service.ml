@@ -41,8 +41,30 @@ type startup_failure_stage =
   | During_bootstrap
   | During_e2ee
 
+type local_unavailability = Logseq_sync_pure_reducer.Core.local_unavailability =
+  | No_local_account
+  | Local_catalog_unavailable
+  | Local_mirror_unavailable
+  | Local_key_unavailable
+  | Local_restore_failed
+
+type local_access = Logseq_sync_pure_reducer.Core.local_access =
+  | Local_pending
+  | Local_available
+  | Local_unavailable of local_unavailability
+
+type startup_network_phase = Logseq_sync_pure_reducer.Core.startup_network_phase =
+  | Local_only
+  | Online_after_timeline
+  | Online_by_user
+
+type startup_scope = Logseq_sync_pure_reducer.Core.startup_scope
+type timeline_scope = Logseq_sync_pure_reducer.Core.timeline_scope
+
 type startup_facts =
   { authenticated : bool
+  ; local_access : local_access
+  ; network_phase : startup_network_phase
   ; catalog_loading : bool
   ; awaiting_selection : bool
   ; restoring_local : bool
@@ -119,6 +141,8 @@ let failure_stage = function
 
 let startup_facts (facts : Sync.startup_facts) =
   { authenticated = facts.authenticated
+  ; local_access = facts.local_access
+  ; network_phase = facts.network_phase
   ; catalog_loading = facts.catalog_loading
   ; awaiting_selection = facts.awaiting_selection
   ; restoring_local = facts.restoring_local
@@ -167,7 +191,10 @@ type client_command =
   | Restore_local_account of { user_id : string }
   | Reconcile_authenticated_user of { user_id : string option }
   | Acknowledge_local_feed
-  | Acknowledge_timeline_presented
+  | Acknowledge_timeline_presented of timeline_scope
+  | Request_sign_in of startup_scope
+  | Cancel_online of startup_scope
+  | Local_account_unavailable of startup_scope * local_unavailability
   | Provide_token of
       { request : token_request
       ; token : string
@@ -175,8 +202,8 @@ type client_command =
   | Reject_token of token_request
   | Select_graph of Sync.graph_id
   | Return_to_graph_picker
-  | Refresh_catalog
-  | Begin_online_recovery
+  | Refresh_catalog of startup_scope
+  | Begin_online_recovery of timeline_scope
   | Submit_e2ee_password of string
   | Delete_local_cache of Sync.graph_id
   | Set_foreground of bool
@@ -487,13 +514,16 @@ let client_event = function
   | Reconcile_authenticated_user { user_id } ->
     Pure.Sync_event (Sync.Account_authenticated { user_id })
   | Acknowledge_local_feed -> Pure.Sync_event Sync.Local_feed_acknowledged
-  | Acknowledge_timeline_presented -> Pure.Sync_event Sync.Timeline_presented
+  | Acknowledge_timeline_presented scope -> Pure.Sync_event (Sync.Timeline_presented scope)
+  | Request_sign_in scope -> Pure.Sync_event (Sync.Sign_in_requested scope)
+  | Cancel_online scope -> Pure.Sync_event (Sync.Online_cancelled scope)
+  | Local_account_unavailable (scope,reason) -> Pure.Sync_event (Sync.Local_account_unavailable (scope,reason))
   | Provide_token _ | Reject_token _ ->
     invalid_arg "token commands are handled by the service"
   | Select_graph graph_id -> Pure.Sync_event (Sync.Graph_selected graph_id)
   | Return_to_graph_picker -> Pure.Sync_event Sync.Graph_picker_requested
-  | Refresh_catalog -> Pure.Sync_event Sync.Catalog_refresh_requested
-  | Begin_online_recovery -> Pure.Sync_event Sync.Online_recovery_requested
+  | Refresh_catalog scope -> Pure.Sync_event (Sync.Catalog_refresh_requested scope)
+  | Begin_online_recovery scope -> Pure.Sync_event (Sync.Online_recovery_requested scope)
   | Submit_e2ee_password password ->
     Pure.Sync_event (Sync.E2ee_password_submitted password)
   | Delete_local_cache graph_id ->
@@ -765,10 +795,11 @@ let create ~(dependencies : dependencies) =
           "host rejected request";
         Ok Client_command_completed
       | Client_command (Reconcile_authenticated_user _) ->
-        (* The reliable latest-state daemon owns Core delivery, including Full.
-           An old admitted request must not repost its superseded user value.
-           Completion means the current state has entered Core's event queue,
-           not that Core has applied or persisted it. *)
+        (* Latest controls may coalesce an identical user even after local startup
+           closed the network gate. An admitted fresh verification must still
+           reach Core. Reassert the latest observed SDK identity, never the
+           possibly superseded value carried by an old admitted request. *)
+        if !(session.auth_seen) then session.queue_auth !(session.authenticated_user);
         Eio.Condition.loop_no_mutex session.auth_wake (fun () ->
           if !(session.auth_enqueued_sequence) >= !(session.auth_sequence)
           then Some ()

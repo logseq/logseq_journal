@@ -7,6 +7,24 @@ import Foundation
 
   static func main() throws {
     let cases: [(String, () throws -> Void)] = [
+      ("cancelled online scope rejects late retry and permission", {
+        var events = JournalPlatformEvents()
+        events.connect()
+        let scope = JournalPlatformWire.StartupScope(accountGeneration: 1, presentationGeneration: 2)
+        let cancel = JournalPlatformWire.onlineCancelled(scope)
+        events.requestOnline(cancel)
+        try check(!events.acceptsOnlinePermission(scope), "late permission reopened cancelled scope")
+        events.requestOnline(JournalPlatformWire.onlineRequested(scope))
+        try check(events.next == cancel, "same-scope retry replaced cancellation barrier")
+        events.accepted(cancel)
+        events.requestOnline(JournalPlatformWire.onlineRequested(scope))
+        try check(events.next == nil, "cancelled scope re-entered pending events")
+        let next = JournalPlatformWire.StartupScope(accountGeneration: 1, presentationGeneration: 3)
+        let retry = JournalPlatformWire.onlineRequested(next)
+        try check(events.acceptsOnlinePermission(next), "new presentation permission rejected")
+        events.requestOnline(retry)
+        try check(events.next == retry, "new presentation cannot retry")
+      }),
       ("background and resume preserve one generation", {
         var events = JournalPlatformEvents()
         events.connect()

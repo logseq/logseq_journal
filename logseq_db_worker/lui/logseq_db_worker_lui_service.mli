@@ -17,8 +17,30 @@ type startup_failure_stage =
   | During_bootstrap
   | During_e2ee
 
+type local_unavailability = Logseq_sync_pure_reducer.Core.local_unavailability =
+  | No_local_account
+  | Local_catalog_unavailable
+  | Local_mirror_unavailable
+  | Local_key_unavailable
+  | Local_restore_failed
+
+type local_access = Logseq_sync_pure_reducer.Core.local_access =
+  | Local_pending
+  | Local_available
+  | Local_unavailable of local_unavailability
+
+type startup_network_phase = Logseq_sync_pure_reducer.Core.startup_network_phase =
+  | Local_only
+  | Online_after_timeline
+  | Online_by_user
+
+type startup_scope = Logseq_sync_pure_reducer.Core.startup_scope
+type timeline_scope = Logseq_sync_pure_reducer.Core.timeline_scope
+
 type startup_facts =
   { authenticated : bool
+  ; local_access : local_access
+  ; network_phase : startup_network_phase
   ; catalog_loading : bool
   ; awaiting_selection : bool
   ; restoring_local : bool
@@ -76,7 +98,10 @@ type client_command =
   | Restore_local_account of { user_id : string }
   | Reconcile_authenticated_user of { user_id : string option }
   | Acknowledge_local_feed
-  | Acknowledge_timeline_presented
+  | Acknowledge_timeline_presented of timeline_scope
+  | Request_sign_in of startup_scope
+  | Cancel_online of startup_scope
+  | Local_account_unavailable of startup_scope * local_unavailability
   | Provide_token of
       { request : token_request
       ; token : string
@@ -84,8 +109,8 @@ type client_command =
   | Reject_token of token_request
   | Select_graph of graph_id
   | Return_to_graph_picker
-  | Refresh_catalog
-  | Begin_online_recovery
+  | Refresh_catalog of startup_scope
+  | Begin_online_recovery of timeline_scope
   | Submit_e2ee_password of string
   | Delete_local_cache of graph_id
   | Set_foreground of bool

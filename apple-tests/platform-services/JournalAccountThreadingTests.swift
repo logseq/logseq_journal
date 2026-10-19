@@ -121,7 +121,7 @@ enum JournalLocalAccountBindingStore {
     try await canceled(lookup)
 
     let authGate = JournalLocalAccountBindingStore.hold("load")
-    let authentication = Task { try await platform.response(for: .authenticatedUser) }
+    let authentication = Task { try await platform.explicitOnlineResponse(for: .authenticatedUser) }
     try await waitFor { JournalLocalAccountBindingStore.state.withLock { $0.operations == ["load"] } }
     let signOut = Task { try await platform.response(for: .signOut) }
     try await waitFor { JournalCognitoSession.signOutCalls == 1 }
@@ -132,7 +132,7 @@ enum JournalLocalAccountBindingStore {
     precondition(JournalLocalAccountBindingStore.state.withLock { $0.value == nil })
 
     let saveGate = JournalLocalAccountBindingStore.hold("save")
-    let saving = Task { try await platform.response(for: .authenticatedUser) }
+    let saving = Task { try await platform.explicitOnlineResponse(for: .authenticatedUser) }
     try await waitFor { JournalLocalAccountBindingStore.state.withLock { $0.operations.contains("save") } }
     let cleanup = Task { try await platform.response(for: .signOut) }
     try await waitFor { JournalCognitoSession.signOutCalls == 2 }
@@ -163,7 +163,7 @@ enum JournalLocalAccountBindingStore {
     _ = try await recovering.response(for: .localAccount)
     JournalCognitoSession.userID = "replacement-user"
     let delayedSave = JournalLocalAccountBindingStore.hold("save")
-    let replacement = Task { try await recovering.response(for: .authenticatedUser) }
+    let replacement = Task { try await recovering.explicitOnlineResponse(for: .authenticatedUser) }
     try await waitFor { JournalLocalAccountBindingStore.state.withLock { $0.operations.contains("save") } }
     _ = try await recovering.response(for: .timelinePresented)
     let otherWindow = JournalNativeServices.makePlatformServices()
@@ -187,13 +187,13 @@ enum JournalLocalAccountBindingStore {
     precondition(restored == .localAccount(userID: "fixture-user", origin: "https://api.logseq.io"),
       "Retry must repair the original bytes before exposing account metadata")
     JournalCognitoSession.userID = "fixture-user"
-    _ = try await recovering.response(for: .authenticatedUser)
+    _ = try await recovering.explicitOnlineResponse(for: .authenticatedUser)
     precondition(recovering.accountIssue == nil)
 
     JournalLocalAccountBindingStore.state.withLock { $0.value = nil }
     let creating = JournalNativeServices.makePlatformServices()
     let createdSaveGate = JournalLocalAccountBindingStore.hold("save")
-    let created = Task { try await creating.response(for: .authenticatedUser) }
+    let created = Task { try await creating.explicitOnlineResponse(for: .authenticatedUser) }
     try await waitFor { JournalLocalAccountBindingStore.state.withLock { $0.operations.contains("save") } }
     creating.cancelAuthenticationPreparation()
     createdSaveGate.signal()
@@ -208,12 +208,12 @@ enum JournalLocalAccountBindingStore {
     _ = try await ordered.response(for: .localAccount)
     JournalCognitoSession.userID = "replacement-user"
     let oldSaveGate = JournalLocalAccountBindingStore.hold("save")
-    let oldSave = Task { try await ordered.response(for: .authenticatedUser) }
+    let oldSave = Task { try await ordered.explicitOnlineResponse(for: .authenticatedUser) }
     try await waitFor { JournalLocalAccountBindingStore.state.withLock { $0.operations.contains("save") } }
     _ = try await ordered.response(for: .timelinePresented)
     ordered.cancelAuthenticationPreparation()
     JournalCognitoSession.userID = "fixture-user"
-    let newerSave = Task { try await ordered.response(for: .authenticatedUser) }
+    let newerSave = Task { try await ordered.explicitOnlineResponse(for: .authenticatedUser) }
     oldSaveGate.signal()
     try await canceled(oldSave)
     let newResult = try await newerSave.value
@@ -221,5 +221,13 @@ enum JournalLocalAccountBindingStore {
     precondition(JournalLocalAccountBindingStore.state.withLock { $0.value?["userId"] == "fixture-user" },
       "Old undo must complete before a newer accepted write")
     print("PASS background account storage, responsive UI, ordered cleanup and stale-result fencing")
+  }
+}
+
+// The existing storage/undo scenarios exercise user-authorized online recovery.
+@MainActor private extension JournalPlatformServices {
+  func explicitOnlineResponse(for request:JournalPlatformWire.Request) async throws -> JournalPlatformWire.Response {
+    _ = try await response(for:.onlineRequested)
+    return try await response(for:request)
   }
 }
