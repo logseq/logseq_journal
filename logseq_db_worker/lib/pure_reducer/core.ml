@@ -489,8 +489,15 @@ let step state event =
                        { scope = Sync.effect_scope_of_graph request.scope.graph; message }))
                  state
              in
+             let origin = (Logseq_db_worker_contract.Error.trace error).origin in
+             let signal =
+               match origin.component, origin.operation, origin.code with
+               | Managed_sync, "applyAuthoritative", Some category ->
+                 "worker.applyAuthoritative." ^ category
+               | _ -> "worker.applyAuthoritative"
+             in
              { next = transitioned.next
-             ; effects = Publish (Diagnostic "worker.applyAuthoritative") :: transitioned.effects
+             ; effects = Publish (Diagnostic signal) :: transitioned.effects
              }
            | Some (Sync.Apply_outbox_transition request) ->
              let transitioned =

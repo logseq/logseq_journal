@@ -1629,10 +1629,109 @@ let test_deletion_journal_failure_preserves_worker () = deletion_runtime_fixture
 let test_deletion_confirmation_failure_reports () =
   deletion_runtime_fixture ~confirmation_failure:true ~busy:false ()
 
+(* Producer mapping lives in the runner. Real cursor/format failures reach it
+   through the public reducer and database; no failed external result is injected. *)
+let test_authoritative_rejection_diagnostics kind () =
+  let module G = Logseq_db_types.Graph_types in
+  let module Error = Logseq_db_worker.Error in
+  T.with_managed (fun fixture -> Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
+    let graph_id = G.Uuid.of_string "94000000-0000-4000-8000-000000000707" |> Result.get_ok in
+    let graph : Sync.graph = {graph_id;name="Synthetic authoritative diagnostics";encrypted=false;
+      schema={major=65;minor=33;exact=true}} in
+    let root=fixture.config.application_support_directory in
+    let worker_root=Filename.concat root "logseq-db-worker" in Unix.mkdir worker_root 0o700;
+    let mirrors=Filename.concat worker_root "synced-graphs" in Unix.mkdir mirrors 0o700;
+    let directory=Filename.concat mirrors (G.Uuid.to_string graph_id) in Unix.mkdir directory 0o700;
+    let sqlite=Sqlite3.db_open (Filename.concat directory "db.sqlite") in
+    let open Yojson.Safe.Util in
+    let storage=T.read_json (T.fixture "storage/logseq-65.33-create-page.json") in
+    Sqlite3.Rc.check (Sqlite3.exec sqlite (storage |> member "tableSql" |> to_string));
+    let stmt=Sqlite3.prepare sqlite "INSERT INTO kvs(addr,content,addresses) VALUES(?,?,?)" in
+    storage |> member "rows" |> to_list |> List.iter (fun row ->
+      Sqlite3.Rc.check (Sqlite3.reset stmt);
+      Sqlite3.Rc.check (Sqlite3.bind_int stmt 1 (row |> member "addr" |> to_int));
+      Sqlite3.Rc.check (Sqlite3.bind_text stmt 2 (row |> member "content" |> to_string));
+      Sqlite3.Rc.check (Sqlite3.bind stmt 3 (match member "addresses" row with
+        | `Null -> Sqlite3.Data.NULL | `String value -> TEXT value | _ -> assert false));
+      Sqlite3.Rc.check (Sqlite3.step stmt));
+    Sqlite3.Rc.check (Sqlite3.finalize stmt);
+    let cursor n=Logseq_db_types.Server_cursor.of_int64 n |> Result.get_ok in
+    let checkpoint=Logseq_db_types.Sync_checkpoint.create ~graph_id ~schema:{major=65;minor=33}
+      ~applied_server_t:(cursor 0L) ~checksum:"0123456789abcdef" |> Result.get_ok in
+    Logseq_db_storage.Sync_checkpoint_store.initialize_database sqlite checkpoint |> Result.get_ok;
+    Logseq_db_storage.Sync_outbox_store.initialize_database sqlite |> Result.get_ok;
+    ignore(Sqlite3.db_close sqlite);
+    let limits=Sync.limits ~maximum_response_bytes:1024 ~maximum_artifact_bytes:1048576
+      ~submission_batch_size:32 |> Result.get_ok in
+    let sync=Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits |> Result.get_ok in
+    let state=ref(Core.initial (Core.config ~worker:fixture.config ~sync) |> Result.get_ok) in
+    let events=Queue.create () and emitted=ref [] and failures=ref [] and connection=ref None in
+    let post event=Queue.add event events in
+    let sync_runner=Runner.sync_runner ~shutdown:(fun () -> ()) ~submit:(function
+      | Sync.Request(ticket,Sync.Fetch_catalog _) -> post (Core.Sync_event
+          (Sync.Runner_completed (Sync.Completion(ticket,Ok [graph]))))
+      | Sync.Request(ticket,Sync.Save_catalog _) -> post (Core.Sync_event
+          (Sync.Runner_completed (Sync.Completion(ticket,Ok ()))))
+      | Sync.Start_websocket request -> connection:=Some request.scope
+      | _ -> ()) () in
+    let dependencies=Runner.dependencies ~runtime:(Runner.runtime
+      ~fork:(fun ~sw:_ task -> task ()) ~sleep:(fun _ -> ()) |> Result.get_ok)
+      ~config:fixture.config ~overlay:fixture.overlay ~sync_runner
+      ~publish:(fun output -> emitted:=output :: !emitted) |> Result.get_ok in
+    let runner=Runner.create ~sw dependencies ~post ~recovery_current:(fun _->false)
+      ~upload_current:(fun _->false) ~asset_current:(fun _->false) |> Result.get_ok in
+    let drive event=
+      post event;
+      while not(Queue.is_empty events) do
+        let event=Queue.take events in
+        (match event with Core.Runner_completed (Sync_worker_effect_completed(_,Error error)) ->
+          failures:=error :: !failures | _ -> ());
+        let transition=Core.step !state event in state:=transition.next;
+        List.iter (Runner.submit runner) transition.effects
+      done in
+    Fun.protect ~finally:(fun () -> Runner.shutdown runner) (fun () ->
+      drive (Core.Sync_event (Sync.Sign_in_requested {account_generation=0;presentation_generation=0}));
+      drive (Core.Sync_event (Sync.Account_authenticated {user_id=Some "synthetic-user"}));
+      drive (Core.Sync_event (Sync.Graph_selected graph_id));
+      Alcotest.(check bool) "actual mirror opens" true ((Core.view !state).graph.phase=Graph_open);
+      let connection=Option.get !connection in
+      drive (Core.Sync_event (Sync.Websocket_opened connection));
+      let t,payload,code,category,message=match kind with
+        | `Cursor -> 2L,"[[\"~:db/retractEntity\",99999]]",Error.Ambiguous_sync_state,
+            "authoritativeCursorDiscontinuous","Authoritative transaction cursors are not continuous."
+        | `Format -> 1L,"[[\"~:PRIVATE_SYNTHETIC_PAYLOAD\",99999]]",Error.Unsupported_semantics,
+            "authoritativeDecodeFailed","Authoritative transaction format is unsupported."
+        | `Apply_format -> 1L,"[[\"~:db/add\",null,\"~:block/foo\",\"PRIVATE_SYNTHETIC_PAYLOAD\"]]",Error.Unsupported_semantics,
+            "authoritativeDecodeFailed","Authoritative transaction format is unsupported." in
+      let tx : Logseq_sync_pure_reducer.Sync_protocol.Server.pull_transaction=
+        {t=cursor t;tx=payload;outliner_op=None} in
+      drive (Core.Sync_event (Sync.Websocket_message(connection,Pull_ok {t=cursor t;checksum=None;txs=[tx]})));
+      let error=match !failures with [error]->error | _ -> Alcotest.fail "expected actual authoritative failure" in
+      Alcotest.(check bool) "failure code reflects actual category" true (Error.code error=code);
+      Alcotest.(check string) "producer retains a fixed safe reason" message (Error.message error);
+      Alcotest.(check (option string)) "typed origin retains category" (Some category) (Error.trace error).origin.code;
+      Alcotest.(check (option string)) "actual Last error retains category" (Some message)
+        (Core.view !state).sync.snapshot.last_error;
+      Alcotest.(check bool) "actual Worker diagnostic retains category" true
+        (List.exists (function Core.Diagnostic signal -> signal="worker.applyAuthoritative."^category | _ ->false) !emitted);
+      Alcotest.(check bool) "failure precedes checkpoint advancement" true
+        ((Core.view !state).sync.snapshot.applied_server_t=Some(cursor 0L));
+      let encoded=Yojson.Safe.to_string(Error.to_yojson error) in
+      let contains needle=
+        let rec loop i=i+String.length needle<=String.length encoded &&
+          (String.sub encoded i (String.length needle)=needle || loop(i+1)) in loop 0 in
+      List.iter (fun secret -> Alcotest.(check bool) "source content excluded" false (contains secret))
+        [root;payload;"PRIVATE_SYNTHETIC_PAYLOAD"]))))
+;;
+
 let () =
   Alcotest.run
     "logseq db worker effect runner"
-    [ ( "ID token cache"
+    [ ( "authoritative diagnostics", [
+        Alcotest.test_case "real cursor rejection reaches Diagnostics" `Quick (test_authoritative_rejection_diagnostics `Cursor);
+        Alcotest.test_case "real format rejection reaches Diagnostics" `Quick (test_authoritative_rejection_diagnostics `Format);
+        Alcotest.test_case "apply format failure excludes raw source" `Quick (test_authoritative_rejection_diagnostics `Apply_format) ])
+    ; ( "ID token cache"
       , [ Alcotest.test_case
             "caps reuse at twenty-four hours"
             `Quick

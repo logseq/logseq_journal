@@ -1262,10 +1262,27 @@ let test_restore_error_reaches_diagnostics () =
           | _ -> ()); !cleared)))
 ;;
 
+(* The row allowlist belongs to the service publisher, not the pure reducer. *)
+let test_authoritative_diagnostic_rows () =
+  List.iter (fun (category, expected) ->
+    let operation, phase, message = Service.diagnostic_report
+      ("worker.applyAuthoritative." ^ category) in
+    T.require (operation="applyAuthoritative" && phase="sync") "authoritative row retains its operation";
+    T.require (message=expected) "authoritative row erased category %s" category)
+    [ "authoritativeDatabaseClosed", "Authoritative database is closed."
+    ; "authoritativeSyncTokenConflict", "Authoritative sync version changed."
+    ; "authoritativeCursorDiscontinuous", "Authoritative transaction cursors are not continuous."
+    ; "authoritativeDecodeFailed", "Authoritative transaction format is unsupported." ];
+  let unsafe = "worker.applyAuthoritative.PRIVATE_SYNTHETIC_PAYLOAD" in
+  T.require (Service.diagnostic_report unsafe = Service.diagnostic_report "unknown")
+    "unknown signal must never display caller content"
+;;
+
 let () =
   T.run
     "lui worker service"
-    [ T.case "ignored restore failure reaches scoped safe Diagnostics" test_restore_error_reaches_diagnostics
+    [ T.case "authoritative category row allowlist" test_authoritative_diagnostic_rows
+    ; T.case "ignored restore failure reaches scoped safe Diagnostics" test_restore_error_reaches_diagnostics
     ; T.case "local copy confirmed deletion awaits physical removal" (test_local_copy_presence "delete")
     ; T.case "local copy busy failure recovers" (test_local_copy_presence "busy")
     ; T.case "local copy absent metadata" (test_local_copy_presence "absent")
