@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 @MainActor struct JournalCognitoStorage {
   let load: () async throws -> JournalCognitoTokens?
@@ -129,7 +130,11 @@ import Foundation
     guard signInID == id else { throw CancellationError() }
     tokens = updated; loaded = true
     signInID = nil
-    try? await storage.retireLegacy()
+    do { try await storage.retireLegacy() }
+    catch {
+      Logger(subsystem: "com.logseq.journal", category: "account")
+        .error("Legacy credential cleanup is pending (account.retireLegacy.failed)")
+    }
     try check(savingVersion)
     NotificationCenter.default.post(name: Self.changed, object: self)
   }
@@ -143,15 +148,26 @@ import Foundation
     cancelSignIn(); refresh?.task.cancel(); refresh = nil
     defer { signingOut = false }
     var previous = tokens
-    if previous == nil { previous = try? await storage.load() }
+    if previous == nil {
+      do { previous = try await storage.load() }
+      catch {
+        Logger(subsystem: "com.logseq.journal", category: "account")
+          .error("Remote sign-out credentials unavailable (account.loadForRevocation.failed)")
+      }
+    }
     tokens = nil; loaded = true
     try await storage.clear()
     try await storage.retireLegacy()
     NotificationCenter.default.post(name: Self.changed, object: self)
     if let previous {
       // Local cleanup succeeds offline. Revocation is bounded and best effort.
-      _ = try? await transport(request(path: "/oauth2/revoke", values: ["client_id": configuration.clientID,
-        "token": previous.refreshToken]))
+      do {
+        _ = try await transport(request(path: "/oauth2/revoke", values: ["client_id": configuration.clientID,
+          "token": previous.refreshToken]))
+      } catch {
+        Logger(subsystem: "com.logseq.journal", category: "account")
+          .error("Remote sign-out could not finish (account.revoke.failed)")
+      }
     }
   }
   private func request(path: String, values: [String: String]) -> URLRequest {

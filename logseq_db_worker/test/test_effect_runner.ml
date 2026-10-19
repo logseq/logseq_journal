@@ -1330,6 +1330,7 @@ let test_upload_checkpoint_io () =
         Fun.protect
           ~finally:(fun () -> Unix.chmod staging_directory 0o700)
           (fun () ->
+             Runner.submit runner (Core.Publish (Core.Sync_output (Sync.State_changed (Sync.state !sync_state))));
              Runner.submit runner (Core.Run_upload (context, restore_terminal ()));
              Alcotest.(check bool)
                "unavailable cache retains pending source"
@@ -1343,6 +1344,12 @@ let test_upload_checkpoint_io () =
                     | Core.Diagnostic _ -> true
                     | _ -> false)
                   !published);
+             let signed_out = Sync.step !sync_state (Sync.Account_authenticated {user_id=None}) in
+             Runner.submit runner (Core.Publish (Core.Sync_output (Sync.State_changed (Sync.state signed_out.next))));
+             published := [];
+             Runner.submit runner (Core.Run_upload (context, restore_terminal ()));
+             Alcotest.(check bool) "old scope cleanup cannot create a current diagnostic" false
+               (List.exists (function Core.Diagnostic _ -> true | _ -> false) !published);
              Runner.shutdown runner);
         sync_state := admitted;
         io_runner

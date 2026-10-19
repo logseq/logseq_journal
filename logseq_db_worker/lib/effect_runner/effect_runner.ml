@@ -758,6 +758,9 @@ let close_database_by_id t database_id =
   | Some session ->
     Database.unlisten session.subscription;
     let result = Database.close session.database in
+    (match result with
+     | Ok () -> ()
+     | Error _ -> Printf.eprintf "journal: operation=closeDatabase code=cleanupPending\n%!");
     Hashtbl.remove t.databases database_id;
     Result.map_error
       (fun _ -> effect_error "The overlay database failed to close.")
@@ -1545,7 +1548,8 @@ let recover_local_retirements t (scope : Sync.graph_scope) =
         else
           let deletion = Sync.asset_deletion_reference ~scope ~retirement in
           let* () = finish_local_retirement t scope deletion captured ~commit:committed in
-          (if committed then (try remove_local_retirement journal_path with _ -> ())
+          (if committed then (try remove_local_retirement journal_path with _ ->
+             Printf.eprintf "journal: phase=retirement operation=removeCoordinatorJournal code=cleanupPending\n%!")
            else remove_local_retirement journal_path);
           Ok ())
     with _ -> Error "Local copy recovery is incomplete; its resources were preserved.") (Ok ()) (Sys.readdir directory)
@@ -1681,7 +1685,7 @@ let handle_sync_worker_effect t = function
             if not !committed then
               match finish_local_retirement t scope deletion captured ~commit:false with
               | Ok () -> remove_local_retirement path
-              | Error _ -> () in
+              | Error _ -> Printf.eprintf "journal: phase=retirement operation=abortLocalRetirement code=cleanupPending\n%!" in
           Fun.protect ~finally:abort (fun () ->
             let* () = match asset_call t ~scope (Sync.Prepare_graph_asset_deletion retirement) with
               | Ok (Sync.Asset_deletion_prepared actual) when actual=deletion -> Ok ()
@@ -1697,8 +1701,8 @@ let handle_sync_worker_effect t = function
                if Database.mirror_deletion_committed prepared then
                  match finish_local_retirement t scope deletion captured ~commit:true with
                  | Ok () -> remove_local_retirement path
-                 | Error _ -> ()
-             with _ -> ());
+                 | Error _ -> Printf.eprintf "journal: phase=retirement operation=finishLocalRetirement code=cleanupPending\n%!"
+             with _ -> Printf.eprintf "journal: phase=retirement operation=finishLocalRetirement code=cleanupPending\n%!");
             Hashtbl.remove t.inspections (Graph.Uuid.to_string request.graph_id);
             Ok ())))
       with
@@ -1903,6 +1907,15 @@ let complete t (Core.Request (ticket, request)) =
     t.post (Core.Runner_completed (Core.Sync_worker_effect_completed (ticket, result)))
 ;;
 
+let report_asset_error t (scope : Sync.graph_scope) code =
+  match t.latest_snapshot with
+  | Some snapshot when not t.stopped
+      && snapshot.startup.account_generation = scope.account.account_generation
+      && snapshot.startup.graph_generation = scope.graph_generation ->
+    t.dependencies.publish (Core.Diagnostic code)
+  | _ -> ()
+;;
+
 let run_upload t (context : Sync.asset_context) instruction =
   let current ticket = (not t.stopped) && t.upload_current ticket in
   let database ticket f =
@@ -1954,7 +1967,9 @@ let run_upload t (context : Sync.asset_context) instruction =
          asset_unit t ~scope:context.scope (Sync.Release_staged_file intent.staged_file))
      with
      | Ok () -> ()
-     | Error message -> t.dependencies.publish (Core.Diagnostic message))
+     | Error _ ->
+       report_asset_error t context.scope "asset.release";
+       Printf.eprintf "journal: operation=releaseUploadStaging code=cleanupPending\n%!" )
   | Persist (ticket, intent, expected) ->
     if current ticket then finish ticket (save_upload t intent expected) Upload.Persisted
   | Inspect (ticket, intent) ->
@@ -2231,7 +2246,14 @@ let run_asset t (context : Sync.asset_context) instruction =
       match asset_call t ~scope:context.scope (Sync.Asset_retry_after seconds) with
       | Ok Sync.Asset_retry_elapsed when not t.stopped ->
         t.post (Core.Asset_completed (context.scope, Transfer.Retry_elapsed id))
-      | Ok _ | Error _ -> ())
+      | Error Sync.Asset_cancelled -> ()
+      | Ok _ | Error _ ->
+        (match t.latest_snapshot with
+         | Some snapshot when not t.stopped
+             && snapshot.startup.account_generation=context.scope.account.account_generation
+             && snapshot.startup.graph_generation=context.scope.graph_generation ->
+           t.dependencies.publish (Core.Diagnostic "asset.retryTimer")
+         | _ -> ()))
   | Notify _ | Backpressure _ | Capacity_available -> ()
 ;;
 
@@ -2363,11 +2385,14 @@ let shutdown t =
 let retain_asset_file t ~scope ~handle =
   match asset_call t ~scope (Sync.Retain_asset_file handle) with
   | Ok (Sync.Asset_retained file) -> file
-  | Ok _ | Error _ -> None
+  | Error Sync.Asset_cancelled -> None
+  | Ok _ | Error _ -> report_asset_error t scope "asset.preview"; None
 ;;
 
 let release_asset_file t ~scope ~handle =
-  ignore (asset_unit t ~scope (Sync.Release_asset_file handle))
+  match asset_call t ~scope (Sync.Release_asset_file handle) with
+  | Ok Sync.Asset_unit | Error Sync.Asset_cancelled -> ()
+  | Ok _ | Error _ -> report_asset_error t scope "asset.release"
 ;;
 
 let prepare_import_unlocked
@@ -2468,15 +2493,17 @@ let prepare_import t ~(context : Sync.asset_context) request ~current =
            intent.operation_id;
          if intent.phase <> Logseq_db_types.Asset_upload_intent.Cancelled && current ()
          then
-           ignore
-             (asset_unit
+           (match asset_call
                 t
                 ~scope:context.Sync.scope
                 (Sync.Publish_staged_asset
                    { asset = intent.asset
                    ; version = intent.version
                    ; file = intent.staged_file
-                   }));
+                   }) with
+            | Ok Sync.Asset_unit | Error Sync.Asset_cancelled -> ()
+            | Ok _ | Error _ ->
+              if current () then report_asset_error t context.scope "asset.preview");
          intent)
       (prepare_import_unlocked t ~context request ~current))
 ;;
@@ -2496,6 +2523,8 @@ let retain_imported_file t ~(scope : Sync.graph_scope) ~operation =
            && intent.phase <> Logseq_db_types.Asset_upload_intent.Cancelled ->
       (match asset_call t ~scope (Sync.Retain_staged_file intent.staged_file) with
        | Ok (Sync.Asset_retained file) -> file
-       | Ok _ | Error _ -> None)
-    | Ok _ | Error _ -> None)
+       | Error Sync.Asset_cancelled -> None
+       | Ok _ | Error _ -> report_asset_error t scope "asset.preview"; None)
+    | Ok _ -> None
+    | Error _ -> report_asset_error t scope "asset.metadata"; None)
 ;;

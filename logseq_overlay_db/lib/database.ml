@@ -842,7 +842,7 @@ let collect_retired_mirrors (location : durable_mirror_location) =
             | Error _ -> ()
             | Ok owner -> Fun.protect ~finally:(fun () -> ignore (Ownership.release owner))
                 (fun () -> remove_mirror_tree data; sync_deletion_directory root))
-        with _ -> ())
+        with _ -> Printf.eprintf "journal: phase=cleanup operation=collectRetiredMirrors code=collectionPending\n%!")
 ;;
 
 let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement =
@@ -958,7 +958,7 @@ let commit_mirror_deletion preparation =
        write_deletion_receipt receipt result true;
        preparation.deletion_durable <- true;
        collect_retired_mirrors location
-     with _ -> ());
+     with _ -> Printf.eprintf "journal: phase=retirement operation=confirmMirrorRetirement code=confirmationPending\n%!");
     Ok result
   | None, None when preparation.deletion_cancelled || preparation.deletion_ownership = None -> Error Types.Mirror_delete_stale
   | None, None ->
@@ -990,7 +990,7 @@ let commit_mirror_deletion preparation =
           write_deletion_receipt receipt result true;
           preparation.deletion_durable <- true;
           collect_retired_mirrors location
-        with _ -> ());
+        with _ -> Printf.eprintf "journal: phase=retirement operation=confirmMirrorRetirement code=confirmationPending\n%!");
        Ok result)
 ;;
 
@@ -5536,7 +5536,8 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
 ;;
 
 let open_ ~sw dependencies inspection ~graph_name =
-  (try collect_retired_mirrors inspection.location with _ -> ());
+  (try collect_retired_mirrors inspection.location with _ ->
+     Printf.eprintf "journal: phase=cleanup operation=collectRetiredMirrors code=collectionPending\n%!");
   if String.trim graph_name = ""
   then Error Types.Invalid_graph_name
   else (

@@ -69,12 +69,23 @@ private let platformRequest: PlatformRequestCallback = { data, length in
 /// Owns the lui backend, the OCaml runtime, and the platform bridge for one
 /// journal session. Replaces `BonsaiApplicationView` + `BonsaiApplicationBridge`.
 @Observable @MainActor final class JournalRuntime {
+  enum Failure: String, Error, LocalizedError {
+    case start = "runtime.start.failed"
+    case patch = "runtime.patch.failed"
+    case pump = "runtime.pump.failed"
+    case event = "runtime.event.failed"
+    case stop = "runtime.stop.failed"
+    var errorDescription: String? {
+      "Journal could not complete a native operation (\(rawValue)). Retry opening Journal."
+    }
+  }
   let backend: LUIAppleBackend
   let platform: JournalApplicationPlatform
   private let startupPayload: Data
   private(set) var rootID: Int?
   /// Count of patch batches applied from the OCaml runtime (test visibility).
   private(set) var appliedPatches = 0
+  private(set) var failure: Failure?
   private var started = false
 
   init(
@@ -94,7 +105,8 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   /// Boots the OCaml runtime; the LDB1 startup payload rides inside
   /// `lui_ocaml_start` so init receives it before the worker session begins.
   /// The platform event stream attaches afterwards.
-  func start() {
+  func start() throws {
+    if let failure { throw failure }
     guard !started else { return }
     journalOCamlSetWakeupCallback(wakeup)
     journalOCamlSetPlatformRequestCallback(platformRequest)
@@ -113,8 +125,21 @@ private let platformRequest: PlatformRequestCallback = { data, length in
         Int32(bytes.count))
     }
     guard accepted == 1 else {
+      _ = luiOCamlStop()
       activeRuntime = nil
-      return
+      failure = .start
+      throw Failure.start
+    }
+    if let failure {
+      _ = luiOCamlStop()
+      activeRuntime = nil
+      throw failure
+    }
+    guard rootID != nil else {
+      _ = luiOCamlStop()
+      activeRuntime = nil
+      failure = .start
+      throw Failure.start
     }
     started = true
     platform.connect(to: self)
@@ -123,7 +148,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   func stop() {
     guard started else { return }
     platform.disconnect()
-    _ = luiOCamlStop()
+    if luiOCamlStop() != 1 { failure = .stop }
     started = false
     activeRuntime = nil
   }
@@ -134,13 +159,13 @@ private let platformRequest: PlatformRequestCallback = { data, length in
       rootID = backend.rootIDs.first
       appliedPatches += 1
     } catch {
-      assertionFailure("Invalid LUI patch: \(error)")
+      failure = .patch
     }
   }
 
   func pump() {
     guard started else { return }
-    _ = journalOCamlPump()
+    if journalOCamlPump() != 1 { failure = .pump }
   }
 
   /// Marshals one LJP2 request onto the platform actor and ships its response
@@ -176,6 +201,6 @@ private let platformRequest: PlatformRequestCallback = { data, length in
 
   private func handle(_ event: LUIEvent) {
     guard started else { return }
-    _ = JournalLUIEvents.dispatch(event)
+    if JournalLUIEvents.dispatch(event) != 1 { failure = .event }
   }
 }

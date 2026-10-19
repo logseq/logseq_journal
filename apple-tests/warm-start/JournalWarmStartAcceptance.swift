@@ -151,7 +151,7 @@ private struct WarmFixture: Decodable {
       let runtime = try JournalRuntime(
         platform: headless, startupPayload: payload,
         extensionRegistry: try JournalExtensions.registry())
-      runtime.start()
+      try runtime.start()
       for index in 0..<5 {
         runtime.pump()
         try await Task.sleep(for: .milliseconds(50))

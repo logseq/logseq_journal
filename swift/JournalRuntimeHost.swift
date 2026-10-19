@@ -23,15 +23,19 @@ struct JournalRuntimeHost: View {
 
   private var content: some SwiftUI.View {
     Group {
-      if let runtime, let rootID = runtime.rootID {
-        LUISwiftUIRoot(backend: runtime.backend, rootID: rootID)
-      } else if failure != nil {
+      if failure != nil || runtime?.failure != nil {
         ContentUnavailableView {
           Label("Unable to open journal", systemImage: "exclamationmark.folder")
+        } description: {
+          Text(runtime?.failure?.errorDescription ??
+            (failure as? JournalRuntime.Failure)?.errorDescription ??
+            "Journal could not start (runtime.start.failed). Retry opening Journal.")
         } actions: {
-          Button("Retry") { failure = nil; clock.restart(); retry += 1 }
+          Button("Retry") { runtime?.stop(); runtime = nil; failure = nil; clock.restart(); retry += 1 }
             .accessibilityIdentifier("journal-runtime-retry")
         }
+      } else if let runtime, let rootID = runtime.rootID {
+        LUISwiftUIRoot(backend: runtime.backend, rootID: rootID)
       } else {
         JournalStartupLoadingSurface(loading: false, initial: true, active: true)
       }
@@ -61,12 +65,12 @@ struct JournalRuntimeHost: View {
             platform: platform,
             startupPayload: payload,
             extensionRegistry: extensions)
-          next.start()
+          try next.start()
           runtime = next
         } catch {
           failure = error
           Logger(subsystem: "com.logseq.journal", category: "runtime")
-            .error("Unable to start journal runtime: \(error)")
+            .error("Unable to start journal runtime (runtime.start.failed)")
         }
       }
     }
@@ -162,6 +166,8 @@ struct JournalHost: View {
       case .failure:
         ContentUnavailableView {
           Label("Unable to open local application storage", systemImage: "exclamationmark.folder")
+        } description: {
+          Text("Local storage setup could not finish (storage.setup.failed). Check available storage and retry.")
         } actions: {
           Button("Retry") { setup = nil; clock.restart(); retry += 1 }
             .accessibilityIdentifier("journal-storage-retry")

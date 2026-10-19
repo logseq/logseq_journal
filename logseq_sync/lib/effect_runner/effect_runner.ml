@@ -477,7 +477,7 @@ let load_catalog local_store account =
       |> Result.map Option.some
       |> Result.map_error (fun message -> Core.Effect_failed message)
     with
-    | Sys_error message -> Error (Core.Effect_failed message))
+    | Sys_error _ -> Error (Core.Effect_failed "The local graph catalog could not be read."))
 ;;
 
 let ensure_directory path =
@@ -511,12 +511,13 @@ let save_catalog local_store account cache =
            let path = cache_path local_store account in
            try
              let channel = open_out_bin path in
-             Fun.protect
-               ~finally:(fun () -> close_out_noerr channel)
-               (fun () -> output_string channel (Core.encode_catalog_cache cache));
-             Ok ()
+             (try
+                output_string channel (Core.encode_catalog_cache cache);
+                close_out channel;
+                Ok ()
+              with exn -> close_out_noerr channel; raise exn)
            with
-           | Sys_error message -> Error (Core.Effect_failed message))))
+           | Sys_error _ -> Error (Core.Effect_failed "The local graph catalog could not be saved."))))
 ;;
 
 let effect_error message = Error (Core.Effect_failed message)

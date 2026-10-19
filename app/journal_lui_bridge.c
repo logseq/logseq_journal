@@ -28,10 +28,10 @@ static journal_wakeup_callback wakeup_callback = NULL;
 static journal_platform_request_callback platform_request_callback = NULL;
 
 static void report_ocaml_exception(const char *where, value result) {
-  char *message = caml_format_exception(Extract_exception(result));
-  fprintf(stderr, "journal_lui_bridge: OCaml exception in %s: %s\n",
-          where, message);
-  caml_stat_free(message);
+  (void)result;
+  /* Exception text may contain credentials, paths or graph content. The return
+     code reaches the native host, which can report failure without a patch. */
+  fprintf(stderr, "journal_lui_bridge: operation=%s code=ocamlCallbackFailed\n", where);
 }
 
 typedef struct {

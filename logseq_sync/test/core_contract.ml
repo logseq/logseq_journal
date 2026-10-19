@@ -376,7 +376,23 @@ let catalog_save_failure_keeps_selected_graph_usable () =
   Alcotest.(check bool)
     "advisory cache save failure preserves selection"
     true
-    (Core.state failed.next = Core.state selected.next);
+    ((Core.state failed.next).snapshot = (Core.state selected.next).snapshot);
+  let groups = (Core.state failed.next).diagnostics.groups in
+  Alcotest.(check bool) "ignored catalog save is visible in Diagnostics" true
+    (List.exists (fun (g : Core.diagnostic_group) ->
+       List.exists (fun (_, value) -> String.starts_with ~prefix:"saveCatalog" value) g.entries) groups);
+  Alcotest.(check bool) "diagnostic update is published" true
+    (List.exists (function Core.Publish (Core.State_changed _) -> true | _ -> false) failed.effects);
+  let duplicate = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Save_catalog _)) ->
+      Some (Core.step failed.next (Core.Runner_completed
+        (Core.Completion (ticket, Error (Core.Effect_failed "sensitive ignored duplicate")))))
+    | _ -> None) selected.effects |> Option.get in
+  Alcotest.(check bool) "consumed duplicate cannot add or replace a diagnostic" true
+    (Core.state duplicate.next = Core.state failed.next && duplicate.effects = []);
+  let changed = Core.step failed.next (Core.Account_authenticated {user_id=Some "other-user"}) in
+  Alcotest.(check bool) "new account cannot inherit advisory errors" true
+    ((Core.state changed.next).diagnostics.groups = []);
   let inspected =
     Core.step failed.next (Core.Mirror_inspected (Core.Mirror_available { graph; scope }))
   in

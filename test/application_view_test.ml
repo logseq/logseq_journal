@@ -4848,7 +4848,7 @@ let test_fixture_exception_cleanup exception_ =
 
 (* Application owns password admission and UI. No public pure root event exists
    for E2EE; this fixture exercises mounted Application through its public hooks. *)
-let unlock_fixture ?(worker_failure = false) ?(queue_full = false) () =
+let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init = false) () =
   let module W = Logseq_db_worker_lui.Journal_worker in
   let graph_id =
     Logseq_db_types.Graph_types.Uuid.of_string "00000000-0000-0000-0000-000000000901"
@@ -4986,10 +4986,27 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) () =
   in
   let hooks =
     Application.For_testing.app_with_service
-      ~on_client:(fun value -> client := Some value)
+      ~on_client:(fun value -> client := Some value; if fail_init then failwith "synthetic init failure")
       worker
   in
   hooks, submissions, release, client
+;;
+
+let test_failed_init_disposes_context () =
+  (* Startup failure belongs to the public native hook, outside Root_navigation. *)
+  let hooks, _, release, client = unlock_fixture ~fail_init:true () in
+  let startup = Logseq_db_worker.Config.create
+      ~application_support_directory:"/tmp/journal-init-synthetic"
+      ~target:(Managed_sync {base_url="https://example.invalid"})
+      ~compatibility_profile:Logseq_65_33_or_newer
+      ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
+      ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+      |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
+  Fun.protect ~finally:(fun () -> Atomic.set release true; ignore(hooks.dispose());
+    Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client) (fun () ->
+      let failed = try ignore(hooks.init 2 2 startup); false with Failure _ -> true in
+      Alcotest.(check bool) "init exception reaches native boundary" true failed;
+      Alcotest.(check int) "failed startup releases its mounted context" 0 (hooks.root_node ()))
 ;;
 
 let capture_unlock_logs run =
@@ -5014,7 +5031,7 @@ let capture_unlock_logs run =
 ;;
 
 let run_unlock_application ?(worker_failure = false) ?(queue_full = false)
-    ?(stopping = false) () =
+    ?(stopping = false) ?(check_diagnostics = false) ?(native_report = false) () =
   let hooks, submissions, release, client = unlock_fixture ~worker_failure ~queue_full () in
   let props = Hashtbl.create 64 in
   let track_teardown = track_json_wire_teardown (Hashtbl.remove props) in
@@ -5113,7 +5130,18 @@ let run_unlock_application ?(worker_failure = false) ?(queue_full = false)
          wait "worker failure releases unlock pending" (fun () ->
            property (node "e2ee-password-editor") "enabled" = Some (`Bool true));
          Alcotest.(check int) "failure bypasses no crypto service" 0
-           (List.length (Atomic.get submissions)))
+           (List.length (Atomic.get submissions));
+         if native_report then (
+           let extension = Hashtbl.fold (fun id values found ->
+             if List.mem_assoc "payload" values then Some id else found) props None |> Option.get in
+           consume (hooks.extension_event extension "event"
+             {|{"id":-1,"payload":"diagnostic.nativePropsDecode"}|}));
+         if check_diagnostics || native_report then (
+           dispatch (Lui_protocol.Press (node "journal-startup-diagnostics"));
+           wait "queue refusal is retained in existing Diagnostics" (fun () ->
+             Option.is_some (find "text" (if native_report then "decodeNativeProps" else "submitE2eePassword")));
+           Alcotest.(check bool) "diagnostic excludes submitted password" true
+             (Option.is_none (find "text" " synthetic-only "))))
        else (
        wait "Return reaches worker" (fun () -> List.length (Atomic.get submissions) = 1);
        Alcotest.(check string)
@@ -5666,7 +5694,11 @@ let () =
     Journal_bridge.register hooks)
   else Alcotest.run
     "application view"
-    [ ( "diagnostic failure", [ Alcotest.test_case "current error and clearing" `Quick test_diagnostic_phase_rows_retain_current_error ])
+    [ ( "diagnostic failure", [ Alcotest.test_case "failed init disposes context" `Quick test_failed_init_disposes_context; Alcotest.test_case "current error and clearing" `Quick test_diagnostic_phase_rows_retain_current_error
+        ; Alcotest.test_case "current admission failure reaches Diagnostics" `Quick
+            (fun () -> run_unlock_application ~queue_full:true ~check_diagnostics:true ())
+        ; Alcotest.test_case "native extension failure reaches Diagnostics" `Quick
+            (fun () -> run_unlock_application ~worker_failure:true ~native_report:true ()) ])
     ; ( "direct delete", List.map (fun scenario ->
         Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~delete_scenario:scenario ()))
         ["success"; "failure"])

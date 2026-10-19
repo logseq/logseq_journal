@@ -621,10 +621,11 @@ module Asset_cache = struct
           (* The producer owns deferred collection. A purge failure must not
              block a replacement cache or undo the durable commit decision. *)
           (match remove_tree data with
-           | Error _ -> ()
+           | Error _ -> Printf.eprintf "journal: phase=cleanup operation=collectRetiredAssets code=collectionPending\n%!"
            | Ok () ->
              (try sync_path (Filename.dirname data);
-                  write_retirement manifest (retirement_json captured "complete") with _ -> ()));
+                  write_retirement manifest (retirement_json captured "complete") with _ ->
+                    Printf.eprintf "journal: phase=cleanup operation=completeRetirement code=cleanupPending\n%!"));
           Ok ())
         else if state = "committed" then Ok ()
         else (
@@ -657,7 +658,7 @@ module Asset_cache = struct
             if state = "committed" || state = "complete" || state = "account-deleted" then
               ignore (finish_graph_deletion ~root
                 ~deletion:(Core.asset_deletion_reference ~scope ~retirement) ~commit:true)
-          with _ -> ()) (Sys.readdir pending)
+          with _ -> Printf.eprintf "journal: phase=cleanup operation=collectRetiredAssets code=collectionPending\n%!") (Sys.readdir pending)
   ;;
 
   let delete_account ~root ~account =
@@ -682,7 +683,8 @@ module Asset_cache = struct
   ;;
 
   let create ~root ~(scope : Core.graph_scope) ~budget_bytes ~maximum_file_bytes =
-    (try collect_retired_assets ~root ~scope with _ -> ());
+    (try collect_retired_assets ~root ~scope with _ ->
+       Printf.eprintf "journal: phase=cleanup operation=collectRetiredAssets code=collectionPending\n%!");
     protect (fun () ->
       if
         budget_bytes < 0L

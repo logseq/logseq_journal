@@ -402,8 +402,62 @@ let production_dependencies () =
   { overlay; tls_authenticator; secrets; crypto }
 ;;
 
-let publish context = function
+(* Diagnostic strings are internal signals, never display text. Unknown values
+   receive a fixed fallback so exception/path/content strings cannot escape. *)
+let diagnostic_report = function
+  | "worker.inspectMirror" -> "inspectMirror", "localRestore", "Local graph inspection failed. Retry or choose another graph."
+  | "worker.attachGraph" -> "attachGraph", "localRestore", "The local graph could not be opened. Retry or choose another graph."
+  | "worker.inspectSync" -> "inspectSync", "sync", "Sync information is unavailable. Retry sync."
+  | "worker.applyAuthoritative" -> "applyAuthoritative", "sync", "Remote changes could not be applied. Retry sync or reopen Journal."
+  | "worker.applyOutbox" -> "applyOutbox", "sync", "Local sync progress could not be saved. Retry sync or reopen Journal."
+  | "worker.resetAccount" -> "resetAccount", "account", "Local account cleanup could not finish. Retry or reopen Journal."
+  | "asset.retryTimer" -> "assetRetryTimer", "asset", "Attachment retry could not be scheduled. Retry the attachment."
+  | "asset.release" -> "releaseAsset", "asset", "Attachment cleanup could not finish. Retry or reopen Journal."
+  | "asset.preview" -> "prepareAssetPreview", "asset", "Attachment preview is unavailable. Retry opening the attachment."
+  | "asset.metadata" -> "readAssetMetadata", "asset", "Attachment metadata is unavailable. Retry the attachment."
+  | "Upload queue capacity reached" -> "admitUpload", "upload", "The upload queue is full. Finish pending uploads, then retry."
+  | "Upload recovery could not read a valid checkpoint page" -> "restoreUploads", "upload", "Saved uploads could not be recovered. Retry online recovery."
+  | "asset.download" -> "downloadAsset", "asset", "Attachment download needs attention. Retry or check access and available storage."
+  | "asset.upload" -> "uploadAsset", "upload", "Attachment upload needs attention. Retry, or attach the source again."
+  | _ -> "workerOperation", "worker", "A Worker operation could not finish. Retry the operation or reopen Journal."
+;;
+
+let publish context =
+  let latest : state option ref = ref None in
+  let owner = ref None in
+  let reports = ref [] in
+  let with_reports (state : state) =
+    let scope = state.snapshot.startup in
+    let entries =
+      [ "Scope", Printf.sprintf "account=%d graph=%d"
+          scope.account_generation scope.graph_generation ] @ !reports
+    in
+    { state with diagnostics =
+        { groups =
+            (if !reports = [] then [] else [{title="Worker errors";entries}])
+            @ List.filter (fun (g:diagnostic_group)->g.title<>"Worker errors") state.diagnostics.groups
+        }
+    }
+  in
+  let emit state = Journal_worker.Session_context.emit context ~topic:manager_topic
+      (Client_state_changed (with_reports state)) in
+  let report code =
+    let operation, phase, message = diagnostic_report code in
+    let value = Printf.sprintf "%s · phase=%s · code=%s.failed · %s" operation phase operation message in
+    let rec take n = function [] -> [] | _ when n=0 -> [] | x::xs -> x::take (n-1) xs in
+    reports := take 16 ((operation,value)::List.remove_assoc operation !reports);
+    Option.iter emit !latest
+  in
+  function
   | Pure.Asset_notice (scope, notice) ->
+    (match !latest with
+     | Some current when current.snapshot.startup.account_generation=scope.account.account_generation
+         && current.snapshot.startup.graph_generation=scope.graph_generation ->
+       (match notice with
+        | Asset_availability {availability=Failed {retry_scheduled=false;_};_} -> report "asset.download"
+        | Upload_status {status=Failed_upload _;_} -> report "asset.upload"
+        | _ -> ())
+     | _ -> ());
     Journal_worker.Session_context.emit
       context
       ~topic:asset_topic
@@ -417,10 +471,12 @@ let publish context = function
   | Sync_output output ->
     (match output with
      | State_changed state ->
-       Journal_worker.Session_context.emit
-         context
-         ~topic:manager_topic
-         (Client_state_changed (client_state state))
+       let state = client_state state in
+       let scope = state.snapshot.startup.account_generation, state.snapshot.startup.graph_generation in
+       if !owner <> Some scope then reports := [];
+       owner := Some scope;
+       latest := Some state;
+       emit state
      | Bootstrap_progressed progress ->
        Journal_worker.Session_context.emit
          context
@@ -432,7 +488,7 @@ let publish context = function
       context
       ~topic:graph_state_topic
       (Graph_state_changed state)
-  | Diagnostic _ -> ()
+  | Diagnostic code -> report code
 ;;
 
 let sync_limits config =
