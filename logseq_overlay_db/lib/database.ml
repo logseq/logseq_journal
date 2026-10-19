@@ -1055,7 +1055,7 @@ let collect_garbage inspection =
           in
           Fun.protect
             ~finally:(fun () ->
-              ignore (Sqlite3.db_close sqlite);
+              (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" );
               ignore (Ownership.release ownership))
             (fun () ->
                match
@@ -1843,7 +1843,7 @@ let decode_outbox records =
 let read_outbox path =
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
   Fun.protect
-    ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ))
     (fun () ->
        let exec sql =
          let rc = Sqlite3.exec sqlite sql in
@@ -1914,7 +1914,7 @@ let outbox_write_set database ~revision records =
 
 let migrate_outbox path ~revision ~expected_records rows =
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
-  Fun.protect ~finally:(fun () -> ignore (Sqlite3.db_close sqlite)) (fun () ->
+  Fun.protect ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" )) (fun () ->
     Logseq_db_storage.Sync_outbox_store.migrate_database sqlite ~revision ~expected_records
       (ordered_durable_rows rows))
 ;;
@@ -1922,7 +1922,7 @@ let migrate_outbox path ~revision ~expected_records rows =
 let validate_durable_receipts path =
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
   Fun.protect
-    ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ))
     (fun () ->
        let ( let* ) = Result.bind in
        let* () = Logseq_db_storage.Mutation_receipt_store.initialize_database sqlite in
@@ -1933,7 +1933,7 @@ let read_durable_receipt path mutation_id =
   let key = Persistence_receipt_v1.receipt_key mutation_id in
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
   Fun.protect
-    ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ))
     (fun () ->
        Result.bind
          (Logseq_db_storage.Mutation_receipt_store.read_mutation sqlite key)
@@ -1952,7 +1952,7 @@ let read_terminal_batch database batch_id =
   let key = Persistence_receipt_v1.terminal_batch_key batch_id in
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database.database_path in
   Fun.protect
-    ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ))
     (fun () ->
        Result.bind
          (Logseq_db_storage.Mutation_receipt_store.read_terminal_batch sqlite key)
@@ -5584,7 +5584,7 @@ let persist_outbox ?(terminal_batches = []) database =
   in
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database.database_path in
   Fun.protect
-    ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ))
     (fun () ->
        let rc_result rc =
          if Sqlite3.Rc.is_success rc then Ok () else Error (Sqlite3.errmsg sqlite)
