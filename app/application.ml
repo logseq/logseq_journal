@@ -3877,14 +3877,18 @@ type app_context =
 let latest_patch = ref ""
 let current_app : app_context option ref = ref None
 
+let report_cleanup_warning message =
+  try output_string stderr message; flush stderr with _ -> ()
+;;
+
 let dispose_context context =
   context.running := false;
   current_app := None;
   Worker.Private.request_stop context.client;
   (try context.release_staging () with _ ->
-     Printf.eprintf "journal: operation=releaseDraftStaging code=cleanupPending\n%!");
+     report_cleanup_warning "journal: operation=releaseDraftStaging code=cleanupPending\n");
   (try ignore (Lui_app.dispose context.app) with _ ->
-     Printf.eprintf "journal: operation=disposeApplication code=cleanupPending\n%!")
+     report_cleanup_warning "journal: operation=disposeApplication code=cleanupPending\n")
 ;;
 
 let decode_extension_values payload =

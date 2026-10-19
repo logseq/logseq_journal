@@ -1,3 +1,8 @@
+(* Secondary warnings must preserve the operation result and finish cleanup. *)
+let report_warning message =
+  try output_string stderr message; flush stderr with _ -> ()
+;;
+
 module Upload = Logseq_db_worker_pure_reducer.Asset_upload
 module Core = Logseq_db_worker_pure_reducer.Core
 module Database = Logseq_overlay_db.Database
@@ -426,7 +431,7 @@ let with_upload_store t action =
     Unix.close fd;
     let db = Sqlite3.db_open path in
     Fun.protect
-      ~finally:(fun () -> (if not (Sqlite3.db_close db) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ))
+      ~finally:(fun () -> (if not (Sqlite3.db_close db) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
       (fun () ->
          Unix.chmod path 0o600;
          Result.bind
@@ -767,7 +772,7 @@ let close_database_by_id ?scope t database_id =
               owned detach runs; a newly selected graph fences that close. *)
            t.dependencies.publish (Core.Diagnostic "worker.closeDatabase")
          | _ -> ()) scope;
-       Printf.eprintf "journal: operation=closeDatabase code=cleanupPending\n%!");
+       report_warning "journal: operation=closeDatabase code=cleanupPending\n");
     Hashtbl.remove t.databases database_id;
     Result.map_error
       (fun _ -> effect_error "The overlay database failed to close.")
@@ -1593,7 +1598,7 @@ let recover_local_retirements t (scope : Sync.graph_scope) =
                     if committed
                     then (
                       try remove_local_retirement journal_path with
-                      | _ -> Printf.eprintf "journal: phase=retirement operation=removeCoordinatorJournal code=cleanupPending\n%!")
+                      | _ -> report_warning "journal: phase=retirement operation=removeCoordinatorJournal code=cleanupPending\n")
                     else remove_local_retirement journal_path;
                     Ok ()))
            with
@@ -1734,7 +1739,7 @@ let handle_sync_worker_effect t = function
                  then (
               match finish_local_retirement t scope deletion captured ~commit:false with
               | Ok () -> remove_local_retirement path
-                   | Error _ -> Printf.eprintf "journal: phase=retirement operation=abortLocalRetirement code=cleanupPending\n%!")
+                   | Error _ -> report_warning "journal: phase=retirement operation=abortLocalRetirement code=cleanupPending\n")
                in
           Fun.protect ~finally:abort (fun () ->
             let* () = match asset_call t ~scope (Sync.Prepare_graph_asset_deletion retirement) with
@@ -2024,7 +2029,7 @@ let run_upload t (context : Sync.asset_context) instruction =
      | Ok () -> ()
      | Error _ ->
        report_asset_error t context.scope "asset.release";
-       Printf.eprintf "journal: operation=releaseUploadStaging code=cleanupPending\n%!" )
+       report_warning "journal: operation=releaseUploadStaging code=cleanupPending\n" )
   | Persist (ticket, intent, expected) ->
     if current ticket then finish ticket (save_upload t intent expected) Upload.Persisted
   | Inspect (ticket, intent) ->
