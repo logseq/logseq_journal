@@ -245,7 +245,12 @@ let handle_public_state context state =
   (match snapshot.sync_phase, snapshot.startup.failure with
    | Failed, Some During_local_restore when not context.recovery_started ->
      context.recovery_started <- true;
-     send_command context Begin_online_recovery
+     (match snapshot.selected_graph with
+      | Some graph_id -> send_command context (Begin_online_recovery
+          {startup={account_generation=snapshot.startup.account_generation;
+                    presentation_generation=snapshot.startup.presentation_generation};
+           graph_id; graph_generation=snapshot.startup.graph_generation})
+      | None -> fail_worker context "local-restore" "missing-selected-graph")
    | Failed, _ -> fail_worker context "sync" "failed"
    | _ -> ());
   if snapshot.sync_phase = Pulling then context.saw_opening_pull <- true;
@@ -1027,7 +1032,7 @@ let with_client ~label ~support ~credentials ~cognito f =
       if not (Worker.For_testing.is_stopping client) then Worker_runtime.stop client;
       await_runtime_idle label)
     (fun () ->
-       send_command context (Restore_local_account { user_id = cognito.user_id });
+       send_command context (Request_sign_in {account_generation=0; presentation_generation=0});
        send_command
          context
          (Reconcile_authenticated_user { user_id = Some cognito.user_id });

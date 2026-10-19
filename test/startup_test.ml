@@ -99,6 +99,8 @@ let startup_snapshot
     ; timeline_presentation_pending
     ; startup =
         { authenticated
+        ; local_access = Graph_service.Local_pending
+        ; network_phase = Graph_service.Local_only
         ; catalog_loading
         ; awaiting_selection
         ; restoring_local
@@ -360,7 +362,42 @@ let test_e2ee_recovery_requires_a_prepared_challenge () =
       = Some expected) "E2EE recovery offers password without a prepared challenge") [false;true]
 ;;
 
+let test_online_key_recovery_can_present_its_password_challenge () =
+  List.iter (fun failed ->
+    let snapshot=startup_snapshot ~awaiting_e2ee_password:true ?failure:(if failed then Some Graph_service.During_e2ee else None) () in
+    let snapshot={snapshot with startup={snapshot.startup with
+      local_access=Graph_service.Local_unavailable Graph_service.Local_key_unavailable;
+      network_phase=Graph_service.Online_by_user}} in
+    let derived=Journal_startup.derive ~snapshot ~graph:(graph_state ~phase:Graph_closed ()) in
+    if failed then
+      require (Option.bind derived.error (fun e->e.Journal_startup.recovery)=Some Journal_startup.Submit_e2ee_password)
+        "failed prepared challenge must still permit password retry"
+    else require (derived.phase=Journal_startup.Awaiting_e2ee_password)
+      "explicit recovery must show its prepared password challenge"
+  ) [false;true]
+;;
+
+let test_local_timeline_does_not_require_online_authentication () =
+  let snapshot = startup_snapshot ~authenticated:false ~timeline_presentation_pending:true () in
+  let snapshot = {snapshot with startup={snapshot.startup with local_access=Graph_service.Local_available}} in
+  let module P = Journal_startup.Presentation in
+  let t = P.create () in
+  let t = P.step t (Account(P.account_ticket t,Local)) in
+  let t = P.step t (Observe {manager=Some snapshot;graph=graph_state ();graph_ready=true;
+    feed_loaded=true;password_pending=false;graph_error=false}) in
+  require (P.screen t=P.Timeline) "usable local graph must render before authentication/appearance";
+  let unavailable = {snapshot with startup={snapshot.startup with
+    local_access=Graph_service.Local_unavailable Graph_service.Local_mirror_unavailable;
+    restoring_local=false}} in
+  let t = P.step t (Observe {manager=Some unavailable;graph=graph_state ~phase:Graph_closed ();
+    graph_ready=false;feed_loaded=false;password_pending=false;graph_error=false}) in
+  require (match P.screen t with Interaction {phase=Failed;_}->true|_->false)
+    "missing mirror must stop loading"
+;;
+
 let () =
+  test_online_key_recovery_can_present_its_password_challenge ();
+  test_local_timeline_does_not_require_online_authentication ();
   test_e2ee_recovery_requires_a_prepared_challenge ();
   test_stable_startup_presentation ();
   test_noncurrent_deletion_keeps_active_graph_ready ();

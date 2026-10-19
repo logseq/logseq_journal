@@ -59,6 +59,7 @@ let initial () =
   |> Result.get_ok
   |> Core.initial
   |> Result.get_ok
+  |> fun core -> (Core.step core (Core.Sign_in_requested {account_generation=0;presentation_generation=0})).next
 ;;
 
 let token module_of_string value = module_of_string value |> Result.get_ok

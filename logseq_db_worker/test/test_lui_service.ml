@@ -937,15 +937,10 @@ let test_real_auth_control ~transition () =
               client
               (Service.Client_command (Restore_local_account { user_id = "auth-A" }))
             |> accepted);
-         ignore
-           (Worker.send
-              client
-              (Service.Client_command
-                 (Reconcile_authenticated_user { user_id = Some "auth-A" }))
-            |> accepted);
          let challenge = ref None
          and errors = ref []
          and authenticated = ref true
+         and current_startup = ref None
          and account_generation = ref 0
          and cancelled = ref [] in
          let drain () =
@@ -954,6 +949,7 @@ let test_real_auth_control ~transition () =
                | Worker.Push { payload = Service.Need_id_token request; _ } ->
                  challenge := Some request
                | Worker.Push { payload = Service.Client_state_changed state; _ } ->
+                 current_startup := Some state.snapshot.startup;
                  authenticated := state.snapshot.startup.authenticated;
                  account_generation := state.snapshot.startup.account_generation;
                  Option.iter
@@ -964,6 +960,16 @@ let test_real_auth_control ~transition () =
                | _ -> ())
              (Worker.For_testing.drain_events client ~max_events:64)
          in
+         let permit_online () =
+           let startup : Service.startup_facts = Option.get !current_startup in
+           ignore (Worker.send client (Service.Client_command (Request_sign_in
+             {account_generation=startup.account_generation; presentation_generation=startup.presentation_generation})) |> accepted)
+         in
+         let reconcile () = ignore (Worker.send client (Service.Client_command
+           (Reconcile_authenticated_user {user_id=Some "auth-A"})) |> accepted) in
+         control_wait "local startup scope available" (fun () -> drain (); !account_generation > 0);
+         permit_online ();
+         reconcile ();
          control_wait "real current token flight" (fun () ->
            drain ();
            Option.is_some !challenge);
@@ -1070,6 +1076,12 @@ let test_real_auth_control ~transition () =
            (Worker.For_testing.pending_control_count client <= 2)
            "real service has two bounded topics";
          Atomic.set pause false;
+         if transition = `Late_restore then (
+           control_wait "local reset closes network permission" (fun () ->
+             drain (); !account_generation > initial_account_generation && not !authenticated);
+           permit_online ();
+           reconcile ());
+         let retry_permitted = ref false in
          (match transition with
           | `Late_restore ->
             control_wait "SDK auth is reasserted after late local restoration" (fun () ->
@@ -1084,6 +1096,8 @@ let test_real_auth_control ~transition () =
               "A-B-A creates a new flight instead of joining the revoked one"
               (fun () ->
                  drain ();
+                 if transition = `Full_auth_after_signout && not !authenticated && not !retry_permitted then (
+                   retry_permitted := true; permit_online (); reconcile ());
                  match !challenge with
                  | Some fresh ->
                    Service.token_request_id fresh <> Service.token_request_id request
@@ -1140,7 +1154,17 @@ let test_local_copy_presence mode () =
     let mirror_directory = Filename.concat (Filename.concat directory "synced-graphs") (G.Uuid.to_string graph_id) in
 
     with_client fixture.config (fun client ->
-      ignore (Worker.send client (Service.Client_command (Restore_local_account { user_id = user })) |> accepted);
+      ignore (Worker.send client (Service.Client_command (Restore_local_account {user_id=user})) |> accepted);
+      let local = ref None in
+      control_wait "local catalog available before explicit permission" (fun () ->
+        Worker.For_testing.drain_events client ~max_events:64 |> List.iter (function
+          | Worker.Push {payload=Service.Client_state_changed state; _} when state.snapshot.catalog <> [] ->
+            local := Some state.snapshot.startup
+          | _ -> ());
+        Option.is_some !local);
+      let startup : Service.startup_facts = Option.get !local in
+      ignore (Worker.send client (Service.Client_command (Request_sign_in
+        {account_generation=startup.account_generation; presentation_generation=startup.presentation_generation})) |> accepted);
       ignore (Worker.send client (Service.Client_command (Reconcile_authenticated_user { user_id = Some user })) |> accepted);
       let observed = ref None in
       control_wait "synthetic catalog available" (fun () ->

@@ -30,9 +30,14 @@ import Foundation
   var writes = 0
   var clears = 0
   var failSave = false
+  var holdLoad = false
+  var heldLoad: CheckedContinuation<JournalLocalAccount?, Error>?
   init(_ value: JournalLocalAccount?) { self.value = value }
   var capability: JournalAccountStore {
-    JournalAccountStore(load: { self.value }, save: {
+    JournalAccountStore(load: {
+      if self.holdLoad { return try await withCheckedThrowingContinuation { self.heldLoad=$0 } }
+      return self.value
+    }, save: {
       if self.failSave { throw CocoaError(.fileWriteUnknown) }
       let previous = self.value
       self.writes += 1; self.value = $0
@@ -50,10 +55,44 @@ import Foundation
     let store = Store(old)
     let platform = JournalPlatformServices(auth: auth, account: store.capability,
       managedSyncOrigin: origin)
+    let bindingStore=Store(old),bindingAuth=Auth()
+    bindingStore.holdLoad=true
+    let bindingService=JournalPlatformServices(auth:bindingAuth,account:bindingStore.capability,managedSyncOrigin:origin)
+    let bindingRead=Task {try await bindingService.response(for:.localAccount)}
+    while bindingStore.heldLoad == nil {await Task.yield()}
+    _ = try await bindingService.response(for:.onlineCancelled)
+    bindingStore.heldLoad?.resume(returning:old)
+    require(try await bindingRead.value == .localAccount(userID:old.userID,origin:origin))
+    precondition(bindingAuth.userCalls==0 && bindingAuth.tokenCalls==0,"closing an already-closed gate must preserve local discovery")
+    let gatedAuth = Auth()
+    gatedAuth.user = old.userID
+    let gated = JournalPlatformServices(auth:gatedAuth, account:store.capability, managedSyncOrigin:origin)
+    for request in [JournalPlatformWire.Request.authenticatedUser, .idToken(challengeID: "before-frame")] {
+      do { _ = try await gated.response(for: request); fatalError("cold start admitted online capability") }
+      catch JournalPlatformServices.Failure.unavailable {}
+    }
+    precondition(gatedAuth.userCalls == 0 && gatedAuth.tokenCalls == 0, "zero online calls before native appearance")
+    _ = try await gated.response(for: .onlineRequested)
+    _ = try await gated.response(for: .authenticatedUser)
+    gatedAuth.holdUser = true
+    let cancelled = Task {try await gated.response(for: .authenticatedUser)}
+    while gatedAuth.heldUser == nil {await Task.yield()}
+    _ = try await gated.response(for: .onlineCancelled)
+    gatedAuth.heldUser?.resume(returning:old.userID)
+    do {_ = try await cancelled.value; fatalError("cancelled online completion admitted")} catch is CancellationError {}
+    let calls = gatedAuth.userCalls
+    do {_ = try await gated.response(for:.idToken(challengeID:"cancelled")); fatalError("cancelled gate admitted token")} catch JournalPlatformServices.Failure.unavailable {}
+    precondition(gatedAuth.userCalls==calls && gatedAuth.tokenCalls==0)
+    _ = try await gated.response(for: .timelinePresented)
+    gatedAuth.holdUser=false
+    _ = try await gated.response(for: .idToken(challengeID:"presented"))
+    precondition(gatedAuth.tokenCalls==1)
+    _ = try await platform.response(for:.onlineRequested)
     let pickerAuth = Auth()
     pickerAuth.user = "offline-user"
     let picker = JournalPlatformServices(auth: pickerAuth, account: store.capability,
       managedSyncOrigin: origin)
+    _ = try await picker.response(for:.onlineRequested)
     do {
       let response = try await picker.response(for: .authenticatedUser)
       precondition(response == .authenticatedUser("offline-user"))
@@ -87,6 +126,7 @@ import Foundation
       fatalError("A different identity must not take over a presented graph")
     } catch let issue as JournalAccountIssue { precondition(issue.kind == .accountChangeBlocked) }
     platform.invalidateConnection()
+    _ = try await platform.response(for:.onlineRequested)
     require(try await platform.response(for: .authenticatedUser) == .authenticatedUser("online-user"))
     precondition(store.value?.userID == "online-user")
     store.failSave = true
@@ -130,6 +170,7 @@ import Foundation
     } catch is CancellationError {}
     precondition(store.value == nil)
     auth.holdUser = false
+    _ = try await platform.response(for:.onlineRequested)
     require(try await platform.response(for: .authenticatedUser) == .authenticatedUser(nil))
 
     store.value = old

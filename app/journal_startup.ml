@@ -70,7 +70,7 @@ let derive ~snapshot ~(graph : Logseq_db_worker.graph_state) =
   let facts = snapshot.Graph_service.startup in
   let graph_is_current = graph_matches snapshot graph in
   let ready =
-    facts.authenticated
+    (facts.authenticated || facts.local_access=Graph_service.Local_available)
     && graph_is_current
     && graph.phase = Logseq_db_worker.Graph_open
     && not snapshot.timeline_presentation_pending
@@ -93,6 +93,22 @@ let derive ~snapshot ~(graph : Logseq_db_worker.graph_state) =
     | None -> assert false)
   else if ready
   then { phase = Ready; error = None }
+  else if facts.local_access=Graph_service.Local_unavailable Graph_service.No_local_account
+  then {phase=Signed_out;error=None}
+  else if facts.awaiting_selection then {phase=Awaiting_selection;error=None}
+  else if facts.awaiting_e2ee_password then
+    (match facts.failure with
+     | None -> {phase=Awaiting_e2ee_password;error=None}
+     | Some stage -> {phase=Failed;error=Some(startup_error ~awaiting_e2ee_password:true stage
+         (Option.value snapshot.last_error ~default:"Unable to unlock the graph."))})
+  else if (match facts.local_access with Graph_service.Local_unavailable _ -> true | _ -> false)
+  then
+    let error=startup_error ~awaiting_e2ee_password:false
+      (Option.value facts.failure ~default:Graph_service.During_local_restore)
+      (Option.value snapshot.last_error ~default:"Local graph data is unavailable.") in
+    let error=if facts.local_access=Graph_service.Local_unavailable Graph_service.Local_restore_failed
+      then {error with recovery=Some Retry_graph_open} else error in
+    {phase=Failed;error=Some error}
   else if not facts.authenticated
   then
     (match facts.failure with
@@ -236,11 +252,12 @@ module Presentation = struct
     | Some o ->
       (match o.manager with
        | Some manager when o.graph_ready && o.feed_loaded && not o.graph_error
-           && manager.startup.authenticated
+           && (manager.startup.authenticated || manager.startup.local_access=Graph_service.Local_available)
            && o.graph.phase = Logseq_db_worker.Graph_open && graph_matches manager o.graph -> Timeline
        | Some manager ->
          let startup = derive ~snapshot:manager ~graph:o.graph in
          (match startup.phase with
+          | Signed_out when manager.startup.local_access=Graph_service.Local_unavailable Graph_service.No_local_account -> Interaction startup
           | Awaiting_selection | Awaiting_e2ee_password | Failed -> Interaction startup
           | _ when o.graph_error -> required Failed
           | _ when t.account_failed && not t.local_available -> Account_failure
@@ -265,7 +282,7 @@ module Presentation = struct
         | _ -> false in
       let account = match o.manager with
         | Some manager when changed_account && not manager.startup.authenticated
-            && not manager.startup.restoring_local -> User_required
+            && not manager.startup.restoring_local && manager.startup.local_access=Graph_service.Local_pending -> User_required
         | Some manager when manager.startup.authenticated && t.account <> User_required -> User_available
         | _ -> t.account in
       project {t with observed=Some o;account;

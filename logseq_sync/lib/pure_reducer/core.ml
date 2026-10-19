@@ -40,8 +40,27 @@ type startup_failure_stage =
   | During_bootstrap
   | During_e2ee
 
+type local_unavailability =
+  | No_local_account
+  | Local_catalog_unavailable
+  | Local_mirror_unavailable
+  | Local_key_unavailable
+  | Local_restore_failed
+
+type local_access =
+  | Local_pending
+  | Local_available
+  | Local_unavailable of local_unavailability
+
+type startup_network_phase =
+  | Local_only
+  | Online_after_timeline
+  | Online_by_user
+
 type startup_facts =
   { authenticated : bool
+  ; local_access : local_access
+  ; network_phase : startup_network_phase
   ; catalog_loading : bool
   ; awaiting_selection : bool
   ; restoring_local : bool
@@ -512,6 +531,7 @@ type runner_effect =
   | Close_websocket of connection_scope
   | Schedule_timer of timer_request
   | Cancel_effects of effect_scope
+  | Cancel_network_effects of effect_scope
 
 type runner_completion =
   | Asset_completion of asset_ticket * asset_result
@@ -542,7 +562,7 @@ let runner_effect_scope = function
   | Send_websocket value -> effect_scope_of_connection value.scope
   | Close_websocket value -> effect_scope_of_connection value
   | Schedule_timer value -> value.scope
-  | Cancel_effects value -> value
+  | Cancel_effects value | Cancel_network_effects value -> value
 ;;
 
 let runner_effect_diagnostic = function
@@ -554,6 +574,7 @@ let runner_effect_diagnostic = function
   | Close_websocket _ -> "close-websocket"
   | Schedule_timer value -> Printf.sprintf "timer:%d" value.id
   | Cancel_effects _ -> "cancel-effects"
+  | Cancel_network_effects _ -> "cancel-network-effects"
 ;;
 
 let equal_runner_effect left right = left = right
@@ -659,6 +680,17 @@ type outbox_transition_result =
 
 type snapshot_activation = { scope : graph_scope }
 
+type startup_scope =
+  { account_generation : account_generation
+  ; presentation_generation : presentation_generation
+  }
+
+type timeline_scope =
+  { startup : startup_scope
+  ; graph_id : graph_id
+  ; graph_generation : graph_generation
+  }
+
 type event =
   | Asset_requested of asset_request
   | Protected_requested of protected_request
@@ -666,11 +698,14 @@ type event =
   | Account_authenticated of { user_id : string option }
   | Local_feed_acknowledged
   | Local_outbox_changed
-  | Timeline_presented
+  | Timeline_presented of timeline_scope
   | Graph_selected of graph_id
   | Graph_picker_requested
-  | Catalog_refresh_requested
-  | Online_recovery_requested
+  | Sign_in_requested of startup_scope
+  | Catalog_refresh_requested of startup_scope
+  | Online_recovery_requested of timeline_scope
+  | Online_cancelled of startup_scope
+  | Local_account_unavailable of startup_scope * local_unavailability
   | E2ee_password_submitted of string
   | Local_cache_deletion_requested of graph_id
   | Foreground_changed of
@@ -771,6 +806,7 @@ type t =
   ; snapshot_scope : graph_scope option
   ; snapshot_server_t : Server_cursor.t option
   ; active_snapshot_download : graph_scope option
+  ; pending_snapshot_activation : graph_scope option
   ; sync_view : Overlay.sync_view option
   ; pending_sync_inspection : graph_scope option
   ; pending_outbox_transition : outbox_transition_request option
@@ -796,6 +832,8 @@ type create_error = Invalid_create of string
 
 let initial_startup =
   { authenticated = false
+  ; local_access = Local_pending
+  ; network_phase = Local_only
   ; catalog_loading = false
   ; awaiting_selection = false
   ; restoring_local = false
@@ -847,6 +885,7 @@ let initial config =
     ; snapshot_scope = None
     ; snapshot_server_t = None
     ; active_snapshot_download = None
+      ; pending_snapshot_activation = None
     ; sync_view = None
     ; pending_sync_inspection = None
     ; pending_outbox_transition = None
@@ -898,10 +937,42 @@ let set_snapshot core snapshot =
   { core with public_state = { snapshot; diagnostics } }
 ;;
 
+let network_allowed core =
+  let f=core.public_state.snapshot.startup in
+  f.network_phase <> Local_only && f.authenticated
+;;
+let startup_scope_is_current core (scope : startup_scope) =
+  let f=core.public_state.snapshot.startup in
+  scope.account_generation=f.account_generation && scope.presentation_generation=f.presentation_generation
+;;
+let timeline_scope_is_current core (scope : timeline_scope) =
+  startup_scope_is_current core scope.startup
+  && core.public_state.snapshot.selected_graph=Some scope.graph_id
+  && core.public_state.snapshot.startup.graph_generation=scope.graph_generation
+;;
+let network_phase core phase =
+  let snapshot=core.public_state.snapshot in
+  set_snapshot core {snapshot with startup={snapshot.startup with network_phase=phase}}
+;;
+let local_unavailable core reason message =
+  let snapshot=core.public_state.snapshot in
+  let startup={snapshot.startup with local_access=Local_unavailable reason;
+    restoring_local=false;bootstrapping=false;catalog_loading=false;awaiting_e2ee_password=false;
+    failure=Some (if reason=Local_catalog_unavailable then During_catalog else During_local_restore)} in
+  let next=set_snapshot core {snapshot with startup;last_error=Some message;sync_phase=Offline} in
+  {next;effects=[publish next]}
+;;
+
 let fail core stage message =
   let startup =
     { core.public_state.snapshot.startup with
       failure = Some stage
+    ; restoring_local = false
+    ; bootstrapping = false
+    ; catalog_loading = false
+    ; local_access = (match core.public_state.snapshot.startup.local_access with
+        | Local_available -> Local_available
+        | _ -> Local_unavailable (if stage=During_catalog then Local_catalog_unavailable else Local_restore_failed))
     ; awaiting_e2ee_password = false
     }
   in
@@ -925,6 +996,7 @@ let fail core stage message =
     ; snapshot_scope = None
     ; snapshot_server_t = None
     ; active_snapshot_download = None
+      ; pending_snapshot_activation = None
     ; pending_sync_inspection = None
     ; pending_outbox_transition = None
     ; active_authoritative_batch = None
@@ -997,12 +1069,14 @@ let issue_request : type a. t -> a runner_request -> t * runner_effect =
 ;;
 
 let begin_snapshot_bootstrap core scope =
+  if not (network_allowed core) then local_unavailable core Local_mirror_unavailable "This graph is not downloaded. Connect to download it." else
   let core = { core with snapshot_scope = Some scope; snapshot_server_t = None } in
   let next, request = issue_request core (Fetch_snapshot_baseline scope) in
   { next; effects = [ Run request ] }
 ;;
 
 let begin_e2ee_key_access core scope =
+  if not (network_allowed core) then local_unavailable core Local_key_unavailable "The local encryption key is unavailable. Connect to recover access." else
   let core =
     { core with
       snapshot_scope = Some scope
@@ -1016,6 +1090,7 @@ let begin_e2ee_key_access core scope =
 ;;
 
 let start_websocket core graph =
+  if not (network_allowed core) then unchanged core else
   let core =
     { core with
       connection_generation = core.connection_generation + 1
@@ -1096,6 +1171,7 @@ let authenticate_new_account core user_id =
   let startup =
     { initial_startup with
       authenticated = true
+    ; network_phase = core.public_state.snapshot.startup.network_phase
     ; catalog_loading = true
     ; account_generation = core.public_state.snapshot.startup.account_generation + 1
     ; presentation_generation =
@@ -1131,6 +1207,7 @@ let authenticate_new_account core user_id =
       ; snapshot_scope = None
       ; snapshot_server_t = None
       ; active_snapshot_download = None
+      ; pending_snapshot_activation = None
       ; sync_view = None
       ; pending_sync_inspection = None
       ; pending_outbox_transition = None
@@ -1151,7 +1228,7 @@ let authenticate_new_account core user_id =
 
 let clear_reconciliation_failure (snapshot : snapshot) =
   match snapshot.startup.failure with
-  | Some (During_local_restore | During_e2ee) -> snapshot
+  | Some (During_local_restore | During_e2ee | During_bootstrap) -> snapshot
   | None | Some _ ->
     { snapshot with
       startup = { snapshot.startup with failure = None }
@@ -1160,6 +1237,7 @@ let clear_reconciliation_failure (snapshot : snapshot) =
 ;;
 
 let request_catalog_reconciliation core =
+  if not (network_allowed core) then unchanged { core with deferred_catalog_reconciliation = false } else
   let snapshot = clear_reconciliation_failure core.public_state.snapshot in
   let startup = { snapshot.startup with authenticated = true; catalog_loading = true } in
   let core =
@@ -1192,6 +1270,7 @@ let restore_local core user_id =
   let startup =
     { initial_startup with
       restoring_local = true
+    ; presentation_generation = core.public_state.snapshot.startup.presentation_generation + 1
     ; account_generation = core.public_state.snapshot.startup.account_generation + 1
     }
   in
@@ -1215,6 +1294,7 @@ let restore_local core user_id =
       ; snapshot_scope = None
       ; snapshot_server_t = None
       ; active_snapshot_download = None
+      ; pending_snapshot_activation = None
       ; sync_view = None
       ; pending_sync_inspection = None
       ; pending_outbox_transition = None
@@ -1272,6 +1352,7 @@ let sign_out core =
       ; snapshot_scope = None
       ; snapshot_server_t = None
       ; active_snapshot_download = None
+      ; pending_snapshot_activation = None
       ; sync_view = None
       ; pending_sync_inspection = None
       ; pending_outbox_transition = None
@@ -1324,6 +1405,10 @@ let select_graph_transition core ~persist graph_id =
     let startup =
       { core.public_state.snapshot.startup with
         awaiting_selection = false
+      ; local_access = Local_pending
+      ; presentation_generation = core.public_state.snapshot.startup.presentation_generation + 1
+      ; network_phase = (match core.public_state.snapshot.startup.network_phase with
+          | Online_by_user -> Online_by_user | _ -> Local_only)
       ; restoring_local = true
       ; bootstrapping = false
       ; awaiting_e2ee_password = false
@@ -1340,7 +1425,7 @@ let select_graph_transition core ~persist graph_id =
       ; startup
       }
     in
-    let scope = { account = account_scope core user_id; graph_id; graph_generation } in
+    let scope = { account = { (account_scope core user_id) with presentation_generation=startup.presentation_generation }; graph_id; graph_generation } in
     let mirror_request = { graph; scope } in
     let core =
       set_snapshot
@@ -1358,6 +1443,7 @@ let select_graph_transition core ~persist graph_id =
         ; snapshot_scope = None
         ; snapshot_server_t = None
         ; active_snapshot_download = None
+      ; pending_snapshot_activation = None
         ; sync_view = None
         ; pending_sync_inspection = None
         ; pending_outbox_transition = None
@@ -1407,6 +1493,9 @@ let mirror_inspected core = function
               ~some:(fun (request : mirror_request) -> request.scope = scope)
               core.pending_mirror_inspection ->
     let core = { core with pending_mirror_inspection = None } in
+    if not (network_allowed core) then
+      local_unavailable core Local_mirror_unavailable "This graph is not downloaded. Download it to open it on this device."
+    else
     let startup =
       { core.public_state.snapshot.startup with
         restoring_local = false
@@ -1438,13 +1527,14 @@ let graph_attached core (attachment : graph_attachment) =
     let startup =
       { core.public_state.snapshot.startup with
         restoring_local = false
+      ; local_access = Local_available
       ; bootstrapping = false
       ; failure = None
       }
     in
     let snapshot =
       { core.public_state.snapshot with
-        sync_phase = Current
+        sync_phase = (if network_allowed core then Current else Offline)
       ; applied_server_t = Some (Overlay.sync_view_checkpoint attachment.sync)
       ; timeline_presentation_pending = true
       ; startup
@@ -1452,7 +1542,8 @@ let graph_attached core (attachment : graph_attachment) =
       }
     in
     let core = set_snapshot { core with sync_view = Some attachment.sync } snapshot in
-    start_websocket core attachment.scope)
+    let online=start_websocket core attachment.scope in
+    if online.effects=[] then {next=core;effects=[publish core]} else online)
 ;;
 
 let operation_name = function
@@ -1544,6 +1635,7 @@ let rejection_message (rejection : Sync_protocol.rejection) =
 ;;
 
 let plan_submission core =
+  if not (network_allowed core) then unchanged core else
   match core.sync_view, core.current_graph_scope, core.websocket_live with
   | Some sync, Some scope, true ->
     let descriptors = Overlay.sync_view_submissions sync in
@@ -2237,6 +2329,15 @@ let authoritative_deferred core (result : authoritative_deferred_result) =
     | Some _ -> fail core During_catalog "authoritative defer owner mismatch")
 ;;
 
+let pending_is_network (Pending_effect ticket) =
+  match ticket.kind with
+  | Fetch_catalog_kind | Fetch_snapshot_baseline_kind | Fetch_snapshot_metadata_kind
+  | Download_snapshot_kind | Fetch_e2ee_graph_key_kind | Fetch_e2ee_user_keys_kind -> true
+  | Load_catalog_kind | Save_catalog_kind | Load_and_unlock_graph_key_kind
+  | Fetch_and_unlock_graph_key_kind | Unlock_private_key_kind | Delete_account_secrets_kind
+  | Encrypt_protected_values_kind | Decrypt_protected_values_kind -> false
+;;
+
 let consume_ticket : type a. t -> a effect_ticket -> t option =
   fun core ticket ->
   let rec loop kept = function
@@ -2309,6 +2410,7 @@ let clear_selected_graph_for_catalog core catalog =
       ; snapshot_scope = None
       ; snapshot_server_t = None
       ; active_snapshot_download = None
+      ; pending_snapshot_activation = None
       ; sync_view = None
       ; pending_sync_inspection = None
       ; pending_outbox_transition = None
@@ -2418,6 +2520,8 @@ let complete_catalog_load core cache =
   then (
     let requested = request_catalog_reconciliation restored.next in
     { next = requested.next; effects = restored.effects @ requested.effects })
+  else if catalog=[] then
+    local_unavailable restored.next Local_catalog_unavailable "No local graph catalog is available. Refresh graphs to connect."
   else restored
 ;;
 
@@ -2496,7 +2600,7 @@ let complete_runner : type a. t -> a effect_ticket -> a -> transition =
      | Some scope, Some applied_server_t, Some graph when graph.encrypted ->
        (match core.graph_key with
         | Some key when graph_key_handle_scope key = scope ->
-          { next = core
+          { next = { core with pending_snapshot_activation = Some scope }
           ; effects =
               [ Delegate
                   (Activate_snapshot
@@ -2511,7 +2615,7 @@ let complete_runner : type a. t -> a effect_ticket -> a -> transition =
             During_bootstrap
             "graph key handle is outside the selected graph scope")
      | Some scope, Some applied_server_t, Some _ ->
-       { next = core
+       { next = { core with pending_snapshot_activation = Some scope }
        ; effects =
            [ Delegate
                (Activate_snapshot
@@ -2611,8 +2715,11 @@ let consume_completion core = function
                message
            | Load_and_unlock_graph_key_kind ->
              (match core.current_graph_scope with
-              | Some scope -> begin_e2ee_key_access core scope
+              | Some scope when network_allowed core -> begin_e2ee_key_access core scope
+              | Some _ -> local_unavailable core Local_key_unavailable "The local encryption key is unavailable. Connect to recover access."
               | None -> unchanged core)
+           | Unlock_private_key_kind when core.public_state.snapshot.startup.network_phase = Local_only ->
+             fail core During_e2ee message
            | Unlock_private_key_kind ->
              (* A rejected password leaves the encrypted challenge available for
              another attempt. No password or unlocked key is retained. *)
@@ -2703,6 +2810,7 @@ let return_to_graph_picker core =
       ; snapshot_scope = None
       ; snapshot_server_t = None
       ; active_snapshot_download = None
+      ; pending_snapshot_activation = None
       ; sync_view = None
       ; pending_effects = []
       ; pending_sync_inspection = None
@@ -2837,9 +2945,71 @@ let step core event =
   then unchanged core
   else (
     match event with
+    | Sign_in_requested scope when startup_scope_is_current core scope ->
+      let next=network_phase core Online_by_user in {next;effects=[publish next]}
+    | Online_cancelled scope when startup_scope_is_current core scope ->
+      let next = network_phase core Local_only in
+      let snapshot = next.public_state.snapshot in
+      let local_pending = List.filter (fun pending -> not (pending_is_network pending)) next.pending_effects in
+      let local_restore_pending =
+        next.catalog_cache_loading
+        || Option.is_some next.pending_mirror_inspection
+        || Option.is_some next.pending_attachment
+        || Option.is_some next.pending_sync_inspection
+        || List.exists (fun (Pending_effect ticket) -> match ticket.kind with
+             | Load_and_unlock_graph_key_kind | Fetch_and_unlock_graph_key_kind
+             | Unlock_private_key_kind -> true | _ -> false) local_pending
+        || Option.is_some next.pending_snapshot_activation
+      in
+      let local_access = match snapshot.startup.local_access with
+        | Local_pending when not local_restore_pending ->
+          Local_unavailable (if Option.is_some next.pending_graph_open
+            then Local_key_unavailable else if Option.is_some next.snapshot_scope
+            then Local_mirror_unavailable else Local_restore_failed)
+        | access -> access
+      in
+      (* Presentation tickets retire independently of the retained DB/key scope. *)
+      let startup = { snapshot.startup with
+        authenticated = false;
+        presentation_generation = snapshot.startup.presentation_generation + 1;
+        restoring_local = snapshot.startup.restoring_local && local_restore_pending;
+        bootstrapping = false; catalog_loading = next.catalog_cache_loading;
+        awaiting_e2ee_password = false; local_access } in
+      let next = set_snapshot { next with
+        pending_effects = local_pending; websocket_live = false; deferred_catalog_reconciliation = false;
+        pending_encrypted_graph_key = (if List.exists (fun (Pending_effect ticket) ->
+          match ticket.kind with Unlock_private_key_kind -> true | _ -> false) local_pending
+          then next.pending_encrypted_graph_key else None); pending_private_key_package = None;
+        active_snapshot_download = None; pull_wanted = None;
+        pull_owner = (match next.pull_owner with
+          | Some {pull_stage=Applying_pull; _} as owner -> owner | _ -> None)
+      } { snapshot with timeline_presentation_pending = false; startup; sync_phase = Offline } in
+      let scope = { account_generation = Some snapshot.startup.account_generation;
+        graph_generation = None; connection_generation = None;
+        presentation_generation = None; lifecycle_generation = None } in
+      { next; effects = [Run (Cancel_network_effects scope); publish next] }
+    | Local_account_unavailable (scope,reason) when startup_scope_is_current core scope ->
+      local_unavailable core reason "No local account is available. Sign in to connect."
+    | Sign_in_requested _ | Online_cancelled _ | Local_account_unavailable _ -> unchanged core
     | Restore_local_account { user_id } -> restore_local core user_id
-    | Account_authenticated { user_id = Some user_id } -> authenticate core user_id
+    | Account_authenticated { user_id = Some user_id } ->
+      if core.public_state.snapshot.startup.network_phase=Local_only then unchanged core else
+      let authenticated=authenticate core user_id in
+      let next=authenticated.next in
+      let resumed = match next.current_graph_scope,next.sync_view,core.public_state.snapshot.startup.local_access with
+        | Some scope,Some _,_ when not next.websocket_live && (match next.websocket_owner with
+            | None | Some {phase=Retiring;_} -> true | Some _ -> false) -> start_websocket next scope
+        | Some scope,None,Local_unavailable Local_key_unavailable
+          when core.public_state.snapshot.startup.failure=Some During_local_restore ->
+          begin_e2ee_key_access next scope
+        | Some scope,None,Local_unavailable _
+          when next.public_state.snapshot.startup.network_phase=Online_by_user
+               && core.public_state.snapshot.startup.failure=Some During_local_restore ->
+          select_graph_transition next ~persist:false scope.graph_id
+        | _ -> unchanged next in
+      {next=resumed.next;effects=authenticated.effects @ resumed.effects}
     | Account_authenticated { user_id = None } -> sign_out core
+    | Local_outbox_changed when not (network_allowed core) -> unchanged core
     | Local_outbox_changed ->
       (match core.current_graph_scope with
        | Some scope -> inspect_sync core scope
@@ -2873,7 +3043,7 @@ let step core event =
       (match core.selected_graph_value with
        | Some graph when graph_scope_is_current core activation.scope ->
          let request = { graph; scope = activation.scope } in
-         { next = { core with pending_mirror_inspection = Some request }
+         { next = { core with pending_mirror_inspection = Some request; pending_snapshot_activation = None }
          ; effects = [ Delegate (Inspect_mirror request) ]
          }
        | _ -> unchanged core)
@@ -2885,7 +3055,10 @@ let step core event =
          -> { next = core; effects = [ Publish (Bootstrap_progressed progress) ] }
        | None | Some _ -> unchanged core)
     | Graph_picker_requested -> return_to_graph_picker core
-    | Catalog_refresh_requested ->
+    | Catalog_refresh_requested scope when not (startup_scope_is_current core scope) -> unchanged core
+    | Catalog_refresh_requested _ ->
+      let core=network_phase core Online_by_user in
+      if not core.public_state.snapshot.startup.authenticated then {next=core;effects=[publish core]} else
       (match core.user_id with
        | None -> unchanged core
        | Some user_id ->
@@ -2893,13 +3066,19 @@ let step core event =
            issue_request core (Fetch_catalog (account_scope core user_id))
          in
          { next; effects = [ Run request ] })
-    | Online_recovery_requested ->
+    | Online_recovery_requested scope when not (timeline_scope_is_current core scope) -> unchanged core
+    | Online_recovery_requested _ ->
+      let core=network_phase core Online_by_user in
+      if not core.public_state.snapshot.startup.authenticated then {next=core;effects=[publish core]} else
       (match core.current_graph_scope, core.public_state.snapshot.startup.failure with
        | Some scope, Some During_bootstrap when core.sync_view = None ->
          select_graph_transition core ~persist:false scope.graph_id
        | Some _, _
          when core.public_state.snapshot.startup.awaiting_e2ee_password
               || List.exists is_graph_key_access core.pending_effects -> unchanged core
+       | Some scope, Some During_local_restore
+         when core.public_state.snapshot.startup.local_access <> Local_unavailable Local_key_unavailable ->
+         select_graph_transition core ~persist:false scope.graph_id
        | Some scope, Some (During_local_restore | During_e2ee)
          when not core.public_state.snapshot.startup.awaiting_e2ee_password ->
          let startup =
@@ -2950,17 +3129,19 @@ let step core event =
       (match core.current_graph_scope with
        | None -> unchanged core
        | Some graph -> start_websocket core graph)
-    | Timeline_presented ->
-      let next =
-        set_snapshot
-          core
-          { core.public_state.snapshot with timeline_presentation_pending = false }
-      in
-      { next; effects = [ publish next ] }
+    | Timeline_presented scope ->
+      if not (timeline_scope_is_current core scope)
+        || core.public_state.snapshot.startup.local_access<>Local_available
+        || not core.public_state.snapshot.timeline_presentation_pending
+      then unchanged core else
+      let core=network_phase core Online_after_timeline in
+      let next=set_snapshot core {core.public_state.snapshot with timeline_presentation_pending=false} in
+      {next;effects=[publish next]}
     | Graph_attachment_failed error
     | Authoritative_batch_failed error
     | Snapshot_activation_failed error
-      when scoped_error_is_current core error -> fail core During_bootstrap error.message
+      when scoped_error_is_current core error ->
+      fail core (if core.public_state.snapshot.startup.restoring_local then During_local_restore else During_bootstrap) error.message
     | Graph_attachment_failed _
     | Authoritative_batch_failed _
     | Snapshot_activation_failed _ -> unchanged core
@@ -3063,6 +3244,7 @@ let step core event =
           ; pending_mirror_inspection = None
           ; pending_attachment = None
           ; active_snapshot_download = None
+      ; pending_snapshot_activation = None
           ; pending_sync_inspection = None
           ; pending_outbox_transition = None
           ; submission_owner = None
@@ -3241,6 +3423,9 @@ let same_asset_account (left : account_scope) (right : account_scope) =
 ;;
 
 let request_asset core (request : asset_request) =
+  if (match request.action with Fetch_asset _ | Put_asset_file _ -> true | _ -> false)
+    && not (network_allowed core)
+  then {next=core;effects=[asset_output request (Error Asset_network)]} else
   let cleanup = asset_cleanup_action request.action in
   let context =
     match asset_context core with
@@ -3504,7 +3689,7 @@ let enforce_websocket_owner before (transition : transition) =
   in
   let target_changed = before.current_graph_scope <> next.current_graph_scope in
   let next, cancelled =
-    if target_changed || (not next.foreground) || next.closed
+    if target_changed || (not next.foreground) || next.closed || not (network_allowed next)
     then cancel_reconnect next
     else next, []
   in
@@ -3520,6 +3705,7 @@ let enforce_websocket_owner before (transition : transition) =
     match wanted with
     | Some request
       when next.foreground
+           && network_allowed next
            && (not next.closed)
            && next.current_graph_scope = Some request.scope.graph -> wanted
     | Some _ | None -> None
@@ -3545,6 +3731,7 @@ let enforce_websocket_owner before (transition : transition) =
         next.reconnect_pending
         && (not target_changed)
         && next.foreground
+        && network_allowed next
         && not next.closed
     }
   in
@@ -3562,7 +3749,8 @@ let enforce_websocket_owner before (transition : transition) =
           || replace
           || target_changed
           || (not next.foreground)
-          || next.closed)
+          || next.closed
+          || not (network_allowed next))
     then
       { next = { next with websocket_owner = Some { owner with phase = Retiring } }
       ; effects = cancelled @ effects @ [ Run (Close_websocket owner.physical_scope) ]

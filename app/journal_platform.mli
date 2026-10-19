@@ -40,3 +40,11 @@ val is_environment_event : bytes -> bool
 
 val copy_text_request : text:string -> (bytes, string) result
 val decode_copy_text_response : bytes -> (unit, string) result
+
+val online_requested_request : bytes
+val online_cancelled_request : bytes
+val scoped_online_requested_request : Logseq_db_worker_lui.Logseq_db_worker_lui_service.startup_scope -> bytes
+val scoped_online_cancelled_request : Logseq_db_worker_lui.Logseq_db_worker_lui_service.startup_scope -> bytes
+val scoped_timeline_presented_request : Logseq_db_worker_lui.Logseq_db_worker_lui_service.startup_scope -> bytes
+val decode_online_event : bytes -> (bool * Logseq_db_worker_lui.Logseq_db_worker_lui_service.startup_scope, string) result
+val decode_authenticated_scope : bytes -> (Logseq_db_worker_lui.Logseq_db_worker_lui_service.startup_scope, string) result

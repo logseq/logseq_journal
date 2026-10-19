@@ -67,6 +67,7 @@ let core ?(origin = Uri.of_string "https://api.logseq.io") () =
   |> Result.get_ok
   |> Core.initial
   |> Result.get_ok
+  |> fun core -> (Core.step core (Core.Sign_in_requested {account_generation=0;presentation_generation=0})).next
 ;;
 
 let load_catalog_transition () =
@@ -411,7 +412,7 @@ let protected_run runner ~tasks ~posted core operation scope action =
 ;;
 
 let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
-      ?(malformed_plaintext = false) ?(decryption_failure = false) () =
+      ?(malformed_plaintext = false) ?(decryption_failure = false) ?(cancel_online = false) () =
   with_support (fun support ->
     Eio_main.run (fun environment ->
       Eio.Switch.run (fun sw ->
@@ -486,7 +487,7 @@ let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
           | Send_websocket _
           | Close_websocket _
           | Schedule_timer _
-          | Cancel_effects _ -> fail "cached key effect had an unexpected request type"
+          | Cancel_effects _ | Cancel_network_effects _ -> fail "cached key effect had an unexpected request type"
         in
         Runner.submit runner instruction;
         List.iter (fun task -> task ()) (List.rev !tasks);
@@ -506,6 +507,16 @@ let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
           match !posted with
           | [ event ] -> (Core.step before.next event).next
           | _ -> fail "missing key completion"
+        in
+        let unlocked =
+          if not cancel_online then unlocked else (
+            tasks := [];
+            let startup = (Core.state unlocked).snapshot.startup in
+            let cancelled = Core.step unlocked (Core.Online_cancelled
+              {account_generation=startup.account_generation; presentation_generation=startup.presentation_generation}) in
+            List.iter (function Core.Run instruction -> Runner.submit runner instruction | _ -> ()) cancelled.effects;
+            List.iter (fun task -> task ()) (List.rev !tasks);
+            cancelled.next)
         in
         let result = protected_run
              runner
@@ -577,7 +588,7 @@ let test_cached_wrapped_key_unlock_failure_is_fail_closed () =
           | Send_websocket _
           | Close_websocket _
           | Schedule_timer _
-          | Cancel_effects _ -> fail "cached key effect had an unexpected request type"
+          | Cancel_effects _ | Cancel_network_effects _ -> fail "cached key effect had an unexpected request type"
         in
         Runner.submit runner instruction;
         List.iter (fun task -> task ()) (List.rev !tasks);
@@ -940,6 +951,10 @@ let scenarios =
       `Quick
       (test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
          ~malformed_plaintext:false)
+  ; Alcotest.test_case
+      "network cancellation retains local graph key bytes"
+      `Quick
+      (test_cached_wrapped_key_is_unlocked_before_protected_value_decryption ~cancel_online:true)
   ; Alcotest.test_case
       "decrypted parser error excludes plaintext"
       `Quick

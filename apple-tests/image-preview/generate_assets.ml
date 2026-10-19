@@ -297,6 +297,8 @@ server.serve_forever()
                        |> Core.initial
                        |> get
                      in
+                     let initial = (Core.step initial (Core.Sign_in_requested
+                       {account_generation=0; presentation_generation=0})).next in
                      let authenticated =
                        Core.step
                          initial

@@ -24,8 +24,27 @@ type startup_failure_stage =
   | During_bootstrap
   | During_e2ee
 
+type local_unavailability =
+  | No_local_account
+  | Local_catalog_unavailable
+  | Local_mirror_unavailable
+  | Local_key_unavailable
+  | Local_restore_failed
+
+type local_access =
+  | Local_pending
+  | Local_available
+  | Local_unavailable of local_unavailability
+
+type startup_network_phase =
+  | Local_only
+  | Online_after_timeline
+  | Online_by_user
+
 type startup_facts =
   { authenticated : bool
+  ; local_access : local_access
+  ; network_phase : startup_network_phase
   ; catalog_loading : bool
   ; awaiting_selection : bool
   ; restoring_local : bool
@@ -401,6 +420,7 @@ type runner_effect = private
   | Close_websocket of connection_scope
   | Schedule_timer of timer_request
   | Cancel_effects of effect_scope
+  | Cancel_network_effects of effect_scope
 
 type runner_completion =
   | Asset_completion of asset_ticket * asset_result
@@ -514,6 +534,17 @@ type outbox_transition_result =
 
 type snapshot_activation = { scope : graph_scope }
 
+type startup_scope =
+  { account_generation : account_generation
+  ; presentation_generation : presentation_generation
+  }
+
+type timeline_scope =
+  { startup : startup_scope
+  ; graph_id : graph_id
+  ; graph_generation : graph_generation
+  }
+
 type event =
   | Asset_requested of asset_request
   | Protected_requested of protected_request
@@ -521,11 +552,14 @@ type event =
   | Account_authenticated of { user_id : string option }
   | Local_feed_acknowledged
   | Local_outbox_changed
-  | Timeline_presented
+  | Timeline_presented of timeline_scope
   | Graph_selected of graph_id
   | Graph_picker_requested
-  | Catalog_refresh_requested
-  | Online_recovery_requested
+  | Sign_in_requested of startup_scope
+  | Catalog_refresh_requested of startup_scope
+  | Online_recovery_requested of timeline_scope
+  | Online_cancelled of startup_scope
+  | Local_account_unavailable of startup_scope * local_unavailability
   | E2ee_password_submitted of string
   | Local_cache_deletion_requested of graph_id
   | Foreground_changed of
