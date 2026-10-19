@@ -245,6 +245,148 @@ let snapshot_rejection_preserves_schema_versions () =
     [65, 29; 64, 200]
 ;;
 
+let with_snapshot_metadata changes f =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let module Session = Logseq_db_storage.Storage_session in
+  let behavior = "synthetic snapshot metadata" in
+  T.with_temp_directory "overlay-snapshot-metadata-" (fun root ->
+    let source = Filename.concat root "source" in
+    Unix.mkdir source 0o700;
+    let database_path = T.seed_mirror source in
+    let connection = Storage.open_database database_path |> T.require_ok ~behavior in
+    let database = Storage.restore_database connection |> T.require_ok ~behavior in
+    let session =
+      Session.create
+        ~tail:(Datascript.Storage.restore_tail_groups (Storage.datascript_storage connection))
+        ~callbacks:(Storage.connection_callbacks connection)
+    in
+    Fun.protect ~finally:(fun () -> ignore (Session.close session)) (fun () ->
+      if changes <> [] then (
+        let staged = Session.stage_transact session ~authoritative_before:database changes
+          |> T.require_ok ~behavior in
+        Session.commit_staged session staged |> T.require_ok ~behavior));
+    f root database_path)
+;;
+
+let snapshot_uuid_metadata_case changes expected_error () =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let module Checkpoint = Logseq_db_storage.Sync_checkpoint_store in
+  let behavior = "optional snapshot UUID metadata" in
+  with_snapshot_metadata changes (fun root database_path ->
+    let path = Filename.concat root "snapshot.transit" in
+    let expected_rows = T.write_snapshot_from_database ~database_path ~snapshot_path:path in
+    let support = Filename.concat root "target" in
+    Unix.mkdir support 0o700;
+    let dependencies, _, inspection = absent_inspection ~behavior support in
+    let cursor = server_cursor 42 in
+    let result = Database.prepare_snapshot_activation dependencies inspection ~path
+      ~applied_server_cursor:cursor ~expected_checksum:None ~expected_rows in
+    match expected_error, result with
+    | Some expected, Error (Snapshot_parse_error actual) ->
+      Alcotest.(check string) "metadata rejection is preserved" expected actual;
+      (match Database.mirror_presence (inspect_mirror support behavior) with
+       | Absent _ -> ()
+       | Available _ -> Alcotest.fail "rejected snapshot installed a mirror")
+    | Some _, Error _ -> Alcotest.fail "metadata returned the wrong error category"
+    | Some _, Ok prepared ->
+      Database.cancel_snapshot_activation prepared;
+      Alcotest.fail "invalid snapshot metadata was admitted"
+    | None, Error (Snapshot_parse_error message) -> Alcotest.fail message
+    | None, Error _ -> Alcotest.fail "valid optional UUID metadata was rejected"
+    | None, Ok prepared ->
+      Fun.protect ~finally:(fun () -> Database.cancel_snapshot_activation prepared) (fun () ->
+        ignore (supply_snapshot_crypto ~behavior prepared 0);
+        ignore (Database.commit_snapshot_activation prepared |> T.require_ok ~behavior));
+      (* The fixture helper only exports kvs, so this checkpoint must have been
+         created from the requested target and baseline, not copied from input. *)
+      let target_path = Filename.concat support
+        ("logseq-db-worker/synced-graphs/" ^ Logseq_db_types.Graph_types.Uuid.to_string T.graph_uuid ^ "/db.sqlite") in
+      let checkpoint = Checkpoint.read_path target_path |> T.require_ok ~behavior in
+      T.require (Logseq_db_types.Graph_types.Uuid.equal checkpoint.graph_id T.graph_uuid)
+        "checkpoint did not retain the download target";
+      T.require (Server_cursor.equal checkpoint.applied_server_t cursor)
+        "checkpoint did not retain the baseline cursor";
+      let metadata_values path =
+        let connection = Storage.open_database path |> T.require_ok ~behavior in
+        Fun.protect ~finally:(fun () -> ignore (Storage.close (Storage.connection_callbacks connection))) (fun () ->
+          let database = Storage.restore_database connection |> T.require_ok ~behavior in
+          List.map (fun ident ->
+            Datascript.datoms database Datascript.Avet ~a:"db/ident"
+              ~v:(Datascript.Keyword ident) ()
+            |> Seq.flat_map (fun datom ->
+              Datascript.datoms database Datascript.Eavt ~e:datom.Datascript.e
+                ~a:"kv/value" ())
+            |> Seq.map (fun datom -> datom.Datascript.v)
+            |> List.of_seq)
+            ["logseq.kv/local-graph-uuid"; "logseq.kv/graph-uuid"])
+      in
+      Alcotest.(check bool) "activation does not invent UUID metadata" true
+        (metadata_values database_path = metadata_values target_path);
+      Eio_main.run (fun _ -> Eio.Switch.run (fun sw ->
+        let database = Database.open_ ~sw dependencies (inspect_mirror support behavior)
+          ~graph_name:"optional-uuid-graph" |> T.require_ok ~behavior in
+        Fun.protect ~finally:(fun () -> ignore (Database.close database)) (fun () ->
+          let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+          Fun.protect ~finally:(fun () -> Database.release_snapshot snapshot) (fun () ->
+            let info = Database.graph_info snapshot |> T.require_ok ~behavior in
+            T.require (Logseq_db_types.Graph_types.Uuid.equal info.graph_uuid T.graph_uuid)
+              "reopened mirror lost target identity";
+            match Database.get_outline_blocks snapshot [T.authoritative_block_uuid]
+                  |> T.require_ok ~behavior with
+            | [Present_block _] -> ()
+            | _ -> Alcotest.fail "reopened snapshot lost graph data")))))
+;;
+
+let local_admission_keeps_uuid_requirement missing () =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let behavior = "local graph admission remains unchanged" in
+  let changes = Datascript.[RetractEntity (Ident "logseq.kv/graph-uuid");
+    Add (Ident "logseq.kv/graph-remote?", "kv/value", Bool false)]
+    @ (if missing then [Datascript.RetractEntity (Ident "logseq.kv/local-graph-uuid")] else []) in
+  with_snapshot_metadata changes (fun _ database_path ->
+    let connection = Storage.open_database database_path |> T.require_ok ~behavior in
+    Fun.protect ~finally:(fun () -> ignore (Storage.close (Storage.connection_callbacks connection))) (fun () ->
+      let database = Storage.restore_database connection |> T.require_ok ~behavior in
+      let startup = Storage.startup_metadata connection |> T.require_ok ~behavior in
+      match Logseq_db_storage.Admission.inspect ~target:Local_target ~db:database
+        ~storage_schema:startup.schema, missing with
+      | Error Corrupt_storage, true | Ok _, false -> ()
+      | _ -> Alcotest.fail "local graph UUID requirement changed"))
+;;
+
+let snapshot_uuid_metadata_cases =
+  let open Datascript in
+  let remove ident = RetractEntity (Ident ("logseq.kv/" ^ ident)) in
+  let set ident value = Add (Ident ("logseq.kv/" ^ ident), "kv/value", value) in
+  let corrupt = Some "The downloaded graph storage is corrupt." in
+  let identity = Some "The downloaded graph has an invalid synchronization identity." in
+  List.map (fun (name, changes, expected) ->
+    Alcotest.test_case name `Quick (snapshot_uuid_metadata_case changes expected))
+    [ "snapshot UUIDs present", [], None
+    ; "snapshot remote UUID absent", [remove "graph-uuid"], None
+    ; "snapshot local UUID absent", [remove "local-graph-uuid"], None
+    ; "snapshot both UUIDs absent", [remove "graph-uuid"; remove "local-graph-uuid"], None
+    ; "snapshot present remote UUID conflict", [set "graph-uuid" (Uuid "70000000-0000-4000-8000-000000000001")], identity
+    ; "snapshot absent local UUID retains remote conflict rejection", [remove "local-graph-uuid"; set "graph-uuid" (Uuid "70000000-0000-4000-8000-000000000001")], identity
+    ; "snapshot malformed remote UUID", [set "graph-uuid" (String "invalid-uuid")], corrupt
+    ; "snapshot malformed local UUID", [set "local-graph-uuid" (String "invalid-uuid")], corrupt
+    ; "snapshot remote UUID wrong type", [set "graph-uuid" (Bool false)], corrupt
+    ; "snapshot local UUID wrong type", [set "local-graph-uuid" (Bool false)], corrupt
+    ; "snapshot missing db type", [remove "db-type"], corrupt
+    ; "snapshot invalid db type", [set "db-type" (String "file")], corrupt
+    ; "snapshot missing schema version", [remove "schema-version"], corrupt
+    ; "snapshot invalid schema version", [set "schema-version" (String "65.33")], corrupt
+    ; "snapshot missing remote flag", [remove "graph-remote?"], identity
+    ; "snapshot false remote flag", [set "graph-remote?" (Bool false)], identity
+    ; "snapshot malformed remote flag", [set "graph-remote?" (String "true")], identity
+    ]
+  @ [ Alcotest.test_case "local admission still requires local UUID" `Quick
+        (local_admission_keeps_uuid_requirement true)
+    ; Alcotest.test_case "local admission accepts existing local UUID" `Quick
+        (local_admission_keeps_uuid_requirement false)
+    ]
+;;
+
 let snapshot_import_error_does_not_disclose_payload () =
   T.with_temp_directory "overlay-invalid-payload-" (fun root ->
     let support = Filename.concat root "target" in
@@ -3104,6 +3246,7 @@ let () =
             `Quick
             sqlite_full_int64_checkpoint
         ] )
+    ; "snapshot UUID metadata", snapshot_uuid_metadata_cases
     ; "mirror and durability", cases @
         [Alcotest.test_case "legacy post-rename retirement replays" `Quick (legacy_retirement_replays_without_content_load `After);
          Alcotest.test_case "legacy pre-rename retirement cancels with lease fencing" `Quick (legacy_retirement_replays_without_content_load `Before);

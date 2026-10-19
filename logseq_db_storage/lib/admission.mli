@@ -29,7 +29,7 @@ type target =
 
 type admitted =
   { schema : Graph_types.schema_version
-  ; local_graph_uuid : Graph_types.Uuid.t
+  ; local_graph_uuid : Graph_types.Uuid.t option
   ; admission_facts : Graph_types.admission_fact list
   }
 

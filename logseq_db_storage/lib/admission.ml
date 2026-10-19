@@ -29,7 +29,7 @@ type target =
 
 type admitted =
   { schema : Graph_types.schema_version
-  ; local_graph_uuid : Graph_types.Uuid.t
+  ; local_graph_uuid : Graph_types.Uuid.t option
   ; admission_facts : Graph_types.admission_fact list
   }
 
@@ -68,19 +68,21 @@ let local_facts (observed : observed) =
 
 let synced_facts graph_id (observed : observed) =
   match
-    ( observed.local_graph_uuid
-    , observed.remote_flag
+    ( observed.remote_flag
     , observed.rtc_graph_uuid
     , observed.client_ops_graph_uuid )
   with
-  | Some local_graph_uuid, Boolean true, Some rtc_graph_uuid, None
-    when Graph_types.Uuid.equal graph_id rtc_graph_uuid ->
+  | Boolean true, rtc_graph_uuid, None
+    when Option.fold ~none:true ~some:(Graph_types.Uuid.equal graph_id) rtc_graph_uuid ->
+    (* Upstream incremental sync omits both UUID KVs. The requested target owns
+       remote identity; a supplied UUID must still agree with that target. *)
     Ok
-      [ Graph_types.Local_graph local_graph_uuid
-      ; Remote_flag_true
-      ; Synced_graph_identity graph_id
-      ; Lossless_codec
-      ]
+      (Option.to_list
+         (Option.map (fun uuid -> Graph_types.Local_graph uuid) observed.local_graph_uuid)
+       @ [ Graph_types.Remote_flag_true
+         ; Synced_graph_identity graph_id
+         ; Lossless_codec
+         ])
   | _ -> Error Ambiguous_sync_state
 ;;
 
@@ -189,12 +191,13 @@ let inspect ~target ~db ~storage_schema =
     , single_kv db "logseq.kv/db-type" )
   with
   | ( Ok schema
-    , Ok (Some local_graph_uuid)
+    , Ok local_graph_uuid
     , Ok rtc_graph_uuid
-    , Ok (Some (Datascript.String "db")) ) ->
+    , Ok (Some (Datascript.String "db")) )
+    when target <> Local_target || Option.is_some local_graph_uuid ->
     let observed =
       { schema
-      ; local_graph_uuid = Some local_graph_uuid
+      ; local_graph_uuid
       ; remote_flag = remote_flag db
       ; rtc_graph_uuid
       ; client_ops_graph_uuid = None
