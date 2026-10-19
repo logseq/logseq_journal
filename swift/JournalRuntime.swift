@@ -25,11 +25,11 @@ private func luiOCamlStop() -> Int32
 @_silgen_name("journal_ocaml_pump")
 private func journalOCamlPump() -> Int32
 @_silgen_name("journal_ocaml_platform_event")
-private func journalOCamlPlatformEvent(_ data: UnsafePointer<CChar>?, _ length: Int32)
+private func journalOCamlPlatformEvent(_ data: UnsafePointer<CChar>?, _ length: Int32) -> Int32
 @_silgen_name("journal_ocaml_platform_response")
-private func journalOCamlPlatformResponse(_ data: UnsafePointer<CChar>?, _ length: Int32)
+private func journalOCamlPlatformResponse(_ data: UnsafePointer<CChar>?, _ length: Int32) -> Int32
 @_silgen_name("journal_ocaml_platform_failure")
-private func journalOCamlPlatformFailure(_ data: UnsafePointer<CChar>?, _ length: Int32)
+private func journalOCamlPlatformFailure(_ data: UnsafePointer<CChar>?, _ length: Int32) -> Int32
 @_silgen_name("journal_ocaml_set_wakeup_callback")
 private func journalOCamlSetWakeupCallback(_ callback: WakeupCallback?)
 @_silgen_name("journal_ocaml_set_platform_request_callback")
@@ -74,6 +74,9 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     case patch = "runtime.patch.failed"
     case pump = "runtime.pump.failed"
     case event = "runtime.event.failed"
+    case platformEvent = "runtime.platformEvent.failed"
+    case platformResponse = "runtime.platformResponse.failed"
+    case platformFailure = "runtime.platformFailure.failed"
     case stop = "runtime.stop.failed"
     var errorDescription: String? {
       "Journal could not complete a native operation (\(rawValue)). Retry opening Journal."
@@ -174,29 +177,34 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   /// continuation instead of waiting forever.
   func deliverPlatformRequest(_ bytes: Data) async {
     guard started else { return }
-    guard let response = await platform.request(bytes) else {
-      bytes.withUnsafeBytes { buffer in
+    let response = await platform.request(bytes)
+    guard started else { return } // This runtime may have stopped while awaiting the platform.
+    guard let response else {
+      let accepted = bytes.withUnsafeBytes { buffer in
         journalOCamlPlatformFailure(
           buffer.baseAddress?.assumingMemoryBound(to: CChar.self),
           Int32(buffer.count))
       }
+      if accepted != 1 { failure = .platformFailure }
       return
     }
-    response.withUnsafeBytes { buffer in
+    let accepted = response.withUnsafeBytes { buffer in
       journalOCamlPlatformResponse(
         buffer.baseAddress?.assumingMemoryBound(to: CChar.self),
         Int32(buffer.count))
     }
+    if accepted != 1 { failure = .platformResponse }
   }
 
   /// Pushes one host-originated LJP2 event envelope to OCaml.
   func sendPlatformEvent(_ bytes: Data) {
     guard started else { return }
-    bytes.withUnsafeBytes { buffer in
+    let accepted = bytes.withUnsafeBytes { buffer in
       journalOCamlPlatformEvent(
         buffer.baseAddress?.assumingMemoryBound(to: CChar.self),
         Int32(buffer.count))
     }
+    if accepted != 1 { failure = .platformEvent }
   }
 
   private func handle(_ event: LUIEvent) {

@@ -1711,11 +1711,11 @@ module View = struct
         match read_json Json.row_event_of_yojson payload with
         | Ok wire -> Option.iter (fun handler -> invoke handler Event.Payload.Unit)
             (Hashtbl.find_opt row_actions (wire.row, wire.key))
-        | Error _ -> ()
+        | Error _ -> Printf.eprintf "journal: phase=native operation=decodeListRowEvent code=invalidEvent recovery=retry\n%!"
       in
       let on_event (event : Journal_lui_native.event) =
         match read_json Json.event_of_yojson event.payload with
-        | Error _ -> ()
+        | Error _ -> Printf.eprintf "journal: phase=native operation=decodeListEvent code=invalidEvent recovery=retry\n%!"
         | Ok wire ->
           match wire.event_type with
           | "visible_range" ->
@@ -2085,7 +2085,7 @@ module Native_widget = struct
              payload
          with
          | Ok event -> callback event
-         | Error _ -> ())
+         | Error _ -> Printf.eprintf "journal: phase=native operation=decodeExtensionEvent code=invalidEvent recovery=retry\n%!")
       | _ -> ())
   ;;
 
@@ -2098,7 +2098,7 @@ module Native_widget = struct
       ~on_event:(fun event ->
         match decode extension event with
         | Ok decoded -> on_event decoded
-        | Error _ -> ())
+        | Error _ -> Printf.eprintf "journal: phase=native operation=decodeExtensionEvent code=invalidEvent recovery=retry\n%!")
       extension.Extension.identifier
       context
       parent

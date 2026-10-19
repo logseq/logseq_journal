@@ -950,7 +950,7 @@ let read_snapshot database request command =
                    | Overlay.Missing_page { uuid; _ } ->
                      Hashtbl.replace titles (Graph.Uuid.to_string uuid) None)
                  pages
-             | Error _ -> ());
+             | Error _ -> Printf.eprintf "journal: phase=presentation operation=readTagTitles code=enrichmentUnavailable recovery=refresh\n%!");
            let tag_titles =
              List.filter_map
                (fun uuid ->
@@ -2115,7 +2115,9 @@ let local_import t ~(scope : Sync.graph_scope) ~asset ~checksum ~current =
 
 let lookup_local_asset t ~scope ~asset ~checksum ~current call =
   match local_import t ~scope ~asset ~checksum ~current with
-  | Error _ -> Error Sync.Asset_cancelled
+  | Error _ ->
+    if current () then report_asset_error t scope "asset.metadata";
+    Error Sync.Asset_cancelled
   | Ok None -> Ok (Sync.Asset_cached None)
   | Ok (Some intent) ->
     (match call (Sync.Check_asset_cache (asset, intent.version)) with

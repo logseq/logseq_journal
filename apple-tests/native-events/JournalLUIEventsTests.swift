@@ -20,11 +20,11 @@ private func extensionEvent(
   _ node: Int64, _ name: UnsafePointer<CChar>?, _ payload: UnsafePointer<CChar>?
 ) -> Int32
 @_silgen_name("journal_ocaml_platform_event")
-private func platformEvent(_ bytes: UnsafePointer<UInt8>?, _ length: Int32)
+private func platformEvent(_ bytes: UnsafePointer<UInt8>?, _ length: Int32) -> Int32
 @_silgen_name("journal_ocaml_platform_response")
-private func platformResponse(_ bytes: UnsafePointer<UInt8>?, _ length: Int32)
+private func platformResponse(_ bytes: UnsafePointer<UInt8>?, _ length: Int32) -> Int32
 @_silgen_name("journal_ocaml_platform_failure")
-private func platformFailure(_ bytes: UnsafePointer<UInt8>?, _ length: Int32)
+private func platformFailure(_ bytes: UnsafePointer<UInt8>?, _ length: Int32) -> Int32
 
 nonisolated(unsafe) private var patches: [String] = []
 nonisolated(unsafe) private var callbackFailure: String?
@@ -135,13 +135,22 @@ private let receivePatch: PatchCallback = { source in
     let bytes: [UInt8] = [65, 0, 66]
     for deliver in [platformEvent, platformResponse, platformFailure] {
       patches.removeAll()
-      bytes.withUnsafeBufferPointer { deliver($0.baseAddress, Int32($0.count)) }
+      try check(bytes.withUnsafeBufferPointer { deliver($0.baseAddress, Int32($0.count)) } == 1,
+        "platform success was not acknowledged")
+      let rejected = Array("raise".utf8)
+      try check(rejected.withUnsafeBufferPointer { deliver($0.baseAddress, Int32($0.count)) } == 0,
+        "platform callback exception reported success")
       try check(patches.isEmpty, "platform envelope unexpectedly applied a patch")
       try check(pump() == 1 && patches.count == 1, "platform completion could not pump")
       let object = try JSONSerialization.jsonObject(with: Data(patches[0].utf8)) as? [String: Any]
       let value = (object?["ops"] as? [[String: Any]])?.first?["value"] as? String
       try check(value == "platform:410042", "binary platform envelope changed")
     }
+    let pumpFailure = Array("pump-raise".utf8)
+    try check(pumpFailure.withUnsafeBufferPointer { platformEvent($0.baseAddress, Int32($0.count)) } == 1,
+      "pump failure setup was not accepted")
+    try check(pump() == 0, "pump exception reported success")
+    try check(pump() == 1, "fixture did not recover after pump exception")
     for _ in 0..<100 {
       for (event, _) in cases.prefix(9) {
         patches.removeAll()

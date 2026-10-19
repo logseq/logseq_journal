@@ -7282,7 +7282,10 @@ let create
            | "event", Some (IntValue (-1)), Some (StringValue "diagnostic.nativePropsDecode") -> report "decodeNativeProps"
            | "event", Some (IntValue (-1)), Some (StringValue "diagnostic.nativeEventEncode") -> report "encodeNativeEvent"
            | "event", Some (IntValue (-1)), Some (StringValue "diagnostic.nativeEventDelivery") -> report "deliverNativeEvent"
-           | "event", _, _ when Lui_protocol.String_map.is_empty values -> report "decodeNativeEvent"
+           | "event", Some (IntValue _), Some (StringValue _) ->
+             ignore (Lui_app.dispatch_event app
+               (Lui_protocol.ExtensionEvent (node, identifier, name, values)))
+           | "event", _, _ -> report "decodeNativeEvent"
            | _ ->
              ignore (Lui_app.dispatch_event app
                (Lui_protocol.ExtensionEvent (node, identifier, name, values))))

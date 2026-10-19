@@ -2967,7 +2967,7 @@ let receive_response t (protocol_response : Protocol.response) =
                  Option.iter
                    (fun children ->
                       match projection_time_context t with
-                      | Error _ -> ()
+                      | Error _ -> Printf.eprintf "journal: phase=presentation operation=reconcileDetailCalendar code=projectionUnavailable recovery=refresh\n%!"
                       | Ok time_context ->
                         (match
                            detail_projection
@@ -2980,7 +2980,7 @@ let receive_response t (protocol_response : Protocol.response) =
                          | Ok detail ->
                            reconciled
                            := response (Children_reconciled detail) :: !reconciled
-                         | Error _ -> ()))
+                         | Error _ -> Printf.eprintf "journal: phase=presentation operation=reconcileDetail code=projectionUnavailable recovery=refresh\n%!"))
                    (Hashtbl.find_opt t.detail_children key);
                  Some interest)
                else Some interest)

@@ -441,7 +441,7 @@ module Asset_cache = struct
   ;;
 
   let clean_retired_staging t record =
-    if record.retired && record.staged_pins = 0
+    let result = if record.retired && record.staged_pins = 0
     then
       protect (fun () ->
         unlink record.staged_location;
@@ -452,7 +452,11 @@ module Asset_cache = struct
           Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> Unix.fsync fd));
         Hashtbl.remove t.staged_records record.staged_name;
         Ok ())
-    else Ok ()
+    else Ok () in
+    (match result with
+     | Ok () -> ()
+     | Error _ -> Printf.eprintf "journal: phase=cleanup operation=releaseRetiredStaging code=cleanupPending\n%!");
+    result
   ;;
 
   let path t handle =
@@ -613,7 +617,9 @@ module Asset_cache = struct
       else
         let captured, state = retirement_state manifest in
         if state = "account-deleted" then (
-          ignore (remove_tree data); Ok ())
+          (match remove_tree data with
+           | Ok () -> ()
+           | Error _ -> Printf.eprintf "journal: phase=cleanup operation=collectDeletedAccountAssets code=collectionPending\n%!"); Ok ())
         else if state = "aborted" || state = "complete" then Ok ()
         else if commit then (
           if Sys.file_exists data && identity data <> captured then failwith "retired asset identity changed";
@@ -656,8 +662,10 @@ module Asset_cache = struct
             let _, _, manifest, _ = graph_deletion_paths ~root scope retirement in
             let _, state = retirement_state manifest in
             if state = "committed" || state = "complete" || state = "account-deleted" then
-              ignore (finish_graph_deletion ~root
-                ~deletion:(Core.asset_deletion_reference ~scope ~retirement) ~commit:true)
+              (match finish_graph_deletion ~root
+                ~deletion:(Core.asset_deletion_reference ~scope ~retirement) ~commit:true with
+               | Ok () -> ()
+               | Error _ -> Printf.eprintf "journal: phase=cleanup operation=finishRetiredAssets code=collectionPending\n%!")
           with _ -> Printf.eprintf "journal: phase=cleanup operation=collectRetiredAssets code=collectionPending\n%!") (Sys.readdir pending)
   ;;
 

@@ -1788,21 +1788,6 @@ let prune_staged_assets t ~scope ~keep =
       |> Result.map_error asset_cache_failure)
 ;;
 
-let retain_staged_file t ~scope ~file =
-  if t.closed
-  then None
-  else (
-    match scoped_asset_cache t scope with
-    | Error _ -> None
-    | Ok cache ->
-      Option.bind (Asset_cache.retain_staged cache ~file) (fun lease ->
-        match Asset_cache.path cache lease with
-        | Some path -> Hashtbl.replace t.asset_leases (scope, lease) (); Some (lease, path)
-        | None ->
-          Asset_cache.release cache lease;
-          None))
-;;
-
 let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
   let scope = request.context.scope in
   let map_unit result = Result.map (fun () -> Core.Asset_unit) result in
@@ -1890,7 +1875,12 @@ let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
   | Retain_asset_file handle ->
     Ok (Core.Asset_retained (retain_asset_file t ~scope ~handle))
   | Retain_staged_file file ->
-    Ok (Core.Asset_retained (retain_staged_file t ~scope ~file))
+    if t.closed then Ok (Core.Asset_retained None) else cache (fun cache ->
+      let retained = Option.bind (Asset_cache.retain_staged cache ~file) (fun lease ->
+        match Asset_cache.path cache lease with
+        | Some path -> Hashtbl.replace t.asset_leases (scope, lease) (); Some (lease, path)
+        | None -> Asset_cache.release cache lease; None) in
+      Ok (Core.Asset_retained retained))
   | Release_asset_file handle ->
     release_asset_file t ~scope ~handle;
     Ok Core.Asset_unit

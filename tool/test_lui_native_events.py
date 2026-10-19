@@ -50,4 +50,9 @@ with tempfile.TemporaryDirectory(prefix="journal-lui-events-") as directory:
          str(binary_directory / "libLUIAppleBackendStatic.a"),
          str(temporary / "fixture.o"), str(temporary / "bridge.o"), "-o", str(executable)])
     # A bridge lock regression must fail instead of parking the test runner.
-    subprocess.run([str(executable)], cwd=temporary, check=True, timeout=20)
+    result = subprocess.run([str(executable)], cwd=temporary, capture_output=True, text=True, timeout=20)
+    print(result.stdout, end="")
+    print(result.stderr, end="")
+    if "SENSITIVE" in result.stderr:
+        raise AssertionError("Raw native exception text escaped the C bridge")
+    result.check_returncode()

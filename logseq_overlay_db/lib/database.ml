@@ -839,7 +839,9 @@ let collect_retired_mirrors (location : durable_mirror_location) =
             ignore (directory_stat data);
             validate_deletion_lease data;
             match Ownership.acquire ~graph_directory:data with
-            | Error _ -> ()
+            | Error Ownership.Already_owned -> ()
+            | Error (Ownership.Unavailable _) ->
+              Printf.eprintf "journal: phase=cleanup operation=collectRetiredMirrors code=ownershipUnavailable\n%!"
             | Ok owner -> Fun.protect ~finally:(fun () -> ignore (Ownership.release owner))
                 (fun () -> remove_mirror_tree data; sync_deletion_directory root))
         with _ -> Printf.eprintf "journal: phase=cleanup operation=collectRetiredMirrors code=collectionPending\n%!")

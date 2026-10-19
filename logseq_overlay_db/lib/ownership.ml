@@ -8,7 +8,10 @@ type error =
   | Unavailable of string
 
 let close database =
-  if Sqlite3.db_close database then Ok () else Error (Sqlite3.errmsg database)
+  if Sqlite3.db_close database then Ok ()
+  else (
+    Printf.eprintf "journal: phase=cleanup operation=releaseOwnership code=closePending recovery=reopen\n%!";
+    Error (Sqlite3.errmsg database))
 ;;
 
 let acquire ~graph_directory =
@@ -44,6 +47,8 @@ let release owner =
   then Ok ()
   else (
     owner.released <- true;
-    ignore (Sqlite3.exec owner.database "ROLLBACK");
+    (match Sqlite3.exec owner.database "ROLLBACK" with
+     | result when Sqlite3.Rc.is_success result -> ()
+     | _ -> Printf.eprintf "journal: phase=cleanup operation=releaseOwnership code=rollbackPending recovery=reopen\n%!");
     close owner.database)
 ;;

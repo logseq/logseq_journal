@@ -30,6 +30,8 @@ public struct LUIAppleExtensionRegistry { public init() {} }
 #include <stdint.h>
 static int mode;
 static int stops;
+static int platform_calls;
+int32_t fixture_platform_count(void) { return platform_calls; }
 int32_t fixture_stop_count(void) { return stops; }
 void fixture_set_mode(int32_t value) { mode = value; }
 int32_t lui_ocaml_start(void (*patch)(const char *), int32_t p, int32_t h, const char *d, int32_t n) {
@@ -37,12 +39,12 @@ int32_t lui_ocaml_start(void (*patch)(const char *), int32_t p, int32_t h, const
   patch(mode == 2 ? "invalid" : "valid"); return 1;
 }
 int32_t lui_ocaml_stop(void) { stops++; return 1; }
-int32_t journal_ocaml_pump(void) { return 1; }
+int32_t journal_ocaml_pump(void) { return mode == 3 ? 0 : 1; }
 void journal_ocaml_set_wakeup_callback(void (*f)(void)) {}
 void journal_ocaml_set_platform_request_callback(void (*f)(const char *,int32_t)) {}
-void journal_ocaml_platform_event(const char *d,int32_t n) {}
-void journal_ocaml_platform_response(const char *d,int32_t n) {}
-void journal_ocaml_platform_failure(const char *d,int32_t n) {}
+int32_t journal_ocaml_platform_event(const char *d,int32_t n) { platform_calls++; return mode == 4 ? 0 : 1; }
+int32_t journal_ocaml_platform_response(const char *d,int32_t n) { platform_calls++; return mode == 5 ? 0 : 1; }
+int32_t journal_ocaml_platform_failure(const char *d,int32_t n) { platform_calls++; return mode == 6 ? 0 : 1; }
 ''')
     def run(args):
         subprocess.run(args, cwd=work, check=True)
@@ -56,7 +58,7 @@ void journal_ocaml_platform_failure(const char *d,int32_t n) {}
          str(ROOT / "apple-tests/platform-services/JournalRuntimeFailureTests.swift"),
          str(work / "bridge.o"), "-o", str(executable)])
     failures = []
-    for scenario in ["success", "rejected", "invalid-patch"]:
+    for scenario in ["success", "rejected", "invalid-patch", "pump", "platform-event", "platform-response", "platform-failure", "stopped-response", "stopped-failure"]:
         result = subprocess.run([str(executable), scenario], cwd=work, capture_output=True, text=True)
         print(f"runtime {scenario}: exit={result.returncode}")
         if result.returncode:
