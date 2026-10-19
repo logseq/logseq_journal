@@ -3248,7 +3248,9 @@ let manager_page ?picker_signal state dispatch =
               | Some (Error _) -> "Unable to check local copy"
               | _ -> "" in
           let selection_enabled owner = owner.local_copy_deleting = None in
-          let deletion_enabled owner = not current && owner.local_copy_check = None
+          let deletion_enabled owner =
+            Option.exists (fun manager -> manager.Graph_service.startup.authenticated) owner.manager
+            && not current && owner.local_copy_check = None
             && owner.local_copy_deleting = None && presence owner <> Some (Ok Graph_service.Not_downloaded) in
           (* Native List cells retain their interactive children. Property signals
              update status and enabled state without replacing callback owners. *)
@@ -3281,7 +3283,10 @@ let manager_page ?picker_signal state dispatch =
                       ~enabled:(deletion_enabled state) ?enabled_signal:(projected context deletion_enabled)
                       ~test_id:(Ui.Test_id.string ("graph-picker-delete:" ^ id)) ()]
                    @ if current then [V.Menu.action ~id:2L
-                       ~title:"Switch graphs first." ~enabled:false ()] else [])]
+                       ~title:"Switch graphs first." ~enabled:false ()]
+                     else if not snapshot.startup.authenticated then [V.Menu.action ~id:2L
+                       ~title:"Connect your account to manage local copies." ~enabled:false ()]
+                     else [])]
                 () |> V.with_test_id (Ui.Test_id.string ("graph-picker-options:" ^ id)) in
             Ui.mount (V.row ~spacing:8. [select; options] |> V.frame ~max_width:Fill) context parent)
           in
@@ -4965,7 +4970,10 @@ let start
         Journal_startup.Presentation.step state.startup_presentation (Account(ticket,No_local))}))
         ~f:(fun () -> send_manager (Graph_service.Local_account_unavailable (startup_scope !state_ref,No_local_account))) in
     match Result.bind result Journal_platform.decode_local_account_binding with
-    | Error _ | Ok None -> unavailable ()
+    | Error _ ->
+      set_state (fun state -> {state with startup_presentation=
+        Journal_startup.Presentation.step state.startup_presentation (Account_error ticket)})
+    | Ok None -> unavailable ()
     | Ok (Some binding) ->
       if String.equal binding.managed_sync_origin !managed_sync_origin
          && ticket = Journal_startup.Presentation.account_ticket !state_ref.startup_presentation
