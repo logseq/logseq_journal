@@ -1881,6 +1881,10 @@ let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
         | Some path -> Hashtbl.replace t.asset_leases (scope, lease) (); Some (lease, path)
         | None -> Asset_cache.release cache lease; None) in
       Ok (Core.Asset_retained retained))
+    |> Result.map_error (function
+      | Core.Asset_invalid_content _ ->
+        Core.Asset_invalid_content "Attachment preview storage is unavailable"
+      | failure -> failure)
   | Release_asset_file handle ->
     release_asset_file t ~scope ~handle;
     Ok Core.Asset_unit

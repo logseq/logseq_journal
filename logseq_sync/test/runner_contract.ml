@@ -2295,8 +2295,12 @@ let test_staged_preview_cache_failure_is_not_missing_file () =
   with_local_asset_cache (fun support request ->
     Out_channel.with_open_bin (Filename.concat support "logseq-db-worker")
       (fun output -> output_string output "synthetic path obstruction");
-    cache_bool "cache initialization failure is not a successful missing preview" true
-      (Result.is_error (request (Core.Retain_staged_file "missing.bin"))))
+    match request (Core.Retain_staged_file "missing.bin") with
+    | Error (Core.Asset_invalid_content message) ->
+      Alcotest.(check string) "preview failure excludes raw filesystem details"
+        "Attachment preview storage is unavailable" message
+    | Error _ -> fail "cache IO failure must not become cancellation or another failure class"
+    | Ok _ -> fail "cache initialization failure is not a successful missing preview")
 ;;
 let scenarios = scenarios @ [Alcotest.test_case
   "staged preview cache IO failure stays an error" `Quick test_staged_preview_cache_failure_is_not_missing_file]
