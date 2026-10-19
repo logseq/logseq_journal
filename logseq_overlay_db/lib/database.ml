@@ -857,7 +857,7 @@ let collect_retired_mirrors (location : durable_mirror_location) =
             | Ok owner -> Fun.protect ~finally:(fun () -> ignore (Ownership.release owner))
                 (fun () -> remove_mirror_tree data; sync_deletion_directory root))
         with
-        | _ -> Printf.eprintf "journal: phase=cleanup operation=collectRetiredMirrors code=collectionPending\n%!")))
+        | _ -> Printf.eprintf "journal: phase=cleanup operation=collectRetiredMirrors code=collectionPending\n%!"))
 ;;
 
 let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement =

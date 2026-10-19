@@ -4054,8 +4054,8 @@ let start
              | Graph_service.Client_command (Submit_e2ee_password _) -> "submitE2eePassword"
              | Client_command (Restore_local_account _) -> "restoreLocalAccount"
              | Client_command (Select_graph _) -> "selectGraph"
-             | Client_command Refresh_catalog -> "refreshCatalog"
-             | Client_command Begin_online_recovery -> "recoverOnline"
+             | Client_command (Refresh_catalog _) -> "refreshCatalog"
+             | Client_command (Begin_online_recovery _) -> "recoverOnline"
              | Client_command (Set_foreground _) -> "setForeground"
              | Client_command Return_to_graph_picker -> "returnToGraphPicker"
              | Client_command _ -> "clientCommand"
@@ -4069,7 +4069,7 @@ let start
              | Get_graph_state -> "getGraphState"
            in
            Effect.run (set_state (fun state -> report_ui_error state ~operation ~phase:"admission")));
-        refused
+        refused)
   in
   let retire_worker_lease worker_id =
     match Hashtbl.find_opt admitted_graph_requests worker_id with

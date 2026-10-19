@@ -926,7 +926,7 @@ type transition =
 let unchanged next = { next; effects = [] }
 let publish core = Publish (State_changed core.public_state)
 
-let set_snapshot core snapshot =
+let set_snapshot core (snapshot : snapshot) =
   let previous = core.public_state.snapshot.startup in
   let diagnostics =
     if previous.account_generation <> snapshot.startup.account_generation

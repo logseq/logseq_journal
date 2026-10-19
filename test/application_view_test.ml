@@ -150,7 +150,8 @@ let test_diagnostic_identity_comes_from_worker () =
     ; startup = { authenticated = true; catalog_loading = false
         ; awaiting_selection = false; restoring_local = false; bootstrapping = false
         ; awaiting_e2ee_password = false; failure = None; account_generation = 1
-        ; graph_generation = 7; presentation_generation = 1 } }
+        ; graph_generation = 7; presentation_generation = 1
+        ; local_access = Local_available; network_phase = Online_after_timeline } }
   in
   let graph : Logseq_db_worker.graph_state =
     { generation = 7; graph_id = Some actual; phase = Graph_open; error = None }
