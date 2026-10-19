@@ -179,6 +179,7 @@ end
 let loading_view () = V.loading ~centered:true ~message:"Loading journal" ()
 
 let view
+      ?status_name
       ?current_day
       ?store
       ?(on_region = fun _ -> ())
@@ -232,7 +233,10 @@ let view
       | Top_level entry ->
         let render entry show_timestamp =
           on_region "timeline-item-build";
-          Journal_row.view ~render_source ?render_title
+          Journal_row.view
+            ?status_name
+            ~render_source
+            ?render_title
             ~render_media ~show_timestamp entry
         in
         (match store with

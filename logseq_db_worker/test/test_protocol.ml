@@ -1,6 +1,22 @@
 module T = Logseq_db_worker_test_support.Test_support
 module P = Logseq_db_worker.Protocol
 
+let arbitrary_status_uuid_wire () =
+  let uuid = "b1000000-0000-4000-8000-000000000099" in
+  let raw =
+    Yojson.Safe.from_string
+      (Printf.sprintf
+         {|{"api_version":2,"request_id":"00000000-0000-4000-8000-000000000009","command":["V2_set_task_status",{"mutation_id":"30000000-0000-4000-8000-000000000003","block":"10000000-0000-4000-8000-000000000002","status":"%s","preconditions":{"blocks":[],"pages":[],"scopes":[]}}]}|}
+         uuid)
+  in
+  match P.request_of_yojson raw with
+  | Error _ -> T.fail "custom status UUID rejected"
+  | Ok request ->
+    T.require
+      (Yojson.Safe.equal raw (P.request_to_yojson request))
+      "status UUID wire changed"
+;;
+
 let closed_internal_config_fields () =
   let base =
     `Assoc
@@ -984,7 +1000,8 @@ let request_tree_boundaries () =
 let () =
   T.run
     "protocol"
-    [ T.case "closed internal Config root and nested fields" closed_internal_config_fields
+    [ T.case "arbitrary task status UUID wire" arbitrary_status_uuid_wire
+    ; T.case "closed internal Config root and nested fields" closed_internal_config_fields
     ; T.case "tree depth node and root boundaries" request_tree_boundaries
     ; T.case "config golden and validation" config_generated_golden_and_validation
     ; T.case "generated golden and legacy rejection" generated_golden_and_legacy_rejection

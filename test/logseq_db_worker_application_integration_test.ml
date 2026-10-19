@@ -61,7 +61,8 @@ let capture : Journal_graph_projection.capture =
         ~local_minute_of_day:0
       |> Result.get_ok
   ; children = []
-  }
+  ; status_confirmation = false
+}
 ;;
 
 let capture_page_request_for runtime command =
@@ -272,20 +273,24 @@ let test_unrelated_projection_revision_does_not_reject_status_mutation () =
          { mutation_id = "a2000000-0000-4000-a000-000000000003"
          ; block_id = Graph.Uuid.to_string block_uuid
          ; expected_revision = "block-1"
-         ; task_state = Journal_model.Done
+         ; task_state = Journal_model.Status "00000002-1827-5820-8200-000000000000"
          })
   in
   match output.requests with
   | [ { Protocol.command =
           V2_set_task_status
             { block = target
-            ; status = V2_done
+            ; status
             ; preconditions = { blocks = [ (precondition_block, revision) ]; _ }
             ; _
             }
       ; _
       }
     ] ->
+    Alcotest.(check string)
+      "exact selected status UUID"
+      "00000002-1827-5820-8200-000000000000"
+      (Graph.Uuid.to_string status);
     Alcotest.(check string)
       "status target"
       (Graph.Uuid.to_string block_uuid)
@@ -309,7 +314,7 @@ let test_status_conflict_refreshes_authoritative_block () =
          { mutation_id = "a2000000-0000-4000-a000-000000000006"
          ; block_id = Graph.Uuid.to_string block_uuid
          ; expected_revision = "block-1"
-         ; task_state = Journal_model.Done
+         ; task_state = Journal_model.Status "00000002-1827-5820-8200-000000000000"
          })
     |> fun output -> only "status mutation request" output.requests
   in
@@ -433,7 +438,8 @@ let test_create_child_uses_caller_observed_parent_revision () =
          ; source = "Child"
          ; task_state = Journal_model.No_status
          ; creation_time = capture.creation_time
-         })
+         ; status_confirmation = false
+})
   in
   match output.requests with
   | [ { Protocol.command =
@@ -564,7 +570,11 @@ let test_capture_retries_after_revision_conflict () =
   | _ -> Alcotest.fail "Capture did not retry with a refreshed children revision"
 ;;
 
-let capture_task = { capture with task_state = Journal_model.Todo }
+let capture_task =
+  { capture with
+    task_state = Journal_model.Status "00000002-1615-5853-7700-000000000000"
+  }
+;;
 
 let captured_block : Graph.block =
   { block with
@@ -622,13 +632,17 @@ let test_capture_task_reads_inserted_block_revision_before_status () =
   | [ { Protocol.command =
           V2_set_task_status
             { block
-            ; status = V2_todo
+            ; status
             ; preconditions = { blocks = [ (precondition_block, revision) ]; _ }
             ; _
             }
       ; _
       }
     ] ->
+    Alcotest.(check string)
+      "exact selected status UUID"
+      "00000002-1615-5853-7700-000000000000"
+      (Graph.Uuid.to_string status);
     Alcotest.(check string)
       "status target"
       capture_task.block_id

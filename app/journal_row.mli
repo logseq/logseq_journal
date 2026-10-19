@@ -1,5 +1,6 @@
 val view
-  :  ?render_source:(string -> string)
+  :  ?status_name:(Journal_model.task_state -> string)
+  -> ?render_source:(string -> string)
   -> ?render_title:(string -> Journal_model.Title.t)
   -> render_media:
        (title:string
@@ -12,4 +13,7 @@ val view
   -> Journal_view.View.t
 
 (** Shared status and tag presentation. *)
-val metadata : Journal_model.t -> Journal_view.View.t list
+val metadata
+  :  ?status_name:(Journal_model.task_state -> string)
+  -> Journal_model.t
+  -> Journal_view.View.t list

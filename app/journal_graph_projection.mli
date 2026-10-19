@@ -33,6 +33,7 @@ type capture =
   ; sibling_order : string
   ; source : string
   ; task_state : Journal_model.task_state
+  ; status_confirmation : bool
   ; creation_time : Journal_time.t
   ; children : capture_child list
   }
@@ -46,6 +47,7 @@ type create_child =
   ; sibling_order : string
   ; source : string
   ; task_state : Journal_model.task_state
+  ; status_confirmation : bool
   ; creation_time : Journal_time.t
   }
 

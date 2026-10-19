@@ -204,9 +204,7 @@
         {
           "mutation_id": "30000000-0000-4000-8000-000000000005",
           "block": "10000000-0000-4000-8000-000000000001",
-          "status": [
-            "V2_todo"
-          ],
+          "status": "00000002-1615-5853-7700-000000000000",
           "preconditions": {
             "blocks": [
               [
@@ -332,6 +330,29 @@
           }
         }
       ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000024",
+      "command": [
+        "V2_list_task_statuses",
+        {
+          "limit": 50,
+          "cursor": null
+        }
+      ]
+    },
+    {
+      "api_version": 2,
+      "request_id": "00000000-0000-4000-8000-000000000025",
+      "command": [
+        "V2_get_task_status_definitions",
+        {
+          "statuses": [
+            "b1000000-0000-4000-8000-000000000099"
+          ]
+        }
+      ]
     }
   ],
   "read_operations": [
@@ -345,7 +366,9 @@
     "V2_inspect_admission",
     "V2_get_asset_descriptors",
     "V2_list_assets",
-    "V2_get_outline_block_summary"
+    "V2_get_outline_block_summary",
+    "V2_list_task_statuses",
+    "V2_get_task_status_definitions"
   ],
   "mutation_operations": [
     "V2_save_block",

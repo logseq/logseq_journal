@@ -1336,7 +1336,10 @@ let authoritative_rebase_terminalizes_queued_no_change database =
   let mutation_id = T.mutation_uuid 279 in
   let mutation =
     Types.Set_task_status
-      { mutation_id; block = T.authoritative_block_uuid; status = Todo }
+      { mutation_id
+      ; block = T.authoritative_block_uuid
+      ; status = Status_uuid T.builtin_todo_uuid
+      }
   in
   ignore (T.commit_mutation database ~expected mutation ~behavior);
   let module Transit = Transit_core.Json in
@@ -3394,7 +3397,11 @@ let stale_mutation kind =
     Save_block
       { mutation_id; block = T.authoritative_block_uuid; title = "Stale local title" }
   | "set" ->
-    Set_task_status { mutation_id; block = T.authoritative_block_uuid; status = Todo }
+    Set_task_status
+      { mutation_id
+      ; block = T.authoritative_block_uuid
+      ; status = Status_uuid T.builtin_todo_uuid
+      }
   | "clear" -> Clear_task_status { mutation_id; block = T.authoritative_block_uuid }
   | _ -> invalid_arg "unknown Stale mutation fixture"
 ;;
@@ -3739,6 +3746,67 @@ let numeric_cursor_construction_and_comparison () =
     [ 0L, 1L; Int64.pred Int64.max_int, Int64.max_int ]
 ;;
 
+let rejected_status_rename_restores_catalog database =
+  let behavior = "rejected status rename restores catalog metadata" in
+  T.seed_task_statuses database;
+  let status = T.status_uuid 0 in
+  let commit =
+    Database.commit_local
+      database
+      ~expected:(block_precondition database status behavior)
+      (Save_block
+         { mutation_id = T.mutation_uuid 710; block = status; title = "Renamed locally" })
+    |> T.require_ok ~behavior
+    |> function
+    | Local_committed c -> c
+    | _ -> Alcotest.fail "rename reused mutation"
+  in
+  let title () =
+    let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+    Fun.protect
+      ~finally:(fun () -> Database.release_snapshot snapshot)
+      (fun () ->
+         let catalog =
+           Database.get_task_statuses snapshot ~limit:200 ~cursor:None
+           |> T.require_ok ~behavior
+         in
+         (List.find
+            (fun (d : Graph.task_status_definition) -> Graph.Uuid.equal d.uuid status)
+            catalog.items)
+           .title)
+  in
+  Alcotest.(check string) "queued rename visible" "Renamed locally" (title ());
+  let batch = submit_one database commit behavior in
+  let view = Database.inspect_sync database |> T.require_ok ~behavior in
+  let partition =
+    { accepted_prefix = []
+    ; failed_member = Some commit.mutation_id
+    ; unexecuted_suffix = []
+    ; acceptance_barrier = None
+    ; missing_uuids = []
+    ; diagnostics = [ "Synthetic rejection" ]
+    }
+  in
+  let prepared, crypto =
+    Database.begin_outbox_transition
+      database
+      ~expected:(sync_view_token view)
+      (Reject_group
+         { batch_id = submission_batch_id batch
+         ; resolution = Definitive { reason = Invalid_request; partition }
+         })
+    |> T.require_ok ~behavior
+  in
+  T.require (crypto = None) "rename rejection requested crypto";
+  ignore
+    (Database.apply_outbox_transition database prepared ~encrypted:None
+     |> T.require_ok ~behavior);
+  Alcotest.(check string)
+    "rejected rename rolled back in catalog"
+    "Duplicate name"
+    (title ())
+;;
+
 let pure_cases =
   [ Alcotest.test_case
       "numeric cursor construction and comparison"
@@ -3813,7 +3881,10 @@ let stale_cases =
 
 let database_cases =
   stale_cases
-  @ [ Alcotest.test_case
+  @ [ T.database_case
+        "rejected status rename restores catalog"
+        rejected_status_rename_restores_catalog
+    ; Alcotest.test_case
         "reopen never reuses a terminal batch identity"
         `Quick
         reopened_submission_does_not_reuse_terminal_batch

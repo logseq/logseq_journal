@@ -988,7 +988,7 @@ let test_status_failure_conversion () =
               { mutation_id = "a1000000-0000-4000-a000-000000000001"
               ; block_id = Graph.Uuid.to_string block_uuid
               ; expected_revision = "block-1"
-              ; task_state = Journal_model.Todo
+              ; task_state = Journal_model.Status "00000002-1615-5853-7700-000000000000"
               })
          |> fun output -> only "status mutation" output.requests
        in
@@ -1099,6 +1099,7 @@ let prepare_paged_refresh kind =
                  ; task_state = Journal_model.No_status
                  ; creation_time
                  ; children = []
+                 ; status_confirmation = false
                  }
              })
         |> next "capture page lookup"
@@ -1428,7 +1429,7 @@ let target_refresh kind =
            { mutation_id = "a1000000-0000-4000-a000-000000000072"
            ; block_id = Graph.Uuid.to_string block_uuid
            ; expected_revision = "block-1"
-           ; task_state = Done
+           ; task_state = Journal_model.Status "00000002-1827-5820-8200-000000000000"
            })
       |> fun output -> only "status mutation" output.requests
     in
@@ -1948,7 +1949,7 @@ let test_target_confirmation_retains_child_mutation_context () =
          { mutation_id = "a1000000-0000-4000-a000-000000000075"
          ; block_id = Graph.Uuid.to_string child
          ; expected_revision = "child-2"
-         ; task_state = Done
+         ; task_state = Journal_model.Status "00000002-1827-5820-8200-000000000000"
          })
   in
   match status.requests with
@@ -2207,6 +2208,7 @@ let capture_format_read ~journal_day =
              ; task_state = Journal_model.No_status
              ; creation_time
              ; children = []
+             ; status_confirmation = false
              }
          })
     |> fun output -> only "capture page lookup" output.requests
@@ -2621,7 +2623,13 @@ let test_reference_burst_is_bounded () =
       (response
          request
          (Protocol.V2_page_outcome
-            (V2_missing_page { uuid = (match request.command with V2_get_page {page;_}->page | _->assert false); revision = "missing" })))
+            (V2_missing_page
+               { uuid =
+                   (match request.command with
+                    | V2_get_page { page; _ } -> page
+                    | _ -> assert false)
+               ; revision = "missing"
+               })))
   in
   Alcotest.(check int)
     "completion drains one queued lookup"
@@ -2793,7 +2801,7 @@ let test_status_failure_keeps_admitted_owner () =
          { mutation_id = "a1000000-0000-4000-a000-000000000071"
          ; block_id = Graph.Uuid.to_string block_uuid
          ; expected_revision = "block-1"
-         ; task_state = Journal_model.Done
+         ; task_state = Journal_model.Status "00000002-1827-5820-8200-000000000000"
          })
     |> fun output -> only "admitted status" output.requests
   in
@@ -2829,7 +2837,11 @@ let test_submit_rejections_keep_admitted_identity () =
   check
     Status_mutation
     (Journal_graph_request.Set_task_state
-       { mutation_id; block_id; expected_revision = "old"; task_state = Done });
+       { mutation_id
+       ; block_id
+       ; expected_revision = "old"
+       ; task_state = Journal_model.Status "00000002-1827-5820-8200-000000000000"
+       });
   check
     Delete_subtree_mutation
     (Journal_graph_request.Delete_subtree
@@ -2853,6 +2865,7 @@ let test_submit_rejections_keep_admitted_identity () =
            ; task_state = No_status
            ; creation_time
            ; children = []
+           ; status_confirmation = false
            }
        })
 ;;
@@ -2886,6 +2899,7 @@ let test_child_failure_retains_admitted_child () =
           ~local_day:20260901
           ~local_minute_of_day:0
         |> Result.get_ok
+    ; status_confirmation = false
     }
   in
   let check output =
@@ -4379,8 +4393,28 @@ let parent_visibility_fixture (page : Graph.page) =
           []
           None )
     ; true, root 6 "" [ own_asset ] [] [] None
-    ; false, root 7 "" [ status ] [] [] (Some V2_doing)
-    ; true, root 8 "" [ status ] [ tag ] [ "Task" ] (Some V2_doing)
+    ; ( false
+      , root
+          7
+          ""
+          [ status ]
+          []
+          []
+          (Some
+             (Logseq_db_types.Graph_types.Uuid.of_string
+                "00000002-1840-1229-0800-000000000000"
+              |> Result.get_ok)) )
+    ; ( true
+      , root
+          8
+          ""
+          [ status ]
+          [ tag ]
+          [ "Task" ]
+          (Some
+             (Logseq_db_types.Graph_types.Uuid.of_string
+                "00000002-1840-1229-0800-000000000000"
+              |> Result.get_ok)) )
     ]
   in
   let children n parent =
@@ -4653,10 +4687,10 @@ let test_changed_journal_detail_discovers_property_reference () =
     (Protocol.V2_block_outcome (V2_present_block
       {value={record with block={block with properties=[property]}}; revision="block-2"}))) in
   let reference = only "new property reference after sync" output.requests in
-  (match reference.command with
+  match reference.command with
    | Protocol.V2_get_page {page=block;_} -> Alcotest.(check string) "new closed value"
        (Graph.Uuid.to_string unrelated_uuid) (Graph.Uuid.to_string block)
-   | _ -> Alcotest.fail "sync did not use the owned reference reader")
+  | _ -> Alcotest.fail "sync did not use the owned reference reader"
 ;;
 
 let test_materialized_detail_leaf_discovers_property_reference () =
@@ -4978,7 +5012,9 @@ let test_page_property_promotes_prior_block_reference () =
     let first=Runtime.receive runtime (tree_page tree [root] None)
       |> fun o -> only "initial generic page reference" o.requests
       |> outline_after_page_miss runtime in
-    (match first.command with Protocol.V2_get_outline_block _ -> () | _ -> Alcotest.fail "expected generic block lookup");
+       (match first.command with
+        | Protocol.V2_get_outline_block _ -> ()
+        | _ -> Alcotest.fail "expected generic block lookup");
     if not pending then ignore (Runtime.receive runtime (response first (Protocol.V2_block_outcome
       (V2_missing_block {uuid=unrelated_uuid;revision="missing-1"}))));
     let property : Graph.property_summary =
@@ -5420,10 +5456,18 @@ let test_page_detail_root_and_append () =
       (Journal_model.page_id detail.root);
     Alcotest.(check int) "page children" (List.length children) (List.length detail.children.blocks);
     let command : Journal_graph_projection.create_child =
-      {mutation_id=Graph.Uuid.to_string unrelated_uuid; calendar_generation=1L;
-       block_id=Graph.Uuid.to_string unrelated_uuid; parent_block_id=Graph.Uuid.to_string page_uuid;
-       expected_parent_revision=Journal_model.revision detail.root; sibling_order="z";
-       source="Append only here";task_state=No_status;creation_time=Journal_model.creation_time detail.root} in
+         { mutation_id = Graph.Uuid.to_string unrelated_uuid
+         ; calendar_generation = 1L
+         ; block_id = Graph.Uuid.to_string unrelated_uuid
+         ; parent_block_id = Graph.Uuid.to_string page_uuid
+         ; expected_parent_revision = Journal_model.revision detail.root
+         ; sibling_order = "z"
+         ; source = "Append only here"
+         ; task_state = No_status
+         ; creation_time = Journal_model.creation_time detail.root
+         ; status_confirmation = false
+         }
+       in
     let request=Runtime.submit runtime (Create_child command) |> fun out->only "page append" out.requests in
     (match request.command with
      | V2_insert_blocks {parent;preconditions;_} ->
@@ -5583,7 +5627,7 @@ let scheduling_block n : Protocol.v2_block_record =
         uuid = scheduling_uuid 9000 n
       ; parent
       ; page = parent
-      ; title = if n = 0 then "Favorite " ^ reference else "Favorite block"
+      ; title = (if n = 0 then "Favorite " ^ reference else "Favorite block")
       }
   }
 ;;
@@ -5616,7 +5660,11 @@ let scheduling_reply (request : Protocol.request) =
   | V2_get_page { page = requested; _ } ->
     response request (Protocol.V2_page_outcome (V2_present_page
       { page = { page with uuid = requested; kind = Ordinary_page
-          ; title = if Graph.Uuid.equal requested target_uuid then "Resolved" else "Parent" }
+                ; title =
+                    (if Graph.Uuid.equal requested target_uuid
+                     then "Resolved"
+                     else "Parent")
+                }
       ; revision = "p" }))
   | _ -> Alcotest.fail "unexpected scheduling demand"
 ;;
@@ -5762,7 +5810,10 @@ let test_page_detail_root_title_discovers_reference () =
     (V2_present_page { page = { page with kind = Ordinary_page; title = reference }
     ; revision = "p" }))) in
   let children = out.requests |> List.find (fun (r : Protocol.request) ->
-    match r.command with V2_get_children _ -> true | _ -> false) in
+      match r.command with
+      | V2_get_children _ -> true
+      | _ -> false)
+  in
   let loaded = Runtime.receive runtime (response children (Protocol.V2_children_outcome
     { parent = page_uuid; revision_scope = V2_children_revision page_uuid
     ; scope_revision = "c"; items = []; next_cursor = None })) in
@@ -5797,17 +5848,540 @@ let test_copy_page_root () =
       (effects=[Copy.Copied (page.title ^ if populated then "\n  - Child" else "")])) [false;true]
 ;;
 
+let test_invalid_status_precedes_insert () =
+  List.iter
+    (fun task_state ->
+       let runtime = Runtime.create () in
+       set_calendar runtime;
+       let creation_time =
+         Journal_time.create
+           ~instant_unix_ms:1_788_192_000_000L
+           ~local_day:20260901
+           ~local_minute_of_day:0
+         |> Result.get_ok
+       in
+       let output =
+         Runtime.submit
+           runtime
+           (Journal_graph_request.Capture
+              { calendar_generation = 1L
+              ; command =
+                  { mutation_id = "a1000000-0000-4000-a000-0000000000c1"
+                  ; block_id = Graph.Uuid.to_string block_uuid
+                  ; sibling_order = "a"
+                  ; source = "Retained draft"
+                  ; task_state
+                  ; creation_time
+                  ; children = []
+                  ; status_confirmation = false
+                  }
+              })
+       in
+       Alcotest.(check int)
+         "invalid status cannot start Capture insertion"
+         0
+         (List.length output.requests);
+       expect_admitted_failure
+         "invalid status keeps Capture owner"
+         ~kind:Capture_mutation
+         ~mutation_id:"a1000000-0000-4000-a000-0000000000c1"
+         ~block_id:(Graph.Uuid.to_string block_uuid)
+         output)
+    Journal_model.[ Default_status; Invalid_status "broken"; Status "not-a-uuid" ]
+;;
+
+let test_catalog_and_lookup_cross_fences () =
+  let definition : Graph.task_status_definition =
+    { uuid = unrelated_uuid
+    ; title = "Old"
+    ; ident = None
+    ; order = "a"
+    ; checkbox_state = None
+    }
+  in
+  let find_catalog requests =
+    List.find
+      (fun (r : Protocol.request) ->
+         match r.command with
+         | V2_list_task_statuses _ -> true
+         | _ -> false)
+      requests
+  in
+  let start () =
+    let runtime = Runtime.create () in
+    let started = Runtime.start runtime in
+    let output =
+      Runtime.receive
+        runtime
+        (response started (graph_info_outcome ~journal_title_format:None))
+    in
+    runtime, find_catalog output.requests
+  in
+  let catalog items next_cursor =
+    Protocol.V2_task_statuses_outcome
+      { property_uuid = Some page_uuid; default_status = None; items; next_cursor }
+  in
+  let runtime, first = start () in
+  let page2 =
+    Runtime.receive
+      runtime
+      (response
+         first
+         (catalog [] (Some (Graph.Cursor.of_string "next" |> Result.get_ok))))
+    |> fun out -> find_catalog out.requests
+  in
+  let delta =
+    changed runtime (window ~blocks:[ unrelated_uuid ] ())
+    |> fun out ->
+    List.find
+      (fun (r : Protocol.request) ->
+         match r.command with
+         | V2_get_task_status_definitions _ -> true
+         | _ -> false)
+      out.requests
+  in
+  ignore
+    (Runtime.receive
+       runtime
+       (response delta (V2_task_status_definitions_outcome [ None ])));
+  let done_ = Runtime.receive runtime (response page2 (catalog [ definition ] None)) in
+  Alcotest.(check bool)
+    "late page cannot restore deleted status"
+    true
+    (List.exists
+       (fun r ->
+          match r.Runtime.payload with
+          | Task_statuses_changed { items; _ } -> Rrbvec.is_empty items
+          | _ -> false)
+       done_.responses);
+  let runtime, first = start () in
+  ignore (Runtime.receive runtime (response first (catalog [ definition ] None)));
+  let delta =
+    changed runtime (window ~blocks:[ unrelated_uuid ] ())
+    |> fun out ->
+    List.find
+      (fun (r : Protocol.request) ->
+         match r.command with
+         | V2_get_task_status_definitions _ -> true
+         | _ -> false)
+      out.requests
+  in
+  let reload =
+    Runtime.submit runtime Load_task_statuses |> fun out -> find_catalog out.requests
+  in
+  ignore (Runtime.receive runtime (response reload (catalog [] None)));
+  let stale =
+    Runtime.receive
+      runtime
+      (response delta (V2_task_status_definitions_outcome [ Some definition ]))
+  in
+  Alcotest.(check int)
+    "old lookup cannot restore catalog deletion"
+    0
+    (List.length stale.responses)
+;;
+
+let test_capture_recovery_explicit_clear () =
+  let runtime = Runtime.create () in
+  set_calendar runtime;
+  let creation_time =
+    Journal_time.create
+      ~instant_unix_ms:1_788_192_000_000L
+      ~local_day:20260901
+      ~local_minute_of_day:0
+    |> Result.get_ok
+  in
+  let next out = only "capture recovery continuation" out.Runtime.requests in
+  let lookup =
+    Runtime.submit
+      runtime
+      (Capture
+         { calendar_generation = 1L
+         ; command =
+             { mutation_id = "a1000000-0000-4000-a000-0000000000c1"
+             ; block_id = Graph.Uuid.to_string block_uuid
+             ; sibling_order = "a"
+             ; source = "Retained"
+             ; task_state = No_status
+             ; status_confirmation = true
+             ; creation_time
+             ; children = []
+             }
+         })
+    |> next
+  in
+  let target_page =
+    match lookup.command with
+    | V2_get_page { page = id; _ } -> { page with uuid = id }
+    | _ -> assert false
+  in
+  let children =
+    Runtime.receive
+      runtime
+      (response
+         lookup
+         (V2_page_outcome (V2_present_page { page = target_page; revision = "p" })))
+    |> next
+  in
+  let insert =
+    Runtime.receive
+      runtime
+      (response
+         children
+         (V2_children_outcome
+            { parent = target_page.uuid
+            ; revision_scope = V2_children_revision target_page.uuid
+            ; scope_revision = "c"
+            ; items = []
+            ; next_cursor = None
+            }))
+    |> next
+  in
+  let mutation_id =
+    match insert.command with
+    | V2_insert_blocks { mutation_id; _ } -> mutation_id
+    | _ -> assert false
+  in
+  let read =
+    Runtime.receive
+      runtime
+      (response
+         insert
+         (V2_mutation_committed
+            { mutation_id
+            ; status = V2_already_applied
+            ; generation = "g"
+            ; before_projection_revision = "p"
+            ; after_projection_revision = "p"
+            }))
+    |> next
+  in
+  let clear =
+    Runtime.receive
+      runtime
+      (response
+         read
+         (V2_block_outcome
+            (V2_present_block
+               { value =
+                   { record with
+                     block = { block with page = target_page.uuid }
+                   ; task_status = Some unrelated_uuid
+                   }
+               ; revision = "b"
+               })))
+    |> next
+  in
+  Alcotest.(check bool)
+    "Clear recovery writes explicit clear"
+    true
+    (match clear.command with
+     | V2_clear_task_status { block = id; _ } -> Graph.Uuid.equal id block_uuid
+     | _ -> false)
+;;
+
+let test_child_recovery_explicit_clear () =
+  let runtime = Runtime.create () in
+  seed_children_interest runtime;
+  set_calendar runtime;
+  let child_uuid = uuid "a1000000-0000-4000-9000-000000000081" in
+  let creation_time =
+    Journal_time.create
+      ~instant_unix_ms:1_788_192_000_000L
+      ~local_day:20260901
+      ~local_minute_of_day:0
+    |> Result.get_ok
+  in
+  let next out = only "Append recovery continuation" out.Runtime.requests in
+  let insert =
+    Runtime.submit
+      runtime
+      (Create_child
+         { mutation_id = "a1000000-0000-4000-a000-000000000081"
+         ; block_id = Graph.Uuid.to_string child_uuid
+         ; parent_block_id = Graph.Uuid.to_string block_uuid
+         ; calendar_generation = 1L
+         ; expected_parent_revision = "block-detail-1"
+         ; sibling_order = "a"
+         ; source = "Retained child"
+         ; task_state = No_status
+         ; status_confirmation = true
+         ; creation_time
+         })
+    |> next
+  in
+  let mutation_id =
+    match insert.command with
+    | V2_insert_blocks { mutation_id; _ } -> mutation_id
+    | _ -> assert false
+  in
+  let read =
+    Runtime.receive
+      runtime
+      (response
+         insert
+         (V2_mutation_committed
+            { mutation_id
+            ; status = V2_already_applied
+            ; generation = "g"
+            ; before_projection_revision = "p"
+            ; after_projection_revision = "p"
+            }))
+    |> next
+  in
+  let clear =
+    Runtime.receive
+      runtime
+      (response
+         read
+         (V2_block_outcome
+            (V2_present_block
+               { value =
+                   { record with
+                     block = { block with uuid = child_uuid; parent = block_uuid }
+                   ; task_status = Some unrelated_uuid
+                   }
+               ; revision = "b"
+               })))
+    |> next
+  in
+  Alcotest.(check bool)
+    "Append Clear recovery writes explicit clear"
+    true
+    (match clear.command with
+     | V2_clear_task_status { block = id; _ } -> Graph.Uuid.equal id child_uuid
+     | _ -> false)
+;;
+
+let test_task_catalog_generation_and_deltas () =
+  let runtime = Runtime.create () in
+  let initial = Runtime.start runtime in
+  let raw =
+    Yojson.Safe.from_string
+      {|["V2_response",{"api_version":2,"request_id":"00000000-0000-4000-8000-000000000001","outcome":["V2_graph_info_outcome",{"graph_uuid":"a1000000-0000-4000-8000-000000000001","graph_name":"Synthetic","schema":{"major":65,"minor":33},"admission_facts":[],"journal_title_format":null,"generation":"generation-1","projection_revision":"revision-1","limits":{"response_budget_bytes":1048576,"outbox_max_records":100,"outbox_max_bytes":1048576,"change_max_items":256,"change_max_bytes":1048576,"dispatcher_capacity":100,"wire_batch_max_bytes":1048576}}]}]|}
+  in
+  let (Protocol.V2_response { outcome; _ }) =
+    Protocol.response_of_yojson raw |> Result.get_ok
+  in
+  let output = Runtime.receive runtime (response initial outcome) in
+  let catalog =
+    List.find
+      (fun (r : Protocol.request) ->
+         match r.command with
+         | V2_list_task_statuses _ -> true
+         | _ -> false)
+      output.requests
+  in
+  let definition n title : Graph.task_status_definition =
+    { uuid = uuid (Printf.sprintf "b1000000-0000-4000-8000-%012d" n)
+    ; title
+    ; ident = None
+    ; order = string_of_int n
+    ; checkbox_state = None
+    }
+  in
+  let choices = List.init 12 (fun n -> definition n "Same name") in
+  let output =
+    Runtime.receive
+      runtime
+      (response
+         catalog
+         (V2_task_statuses_outcome
+            { property_uuid = Some page_uuid
+            ; default_status = None
+            ; items = choices
+            ; next_cursor = None
+            }))
+  in
+  Alcotest.(check bool)
+    "catalog published"
+    true
+    (List.exists
+       (fun r ->
+          match r.Runtime.payload with
+          | Task_statuses_changed { items; complete = true; _ } ->
+            Rrbvec.length items = 12
+          | _ -> false)
+       output.responses);
+  let output = changed runtime (window ~blocks:[ (List.hd choices).uuid ] ()) in
+  let delta =
+    List.find
+      (fun (r : Protocol.request) ->
+         match r.command with
+         | V2_get_task_status_definitions _ -> true
+         | _ -> false)
+      output.requests
+  in
+  Alcotest.(check bool)
+    "no full catalog refresh for rename"
+    false
+    (List.exists
+       (fun (r : Protocol.request) ->
+          match r.command with
+          | V2_list_task_statuses _ -> true
+          | _ -> false)
+       output.requests);
+  let renamed =
+    Runtime.receive
+      runtime
+      (response
+         delta
+         (V2_task_status_definitions_outcome [ Some (definition 0 "Renamed") ]))
+  in
+  Alcotest.(check bool)
+    "rename changes label while retaining UUID"
+    true
+    (List.exists
+       (fun r ->
+          match r.Runtime.payload with
+          | Task_statuses_changed { items; _ } ->
+            Rrbvec.to_seq items
+            |> Seq.exists (fun (d : Graph.task_status_definition) ->
+              d.title = "Renamed" && Graph.Uuid.equal d.uuid (List.hd choices).uuid)
+          | _ -> false)
+       renamed.responses);
+  let reload =
+    Runtime.submit runtime Journal_graph_request.Load_task_statuses
+    |> fun output -> only "catalog retry" output.requests
+  in
+  let failing =
+    Runtime.submit runtime Journal_graph_request.Load_task_statuses
+    |> fun output -> only "old catalog failure" output.requests
+  in
+  let newer =
+    Runtime.submit runtime Journal_graph_request.Load_task_statuses
+    |> fun output -> only "newer catalog retry" output.requests
+  in
+  ignore
+    (Runtime.receive
+       runtime
+       (response
+          newer
+          (V2_task_statuses_outcome
+             { property_uuid = Some page_uuid
+             ; default_status = None
+             ; items = [ definition 0 "Newest" ]
+             ; next_cursor = None
+             })));
+  let stale =
+    Runtime.receive
+      runtime
+      (response
+         reload
+         (V2_task_statuses_outcome
+            { property_uuid = Some page_uuid
+            ; default_status = None
+            ; items = [ definition 0 "Stale" ]
+            ; next_cursor = None
+            }))
+  in
+  Alcotest.(check int)
+    "older catalog completion is ignored"
+    0
+    (List.length stale.responses);
+  let old_failure =
+    Runtime.receive
+      runtime
+      (response
+         failing
+         (V2_failed { code = "invalid-request"; message = "Old catalog error" }))
+  in
+  Alcotest.(check int)
+    "old catalog failure is ignored"
+    0
+    (List.length old_failure.responses);
+  let resync =
+    Runtime.reconcile_push
+      runtime
+      ~request_generation:99L
+      (Protocol.V2_resync_required_push
+         { api_version = Protocol.api_version
+         ; generation = "generation-2"
+         ; reason = "overflow"
+         })
+  in
+  let graph =
+    List.find (fun (r : Protocol.request) -> r.command = V2_graph_info) resync.requests
+  in
+  let refreshed = Runtime.receive runtime (response graph outcome) in
+  Alcotest.(check bool)
+    "resync refreshes status catalog"
+    true
+    (List.exists
+       (fun (r : Protocol.request) ->
+          match r.command with
+          | V2_list_task_statuses _ -> true
+          | _ -> false)
+       (resync.requests @ refreshed.requests));
+  Runtime.reset runtime;
+  let late =
+    Runtime.receive
+      runtime
+      (response
+         delta
+         (V2_task_status_definitions_outcome [ Some (definition 0 "Renamed") ]))
+  in
+  Alcotest.(check int) "old graph catalog ignored" 0 (List.length late.responses)
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
-    [ ("unified request scheduling", [
-        Alcotest.test_case "four and eight Favorites drain exactly once" `Quick test_favorite_dependencies_drain_once;
-        Alcotest.test_case "cancelled dependency releases capacity" `Quick test_favorite_cancel_releases_slot;
-        Alcotest.test_case "scope reset discards old queue" `Quick test_favorite_scope_discards_queued_reads;
-        Alcotest.test_case "Favorite epoch preserves new queue" `Quick test_favorite_epoch_preserves_new_queue;
-        Alcotest.test_case "refused delivery settles all unsent demands" `Quick test_rejected_delivery_retires_unsent_queue;
-        Alcotest.test_case "Favorite page discovers title reference" `Quick test_favorite_page_title_discovers_reference;
-        Alcotest.test_case "empty page detail discovers root reference" `Quick test_page_detail_root_title_discovers_reference
+    [ ( "status recovery"
+      , [ Alcotest.test_case
+            "explicit clear after lost response"
+            `Quick
+            test_capture_recovery_explicit_clear
+        ; Alcotest.test_case
+            "Append explicit clear after lost response"
+            `Quick
+            test_child_recovery_explicit_clear
+        ; Alcotest.test_case
+            "catalog and delta cross fences"
+            `Quick
+            test_catalog_and_lookup_cross_fences
+        ] )
+    ; ( "task status admission"
+      , [ Alcotest.test_case
+            "invalid status before insertion"
+            `Quick
+            test_invalid_status_precedes_insert
+        ] )
+    ; ( "task catalog"
+      , [ Alcotest.test_case
+            "generation and targeted deltas"
+            `Quick
+            test_task_catalog_generation_and_deltas
+        ] )
+    ; ( "unified request scheduling"
+      , [ Alcotest.test_case
+            "four and eight Favorites drain exactly once"
+            `Quick
+            test_favorite_dependencies_drain_once
+        ; Alcotest.test_case
+            "cancelled dependency releases capacity"
+            `Quick
+            test_favorite_cancel_releases_slot
+        ; Alcotest.test_case
+            "scope reset discards old queue"
+            `Quick
+            test_favorite_scope_discards_queued_reads
+        ; Alcotest.test_case
+            "Favorite epoch preserves new queue"
+            `Quick
+            test_favorite_epoch_preserves_new_queue
+        ; Alcotest.test_case
+            "refused delivery settles all unsent demands"
+            `Quick
+            test_rejected_delivery_retires_unsent_queue
+        ; Alcotest.test_case
+            "Favorite page discovers title reference"
+            `Quick
+            test_favorite_page_title_discovers_reference
+        ; Alcotest.test_case
+            "empty page detail discovers root reference"
+            `Quick
+            test_page_detail_root_title_discovers_reference
       ]);
       ("Favorites page detail", [Alcotest.test_case "page property refresh discovers references" `Quick test_page_property_refresh_discovers_references; Alcotest.test_case "page root and scoped append" `Quick test_page_detail_root_and_append; Alcotest.test_case "copy page root and empty page" `Quick test_copy_page_root; Alcotest.test_case "recycled page is unavailable" `Quick test_recycled_page_root_is_removed; Alcotest.test_case "page point-change identity" `Quick test_page_root_block_change_uses_page_identity; Alcotest.test_case "page root refresh and resync" `Quick test_page_root_refresh_and_resync; Alcotest.test_case "Favorites share page-first reference cache" `Quick test_favorites_share_reference_cache; Alcotest.test_case "Favorites outline and absent references" `Quick test_favorites_outline_and_missing_reference]); ( "review reference ownership", [
         Alcotest.test_case "typed metadata retains newer fence" `Quick test_typed_metadata_preserves_newer_reference_fence;

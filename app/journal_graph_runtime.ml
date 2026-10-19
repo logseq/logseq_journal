@@ -31,6 +31,12 @@ type mutation_kind =
 type payload =
   | Projection_changes of Protocol.v2_change_window list
   | Projection_resync
+  | Task_statuses_changed of
+      { items : Graph.task_status_definition Rrbvec.t
+      ; default_status : Graph.Uuid.t option
+      ; complete : bool
+      ; error : string option
+      }
   | Reference_sources_changed of (string * string option) list
   | Favorites_loaded of
       Journal_graph_request.favorites_request
@@ -159,7 +165,9 @@ type target_summary =
   ; retries : int
   }
 
-type reference_lookup = Page_lookup | Outline_lookup
+type reference_lookup =
+  | Page_lookup
+  | Outline_lookup
 
 type reference_source =
   | Source_text of string
@@ -186,6 +194,11 @@ type operation =
       ; consumed : int
       ; seen : string list
       }
+  | Task_catalog of
+      { epoch : int64
+      ; seen : string Rrbvec.t
+      }
+  | Task_definitions of Graph.Uuid.t list
   | Graph_info
   | Admission_info of Journal_graph_request.admission_request
   | Pull_changes of
@@ -295,7 +308,10 @@ type failure_owner =
       ; block_id : string
       }
 
-type request_delivery = Planned | Queued | Dispatched
+type request_delivery =
+  | Planned
+  | Queued
+  | Dispatched
 
 type pending_operation =
   { operation : operation
@@ -310,6 +326,15 @@ type t =
   ; hydration_queue : Protocol.request Queue.t
   ; hydration_active : (string, unit) Hashtbl.t
   ; mutable next_request : int64
+  ; task_definitions : (string, int64 * Graph.task_status_definition option) Hashtbl.t
+  ; task_lookup_epochs : (string, int64) Hashtbl.t
+  ; task_catalog_deletions : (string, int64) Hashtbl.t
+  ; mutable task_catalog_loading : bool
+  ; mutable task_catalog_epoch : int64
+  ; mutable task_catalog_started : bool
+  ; mutable task_catalog_complete : bool
+  ; mutable task_property : Graph.Uuid.t option
+  ; mutable default_task_status : Graph.Uuid.t option
   ; mutable change_generation : string option
   ; mutable change_cursor : string option
   ; block_revisions : (string, string) Hashtbl.t
@@ -381,6 +406,15 @@ let create ?(localtime = Unix.localtime) () =
   ; hydration_queue = Queue.create ()
   ; hydration_active = Hashtbl.create 4
   ; next_request = 1L
+  ; task_definitions = Hashtbl.create 32
+  ; task_lookup_epochs = Hashtbl.create 32
+  ; task_catalog_deletions = Hashtbl.create 32
+  ; task_catalog_loading = false
+  ; task_catalog_epoch = 0L
+  ; task_catalog_started = false
+  ; task_catalog_complete = false
+  ; task_property = None
+  ; default_task_status = None
   ; change_generation = None
   ; change_cursor = None
   ; block_revisions = Hashtbl.create 64
@@ -424,6 +458,15 @@ let reset t =
   Hashtbl.clear t.pending;
   Queue.clear t.hydration_queue;
   Hashtbl.clear t.hydration_active;
+  Hashtbl.clear t.task_definitions;
+  Hashtbl.clear t.task_catalog_deletions;
+  t.task_catalog_loading <- false;
+  Hashtbl.clear t.task_lookup_epochs;
+  t.task_catalog_epoch <- t.next_request;
+  t.task_catalog_started <- false;
+  t.task_catalog_complete <- false;
+  t.task_property <- None;
+  t.default_task_status <- None;
   t.change_generation <- None;
   t.change_cursor <- None;
   Hashtbl.clear t.block_revisions;
@@ -489,6 +532,13 @@ let uuid value = Graph.Uuid.of_string value
 let make_request ?source_epoch ?(background = false) t operation command =
   let source_epoch = Option.value source_epoch ~default:t.next_request in
   let request_id = request_uuid t in
+  (match operation with
+   | Task_definitions ids ->
+     List.iter
+       (fun uuid ->
+          Hashtbl.replace t.task_lookup_epochs (Graph.Uuid.to_string uuid) source_epoch)
+       ids
+   | _ -> ());
   Hashtbl.replace
     t.pending
     (Graph.Uuid.to_string request_id)
@@ -506,6 +556,38 @@ let issue_request t (request : Protocol.request) =
   pending.delivery <- Dispatched;
   if pending.background then Hashtbl.replace t.hydration_active key ();
   request
+;;
+
+let task_catalog_response ?error t =
+  let items =
+    Hashtbl.to_seq_values t.task_definitions |> Seq.filter_map snd |> Array.of_seq
+  in
+  Array.sort
+    (fun (a : Graph.task_status_definition) b ->
+       let c = String.compare a.order b.order in
+       if c = 0 then Graph.Uuid.compare a.uuid b.uuid else c)
+    items;
+  let items = Array.to_seq items |> Seq.fold_left Rrbvec.push_back Rrbvec.empty in
+  response
+    (Task_statuses_changed
+       { items
+       ; default_status = t.default_task_status
+       ; complete = t.task_catalog_complete
+       ; error
+       })
+;;
+
+let request_task_catalog t =
+  t.task_catalog_started <- true;
+  t.task_catalog_loading <- true;
+  t.task_catalog_complete <- false;
+  Hashtbl.clear t.task_catalog_deletions;
+  let epoch = t.next_request in
+  t.task_catalog_epoch <- epoch;
+  read
+    t
+    (Task_catalog { epoch; seen = Rrbvec.empty })
+    (Protocol.V2_list_task_statuses { limit = Protocol.maximum_page_size; cursor = None })
 ;;
 
 let start t = issue_request t (read t Graph_info Protocol.V2_graph_info)
@@ -1051,8 +1133,23 @@ let page_root_member (page : Graph.page) revision : Projection.block_member =
   }
 ;;
 
+let task_status_uuid t = function
+  | Journal_model.No_status -> Ok None
+  | Status value ->
+    Result.bind (parse_uuid "status UUID" value) (fun uuid ->
+      if t.task_catalog_complete && not (Hashtbl.mem t.task_definitions value)
+      then Error "This task status is unavailable. Choose another status before saving."
+      else Ok (Some uuid))
+  | Default_status ->
+    (match t.default_task_status with
+     | Some uuid -> Ok (Some uuid)
+     | None -> Error "Choose a task status; this graph has no available default.")
+  | Invalid_status _ -> Error "Choose a valid task status before saving."
+;;
+
 let submit_unowned t (request : Journal_graph_request.t) =
   match request with
+  | Load_task_statuses -> requests [ request_task_catalog t ]
   | Load_favorites request ->
     requests
       [ read
@@ -1130,8 +1227,10 @@ let submit_unowned t (request : Journal_graph_request.t) =
                     Option.bind after (fun cursor -> cursor.Projection.protocol_cursor)
                 })
              (if Hashtbl.mem t.graph_pages block_id
-                 || (match Hashtbl.find_opt t.favorite_targets block_id with
-                     | Some (V2_favorite_page _) -> true | _ -> false)
+                ||
+                match Hashtbl.find_opt t.favorite_targets block_id with
+                | Some (V2_favorite_page _) -> true
+                | _ -> false
               then Protocol.V2_get_page { page = block; revision = None }
               else Protocol.V2_get_outline_block { block; revision = None })
          ])
@@ -1149,12 +1248,15 @@ let submit_unowned t (request : Journal_graph_request.t) =
      | false, _ -> reject "The local calendar changed before capture admission."
      | true, Error message -> reject message
      | true, Ok page_uuid ->
+       (match task_status_uuid t command.task_state with
+        | Error message -> reject message
+        | Ok _ ->
        requests
          [ read
              t
              (Capture_page command)
              (Protocol.V2_get_page { page = page_uuid; revision = None })
-         ])
+            ]))
   | Update_source command ->
     (match
        mutation_context t command.mutation_id, parse_uuid "block UUID" command.block_id
@@ -1189,39 +1291,24 @@ let submit_unowned t (request : Journal_graph_request.t) =
             preconditions ~blocks:[ block, command.expected_revision ] ()
           in
           let mutation =
-            match command.task_state with
-            | Journal_model.No_status ->
-              Protocol.V2_clear_task_status { mutation_id; block; preconditions }
-            | Todo ->
-              V2_set_task_status { mutation_id; block; status = V2_todo; preconditions }
-            | Doing ->
-              V2_set_task_status { mutation_id; block; status = V2_doing; preconditions }
-            | In_review ->
-              V2_set_task_status
-                { mutation_id; block; status = V2_in_review; preconditions }
-            | Now ->
-              V2_set_task_status { mutation_id; block; status = V2_now; preconditions }
-            | Done ->
-              V2_set_task_status { mutation_id; block; status = V2_done; preconditions }
-            | Canceled ->
-              V2_set_task_status
-                { mutation_id; block; status = V2_canceled; preconditions }
-            | Backlog ->
-              V2_set_task_status
-                { mutation_id; block; status = V2_backlog; preconditions }
-            | Waiting ->
-              V2_set_task_status
-                { mutation_id; block; status = V2_waiting; preconditions }
-            | Later ->
-              V2_set_task_status { mutation_id; block; status = V2_later; preconditions }
+            match task_status_uuid t command.task_state with
+            | Ok None ->
+              Ok (Protocol.V2_clear_task_status { mutation_id; block; preconditions })
+            | Ok (Some status) ->
+              Ok
+                (Protocol.V2_set_task_status { mutation_id; block; status; preconditions })
+            | Error message -> Error message
           in
+          (match mutation with
+           | Error message -> reject message
+           | Ok mutation ->
           requests
             [ mutate
                 t
                 (Mutation_refresh
                    { page; refresh = Updated { block_id = command.block_id } })
                 mutation
-            ])
+               ]))
      | Error message, _ | _, Error message -> reject message)
   | Create_child command ->
     let reject message =
@@ -1236,6 +1323,8 @@ let submit_unowned t (request : Journal_graph_request.t) =
     in
     if not (calendar_generation_is_current t command.calendar_generation)
     then reject "The local calendar changed before child admission."
+    else if Result.is_error (task_status_uuid t command.task_state)
+    then reject (Result.get_error (task_status_uuid t command.task_state))
     else (
       match
         ( mutation_context t command.mutation_id
@@ -1455,45 +1544,32 @@ let capture_children t command page conflict_retries =
 ;;
 
 let capture_status t (command : Projection.capture) page =
-  match command.Projection.task_state with
-  | Journal_model.No_status ->
+  match task_status_uuid t command.task_state with
+  | Error message -> reject message
+  | Ok None when not command.status_confirmation ->
     request_target_summary t page (Captured { block_id = command.block_id })
-  | Todo | Doing | In_review | Now | Done | Canceled | Backlog | Waiting | Later ->
-    (match
-       ( mutation_context t (Graph.Uuid.to_string (request_uuid t))
-       , parse_uuid "block UUID" command.block_id )
-     with
-     | Ok mutation_id, Ok block ->
+  | Ok status ->
+    (match parse_uuid "block UUID" command.block_id with
+     | Error message -> reject message
+     | Ok block ->
        (match block_preconditions t block with
         | Error message -> reject message
         | Ok preconditions ->
-          let status =
-            match command.task_state with
-            | Todo -> Protocol.V2_todo
-            | Doing -> V2_doing
-            | In_review -> V2_in_review
-            | Now -> V2_now
-            | Done -> V2_done
-            | Canceled -> V2_canceled
-            | Backlog -> V2_backlog
-            | Waiting -> V2_waiting
-            | Later -> V2_later
-            | No_status -> assert false
+          let mutation_id = request_uuid t in
+          let command_status =
+            match status with
+            | None -> Protocol.V2_clear_task_status { mutation_id; block; preconditions }
+            | Some status ->
+              V2_set_task_status { mutation_id; block; status; preconditions }
           in
-          requests
-            [ mutate
-                t
-                (Capture_status { command; page })
-                (Protocol.V2_set_task_status { mutation_id; block; status; preconditions })
-            ])
-     | Error message, _ | _, Error message -> reject message)
+          requests [ mutate t (Capture_status { command; page }) command_status ]))
 ;;
 
 let continue_capture t (command : Projection.capture) page =
-  match command.Projection.task_state with
-  | Journal_model.No_status -> capture_status t command page
-  | Todo | Doing | In_review | Now | Done | Canceled | Backlog | Waiting | Later ->
-    (match parse_uuid "block UUID" command.block_id with
+  if command.task_state = Journal_model.No_status && not command.status_confirmation
+  then capture_status t command page
+  else (
+    match parse_uuid "block UUID" command.block_id with
      | Error message -> reject message
      | Ok block ->
        requests
@@ -1693,7 +1769,6 @@ let dispatch_output t output =
 ;;
 
 let submit t request = dispatch_output t (plan_request t request)
-;;
 
 (* Session bounds keep adversarial reference chains/bursts finite. Unresolved
    tokens remain literal. Point reads use the Worker's indexed UUID lookup. *)
@@ -1975,7 +2050,10 @@ let observe_reference_sources
              | None -> if missing_is_final then Source_missing else Source_retryable in
            Hashtbl.replace t.reference_sources id (source_epoch, state);
            if (Option.map (fun (_, state) -> reference_source_text state) previous <> Some source
-               || (match previous with Some (_, Source_retryable) -> true | _ -> false))
+              ||
+              match previous with
+              | Some (_, Source_retryable) -> true
+              | _ -> false)
               && Hashtbl.mem t.reference_depths id
            then updates := (id, source) :: !updates;
            Rrbvec.push_back installed value)
@@ -2088,7 +2166,8 @@ let hydration_for_changes t ~request_generation windows =
            Hashtbl.replace refreshed_pages block_id ();
            Some (read t (Changed_detail_page block)
              (Protocol.V2_get_page {page=block;revision=None})))
-         else match page_by_block t block_id with
+         else (
+           match page_by_block t block_id with
          | Some page ->
            Some
              (read
@@ -2102,7 +2181,7 @@ let hydration_for_changes t ~request_generation windows =
                   t
                   (Changed_detail_block { block_id; page })
                   (Protocol.V2_get_outline_block { block; revision = None }))
-             (Hashtbl.find_opt t.detail_pages block_id))
+               (Hashtbl.find_opt t.detail_pages block_id)))
       blocks
   in
   let reference_reads =
@@ -2214,6 +2293,12 @@ let hydration_for_changes t ~request_generation windows =
 let rehydrate_current_interests t ~request_generation ~generation =
   t.change_generation <- Some generation;
   t.change_cursor <- None;
+  t.task_catalog_started <- false;
+  t.task_catalog_loading <- false;
+  Hashtbl.clear t.task_catalog_deletions;
+  t.task_catalog_complete <- false;
+  t.task_catalog_epoch <- t.next_request;
+  Hashtbl.clear t.task_lookup_epochs;
   let graph_info = read t Graph_info Protocol.V2_graph_info in
   let journal =
     match t.initial_feed with
@@ -2384,16 +2469,19 @@ let complete_child t (command : Projection.create_child) (page : Graph.page)
       (child : Projection.block_member) (parent : Projection.block_member) =
   if Graph.Uuid.to_string parent.block.uuid <> command.parent_block_id
      || Graph.Uuid.to_string child.block.uuid <> command.block_id
-     || not (Graph.Uuid.equal child.block.parent parent.block.uuid)
-     || not (Graph.Uuid.equal child.block.page page.uuid)
+    || (not (Graph.Uuid.equal child.block.parent parent.block.uuid))
+    || (not (Graph.Uuid.equal child.block.page page.uuid))
      || not (Graph.Uuid.equal parent.block.page page.uuid)
   then reject "The append completion does not match the selected parent."
-  else match projection_time_context t with
+  else (
+    match projection_time_context t with
   | Error message -> reject message
   | Ok time_context ->
     let old_count = Hashtbl.find_opt t.projected_blocks command.parent_block_id
-      |> Option.map Journal_model.child_count |> Option.value ~default:0 in
-    match
+        |> Option.map Journal_model.child_count
+        |> Option.value ~default:0
+      in
+      (match
       (Projection.block_on_page ~page ~revision:parent.revision
          ~child_count:(old_count + 1) ~time_context parent.block,
        Projection.block_on_page ~page ~revision:child.revision ~child_count:0
@@ -2403,10 +2491,15 @@ let complete_child t (command : Projection.create_child) (page : Graph.page)
       let completion = response (Child_created {child;parent;timeline_entry_update=None}) in
       let refresh = match page_by_uuid t page.uuid with
         | None -> empty
-        | Some page -> match page_tree t (Changed_page_tree page) page Protocol.maximum_page_size with
-          | Ok request -> requests [request] | Error _ -> empty in
+           | Some page ->
+             (match
+                page_tree t (Changed_page_tree page) page Protocol.maximum_page_size
+              with
+              | Ok request -> requests [ request ]
+              | Error _ -> empty)
+         in
       {refresh with responses=completion::refresh.responses}
-    | Error message,_ | _,Error message -> reject message
+       | Error message, _ | _, Error message -> reject message))
 ;;
 
 let operation_name = function
@@ -2415,6 +2508,8 @@ let operation_name = function
   | Favorite_dependency _ -> "readFavoriteDependency"
   | Favorite_page_candidate _ -> "findFavoritePage"
   | Favorite_memberships _ -> "readFavoriteMemberships"
+  | Task_catalog _ -> "listTaskStatuses"
+  | Task_definitions _ -> "readTaskStatuses"
   | Graph_info -> "graphInfo"
   | Admission_info _ -> "inspectAdmission"
   | Pull_changes _ -> "pullChanges"
@@ -2470,6 +2565,22 @@ let failure_output
   let request_id, error = worker_error code request_id message in
   let worker_failure = { operation = operation_name operation; request_id; error } in
   match operation with
+  | Task_catalog { epoch; _ } when epoch <> t.task_catalog_epoch -> empty
+  | Task_catalog _ ->
+    t.task_catalog_loading <- false;
+    Hashtbl.clear t.task_catalog_deletions;
+    responses [ task_catalog_response ~error:message t ]
+  | Task_definitions ids ->
+    let current = ref false in
+    List.iter
+      (fun uuid ->
+         let id = Graph.Uuid.to_string uuid in
+         if Hashtbl.find_opt t.task_lookup_epochs id = Some source_epoch
+         then (
+           current := true;
+           Hashtbl.remove t.task_lookup_epochs id))
+      ids;
+    if !current then responses [ task_catalog_response ~error:message t ] else empty
   | List_favorites request ->
     responses
       [ response (Favorites_failed (request, code = Error.Stale_read_cursor, message)) ]
@@ -2833,7 +2944,11 @@ let receive_response t (protocol_response : Protocol.response) =
          } ->
        (match operation with
         | Graph_info ->
-          responses
+          let catalog =
+            if t.task_catalog_started then [] else [ request_task_catalog t ]
+          in
+          { requests = catalog
+          ; responses =
             [ response
                 (Graph_ready
                    { graph_uuid
@@ -2843,7 +2958,8 @@ let receive_response t (protocol_response : Protocol.response) =
                    ; generation
                    ; projection_revision
                    })
-            ]
+              ]
+          }
         | Capture_format { command; page_uuid; page_revision } ->
           let journal_day = Journal_time.local_day command.creation_time in
           requests
@@ -2859,6 +2975,122 @@ let receive_response t (protocol_response : Protocol.response) =
                    })
             ]
         | _ -> failure_output t operation request_id "Unexpected graph-info response.")
+     | V2_task_statuses_outcome { property_uuid; default_status; items; next_cursor } ->
+       (match operation with
+        | Task_catalog { epoch; _ } when epoch <> t.task_catalog_epoch -> empty
+        | Task_catalog { epoch; seen } ->
+          t.task_property <- property_uuid;
+          t.default_task_status <- default_status;
+          let seen =
+            List.fold_left
+              (fun seen (definition : Graph.task_status_definition) ->
+                 let id = Graph.Uuid.to_string definition.uuid in
+                 (match
+                    ( Hashtbl.find_opt t.task_catalog_deletions id
+                    , Hashtbl.find_opt t.task_definitions id )
+                  with
+                  | Some deleted, _ when deleted > epoch -> ()
+                  | _, Some (previous, _) when previous > epoch -> ()
+                  | _ -> Hashtbl.replace t.task_definitions id (epoch, Some definition));
+                 Rrbvec.push_back seen id)
+              seen
+              items
+          in
+          let requests =
+            match next_cursor with
+            | Some cursor ->
+              [ read
+                  t
+                  (Task_catalog { epoch; seen })
+                  (Protocol.V2_list_task_statuses
+                     { limit = Protocol.maximum_page_size; cursor = Some cursor })
+              ]
+            | None ->
+              let seen =
+                Rrbvec.to_seq seen |> Seq.map (fun id -> id, ()) |> Hashtbl.of_seq
+              in
+              Hashtbl.filter_map_inplace
+                (fun id (previous, value) ->
+                   if previous <= epoch && not (Hashtbl.mem seen id)
+                   then None
+                   else Some (previous, value))
+                t.task_definitions;
+              t.task_catalog_complete <- true;
+              t.task_catalog_loading <- false;
+              Hashtbl.clear t.task_catalog_deletions;
+              Hashtbl.filter_map_inplace
+                (fun _ lookup_epoch ->
+                   if lookup_epoch < epoch then None else Some lookup_epoch)
+                t.task_lookup_epochs;
+              (match t.default_task_status with
+               | Some uuid
+                 when not (Hashtbl.mem t.task_definitions (Graph.Uuid.to_string uuid)) ->
+                 t.default_task_status <- None
+               | _ -> ());
+              []
+          in
+          { requests
+          ; responses = (if next_cursor = None then [ task_catalog_response t ] else [])
+          }
+        | _ -> failure_output t operation request_id "Unexpected status catalog response.")
+     | V2_task_status_definitions_outcome definitions ->
+       (match operation with
+        | Task_definitions ids
+          when List.length ids = List.length definitions
+               && List.for_all2
+                    (fun id ->
+                       Option.fold
+                         ~none:true
+                         ~some:(fun (d : Graph.task_status_definition) ->
+                           Graph.Uuid.equal id d.uuid))
+                    ids
+                    definitions ->
+          let changed = ref false in
+          let restart_catalog = ref false in
+          List.iter2
+            (fun uuid definition ->
+               let id = Graph.Uuid.to_string uuid in
+               if Hashtbl.find_opt t.task_lookup_epochs id = Some source_epoch
+               then (
+                 Hashtbl.remove t.task_lookup_epochs id;
+                 let previous = Hashtbl.find_opt t.task_definitions id in
+                 if
+                   not
+                     (Option.fold
+                        ~none:false
+                        ~some:(fun (epoch, _) -> epoch > source_epoch)
+                        previous)
+                 then (
+                   if Option.bind previous snd <> definition then changed := true;
+                   match definition with
+                   | None ->
+                     Hashtbl.remove t.task_definitions id;
+                     if t.task_catalog_loading
+                     then
+                       if
+                         Hashtbl.length t.task_catalog_deletions < 10000
+                         || Hashtbl.mem t.task_catalog_deletions id
+                       then Hashtbl.replace t.task_catalog_deletions id source_epoch
+                       else restart_catalog := true
+                   | Some _ ->
+                     Hashtbl.replace t.task_definitions id (source_epoch, definition))))
+            ids
+            definitions;
+          (match t.default_task_status with
+           | Some uuid
+             when List.exists (Graph.Uuid.equal uuid) ids
+                  && not
+                       (Option.fold
+                          ~none:false
+                          ~some:(fun (_, d) -> Option.is_some d)
+                          (Hashtbl.find_opt
+                             t.task_definitions
+                             (Graph.Uuid.to_string uuid))) ->
+             t.default_task_status <- None
+           | _ -> ());
+          let requests = if !restart_catalog then [ request_task_catalog t ] else [] in
+          { requests; responses = (if !changed then [ task_catalog_response t ] else []) }
+        | _ -> failure_output t operation request_id "Unexpected status lookup response.")
      | V2_admission_outcome observation ->
        (match operation with
         | Admission_info request ->
@@ -2892,8 +3124,8 @@ let receive_response t (protocol_response : Protocol.response) =
         | _ -> failure_output t operation request_id "Unexpected journal response.")
      | V2_page_outcome lookup ->
        (match lookup, operation with
-        | (V2_present_page _ | V2_missing_page _),
-          Reference_read { block_id; depth; lookup = Page_lookup } ->
+        | ( (V2_present_page _ | V2_missing_page _)
+          , Reference_read { block_id; depth; lookup = Page_lookup } ) ->
           (match lookup with
            | V2_missing_page _ ->
              continue_reference_outline t ~source_epoch ~block_id ~depth
@@ -2906,12 +3138,14 @@ let receive_response t (protocol_response : Protocol.response) =
              else
                complete_reference_read t ~source_epoch ~block_id ~depth
                  (Some page.title))
-        | V2_present_page {page;revision}, Detail_block {generation;block_id;limit;after}
+        | ( V2_present_page { page; revision }
+          , Detail_block { generation; block_id; limit; after } )
           when Graph.Uuid.to_string page.uuid = block_id && not page.recycled ->
           remember_page_revision t page.uuid revision;
           Hashtbl.replace t.graph_pages block_id page;
           detail_children t ~generation ~page ~root:(page_root_member page revision) ~limit ~after
-        | (V2_missing_page _ | V2_present_page _), Detail_block {generation;block_id;_} ->
+        | ( (V2_missing_page _ | V2_present_page _)
+          , Detail_block { generation; block_id; _ } ) ->
           responses [response (Detail_failed {request_generation=generation;block_id;
             missing=true;stale_cursor=false;failure=Projection_failure "This page is unavailable."})]
         | V2_present_page {page;revision}, Child_parent (command,_,child)
@@ -2990,8 +3224,9 @@ let receive_response t (protocol_response : Protocol.response) =
                Some (if Graph.Uuid.equal old.Graph.uuid page.uuid then page else old))
             t.detail_pages;
           responses (List.rev !reconciled)
-        | (V2_missing_page { uuid; _ }
-          | V2_present_page {page={uuid;recycled=true;_};_}), Changed_detail_page _ ->
+        | ( ( V2_missing_page { uuid; _ }
+            | V2_present_page { page = { uuid; recycled = true; _ }; _ } )
+          , Changed_detail_page _ ) ->
           responses
             (Hashtbl.to_seq_values t.children_interests
              |> Seq.filter_map (fun (interest : children_interest) ->
@@ -3278,35 +3513,37 @@ let receive_response t (protocol_response : Protocol.response) =
                    (Detail_page { generation; root; limit; after })
                    (Protocol.V2_get_page { page = value.block.page; revision = None })
                ])
-        | V2_missing_block {uuid;_}, Detail_block { generation; block_id; limit; after }
+        | ( V2_missing_block { uuid; _ }
+          , Detail_block { generation; block_id; limit; after } )
           when Graph.Uuid.to_string uuid = block_id ->
           requests [read t (Detail_block {generation;block_id;limit;after})
             (Protocol.V2_get_page {page=uuid;revision=None})]
         | V2_present_block { value; revision }, Child_read (command, page) ->
           remember_block_revision t value.block.uuid revision;
           let child = Projection.{ block = value.block; revision } in
-          if
-            command.task_state = Journal_model.No_status
-            || value.task_status = Some Protocol.V2_todo
-          then read_child_parent t command page child
-          else
-            requests
-              [ mutate
-                  t
-                  (Child_status (command, page))
-                  (Protocol.V2_set_task_status
-                     { mutation_id = request_uuid t
-                     ; block = value.block.uuid
-                     ; status = Protocol.V2_todo
-                     ; preconditions =
-                         preconditions ~blocks:[ value.block.uuid, revision ] ()
-                     })
-              ]
+          (match task_status_uuid t command.task_state with
+           | Error message -> reject message
+           | Ok status
+             when value.task_status = status
+                  || (status = None && not command.status_confirmation) ->
+             read_child_parent t command page child
+           | Ok status ->
+             let mutation_id = request_uuid t in
+             let block = value.block.uuid in
+             let preconditions = preconditions ~blocks:[ block, revision ] () in
+             let mutation =
+               match status with
+               | None ->
+                 Protocol.V2_clear_task_status { mutation_id; block; preconditions }
+               | Some status ->
+                 V2_set_task_status { mutation_id; block; status; preconditions }
+             in
+             requests [ mutate t (Child_status (command, page)) mutation ])
         | V2_present_block { value; revision }, Child_parent (command, page, child) ->
           remember_block_revision t value.block.uuid revision;
           complete_child t command page child Projection.{block=value.block;revision}
-        | (V2_present_block _ | V2_missing_block _),
-          Reference_read { block_id; depth; lookup = Outline_lookup } ->
+        | ( (V2_present_block _ | V2_missing_block _)
+          , Reference_read { block_id; depth; lookup = Outline_lookup } ) ->
           let source =
             match lookup with
             | V2_present_block { value; _ } -> Some (reference_source t value.block)
@@ -3736,7 +3973,36 @@ let receive_response t (protocol_response : Protocol.response) =
             read t Acknowledge_changes (Protocol.V2_ack_changes { generation; through })
           in
           let hydration = hydration_for_changes t ~request_generation windows in
-          { requests = acknowledgement :: hydration.requests
+          let catalog_requests =
+            if not t.task_catalog_started
+            then []
+            else (
+              let ids =
+                List.concat_map
+                  (fun (w : Protocol.v2_change_window) -> w.block_uuids @ w.page_uuids)
+                  windows
+                |> List.sort_uniq Graph.Uuid.compare
+              in
+              if
+                Option.fold
+                  ~none:false
+                  ~some:(fun property -> List.exists (Graph.Uuid.equal property) ids)
+                  t.task_property
+              then [ request_task_catalog t ]
+              else (
+                let rec batches = function
+                  | [] -> []
+                  | ids ->
+                    let batch = List.take Protocol.maximum_page_size ids in
+                    read
+                      t
+                      (Task_definitions batch)
+                      (Protocol.V2_get_task_status_definitions { statuses = batch })
+                    :: batches (List.drop (List.length batch) ids)
+                in
+                batches ids))
+          in
+          { requests = (acknowledgement :: hydration.requests) @ catalog_requests
           ; responses = response (Projection_changes windows) :: hydration.responses
           }
         | _ -> failure_output t operation request_id "Unexpected changes response.")
@@ -3800,12 +4066,13 @@ let receive t (protocol_response : Protocol.response) =
                   (Rrbvec.append_list retained items))
         | V2_page_outcome (V2_present_page { page; _ })
           when Hashtbl.mem t.reference_pages (Graph.Uuid.to_string page.uuid)
-               || (match operation with
+                 ||
+                 match operation with
                    | Detail_block { block_id; _ } ->
                      block_id = Graph.Uuid.to_string page.uuid
                    | Changed_detail_page _ ->
                      Hashtbl.mem t.detail_pages (Graph.Uuid.to_string page.uuid)
-                   | _ -> false) ->
+                 | _ -> false ->
           if Hashtbl.length t.reference_pages < maximum_reference_targets
           then Hashtbl.replace t.reference_pages (Graph.Uuid.to_string page.uuid) ();
           [ ( Graph.Uuid.to_string page.uuid
@@ -3857,7 +4124,7 @@ let receive t (protocol_response : Protocol.response) =
           , V2_block_outcome (V2_present_block { value; _ }) )
           when Hashtbl.mem t.detail_pages block_id -> Seq.return value.block
         | Changed_detail_page _, V2_page_outcome (V2_present_page {page;revision})
-          when not page.recycled
+            when (not page.recycled)
             && Hashtbl.mem t.detail_pages (Graph.Uuid.to_string page.uuid) ->
           Seq.return (page_root_member page revision).block
         | _ -> Seq.empty
@@ -3956,8 +4223,19 @@ let abandon t (request : Protocol.request) =
    | Some { operation = Reference_read { block_id; _ }; source_epoch; _ } ->
      Hashtbl.remove t.reference_pending block_id;
      Hashtbl.remove t.reference_dirty block_id;
-     if reference_is_current t ~source_epoch block_id then
-       Hashtbl.replace t.reference_sources block_id (source_epoch, Source_retryable)
+     if reference_is_current t ~source_epoch block_id
+     then Hashtbl.replace t.reference_sources block_id (source_epoch, Source_retryable)
+   | Some { operation = Task_catalog { epoch; _ }; _ } when epoch = t.task_catalog_epoch
+     ->
+     t.task_catalog_loading <- false;
+     Hashtbl.clear t.task_catalog_deletions
+   | Some { operation = Task_definitions ids; source_epoch; _ } ->
+     List.iter
+       (fun uuid ->
+          let id = Graph.Uuid.to_string uuid in
+          if Hashtbl.find_opt t.task_lookup_epochs id = Some source_epoch
+          then Hashtbl.remove t.task_lookup_epochs id)
+       ids
    | _ -> ());
   Hashtbl.remove t.pending key;
   Hashtbl.remove t.hydration_active key

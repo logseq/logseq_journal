@@ -139,16 +139,23 @@ let complete_retained_composer draft ~child ~parent =
   else Some draft
 ;;
 
+let lock_retained_attempt draft =
+  match draft.draft_pending with
+  | Some (Journal_graph_request.Create_child command) when command.status_confirmation ->
+    { draft with draft_capture = Journal_capture.lock_for_retry draft.draft_capture }
+  | _ -> draft
+;;
+
 let fail_retained_composer draft ~block_id ~message =
   if pending_child draft.draft_pending block_id
-  then { draft with draft_mode = Failed message }
+  then { (lock_retained_attempt draft) with draft_mode = Failed message }
   else draft
 ;;
 
 let interrupt_retained_composer draft =
   match draft.draft_mode with
   | Saving_child ->
-    { draft with
+    { (lock_retained_attempt draft) with
       draft_mode = Failed "Save was interrupted. Retry to confirm the original attempt."
     }
   | Reading | Failed _ -> draft
@@ -365,10 +372,10 @@ let initial_staging (t : t) =
   then `Waiting
   else if not (automatic_budget_available t)
   then `Ready
-  else
+  else (
     match next_unloaded_in t current_rows 0 (Array.length current_rows.indexed) with
     | None -> `Ready
-    | Some id -> `Load id
+    | Some id -> `Load id)
 ;;
 
 let next_automatic_load (t : t) =
@@ -426,13 +433,28 @@ let load ?(automatic = false) (t : t) id =
     , [ request ] ))
 ;;
 
+let fail_child_attempt (t : t) message =
+  let lock =
+    match t.pending with
+    | Some (Journal_graph_request.Create_child command) -> command.status_confirmation
+    | _ -> false
+  in
+  { t with
+    mode = Failed message
+  ; child_capture =
+      (if lock
+       then Option.map Journal_capture.lock_for_retry t.child_capture
+       else t.child_capture)
+  }
+;;
+
 let step (t : t) = function
   | Observe_visible_range (first, last) ->
     let first = Int64.max 0L first in
     let range = Some (first, Int64.max first last) in
     (if range = t.visible_range then t else { t with visible_range = range }), []
   | Append_failed (block_id, message) ->
-    (if pending_child t.pending block_id then { t with mode = Failed message } else t), []
+    (if pending_child t.pending block_id then fail_child_attempt t message else t), []
   | Load_next ->
     (match next_automatic_load t with
      | None -> t, []
@@ -534,7 +556,9 @@ let row_key = function
 ;;
 
 let update_child_source (t : t) source =
-  if t.mode = Saving_child
+  if
+    t.mode = Saving_child
+    || Option.fold ~none:false ~some:Journal_capture.retry_identity_locked t.child_capture
   then t
   else (
     let capture =
@@ -560,16 +584,40 @@ let apply_child_edit t edit =
     else { t with child_capture = Some capture; mode = Reading; pending = None })
 ;;
 
-let toggle_child_task (t : t) =
+let set_child_task (t : t) task_state =
   if t.mode = Saving_child
   then t
   else (
     let t = if t.child_capture = None then update_child_source t "" else t in
-    { t with
-      child_capture = Option.map Journal_capture.toggle_task_intent t.child_capture
-    ; mode = Reading
-    ; pending = None
-    })
+    let child_capture =
+      Option.map
+        (fun capture -> Journal_capture.with_task_state capture task_state)
+        t.child_capture
+    in
+    if Option.fold ~none:false ~some:Journal_capture.retry_identity_locked child_capture
+    then (
+      let pending =
+        Option.map
+          (function
+            | Journal_graph_request.Create_child command ->
+              Journal_graph_request.Create_child { command with task_state }
+            | request -> request)
+          t.pending
+      in
+      { t with child_capture; pending })
+    else { t with child_capture; mode = Reading; pending = None })
+;;
+
+let toggle_child_task (t : t) =
+  let current =
+    Option.map Journal_capture.task_state t.child_capture
+    |> Option.value ~default:Journal_model.No_status
+  in
+  set_child_task
+    t
+    (match current with
+     | Journal_model.No_status -> Journal_model.Default_status
+     | Status _ | Default_status | Invalid_status _ -> No_status)
 ;;
 
 let admit_child
@@ -592,6 +640,8 @@ let admit_child
         ; parent_block_id = t.root_id
         ; expected_parent_revision = Journal_model.revision (root t)
         ; source = Journal_capture.submission_source capture
+        ; status_confirmation =
+            Journal_capture.task_state capture <> Journal_model.No_status
         ; task_state = Journal_capture.task_state capture
         }
     in
@@ -599,9 +649,7 @@ let admit_child
   | _ -> t, None
 ;;
 
-let fail (t : t) ~message =
-  if t.pending = None then t else { t with mode = Failed message }
-;;
+let fail (t : t) ~message = if t.pending = None then t else fail_child_attempt t message
 
 let retry (t : t) =
   match t.mode, t.pending with

@@ -230,14 +230,16 @@ type property_definition =
   ; closed_values : block_uuid list
   }
 
-type task_state =
-  | Todo
-  | Doing
-  | Done
-  | Cancelled
-  | Waiting
-  | Now
-  | Later
+type task_status_definition =
+  { uuid : Uuid.t
+  ; title : string
+  ; ident : qualified_ident option
+  ; order : string
+  ; checkbox_state : bool option
+  }
+[@@deriving yojson]
+
+type task_state = Uuid.t
 
 type task =
   { block : block

@@ -26,6 +26,12 @@ type mutation_kind =
 type payload =
   | Projection_changes of Logseq_db_worker.Protocol.v2_change_window list
   | Projection_resync
+  | Task_statuses_changed of
+      { items : Logseq_db_types.Graph_types.task_status_definition Rrbvec.t
+      ; default_status : Logseq_db_types.Graph_types.Uuid.t option
+      ; complete : bool
+      ; error : string option
+      }
   | Reference_sources_changed of (string * string option) list
   | Favorites_loaded of
       Journal_graph_request.favorites_request

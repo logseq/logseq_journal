@@ -29,7 +29,7 @@ let block
       ?(id = "70000000-0000-4000-a000-000000000001")
       ?(parent_id = None)
       ?(source = "Original #literal @source")
-      ?(task_state = Journal_model.Todo)
+      ?(task_state = Journal_model.Status "00000002-1615-5853-7700-000000000000")
       ?(child_count = 1)
       ?(revision = "block-1")
       ?(order = "000000000001")
@@ -80,9 +80,34 @@ let edit
   }
 ;;
 
+let with_status_catalog state =
+  let module Graph = Logseq_db_types.Graph_types in
+  let uuid =
+    Graph.Uuid.of_string "00000002-1615-5853-7700-000000000000" |> Result.get_ok
+  in
+  let definition : Graph.task_status_definition =
+    { uuid; title = "Todo"; ident = None; order = "b01"; checkbox_state = Some false }
+  in
+  Application.Root_navigation.step
+    state
+    (Completed
+       { payload =
+           Task_statuses_changed
+             { items = Rrbvec.singleton definition
+             ; default_status = Some uuid
+             ; complete = true
+             ; error = None
+             }
+       })
+;;
+
+let root_navigation ~graph_generation =
+  Application.Root_navigation.create ~graph_generation |> with_status_catalog
+;;
+
 let test_native_composer_dismissal_and_edit_fences () =
   let module R = Application.Root_navigation in
-  let initial = R.create ~graph_generation:3 in
+  let initial = root_navigation ~graph_generation:3 in
   let opened = R.step initial Capture_opened in
   require (R.capture_presented opened) "Capture opener must present a native sheet";
   let capture = Option.get (R.capture opened) in
@@ -106,7 +131,10 @@ let test_native_composer_dismissal_and_edit_fences () =
   let reopened = R.step closed Capture_opened in
   let restored = Option.get (R.capture reopened) in
   require_string "Draft 中文" (Journal_capture.source restored) "retained source";
-  require (Journal_capture.task_state restored = Todo) "Close discarded task intent";
+  require
+    (Journal_capture.task_state restored
+     = Journal_model.Status "00000002-1615-5853-7700-000000000000")
+    "Close discarded task intent";
   require
     (Ui.Text_editing.Value.composing (Journal_capture.value restored) <> None)
     "sheet lifetime discarded editing state";
@@ -352,7 +380,7 @@ let test_direct_capture_pending_attachments () =
 
 let test_collapse_retains_complete_capture () =
   let module R = Application.Root_navigation in
-  let state = R.create ~graph_generation:3 |> fun s -> R.step s Capture_opened in
+  let state = root_navigation ~graph_generation:3 |> fun s -> R.step s Capture_opened in
   let original = Option.get (R.capture state) in
   let edited =
     Journal_capture.apply_text_edit
@@ -454,7 +482,7 @@ let test_direct_capture_task_intent_survives_edit_failure_and_retry () =
   let capture = Journal_capture.create ~session_number:12L ~source in
   let task_capture = Journal_capture.toggle_task_intent capture in
   require
-    (Journal_capture.task_state task_capture = Journal_model.Todo)
+    (Journal_capture.task_state task_capture = Journal_model.Default_status)
     "Capture task intent did not toggle to Todo";
   require_string
     source
@@ -474,7 +502,7 @@ let test_direct_capture_task_intent_survives_edit_failure_and_retry () =
          ())
   in
   require
-    (Journal_capture.task_state edited = Journal_model.Todo)
+    (Journal_capture.task_state edited = Journal_model.Default_status)
     "text edit cleared Capture task intent";
   let saving, request =
     Journal_capture.admit_save
@@ -488,41 +516,41 @@ let test_direct_capture_task_intent_survives_edit_failure_and_retry () =
   (match request with
    | Some
        (Journal_graph_request.Capture
-          { command = { source; task_state = Journal_model.Todo; _ }; _ }) ->
+          { command = { source; task_state = Journal_model.Default_status; _ }; _ }) ->
      require_string edited_source source "Todo Capture admitted source"
    | _ -> fail "checked Capture did not admit one Todo request");
   let gated = Journal_capture.toggle_task_intent saving in
   require
-    (Journal_capture.task_state gated = Journal_model.Todo)
+    (Journal_capture.task_state gated = Journal_model.Default_status)
     "Saving Capture accepted a contradictory task toggle";
   let failed = Journal_capture.fail saving ~message:"storage unavailable" in
   require
-    (Journal_capture.task_state failed = Journal_model.Todo)
+    (Journal_capture.task_state failed = Journal_model.Default_status)
     "failed Capture lost task intent";
   let retrying, retry = Journal_capture.retry failed in
   require (retry = request) "Todo retry did not reuse the admitted request";
   require
-    (Journal_capture.task_state retrying = Journal_model.Todo)
+    (Journal_capture.task_state retrying = Journal_model.Default_status)
     "Todo retry lost task intent";
   let replacement = Journal_capture.toggle_task_intent failed in
   require
-    (Journal_capture.task_state replacement = Journal_model.No_status
-     && Journal_capture.phase replacement = Journal_capture.Editing)
-    "task change after terminal failure did not replace the failed attempt";
-  let _, replacement_request =
-    Journal_capture.admit_save
-      replacement
-      ~mutation_id:"70000000-0000-4000-9000-000000000013"
-      ~block_id:"70000000-0000-4000-a000-000000000013"
-      ~sibling_order:"000000000013"
-      ~calendar_generation:7L
-      ~creation_time:(creation_time 543)
-  in
+    (Journal_capture.task_state replacement = Journal_model.No_status)
+    "failed task recovery did not clear intent";
+  require_string
+    edited_source
+    (Journal_capture.source
+       (Journal_capture.update_source replacement ~source:"Another draft"))
+    "ambiguous failed attempt must retain its body until confirmed";
+  let _, replacement_request = Journal_capture.retry replacement in
   match replacement_request with
   | Some
       (Journal_graph_request.Capture
-         { command = { task_state = Journal_model.No_status; _ }; _ }) -> ()
-  | _ -> fail "replacement Capture reused stale Todo intent"
+         { command = { task_state = Journal_model.No_status; mutation_id; block_id; _ }
+         ; _
+         }) ->
+    require_string "70000000-0000-4000-9000-000000000012" mutation_id "retry mutation";
+    require_string "70000000-0000-4000-a000-000000000012" block_id "retry block"
+  | _ -> fail "status recovery did not retain original Capture identity"
 ;;
 
 let test_child_refresh_replaces_cursor_and_fences_pending_read () =
@@ -761,7 +789,12 @@ let test_outline_branches_append_and_delete () =
   require
     (D.continuation initial ~parent_id:root_id = Some cursor)
     "root lost continuation";
-  require (List.exists (function D.More { parent_id; _ } -> parent_id = child_id | _ -> false) (D.rows initial))
+  require
+    (List.exists
+       (function
+         | D.More { parent_id; _ } -> parent_id = child_id
+         | _ -> false)
+       (D.rows initial))
     "default outline has no child loading action";
   let opened, requests = D.step initial (Load_more child_id) in
   let generation =
@@ -813,7 +846,7 @@ let test_outline_branches_append_and_delete () =
   (match request with
    | Some
        (Journal_graph_request.Create_child
-          { parent_block_id; source; task_state = Todo; _ }) ->
+          { parent_block_id; source; task_state = Journal_model.Default_status; _ }) ->
      require_string root_id parent_block_id "append parent";
      require_string "One block\nTwo lines" source "append multiline source"
    | _ -> fail "append lost root target or task intent");
@@ -853,7 +886,13 @@ let test_outline_branches_append_and_delete () =
   require
     (D.mode created = Reading && D.child_capture created = None)
     "append did not reset composer";
-  require (List.exists (function D.Block { block; _ } -> Journal_model.id block = Journal_model.id grandchild | _ -> false) (D.rows created)) "append discarded visible descendant";
+  require
+    (List.exists
+       (function
+         | D.Block { block; _ } -> Journal_model.id block = Journal_model.id grandchild
+         | _ -> false)
+       (D.rows created))
+    "append discarded visible descendant";
   let second =
     block
       ~id:"70000000-0000-4000-a000-000000000004"
@@ -1133,8 +1172,7 @@ let test_favorite_target_origin_and_delete () =
   let hidden, _ = F.step loaded (Hide_target (G.Uuid.to_string target)) in
   require
     (List.length (F.items hidden) = 1)
-    "delete did not hide only the matching block favorite";
-
+    "delete did not hide only the matching block favorite"
 ;;
 
 let load_parent routes parent generation =
@@ -1186,7 +1224,9 @@ let test_append_drafts_follow_parent_navigation () =
     "returning to parent lost Append draft";
   let capture = Option.get (Journal_detail.child_capture restored) in
   require_string "Append 中文" (Journal_capture.source capture) "returned parent draft";
-  require (Journal_capture.task_state capture = Todo) "parent return lost task intent";
+  require
+    (Journal_capture.task_state capture = Journal_model.Default_status)
+    "parent return lost task intent";
   let value = Journal_capture.value capture in
   require
     (Ui.Text_editing.Range.start_utf16 (Ui.Text_editing.Value.selection value) = 7)
@@ -1290,10 +1330,10 @@ let test_graph_draft_retention_and_privacy () =
   let first = graph "70000000-0000-4000-b000-000000000001" in
   let second = graph "70000000-0000-4000-b000-000000000002" in
   let switch graph_id generation state =
-    R.step state (Graph_replaced { graph_id; generation })
+    R.step state (Graph_replaced { graph_id; generation }) |> with_status_catalog
   in
   let start =
-    R.create ~graph_generation:1
+    root_navigation ~graph_generation:1
     |> switch (Some first) 1
     |> fun state -> R.step state Capture_opened
   in
@@ -1325,7 +1365,10 @@ let test_graph_draft_retention_and_privacy () =
   require (R.capture returned <> None) "graph return lost Capture";
   let restored = Option.get (R.capture returned) in
   require_string "Graph 中文" (Journal_capture.source restored) "graph-scoped draft";
-  require (Journal_capture.task_state restored = Todo) "graph return lost task intent";
+  require
+    (Journal_capture.task_state restored
+     = Journal_model.Status "00000002-1615-5853-7700-000000000000")
+    "graph return lost task intent";
   require
     (Ui.Text_editing.Range.start_utf16
        (Ui.Text_editing.Value.selection (Journal_capture.value restored))
@@ -1359,7 +1402,7 @@ let test_graph_draft_retention_and_privacy () =
     R.step other Account_cleared |> switch (Some first) 7 |> switch (Some second) 8
   in
   require (R.capture signed_out = None) "account change retained private drafts";
-  let restarted = R.create ~graph_generation:9 |> switch (Some first) 9 in
+  let restarted = root_navigation ~graph_generation:9 |> switch (Some first) 9 in
   require
     (R.capture restarted = None)
     "process-local drafts leaked into a new application owner"
@@ -1372,7 +1415,7 @@ let test_graph_interruption_preserves_capture_attempt () =
     |> Result.get_ok
   in
   let start =
-    R.create ~graph_generation:1
+    root_navigation ~graph_generation:1
     |> fun state ->
     R.step state (Graph_replaced { generation = 1; graph_id = Some graph_id })
     |> fun state -> R.step state (Capture_edited "Retain admitted attempt")
@@ -1446,7 +1489,8 @@ let test_graph_retained_append_owner () =
 let test_late_capture_completion_preserves_newer_edit () =
   let module R = Application.Root_navigation in
   let start =
-    R.create ~graph_generation:1 |> fun state -> R.step state (Capture_edited "Original")
+    root_navigation ~graph_generation:1
+    |> fun state -> R.step state (Capture_edited "Original")
   in
   let capture, request =
     Journal_capture.admit_save
@@ -1540,7 +1584,8 @@ let test_failed_append_edit_replaces_only_failed_attempt () =
     (D.mode toggled = Reading && snd (D.retry toggled) = None)
     "task edit retained failed request";
   require
-    (Journal_capture.task_state (Option.get (D.child_capture toggled)) = Todo)
+    (Journal_capture.task_state (Option.get (D.child_capture toggled))
+     = Journal_model.Default_status)
     "failed Append task edit ignored";
   let text_changed = D.update_child_source failed "Replacement" in
   require_string
@@ -1549,10 +1594,103 @@ let test_failed_append_edit_replaces_only_failed_attempt () =
     "failed Append source replacement"
 ;;
 
+let test_failed_task_append_retains_identity () =
+  let module D = Journal_detail in
+  let root = block () in
+  let saving, request =
+    D.create ~session_number:12L (detail ~root ())
+    |> fun t ->
+    D.update_child_source t "Original task"
+    |> D.toggle_child_task
+    |> fun t ->
+    D.admit_child
+      t
+      ~mutation_id:"70000000-0000-4000-9000-000000000012"
+      ~calendar_generation:1L
+      ~block_id:"70000000-0000-4000-a000-000000000012"
+      ~sibling_order:"z"
+      ~creation_time:(creation_time 550)
+  in
+  require (request <> None) "task Append admission failed";
+  let failed = D.fail saving ~message:"Status deleted after insertion" in
+  let cleared = D.set_child_task failed Journal_model.No_status in
+  let edited = D.update_child_source cleared "Another draft" in
+  require_string
+    "Original task"
+    (Journal_capture.source (Option.get (D.child_capture edited)))
+    "task Append retained body";
+  match snd (D.retry edited) with
+  | Some (Journal_graph_request.Create_child command) ->
+    require_string
+      "70000000-0000-4000-a000-000000000012"
+      command.block_id
+      "task Append retry block";
+    require_string
+      "70000000-0000-4000-9000-000000000012"
+      command.mutation_id
+      "task Append retry mutation";
+    require
+      (command.task_state = Journal_model.No_status)
+      "task Append retry did not clear status"
+  | _ -> fail "task Append lost failed identity"
+;;
+
+let test_retained_task_append_keeps_recovery_identity () =
+  let module D = Journal_detail in
+  List.iter
+    (fun interrupted ->
+       let root = block () in
+       let saving, _ =
+         D.create ~session_number:12L (detail ~root ())
+         |> fun t ->
+         D.update_child_source t "Retained task"
+         |> D.toggle_child_task
+         |> fun t ->
+         D.admit_child
+           t
+           ~mutation_id:"70000000-0000-4000-9000-000000000012"
+           ~calendar_generation:1L
+           ~block_id:"70000000-0000-4000-a000-000000000012"
+           ~sibling_order:"z"
+           ~creation_time:(creation_time 550)
+       in
+       let retained = Option.get (D.retain_composer saving) in
+       let retained =
+         if interrupted
+         then D.interrupt_retained_composer retained
+         else
+           D.fail_retained_composer
+             retained
+             ~block_id:"70000000-0000-4000-a000-000000000012"
+             ~message:"Lost status response"
+       in
+       let restored =
+         D.restore_composer (D.create ~session_number:13L (detail ~root ())) retained
+         |> fun t ->
+         D.set_child_task t Journal_model.No_status
+         |> fun t -> D.update_child_source t "Another draft"
+       in
+       require_string
+         "Retained task"
+         (Journal_capture.source (Option.get (D.child_capture restored)))
+         "retained task recovery body";
+       match snd (D.retry restored) with
+       | Some (Journal_graph_request.Create_child command) ->
+         require
+           (command.status_confirmation && command.task_state = Journal_model.No_status)
+           "retained task recovery lost explicit status confirmation";
+         require_string
+           "70000000-0000-4000-a000-000000000012"
+           command.block_id
+           "retained task retry block"
+       | _ -> fail "retained task recovery lost pending request")
+    [ false; true ]
+;;
+
 let test_capture_editor_sessions_are_not_reused () =
   let module R = Application.Root_navigation in
   let initial =
-    R.create ~graph_generation:1 |> fun state -> R.step state Capture_opened
+    root_navigation ~graph_generation:1 |> fun state -> R.step state Capture_opened
   in
   let edited, old_edits =
     List.fold_left
@@ -1695,7 +1833,9 @@ let test_automatic_outline_reads_are_bounded_and_idempotent () =
   let owner, _ = D.step owner (Loaded (generation,
       { root; children = { blocks = List.filteri (fun n _ -> n >= 128) children; continuation = None } })) in
   let rec finish owner n =
-    if n = 128 then owner else
+    if n = 128
+    then owner
+    else (
       let expected = Journal_model.id (List.nth children n) in
       require (D.next_automatic_load owner = Some expected) "automatic order changed";
       let owner, requests = D.step owner Load_next in
@@ -1708,11 +1848,15 @@ let test_automatic_outline_reads_are_bounded_and_idempotent () =
         "automatic loading admitted a duplicate/concurrent read";
       let owner, _ = D.step duplicate (Loaded (generation,
           { root = List.nth children n; children = { blocks = []; continuation = None } })) in
-      finish owner (n + 1) in
+      finish owner (n + 1))
+  in
   let owner = finish owner 0 in
   require (D.next_automatic_load owner = None) "automatic branch budget exceeded 128";
   let manual = Journal_model.id (List.nth children 128) in
-  require (List.exists (function D.More { parent_id; loading = false; _ } -> parent_id = manual
+  require
+    (List.exists
+       (function
+         | D.More { parent_id; loading = false; _ } -> parent_id = manual
       | _ -> false) (D.rows owner)) "budget exhaustion removed Load more";
   let owner, requests = D.step owner (Load_more manual) in
   let generation = match requests with
@@ -1816,7 +1960,7 @@ let test_root_noops_preserve_observable_owner () =
   let unchanged state event label =
     require (R.step state event == state) "%s published an unchanged root model" label
   in
-  let initial = R.create ~graph_generation:3 in
+  let initial = root_navigation ~graph_generation:3 in
   unchanged initial Capture_closed "already closed capture";
   unchanged initial (Capture_task_intent false) "task intent without a draft";
   let opened = R.step initial Capture_opened in
@@ -1871,7 +2015,8 @@ let test_root_noops_preserve_observable_owner () =
   let selected = R.step edited (Capture_task_intent true) in
   require (selected != edited) "changed task intent was suppressed";
   require
-    (Journal_capture.task_state (Option.get (R.capture selected)) = Todo)
+    (Journal_capture.task_state (Option.get (R.capture selected))
+     = Journal_model.Status "00000002-1615-5853-7700-000000000000")
     "changed task intent was not retained";
   let closed = R.step selected Capture_closed in
   require (not (R.capture_presented closed)) "closing was suppressed";
@@ -2206,12 +2351,15 @@ let test_typed_shared_data_delete_and_drafts () =
           (Journal_detail.session_id (entry_detail second first_id))
           (Journal_detail.session_id (entry_detail second second_id))))
     "duplicate entry reused editor session";
-  let latest = block ~task_state:Done () in
+  let latest =
+    block ~task_state:(Journal_model.Status "00000002-1827-5820-8200-000000000000") ()
+  in
   let shared = R.map_details second ~f:(fun d -> Journal_detail.apply_block d latest) in
   List.iter
     (fun id ->
        require
-         (Journal_model.task_state (Journal_detail.root (entry_detail shared id)) = Done)
+         (Journal_model.task_state (Journal_detail.root (entry_detail shared id))
+          = Journal_model.Status "00000002-1827-5820-8200-000000000000")
          "shared graph data was not propagated to every matching live owner")
     [ first_id; second_id ];
   require_string
@@ -2387,7 +2535,7 @@ let test_multiselect_order_duplicates_and_readd () =
           [ a; b; c ]
       in
       let start =
-        R.create ~graph_generation:1
+        root_navigation ~graph_generation:1
         |> fun s ->
         R.step s Capture_opened |> fun s -> R.step s (Capture_picker_requested Files)
       in
@@ -2428,7 +2576,7 @@ let test_multiselect_rejected_resource_ownership () =
         files
     in
     let start =
-      R.create ~graph_generation:1
+      root_navigation ~graph_generation:1
       |> fun s ->
       R.step s Capture_opened |> fun s -> R.step s (Capture_picker_requested Files)
     in
@@ -2481,7 +2629,7 @@ let test_multiselect_graph_owner_and_cancel () =
   with_multiselect_files 2 (function
     | [ kept; late ] ->
       let start =
-        R.create ~graph_generation:1
+        root_navigation ~graph_generation:1
         |> fun s ->
         R.step s (Graph_replaced { graph_id = Some (graph 1); generation = 1 })
         |> fun s ->
@@ -2629,9 +2777,19 @@ let test_projected_unknown_children_are_read_once () =
   let owner = load owner child [ grandchild ] in
   let owner = load owner grandchild [] in
   require (D.next_automatic_load owner = None) "confirmed empty leaf was read twice";
-  require (List.filter_map (function D.Block { depth; _ } -> Some depth | _ -> None)
+  require
+    (List.filter_map
+       (function
+         | D.Block { depth; _ } -> Some depth
+         | _ -> None)
       (D.rows owner) = [ 0; 1; 2 ]) "real projected descendants did not auto-expand";
-  require (not (List.exists (function D.More _ -> true | _ -> false) (D.rows owner)))
+  require
+    (not
+       (List.exists
+          (function
+            | D.More _ -> true
+            | _ -> false)
+          (D.rows owner)))
     "confirmed leaves retained a spurious Load more"
 ;;
 
@@ -2645,22 +2803,36 @@ let test_detail_default_outline_depth_and_cycle_boundaries () =
     { root = List.nth chain n; children =
         { blocks = [ List.nth chain (n + 1) ]; continuation = None } } in
   let owner = D.create ~session_number:131L (projection 0) |> observe_outline in
-  require (List.exists (function D.More { parent_id; _ } -> parent_id = id 1
+  require
+    (List.exists
+       (function
+         | D.More { parent_id; _ } -> parent_id = id 1
       | _ -> false) (D.rows owner))
     "default expanded child must expose loading/Load more without disclosure";
   let rec load owner n =
-    if n >= 9 then owner else
+    if n >= 9
+    then owner
+    else (
       let next, requests = D.step owner Load_next in
       let generation = match requests with
         | [ Journal_graph_request.Load_detail { request_generation; limit = 128; _ } ] -> request_generation
         | _ -> fail "visible descendant did not admit one bounded page" in
       let next, _ = D.step next (Loaded (generation, projection n)) in
-      load next (n + 1) in
+      load next (n + 1))
+  in
   let owner = load owner 1 in
-  require (List.filter_map (function D.Block { depth; _ } -> Some depth | _ -> None)
+  require
+    (List.filter_map
+       (function
+         | D.Block { depth; _ } -> Some depth
+         | _ -> None)
       (D.rows owner) = List.init 10 Fun.id)
     "Detail must display ten data levels including the root";
-  require (not (List.exists (function D.More { parent_id; _ } -> parent_id = id 9
+  require
+    (not
+       (List.exists
+          (function
+            | D.More { parent_id; _ } -> parent_id = id 9
       | _ -> false) (D.rows owner)))
     "depth ten must not expose a read for depth eleven";
   require (D.next_automatic_load owner = None) "automatic traversal crossed the depth limit";
@@ -2668,7 +2840,10 @@ let test_detail_default_outline_depth_and_cycle_boundaries () =
   require (requests = []) "depth limit admitted a hidden subtree read";
   let cycle = D.reconcile_children owner
       { root = List.nth chain 2; children = { blocks = [ List.nth chain 0 ]; continuation = None } } in
-  require (List.filter_map (function D.Block { block; _ } -> Some (Journal_model.id block)
+  require
+    (List.filter_map
+       (function
+         | D.Block { block; _ } -> Some (Journal_model.id block)
       | _ -> None) (D.rows cycle) = [ id 0; id 1; id 2 ])
     "ancestor cycle must terminate without hiding valid ancestors";
   let leaf = block ~id:(id 20) ~parent_id:(Some (id 0)) ~child_count:0 () in
@@ -2680,7 +2855,11 @@ let test_detail_default_outline_depth_and_cycle_boundaries () =
     | _ -> fail "unknown zero count must be read once" in
   let leaf_owner, _ = D.step leaf_owner (Loaded (generation,
       { root = leaf; children = { blocks = []; continuation = None } })) in
-  require (not (List.exists (function D.More { parent_id; _ } -> parent_id = id 20
+  require
+    (not
+       (List.exists
+          (function
+            | D.More { parent_id; _ } -> parent_id = id 20
       | _ -> false) (D.rows leaf_owner)))
     "confirmed empty leaf must not offer another empty-page read";
   let _, requests = D.step leaf_owner (Load_more (id 20)) in
@@ -2702,7 +2881,10 @@ let test_detail_serial_reads_and_retry_feedback () =
   let same, requests = D.step owner (Load_more (Journal_model.id b)) in
   require (requests = []) "Detail admitted concurrent automatic branch reads";
   let failed, _ = D.step same (Load_failed (generation, false, "offline")) in
-  require (List.exists (function D.More { parent_id; error = Some "offline"; loading = false; _ } ->
+  require
+    (List.exists
+       (function
+         | D.More { parent_id; error = Some "offline"; loading = false; _ } ->
       parent_id = Journal_model.id a | _ -> false) (D.rows failed))
     "failed read must remain visible and retryable";
   let _, requests = D.step failed (Load_more (Journal_model.id a)) in
@@ -2763,7 +2945,9 @@ let test_detail_128_item_pages_preserve_order_and_completion () =
   let _, requests = D.step replayed (Load_more parent_id) in
   require (requests = []) "completed 128-item paging kept requesting";
   require
-    (List.filter_map (function D.Block { block; _ } -> Some (Journal_model.id block)
+    (List.filter_map
+       (function
+         | D.Block { block; _ } -> Some (Journal_model.id block)
       | D.More _ -> None) (D.rows replayed)
      = List.map Journal_model.id (root :: parent :: children))
     "flat Detail traversal lost the complete 260-child order"
@@ -3075,7 +3259,7 @@ let test_followup_snapshot_invalidation_and_owner_isolation () =
       ~parent_id:(Some (Journal_model.id root))
       ~source:"Updated task/media source"
       ~revision:"changed"
-      ~task_state:Done
+      ~task_state:(Journal_model.Status "00000002-1827-5820-8200-000000000000")
       ~child_count:0
       ()
     |> fun block -> Journal_model.with_tag_titles block ~tag_titles:[ "QA updated" ]
@@ -3088,7 +3272,8 @@ let test_followup_snapshot_invalidation_and_owner_isolation () =
           (function
             | D.Block { block; _ } ->
               Journal_model.source block = "Updated task/media source"
-              && Journal_model.task_state block = Done
+              && Journal_model.task_state block
+                 = Journal_model.Status "00000002-1827-5820-8200-000000000000"
               && Journal_model.tag_titles block = [ "QA updated" ]
             | _ -> false)
           (D.rows owner))
@@ -3153,8 +3338,9 @@ let test_followup_review_regressions () =
    indicator belongs to its route/request identity rather than asset work. *)
 let test_detail_initial_loading_delay_and_ownership () =
   let module R = Journal_routes in
-  let cases = [
-    "fast completion", (fun () ->
+  let cases =
+    [ ( "fast completion"
+      , fun () ->
       let t = R.open_detail (R.create ()) ~block_id:(Journal_model.id (block ())) ~request_generation:9000L in
       require (not (R.loading_indicator t)) "initial Detail shows loading before 100ms";
       let t = R.observe_loading_delay t ~entry_id:(entry_id t) ~request_generation:9000L ~elapsed:0.099 in
@@ -3168,9 +3354,25 @@ let test_detail_initial_loading_delay_and_ownership () =
         | _ -> fail "fast initial child discovery was not admitted" in
       let ready = R.apply_detail_response pending ~request_generation:generation (detail ~root:child ()) in
       require (R.route ready = Detail && not (R.loading_indicator ready)) "fast body is artificially delayed";
-      require (List.length (List.filter (function Journal_detail.Block _ -> true | More _ -> false) (Journal_detail.rows (Option.get (R.detail ready)))) = 2) "root published without its bounded children page";
-      require (R.observe_loading_delay ready ~entry_id:(entry_id ready) ~request_generation:9000L ~elapsed:1. == ready) "late timer changes ready body");
-    "slow delay boundary", (fun () ->
+          require
+            (List.length
+               (List.filter
+                  (function
+                    | Journal_detail.Block _ -> true
+                    | More _ -> false)
+                  (Journal_detail.rows (Option.get (R.detail ready))))
+             = 2)
+            "root published without its bounded children page";
+          require
+            (R.observe_loading_delay
+               ready
+               ~entry_id:(entry_id ready)
+               ~request_generation:9000L
+               ~elapsed:1.
+             == ready)
+            "late timer changes ready body" )
+    ; ( "slow delay boundary"
+      , fun () ->
       let t = R.open_detail (R.create ()) ~block_id:(Journal_model.id (block ())) ~request_generation:9001L in
       let id = entry_id t in
       require (not (R.loading_indicator t)) "slow route starts with a spinner";
@@ -3182,8 +3384,16 @@ let test_detail_initial_loading_delay_and_ownership () =
       require (R.loading_indicator slow) "100ms pending route has no indicator";
       require (R.loading_indicator (R.observe_loading_delay t ~entry_id:id ~request_generation:9001L ~elapsed:3600.)) "suspended pending route loses its elapsed loading delay";
       require (R.detail slow = None) "pending route exposes a partial root";
-      require (R.observe_loading_delay slow ~entry_id:id ~request_generation:9001L ~elapsed:0.2 == slow) "duplicate delay republishes owner");
-    "failure and retry", (fun () ->
+          require
+            (R.observe_loading_delay
+               slow
+               ~entry_id:id
+               ~request_generation:9001L
+               ~elapsed:0.2
+             == slow)
+            "duplicate delay republishes owner" )
+    ; ( "failure and retry"
+      , fun () ->
       let t = R.open_detail (R.create ()) ~block_id:(Journal_model.id (block ())) ~request_generation:9002L in
       let id = entry_id t in
       let failed = R.apply_detail_failure t ~request_generation:9002L ~missing:false ~message:"read failed" in
@@ -3194,8 +3404,11 @@ let test_detail_initial_loading_delay_and_ownership () =
       require (R.observe_loading_delay retry ~entry_id:id ~request_generation:9002L ~elapsed:1. == retry) "old timer activates retry";
       require (R.apply_detail_response retry ~request_generation:9002L (detail ()) == retry) "old completion activates retry";
       let missing = R.apply_missing_detail retry ~request_generation:9003L in
-      require (R.route missing = Missing_detail && not (R.loading_indicator missing)) "missing route retains progress");
-    "back and new route", (fun () ->
+          require
+            (R.route missing = Missing_detail && not (R.loading_indicator missing))
+            "missing route retains progress" )
+    ; ( "back and new route"
+      , fun () ->
       let t = R.open_detail (R.create ()) ~block_id:(Journal_model.id (block ())) ~request_generation:9004L in
       let old = entry_id t in
       let back = R.back t in
@@ -3205,23 +3418,36 @@ let test_detail_initial_loading_delay_and_ownership () =
       require (entry_id fresh <> old && not (R.loading_indicator fresh)) "reentry inherits progress";
       require (R.observe_loading_delay fresh ~entry_id:old ~request_generation:9004L ~elapsed:1. == fresh) "retired timer affects reentry";
       let reset = R.graph_unavailable fresh in
-      require (R.observe_loading_delay reset ~entry_id:(entry_id fresh) ~request_generation:9005L ~elapsed:1. == reset) "graph reset accepts timer");
-    "rapid nested routes", (fun () ->
+          require
+            (R.observe_loading_delay
+               reset
+               ~entry_id:(entry_id fresh)
+               ~request_generation:9005L
+               ~elapsed:1.
+             == reset)
+            "graph reset accepts timer" )
+    ; ( "rapid nested routes"
+      , fun () ->
       let a = block () and b = block ~id:"70000000-0000-4000-a000-000000000002" () in
       let t = R.open_detail (R.create ()) ~block_id:(Journal_model.id a) ~request_generation:9006L in
       let a_id = entry_id t in
       let t = R.open_detail t ~block_id:(Journal_model.id b) ~request_generation:9007L in
       let b_id = entry_id t in
       let t = R.observe_loading_delay t ~entry_id:a_id ~request_generation:9006L ~elapsed:0.2 in
-      require (not (R.loading_indicator t) && R.loading_indicator (entry t a_id)) "covered timer leaks into top route";
+          require
+            ((not (R.loading_indicator t)) && R.loading_indicator (entry t a_id))
+            "covered timer leaks into top route";
       require (R.observe_loading_delay t ~entry_id:b_id ~request_generation:9006L ~elapsed:0.2 == t) "timer accepts wrong generation";
       let t = R.apply_detail_response t ~request_generation:9006L (detail ~root:a ()) in
       require (R.route t = Detail_loading && not (R.loading_indicator t)) "covered completion reveals top body";
       let t = R.apply_detail_response t ~request_generation:9007L (detail ~root:b ()) in
-      require (R.route t = Detail) "current completion does not reveal body");
+          require (R.route t = Detail) "current completion does not reveal body" )
   ] in
   let failures = ref [] in
-  List.iter (fun (name, test) -> try test () with exn ->
+  List.iter
+    (fun (name, test) ->
+       try test () with
+       | exn ->
     Printf.eprintf "DETAIL_LOADING_RED %s: %s\n%!" name (Printexc.to_string exn);
     failures := name :: !failures) cases;
   require (!failures = []) "Detail loading cases failed: %s" (String.concat ", " !failures)
@@ -3246,7 +3472,9 @@ let test_detail_initial_nested_body_staging () =
   in
   let text_ids t =
     D.rows (Option.get (R.detail t))
-    |> List.filter_map (function D.Block {block;_} -> Some (Journal_model.id block) | More _ -> None)
+    |> List.filter_map (function
+      | D.Block { block; _ } -> Some (Journal_model.id block)
+      | More _ -> None)
   in
   let admit t =
     let _, parent = Option.get (R.initial_load t) in
@@ -3277,16 +3505,20 @@ let test_detail_initial_nested_body_staging () =
   let grandchild=node ~parent:(id 1) 3 and extra=node ~parent:(id 1) ~order:"b" 4 in
   let small=projection root [child;tail] in
   let small_pages=[projection child [grandchild;extra];projection grandchild [];projection extra [];projection tail []] in
-  let cases=[
-    "three levels publish all text once", (fun () ->
+  let cases =
+    [ ( "three levels publish all text once"
+      , fun () ->
       let t=start small in
       require (R.route t = Detail_loading && R.detail t = None) "first direct page publishes ahead of deeper text";
       let ready,calls=finish t small_pages in
       require (text_ids ready = List.map id [0;1;3;4;2]) "three-level first body is incomplete or unordered";
       require (List.length calls=4) "small tree has unexpected discovery reads";
       let visible=observe_outline (Option.get (R.detail ready)) in
-      require (D.next_automatic_load visible=None) "small body inserts more text after publication");
-    "ten levels and following sibling publish together", (fun () ->
+          require
+            (D.next_automatic_load visible = None)
+            "small body inserts more text after publication" )
+    ; ( "ten levels and following sibling publish together"
+      , fun () ->
       let chain=List.init 11 (fun depth -> node ?parent:(if depth=0 then None else Some (id (depth-1))) depth) in
       let tail=node ~parent:(id 0) ~order:"z" 20 in
       let pages=List.init 8 (fun i -> projection (List.nth chain (i+1)) [List.nth chain (i+2)]) @ [projection tail []] in
@@ -3295,8 +3527,11 @@ let test_detail_initial_nested_body_staging () =
       let ready,calls=finish t pages in
       require (text_ids ready = List.init 10 id @ [id 20]) "ten-level first body is incomplete";
       require (List.length calls=9 && not (List.mem (id 9) calls)) "staging exceeds ten levels or repeats a branch";
-      require (D.next_automatic_load (observe_outline (Option.get (R.detail ready)))=None) "ten-level body continues inserting after publication");
-    "wide tree stops at material budget and retains continuation", (fun () ->
+          require
+            (D.next_automatic_load (observe_outline (Option.get (R.detail ready))) = None)
+            "ten-level body continues inserting after publication" )
+    ; ( "wide tree stops at material budget and retains continuation"
+      , fun () ->
       let branches=List.init 128 (fun i -> node ~parent:(id 0) ~order:(Printf.sprintf "%04d" i) (100+i)) in
       let children=List.init 128 (fun i -> node ~parent:(id 100) ~order:(Printf.sprintf "%04d" i) (300+i)) in
       let t=start (projection root branches) in
@@ -3306,8 +3541,9 @@ let test_detail_initial_nested_body_staging () =
       let outline=observe_outline (Option.get (R.detail ready)) in
       require (D.next_automatic_load outline=None) "publication resets material budget";
       let _,commands=D.step outline (Load_more (id 101)) in
-      require (List.length commands=1) "budget stop loses explicit continuation");
-    "128 attempts bound unknown zero-count discovery", (fun () ->
+          require (List.length commands = 1) "budget stop loses explicit continuation" )
+    ; ( "128 attempts bound unknown zero-count discovery"
+      , fun () ->
       let branches=List.init 128 (fun i -> node ~parent:(id 0) ~order:(Printf.sprintf "%04d" i) (100+i)) in
       let leaf=node ~parent:(id 100) 500 in
       let pages=projection (List.hd branches) [leaf] :: projection leaf [] :: List.map (fun b -> projection b []) (List.tl branches) in
@@ -3318,8 +3554,15 @@ let test_detail_initial_nested_body_staging () =
       require (List.length (text_ids ready)=130) "bounded attempt result loses discovered text";
       let outline=observe_outline (Option.get (R.detail ready)) in
       require (D.next_automatic_load outline=None) "attempt cap resets at publication";
-      require (List.exists (function D.More {enabled=true;_} -> true | _ -> false) (D.rows outline)) "attempt cap loses explicit continue action");
-    "initial descendant failure and explicit fresh Retry", (fun () ->
+          require
+            (List.exists
+               (function
+                 | D.More { enabled = true; _ } -> true
+                 | _ -> false)
+               (D.rows outline))
+            "attempt cap loses explicit continue action" )
+    ; ( "initial descendant failure and explicit fresh Retry"
+      , fun () ->
       let t=start small in
       require (R.detail t=None) "partial body visible before failure";
       let pending,parent,generation=admit t in
@@ -3343,8 +3586,9 @@ let test_detail_initial_nested_body_staging () =
       require_string "Retained initial draft"
         (Option.fold ~none:"" ~some:Journal_capture.source
            (D.child_capture (Option.get (R.detail restored))))
-        "initial staged failure retains the exact detached composer");
-    "Back graph replacement and covered route fence staged reads", (fun () ->
+            "initial staged failure retains the exact detached composer" )
+    ; ( "Back graph replacement and covered route fence staged reads"
+      , fun () ->
       let t=start (projection root [child]) in
       require (R.detail t=None) "staging owner prematurely visible";
       let pending,_,generation=admit t in
@@ -3360,14 +3604,21 @@ let test_detail_initial_nested_body_staging () =
       require (text_ids ready=[id 90]) "covered completion replaces current target";
       require (text_ids (R.back ready)=[id 0;id 1]) "covered completed owner loses staged text";
       let replaced=R.runtime_replaced pending in
-      require (R.apply_detail_response replaced ~request_generation:generation response==replaced) "runtime replacement accepts old staged read");
-    "asset-bearing text never waits for asset availability", (fun () ->
+          require
+            (R.apply_detail_response replaced ~request_generation:generation response
+             == replaced)
+            "runtime replacement accepts old staged read" )
+    ; ( "asset-bearing text never waits for asset availability"
+      , fun () ->
       let asset=node ~parent:(id 0) ~source:"![local attachment](../assets/image.png)" 70 in
       let t=start (projection root [asset]) in
       require (R.detail t=None) "asset-bearing direct text publishes before initial staging";
       let ready,calls=finish t [projection asset []] in
-      require (calls=[id 70] && text_ids ready=[id 0;id 70]) "asset state gates non-asset body completion");
-    "first-page continuation remains an explicit action", (fun () ->
+          require
+            (calls = [ id 70 ] && text_ids ready = [ id 0; id 70 ])
+            "asset state gates non-asset body completion" )
+    ; ( "first-page continuation remains an explicit action"
+      , fun () ->
       let cursor : Journal_graph_projection.block_cursor = {after_sibling_order="a";after_block_id=id 1;protocol_cursor=None} in
       let t=start (projection ~continuation:cursor root [child]) in
       require (R.detail t=None) "continuation direct page publishes early";
@@ -3376,8 +3627,14 @@ let test_detail_initial_nested_body_staging () =
       let outline=Option.get (R.detail ready) in
       require (D.continuation outline ~parent_id:(id 0)=Some cursor) "staging discards pagination cursor";
       let _,commands=D.step outline (Load_more (id 0)) in
-      require (match commands with [Journal_graph_request.Load_detail {after=Some value;limit=128;_}] -> value=cursor | _ -> false) "explicit continuation cannot load next page");
-    "100ms belongs to the whole initial body without a minimum delay", (fun () ->
+          require
+            (match commands with
+             | [ Journal_graph_request.Load_detail { after = Some value; limit = 128; _ }
+               ] -> value = cursor
+             | _ -> false)
+            "explicit continuation cannot load next page" )
+    ; ( "100ms belongs to the whole initial body without a minimum delay"
+      , fun () ->
       let t=start (projection root [child]) in
       require (R.route t=Detail_loading && not (R.loading_indicator t)) "root response ends the grace period with partial body";
       let identity=entry_id t in
@@ -3391,10 +3648,17 @@ let test_detail_initial_nested_body_staging () =
       require (R.route fast=Detail && not (R.loading_indicator fast)) "completed small tree has a minimum artificial delay")
   ] in
   let failures=ref [] in
-  List.iter (fun (name,test) -> try test () with error ->
-    Printf.eprintf "INITIAL_STAGING_RED %s: %s\n%!" name (Printexc.to_string error);
-    failures:=name::!failures) cases;
-  require (!failures=[]) "Initial staging regressions: %s" (String.concat ", " (List.rev !failures))
+  List.iter
+    (fun (name, test) ->
+       try test () with
+       | error ->
+         Printf.eprintf "INITIAL_STAGING_RED %s: %s\n%!" name (Printexc.to_string error);
+         failures := name :: !failures)
+    cases;
+  require
+    (!failures = [])
+    "Initial staging regressions: %s"
+    (String.concat ", " (List.rev !failures))
 ;;
 
 let test_initial_staging_refresh_and_delete () =
@@ -3548,8 +3812,7 @@ let test_initial_staging_refresh_and_delete () =
           let pending, _, old = admit (start [ child ]) in
           let missing, _ = R.commit_delete pending ~block_id:(id 0) in
           require
-            (R.route missing = Missing_detail
-             && not (R.loading_indicator missing))
+            (R.route missing = Missing_detail && not (R.loading_indicator missing))
             "committed root deletion is ignored";
           require
             (R.apply_detail_response missing ~request_generation:old (page child [])
@@ -3591,7 +3854,8 @@ let test_initial_staging_refresh_and_delete () =
              == hidden)
             "removed subtree is revived";
           let ready = finish hidden in
-          require (ids ready = [ id 0; id 2 ]) "deleted subtree remains in published text" )
+          require (ids ready = [ id 0; id 2 ]) "deleted subtree remains in published text"
+      )
     ]
   in
   let failures = ref [] in
@@ -3649,28 +3913,38 @@ let test_page_detail_append_matches_exact_page () =
 ;;
 
 let tests =
-  [ "Page append exact page ownership", test_page_detail_append_matches_exact_page; "Initial staging refresh and delete review regressions", test_initial_staging_refresh_and_delete ] @
-  [ "Detail bounded initial nested body staging", test_detail_initial_nested_body_staging ] @
-  [ "Detail initial loading delay and ownership", test_detail_initial_loading_delay_and_ownership ] @
-  [ "Unicode blank Capture admission", test_unicode_blank_capture_admission
-  ] @
-  [ "PR63 public review regressions", test_followup_review_regressions
-  ] @
-  [ "projected unknown children are read once", test_projected_unknown_children_are_read_once
-  ; "Detail default ten levels and cycle boundaries", test_detail_default_outline_depth_and_cycle_boundaries
-  ; "Detail serialized reads and retry feedback", test_detail_serial_reads_and_retry_feedback
+  [ "Page append exact page ownership", test_page_detail_append_matches_exact_page
+  ; ( "Initial staging refresh and delete review regressions"
+    , test_initial_staging_refresh_and_delete )
+  ]
+  @ [ ( "Detail bounded initial nested body staging"
+      , test_detail_initial_nested_body_staging )
+    ]
+  @ [ ( "Detail initial loading delay and ownership"
+      , test_detail_initial_loading_delay_and_ownership )
+    ]
+  @ [ "Unicode blank Capture admission", test_unicode_blank_capture_admission ]
+  @ [ "PR63 public review regressions", test_followup_review_regressions ]
+  @ [ ( "projected unknown children are read once"
+      , test_projected_unknown_children_are_read_once )
+    ; ( "Detail default ten levels and cycle boundaries"
+      , test_detail_default_outline_depth_and_cycle_boundaries )
+    ; ( "Detail serialized reads and retry feedback"
+      , test_detail_serial_reads_and_retry_feedback )
   ] @
   [ ( "retained picker and terminal delete"
     , test_retained_detail_picker_owner_and_terminal_delete )
   ; "typed path prefix and loading owners", test_typed_path_prefix_and_loading_owners
   ; "multiselect batch boundary", test_multiselect_batch_boundary
-  ; "multiselect order duplicates and readd", test_multiselect_order_duplicates_and_readd
+    ; ( "multiselect order duplicates and readd"
+      , test_multiselect_order_duplicates_and_readd )
   ; ( "multiselect rejected resource ownership"
     , test_multiselect_rejected_resource_ownership )
   ; "multiselect graph owner and cancel", test_multiselect_graph_owner_and_cancel
   ; "typed covered failure and branch", test_typed_covered_failure_missing_and_branch
   ; "typed shared data and committed deletion", test_typed_shared_data_delete_and_drafts
-  ; "typed duplicate detached mutations", test_typed_detached_duplicate_pending_mutations
+    ; ( "typed duplicate detached mutations"
+      , test_typed_detached_duplicate_pending_mutations )
   ; "public nested detail owners", test_public_nested_detail_owners
   ; ( "normal attachment pick without replacement metadata"
     , test_normal_attachment_pick_needs_no_replacement_metadata )
@@ -3681,13 +3955,18 @@ let tests =
   ; ( "child refresh replaces opaque cursor"
     , test_child_refresh_replaces_cursor_and_fences_pending_read )
   ; "hidden favorites pagination", test_favorites_hidden_rows_do_not_block_pagination
-  ; "automatic outline reads are bounded and idempotent", test_automatic_outline_reads_are_bounded_and_idempotent
-  ; "Detail 128-item pages preserve order", test_detail_128_item_pages_preserve_order_and_completion
+    ; ( "automatic outline reads are bounded and idempotent"
+      , test_automatic_outline_reads_are_bounded_and_idempotent )
+    ; ( "Detail 128-item pages preserve order"
+      , test_detail_128_item_pages_preserve_order_and_completion )
   ; "Detail retry uses 128-item first page", test_detail_retry_uses_128_item_first_page
   ; "Append editor session after save", test_append_editor_session_after_save
   ; ( "Capture editor sessions are never reused"
     , test_capture_editor_sessions_are_not_reused )
-  ; ( "failed Append editing and late completion"
+    ; "retained task Append recovery", test_retained_task_append_keeps_recovery_identity
+    ; ( "task Append failure retains insertion identity"
+      , test_failed_task_append_retains_identity )
+    ; ( "failed Append editing and late completion"
     , test_failed_append_edit_replaces_only_failed_attempt )
   ; ( "late Capture completion preserves newer edit"
     , test_late_capture_completion_preserves_newer_edit )
@@ -3695,9 +3974,12 @@ let tests =
   ; "graph draft retention and privacy", test_graph_draft_retention_and_privacy
   ; ( "graph interruption preserves Capture attempt"
     , test_graph_interruption_preserves_capture_attempt )
-  ; "Append drafts follow parent navigation", test_append_drafts_follow_parent_navigation
-  ; "detached Append completion and failure", test_detached_append_completion_and_failure
-  ; "favorite target identity, origin and deletion", test_favorite_target_origin_and_delete
+    ; ( "Append drafts follow parent navigation"
+      , test_append_drafts_follow_parent_navigation )
+    ; ( "detached Append completion and failure"
+      , test_detached_append_completion_and_failure )
+    ; ( "favorite target identity, origin and deletion"
+      , test_favorite_target_origin_and_delete )
   ; ( "detail rejects another root even with matching generation"
     , fun () ->
         let routes =

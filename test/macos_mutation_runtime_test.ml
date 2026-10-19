@@ -591,7 +591,8 @@ let capture worker runtime ordinal task_state =
              ; task_state
              ; creation_time
              ; children = []
-             }
+             ; status_confirmation = false
+}
          })
   in
   match deliver worker runtime output with
@@ -611,7 +612,13 @@ let capture worker runtime ordinal task_state =
 let test_delete_conflict_recovery () =
   with_worker (fun worker ->
     let runtime = runtime () in
-    let captured = capture worker runtime 910 Journal_model.Todo in
+    let captured =
+      capture
+        worker
+        runtime
+        910
+        (Journal_model.Status "00000002-1615-5853-7700-000000000000")
+    in
     let block_id = Journal_model.id captured in
     save worker 911 (uuid block_id) "Concurrent edit before delete deadline";
     let deletion revision ordinal =
@@ -702,7 +709,7 @@ let test_reconciled_capture_status () =
            { mutation_id = Graph.Uuid.to_string (Fixture.mutation_uuid 933)
            ; block_id
            ; expected_revision = Journal_model.revision latest
-           ; task_state = Journal_model.Backlog
+           ; task_state = Journal_model.Status "00000002-7233-3491-0000-000000000000"
            })
       |> deliver worker runtime
     in
@@ -711,7 +718,8 @@ let test_reconciled_capture_status () =
          (fun response ->
             match response.Runtime.payload with
             | Block_updated { block; _ } ->
-              Journal_model.task_state block = Journal_model.Backlog
+              Journal_model.task_state block
+              = Journal_model.Status "00000002-7233-3491-0000-000000000000"
             | _ -> false)
          responses)
       "first status change falsely conflicted after reconciliation and unrelated write";

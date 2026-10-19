@@ -1334,8 +1334,106 @@ let favorites_resolve_order_filter_and_snapshot database =
   | _ -> Alcotest.fail "released favorites snapshot accepted"
 ;;
 
+let task_catalog_uses_database_identity database =
+  let behavior = "database-defined N task statuses" in
+  T.seed_task_statuses database;
+  let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+  Fun.protect
+    ~finally:(fun () -> Database.release_snapshot snapshot)
+    (fun () ->
+       let first =
+         Database.get_task_statuses snapshot ~limit:2 ~cursor:None
+         |> T.require_ok ~behavior
+       in
+       T.require
+         (first.default_status = Some T.builtin_todo_uuid)
+         "database default status lost";
+       let rec collect cursor acc =
+         let page =
+           Database.get_task_statuses snapshot ~limit:2 ~cursor |> T.require_ok ~behavior
+         in
+         T.require (List.length page.items <= 2) "catalog exceeded page limit";
+         match page.next_cursor with
+         | None -> acc @ page.items
+         | Some cursor -> collect (Some cursor) (acc @ page.items)
+       in
+       let all = collect None [] in
+       List.iter
+         (fun n ->
+            T.require
+              (List.exists
+                 (fun (d : Graph.task_status_definition) ->
+                    Graph.Uuid.equal d.uuid (T.status_uuid n))
+                 all)
+              "custom choice %d was lost"
+              n)
+         (List.init 12 Fun.id);
+       T.require (List.length all > 9) "catalog retained a nine-status ceiling";
+       let lookups =
+         Database.get_task_status_definitions
+           snapshot
+           [ T.status_uuid 1; T.missing_block_uuid; T.status_uuid 0 ]
+         |> T.require_ok ~behavior
+       in
+       (match lookups with
+        | [ Some b; None; Some a ] ->
+          T.require
+            (Graph.Uuid.equal a.uuid (T.status_uuid 0)
+             && Graph.Uuid.equal b.uuid (T.status_uuid 1))
+            "lookup order or identity changed";
+          T.require (a.title = b.title) "duplicate names were rewritten"
+        | _ -> Alcotest.fail "missing status or duplicate identities were collapsed");
+       List.iter
+         (fun limit ->
+            T.require
+              (Result.is_error (Database.get_task_statuses snapshot ~limit ~cursor:None))
+              "invalid catalog limit accepted")
+         [ 0; 201 ];
+       let module J = Transit_core.Json in
+       T.apply_test_transaction
+         database
+         ~cursor:2
+         [ T.status_add
+             (T.status_lookup (T.status_uuid 0))
+             "block/title"
+             (J.String "Renamed **status**")
+         ; T.status_add
+             (T.status_lookup (T.status_uuid 1))
+             "logseq.property/deleted-at"
+             (J.Int 5)
+         ];
+       let fresh = Database.current_snapshot database |> T.require_ok ~behavior in
+       Fun.protect
+         ~finally:(fun () -> Database.release_snapshot fresh)
+         (fun () ->
+            (match
+               Database.get_task_status_definitions
+                 fresh
+                 [ T.status_uuid 0; T.status_uuid 1 ]
+               |> T.require_ok ~behavior
+             with
+             | [ Some renamed; None ] ->
+               T.require (renamed.title = "Renamed **status**") "rename lost identity"
+             | _ -> Alcotest.fail "deleted status remains selectable");
+            match Database.get_task_statuses fresh ~limit:2 ~cursor:first.next_cursor with
+            | Error Stale_read_cursor -> ()
+            | _ -> Alcotest.fail "catalog cursor crossed projections");
+       match
+         Database.get_task_status_definitions
+           snapshot
+           [ T.status_uuid 0; T.status_uuid 1 ]
+         |> T.require_ok ~behavior
+       with
+       | [ Some a; Some b ] ->
+         T.require (a.title = b.title) "pinned catalog snapshot changed"
+       | _ -> Alcotest.fail "pinned status catalog lost deleted entity")
+;;
+
 let cases =
   [ T.database_case
+      "task catalog reads N identities and lifecycle"
+      task_catalog_uses_database_identity
+  ; T.database_case
       "favorites resolve order, filtering, and snapshot consistency"
       favorites_resolve_order_filter_and_snapshot
   ; T.database_case
