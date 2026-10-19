@@ -90,6 +90,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   private(set) var appliedPatches = 0
   private(set) var failure: Failure?
   private var started = false
+  private var stopPending = false
 
   init(
     platform: JournalApplicationPlatform,
@@ -148,12 +149,14 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     platform.connect(to: self)
   }
 
-  func stop() {
-    guard started else { return }
+  @discardableResult func stop() -> Bool {
+    guard started || stopPending else { return true }
     platform.disconnect()
-    if luiOCamlStop() != 1 { failure = .stop }
     started = false
     activeRuntime = nil
+    stopPending = luiOCamlStop() != 1
+    if stopPending { failure = .stop }
+    return !stopPending
   }
 
   func apply(json: String) {

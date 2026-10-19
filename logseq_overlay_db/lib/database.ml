@@ -1,3 +1,8 @@
+(* Warning output is secondary to committed operations and resource cleanup. *)
+let report_warning message =
+  try output_string stderr message; flush stderr with _ -> ()
+;;
+
 module Graph = Logseq_db_types.Graph_types
 module Storage = Logseq_db_storage.Logseq_sqlite_storage
 open Types
@@ -853,11 +858,11 @@ let collect_retired_mirrors (location : durable_mirror_location) =
             match Ownership.acquire ~graph_directory:data with
             | Error Ownership.Already_owned -> ()
             | Error (Ownership.Unavailable _) ->
-              Printf.eprintf "journal: phase=cleanup operation=collectRetiredMirrors code=ownershipUnavailable\n%!"
+              report_warning "journal: phase=cleanup operation=collectRetiredMirrors code=ownershipUnavailable\n"
             | Ok owner -> Fun.protect ~finally:(fun () -> ignore (Ownership.release owner))
                 (fun () -> remove_mirror_tree data; sync_deletion_directory root))
         with
-        | _ -> Printf.eprintf "journal: phase=cleanup operation=collectRetiredMirrors code=collectionPending\n%!"))
+        | _ -> report_warning "journal: phase=cleanup operation=collectRetiredMirrors code=collectionPending\n"))
 ;;
 
 let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement =
@@ -993,7 +998,7 @@ let commit_mirror_deletion preparation =
        write_deletion_receipt receipt result true;
        preparation.deletion_durable <- true;
        collect_retired_mirrors location
-     with _ -> Printf.eprintf "journal: phase=retirement operation=confirmMirrorRetirement code=confirmationPending\n%!");
+     with _ -> report_warning "journal: phase=retirement operation=confirmMirrorRetirement code=confirmationPending\n");
     Ok result
   | None, None when preparation.deletion_cancelled || preparation.deletion_ownership = None -> Error Types.Mirror_delete_stale
   | None, None ->
@@ -1036,7 +1041,7 @@ let commit_mirror_deletion preparation =
           write_deletion_receipt receipt result true;
           preparation.deletion_durable <- true;
           collect_retired_mirrors location
-        with _ -> Printf.eprintf "journal: phase=retirement operation=confirmMirrorRetirement code=confirmationPending\n%!");
+        with _ -> report_warning "journal: phase=retirement operation=confirmMirrorRetirement code=confirmationPending\n");
        Ok result)
 ;;
 
@@ -1099,7 +1104,7 @@ let collect_garbage inspection =
           in
           Fun.protect
             ~finally:(fun () ->
-              (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" );
+              (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" );
               ignore (Ownership.release ownership))
             (fun () ->
                match
@@ -1946,7 +1951,7 @@ let decode_outbox records =
 let read_outbox path =
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
   Fun.protect
-    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ))
+    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
     (fun () ->
        let exec sql =
          let rc = Sqlite3.exec sqlite sql in
@@ -2019,7 +2024,7 @@ let outbox_write_set database ~revision records =
 
 let migrate_outbox path ~revision ~expected_records rows =
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
-  Fun.protect ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" )) (fun () ->
+  Fun.protect ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" )) (fun () ->
     Logseq_db_storage.Sync_outbox_store.migrate_database sqlite ~revision ~expected_records
       (ordered_durable_rows rows))
 ;;
@@ -2027,7 +2032,7 @@ let migrate_outbox path ~revision ~expected_records rows =
 let validate_durable_receipts path =
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
   Fun.protect
-    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ))
+    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
     (fun () ->
        let ( let* ) = Result.bind in
        let* () = Logseq_db_storage.Mutation_receipt_store.initialize_database sqlite in
@@ -2038,7 +2043,7 @@ let read_durable_receipt path mutation_id =
   let key = Persistence_receipt_v1.receipt_key mutation_id in
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
   Fun.protect
-    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ))
+    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
     (fun () ->
        Result.bind
          (Logseq_db_storage.Mutation_receipt_store.read_mutation sqlite key)
@@ -2057,7 +2062,7 @@ let read_terminal_batch database batch_id =
   let key = Persistence_receipt_v1.terminal_batch_key batch_id in
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database.database_path in
   Fun.protect
-    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ))
+    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
     (fun () ->
        Result.bind
          (Logseq_db_storage.Mutation_receipt_store.read_terminal_batch sqlite key)
@@ -5854,7 +5859,7 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
 
 let open_ ~sw dependencies inspection ~graph_name =
   (try collect_retired_mirrors inspection.location with _ ->
-     Printf.eprintf "journal: phase=cleanup operation=collectRetiredMirrors code=collectionPending\n%!");
+     report_warning "journal: phase=cleanup operation=collectRetiredMirrors code=collectionPending\n");
   if String.trim graph_name = ""
   then Error Types.Invalid_graph_name
   else (
@@ -5899,7 +5904,7 @@ let persist_outbox ?(terminal_batches = []) database =
   in
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database.database_path in
   Fun.protect
-    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ))
+    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
     (fun () ->
        let rc_result rc =
          if Sqlite3.Rc.is_success rc then Ok () else Error (Sqlite3.errmsg sqlite)
