@@ -5515,8 +5515,32 @@ let online_cancellation_preserves_local_restore () =
   Alcotest.(check bool) "pending local key completion still attaches graph" true
     (List.exists (function Core.Delegate (Core.Attach_graph _) -> true | _ -> false) loaded.effects)
 ;;
+(* The pure owner can reproduce authenticated Local_only by public timeline,
+   identity and graph-selection events; no native-result forgery is required. *)
+let authenticated_local_catalog_refresh_waits_for_permission () =
+  let attached=local_attached () in
+  let shown=Core.step attached.next (Core.Timeline_presented (timeline_ticket attached.next)) in
+  let verified=Core.step shown.next (Core.Account_authenticated {user_id=Some "user"}) in
+  let selected=Core.step verified.next (Core.Graph_selected graph_id) in
+  let startup=(Core.state selected.next).snapshot.startup in
+  Alcotest.(check bool) "graph switch preserves identity while returning local" true
+    (startup.authenticated && startup.network_phase=Core.Local_only);
+  let refresh=Core.step selected.next (Core.Catalog_refresh_requested (startup_ticket selected.next)) in
+  no_network "catalog refresh waits for native permission and identity round-trip" refresh.effects;
+  Alcotest.(check bool) "native permission phase is published" true
+    (List.exists (function Core.Publish (Core.State_changed state) ->
+      state.snapshot.startup.network_phase=Core.Online_by_user | _ -> false) refresh.effects);
+  let duplicate=Core.step refresh.next (Core.Catalog_refresh_requested (startup_ticket refresh.next)) in
+  no_network "repeated refresh cannot bypass pending native permission" duplicate.effects;
+  let confirmed=Core.step duplicate.next (Core.Account_authenticated {user_id=Some "user"}) in
+  Alcotest.(check bool) "confirmed identity starts catalog refresh" true
+    (has_catalog_request confirmed.effects);
+  let repeated=Core.step confirmed.next (Core.Catalog_refresh_requested (startup_ticket confirmed.next)) in
+  Alcotest.(check bool) "already online refresh remains direct" true (has_catalog_request repeated.effects)
+;;
 let scenarios = scenarios @
-  [ Alcotest.test_case "cancelled local key crypto completes without reopening password" `Quick cancelled_local_key_crypto_still_completes
+  [ Alcotest.test_case "authenticated local catalog refresh waits for permission" `Quick authenticated_local_catalog_refresh_waits_for_permission
+  ; Alcotest.test_case "cancelled local key crypto completes without reopening password" `Quick cancelled_local_key_crypto_still_completes
   ; Alcotest.test_case "local staged asset publishes offline" `Quick local_staged_asset_publication_is_available_offline
   ; Alcotest.test_case "cancellation fences deferred catalog and snapshot metadata" `Quick cancellation_fences_deferred_catalog_and_snapshot
   ; Alcotest.test_case "online cancellation retains pending local restoration" `Quick online_cancellation_preserves_local_restore

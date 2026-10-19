@@ -3057,8 +3057,16 @@ let step core event =
     | Graph_picker_requested -> return_to_graph_picker core
     | Catalog_refresh_requested scope when not (startup_scope_is_current core scope) -> unchanged core
     | Catalog_refresh_requested _ ->
+      let needs_permission = core.public_state.snapshot.startup.network_phase = Local_only in
       let core=network_phase core Online_by_user in
-      if not core.public_state.snapshot.startup.authenticated then {next=core;effects=[publish core]} else
+      let core = if needs_permission then
+        let snapshot=core.public_state.snapshot in
+        set_snapshot core {snapshot with startup={snapshot.startup with authenticated=false}}
+        else core in
+      (* Publishing opens the native gate; its verified identity round-trip owns
+         catalog admission when this request resumes a local-only session. *)
+      if needs_permission || not core.public_state.snapshot.startup.authenticated
+      then {next=core;effects=[publish core]} else
       (match core.user_id with
        | None -> unchanged core
        | Some user_id ->

@@ -182,7 +182,8 @@ struct JournalHost: View {
             if platform.authenticationRequired || platform.accountIssue != nil {
               JournalAccountRecoveryView(issue: platform.accountIssue,
                 signInAvailable: platform.authenticationRequired || platform.accountIssue?.offersSignIn == true,
-                signIn: { signInPresented = true }, retry: { platform.retryOnline() })
+                signIn: { signInPresented = true },
+                retry: platform.accountIssue?.stage == .bindingRead ? nil : { platform.retryOnline() })
             }
           }
       }

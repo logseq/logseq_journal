@@ -246,7 +246,9 @@ import AppKit
     try Task.checkCancellation()
     guard connected, !pending.terminating else {throw CancellationError()}
     if services.onlineAllowed {return}
-    guard onlineWaiter == nil else {throw JournalPlatformServices.Failure.unavailable}
+    guard onlineWaiter == nil, pending.acceptsOnlinePermission(startupScope) else {
+      throw JournalPlatformServices.Failure.unavailable
+    }
     signInScope=startupScope
     try await withTaskCancellationHandler {
       try await withCheckedThrowingContinuation { continuation in
