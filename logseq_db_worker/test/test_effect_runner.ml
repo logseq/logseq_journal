@@ -963,7 +963,9 @@ let test_db_shutdown_accepts_late_staging_completion () =
              Eio.Fiber.yield ()))))
 ;;
 
-let test_upload_checkpoint_io () =
+(* Pure reducers cannot execute filesystem cleanup or warning-output failures.
+   Reuse real public Runner staging cleanup with an unwritable stderr capability. *)
+let test_upload_checkpoint_io ?(closed_stderr = false) () =
   let module U = Logseq_db_worker_pure_reducer.Asset_upload in
   let module I = Logseq_db_types.Asset_upload_intent in
   let module Store = Logseq_db_storage.Asset_upload_store in
@@ -1331,7 +1333,15 @@ let test_upload_checkpoint_io () =
           ~finally:(fun () -> Unix.chmod staging_directory 0o700)
           (fun () ->
              Runner.submit runner (Core.Publish (Core.Sync_output (Sync.State_changed (Sync.state !sync_state))));
-             Runner.submit runner (Core.Run_upload (context, restore_terminal ()));
+             let terminal_cleanup = restore_terminal () in
+             let cleanup () = Runner.submit runner (Core.Run_upload (context, terminal_cleanup)) in
+             if not closed_stderr then cleanup () else (
+               flush stderr;
+               let saved = Unix.dup Unix.stderr in
+               let read_only = Unix.openfile "/dev/null" [Unix.O_RDONLY] 0 in
+               Fun.protect ~finally:(fun () ->
+                 Unix.dup2 saved Unix.stderr; Unix.close saved; Unix.close read_only)
+                 (fun () -> Unix.dup2 read_only Unix.stderr; cleanup ()));
              Alcotest.(check bool)
                "unavailable cache retains pending source"
                true
@@ -1678,6 +1688,8 @@ let () =
             "durable upload checkpoint IO"
             `Quick
             test_upload_checkpoint_io
+        ; Alcotest.test_case "staging cleanup survives unavailable warning output" `Quick
+            (test_upload_checkpoint_io ~closed_stderr:true)
         ; Alcotest.test_case
             "sync and publish delegation"
             `Quick
