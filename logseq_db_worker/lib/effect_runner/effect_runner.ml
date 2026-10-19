@@ -752,7 +752,20 @@ let publish_projection_change t session = function
             }))
 ;;
 
-let close_database_by_id t database_id =
+let report_current_graph t (scope : Sync.graph_scope) code =
+  match t.latest_snapshot with
+  | Some snapshot when not t.stopped
+      && snapshot.startup.account_generation = scope.account.account_generation
+      && snapshot.startup.graph_generation = scope.graph_generation ->
+    t.dependencies.publish (Core.Diagnostic code)
+  | _ -> ()
+;;
+
+let close_database_by_id ?scope t database_id =
+  let scope = match scope with
+    | Some _ -> scope
+    | None -> Option.bind t.attached (fun (id, scope) ->
+        if id=database_id then Some scope else None) in
   match Hashtbl.find_opt t.databases database_id with
   | None -> Ok ()
   | Some session ->
@@ -760,7 +773,18 @@ let close_database_by_id t database_id =
     let result = Database.close session.database in
     (match result with
      | Ok () -> ()
-     | Error _ -> Printf.eprintf "journal: operation=closeDatabase code=cleanupPending\n%!");
+     | Error _ ->
+       Option.iter (fun (scope:Sync.graph_scope) ->
+         match t.latest_snapshot with
+         | Some snapshot when not t.stopped
+             && snapshot.startup.account_generation=scope.account.account_generation
+             && (snapshot.startup.graph_generation=scope.graph_generation
+                 || snapshot.selected_graph=None) ->
+           (* Returning to the picker advances graph_generation before its
+              owned detach runs; a newly selected graph fences that close. *)
+           t.dependencies.publish (Core.Diagnostic "worker.closeDatabase")
+         | _ -> ()) scope;
+       Printf.eprintf "journal: operation=closeDatabase code=cleanupPending\n%!");
     Hashtbl.remove t.databases database_id;
     Result.map_error
       (fun _ -> effect_error "The overlay database failed to close.")
@@ -770,9 +794,9 @@ let close_database_by_id t database_id =
 let close_attached t =
   match t.attached with
   | None -> Ok ()
-  | Some (database_id, _) ->
+  | Some (database_id, scope) ->
     t.attached <- None;
-    close_database_by_id t database_id
+    close_database_by_id ~scope t database_id
 ;;
 
 let overlay_scope_of_protocol = function
@@ -922,7 +946,7 @@ let read_failure request = function
   | Fatal_read_state message -> failure request Corrupt_storage message
 ;;
 
-let read_snapshot database request command =
+let read_snapshot ~on_enrichment_error database request command =
   match Database.current_snapshot database with
   | Error _ -> failure request Closed_session "The graph snapshot is unavailable."
   | Ok snapshot ->
@@ -950,7 +974,7 @@ let read_snapshot database request command =
                    | Overlay.Missing_page { uuid; _ } ->
                      Hashtbl.replace titles (Graph.Uuid.to_string uuid) None)
                  pages
-             | Error _ -> Printf.eprintf "journal: phase=presentation operation=readTagTitles code=enrichmentUnavailable recovery=refresh\n%!");
+             | Error _ -> on_enrichment_error ());
            let tag_titles =
              List.filter_map
                (fun uuid ->
@@ -1348,7 +1372,7 @@ let acknowledge_changes session request generation through =
       response request (Protocol.V2_changes_acknowledged { generation; through }))
 ;;
 
-let execute_database session ~response_budget_bytes request =
+let execute_database ~on_enrichment_error session ~response_budget_bytes request =
   match request.Protocol.command with
   | Protocol.V2_pull_changes { generation; after; limit } ->
     pull_changes session request generation after limit
@@ -1364,7 +1388,7 @@ let execute_database session ~response_budget_bytes request =
     | V2_clear_task_status _ ) as command ->
     execute_mutation session.database request command
   | command ->
-    let result = read_snapshot session.database request command in
+    let result = read_snapshot ~on_enrichment_error session.database request command in
     let budget = min response_budget_bytes Protocol.maximum_response_bytes in
     if Protocol.encoded_response_bytes result <= budget
     then result
@@ -1695,14 +1719,18 @@ let handle_sync_worker_effect t = function
             let* _ = Database.commit_mirror_deletion prepared
               |> Result.map_error (fun _ -> "Local deletion did not commit; its resources were preserved.") in
             committed := true;
+            let report code =
+              if not t.stopped && current () then t.dependencies.publish (Core.Diagnostic code) in
+            if not (Database.mirror_deletion_committed prepared)
+            then report "worker.confirmMirrorRetirement";
             (* The mirror receipt is the durable commit authority. Cleanup failure
                retains this coordinator journal for exact replay, not a broad sweep. *)
             (try
                if Database.mirror_deletion_committed prepared then
                  match finish_local_retirement t scope deletion captured ~commit:true with
                  | Ok () -> remove_local_retirement path
-                 | Error _ -> Printf.eprintf "journal: phase=retirement operation=finishLocalRetirement code=cleanupPending\n%!"
-             with _ -> Printf.eprintf "journal: phase=retirement operation=finishLocalRetirement code=cleanupPending\n%!");
+                 | Error _ -> report "worker.finishLocalRetirement"
+             with _ -> report "worker.finishLocalRetirement");
             Hashtbl.remove t.inspections (Graph.Uuid.to_string request.graph_id);
             Ok ())))
       with
@@ -1887,6 +1915,11 @@ let run_request t (type a) (request : a Core.runner_request)
      | Some session ->
        Ok
          (execute_database
+            ~on_enrichment_error:(fun () ->
+              match t.attached with
+              | Some (id, scope) when id=Core.database_handle_id database ->
+                report_current_graph t scope "worker.readTagTitles"
+              | _ -> ())
             session
             ~response_budget_bytes:t.dependencies.config.response_budget_bytes
             request))
@@ -1907,13 +1940,7 @@ let complete t (Core.Request (ticket, request)) =
     t.post (Core.Runner_completed (Core.Sync_worker_effect_completed (ticket, result)))
 ;;
 
-let report_asset_error t (scope : Sync.graph_scope) code =
-  match t.latest_snapshot with
-  | Some snapshot when not t.stopped
-      && snapshot.startup.account_generation = scope.account.account_generation
-      && snapshot.startup.graph_generation = scope.graph_generation ->
-    t.dependencies.publish (Core.Diagnostic code)
-  | _ -> ()
+let report_asset_error = report_current_graph
 ;;
 
 let run_upload t (context : Sync.asset_context) instruction =

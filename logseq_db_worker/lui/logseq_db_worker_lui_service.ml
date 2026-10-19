@@ -405,6 +405,10 @@ let production_dependencies () =
 (* Diagnostic strings are internal signals, never display text. Unknown values
    receive a fixed fallback so exception/path/content strings cannot escape. *)
 let diagnostic_report = function
+  | "worker.readTagTitles" -> "readTagTitles", "presentation", "Tag labels could not be read. Reopen this page, or reopen Journal."
+  | "worker.closeDatabase" -> "closeDatabase", "cleanup", "The current graph could not finish closing. Reopen Journal before trying again."
+  | "worker.confirmMirrorRetirement" -> "confirmMirrorRetirement", "localDeletion", "Local copy removal could not be confirmed as durable. Reopen Journal and check the local copy before trying again."
+  | "worker.finishLocalRetirement" -> "finishLocalRetirement", "localDeletion", "Local copy cleanup is pending. Reopen Journal to resume cleanup."
   | "worker.inspectMirror" -> "inspectMirror", "localRestore", "Local graph inspection failed. Retry or choose another graph."
   | "worker.attachGraph" -> "attachGraph", "localRestore", "The local graph could not be opened. Retry or choose another graph."
   | "worker.inspectSync" -> "inspectSync", "sync", "Sync information is unavailable. Retry sync."

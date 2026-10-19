@@ -223,6 +223,7 @@ type worker_error_occurrence =
   ; operation : string
   ; occurred_at_label : string option
   ; active : bool
+  ; recovery : string
   }
 
 type graph_error =
@@ -636,6 +637,8 @@ let clear_account_drafts state =
   { (clear_graph_surface state) with
     draft_graph = None
   ; graph_drafts = Graph_drafts.empty
+  ; worker_errors = []
+  ; sync_error = None
   }
 ;;
 
@@ -891,7 +894,8 @@ let sync_failure_message = function
   | Non_worker_sync_failure message -> message
 ;;
 
-let record_worker_error state ~operation ?request_id ?phase error =
+let record_worker_error state ~operation ?request_id ?phase
+    ?(recovery = "Retry the operation. If it persists, reopen Journal.") error =
   let occurrence =
     { sequence = state.next_worker_error_sequence
     ; error
@@ -912,6 +916,7 @@ let record_worker_error state ~operation ?request_id ?phase error =
                (Journal_calendar.local_minute_of_day calendar mod 60))
           state.calendar
     ; active = true
+    ; recovery
     }
   in
   { state with
@@ -972,13 +977,13 @@ let service_error ~operation message =
   |> Result.get_ok
 ;;
 
-let report_ui_error state ~operation ~phase =
+let report_ui_error ?(code = Logseq_db_worker.Error.Invalid_request) ?(message = "The operation could not finish. Retry the operation or reopen Journal.")
+    ?recovery state ~operation ~phase =
   if List.exists (fun (e:worker_error_occurrence) -> e.active && e.operation=operation
        && e.phase=Some phase && e.graph_generation=state.graph_state.generation) state.worker_errors
   then state
-  else record_worker_error state ~operation ~phase
-      (service_error ~operation
-         "The operation could not finish. Retry the operation or reopen Journal.")
+  else record_worker_error state ~operation ~phase ?recovery
+      (Logseq_db_worker.Error.create ~code ~message ~details:[] |> Result.get_ok)
 ;;
 
 let graph_lifecycle_owns_publication error =
@@ -1275,6 +1280,17 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
       timeline =
         Journal_timeline_state.replace_timeline_entry_page state.timeline ~page value
     }
+  | Projection_unavailable operation ->
+    let operation, message = match operation with
+      | `Detail_calendar -> "reconcileDetailCalendar",
+          "The host calendar is unavailable, so this detail refresh could not finish."
+      | `Detail_time -> "reconcileDetail",
+          "The entry time could not be converted to a valid local date and time."
+      | `Detail -> "reconcileDetail",
+          "Some entry data is unsupported or invalid, so the detail view could not be rebuilt." in
+    report_ui_error state ~operation ~phase:"presentation" ~message
+      ~code:Logseq_db_worker.Error.Unsupported_semantics
+      ~recovery:"Reopen this page. If it persists, reopen Journal."
   | Children_reconciled detail ->
     let routes =
       Journal_routes.map_details state.routes ~f:(fun current ->
@@ -1436,6 +1452,20 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
        | Projection_failure message -> Non_worker_sync_failure message)
 ;;
 
+let application_error_rows errors =
+  List.concat_map
+    (fun (occurrence : worker_error_occurrence) ->
+       [ "Operation", occurrence.operation
+       ; "Status", (if occurrence.active then "Active" else "Resolved")
+       ; "Stage", Option.value occurrence.phase ~default:"graph operation"
+       ; "Reason", Logseq_db_worker.Error.message occurrence.error
+       ; "Code", Logseq_db_worker.Error.code_string (Logseq_db_worker.Error.code occurrence.error)
+       ; "Scope", Printf.sprintf "graph generation=%d" occurrence.graph_generation
+       ; "Recovery", occurrence.recovery
+       ])
+    errors
+;;
+
 module Root_navigation = struct
   type t = state
 
@@ -1478,6 +1508,8 @@ module Root_navigation = struct
     ; timeline_notice = None
     }
   ;;
+
+  let diagnostic_rows state = application_error_rows state.worker_errors
 
   let create ~graph_generation = replace_graph initial_state graph_generation None
 
@@ -2767,15 +2799,7 @@ let diagnostics_page ?(errors = []) ~snapshot ~graph ~admission diagnostics disp
     @ diagnostic_groups diagnostics
     @ (if errors=[] then [] else
         [ "Application errors",
-          List.concat_map (fun (occurrence:worker_error_occurrence) ->
-            [ "Operation", occurrence.operation
-            ; "Status", (if occurrence.active then "Active" else "Resolved")
-            ; "Stage", Option.value occurrence.phase ~default:"graph operation"
-            ; "Reason", Logseq_db_worker.Error.message occurrence.error
-            ; "Code", Logseq_db_worker.Error.code_string (Logseq_db_worker.Error.code occurrence.error)
-            ; "Scope", Printf.sprintf "graph generation=%d" occurrence.graph_generation
-            ; "Recovery", "Retry the operation. If it persists, reopen Journal."
-            ]) errors
+          application_error_rows errors
         ])
   in
   Presentation.form
@@ -7262,9 +7286,13 @@ let create
   let dispatch event =
     latest_patch := "";
     (match !current_app with
-     | Some { app; _ } ->
-       ignore (Lui_app.dispatch_event app event);
-       ignore (Lui_app.flush app)
+     | Some { app; send_action; _ } ->
+       Ui.with_event_error_handler
+         (fun operation -> send_action (Update (fun state ->
+           report_ui_error state ~operation ~phase:"native", Effect.ignore)))
+         (fun () ->
+           ignore (Lui_app.dispatch_event app event);
+           ignore (Lui_app.flush app))
      | None -> ());
     !latest_patch
   in
@@ -7272,7 +7300,11 @@ let create
     latest_patch := "";
     (match !current_app with
      | Some { app; send_action; _ } ->
-       (match Lui_runtime.extension_identifier (Lui_app.runtime app) node with
+       Ui.with_event_error_handler
+         (fun operation -> send_action (Update (fun state ->
+           report_ui_error state ~operation ~phase:"native", Effect.ignore)))
+         (fun () ->
+           (match Lui_runtime.extension_identifier (Lui_app.runtime app) node with
         | Some identifier ->
           let values = decode_extension_values values in
           let report operation = send_action (Update (fun state ->
@@ -7290,7 +7322,7 @@ let create
              ignore (Lui_app.dispatch_event app
                (Lui_protocol.ExtensionEvent (node, identifier, name, values))))
         | None -> ());
-       ignore (Lui_app.flush app)
+           ignore (Lui_app.flush app))
      | None -> ());
     !latest_patch
   in

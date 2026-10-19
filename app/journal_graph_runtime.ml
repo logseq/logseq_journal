@@ -66,6 +66,7 @@ type payload =
       { page : Projection.page
       ; value : Projection.timeline_entry_page
       }
+  | Projection_unavailable of [ `Detail_calendar | `Detail_time | `Detail ]
   | Children_reconciled of Projection.detail
   | Update_conflict of Projection.block
   | Subtree_deleted of
@@ -2967,7 +2968,7 @@ let receive_response t (protocol_response : Protocol.response) =
                  Option.iter
                    (fun children ->
                       match projection_time_context t with
-                      | Error _ -> Printf.eprintf "journal: phase=presentation operation=reconcileDetailCalendar code=projectionUnavailable recovery=refresh\n%!"
+                      | Error _ -> reconciled := response (Projection_unavailable `Detail_calendar) :: !reconciled
                       | Ok time_context ->
                         (match
                            detail_projection
@@ -2980,7 +2981,12 @@ let receive_response t (protocol_response : Protocol.response) =
                          | Ok detail ->
                            reconciled
                            := response (Children_reconciled detail) :: !reconciled
-                         | Error _ -> Printf.eprintf "journal: phase=presentation operation=reconcileDetail code=projectionUnavailable recovery=refresh\n%!"))
+                         | Error message ->
+                           let reason =
+                             if String.starts_with ~prefix:"local time conversion failed:" message
+                                || String.starts_with ~prefix:"creation local " message
+                             then `Detail_time else `Detail in
+                           reconciled := response (Projection_unavailable reason) :: !reconciled))
                    (Hashtbl.find_opt t.detail_children key);
                  Some interest)
                else Some interest)

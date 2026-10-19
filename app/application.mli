@@ -129,6 +129,7 @@ module Root_navigation : sig
     | Account_cleared
     | Local_copy_deleted
 
+  val diagnostic_rows : t -> (string * string) list
   val create : graph_generation:int -> t
   val step : t -> event -> t
   val destination : t -> Journal_routes.destination

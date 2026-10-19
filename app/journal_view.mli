@@ -3,6 +3,8 @@
 
 type t
 
+val with_event_error_handler : (string -> unit) -> (unit -> 'a) -> 'a
+
 val mount : t -> Lui_elements.t
 
 module Key : sig
