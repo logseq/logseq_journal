@@ -31,7 +31,10 @@ struct JournalRuntimeHost: View {
             (failure as? JournalRuntime.Failure)?.errorDescription ??
             "Journal could not start (runtime.start.failed). Retry opening Journal.")
         } actions: {
-          Button("Retry") { runtime?.stop(); runtime = nil; failure = nil; clock.restart(); retry += 1 }
+          Button("Retry") {
+            guard runtime?.stop() != false else { return }
+            runtime = nil; failure = nil; clock.restart(); retry += 1
+          }
             .accessibilityIdentifier("journal-runtime-retry")
         }
       } else if let runtime, let rootID = runtime.rootID {

@@ -6050,6 +6050,28 @@ let test_detail_reconciliation_diagnostics mode =
     (List.length (step read (P.V2_page_outcome (V2_present_page {page; revision="p2"}))).responses)
 ;;
 
+(* Root_navigation owns acceptance of feed completions and its issue ledger.
+   Generate the failure through the real graph runtime, then retire its owner. *)
+let test_retired_feed_failure_does_not_publish_diagnostics projection =
+  let module R = Journal_graph_runtime in
+  let module A = Application.Root_navigation in
+  let runtime = R.create () in
+  let output = R.submit runtime (Journal_graph_request.Load_feed
+    {before_day=None; day_limit=(if projection then 0 else 7);
+     blocks_per_day=32; slot_limit=64; request_generation=9L}) in
+  let responses = if projection then output.responses else
+    match output.requests with
+    | [request] -> (R.fail_request runtime request ~message:"Retired transport failed.").responses
+    | _ -> Alcotest.fail "expected admitted feed request" in
+  Alcotest.(check int) "real producer emitted one failure" 1 (List.length responses);
+  let state = A.create ~graph_generation:7
+    |> fun state -> A.step state (Capture_edited "retained draft") in
+  let state = A.step state (Graph_replaced {generation=8; graph_id=None}) in
+  let state = List.fold_left (fun state response -> A.step state (Completed response)) state responses in
+  Alcotest.(check (list (pair string string))) "retired feed cannot create a current issue" []
+    (A.diagnostic_rows state)
+;;
+
 let () =
   if Sys.getenv_opt "JOURNAL_UNLOCK_SYNTHETIC_HOST" = Some "1"
   then (
@@ -6059,6 +6081,10 @@ let () =
     "application view"
     [ ( "diagnostic identity", [ Alcotest.test_case "actual worker identity" `Quick test_diagnostic_identity_comes_from_worker ])
     ; ( "diagnostic failure", [
+      Alcotest.test_case "retired feed Worker failure is ignored" `Quick
+        (fun () -> test_retired_feed_failure_does_not_publish_diagnostics false);
+      Alcotest.test_case "retired feed projection failure is ignored" `Quick
+        (fun () -> test_retired_feed_failure_does_not_publish_diagnostics true);
       Alcotest.test_case "mounted malformed list reaches Diagnostics" `Quick (fun () -> run_favorites_native_visibility ~malformed_native_event:`List ());
       Alcotest.test_case "mounted malformed row reaches Diagnostics" `Quick (fun () -> run_favorites_native_visibility ~malformed_native_event:`Row ());
       Alcotest.test_case "mounted malformed extension reaches Diagnostics" `Quick (fun () -> run_favorites_native_visibility ~malformed_native_event:`Extension ());

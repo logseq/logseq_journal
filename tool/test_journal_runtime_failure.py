@@ -38,7 +38,7 @@ int32_t lui_ocaml_start(void (*patch)(const char *), int32_t p, int32_t h, const
   if (mode == 1) return 0;
   patch(mode == 2 ? "invalid" : "valid"); return 1;
 }
-int32_t lui_ocaml_stop(void) { stops++; return 1; }
+int32_t lui_ocaml_stop(void) { stops++; return mode == 7 ? 0 : 1; }
 int32_t journal_ocaml_pump(void) { return mode == 3 ? 0 : 1; }
 void journal_ocaml_set_wakeup_callback(void (*f)(void)) {}
 void journal_ocaml_set_platform_request_callback(void (*f)(const char *,int32_t)) {}
@@ -58,7 +58,7 @@ int32_t journal_ocaml_platform_failure(const char *d,int32_t n) { platform_calls
          str(ROOT / "apple-tests/platform-services/JournalRuntimeFailureTests.swift"),
          str(work / "bridge.o"), "-o", str(executable)])
     failures = []
-    for scenario in ["success", "rejected", "invalid-patch", "pump", "platform-event", "platform-response", "platform-failure", "stopped-response", "stopped-failure"]:
+    for scenario in ["success", "rejected", "invalid-patch", "pump", "platform-event", "platform-response", "platform-failure", "stopped-response", "stopped-failure", "stop-retry", "stop-failure"]:
         result = subprocess.run([str(executable), scenario], cwd=work, capture_output=True, text=True)
         print(f"runtime {scenario}: exit={result.returncode}")
         if result.returncode:

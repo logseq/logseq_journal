@@ -27,14 +27,23 @@ let journalAppIcons: [String: String] = [:]
 @MainActor @main struct JournalRuntimeFailureTests {
   static func main() async throws {
     let scenario = CommandLine.arguments[1]
-    let modes = ["rejected":1, "invalid-patch":2, "pump":3, "platform-event":4, "platform-response":5, "platform-failure":6]
+    let modes = ["rejected":1, "invalid-patch":2, "pump":3, "platform-event":4, "platform-response":5, "platform-failure":6, "stop-retry":7, "stop-failure":7]
     setMode(Int32(modes[scenario] ?? 0))
     let platform = JournalApplicationPlatform()
     let runtime = try JournalRuntime(platform: platform, startupPayload: Data(),
       extensionRegistry: LUIAppleExtensionRegistry())
     var reported: Error?
     do { try runtime.start() } catch { reported = error }
-    if scenario == "stopped-response" || scenario == "stopped-failure" {
+    if scenario == "stop-retry" || scenario == "stop-failure" {
+      precondition(reported == nil && platform.connected)
+      runtime.stop()
+      precondition(runtime.failure == .stop && !platform.connected,
+        "Failed native cleanup must remain visible and detach platform delivery")
+      if scenario == "stop-retry" { setMode(0) }
+      runtime.stop()
+      precondition(stopCount() == 2, "Retry must reattempt a previously rejected native cleanup")
+      precondition(runtime.failure == .stop, "Cleanup must not erase the failure before the host admits retry")
+    } else if scenario == "stopped-response" || scenario == "stopped-failure" {
       platform.hold = true
       let delivery = Task { await runtime.deliverPlatformRequest(Data([0, 1])) }
       while platform.waiter == nil { await Task.yield() }
