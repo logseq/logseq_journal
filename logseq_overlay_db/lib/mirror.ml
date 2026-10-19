@@ -33,7 +33,7 @@ let sqlite_result sqlite result =
 let import_snapshot_rows ~snapshot_path ~expected_rows database_path =
   let sqlite = Sqlite3.db_open database_path in
   let rollback () = ignore (Sqlite3.exec sqlite "ROLLBACK") in
-  let close () = ignore (Sqlite3.db_close sqlite) in
+  let close () = (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ) in
   let fail message =
     rollback ();
     close ();
@@ -170,7 +170,9 @@ let close_storage staged =
     | Ok () ->
       staged.storage_closed <- true;
       Ok ()
-    | Error _ -> Error "snapshot storage cannot be closed")
+    | Error _ ->
+      Printf.eprintf "journal: phase=cleanup operation=closeSnapshotStorage code=closePending recovery=reopen\n%!";
+      Error "snapshot storage cannot be closed")
 ;;
 
 let initialize_plaintext_table sqlite =
@@ -188,7 +190,7 @@ let initialize_plaintext_table sqlite =
 let stage_plaintexts staged replacements =
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE staged.database_path in
   Fun.protect
-    ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ))
     (fun () ->
        Result.bind (initialize_plaintext_table sqlite) (fun () ->
          Result.bind
@@ -237,7 +239,7 @@ let stage_plaintexts staged replacements =
 let apply_staged_plaintexts staged =
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE staged.database_path in
   Fun.protect
-    ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ))
     (fun () ->
        Result.bind (initialize_plaintext_table sqlite) (fun () ->
          let statement =
@@ -297,7 +299,7 @@ let apply_staged_plaintexts staged =
 let initialize_ledgers path metadata =
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
   Fun.protect
-    ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then Printf.eprintf "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n%!" ))
     (fun () ->
        Result.bind
          (Logseq_db_storage.Sync_checkpoint_store.initialize_database sqlite metadata)

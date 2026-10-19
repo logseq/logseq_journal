@@ -28,10 +28,10 @@ static journal_wakeup_callback wakeup_callback = NULL;
 static journal_platform_request_callback platform_request_callback = NULL;
 
 static void report_ocaml_exception(const char *where, value result) {
-  char *message = caml_format_exception(Extract_exception(result));
-  fprintf(stderr, "journal_lui_bridge: OCaml exception in %s: %s\n",
-          where, message);
-  caml_stat_free(message);
+  (void)result;
+  /* Exception text may contain credentials, paths or graph content. The return
+     code reaches the native host, which can report failure without a patch. */
+  fprintf(stderr, "journal_lui_bridge: operation=%s code=ocamlCallbackFailed\n", where);
 }
 
 typedef struct {
@@ -77,7 +77,7 @@ static int release_and_deliver(patch_response response) {
 
 static value copy_bytes(const char *data, int32_t length) {
   value text = caml_alloc_string((mlsize_t)length);
-  memcpy(Bytes_val(text), data, (size_t)length);
+  if (length > 0) memcpy(Bytes_val(text), data, (size_t)length);
   return text;
 }
 
@@ -338,8 +338,10 @@ LUI_EXPORT int32_t journal_ocaml_pump(void) {
 }
 
 /* Host -> OCaml LJP2 envelopes (binary safe). */
-static void deliver_platform(const char *name, const char *data,
-                             int32_t length) {
+static int32_t deliver_platform(const char *name, const char *data,
+                                int32_t length) {
+  if (length < 0 || (length > 0 && data == NULL)) return 0;
+  int32_t accepted = 0;
   caml_leave_blocking_section();
   const value *handler = caml_named_value(name);
   if (handler != NULL) {
@@ -347,27 +349,30 @@ static void deliver_platform(const char *name, const char *data,
     value result = caml_callback_exn(*handler, payload);
     if (Is_exception_result(result)) {
       report_ocaml_exception(name, result);
+    } else {
+      accepted = 1;
     }
   }
   caml_enter_blocking_section();
+  return accepted;
 }
 
-LUI_EXPORT void journal_ocaml_platform_event(const char *data,
-                                             int32_t length) {
-  deliver_platform("journal_ocaml_platform_event", data, length);
+LUI_EXPORT int32_t journal_ocaml_platform_event(const char *data,
+                                               int32_t length) {
+  return deliver_platform("journal_ocaml_platform_event", data, length);
 }
 
-LUI_EXPORT void journal_ocaml_platform_response(const char *data,
-                                                int32_t length) {
-  deliver_platform("journal_ocaml_platform_response", data, length);
+LUI_EXPORT int32_t journal_ocaml_platform_response(const char *data,
+                                                  int32_t length) {
+  return deliver_platform("journal_ocaml_platform_response", data, length);
 }
 
 /* The host reports a failed platform request by passing the original
    request envelope; OCaml resolves the pending continuation with an
    error instead of leaving it parked forever. */
-LUI_EXPORT void journal_ocaml_platform_failure(const char *data,
-                                               int32_t length) {
-  deliver_platform("journal_ocaml_platform_failure", data, length);
+LUI_EXPORT int32_t journal_ocaml_platform_failure(const char *data,
+                                                 int32_t length) {
+  return deliver_platform("journal_ocaml_platform_failure", data, length);
 }
 
 /* Host-installed callbacks for OCaml -> host delivery. */

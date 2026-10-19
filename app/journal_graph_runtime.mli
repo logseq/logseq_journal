@@ -67,6 +67,7 @@ type payload =
       { page : Journal_graph_projection.page
       ; value : Journal_graph_projection.timeline_entry_page
       }
+  | Projection_unavailable of [ `Detail_calendar | `Detail_time | `Detail ]
   | Children_reconciled of Journal_graph_projection.detail
   | Update_conflict of Journal_graph_projection.block
   | Subtree_deleted of

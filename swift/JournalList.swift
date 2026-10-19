@@ -202,6 +202,9 @@ import Observation
       if nextPayload != payload {
         payload = nextPayload
         snapshot = nextPayload.flatMap(Snapshot.init)
+        if snapshot == nil {
+          JournalExtensions.report(context: context, code: "diagnostic.nativePropsDecode")
+        }
         let positions = snapshot?.positions ?? [:]
         rowIncarnations = positions.reduce(into: [:]) { result, entry in
           result[entry.key] = rowIncarnations[entry.key] ?? UUID()

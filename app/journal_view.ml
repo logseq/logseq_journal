@@ -9,6 +9,18 @@
    and test_id so [For_testing] can recover them like the old widget
    identity did. *)
 
+(* Dynamically bound by the owning Application only while it dispatches a
+   mounted event. Restoring the previous handler also handles nested dispatch. *)
+let event_error_handler = ref (fun (_ : string) -> ())
+
+let with_event_error_handler handler f =
+  let previous = !event_error_handler in
+  event_error_handler := handler;
+  Fun.protect ~finally:(fun () -> event_error_handler := previous) f
+;;
+
+let report_event_error operation = !event_error_handler operation
+
 type toolbar_control_props = { mode : string; title : string } [@@deriving yojson]
 
 type label_content =
@@ -1711,11 +1723,11 @@ module View = struct
         match read_json Json.row_event_of_yojson payload with
         | Ok wire -> Option.iter (fun handler -> invoke handler Event.Payload.Unit)
             (Hashtbl.find_opt row_actions (wire.row, wire.key))
-        | Error _ -> ()
+        | Error _ -> report_event_error "decodeListRowEvent"
       in
       let on_event (event : Journal_lui_native.event) =
         match read_json Json.event_of_yojson event.payload with
-        | Error _ -> ()
+        | Error _ -> report_event_error "decodeListEvent"
         | Ok wire ->
           match wire.event_type with
           | "visible_range" ->
@@ -2085,7 +2097,7 @@ module Native_widget = struct
              payload
          with
          | Ok event -> callback event
-         | Error _ -> ())
+         | Error _ -> report_event_error "decodeExtensionEvent")
       | _ -> ())
   ;;
 
@@ -2098,7 +2110,7 @@ module Native_widget = struct
       ~on_event:(fun event ->
         match decode extension event with
         | Ok decoded -> on_event decoded
-        | Error _ -> ())
+        | Error _ -> report_event_error "decodeExtensionEvent")
       extension.Extension.identifier
       context
       parent

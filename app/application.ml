@@ -224,6 +224,7 @@ type worker_error_occurrence =
   ; operation : string
   ; occurred_at_label : string option
   ; active : bool
+  ; recovery : string
   }
 
 type graph_error =
@@ -656,6 +657,8 @@ let clear_account_drafts state =
   { (clear_graph_surface state) with
     draft_graph = None
   ; graph_drafts = Graph_drafts.empty
+  ; worker_errors = []
+  ; sync_error = None
   }
 ;;
 
@@ -730,6 +733,11 @@ let apply_manager_state state (manager_state : Graph_service.state) =
       previous.startup.account_generation <> snapshot.startup.account_generation
       || previous.startup.graph_generation <> snapshot.startup.graph_generation
     | None -> true in
+  let state =
+    if owner_changed && Option.is_some state.manager
+    then {state with worker_errors=[]; sync_error=None}
+    else state
+  in
   let state =
     match state.manager with
     | Some previous
@@ -909,7 +917,8 @@ let sync_failure_message = function
   | Non_worker_sync_failure message -> message
 ;;
 
-let record_worker_error state ~operation ?request_id ?phase error =
+let record_worker_error state ~operation ?request_id ?phase
+    ?(recovery = "Retry the operation. If it persists, reopen Journal.") error =
   let occurrence =
     { sequence = state.next_worker_error_sequence
     ; error
@@ -930,11 +939,13 @@ let record_worker_error state ~operation ?request_id ?phase error =
                (Journal_calendar.local_minute_of_day calendar mod 60))
           state.calendar
     ; active = true
+    ; recovery
     }
   in
   { state with
     next_worker_error_sequence = Int64.succ state.next_worker_error_sequence
   ; worker_errors = occurrence :: state.worker_errors
+      |> List.to_seq |> Seq.take 32 |> List.of_seq
   }
 ;;
 
@@ -958,7 +969,11 @@ let failure_source_message = function
 let record_failure_source state = function
   | Journal_graph_runtime.Worker_failure worker_failure ->
     record_runtime_worker_failure state worker_failure
-  | Projection_failure _ -> state
+  | Projection_failure _ ->
+    let error = Logseq_db_worker.Error.create ~code:Unsupported_semantics
+        ~message:"The graph view could not be prepared. Retry the operation." ~details:[]
+      |> Result.get_ok in
+    record_worker_error state ~operation:"projectGraph" ~phase:"presentation" error
 ;;
 
 let resolve_worker_errors state =
@@ -983,6 +998,15 @@ let service_error ~operation message =
     ~details:[]
     ~origin
   |> Result.get_ok
+;;
+
+let report_ui_error ?(code = Logseq_db_worker.Error.Invalid_request) ?(message = "The operation could not finish. Retry the operation or reopen Journal.")
+    ?recovery state ~operation ~phase =
+  if List.exists (fun (e:worker_error_occurrence) -> e.active && e.operation=operation
+       && e.phase=Some phase && e.graph_generation=state.graph_state.generation) state.worker_errors
+  then state
+  else record_worker_error state ~operation ~phase ?recovery
+      (Logseq_db_worker.Error.create ~code ~message ~details:[] |> Result.get_ok)
 ;;
 
 let graph_lifecycle_owns_publication error =
@@ -1057,7 +1081,9 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
     else { state with reference_sources }
   | Favorites_loaded (request, result) -> favorites_event state (Loaded (request, result))
   | Favorites_failed (request, stale, message) ->
-    favorites_event state (Failed (request, stale, message))
+    let next = favorites_event state (Failed (request, stale, message)) in
+    if next == state || stale then next
+    else report_ui_error next ~operation:"listFavorites" ~phase:"read"
   | Favorites_invalidated -> favorites_event state Invalidate
   | Journal_graph_runtime.Graph_ready info ->
     ignore info.admission_facts;
@@ -1192,7 +1218,10 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
         ~missing
         ~message:(failure_source_message failure)
     in
-    if routes == state.routes then state else { state with routes }
+    if routes == state.routes then state
+    else
+      let state = if stale_cursor then state else record_failure_source state failure in
+      { state with routes }
   | Feed_failed { request_generation; failure } ->
     let state = record_failure_source state failure in
     let message = failure_source_message failure in
@@ -1299,6 +1328,17 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
       timeline =
         Journal_timeline_state.replace_timeline_entry_page state.timeline ~page value
     }
+  | Projection_unavailable operation ->
+    let operation, message = match operation with
+      | `Detail_calendar -> "reconcileDetailCalendar",
+          "The host calendar is unavailable, so this detail refresh could not finish."
+      | `Detail_time -> "reconcileDetail",
+          "The entry time could not be converted to a valid local date and time."
+      | `Detail -> "reconcileDetail",
+          "Some entry data is unsupported or invalid, so the detail view could not be rebuilt." in
+    report_ui_error state ~operation ~phase:"presentation" ~message
+      ~code:Logseq_db_worker.Error.Unsupported_semantics
+      ~recovery:"Reopen this page. If it persists, reopen Journal."
   | Children_reconciled detail ->
     let routes =
       Journal_routes.map_details state.routes ~f:(fun current ->
@@ -1460,6 +1500,20 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
        | Projection_failure message -> Non_worker_sync_failure message)
 ;;
 
+let application_error_rows errors =
+  List.concat_map
+    (fun (occurrence : worker_error_occurrence) ->
+       [ "Operation", occurrence.operation
+       ; "Status", (if occurrence.active then "Active" else "Resolved")
+       ; "Stage", Option.value occurrence.phase ~default:"graph operation"
+       ; "Reason", Logseq_db_worker.Error.message occurrence.error
+       ; "Code", Logseq_db_worker.Error.code_string (Logseq_db_worker.Error.code occurrence.error)
+       ; "Scope", Printf.sprintf "graph generation=%d" occurrence.graph_generation
+       ; "Recovery", occurrence.recovery
+       ])
+    errors
+;;
+
 module Root_navigation = struct
   type t = state
 
@@ -1508,6 +1562,8 @@ module Root_navigation = struct
     ; timeline_notice = None
     }
   ;;
+
+  let diagnostic_rows state = application_error_rows state.worker_errors
 
   let create ~graph_generation = replace_graph initial_state graph_generation None
 
@@ -1616,6 +1672,9 @@ module Root_navigation = struct
                owner
                (Option.map (fun message -> Local_capture_failure message) error)
            in
+           let state = match error with
+             | None -> state
+             | Some _ -> report_ui_error state ~operation:"selectAttachment" ~phase:"native" in
            { state with
              capture_picker_armed =
                (match event with
@@ -2898,12 +2957,16 @@ let error_info_page ~sync_error ~operation_failure occurrences dispatch =
   |> V.Body.with_test_id (Ui.Test_id.string "journal-error-info-page")
 ;;
 
-let diagnostics_page ~snapshot ~graph ~admission diagnostics dispatch =
+let diagnostics_page ?(errors = []) ~snapshot ~graph ~admission diagnostics dispatch =
   let groups =
     [ "Phases", diagnostic_phase_rows ~snapshot ~graph
     ; "Overlay DB", admission_rows admission
     ]
     @ diagnostic_groups diagnostics
+    @ (if errors=[] then [] else
+        [ "Application errors",
+          application_error_rows errors
+        ])
   in
   Presentation.form
     (List.map
@@ -3820,6 +3883,16 @@ type app_context =
 let latest_patch = ref ""
 let current_app : app_context option ref = ref None
 
+let dispose_context context =
+  context.running := false;
+  current_app := None;
+  Worker.Private.request_stop context.client;
+  (try context.release_staging () with _ ->
+     Printf.eprintf "journal: operation=releaseDraftStaging code=cleanupPending\n%!");
+  (try ignore (Lui_app.dispose context.app) with _ ->
+     Printf.eprintf "journal: operation=disposeApplication code=cleanupPending\n%!")
+;;
+
 let decode_extension_values payload =
   let json =
     try Yojson.Safe.from_string payload with
@@ -3951,7 +4024,32 @@ let start
           Hashtbl.add admitted_protocol_ids protocol.Logseq_db_worker.Protocol.request_id worker_id;
           if observe_projection then !projection_request_accepted protocol) protocol;
         accepted
-      | (Full | Not_ready | Stopping) as refused -> refused)
+      | (Full | Not_ready | Stopping) as refused ->
+        (* Latest authentication is staged before the data reservation. Full
+           does not discard that control intent; do not diagnose it as lost. *)
+        (match request, refused with
+         | Graph_service.Client_command (Reconcile_authenticated_user _), Full -> ()
+         | _ ->
+           let operation = match request with
+             | Graph_service.Client_command (Submit_e2ee_password _) -> "submitE2eePassword"
+             | Client_command (Restore_local_account _) -> "restoreLocalAccount"
+             | Client_command (Select_graph _) -> "selectGraph"
+             | Client_command Refresh_catalog -> "refreshCatalog"
+             | Client_command Begin_online_recovery -> "recoverOnline"
+             | Client_command (Set_foreground _) -> "setForeground"
+             | Client_command Return_to_graph_picker -> "returnToGraphPicker"
+             | Client_command _ -> "clientCommand"
+             | Graph_request _ -> "graphRequest"
+             | Import_asset _ -> "importAsset"
+             | Inspect_local_copy _ -> "inspectLocalCopy"
+             | Delete_local_copy _ -> "deleteLocalCopy"
+             | Asset_command _ -> "assetCommand"
+             | Acquire_imported_file _ | Acquire_asset_file _ -> "acquireAssetFile"
+             | Release_asset_file _ -> "releaseAssetFile"
+             | Get_graph_state -> "getGraphState"
+           in
+           Effect.run (set_state (fun state -> report_ui_error state ~operation ~phase:"admission")));
+        refused
   in
   let retire_worker_lease worker_id =
     match Hashtbl.find_opt admitted_graph_requests worker_id with
@@ -6051,8 +6149,10 @@ let start
            else state)
        | Journal_asset_import.Unavailable message ->
          update (fun state ->
-           set_composer_error
-             { state with capture_picker_armed = false }
+           if not state.capture_picker_armed then state
+           else set_composer_error
+             (report_ui_error {state with capture_picker_armed=false}
+                ~operation:"selectAttachment" ~phase:"native")
              (picker_owner state)
              (Some (Local_capture_failure message)))
        | Journal_asset_import.Removed token ->
@@ -6605,12 +6705,15 @@ let start
       state_ref := model;
       model
     | Platform_response (tag, result) ->
+      let current = Hashtbl.mem pending_platform tag in
       (match Hashtbl.find_opt pending_platform tag with
        | Some k ->
          Hashtbl.remove pending_platform tag;
          k result
        | None -> ());
-      model
+      (match result with
+       | Error _ when current -> report_ui_error model ~operation:"platformRequest" ~phase:"native"
+       | Ok _ | Error _ -> model)
     | Environment_changed snapshot ->
       prepare_presentation (sync_startup_presentation { model with environment = snapshot })
   in
@@ -6781,7 +6884,8 @@ let start
       let on_event payload =
         match Journal_asset_import.decode_event payload with
         | Ok event -> dispatch.send (Capture_asset event)
-        | Error _ -> ()
+        | Error _ -> Effect.run (set_state (fun state ->
+            report_ui_error state ~operation:"decodeAttachmentSelection" ~phase:"native"))
       in
       let dispatch =
         match owner with
@@ -7205,6 +7309,7 @@ let start
       | Diagnostics ->
         Some
           (diagnostics_page
+             ~errors:state.worker_errors
              ~snapshot:state.manager
              ~graph:state.graph_state
              ~admission:(Admission_refresh.observation state.admission_refresh)
@@ -7398,7 +7503,7 @@ let start
           done)
        ());
   Effect.run calendar_startup;
-  ignore (Lui_app.start app);
+  if not (Lui_app.start app) then failwith "application.mount.failed";
   ignore (Lui_app.flush app);
   context
 ;;
@@ -7425,16 +7530,14 @@ let create
     latest_patch := "";
     Printexc.record_backtrace true;
     (match decode_config (Bytes.of_string payload) with
-     | Error error ->
-       Printf.eprintf "logseq_journal: failed to decode startup config: %s\n%!" error
+     | Error _ -> failwith "application.decodeStartup.failed"
      | Ok config ->
        let runtime_epoch =
          Journal_worker_ids.Runtime.Epoch.of_int64
            (Int64.of_float (Unix.gettimeofday () *. 1e6))
        in
        (match Journal_worker_runtime.start ~runtime_epoch service config with
-        | Error error ->
-          Printf.eprintf "logseq_journal: failed to start worker: %s\n%!" error
+        | Error _ -> failwith "application.startWorker.failed"
         | Ok client ->
           (try
              ignore
@@ -7447,37 +7550,54 @@ let create
                   ~host_code);
              Option.iter (fun observe -> observe client) on_client
            with
-           | exn ->
-             (* The C bridge drops exceptions during the initial patch emit,
-                so surface startup failures on stderr. *)
-             Printf.eprintf
-               "logseq_journal: app start failed: %s\n%s%!"
-               (Printexc.to_string exn)
-               (Printexc.get_backtrace ()))));
+           | _ ->
+             (match !current_app with
+              | Some context when context.client == client -> dispose_context context
+              | _ -> ());
+             Journal_worker_runtime.stop client;
+             failwith "application.initialize.failed")));
     !latest_patch
   in
   let dispatch event =
     latest_patch := "";
     (match !current_app with
-     | Some { app; _ } ->
-       ignore (Lui_app.dispatch_event app event);
-       ignore (Lui_app.flush app)
+     | Some { app; send_action; _ } ->
+       Ui.with_event_error_handler
+         (fun operation -> send_action (Update (fun state ->
+           report_ui_error state ~operation ~phase:"native", Effect.ignore)))
+         (fun () ->
+           ignore (Lui_app.dispatch_event app event);
+           ignore (Lui_app.flush app))
      | None -> ());
     !latest_patch
   in
   let extension_event node name values =
     latest_patch := "";
     (match !current_app with
-     | Some { app; _ } ->
-       (match Lui_runtime.extension_identifier (Lui_app.runtime app) node with
+     | Some { app; send_action; _ } ->
+       Ui.with_event_error_handler
+         (fun operation -> send_action (Update (fun state ->
+           report_ui_error state ~operation ~phase:"native", Effect.ignore)))
+         (fun () ->
+           (match Lui_runtime.extension_identifier (Lui_app.runtime app) node with
         | Some identifier ->
-          ignore
-            (Lui_app.dispatch_event
-               app
-               (Lui_protocol.ExtensionEvent
-                  (node, identifier, name, decode_extension_values values)))
+          let values = decode_extension_values values in
+          let report operation = send_action (Update (fun state ->
+            report_ui_error state ~operation ~phase:"native", Effect.ignore)) in
+          (match name, Lui_protocol.String_map.find_opt "id" values,
+              Lui_protocol.String_map.find_opt "payload" values with
+           | "event", Some (IntValue (-1)), Some (StringValue "diagnostic.nativePropsDecode") -> report "decodeNativeProps"
+           | "event", Some (IntValue (-1)), Some (StringValue "diagnostic.nativeEventEncode") -> report "encodeNativeEvent"
+           | "event", Some (IntValue (-1)), Some (StringValue "diagnostic.nativeEventDelivery") -> report "deliverNativeEvent"
+           | "event", Some (IntValue _), Some (StringValue _) ->
+             ignore (Lui_app.dispatch_event app
+               (Lui_protocol.ExtensionEvent (node, identifier, name, values)))
+           | "event", _, _ -> report "decodeNativeEvent"
+           | _ ->
+             ignore (Lui_app.dispatch_event app
+               (Lui_protocol.ExtensionEvent (node, identifier, name, values))))
         | None -> ());
-       ignore (Lui_app.flush app)
+           ignore (Lui_app.flush app))
      | None -> ());
     !latest_patch
   in
@@ -7501,7 +7621,8 @@ let create
         then (
           match Journal_platform.decode_environment_event bytes with
           | Ok snapshot -> send_action (Environment_changed snapshot)
-          | Error _ -> ())
+          | Error _ -> send_action (Update (fun state ->
+              report_ui_error state ~operation:"decodeEnvironment" ~phase:"native", Effect.ignore)))
         else Effect.run (apply_platform bytes))
     | None -> ()
   in
@@ -7514,6 +7635,9 @@ let create
         let tag = Bytes.get_uint16_le bytes 6 in
         Journal_pump.enqueue pump (fun () ->
           send_action (Platform_response (tag, Ok bytes))))
+      else Journal_pump.enqueue pump (fun () ->
+        send_action (Update (fun state ->
+          report_ui_error state ~operation:"decodePlatformResponse" ~phase:"native", Effect.ignore)))
     | None -> ()
   in
   let platform_failure payload =
@@ -7526,17 +7650,15 @@ let create
         Journal_pump.enqueue pump (fun () ->
           send_action
             (Platform_response (tag, Error "application platform request failed"))))
+      else Journal_pump.enqueue pump (fun () ->
+        send_action (Update (fun state ->
+          report_ui_error state ~operation:"decodePlatformFailure" ~phase:"native", Effect.ignore)))
     | None -> ()
   in
   let dispose () =
     latest_patch := "";
     (match !current_app with
-     | Some context ->
-       context.running := false;
-       Worker.Private.request_stop context.client;
-       context.release_staging ();
-       ignore (Lui_app.dispose context.app);
-       current_app := None
+     | Some context -> dispose_context context
      | None -> ());
     !latest_patch
   in

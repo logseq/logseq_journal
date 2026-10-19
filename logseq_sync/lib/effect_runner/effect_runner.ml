@@ -477,7 +477,7 @@ let load_catalog local_store account =
       |> Result.map Option.some
       |> Result.map_error (fun message -> Core.Effect_failed message)
     with
-    | Sys_error message -> Error (Core.Effect_failed message))
+    | Sys_error _ -> Error (Core.Effect_failed "The local graph catalog could not be read."))
 ;;
 
 let ensure_directory path =
@@ -511,12 +511,13 @@ let save_catalog local_store account cache =
            let path = cache_path local_store account in
            try
              let channel = open_out_bin path in
-             Fun.protect
-               ~finally:(fun () -> close_out_noerr channel)
-               (fun () -> output_string channel (Core.encode_catalog_cache cache));
-             Ok ()
+             (try
+                output_string channel (Core.encode_catalog_cache cache);
+                close_out channel;
+                Ok ()
+              with exn -> close_out_noerr channel; raise exn)
            with
-           | Sys_error message -> Error (Core.Effect_failed message))))
+           | Sys_error _ -> Error (Core.Effect_failed "The local graph catalog could not be saved."))))
 ;;
 
 let effect_error message = Error (Core.Effect_failed message)
@@ -1787,21 +1788,6 @@ let prune_staged_assets t ~scope ~keep =
       |> Result.map_error asset_cache_failure)
 ;;
 
-let retain_staged_file t ~scope ~file =
-  if t.closed
-  then None
-  else (
-    match scoped_asset_cache t scope with
-    | Error _ -> None
-    | Ok cache ->
-      Option.bind (Asset_cache.retain_staged cache ~file) (fun lease ->
-        match Asset_cache.path cache lease with
-        | Some path -> Hashtbl.replace t.asset_leases (scope, lease) (); Some (lease, path)
-        | None ->
-          Asset_cache.release cache lease;
-          None))
-;;
-
 let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
   let scope = request.context.scope in
   let map_unit result = Result.map (fun () -> Core.Asset_unit) result in
@@ -1889,7 +1875,16 @@ let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
   | Retain_asset_file handle ->
     Ok (Core.Asset_retained (retain_asset_file t ~scope ~handle))
   | Retain_staged_file file ->
-    Ok (Core.Asset_retained (retain_staged_file t ~scope ~file))
+    if t.closed then Ok (Core.Asset_retained None) else cache (fun cache ->
+      let retained = Option.bind (Asset_cache.retain_staged cache ~file) (fun lease ->
+        match Asset_cache.path cache lease with
+        | Some path -> Hashtbl.replace t.asset_leases (scope, lease) (); Some (lease, path)
+        | None -> Asset_cache.release cache lease; None) in
+      Ok (Core.Asset_retained retained))
+    |> Result.map_error (function
+      | Core.Asset_invalid_content _ ->
+        Core.Asset_invalid_content "Attachment preview storage is unavailable"
+      | failure -> failure)
   | Release_asset_file handle ->
     release_asset_file t ~scope ~handle;
     Ok Core.Asset_unit

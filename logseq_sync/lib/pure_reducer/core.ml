@@ -888,7 +888,14 @@ let unchanged next = { next; effects = [] }
 let publish core = Publish (State_changed core.public_state)
 
 let set_snapshot core snapshot =
-  { core with public_state = { core.public_state with snapshot } }
+  let previous = core.public_state.snapshot.startup in
+  let diagnostics =
+    if previous.account_generation <> snapshot.startup.account_generation
+       || previous.graph_generation <> snapshot.startup.graph_generation
+    then { groups = [] }
+    else core.public_state.diagnostics
+  in
+  { core with public_state = { snapshot; diagnostics } }
 ;;
 
 let fail core stage message =
@@ -2571,7 +2578,29 @@ let consume_completion core = function
              (match core.public_state.snapshot.local_deletion with
               | Some (Deletion_in_progress Clearing_selection) ->
                 deletion_failed core Clearing_selection
-              | None | Some _ -> unchanged core)
+              | None | Some _ ->
+                (* Advisory failure does not invalidate the open graph. Retain a
+                   safe report until this scope ends; never expose an IO path. *)
+                let group =
+                  { title = "Sync errors"
+                  ; entries =
+                      [ "saveCatalog",
+                        "saveCatalog · phase=catalog · code=catalog.save.failed · \
+                         Local graph selection could not be saved. Retry by \
+                         refreshing or selecting the graph again."
+                      ]
+                  }
+                in
+                let next =
+                  { core with public_state =
+                      { core.public_state with diagnostics =
+                          { groups = group :: List.filter
+                              (fun g -> g.title <> group.title)
+                              core.public_state.diagnostics.groups }
+                      }
+                  }
+                in
+                { next; effects = [ publish next ] })
            | Load_catalog_kind ->
              fail
                { core with
