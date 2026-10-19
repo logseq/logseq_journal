@@ -34,7 +34,7 @@ let create
       ?(entry_parent_id = Some parent_id)
       ?(sibling_order = "000000000001")
       ?(source = "Literal #journal @person 👩🏽‍💻")
-      ?(task_state = Journal_model.Todo)
+      ?(task_state = Journal_model.Status "00000002-1615-5853-7700-000000000000")
       ?(child_count = 3)
       ?(entry_creation_time = creation_time)
       ?(revision = "block-7")
@@ -66,7 +66,10 @@ let test_entry_preserves_domain_behavior () =
   require
     (String.equal (Journal_model.source entry) "Literal #journal @person 👩🏽‍💻")
     "literal source changed";
-  require (Journal_model.task_state entry = Journal_model.Todo) "task state changed";
+  require
+    (Journal_model.task_state entry
+     = Journal_model.Status "00000002-1615-5853-7700-000000000000")
+    "task state changed";
   require (Journal_model.child_count entry = 3) "child count changed";
   require (String.equal (Journal_model.revision entry) "block-7") "revision changed";
   require
@@ -303,7 +306,8 @@ let test_rich_title_boundaries () =
   List.iter (fun (source, expected) -> require (plain source = expected) "rich title: %s" source)
     [ "prefix " ^ link parent_id ^ " suffix", "prefix Target 中文 suffix"
     ; link mutation_id, link mutation_id
-    ; link "00000000-0000-4000-a000-000000000099", link "00000000-0000-4000-a000-000000000099"
+    ; ( link "00000000-0000-4000-a000-000000000099"
+      , link "00000000-0000-4000-a000-000000000099" )
     ; "`" ^ link id ^ "`", link id
     ; "\\" ^ link id, link id
     ; "((" ^ id ^ "))", "((" ^ id ^ "))"

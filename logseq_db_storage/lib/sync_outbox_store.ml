@@ -64,7 +64,8 @@ let payload_identity record =
   with
   | Error error -> failwith ("unsupported or invalid sync outbox JSON: " ^ error)
   | Ok header ->
-    if header.format_version <> 17 then failwith "unsupported sync outbox JSON format";
+    if header.format_version <> 17 && header.format_version <> 18
+    then failwith "unsupported sync outbox JSON format";
     let identity =
       match header.mutation with
       | Save_block x
@@ -86,7 +87,7 @@ let validate_rows rows =
     | (row : row) :: rest ->
       let id, sequence, revision = payload_identity row.record in
       if
-        not (String.equal id row.mutation_id)
+        (not (String.equal id row.mutation_id))
         || sequence <> row.sequence
         || revision <> 0
         || sequence <= previous
@@ -112,7 +113,7 @@ let read_revision db =
                   values := (Option.get row.(0), Option.get row.(1)) :: !values)))
           (fun () ->
              match !values with
-             | [ "1", revision ] ->
+             | [ ("1", revision) ] ->
                (match int_of_string_opt revision with
                 | Some revision when revision >= 0 -> Ok (Some revision)
                 | _ -> Error "invalid sync outbox revision")
@@ -142,8 +143,10 @@ let read_database db =
           let rows = ref [] in
           Result.bind
             (rc_result db
-               (Sqlite3.exec db
-                  "SELECT mutation_id, sequence, record FROM sync_outbox ORDER BY sequence"
+               (Sqlite3.exec
+                  db
+                  "SELECT mutation_id, sequence, record FROM sync_outbox ORDER BY \
+                   sequence"
                   ~cb:(fun row _ ->
                     rows :=
                       { mutation_id = Option.get row.(0)
@@ -187,10 +190,12 @@ let replace_database db records =
 
 let upsert_rows db rows =
   let statement =
-    Sqlite3.prepare db
+    Sqlite3.prepare
+      db
       "INSERT INTO sync_outbox(mutation_id, sequence, record) VALUES(?, ?, ?) ON \
-       CONFLICT(mutation_id) DO UPDATE SET sequence=excluded.sequence, record=excluded.record WHERE \
-       sync_outbox.sequence<>excluded.sequence OR sync_outbox.record<>excluded.record"
+       CONFLICT(mutation_id) DO UPDATE SET sequence=excluded.sequence, \
+       record=excluded.record WHERE sync_outbox.sequence<>excluded.sequence OR \
+       sync_outbox.record<>excluded.record"
   in
   Fun.protect ~finally:(fun () -> ignore (Sqlite3.finalize statement)) (fun () ->
     let rec loop = function
@@ -221,22 +226,27 @@ let migrate_database db ~revision ~expected_records rows =
                   | None ->
                     Result.bind
                       (rc_result db
-                         (Sqlite3.exec db
-                            "ALTER TABLE sync_outbox RENAME TO sync_outbox_legacy; \
-                             CREATE TABLE sync_outbox(mutation_id TEXT PRIMARY KEY NOT NULL, \
-                             sequence INTEGER UNIQUE NOT NULL CHECK(sequence>0), record TEXT NOT NULL); \
-                             CREATE TRIGGER sync_outbox_sequence_immutable BEFORE UPDATE OF sequence \
-                             ON sync_outbox WHEN NEW.sequence<>OLD.sequence BEGIN SELECT \
-                             RAISE(ABORT, 'sync outbox sequence is immutable'); END; \
-                             CREATE TABLE sync_outbox_metadata(singleton INTEGER PRIMARY KEY \
-                             CHECK(singleton=1), format_version INTEGER NOT NULL CHECK(format_version=1), \
-                             revision INTEGER NOT NULL CHECK(revision>=0))"))
+                            (Sqlite3.exec
+                               db
+                               "ALTER TABLE sync_outbox RENAME TO sync_outbox_legacy; \
+                                CREATE TABLE sync_outbox(mutation_id TEXT PRIMARY KEY \
+                                NOT NULL, sequence INTEGER UNIQUE NOT NULL \
+                                CHECK(sequence>0), record TEXT NOT NULL); CREATE TRIGGER \
+                                sync_outbox_sequence_immutable BEFORE UPDATE OF sequence \
+                                ON sync_outbox WHEN NEW.sequence<>OLD.sequence BEGIN \
+                                SELECT RAISE(ABORT, 'sync outbox sequence is \
+                                immutable'); END; CREATE TABLE \
+                                sync_outbox_metadata(singleton INTEGER PRIMARY KEY \
+                                CHECK(singleton=1), format_version INTEGER NOT NULL \
+                                CHECK(format_version=1), revision INTEGER NOT NULL \
+                                CHECK(revision>=0))"))
                       (fun () ->
                          Result.bind (upsert_rows db rows) (fun () ->
                            rc_result db
                              (Sqlite3.exec db
-                                (Printf.sprintf
-                                   "INSERT INTO sync_outbox_metadata VALUES(1,1,%d); DROP TABLE sync_outbox_legacy"
+                                   (Printf.sprintf
+                                      "INSERT INTO sync_outbox_metadata VALUES(1,1,%d); \
+                                       DROP TABLE sync_outbox_legacy"
                                    revision)))))))
         in
         let result = Result.bind result (fun () -> rc_result db (Sqlite3.exec db "COMMIT")) in
@@ -254,8 +264,12 @@ let apply_delta db delta =
         let revision =
           if delta.revision = delta.expected_revision
           then (
-            let statement = Sqlite3.prepare db
-                "SELECT revision FROM sync_outbox_metadata WHERE singleton=1 AND format_version=1 AND revision=?" in
+            let statement =
+              Sqlite3.prepare
+                db
+                "SELECT revision FROM sync_outbox_metadata WHERE singleton=1 AND \
+                 format_version=1 AND revision=?"
+            in
             Fun.protect ~finally:(fun () -> ignore (Sqlite3.finalize statement)) (fun () ->
               Sqlite3.Rc.check (Sqlite3.bind_int statement 1 delta.expected_revision);
               match Sqlite3.step statement with
@@ -263,8 +277,12 @@ let apply_delta db delta =
               | Sqlite3.Rc.DONE -> Error "sync outbox revision conflict"
               | rc -> rc_result db rc))
           else (
-            let statement = Sqlite3.prepare db
-                "UPDATE sync_outbox_metadata SET revision=? WHERE singleton=1 AND format_version=1 AND revision=?" in
+            let statement =
+              Sqlite3.prepare
+                db
+                "UPDATE sync_outbox_metadata SET revision=? WHERE singleton=1 AND \
+                 format_version=1 AND revision=?"
+            in
             Fun.protect ~finally:(fun () -> ignore (Sqlite3.finalize statement)) (fun () ->
               Sqlite3.Rc.check (Sqlite3.bind_int statement 1 delta.revision);
               Sqlite3.Rc.check (Sqlite3.bind_int statement 2 delta.expected_revision);

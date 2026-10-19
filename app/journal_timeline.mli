@@ -15,7 +15,8 @@ end
 val loading_view : unit -> Ui.View.t
 
 val view
-  :  ?current_day:int
+  :  ?status_name:(Journal_model.task_state -> string)
+  -> ?current_day:int
   -> ?store:Store.t
   -> ?on_region:(string -> unit)
   -> render_source:(string -> string)

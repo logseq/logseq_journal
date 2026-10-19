@@ -116,8 +116,16 @@ type dispatch_item =
   | Dispatch_change of Types.projection_change * unit Eio.Promise.u
   | Stop_dispatch
 
+type task_catalog_cache =
+  { catalog_version : string
+  ; catalog_property : Graph.Uuid.t option
+  ; catalog_default : Graph.Uuid.t option
+  ; catalog_items : Graph.task_status_definition array
+  }
+
 type t =
   { lock : Eio.Mutex.t
+  ; task_catalog_cache : task_catalog_cache option Atomic.t
   ; notification_lock : Eio.Mutex.t
   ; sw : Eio.Switch.t
   ; dispatch_stream : dispatch_item Eio.Stream.t
@@ -786,8 +794,9 @@ let rec ensure_retirement_directory path =
 let mirror_deletion_paths (location : durable_mirror_location) retirement =
   let root = mirror_deletion_directory location in
   let id = retirement_id_to_string retirement in
-  root, Filename.concat (Filename.concat root "states") (id ^ ".json"),
-  Filename.concat (Filename.concat root "pending") (id ^ ".data")
+  ( root
+  , Filename.concat (Filename.concat root "states") (id ^ ".json")
+  , Filename.concat (Filename.concat root "pending") (id ^ ".data") )
 ;;
 
 let write_deletion_receipt path (result : Types.mirror_delete) committed =
@@ -795,7 +804,8 @@ let write_deletion_receipt path (result : Types.mirror_delete) committed =
     [ "version", `Int 2
     ; "graph", Graph.Uuid.to_yojson (Option.get result.graph_uuid)
     ; "retirement", `String (Filename.chop_suffix (Filename.basename path) ".json")
-    ; "previous", `String (Types.Mirror_generation.to_string result.previous_generation)
+          ; ( "previous"
+            , `String (Types.Mirror_generation.to_string result.previous_generation) )
     ; "absent", `String (Types.Mirror_generation.to_string result.absent_generation)
     ; "committed", `Bool committed ]) in
   let temporary, output = Filename.open_temp_file ~temp_dir:(Filename.dirname path) ".retirement-" ".part" in
@@ -809,7 +819,8 @@ let write_deletion_receipt path (result : Types.mirror_delete) committed =
 
 let read_deletion_receipt (location : durable_mirror_location) receipt_path =
   let open Yojson.Safe.Util in
-  if not (is_regular_single_link receipt_path) || (Unix.stat receipt_path).st_size > 4096
+  if
+    (not (is_regular_single_link receipt_path)) || (Unix.stat receipt_path).st_size > 4096
   then failwith "invalid retirement receipt";
   let json = Yojson.Safe.from_file receipt_path in
   let version = json |> member "version" |> to_int in
@@ -830,7 +841,8 @@ let collect_retired_mirrors (location : durable_mirror_location) =
   let root = Filename.concat (mirror_deletion_directory location) "pending" in
   if Sys.file_exists root then
     Sys.readdir root |> Array.iter (fun name ->
-      if Filename.check_suffix name ".data" then
+      if Filename.check_suffix name ".data"
+      then (
         try
           let id = String.sub name 0 (String.length name - 5) |> retirement_id_of_string |> Result.get_ok in
           let _, receipt, data = mirror_deletion_paths location id in
@@ -842,7 +854,8 @@ let collect_retired_mirrors (location : durable_mirror_location) =
             | Error _ -> ()
             | Ok owner -> Fun.protect ~finally:(fun () -> ignore (Ownership.release owner))
                 (fun () -> remove_mirror_tree data; sync_deletion_directory root))
-        with _ -> ())
+        with
+        | _ -> ()))
 ;;
 
 let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement =
@@ -860,9 +873,15 @@ let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement
     let read_existing () = if exists receipt then Some (read_deletion_receipt location receipt) else None in
     let existing = read_existing () in
     let preparation ?ownership ?committed ~durable generation =
-      { deletion_location = location; deletion_generation = generation; deletion_ancestors = ancestors
+      ( { deletion_location = location
+        ; deletion_generation = generation
+        ; deletion_ancestors = ancestors
       ; deletion_retirement = retirement; deletion_ownership = ownership; deletion_committed = committed
-      ; deletion_cancelled = false; deletion_durable = durable }, generation in
+        ; deletion_cancelled = false
+        ; deletion_durable = durable
+        }
+      , generation )
+    in
     match existing with
     | Some (result, committed, version) when committed || exists data ->
       let persist_commit () =
@@ -879,7 +898,7 @@ let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement
         | Ok owner -> Fun.protect ~finally:(fun () -> ignore (Ownership.release owner)) (fun () ->
           validate_deletion_ancestors ancestors;
           validate_retirement_directories location;
-          if not (same_directory data observed) || read_existing () <> existing
+               if (not (same_directory data observed)) || read_existing () <> existing
           then failwith "retired mirror changed while acquiring ownership";
           (* An obsolete transaction can only finish its already-retired namespace;
              it never receives a new canonical rename capability. Its generation
@@ -892,9 +911,11 @@ let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement
       (* With neither namespace present there is nothing to commit. Recheck the
          receipt and destination rather than inferring commit from absence. *)
       validate_deletion_ancestors ancestors;
-      if exists data || read_existing () <> existing then Error Types.Mirror_delete_stale else
+      if exists data || read_existing () <> existing
+      then Error Types.Mirror_delete_stale
+      else (
       let canceled, _ = preparation ~durable:false old.previous_generation in
-      Ok ({ canceled with deletion_cancelled = true }, old.previous_generation)
+        Ok ({ canceled with deletion_cancelled = true }, old.previous_generation))
     | _ ->
       let observed = directory_stat graph_directory in
       validate_deletion_lease graph_directory;
@@ -902,15 +923,24 @@ let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement
        | Error Ownership.Already_owned -> Error Types.Mirror_delete_busy
        | Error (Unavailable message) -> Error (Types.Mirror_delete_failed message)
        | Ok owner ->
-         let fail error = ignore (Ownership.release owner); Error error in
-         try
+         let fail error =
+           ignore (Ownership.release owner);
+           Error error
+         in
+         (try
            validate_deletion_ancestors ancestors;
-           if not (same_directory graph_directory observed) || exists data
-              || read_existing () <> existing then fail Types.Mirror_delete_stale else
+            if
+              (not (same_directory graph_directory observed))
+              || exists data
+              || read_existing () <> existing
+            then fail Types.Mirror_delete_stale
+            else (
            let generation = directory_generation_as ~identity_path:graph_directory graph_directory in
            let result = { Types.graph_uuid = Some graph_id; previous_generation = generation
-             ; absent_generation = absent_mirror_generation location.database_path } in
-           (match existing with
+                ; absent_generation = absent_mirror_generation location.database_path
+                }
+              in
+              match existing with
             | Some (old, false, 1) ->
               (* A pre-rename V1 preparation can only be canceled after acquiring
                  the live lease. Never grant it a fresh rename capability. *)
@@ -923,7 +953,8 @@ let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement
               ensure_retirement_directory (Filename.dirname data);
               write_deletion_receipt receipt result false;
               Ok (preparation ~ownership:owner ~durable:false generation))
-         with exn -> fail (Types.Mirror_delete_failed (Printexc.to_string exn)))
+          with
+          | exn -> fail (Types.Mirror_delete_failed (Printexc.to_string exn))))
   with
   | Unix.Unix_error (Unix.ENOENT, _, _) -> Error Types.Mirror_delete_stale
   | exn -> Error (Types.Mirror_delete_failed (Printexc.to_string exn))
@@ -946,7 +977,9 @@ let commit_mirror_deletion preparation =
       validate_retirement_directories location;
       let result, committed, _ = read_deletion_receipt location receipt in
       if committed then Some result else None
-    with _ -> None in
+    with
+    | _ -> None
+  in
   match preparation.deletion_committed, durable with
   | Some result, _ | _, Some result ->
     preparation.deletion_committed <- Some result;
@@ -958,7 +991,8 @@ let commit_mirror_deletion preparation =
        write_deletion_receipt receipt result true;
        preparation.deletion_durable <- true;
        collect_retired_mirrors location
-     with _ -> ());
+     with
+     | _ -> ());
     Ok result
   | None, None when preparation.deletion_cancelled || preparation.deletion_ownership = None -> Error Types.Mirror_delete_stale
   | None, None ->
@@ -969,20 +1003,31 @@ let commit_mirror_deletion preparation =
       validate_deletion_lease graph_directory;
       Types.Mirror_generation.equal preparation.deletion_generation
         (directory_generation_as ~identity_path:graph_directory graph_directory)
-      with _ -> false in
-    if not unchanged then Error Types.Mirror_delete_stale else
+      with
+      | _ -> false
+    in
+    if not unchanged
+    then Error Types.Mirror_delete_stale
+    else (
     let renamed =
       try
         if Sys.file_exists data then failwith "retirement destination is occupied";
         let result, _, _ = read_deletion_receipt location receipt in
         Unix.rename graph_directory data;
         Ok result
-      with exn -> Error (Types.Mirror_delete_failed (Printexc.to_string exn)) in
-    (match renamed with
+        with
+        | exn -> Error (Types.Mirror_delete_failed (Printexc.to_string exn))
+      in
+      match renamed with
      | Error _ as error -> error
      | Ok result ->
        preparation.deletion_committed <- Some result;
-       (try Option.iter (fun owner -> ignore (Ownership.release owner)) preparation.deletion_ownership with _ -> ());
+        (try
+           Option.iter
+             (fun owner -> ignore (Ownership.release owner))
+             preparation.deletion_ownership
+         with
+         | _ -> ());
        preparation.deletion_ownership <- None;
        (try
           sync_deletion_directory (Filename.dirname data);
@@ -990,7 +1035,8 @@ let commit_mirror_deletion preparation =
           write_deletion_receipt receipt result true;
           preparation.deletion_durable <- true;
           collect_retired_mirrors location
-        with _ -> ());
+         with
+         | _ -> ());
        Ok result)
 ;;
 
@@ -1303,7 +1349,32 @@ let property_summary_from_definition
   =
   let values =
     List.filter_map
-      (property_value ?uuid_of_ref database definition.Graph.schema.property_type)
+      (fun value ->
+         if definition.ident = "logseq.property/status"
+         then (
+           match value with
+           | Datascript.Ref entity ->
+             let uuid =
+               (Option.value uuid_of_ref ~default:(uuid_of_entity database)) entity
+             in
+             Some
+               (Graph.Default_value
+                  (Option.fold
+                     ~none:("unresolved-status-entity:" ^ string_of_int entity)
+                     ~some:Graph.Uuid.to_string
+                     uuid))
+           | _ ->
+             property_value
+               ?uuid_of_ref
+               database
+               definition.Graph.schema.property_type
+               value)
+         else
+           property_value
+             ?uuid_of_ref
+             database
+             definition.Graph.schema.property_type
+             value)
       values
   in
   let maximum_values = 256 in
@@ -1694,26 +1765,60 @@ let entity_datoms_for_ids database entities =
   result
 ;;
 
-let task_status_of_ident = function
-  | "logseq.property/status.todo" -> Some Types.Todo
-  | "logseq.property/status.doing" -> Some Doing
-  | "logseq.property/status.in-review" -> Some In_review
-  | "logseq.property/status.now" -> Some Now
-  | "logseq.property/status.done" -> Some Done
-  | "logseq.property/status.canceled" -> Some Canceled
-  | "logseq.property/status.backlog" -> Some Backlog
-  | "logseq.property/status.waiting" -> Some Waiting
-  | "logseq.property/status.later" -> Some Later
-  | _ -> None
+let status_entity database = function
+  | Types.Status_uuid uuid -> entity_of_uuid database uuid
+  | Legacy_status_ident ident -> entity_of_ident database ident
 ;;
 
 let task_status_of_datoms database datoms =
   match one_in_datoms datoms "logseq.property/status" with
-  | Some (Datascript.Ref status) ->
-    (match one database status "db/ident" with
-     | Some (Datascript.Keyword ident | String ident) -> task_status_of_ident ident
-     | Some _ | None -> None)
-  | Some _ | None -> None
+  | Some (Datascript.Ref entity) ->
+    Option.map (fun uuid -> Types.Status_uuid uuid) (uuid_of_entity database entity)
+  | _ -> None
+;;
+
+let task_status_definition database entity =
+  let owner = entity_of_ident database "logseq.property/status" in
+  let owned =
+    match owner with
+    | None -> false
+    | Some owner ->
+      one database entity "logseq.property/created-from-property"
+      = Some (Datascript.Ref owner)
+      || one database entity "block/closed-value-property" = Some (Datascript.Ref owner)
+      || Option.is_some
+           (Datascript.find_datom
+              database
+              Datascript.Eavt
+              ~e:owner
+              ~a:"logseq.property/closed-values"
+              ~v:(Datascript.Ref entity)
+              ())
+  in
+  if
+    (not owned)
+    || Option.is_some (one database entity "logseq.property/deleted-at")
+    || Option.bind (one database entity "db/ident") ident_of_value
+       = Some "logseq.property/empty-placeholder"
+  then None
+  else
+    Option.map
+      (fun uuid ->
+         Graph.
+           { uuid
+           ; title =
+               Option.bind (one database entity "block/title") string_of_value
+               |> Option.value ~default:""
+           ; ident = Option.bind (one database entity "db/ident") ident_of_value
+           ; order =
+               Option.bind (one database entity "block/order") string_of_value
+               |> Option.value ~default:""
+           ; checkbox_state =
+               Option.bind
+                 (one database entity "logseq.property/choice-checkbox-state")
+                 bool_of_value
+           })
+      (uuid_of_entity database entity)
 ;;
 
 let cached_page_title database cache entity =
@@ -1855,7 +1960,8 @@ let read_outbox path =
                   Result.map
                     (fun revision -> records, revision)
                     (Logseq_db_storage.Sync_outbox_store.read_revision sqlite))
-           with exn -> Error (Printexc.to_string exn)
+           with
+           | exn -> Error (Printexc.to_string exn)
          in
          match result with
          | Error _ as error -> ignore (exec "ROLLBACK"); error
@@ -1906,8 +2012,9 @@ let outbox_write_set database ~revision records =
       (fun id _ deleted -> if Uuid_map.mem id rows then deleted else id :: deleted)
       database.durable_outbox []
   in
-  Logseq_db_storage.Sync_outbox_store.
-    { expected_revision = database.durable_sync_revision; revision; upserts; deletes }, rows
+  ( Logseq_db_storage.Sync_outbox_store.
+      { expected_revision = database.durable_sync_revision; revision; upserts; deletes }
+  , rows )
 ;;
 
 let migrate_outbox path ~revision ~expected_records rows =
@@ -2322,8 +2429,6 @@ let logical_page_revision uuid value =
     Types.Page_state_revision.of_string
     ("page-state:v1:" ^ Graph.Uuid.to_string uuid ^ ":" ^ state_digest value)
 ;;
-
-let status_ident = Outliner.Task_status.ident
 
 let assigned_orders (record : outbox_record) =
   match record.mutation with
@@ -2838,7 +2943,7 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                         [ Datascript.Int64 record.intent_time_ms ]
                         value.block.properties
                     in
-                    match entity_of_ident authoritative (status_ident status) with
+                    match status_entity authoritative status with
                     | None -> properties
                     | Some status_entity ->
                       set_property_values
@@ -2904,7 +3009,34 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
          |> Option.map (fun (page : Types.page_record) -> page.page.title)
          |> Option.value ~default:""
        in
-       Types.{ value with rendered_page_title })
+       let task_status =
+         Option.bind value.task_status (function
+           | Types.Status_uuid uuid -> Some (Types.Status_uuid uuid)
+           | Legacy_status_ident ident ->
+             Option.bind (entity_of_ident authoritative ident) (fun entity ->
+               Option.map
+                 (fun uuid -> Types.Status_uuid uuid)
+                 (uuid_of_entity authoritative entity)))
+       in
+       let properties =
+         match value.task_status, task_status with
+         | Some _, Some (Status_uuid uuid) ->
+           set_uuid_property_values
+             ?cache
+             authoritative
+             "logseq.property/status"
+             [ uuid ]
+             value.block.properties
+         | Some (Legacy_status_ident ident), None ->
+           set_property_values
+             ?cache
+             authoritative
+             "logseq.property/status"
+             [ Datascript.String ident ]
+             value.block.properties
+         | _ -> value.block.properties
+       in
+       Types.{ rendered_page_title; task_status; block = { value.block with properties } })
     value
 ;;
 
@@ -3320,6 +3452,177 @@ let indexed_journal_candidates (snapshot : snapshot) ~from_day ~upper_day ~local
     ()
   |> dates
   |> Seq.memoize
+;;
+
+let task_status_at snapshot uuid =
+  let database = Option.get snapshot.authoritative_database in
+  Option.bind (entity_of_uuid database uuid) (fun entity ->
+    Option.bind (task_status_definition database entity) (fun definition ->
+      let effects =
+        Uuid_map.find_opt (Graph.Uuid.to_string uuid) (Option.get snapshot.block_effects)
+        |> Option.value ~default:Rrbvec.empty
+      in
+      Rrbvec.fold_left
+        (fun current (record : outbox_record) ->
+           if not (record_is_logically_active record)
+           then current
+           else (
+             match record.mutation with
+             | Types.Save_block { block; title; _ } when Graph.Uuid.equal block uuid ->
+               Option.map (fun definition -> { definition with Graph.title }) current
+             | Delete_blocks _ ->
+               (match record.delete_artifacts with
+                | Some artifacts
+                  when List.exists (Graph.Uuid.equal uuid) artifacts.frontier -> None
+                | _ -> current)
+             | _ -> current))
+        (Some definition)
+        effects))
+;;
+
+let get_task_status_definitions snapshot uuids =
+  with_snapshot_read snapshot (fun snapshot ->
+    if List.length uuids > 200
+    then Error Types.Read_limit_exceeded
+    else Ok (List.map (task_status_at snapshot) uuids))
+;;
+
+let get_task_statuses snapshot ~limit ~cursor =
+  with_snapshot_read snapshot (fun snapshot ->
+    let exception Read_error of Types.read_error in
+    let invalid message = raise (Read_error (Types.Invalid_read_request message)) in
+    try
+      if not (valid_page_limit limit) then invalid "limit must be between 1 and 200";
+      let version = state_digest snapshot.version in
+      let offset =
+        match cursor with
+        | None -> 0
+        | Some cursor ->
+          (match String.split_on_char ':' (Graph.Cursor.to_string cursor) with
+           | [ "task-statuses"; "v1"; previous; offset ]
+             when String.length previous = 32
+                  && String.for_all
+                       (function
+                         | '0' .. '9' | 'a' .. 'f' -> true
+                         | _ -> false)
+                       previous ->
+             if previous <> version then raise (Read_error Types.Stale_read_cursor);
+             (match int_of_string_opt offset with
+              | Some n when n >= 0 && n <= 10000 -> n
+              | _ -> invalid "invalid status cursor offset")
+           | _ -> invalid "invalid status cursor")
+      in
+      let catalog =
+        match Atomic.get snapshot.owner.task_catalog_cache with
+        | Some catalog when catalog.catalog_version = version -> catalog
+        | _ ->
+          let database = Option.get snapshot.authoritative_database in
+          let owner = entity_of_ident database "logseq.property/status" in
+          let entities = Hashtbl.create 32 in
+          let add entity =
+            if Hashtbl.length entities >= 10000 && not (Hashtbl.mem entities entity)
+            then raise (Read_error Types.Read_limit_exceeded);
+            Hashtbl.replace entities entity ()
+          in
+          Option.iter
+            (fun owner ->
+               List.iter
+                 (fun attribute ->
+                    Datascript.datoms
+                      database
+                      Datascript.Avet
+                      ~a:attribute
+                      ~v:(Datascript.Ref owner)
+                      ()
+                    |> Seq.iter (fun (d : Datascript.datom) -> add d.e))
+                 [ "logseq.property/created-from-property"
+                 ; "block/closed-value-property"
+                 ];
+               Datascript.datoms
+                 database
+                 Datascript.Eavt
+                 ~e:owner
+                 ~a:"logseq.property/closed-values"
+                 ()
+               |> Seq.iter (fun (d : Datascript.datom) ->
+                 match d.v with
+                 | Datascript.Ref entity -> add entity
+                 | _ -> ()))
+            owner;
+          let items =
+            Hashtbl.to_seq_keys entities
+            |> Seq.filter_map (uuid_of_entity database)
+            |> Seq.filter_map (task_status_at snapshot)
+            |> Array.of_seq
+          in
+          Array.sort
+            (fun (a : Graph.task_status_definition) b ->
+               let c = String.compare a.order b.order in
+               if c = 0 then Graph.Uuid.compare a.uuid b.uuid else c)
+            items;
+          let default =
+            Option.bind owner (fun owner ->
+              Option.bind
+                (Option.bind
+                   (one database owner "logseq.property/default-value")
+                   reference_of_value)
+                (fun entity ->
+                   Option.bind (uuid_of_entity database entity) (fun uuid ->
+                     Option.map
+                       (fun (d : Graph.task_status_definition) -> d.uuid)
+                       (task_status_at snapshot uuid))))
+          in
+          let catalog =
+            { catalog_version = version
+            ; catalog_property = Option.bind owner (uuid_of_entity database)
+            ; catalog_default = default
+            ; catalog_items = items
+            }
+          in
+          Atomic.set snapshot.owner.task_catalog_cache (Some catalog);
+          catalog
+      in
+      let count = Array.length catalog.catalog_items in
+      if offset > count then invalid "status cursor past catalog";
+      (* Bound both item count and encoded bytes. Large titles remain intact. *)
+      let budget =
+        max 1 (snapshot.owner.dependencies.limits.response_budget_bytes - 8192)
+      in
+      let rec page position remaining bytes reversed =
+        if remaining = 0 || position = count
+        then position, List.rev reversed
+        else (
+          let item = catalog.catalog_items.(position) in
+          let size =
+            String.length
+              (Yojson.Safe.to_string (Graph.task_status_definition_to_yojson item))
+            + 1
+          in
+          if bytes + size > budget
+          then
+            if reversed = []
+            then raise (Read_error Types.Read_limit_exceeded)
+            else position, List.rev reversed
+          else page (position + 1) (remaining - 1) (bytes + size) (item :: reversed))
+      in
+      let next, items = page offset limit 0 [] in
+      let next_cursor =
+        if next < count
+        then
+          Some
+            (Graph.Cursor.of_string (Printf.sprintf "task-statuses:v1:%s:%d" version next)
+             |> Result.get_ok)
+        else None
+      in
+      Ok
+        Types.
+          { property_uuid = catalog.catalog_property
+          ; default_status = catalog.catalog_default
+          ; items
+          ; next_cursor
+          }
+    with
+    | Read_error error -> Error error)
 ;;
 
 let get_favorites snapshot ~limit ~cursor =
@@ -4432,7 +4735,10 @@ let local_operations
       [ Datascript.Add
           ( uuid_lookup block
           , "logseq.property/status"
-          , Ref_to (Ident (status_ident status)) )
+          , Ref_to
+              (match status with
+               | Types.Status_uuid uuid -> uuid_lookup uuid
+               | Legacy_status_ident ident -> Ident ident) )
       ; Add (uuid_lookup block, "block/updated-at", Int64 (Int64.of_int now))
       ; Add (uuid_lookup block, "block/tx-id", Int64 (Int64.of_int next_tx))
       ]
@@ -4791,8 +5097,8 @@ let has_children_precondition (expected : write_precondition) parent =
 let required_preconditions (expected : write_precondition) = function
   | Types.Set_asset_reference { block; _ }
   | Types.Publish_asset { block; _ }
-  | Types.Save_block { block; _ }
   | Set_task_status { block; _ }
+  | Types.Save_block { block; _ }
   | Clear_task_status { block; _ } ->
     if has_block_precondition expected block
     then Ok ()
@@ -5076,9 +5382,19 @@ let planned_effect database context ~now = function
      | _ ->
        Error
          (Types.Invalid_local_mutation "Uploaded version no longer matches the live asset"))
-  | Types.Save_block { block; _ }
-  | Set_task_status { block; _ }
-  | Clear_task_status { block; _ } ->
+  | Types.Set_task_status { block; status; _ } ->
+    (match status with
+     | Legacy_status_ident _ ->
+       Error (Types.Invalid_local_mutation "Legacy status is replay-only")
+     | Status_uuid uuid ->
+       (match task_status_at context.read_snapshot uuid with
+        | None ->
+          Error
+            (Types.Invalid_local_mutation
+               "Status is missing, recycled or belongs to another property")
+        | Some _ ->
+          Ok ({ block_uuids = [ block ]; page_uuids = []; structure_interests = [] }, None)))
+  | Types.Save_block { block; _ } | Clear_task_status { block; _ } ->
     Ok ({ block_uuids = [ block ]; page_uuids = []; structure_interests = [] }, None)
   | Insert_blocks { tree; parent; asset; _ } ->
     let ( let* ) = Result.bind in
@@ -5438,7 +5754,8 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                    in
                    let database =
                      { lock = Eio.Mutex.create ()
-                     ; notification_lock = Eio.Mutex.create ()
+                        ; task_catalog_cache = Atomic.make None
+                        ; notification_lock = Eio.Mutex.create ()
                      ; sw
                      ; dispatch_stream =
                          Eio.Stream.create dependencies.limits.dispatcher_capacity
@@ -5536,7 +5853,8 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
 ;;
 
 let open_ ~sw dependencies inspection ~graph_name =
-  (try collect_retired_mirrors inspection.location with _ -> ());
+  (try collect_retired_mirrors inspection.location with
+   | _ -> ());
   if String.trim graph_name = ""
   then Error Types.Invalid_graph_name
   else (
@@ -6138,7 +6456,9 @@ let authoritative_satisfies_mutation_in database = function
   | Set_task_status { block; status; _ } ->
     block_of_database database block
     |> option_satisfies (fun (record : Types.block_record) ->
-      record.task_status = Some status)
+      record.task_status
+      = Option.bind (status_entity database status) (fun entity ->
+        Option.map (fun uuid -> Types.Status_uuid uuid) (uuid_of_entity database entity)))
   | Clear_task_status { block; _ } ->
     block_of_database database block
     |> option_satisfies (fun (record : Types.block_record) ->
@@ -7523,7 +7843,13 @@ let logical_snapshot_satisfies_mutation snapshot = function
   | Set_task_status { block; status; _ } ->
     logical_block_at snapshot block
     |> option_satisfies (fun (record : Types.block_record) ->
-      record.task_status = Some status)
+      record.task_status
+      = Option.bind
+          (status_entity (Option.get snapshot.authoritative_database) status)
+          (fun entity ->
+             Option.map
+               (fun uuid -> Types.Status_uuid uuid)
+               (uuid_of_entity (Option.get snapshot.authoritative_database) entity)))
   | Clear_task_status { block; _ } ->
     logical_block_at snapshot block
     |> option_satisfies (fun (record : Types.block_record) ->
@@ -7591,9 +7917,19 @@ let invalid_replan_dependency snapshot mutation =
        match asset_descriptor_at snapshot block with
        | Ok (Some { source = Managed _; _ }) -> true
        | _ -> false)
-  | Types.Save_block { block; _ }
-  | Set_task_status { block; _ }
-  | Clear_task_status { block; _ } ->
+  | Types.Set_task_status { block; status; _ } ->
+    let authoritative = Option.get snapshot.authoritative_database in
+    let status_uuid =
+      match status with
+      | Status_uuid uuid -> Some uuid
+      | Legacy_status_ident ident ->
+        Option.bind (entity_of_ident authoritative ident) (uuid_of_entity authoritative)
+    in
+    (match status_uuid with
+     | Some uuid when Option.is_none (task_status_at snapshot uuid) -> Some uuid
+     | None -> Some block
+     | Some _ -> missing block (Option.is_some (logical_block_at snapshot block)))
+  | Types.Save_block { block; _ } | Clear_task_status { block; _ } ->
     missing block (Option.is_some (logical_block_at snapshot block))
   | Insert_blocks { parent; tree; asset; _ } ->
     let block_exists = Option.is_some (logical_block_at snapshot parent) in

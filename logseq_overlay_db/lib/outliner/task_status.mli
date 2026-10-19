@@ -1,7 +1,6 @@
 module Graph = Logseq_db_types.Graph_types
 
 val name : Types.task_status -> string
-val ident : Types.task_status -> string
 
 val set_identity
   :  mutation_id:Graph.Uuid.t

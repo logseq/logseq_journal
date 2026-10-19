@@ -19,10 +19,9 @@ type t =
   | Doing
 
 let for_task_state = function
-  | Journal_model.No_status | Canceled -> No_status
-  | Todo | Backlog | Later -> Todo
-  | Doing | In_review | Now | Waiting -> Doing
-  | Done -> Done
+  | Journal_model.No_status -> No_status
+  | Status _ | Default_status -> Todo
+  | Invalid_status _ -> Error
 ;;
 
 let name = function

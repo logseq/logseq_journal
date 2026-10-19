@@ -37,6 +37,7 @@ val rebind : t -> session_number:int64 -> t
 val phase : t -> phase
 val can_save : t -> bool
 val update_source : t -> source:string -> t
+val with_task_state : t -> Journal_model.task_state -> t
 val toggle_task_intent : t -> t
 val apply_text_edit : t -> Ui.Event.Payload.text_edit -> t
 
@@ -73,3 +74,5 @@ val fail : t -> message:string -> t
 val fail_attempt : t -> mutation_id:string -> block_id:string -> message:string -> t
 val retry : t -> t * Journal_graph_request.t option
 val completed_by : t -> Journal_model.t -> bool
+val retry_identity_locked : t -> bool
+val lock_for_retry : t -> t

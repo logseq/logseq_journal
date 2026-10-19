@@ -5,8 +5,13 @@ module L = Lui_elements
 let body ?(child = false) title =
   if String.trim (Journal_model.Title.plain title) = "" then V.column []
   else Journal_header.bounded_text ~child title
+;;
 
-let metadata_view ~timeline block =
+let metadata_view
+      ?(status_name = fun status -> Journal_model.status_name status)
+      ~timeline
+      block
+  =
   let status = Journal_model.task_state block in
   let titles = Journal_model.tag_titles block in
   let visible_titles, remaining =
@@ -23,7 +28,7 @@ let metadata_view ~timeline block =
           ~background:"#839B7F16"
           ~corner_radius:5
           [ L.text
-              ~value:(Journal_model.status_name status)
+              ~value:(status_name status)
               ~style_class:"caption"
               ~foreground:"secondary"
               []
@@ -52,9 +57,10 @@ let metadata_view ~timeline block =
   | children -> [ V.of_lui (L.row ~gap:8 ~cross:`start children) ]
 ;;
 
-let metadata block = metadata_view ~timeline:false block
+let metadata ?status_name block = metadata_view ?status_name ~timeline:false block
 
 let view
+      ?status_name
       ?(render_source = Fun.id)
       ?render_title
       ~render_media
@@ -97,7 +103,7 @@ let view
     V.column
       ~spacing:8.
       ~alignment:Leading
-      (body source :: metadata_view ~timeline:true block)
+      (body source :: metadata_view ?status_name ~timeline:true block)
   in
   let labels =
     [ render_media ~title:(Journal_model.source block) ~root:id ~image_children content ]

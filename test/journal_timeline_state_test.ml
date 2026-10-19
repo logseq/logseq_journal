@@ -451,7 +451,9 @@ let test_ten_thousand_record_projection_preserves_loaded_history () =
 ;;
 
 let test_block_replacement () =
-  let original = block ~task_state:Journal_model.Todo 40 in
+  let original =
+    block ~task_state:(Journal_model.Status "00000002-1615-5853-7700-000000000000") 40
+  in
   let state =
     Timeline.empty ~today:20260809
     |> begin_and_apply_feed
@@ -459,13 +461,19 @@ let test_block_replacement () =
          ~before_day:None
          (feed [ day_feed 20260809 "Today" [ original ] ])
   in
-  let updated = block ~task_state:Journal_model.Done ~revision:"block-2" 40 in
+  let updated =
+    block
+      ~task_state:(Journal_model.Status "00000002-1827-5820-8200-000000000000")
+      ~revision:"block-2"
+      40
+  in
   let replaced = Timeline.replace_block state updated in
   require
     (List.exists
        (function
          | Timeline.Top_level entry ->
-           Journal_model.task_state entry.block = Journal_model.Done
+           Journal_model.task_state entry.block
+           = Journal_model.Status "00000002-1827-5820-8200-000000000000"
          | _ -> false)
        (retained_slots replaced))
     "task replacement did not update the projected block"
@@ -861,9 +869,18 @@ let test_page_replacement_invalidates_pending_continuation () =
 ;;
 
 let test_capture_identity_converges_with_reconciliation () =
-  let captured = block ~task_state:Journal_model.Todo ~child_count:1 901 in
+  let captured =
+    block
+      ~task_state:(Journal_model.Status "00000002-1615-5853-7700-000000000000")
+      ~child_count:1
+      901
+  in
   let updated =
-    block ~source:"Completed capture" ~task_state:Journal_model.Todo ~child_count:1 901
+    block
+      ~source:"Completed capture"
+      ~task_state:(Journal_model.Status "00000002-1615-5853-7700-000000000000")
+      ~child_count:1
+      901
   in
   let initial =
     Timeline.empty ~today:20260809
@@ -1059,9 +1076,24 @@ let test_empty_day_visibility_boundaries () =
     ; [ block ~day:20260808 ~source:" \t\r\n " 1 ]
     ; [ block ~day:20260808 ~source:"" ~child_count:1 1 ]
     ; [ block ~day:20260808 ~source:"" 1; block ~day:20260808 ~source:" " 2 ]
-    ; [ block ~day:20260808 ~source:"" ~task_state:Todo 1 ]
-    ; [ block ~day:20260808 ~source:"" ~task_state:Doing 1 ]
-    ; [ block ~day:20260808 ~source:"" ~task_state:Done 1 ]
+    ; [ block
+          ~day:20260808
+          ~source:""
+          ~task_state:(Journal_model.Status "00000002-1615-5853-7700-000000000000")
+          1
+      ]
+    ; [ block
+          ~day:20260808
+          ~source:""
+          ~task_state:(Journal_model.Status "00000002-1840-1229-0800-000000000000")
+          1
+      ]
+    ; [ block
+          ~day:20260808
+          ~source:""
+          ~task_state:(Journal_model.Status "00000002-1827-5820-8200-000000000000")
+          1
+      ]
     ];
   let visible =
     [ [ block ~day:20260808 ~source:"** **" 1 ]
@@ -1109,7 +1141,13 @@ let test_empty_day_mutations_and_delete () =
   let hidden = Timeline.replace_timeline_entry visible (entry placeholder) in
   require_equal_string_list (slot_keys hidden) older_keys "clearing content left a gap";
   let task =
-    Timeline.replace_block hidden (block ~day:20260808 ~source:"" ~task_state:Todo 1)
+    Timeline.replace_block
+      hidden
+      (block
+         ~day:20260808
+         ~source:""
+         ~task_state:(Journal_model.Status "00000002-1615-5853-7700-000000000000")
+         1)
   in
   require (Timeline.total_count task = 2) "status-only parent restored its card";
   let child =
@@ -1459,7 +1497,14 @@ let test_parent_only_cards_and_point_updates () =
       (block ~day:20260808 ~source:"" 6)
       ~asset_file_type:(Some "pdf")
   in
-  let invalid = block ~day:20260808 ~source:"" ~task_state:Doing ~child_count:10001 1 in
+  let invalid =
+    block
+      ~day:20260808
+      ~source:""
+      ~task_state:(Journal_model.Status "00000002-1840-1229-0800-000000000000")
+      ~child_count:10001
+      1
+  in
   let content = block ~day:20260808 3 in
   let state =
     Timeline.empty ~today:20260809

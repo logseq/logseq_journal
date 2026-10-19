@@ -625,7 +625,7 @@ let encode ~sync_revision (record : t) =
    ; blocked_prior_state = Option.map transport_state_to_wire record.blocked_prior_state
    ; blocked_reason = record.blocked_reason
    ; fingerprint = record.fingerprint
-   ; format_version = 17
+   ; format_version = 18
    ; intent_time_ms = record.intent_time_ms
    ; planned_tx = record.planned_tx
    ; sequence = record.sequence
@@ -668,7 +668,7 @@ let decode source =
       |> Result.map_error (fun error ->
         "unsupported or invalid overlay outbox format: " ^ error)
     in
-    if dto.format_version <> 17
+    if dto.format_version <> 17 && dto.format_version <> 18
     then Error "unsupported overlay outbox JSON format"
     else if
       dto.attempt_count < 0

@@ -237,7 +237,11 @@ let snapshot_rejection_preserves_schema_versions () =
           ~applied_server_cursor:(server_cursor 0) ~expected_checksum:None ~expected_rows with
       | Error (Snapshot_parse_error message) ->
         Alcotest.(check string) "version evidence preserved at admission boundary"
-          (Printf.sprintf "Graph schema %d.%d is not supported. Journal requires schema 65.33 or later." major minor)
+             (Printf.sprintf
+                "Graph schema %d.%d is not supported. Journal requires schema 65.33 or \
+                 later."
+                major
+                minor)
           message
       | Error _ -> Alcotest.fail "old schema returned a different error category"
       | Ok prepared -> Database.cancel_snapshot_activation prepared;
@@ -1036,7 +1040,9 @@ let legacy_retirement_replays_without_content_load mode () =
         let busy = Database.prepare_mirror_deletion ~application_support_directory:support
           ~graph_id:T.graph_uuid ~retirement in
         Alcotest.(check bool) "legacy cancellation waits for live ownership" true
-          (match busy with Error Mirror_delete_busy -> true | _ -> false));
+            (match busy with
+             | Error Mirror_delete_busy -> true
+             | _ -> false));
       ignore (Database.close database |> T.require_ok ~behavior)));
     let data = Filename.concat root ("pending/" ^ id ^ ".data") in
     if mode = `Missing then Unix.rename directory (Filename.concat support "preserved-before-missing");
@@ -1197,7 +1203,7 @@ let persistence_outbox_uses_generated_json () =
           ( Set_task_status
               { mutation_id = T.mutation_uuid 604
               ; block = T.authoritative_block_uuid
-              ; status = Todo
+              ; status = Status_uuid T.builtin_todo_uuid
               }
           , block_precondition
               database
@@ -1210,7 +1216,7 @@ let persistence_outbox_uses_generated_json () =
             Set_task_status
               { mutation_id = T.mutation_uuid 605
               ; block = T.authoritative_block_uuid
-              ; status = Todo
+              ; status = Status_uuid T.builtin_todo_uuid
               }
           in
           let expected =
@@ -1382,8 +1388,8 @@ let duplicate_outbox_member_fails_closed () =
         Sqlite3.Rc.check
           (Sqlite3.exec
              sqlite
-             "DROP TABLE sync_outbox; DROP TABLE sync_outbox_metadata; \
-              CREATE TABLE sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
+             "DROP TABLE sync_outbox; DROP TABLE sync_outbox_metadata; CREATE TABLE \
+              sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
         Logseq_db_storage.Sync_outbox_store.replace_database sqlite (records @ records)
         |> T.require_ok ~behavior;
         T.require (Sqlite3.db_close sqlite) "unable to close duplicate fixture";
@@ -1403,7 +1409,83 @@ let corrupt_single_outbox_record sqlite record =
   let statement = Sqlite3.prepare sqlite "UPDATE sync_outbox SET record=?" in
   Fun.protect ~finally:(fun () -> ignore (Sqlite3.finalize statement)) (fun () ->
     Sqlite3.Rc.check (Sqlite3.bind_text statement 1 record);
-    Sqlite3.Rc.check (Sqlite3.step statement))
+       Sqlite3.Rc.check (Sqlite3.step statement))
+;;
+
+let pre_uuid_status_outbox_preserves_identity () =
+  let behavior = "pre-UUID submitted statuses and shadows survive reopen" in
+  T.with_temp_directory "overlay-legacy-status-" (fun support ->
+    let path = T.seed_mirror support in
+    let fixture =
+      Yojson.Safe.from_file
+        (Filename.concat
+           T.root
+           "logseq_overlay_db/test/fixtures/legacy-task-status-format17.json")
+      |> Yojson.Safe.Util.to_list
+    in
+    let records = List.map Yojson.Safe.to_string fixture in
+    let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
+    Sqlite3.Rc.check
+      (Sqlite3.exec
+         sqlite
+         "CREATE TABLE IF NOT EXISTS sync_outbox(position INTEGER PRIMARY KEY,record \
+          TEXT NOT NULL)");
+    Logseq_db_storage.Sync_outbox_store.replace_database sqlite records
+    |> T.require_ok ~behavior;
+    T.require (Sqlite3.db_close sqlite) "legacy fixture connection did not close";
+    let dependencies, _location, inspection = location_and_inspection support behavior in
+    Eio_main.run (fun _ ->
+      Eio.Switch.run (fun sw ->
+        let database =
+          Database.open_ ~sw dependencies inspection ~graph_name:"synthetic"
+          |> T.require_ok ~behavior
+        in
+        let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+        (match
+           Database.get_outline_blocks snapshot [ T.block_uuid ] |> T.require_ok ~behavior
+         with
+         | [ Present_block { value; _ } ] ->
+           T.require
+             (value.task_status = Some (Status_uuid T.builtin_todo_uuid))
+             "legacy selection UUID lost";
+           T.require
+             (value.block.title = "Synthetic legacy status holder")
+             "legacy dependent source lost";
+           let property =
+             List.find
+               (fun (p : Graph.property_summary) -> p.ident = "logseq.property/status")
+               value.block.properties
+           in
+           T.require
+             (property.values
+              = [ Default_value (Graph.Uuid.to_string T.builtin_todo_uuid) ])
+             "legacy propertyRef lost"
+         | _ -> Alcotest.fail "legacy status holder missing");
+        Database.release_snapshot snapshot;
+        let expected = block_precondition database T.block_uuid behavior in
+        let retry =
+          Set_task_status
+            { mutation_id = T.mutation_uuid 882
+            ; block = T.block_uuid
+            ; status = Legacy_status_ident "logseq.property/status.todo"
+            }
+        in
+        (match
+           Database.commit_local database ~expected retry |> T.require_ok ~behavior
+         with
+         | Local_existing _ -> ()
+         | _ -> Alcotest.fail "legacy retry did not retain its fingerprint");
+        Database.close database |> T.require_ok ~behavior));
+    let sqlite = Sqlite3.db_open ~mode:`READONLY path in
+    let after =
+      Logseq_db_storage.Sync_outbox_store.read_database sqlite |> T.require_ok ~behavior
+    in
+    T.require (Sqlite3.db_close sqlite) "legacy verification connection did not close";
+    let fingerprint json = Yojson.Safe.Util.(json |> member "fingerprint" |> to_string) in
+    T.require
+      (List.map fingerprint fixture
+       = List.map (fun s -> fingerprint (Yojson.Safe.from_string s)) after)
+      "opening legacy outbox changed operation fingerprints")
 ;;
 
 let noncanonical_outbox_payload_fails_closed () =
@@ -2059,9 +2141,14 @@ let submit_persistence_failure_restores_queued_state () =
           let prepared, request = Database.begin_outbox_transition database
               ~expected:(sync_view_token submitted_view)
               (Retry_group (submission_batch_id batch)) |> T.require_ok ~behavior in
-          let encrypted = Option.map (fun request -> request,
-              Database.protection_plaintexts request
-              |> List.map (fun (id, plaintext) -> id, "encrypted:" ^ plaintext)) request in
+             let encrypted =
+               Option.map
+                 (fun request ->
+                    ( request
+                    , Database.protection_plaintexts request
+                      |> List.map (fun (id, plaintext) -> id, "encrypted:" ^ plaintext) ))
+                 request
+             in
           (match Database.apply_outbox_transition database prepared ~encrypted with
            | Error (Outbox_commit_persistence_failed _) -> ()
            | _ -> Alcotest.fail "stale durable metadata CAS exposed a successful retry");
@@ -2488,14 +2575,16 @@ let with_outbox_write_fixture behavior f =
         in
         let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
         Sqlite3.Rc.check
-          (Sqlite3.exec sqlite
-             "CREATE TABLE outbox_write_audit (kind TEXT NOT NULL, payload_bytes INTEGER NOT NULL); \
-              CREATE TRIGGER audit_outbox_insert AFTER INSERT ON sync_outbox BEGIN \
-              INSERT INTO outbox_write_audit VALUES('insert', length(CAST(NEW.record AS BLOB))); END; \
-              CREATE TRIGGER audit_outbox_update AFTER UPDATE ON sync_outbox BEGIN \
-              INSERT INTO outbox_write_audit VALUES('update', length(CAST(NEW.record AS BLOB))); END; \
-              CREATE TRIGGER audit_outbox_delete AFTER DELETE ON sync_outbox BEGIN \
-              INSERT INTO outbox_write_audit VALUES('delete', 0); END");
+          (Sqlite3.exec
+             sqlite
+             "CREATE TABLE outbox_write_audit (kind TEXT NOT NULL, payload_bytes INTEGER \
+              NOT NULL); CREATE TRIGGER audit_outbox_insert AFTER INSERT ON sync_outbox \
+              BEGIN INSERT INTO outbox_write_audit VALUES('insert', \
+              length(CAST(NEW.record AS BLOB))); END; CREATE TRIGGER audit_outbox_update \
+              AFTER UPDATE ON sync_outbox BEGIN INSERT INTO outbox_write_audit \
+              VALUES('update', length(CAST(NEW.record AS BLOB))); END; CREATE TRIGGER \
+              audit_outbox_delete AFTER DELETE ON sync_outbox BEGIN INSERT INTO \
+              outbox_write_audit VALUES('delete', 0); END");
         Fun.protect
           ~finally:(fun () ->
             ignore (Sqlite3.db_close sqlite);
@@ -2557,9 +2646,9 @@ let apply_outbox_event database transition behavior =
   let encrypted =
     Option.map
       (fun request ->
-        request,
-        Database.protection_plaintexts request
-        |> List.map (fun (id, plaintext) -> id, "encrypted:" ^ plaintext))
+         ( request
+         , Database.protection_plaintexts request
+           |> List.map (fun (id, plaintext) -> id, "encrypted:" ^ plaintext) ))
       request
   in
   Database.apply_outbox_transition database prepared ~encrypted |> T.require_ok ~behavior
@@ -2579,7 +2668,10 @@ let incremental_outbox_appends count () =
       let final_bytes = List.fold_left (fun total record -> total + String.length record) 0 stored in
       Alcotest.(check int) "each appended payload is persisted exactly once" final_bytes
         (outbox_payload_bytes sqlite);
-      Printf.printf "outbox append N=%d committed_row_changes=%d logical_payload_bytes=%d final_payload_bytes=%d\n%!"
+       Printf.printf
+         "outbox append N=%d committed_row_changes=%d logical_payload_bytes=%d \
+          final_payload_bytes=%d\n\
+          %!"
         count (outbox_write_count sqlite) (outbox_payload_bytes sqlite) final_bytes)
 ;;
 
@@ -2769,9 +2861,11 @@ let incremental_outbox_legacy_migration () =
       ignore (append_outbox_save database 2 behavior);
       let records = persisted_outbox sqlite behavior in
       Database.close database |> T.require_ok ~behavior;
-      Sqlite3.Rc.check (Sqlite3.exec sqlite
-        "DROP TABLE sync_outbox; DROP TABLE IF EXISTS sync_outbox_metadata; \
-         CREATE TABLE sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
+       Sqlite3.Rc.check
+         (Sqlite3.exec
+            sqlite
+            "DROP TABLE sync_outbox; DROP TABLE IF EXISTS sync_outbox_metadata; CREATE \
+             TABLE sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
       let legacy = List.map
         (fun record -> match Yojson.Safe.from_string record with
           | `Assoc fields -> `Assoc (("sync_revision", `Int 57) :: List.remove_assoc "sync_revision" fields)
@@ -2804,9 +2898,11 @@ let incremental_outbox_migration_writer_lock () =
       ignore (append_outbox_save database 1 behavior);
       let legacy = persisted_outbox sqlite behavior in
       Database.close database |> T.require_ok ~behavior;
-      Sqlite3.Rc.check (Sqlite3.exec sqlite
-        "DROP TABLE sync_outbox; DROP TABLE IF EXISTS sync_outbox_metadata; \
-         CREATE TABLE sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
+       Sqlite3.Rc.check
+         (Sqlite3.exec
+            sqlite
+            "DROP TABLE sync_outbox; DROP TABLE IF EXISTS sync_outbox_metadata; CREATE \
+             TABLE sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
       Logseq_db_storage.Sync_outbox_store.replace_database sqlite legacy |> T.require_ok ~behavior;
       Sqlite3.Rc.check (Sqlite3.exec sqlite "BEGIN IMMEDIATE");
       Fun.protect ~finally:(fun () -> Sqlite3.Rc.check (Sqlite3.exec sqlite "ROLLBACK"))
@@ -2834,9 +2930,11 @@ let incremental_outbox_migration_rejects_stale_rows () =
       ignore (append_outbox_save database 2 behavior);
       let all_records = persisted_outbox sqlite behavior in
       Database.close database |> T.require_ok ~behavior;
-      Sqlite3.Rc.check (Sqlite3.exec sqlite
-        "DROP TABLE sync_outbox; DROP TABLE sync_outbox_metadata; \
-         CREATE TABLE sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
+       Sqlite3.Rc.check
+         (Sqlite3.exec
+            sqlite
+            "DROP TABLE sync_outbox; DROP TABLE sync_outbox_metadata; CREATE TABLE \
+             sync_outbox(position INTEGER PRIMARY KEY, record TEXT NOT NULL)");
       let module Store = Logseq_db_storage.Sync_outbox_store in
       Store.replace_database sqlite [ List.hd all_records ] |> T.require_ok ~behavior;
       let validated = Store.read_database sqlite |> T.require_ok ~behavior in
@@ -3234,7 +3332,13 @@ let sqlite_full_int64_checkpoint () =
 let () =
   Alcotest.run
     "logseq_overlay_db storage"
-    [ ( "receipt history"
+    [ ( "legacy status compatibility"
+      , [ Alcotest.test_case
+            "format 17 status and dependency shadows"
+            `Quick
+            pre_uuid_status_outbox_preserves_identity
+        ] )
+    ; ( "receipt history"
       , [ Alcotest.test_case "bounded opening and fail-closed validation" `Quick receipt_history_open_is_bounded ] )
     ; ( "cursor checkpoint"
       , [ Alcotest.test_case
@@ -3247,18 +3351,56 @@ let () =
             sqlite_full_int64_checkpoint
         ] )
     ; "snapshot UUID metadata", snapshot_uuid_metadata_cases
-    ; "mirror and durability", cases @
-        [Alcotest.test_case "legacy post-rename retirement replays" `Quick (legacy_retirement_replays_without_content_load `After);
-         Alcotest.test_case "legacy pre-rename retirement cancels with lease fencing" `Quick (legacy_retirement_replays_without_content_load `Before);
-         Alcotest.test_case "obsolete preparation with missing canonical cancels" `Quick (legacy_retirement_replays_without_content_load `Missing);
-         Alcotest.test_case "legacy pending symlink is rejected" `Quick (legacy_retirement_replays_without_content_load `Linked);
-         Alcotest.test_case "current pending replacement is rejected" `Quick current_retirement_rejects_replaced_pending_data;
-         Alcotest.test_case "graph directory symlink is rejected" `Quick (deletion_does_not_follow_external_paths `Graph);
-         Alcotest.test_case "graph ancestor symlink is rejected" `Quick (deletion_does_not_follow_external_paths `Ancestor);
-         Alcotest.test_case "retirement directory symlink is rejected" `Quick (deletion_does_not_follow_external_paths `Retirement);
-         Alcotest.test_case "lease file symlink is rejected" `Quick (deletion_does_not_follow_external_paths `Lease);
-         Alcotest.test_case "contained symlink target survives deletion" `Quick (deletion_does_not_follow_external_paths `Contained);
-         Alcotest.test_case "retired cleanup preserves new mirror" `Quick retired_cleanup_retries_without_touching_a_new_mirror;
-         Alcotest.test_case "mirror preparation cancel and commit replay" `Quick mirror_preparation_cancel_and_commit_replay]
+    ; ( "mirror and durability"
+      , cases
+        @ [ Alcotest.test_case
+              "legacy post-rename retirement replays"
+              `Quick
+              (legacy_retirement_replays_without_content_load `After)
+          ; Alcotest.test_case
+              "legacy pre-rename retirement cancels with lease fencing"
+              `Quick
+              (legacy_retirement_replays_without_content_load `Before)
+          ; Alcotest.test_case
+              "obsolete preparation with missing canonical cancels"
+              `Quick
+              (legacy_retirement_replays_without_content_load `Missing)
+          ; Alcotest.test_case
+              "legacy pending symlink is rejected"
+              `Quick
+              (legacy_retirement_replays_without_content_load `Linked)
+          ; Alcotest.test_case
+              "current pending replacement is rejected"
+              `Quick
+              current_retirement_rejects_replaced_pending_data
+          ; Alcotest.test_case
+              "graph directory symlink is rejected"
+              `Quick
+              (deletion_does_not_follow_external_paths `Graph)
+          ; Alcotest.test_case
+              "graph ancestor symlink is rejected"
+              `Quick
+              (deletion_does_not_follow_external_paths `Ancestor)
+          ; Alcotest.test_case
+              "retirement directory symlink is rejected"
+              `Quick
+              (deletion_does_not_follow_external_paths `Retirement)
+          ; Alcotest.test_case
+              "lease file symlink is rejected"
+              `Quick
+              (deletion_does_not_follow_external_paths `Lease)
+          ; Alcotest.test_case
+              "contained symlink target survives deletion"
+              `Quick
+              (deletion_does_not_follow_external_paths `Contained)
+          ; Alcotest.test_case
+              "retired cleanup preserves new mirror"
+              `Quick
+              retired_cleanup_retries_without_touching_a_new_mirror
+          ; Alcotest.test_case
+              "mirror preparation cancel and commit replay"
+              `Quick
+              mirror_preparation_cancel_and_commit_replay
+          ] )
     ]
 ;;

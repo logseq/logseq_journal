@@ -1,14 +1,8 @@
 type task_state =
   | No_status
-  | Todo
-  | Doing
-  | In_review
-  | Now
-  | Done
-  | Canceled
-  | Backlog
-  | Waiting
-  | Later
+  | Status of string
+  | Default_status
+  | Invalid_status of string
 
 type status_category =
   | Todo_category
@@ -17,7 +11,7 @@ type status_category =
   | Later_category
 
 val status_category : task_state -> status_category option
-val status_name : task_state -> string
+val status_name : ?lookup:(string -> string option) -> task_state -> string
 
 type t
 

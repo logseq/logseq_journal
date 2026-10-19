@@ -113,6 +113,8 @@ let test_missing_snapshot_keeps_graph_lifecycle_visible () =
     [ "Sync phase", "Not available"
     ; "Startup phase", "Not available"
     ; "Graph phase", "Opening"
+    ; "Worker graph UUID", "Not available"
+    ; "Worker graph generation", "4"
     ]
     (Application.diagnostic_phase_rows ~snapshot:None ~graph)
 ;;
@@ -135,6 +137,40 @@ let test_diagnostic_phase_rows_retain_current_error () =
       ~snapshot:(Some {snapshot with last_error = None}) ~graph in
   Alcotest.(check bool) "retry does not retain obsolete error" false
     (List.mem_assoc "Last error" cleared)
+;;
+
+let test_diagnostic_identity_comes_from_worker () =
+  let uuid value = Logseq_db_types.Graph_types.Uuid.of_string value |> Result.get_ok in
+  let selected = uuid "60000000-0000-4000-8000-000000000001" in
+  let actual = uuid "60000000-0000-4000-8000-000000000002" in
+  let snapshot : Service.snapshot =
+    { sync_phase = Offline; catalog = []; selected_graph = Some selected
+    ; applied_server_t = None; timeline_presentation_pending = false
+    ; local_deletion = None; last_error = None
+    ; startup = { authenticated = true; catalog_loading = false
+        ; awaiting_selection = false; restoring_local = false; bootstrapping = false
+        ; awaiting_e2ee_password = false; failure = None; account_generation = 1
+        ; graph_generation = 7; presentation_generation = 1 } }
+  in
+  let graph : Logseq_db_worker.graph_state =
+    { generation = 7; graph_id = Some actual; phase = Graph_open; error = None }
+  in
+  let rows = Application.diagnostic_phase_rows ~snapshot:(Some snapshot) ~graph in
+  Alcotest.(check (option string)) "worker identity, not selected graph"
+    (Some "60000000-0000-4000-8000-000000000002")
+    (List.assoc_opt "Worker graph UUID" rows);
+  Alcotest.(check (option string)) "worker generation" (Some "7")
+    (List.assoc_opt "Worker graph generation" rows);
+  Alcotest.(check bool) "different worker cannot appear ready" false
+    (List.assoc_opt "Startup phase" rows = Some "Ready");
+  let ready = Application.diagnostic_phase_rows
+      ~snapshot:(Some { snapshot with selected_graph = Some actual }) ~graph in
+  Alcotest.(check (option string)) "matching worker is ready" (Some "Ready")
+    (List.assoc_opt "Startup phase" ready);
+  let closed = Application.diagnostic_phase_rows ~snapshot:(Some snapshot)
+      ~graph:{graph with graph_id = None; phase = Graph_closed} in
+  Alcotest.(check (option string)) "no selected-graph fallback when worker closed"
+    (Some "Not available") (List.assoc_opt "Worker graph UUID" closed)
 ;;
 
 let admission_inspection : Logseq_db_worker.Protocol.v2_admission_inspection =
@@ -438,7 +474,7 @@ let run_favorites_native_visibility
   let roots = List.init 65 (fun n -> uuid (n + 1)) in
   let status_value = Atomic.make (match status_scenario with
     | Some "none" -> None
-    | Some ("now" | "waiting" | "later" as value) -> Some value
+       | Some (("now" | "waiting" | "later") as value) -> Some value
     | Some _ -> Some "doing"
     | None -> None) in
   let delete_writes = Atomic.make 0 in
@@ -519,6 +555,46 @@ let run_favorites_native_visibility
     ; properties = []
     }
   in
+  let status_definitions =
+    List.mapi
+      (fun n (slug, id, title) ->
+         ( slug
+         , ({ G.uuid = G.Uuid.of_string id |> Result.get_ok
+            ; title
+            ; ident = None
+            ; order = Printf.sprintf "%03d" n
+            ; checkbox_state = None
+            }
+            : G.task_status_definition) ))
+      [ "backlog", "00000002-7233-3491-0000-000000000000", "Backlog"
+      ; "todo", "00000002-1615-5853-7700-000000000000", "Todo"
+      ; "doing", "00000002-1840-1229-0800-000000000000", "Doing"
+      ; "in-review", "00000002-1870-0014-4300-000000000000", "In Review"
+      ; "done", "00000002-1827-5820-8200-000000000000", "Done"
+      ; "canceled", "00000002-7526-4326-2000-000000000000", "Canceled"
+      ; "now", "b1000000-0000-4000-8000-000000000091", "Now"
+      ; "waiting", "b1000000-0000-4000-8000-000000000092", "Waiting"
+      ; "later", "b1000000-0000-4000-8000-000000000093", "Later"
+      ]
+  in
+  let status_definitions =
+    status_definitions
+    @ List.init 120 (fun n ->
+      let id = Printf.sprintf "b1000000-0000-4000-8000-%012d" (1000 + n) in
+      ( id
+      , ({ G.uuid = G.Uuid.of_string id |> Result.get_ok
+         ; title = (if n < 2 then "Custom 状态" else Printf.sprintf "Custom 状态 %d" n)
+         ; ident = None
+         ; order = Printf.sprintf "z%04d" n
+         ; checkbox_state = None
+         }
+         : G.task_status_definition) ))
+  in
+  let status_uuid slug =
+    match List.assoc_opt slug status_definitions with
+    | Some definition -> definition.G.uuid
+    | None -> G.Uuid.of_string slug |> Result.get_ok
+  in
   let timeline_block n : P.v2_block_record =
     { block =
         { uuid = List.nth roots n
@@ -538,20 +614,10 @@ let run_favorites_native_visibility
             | Some value ->
               [ { G.ident = "logseq.property/status"; uuid = uuid 90001; title = "Status"
                 ; schema = { property_type = Default; cardinality = One; hidden = false; public = false }
-                ; values = [ Default_value ("logseq.property/status." ^ value) ]
+                 ; values = [ Default_value (G.Uuid.to_string (status_uuid value)) ]
                 ; values_truncated = false } ])
         }
-    ; task_status = (match Atomic.get status_value with
-        | Some "doing" -> Some P.V2_doing
-        | Some "now" -> Some P.V2_now
-        | Some "waiting" -> Some P.V2_waiting
-        | Some "later" -> Some P.V2_later
-        | Some "done" -> Some P.V2_done
-        | Some "todo" -> Some P.V2_todo
-        | Some "backlog" -> Some P.V2_backlog
-        | Some "in-review" -> Some P.V2_in_review
-        | Some "canceled" -> Some P.V2_canceled
-        | Some _ | None -> None)
+    ; task_status = Option.map status_uuid (Atomic.get status_value)
     ; rendered_page_title = page.title
     ; tag_titles = []
     }
@@ -747,7 +813,10 @@ let run_favorites_native_visibility
             done;
           if source.title = "First attachment"
              && detail_capture <> Some "selection-error"
-             && (not (List.mem detail_capture [Some "retry-imports"; Some "interrupted-imports"])
+            && ((not
+                   (List.mem
+                      detail_capture
+                      [ Some "retry-imports"; Some "interrupted-imports" ]))
                  || List.length (List.filter (( = ) "First attachment") (Atomic.get imports_entered)) = 1)
           then (
             while not (Atomic.get import_release) do
@@ -799,7 +868,24 @@ let run_favorites_native_visibility
           in
           let outcome =
             match request.command with
-            | P.V2_delete_blocks { root; mutation_id; preconditions } when Option.is_some delete_scenario ->
+            | P.V2_list_task_statuses _ ->
+              P.V2_task_statuses_outcome
+                { property_uuid = Some (uuid 90001)
+                ; default_status = Some (status_uuid "todo")
+                ; items = List.map snd status_definitions
+                ; next_cursor = None
+                }
+            | V2_get_task_status_definitions { statuses } ->
+              V2_task_status_definitions_outcome
+                (List.map
+                   (fun uuid ->
+                      List.find_map
+                        (fun (_, (d : G.task_status_definition)) ->
+                           if G.Uuid.equal uuid d.uuid then Some d else None)
+                        status_definitions)
+                   statuses)
+            | P.V2_delete_blocks { root; mutation_id; preconditions }
+              when Option.is_some delete_scenario ->
               Alcotest.(check string) "delete keeps target UUID"
                 (G.Uuid.to_string (uuid 1)) (G.Uuid.to_string root);
               Alcotest.(check (list (pair string string))) "delete preserves revision preconditions"
@@ -814,10 +900,13 @@ let run_favorites_native_visibility
               else P.V2_mutation_committed { mutation_id; status = V2_applied; generation = "g"
                 ; before_projection_revision = "p"; after_projection_revision = "p2" }
             | V2_set_task_status { mutation_id; block; status; _ } when Option.is_some status_scenario ->
-              let value = match status with
-                | P.V2_todo -> "todo" | V2_doing -> "doing" | V2_in_review -> "in-review"
-                | V2_now -> "now" | V2_done -> "done" | V2_canceled -> "canceled"
-                | V2_backlog -> "backlog" | V2_waiting -> "waiting" | V2_later -> "later" in
+              let value =
+                List.find_map
+                  (fun (slug, (d : G.task_status_definition)) ->
+                     if G.Uuid.equal status d.uuid then Some slug else None)
+                  status_definitions
+                |> Option.value ~default:(G.Uuid.to_string status)
+              in
               commit_status mutation_id block (Some value)
             | V2_clear_task_status { mutation_id; block; _ } when Option.is_some status_scenario ->
               commit_status mutation_id block None
@@ -1071,11 +1160,13 @@ let run_favorites_native_visibility
                 ; revision_scope = V2_children_revision parent
                 ; scope_revision = "children"
                 ; items =
-                    (List.init (if check_detail_wait then 2 else 1) (fun i ->
+                    List.init
+                      (if check_detail_wait then 2 else 1)
+                      (fun i ->
                        let value = if i = 0 then value else timeline_block 2 in
                        { P.value = { value with block = { value.block with parent } }
                        ; revision = "child"
-                       }))
+                         })
                 ; next_cursor = None
                 }
             | V2_get_children { parent; limit; cursor; _ } ->
@@ -1096,11 +1187,12 @@ let run_favorites_native_visibility
                      then List.init 65 favorite_membership
                      else if check_detail_wait && cursor = None
                           && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
-                     then
+                     then (
                        let value = timeline_block (if G.Uuid.equal parent (uuid 2) then 63 else 64) in
                        [ { P.value = { value with block = { value.block with parent } }
                          ; revision = "child-first-page"
-                         } ]
+                         }
+                       ])
                      else [])
                 ; next_cursor =
                     (if check_detail_wait && cursor = None
@@ -1294,7 +1386,11 @@ let run_favorites_native_visibility
         match List.assoc_opt "payload" values with
         | Some (`String payload) ->
           let p = Yojson.Safe.from_string payload in
-          if accept id && (List.mem (Yojson.Safe.Util.member "mode" p) [`String "detail-text"; `String "bounded-text"])
+             if
+               accept id
+               && List.mem
+                    (Yojson.Safe.Util.member "mode" p)
+                    [ `String "detail-text"; `String "bounded-text" ]
              && Yojson.Safe.Util.member "text" p = `String value then Some id else found
         | _ -> found) props None
     | None -> None
@@ -1435,7 +1531,12 @@ let run_favorites_native_visibility
            send_delete ();
            Alcotest.(check int) "deleted identity cannot submit again" 1 (Atomic.get delete_writes))) delete_scenario;
        Option.iter (fun scenario ->
-         let option tag = find "accessibility-identifier" ("journal-status-sheet-option:" ^ tag) in
+            let option tag =
+              find
+                "accessibility-identifier"
+                ("journal-status-sheet-option:"
+                 ^ if tag = "clear" then tag else G.Uuid.to_string (status_uuid tag))
+            in
          let close () = Option.get (find "accessibility-identifier" "journal-status-close") in
          let send_status () =
            let list = Option.get (find "_extension" "journal-list") in
@@ -1458,7 +1559,11 @@ let run_favorites_native_visibility
              (List.assoc_opt "_kind" (Hashtbl.find props node) = Some (`String "list-item"));
            Alcotest.(check bool) "whole status row has a native press action" true
              (List.assoc_opt "press-enabled" (Hashtbl.find props node) = Some (`Bool true));
-           let expected = match Atomic.get status_value with None -> tag = "clear" | Some value -> tag = value in
+                 let expected =
+                   match Atomic.get status_value with
+                   | None -> tag = "clear"
+                   | Some value -> tag = value
+                 in
            Alcotest.(check bool) "current option is selected without aliasing other statuses" expected
              (List.assoc_opt "selected" (Hashtbl.find props node) = Some (`Bool true))) tags;
          let current = match Atomic.get status_value with
@@ -1475,8 +1580,22 @@ let run_favorites_native_visibility
             dispatch (Lui_protocol.Press (close ()))
           | "dismiss" -> dispatch (Lui_protocol.Dismiss (Option.get (find "_kind" "sheet")))
           | "none" | "now" | "waiting" | "later" -> dispatch (Lui_protocol.Press (close ()))
-          | "failure" | "duplicate" | "clear" | "select" ->
-            let old = Option.get (option (if scenario = "clear" then "clear" else "done")) in
+             | "failure" | "duplicate" | "clear" | "select" | "custom" | "pagination" ->
+               let target =
+                 if scenario = "clear"
+                 then "clear"
+                 else if scenario = "custom"
+                 then "b1000000-0000-4000-8000-000000001000"
+                 else if scenario = "pagination"
+                 then "b1000000-0000-4000-8000-000000001119"
+                 else "done"
+               in
+               if scenario = "pagination"
+               then
+                 dispatch
+                   (Lui_protocol.Press
+                      (Option.get (find "accessibility-identifier" "journal-status-next")));
+               let old = Option.get (option target) in
             dispatch (Lui_protocol.Press old);
             Alcotest.(check bool) "selection closes immediately before completion" true (Option.is_none (option "doing"));
             dispatch (Lui_protocol.Press old);
@@ -1487,12 +1606,19 @@ let run_favorites_native_visibility
               Atomic.set status_release true);
             wait "status operation completes" (fun () ->
               if scenario = "failure" then Option.is_some (find "text" "Status not changed")
-              else Atomic.get status_value = (if scenario = "clear" then None else Some "done"));
+                 else
+                   Atomic.get status_value
+                   = if scenario = "clear" then None else Some target);
             wait "status owner accepts another menu after completion" (fun () ->
               if Option.is_none (option "doing") then send_status ();
               Option.is_some (option "doing"));
             Alcotest.(check int) "stale duplicate press submits once" 1 (List.length (Atomic.get status_writes));
-            let expected = if scenario = "failure" then "doing" else if scenario = "clear" then "clear" else "done" in
+               let expected = if scenario = "failure" then "doing" else target in
+               if scenario = "pagination"
+               then
+                 dispatch
+                   (Lui_protocol.Press
+                      (Option.get (find "accessibility-identifier" "journal-status-next")));
             Alcotest.(check bool) "reopened menu shows the committed status or retains it on failure" true
               (List.assoc_opt "selected" (Hashtbl.find props (Option.get (option expected))) = Some (`Bool true));
             dispatch (Lui_protocol.Press (close ()))
@@ -1508,7 +1634,11 @@ let run_favorites_native_visibility
              let props = Yojson.Safe.from_string payload in
              let open Yojson.Safe.Util in
              if member "mode" props = `String "header" && member "title" props = `String "2026.09.01"
-             then (match member "text" props with `String text -> Some text | _ -> None) else found
+                    then (
+                      match member "text" props with
+                      | `String text -> Some text
+                      | _ -> None)
+                    else found
            | _ -> found) props None in
          Alcotest.(check (option string)) "initial sampled date is today" (Some "today") (label ());
          let lifecycle kind =
@@ -1557,9 +1687,20 @@ let run_favorites_native_visibility
            if id <> root_list && List.assoc_opt "_extension" values = Some (`String "journal-list")
            then Some id else found) props None |> Option.get in
          let range first last = hooks.extension_event list "event"
-           (Yojson.Safe.to_string (`Assoc ["id", `Int 1; "payload", `String
-             (Yojson.Safe.to_string (`Assoc ["type", `String "visible_range";
-               "first", `Int first; "last", `Int last]))])) |> consume in
+               (Yojson.Safe.to_string
+                  (`Assoc
+                      [ "id", `Int 1
+                      ; ( "payload"
+                        , `String
+                            (Yojson.Safe.to_string
+                               (`Assoc
+                                   [ "type", `String "visible_range"
+                                   ; "first", `Int first
+                                   ; "last", `Int last
+                                   ])) )
+                      ]))
+             |> consume
+           in
          let first_more = Option.get (find "accessibility-identifier"
            ("detail-more:" ^ G.Uuid.to_string (uuid 2))) in
          dispatch (Lui_protocol.Press first_more);
@@ -1640,10 +1781,10 @@ let run_favorites_native_visibility
            "duplicate native ranges do not reread"
            [ 128 ]
            (Atomic.get discovery_reads);
-         Printf.printf
-           "FOLLOWUP_APPLICATION initial_staging reads=1 limit=128 repeated_range=10 \
-            duplicate_reads=0\n\
-            %!";
+           Printf.printf
+             "FOLLOWUP_APPLICATION initial_staging reads=1 limit=128 repeated_range=10 \
+              duplicate_reads=0\n\
+              %!";
          let navigator = Option.get (find "_extension" "navigation-stack") in
          let back name =
            let revision =
@@ -1747,7 +1888,10 @@ let run_favorites_native_visibility
                  The existing non-staged adapter is tested via its public callback;
                  it has no visible iOS opener, so this is not a GUI claim. *)
               let adapter = Hashtbl.fold (fun id values found ->
-                match List.assoc_opt "_extension" values, List.assoc_opt "payload" values with
+                       match
+                         ( List.assoc_opt "_extension" values
+                         , List.assoc_opt "payload" values )
+                       with
                 | Some (`String "journal-asset-import"), Some (`String payload) ->
                   let request = Yojson.Safe.Util.member "request" (Yojson.Safe.from_string payload) in
                   if Yojson.Safe.Util.member "staged" request = `Bool false then Some id else found
@@ -1761,7 +1905,17 @@ let run_favorites_native_visibility
                   "metadataMutation",`String (G.Uuid.to_string (uuid 34004));
                   "path",`String path;"title",`String "First attachment";"type",`String "txt"] in
                 hooks.extension_event adapter "event" (Yojson.Safe.to_string
-                  (`Assoc ["id",`Int 1;"payload",`String (Yojson.Safe.to_string (`Assoc ["action", `String "picked"; "selection", picked]))])) |> consume;
+                          (`Assoc
+                              [ "id", `Int 1
+                              ; ( "payload"
+                                , `String
+                                    (Yojson.Safe.to_string
+                                       (`Assoc
+                                           [ "action", `String "picked"
+                                           ; "selection", picked
+                                           ])) )
+                              ]))
+                     |> consume;
                 Atomic.set import_release true;
                 wait "non-staged interruption requires source reselection" (fun () ->
                   Hashtbl.fold (fun _ values found -> found ||
@@ -1802,8 +1956,9 @@ let run_favorites_native_visibility
               let adapter, request =
                 Hashtbl.fold
                   (fun id values found ->
-                     match
-                       List.assoc_opt "_extension" values, List.assoc_opt "payload" values
+                       match
+                         ( List.assoc_opt "_extension" values
+                         , List.assoc_opt "payload" values )
                      with
                      | Some (`String "journal-asset-import"), Some (`String payload) ->
                        let open Yojson.Safe.Util in
@@ -1825,7 +1980,8 @@ let run_favorites_native_visibility
                   [ "operation", `String (G.Uuid.to_string (uuid (30000 + index)))
                   ; "asset", `String (G.Uuid.to_string (uuid (31000 + index)))
                   ; "localMutation", `String (G.Uuid.to_string (uuid (32000 + index)))
-                  ; "metadataMutation", `String (G.Uuid.to_string (uuid (33000 + index)))
+                    ; ( "metadataMutation"
+                      , `String (G.Uuid.to_string (uuid (33000 + index))) )
                   ; "path", `String path
                   ; "title", `String title
                   ; "type", `String "txt"
@@ -1844,8 +2000,14 @@ let run_favorites_native_visibility
                         else [ first; second ]) )
                   ]
               in
-              let batch = if scenario = "selection-error" then
-                match batch with `Assoc values -> `Assoc (("error", `String "Fixture partial selection failed") :: values) | _ -> assert false
+                let batch =
+                  if scenario = "selection-error"
+                  then (
+                    match batch with
+                    | `Assoc values ->
+                      `Assoc
+                        (("error", `String "Fixture partial selection failed") :: values)
+                    | _ -> assert false)
                 else batch in
               if scenario = "picker-owner" then (
                 collapse (); back (); enter 2; open_capture (); edit "Keep other root draft";
@@ -1971,14 +2133,20 @@ let run_favorites_native_visibility
                   Option.is_some (find "accessibility-label" "Retry imports"));
                 dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Details")));
                 wait "retained imports explain in-place retry" (fun () ->
-                  Option.is_some (find "text"
-                    "Your journal entry and other attachments are kept. Select Retry imports to try again."));
+                    Option.is_some
+                      (find
+                         "text"
+                         "Your journal entry and other attachments are kept. Select \
+                          Retry imports to try again."));
                 if scenario = "interrupted-imports" then
                   Alcotest.(check bool) "interrupted retained import gives retry guidance" true
                     (Option.is_some (find "text" "Import was interrupted. Select Retry imports to try again."));
                 Alcotest.(check bool) "retained import never requires reselection" true
-                  (Option.is_none (find "text"
-                    "Your journal entry and other attachments are kept. Select the file again to retry."));
+                    (Option.is_none
+                       (find
+                          "text"
+                          "Your journal entry and other attachments are kept. Select the \
+                           file again to retry."));
                 dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Close")));
                 (* Routes reducers own the path, but cannot express native
                    feedback ancestry or layout. Mount the real failure through the
@@ -2201,11 +2369,15 @@ let run_favorites_native_visibility
              Hashtbl.fold
                (fun _ values count ->
                   if List.assoc_opt "text" values = Some (`String "Updated covered row")
-                    || (match List.assoc_opt "payload" values with
-                        | Some (`String payload) -> let p = Yojson.Safe.from_string payload in
-                          (List.mem (Yojson.Safe.Util.member "mode" p) [`String "detail-text"; `String "bounded-text"])
+                        ||
+                        match List.assoc_opt "payload" values with
+                        | Some (`String payload) ->
+                          let p = Yojson.Safe.from_string payload in
+                          List.mem
+                            (Yojson.Safe.Util.member "mode" p)
+                            [ `String "detail-text"; `String "bounded-text" ]
                           && Yojson.Safe.Util.member "text" p = `String "Updated covered row"
-                        | _ -> false)
+                        | _ -> false
                   then count + 1
                   else count)
                props
@@ -2448,8 +2620,11 @@ let run_favorites_native_visibility
              (fun id values ids ->
                 if List.assoc_opt key values = Some (`String value)
                    || (key = "text" && match List.assoc_opt "payload" values with
-                       | Some (`String payload) -> let p = Yojson.Safe.from_string payload in
-                         (List.mem (Yojson.Safe.Util.member "mode" p) [`String "detail-text"; `String "bounded-text"])
+                          | Some (`String payload) ->
+                            let p = Yojson.Safe.from_string payload in
+                            List.mem
+                              (Yojson.Safe.Util.member "mode" p)
+                              [ `String "detail-text"; `String "bounded-text" ]
                          && Yojson.Safe.Util.member "text" p = `String value
                        | _ -> false)
                 then id :: ids
@@ -2873,10 +3048,10 @@ let run_favorites_native_visibility
                  "retired child releases last demand once"
                  1
                  (Atomic.get released_demands - before_demands);
-               Printf.printf
-                 "REVIEW_RANGE_EXIT acquired=%d released=%d range_release_delta=%d \
-                  files=%d\n\
-                  %!"
+                   Printf.printf
+                     "REVIEW_RANGE_EXIT acquired=%d released=%d range_release_delta=%d \
+                      files=%d\n\
+                      %!"
                  (Atomic.get acquire_entered)
                  (Atomic.get released_files)
                  (Atomic.get released_files - before_released)
@@ -3355,8 +3530,9 @@ let run_favorites_native_visibility
            let adapter =
              Hashtbl.fold
                (fun id values found ->
-                  match
-                    List.assoc_opt "_extension" values, List.assoc_opt "payload" values
+                      match
+                        ( List.assoc_opt "_extension" values
+                        , List.assoc_opt "payload" values )
                   with
                   | Some (`String "journal-asset-import"), Some (`String payload) ->
                     let request =
@@ -4452,8 +4628,15 @@ let test_favorite_page_uses_shared_reference_lookup () =
           | V2_get_page { page = requested; _ } ->
             if G.Uuid.equal requested (uuid 3) then Atomic.incr target_reads;
             V2_page_outcome (V2_present_page
-              { page = if G.Uuid.equal requested page.uuid then page
-                  else { page with uuid = requested; title = "Resolved"; name = "resolved" }
+                    { page =
+                        (if G.Uuid.equal requested page.uuid
+                         then page
+                         else
+                           { page with
+                             uuid = requested
+                           ; title = "Resolved"
+                           ; name = "resolved"
+                           })
               ; revision = "p" })
           | V2_get_outline_block { block = requested; _ } when G.Uuid.equal requested block.uuid ->
             V2_block_outcome (V2_present_block
@@ -4474,7 +4657,9 @@ let test_favorite_page_uses_shared_reference_lookup () =
       ~clock:(fun () -> 1_788_192_000.) ~localtime:Unix.gmtime ()) service in
   let props = Hashtbl.create 64 in
   let track = track_json_wire_teardown (Hashtbl.remove props) in
-  let consume encoded = if encoded <> "" then (
+  let consume encoded =
+    if encoded <> ""
+    then
     let open Yojson.Safe.Util in
     Yojson.Safe.from_string encoded |> member "ops" |> to_list |> List.iter (fun op ->
       track op;
@@ -4484,12 +4669,13 @@ let test_favorite_page_uses_shared_reference_lookup () =
         let key = member "property" op |> to_string in
         let old = Hashtbl.find_opt props id |> Option.value ~default:[] in
         Hashtbl.replace props id ((key, member "value" op) :: List.remove_assoc key old)
-      | _ -> ())) in
+        | _ -> ())
+  in
   let find key text = Hashtbl.fold (fun id pairs found ->
     if List.assoc_opt key pairs = Some (`String text) then Some id else found) props None in
   let wait label predicate =
     let deadline = Unix.gettimeofday () +. 3. in
-    while not (predicate ()) && Unix.gettimeofday () < deadline do
+    while (not (predicate ())) && Unix.gettimeofday () < deadline do
       consume (hooks.pump ()); Unix.sleepf 0.001
     done;
     Alcotest.(check bool) label true (predicate ()) in
@@ -4517,7 +4703,19 @@ let test_favorites_compact_shared_titles () =
   let items=List.init 2 (fun n ->
     {P.membership_uuid=id (n+1);membership_order=string_of_int n;membership_revision="m";
      target=(if n=0 then V2_favorite_page {uuid=id 10;title="Page";revision="p"}
-       else V2_favorite_block {uuid=id 11;title="**Favorite** [[Named page]]";revision="b";task_status=Some V2_todo})}) in
+           else
+             V2_favorite_block
+               { uuid = id 11
+               ; title = "**Favorite** [[Named page]]"
+               ; revision = "b"
+               ; task_status =
+                   Some
+                     (Logseq_db_types.Graph_types.Uuid.of_string
+                        "00000002-1615-5853-7700-000000000000"
+                      |> Result.get_ok)
+               })
+      })
+  in
   let ops=ref [] in
   let backend : Lui_protocol.backend =
     {backend_profile=Lui_protocol.profile IOS SwiftUIHost;
@@ -4527,7 +4725,13 @@ let test_favorites_compact_shared_titles () =
   Fun.protect ~finally:(fun ()->ignore(Lui_app.dispose app)) (fun () ->
     Alcotest.(check bool) "Favorites mounts" true (Lui_app.start app);
     ignore(Lui_app.flush app);
-    let has prop value=List.exists (function Lui_protocol.SetProp(_,p,v)->p=prop && v=value|_->false) !ops in
+       let has prop value =
+         List.exists
+           (function
+             | Lui_protocol.SetProp (_, p, v) -> p = prop && v = value
+             | _ -> false)
+           !ops
+       in
     Alcotest.(check bool) "shared mldoc title is plain text" true
       (has TextValue (StringValue "Favorite [[Named page]]"));
     Alcotest.(check int) "both title nodes use existing single-line policy" 2
@@ -4551,9 +4755,21 @@ let test_favorites_compact_shared_titles () =
       [Lui_protocol.WidthValue;HeightValue];
     Alcotest.(check bool) "no hollow task-like circle" false (has IconName (StringValue "app:circle"));
     Alcotest.(check bool) "no trailing arrow" false (has IconName (StringValue "app:chevron-right"));
-    Alcotest.(check int) "uses LUI list" 1 (List.length(List.filter (function Lui_protocol.CreateNode(_,ListContainer)->true|_->false) !ops));
+       Alcotest.(check int)
+         "uses LUI list"
+         1
+         (List.length
+            (List.filter
+               (function
+                 | Lui_protocol.CreateNode (_, ListContainer) -> true
+                 | _ -> false)
+               !ops));
     Alcotest.(check bool) "no Journal list extension" false
-      (List.exists (function Lui_protocol.CreateExtension(_,"journal-list",_)->true|_->false) !ops))
+         (List.exists
+            (function
+              | Lui_protocol.CreateExtension (_, "journal-list", _) -> true
+              | _ -> false)
+            !ops))
 ;;
 
 (* Header control placement has no public reducer event/state; exercise the
@@ -4636,7 +4852,10 @@ let test_timeline_relative_date_headers () =
       let assert_label day expected =
         let actual = Yojson.Safe.Util.member "text" (header day) in
         Alcotest.(check (option string)) (Printf.sprintf "relative label %d today %d" day today)
-          expected (match actual with `String text -> Some text | _ -> None)
+          expected
+          (match actual with
+           | `String text -> Some text
+           | _ -> None)
       in
       assert_label today (Some "today");
       assert_label yesterday (Some "yesterday");
@@ -4912,10 +5131,11 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) () =
         match request with
         | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
-          if queue_full && Atomic.fetch_and_add graph_reads 1 > 0 then (
+          if queue_full && Atomic.fetch_and_add graph_reads 1 > 0
+          then
             while not (Atomic.get release) do
               Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
-            done);
+            done;
           Ok
             (Service.Graph_state
                { generation = 1
@@ -5100,10 +5320,11 @@ let run_unlock_application ?(worker_failure = false) ?(queue_full = false)
          let module W = Logseq_db_worker_lui.Journal_worker in
          let rec fill remaining =
            if remaining = 0 then failwith "Unlock queue did not saturate"
-           else match W.send client Service.Get_graph_state with
+           else (
+             match W.send client Service.Get_graph_state with
              | W.Accepted _ -> fill (remaining - 1)
              | Full -> ()
-             | Not_ready | Stopping -> failwith "Unlock queue unexpectedly unavailable"
+             | Not_ready | Stopping -> failwith "Unlock queue unexpectedly unavailable")
          in
          fill 2048);
        dispatch
@@ -5383,10 +5604,14 @@ let test_graph_picker_controls scenario () =
         match request with
         | Service.Inspect_local_copy request ->
           let index = Atomic.fetch_and_add inspections 1 in
-          if scenario = `Late_presence && index = 0 then (
+          if scenario = `Late_presence && index = 0
+          then
             Fun.protect
               ~finally:(fun () -> Atomic.set automatic_inspection_returned true)
-              (fun () -> while not (Atomic.get release_automatic_inspection) do Eio.Fiber.yield () done));
+              (fun () ->
+                 while not (Atomic.get release_automatic_inspection) do
+                   Eio.Fiber.yield ()
+                 done);
           Ok (Service.Local_copy_inspected (request,
             if scenario = `Presence_failure || scenario = `Refresh_after_presence_failure then Error "Synthetic presence read failed. Try again."
             else Ok (if scenario = `Visible then Service.Not_downloaded else Service.Downloaded)))
@@ -5495,7 +5720,7 @@ let test_graph_picker_controls scenario () =
   let press id = consume (hooks.dispatch (Lui_protocol.Press id)) in
   let wait label predicate =
     let deadline = Unix.gettimeofday () +. 3. in
-    while not (predicate ()) && Unix.gettimeofday () < deadline do
+    while (not (predicate ())) && Unix.gettimeofday () < deadline do
       consume (hooks.pump ()); Unix.sleepf 0.001
     done;
     Alcotest.(check bool) label true (predicate ()) in
@@ -5554,11 +5779,19 @@ let test_graph_picker_controls scenario () =
         wait "close returns to retained graph" (fun () ->
           Option.is_none (find "accessibility-identifier" "graph-picker-list"));
         Alcotest.(check bool) "picker never detaches current graph" false
-          (List.exists (function Service.Return_to_graph_picker -> true | _ -> false) (Atomic.get commands))
+           (List.exists
+              (function
+                | Service.Return_to_graph_picker -> true
+                | _ -> false)
+              (Atomic.get commands))
       | `Select ->
         press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
         wait "name selection reaches worker" (fun () ->
-          List.exists (function Service.Select_graph id -> id = second | _ -> false) (Atomic.get commands))
+           List.exists
+             (function
+               | Service.Select_graph id -> id = second
+               | _ -> false)
+             (Atomic.get commands))
       | `Late_graph_cancel ->
         press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
         wait "new graph is visible while old cancellation cleanup is held" (fun () ->
@@ -5575,7 +5808,15 @@ let test_graph_picker_controls scenario () =
           ((Atomic.get current).snapshot.selected_graph = Some second);
         Alcotest.(check bool) "old graph cancellation does not publish a current sync error" true
           (Option.is_none (find "text" "Worker unavailable"))
-      | (`Delete_menu | `Cancel | `Confirm | `Reopen | `Failure_select | `Presence_failure | `Refresh_after_presence_failure | `During_delete | `Late_presence) ->
+       | `Delete_menu
+       | `Cancel
+       | `Confirm
+       | `Reopen
+       | `Failure_select
+       | `Presence_failure
+       | `Refresh_after_presence_failure
+       | `During_delete
+       | `Late_presence ->
         let stable_select = node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second) in
         if scenario = `Failure_select then retained_select := Some stable_select;
         ignore (node ("graph-picker-options:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
@@ -5591,10 +5832,16 @@ let test_graph_picker_controls scenario () =
         else (
         wait "confirm names data loss" (fun () ->
           Hashtbl.fold (fun _ values found -> found || List.exists (fun (_, value) ->
-            match value with `String text -> String.starts_with ~prefix:"Remove “" text
+                          match value with
+                          | `String text ->
+                            String.starts_with ~prefix:"Remove “" text
               && String.contains text '\n' | _ -> false) values) props false);
         Alcotest.(check bool) "requesting confirmation does not delete" false
-          (List.exists (function Service.Delete_local_cache _ -> true | _ -> false) (Atomic.get commands));
+             (List.exists
+                (function
+                  | Service.Delete_local_cache _ -> true
+                  | _ -> false)
+                (Atomic.get commands));
         let expected_inspections = if scenario = `Late_presence then 2 else 1 in
         wait "bounded presence request completes" (fun () -> Atomic.get inspections = expected_inspections);
         for _ = 1 to 8 do consume (hooks.pump ()) done;
@@ -5628,10 +5875,18 @@ let test_graph_picker_controls scenario () =
               (Option.is_some (find "accessibility-identifier" "journal-capture-composer")))
           else if scenario = `Failure_select then (
             wait "delete failure is visible" (fun () -> Option.is_some (find "text" "Synthetic delete failed. Try again."));
-            Alcotest.(check bool) "native List retains live interactive row during operation status changes" false !select_detached;
+               Alcotest.(check bool)
+                 "native List retains live interactive row during operation status \
+                  changes"
+                 false
+                 !select_detached;
             press stable_select;
             wait "existing row callback retains its graph after failure" (fun () ->
-              List.exists (function Service.Select_graph id -> id = second | _ -> false) (Atomic.get commands)))
+                 List.exists
+                   (function
+                     | Service.Select_graph id -> id = second
+                     | _ -> false)
+                   (Atomic.get commands)))
           else wait "deleted graph stays available to download" (fun () -> Option.is_some (find "text" "Not downloaded"));
           if scenario = `Late_presence then (
             Atomic.set release_automatic_inspection true;
@@ -5666,13 +5921,26 @@ let () =
     Journal_bridge.register hooks)
   else Alcotest.run
     "application view"
-    [ ( "diagnostic failure", [ Alcotest.test_case "current error and clearing" `Quick test_diagnostic_phase_rows_retain_current_error ])
+    [ ( "diagnostic identity", [ Alcotest.test_case "actual worker identity" `Quick test_diagnostic_identity_comes_from_worker ])
+    ; ( "diagnostic failure", [ Alcotest.test_case "current error and clearing" `Quick test_diagnostic_phase_rows_retain_current_error ])
     ; ( "direct delete", List.map (fun scenario ->
         Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~delete_scenario:scenario ()))
         ["success"; "failure"])
     ; ( "status list", List.map (fun scenario ->
         Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~status_scenario:scenario ()))
-        ["expanded"; "none"; "now"; "waiting"; "later"; "select"; "clear"; "dismiss"; "failure"; "duplicate"])
+            [ "expanded"
+            ; "none"
+            ; "now"
+            ; "waiting"
+            ; "later"
+            ; "select"
+            ; "clear"
+            ; "dismiss"
+            ; "failure"
+            ; "duplicate"
+            ; "custom"
+            ; "pagination"
+            ] )
     ; ("Favorites compact title",[Alcotest.test_case "Favorite Page uses shared reference lookup" `Quick test_favorite_page_uses_shared_reference_lookup; Alcotest.test_case "page property values keep name without duplication" `Quick test_detail_page_property_value_presentation; Alcotest.test_case "root Capture only in Journals" `Quick test_root_capture_placement; Alcotest.test_case "LUI titles icons and no arrow" `Quick test_favorites_compact_shared_titles; Alcotest.test_case "page outline click and native Back" `Quick (fun () -> run_favorites_native_visibility ~check_favorite_targets:true ())])
     ; ( "graph picker", [
         Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);

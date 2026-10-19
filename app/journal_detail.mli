@@ -80,6 +80,7 @@ val child_attachment_imports
 
 val update_child_source : t -> string -> t
 val apply_child_edit : t -> Journal_view.Event.Payload.text_edit -> t
+val set_child_task : t -> Journal_model.task_state -> t
 val toggle_child_task : t -> t
 val fail : t -> message:string -> t
 val retry : t -> t * Journal_graph_request.t option
