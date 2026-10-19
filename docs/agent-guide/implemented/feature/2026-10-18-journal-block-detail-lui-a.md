@@ -30,7 +30,7 @@ The present row and typography change does not require those protected changes.
 
 - Root typography is prominent; depth one is semibold; depth two through nine retain one readable body tier.
 - Existing LUI columns own indentation and spacing; the native detail-row component is not mounted.
-- True depth remains meaningful through ten levels, with at most 56 points of inset and no bullets, numbering, cards, guide lines, or parent labels.
+- True depth remains meaningful through ten levels, with at most 73 points of inset after the approved wider-indentation follow-up and no bullets, numbering, cards, guide lines, or parent labels.
 - Synthetic mounted composition covers ten levels, long multilingual text, rich title runs, metadata, properties, and existing interaction tests.
 - Runtime screenshots cover light/dark, contrast, Dynamic Type, loading, and back navigation when coordinated build/Simulator resources are available.
 - No private graph is used, no Simulator is created, and the HTTP task retains device and build priority.
@@ -130,3 +130,32 @@ Full Application task/metadata mutations were not exercised; existing mounted re
 Production authentication and full cross-target iOS ABI remain outside this synthetic-host acceptance.
 All three owned fixture processes stopped and preparation connections closed; the HTTP task's resource window was released.
 No iPhone, private graph, new Simulator, shared switch, push, PR, or merge was involved.
+
+
+## Current-main draft PR acceptance, 2026-10-19
+
+The user authorized publishing this A layout with the wider indentation as a draft PR.
+The isolated branch now starts from main 851cb85a5e80018d187795793ce57a93002e5faa, preserving merged PR96–99.
+Implementation de16462cad86c468b0db443eefd2790489c9d0f5 changes only the OCaml Detail row composition, the existing Swift attributed leaf typography/removal of its obsolete row wrapper, mounted semantics tests, and these two decisions.
+Earlier sections describe historical attempts and evidence; their old no-publication scope and startup limitations do not describe this latest acceptance.
+
+The prepared switch and locked LUI were read only. A clean external build passed @all and forced full runtest: 21 Alcotest suites, 973 cases, plus standalone programs.
+Independent source review found no evidence-backed issues and verified that all current-main test registrations and database status identity coverage remain present.
+Native producer run-o5nqm7_h and Simulator importer run-i7lqicuh bind the clean implementation commit.
+Installed executable SHA-256 is 6864ecd9854cd63ff2e97be8d9f0ffde807a4c7feb0b7ea0173a8b6459c4dbbe, build 1.5879.6101, independent bundle org.logseq.journal.block-detail-a-probe.
+The complete Application/Worker host uses the existing warm-start Swift entry plus a test-window-only high-contrast trait; no native OCaml runtime or production authentication override was used.
+The producer/import remain experimental-host-restamp with cross_abi_validated=false. This is manual synthetic Application acceptance, not an ordinary App authentication or complete cross-target ABI claim.
+
+Only existing synthetic Simulator 1446A493-492B-4F2D-974D-3AED9DA5C97B was used. Independently generated expected graph UUID was matched to actual production Diagnostics Worker UUID, generation 1, Ready/Open.
+Current-source native observations verify light Detail with all ten expanded levels, multilingual long text, resolved references, inline bold/italic/code/URL, task status, tags, and property label/value.
+The URL opened Safari at example.com and return retained Detail, using the same production executable before the fixture-only order correction below.
+Composer appended one synthetic child; public overlay readback found exactly one matching child and outbox count one. Back returned Timeline with that child, and restart retained it.
+Dark appearance with maximum accessibility size and high contrast wrapped the root and deeper body naturally. Native accessibility Scroll Down reached the entire depth-nine Chinese text and final appended child; native Back returned Timeline.
+Raw screenshots 02 through 07, native manifests, graph identity, public readback, and full test logs are outside the repository under task evidence/ui-a-pr-20261019.
+
+The first generated fixture used an invalid fractional order key; Append correctly surfaced invalidRequest/invalid order integer. That failed package and screenshots remain archived under attempt1-invalid-order.
+The helper was corrected to valid existing-generator order keys and fresh complete WAL data; no product source or installed executable changed before the successful append/readback.
+No fresh image preview, ordinary physical scrolling, VoiceOver traversal, real authentication/server synchronization, or phone test is claimed. Historical media evidence remains explicitly historical; existing full media regressions passed.
+Both changed decision documents pass validation. The current whole-repository document check reports four pre-existing invalid decisions, including the merged local-only startup network-gate document; none is modified by this branch.
+Final independent visual and provenance review found no evidence-backed issues across the six new raw screenshots, source manifests, append readback, and test logs.
+The independent synthetic App was stopped after acceptance, preparation connections closed, and Simulator/build resources released. No A135, private graph, iPhone, new Simulator, shared switch mutation, or merge was involved.

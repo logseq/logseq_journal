@@ -19,8 +19,8 @@ Rejected because a ninth-level inset of 144 points makes mobile text unnecessari
 - All ten real depths remain distinct; negative and oversized inputs clamp safely.
 - Mounted public row behavior verifies the intended insets, unchanged spacing, content, and child actions.
 - Existing prepared resources are coordinated before building or using either existing Simulator; no new Simulator or phone operation occurs.
-- Representative shallow/deep and large-type screenshots identify their exact source, installed App, device, and graph. Real Lambda RTC is read only and its stable identity is checked.
-- No status implementation, public interface, spec, Dune, lock, or Swift change is included. No push, PR, or merge occurs.
+- Representative shallow/deep and large-type screenshots identify their exact source, installed App, device, and graph. The current-main PR acceptance uses only independently generated synthetic graph identity; earlier real-graph evidence remains historical.
+- No status implementation, public interface, spec, Dune, lock, or additional Swift responsibility is included. The current-main combined A branch may be pushed as a draft PR under the later explicit user authorization; no merge occurs.
 
 ## Risks
 
@@ -44,3 +44,13 @@ The maintained producer run-q0yeo7fe and Simulator importer run-7cfseb0a both bi
 An existing native fixture on existing 1446 Simulator rendered newly generated public OCaml patches using unchanged production Swift. Light shallow/deep and accessibility3 dark/high-contrast screenshots show complete wrapping through depth nine. Native accessibility scrolling reached the complete tenth-level body, and Back returned Synthetic Timeline. This component evidence does not exercise a full synthetic worker or graph.
 
 All raw screenshots, source-bound manifests, graph identity checks without private IDs or body, and test logs are outside the repository under the current task evidence/indent-wider-20261018 directory. The full document check retains three pre-existing invalid historical documents. Host restamping remains experimental: cross_abi_validated=false and runtime_acceptance=false; manual interaction observations do not certify complete cross-target ABI correctness. No phone, new Simulator, shared dependency mutation, graph edit, push, PR, or merge occurred.
+
+
+## Current-main integration and acceptance
+
+This indentation is included in implementation de16462cad86c468b0db443eefd2790489c9d0f5 on main 851cb85, together with the approved A typography and LUI row ownership.
+The exact ten insets remain 0/16/32/40/48/53/58/63/68/73 points, with bounds and row events checked through mounted public composition.
+The accompanying A decision records the current clean-source 21-suite/973-case full regression, native provenance, actual synthetic Application screenshots, successful composer readback, source/visual review, and experimental ABI limits.
+The 2026-10-19 screenshots use only existing synthetic Simulator 1446 and an independent bundle; A135 and private graphs were not accessed.
+Light normal-size and dark maximum-accessibility/high-contrast views reach the complete depth-nine body and native Back returns Timeline.
+The new draft PR authorization supersedes the earlier no-push scope solely for this isolated UI branch; the historical evidence above is not substituted for current-source acceptance.
