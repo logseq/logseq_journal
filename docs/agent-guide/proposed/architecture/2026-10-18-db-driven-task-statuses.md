@@ -229,6 +229,11 @@ status catalog reader. A UI-only replacement cannot correctly save a custom UUID
   Retry confirms it. Body/attachment editing is temporarily held until the
   attempt is confirmed, with an explicit native recovery message. This prevents
   inserting a second block after a late status deletion.
+- Existing Diagnostics now displays the Worker graph UUID and generation from
+  the observed Worker graph state. It never substitutes the manager's selected
+  graph, a catalog name or a disk record. With Ready/Open and an independent
+  expected UUID, these rows support manual identity checks before and after
+  device acceptance; they are not authenticated IPC or full iOS ABI evidence.
 
 
 ### Source validation before Simulator acceptance
@@ -237,8 +242,16 @@ The final source build passes `@all`. Targeted final runs pass 90 overlay sync
 cases (including rejected metadata rollback), 23 mutation cases, 152 Runtime
 cases, 122 mounted Application cases, and the route/semantics programs. An
 independent reader reviewed the final logical changes with no remaining finding.
-The broader local run passed the remaining app/worker/storage/type suites except
-the unchanged Swift synthetic RSA creation test. The full sync transport run is
-blocked by sandbox loopback bind EPERM and waits for its fixture server; it was
-stopped without changing transport or permissions. Exact-head CI is still required.
-Simulator acceptance remains pending at this checkpoint.
+An initial ordinary-sandbox run was blocked by Swift synthetic RSA creation and
+loopback bind EPERM. On October 19 the user explicitly requested broader shell
+permissions; normal approval allowed the maintained build and complete local
+regression. The unchanged checkpoint then passed `@all` and full `runtest --force`
+(20 Alcotest suites / 918 cases, plus the standalone programs), and both ordinary
+and complete-Worker test-host Simulator Apps built with strict signature checks.
+They use experimental host restamping with `cross_abi_validated=false`.
+
+The added read-only identity rows were tested first: the unmodified presenter
+failed to show the actual Worker UUID; the implementation preserves actual versus
+selected identity, generation and the explicit unavailable state. Matching final
+source builds/regression, actual Simulator acceptance and exact-head CI are still
+required after this observation change.

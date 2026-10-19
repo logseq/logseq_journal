@@ -2704,18 +2704,26 @@ let graph_phase_name : Logseq_db_worker.graph_phase -> string = function
 ;;
 
 let diagnostic_phase_rows ~snapshot ~(graph : Logseq_db_worker.graph_state) =
+  let worker_rows =
+    [ "Graph phase", graph_phase_name graph.phase
+    ; "Worker graph UUID",
+      Option.fold ~none:"Not available"
+        ~some:Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id
+    ; "Worker graph generation", string_of_int graph.generation
+    ]
+  in
   match snapshot with
   | None ->
     [ "Sync phase", "Not available"
     ; "Startup phase", "Not available"
-    ; "Graph phase", graph_phase_name graph.phase
     ]
+    @ worker_rows
   | Some snapshot ->
     let startup = Journal_startup.derive ~snapshot ~graph in
     [ "Sync phase", sync_phase_name snapshot.sync_phase
     ; "Startup phase", startup_phase_name startup.phase
-    ; "Graph phase", graph_phase_name graph.phase
     ]
+    @ worker_rows
     @ Option.fold ~none:[] ~some:(fun message -> [ "Last error", message ]) snapshot.last_error
 ;;
 

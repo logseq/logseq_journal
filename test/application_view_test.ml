@@ -113,6 +113,8 @@ let test_missing_snapshot_keeps_graph_lifecycle_visible () =
     [ "Sync phase", "Not available"
     ; "Startup phase", "Not available"
     ; "Graph phase", "Opening"
+    ; "Worker graph UUID", "Not available"
+    ; "Worker graph generation", "4"
     ]
     (Application.diagnostic_phase_rows ~snapshot:None ~graph)
 ;;
@@ -135,6 +137,40 @@ let test_diagnostic_phase_rows_retain_current_error () =
       ~snapshot:(Some {snapshot with last_error = None}) ~graph in
   Alcotest.(check bool) "retry does not retain obsolete error" false
     (List.mem_assoc "Last error" cleared)
+;;
+
+let test_diagnostic_identity_comes_from_worker () =
+  let uuid value = Logseq_db_types.Graph_types.Uuid.of_string value |> Result.get_ok in
+  let selected = uuid "60000000-0000-4000-8000-000000000001" in
+  let actual = uuid "60000000-0000-4000-8000-000000000002" in
+  let snapshot : Service.snapshot =
+    { sync_phase = Offline; catalog = []; selected_graph = Some selected
+    ; applied_server_t = None; timeline_presentation_pending = false
+    ; local_deletion = None; last_error = None
+    ; startup = { authenticated = true; catalog_loading = false
+        ; awaiting_selection = false; restoring_local = false; bootstrapping = false
+        ; awaiting_e2ee_password = false; failure = None; account_generation = 1
+        ; graph_generation = 7; presentation_generation = 1 } }
+  in
+  let graph : Logseq_db_worker.graph_state =
+    { generation = 7; graph_id = Some actual; phase = Graph_open; error = None }
+  in
+  let rows = Application.diagnostic_phase_rows ~snapshot:(Some snapshot) ~graph in
+  Alcotest.(check (option string)) "worker identity, not selected graph"
+    (Some "60000000-0000-4000-8000-000000000002")
+    (List.assoc_opt "Worker graph UUID" rows);
+  Alcotest.(check (option string)) "worker generation" (Some "7")
+    (List.assoc_opt "Worker graph generation" rows);
+  Alcotest.(check bool) "different worker cannot appear ready" false
+    (List.assoc_opt "Startup phase" rows = Some "Ready");
+  let ready = Application.diagnostic_phase_rows
+      ~snapshot:(Some { snapshot with selected_graph = Some actual }) ~graph in
+  Alcotest.(check (option string)) "matching worker is ready" (Some "Ready")
+    (List.assoc_opt "Startup phase" ready);
+  let closed = Application.diagnostic_phase_rows ~snapshot:(Some snapshot)
+      ~graph:{graph with graph_id = None; phase = Graph_closed} in
+  Alcotest.(check (option string)) "no selected-graph fallback when worker closed"
+    (Some "Not available") (List.assoc_opt "Worker graph UUID" closed)
 ;;
 
 let admission_inspection : Logseq_db_worker.Protocol.v2_admission_inspection =
@@ -5885,7 +5921,8 @@ let () =
     Journal_bridge.register hooks)
   else Alcotest.run
     "application view"
-    [ ( "diagnostic failure", [ Alcotest.test_case "current error and clearing" `Quick test_diagnostic_phase_rows_retain_current_error ])
+    [ ( "diagnostic identity", [ Alcotest.test_case "actual worker identity" `Quick test_diagnostic_identity_comes_from_worker ])
+    ; ( "diagnostic failure", [ Alcotest.test_case "current error and clearing" `Quick test_diagnostic_phase_rows_retain_current_error ])
     ; ( "direct delete", List.map (fun scenario ->
         Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~delete_scenario:scenario ()))
         ["success"; "failure"])
