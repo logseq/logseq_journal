@@ -1175,32 +1175,26 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
       let state = if stale_cursor then state else record_failure_source state failure in
       { state with routes }
   | Feed_failed { request_generation; failure } ->
-    let state = record_failure_source state failure in
-    let message = failure_source_message failure in
-    let terminal_failure state =
-      match failure with
-      | Journal_graph_runtime.Worker_failure _ ->
+    let accept_failure state =
+      let state = record_failure_source state failure in
+      let message = failure_source_message failure in
+      match failure, state.feed_loaded with
+      | Journal_graph_runtime.Worker_failure _, true ->
+        show_sync_error state (Worker_sync_failure (latest_worker_error state))
+      | Projection_failure _, true ->
+        show_sync_error state (Non_worker_sync_failure message)
+      | Journal_graph_runtime.Worker_failure _, false ->
         terminal_graph_state state (Worker_graph_error (latest_worker_error state))
-      | Projection_failure _ -> terminal_graph_state state (Transport_graph_error message)
-    in
-    let sync_failure =
-      match failure with
-      | Journal_graph_runtime.Worker_failure _ ->
-        Worker_sync_failure (latest_worker_error state)
-      | Projection_failure _ -> Non_worker_sync_failure message
+      | Projection_failure _, false ->
+        terminal_graph_state state (Transport_graph_error message)
     in
     (match state.feed_refresh with
      | Some refresh when Int64.equal refresh.generation request_generation ->
-       if state.feed_loaded
-       then show_sync_error state sync_failure
-       else terminal_failure state
+       accept_failure state
      | None | Some _ ->
        (match Journal_timeline_state.pending_request state.timeline with
         | Some (generation, Feed { before_day = None })
-          when Int64.equal generation request_generation ->
-          if state.feed_loaded
-          then show_sync_error state sync_failure
-          else terminal_failure state
+          when Int64.equal generation request_generation -> accept_failure state
         | Some (_, Feed { before_day = Some _ })
         | Some (_, Day _)
         | Some (_, Feed { before_day = None })

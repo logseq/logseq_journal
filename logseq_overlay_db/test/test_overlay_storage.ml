@@ -764,7 +764,9 @@ let stale_delete_cannot_remove_replacement () =
       Alcotest.(check bool) "replacement remains present" true (Sys.file_exists database_path)))
 ;;
 
-let retired_cleanup_retries_without_touching_a_new_mirror () =
+(* No pure reducer owns the filesystem rename, purge, or stderr capability.
+   Exercise the public deletion operation with a real purge obstruction. *)
+let retired_cleanup_retries_without_touching_a_new_mirror ?(closed_stderr = false) () =
   let behavior = "committed retirement survives cleanup failure" in
   T.with_temp_directory "overlay-retired-cleanup-" (fun support ->
     let database_path = T.seed_mirror support in
@@ -784,10 +786,19 @@ let retired_cleanup_retries_without_touching_a_new_mirror () =
     Fun.protect ~finally:unblock (fun () ->
       let dependencies = T.dependencies ~behavior in
       Unix.chmod blocked 0o500;
-      ignore ((match Database.prepare_mirror_deletion ~application_support_directory:support ~graph_id:T.graph_uuid ~retirement:(next_retirement ()) with
-      | Error _ as error -> error
-      | Ok (preparation, _) -> Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion preparation)
-          (fun () -> Database.commit_mirror_deletion preparation)) |> T.require_ok ~behavior);
+      let commit () =
+        match Database.prepare_mirror_deletion ~application_support_directory:support ~graph_id:T.graph_uuid ~retirement:(next_retirement ()) with
+        | Error _ as error -> error
+        | Ok (preparation, _) -> Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion preparation)
+            (fun () -> Database.commit_mirror_deletion preparation) in
+      let result = if not closed_stderr then commit () else (
+        flush stderr;
+        let saved = Unix.dup Unix.stderr in
+        let unreadable = Unix.openfile "/dev/null" [Unix.O_RDONLY] 0 in
+        Fun.protect ~finally:(fun () ->
+          Unix.dup2 saved Unix.stderr; Unix.close saved; Unix.close unreadable)
+          (fun () -> Unix.dup2 unreadable Unix.stderr; commit ())) in
+      ignore (result |> T.require_ok ~behavior);
       Alcotest.(check bool) "canonical copy was committed absent" false (Sys.file_exists database_path);
       Alcotest.(check bool) "failed purge remains durably retryable" true (blocked_paths support <> []);
       ignore (T.seed_mirror support);
@@ -3105,7 +3116,9 @@ let () =
             sqlite_full_int64_checkpoint
         ] )
     ; "mirror and durability", cases @
-        [Alcotest.test_case "legacy post-rename retirement replays" `Quick (legacy_retirement_replays_without_content_load `After);
+        [Alcotest.test_case "committed deletion survives unavailable warning output" `Quick
+           (retired_cleanup_retries_without_touching_a_new_mirror ~closed_stderr:true);
+         Alcotest.test_case "legacy post-rename retirement replays" `Quick (legacy_retirement_replays_without_content_load `After);
          Alcotest.test_case "legacy pre-rename retirement cancels with lease fencing" `Quick (legacy_retirement_replays_without_content_load `Before);
          Alcotest.test_case "obsolete preparation with missing canonical cancels" `Quick (legacy_retirement_replays_without_content_load `Missing);
          Alcotest.test_case "legacy pending symlink is rejected" `Quick (legacy_retirement_replays_without_content_load `Linked);
