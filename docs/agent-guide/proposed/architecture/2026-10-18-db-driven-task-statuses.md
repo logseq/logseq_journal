@@ -246,12 +246,43 @@ An initial ordinary-sandbox run was blocked by Swift synthetic RSA creation and
 loopback bind EPERM. On October 19 the user explicitly requested broader shell
 permissions; normal approval allowed the maintained build and complete local
 regression. The unchanged checkpoint then passed `@all` and full `runtest --force`
-(20 Alcotest suites / 918 cases, plus the standalone programs), and both ordinary
+(21 Alcotest suites / 919 cases, plus the standalone programs), and both ordinary
 and complete-Worker test-host Simulator Apps built with strict signature checks.
 They use experimental host restamping with `cross_abi_validated=false`.
 
 The added read-only identity rows were tested first: the unmodified presenter
 failed to show the actual Worker UUID; the implementation preserves actual versus
-selected identity, generation and the explicit unavailable state. Matching final
-source builds/regression, actual Simulator acceptance and exact-head CI are still
-required after this observation change.
+selected identity, generation and the explicit unavailable state. The matching
+`c983bee` source passes `@all` and full `runtest --force` (21 reported Alcotest
+suites / 920 cases, plus standalone programs), and its ordinary Simulator App
+built and passed strict signature verification.
+
+After explicit user authorization accepting normal background synchronization,
+the ordinary App was installed and launched on A135. Its observed Worker is Open
+at generation 1, but startup remains Restoring local. No original page acceptance
+or accepted screenshot is claimed.
+
+The first 1446 fixture omitted the complete WAL/SHM transfer documented in the
+warm-start README. Public mirror inspection and a system SQLite schema-query
+comparison both returned `unable to open database file`; that error is discarded
+by the existing service. This fixture packaging mistake was corrected using the
+public Storage API: verify and restore each synthetic database, checkpoint it,
+keep its preparation connection quiescent during an explicit db/WAL/SHM copy,
+then close it. No sidecar was hand-crafted and no storage behavior was changed.
+
+With this complete package, the clean `c983bee` native object and unmodified
+existing warm-start entry open the expected synthetic Worker UUID at generation
+1, but the initial screen still waits. A separate read-only observer records the
+same scope progressing from an unauthenticated manager to Worker Open, then an
+unauthenticated attached manager with timeline presentation pending, then an
+authenticated manager still awaiting presentation; no initial graph response is
+observed. This supports investigating the existing Application scope-retirement
+path, but does not by itself prove cancellation or establish the ordinary App's
+cause.
+
+An existing independent local-restoration repair is preserved on
+`codex/fix-local-restore-auth-order-20261017` at `e5b9b2b`, and the separate
+Graph-restoration task is implementing the startup dependency. Neither repair
+has been copied into this status branch. All temporary observers, logs and
+synthetic data remain outside this product worktree. Actual Simulator acceptance
+and exact-head CI remain required before a formal PR.
