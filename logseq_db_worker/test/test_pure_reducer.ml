@@ -1131,10 +1131,49 @@ let test_local_restore_worker_failures_are_terminal () =
   ) [false;true]
 ;;
 
+(* This tests downstream propagation only: the runner owns producer classification.
+   Closed/version preparation races have no deterministic public runner hook. *)
+let test_authoritative_failure_categories_reach_diagnostics () =
+  let module Error = Logseq_db_worker.Error in
+  List.iter (fun (code, category, message) ->
+    let ready, graph = worker_open_graph_transition () in
+    let connection = List.find_map (function
+      | Core.Run_sync (Sync.Start_websocket request) -> Some request.scope
+      | _ -> None) ready.effects |> Option.get in
+    let opened = Core.step ready.next (Sync_event (Sync.Websocket_opened connection)) in
+    let cursor = Logseq_db_types.Server_cursor.of_int64 1L |> Result.get_ok in
+    let tx : Logseq_sync_pure_reducer.Sync_protocol.Server.pull_transaction =
+      {t=cursor;tx="[[\"~:db/retractEntity\",99999]]";outliner_op=None} in
+    let pending = Core.step opened.next (Sync_event (Sync.Websocket_message
+      (connection, Pull_ok {t=cursor;checksum=None;txs=[tx]}))) in
+    let ticket = List.find_map (function
+      | Core.Run_worker (Core.Request (ticket, Handle_sync_worker_effect (Sync.Apply_authoritative_batch _))) -> Some ticket
+      | _ -> None) pending.effects |> Option.get in
+    let origin = Error.create_cause ~component:Managed_sync ~operation:"applyAuthoritative"
+      ~code:(Some category) ~message |> Result.get_ok in
+    let error = Error.create_with_origin ~code ~message ~details:[] ~origin |> Result.get_ok in
+    let failure = Core.Runner_completed (Sync_worker_effect_completed (ticket, Error error)) in
+    let failed = Core.step pending.next failure in
+    Alcotest.(check (option string)) "Last error retains category" (Some message)
+      (Core.view failed.next).sync.snapshot.last_error;
+    Alcotest.(check bool) "Worker diagnostics retain category" true
+      (List.exists (function Core.Publish (Diagnostic signal) ->
+        signal="worker.applyAuthoritative." ^ category | _ -> false) failed.effects);
+    Alcotest.(check bool) "local graph remains open" true
+      ((Core.view failed.next).graph.phase=Graph_open && graph.graph_generation=(Core.view failed.next).graph.generation);
+    Alcotest.(check int) "duplicate completion is inert" 0
+      (List.length (Core.step failed.next failure).effects))
+    [ Error.Closed_session, "authoritativeDatabaseClosed", "Authoritative database is closed."
+    ; Conflict, "authoritativeSyncTokenConflict", "Authoritative sync version changed."
+    ; Ambiguous_sync_state, "authoritativeCursorDiscontinuous", "Authoritative transaction cursors are not continuous."
+    ; Unsupported_semantics, "authoritativeDecodeFailed", "Authoritative transaction format is unsupported." ]
+;;
+
 let () =
   Alcotest.run
     "logseq db worker pure reducer"
-    [ ( "snapshot failure", [
+    [ ( "authoritative diagnostics", [Alcotest.test_case "four categories propagate without closing graph" `Quick test_authoritative_failure_categories_reach_diagnostics])
+    ; ( "snapshot failure", [
         Alcotest.test_case "terminal failure and explicit retry" `Quick test_snapshot_failure_is_terminal_and_retryable;
         Alcotest.test_case "success and late graph switch completions" `Quick test_snapshot_success_and_late_switch_completions ])
     ; ( "asset session"

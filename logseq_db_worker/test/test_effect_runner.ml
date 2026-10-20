@@ -1629,10 +1629,403 @@ let test_deletion_journal_failure_preserves_worker () = deletion_runtime_fixture
 let test_deletion_confirmation_failure_reports () =
   deletion_runtime_fixture ~confirmation_failure:true ~busy:false ()
 
+(* Producer mapping lives in the runner. Real cursor/format failures reach it
+   through the public reducer and database; no failed external result is injected. *)
+let authoritative_detail_cases =
+  [ "empty", "[]", [ "stage=prepare"; "reason=empty-transaction"; "transaction=1" ]
+  ; "top-level", "{}", [ "stage=prepare"; "reason=transaction-shape"; "type=map" ]
+  ; "syntax", "[", [ "stage=prepare"; "reason=transit-syntax" ]
+  ; "entry", "[42]", [ "reason=operation-shape"; "operationIndex=1"; "type=integer" ]
+  ; ( "keyword"
+    , "[[\"PRIVATE_SYNTHETIC_PAYLOAD\",99999]]"
+    , [ "reason=operation-keyword"; "type=string" ] )
+  ; ( "attribute"
+    , "[[\"~:db/add\",99999,\"PRIVATE_SYNTHETIC_PAYLOAD\",1]]"
+    , [ "reason=operation-fields"; "operation=add"; "arity=4" ] )
+  ; ( "protected"
+    , "[[\"~:db/add\",99999,\"~:block/title\",false]]"
+    , [ "reason=protected-value-type"; "attribute=block/title"; "type=bool" ] )
+  ; ( "extra-fields"
+    , "[[\"~:db/add\",99999,\"~:block/PRIVATE_SYNTHETIC_PAYLOAD\",1,2,3]]"
+    , [ "stage=decode"; "reason=operation-fields"; "arity=6"; "attribute=custom" ] )
+  ; ( "source-tx"
+    , "[[\"~:db/add\",99999,\"~:block/foo\",1,\"PRIVATE_SYNTHETIC_PAYLOAD\"]]"
+    , [ "reason=source-tx-type"; "field=source-tx"; "type=string" ] )
+  ; ( "entity-range"
+    , "[[\"~:db/add\",\"~i4611686018427387904\",\"~:block/foo\",1]]"
+    , [ "reason=integer-range"; "field=entity"; "type=int64" ] )
+  ; ( "big-integer"
+    , "[[\"~:db/add\",99999,\"~:block/foo\",\"~n9223372036854775808\"]]"
+    , [ "reason=integer-value"; "type=big-integer" ] )
+  ; ( "reference"
+    , "[[\"~:db/add\",[\"~:block/uuid\",\"~u22222222-2222-4222-8222-222222222222\"],\"~:block/parent\",null]]"
+    , [ "reason=reference-shape"; "field=value"; "type=null" ] )
+  ; ( "missing-lookup"
+    , "[[\"~:db/add\",[\"~:block/uuid\",\"~u99999999-9999-4999-8999-999999999999\"],\"~:block/foo\",42]]"
+    , [ "stage=application"
+      ; "reason=application-exception"
+      ; "exception=invalid-argument"
+      ; "lookupRefs=1"
+      ; "operationCount=1"
+      ] )
+  ; ( "application-nil"
+    , "[[\"~:db/add\",99999,\"~:block/PRIVATE_SYNTHETIC_PAYLOAD\",null]]"
+    , [ "stage=application"
+      ; "reason=application-exception"
+      ; "exception=invalid-argument"
+      ; "operationCount=1"
+      ] )
+  ; ( "cas-expected"
+    , "[[\"~:db.fn/cas\",99999,\"~:block/title\",false,true]]"
+    , [ "stage=prepare"
+      ; "reason=protected-value-type"
+      ; "field=expected"
+      ; "operation=cas"
+      ] )
+  ; ( "cas-value"
+    , "[[\"~:db.fn/cas\",99999,\"~:block/title\",null,false]]"
+    , [ "stage=prepare"; "reason=protected-value-type"; "field=value" ] )
+  ; ( "second-transaction"
+    , "[]"
+    , [ "stage=prepare"; "reason=empty-transaction"; "transaction=2" ] )
+  ; ( "second-operation"
+    , "[[\"~:db/retractEntity\",99998],[\"~:PRIVATE_SYNTHETIC_PAYLOAD\",99999]]"
+    , [ "transaction=1"
+      ; "operationIndex=2"
+      ; "operation=other"
+      ; "reason=unsupported-operation"
+      ] )
+  ; ( "application-bounded-stats"
+    , "[[\"~:db/add\",99999,\"~:block/foo\",null],[\"~:db/add\",99999,\"~:block/bar\",["
+      ^ String.concat "," (List.init 3000 (fun _ -> "0"))
+      ^ "]]]"
+    , [ "stage=application"
+      ; "reason=application-exception"
+      ; "operationCount=2"
+      ; "!lookupRefs="
+      ] )
+  ]
+;;
+
+let test_authoritative_rejection_diagnostics kind () =
+  let module G = Logseq_db_types.Graph_types in
+  let module Error = Logseq_db_worker.Error in
+  T.with_managed (fun fixture ->
+    Eio_main.run (fun _ ->
+      Eio.Switch.run (fun sw ->
+        let graph_id =
+          G.Uuid.of_string "94000000-0000-4000-8000-000000000707" |> Result.get_ok
+        in
+        let graph : Sync.graph =
+          { graph_id
+          ; name = "Synthetic authoritative diagnostics"
+          ; encrypted = false
+          ; schema = { major = 65; minor = 33; exact = true }
+          }
+        in
+        let root = fixture.config.application_support_directory in
+        let worker_root = Filename.concat root "logseq-db-worker" in
+        Unix.mkdir worker_root 0o700;
+        let mirrors = Filename.concat worker_root "synced-graphs" in
+        Unix.mkdir mirrors 0o700;
+        let directory = Filename.concat mirrors (G.Uuid.to_string graph_id) in
+        Unix.mkdir directory 0o700;
+        let sqlite = Sqlite3.db_open (Filename.concat directory "db.sqlite") in
+        let open Yojson.Safe.Util in
+        let storage = T.read_json (T.fixture "storage/logseq-65.33-create-page.json") in
+        Sqlite3.Rc.check (Sqlite3.exec sqlite (storage |> member "tableSql" |> to_string));
+        let stmt =
+          Sqlite3.prepare sqlite "INSERT INTO kvs(addr,content,addresses) VALUES(?,?,?)"
+        in
+        storage
+        |> member "rows"
+        |> to_list
+        |> List.iter (fun row ->
+          Sqlite3.Rc.check (Sqlite3.reset stmt);
+          Sqlite3.Rc.check (Sqlite3.bind_int stmt 1 (row |> member "addr" |> to_int));
+          Sqlite3.Rc.check
+            (Sqlite3.bind_text stmt 2 (row |> member "content" |> to_string));
+          Sqlite3.Rc.check
+            (Sqlite3.bind
+               stmt
+               3
+               (match member "addresses" row with
+                | `Null -> Sqlite3.Data.NULL
+                | `String value -> TEXT value
+                | _ -> assert false));
+          Sqlite3.Rc.check (Sqlite3.step stmt));
+        Sqlite3.Rc.check (Sqlite3.finalize stmt);
+        let cursor n = Logseq_db_types.Server_cursor.of_int64 n |> Result.get_ok in
+        let checkpoint =
+          Logseq_db_types.Sync_checkpoint.create
+            ~graph_id
+            ~schema:{ major = 65; minor = 33 }
+            ~applied_server_t:(cursor 0L)
+            ~checksum:"0123456789abcdef"
+          |> Result.get_ok
+        in
+        Logseq_db_storage.Sync_checkpoint_store.initialize_database sqlite checkpoint
+        |> Result.get_ok;
+        Logseq_db_storage.Sync_outbox_store.initialize_database sqlite |> Result.get_ok;
+        ignore (Sqlite3.db_close sqlite);
+        let limits =
+          Sync.limits
+            ~maximum_response_bytes:
+              (match kind with
+               | `Detail ("application-bounded-stats", _, _) -> 16384
+               | _ -> 1024)
+            ~maximum_artifact_bytes:1048576
+            ~submission_batch_size:32
+          |> Result.get_ok
+        in
+        let sync =
+          Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits
+          |> Result.get_ok
+        in
+        let state =
+          ref (Core.initial (Core.config ~worker:fixture.config ~sync) |> Result.get_ok)
+        in
+        let events = Queue.create ()
+        and emitted = ref []
+        and failures = ref []
+        and connection = ref None in
+        let post event = Queue.add event events in
+        let sync_runner =
+          Runner.sync_runner
+            ~shutdown:(fun () -> ())
+            ~submit:(function
+              | Sync.Request (ticket, Sync.Fetch_catalog _) ->
+                post
+                  (Core.Sync_event
+                     (Sync.Runner_completed (Sync.Completion (ticket, Ok [ graph ]))))
+              | Sync.Request (ticket, Sync.Save_catalog _) ->
+                post
+                  (Core.Sync_event
+                     (Sync.Runner_completed (Sync.Completion (ticket, Ok ()))))
+              | Sync.Start_websocket request -> connection := Some request.scope
+              | _ -> ())
+            ()
+        in
+        let dependencies =
+          Runner.dependencies
+            ~runtime:
+              (Runner.runtime ~fork:(fun ~sw:_ task -> task ()) ~sleep:(fun _ -> ())
+               |> Result.get_ok)
+            ~config:fixture.config
+            ~overlay:fixture.overlay
+            ~sync_runner
+            ~publish:(fun output -> emitted := output :: !emitted)
+          |> Result.get_ok
+        in
+        let runner =
+          Runner.create
+            ~sw
+            dependencies
+            ~post
+            ~recovery_current:(fun _ -> false)
+            ~upload_current:(fun _ -> false)
+            ~asset_current:(fun _ -> false)
+          |> Result.get_ok
+        in
+        let drive event =
+          post event;
+          while not (Queue.is_empty events) do
+            let event = Queue.take events in
+            (match event with
+             | Core.Runner_completed (Sync_worker_effect_completed (_, Error error)) ->
+               failures := error :: !failures
+             | _ -> ());
+            let transition = Core.step !state event in
+            state := transition.next;
+            List.iter (Runner.submit runner) transition.effects
+          done
+        in
+        Fun.protect
+          ~finally:(fun () -> Runner.shutdown runner)
+          (fun () ->
+             drive
+               (Core.Sync_event
+                  (Sync.Sign_in_requested
+                     { account_generation = 0; presentation_generation = 0 }));
+             drive
+               (Core.Sync_event
+                  (Sync.Account_authenticated { user_id = Some "synthetic-user" }));
+             drive (Core.Sync_event (Sync.Graph_selected graph_id));
+             Alcotest.(check bool)
+               "actual mirror opens"
+               true
+               ((Core.view !state).graph.phase = Graph_open);
+             let connection = Option.get !connection in
+             drive (Core.Sync_event (Sync.Websocket_opened connection));
+             let t, payload, code, category, message, checks =
+               match kind with
+               | `Cursor ->
+                 ( 2L
+                 , "[[\"~:db/retractEntity\",99999]]"
+                 , Error.Ambiguous_sync_state
+                 , "authoritativeCursorDiscontinuous"
+                 , Some "Authoritative transaction cursors are not continuous."
+                 , [] )
+               | `Format ->
+                 ( 1L
+                 , "[[\"~:PRIVATE_SYNTHETIC_PAYLOAD\",99999]]"
+                 , Error.Unsupported_semantics
+                 , "authoritativeDecodeFailed"
+                 , None
+                 , [ "stage=prepare"; "reason=unsupported-operation"; "operation=other" ]
+                 )
+               | `Apply_format ->
+                 ( 1L
+                 , "[[\"~:db/add\",null,\"~:block/foo\",\"PRIVATE_SYNTHETIC_PAYLOAD\"]]"
+                 , Error.Unsupported_semantics
+                 , "authoritativeDecodeFailed"
+                 , None
+                 , [ "stage=decode"; "reason=entity-shape"; "field=entity"; "type=null" ]
+                 )
+               | `Detail (name, payload, checks) ->
+                 ( (if name = "second-transaction" then 2L else 1L)
+                 , payload
+                 , Error.Unsupported_semantics
+                 , "authoritativeDecodeFailed"
+                 , None
+                 , checks )
+             in
+             let tx : Logseq_sync_pure_reducer.Sync_protocol.Server.pull_transaction =
+               { t = cursor t; tx = payload; outliner_op = None }
+             in
+             let txs =
+               match kind with
+               | `Detail ("second-transaction", _, _) ->
+                 [ { tx with t = cursor 1L; tx = "[[\"~:db/retractEntity\",99998]]" }
+                 ; tx
+                 ]
+               | _ -> [ tx ]
+             in
+             drive
+               (Core.Sync_event
+                  (Sync.Websocket_message
+                     (connection, Pull_ok { t = cursor t; checksum = None; txs })));
+             let empty_success=match kind with `Detail (("empty"|"second-transaction"),_,_) -> true | _ -> false in
+             if empty_success then (
+               Alcotest.(check bool) "legal empty authoritative batch succeeds" true (!failures=[]);
+               Alcotest.(check bool) "empty cursor reaches actual manager" true
+                 ((Core.view !state).sync.snapshot.applied_server_t=Some(cursor t));
+               Alcotest.(check (option string)) "successful empty pull has no Last error" None
+                 (Core.view !state).sync.snapshot.last_error;
+               Alcotest.(check bool) "successful empty pull keeps graph open" true
+                 ((Core.view !state).graph.phase=Graph_open)) else (
+             let error =
+               match !failures with
+               | [ error ] -> error
+               | _ -> Alcotest.fail "expected actual authoritative failure"
+             in
+             Alcotest.(check bool)
+               "failure code reflects actual category"
+               true
+               (Error.code error = code);
+             let message_text = Error.message error in
+             let includes text needle =
+               let rec loop i =
+                 i + String.length needle <= String.length text
+                 && (String.sub text i (String.length needle) = needle || loop (i + 1))
+               in
+               loop 0
+             in
+             Option.iter
+               (fun expected ->
+                  Alcotest.(check string)
+                    "producer retains a fixed safe reason"
+                    expected
+                    message_text)
+               message;
+             List.iter
+               (fun expected ->
+                  let absent = String.starts_with ~prefix:"!" expected in
+                  let part =
+                    if absent
+                    then String.sub expected 1 (String.length expected - 1)
+                    else expected
+                  in
+                  Alcotest.(check bool)
+                    ("safe detail " ^ expected)
+                    (not absent)
+                    (includes message_text part))
+               checks;
+             Alcotest.(check (option string))
+               "typed origin retains category"
+               (Some category)
+               (Error.trace error).origin.code;
+             Alcotest.(check (option string))
+               "actual Last error retains category"
+               (Some message_text)
+               (Core.view !state).sync.snapshot.last_error;
+             Alcotest.(check bool)
+               "actual Worker diagnostic retains category"
+               true
+               (List.exists
+                  (function
+                    | Core.Diagnostic signal ->
+                      String.starts_with
+                        ~prefix:("worker.applyAuthoritative." ^ category)
+                        signal
+                    | _ -> false)
+                  !emitted);
+             if checks <> []
+             then
+               Alcotest.(check bool)
+                 "validated detail travels in actual diagnostic signal"
+                 true
+                 (List.exists
+                    (function
+                      | Core.Diagnostic signal ->
+                        includes signal "authoritative-decode:v1:"
+                      | _ -> false)
+                    !emitted);
+             Alcotest.(check bool)
+               "failure precedes checkpoint advancement"
+               true
+               ((Core.view !state).sync.snapshot.applied_server_t = Some (cursor 0L));
+             let encoded =
+               Yojson.Safe.to_string (Error.to_yojson error)
+               ^ "\n"
+               ^ String.concat
+                   "\n"
+                   (List.filter_map
+                      (function
+                        | Core.Diagnostic signal -> Some signal
+                        | _ -> None)
+                      !emitted)
+             in
+             let contains needle =
+               let rec loop i =
+                 i + String.length needle <= String.length encoded
+                 && (String.sub encoded i (String.length needle) = needle || loop (i + 1))
+               in
+               loop 0
+             in
+             List.iter
+               (fun secret ->
+                  Alcotest.(check bool) "source content excluded" false (contains secret))
+               ([ root
+                ; "PRIVATE_SYNTHETIC_PAYLOAD"
+                ; "99999999-9999-4999-8999-999999999999"
+                ; "Nothing found"
+                ; "Cannot store nil"
+                ]
+                @ if String.length payload > 30 then [ payload ] else []))))))
+;;
+
+
 let () =
   Alcotest.run
     "logseq db worker effect runner"
-    [ ( "ID token cache"
+    [ ( "authoritative diagnostics", [
+        Alcotest.test_case "real cursor rejection reaches Diagnostics" `Quick (test_authoritative_rejection_diagnostics `Cursor);
+        Alcotest.test_case "real format rejection reaches Diagnostics" `Quick (test_authoritative_rejection_diagnostics `Format);
+        Alcotest.test_case "apply format failure excludes raw source" `Quick (test_authoritative_rejection_diagnostics `Apply_format) ] @
+      List.map (fun ((name,_,_) as detail) -> Alcotest.test_case ("safe detail "^name) `Quick
+        (test_authoritative_rejection_diagnostics (`Detail detail))) authoritative_detail_cases)
+    ; ( "ID token cache"
       , [ Alcotest.test_case
             "caps reuse at twenty-four hours"
             `Quick

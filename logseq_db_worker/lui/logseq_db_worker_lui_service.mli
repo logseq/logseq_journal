@@ -258,6 +258,10 @@ val create
 val service
   : (Logseq_db_worker.Config.t, request, response, push) Journal_worker.Service.t
 
+(** Fixed operation, phase and display text for an internal diagnostic signal.
+    Unknown signals use a safe fallback without displaying the input. *)
+val diagnostic_report : string -> string * string * string
+
 (** Complete the current token challenge through bounded control storage.
     Stale/duplicate replies cannot replace the current flight. Authentication
     changes revoke old tickets before their ordered DB work is admitted. *)

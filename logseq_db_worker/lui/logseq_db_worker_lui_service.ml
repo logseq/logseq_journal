@@ -432,6 +432,12 @@ let production_dependencies () =
 (* Diagnostic strings are internal signals, never display text. Unknown values
    receive a fixed fallback so exception/path/content strings cannot escape. *)
 let diagnostic_report = function
+  | code when String.starts_with ~prefix:Logseq_db_types.Authoritative_diagnostic.signal_prefix code ->
+    let module Diagnostic = Logseq_db_types.Authoritative_diagnostic in
+    let prefix=Diagnostic.signal_prefix in
+    let detail=Diagnostic.decode (String.sub code (String.length prefix) (String.length code-String.length prefix)) in
+    "applyAuthoritative", "sync",
+    Option.fold ~none:"Authoritative transaction format is unsupported." ~some:Diagnostic.message detail
   | "worker.readTagTitles" -> "readTagTitles", "presentation", "Tag labels could not be read. Reopen this page, or reopen Journal."
   | "worker.closeDatabase" -> "closeDatabase", "cleanup", "The current graph could not finish closing. Reopen Journal before trying again."
   | "worker.confirmMirrorRetirement" -> "confirmMirrorRetirement", "localDeletion", "Local copy removal could not be confirmed as durable. Reopen Journal and check the local copy before trying again."
@@ -439,6 +445,42 @@ let diagnostic_report = function
   | "worker.inspectMirror" -> "inspectMirror", "localRestore", "Local graph inspection failed. Retry or choose another graph."
   | "worker.attachGraph" -> "attachGraph", "localRestore", "The local graph could not be opened. Retry or choose another graph."
   | "worker.inspectSync" -> "inspectSync", "sync", "Sync information is unavailable. Retry sync."
+  | "worker.applyAuthoritative.authoritativeDatabaseClosed" ->
+    "applyAuthoritative", "sync", "Authoritative database is closed."
+  | "worker.applyAuthoritative.authoritativeSyncTokenConflict" ->
+    "applyAuthoritative", "sync", "Authoritative sync version changed."
+  | "worker.applyAuthoritative.authoritativeCursorDiscontinuous" ->
+    "applyAuthoritative", "sync", "Authoritative transaction cursors are not continuous."
+  | "worker.applyAuthoritative.authoritativeChecksumMismatch" ->
+    "applyAuthoritative", "sync", "Authoritative checksum does not match."
+  | "worker.applyAuthoritative.authoritativeCryptoRequired" ->
+    "applyAuthoritative", "sync", "Authoritative transition requires decrypted values."
+  | "worker.applyAuthoritative.authoritativeCryptoUnexpected" ->
+    "applyAuthoritative", "sync", "Authoritative transition received unexpected decrypted values."
+  | "worker.applyAuthoritative.authoritativeCryptoInvalid" ->
+    "applyAuthoritative", "sync", "Authoritative decrypted values are invalid."
+  | "worker.applyAuthoritative.authoritativeDecodeFailed" ->
+    "applyAuthoritative", "sync", "Authoritative transaction format is unsupported."
+  | "worker.applyAuthoritative.authoritativeOriginUnresolved" ->
+    "applyAuthoritative", "sync", "Authoritative transaction origin is unresolved."
+  | "worker.applyAuthoritative.authoritativePreparationConsumed" ->
+    "applyAuthoritative", "sync", "Authoritative preparation was already consumed."
+  | "worker.applyAuthoritative.authoritativePrepareBusy" ->
+    "applyAuthoritative", "sync", "Authoritative preparation is busy."
+  | "worker.applyAuthoritative.authoritativeIntegrityFailure" ->
+    "applyAuthoritative", "sync", "Authoritative integrity validation failed."
+  | "worker.applyAuthoritative.authoritativeCommitDatabaseClosed" ->
+    "applyAuthoritative", "sync", "Authoritative database closed before commit."
+  | "worker.applyAuthoritative.authoritativeCommitTokenConflict" ->
+    "applyAuthoritative", "sync", "Authoritative sync version changed before commit."
+  | "worker.applyAuthoritative.authoritativeCommitGenerationInvalidated" ->
+    "applyAuthoritative", "sync", "Authoritative database generation changed before commit."
+  | "worker.applyAuthoritative.authoritativeCommitBusy" ->
+    "applyAuthoritative", "sync", "Authoritative commit is busy."
+  | "worker.applyAuthoritative.authoritativeCommitPersistenceFailed" ->
+    "applyAuthoritative", "sync", "Authoritative commit could not be persisted."
+  | "worker.applyAuthoritative.authoritativeCommitFatalState" ->
+    "applyAuthoritative", "sync", "Authoritative storage requires recovery."
   | "worker.applyAuthoritative" -> "applyAuthoritative", "sync", "Remote changes could not be applied. Retry sync or reopen Journal."
   | "worker.applyOutbox" -> "applyOutbox", "sync", "Local sync progress could not be saved. Retry sync or reopen Journal."
   | "worker.resetAccount" -> "resetAccount", "account", "Local account cleanup could not finish. Retry or reopen Journal."

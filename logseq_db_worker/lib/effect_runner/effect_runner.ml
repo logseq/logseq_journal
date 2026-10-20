@@ -1455,29 +1455,107 @@ let unprotect_request t key request =
      | Ok plaintexts -> Ok (request, plaintexts))
 ;;
 
-let authoritative_transition_error = function
-  | Overlay.Authoritative_database_closed -> "authoritative database closed"
-  | Authoritative_sync_token_conflict -> "authoritative sync token conflict"
-  | Authoritative_cursor_discontinuous -> "authoritative cursor discontinuous"
-  | Authoritative_checksum_mismatch -> "authoritative checksum mismatch"
-  | Authoritative_crypto_required -> "authoritative crypto required"
-  | Authoritative_crypto_unexpected -> "authoritative crypto unexpected"
-  | Authoritative_crypto_error _ -> "authoritative crypto result invalid"
-  | Authoritative_decode_failed message -> "authoritative decode failed: " ^ message
-  | Authoritative_origin_unresolved -> "authoritative origin unresolved"
-  | Authoritative_preparation_consumed -> "authoritative preparation consumed"
-  | Authoritative_prepare_busy -> "authoritative preparation busy"
-  | Authoritative_integrity_failure message ->
-    "authoritative integrity failure: " ^ message
-  | Authoritative_commit_database_closed -> "authoritative database closed at commit"
-  | Authoritative_commit_token_conflict -> "authoritative commit token conflict"
-  | Authoritative_commit_generation_invalidated ->
-    "authoritative commit generation invalidated"
-  | Authoritative_commit_busy -> "authoritative commit busy"
-  | Authoritative_commit_persistence_failed message ->
-    "authoritative commit persistence failed: " ^ message
-  | Authoritative_commit_fatal_state message ->
-    "authoritative commit fatal state: " ^ message
+let authoritative_transition_error error =
+  let module Error = Logseq_db_worker_contract.Error in
+  let module Diagnostic = Logseq_db_types.Authoritative_diagnostic in
+  let diagnostic =
+    match error with
+    | Overlay.Authoritative_decode_failed source -> Diagnostic.decode source
+    | _ -> None
+  in
+  let code, category, message =
+    match error with
+    | Overlay.Authoritative_database_closed ->
+      ( Error.Closed_session
+      , "authoritativeDatabaseClosed"
+      , "Authoritative database is closed." )
+    | Overlay.Authoritative_sync_token_conflict ->
+      ( Error.Conflict
+      , "authoritativeSyncTokenConflict"
+      , "Authoritative sync version changed." )
+    | Overlay.Authoritative_cursor_discontinuous ->
+      ( Error.Ambiguous_sync_state
+      , "authoritativeCursorDiscontinuous"
+      , "Authoritative transaction cursors are not continuous." )
+    | Overlay.Authoritative_checksum_mismatch ->
+      ( Error.Ambiguous_sync_state
+      , "authoritativeChecksumMismatch"
+      , "Authoritative checksum does not match." )
+    | Overlay.Authoritative_crypto_required ->
+      ( Error.Invalid_request
+      , "authoritativeCryptoRequired"
+      , "Authoritative transition requires decrypted values." )
+    | Overlay.Authoritative_crypto_unexpected ->
+      ( Error.Invalid_request
+      , "authoritativeCryptoUnexpected"
+      , "Authoritative transition received unexpected decrypted values." )
+    | Overlay.Authoritative_crypto_error _ ->
+      ( Error.Unsupported_value
+      , "authoritativeCryptoInvalid"
+      , "Authoritative decrypted values are invalid." )
+    | Overlay.Authoritative_decode_failed _ ->
+      ( Error.Unsupported_semantics
+      , "authoritativeDecodeFailed"
+      , Option.fold
+          ~none:"Authoritative transaction format is unsupported."
+          ~some:Diagnostic.message
+          diagnostic )
+    | Overlay.Authoritative_origin_unresolved ->
+      ( Error.Ambiguous_sync_state
+      , "authoritativeOriginUnresolved"
+      , "Authoritative transaction origin is unresolved." )
+    | Overlay.Authoritative_preparation_consumed ->
+      ( Error.Invalid_request
+      , "authoritativePreparationConsumed"
+      , "Authoritative preparation was already consumed." )
+    | Overlay.Authoritative_prepare_busy ->
+      Error.Storage_busy, "authoritativePrepareBusy", "Authoritative preparation is busy."
+    | Overlay.Authoritative_integrity_failure _ ->
+      ( Error.Ambiguous_sync_state
+      , "authoritativeIntegrityFailure"
+      , "Authoritative integrity validation failed." )
+    | Overlay.Authoritative_commit_database_closed ->
+      ( Error.Closed_session
+      , "authoritativeCommitDatabaseClosed"
+      , "Authoritative database closed before commit." )
+    | Overlay.Authoritative_commit_token_conflict ->
+      ( Error.Conflict
+      , "authoritativeCommitTokenConflict"
+      , "Authoritative sync version changed before commit." )
+    | Overlay.Authoritative_commit_generation_invalidated ->
+      ( Error.Conflict
+      , "authoritativeCommitGenerationInvalidated"
+      , "Authoritative database generation changed before commit." )
+    | Overlay.Authoritative_commit_busy ->
+      Error.Storage_busy, "authoritativeCommitBusy", "Authoritative commit is busy."
+    | Overlay.Authoritative_commit_persistence_failed _ ->
+      ( Error.Ambiguous_sync_state
+      , "authoritativeCommitPersistenceFailed"
+      , "Authoritative commit could not be persisted." )
+    | Overlay.Authoritative_commit_fatal_state _ ->
+      ( Error.Closed_session
+      , "authoritativeCommitFatalState"
+      , "Authoritative storage requires recovery." )
+  in
+  let origin =
+    Error.create_cause
+      ~component:Error.Managed_sync
+      ~operation:"applyAuthoritative"
+      ~code:(Some category)
+      ~message
+    |> Result.get_ok
+  in
+  let details =
+    match diagnostic with
+    | None -> []
+    | Some detail ->
+      [ Error.
+          { name = Diagnostic.detail_name
+          ; value = Detail_string (Diagnostic.encode detail)
+          }
+      ]
+  in
+  Error.create_with_origin ~code ~message ~details ~origin |> Result.get_ok
 ;;
 
 let deletion_authorized t (request : Sync.mirror_deletion) =
@@ -1902,7 +1980,7 @@ let handle_sync_worker_effect t = function
                ~expected:(Overlay.sync_view_token sync)
                request.input
            with
-           | Error _ -> Error (effect_error "The authoritative transition was rejected.")
+           | Error error -> Error (authoritative_transition_error error)
            | Ok (prepared, crypto) ->
              let decrypted =
                match crypto with
@@ -1917,7 +1995,7 @@ let handle_sync_worker_effect t = function
                    Database.apply_authoritative session.database prepared ~decrypted
                  with
                  | Error error ->
-                   Error (effect_error (authoritative_transition_error error))
+                   Error (authoritative_transition_error error)
                  | Ok (Database.Authoritative_deferred defer) ->
                    Ok
                      (sync_result
