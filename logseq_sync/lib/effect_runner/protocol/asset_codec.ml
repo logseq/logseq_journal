@@ -60,6 +60,56 @@ let envelope_shape wire =
      if whitespace index = length then Some () else None)
 ;;
 
+(* Reserve JSON/Transit roots, including incomplete envelopes, for the existing
+   bounded decoder. A parse/authentication failure is never a raw-file signal. *)
+let transit_candidate wire =
+  let length = String.length wire in
+  let whitespace = function
+    | ' ' | '\n' | '\r' | '\t' -> true
+    | _ -> false
+  in
+  let rec start index =
+    if index < length && whitespace wire.[index]
+    then start (index + 1)
+    else if
+      index + 3 <= length
+      && wire.[index] = '\239'
+      && wire.[index + 1] = '\187'
+      && wire.[index + 2] = '\191'
+    then start (index + 3)
+    else index
+  in
+  let index = start 0 in
+  let literal text =
+    let count = String.length text in
+    let rec prefix offset =
+      if index + offset = length
+      then true
+      else if offset = count
+      then (
+        match wire.[index + offset] with
+        | ']' | '}' | ',' -> true
+        | c -> whitespace c)
+      else wire.[index + offset] = text.[offset] && prefix (offset + 1)
+    in
+    prefix 0
+  in
+  index < length
+  &&
+  match wire.[index] with
+  | '[' | '{' | '"' | '0' .. '9' -> true
+  | '-' ->
+    index + 1 = length
+    ||
+      (match wire.[index + 1] with
+      | '0' .. '9' -> true
+      | _ -> false)
+  | 't' -> literal "true"
+  | 'f' -> literal "false"
+  | 'n' -> literal "null"
+  | _ -> false
+;;
+
 let decode ~maximum_plaintext_bytes ~crypto ~key ~expected_checksum wire =
   if not (limit maximum_plaintext_bytes)
   then Error "Invalid plaintext size limit"
@@ -75,6 +125,10 @@ let decode ~maximum_plaintext_bytes ~crypto ~key ~expected_checksum wire =
       let* plaintext =
         match key with
         | None -> Ok wire
+        | Some _ when not (transit_candidate wire) ->
+          (try Printf.eprintf "journal asset decode path=raw-fallback\n%!" with
+           | _ -> ());
+          Ok wire
         | Some key ->
           let* () =
             if envelope_shape wire then Ok () else Error "Invalid asset AES-GCM envelope"
