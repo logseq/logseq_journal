@@ -432,6 +432,12 @@ let production_dependencies () =
 (* Diagnostic strings are internal signals, never display text. Unknown values
    receive a fixed fallback so exception/path/content strings cannot escape. *)
 let diagnostic_report = function
+  | code when String.starts_with ~prefix:Logseq_db_types.Authoritative_diagnostic.signal_prefix code ->
+    let module Diagnostic = Logseq_db_types.Authoritative_diagnostic in
+    let prefix=Diagnostic.signal_prefix in
+    let detail=Diagnostic.decode (String.sub code (String.length prefix) (String.length code-String.length prefix)) in
+    "applyAuthoritative", "sync",
+    Option.fold ~none:"Authoritative transaction format is unsupported." ~some:Diagnostic.message detail
   | "worker.readTagTitles" -> "readTagTitles", "presentation", "Tag labels could not be read. Reopen this page, or reopen Journal."
   | "worker.closeDatabase" -> "closeDatabase", "cleanup", "The current graph could not finish closing. Reopen Journal before trying again."
   | "worker.confirmMirrorRetirement" -> "confirmMirrorRetirement", "localDeletion", "Local copy removal could not be confirmed as durable. Reopen Journal and check the local copy before trying again."

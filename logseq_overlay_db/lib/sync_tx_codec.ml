@@ -18,6 +18,80 @@ let map_all decode values =
   loop [] values
 ;;
 
+module Diagnostic = Logseq_db_types.Authoritative_diagnostic
+
+let transit_kind = function
+  | Transit.Null -> "null"
+  | Bool _ -> "bool"
+  | String _ -> "string"
+  | Int _ -> "integer"
+  | Int64 _ -> "int64"
+  | Float _ -> "float"
+  | Binary _ -> "binary"
+  | Big_decimal _ -> "decimal"
+  | Big_int _ -> "big-integer"
+  | Date _ -> "date"
+  | Uuid _ -> "uuid"
+  | Uri _ -> "uri"
+  | Keyword _ -> "keyword"
+  | Symbol _ -> "symbol"
+  | Array _ -> "array"
+  | Map _ -> "map"
+  | Set _ -> "set"
+  | List _ -> "list"
+  | Tagged _ -> "tagged"
+;;
+
+let diagnostic_error ?field ?actual reason =
+  Error (Diagnostic.encode (Diagnostic.create ~stage:Decode ~reason ?field ?actual ()))
+;;
+
+let diagnostic_context
+      ?field
+      ?operation_index
+      ?operation_count
+      ?arity
+      ?operation
+      ?attribute
+      result
+  =
+  Result.map_error
+    (fun source ->
+       let detail =
+         match Diagnostic.decode source with
+         | Some detail -> detail
+         | None -> Diagnostic.create ~stage:Decode ~reason:Unknown ()
+       in
+       Diagnostic.with_context
+         ?field
+         ?operation_index
+         ?operation_count
+         ?arity
+         ?operation
+         ?attribute
+         detail
+       |> Diagnostic.encode)
+    result
+;;
+
+let operation_context index count operation result =
+  let arity, name, attribute =
+    match operation with
+    | Transit.Array (Keyword op :: _entity :: Keyword attr :: _ as fields) ->
+      Some (List.length fields), Some op, Some attr
+    | Array (Keyword op :: _ as fields) -> Some (List.length fields), Some op, None
+    | Array fields -> Some (List.length fields), None, None
+    | _ -> None, None, None
+  in
+  diagnostic_context
+    ~operation_index:index
+    ~operation_count:count
+    ?arity
+    ?operation:name
+    ?attribute
+    result
+;;
+
 let lookup_value entity attr =
   match Datascript.Entity.entity_attr_raw entity attr with
   | Some (Datascript.One_value value) -> Some value
@@ -256,13 +330,13 @@ let integer = function
   | Int64 value
     when Int64.compare value (Int64.of_int min_int) >= 0
          && Int64.compare value (Int64.of_int max_int) <= 0 -> Ok (Int64.to_int value)
-  | _ -> Error "expected a Transit integer"
+  | value -> diagnostic_error ~actual:(transit_kind value) Integer_range
 ;;
 
 let integer64 = function
   | Transit.Int value -> Ok (Int64.of_int value)
   | Int64 value -> Ok value
-  | _ -> Error "expected a Transit integer"
+  | value -> diagnostic_error ~actual:(transit_kind value) Integer_value
 ;;
 
 let rec value_of_transit = function
@@ -276,11 +350,11 @@ let rec value_of_transit = function
   | Big_decimal value ->
     (match float_of_string_opt value with
      | Some value -> Ok (Float value)
-     | None -> Error "invalid Transit decimal")
+     | None -> diagnostic_error ~actual:"decimal" Decimal_value)
   | Big_int value ->
     (match Int64.of_string_opt value with
      | Some value -> value_of_transit (Transit.Int64 value)
-     | None -> Error "invalid Transit integer")
+     | None -> diagnostic_error ~actual:"big-integer" Integer_value)
   | Date value -> Ok (Instant value)
   | Uuid value -> Ok (Uuid value)
   | Uri value -> Ok (String value)
@@ -303,7 +377,7 @@ let rec value_of_transit = function
     bind (value_of_transit value) (fun value -> Ok (Vector [ String tag; value ]))
 ;;
 
-let entity_ref_of_transit = function
+let entity_ref_of_transit ?(reason = Diagnostic.Entity_shape) = function
   | Transit.Int value -> Ok (Entity_id value)
   | Int64 value ->
     bind (integer (Transit.Int64 value)) (fun value -> Ok (Entity_id value))
@@ -312,7 +386,7 @@ let entity_ref_of_transit = function
   | Keyword value -> Ok (Ident value)
   | Array [ Keyword attr; value ] ->
     bind (value_of_transit value) (fun value -> Ok (Lookup_ref (attr, value)))
-  | _ -> Error "transaction entity must be an eid, tempid, ident, or lookup ref"
+  | value -> diagnostic_error ~actual:(transit_kind value) reason
 ;;
 
 let schema_attr db attr = List.assoc_opt attr (Datascript.schema db)
@@ -320,14 +394,16 @@ let schema_attr db attr = List.assoc_opt attr (Datascript.schema db)
 let tx_value ~db ~attr value =
   match schema_attr db attr with
   | Some { Datascript.value_type = Some RefType; _ } ->
-    bind (entity_ref_of_transit value) (fun entity -> Ok (Ref_to entity))
+    bind (entity_ref_of_transit ~reason:Reference_shape value) (fun entity ->
+      Ok (Ref_to entity))
   | None | Some _ -> value_of_transit value
 ;;
 
 let valid_source_tx = function
   | Transit.Int _ -> Ok ()
   | Int64 value -> bind (integer (Transit.Int64 value)) (fun _ -> Ok ())
-  | _ -> Error "normalized transaction source tx must be an integer"
+  | value ->
+    diagnostic_error ~field:"source-tx" ~actual:(transit_kind value) Source_tx_type
 ;;
 
 let plaintext_value attribute value plaintexts =
@@ -335,8 +411,8 @@ let plaintext_value attribute value plaintexts =
   then (
     match value, plaintexts with
     | Transit.String _, plaintext :: rest -> Ok (Transit.String plaintext, rest)
-    | String _, [] -> Error "decrypted value count does not match protected values"
-    | _, _ -> Error "protected sync attributes must contain strings")
+    | String _, [] -> diagnostic_error Decrypted_value_count
+    | value, _ -> diagnostic_error ~actual:(transit_kind value) Protected_value_type)
   else Ok (value, plaintexts)
 ;;
 
@@ -345,14 +421,22 @@ let decode_add_or_retract ~db constructor fields plaintexts =
   | [ entity; Transit.Keyword attr; value ]
   | [ entity; Transit.Keyword attr; value; Transit.Int _ ]
   | [ entity; Transit.Keyword attr; value; Transit.Int64 _ ] ->
-    bind (entity_ref_of_transit entity) (fun entity ->
-      bind (plaintext_value attr value plaintexts) (fun (value, plaintexts) ->
-        bind (tx_value ~db ~attr value) (fun value ->
-          Ok (constructor entity attr value, plaintexts))))
-  | [ _; _; _; source_tx ] ->
+    bind
+      (diagnostic_context ~field:"entity" (entity_ref_of_transit entity))
+      (fun entity ->
+         bind (plaintext_value attr value plaintexts) (fun (value, plaintexts) ->
+           bind
+             (diagnostic_context ~field:"value" (tx_value ~db ~attr value))
+             (fun value -> Ok (constructor entity attr value, plaintexts))))
+  | [ _; attribute; _; source_tx ] ->
     bind (valid_source_tx source_tx) (fun () ->
-      Error "normalized add/retract operation has invalid fields")
-  | _ -> Error "normalized add/retract operation has invalid fields"
+      diagnostic_error
+        ~field:"attribute"
+        ~actual:(transit_kind attribute)
+        Operation_fields)
+  | [ _; attribute; _ ] ->
+    diagnostic_error ~field:"attribute" ~actual:(transit_kind attribute) Operation_fields
+  | _ -> diagnostic_error Operation_fields
 ;;
 
 let decode_operation ~db operation plaintexts =
@@ -372,50 +456,75 @@ let decode_operation ~db operation plaintexts =
   | Array
       [ Keyword ("db.fn/retractAttribute" | "db/retractAttribute"); entity; Keyword attr ]
     ->
-    bind (entity_ref_of_transit entity) (fun entity ->
-      Ok (RetractAttr (entity, attr), plaintexts))
+    bind
+      (diagnostic_context ~field:"entity" (entity_ref_of_transit entity))
+      (fun entity -> Ok (RetractAttr (entity, attr), plaintexts))
   | Array [ Keyword "db/retractEntity"; entity ] ->
-    bind (entity_ref_of_transit entity) (fun entity ->
-      Ok (RetractEntity entity, plaintexts))
+    bind
+      (diagnostic_context ~field:"entity" (entity_ref_of_transit entity))
+      (fun entity -> Ok (RetractEntity entity, plaintexts))
   | Array [ Keyword ("db.fn/cas" | "db/cas"); entity; Keyword attr; expected; value ] ->
-    bind (entity_ref_of_transit entity) (fun entity ->
-      bind
-        (match expected with
-         | Transit.Null -> Ok (None, plaintexts)
-         | expected ->
-           bind (plaintext_value attr expected plaintexts) (fun (expected, plaintexts) ->
-             bind (tx_value ~db ~attr expected) (fun expected ->
-               Ok (Some expected, plaintexts))))
-        (fun (expected, plaintexts) ->
-           bind (plaintext_value attr value plaintexts) (fun (value, plaintexts) ->
-             bind (tx_value ~db ~attr value) (fun value ->
-               Ok (CompareAndSet (entity, attr, expected, value), plaintexts)))))
+    bind
+      (diagnostic_context ~field:"entity" (entity_ref_of_transit entity))
+      (fun entity ->
+         bind
+           (match expected with
+            | Transit.Null -> Ok (None, plaintexts)
+            | expected ->
+              bind
+                (diagnostic_context
+                   ~field:"expected"
+                   (plaintext_value attr expected plaintexts))
+                (fun (expected, plaintexts) ->
+                   bind
+                     (diagnostic_context ~field:"expected" (tx_value ~db ~attr expected))
+                     (fun expected -> Ok (Some expected, plaintexts))))
+           (fun (expected, plaintexts) ->
+              bind (plaintext_value attr value plaintexts) (fun (value, plaintexts) ->
+                bind
+                  (diagnostic_context ~field:"value" (tx_value ~db ~attr value))
+                  (fun value ->
+                     Ok (CompareAndSet (entity, attr, expected, value), plaintexts)))))
   | Array (Keyword operation :: _) ->
-    Error ("unsupported normalized transaction operation: " ^ operation)
-  | Array _ -> Error "normalized transaction operation must start with a keyword"
-  | _ -> Error "normalized transaction entries must be operation arrays"
+    diagnostic_error
+      (if
+         List.mem
+           operation
+           [ "db/add"
+           ; "db/retract"
+           ; "db.fn/cas"
+           ; "db/cas"
+           ; "db.fn/retractAttribute"
+           ; "db/retractAttribute"
+           ; "db/retractEntity"
+           ]
+       then Operation_fields
+       else Unsupported_operation)
+  | Array fields ->
+    diagnostic_error
+      ?actual:(List.nth_opt fields 0 |> Option.map transit_kind)
+      Operation_keyword
+  | value -> diagnostic_error ~actual:(transit_kind value) Operation_shape
 ;;
 
 let parse source =
   try
     match Codec.of_string source with
-    | Transit.Array [] | List [] -> Error "normalized transaction must not be empty"
+    | Transit.Array [] | List [] -> diagnostic_error Empty_transaction
     | Array operations | List operations -> Ok operations
-    | _ -> Error "normalized transaction must be a Transit array or list"
+    | value -> diagnostic_error ~actual:(transit_kind value) Transaction_shape
   with
-  | Transit.Decode_error message
-  | Yojson.Json_error message
-  | Failure message
-  | Invalid_argument message -> Error ("invalid transaction Transit: " ^ message)
+  | Transit.Decode_error _ | Yojson.Json_error _ | Failure _ | Invalid_argument _ ->
+    diagnostic_error Transit_syntax
 ;;
 
 let protected_values source =
-  let value attribute value =
+  let value ?(field = "value") attribute value =
     if List.mem attribute protected_attributes
     then (
       match value with
       | Transit.String ciphertext -> Ok [ ciphertext ]
-      | _ -> Error "protected sync attributes must contain encrypted strings")
+      | value -> diagnostic_error ~field ~actual:(transit_kind value) Protected_value_type)
     else Ok []
   in
   let operation = function
@@ -428,37 +537,63 @@ let protected_values source =
       bind
         (match expected with
          | Transit.Null -> Ok []
-         | expected -> value attribute expected)
+         | expected -> value ~field:"expected" attribute expected)
         (fun expected ->
            bind (value attribute value_) (fun value -> Ok (expected @ value)))
     | Array [ Keyword ("db.fn/retractAttribute" | "db/retractAttribute"); _; Keyword _ ]
     | Array [ Keyword "db/retractEntity"; _ ] -> Ok []
     | Array (Keyword operation :: _) ->
-      Error ("unsupported normalized transaction operation: " ^ operation)
-    | Array _ -> Error "normalized transaction operation must start with a keyword"
-    | _ -> Error "normalized transaction entries must be operation arrays"
+      diagnostic_error
+        (if
+           List.mem
+             operation
+             [ "db/add"
+             ; "db/retract"
+             ; "db.fn/cas"
+             ; "db/cas"
+             ; "db.fn/retractAttribute"
+             ; "db/retractAttribute"
+             ; "db/retractEntity"
+             ]
+         then Operation_fields
+         else Unsupported_operation)
+    | Array fields ->
+      diagnostic_error
+        ?actual:(List.nth_opt fields 0 |> Option.map transit_kind)
+        Operation_keyword
+    | value -> diagnostic_error ~actual:(transit_kind value) Operation_shape
   in
   bind (parse source) (fun operations ->
-    let rec loop values = function
+    let operation_count = List.length operations in
+    let rec loop index values = function
       | [] -> Ok (List.concat (List.rev values))
       | operation_ :: rest ->
-        bind (operation operation_) (fun current -> loop (current :: values) rest)
+        bind
+          (operation_context index operation_count operation_ (operation operation_))
+          (fun current -> loop (index + 1) (current :: values) rest)
     in
-    loop [] operations)
+    loop 1 [] operations)
 ;;
 
 let decode ~db ~decrypted_values source =
   bind (parse source) (fun operations ->
-    let rec loop decoded plaintexts = function
+    let operation_count = List.length operations in
+    let rec loop index decoded plaintexts = function
       | [] ->
         if plaintexts = []
         then Ok (List.rev decoded)
-        else Error "decrypted value count does not match protected values"
+        else diagnostic_error Decrypted_value_count
       | operation :: rest ->
-        bind (decode_operation ~db operation plaintexts) (fun (operation, plaintexts) ->
-          loop (operation :: decoded) plaintexts rest)
+        bind
+          (operation_context
+             index
+             operation_count
+             operation
+             (decode_operation ~db operation plaintexts))
+          (fun (operation, plaintexts) ->
+             loop (index + 1) (operation :: decoded) plaintexts rest)
     in
-    loop [] decrypted_values operations)
+    loop 1 [] decrypted_values operations)
 ;;
 
 let inserted_orders source =

@@ -1278,10 +1278,97 @@ let test_authoritative_diagnostic_rows () =
     "unknown signal must never display caller content"
 ;;
 
+let test_authoritative_detail_rows () =
+  let prefix =
+    "worker.applyAuthoritative.authoritativeDecodeFailed:authoritative-decode:v1:"
+  in
+  let carrier =
+    "{\"stage\":\"decode\",\"reason\":\"entity-shape\",\"transaction\":1,\"operationIndex\":2,\"arity\":4,\"operation\":\"add\",\"attribute\":\"custom\",\"field\":\"entity\",\"type\":\"null\"}"
+  in
+  let op, phase, message = Service.diagnostic_report (prefix ^ carrier) in
+  let contains text needle =
+    let rec loop i =
+      i + String.length needle <= String.length text
+      && (String.sub text i (String.length needle) = needle || loop (i + 1))
+    in
+    loop 0
+  in
+  T.require (op = "applyAuthoritative" && phase = "sync") "detail row preserves operation";
+  List.iter
+    (fun part -> T.require (contains message part) "detail row omitted %s" part)
+    [ "stage=decode"
+    ; "reason=entity-shape"
+    ; "transaction=1"
+    ; "operationIndex=2"
+    ; "attribute=custom"
+    ; "type=null"
+    ];
+  List.iter
+    (fun malicious ->
+       let _, _, message = Service.diagnostic_report (prefix ^ malicious) in
+       T.require
+         (not (contains message "PRIVATE_SYNTHETIC_PAYLOAD"))
+         "unsafe diagnostic echoed data";
+       T.require
+         (not (contains message "stage=decode"))
+         "invalid detail was partly accepted")
+    [ "PRIVATE_SYNTHETIC_PAYLOAD"
+    ; "{\"stage\":\"decode\",\"reason\":\"PRIVATE_SYNTHETIC_PAYLOAD\"}"
+    ; "{\"stage\":\"decode\",\"reason\":\"entity-shape\",\"attribute\":\"PRIVATE_SYNTHETIC_PAYLOAD\"}"
+    ; "{\"stage\":\"decode\",\"reason\":\"entity-shape\",\"transaction\":-1}"
+    ; "{\"stage\":\"decode\",\"reason\":\"entity-shape\",\"operationIndex\":0}"
+    ; "{\"stage\":\"decode\",\"reason\":\"entity-shape\",\"arity\":1000000001}"
+    ; "{\"stage\":\"decode\",\"stage\":\"prepare\",\"reason\":\"entity-shape\"}"
+    ; "{\"stage\":\"decode\",\"reason\":\"entity-shape\",\"raw\":\"PRIVATE_SYNTHETIC_PAYLOAD\"}"
+    ; "{\"stage\":\"decode\",\"reason\":\"entity-shape\",\"type\":\"PRIVATE_SYNTHETIC_PAYLOAD\"}"
+    ; "{\"stage\":\"application\",\"reason\":\"application-exception\",\"operationIndex\":1}"
+    ; "{\"stage\":\"decode\",\"reason\":\"entity-shape\",\"transaction\":true}"
+    ; String.make 2048 'x'
+    ];
+  let _, _, legacy =
+    Service.diagnostic_report
+      "worker.applyAuthoritative.authoritativeDecodeFailed:PRIVATE_SYNTHETIC_PAYLOAD"
+  in
+  T.require (not (contains legacy "PRIVATE_SYNTHETIC_PAYLOAD")) "legacy raw string leaked"
+;;
+
+let test_authoritative_detail_budget () =
+  let module D = Logseq_db_types.Authoritative_diagnostic in
+  let detail =
+    D.create
+      ~stage:Decode
+      ~reason:Decrypted_value_count
+      ~transaction:max_int
+      ~operation_index:max_int
+      ~operation_count:max_int
+      ~lookup_refs:max_int
+      ~arity:max_int
+      ~operation:"db.fn/retractAttribute"
+      ~attribute:"db/cardinality"
+      ~field:"source-tx"
+      ~actual:"big-integer"
+      ~exception_kind:"invalid-argument"
+      ()
+  in
+  let encoded = D.encode detail
+  and message = D.message detail in
+  T.require
+    (String.length encoded <= 512 && String.length message <= 512)
+    "diagnostic exceeds Error budget";
+  T.require
+    (Option.map D.message (D.decode encoded) = Some message)
+    "largest detail failed roundtrip";
+  let _, _, row = Service.diagnostic_report (D.signal_prefix ^ encoded) in
+  T.require (row = message) "actual row lost maximum bounded detail"
+;;
+
+
 let () =
   T.run
     "lui worker service"
-    [ T.case "authoritative category row allowlist" test_authoritative_diagnostic_rows
+    [ T.case "authoritative detail byte budget" test_authoritative_detail_budget
+    ; T.case "strict authoritative detail rows" test_authoritative_detail_rows
+    ; T.case "authoritative category row allowlist" test_authoritative_diagnostic_rows
     ; T.case "ignored restore failure reaches scoped safe Diagnostics" test_restore_error_reaches_diagnostics
     ; T.case "local copy confirmed deletion awaits physical removal" (test_local_copy_presence "delete")
     ; T.case "local copy busy failure recovers" (test_local_copy_presence "busy")

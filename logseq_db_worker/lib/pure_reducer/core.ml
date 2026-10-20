@@ -492,6 +492,14 @@ let step state event =
              let origin = (Logseq_db_worker_contract.Error.trace error).origin in
              let signal =
                match origin.component, origin.operation, origin.code with
+               | Managed_sync, "applyAuthoritative", Some "authoritativeDecodeFailed" ->
+                 let module Diagnostic = Logseq_db_types.Authoritative_diagnostic in
+                 let detail = List.find_map (fun (detail:Logseq_db_worker_contract.Error.detail) ->
+                   match detail.name,detail.value with
+                   | name,Detail_string source when name=Diagnostic.detail_name -> Diagnostic.decode source
+                   | _ -> None) (Logseq_db_worker_contract.Error.details error) in
+                 Option.fold ~none:"worker.applyAuthoritative.authoritativeDecodeFailed"
+                   ~some:(fun value -> Diagnostic.signal_prefix ^ Diagnostic.encode value) detail
                | Managed_sync, "applyAuthoritative", Some category ->
                  "worker.applyAuthoritative." ^ category
                | _ -> "worker.applyAuthoritative"

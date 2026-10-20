@@ -7036,6 +7036,18 @@ let authoritative_crypto_item_id database revision index =
        (Graph.Uuid.to_string database.graph_uuid))
 ;;
 
+module Authoritative_diagnostic = Logseq_db_types.Authoritative_diagnostic
+
+let authoritative_decode_context ~stage ~transaction source =
+  let detail =
+    match Authoritative_diagnostic.decode source with
+    | Some detail -> detail
+    | None -> Authoritative_diagnostic.create ~stage ~reason:Unknown ()
+  in
+  Authoritative_diagnostic.with_context ~stage ~transaction detail
+  |> Authoritative_diagnostic.encode
+;;
+
 let begin_authoritative database ~expected batch =
   Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
     if database.closed
@@ -7063,13 +7075,16 @@ let begin_authoritative database ~expected batch =
                |> Types.encoded_transaction_to_string)
             transactions
         in
-        let rec collect acc = function
+        let rec collect index acc = function
           | [] -> Ok (List.rev acc |> List.concat)
           | wire :: rest ->
-            Result.bind (Sync_tx_codec.protected_values wire) (fun values ->
-              collect (values :: acc) rest)
+            Result.bind
+              (Sync_tx_codec.protected_values wire
+               |> Result.map_error
+                    (authoritative_decode_context ~stage:Prepare ~transaction:index))
+              (fun values -> collect (index + 1) (values :: acc) rest)
         in
-        match collect [] wires with
+        match collect 1 [] wires with
         | Error message -> Error (Types.Authoritative_decode_failed message)
         | Ok protected ->
           let request =
@@ -7597,6 +7612,77 @@ let same_authoritative_decrypted_input left right =
   | None, Some _ | Some _, None -> false
 ;;
 
+(* Structural statistics only; neither reference values nor exception strings leave this layer. *)
+let authoritative_lookup_refs operations =
+  (* A diagnostic must not replace the caught application failure. Bound both
+     traversal work and depth, and omit incomplete statistics. *)
+  try
+    let remaining = ref 1024 in
+    let spend depth =
+      if depth > 64 || !remaining = 0 then raise Exit;
+      decr remaining
+    in
+    let rec entity depth = function
+      | Datascript.Lookup_ref (_, v) ->
+        spend depth;
+        1 + value (depth + 1) v
+      | _ ->
+        spend depth;
+        0
+    and value depth v =
+      spend depth;
+      match v with
+      | Datascript.Ref_to e -> entity (depth + 1) e
+      | List vs | Vector vs | Set vs ->
+        List.fold_left (fun n v -> n + value (depth + 1) v) 0 vs
+      | Tuple vs ->
+        List.fold_left
+          (fun n v -> n + Option.fold ~none:0 ~some:(value (depth + 1)) v)
+          0
+          vs
+      | Map vs ->
+        List.fold_left
+          (fun n (k, v) -> n + value (depth + 1) k + value (depth + 1) v)
+          0
+          vs
+      | _ -> 0
+    in
+    Some
+      (List.fold_left
+         (fun n op ->
+            spend 0;
+            match op with
+            | Datascript.Add (e, _, v) -> n + entity 1 e + value 1 v
+            | Retract (e, _, v) -> n + entity 1 e + Option.fold ~none:0 ~some:(value 1) v
+            | RetractAttr (e, _) | RetractEntity e -> n + entity 1 e
+            | CompareAndSet (e, _, old, v) ->
+              n + entity 1 e + Option.fold ~none:0 ~some:(value 1) old + value 1 v
+            | _ -> n)
+         0
+         operations)
+  with
+  | _ -> None
+;;
+
+let authoritative_exception_kind = function
+  | Invalid_argument _ -> "invalid-argument"
+  | Failure _ -> "failure"
+  | Not_found -> "not-found"
+  | _ -> "other"
+;;
+
+let authoritative_application_error ~transaction operations exn =
+  Authoritative_diagnostic.create
+    ~stage:Application
+    ~reason:Application_exception
+    ~transaction
+    ~operation_count:(List.length operations)
+    ?lookup_refs:(authoritative_lookup_refs operations)
+    ~exception_kind:(authoritative_exception_kind exn)
+    ()
+  |> Authoritative_diagnostic.encode
+;;
+
 let prepare_authoritative_candidate preparation ~decrypted =
   match preparation.authoritative_state with
   | Authoritative_ready candidate
@@ -7618,41 +7704,79 @@ let prepare_authoritative_candidate preparation ~decrypted =
       | Some _, Some _ -> Error Types.Authoritative_crypto_unexpected
     in
     Result.bind decrypted_values (fun plaintexts ->
-      let rec decode database decoded expected_tx_data roots_after remaining wires =
+      let rec decode index database decoded expected_tx_data roots_after remaining wires =
         match wires with
         | [] ->
           if remaining = []
           then
             Ok
               (List.rev decoded, List.rev expected_tx_data, List.rev roots_after, database)
-          else Error "decrypted value count does not match protected values"
+          else
+            Error
+              (Authoritative_diagnostic.create
+                 ~stage:Decode
+                 ~reason:Decrypted_value_count
+                 ()
+               |> Authoritative_diagnostic.encode)
         | wire :: rest ->
-          Result.bind (Sync_tx_codec.protected_values wire) (fun protected ->
-            Result.bind
-              (split_prefix (List.length protected) remaining)
-              (fun (plain, remaining) ->
-                 Result.bind
-                   (Sync_tx_codec.decode ~db:database ~decrypted_values:plain wire)
-                   (fun operations ->
-                      try
-                        let report =
-                          Datascript.with_tx
-                            ~tx_meta:[ "skip-store?", Datascript.Bool true ]
-                            database
-                            operations
-                        in
-                        decode
-                          report.db_after
-                          (operations :: decoded)
-                          (report.tx_data :: expected_tx_data)
-                          (report.db_after :: roots_after)
-                          remaining
-                          rest
-                      with
-                      | exn -> Error (Printexc.to_string exn))))
+          let current =
+            Result.bind (Sync_tx_codec.protected_values wire) (fun protected ->
+              Result.bind
+                (split_prefix (List.length protected) remaining
+                 |> Result.map_error (fun _ ->
+                   Authoritative_diagnostic.create
+                     ~stage:Decode
+                     ~reason:Decrypted_value_count
+                     ()
+                   |> Authoritative_diagnostic.encode))
+                (fun (plain, remaining) ->
+                   Result.bind
+                     (Sync_tx_codec.decode ~db:database ~decrypted_values:plain wire)
+                     (fun operations ->
+                        try
+                          let report =
+                            Datascript.with_tx
+                              ~tx_meta:[ "skip-store?", Datascript.Bool true ]
+                              database
+                              operations
+                          in
+                          Ok (report, operations, remaining)
+                        with
+                        | exn ->
+                          Error
+                            (authoritative_application_error
+                               ~transaction:index
+                               operations
+                               exn))))
+            |> Result.map_error (fun source ->
+              match Authoritative_diagnostic.decode source with
+              | Some detail ->
+                Authoritative_diagnostic.with_context ~transaction:index detail
+                |> Authoritative_diagnostic.encode
+              | None ->
+                authoritative_decode_context ~stage:Decode ~transaction:index source)
+          in
+          Result.bind current (fun (report, operations, remaining) ->
+            (* Preserve the existing catch around recursive decoding, but do not
+               attribute an unexpected later decode exception to this with_tx. *)
+            try
+              decode
+                (index + 1)
+                report.db_after
+                (operations :: decoded)
+                (report.tx_data :: expected_tx_data)
+                (report.db_after :: roots_after)
+                remaining
+                rest
+            with exn ->
+              Error (Authoritative_diagnostic.create ~stage:Decode ~reason:Unknown
+                       ?transaction:(if rest=[] then None else Some(index+1))
+                       ~exception_kind:(authoritative_exception_kind exn) ()
+                     |> Authoritative_diagnostic.encode))
       in
       match
         decode
+          1
           (authoritative_database preparation.authoritative_owner)
           []
           []
@@ -8863,15 +8987,28 @@ let logical_change_footprint
       ~maximum:before.owner.dependencies.limits.change_max_items
   in
   let favorite_memberships, favorite_overflow =
-    favorite_membership_dependents authoritative_before authoritative_after transaction_data
+    favorite_membership_dependents
+      authoritative_before
+      authoritative_after
+      transaction_data
       ~maximum:before.owner.dependencies.limits.change_max_items
   in
   let asset_holders, asset_overflow =
-    asset_reference_dependents before after authoritative_before authoritative_after transaction_data
+    asset_reference_dependents
+      before
+      after
+      authoritative_before
+      authoritative_after
+      transaction_data
       ~maximum:before.owner.dependencies.limits.change_max_items
   in
-  let asset_pages, asset_blocks = List.partition (fun uuid ->
-    Option.is_some (logical_page_at before uuid) || Option.is_some (logical_page_at after uuid)) asset_holders in
+  let asset_pages, asset_blocks =
+    List.partition
+      (fun uuid ->
+         Option.is_some (logical_page_at before uuid)
+         || Option.is_some (logical_page_at after uuid))
+      asset_holders
+  in
   let outbox_blocks, outbox_pages =
     List.fold_left
       (fun (blocks, pages) (footprint : effect_footprint) ->
@@ -8926,7 +9063,8 @@ let logical_change_footprint
          let after_value = logical_block_at after uuid in
          before_value <> after_value)
       block_candidates
-    |> fun changed -> List.sort_uniq Graph.Uuid.compare (changed @ favorite_memberships @ asset_blocks)
+    |> fun changed ->
+    List.sort_uniq Graph.Uuid.compare (changed @ favorite_memberships @ asset_blocks)
   in
   let parents, membership_pages =
     List.fold_left
@@ -9466,7 +9604,9 @@ let commit_authoritative_candidate database prepared =
               |> Result.get_ok
             in
             let outbox_delta, durable_outbox =
-              outbox_write_set database ~revision:(database.sync_revision + 1)
+              outbox_write_set
+                database
+                ~revision:(database.sync_revision + 1)
                 candidate_outbox
             in
             let receipts =
@@ -9530,7 +9670,10 @@ let commit_authoritative_candidate database prepared =
                            transitioned_records)
                   in
                   let changed =
-                    fanout_overflow || block_uuids <> [] || page_uuids <> [] || structure_interests <> []
+                    fanout_overflow
+                    || block_uuids <> []
+                    || page_uuids <> []
+                    || structure_interests <> []
                   in
                   database.projection
                   <- (if changed then candidate_projection else before_projection);
