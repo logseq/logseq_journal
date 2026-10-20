@@ -43,6 +43,302 @@ let commit_plain_authoritative database ~cursor wire behavior =
   | Authoritative_deferred _ -> Alcotest.fail "ordinary authoritative batch was deferred"
 ;;
 
+(* The pure sync reducer carries opaque wire text. The public Database boundary
+   executes the actual codec, candidate, durability and replay for this defect. *)
+let empty_authoritative_batch wires =
+  let transactions =
+    List.mapi
+      (fun index wire ->
+         authoritative_transaction
+           ~cursor:(server_cursor (index + 1))
+           ~transaction:(encoded wire))
+      wires
+  in
+  authoritative_batch
+    ~maximum_count:16
+    ~maximum_bytes:4096
+    ~transactions
+    ~through:(server_cursor (List.length wires))
+    ~checksum:None
+  |> T.require_ok ~behavior:"construct empty-compatible authoritative batch"
+;;
+
+let apply_empty_compatible_batch database batch =
+  let behavior = "apply empty-compatible authoritative batch" in
+  let sync = Database.inspect_sync database |> T.require_ok ~behavior in
+  let prepared, crypto =
+    Database.begin_authoritative database ~expected:(sync_view_token sync) batch
+    |> T.require_ok ~behavior
+  in
+  T.require (Option.is_none crypto) "empty/plain batch requested crypto";
+  match
+    Database.apply_authoritative database prepared ~decrypted:None
+    |> T.require_ok ~behavior
+  with
+  | Authoritative_applied commit -> commit
+  | Authoritative_deferred _ -> Alcotest.fail "empty/plain batch unexpectedly deferred"
+;;
+
+let empty_batch_state database =
+  let behavior = "inspect empty authoritative regression" in
+  let sync = Database.inspect_sync database |> T.require_ok ~behavior in
+  let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+  Fun.protect
+    ~finally:(fun () -> Database.release_snapshot snapshot)
+    (fun () ->
+       let version = Database.snapshot_version snapshot in
+       let updated =
+         match
+           Database.get_outline_blocks snapshot [ T.authoritative_block_uuid ]
+           |> T.require_ok ~behavior
+         with
+         | [ Present_block { value; _ } ] -> value.block.updated_at_ms
+         | _ -> Alcotest.fail "authoritative fixture block missing"
+       in
+       sync, version.projection_revision, updated)
+;;
+
+let empty_batch_update_wire =
+  "[[\"~:db/add\",[\"~:block/uuid\",\"~u22222222-2222-4222-8222-222222222224\"],\"~:block/updated-at\",1704067200123]]"
+;;
+
+let empty_authoritative_preserves_logical_state wire database =
+  let before, projection, updated = empty_batch_state database in
+  let commit =
+    apply_empty_compatible_batch database (empty_authoritative_batch [ wire ])
+  in
+  let after, after_projection, after_updated = empty_batch_state database in
+  T.require
+    (Server_cursor.equal (sync_view_checkpoint after) (server_cursor 1))
+    "empty tx did not advance checkpoint";
+  T.require
+    (not (sync_token_equal (sync_view_token before) (sync_view_token after)))
+    "empty tx did not advance sync revision";
+  T.require
+    (Projection_revision.equal projection after_projection && updated = after_updated)
+    "empty tx changed logical data/revision";
+  T.require
+    (commit.logical_change_summary = No_logical_change)
+    "empty tx emitted logical change";
+  T.require (sync_view_submissions after = []) "empty tx fabricated outbox submissions";
+  match
+    Database.begin_authoritative
+      database
+      ~expected:(sync_view_token before)
+      (empty_authoritative_batch [ wire ])
+  with
+  | Error Authoritative_sync_token_conflict -> ()
+  | _ -> Alcotest.fail "successful empty transaction left its old token usable"
+;;
+
+let empty_authoritative_mixed_batch database =
+  let _before, projection, _updated = empty_batch_state database in
+  let commit =
+    apply_empty_compatible_batch
+      database
+      (empty_authoritative_batch [ "[]"; empty_batch_update_wire; "[]" ])
+  in
+  let after, after_projection, updated = empty_batch_state database in
+  T.require
+    (Server_cursor.equal commit.checkpoint (server_cursor 3)
+     && Server_cursor.equal (sync_view_checkpoint after) (server_cursor 3))
+    "mixed batch dropped empty cursor slots";
+  T.require
+    (updated = 1_704_067_200_123L
+     && not (Projection_revision.equal projection after_projection))
+    "mixed batch failed to apply real operation"
+;;
+
+let with_empty_authoritative_storage run =
+  let behavior = "empty authoritative durability" in
+  T.with_temp_directory "overlay-empty-authoritative-" (fun support ->
+    let path = T.seed_mirror support in
+    let dependencies = T.dependencies ~behavior in
+    Eio_main.run (fun _ ->
+      Eio.Switch.run (fun sw ->
+        let handles = ref [] in
+        let open_database () =
+          let inspection =
+            Database.inspect_mirror
+              ~application_support_directory:support
+              ~graph_id:T.graph_uuid
+            |> T.require_ok ~behavior
+          in
+          let database =
+            Database.open_
+              ~sw
+              dependencies
+              inspection
+              ~graph_name:"empty-authoritative-fixture"
+            |> T.require_ok ~behavior
+          in
+          handles := database :: !handles;
+          database
+        in
+        Fun.protect
+          ~finally:(fun () ->
+            List.iter
+              (fun db ->
+                 try ignore (Database.close db) with
+                 | _ -> ())
+              !handles)
+          (fun () -> run path open_database (open_database ())))))
+;;
+
+let empty_authoritative_survives_reopen () =
+  with_empty_authoritative_storage (fun _path open_database database ->
+    let before, projection, updated = empty_batch_state database in
+    ignore (apply_empty_compatible_batch database (empty_authoritative_batch [ "[]" ]));
+    let committed, _, _ = empty_batch_state database in
+    Database.close database |> T.require_ok ~behavior:"close empty authoritative";
+    let reopened = open_database () in
+    let restored, restored_projection, restored_updated = empty_batch_state reopened in
+    T.require
+      (Server_cursor.equal (sync_view_checkpoint restored) (server_cursor 1))
+      "reopen lost empty server cursor";
+    T.require
+      (sync_token_equal (sync_view_token committed) (sync_view_token restored)
+       && not (sync_token_equal (sync_view_token before) (sync_view_token restored)))
+      "reopen lost sync revision";
+    T.require
+      (Projection_revision.equal projection restored_projection
+       && updated = restored_updated)
+      "reopen changed empty logical state";
+    ignore
+      (commit_plain_authoritative
+         reopened
+         ~cursor:(server_cursor 2)
+         empty_batch_update_wire
+         "next cursor after empty reopen"))
+;;
+
+let empty_authoritative_failure_is_atomic ~storage () =
+  with_empty_authoritative_storage (fun path open_database database ->
+    let before, projection, updated = empty_batch_state database in
+    let invalid = "[[\"~:db/add\",null,\"~:block/foo\",1]]" in
+    let wires =
+      if storage
+      then [ "[]"; empty_batch_update_wire; "[]" ]
+      else [ "[]"; empty_batch_update_wire; invalid ]
+    in
+    let batch = empty_authoritative_batch wires in
+    let prepared, _ =
+      Database.begin_authoritative database ~expected:(sync_view_token before) batch
+      |> T.require_ok ~behavior:"prepare empty-containing rollback"
+    in
+    let sql command =
+      let db = Sqlite3.db_open ~mode:`NO_CREATE path in
+      Fun.protect
+        ~finally:(fun () -> ignore (Sqlite3.db_close db))
+        (fun () -> Sqlite3.Rc.check (Sqlite3.exec db command))
+    in
+    if storage
+    then
+      sql
+        "CREATE TRIGGER fail_empty_checkpoint BEFORE UPDATE ON sync_meta BEGIN SELECT \
+         RAISE(ABORT, 'synthetic empty metadata failure'); END";
+    (match Database.apply_authoritative database prepared ~decrypted:None with
+     | Error (Authoritative_commit_persistence_failed _) when storage -> ()
+     | Error (Authoritative_decode_failed source) when not storage ->
+       let module D = Logseq_db_types.Authoritative_diagnostic in
+       let detail =
+         match D.decode source with
+         | Some detail -> D.message detail
+         | None -> Alcotest.fail "late failure lost safe diagnostic"
+       in
+       let contains needle =
+         let rec loop i =
+           i + String.length needle <= String.length detail
+           && (String.sub detail i (String.length needle) = needle || loop (i + 1))
+         in
+         loop 0
+       in
+       T.require
+         (contains "stage=decode" && contains "transaction=3")
+         "empty slots shifted the late failure transaction ordinal"
+     | _ -> Alcotest.fail "empty-containing failure returned wrong outcome");
+    if storage then sql "DROP TRIGGER fail_empty_checkpoint";
+    let assert_unchanged database =
+      let after, after_projection, after_updated = empty_batch_state database in
+      T.require
+        (Server_cursor.equal (sync_view_checkpoint before) (sync_view_checkpoint after)
+         && sync_token_equal (sync_view_token before) (sync_view_token after))
+        "failed batch advanced checkpoint/revision";
+      T.require
+        (Projection_revision.equal projection after_projection && updated = after_updated)
+        "failed mixed batch exposed partial data";
+      T.require (sync_view_submissions after = []) "failed batch changed outbox"
+    in
+    assert_unchanged database;
+    Database.close database |> T.require_ok ~behavior:"close failed empty batch";
+    assert_unchanged (open_database ()))
+;;
+
+let empty_authoritative_keeps_token_guards database =
+  let before =
+    Database.inspect_sync database |> T.require_ok ~behavior:"before empty guards"
+  in
+  let empty = empty_authoritative_batch [ "[]" ] in
+  let stale, _ =
+    Database.begin_authoritative database ~expected:(sync_view_token before) empty
+    |> T.require_ok ~behavior:"prepare empty token conflict"
+  in
+  ignore
+    (commit_plain_authoritative
+       database
+       ~cursor:(server_cursor 1)
+       empty_batch_update_wire
+       "advance competing commit");
+  (match
+     Database.begin_authoritative database ~expected:(sync_view_token before) empty
+   with
+   | Error Authoritative_sync_token_conflict -> ()
+   | _ -> Alcotest.fail "empty payload bypassed begin token guard");
+  (match Database.apply_authoritative database stale ~decrypted:None with
+   | Error Authoritative_commit_token_conflict -> ()
+   | _ -> Alcotest.fail "empty payload bypassed commit token guard");
+  let after, _, updated = empty_batch_state database in
+  T.require
+    (Server_cursor.equal (sync_view_checkpoint after) (server_cursor 1)
+     && updated = 1_704_067_200_123L)
+    "stale empty preparation changed winning transaction"
+;;
+
+let empty_authoritative_keeps_invalid_input_rejection database =
+  let before =
+    Database.inspect_sync database
+    |> T.require_ok ~behavior:"before invalid empty neighbours"
+  in
+  List.iter
+    (fun wire ->
+       match
+         Database.begin_authoritative
+           database
+           ~expected:(sync_view_token before)
+           (empty_authoritative_batch [ wire ])
+       with
+       | Error (Authoritative_decode_failed _) -> ()
+       | _ -> Alcotest.fail "empty support accepted malformed transaction")
+    [ "["; "null"; "{}"; "[42]" ];
+  (match
+     authoritative_batch
+       ~maximum_count:16
+       ~maximum_bytes:4096
+       ~transactions:[]
+       ~through:(server_cursor 0)
+       ~checksum:None
+   with
+   | Error Authoritative_batch_empty -> ()
+   | _ -> Alcotest.fail "empty outer batch accepted");
+  let after =
+    Database.inspect_sync database
+    |> T.require_ok ~behavior:"after invalid empty neighbours"
+  in
+  T.require
+    (sync_token_equal (sync_view_token before) (sync_view_token after))
+    "invalid input changed revision"
+;;
+
 let revision_codecs_reject_unknown_versions () =
   T.require
     (Result.is_error (Generation.of_string "generation:v0:1")
@@ -4023,5 +4319,15 @@ let database_cases =
 let () =
   Alcotest.run
     "logseq_overlay_db sync"
-    [ "validated wire inputs", pure_cases; "durable sync view", database_cases ]
+    [ "empty authoritative compatibility",
+      [ T.database_case "empty array advances only sync state" (empty_authoritative_preserves_logical_state "[]")
+      ; T.database_case "empty Transit list advances only sync state" (empty_authoritative_preserves_logical_state
+          (Transit_native.Transit.Json.to_string (Transit_core.Json.List [])))
+      ; T.database_case "mixed batch preserves empty cursor slots" empty_authoritative_mixed_batch
+      ; Alcotest.test_case "empty cursor and revision survive reopen" `Quick empty_authoritative_survives_reopen
+      ; Alcotest.test_case "late decode failure rolls back mixed batch" `Quick (empty_authoritative_failure_is_atomic ~storage:false)
+      ; Alcotest.test_case "storage failure rolls back mixed batch" `Quick (empty_authoritative_failure_is_atomic ~storage:true)
+      ; T.database_case "empty payload keeps both token guards" empty_authoritative_keeps_token_guards
+      ; T.database_case "malformed neighbours and empty outer batch reject" empty_authoritative_keeps_invalid_input_rejection ]
+    ; "validated wire inputs", pure_cases; "durable sync view", database_cases ]
 ;;

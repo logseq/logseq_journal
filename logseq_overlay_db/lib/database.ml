@@ -7079,7 +7079,7 @@ let begin_authoritative database ~expected batch =
           | [] -> Ok (List.rev acc |> List.concat)
           | wire :: rest ->
             Result.bind
-              (Sync_tx_codec.protected_values wire
+              (Sync_tx_codec.protected_values ~allow_empty:true wire
                |> Result.map_error
                     (authoritative_decode_context ~stage:Prepare ~transaction:index))
               (fun values -> collect (index + 1) (values :: acc) rest)
@@ -7720,7 +7720,7 @@ let prepare_authoritative_candidate preparation ~decrypted =
                |> Authoritative_diagnostic.encode)
         | wire :: rest ->
           let current =
-            Result.bind (Sync_tx_codec.protected_values wire) (fun protected ->
+            Result.bind (Sync_tx_codec.protected_values ~allow_empty:true wire) (fun protected ->
               Result.bind
                 (split_prefix (List.length protected) remaining
                  |> Result.map_error (fun _ ->
@@ -7731,7 +7731,7 @@ let prepare_authoritative_candidate preparation ~decrypted =
                    |> Authoritative_diagnostic.encode))
                 (fun (plain, remaining) ->
                    Result.bind
-                     (Sync_tx_codec.decode ~db:database ~decrypted_values:plain wire)
+                     (Sync_tx_codec.decode ~allow_empty:true ~db:database ~decrypted_values:plain wire)
                      (fun operations ->
                         try
                           let report =

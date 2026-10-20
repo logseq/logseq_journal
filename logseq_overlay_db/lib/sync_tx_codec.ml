@@ -507,10 +507,10 @@ let decode_operation ~db operation plaintexts =
   | value -> diagnostic_error ~actual:(transit_kind value) Operation_shape
 ;;
 
-let parse source =
+let parse ?(allow_empty = false) source =
   try
     match Codec.of_string source with
-    | Transit.Array [] | List [] -> diagnostic_error Empty_transaction
+    | (Transit.Array [] | List []) when not allow_empty -> diagnostic_error Empty_transaction
     | Array operations | List operations -> Ok operations
     | value -> diagnostic_error ~actual:(transit_kind value) Transaction_shape
   with
@@ -518,7 +518,7 @@ let parse source =
     diagnostic_error Transit_syntax
 ;;
 
-let protected_values source =
+let protected_values ?(allow_empty = false) source =
   let value ?(field = "value") attribute value =
     if List.mem attribute protected_attributes
     then (
@@ -563,7 +563,7 @@ let protected_values source =
         Operation_keyword
     | value -> diagnostic_error ~actual:(transit_kind value) Operation_shape
   in
-  bind (parse source) (fun operations ->
+  bind (parse ~allow_empty source) (fun operations ->
     let operation_count = List.length operations in
     let rec loop index values = function
       | [] -> Ok (List.concat (List.rev values))
@@ -575,8 +575,8 @@ let protected_values source =
     loop 1 [] operations)
 ;;
 
-let decode ~db ~decrypted_values source =
-  bind (parse source) (fun operations ->
+let decode ?(allow_empty = false) ~db ~decrypted_values source =
+  bind (parse ~allow_empty source) (fun operations ->
     let operation_count = List.length operations in
     let rec loop index decoded plaintexts = function
       | [] ->

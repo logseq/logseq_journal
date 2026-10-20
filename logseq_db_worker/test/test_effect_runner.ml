@@ -1905,6 +1905,15 @@ let test_authoritative_rejection_diagnostics kind () =
                (Core.Sync_event
                   (Sync.Websocket_message
                      (connection, Pull_ok { t = cursor t; checksum = None; txs })));
+             let empty_success=match kind with `Detail (("empty"|"second-transaction"),_,_) -> true | _ -> false in
+             if empty_success then (
+               Alcotest.(check bool) "legal empty authoritative batch succeeds" true (!failures=[]);
+               Alcotest.(check bool) "empty cursor reaches actual manager" true
+                 ((Core.view !state).sync.snapshot.applied_server_t=Some(cursor t));
+               Alcotest.(check (option string)) "successful empty pull has no Last error" None
+                 (Core.view !state).sync.snapshot.last_error;
+               Alcotest.(check bool) "successful empty pull keeps graph open" true
+                 ((Core.view !state).graph.phase=Graph_open)) else (
              let error =
                match !failures with
                | [ error ] -> error
@@ -2003,7 +2012,7 @@ let test_authoritative_rejection_diagnostics kind () =
                 ; "Nothing found"
                 ; "Cannot store nil"
                 ]
-                @ if String.length payload > 30 then [ payload ] else [])))))
+                @ if String.length payload > 30 then [ payload ] else []))))))
 ;;
 
 

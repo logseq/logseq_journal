@@ -1,4 +1,5 @@
-val protected_values : string -> (string list, string) result
+(** Empty operations are accepted only when explicitly enabled for authoritative input. *)
+val protected_values : ?allow_empty:bool -> string -> (string list, string) result
 val protected_plaintexts : Datascript.tx_op list -> (string list, string) result
 val synchronized_operations : Datascript.tx_op list -> Datascript.tx_op list
 val encode : db:Datascript.db -> Datascript.tx_op list -> (string, string) result
@@ -10,7 +11,8 @@ val encode_protected
   -> (string, string) result
 
 val decode
-  :  db:Datascript.db
+  :  ?allow_empty:bool
+  -> db:Datascript.db
   -> decrypted_values:string list
   -> string
   -> (Datascript.tx_op list, string) result

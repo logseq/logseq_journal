@@ -1499,7 +1499,7 @@ let pre_uuid_status_outbox_preserves_identity () =
       "opening legacy outbox changed operation fingerprints")
 ;;
 
-let noncanonical_outbox_payload_fails_closed () =
+let noncanonical_outbox_payload_fails_closed ?(payload="tampered") () =
   let behavior = "noncanonical durable outbox payload fails closed" in
   T.with_temp_directory "overlay-noncanonical-outbox-" (fun support ->
     let database_path = T.seed_mirror support in
@@ -1532,7 +1532,7 @@ let noncanonical_outbox_payload_fails_closed () =
             (match Yojson.Safe.from_string source with
              | `Assoc fields ->
                `Assoc
-                 (("normalized_transaction", `String "tampered")
+                 (("normalized_transaction", `String payload)
                   :: List.remove_assoc "normalized_transaction" fields)
                |> Yojson.Safe.to_string
              | _ -> Alcotest.fail "queued fixture record is not JSON")
@@ -3086,8 +3086,9 @@ let cases =
       duplicate_outbox_member_fails_closed
   ; Alcotest.test_case
       "noncanonical outbox payload fails closed"
-      `Quick
-      noncanonical_outbox_payload_fails_closed
+      `Quick (noncanonical_outbox_payload_fails_closed ~payload:"tampered")
+    ; Alcotest.test_case "empty outgoing transaction stays corrupt" `Quick
+        (noncanonical_outbox_payload_fails_closed ~payload:"[]")
   ; Alcotest.test_case
       "inconsistent origin evidence fails closed"
       `Quick
