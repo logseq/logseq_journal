@@ -54,12 +54,16 @@ No authentication, encryption, account-preparation or storage guard is bypassed.
 The user additionally identified the error-page recovery actions being off-center.
 The shared empty-state composite puts actions inside a row with leading main-axis
 alignment; a centered inner column does not center that group in the offered width.
-Only the Failed route will wrap its existing action group in a native main=center
+Only the Failed route wraps its existing action group in a native main=center
 row, preserving action order and handlers. Pure sync events cannot reproduce pixel
 layout; the actual one-action native screenshot reproduces the defect and a
 temporary screenshot assertion checks the narrowest rendering boundary. Single and
 multiple actions, a 320-point offered viewport and accessibility text sizing are
-required before accepting this additional correction. Shared components are unchanged.
+verified on the same isolated device. The narrow fixture offers the actual native
+view 320 points, rather than cropping a screenshot. Accessibility-medium retains
+centering and actionable full semantic labels; visible button text ellipsizes at
+that size, which this layout-only correction does not change. The original large
+text-size setting was restored. Shared components are unchanged.
 
 Four regressions extend the existing public pure-core suite, with expected RED
 failures before the change and 84 core cases passing afterward. The Swift owner
