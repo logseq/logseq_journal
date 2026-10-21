@@ -5092,7 +5092,11 @@ let test_fixture_exception_cleanup exception_ =
 
 (* Application owns password admission and UI. No public pure root event exists
    for E2EE; this fixture exercises mounted Application through its public hooks. *)
-let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init = false) ?(cold_start = false) ?on_platform_request ?(on_auth_classified = fun _ -> ()) () =
+let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init = false) ?(cold_start = false)
+    ?(attach_mirror = false) ?(graph_first = false)
+    ?(attachment_stage = Atomic.make 0) ?(finish_attachment = Atomic.make true)
+    ?(on_timeline_presented = fun _ -> ())
+    ?on_platform_request ?(on_auth_classified = fun _ -> ()) () =
   let module W = Logseq_db_worker_lui.Journal_worker in
   let graph_id =
     Logseq_db_types.Graph_types.Uuid.of_string "00000000-0000-0000-0000-000000000901"
@@ -5136,6 +5140,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
     else manager in
   let graph_reads = Atomic.make 0 in
   let current = Atomic.make manager in
+  let graph_phase = Atomic.make Logseq_db_worker.Graph_closed in
   let submissions = Atomic.make [] in
   let release = Atomic.make false in
   let client = ref None in
@@ -5177,7 +5182,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
             (Service.Graph_state
                { generation = 1
                ; graph_id = (Atomic.get current).snapshot.selected_graph
-               ; phase = Graph_closed
+               ; phase = Atomic.get graph_phase
                ; error = None
                })
         | Client_command (Submit_e2ee_password _) when worker_failure ->
@@ -5204,7 +5209,31 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
           while (not (Atomic.get release)) && Unix.gettimeofday () < deadline do
             Eio.Time.Mono.sleep (W.Request_context.clock context) 0.01
           done;
-          publish
+          if attach_mirror then (
+            let attached =
+              { old with snapshot = { old.snapshot with
+                  applied_server_t = Some (server_cursor_of_int 51)
+                ; timeline_presentation_pending = true
+                ; startup = { old.snapshot.startup with
+                    awaiting_e2ee_password = false; restoring_local = false
+                  ; local_access = Service.Local_available; failure = None }
+                ; last_error = None } }
+            in
+            let manager_changed () = publish attached in
+            let graph_changed () =
+              Atomic.set graph_phase Logseq_db_worker.Graph_open;
+              W.Request_context.emit context ~topic:Service.graph_state_topic
+                (Service.Graph_state_changed
+                   { generation = 1; graph_id = Some graph_id; phase = Graph_open; error = None })
+            in
+            (if graph_first then graph_changed else manager_changed) ();
+            Atomic.set attachment_stage 1;
+            while not (Atomic.get finish_attachment) do
+              Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
+            done;
+            (if graph_first then manager_changed else graph_changed) ();
+            Atomic.set attachment_stage 2)
+          else publish
             { manager with
               snapshot =
                 { manager.snapshot with
@@ -5215,6 +5244,11 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
                        try again."
                 }
             };
+          Ok Service.Client_command_completed
+        | Client_command (Acknowledge_timeline_presented scope) ->
+          on_timeline_presented scope;
+          let value = Atomic.get current in
+          publish { value with snapshot = { value.snapshot with timeline_presentation_pending = false } };
           Ok Service.Client_command_completed
         | Client_command Return_to_graph_picker ->
           publish
@@ -5243,6 +5277,23 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
         | Client_command _ | Asset_command _ | Release_asset_file _ ->
           Ok Service.Client_command_completed
         | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
+        | Graph_request request when attach_mirror ->
+          let module P = Logseq_db_worker.Protocol in
+          let outcome = match request.command with
+            | P.V2_graph_info -> P.V2_graph_info_outcome
+                { graph_uuid = graph_id; graph_name = "Synthetic"
+                ; schema = { major = 65; minor = 33 }; admission_facts = []
+                ; journal_title_format = None
+                ; limits = { response_budget_bytes = P.maximum_response_bytes
+                  ; outbox_max_records = 4096; outbox_max_bytes = 8388608
+                  ; change_max_items = 4096; change_max_bytes = 1048576
+                  ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 }
+                ; generation = "g"; projection_revision = "p" }
+            | V2_list_journals _ -> P.V2_journals_outcome { items = []; next_cursor = None }
+            | _ -> P.V2_failed { code = "UnusedFixtureRead"; message = "Unused unlock fixture read" }
+          in
+          Ok (Service.Graph_response (P.V2_response
+            { api_version = P.api_version; request_id = request.request_id; outcome }))
         | Import_asset _ | Graph_request _ ->
           Error "Unused isolated password fixture command")
       ~shutdown:(fun () -> ())
@@ -5625,6 +5676,86 @@ let test_unlock_application () =
     ; "pending=false"; "failure=e2ee" ];
   List.iter (fun value -> Alcotest.(check bool) "sensitive UI value excluded" false (has value))
     [ "synthetic-only"; "Private Journal"; "Check your encryption password" ]
+;;
+
+let test_unlock_attached_mirror ~graph_first () =
+  let attachment_stage = Atomic.make 0 and finish_attachment = Atomic.make false in
+  let acknowledgements = Atomic.make [] in
+  let hooks, submissions, release, client =
+    unlock_fixture ~attach_mirror:true ~graph_first ~attachment_stage ~finish_attachment
+      ~on_timeline_presented:(fun scope ->
+        Atomic.set acknowledgements (scope :: Atomic.get acknowledgements)) ()
+  in
+  let props = Hashtbl.create 64 and parents = Hashtbl.create 64 in
+  let track = track_json_wire_teardown ~parents (Hashtbl.remove props) in
+  let consume encoded =
+    if encoded <> "" then (
+      let open Yojson.Safe.Util in
+      Yojson.Safe.from_string encoded |> member "ops" |> to_list |> List.iter (fun op ->
+        track op;
+        match op |> member "op" |> to_string with
+        | "create-node" -> Hashtbl.replace props (op |> member "id" |> to_int) []
+        | "create-extension" -> Hashtbl.replace props (op |> member "id" |> to_int)
+            ["_extension", member "identifier" op]
+        | "set-prop" | "set-extension-prop" ->
+          let id = op |> member "id" |> to_int in
+          let key = op |> member "property" |> to_string in
+          let previous = Option.value (Hashtbl.find_opt props id) ~default:[] in
+          Hashtbl.replace props id ((key, member "value" op) :: List.remove_assoc key previous)
+        | _ -> ()))
+  in
+  let find key value = Hashtbl.fold (fun id values found ->
+    if List.assoc_opt key values = Some (`String value) then Some id else found) props None in
+  let editor () = find "accessibility-identifier" "e2ee-password-editor" in
+  let property id key = List.assoc_opt key (Hashtbl.find props id) in
+  let dispatch event = consume (hooks.dispatch event) in
+  let wait label predicate =
+    let deadline = Unix.gettimeofday () +. 5. in
+    while not (predicate ()) && Unix.gettimeofday () < deadline do
+      consume (hooks.pump ()); Unix.sleepf 0.001
+    done;
+    Alcotest.(check bool) label true (predicate ())
+  in
+  let startup = Logseq_db_worker.Config.create
+      ~application_support_directory:"/tmp/journal-attached-unlock-synthetic"
+      ~target:(Managed_sync {base_url="https://example.invalid"})
+      ~compatibility_profile:Logseq_65_33_or_newer
+      ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
+      ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+      |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
+  Fun.protect ~finally:(fun () ->
+    Atomic.set release true; Atomic.set finish_attachment true;
+    ignore (hooks.dispose ());
+    Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client) (fun () ->
+    consume (hooks.init 2 2 startup);
+    wait "existing mirror asks for password" (fun () -> Option.is_some (editor ()));
+    dispatch (Lui_protocol.TextChanged (Option.get (editor ()), "synthetic-only"));
+    dispatch (Lui_protocol.Submit (Option.get (editor ())));
+    wait "submission reaches worker" (fun () -> Atomic.get submissions <> []);
+    wait "local availability alone keeps submission pending" (fun () ->
+      Option.fold ~none:false ~some:(fun id -> property id "enabled" = Some (`Bool false)) (editor ()));
+    Atomic.set release true;
+    wait "first attachment notification" (fun () -> Atomic.get attachment_stage = 1);
+    if not graph_first then
+      wait "attached manager releases password before graph notification" (fun () -> Option.is_none (editor ()));
+    Alcotest.(check int) "attachment cannot acknowledge a hidden Timeline" 0
+      (List.length (Atomic.get acknowledgements));
+    Atomic.set finish_attachment true;
+    wait "attached mirror exits password page" (fun () -> Option.is_none (editor ()));
+    wait "Timeline mounts before Ready acknowledgement" (fun () -> Option.is_some (find "_extension" "journal-list"));
+    let rec appear id =
+      let parent = Hashtbl.find_opt parents id in
+      if property id "appear-enabled" = Some (`Bool true) then dispatch (Lui_protocol.Appear id);
+      Option.iter appear parent
+    in
+    appear (Option.get (find "_extension" "journal-list"));
+    wait "Timeline retains first appearance acknowledgement" (fun () -> Atomic.get acknowledgements <> []);
+    let scope : Service.timeline_scope = List.hd (Atomic.get acknowledgements) in
+    Alcotest.(check int) "acknowledgement uses current account" 1 scope.startup.account_generation;
+    Alcotest.(check int) "acknowledgement uses current graph generation" 1 scope.graph_generation;
+    Alcotest.(check string) "acknowledgement uses selected graph"
+      "00000000-0000-0000-0000-000000000901"
+      (Logseq_db_types.Graph_types.Uuid.to_string scope.graph_id))
 ;;
 
 (* Root_navigation public reducer events do not own platform continuations,
@@ -6392,6 +6523,10 @@ let () =
             test_repeated_native_sign_in_intent_receives_permission ] )
     ; ( "E2EE input"
       , [ Alcotest.test_case "Application admission and recovery" `Quick test_unlock_application
+        ; Alcotest.test_case "existing mirror attach manager first" `Quick
+            (test_unlock_attached_mirror ~graph_first:false)
+        ; Alcotest.test_case "existing mirror attach graph first" `Quick
+            (test_unlock_attached_mirror ~graph_first:true)
         ; Alcotest.test_case "Application unlock worker failure releases pending" `Quick
             (fun () -> run_unlock_application ~worker_failure:true ())
         ; Alcotest.test_case "Application unlock Full releases pending" `Quick

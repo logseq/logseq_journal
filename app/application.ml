@@ -779,6 +779,15 @@ let apply_manager_state state (manager_state : Graph_service.state) =
     | None | Some _ -> false
   in
   let is_awaiting_password = snapshot.startup.awaiting_e2ee_password in
+  (* Attachment precedes Timeline's first appearance. Waiting for Ready here
+     would keep the password screen mounted and prevent that acknowledgement. *)
+  let current_graph_attached =
+    not (owner_changed || graph_context_changed)
+    && Option.is_some snapshot.selected_graph
+    && snapshot.startup.local_access = Graph_service.Local_available
+    && not snapshot.startup.restoring_local
+    && snapshot.timeline_presentation_pending
+  in
   let e2ee_password, next_local_sequence =
     if is_awaiting_password = was_awaiting_password
        && not (owner_changed || graph_context_changed)
@@ -816,6 +825,7 @@ let apply_manager_state state (manager_state : Graph_service.state) =
               || is_awaiting_password
               || Option.is_some snapshot.startup.failure
               || snapshot.startup.bootstrapping
+              || current_graph_attached
               || (not snapshot.startup.authenticated)
               || (Journal_startup.derive ~snapshot ~graph:state.graph_state).phase = Ready
              )
