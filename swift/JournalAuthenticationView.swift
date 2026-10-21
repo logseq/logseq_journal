@@ -33,9 +33,15 @@ struct JournalAccountRecoveryView: View {
 struct JournalAuthenticationView: View {
   @State private var model: JournalAuthentication
   @State private var operation: Task<Void, Never>?
+  @State private var automaticStartConsumed = false
+  let startsImmediately: Bool
+  let cancelled: () -> Void
   let authenticated: () -> Void
-  init(api: any JournalAuthenticationAPI, authenticated: @escaping () -> Void) {
+  init(api: any JournalAuthenticationAPI, startsImmediately: Bool = false,
+    cancelled: @escaping () -> Void = {}, authenticated: @escaping () -> Void) {
     _model = State(initialValue: JournalAuthentication(api: api))
+    self.startsImmediately = startsImmediately
+    self.cancelled = cancelled
     self.authenticated = authenticated
   }
   var body: some View {
@@ -47,12 +53,7 @@ struct JournalAuthenticationView: View {
         if let message = model.message {
           Text(message).foregroundStyle(.red).accessibilityIdentifier("authentication-error")
         }
-        Button {
-          operation = Task {
-            await model.submit()
-            if model.complete && !Task.isCancelled { authenticated() }
-          }
-        } label: {
+        Button(action: submit) {
           HStack {
             if model.busy { ProgressView() }
             Text(model.busy ? "Opening sign-in…" : "Continue to sign in")
@@ -61,11 +62,29 @@ struct JournalAuthenticationView: View {
         .buttonStyle(.borderedProminent).disabled(!model.canSubmit)
         .accessibilityIdentifier("authentication-submit")
         if model.busy {
-          Button("Cancel", role: .cancel) { cancel() }
+          Button("Cancel", role: .cancel) {
+            cancel()
+            if startsImmediately { cancelled() }
+          }
         }
       }.padding(24).frame(maxWidth: 480, alignment: .leading)
     }
+    .task {
+      guard startsImmediately && !automaticStartConsumed else { return }
+      automaticStartConsumed = true
+      submit()
+    }
     .onDisappear { cancel() }
+  }
+  private func submit() {
+    guard operation == nil && model.canSubmit else { return }
+    operation = Task {
+      await model.submit()
+      guard !Task.isCancelled else { return }
+      operation = nil
+      if model.complete { authenticated() }
+      else if startsImmediately && model.message == nil { cancelled() }
+    }
   }
   private func cancel() { operation?.cancel(); operation = nil; model.cancel() }
 }

@@ -800,6 +800,7 @@ type t =
   ; graph_key : graph_key_handle option
   ; pending_graph_open : mirror_request option
   ; pending_mirror_inspection : mirror_request option
+  ; pending_selected_download : graph_scope option
   ; pending_attachment : mirror_request option
   ; pending_encrypted_graph_key : string option
   ; pending_private_key_package : string option
@@ -875,6 +876,7 @@ let initial config =
     ; selected_graph_value = None
     ; deletion_scope = None
     ; current_graph_scope = None
+    ; pending_selected_download = None
     ; connection_generation = 0
     ; graph_key = None
     ; pending_graph_open = None
@@ -990,6 +992,7 @@ let fail core stage message =
     ; pull_wanted = None
     ; pull_retry_delay = 1.
     ; pending_mirror_inspection = None
+    ; pending_selected_download = None
     ; pending_attachment = None
     ; pending_encrypted_graph_key = None
     ; pending_private_key_package = None
@@ -1198,6 +1201,7 @@ let authenticate_new_account core user_id =
       ; deletion_scope = None
       ; cached_selected_graph = None
       ; current_graph_scope = None
+      ; pending_selected_download = None
       ; graph_key = None
       ; pending_graph_open = None
       ; pending_mirror_inspection = None
@@ -1285,6 +1289,7 @@ let restore_local core user_id =
       ; cached_selected_graph = None
       ; selected_graph_value = None
       ; current_graph_scope = None
+      ; pending_selected_download = None
       ; graph_key = None
       ; pending_graph_open = None
       ; pending_mirror_inspection = None
@@ -1343,6 +1348,7 @@ let sign_out core =
       ; deletion_scope = None
       ; cached_selected_graph = None
       ; current_graph_scope = None
+      ; pending_selected_download = None
       ; graph_key = None
       ; pending_graph_open = None
       ; pending_mirror_inspection = None
@@ -1434,6 +1440,7 @@ let select_graph_transition core ~persist graph_id =
         ; pending_effects = List.filter (fun pending -> not (is_graph_key_access pending)) core.pending_effects
         ; selected_graph_value = Some graph
         ; current_graph_scope = Some scope
+        ; pending_selected_download = (if persist then Some scope else None)
         ; graph_key = None
         ; pending_graph_open = None
         ; pending_mirror_inspection = Some mirror_request
@@ -1464,11 +1471,26 @@ let select_graph_transition core ~persist graph_id =
 
 let select_graph core graph_id = select_graph_transition core ~persist:true graph_id
 
+let begin_missing_mirror_bootstrap core scope =
+  let startup =
+    { core.public_state.snapshot.startup with restoring_local = false; bootstrapping = true }
+  in
+  let core = set_snapshot { core with pending_selected_download = None }
+      { core.public_state.snapshot with startup } in
+  match core.selected_graph_value with
+  | Some graph when graph.encrypted ->
+    let next, request = issue_request core (Load_and_unlock_graph_key scope) in
+    { next; effects = [ publish next; Run request ] }
+  | Some _ | None ->
+    let requested = begin_snapshot_bootstrap core scope in
+    { requested with effects = publish requested.next :: requested.effects }
+;;
+
 let mirror_inspected core = function
   | Mirror_available request
     when graph_scope_is_current core request.scope
          && core.pending_mirror_inspection = Some request ->
-    let core = { core with pending_mirror_inspection = None } in
+    let core = { core with pending_mirror_inspection = None; pending_selected_download = None } in
     (match core.selected_graph_value, core.graph_key with
      | Some graph, Some key
        when graph.encrypted && graph_key_handle_scope key = request.scope ->
@@ -1494,22 +1516,19 @@ let mirror_inspected core = function
               core.pending_mirror_inspection ->
     let core = { core with pending_mirror_inspection = None } in
     if not (network_allowed core) then
-      local_unavailable core Local_mirror_unavailable "This graph is not downloaded. Download it to open it on this device."
-    else
-    let startup =
-      { core.public_state.snapshot.startup with
-        restoring_local = false
-      ; bootstrapping = true
-      }
-    in
-    let core = set_snapshot core { core.public_state.snapshot with startup } in
-    (match core.selected_graph_value with
-     | Some graph when graph.encrypted ->
-       let next, request = issue_request core (Load_and_unlock_graph_key scope) in
-       { next; effects = [ publish next; Run request ] }
-     | Some _ | None ->
-       let requested = begin_snapshot_bootstrap core scope in
-       { requested with effects = publish requested.next :: requested.effects })
+      if core.pending_selected_download = Some scope then
+        (* Only the user's current selection may request online admission. Native
+           permission and verified identity still precede any remote effect. *)
+        let core = network_phase core Online_by_user in
+        let snapshot = core.public_state.snapshot in
+        let startup = { snapshot.startup with authenticated = false;
+          restoring_local = false; bootstrapping = true } in
+        let next = set_snapshot { core with snapshot_scope = Some scope }
+            { snapshot with startup } in
+        { next; effects = [publish next] }
+      else
+        local_unavailable core Local_mirror_unavailable "This graph is not downloaded. Download it to open it on this device."
+    else begin_missing_mirror_bootstrap core scope
   | _ -> unchanged core
 ;;
 
@@ -2401,6 +2420,7 @@ let clear_selected_graph_for_catalog core catalog =
       ; cached_selected_graph = None
       ; selected_graph_value = None
       ; current_graph_scope = None
+      ; pending_selected_download = None
       ; graph_key = None
       ; pending_graph_open = None
       ; pending_mirror_inspection = None
@@ -2801,6 +2821,7 @@ let return_to_graph_picker core =
       { core with
         selected_graph_value = None
       ; current_graph_scope = None
+      ; pending_selected_download = None
       ; graph_key = None
       ; pending_graph_open = None
       ; pending_mirror_inspection = None
@@ -2974,8 +2995,10 @@ let step core event =
         presentation_generation = snapshot.startup.presentation_generation + 1;
         restoring_local = snapshot.startup.restoring_local && local_restore_pending;
         bootstrapping = false; catalog_loading = next.catalog_cache_loading;
-        awaiting_e2ee_password = false; local_access } in
+        awaiting_e2ee_password = false; local_access;
+        failure = (if Option.is_some next.pending_selected_download then Some During_local_restore else snapshot.startup.failure) } in
       let next = set_snapshot { next with
+        pending_selected_download = None;
         pending_effects = local_pending; websocket_live = false; deferred_catalog_reconciliation = false;
         pending_encrypted_graph_key = (if List.exists (fun (Pending_effect ticket) ->
           match ticket.kind with Unlock_private_key_kind -> true | _ -> false) local_pending
@@ -2997,6 +3020,9 @@ let step core event =
       let authenticated=authenticate core user_id in
       let next=authenticated.next in
       let resumed = match next.current_graph_scope,next.sync_view,core.public_state.snapshot.startup.local_access with
+        | Some scope,None,_ when next.pending_selected_download = Some scope
+            && next.public_state.snapshot.startup.bootstrapping ->
+          begin_missing_mirror_bootstrap next scope
         | Some scope,Some _,_ when not next.websocket_live && (match next.websocket_owner with
             | None | Some {phase=Retiring;_} -> true | Some _ -> false) -> start_websocket next scope
         | Some scope,None,Local_unavailable Local_key_unavailable

@@ -3474,7 +3474,7 @@ let manager_page ?picker_signal state dispatch =
             then "Deleting local copy…"
                  else (
                    match presence owner with
-              | Some (Ok Graph_service.Not_downloaded) -> "Not downloaded"
+              | Some (Ok Graph_service.Not_downloaded) -> "Download and open"
               | Some (Error _) -> "Unable to check local copy"
                    | _ -> "")
                in

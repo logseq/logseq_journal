@@ -159,6 +159,7 @@ struct JournalHost: View {
   @State private var setup: Result<JournalRuntimeSetup, Error>?
   @State private var retry = 0
   @State private var signInPresented = false
+  @State private var signInStartsImmediately = false
   @State private var clock = JournalStartupClock()
 
   var body: some View {
@@ -182,7 +183,7 @@ struct JournalHost: View {
             if platform.authenticationRequired || platform.accountIssue != nil {
               JournalAccountRecoveryView(issue: platform.accountIssue,
                 signInAvailable: platform.authenticationRequired || platform.accountIssue?.offersSignIn == true,
-                signIn: { signInPresented = true },
+                signIn: { signInStartsImmediately = true; signInPresented = true },
                 retry: platform.accountIssue?.stage == .bindingRead ? nil : { platform.retryOnline() })
             }
           }
@@ -199,12 +200,16 @@ struct JournalHost: View {
       else if phase == .active { lifecycle(backgrounded: false) }
     }
     .onChange(of: platform.authenticationRequired) { _, required in
-      if required && platform.localAccountAvailable == false { signInPresented = true }
+      if required && platform.localAccountAvailable == false && !signInPresented {
+        signInStartsImmediately = false; signInPresented = true
+      }
       // The authentication owner closes its sheet after account preparation.
       // Closing on the intermediate native identity update can cancel that work.
     }
     .onChange(of: platform.localAccountAvailable) { _, available in
-      if available == false && platform.authenticationRequired { signInPresented = true }
+      if available == false && platform.authenticationRequired && !signInPresented {
+        signInStartsImmediately = false; signInPresented = true
+      }
     }
     .sheet(isPresented: $signInPresented) {
       NavigationStack {
@@ -214,7 +219,8 @@ struct JournalHost: View {
           cancelPreparation: { platform.cancelAccountPreparation() },
           preparationMessage: {
             platform.accountIssue.map { ($0.errorDescription ?? "") + "\n" + $0.diagnostic }
-          })) {
+          }), startsImmediately: signInStartsImmediately,
+          cancelled: { signInPresented = false }) {
           signInPresented = false
         }
         .toolbar {
