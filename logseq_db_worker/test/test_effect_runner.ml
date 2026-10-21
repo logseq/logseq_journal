@@ -861,9 +861,9 @@ let test_db_shutdown_accepts_late_staging_completion () =
                   (Core.Sync_event
                      (Sync.Runner_completed (Sync.Completion (ticket, Ok [ graph ]))));
                 Eio.Promise.resolve catalog_resolve ()
-              | Sync.Request (_, Sync.Fetch_snapshot_baseline scope) ->
+              | Sync.Request (_, Sync.Fetch_snapshot_metadata scope) ->
                 Eio.Promise.resolve scope_resolve scope
-              | Sync.Request (_, Sync.Fetch_snapshot_metadata _)
+              | Sync.Request (_, Sync.Fetch_snapshot_baseline _)
               | Sync.Request (_, Sync.Download_snapshot _) -> ()
               | Sync.Asset_io (_, request) as runnable ->
                 (match request.action with

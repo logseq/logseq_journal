@@ -1074,7 +1074,7 @@ let issue_request : type a. t -> a runner_request -> t * runner_effect =
 let begin_snapshot_bootstrap core scope =
   if not (network_allowed core) then local_unavailable core Local_mirror_unavailable "This graph is not downloaded. Connect to download it." else
   let core = { core with snapshot_scope = Some scope; snapshot_server_t = None } in
-  let next, request = issue_request core (Fetch_snapshot_baseline scope) in
+  let next, request = issue_request core (Fetch_snapshot_metadata scope) in
   { next; effects = [ Run request ] }
 ;;
 
@@ -1134,6 +1134,7 @@ let decode_snapshot_baseline source =
 type snapshot_uri_response =
   { ok : bool
   ; url : string
+  ; t : int64
   }
 [@@deriving of_yojson { strict = false }]
 
@@ -1144,11 +1145,15 @@ let decode_snapshot_uri source =
         snapshot_uri_response_of_yojson
         (Yojson.Safe.from_string source)
     with
-    | Ok { ok = true; url } ->
+    | Ok { ok = true; url; t } ->
       let uri = Uri.of_string url in
-      (match Uri.scheme uri, Uri.host uri, Uri.userinfo uri, Uri.fragment uri with
-       | Some "https", Some host, None, None when String.length host > 0 -> Ok uri
-       | _ -> Error "snapshot download URL is invalid")
+      (match Server_cursor.of_int64 t with
+       | Error `Negative_cursor -> Error "snapshot metadata cursor is invalid"
+       | Ok server_t ->
+         (match Uri.scheme uri, Uri.host uri, Uri.userinfo uri, Uri.fragment uri with
+          | Some "https", Some host, None, None when String.length host > 0 ->
+            Ok (uri, server_t)
+          | _ -> Error "snapshot download URL is invalid"))
     | Ok _ | Error _ -> Error "snapshot metadata is invalid"
   with
   | Yojson.Json_error _ -> Error "snapshot metadata is not valid JSON"
@@ -2368,6 +2373,18 @@ let consume_ticket : type a. t -> a effect_ticket -> t option =
   loop [] core.pending_effects
 ;;
 
+let snapshot_ticket_is_current : type a. t -> a effect_ticket -> bool =
+  fun core ticket ->
+  match ticket.kind with
+  | Fetch_snapshot_baseline_kind | Fetch_snapshot_metadata_kind | Download_snapshot_kind ->
+    (match core.snapshot_scope with
+     | Some scope ->
+       graph_scope_is_current core scope
+       && ticket.scope = effect_scope_of_graph scope
+     | None -> false)
+  | _ -> true
+;;
+
 let graph_key_loaded core key =
   match core.current_graph_scope with
   | Some scope when graph_key_handle_scope key = scope ->
@@ -2598,7 +2615,7 @@ let complete_runner : type a. t -> a effect_ticket -> a -> transition =
      | Ok _, _, _ -> unchanged core)
   | Fetch_snapshot_metadata_kind ->
     (match decode_snapshot_uri value, core.snapshot_scope with
-     | Ok uri, Some scope ->
+     | Ok (uri, server_t), Some scope ->
        let request =
          { scope
          ; uri
@@ -2607,7 +2624,12 @@ let complete_runner : type a. t -> a effect_ticket -> a -> transition =
          }
        in
        let next, request_effect = issue_request core (Download_snapshot request) in
-       { next = { next with active_snapshot_download = Some scope }
+       (* Metadata precedes a live stream that may contain later writes. Keep
+          this cursor so catchup replays all intervening journal entries. *)
+       { next =
+           { next with active_snapshot_download = Some scope
+           ; snapshot_server_t = Some server_t
+           }
        ; effects = [ Run request_effect ]
        }
      | Error message, _ -> fail core During_bootstrap message
@@ -2688,6 +2710,7 @@ let consume_completion core = function
   | Completion (ticket, result) ->
     (match consume_ticket core ticket with
      | None -> unchanged core
+     | Some core when not (snapshot_ticket_is_current core ticket) -> unchanged core
      | Some core ->
        (match result with
         | Ok value -> complete_runner core ticket value

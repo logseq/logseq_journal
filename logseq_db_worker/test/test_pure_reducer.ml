@@ -1016,16 +1016,11 @@ let snapshot_activation () =
           { event = Some (Sync.Mirror_inspected (Mirror_absent request.scope))
           ; lifecycle = Lifecycle_unchanged }))), request.scope)
     | _ -> None) selected.effects |> Option.get in
-  let baseline = List.find_map (function
-    | Core.Run_sync (Sync.Request (ticket, Sync.Fetch_snapshot_baseline _)) ->
-      Some (Core.step missing.next (Sync_event (Sync.Runner_completed
-        (Sync.Completion (ticket, Ok {|{"type":"pull/ok","t":42}|})))))
-    | _ -> None) missing.effects |> Option.get in
   let download = List.find_map (function
     | Core.Run_sync (Sync.Request (ticket, Sync.Fetch_snapshot_metadata _)) ->
-      Some (Core.step baseline.next (Sync_event (Sync.Runner_completed
-        (Sync.Completion (ticket, Ok {|{"ok":true,"url":"https://example.invalid/snapshot"}|})))))
-    | _ -> None) baseline.effects |> Option.get in
+      Some (Core.step missing.next (Sync_event (Sync.Runner_completed
+        (Sync.Completion (ticket, Ok {|{"ok":true,"t":42,"url":"https://example.invalid/snapshot"}|})))))
+    | _ -> None) missing.effects |> Option.get in
   let activation = List.find_map (function
     | Core.Run_sync (Sync.Request (ticket, Sync.Download_snapshot _)) ->
       let artifact = Sync.staged_artifact ~id:"synthetic" ~scope
