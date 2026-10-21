@@ -25,7 +25,7 @@ module JournalRelease
       ent=Plist.parse_xml(ent_xml,marshal: false)
       profile=Plist.parse_xml(run!('/usr/bin/openssl','smime','-inform','der','-verify','-noverify','-in',File.join(app,'embedded.mobileprovision')),marshal: false)
       prefix=File.join(directory,'certificate')
-      run!('/usr/bin/codesign','-d','--extract-certificates',prefix,app)
+      run!('/usr/bin/codesign','-d',"--extract-certificates=#{prefix}",app)
       cert_sha=Digest::SHA1.file(prefix+'0').hexdigest
       validate_profile!(profile,ent,cert_sha)
       executable=File.join(app,info.fetch('CFBundleExecutable'))
