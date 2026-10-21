@@ -5548,3 +5548,104 @@ let scenarios = scenarios @
   ; Alcotest.test_case "local insufficiency stops loading without network fallback" `Quick missing_local_data_stops_loading
   ; Alcotest.test_case "native appearance and explicit online permissions are scoped" `Quick appearance_is_scoped_and_authentication_is_required ]
 ;;
+
+(* User graph selection owns the decision to download an absent mirror. A cold
+   restore and unrelated storage/key failures still require explicit recovery. *)
+let user_selected_missing_mirror () =
+  let selected, _ = local_selected () in
+  let chosen = Core.step selected.next (Core.Graph_selected graph_id) in
+  let request = inspect_mirror_request chosen.effects in
+  let missing = Core.step chosen.next (Core.Mirror_inspected (Core.Mirror_absent request.scope)) in
+  no_network "selection requests native permission before remote work" missing.effects;
+  let facts = (Core.state missing.next).snapshot.startup in
+  Alcotest.(check bool) "absent user selection publishes online permission without error" true
+    (facts.network_phase = Core.Online_by_user && facts.failure = None
+     && facts.local_access = Core.Local_pending && not facts.authenticated);
+  let confirmed = Core.step missing.next (Core.Account_authenticated {user_id=Some "user"}) in
+  let downloading = confirmed in
+  Alcotest.(check bool) "verified selection starts one baseline request" true
+    (List.exists (function Core.Run(Core.Request(_,Core.Fetch_snapshot_baseline _))->true|_->false) downloading.effects);
+  let failure = List.find_map (function
+    | Core.Run(Core.Request(ticket,Core.Fetch_snapshot_baseline _)) ->
+      Some (Core.Runner_completed(Core.Completion(ticket,Error(Core.Effect_failed "synthetic offline"))))
+    | _ -> None) downloading.effects |> Option.get in
+  let failed = Core.step downloading.next failure in
+  Alcotest.(check bool) "download failure remains terminal instead of auto-retrying" true
+    ((Core.state failed.next).snapshot.startup.failure = Some Core.During_bootstrap);
+  no_network "failed request has no automatic retry" failed.effects;
+  let retry = Core.step failed.next (Core.Online_recovery_requested (timeline_ticket failed.next)) in
+  ignore (inspect_mirror_request retry.effects)
+;;
+
+let selected_download_cancellation_and_stale_inspections () =
+  let selected, old_request = local_selected () in
+  let chosen = Core.step selected.next (Core.Graph_selected graph_id) in
+  let request = inspect_mirror_request chosen.effects in
+  let stale = Core.step chosen.next (Core.Mirror_inspected(Core.Mirror_absent old_request.scope)) in
+  Alcotest.(check bool) "old inspection cannot authorize selected graph" true
+    ((Core.state stale.next).snapshot.startup.network_phase = Core.Local_only);
+  let missing = Core.step stale.next (Core.Mirror_inspected(Core.Mirror_absent request.scope)) in
+  let cancelled = Core.step missing.next (Core.Online_cancelled(startup_ticket missing.next)) in
+  no_network "cancellation keeps remote work stopped" cancelled.effects;
+  let late = Core.step cancelled.next (Core.Account_authenticated {user_id=Some "user"}) in
+  no_network "late identity cannot resume cancelled download" late.effects;
+  Alcotest.(check bool) "cancelled download offers explicit mirror recovery" true
+    ((Core.state late.next).snapshot.startup.local_access = Core.Local_unavailable Core.Local_mirror_unavailable);
+  let retry=Core.step late.next (Core.Online_recovery_requested(timeline_ticket late.next)) in
+  let confirmed=Core.step retry.next (Core.Account_authenticated {user_id=Some "user"}) in
+  ignore(inspect_mirror_request confirmed.effects);
+  let replacement = Core.step chosen.next (Core.Graph_selected graph_id) in
+  let retired = Core.step replacement.next (Core.Mirror_inspected(Core.Mirror_absent request.scope)) in
+  no_network "replaced selection ignores previous inspection" retired.effects;
+  Alcotest.(check bool) "replacement still starts locally" true
+    ((Core.state retired.next).snapshot.startup.network_phase = Core.Local_only)
+;;
+
+let selected_available_mirror_keeps_local_key_failures () =
+  let selected, _ = local_selected ~encrypted:true () in
+  let chosen = Core.step selected.next (Core.Graph_selected graph_id) in
+  let request = inspect_mirror_request chosen.effects in
+  let available = Core.step chosen.next (Core.Mirror_inspected(Core.Mirror_available request)) in
+  no_network "available selected mirror keeps local-only key access" available.effects;
+  let completion = List.find_map (function
+    | Core.Run(Core.Request(ticket,Core.Load_and_unlock_graph_key _)) ->
+      Some(Core.Runner_completed(Core.Completion(ticket,Error(Core.Effect_failed "key missing"))))
+    | _ -> None) available.effects |> Option.get in
+  let failed=Core.step available.next completion in
+  no_network "key failure is not a download request" failed.effects;
+  Alcotest.(check bool) "key failure stays explicit" true
+    ((Core.state failed.next).snapshot.startup.local_access=Core.Local_unavailable Core.Local_key_unavailable)
+;;
+
+let scenarios = scenarios @
+  [ Alcotest.test_case "user-selected missing mirror requests direct download" `Quick user_selected_missing_mirror
+  ; Alcotest.test_case "selected download cancellation and stale inspections are fenced" `Quick selected_download_cancellation_and_stale_inspections
+  ; Alcotest.test_case "selected existing mirror retains local key failure" `Quick selected_available_mirror_keeps_local_key_failures ]
+;;
+
+let selected_encrypted_download_retains_crypto_and_failure () =
+  let selected, _ = local_selected ~encrypted:true () in
+  let chosen = Core.step selected.next (Core.Graph_selected graph_id) in
+  let request=inspect_mirror_request chosen.effects in
+  let missing=Core.step chosen.next (Core.Mirror_inspected(Core.Mirror_absent request.scope)) in
+  Alcotest.(check bool) "encrypted selection opens scoped permission" true
+    ((Core.state missing.next).snapshot.startup.network_phase=Core.Online_by_user);
+  let confirmed=Core.step missing.next (Core.Account_authenticated {user_id=Some "user"}) in
+  let keys=confirmed in
+  Alcotest.(check bool) "encrypted selection still requires local key validation" true
+    (List.exists (function Core.Run(Core.Request(_,Core.Load_and_unlock_graph_key _))->true|_->false) keys.effects);
+  let missing_key=List.find_map (function
+    | Core.Run(Core.Request(ticket,Core.Load_and_unlock_graph_key _)) ->
+      Some(Core.Runner_completed(Core.Completion(ticket,Error(Core.Effect_failed "key missing"))))
+    | _ -> None) keys.effects |> Option.get in
+  let remote=Core.step keys.next missing_key in
+  let failed=List.find_map (function
+    | Core.Run(Core.Request(ticket,Core.Fetch_e2ee_graph_key _)) ->
+      Some(Core.step remote.next (Core.Runner_completed(Core.Completion(ticket,Error(Core.Effect_failed "synthetic key server offline")))))
+    | _ -> None) remote.effects |> Option.get in
+  Alcotest.(check bool) "key recovery failure remains visible" true
+    ((Core.state failed.next).snapshot.startup.failure=Some Core.During_e2ee);
+  no_network "key recovery failure does not auto-repeat" failed.effects
+;;
+let scenarios=scenarios @ [Alcotest.test_case "selected encrypted download retains key validation and bounded failure" `Quick selected_encrypted_download_retains_crypto_and_failure]
+;;

@@ -3474,7 +3474,7 @@ let manager_page ?picker_signal state dispatch =
             then "Deleting local copy…"
                  else (
                    match presence owner with
-              | Some (Ok Graph_service.Not_downloaded) -> "Not downloaded"
+              | Some (Ok Graph_service.Not_downloaded) -> "Download and open"
               | Some (Error _) -> "Unable to check local copy"
                    | _ -> "")
                in
@@ -3760,6 +3760,10 @@ let manager_page ?picker_signal state dispatch =
              && Option.is_none snapshot.local_deletion
            then V.column ~spacing:12. [ actions; choose_graph ]
            else actions
+         in
+         let actions =
+           V.of_lui
+             (Lui_elements.row ~gap:0 ~main:`center ~cross:`center [ Ui.mount actions ])
          in
          unavailable
            ~title:"Unable to open graph"
