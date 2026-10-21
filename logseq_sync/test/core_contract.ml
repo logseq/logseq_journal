@@ -982,7 +982,7 @@ let encrypted_graph_recovery_fetches_and_unlocks_key_before_bootstrap () =
        bootstrapping.effects)
 ;;
 
-let begin_snapshot_bootstrap () =
+let begin_snapshot_bootstrap ?(graphs = [ graph ]) () =
   let authenticated =
     Core.step (initial ()) (Core.Account_authenticated { user_id = Some "user" })
   in
@@ -993,7 +993,7 @@ let begin_snapshot_bootstrap () =
           Some
             (Core.step
                authenticated.next
-               (Core.Runner_completed (Core.Completion (ticket, Ok [ graph ]))))
+               (Core.Runner_completed (Core.Completion (ticket, Ok graphs))))
         | Run _ | Delegate _ | Publish _ -> None)
       authenticated.effects
     |> Option.get
@@ -5795,4 +5795,66 @@ let scenarios =
         `Quick
         snapshot_failure_and_retry_keep_cursor_uncommitted
     ]
+;;
+
+let replaced_snapshot_completions_are_inert () =
+  let other = { graph with graph_id =
+    Logseq_db_types.Graph_types.Uuid.of_string "22222222-2222-4222-8222-222222222222"
+    |> Result.get_ok } in
+  List.iter (fun download_pending ->
+    let requested, old_scope = begin_snapshot_bootstrap ~graphs:[graph; other] () in
+    let metadata (result : (Core.snapshot_metadata, Core.effect_error) result) = List.find_map (function
+      | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
+        Some (Core.Runner_completed (Core.Completion (ticket, result)))
+      | _ -> None) requested.effects |> Option.get in
+    let old_owner, successes, failure =
+      if download_pending then (
+        let downloading = Core.step requested.next
+          (metadata (Ok {|{"ok":true,"t":42,"url":"https://example.com/old"}|})) in
+        List.find_map (function
+          | Core.Run (Core.Request (ticket, Core.Download_snapshot _)) ->
+            let artifact = Core.staged_artifact ~id:"old" ~scope:old_scope
+              ~path:"/tmp/synthetic-old" ~expected_rows:1 in
+            Some (downloading.next,
+              [Core.Runner_completed (Core.Completion (ticket, Ok artifact))],
+              Core.Runner_completed (Core.Completion
+                (ticket, Error (Core.Effect_failed "obsolete stream"))))
+          | _ -> None) downloading.effects |> Option.get)
+      else requested.next,
+        [metadata (Ok {|{"ok":true,"t":42,"url":"https://example.com/old"}|});
+         metadata (Ok {|{"ok":true,"url":"https://example.com/invalid"}|})],
+        metadata (Error (Core.Effect_failed "obsolete metadata")) in
+    let selected = Core.step old_owner (Core.Graph_selected other.graph_id) in
+    let inspection = inspect_mirror_request selected.effects in
+    let current = Core.step selected.next
+      (Core.Mirror_inspected (Core.Mirror_absent inspection.scope)) in
+    List.iter (fun completion ->
+      let late = Core.step current.next completion in
+      check_instructions "replaced snapshot completion has no effects" [] late.effects;
+      check_observed "replaced snapshot" "current owner is unchanged"
+        (observe current.next) (observe late.next);
+      let fresh = List.find_map (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
+          Some (Core.step late.next (Core.Runner_completed (Core.Completion
+            (ticket, Ok {|{"ok":true,"t":84,"url":"https://example.com/current"}|}))))
+        | _ -> None) current.effects |> Option.get in
+      List.find_map (function
+        | Core.Run (Core.Request (ticket, Core.Download_snapshot request)) ->
+          Alcotest.(check bool) "fresh download retains graph and URL" true
+            (request.scope = inspection.scope && request.uri = Uri.of_string "https://example.com/current");
+          let artifact = Core.staged_artifact ~id:"current" ~scope:inspection.scope
+            ~path:"/tmp/synthetic-current" ~expected_rows:1 in
+          Some (Core.step fresh.next (Core.Runner_completed
+            (Core.Completion (ticket, Ok artifact))))
+        | _ -> None) fresh.effects |> Option.get |> fun activation ->
+      Alcotest.(check bool) "fresh activation keeps its own graph and cursor" true
+        (List.exists (function
+          | Core.Delegate (Core.Activate_snapshot request) ->
+            request.scope = inspection.scope && request.applied_server_t = server_cursor_of_int 84
+          | _ -> false) activation.effects)) (successes @ [failure])) [false; true]
+;;
+
+let scenarios = scenarios @ [ Alcotest.test_case
+  "replaced snapshot metadata and download completions are inert" `Quick
+  replaced_snapshot_completions_are_inert ]
 ;;

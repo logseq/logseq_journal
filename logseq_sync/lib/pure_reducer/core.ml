@@ -2373,6 +2373,18 @@ let consume_ticket : type a. t -> a effect_ticket -> t option =
   loop [] core.pending_effects
 ;;
 
+let snapshot_ticket_is_current : type a. t -> a effect_ticket -> bool =
+  fun core ticket ->
+  match ticket.kind with
+  | Fetch_snapshot_baseline_kind | Fetch_snapshot_metadata_kind | Download_snapshot_kind ->
+    (match core.snapshot_scope with
+     | Some scope ->
+       graph_scope_is_current core scope
+       && ticket.scope = effect_scope_of_graph scope
+     | None -> false)
+  | _ -> true
+;;
+
 let graph_key_loaded core key =
   match core.current_graph_scope with
   | Some scope when graph_key_handle_scope key = scope ->
@@ -2698,6 +2710,7 @@ let consume_completion core = function
   | Completion (ticket, result) ->
     (match consume_ticket core ticket with
      | None -> unchanged core
+     | Some core when not (snapshot_ticket_is_current core ticket) -> unchanged core
      | Some core ->
        (match result with
         | Ok value -> complete_runner core ticket value

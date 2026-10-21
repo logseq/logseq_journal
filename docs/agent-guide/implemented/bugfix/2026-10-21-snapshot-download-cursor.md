@@ -2,7 +2,7 @@
 
 ## Problem
 
-Journal downloads issue GET /pull?since=0 only to obtain the initial journal cursor. Current Logseq obtains it from /snapshot/download metadata.
+Journal downloads issue GET /sync/{graph-id}/pull (without query; the server defaults since to 0) only to obtain the initial journal cursor. Current Logseq obtains it from /snapshot/download metadata.
 
 ## Decision
 
@@ -27,9 +27,10 @@ Rejected: live rows may include later writes without representing every interven
 - Bootstrap emits metadata then download then activation, with no preliminary pull.
 - Metadata t reaches activation and initial WebSocket catchup unchanged.
 - Missing, negative, fractional or malformed t fails before download; zero is accepted.
+- Replaced-graph metadata and stream completions (including failures) are inert; current graph downloads retain their own URL and cursor.
 - Stale completions, download/activation failure and retry cannot publish an uncommitted cursor.
 - Existing incremental synchronization and acknowledgement compatibility tests remain green.
-- No server writes, graph resets, signing, Simulator or release artifact mutations.
+- No real server writes or graph/account resets. Simulator verification uses an isolated synthetic fixture; release artifacts remain untouched.
 
 ## Consequences
 
@@ -37,4 +38,4 @@ Rejected: live rows may include later writes without representing every interven
 
 ## Questions
 
-None outstanding. The user authorized code alignment and verification, prohibited a preliminary pull, and scoped out publishing and unrelated repairs.
+None outstanding. The user authorized code alignment and verification, prohibited a preliminary pull, and later authorized isolated Simulator testing and a formal PR, while excluding merge, deployment and unrelated repairs.
