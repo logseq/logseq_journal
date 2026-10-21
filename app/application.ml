@@ -3761,6 +3761,10 @@ let manager_page ?picker_signal state dispatch =
            then V.column ~spacing:12. [ actions; choose_graph ]
            else actions
          in
+         let actions =
+           V.of_lui
+             (Lui_elements.row ~gap:0 ~main:`center ~cross:`center [ Ui.mount actions ])
+         in
          unavailable
            ~title:"Unable to open graph"
            ~symbol:"questionmark.folder"
