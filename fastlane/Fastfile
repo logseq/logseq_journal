@@ -1,0 +1,94 @@
+require_relative 'lib/journal_release'
+require 'shellwords'
+ENV['FASTLANE_OPT_OUT_USAGE']='1'
+ENV['FASTLANE_SKIP_UPDATE_CHECK']='1'
+default_platform(:ios)
+
+def required_path(options, name)
+  JournalRelease.external!(options.fetch(name).to_s)
+end
+
+def prepared_inputs(options)
+  prepared=required_path(options,:prepared)
+  inputs=JSON.parse(File.read(File.join(prepared,'release-inputs.json')))
+  JournalRelease.verify_inputs!(**inputs.slice('root','manifest_path','lui','experimental').transform_keys(&:to_sym))
+  project=Xcodeproj::Project.open(File.join(prepared,'Journal.xcodeproj'))
+  target=project.targets.find { |t| t.name=='Journal' }
+  UI.user_error!('Prepared project must target only iPhone') unless target && target.build_configurations.all? { |c| c.build_settings['TARGETED_DEVICE_FAMILY']=='1' && c.build_settings['PRODUCT_BUNDLE_IDENTIFIER']==JournalRelease::BUNDLE }
+  info=Plist.parse_xml(File.read(File.join(prepared,'Info.plist')))
+  JournalRelease.validate_info!(info.merge('CFBundleIdentifier'=>JournalRelease::BUNDLE,'DTPlatformName'=>'iphoneos'),version: inputs.fetch('version'),build: inputs.fetch('build'),experimental: inputs.fetch('experimental'))
+  [prepared,inputs]
+end
+
+platform :ios do
+  desc 'Prepare an unsigned iPhone project from an explicitly experimental device build receipt'
+  lane :prepare do |o|
+    JournalRelease.prepare!(root: JournalRelease::ROOT,manifest_path: File.expand_path(o.fetch(:manifest)),
+      lui: File.expand_path(o.fetch(:lui)),output: required_path(o,:prepared),
+      version: o.fetch(:version),build: o.fetch(:build),experimental: o[:experimental]==true || o[:experimental]=='true')
+  end
+
+  desc 'Archive Swift Release with existing native provenance; no signing, cleaning or dependency updates'
+  lane :archive do |o|
+    prepared,inputs=prepared_inputs(o)
+    archive=required_path(o,:archive); cache=required_path(o,:cache)
+    UI.user_error!('Archive already exists; preserve it') if File.exist?(archive)
+    build_app(project: File.join(prepared,'Journal.xcodeproj'),scheme: 'Journal',
+      configuration: 'Release',sdk: 'iphoneos',destination: 'generic/platform=iOS',
+      archive_path: archive,derived_data_path: File.join(cache,'DerivedData'),
+      buildlog_path: File.join(cache,'logs'),build_path: File.join(cache,'archives'),
+      clean: false,skip_codesigning: true,skip_package_ipa: true,skip_profile_detection: true,
+      skip_package_dependencies_resolution: true,disable_package_automatic_updates: true,
+      skip_package_repository_fetches: true,xcodebuild_formatter: '',
+      xcargs: "CODE_SIGNING_ALLOWED=NO -jobs 1 -packageCachePath #{Shellwords.escape(File.join(cache,'PackageCache'))} -clonedSourcePackagesDirPath #{Shellwords.escape(File.join(cache,'SourcePackages'))}")
+    prepared_inputs(o)
+    app=File.join(archive,'Products/Applications/JournalApp.app')
+    JournalRelease.validate_info!(JournalRelease.read_plist(File.join(app,'Info.plist')),version: inputs.fetch('version'),build: inputs.fetch('build'),experimental: true)
+    executable=File.join(app,'JournalApp'); symbols=File.join(archive,'dSYMs/JournalApp.app.dSYM')
+    ids=->(path) { JournalRelease.run!('xcrun','dwarfdump','--uuid',path).scan(/UUID: ([0-9A-F-]+) \(([^)]+)\)/).sort }
+    UI.user_error!('Archive dSYM UUID mismatch') unless !ids.call(executable).empty? && ids.call(executable)==ids.call(symbols)
+  end
+
+  desc 'Export using an existing Journal App Store profile and identity; never create signing credentials'
+  lane :export do |o|
+    prepared,inputs=prepared_inputs(o)
+    archive=required_path(o,:archive); output=required_path(o,:output)
+    profile_path=File.expand_path(o.fetch(:profile)); identity=o.fetch(:identity).upcase
+    UI.user_error!('Expected a certificate SHA1, not a private key or password') unless identity.match?(/\A[0-9A-F]{40}\z/)
+    profile=Plist.parse_xml(JournalRelease.run!('/usr/bin/openssl','smime','-inform','der','-verify','-noverify','-in',profile_path))
+    JournalRelease.validate_profile!(profile,profile.fetch('Entitlements'),identity)
+    identities=JournalRelease.run!('security','find-identity','-v','-p','codesigning')
+    UI.user_error!('Existing Apple Distribution identity is unavailable') unless identities.lines.any? { |line| line.include?(identity) && line.include?('Apple Distribution:') }
+    UI.user_error!('Export directory already exists; preserve it') if File.exist?(output)
+    app=File.join(archive,'Products/Applications/JournalApp.app')
+    JournalRelease.validate_info!(JournalRelease.read_plist(File.join(app,'Info.plist')),version: inputs.fetch('version'),build: inputs.fetch('build'),experimental: true)
+    build_app(project: File.join(prepared,'Journal.xcodeproj'),scheme: 'Journal',
+      skip_build_archive: true,archive_path: archive,output_directory: output,output_name: 'Journal.ipa',
+      buildlog_path: File.join(output,'logs'),export_method: 'app-store',skip_profile_detection: true,xcodebuild_formatter: '',
+      export_options: {method: 'app-store-connect',destination: 'export',signingStyle: 'manual',
+        teamID: JournalRelease::TEAM,signingCertificate: identity,
+        provisioningProfiles: {JournalRelease::BUNDLE=>profile.fetch('UUID')},
+        manageAppVersionAndBuildNumber: false,uploadSymbols: true})
+    prepared_inputs(o)
+    ipa=File.join(output,'Journal.ipa'); hash=Digest::SHA256.file(ipa).hexdigest
+    report=JournalRelease.verify_ipa!(ipa: ipa,version: inputs.fetch('version'),build: inputs.fetch('build'),sha256: hash,experimental: true)
+    File.write(File.join(output,'verification.json'),JSON.pretty_generate(report)+"\n",mode:'wx',perm:0o600)
+  end
+
+  desc 'Verify a signed IPA offline without changing it or contacting Apple'
+  lane :verify do |o|
+    report=JournalRelease.verify_ipa!(ipa: File.expand_path(o.fetch(:ipa)),version: o.fetch(:version),
+      build: o.fetch(:build),sha256: o.fetch(:sha256),experimental: o[:experimental]==true || o[:experimental]=='true')
+    UI.message(JSON.pretty_generate(report))
+  end
+
+  desc 'One upload only, hidden process-local auth, fresh ASC check; no tester distribution'
+  lane :upload do |o|
+    ipa=File.expand_path(o.fetch(:ipa))
+    package=JournalRelease.verify_ipa!(ipa: ipa,version: o.fetch(:version),build: o.fetch(:build),
+      sha256: o.fetch(:sha256),experimental: o[:experimental]==true || o[:experimental]=='true')
+    report=JournalRelease.upload!(package: package,ipa: ipa,state_dir: required_path(o,:state),
+      proof: JSON.parse(File.read(o.fetch(:receipt_check))),retry_upload: o[:retry_upload]==true || o[:retry_upload]=='true')
+    UI.user_error!('Upload failed or remains uncertain; inspect sanitized attempt and Apple before retry') unless report['status']=='tool_reported_success'
+  end
+end

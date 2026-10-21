@@ -43,3 +43,14 @@ __pycache__/
 /docs/test-reports/
 /.ci-deps/
 /.ci-reports/
+
+# Local release dependencies and outputs; signing material stays outside Git.
+/.bundle/
+/vendor/bundle/
+/fastlane/report.xml
+/fastlane/README.md
+*.ipa
+*.xcarchive/
+*.mobileprovision
+*.p12
+*.p8

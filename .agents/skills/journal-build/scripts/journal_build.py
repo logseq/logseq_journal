@@ -1031,6 +1031,9 @@ class Build:
         if not (resource / "Assets.car").is_file():
             raise RuntimeError("icon Assets.car missing")
         packaged = plistlib.loads(plist.read_bytes())
+        if not mac and (packaged.get("UIDeviceFamily") != [1]
+                        or packaged.get("ITSAppUsesNonExemptEncryption") is not False):
+            raise RuntimeError("Journal iOS packaging requires iPhone-only family and the reviewed encryption declaration")
         if not any(key in packaged for key in ("CFBundleIconName", "CFBundleIcons")):
             raise RuntimeError("packaged icon declaration missing")
         self.phase = "sign"
