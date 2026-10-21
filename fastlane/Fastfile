@@ -9,15 +9,7 @@ def required_path(options, name)
 end
 
 def prepared_inputs(options)
-  prepared=required_path(options,:prepared)
-  inputs=JSON.parse(File.read(File.join(prepared,'release-inputs.json')))
-  JournalRelease.verify_inputs!(**inputs.slice('root','manifest_path','lui','experimental').transform_keys(&:to_sym))
-  project=Xcodeproj::Project.open(File.join(prepared,'Journal.xcodeproj'))
-  target=project.targets.find { |t| t.name=='Journal' }
-  UI.user_error!('Prepared project must target only iPhone') unless target && target.build_configurations.all? { |c| c.build_settings['TARGETED_DEVICE_FAMILY']=='1' && c.build_settings['PRODUCT_BUNDLE_IDENTIFIER']==JournalRelease::BUNDLE }
-  info=Plist.parse_xml(File.read(File.join(prepared,'Info.plist')))
-  JournalRelease.validate_info!(info.merge('CFBundleIdentifier'=>JournalRelease::BUNDLE,'DTPlatformName'=>'iphoneos'),version: inputs.fetch('version'),build: inputs.fetch('build'),experimental: inputs.fetch('experimental'))
-  [prepared,inputs]
+  JournalRelease.prepared_inputs!(required_path(options,:prepared))
 end
 
 platform :ios do
@@ -43,7 +35,7 @@ platform :ios do
       xcargs: "CODE_SIGNING_ALLOWED=NO -jobs 1 -packageCachePath #{Shellwords.escape(File.join(cache,'PackageCache'))} -clonedSourcePackagesDirPath #{Shellwords.escape(File.join(cache,'SourcePackages'))}")
     prepared_inputs(o)
     app=File.join(archive,'Products/Applications/JournalApp.app')
-    JournalRelease.validate_info!(JournalRelease.read_plist(File.join(app,'Info.plist')),version: inputs.fetch('version'),build: inputs.fetch('build'),experimental: true)
+    JournalRelease.validate_info!(JournalRelease.read_plist(File.join(app,'Info.plist')),version: inputs.fetch('version'),build: inputs.fetch('build'),source_sha: inputs.fetch('source_sha'),experimental: true)
     executable=File.join(app,'JournalApp'); symbols=File.join(archive,'dSYMs/JournalApp.app.dSYM')
     ids=->(path) { JournalRelease.run!('xcrun','dwarfdump','--uuid',path).scan(/UUID: ([0-9A-F-]+) \(([^)]+)\)/).sort }
     UI.user_error!('Archive dSYM UUID mismatch') unless !ids.call(executable).empty? && ids.call(executable)==ids.call(symbols)
@@ -61,7 +53,7 @@ platform :ios do
     UI.user_error!('Existing Apple Distribution identity is unavailable') unless identities.lines.any? { |line| line.include?(identity) && line.include?('Apple Distribution:') }
     UI.user_error!('Export directory already exists; preserve it') if File.exist?(output)
     app=File.join(archive,'Products/Applications/JournalApp.app')
-    JournalRelease.validate_info!(JournalRelease.read_plist(File.join(app,'Info.plist')),version: inputs.fetch('version'),build: inputs.fetch('build'),experimental: true)
+    JournalRelease.validate_info!(JournalRelease.read_plist(File.join(app,'Info.plist')),version: inputs.fetch('version'),build: inputs.fetch('build'),source_sha: inputs.fetch('source_sha'),experimental: true)
     build_app(project: File.join(prepared,'Journal.xcodeproj'),scheme: 'Journal',
       skip_build_archive: true,archive_path: archive,output_directory: output,output_name: 'Journal.ipa',
       buildlog_path: File.join(output,'logs'),export_method: 'app-store',skip_profile_detection: true,xcodebuild_formatter: '',
@@ -71,14 +63,14 @@ platform :ios do
         manageAppVersionAndBuildNumber: false,uploadSymbols: true})
     prepared_inputs(o)
     ipa=File.join(output,'Journal.ipa'); hash=Digest::SHA256.file(ipa).hexdigest
-    report=JournalRelease.verify_ipa!(ipa: ipa,version: inputs.fetch('version'),build: inputs.fetch('build'),sha256: hash,experimental: true)
+    report=JournalRelease.verify_ipa!(ipa: ipa,version: inputs.fetch('version'),build: inputs.fetch('build'),sha256: hash,source_sha: inputs.fetch('source_sha'),experimental: true)
     File.write(File.join(output,'verification.json'),JSON.pretty_generate(report)+"\n",mode:'wx',perm:0o600)
   end
 
   desc 'Verify a signed IPA offline without changing it or contacting Apple'
   lane :verify do |o|
     report=JournalRelease.verify_ipa!(ipa: File.expand_path(o.fetch(:ipa)),version: o.fetch(:version),
-      build: o.fetch(:build),sha256: o.fetch(:sha256),experimental: o[:experimental]==true || o[:experimental]=='true')
+      build: o.fetch(:build),sha256: o.fetch(:sha256),source_sha: o.fetch(:source),experimental: o[:experimental]==true || o[:experimental]=='true')
     UI.message(JSON.pretty_generate(report))
   end
 
@@ -86,7 +78,7 @@ platform :ios do
   lane :upload do |o|
     ipa=File.expand_path(o.fetch(:ipa))
     package=JournalRelease.verify_ipa!(ipa: ipa,version: o.fetch(:version),build: o.fetch(:build),
-      sha256: o.fetch(:sha256),experimental: o[:experimental]==true || o[:experimental]=='true')
+      sha256: o.fetch(:sha256),source_sha: o.fetch(:source),experimental: o[:experimental]==true || o[:experimental]=='true')
     report=JournalRelease.upload!(package: package,ipa: ipa,state_dir: required_path(o,:state),
       proof: JSON.parse(File.read(o.fetch(:receipt_check))),retry_upload: o[:retry_upload]==true || o[:retry_upload]=='true')
     UI.user_error!('Upload failed or remains uncertain; inspect sanitized attempt and Apple before retry') unless report['status']=='tool_reported_success'

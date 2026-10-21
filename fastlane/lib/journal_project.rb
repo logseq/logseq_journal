@@ -1,6 +1,25 @@
 require 'xcodeproj'
 
 module JournalRelease
+  def self.prepared_inputs!(prepared)
+    external!(prepared)
+    inputs=JSON.parse(File.read(File.join(prepared,'release-inputs.json')))
+    raise Failure, 'Prepared receipt changed; prepare a new project' unless Digest::SHA256.file(inputs.fetch('manifest_path')).hexdigest==inputs.fetch('manifest_sha256')
+    manifest=verify_inputs!(**inputs.slice('root','manifest_path','lui','experimental').transform_keys(&:to_sym))
+    inputs['source_sha']=manifest.fetch('source_sha')
+    expected_flags=['$(inherited)',manifest.fetch('native_object').fetch('path'),manifest.fetch('production_link').fetch('target_c').fetch('path'),'-lsqlite3']
+    project=Xcodeproj::Project.open(File.join(prepared,'Journal.xcodeproj'))
+    target=project.targets.find { |t| t.name=='Journal' }
+    valid=target && target.build_configurations.all? do |config|
+      settings=config.build_settings
+      settings['TARGETED_DEVICE_FAMILY']=='1' && settings['PRODUCT_BUNDLE_IDENTIFIER']==BUNDLE && settings['OTHER_LDFLAGS']==expected_flags
+    end
+    raise Failure, 'Prepared project target or native link inputs changed' unless valid
+    info=Plist.parse_xml(File.read(File.join(prepared,'Info.plist')))
+    validate_info!(info.merge('CFBundleIdentifier'=>BUNDLE,'DTPlatformName'=>'iphoneos'),version: inputs.fetch('version'),build: inputs.fetch('build'),source_sha: inputs.fetch('source_sha'),experimental: inputs.fetch('experimental'))
+    [prepared,inputs]
+  end
+
   def self.verify_inputs!(root:, manifest_path:, lui:, experimental: false)
     manifest=JSON.parse(File.read(manifest_path))
     raise Failure, 'Only explicitly experimental device receipts are supported' unless experimental && manifest.values_at('status','mode','cross_abi_validated','sdk_name','architecture')==['built','experimental-host-restamp',false,'iphoneos','arm64']
@@ -67,7 +86,7 @@ module JournalRelease
     project.save
     scheme=Xcodeproj::XCScheme.new; scheme.add_build_target(target); scheme.set_launch_target(target)
     scheme.archive_action.build_configuration='Release'; scheme.save_as(project.path,'Journal',true)
-    File.write(File.join(output,'release-inputs.json'),JSON.pretty_generate({root: root,manifest_path: File.expand_path(manifest_path),lui: lui,experimental: true,version: version,build: build})+"\n")
+    File.write(File.join(output,'release-inputs.json'),JSON.pretty_generate({root: root,manifest_path: File.expand_path(manifest_path),manifest_sha256: Digest::SHA256.file(manifest_path).hexdigest,lui: lui,experimental: true,version: version,build: build})+"\n")
     project.path.to_s
   end
 end

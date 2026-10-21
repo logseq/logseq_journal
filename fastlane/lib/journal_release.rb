@@ -33,12 +33,12 @@ module JournalRelease
     expanded
   end
 
-  def self.validate_info!(info, version:, build:, experimental: false)
+  def self.validate_info!(info, version:, build:, source_sha:, experimental: false)
     expected = {'CFBundleIdentifier'=>BUNDLE, 'CFBundleShortVersionString'=>version,
       'CFBundleVersion'=>build, 'UIDeviceFamily'=>[1], 'ITSAppUsesNonExemptEncryption'=>false,
       'DTPlatformName'=>'iphoneos'}
     expected.each { |key,value| raise Failure, "Unexpected #{key}" unless info[key] == value }
-    raise Failure, 'Invalid source revision' unless info['JournalSourceRevision'].to_s.match?(/\A[0-9a-f]{40}\z/)
+    raise Failure, 'Source revision differs from the expected release' unless source_sha.to_s.match?(/\A[0-9a-f]{40}\z/) && info['JournalSourceRevision']==source_sha
     raise Failure, 'Experimental host-restamp requires explicit opt-in; no verified cross-release route exists here' unless experimental && info['JournalBuildMode']=='experimental-host-restamp' && info['JournalCrossABIValidated']==false
     true
   end

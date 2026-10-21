@@ -18,6 +18,8 @@ There is no implicit production cross-release fallback.
 Use a clean checkout and a prepared, clean LUI checkout matching the receipt.
 Never edit a receipt to make stale inputs pass. New source revisions require new
 verified receipts; compatible caches may be reused through the build entry.
+Preparation fixes the receipt digest and native linker paths. Replacing a receipt
+or changing the prepared project's link inputs requires a new prepared project.
 Coordinate build/cache ownership with other tasks. No lane runs `clean`, installs
 dependencies, creates certificates/profiles, or installs on a phone.
 
@@ -55,13 +57,16 @@ Export preserves version/build numbers, verifies dSYM UUIDs at archive time, and
 writes `export/verification.json`. Final IPA verification checks its SHA256,
 Bundle, Team, version/build, device family, encryption declaration, source SHA,
 experimental provenance, code signature, App Store profile, signed entitlements,
-certificate membership, arm64 architecture and iPhoneOS Mach-O platform.
+certificate membership, arm64 architecture and iPhoneOS Mach-O platform. Source
+SHA must equal the current verified receipt, not merely have the right format.
 It does not certify full runtime ABI compatibility.
 
 ## Upload and repeat-attempt rules
 
 Stable identity is `com.logseq.journal`, Developer Team `K378MFWK59`, ASC app
 `6824952205`, account `dev@logseq.com`. Do not replace the original Logseq app.
+`SOURCE_SHA` is the intended full source revision from the verified build receipt;
+the upload preflight requires an exact match in the IPA.
 
 Before **each attempt**, inspect that app's ASC Build Uploads and TestFlight
 records for the same version/build. Check for active uploads and confirm that
@@ -78,7 +83,7 @@ old. This file records a human ASC check; it is not an automated Apple API resul
 
 ```sh
 bundle exec fastlane ios upload ipa:"$RELEASE_DIR/export/Journal.ipa" \
-  version:"$VERSION" build:"$BUILD" sha256:"$IPA_SHA256" experimental:true \
+  version:"$VERSION" build:"$BUILD" sha256:"$IPA_SHA256" source:"$SOURCE_SHA" experimental:true \
   state:"$RELEASE_STATE" receipt_check:"$RELEASE_DIR/receipt-check.json"
 ```
 
@@ -137,12 +142,12 @@ key can have its declaration completed in ASC without reuploading just for this 
 ## Offline verification
 
 ```sh
-bundle exec ruby test/test_journal_release.rb
 PYTHONDONTWRITEBYTECODE=1 python3 .agents/skills/journal-build/scripts/test_journal_build.py
 ```
 
-The release tests use synthetic data and the actual pinned Pilot/Altool parser
-with its PTY execution replaced. No Apple network call, credential store, signing
-identity or graph is used. No release lane runs in CI. Keep credentials, profiles,
+Release tooling was checked using temporary, external synthetic fixtures and the
+actual pinned Pilot/Altool parser with its PTY execution replaced. Those fixtures
+are not shipped in this repository. No Apple network call, credential store,
+signing identity or graph is needed for that check. Keep credentials, profiles,
 private certificates/keys, recovery GPG material, graphs, raw upload logs,
 IPAs/archives/dSYMs and local attempt evidence outside Git.

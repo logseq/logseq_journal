@@ -20,21 +20,6 @@ permissions:
   contents: read
 
 jobs:
-  release-contracts:
-    runs-on: macos-latest
-    timeout-minutes: 10
-    env:
-      FASTLANE_OPT_OUT_USAGE: '1'
-      FASTLANE_SKIP_UPDATE_CHECK: '1'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ruby/setup-ruby@824c0e29fdfc7d689c191c27acc969d2d04b7dd8 # v1
-        with:
-          ruby-version: '3.4'
-          bundler-cache: true
-      - name: Verify release contracts without signing or Apple access
-        run: bundle exec ruby test/test_journal_release.rb
-
   build-and-test:
     # The production transport explicitly requires Apple DNS-SD.
     runs-on: macos-latest

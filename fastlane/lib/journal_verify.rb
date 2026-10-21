@@ -5,7 +5,7 @@ module JournalRelease
     Plist.parse_xml(run!('/usr/bin/plutil','-convert','xml1','-o','-',path))
   end
 
-  def self.verify_ipa!(ipa:, version:, build:, sha256:, experimental: false)
+  def self.verify_ipa!(ipa:, version:, build:, sha256:, source_sha:, experimental: false)
     raise Failure, 'IPA SHA256 mismatch' unless sha256.to_s.match?(/\A[0-9a-f]{64}\z/) && Digest::SHA256.file(ipa).hexdigest==sha256
     Dir.mktmpdir('journal-ipa-') do |directory|
       Zip::File.open(ipa) do |zip|
@@ -19,7 +19,7 @@ module JournalRelease
       apps=Dir[File.join(directory,'Payload','*.app')]
       raise Failure, 'IPA must contain exactly one Journal app' unless apps.length==1
       app=apps.first; info=read_plist(File.join(app,'Info.plist'))
-      validate_info!(info,version: version,build: build,experimental: experimental)
+      validate_info!(info,version: version,build: build,source_sha: source_sha,experimental: experimental)
       run!('/usr/bin/codesign','--verify','--deep','--strict',app)
       ent_xml=run!('/usr/bin/codesign','-d','--entitlements',':-',app)
       ent=Plist.parse_xml(ent_xml)
