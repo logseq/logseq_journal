@@ -47,7 +47,7 @@ platform :ios do
     archive=required_path(o,:archive); output=required_path(o,:output)
     profile_path=File.expand_path(o.fetch(:profile)); identity=o.fetch(:identity).upcase
     UI.user_error!('Expected a certificate SHA1, not a private key or password') unless identity.match?(/\A[0-9A-F]{40}\z/)
-    profile=Plist.parse_xml(JournalRelease.run!('/usr/bin/openssl','smime','-inform','der','-verify','-noverify','-in',profile_path))
+    profile=Plist.parse_xml(JournalRelease.run!('/usr/bin/openssl','smime','-inform','der','-verify','-noverify','-in',profile_path),marshal: false)
     JournalRelease.validate_profile!(profile,profile.fetch('Entitlements'),identity)
     identities=JournalRelease.run!('security','find-identity','-v','-p','codesigning')
     UI.user_error!('Existing Apple Distribution identity is unavailable') unless identities.lines.any? { |line| line.include?(identity) && line.include?('Apple Distribution:') }

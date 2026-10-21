@@ -2,7 +2,7 @@ require 'zip'
 
 module JournalRelease
   def self.read_plist(path)
-    Plist.parse_xml(run!('/usr/bin/plutil','-convert','xml1','-o','-',path))
+    Plist.parse_xml(run!('/usr/bin/plutil','-convert','xml1','-o','-',path),marshal: false)
   end
 
   def self.verify_ipa!(ipa:, version:, build:, sha256:, source_sha:, experimental: false)
@@ -13,7 +13,7 @@ module JournalRelease
           destination=File.expand_path(entry.name,directory)
           raise Failure, 'Unsafe IPA entry' unless destination.start_with?(directory+'/') && !entry.symlink?
           FileUtils.mkdir_p(File.dirname(destination))
-          entry.extract(destination)
+          entry.extract(entry.name,destination_directory: directory)
         end
       end
       apps=Dir[File.join(directory,'Payload','*.app')]
@@ -22,8 +22,8 @@ module JournalRelease
       validate_info!(info,version: version,build: build,source_sha: source_sha,experimental: experimental)
       run!('/usr/bin/codesign','--verify','--deep','--strict',app)
       ent_xml=run!('/usr/bin/codesign','-d','--entitlements',':-',app)
-      ent=Plist.parse_xml(ent_xml)
-      profile=Plist.parse_xml(run!('/usr/bin/openssl','smime','-inform','der','-verify','-noverify','-in',File.join(app,'embedded.mobileprovision')))
+      ent=Plist.parse_xml(ent_xml,marshal: false)
+      profile=Plist.parse_xml(run!('/usr/bin/openssl','smime','-inform','der','-verify','-noverify','-in',File.join(app,'embedded.mobileprovision')),marshal: false)
       prefix=File.join(directory,'certificate')
       run!('/usr/bin/codesign','-d','--extract-certificates',prefix,app)
       cert_sha=Digest::SHA1.file(prefix+'0').hexdigest

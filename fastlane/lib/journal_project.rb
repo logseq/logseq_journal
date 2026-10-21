@@ -15,7 +15,7 @@ module JournalRelease
       settings['TARGETED_DEVICE_FAMILY']=='1' && settings['PRODUCT_BUNDLE_IDENTIFIER']==BUNDLE && settings['OTHER_LDFLAGS']==expected_flags
     end
     raise Failure, 'Prepared project target or native link inputs changed' unless valid
-    info=Plist.parse_xml(File.read(File.join(prepared,'Info.plist')))
+    info=Plist.parse_xml(File.read(File.join(prepared,'Info.plist')),marshal: false)
     validate_info!(info.merge('CFBundleIdentifier'=>BUNDLE,'DTPlatformName'=>'iphoneos'),version: inputs.fetch('version'),build: inputs.fetch('build'),source_sha: inputs.fetch('source_sha'),experimental: inputs.fetch('experimental'))
     [prepared,inputs]
   end
@@ -46,7 +46,7 @@ module JournalRelease
     raise Failure, 'Prepared output already exists; preserve it' if File.exist?(output)
     raise Failure, 'Invalid version/build' unless [version,build].all? { |s| s.to_s.match?(/\A\d+(?:\.\d+){0,2}\z/) }
     manifest=verify_inputs!(root: root,manifest_path: manifest_path,lui: lui,experimental: experimental)
-    info=Plist.parse_xml(File.read(File.join(root,'apple/Info.plist')))
+    info=Plist.parse_xml(File.read(File.join(root,'apple/Info.plist')),marshal: false)
     raise Failure, 'Source encryption declaration missing or changed' unless info['ITSAppUsesNonExemptEncryption']==false
     info.merge!('CFBundleExecutable'=>'$(EXECUTABLE_NAME)','CFBundleIdentifier'=>'$(PRODUCT_BUNDLE_IDENTIFIER)',
       'CFBundleShortVersionString'=>version,'CFBundleVersion'=>build,'UIDeviceFamily'=>[1],
