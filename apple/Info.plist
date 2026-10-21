@@ -9,7 +9,7 @@
   <key>CFBundleName</key>
   <string>Logseq Journal</string>
   <key>CFBundleDisplayName</key>
-  <string>Logseq Journal</string>
+    <string>Journal</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
