@@ -696,7 +696,7 @@ let warm_encrypted_graph_online_recovery_attaches_existing_mirror () =
     false
     (List.exists
        (function
-         | Core.Run (Core.Request (_, Core.Fetch_snapshot_baseline _)) -> true
+         | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) -> true
          | Run _ | Delegate _ | Publish _ -> false)
        recovered.effects)
 ;;
@@ -849,7 +849,7 @@ let e2ee_password_retry_recovers_after_failed_unlock () =
     true
     (List.exists
        (function
-         | Core.Run (Core.Request (_, Core.Fetch_snapshot_baseline _)) -> true
+         | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) -> true
          | Run _ | Delegate _ | Publish _ -> false)
        resumed.effects);
   let picker = Core.step rejected.next Core.Graph_picker_requested in
@@ -977,7 +977,7 @@ let encrypted_graph_recovery_fetches_and_unlocks_key_before_bootstrap () =
     true
     (List.exists
        (function
-         | Core.Run (Core.Request (_, Core.Fetch_snapshot_baseline _)) -> true
+         | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) -> true
          | Run _ | Delegate _ | Publish _ -> false)
        bootstrapping.effects)
 ;;
@@ -1013,34 +1013,27 @@ let begin_snapshot_bootstrap () =
   missing, scope
 ;;
 
-let cold_start_absent_mirror_reaches_pull_after_snapshot_activation () =
+let snapshot_catchup_fixture () =
   let requested, scope = begin_snapshot_bootstrap () in
-  let metadata =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_baseline _)) ->
-          Some
-            (Core.step
-               requested.next
-               (Core.Runner_completed
-                  (Core.Completion (ticket, Ok {|{"type":"pull/ok","t":42}|}))))
-        | Run _ | Delegate _ | Publish _ -> None)
-      requested.effects
-    |> Option.get
-  in
+  Alcotest.(check bool)
+    "bootstrap starts with exactly one metadata request and no preliminary pull"
+    true
+    (match List.filter (function Core.Publish _ -> false | _ -> true) requested.effects with
+     | [ Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) ] -> true
+     | _ -> false);
   let download =
     List.find_map
       (function
         | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
           Some
             (Core.step
-               metadata.next
+               requested.next
                (Core.Runner_completed
                   (Core.Completion
                      ( ticket
-                     , Ok {|{"ok":true,"url":"https://example.com/snapshot.sqlite"}|} ))))
+                     , Ok {|{"ok":true,"t":42,"url":"https://example.com/snapshot.sqlite"}|} ))))
         | Run _ | Delegate _ | Publish _ -> None)
-      metadata.effects
+      requested.effects
     |> Option.get
   in
   let activated =
@@ -1075,13 +1068,16 @@ let cold_start_absent_mirror_reaches_pull_after_snapshot_activation () =
     |> Option.get
   in
   Alcotest.(check cursor_testable)
-    "activation uses baseline cursor"
+    "activation uses metadata cursor"
     (server_cursor_of_int 42)
     activation.applied_server_t;
   Alcotest.(check bool)
     "plain snapshot has no graph key"
     true
     (Option.is_none activation.key);
+  Alcotest.(check (option cursor_testable))
+    "download completion cannot publish an uncommitted cursor"
+    None (Core.state activated.next).snapshot.applied_server_t;
   let activated_snapshot = Core.step activated.next (Core.Snapshot_activated { scope }) in
   let mirror = inspect_mirror_request activated_snapshot.effects in
   let attaching =
@@ -1131,11 +1127,15 @@ let cold_start_absent_mirror_reaches_pull_after_snapshot_activation () =
                 { scope; message = Logseq_sync_pure_reducer.Sync_protocol.Client.Pull _ })
            -> scope = connection
          | Run _ | Delegate _ | Publish _ -> false)
-       pulling.effects)
+       pulling.effects);
+  pulling, connection, sync
 ;;
 
-let snapshot_baseline_above_websocket_budget_bootstraps () =
-  let requested, _scope = begin_snapshot_bootstrap () in
+let cold_start_absent_mirror_reaches_pull_after_snapshot_activation () =
+  ignore (snapshot_catchup_fixture ())
+;;
+
+let snapshot_baseline_decoder_retains_http_budget () =
   (* Ordinary cursor values and small valid Transit transactions form a valid
      HTTP pull response larger than a WebSocket frame, within the endpoint budget. *)
   let transaction =
@@ -1168,50 +1168,30 @@ let snapshot_baseline_above_websocket_budget_bootstraps () =
     true
     (String.length body > Logseq_db_types.Limits.maximum_response_bytes
      && String.length body <= 64 * 1024 * 1024);
-  let metadata =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_baseline _)) ->
-          Some
-            (Core.step
-               requested.next
-               (Core.Runner_completed (Core.Completion (ticket, Ok body))))
-        | Run _ | Delegate _ | Publish _ -> None)
-      requested.effects
-    |> Option.get
-  in
   Alcotest.(check bool)
-    "valid HTTP baseline proceeds to snapshot metadata"
+    "legacy HTTP baseline decoder retains its endpoint budget"
     true
-    (List.exists
-       (function
-         | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) -> true
-         | Run _ | Delegate _ | Publish _ -> false)
-       metadata.effects);
-  Alcotest.(check bool)
-    "valid HTTP baseline does not fail bootstrap"
-    false
-    ((Core.state metadata.next).snapshot.sync_phase = Core.Failed)
+    (Result.is_ok (Logseq_sync_pure_reducer.Sync_protocol.decode_snapshot_baseline body))
 ;;
 
-let invalid_snapshot_baseline_fails_bootstrap () =
+let invalid_snapshot_metadata_fails_bootstrap () =
   let requested, _scope = begin_snapshot_bootstrap () in
   let failed =
     List.find_map
       (function
-        | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_baseline _)) ->
+        | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
           Some
             (Core.step
                requested.next
                (Core.Runner_completed
-                  (Core.Completion (ticket, Ok {|{"type":"pull/ok","t":-1}|}))))
+                  (Core.Completion (ticket, Ok {|{"ok":true,"t":-1,"url":"https://example.com/snapshot"}|}))))
         | Run _ | Delegate _ | Publish _ -> None)
       requested.effects
     |> Option.get
   in
   let snapshot = (Core.state failed.next).snapshot in
   Alcotest.(check bool)
-    "invalid baseline enters failed state"
+    "invalid metadata cursor enters failed state"
     true
     (snapshot.sync_phase = Core.Failed
      && snapshot.startup.failure = Some Core.During_bootstrap)
@@ -2337,32 +2317,19 @@ let local_cache_deletion_rejects_unopened_graphs () =
   let absent =
     Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope))
   in
-  let metadata =
-    List.find_map
-      (function
-        | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_baseline _)) ->
-          Some
-            (Core.step
-               absent.next
-               (Core.Runner_completed
-                  (Core.Completion (ticket, Ok {|{"type":"pull/ok","t":42}|}))))
-        | _ -> None)
-      absent.effects
-    |> Option.get
-  in
   let downloading =
     List.find_map
       (function
         | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
           Some
             (Core.step
-               metadata.next
+               absent.next
                (Core.Runner_completed
                   (Core.Completion
                      ( ticket
-                     , Ok {|{"ok":true,"url":"https://example.com/snapshot.sqlite"}|} ))))
+                     , Ok {|{"ok":true,"t":42,"url":"https://example.com/snapshot.sqlite"}|} ))))
         | _ -> None)
-      metadata.effects
+      absent.effects
     |> Option.get
   in
   let activating =
@@ -2409,7 +2376,6 @@ let local_cache_deletion_rejects_unopened_graphs () =
     ; authenticated.next
     ; selected.next
     ; absent.next
-    ; metadata.next
     ; downloading.next
     ; activating.next
     ; activated.next
@@ -2577,7 +2543,7 @@ let local_deletion_orders_cleanup encrypted () =
   let absent = Core.step requested.next (Core.Mirror_inspected (Core.Mirror_absent mirror.scope)) in
   Alcotest.(check bool) "explicit download of deleted graph uses normal absent-mirror flow" true
     (List.exists (function
-       | Core.Run (Core.Request (_, Core.Fetch_snapshot_baseline _)) -> not encrypted
+       | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) -> not encrypted
        | Core.Run (Core.Request (_, Core.Load_and_unlock_graph_key _)) -> encrypted
        | _ -> false) absent.effects);
   let _ = sync in
@@ -4044,7 +4010,7 @@ let scenarios =
   [ Alcotest.test_case
       "snapshot baseline retains HTTP response budget"
       `Quick
-      snapshot_baseline_above_websocket_budget_bootstraps
+      snapshot_baseline_decoder_retains_http_budget
   ; Alcotest.test_case
       "numeric cursor decimal boundaries"
       `Quick
@@ -4142,9 +4108,9 @@ let scenarios =
       `Quick
       cold_start_absent_mirror_reaches_pull_after_snapshot_activation
   ; Alcotest.test_case
-      "invalid snapshot baseline fails bootstrap"
+      "invalid snapshot metadata fails bootstrap"
       `Quick
-      invalid_snapshot_baseline_fails_bootstrap
+      invalid_snapshot_metadata_fails_bootstrap
   ; Alcotest.test_case
       "E2EE password retry after failed unlock"
       `Quick
@@ -5160,31 +5126,16 @@ let snapshot_metadata_open_fields_keep_declared_constraints () =
   List.iter
     (fun ((body : string), success) ->
        let requested, _ = begin_snapshot_bootstrap () in
-       let metadata =
-         List.find_map
-           (function
-             | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_baseline _)) ->
-               Some
-                 (Core.step
-                    requested.next
-                    (Core.Runner_completed
-                       (Core.Completion
-                          ( ticket
-                          , Ok {|{"type":"pull/ok","t":1,"future":{"nested":true}}|} ))))
-             | _ -> None)
-           requested.effects
-         |> Option.get
-       in
        let downloaded =
          List.find_map
            (function
              | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
                Some
                  (Core.step
-                    metadata.next
+                    requested.next
                     (Core.Runner_completed (Core.Completion (ticket, Ok body))))
              | _ -> None)
-           metadata.effects
+           requested.effects
          |> Option.get
        in
        Alcotest.(check bool)
@@ -5195,12 +5146,20 @@ let snapshot_metadata_open_fields_keep_declared_constraints () =
               | Core.Run (Core.Request (_, Core.Download_snapshot _)) -> true
               | _ -> false)
             downloaded.effects))
-    [ ( {|{"ok":true,"url":"https://example.com/snapshot","key":"synthetic","future":{"nested":true}}|}
+    [ ( {|{"ok":true,"t":0,"url":"https://example.com/snapshot","key":"synthetic","future":{"nested":true}}|}
       , true )
-    ; {|{"ok":true,"future":true}|}, false
-    ; {|{"ok":true,"url":null,"future":true}|}, false
-    ; {|{"ok":"true","url":"https://example.com/snapshot","future":true}|}, false
-    ; {|{"ok":true,"url":"http://example.com/snapshot","future":true}|}, false
+    ; {|{"ok":true,"url":"https://example.com/snapshot"}|}, false
+    ; {|{"ok":true,"t":null,"url":"https://example.com/snapshot"}|}, false
+    ; {|{"ok":true,"t":-1,"url":"https://example.com/snapshot"}|}, false
+    ; {|{"ok":true,"t":1.5,"url":"https://example.com/snapshot"}|}, false
+    ; {|{"ok":true,"t":"42","url":"https://example.com/snapshot"}|}, false
+    ; {|{"ok":true,"t":true,"url":"https://example.com/snapshot"}|}, false
+    ; {|{"ok":true,"t":0,"t":1,"url":"https://example.com/snapshot"}|}, false
+    ; {|{"ok":true,"t":9223372036854775808,"url":"https://example.com/snapshot"}|}, false
+    ; {|{"ok":true,"t":0,"future":true}|}, false
+    ; {|{"ok":true,"t":0,"url":null,"future":true}|}, false
+    ; {|{"ok":"true","t":0,"url":"https://example.com/snapshot","future":true}|}, false
+    ; {|{"ok":true,"t":0,"url":"http://example.com/snapshot","future":true}|}, false
     ]
 ;;
 
@@ -5482,12 +5441,13 @@ let cancellation_fences_deferred_catalog_and_snapshot () =
   Alcotest.(check bool) "local completion cannot restore online authentication" false
     (Core.state loaded.next).snapshot.startup.authenticated;
   let requested, _ = begin_snapshot_bootstrap () in
-  let metadata = List.find_map (function
-    | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_baseline _)) ->
-      Some (Core.step requested.next (Core.Runner_completed
-        (Core.Completion (ticket, Ok {|{"type":"pull/ok","t":42}|}))))
-    | _ -> None) requested.effects |> Option.get in
-  let cancelled = Core.step metadata.next (Core.Online_cancelled (startup_ticket metadata.next)) in
+  let cancelled = Core.step requested.next (Core.Online_cancelled (startup_ticket requested.next)) in
+  List.iter (function
+    | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
+      let late = Core.step cancelled.next (Core.Runner_completed
+        (Core.Completion (ticket, Ok {|{"ok":true,"t":42,"url":"https://example.com/snapshot"}|}))) in
+      check_instructions "cancelled snapshot metadata completion" [] late.effects
+    | _ -> ()) requested.effects;
   let facts = (Core.state cancelled.next).snapshot.startup in
   Alcotest.(check bool) "cancelled metadata has a terminal local result" true
     (match facts.local_access with Core.Local_unavailable _ -> true | _ -> false)
@@ -5563,10 +5523,10 @@ let user_selected_missing_mirror () =
      && facts.local_access = Core.Local_pending && not facts.authenticated);
   let confirmed = Core.step missing.next (Core.Account_authenticated {user_id=Some "user"}) in
   let downloading = confirmed in
-  Alcotest.(check bool) "verified selection starts one baseline request" true
-    (List.exists (function Core.Run(Core.Request(_,Core.Fetch_snapshot_baseline _))->true|_->false) downloading.effects);
+  Alcotest.(check bool) "verified selection starts one metadata request" true
+    (List.exists (function Core.Run(Core.Request(_,Core.Fetch_snapshot_metadata _))->true|_->false) downloading.effects);
   let failure = List.find_map (function
-    | Core.Run(Core.Request(ticket,Core.Fetch_snapshot_baseline _)) ->
+    | Core.Run(Core.Request(ticket,Core.Fetch_snapshot_metadata _)) ->
       Some (Core.Runner_completed(Core.Completion(ticket,Error(Core.Effect_failed "synthetic offline"))))
     | _ -> None) downloading.effects |> Option.get in
   let failed = Core.step downloading.next failure in
@@ -5648,4 +5608,191 @@ let selected_encrypted_download_retains_crypto_and_failure () =
   no_network "key recovery failure does not auto-repeat" failed.effects
 ;;
 let scenarios=scenarios @ [Alcotest.test_case "selected encrypted download retains key validation and bounded failure" `Quick selected_encrypted_download_retains_crypto_and_failure]
+;;
+
+(* The stream is live: a write after metadata may already be present in the
+   artifact. Core must still replay every journal position after metadata t,
+   and only durable application may advance that cursor. *)
+let snapshot_live_stream_catchup_keeps_metadata_cursor () =
+  let opened, connection, sync = snapshot_catchup_fixture () in
+  Alcotest.(check bool)
+    "initial catchup starts at metadata t"
+    true
+    (pull_sends opened.effects = [ connection, Some (server_cursor_of_int 42) ]);
+  let hello =
+    pull_message
+      opened.next
+      connection
+      (Protocol.Server.Hello { t = server_cursor_of_int 44; checksum = None })
+  in
+  let changed =
+    pull_message
+      hello.next
+      connection
+      (Protocol.Server.Changed { t = server_cursor_of_int 45 })
+  in
+  check_pull_count "head changes join the in-flight catchup" 0 changed.effects;
+  Alcotest.(check (option cursor_testable))
+    "later live stream writes cannot skip journal positions"
+    (Some (server_cursor_of_int 42))
+    (Core.state changed.next).snapshot.applied_server_t;
+  let received = pull_response changed.next connection ~after:42 44 in
+  let batches =
+    List.filter_map
+      (function
+        | Core.Delegate (Core.Apply_authoritative_batch batch) -> Some batch
+        | _ -> None)
+      received.effects
+  in
+  let batch =
+    match batches with
+    | [ batch ] -> batch
+    | _ -> Alcotest.fail "one catchup batch"
+  in
+  Alcotest.(check (list int64))
+    "every post-metadata transaction reaches the owner in order"
+    [ 43L; 44L ]
+    (List.map
+       (fun tx ->
+          Overlay.authoritative_transaction_cursor tx
+          |> Logseq_db_types.Server_cursor.to_int64)
+       (Overlay.authoritative_batch_transactions batch.input));
+  Alcotest.(check (option cursor_testable))
+    "delegation is not a durable commit"
+    (Some (server_cursor_of_int 42))
+    (Core.state received.next).snapshot.applied_server_t;
+  let committed =
+    recovery_apply received.next connection (recovery_sync sync ~checkpoint:44 1 [])
+  in
+  Alcotest.(check bool)
+    "next catchup starts at committed t, including concurrent write"
+    true
+    (pull_sends committed.effects = [ connection, Some (server_cursor_of_int 44) ]);
+  let final = pull_response committed.next connection ~after:44 45 in
+  let committed =
+    recovery_apply final.next connection (recovery_sync sync ~checkpoint:45 2 [])
+  in
+  Alcotest.(check (option cursor_testable))
+    "all concurrent writes are durably acknowledged"
+    (Some (server_cursor_of_int 45))
+    (Core.state committed.next).snapshot.applied_server_t;
+  check_pull_count "caught up has no redundant pull" 0 committed.effects;
+  let repeated = pull_response committed.next connection ~after:42 45 in
+  Alcotest.(check bool)
+    "repeated catchup cannot reapply committed transactions"
+    false
+    (List.exists
+       (function
+         | Core.Delegate (Core.Apply_authoritative_batch _) -> true
+         | _ -> false)
+       repeated.effects)
+;;
+
+let snapshot_failure_and_retry_keep_cursor_uncommitted () =
+  List.iter
+    (fun activation_failure ->
+       let requested, scope = begin_snapshot_bootstrap () in
+       let download =
+         List.find_map
+           (function
+             | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
+               Some
+                 (Core.step
+                    requested.next
+                    (Core.Runner_completed
+                       (Core.Completion
+                          ( ticket
+                          , Ok
+                              {|{"ok":true,"t":42,"key":"stream/graph.snapshot","url":"https://example.com/snapshot","content-encoding":"gzip"}|}
+                          ))))
+             | _ -> None)
+           requested.effects
+         |> Option.get
+       in
+       let failed, late_completion =
+         List.find_map
+           (function
+             | Core.Run (Core.Request (ticket, Core.Download_snapshot _)) ->
+               let artifact =
+                 Core.staged_artifact
+                   ~id:"synthetic-failure"
+                   ~scope
+                   ~path:"/tmp/synthetic-snapshot"
+                   ~expected_rows:1
+               in
+               let completion =
+                 Core.Runner_completed (Core.Completion (ticket, Ok artifact))
+               in
+               let failed =
+                 if activation_failure
+                 then (
+                   let activating = Core.step download.next completion in
+                   Core.step
+                     activating.next
+                     (Core.Snapshot_activation_failed
+                        { scope = Core.effect_scope_of_graph scope
+                        ; message = "synthetic activation failure"
+                        }))
+                 else
+                   Core.step
+                     download.next
+                     (Core.Runner_completed
+                        (Core.Completion
+                           (ticket, Error (Core.Effect_failed "synthetic stream failure"))))
+               in
+               Some (failed, completion)
+             | _ -> None)
+           download.effects
+         |> Option.get
+       in
+       Alcotest.(check (option cursor_testable))
+         "failed bootstrap cannot publish a cursor"
+         None
+         (Core.state failed.next).snapshot.applied_server_t;
+       Alcotest.(check bool)
+         "failure stays visible"
+         true
+         ((Core.state failed.next).snapshot.startup.failure = Some Core.During_bootstrap);
+       let stale = Core.step failed.next late_completion in
+       check_instructions
+         "completed download ticket cannot be consumed twice"
+         []
+         stale.effects;
+       let retry =
+         Core.step
+           stale.next
+           (Core.Online_recovery_requested (timeline_ticket stale.next))
+       in
+       let mirror = inspect_mirror_request retry.effects in
+       let missing =
+         Core.step retry.next (Core.Mirror_inspected (Core.Mirror_absent mirror.scope))
+       in
+       Alcotest.(check bool)
+         "retry obtains fresh metadata without a preliminary pull"
+         true
+         (List.exists
+            (function
+              | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _)) -> true
+              | _ -> false)
+            missing.effects
+          && not
+               (List.exists
+                  (function
+                    | Core.Run (Core.Request (_, Core.Fetch_snapshot_baseline _)) -> true
+                    | _ -> false)
+                  missing.effects)))
+    [ false; true ]
+;;
+
+let scenarios =
+  scenarios
+  @ [ Alcotest.test_case
+        "live snapshot catchup preserves metadata cursor"
+        `Quick
+        snapshot_live_stream_catchup_keeps_metadata_cursor
+    ; Alcotest.test_case
+        "snapshot stream and activation failure retry"
+        `Quick
+        snapshot_failure_and_retry_keep_cursor_uncommitted
+    ]
 ;;

@@ -237,31 +237,18 @@ let operation ?artifact_uri ~download origin =
   then
     List.find_map
       (function
-        | Core.Run (Core.Request (_, Core.Fetch_snapshot_baseline _) as op) -> Some op
+        | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _) as op) -> Some op
         | _ -> None)
       transition.effects
     |> Option.get
   else (
-    let metadata =
-      List.find_map
-        (function
-          | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_baseline _)) ->
-            Some
-              (Core.step
-                 transition.next
-                 (Core.Runner_completed
-                    (Core.Completion (ticket, Ok {|{"type":"pull/ok","t":42}|}))))
-          | _ -> None)
-        transition.effects
-      |> Option.get
-    in
     let artifact_uri =
       Option.value
         artifact_uri
         ~default:(Uri.with_path origin "/artifact" |> Uri.to_string)
     in
     let response =
-      Yojson.Basic.to_string (`Assoc [ "ok", `Bool true; "url", `String artifact_uri ])
+      Yojson.Basic.to_string (`Assoc [ "ok", `Bool true; "t", `Int 42; "url", `String artifact_uri ])
     in
     let downloading =
       List.find_map
@@ -269,10 +256,10 @@ let operation ?artifact_uri ~download origin =
           | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
             Some
               (Core.step
-                 metadata.next
+                 transition.next
                  (Core.Runner_completed (Core.Completion (ticket, Ok response))))
           | _ -> None)
-        metadata.effects
+        transition.effects
       |> Option.get
     in
     List.find_map
@@ -2453,7 +2440,7 @@ let submitted_authentication_policy
          let runnable =
            List.find_map
              (function
-               | Core.Run (Core.Request (_, Core.Fetch_snapshot_baseline _) as runnable)
+               | Core.Run (Core.Request (_, Core.Fetch_snapshot_metadata _) as runnable)
                  -> Some runnable
                | _ -> None)
              requested.effects
