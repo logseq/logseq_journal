@@ -1,0 +1,3 @@
+app_identifier('com.logseq.journal')
+apple_id('dev@logseq.com')
+team_id('K378MFWK59')
