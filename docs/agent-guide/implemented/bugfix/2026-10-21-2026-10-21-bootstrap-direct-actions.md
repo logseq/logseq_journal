@@ -55,7 +55,9 @@ Four regressions extend the existing public pure-core suite, with expected RED
 failures before the change and 84 core cases passing afterward. The Swift owner
 model suite passes. The native presentation defect cannot originate at the pure
 OCaml boundary; its actual SwiftUI retry assertion failed on the baseline and
-passed on the fixed synthetic host. Independent review found no definite issue.
+passed on the fixed synthetic host. Four existing graph-picker presentation
+expectations were updated for the new action label; their 17 existing cases pass.
+No duplicate UI regression cases were added. Independent review found no definite issue.
 
 Same-condition UI evidence on the existing isolated iOS 26.1 Simulator shows
 both actions reduced from two clicks to one. Cancel/Close/retry, synthetic

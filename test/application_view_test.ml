@@ -6039,7 +6039,7 @@ let test_graph_picker_controls scenario () =
           {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":0,\"last\":9223372036854775807}"}|}) in
         range ();
         wait "visible rows are inspected" (fun () -> Atomic.get inspections = 2
-          && Option.is_some (find "text" "Not downloaded"));
+          && Option.is_some (find "text" "Download and open"));
         for _ = 1 to 10 do range (); consume (hooks.pump ()) done;
         Alcotest.(check int) "same viewport reuses presence observations" 2 (Atomic.get inspections);
         Alcotest.(check int) "presence does not reconstruct the graph catalog" before !root_renders
@@ -6162,13 +6162,13 @@ let test_graph_picker_controls scenario () =
                      | Service.Select_graph id -> id = second
                      | _ -> false)
                    (Atomic.get commands)))
-          else wait "deleted graph stays available to download" (fun () -> Option.is_some (find "text" "Not downloaded"));
+          else wait "deleted graph stays available to download" (fun () -> Option.is_some (find "text" "Download and open"));
           if scenario = `Late_presence then (
             Atomic.set release_automatic_inspection true;
             wait "automatic inspection retires" (fun () ->
               Atomic.get automatic_inspection_returned && !inspection_terminals = 2);
             Alcotest.(check bool) "late pre-delete inspection cannot restore Downloaded" true
-              (Option.is_some (find "text" "Not downloaded")));
+              (Option.is_some (find "text" "Download and open")));
           if scenario = `Reopen then (
             let switch id =
               let before = Atomic.get graph_opens in
@@ -6182,7 +6182,7 @@ let test_graph_picker_controls scenario () =
             switch second;
             switch first;
             Alcotest.(check bool) "reopened copy does not keep the stale not-downloaded label" true
-              (Option.is_none (find "text" "Not downloaded")))))
+              (Option.is_none (find "text" "Download and open")))))
       | `Current_menu ->
         ignore (node ("graph-picker-options:" ^ Logseq_db_types.Graph_types.Uuid.to_string first));
         Alcotest.(check bool) "current protection explains switching first" true
