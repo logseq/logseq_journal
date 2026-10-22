@@ -4,15 +4,6 @@ type worker_failure =
   ; error : Logseq_db_worker.Error.t
   }
 
-type graph_info =
-  { graph_uuid : Logseq_db_types.Graph_types.Uuid.t
-  ; graph_name : string
-  ; schema : Logseq_db_types.Graph_types.schema_version
-  ; admission_facts : Logseq_db_types.Graph_types.admission_fact list
-  ; generation : string
-  ; projection_revision : string
-  }
-
 type failure_source =
   | Worker_failure of worker_failure
   | Projection_failure of string
@@ -38,7 +29,7 @@ type payload =
       * Logseq_db_worker.Protocol.v2_favorites_result
   | Favorites_failed of Journal_graph_request.favorites_request * bool * string
   | Favorites_invalidated
-  | Graph_ready of graph_info
+  | Graph_ready
   | Admission_inspected of
       { request : Journal_graph_request.admission_request
       ; observation : Logseq_db_worker.Protocol.v2_admission_inspection
