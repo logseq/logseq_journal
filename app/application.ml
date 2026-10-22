@@ -1095,8 +1095,7 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
     if next == state || stale then next
     else report_ui_error next ~operation:"listFavorites" ~phase:"read"
   | Favorites_invalidated -> favorites_event state Invalidate
-  | Journal_graph_runtime.Graph_ready info ->
-    ignore info.admission_facts;
+  | Journal_graph_runtime.Graph_ready ->
     let state = resolve_worker_errors state in
     { state with write_enabled = true; graph_ready = true; graph_error = None }
   | Admission_inspected _ | Admission_unavailable _ -> state

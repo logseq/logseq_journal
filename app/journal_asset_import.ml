@@ -87,31 +87,13 @@ let staged_of_pick (pick : Json.pick) =
     ; source_identity = pick.sourceIdentity }
 ;;
 
-let parse payload =
+let picked (wire : Json.event) =
   let ( let* ) = Result.bind in
-  let* wire = read_event payload in
   match wire.action, wire.selection with
   | "picked", Some selection ->
     let* staged = staged_of_pick selection in
     Ok (staged, Option.map (fun (request : Json.request) -> request.id) wire.request)
   | _ -> Error "Invalid attachment selection"
-;;
-
-let decode ~target payload =
-  Result.map
-    (fun ((pick : staged), _) ->
-       Logseq_db_types.Asset_import.
-         { operation = pick.operation
-         ; asset = pick.asset
-         ; target
-         ; replace_reference = None
-         ; local_mutation = pick.local_mutation
-         ; metadata_mutation = pick.metadata_mutation
-         ; source_file = pick.source_file
-         ; title = pick.title
-         ; file_type = pick.file_type
-         })
-    (parse payload)
 ;;
 
 let to_import (staged : staged) ~target : Logseq_db_types.Asset_import.t =
@@ -127,6 +109,13 @@ let to_import (staged : staged) ~target : Logseq_db_types.Asset_import.t =
   }
 ;;
 
+let decode ~target payload =
+  let ( let* ) = Result.bind in
+  let* wire = read_event payload in
+  let* staged, _ = picked wire in
+  Ok (to_import staged ~target)
+;;
+
 type event =
   | Picked of staged * int option
   | Picked_batch of staged list * int option * string option
@@ -140,7 +129,7 @@ let decode_event payload =
   let* wire = read_event payload in
   let request_id = Option.map (fun (request : Json.request) -> request.id) wire.request in
   match wire.action with
-  | "picked" -> Result.map (fun (staged, id) -> Picked (staged, id)) (parse payload)
+  | "picked" -> Result.map (fun (staged, id) -> Picked (staged, id)) (picked wire)
   | "picked-batch" ->
     (match wire.items with
      | None -> Error "Invalid attachment batch"

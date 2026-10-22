@@ -9,15 +9,6 @@ type worker_failure =
   ; error : Error.t
   }
 
-type graph_info =
-  { graph_uuid : Graph.Uuid.t
-  ; graph_name : string
-  ; schema : Graph.schema_version
-  ; admission_facts : Graph.admission_fact list
-  ; generation : string
-  ; projection_revision : string
-  }
-
 type failure_source =
   | Worker_failure of worker_failure
   | Projection_failure of string
@@ -43,7 +34,7 @@ type payload =
       * Logseq_db_worker.Protocol.v2_favorites_result
   | Favorites_failed of Journal_graph_request.favorites_request * bool * string
   | Favorites_invalidated
-  | Graph_ready of graph_info
+  | Graph_ready
   | Admission_inspected of
       { request : Journal_graph_request.admission_request
       ; observation : Protocol.v2_admission_inspection
@@ -2933,34 +2924,13 @@ let receive_response t (protocol_response : Protocol.response) =
         | Pull_changes { request_generation; _ } ->
           rehydrate_current_interests t ~request_generation ~generation
         | _ -> failure_output t operation request_id reason)
-     | V2_graph_info_outcome
-         { graph_uuid
-         ; graph_name
-         ; schema
-         ; admission_facts
-         ; journal_title_format
-         ; generation
-         ; projection_revision
-         ; _
-         } ->
+     | V2_graph_info_outcome { journal_title_format; _ } ->
        (match operation with
         | Graph_info ->
           let catalog =
             if t.task_catalog_started then [] else [ request_task_catalog t ]
           in
-          { requests = catalog
-          ; responses =
-            [ response
-                (Graph_ready
-                   { graph_uuid
-                   ; graph_name
-                   ; schema
-                   ; admission_facts
-                   ; generation
-                   ; projection_revision
-                   })
-              ]
-          }
+          { requests = catalog; responses = [ response Graph_ready ] }
         | Capture_format { command; page_uuid; page_revision } ->
           let journal_day = Journal_time.local_day command.creation_time in
           requests

@@ -1175,6 +1175,32 @@ let save_cache core =
     next, [ Run request ]
 ;;
 
+(* Only operation state shared by graph/account replacement paths. Scope,
+   pending-effect and teardown policies remain with each transition. *)
+let reset_graph_operations core =
+  { core with
+    graph_key = None
+  ; pending_graph_open = None
+  ; pending_attachment = None
+  ; pending_encrypted_graph_key = None
+  ; pending_private_key_package = None
+  ; snapshot_scope = None
+  ; snapshot_server_t = None
+  ; active_snapshot_download = None
+  ; pending_snapshot_activation = None
+  ; sync_view = None
+  ; pending_sync_inspection = None
+  ; pending_outbox_transition = None
+  ; submission_owner = None
+  ; pull_owner = None
+  ; pull_wanted = None
+  ; pull_retry_delay = 1.
+  ; active_authoritative_batch = None
+  ; queued_authoritative_batch = None
+  ; deferred_authoritative_owner = None
+  }
+;;
+
 let authenticate_new_account core user_id =
   let startup =
     { initial_startup with
@@ -1198,7 +1224,7 @@ let authenticate_new_account core user_id =
   in
   let core =
     set_snapshot
-      { core with
+      { (reset_graph_operations core) with
         user_id = Some user_id
       ; pending_effects = []
       ; catalog_cache_loading = false
@@ -1207,26 +1233,7 @@ let authenticate_new_account core user_id =
       ; cached_selected_graph = None
       ; current_graph_scope = None
       ; pending_selected_download = None
-      ; graph_key = None
-      ; pending_graph_open = None
       ; pending_mirror_inspection = None
-      ; pending_attachment = None
-      ; pending_encrypted_graph_key = None
-      ; pending_private_key_package = None
-      ; snapshot_scope = None
-      ; snapshot_server_t = None
-      ; active_snapshot_download = None
-      ; pending_snapshot_activation = None
-      ; sync_view = None
-      ; pending_sync_inspection = None
-      ; pending_outbox_transition = None
-      ; submission_owner = None
-      ; pull_owner = None
-      ; pull_wanted = None
-      ; pull_retry_delay = 1.
-      ; active_authoritative_batch = None
-      ; queued_authoritative_batch = None
-      ; deferred_authoritative_owner = None
       ; websocket_live = false
       }
       snapshot
@@ -1285,7 +1292,7 @@ let restore_local core user_id =
   in
   let core =
     set_snapshot
-      { core with
+      { (reset_graph_operations core) with
         user_id = Some user_id
       ; pending_effects = []
       ; catalog_cache_loading = true
@@ -1295,26 +1302,7 @@ let restore_local core user_id =
       ; selected_graph_value = None
       ; current_graph_scope = None
       ; pending_selected_download = None
-      ; graph_key = None
-      ; pending_graph_open = None
       ; pending_mirror_inspection = None
-      ; pending_attachment = None
-      ; pending_encrypted_graph_key = None
-      ; pending_private_key_package = None
-      ; snapshot_scope = None
-      ; snapshot_server_t = None
-      ; active_snapshot_download = None
-      ; pending_snapshot_activation = None
-      ; sync_view = None
-      ; pending_sync_inspection = None
-      ; pending_outbox_transition = None
-      ; submission_owner = None
-      ; pull_owner = None
-      ; pull_wanted = None
-      ; pull_retry_delay = 1.
-      ; active_authoritative_batch = None
-      ; queued_authoritative_batch = None
-      ; deferred_authoritative_owner = None
       ; websocket_live = false
       }
       { core.public_state.snapshot with local_deletion = None; startup }
@@ -1345,7 +1333,7 @@ let sign_out core =
   in
   let next =
     set_snapshot
-      { core with
+      { (reset_graph_operations core) with
         user_id = None
       ; pending_effects = []
       ; catalog_cache_loading = false
@@ -1354,26 +1342,7 @@ let sign_out core =
       ; cached_selected_graph = None
       ; current_graph_scope = None
       ; pending_selected_download = None
-      ; graph_key = None
-      ; pending_graph_open = None
       ; pending_mirror_inspection = None
-      ; pending_attachment = None
-      ; pending_encrypted_graph_key = None
-      ; pending_private_key_package = None
-      ; snapshot_scope = None
-      ; snapshot_server_t = None
-      ; active_snapshot_download = None
-      ; pending_snapshot_activation = None
-      ; sync_view = None
-      ; pending_sync_inspection = None
-      ; pending_outbox_transition = None
-      ; submission_owner = None
-      ; pull_owner = None
-      ; pull_wanted = None
-      ; pull_retry_delay = 1.
-      ; active_authoritative_batch = None
-      ; queued_authoritative_batch = None
-      ; deferred_authoritative_owner = None
       ; websocket_live = false
       }
       snapshot
@@ -1440,32 +1409,13 @@ let select_graph_transition core ~persist graph_id =
     let mirror_request = { graph; scope } in
     let core =
       set_snapshot
-        { core with
+        { (reset_graph_operations core) with
           cached_selected_graph = Some graph_id
         ; pending_effects = List.filter (fun pending -> not (is_graph_key_access pending)) core.pending_effects
         ; selected_graph_value = Some graph
         ; current_graph_scope = Some scope
         ; pending_selected_download = (if persist then Some scope else None)
-        ; graph_key = None
-        ; pending_graph_open = None
         ; pending_mirror_inspection = Some mirror_request
-        ; pending_attachment = None
-        ; pending_encrypted_graph_key = None
-        ; pending_private_key_package = None
-        ; snapshot_scope = None
-        ; snapshot_server_t = None
-        ; active_snapshot_download = None
-      ; pending_snapshot_activation = None
-        ; sync_view = None
-        ; pending_sync_inspection = None
-        ; pending_outbox_transition = None
-        ; submission_owner = None
-        ; pull_owner = None
-        ; pull_wanted = None
-        ; pull_retry_delay = 1.
-        ; active_authoritative_batch = None
-        ; queued_authoritative_batch = None
-        ; deferred_authoritative_owner = None
         }
         snapshot
     in
@@ -2432,32 +2382,13 @@ let clear_selected_graph_for_catalog core catalog =
   in
   let next =
     set_snapshot
-      { core with
+      { (reset_graph_operations core) with
         pending_effects = []
       ; cached_selected_graph = None
       ; selected_graph_value = None
       ; current_graph_scope = None
       ; pending_selected_download = None
-      ; graph_key = None
-      ; pending_graph_open = None
       ; pending_mirror_inspection = None
-      ; pending_attachment = None
-      ; pending_encrypted_graph_key = None
-      ; pending_private_key_package = None
-      ; snapshot_scope = None
-      ; snapshot_server_t = None
-      ; active_snapshot_download = None
-      ; pending_snapshot_activation = None
-      ; sync_view = None
-      ; pending_sync_inspection = None
-      ; pending_outbox_transition = None
-      ; submission_owner = None
-      ; pull_owner = None
-      ; pull_wanted = None
-      ; pull_retry_delay = 1.
-      ; active_authoritative_batch = None
-      ; queued_authoritative_batch = None
-      ; deferred_authoritative_owner = None
       ; websocket_live = false
       }
       snapshot
@@ -2841,32 +2772,13 @@ let return_to_graph_picker core =
   in
   let next =
     set_snapshot
-      { core with
+      { (reset_graph_operations core) with
         selected_graph_value = None
       ; current_graph_scope = None
       ; pending_selected_download = None
-      ; graph_key = None
-      ; pending_graph_open = None
       ; pending_mirror_inspection = None
-      ; pending_attachment = None
-      ; pending_encrypted_graph_key = None
-      ; pending_private_key_package = None
-      ; snapshot_scope = None
-      ; snapshot_server_t = None
-      ; active_snapshot_download = None
-      ; pending_snapshot_activation = None
-      ; sync_view = None
       ; pending_effects = []
-      ; pending_sync_inspection = None
-      ; pending_outbox_transition = None
       ; websocket_live = false
-      ; submission_owner = None
-      ; pull_owner = None
-      ; pull_wanted = None
-      ; pull_retry_delay = 1.
-      ; active_authoritative_batch = None
-      ; queued_authoritative_batch = None
-      ; deferred_authoritative_owner = None
       }
       { core.public_state.snapshot with
         sync_phase = Offline
