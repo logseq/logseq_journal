@@ -39,6 +39,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Verify Apple app icon packaging
         run: python3 .agents/skills/journal-build/scripts/test_apple_app_icon.py
+      - name: Verify Swift runtime startup and failure boundaries
+        run: |
+          python3 tool/test_journal_runtime_startup.py
+          python3 tool/test_journal_runtime_failure.py
       - name: Prepare native system libraries before cache lookup
         run: |
           brew install pkg-config gmp sqlite zlib zstd

@@ -55,15 +55,42 @@ private let wakeup: WakeupCallback = {
   }
 }
 
-/// OCaml calls this synchronously on its worker thread with an LJP2 request
-/// envelope. The callback returns immediately; the platform answers later via
-/// `journal_ocaml_platform_response` on the main actor.
+/// One bridge session owns both buffered startup requests and later deliveries.
+/// A callback copies its payload before returning; it never enters OCaml again.
+private final class JournalPlatformRequestIngress: @unchecked Sendable {
+  private let lock = NSLock()
+  private var owner: UUID?
+  private var pending: [Data] = []
+  private var receiver: (@Sendable (Data) -> Void)?
+  func begin(_ identity: UUID) {
+    lock.lock(); defer { lock.unlock() }
+    owner = identity; pending = []; receiver = nil
+  }
+  func submit(_ request: Data) {
+    lock.lock()
+    guard owner != nil else { lock.unlock(); return }
+    let deliver = receiver
+    if deliver == nil { pending.append(request) }
+    lock.unlock()
+    deliver?(request)
+  }
+  func activate(_ identity: UUID, receiver: @escaping @Sendable (Data) -> Void) -> [Data] {
+    lock.lock(); defer { lock.unlock() }
+    guard owner == identity else { return [] }
+    self.receiver = receiver
+    let requests = pending; pending = []
+    return requests
+  }
+  func close(_ identity: UUID) {
+    lock.lock(); defer { lock.unlock() }
+    guard owner == identity else { return }
+    owner = nil; receiver = nil; pending = []
+  }
+}
+private let platformRequestIngress = JournalPlatformRequestIngress()
 private let platformRequest: PlatformRequestCallback = { data, length in
   guard let data, length > 0 else { return }
-  let bytes = Data(bytes: data, count: Int(length))
-  Task { @MainActor in
-    await activeRuntime?.deliverPlatformRequest(bytes)
-  }
+  platformRequestIngress.submit(Data(bytes: data, count: Int(length)))
 }
 
 /// Owns the lui backend, the OCaml runtime, and the platform bridge for one
@@ -90,6 +117,8 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   private(set) var appliedPatches = 0
   private(set) var failure: Failure?
   private var started = false
+  @ObservationIgnored private var generation = UUID()
+  @ObservationIgnored private var initialPlatformTasks: [Task<Void, Never>] = []
   private var stopPending = false
 
   init(
@@ -112,6 +141,10 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   func start() throws {
     if let failure { throw failure }
     guard !started else { return }
+    generation = UUID()
+    let identity = generation
+    platformRequestIngress.begin(identity)
+    defer { if !started { platformRequestIngress.close(identity) } }
     journalOCamlSetWakeupCallback(wakeup)
     journalOCamlSetPlatformRequestCallback(platformRequest)
     activeRuntime = self
@@ -147,10 +180,42 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     }
     started = true
     platform.connect(to: self)
+    let requests = platformRequestIngress.activate(identity) { [weak self] request in
+      Task { @MainActor [weak self] in
+        guard let self, self.generation == identity else { return }
+        await self.deliverPlatformRequest(request)
+      }
+    }
+    initialPlatformTasks = requests.map { request in
+      Task { @MainActor [weak self] in
+        guard let self, self.generation == identity else { return }
+        await self.deliverPlatformRequest(request)
+      }
+    }
+  }
+
+  /// Waits for requests emitted during admission, after native start/connect.
+  /// Mounting the root afterwards lets local initialization precede UI work.
+  func waitForInitialPlatformRequests() async throws {
+    let identity = generation, tasks = initialPlatformTasks
+    try await withTaskCancellationHandler {
+      for task in tasks { await task.value }
+      try Task.checkCancellation()
+      guard started, generation == identity else { throw CancellationError() }
+      initialPlatformTasks = []
+    } onCancel: {
+      Task { @MainActor [weak self] in
+        guard let self, self.generation == identity else { return }
+        self.stop()
+      }
+    }
   }
 
   @discardableResult func stop() -> Bool {
     guard started || stopPending else { return true }
+    platformRequestIngress.close(generation)
+    for task in initialPlatformTasks { task.cancel() }
+    initialPlatformTasks = []
     platform.disconnect()
     started = false
     activeRuntime = nil
@@ -180,8 +245,9 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   /// continuation instead of waiting forever.
   func deliverPlatformRequest(_ bytes: Data) async {
     guard started else { return }
+    let identity = generation
     let response = await platform.request(bytes)
-    guard started else { return } // This runtime may have stopped while awaiting the platform.
+    guard started, generation == identity, !Task.isCancelled else { return }
     guard let response else {
       let accepted = bytes.withUnsafeBytes { buffer in
         journalOCamlPlatformFailure(

@@ -15,6 +15,7 @@ struct JournalRuntimeHost: View {
   let payload: Data
   let extensions: LUIAppleExtensionRegistry
   @State private var runtime: JournalRuntime?
+  @State private var startingRuntime: JournalRuntime?
   @State private var fallbackClock = JournalStartupClock()
   @Environment(\.journalStartupClock) private var inheritedClock
   @State private var failure: Error?
@@ -32,8 +33,8 @@ struct JournalRuntimeHost: View {
             "Journal could not start (runtime.start.failed). Retry opening Journal.")
         } actions: {
           Button("Retry") {
-            guard runtime?.stop() != false else { return }
-            runtime = nil; failure = nil; clock.restart(); retry += 1
+            guard runtime?.stop() != false, startingRuntime?.stop() != false else { return }
+            runtime = nil; startingRuntime = nil; failure = nil; clock.restart(); retry += 1
           }
             .accessibilityIdentifier("journal-runtime-retry")
         }
@@ -62,14 +63,36 @@ struct JournalRuntimeHost: View {
     .environment(\.journalStartupClock, clock)
     .background(JournalEnvironmentObserver { platform.pushEnvironment($0) })
     .task(id: retry) {
-      if runtime == nil {
+      if runtime == nil && startingRuntime == nil {
         do {
           let next = try JournalRuntime(
             platform: platform,
             startupPayload: payload,
             extensionRegistry: extensions)
-          try next.start()
-          runtime = next
+          startingRuntime = next
+          do {
+            try next.start()
+            try await next.waitForInitialPlatformRequests()
+            try Task.checkCancellation()
+            guard startingRuntime === next else { throw CancellationError() }
+            runtime = next
+            startingRuntime = nil
+          } catch {
+            if next.stop() {
+              if startingRuntime === next {
+                startingRuntime = nil
+                if Task.isCancelled {
+                  if let stoppedFailure = next.failure { failure = stoppedFailure }
+                  else { retry += 1 }
+                }
+              }
+            } else if startingRuntime === next {
+              failure = next.failure
+            }
+            throw error
+          }
+        } catch is CancellationError {
+          // Cancellation retires only its own startup; a visible host retries.
         } catch {
           failure = error
           Logger(subsystem: "com.logseq.journal", category: "runtime")
@@ -77,7 +100,10 @@ struct JournalRuntimeHost: View {
         }
       }
     }
-    .onDisappear { runtime?.stop() }
+    .onDisappear {
+      runtime?.stop()
+      if startingRuntime?.stop() == false { failure = startingRuntime?.failure }
+    }
   }
 }
 
