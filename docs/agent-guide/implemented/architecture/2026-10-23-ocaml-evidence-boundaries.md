@@ -136,6 +136,43 @@ asset decode/publication boundaries.
   green before the refactor; do not invent a regression or claim a RED run that
   was not observed. No build/test process was started during resource hold.
 
+## Consequences
+
+The three boundaries are implemented within their existing owners. Public compiler
+negative tests reject arbitrary activation/challenge/attached/verified construction
+and the old artifact factory. Core retains ticket/generation/current/request identity
+checks; cache publication retains current, size, checksum, disk and lease checks.
+The slow-bootstrap regression was reproduced through public Core events before
+fixing publication of Unlock_bootstrapping ahead of metadata work.
+
+Final production-source build @all and repository runtest pass. Applicable reruns
+include Sync 305, Application 144, runtime locality 152, worker integration 15,
+worker reducer 20 and LUI service 49; existing overlay storage 85 also passes.
+Independent read-only review of source commit b6b61a7 found no remaining proven
+issue. Temporary logs, hosts and screenshots remain outside the repository.
+
+The same source modules were tested on the existing A135 iOS 26.1 Simulator with
+an isolated synthetic account/graph, a memory secrets adapter and a loopback server.
+The temporary test entry is not committed; production native_embed is unchanged.
+The real UI covers wrong-password retry, cancel/reselect, sign out/login/unlock,
+retained-mirror attach, and a fresh 412-row snapshot with delayed delivery. Password
+pending clears in bootstrapping, before attachment and Timeline appearance. The
+persisted metadata cursor is 42, SQLite integrity_check is ok, and diagnostics show
+Sync Current, Startup Ready and Graph Open. Clear and Apple AES-GCM attachments
+publish the expected plaintext; a corrupted-auth envelope whose wire checksum
+matches is rejected and never published. Sign out clears decoded cache files and
+memory secrets; relogin downloads and verifies attachments again.
+
+The first temporary server used the wrong pull reply spelling; its affected run
+was not accepted. The corrected server and final source were rerun successfully.
+No real account/keychain or graph was accessed. No device was created or reset;
+the protected 1446 device was untouched. Host-restamp remains experimental with
+cross_abi_validated=false; these checks do not establish complete cross-ABI support
+or production authentication-service acceptance. Disk-full/hardware faults and
+pending-operation UI cancellation were not simulated on-device; applicable existing
+runtime regressions remain separate evidence. A135 and this task's processes were
+released after verification. No merge, TestFlight or deployment is authorized.
+
 ## Questions
 
 None. The user answered the protected-interface authorization question with
