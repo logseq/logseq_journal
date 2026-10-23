@@ -80,7 +80,7 @@ it only if an implementation type equality actually requires it.
 
 The user explicitly authorized the required protected spec .mli changes on
 2026-10-23, as relayed by the parent with the direct question and answer. Proceed
-within these three boundaries. Build/test/Simulator work still waits for an
+within these three boundaries. Build/test/Simulator work began after the
 explicit resource handoff; no Dune or pin changes are authorized.
 
 ## Alternatives considered
