@@ -82,6 +82,16 @@ import SwiftUI
     try backend.apply(json: String(decoding: JSONSerialization.data(withJSONObject: childOnly), as: UTF8.self))
     await settle()
     check(owner.snapshot === first, "child-only content revision must not decode payload")
+    // A scroll command must not replace identical row content or force the
+    // native List to reprepare its cells before the jump.
+    try patch(backend, payload(["a", "b", "c"], token: 19))
+    await settle()
+    check(owner.snapshot === first, "scroll-only command retains prepared row content")
+    check(owner.scrollRequest?.token == 19, "scroll-only command is still delivered")
+    try patch(backend, payload(["a", "b", "c"]))
+    await settle()
+    check(owner.snapshot === first, "scroll completion retains prepared row content")
+    check(owner.scrollRequest == nil, "completion clears the command independently")
     owner.suspend()
     check(!owner.receive(c, appeared: true), "offscreen retained list rejects queued callback")
     check(owner.snapshot === first && owner.range == 1..<2, "navigation suspension retains content and visibility")
@@ -118,7 +128,7 @@ import SwiftUI
     check(!owner.receive(child, appeared: true), "re-expansion does not revive collapsed incarnation")
     try patch(backend, payload(["a", "b"], expanded: true, track: false, token: 17))
     await settle()
-    check(owner.snapshot?.properties.track_visible_range == false && owner.snapshot?.properties.scroll_request?.token == "17", "track flags and scroll tokens invalidate snapshot")
+    check(owner.snapshot?.properties.track_visible_range == false && owner.scrollRequest?.token == 17, "track flags and scroll tokens invalidate snapshot")
     let beforeNoop = owner.snapshot
     try patch(backend, payload(["a", "b"], expanded: true, track: false, token: 17))
     await settle()

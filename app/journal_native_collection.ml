@@ -140,14 +140,15 @@ let view
   let scroll_request =
     Option.map
       (fun (token, section, row) ->
+         let date = String.equal row ("day:" ^ section) in
          V.Native_list.scroll_request
            ~token
            ~target:
              (V.Native_list.target
                 ~section:(Ui.Key.string section)
-                ~row_path:[ Ui.Key.string row ])
+                ~row_path:(if date then [] else [ Ui.Key.string row ]))
            ~anchor:Top
-           ~animated:false
+           ~animated:date
            ())
       scroll_target
   in

@@ -1050,6 +1050,25 @@ let next_request (state : t) =
 
 let pending_request (state : t) = state.pending
 
+let request_top (state : t) =
+  match state.scroll_target with
+  | Some _ -> state
+  | None ->
+    let token = Int64.succ state.scroll_generation in
+    { state with
+      scroll_generation = token
+    ; scroll_target = Some (token, state.today, "day:" ^ string_of_int state.today)
+    ; scroll_outcome = None
+    }
+;;
+
+let cancel_scroll (state : t) =
+  match state.scroll_target with
+  | None -> state
+  | Some _ ->
+    { state with scroll_target = None; scroll_outcome = Some Cancelled }
+;;
+
 let prepend_timeline_entry (state : t) (entry : Journal_graph_projection.timeline_entry) =
   let before = state in
   let block = entry.Journal_graph_projection.block in
