@@ -123,6 +123,41 @@ let test_managed_client_command_is_accepted () =
       | _ -> T.fail "managed client command returned the wrong response"))
 ;;
 
+(* Build opaque unlock evidence through the production reducer, including its
+   actual key-package and attachment owners. No boolean-to-receipt fixture. *)
+let synthetic_unlock_prompt graph_id =
+  let module C = Logseq_sync_pure_reducer.Core in
+  let limits = C.limits ~maximum_response_bytes:Logseq_db_types.Limits.maximum_response_bytes
+    ~maximum_artifact_bytes:1048576 ~submission_batch_size:32 |> Result.get_ok in
+  let initial = C.config ~managed_sync_origin:(Uri.of_string "https://example.invalid") ~limits
+    |> Result.get_ok |> C.initial |> Result.get_ok in
+  let permitted = C.step initial (C.Sign_in_requested
+    { account_generation = 0; presentation_generation = 0 }) in
+  let auth = C.step permitted.next (C.Account_authenticated { user_id = Some "synthetic-user" }) in
+  let graph : C.graph = { graph_id; name = "Private Journal"; encrypted = true
+    ; schema = { major = 65; minor = 33; exact = true } } in
+  let catalog = List.find_map (function
+    | C.Run (C.Request (ticket, C.Fetch_catalog _)) -> Some (C.step auth.next
+        (C.Runner_completed (C.Completion (ticket, Ok [graph]))))
+    | _ -> None) auth.effects |> Option.get in
+  let selected = C.step catalog.next (C.Graph_selected graph_id) in
+  let mirror = List.find_map (function C.Delegate (C.Inspect_mirror request) -> Some request
+    | _ -> None) selected.effects |> Option.get in
+  let local = C.step selected.next (C.Mirror_inspected (C.Mirror_available mirror)) in
+  let prepare = List.find_map (function
+    | C.Run (C.Request (ticket, C.Load_and_unlock_graph_key _)) -> Some (C.step local.next
+        (C.Runner_completed (C.Completion (ticket, Error (C.Effect_failed "synthetic missing key")))))
+    | _ -> None) local.effects |> Option.get in
+  let wrapped = List.find_map (function
+    | C.Run (C.Request (ticket, C.Fetch_e2ee_graph_key _)) -> Some (C.step prepare.next
+        (C.Runner_completed (C.Completion (ticket, Ok "synthetic-wrapped"))))
+    | _ -> None) prepare.effects |> Option.get in
+  List.find_map (function
+    | C.Run (C.Request (ticket, C.Fetch_e2ee_user_keys _)) -> Some (C.step wrapped.next
+        (C.Runner_completed (C.Completion (ticket, Ok "synthetic-package"))))
+    | _ -> None) wrapped.effects |> Option.get
+;;
+
 let test_unlock_ignored_logging () =
   let path = Filename.temp_file "journal-unlock-worker-log-" "" in
   let saved = Unix.dup Unix.stderr in
@@ -144,7 +179,12 @@ let test_unlock_ignored_logging () =
       T.with_managed (fun fixture ->
         with_client fixture.config (fun client ->
           let id = Worker.send client (Service.Client_command
-            (Submit_e2ee_password "LOG_SECRET_PASSWORD")) |> accepted in
+            (Submit_e2ee_password
+              (Logseq_sync_pure_reducer.Core.unlock_challenge
+                (Logseq_sync_pure_reducer.Core.state
+                  (synthetic_unlock_prompt (Logseq_db_types.Graph_types.Uuid.of_string
+                    "00000000-0000-0000-0000-000000000901" |> Result.get_ok)).next).snapshot.unlock
+                |> Option.get, "LOG_SECRET_PASSWORD"))) |> accepted in
           (match await_response client id with
            | Service.Client_command_completed -> ()
            | _ -> T.fail "password queue acknowledgement changed");

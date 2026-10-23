@@ -96,6 +96,7 @@ let startup_snapshot
     ; catalog = []
     ; selected_graph = Some graph_id
     ; applied_server_t = Some (server_cursor_of_int 11)
+    ; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
     ; timeline_presentation_pending
     ; startup =
         { authenticated

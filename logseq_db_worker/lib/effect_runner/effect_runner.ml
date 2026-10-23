@@ -1709,19 +1709,19 @@ let handle_sync_worker_effect t = function
         | Available _ ->
              Ok (sync_result ~event:(Sync.Mirror_inspected (Mirror_available request)) ()))))
   | Activate_snapshot request ->
-    let key = Graph.Uuid.to_string request.scope.graph_id in
+    let key = Graph.Uuid.to_string (Sync.snapshot_activation_scope request).graph_id in
     (match Hashtbl.find_opt t.inspections key with
      | None -> Error (effect_error "The snapshot mirror inspection is stale.")
      | Some inspection ->
-       let cursor = request.applied_server_t in
+       let cursor = (Sync.snapshot_activation_cursor request) in
        (match
           Database.prepare_snapshot_activation
             t.dependencies.overlay
             inspection
-            ~path:(Sync.staged_artifact_path request.artifact)
+            ~path:(Sync.staged_artifact_path (Sync.snapshot_activation_artifact request))
             ~applied_server_cursor:cursor
             ~expected_checksum:None
-            ~expected_rows:(Sync.staged_artifact_expected_rows request.artifact)
+            ~expected_rows:(Sync.staged_artifact_expected_rows (Sync.snapshot_activation_artifact request))
         with
         | Error (Overlay.Snapshot_parse_error message) -> Error (effect_error message)
         | Error _ -> Error (effect_error "The snapshot activation could not start.")
@@ -1736,7 +1736,7 @@ let handle_sync_worker_effect t = function
                  | Ok (Some crypto_request) ->
                    let ciphertexts = Database.unprotection_ciphertexts crypto_request in
                    let plaintexts =
-                     match request.key with
+                     match (Sync.snapshot_activation_key request) with
                      | None -> Ok ciphertexts
                      | Some graph_key ->
                        let rec decrypt reversed = function
@@ -1769,7 +1769,7 @@ let handle_sync_worker_effect t = function
                     Hashtbl.replace t.inspections key inspection;
                     Ok
                       (sync_result
-                         ~event:(Sync.Snapshot_activated { scope = request.scope })
+                         ~event:(Sync.Snapshot_activated (Sync.snapshot_activation_completed request))
                          ())))))
   | Delete_mirror request ->
     let ( let* ) = Result.bind in

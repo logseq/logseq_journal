@@ -123,7 +123,8 @@ let test_diagnostic_phase_rows_retain_current_error () =
   let message = "Graph schema 65.29 is not supported. Journal requires schema 65.33 or later." in
   let snapshot : Service.snapshot =
     { sync_phase = Failed; catalog = []; selected_graph = None; applied_server_t = None
-    ; timeline_presentation_pending = false; local_deletion = None; last_error = Some message
+    ; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
+        ; timeline_presentation_pending = false; local_deletion = None; last_error = Some message
     ; startup = { authenticated = true; local_access=Service.Local_available; network_phase=Service.Online_by_user; catalog_loading = false; awaiting_selection = false
         ; restoring_local = false; bootstrapping = true; awaiting_e2ee_password = false
         ; failure = Some During_bootstrap; account_generation = 1; graph_generation = 1
@@ -145,7 +146,8 @@ let test_diagnostic_identity_comes_from_worker () =
   let actual = uuid "60000000-0000-4000-8000-000000000002" in
   let snapshot : Service.snapshot =
     { sync_phase = Offline; catalog = []; selected_graph = Some selected
-    ; applied_server_t = None; timeline_presentation_pending = false
+    ; applied_server_t = None; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
+        ; timeline_presentation_pending = false
     ; local_deletion = None; last_error = None
     ; startup = { authenticated = true; catalog_loading = false
         ; awaiting_selection = false; restoring_local = false; bootstrapping = false
@@ -694,6 +696,7 @@ let run_favorites_native_visibility
         ; catalog = []
         ; selected_graph = Some (uuid 900)
         ; applied_server_t = Some (server_cursor_of_int 0)
+        ; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
         ; timeline_presentation_pending = false
         ; startup =
             { authenticated = true; local_access=Service.Local_available; network_phase=Service.Online_by_user
@@ -4074,6 +4077,7 @@ let test_reference_outer_terminals cancel =
         ; catalog = []
         ; selected_graph = Some (uuid 900)
         ; applied_server_t = Some (server_cursor_of_int 0)
+        ; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
         ; timeline_presentation_pending = false
         ; startup =
             { authenticated = true; local_access=Service.Local_available; network_phase=Service.Online_by_user
@@ -4679,7 +4683,8 @@ let test_favorite_page_uses_shared_reference_lookup () =
   let manager : Service.state =
     { snapshot =
         { sync_phase = Current; catalog = []; selected_graph = Some (uuid 9)
-        ; applied_server_t = Some (server_cursor_of_int 0); timeline_presentation_pending = false
+        ; applied_server_t = Some (server_cursor_of_int 0); unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
+        ; timeline_presentation_pending = false
         ; startup = { authenticated = true; local_access=Service.Local_available; network_phase=Service.Online_by_user; catalog_loading = false; awaiting_selection = false
             ; restoring_local = false; bootstrapping = false; awaiting_e2ee_password = false
             ; failure = None; account_generation = 1; graph_generation = 1; presentation_generation = 1 }
@@ -5152,6 +5157,41 @@ let test_fixture_exception_cleanup exception_ =
   check_fixture_worker_idle ()
 ;;
 
+(* Build opaque unlock evidence through the production reducer, including its
+   actual key-package and attachment owners. No boolean-to-receipt fixture. *)
+let synthetic_unlock_prompt graph_id =
+  let module C = Logseq_sync_pure_reducer.Core in
+  let limits = C.limits ~maximum_response_bytes:Logseq_db_types.Limits.maximum_response_bytes
+    ~maximum_artifact_bytes:1048576 ~submission_batch_size:32 |> Result.get_ok in
+  let initial = C.config ~managed_sync_origin:(Uri.of_string "https://example.invalid") ~limits
+    |> Result.get_ok |> C.initial |> Result.get_ok in
+  let permitted = C.step initial (C.Sign_in_requested
+    { account_generation = 0; presentation_generation = 0 }) in
+  let auth = C.step permitted.next (C.Account_authenticated { user_id = Some "synthetic-user" }) in
+  let graph : C.graph = { graph_id; name = "Private Journal"; encrypted = true
+    ; schema = { major = 65; minor = 33; exact = true } } in
+  let catalog = List.find_map (function
+    | C.Run (C.Request (ticket, C.Fetch_catalog _)) -> Some (C.step auth.next
+        (C.Runner_completed (C.Completion (ticket, Ok [graph]))))
+    | _ -> None) auth.effects |> Option.get in
+  let selected = C.step catalog.next (C.Graph_selected graph_id) in
+  let mirror = List.find_map (function C.Delegate (C.Inspect_mirror request) -> Some request
+    | _ -> None) selected.effects |> Option.get in
+  let local = C.step selected.next (C.Mirror_inspected (C.Mirror_available mirror)) in
+  let prepare = List.find_map (function
+    | C.Run (C.Request (ticket, C.Load_and_unlock_graph_key _)) -> Some (C.step local.next
+        (C.Runner_completed (C.Completion (ticket, Error (C.Effect_failed "synthetic missing key")))))
+    | _ -> None) local.effects |> Option.get in
+  let wrapped = List.find_map (function
+    | C.Run (C.Request (ticket, C.Fetch_e2ee_graph_key _)) -> Some (C.step prepare.next
+        (C.Runner_completed (C.Completion (ticket, Ok "synthetic-wrapped"))))
+    | _ -> None) prepare.effects |> Option.get in
+  List.find_map (function
+    | C.Run (C.Request (ticket, C.Fetch_e2ee_user_keys _)) -> Some (C.step wrapped.next
+        (C.Runner_completed (C.Completion (ticket, Ok "synthetic-package"))))
+    | _ -> None) wrapped.effects |> Option.get
+;;
+
 (* Application owns password admission and UI. No public pure root event exists
    for E2EE; this fixture exercises mounted Application through its public hooks. *)
 let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init = false) ?(cold_start = false)
@@ -5164,6 +5204,9 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
     Logseq_db_types.Graph_types.Uuid.of_string "00000000-0000-0000-0000-000000000901"
     |> Result.get_ok
   in
+  let module C = Logseq_sync_pure_reducer.Core in
+  let prompt = synthetic_unlock_prompt graph_id in
+  let core = ref prompt.next in
   let manager : Service.state =
     { snapshot =
         { sync_phase = Offline
@@ -5176,6 +5219,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
             ]
         ; selected_graph = Some graph_id
         ; applied_server_t = None
+        ; unlock = (C.state !core).snapshot.unlock
         ; timeline_presentation_pending = false
         ; startup =
             { authenticated = true; local_access=Service.Local_available; network_phase=Service.Online_by_user
@@ -5187,7 +5231,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
             ; failure = None
             ; account_generation = 1
             ; graph_generation = 1
-            ; presentation_generation = 1
+            ; presentation_generation = (C.state !core).snapshot.startup.presentation_generation
             }
         ; last_error = None
         ; local_deletion = None
@@ -5198,7 +5242,8 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
   let manager = if cold_start then
     { manager with snapshot = { manager.snapshot with startup =
       { manager.snapshot.startup with authenticated = false; local_access = Service.Local_pending
-      ; network_phase = Service.Local_only; awaiting_e2ee_password = false } } }
+      ; network_phase = Service.Local_only; awaiting_e2ee_password = false }
+      ; unlock = C.Unlock_inactive } }
     else manager in
   let graph_reads = Atomic.make 0 in
   let current = Atomic.make manager in
@@ -5249,14 +5294,17 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
                })
         | Client_command (Submit_e2ee_password _) when worker_failure ->
           Error "Synthetic unlock worker failure"
-        | Client_command (Submit_e2ee_password password) ->
+        | Client_command (Submit_e2ee_password (challenge, password)) ->
+          let unlocking = C.step !core (C.E2ee_password_submitted (challenge, password)) in
+          core := unlocking.next;
           Atomic.set submissions (password :: Atomic.get submissions);
           let old = Atomic.get current in
           publish
             { old with
               snapshot =
                 { old.snapshot with
-                  startup =
+                  unlock = (C.state !core).snapshot.unlock
+                ; startup =
                     { old.snapshot.startup with
                       awaiting_e2ee_password = false
                     ; failure = None
@@ -5272,9 +5320,27 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
             Eio.Time.Mono.sleep (W.Request_context.clock context) 0.01
           done;
           if attach_mirror then (
+            let private_key = List.find_map (function
+              | C.Run (C.Request (ticket, C.Unlock_private_key _)) -> Some (C.step !core
+                  (C.Runner_completed (C.Completion (ticket, Ok ()))))
+              | _ -> None) unlocking.effects |> Option.get in
+            let graph_key = List.find_map (function
+              | C.Run (C.Request (ticket, C.Fetch_and_unlock_graph_key request)) ->
+                Some (C.step private_key.next (C.Runner_completed (C.Completion
+                  (ticket, Ok (C.graph_key_handle ~id:"synthetic-key" ~scope:request.scope)))))
+              | _ -> None) private_key.effects |> Option.get in
+            let attach = List.find_map (function C.Delegate (C.Attach_graph request) -> Some request
+              | _ -> None) graph_key.effects |> Option.get in
+            let token = Logseq_overlay_db.Types.sync_token_of_string "sync-token:v1:synthetic-unlock"
+              |> Result.get_ok in
+            let sync = Logseq_overlay_db.Types.sync_view ~token
+              ~checkpoint:(server_cursor_of_int 51) ~submissions:[] in
+            let completed = C.step graph_key.next (C.Graph_attached { scope = attach.scope; sync }) in
+            core := completed.next;
             let attached =
               { old with snapshot = { old.snapshot with
-                  applied_server_t = Some (server_cursor_of_int 51)
+                  unlock = (C.state !core).snapshot.unlock
+                ; applied_server_t = Some (server_cursor_of_int 51)
                 ; timeline_presentation_pending = true
                 ; startup = { old.snapshot.startup with
                     awaiting_e2ee_password = false; restoring_local = false
@@ -5295,17 +5361,25 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
             done;
             (if graph_first then manager_changed else graph_changed) ();
             Atomic.set attachment_stage 2)
-          else publish
+          else (
+            let failed = List.find_map (function
+              | C.Run (C.Request (ticket, C.Unlock_private_key _)) -> Some (C.step !core
+                  (C.Runner_completed (C.Completion (ticket,
+                    Error (C.Effect_failed "Could not unlock the graph. Check your encryption password and try again.")))))
+              | _ -> None) unlocking.effects |> Option.get in
+            core := failed.next;
+            publish
             { manager with
               snapshot =
                 { manager.snapshot with
-                  startup = { manager.snapshot.startup with failure = Some During_e2ee }
+                  unlock = (C.state !core).snapshot.unlock
+                ; startup = { manager.snapshot.startup with failure = Some During_e2ee }
                 ; last_error =
                     Some
                       "Could not unlock the graph. Check your encryption password and \
                        try again."
                 }
-            };
+            });
           Ok Service.Client_command_completed
         | Client_command (Acknowledge_timeline_presented scope) ->
           on_timeline_presented scope;
@@ -5318,6 +5392,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
               snapshot =
                 { manager.snapshot with
                   selected_graph = None
+                ; unlock = C.Unlock_inactive
                 ; startup =
                     { manager.snapshot.startup with
                       awaiting_selection = true
@@ -5429,16 +5504,16 @@ let test_repeated_native_sign_in_intent_receives_permission () =
       ignore (hooks.init 2 2 startup);
       wait "initial Online_by_user permission" (fun () -> permit_count () >= 1);
       requests := [];
-      send_intent 1 1;
+      send_intent 1 2;
       wait "same-phase sign-in receives permission" (fun () -> permit_count () >= 1);
-      send_intent 1 1;
+      send_intent 1 2;
       wait "reopened sign-in receives permission" (fun () -> permit_count () >= 2);
       let before = permit_count () in
       send_intent 0 0;
       for _ = 1 to 100 do ignore (hooks.pump ()); Unix.sleepf 0.001 done;
       Alcotest.(check int) "stale startup intent cannot grant permission" before (permit_count ());
-      send_intent ~tag:35 1 1;
-      send_intent 1 1;
+      send_intent ~tag:35 1 2;
+      send_intent 1 2;
       for _ = 1 to 100 do ignore (hooks.pump ()); Unix.sleepf 0.001 done;
       Alcotest.(check int) "queued cancellation fences old-scope retry" before (permit_count ()))
 ;;
@@ -5504,7 +5579,7 @@ let test_pending_auth_never_replays_older_identity ~newer_accepted () =
   in
   let payload user =
     let json = Yojson.Safe.to_string (`Assoc ["userId",`String user;
-      "startupScope",`Assoc ["accountGeneration",`Int 1;"presentationGeneration",`Int 1]]) |> Bytes.of_string in
+      "startupScope",`Assoc ["accountGeneration",`Int 1;"presentationGeneration",`Int 2]]) |> Bytes.of_string in
     let bytes = Bytes.make (32 + Bytes.length json) '\000' in
     Bytes.blit_string "LJP2" 0 bytes 0 4;
     Bytes.set_uint16_le bytes 4 2; Bytes.set_uint16_le bytes 6 7;
@@ -6016,6 +6091,7 @@ let test_graph_picker_controls scenario () =
     { snapshot =
         { sync_phase = Current; catalog = [graph first "Current synthetic graph"; graph second long_name]
         ; selected_graph = Some first; applied_server_t = Some (server_cursor_of_int 0)
+        ; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
         ; timeline_presentation_pending = false
         ; startup = { authenticated = scenario <> `Offline; local_access=Service.Local_available; network_phase=(if scenario = `Offline then Service.Local_only else Service.Online_by_user); catalog_loading = false; awaiting_selection = false
           ; restoring_local = false; bootstrapping = false; awaiting_e2ee_password = false

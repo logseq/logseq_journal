@@ -110,9 +110,68 @@ let transit_candidate wire =
   | _ -> false
 ;;
 
-let decode ~maximum_plaintext_bytes ~crypto ~key ~expected_checksum wire =
+type decode_error =
+  | Invalid_limit
+  | Wire_too_large
+  | Plaintext_too_large
+  | Malformed_envelope
+  | Malformed_transit of string
+  | Decryption_failed of string
+  | Checksum_mismatch
+
+let decode_error_message = function
+  | Invalid_limit -> "Invalid plaintext size limit"
+  | Wire_too_large -> "Asset exceeds wire size limit"
+  | Plaintext_too_large -> "Asset exceeds plaintext size limit"
+  | Malformed_envelope -> "Invalid asset AES-GCM envelope"
+  | Malformed_transit message -> "Invalid asset Transit: " ^ message
+  | Decryption_failed message -> message
+  | Checksum_mismatch -> "Asset checksum mismatch"
+;;
+
+(* These roles stay inside the decoder: a failed candidate has no raw constructor
+   path, and ciphertext cannot be fed directly to verification. *)
+type raw = Raw of string
+type envelope = Envelope of { iv : string; ciphertext : string }
+type plaintext = Plaintext of string
+type classified = Clear of raw | Protected of envelope
+
+type verified =
+  { bytes : string
+  ; version : Logseq_db_types.Asset_descriptor.version
+  }
+
+let verified_bytes value = value.bytes
+let verified_version value = value.version
+
+let classify ~maximum_plaintext_bytes ~key wire =
+  match key with
+  | None -> Ok (Clear (Raw wire))
+  | Some _ when not (transit_candidate wire) ->
+    (try Printf.eprintf "journal asset decode path=raw-fallback\n%!" with
+     | _ -> ());
+    Ok (Clear (Raw wire))
+  | Some _ ->
+    let* () = if envelope_shape wire then Ok () else Error Malformed_envelope in
+    let* value =
+      try Ok (Codec.of_string wire) with
+      | Transit.Decode_error message
+      | Yojson.Json_error message
+      | Failure message
+      | Invalid_argument message -> Error (Malformed_transit message)
+    in
+    (match value with
+     | Transit.Array [ Binary iv; Binary ciphertext ]
+       when String.length iv = 12
+            && String.length ciphertext >= 16
+            && String.length ciphertext - 16 <= maximum_plaintext_bytes ->
+       Ok (Protected (Envelope { iv; ciphertext }))
+     | _ -> Error Malformed_envelope)
+;;
+
+let decode ~maximum_plaintext_bytes ~crypto ~key ~expected wire =
   if not (limit maximum_plaintext_bytes)
-  then Error "Invalid plaintext size limit"
+  then Error Invalid_limit
   else (
     let maximum_wire =
       match key with
@@ -120,37 +179,21 @@ let decode ~maximum_plaintext_bytes ~crypto ~key ~expected_checksum wire =
       | Some _ -> (4 * ((maximum_plaintext_bytes + 16 + 2) / 3)) + 128
     in
     if String.length wire > maximum_wire
-    then Error "Asset exceeds wire size limit"
+    then Error Wire_too_large
     else
-      let* plaintext =
-        match key with
-        | None -> Ok wire
-        | Some _ when not (transit_candidate wire) ->
-          (try Printf.eprintf "journal asset decode path=raw-fallback\n%!" with
-           | _ -> ());
-          Ok wire
-        | Some key ->
-          let* () =
-            if envelope_shape wire then Ok () else Error "Invalid asset AES-GCM envelope"
-          in
-          let* value =
-            try Ok (Codec.of_string wire) with
-            | Transit.Decode_error message
-            | Yojson.Json_error message
-            | Failure message
-            | Invalid_argument message -> Error ("Invalid asset Transit: " ^ message)
-          in
-          (match value with
-           | Transit.Array [ Binary iv; Binary ciphertext ]
-             when String.length iv = 12
-                  && String.length ciphertext >= 16
-                  && String.length ciphertext - 16 <= maximum_plaintext_bytes ->
-             crypto.decrypt ~key ~iv ~ciphertext
-           | _ -> Error "Invalid asset AES-GCM envelope")
+      let* classified = classify ~maximum_plaintext_bytes ~key wire in
+      let* Plaintext plaintext =
+        match classified, key with
+        | Clear (Raw bytes), _ -> Ok (Plaintext bytes)
+        | Protected (Envelope { iv; ciphertext }), Some key ->
+          crypto.decrypt ~key ~iv ~ciphertext
+          |> Result.map (fun bytes -> Plaintext bytes)
+          |> Result.map_error (fun message -> Decryption_failed message)
+        | Protected _, None -> Error Malformed_envelope
       in
       if String.length plaintext > maximum_plaintext_bytes
-      then Error "Asset exceeds plaintext size limit"
-      else if checksum plaintext <> expected_checksum
-      then Error "Asset checksum mismatch"
-      else Ok plaintext)
+      then Error Plaintext_too_large
+      else if checksum plaintext <> expected.Logseq_db_types.Asset_descriptor.checksum
+      then Error Checksum_mismatch
+      else Ok { bytes = plaintext; version = expected })
 ;;

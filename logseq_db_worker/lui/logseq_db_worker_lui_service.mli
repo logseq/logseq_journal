@@ -1,6 +1,33 @@
 type graph_id = Logseq_db_types.Graph_types.Uuid.t
 type graph = Logseq_db_types.Managed_graph.t
 
+(** Narrow projection of the unlock operation; construction evidence stays with
+    the sync owner. UI clients need not depend on the sync library directly. *)
+module Unlock : sig
+  type graph_scope = Logseq_sync_pure_reducer.Core.graph_scope
+  type unlock_challenge = Logseq_sync_pure_reducer.Core.unlock_challenge
+  type unlock_submission = Logseq_sync_pure_reducer.Core.unlock_submission
+  type unlock_attached = Logseq_sync_pure_reducer.Core.unlock_attached
+  type unlock_recovery = Logseq_sync_pure_reducer.Core.unlock_recovery =
+    | Retry_password of unlock_challenge * string
+    | Retry_preparation of string
+  type unlock_phase = Logseq_sync_pure_reducer.Core.unlock_phase =
+    | Unlock_inactive
+    | Unlock_challenge of unlock_challenge
+    | Unlock_running of unlock_submission
+    | Unlock_bootstrapping of unlock_submission
+    | Unlock_presentable of unlock_attached
+    | Unlock_failed of unlock_recovery
+    | Unlock_cancelled of unlock_submission
+  val unlock_challenge : unlock_phase -> unlock_challenge option
+  val equal_unlock_challenge : unlock_challenge -> unlock_challenge -> bool
+  val unlock_challenge_scope : unlock_challenge -> graph_scope
+  val unlock_submission_challenge : unlock_submission -> unlock_challenge
+  val equal_unlock_submission : unlock_submission -> unlock_submission -> bool
+  val unlock_attached_submission : unlock_attached -> unlock_submission
+  val unlock_attached_scope : unlock_attached -> graph_scope
+end
+
 type sync_phase =
   | Offline
   | Connecting
@@ -67,6 +94,7 @@ type snapshot =
   ; selected_graph : graph_id option
   ; applied_server_t : Logseq_db_types.Server_cursor.t option
   ; timeline_presentation_pending : bool
+  ; unlock : Unlock.unlock_phase
   ; startup : startup_facts
   ; last_error : string option
   ; local_deletion : local_deletion option
@@ -111,7 +139,7 @@ type client_command =
   | Return_to_graph_picker
   | Refresh_catalog of startup_scope
   | Begin_online_recovery of timeline_scope
-  | Submit_e2ee_password of string
+  | Submit_e2ee_password of Unlock.unlock_challenge * string
   | Delete_local_cache of graph_id
   | Set_foreground of bool
 

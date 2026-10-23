@@ -47,9 +47,8 @@ module Asset_cache : sig
   val publish
     :  t
     -> asset:Logseq_db_types.Graph_types.Uuid.t
-    -> version:Logseq_db_types.Asset_descriptor.version
     -> current:(unit -> bool)
-    -> plaintext:string
+    -> verified:Asset_codec.verified
     -> (handle, error) result
 
   val path : t -> handle -> string option

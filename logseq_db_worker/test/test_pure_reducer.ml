@@ -1008,7 +1008,7 @@ let snapshot_activation () =
         (Sync.Runner_completed (Sync.Completion (ticket, Ok [graph])))))
     | _ -> None) auth.effects |> Option.get in
   let selected = Core.step catalog.next (Sync_event (Sync.Graph_selected graph.graph_id)) in
-  let missing, scope = List.find_map (function
+  let missing, _scope = List.find_map (function
     | Core.Run_worker (Core.Request (ticket,
         Core.Handle_sync_worker_effect (Sync.Inspect_mirror request))) ->
       Some (Core.step selected.next (Runner_completed
@@ -1022,9 +1022,8 @@ let snapshot_activation () =
         (Sync.Completion (ticket, Ok {|{"ok":true,"t":42,"url":"https://example.invalid/snapshot"}|})))))
     | _ -> None) missing.effects |> Option.get in
   let activation = List.find_map (function
-    | Core.Run_sync (Sync.Request (ticket, Sync.Download_snapshot _)) ->
-      let artifact = Sync.staged_artifact ~id:"synthetic" ~scope
-          ~path:"/tmp/synthetic-schema.snapshot" ~expected_rows:1 in
+    | Core.Run_sync (Sync.Request (ticket, Sync.Download_snapshot download_request)) ->
+      let artifact = Sync.stage_snapshot_download download_request ~path:"/tmp/synthetic-schema.snapshot" ~expected_rows:1 |> Result.get_ok in
       Some (Core.step download.next (Sync_event (Sync.Runner_completed
         (Sync.Completion (ticket, Ok artifact)))))
     | _ -> None) download.effects |> Option.get in
@@ -1036,7 +1035,7 @@ let snapshot_activation () =
         Core.Handle_sync_worker_effect (Sync.Activate_snapshot request))) ->
       Some (Core.Runner_completed (Sync_worker_effect_completed (ticket, Error error)),
         Core.Runner_completed (Sync_worker_effect_completed (ticket, Ok
-          { event = Some (Sync.Snapshot_activated {scope = request.scope})
+          { event = Some (Sync.Snapshot_activated (Sync.snapshot_activation_completed request))
           ; lifecycle = Lifecycle_unchanged })))
     | _ -> None) activation.effects |> Option.get in
   activation, failure, success, Logseq_db_worker.Error.message error

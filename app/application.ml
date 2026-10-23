@@ -46,6 +46,66 @@ module Effect = struct
   let run (t : unit t) = t ()
 end
 
+module Unlock = Graph_service.Unlock
+
+type unlock_ui =
+  | Unlock_idle
+  | Unlock_waiting of Unlock.unlock_challenge
+  | Unlock_queued of Unlock.unlock_challenge
+  | Unlock_active of Unlock.unlock_submission
+  | Unlock_downloading of Unlock.unlock_submission
+  | Unlock_retry of Unlock.unlock_challenge * string
+  | Unlock_preparation_error of string
+  | Unlock_complete of Unlock.unlock_attached
+
+let unlock_pending = function Unlock_queued _ | Unlock_active _ -> true | _ -> false
+let unlock_ui_challenge = function
+  | Unlock_waiting challenge | Unlock_queued challenge | Unlock_retry (challenge, _) -> Some challenge
+  | Unlock_active submission -> Some (Unlock.unlock_submission_challenge submission)
+  | Unlock_idle | Unlock_downloading _ | Unlock_preparation_error _ | Unlock_complete _ -> None
+;;
+let unlock_ui_error = function
+  | Unlock_retry (_, message) | Unlock_preparation_error message -> Some message
+  | _ -> None
+;;
+
+let unlock_rejected = function
+  | Unlock_queued challenge -> Unlock_retry (challenge, "Unable to unlock the graph. Try again.")
+  | Unlock_active submission -> Unlock_retry
+      (Unlock.unlock_submission_challenge submission, "Unable to unlock the graph. Try again.")
+  | phase -> phase
+;;
+
+let reconcile_unlock previous (snapshot : Graph_service.snapshot) =
+  let current_scope (scope : Unlock.graph_scope) =
+    scope.account.account_generation = snapshot.startup.account_generation
+    && scope.graph_generation = snapshot.startup.graph_generation
+    && snapshot.selected_graph = Some scope.graph_id in
+  let same_challenge challenge = Option.fold ~none:false
+    ~some:(Unlock.equal_unlock_challenge challenge) (unlock_ui_challenge previous) in
+  match snapshot.unlock with
+  | Unlock.Unlock_challenge challenge when current_scope (Unlock.unlock_challenge_scope challenge) ->
+    if unlock_pending previous && same_challenge challenge then previous
+    else Unlock_waiting challenge
+  | Unlock_running submission when current_scope
+      (Unlock.unlock_challenge_scope (Unlock.unlock_submission_challenge submission)) ->
+    (match previous with
+     | Unlock_complete receipt when Unlock.equal_unlock_submission submission
+         (Unlock.unlock_attached_submission receipt) -> previous
+     | _ -> Unlock_active submission)
+  | Unlock_bootstrapping submission when current_scope
+      (Unlock.unlock_challenge_scope (Unlock.unlock_submission_challenge submission)) ->
+    Unlock_downloading submission
+  | Unlock_presentable receipt when current_scope (Unlock.unlock_attached_scope receipt) ->
+    Unlock_complete receipt
+  | Unlock_failed (Retry_password (challenge, message))
+    when current_scope (Unlock.unlock_challenge_scope challenge) -> Unlock_retry (challenge, message)
+  | Unlock_failed (Retry_preparation message) -> Unlock_preparation_error message
+  | Unlock_inactive | Unlock_cancelled _ | Unlock_challenge _ | Unlock_running _
+  | Unlock_bootstrapping _ | Unlock_presentable _ | Unlock_failed (Retry_password _) -> Unlock_idle
+;;
+
+
 module Admission_refresh = struct
   type observation =
     | Unavailable
@@ -338,8 +398,7 @@ type state =
   ; worker_errors : worker_error_occurrence list
   ; next_sync_error_sequence : int64
   ; e2ee_password : Journal_capture.t
-  ; e2ee_submission_pending : bool
-  ; e2ee_submission_error : string option
+  ; unlock : unlock_ui
   ; modal : modal
   ; confirmation_sequence : int64
   ; environment : Journal_environment.snapshot
@@ -454,8 +513,7 @@ let initial_state =
   ; worker_errors = []
   ; next_sync_error_sequence = 1L
   ; e2ee_password = Journal_capture.create ~session_number:9_000_000L ~source:""
-  ; e2ee_submission_pending = false
-  ; e2ee_submission_error = None
+  ; unlock = Unlock_idle
   ; modal = No_modal
   ; confirmation_sequence = 0L
   ; environment = Journal_environment.fallback
@@ -466,7 +524,7 @@ let initial_state =
 let sync_startup_presentation state =
   let startup_presentation = Journal_startup.Presentation.step state.startup_presentation
     (Observe {manager=state.manager;graph=state.graph_state;graph_ready=state.graph_ready;
-      feed_loaded=state.feed_loaded;password_pending=state.e2ee_submission_pending;
+      feed_loaded=state.feed_loaded;password_pending=(unlock_pending state.unlock);
       graph_error=Option.is_some state.graph_error}) in
   if startup_presentation == state.startup_presentation then state
   else {state with startup_presentation}
@@ -734,7 +792,7 @@ let local_deletion_available state =
 ;;
 
 let apply_manager_state state (manager_state : Graph_service.state) =
-  let e2ee_submission_was_pending = state.e2ee_submission_pending in
+  let e2ee_submission_was_pending = (unlock_pending state.unlock) in
   let snapshot = manager_state.snapshot in
   let graph_catalog = match state.manager with
     | Some previous when previous.catalog == snapshot.catalog -> state.graph_catalog
@@ -790,15 +848,6 @@ let apply_manager_state state (manager_state : Graph_service.state) =
     | None | Some _ -> false
   in
   let is_awaiting_password = snapshot.startup.awaiting_e2ee_password in
-  (* Attachment precedes Timeline's first appearance. Waiting for Ready here
-     would keep the password screen mounted and prevent that acknowledgement. *)
-  let current_graph_attached =
-    not (owner_changed || graph_context_changed)
-    && Option.is_some snapshot.selected_graph
-    && snapshot.startup.local_access = Graph_service.Local_available
-    && not snapshot.startup.restoring_local
-    && snapshot.timeline_presentation_pending
-  in
   let e2ee_password, next_local_sequence =
     if is_awaiting_password = was_awaiting_password
        && not (owner_changed || graph_context_changed)
@@ -828,35 +877,19 @@ let apply_manager_state state (manager_state : Graph_service.state) =
     ; graph_picker_open = state.graph_picker_open && not owner_changed
     ; diagnostics = Some manager_state.diagnostics
     ; e2ee_password
-    ; e2ee_submission_pending =
-        state.e2ee_submission_pending
-        && not
-             (owner_changed
-              || graph_context_changed
-              || is_awaiting_password
-              || Option.is_some snapshot.startup.failure
-              || snapshot.startup.bootstrapping
-              || current_graph_attached
-              || (not snapshot.startup.authenticated)
-              || (Journal_startup.derive ~snapshot ~graph:state.graph_state).phase = Ready
-             )
-    ; e2ee_submission_error =
-        (if owner_changed || graph_context_changed
-            || was_awaiting_password <> is_awaiting_password
-            || Option.is_some snapshot.startup.failure
-         then None else state.e2ee_submission_error)
+    ; unlock = reconcile_unlock (if owner_changed || graph_context_changed then Unlock_idle else state.unlock) snapshot
     ; next_local_sequence
     ; modal
     ; graph_ready = state.graph_ready && not graph_context_changed
     ; graph_error = state.graph_error
     }
   in
-  if state.e2ee_submission_pending <> e2ee_submission_was_pending
+  if (unlock_pending state.unlock) <> e2ee_submission_was_pending
   then
     unlock_log
       "phase=state pending=%b challenge_advertised=%b failure=%s account_generation=%d \
        graph_generation=%d"
-    state.e2ee_submission_pending is_awaiting_password (unlock_failure snapshot.startup.failure)
+    (unlock_pending state.unlock) is_awaiting_password (unlock_failure snapshot.startup.failure)
     snapshot.startup.account_generation snapshot.startup.graph_generation;
   match snapshot.last_error with
   | Some message when previous_sync_error <> Some message ->
@@ -3557,9 +3590,11 @@ let manager_page ?picker_signal state dispatch =
       content
   in
   let unlock error =
-    let error = match state.e2ee_submission_error with
+    let error = match (unlock_ui_error state.unlock) with
       | Some _ as error -> error | None -> error in
-    let pending = state.e2ee_submission_pending in
+    let pending = (unlock_pending state.unlock) in
+    let challenge_ready = Option.is_some
+      (Option.bind state.manager (fun manager -> Unlock.unlock_challenge manager.unlock)) in
     let password = state.e2ee_password in
     let ignored = Ui.Event.Handler.create (fun _ -> ()) in
     let submit = bind_action dispatch Submit_e2ee_password in
@@ -3605,7 +3640,7 @@ let manager_page ?picker_signal state dispatch =
            ~text_alignment:`center
            ~grow:1.
            ~min_height:44
-           ~disabled:(pending || not (Journal_capture.can_save password))
+           ~disabled:(pending || not challenge_ready || not (Journal_capture.can_save password))
            ~on_press:(fun _ -> dispatch.send Submit_e2ee_password)
            ~text:(if pending then "Unlocking…" else "Unlock graph")
            [])
@@ -3666,7 +3701,7 @@ let manager_page ?picker_signal state dispatch =
         | _ -> Journal_startup.derive ~snapshot ~graph:state.graph_state in
       (match startup.phase with
        | _ when state.graph_picker_open -> graph_picker snapshot
-       | _ when state.e2ee_submission_pending -> unlock None
+       | _ when (unlock_pending state.unlock) -> unlock None
        | Awaiting_selection -> graph_picker snapshot
        | Awaiting_e2ee_password -> unlock None
        | Failed
@@ -4356,8 +4391,7 @@ let start
       if unlock_owner state <> owner then state
       else
         { state with
-          e2ee_submission_pending = false
-        ; e2ee_submission_error = Some "Unable to unlock the graph. Try again."
+          unlock = unlock_rejected state.unlock
         }) () in
   let pending_startup_commands = ref [] in
   let send_manager command =
@@ -5127,7 +5161,7 @@ let start
       when Option.fold ~none:false ~some:(fun (owned, _) -> owned = request_id) !unlock_request ->
       let _, owner = Option.get !unlock_request in
       unlock_request := None;
-      if owner = unlock_owner !state_ref && !state_ref.e2ee_submission_pending
+      if owner = unlock_owner !state_ref && (unlock_pending !state_ref.unlock)
       then Effect.of_thunk (reject_unlock owner)
       else Effect.ignore
     | Worker.Response { outcome = Completed (Asset_file _); _ } -> Effect.ignore
@@ -5217,9 +5251,8 @@ let start
         let worker_error = service_error ~operation:"terminal" error in
         record_worker_error state ~operation:"terminal" worker_error
         |> fun state ->
-        let state = if state.e2ee_submission_pending then
-          { state with e2ee_submission_pending = false
-          ; e2ee_submission_error = Some "Unable to unlock the graph. Try again." }
+        let state = if (unlock_pending state.unlock) then
+          { state with unlock = unlock_rejected state.unlock }
           else state in
         terminal_graph_state state (Worker_graph_error (latest_worker_error state)))
   in
@@ -5971,7 +6004,7 @@ let start
              else { state with routes = Journal_routes.update_detail state.routes next })
         | _, Some { startup = { awaiting_e2ee_password = true; _ }; _ }
         | _, Some { startup = { failure = Some During_e2ee; _ }; _ }
-          when not state.e2ee_submission_pending ->
+          when not (unlock_pending state.unlock) ->
           let e2ee_password = Journal_capture.apply_text_edit state.e2ee_password edit in
           (* A mount-time echo produces an identical capture; rebuilding the
              record would republish the model and remount the field, which
@@ -6405,14 +6438,10 @@ let start
         ]
     | Submit_e2ee_password ->
       let password = Journal_capture.source snapshot.e2ee_password in
-      let awaiting =
-        match snapshot.manager with
-        | Some { startup = { awaiting_e2ee_password = true; _ }; _ } -> true
-        | None | Some _ -> false
-      in
+      let challenge = Option.bind snapshot.manager (fun manager -> Unlock.unlock_challenge manager.unlock) in
       if
-        snapshot.e2ee_submission_pending
-        || (not awaiting)
+        (unlock_pending snapshot.unlock)
+        || Option.is_none challenge
         || String.equal (String.trim password) ""
       then Effect.ignore
       else (
@@ -6422,15 +6451,14 @@ let start
         Effect.bind
           (update (fun state ->
              { state with
-               e2ee_submission_pending = true
-             ; e2ee_submission_error = None
+               unlock = Unlock_queued (Option.get challenge)
              ; e2ee_password =
                  Journal_capture.create
                    ~session_number:state.next_local_sequence
                    ~source:""
              ; next_local_sequence = Int64.succ state.next_local_sequence
              }))
-          ~f:(fun () -> send_manager (Graph_service.Submit_e2ee_password password)))
+          ~f:(fun () -> send_manager (Graph_service.Submit_e2ee_password (Option.get challenge, password))))
     | Request_local_cache_reset ->
       update (fun state -> { state with graph_picker_open = true; modal = No_modal })
     | Timeline_retry value ->

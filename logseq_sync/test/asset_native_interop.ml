@@ -29,6 +29,16 @@ let get = function
   | Error e -> failwith e
 ;;
 
+let version checksum =
+  get (Logseq_db_types.Asset_descriptor.version ~checksum ~file_type:"bin")
+;;
+
+let decoded result =
+  result
+  |> Result.map C.verified_bytes
+  |> Result.map_error C.decode_error_message
+;;
+
 let reject label result = if Result.is_ok result then failwith ("Accepted " ^ label)
 
 let () =
@@ -56,8 +66,8 @@ let () =
            ~maximum_plaintext_bytes:size
            ~crypto
            ~key:(Some key)
-           ~expected_checksum:checksum
-           wire
+           ~expected:(version checksum)
+           wire |> decoded
        in
        if get (decode upstream) <> plaintext then failwith "Upstream bytes changed";
        reject "wrong key" (decode ~key:(String.make 32 '\255') upstream);

@@ -743,22 +743,22 @@ let execute_request
         ; Filename.concat staging ("snapshot-" ^ id ^ ".gzip-2")
         ]
       in
-      let base_url = download.scope.account.managed_sync_origin in
-      let bearer_authorized = Http.same_origin base_url download.uri in
+      let base_url = (Core.snapshot_download_scope download).account.managed_sync_origin in
+      let bearer_authorized = Http.same_origin base_url (Core.snapshot_download_uri download) in
       let download_once token =
-        let request = Http.artifact ~base_url ~uri:download.uri ~token in
+        let request = Http.artifact ~base_url ~uri:(Core.snapshot_download_uri download) ~token in
         let response =
           t.dependencies.transport.download
             ~sw:t.sw
             ~request
             ~destination:raw
-            ~maximum_bytes:download.maximum_bytes
+            ~maximum_bytes:(Core.snapshot_download_maximum_bytes download)
             ~on_progress:(fun progress ->
               if not t.closed
               then
                 t.post
                   (Core.Snapshot_download_progress
-                     { graph_id = download.scope.graph_id
+                     { graph_id = (Core.snapshot_download_scope download).graph_id
                      ; received_bytes = Int64.of_int progress.received_bytes
                      ; total_bytes = Option.map Int64.of_int progress.total_bytes
                      }))
@@ -784,27 +784,23 @@ let execute_request
          then
            authenticated_operation
              t.dependencies.id_token_provider
-             ~account:download.scope.account
+             ~account:(Core.snapshot_download_scope download).account
              ~perform:(fun token -> perform (Some token))
          else Result.map_error authenticated_failure (perform None))
         |> Result.map_error (fun message -> Core.Effect_failed message)
       in
       Result.bind response (fun response ->
         Result.bind (Bootstrap.artifact_row_count response.headers) (fun expected_rows ->
-          Result.map
-            (fun () ->
-               Bootstrap.cleanup (raw :: temporary_paths);
-               Core.staged_artifact
-                 ~id
-                 ~scope:download.scope
-                 ~path:destination
-                 ~expected_rows)
+          Result.bind
             (Bootstrap.peel_gzip_layers
                ~decompress_gzip:Artifact_decoder.decompress_gzip
-               ~maximum_bytes:download.maximum_bytes
+               ~maximum_bytes:(Core.snapshot_download_maximum_bytes download)
                ~source:raw
                ~destination
-               ~temporary_paths))
+               ~temporary_paths)
+            (fun () ->
+               Bootstrap.cleanup (raw :: temporary_paths);
+               Core.stage_snapshot_download download ~path:destination ~expected_rows))
         |> Result.map_error (fun message -> Core.Effect_failed message)))
   | Load_and_unlock_graph_key scope ->
     run_secret_action t (fun () ->
@@ -1330,6 +1326,13 @@ let asset_cache_failure = function
   | Invalid message | Io message -> Core.Asset_invalid_content message
 ;;
 
+let asset_decode_failure = function
+  | Asset_codec.Checksum_mismatch -> Core.Asset_checksum_mismatch
+  | (Invalid_limit | Wire_too_large | Plaintext_too_large | Malformed_envelope
+    | Malformed_transit _ | Decryption_failed _) as error ->
+    Core.Asset_invalid_content (Asset_codec.decode_error_message error)
+;;
+
 let asset_graph_key t scope = function
   | Plaintext -> Ok None
   | Encrypted None -> Error Core.Asset_locked
@@ -1451,24 +1454,20 @@ let fetch_asset_admitted
             ; decrypt = t.dependencies.crypto.decrypt_aes_gcm
             }
           in
-          let* plaintext =
+          let* verified =
             Asset_codec.decode
               ~maximum_plaintext_bytes
               ~crypto
               ~key:graph_key
-              ~expected_checksum:version.checksum
+              ~expected:version
               response.body
-            |> Result.map_error (fun message ->
-              if message = "Asset checksum mismatch"
-              then Core.Asset_checksum_mismatch
-              else Core.Asset_invalid_content message)
+            |> Result.map_error asset_decode_failure
           in
           Asset_cache.publish
             cache
             ~asset
-            ~version
             ~current:(fun () -> (not t.closed) && current ())
-            ~plaintext
+            ~verified
           |> Result.map_error asset_cache_failure))
 ;;
 
@@ -1881,7 +1880,17 @@ let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
                let* plaintext = read_upload_source
                  ~maximum_plaintext_bytes:t.dependencies.local_store.asset_maximum_file_bytes
                  source_file in
-               let* handle = Asset_cache.publish cache ~asset ~version ~current ~plaintext
+               let crypto : Asset_codec.crypto =
+                 { encrypt = t.dependencies.crypto.encrypt_aes_gcm
+                 ; decrypt = t.dependencies.crypto.decrypt_aes_gcm }
+               in
+               (* This source is the retained local plaintext staging file, not
+                  HTTP wire data. It still crosses bounded checksum verification. *)
+               let* verified = Asset_codec.decode
+                 ~maximum_plaintext_bytes:t.dependencies.local_store.asset_maximum_file_bytes
+                 ~crypto ~key:None ~expected:version plaintext
+                 |> Result.map_error asset_decode_failure in
+               let* handle = Asset_cache.publish cache ~asset ~current ~verified
                  |> Result.map_error asset_cache_failure in
                Asset_cache.release cache handle;
                Ok Core.Asset_unit))

@@ -2,6 +2,7 @@ module Db = Logseq_db_worker
 module Pure = Logseq_db_worker_pure_reducer.Core
 module Worker_runner = Logseq_db_worker_effect_runner.Effect_runner
 module Sync = Logseq_sync_pure_reducer.Core
+module Unlock = Sync
 module Sync_runner = Logseq_sync_effect_runner.Effect_runner
 module Protocol = Db.Protocol
 module Overlay = Logseq_overlay_db.Database
@@ -91,6 +92,7 @@ type snapshot =
   ; selected_graph : graph_id option
   ; applied_server_t : Logseq_db_types.Server_cursor.t option
   ; timeline_presentation_pending : bool
+  ; unlock : Unlock.unlock_phase
   ; startup : startup_facts
   ; last_error : string option
   ; local_deletion : local_deletion option
@@ -161,6 +163,7 @@ let snapshot (value : Sync.snapshot) =
   ; selected_graph = value.selected_graph
   ; applied_server_t = value.applied_server_t
   ; timeline_presentation_pending = value.timeline_presentation_pending
+  ; unlock = value.unlock
   ; startup = startup_facts value.startup
   ; last_error = value.last_error
   ; local_deletion = value.local_deletion
@@ -204,7 +207,7 @@ type client_command =
   | Return_to_graph_picker
   | Refresh_catalog of startup_scope
   | Begin_online_recovery of timeline_scope
-  | Submit_e2ee_password of string
+  | Submit_e2ee_password of Unlock.unlock_challenge * string
   | Delete_local_cache of Sync.graph_id
   | Set_foreground of bool
 
@@ -626,8 +629,8 @@ let client_event = function
   | Return_to_graph_picker -> Pure.Sync_event Sync.Graph_picker_requested
   | Refresh_catalog scope -> Pure.Sync_event (Sync.Catalog_refresh_requested scope)
   | Begin_online_recovery scope -> Pure.Sync_event (Sync.Online_recovery_requested scope)
-  | Submit_e2ee_password password ->
-    Pure.Sync_event (Sync.E2ee_password_submitted password)
+  | Submit_e2ee_password (challenge, password) ->
+    Pure.Sync_event (Sync.E2ee_password_submitted (challenge, password))
   | Delete_local_cache graph_id ->
     Pure.Sync_event (Sync.Local_cache_deletion_requested graph_id)
   | Set_foreground foreground -> Pure.Set_foreground foreground
