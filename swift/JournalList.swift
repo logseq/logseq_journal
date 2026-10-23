@@ -770,7 +770,7 @@ import UIKit
         }
         .modifier(ListStyleModifier(style: style))
         #if os(iOS)
-        .overlay(TopScrollAccess(owner: topScroll).allowsHitTesting(false).accessibilityHidden(true))
+        .overlay(TopScrollAccess(owner: topScroll).ignoresSafeArea().allowsHitTesting(false).accessibilityHidden(true))
         #endif
         .onScrollGeometryChange(for: Bool.self) { geometry in
           geometry.contentOffset.y + geometry.contentInsets.top <= 1
