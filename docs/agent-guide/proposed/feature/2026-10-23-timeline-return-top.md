@@ -53,6 +53,19 @@ model. Separate scroll commands from prepared row snapshots so command-only
 changes preserve row identities. Reset interaction state on disappearance and
 context replacement; the actual native pan state still gates new requests.
 
+Follow-up review requires a distinct native-list `scroll_request` property,
+including matching OCaml/Swift schemas and fingerprints. Publish command changes
+through a mounted subscription without changing the Timeline content revision,
+serializing its rows, decoding its content or publishing the Swift content owner.
+Resolve the top intent against the actual presented first section, including
+future dates and synthetic empty Today. Preserve Capture's direct row target.
+
+The final PR111 baseline retains synchronous native layout. Removing that call
+was an unsuccessful control experiment, then it was restored to avoid revealing
+before cell layout completed. Its measured stall remains unresolved. Future
+measurements must start at the actual native command entry before OCaml work and
+Swift decoding, and include command clearance after animation completion.
+
 The recording and formal PR are authorized; merge and TestFlight are excluded.
 Remaining native List layout stalls must be disclosed with separate unrecorded
 measurements. Fade completion is not proof of responsiveness.

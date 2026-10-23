@@ -702,6 +702,7 @@ module View : sig
       :  ?key:Key.t
       -> style:style
       -> ?scroll_request:scroll_request
+      -> ?scroll_request_signal:scroll_request option Signal.signal
       -> ?on_scroll_completed:Event.handler
       -> ?on_visible_range:Event.handler
       -> section list

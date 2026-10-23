@@ -1203,14 +1203,13 @@ let observe_visible_range (state : t) ~first_index ~last_exclusive =
   }
 ;;
 
-(* Rendering consumes slots/date/errors and the active scroll command, not the
-   latest demand window or recovery bookkeeping. Slots are persistent. *)
+(* Content rendering consumes slots/date/errors. Scroll commands have an
+   independent mounted subscription; demand and recovery do not rebuild rows. *)
 let equal_presentation (left : t) (right : t) =
   left == right
   || (left.slots == right.slots
       && left.today = right.today
       && left.day_failures == right.day_failures
-      && left.scroll_target = right.scroll_target
       && (left.day_failures = []
           || Option.is_some left.pending = Option.is_some right.pending))
 ;;

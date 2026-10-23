@@ -1603,7 +1603,7 @@ module View = struct
       type scroll = { token : int64; target : target; anchor : string option [@default None]; animated : bool option [@default None] }
       [@@deriving yojson]
       type props =
-        { style : string; sections : section list; scroll_request : scroll option [@default None]
+        { style : string; sections : section list
         ; track_visible_range : bool; track_scroll_completion : bool }
       [@@deriving yojson]
       type row_event = { row : string; key : string } [@@deriving yojson]
@@ -1622,7 +1622,7 @@ module View = struct
     ;;
 
     (* Content indexes retain the native child ownership order. *)
-    let build sections ~style ~scroll_request ~track_visible ~track_scroll =
+    let build sections ~style ~track_visible ~track_scroll =
       let contents = ref Rrbvec.empty in
       let next_content_index = ref 0 in
       let push element =
@@ -1647,18 +1647,23 @@ module View = struct
         { key = section.section_key; separator = separator_name section.separator
         ; header_index; footer_index; rows = List.map row_wire section.rows }
       in
-      let scroll_wire (request : scroll_request) : Json.scroll =
-        { token = request.token
-        ; target = { section = request.target.section; row_path = request.target.row_path }
-        ; anchor = Option.map (function Top -> "top" | Center -> "center" | Bottom -> "bottom") request.anchor
-        ; animated = request.animated }
-      in
       let wire : Json.props =
         { style = style_name style; sections = List.map section_wire sections
-        ; scroll_request = Option.map scroll_wire scroll_request
         ; track_visible_range = track_visible; track_scroll_completion = track_scroll }
       in
       Json.props_to_yojson wire |> Yojson.Safe.to_string, Rrbvec.to_list !contents
+    ;;
+
+    let encode_scroll_request = function
+      | None -> "null"
+      | Some (request : scroll_request) ->
+        let wire : Json.scroll =
+          { token = request.token
+          ; target = { section = request.target.section; row_path = request.target.row_path }
+          ; anchor = Option.map (function Top -> "top" | Center -> "center" | Bottom -> "bottom") request.anchor
+          ; animated = request.animated }
+        in
+        Json.scroll_to_yojson wire |> Yojson.Safe.to_string
     ;;
 
     let decode_outcome = function
@@ -1678,6 +1683,7 @@ module View = struct
           ?key
           ~style
           ?scroll_request
+          ?scroll_request_signal
           ?on_scroll_completed
           ?on_visible_range
           sections
@@ -1686,7 +1692,6 @@ module View = struct
         build
           sections
           ~style
-          ~scroll_request
           ~track_visible:(Option.is_some on_visible_range)
           ~track_scroll:(Option.is_some on_scroll_completed)
       in
@@ -1754,12 +1759,17 @@ module View = struct
           | _ -> ()
       in
       element ?key (fun context parent ->
-        Journal_lui_native.mount
+        let requests = Option.map (fun source ->
+          let mapped = Signal.map encode_scroll_request source in
+          Signal.on_dispose context.Lui_ui.ui_scope (fun () -> Signal.dispose_signal mapped);
+          mapped) scroll_request_signal in
+        Journal_lui_native.list
           ?key
           ~payload
-          ~children:(List.map (fun element -> element.mount) contents)
+          ~scroll_request:(encode_scroll_request scroll_request)
+          ?scroll_request_signal:requests
           ~on_event
-          Journal_lui_native.list_identifier
+          (List.map (fun element -> element.mount) contents)
           context
           parent)
     ;;

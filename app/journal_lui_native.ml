@@ -14,6 +14,7 @@ let apple_profiles =
 ;;
 
 let payload_property = property "payload" StringScalar true None
+let scroll_request_property = property "scroll_request" StringScalar false None
 
 let event_schema =
   event
@@ -65,7 +66,7 @@ let registry =
        apple_profiles
        true
        children
-       [ payload_property ]
+       [ payload_property; scroll_request_property ]
        [ event_schema ]);
   register_component
     registry
@@ -118,9 +119,16 @@ let mount ?key ~payload ~children ?on_event identifier context parent =
   node
 ;;
 
-let list ?key ~payload ?on_event children : Lui_elements.t =
+let list ?key ~payload ?(scroll_request = "null") ?scroll_request_signal ?on_event children : Lui_elements.t =
   fun context parent ->
-  mount ?key ~payload ~children ?on_event list_identifier context parent
+  let node = mount ?key ~payload ~children ?on_event list_identifier context parent in
+  (match scroll_request_signal with
+   | None -> Lui_ui.extension_property context node "scroll_request" (StringValue scroll_request)
+   | Some source ->
+     let values = Signal.map (fun json -> StringValue json) source in
+     Signal.on_dispose context.Lui_ui.ui_scope (fun () -> Signal.dispose_signal values);
+     Lui_ui.extension_property_signal context node "scroll_request" values);
+  node
 ;;
 
 let image_preview ?key ~payload ?on_event children : Lui_elements.t =

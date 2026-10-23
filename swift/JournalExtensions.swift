@@ -56,6 +56,9 @@ enum JournalExtensionFingerprint {
   private static let payloadProperty =
     JournalExtensionFingerprint.Property(
       name: "payload", kind: "string", required: true, defaultValue: nil)
+  private static let scrollRequestProperty =
+    JournalExtensionFingerprint.Property(
+      name: "scroll_request", kind: "string", required: false, defaultValue: nil)
   private static let event =
     JournalExtensionFingerprint.Event(
       name: "event",
@@ -68,7 +71,7 @@ enum JournalExtensionFingerprint {
     JournalExtensionFingerprint.make(
       identifier: identifier, profiles: profiles,
       standardChildren: standardChildren, children: journalChildIdentifiers,
-      properties: [payloadProperty],
+      properties: identifier == "journal-list" ? [payloadProperty, scrollRequestProperty] : [payloadProperty],
       events: events ? [event] : [])
   }
 
@@ -154,7 +157,10 @@ enum JournalExtensionFingerprint {
         standardChildren: standardChildren, events: events),
       acceptsStandardChildren: standardChildren,
       childIdentifiers: journalChildIdentifiers,
-      properties: [.init(name: "payload", kind: .string, isRequired: true)],
+      properties: identifier == "journal-list"
+        ? [.init(name: "payload", kind: .string, isRequired: true),
+           .init(name: "scroll_request", kind: .string)]
+        : [.init(name: "payload", kind: .string, isRequired: true)],
       events: events ? [eventSchema] : [],
       viewFactory: viewFactory)
   }

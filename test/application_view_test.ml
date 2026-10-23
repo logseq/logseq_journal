@@ -1492,8 +1492,8 @@ let run_favorites_native_visibility
        if check_reselect then (
          let list () = Option.get (find "_extension" "journal-list") in
          let request () =
-           let payload = List.assoc "payload" (Hashtbl.find props (list ())) in
-           Yojson.Safe.Util.member "scroll_request" (Yojson.Safe.from_string (Yojson.Safe.Util.to_string payload))
+           List.assoc "scroll_request" (Hashtbl.find props (list ()))
+           |> Yojson.Safe.Util.to_string |> Yojson.Safe.from_string
          in
          let press label = dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" label))) in
          let completion token outcome =
@@ -1503,6 +1503,8 @@ let run_favorites_native_visibility
              (Yojson.Safe.to_string (`Assoc ["id", `Int 1; "payload", `String event])))
          in
          Alcotest.(check bool) "mount has no unsolicited scroll" true (request () = `Null);
+         let content = List.assoc "payload" (Hashtbl.find props (list ())) in
+         Hashtbl.clear regions;
          press "Journals";
          let first = request () in
          Alcotest.(check bool) "reselect requests the first date" true (first <> `Null);
@@ -1513,6 +1515,12 @@ let run_favorites_native_visibility
          let token = Yojson.Safe.Util.member "token" first in
          completion token "cancelled";
          Alcotest.(check bool) "drag cancellation clears request" true (request () = `Null);
+         Alcotest.(check bool) "command cycle preserves serialized content" true
+           (List.assoc "payload" (Hashtbl.find props (list ())) = content);
+         List.iter (fun name ->
+           Alcotest.(check int) ("command cycle does not rebuild " ^ name) 0
+             (Option.value (Hashtbl.find_opt regions name) ~default:0))
+           [ "timeline"; "timeline-item-compare"; "timeline-structure-change" ];
          press "Journals";
          let second = request () in
          completion token "succeeded";

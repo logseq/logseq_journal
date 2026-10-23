@@ -23,7 +23,7 @@ import UIKit
 /// Positions are flat indices across the displayed rows in payload order
 /// (disclosure children count only while the parent is expanded).
 @MainActor enum JournalList {
-  struct Action: Decodable, Identifiable, Equatable {
+  struct Action: Decodable, Identifiable {
     let key: String
     let enabled: Bool?
     let role: String?
@@ -31,8 +31,8 @@ import UIKit
     let title: String
     var id: String { key }
   }
-  struct ActionGroup: Decodable, Equatable { let actions: [Action] }
-  struct Row: Decodable, Identifiable, Equatable {
+  struct ActionGroup: Decodable { let actions: [Action] }
+  struct Row: Decodable, Identifiable {
     let type: String
     let key: String
     let content_index: Int
@@ -44,7 +44,7 @@ import UIKit
     var id: String { key }
     var isDisclosure: Bool { type == "disclosure" }
   }
-  struct SectionModel: Decodable, Identifiable, Equatable {
+  struct SectionModel: Decodable, Identifiable {
     let key: String
     let separator: String?
     let header_index: Int?
@@ -74,23 +74,11 @@ import UIKit
     var payload: String? = nil
   }
 
-  struct Properties: Decodable, Equatable {
+  struct Properties: Decodable {
     let style: String
     let sections: [SectionModel]
     let track_visible_range: Bool?
     let track_scroll_completion: Bool?
-  }
-
-  private struct Payload: Decodable {
-    let content: Properties
-    let scrollRequest: ScrollRequest?
-    private enum CodingKeys: String, CodingKey { case scroll_request }
-
-    init(from decoder: Decoder) throws {
-      content = try Properties(from: decoder)
-      let values = try decoder.container(keyedBy: CodingKeys.self)
-      scrollRequest = try values.decodeIfPresent(ScrollRequest.self, forKey: .scroll_request)
-    }
   }
 
   /// One payload observation belongs to one mounted native list. Child-model
@@ -133,7 +121,15 @@ import UIKit
 
   @MainActor final class PreparedState: ObservableObject {
     @Published private(set) var snapshot: Snapshot?
-    @Published private(set) var scrollRequest: ScrollRequest?
+    private(set) var scrollRequest: ScrollRequest?
+    // Commands never publish this content owner. The mounted view subscribes
+    // directly; row content is decoded only by its separate payload observer.
+    var onScrollRequest: ((ScrollRequest?) -> Void)? {
+      didSet {
+        if onScrollRequest != nil { commandNeedsDelivery = true }
+        deliverScrollRequest()
+      }
+    }
     private var context: LUIAppleExtensionViewContext?
     private var instance = UUID()
     private var rowIncarnations: [String: UUID] = [:]
@@ -141,6 +137,10 @@ import UIKit
     private var delivered: Range<Int>?
     private var payload: String?
     private var refreshTask: Task<Void, Never>?
+    private var commandTask: Task<Void, Never>?
+    private var commandPayload: String?
+    private var commandObservation = UUID()
+    private var commandNeedsDelivery = false
     private var emitTask: Task<Void, Never>?
     private var dirty = false
     private var active = false
@@ -165,15 +165,21 @@ import UIKit
     func bind(_ context: LUIAppleExtensionViewContext) {
       if let previous = self.context, previous.nodeID != context.nodeID { dispose() }
       active = true
-      guard self.context == nil else { scheduleRange(); return }
+      guard self.context == nil else {
+        refreshScrollRequest()
+        scheduleRange()
+        return
+      }
       self.context = context
       refresh()
+      refreshScrollRequest()
     }
 
     // A navigation destination can be retained while temporarily offscreen.
     // Keep its native List content, visible keys and row identities for Back.
     func suspend() {
       active = false
+      onScrollRequest = nil
       emitTask?.cancel()
       emitTask = nil
       delivered = nil
@@ -186,6 +192,11 @@ import UIKit
       context = nil
       refreshTask?.cancel()
       refreshTask = nil
+      commandTask?.cancel()
+      commandTask = nil
+      commandObservation = UUID()
+      commandPayload = nil
+      commandNeedsDelivery = false
       emitTask?.cancel()
       emitTask = nil
       // Keep List content while a retained navigation destination is offscreen.
@@ -220,32 +231,65 @@ import UIKit
       let nextPayload: String?
       if case let .string(json) = value { nextPayload = json } else { nextPayload = nil }
       if nextPayload != payload {
-        let newBinding = payload == nil
         payload = nextPayload
-        let decoded = nextPayload.flatMap {
-          try? JSONDecoder().decode(Payload.self, from: Data($0.utf8))
-        }
-        let contentChanged = decoded?.content != snapshot?.properties
-        if contentChanged {
-          snapshot = decoded.flatMap { Snapshot(properties: $0.content) }
-        }
-        scrollRequest = snapshot == nil ? nil : decoded?.scrollRequest
+        snapshot = nextPayload.flatMap { Snapshot($0) }
         if snapshot == nil {
           JournalExtensions.report(context: context, code: "diagnostic.nativePropsDecode")
         }
-        if contentChanged || newBinding {
-          let positions = snapshot?.positions ?? [:]
-          rowIncarnations = positions.reduce(into: [:]) { result, entry in
-            result[entry.key] = rowIncarnations[entry.key] ?? UUID()
-          }
-          visible = visible.intersection(positions.keys)
+        let positions = snapshot?.positions ?? [:]
+        rowIncarnations = positions.reduce(into: [:]) { result, entry in
+          result[entry.key] = rowIncarnations[entry.key] ?? UUID()
         }
+        visible = visible.intersection(positions.keys)
+        commandNeedsDelivery = true
       }
       dirty = false
       let pending = queued
       queued.removeAll()
       for (lease, appeared) in pending { _ = receive(lease, appeared: appeared) }
       scheduleRange()
+      deliverScrollRequest()
+    }
+
+    private func refreshScrollRequest() {
+      guard let context else { return }
+      let observedInstance = instance
+      let observation = UUID()
+      commandObservation = observation
+      let value = withObservationTracking {
+        context.property("scroll_request")
+      } onChange: { [weak self] in
+        MainActor.assumeIsolated {
+          guard let self, self.instance == observedInstance,
+            self.commandObservation == observation else { return }
+          self.commandTask?.cancel()
+          self.commandTask = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled, self.instance == observedInstance else { return }
+            self.refreshScrollRequest()
+          }
+        }
+      }
+      let next: String?
+      if case let .string(json) = value { next = json } else { next = nil }
+      if next != commandPayload {
+        commandPayload = next
+        do {
+          scrollRequest = try next.flatMap {
+            try JSONDecoder().decode(ScrollRequest?.self, from: Data($0.utf8))
+          }
+        } catch {
+          scrollRequest = nil
+          JournalExtensions.report(context: context, code: "diagnostic.nativePropsDecode")
+        }
+        commandNeedsDelivery = true
+      }
+      deliverScrollRequest()
+    }
+
+    private func deliverScrollRequest() {
+      guard active, !dirty, commandNeedsDelivery, let onScrollRequest else { return }
+      commandNeedsDelivery = false
+      onScrollRequest(snapshot == nil ? nil : scrollRequest)
     }
 
     func lease(for key: String) -> RowLease? {
@@ -527,6 +571,16 @@ import UIKit
       emit(Event(type: "scroll_completed", token: token, outcome: outcome))
     }
 
+    private func observeScrollRequests() {
+      prepared.onScrollRequest = { request in
+        if let request { applyScrollRequest(request) }
+        else {
+          if pendingScroll != nil { pendingScroll = nil }
+          topScroll.cancel()
+        }
+      }
+    }
+
     /// Walk target.row_path from the section's top-level rows; intermediate
     /// elements descend into disclosure children.
     private func resolveTarget(_ target: ScrollRequest.Target) -> Row? {
@@ -572,7 +626,8 @@ import UIKit
       default: .top
       }
       pendingScroll = (request, row.key, anchor)
-      performPendingScroll()
+      // Capture can insert its target in this same content commit. Wait for
+      // SwiftUI to render the pending request with those rows before scrolling.
     }
 
     private func withoutAnimation(_ change: () -> Void) {
@@ -582,7 +637,8 @@ import UIKit
     }
 
     private func performPendingScroll() {
-      guard let pending = pendingScroll, let proxy = scrollProxy else { return }
+      guard topScroll.active, let pending = pendingScroll,
+        pending.request.token == topScroll.handledToken, let proxy = scrollProxy else { return }
       withoutAnimation { proxy.scrollTo(pending.id, anchor: pending.anchor) }
       if !pending.request.target.row_path.isEmpty {
         pendingScroll = nil
@@ -727,13 +783,14 @@ import UIKit
           prepared.bind(context)
           scrollProxy = proxy
           performPendingScroll()
-          if let request = prepared.scrollRequest { applyScrollRequest(request) }
+          observeScrollRequests()
         }
       }
       .onDisappear {
         topScroll.active = false
         topScroll.interactionChanged(false)
         topScroll.cancel()
+        pendingScroll = nil
         prepared.suspend()
         scrollProxy = nil
         topScroll.geometryChanged(false)
@@ -741,17 +798,15 @@ import UIKit
       .onChange(of: context.nodeID) { _, _ in
         topScroll.interactionChanged(false)
         topScroll.cancel()
+        pendingScroll = nil
         prepared.dispose()
         topScroll.handledToken = 0
         topScroll.geometryChanged(false)
         prepared.bind(context)
-        if let request = prepared.scrollRequest { applyScrollRequest(request) }
-      }
-      .onChange(of: prepared.scrollRequest?.token) { _, _ in
-        if let request = prepared.scrollRequest { applyScrollRequest(request) }
-        else { topScroll.cancel() }
+        observeScrollRequests()
       }
       .onChange(of: reduceMotion) { _, reduced in topScroll.reduceMotionChanged(reduced) }
+      .onChange(of: pendingScroll?.request.token) { _, _ in performPendingScroll() }
     }
   }
 

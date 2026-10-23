@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Combine
 @testable import LUIAppleBackend
 
 // Native payload parsing/lifecycle ownership is not reachable through an OCaml
@@ -10,7 +11,7 @@ import SwiftUI
     if !value() { failures += 1; FileHandle.standardOutput.write(Data(("FAIL: " + message + "\n").utf8)) }
   }
   static func payload(_ keys: [String], expanded: Bool? = nil, track: Bool = true,
-                      token: Int64? = nil, title: String = "Status") -> String {
+                      title: String = "Status") -> String {
     var rows: [[String: Any]] = keys.enumerated().map { index, key in
       ["type": "row", "key": key, "content_index": index,
        "context_menu": ["actions": [["key": "status", "title": title]]]]
@@ -20,15 +21,16 @@ import SwiftUI
       rows[0]["expanded"] = expanded
       rows[0]["children"] = [["type": "row", "key": "child", "content_index": 0]]
     }
-    var object: [String: Any] = ["style": "plain", "track_visible_range": track,
+    let object: [String: Any] = ["style": "plain", "track_visible_range": track,
       "track_scroll_completion": true, "sections": [["key": "day", "rows": rows]]]
-    if let token { object["scroll_request"] = ["token": token,
-      "target": ["section": "day", "row_path": [keys.first ?? "missing"]]] }
     return String(decoding: try! JSONSerialization.data(withJSONObject: object, options: .sortedKeys), as: UTF8.self)
   }
-  static func patch(_ backend: LUIAppleBackend, _ payload: String) throws {
+  static func command(_ token: Int64) -> String {
+    "{\"token\":\(token),\"target\":{\"section\":\"day\",\"row_path\":[\"a\"]}}"
+  }
+  static func patch(_ backend: LUIAppleBackend, _ payload: String, property: String = "payload") throws {
     let object: [String: Any] = ["generation": backend.generation + 1, "ops": [["op": "set-extension-prop",
-      "id": 1, "property": "payload", "value": payload]]]
+      "id": 1, "property": property, "value": payload]]]
     try backend.apply(json: String(decoding: JSONSerialization.data(withJSONObject: object), as: UTF8.self))
   }
   static func settle() async { for _ in 0..<10 { await Task.yield() } }
@@ -36,7 +38,8 @@ import SwiftUI
     var captured: LUIAppleExtensionViewContext?
     let registry = LUIAppleExtensionRegistry()
     try registry.register(LUIAppleExtension(identifier: "journal-list", fingerprint: "snapshot-test",
-      acceptsStandardChildren: true, properties: [.init(name: "payload", kind: .string, isRequired: true)],
+      acceptsStandardChildren: true, properties: [.init(name: "payload", kind: .string, isRequired: true),
+        .init(name: "scroll_request", kind: .string)],
       events: [.init(name: "event", fields: [.init(name: "id", kind: .int, isRequired: true),
         .init(name: "payload", kind: .string, isRequired: true)])]) { context in
       captured = context; return AnyView(EmptyView())
@@ -82,16 +85,25 @@ import SwiftUI
     try backend.apply(json: String(decoding: JSONSerialization.data(withJSONObject: childOnly), as: UTF8.self))
     await settle()
     check(owner.snapshot === first, "child-only content revision must not decode payload")
-    // A scroll command must not replace identical row content or force the
-    // native List to reprepare its cells before the jump.
-    try patch(backend, payload(["a", "b", "c"], token: 19))
+    // Command-only commits never publish the content owner or decode its rows.
+    var publications = 0
+    let publication = owner.objectWillChange.sink { publications += 1 }
+    var commands: [Int64?] = []
+    owner.onScrollRequest = { commands.append($0?.token) }
+    check(commands.count == 1 && commands[0] == nil, "new subscriber observes the current empty command")
+    commands.removeAll()
+    try patch(backend, command(19), property: "scroll_request")
     await settle()
     check(owner.snapshot === first, "scroll-only command retains prepared row content")
     check(owner.scrollRequest?.token == 19, "scroll-only command is still delivered")
-    try patch(backend, payload(["a", "b", "c"]))
+    try patch(backend, "null", property: "scroll_request")
     await settle()
     check(owner.snapshot === first, "scroll completion retains prepared row content")
     check(owner.scrollRequest == nil, "completion clears the command independently")
+    check(commands.count == 2 && commands[0] == 19 && commands[1] == nil,
+      "command subscriber receives request and cancellation")
+    check(publications == 0, "command updates and clears must not publish the content owner")
+    publication.cancel()
     owner.suspend()
     check(!owner.receive(c, appeared: true), "offscreen retained list rejects queued callback")
     check(owner.snapshot === first && owner.range == 1..<2, "navigation suspension retains content and visibility")
@@ -126,11 +138,12 @@ import SwiftUI
     try patch(backend, payload(["a", "b"], expanded: true))
     await settle()
     check(!owner.receive(child, appeared: true), "re-expansion does not revive collapsed incarnation")
-    try patch(backend, payload(["a", "b"], expanded: true, track: false, token: 17))
+    try patch(backend, payload(["a", "b"], expanded: true, track: false))
+    try patch(backend, command(17), property: "scroll_request")
     await settle()
     check(owner.snapshot?.properties.track_visible_range == false && owner.scrollRequest?.token == 17, "track flags and scroll tokens invalidate snapshot")
     let beforeNoop = owner.snapshot
-    try patch(backend, payload(["a", "b"], expanded: true, track: false, token: 17))
+    try patch(backend, payload(["a", "b"], expanded: true, track: false))
     await settle()
     check(owner.snapshot === beforeNoop, "identical backend payload does not replace snapshot")
     try patch(backend, "malformed")
