@@ -453,6 +453,7 @@ let run_favorites_native_visibility
       ?calendar_change
       ?(timeline_rows = 3)
       ?(check_generation = false)
+      ?(check_reselect = false)
       ?(check_chrome = false)
       ?(check_error_control = false)
       ?malformed_native_event
@@ -1488,6 +1489,67 @@ let run_favorites_native_visibility
        wait "Journals mounted" (fun () ->
          Option.is_some (find "accessibility-label" "Favorites")
          && Option.is_some (find "text" "Timeline fixture 2"));
+       if check_reselect then (
+         let list () = Option.get (find "_extension" "journal-list") in
+         let request () =
+           List.assoc "scroll_request" (Hashtbl.find props (list ()))
+           |> Yojson.Safe.Util.to_string |> Yojson.Safe.from_string
+         in
+         let press label = dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" label))) in
+         let completion token outcome =
+           let event = Yojson.Safe.to_string (`Assoc
+             ["type", `String "scroll_completed"; "token", token; "outcome", `String outcome]) in
+           consume (hooks.extension_event (list ()) "event"
+             (Yojson.Safe.to_string (`Assoc ["id", `Int 1; "payload", `String event])))
+         in
+         Alcotest.(check bool) "mount has no unsolicited scroll" true (request () = `Null);
+         let content = List.assoc "payload" (Hashtbl.find props (list ())) in
+         Hashtbl.clear regions;
+         press "Journals";
+         let first = request () in
+         Alcotest.(check bool) "reselect requests the first date" true (first <> `Null);
+         Alcotest.(check bool) "section target includes empty Today" true
+           (Yojson.Safe.Util.(member "row_path" (member "target" first)) = `List []);
+         press "Journals";
+         Alcotest.(check bool) "pending reselect coalesces" true (request () = first);
+         let token = Yojson.Safe.Util.member "token" first in
+         completion token "cancelled";
+         Alcotest.(check bool) "drag cancellation clears request" true (request () = `Null);
+         Alcotest.(check bool) "command cycle preserves serialized content" true
+           (List.assoc "payload" (Hashtbl.find props (list ())) = content);
+         List.iter (fun name ->
+           Alcotest.(check int) ("command cycle does not rebuild " ^ name) 0
+             (Option.value (Hashtbl.find_opt regions name) ~default:0))
+           [ "timeline"; "timeline-item-compare"; "timeline-structure-change" ];
+         press "Journals";
+         let second = request () in
+         completion token "succeeded";
+         Alcotest.(check bool) "stale completion cannot clear newer request" true (request () = second);
+         press "Favorites";
+         press "Journals";
+         Alcotest.(check bool) "returning to Timeline does not replay cancelled request" true (request () = `Null);
+         press "Journals";
+         let third = request () in
+         completion (Yojson.Safe.Util.member "token" third) "succeeded";
+         Alcotest.(check bool) "successful completion clears request" true (request () = `Null);
+         (* Root_navigation's opaque public state has no route-open event or scroll
+            observation. The mounted Application is the narrow public boundary. *)
+         press "Journals";
+         let label = Option.get (find "text" "Timeline fixture 1") in
+         dispatch (Lui_protocol.Press (ancestor_property label "press-enabled"));
+         wait "Detail loads during pending return" (fun () ->
+           Option.is_some (find "accessibility-identifier"
+             ("detail-block:" ^ G.Uuid.to_string (uuid 2))));
+         let nav = Option.get (find "_extension" "navigation-stack") in
+         let payload () =
+           let revision = List.assoc "revision" (Hashtbl.find props nav)
+             |> Yojson.Safe.Util.to_int in
+           Yojson.Safe.to_string (`Assoc ["revision", `Int revision; "length", `Int 0])
+         in
+         hooks.extension_event nav "path-changed" (payload ()) |> consume;
+         hooks.extension_event nav "settled" (payload ()) |> consume;
+         (* A hidden/disabled native extension is allowed to drop its completion. *)
+         Alcotest.(check bool) "Detail cancels without requiring a native completion" true (request () = `Null));
        (* OCaml event decoding belongs to the mounted view adapter, outside
           Root_navigation's public reducer events. Exercise the real decoder. *)
        Option.iter (fun mode ->
@@ -6787,7 +6849,9 @@ let () =
             (fun () -> test_reference_outer_terminals true)
         ] )
     ; ( "root navigation"
-      , [ Alcotest.test_case
+      , [ Alcotest.test_case "Timeline reselect ownership" `Quick
+            (fun () -> run_favorites_native_visibility ~check_reselect:true ())
+        ; Alcotest.test_case
             "native Favorites media visibility"
             `Quick
             test_favorites_native_visibility_retires_media

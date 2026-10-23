@@ -440,6 +440,7 @@ let test_timeline_has_no_chevron () =
       ~on_delete:handler
       ~on_copy:handler
       ~children:[ V.text "Body" ]
+      ()
     |> V.Body.Private.to_widget
   in
   with_mounted view (fun _ ops ->
@@ -519,7 +520,71 @@ let timeline_action_view ~enabled received =
     ~on_delete:(handler "delete")
     ~on_copy:(handler "copy")
     ~children:[ V.text "Action target" ]
+    ()
   |> V.Body.Private.to_widget
+;;
+
+(* The Timeline reducer cannot see the synthetic empty-Today heading inserted
+   by presentation. Target resolution belongs to this public mounted view. *)
+let test_timeline_return_targets_presented_first_date () =
+  let module Timeline = Journal_timeline_state in
+  let today = 20260808 in
+  let future = 20260809 in
+  let entry day index : Journal_graph_projection.timeline_entry =
+    let block =
+      Journal_model.create
+        ~id:(Printf.sprintf "20000000-0000-4000-a000-%012d" index)
+        ~page_id:(Printf.sprintf "20000000-0000-4000-b000-%012d" day)
+        ~journal_day:day ~parent_id:None ~sibling_order:"000000000001"
+        ~source:"Future-day return fixture" ~task_state:Journal_model.No_status
+        ~child_count:0 ~creation_time ~revision:"r" ~last_mutation_id:mutation_id
+      |> require_ok
+    in
+    { block; child_summaries = [] }
+  in
+  let day day entries : Journal_graph_projection.day_feed =
+    { page = { id = Printf.sprintf "20000000-0000-4000-b000-%012d" day; day; title = string_of_int day }
+    ; entries; continuation = None; has_more_entries = false }
+  in
+  let handler = Ui.Event.Handler.create (fun _ -> ()) in
+  List.iter (fun today_nonempty ->
+    let feed : Journal_graph_projection.feed =
+      { days = [ day future [ entry future 1 ]; day today (if today_nonempty then [ entry today 2 ] else []) ]
+      ; slot_count = (if today_nonempty then 4 else 3); has_more_days = false }
+    in
+    let state = Timeline.empty ~today in
+    let state = Timeline.begin_request state ~generation:1L (Feed { before_day = None }) in
+    let state = Timeline.apply_feed state ~generation:1L feed in
+    List.iter (fun capture ->
+      let state = if capture then Timeline.prepend_timeline_entry state (entry today 3)
+        else Timeline.request_top state in
+      let capture_target = Timeline.scroll_target state in
+      let view = Journal_timeline.view ~render_source:Fun.id
+        ~render_media:(fun ~title:_ ~root:_ ~image_children:_ child -> child)
+        ~state ~day_presentation:(fun _ -> None) ~on_visible_range:handler
+        ~on_scroll_completed:handler ~on_retry_day:handler ~on_open_block:handler
+        ~delete_enabled:true ~actions_enabled:true ~on_status:handler
+        ~on_delete:handler ~on_copy:handler () |> V.Body.Private.to_widget in
+      with_mounted view (fun _ ops ->
+        let node = native_list_node (ops ()) in
+        let property name = List.find_map (function
+          | Lui_protocol.SetExtensionProp (id, property, StringValue json)
+            when id = node && property = name -> Some (Yojson.Basic.from_string json)
+          | _ -> None) (ops ()) |> Option.get in
+        let open Yojson.Basic.Util in
+        let first = property "payload" |> member "sections" |> to_list |> List.hd |> member "key" in
+        let target = property "scroll_request" |> member "target" in
+        let expected_day = if today_nonempty then future else today in
+        if capture then (
+          let _, expected_day, expected_row = Option.get capture_target in
+          require (member "section" target = `String (string_of_int expected_day)) "Capture date was remapped";
+          require (member "row_path" target = `List [ `String expected_row ])
+            "Capture lost its direct row target")
+        else (
+          require (first = `String (string_of_int expected_day)) "future-date fixture did not expose expected first section";
+          require (member "section" target = first && member "row_path" target = `List [])
+            "return-to-top must target the actual presented first section")))
+      [ false; true ]) [ false; true ]
 ;;
 
 let test_timeline_native_status_delete_callbacks () =
@@ -3057,6 +3122,8 @@ let tests =
       , test_mounted_input_revisions_remain_independent )
   ; ( "Timeline native Status/Delete callbacks"
     , test_timeline_native_status_delete_callbacks )
+  ; ( "Timeline return targets presented first date"
+    , test_timeline_return_targets_presented_first_date )
   ; ( "native action rejection"
     , test_native_row_actions_ignore_disabled_missing_and_malformed )
   ; "nested native action owners", test_native_nested_row_actions_bind_current_owner

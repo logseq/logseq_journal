@@ -1050,6 +1050,25 @@ let next_request (state : t) =
 
 let pending_request (state : t) = state.pending
 
+let request_top (state : t) =
+  match state.scroll_target with
+  | Some _ -> state
+  | None ->
+    let token = Int64.succ state.scroll_generation in
+    { state with
+      scroll_generation = token
+    ; scroll_target = Some (token, state.today, "day:" ^ string_of_int state.today)
+    ; scroll_outcome = None
+    }
+;;
+
+let cancel_scroll (state : t) =
+  match state.scroll_target with
+  | None -> state
+  | Some _ ->
+    { state with scroll_target = None; scroll_outcome = Some Cancelled }
+;;
+
 let prepend_timeline_entry (state : t) (entry : Journal_graph_projection.timeline_entry) =
   let before = state in
   let block = entry.Journal_graph_projection.block in
@@ -1184,14 +1203,13 @@ let observe_visible_range (state : t) ~first_index ~last_exclusive =
   }
 ;;
 
-(* Rendering consumes slots/date/errors and the active scroll command, not the
-   latest demand window or recovery bookkeeping. Slots are persistent. *)
+(* Content rendering consumes slots/date/errors. Scroll commands have an
+   independent mounted subscription; demand and recovery do not rebuild rows. *)
 let equal_presentation (left : t) (right : t) =
   left == right
   || (left.slots == right.slots
       && left.today = right.today
       && left.day_failures == right.day_failures
-      && left.scroll_target = right.scroll_target
       && (left.day_failures = []
           || Option.is_some left.pending = Option.is_some right.pending))
 ;;

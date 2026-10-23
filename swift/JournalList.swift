@@ -1,6 +1,9 @@
 import LUIAppleBackend
 import SwiftUI
 import Observation
+#if os(iOS)
+import UIKit
+#endif
 
 /// SwiftUI host for the `journal-list` extension — the lui replacement for
 /// bonsai's `Native_list` family (grouped sections, disclosure rows, scroll
@@ -74,7 +77,6 @@ import Observation
   struct Properties: Decodable {
     let style: String
     let sections: [SectionModel]
-    let scroll_request: ScrollRequest?
     let track_visible_range: Bool?
     let track_scroll_completion: Bool?
   }
@@ -85,9 +87,13 @@ import Observation
     let properties: Properties
     let positions: [String: Int]
 
-    init?(_ json: String) {
+    convenience init?(_ json: String) {
       guard let properties = try? JSONDecoder().decode(Properties.self, from: Data(json.utf8))
       else { return nil }
+      self.init(properties: properties)
+    }
+
+    init?(properties: Properties) {
       var positions: [String: Int] = [:]
       var keys: Set<String> = []
       var valid = true
@@ -115,6 +121,15 @@ import Observation
 
   @MainActor final class PreparedState: ObservableObject {
     @Published private(set) var snapshot: Snapshot?
+    private(set) var scrollRequest: ScrollRequest?
+    // Commands never publish this content owner. The mounted view subscribes
+    // directly; row content is decoded only by its separate payload observer.
+    var onScrollRequest: ((ScrollRequest?) -> Void)? {
+      didSet {
+        if onScrollRequest != nil { commandNeedsDelivery = true }
+        deliverScrollRequest()
+      }
+    }
     private var context: LUIAppleExtensionViewContext?
     private var instance = UUID()
     private var rowIncarnations: [String: UUID] = [:]
@@ -122,6 +137,10 @@ import Observation
     private var delivered: Range<Int>?
     private var payload: String?
     private var refreshTask: Task<Void, Never>?
+    private var commandTask: Task<Void, Never>?
+    private var commandPayload: String?
+    private var commandObservation = UUID()
+    private var commandNeedsDelivery = false
     private var emitTask: Task<Void, Never>?
     private var dirty = false
     private var active = false
@@ -146,15 +165,21 @@ import Observation
     func bind(_ context: LUIAppleExtensionViewContext) {
       if let previous = self.context, previous.nodeID != context.nodeID { dispose() }
       active = true
-      guard self.context == nil else { scheduleRange(); return }
+      guard self.context == nil else {
+        refreshScrollRequest()
+        scheduleRange()
+        return
+      }
       self.context = context
       refresh()
+      refreshScrollRequest()
     }
 
     // A navigation destination can be retained while temporarily offscreen.
     // Keep its native List content, visible keys and row identities for Back.
     func suspend() {
       active = false
+      onScrollRequest = nil
       emitTask?.cancel()
       emitTask = nil
       delivered = nil
@@ -167,11 +192,17 @@ import Observation
       context = nil
       refreshTask?.cancel()
       refreshTask = nil
+      commandTask?.cancel()
+      commandTask = nil
+      commandObservation = UUID()
+      commandPayload = nil
+      commandNeedsDelivery = false
       emitTask?.cancel()
       emitTask = nil
       // Keep List content while a retained navigation destination is offscreen.
       // Binding again refreshes it before delivering any lifecycle work.
       payload = nil
+      scrollRequest = nil
       rowIncarnations.removeAll()
       visible.removeAll()
       queued.removeAll()
@@ -201,7 +232,7 @@ import Observation
       if case let .string(json) = value { nextPayload = json } else { nextPayload = nil }
       if nextPayload != payload {
         payload = nextPayload
-        snapshot = nextPayload.flatMap(Snapshot.init)
+        snapshot = nextPayload.flatMap { Snapshot($0) }
         if snapshot == nil {
           JournalExtensions.report(context: context, code: "diagnostic.nativePropsDecode")
         }
@@ -210,12 +241,55 @@ import Observation
           result[entry.key] = rowIncarnations[entry.key] ?? UUID()
         }
         visible = visible.intersection(positions.keys)
+        commandNeedsDelivery = true
       }
       dirty = false
       let pending = queued
       queued.removeAll()
       for (lease, appeared) in pending { _ = receive(lease, appeared: appeared) }
       scheduleRange()
+      deliverScrollRequest()
+    }
+
+    private func refreshScrollRequest() {
+      guard let context else { return }
+      let observedInstance = instance
+      let observation = UUID()
+      commandObservation = observation
+      let value = withObservationTracking {
+        context.property("scroll_request")
+      } onChange: { [weak self] in
+        MainActor.assumeIsolated {
+          guard let self, self.instance == observedInstance,
+            self.commandObservation == observation else { return }
+          self.commandTask?.cancel()
+          self.commandTask = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled, self.instance == observedInstance else { return }
+            self.refreshScrollRequest()
+          }
+        }
+      }
+      let next: String?
+      if case let .string(json) = value { next = json } else { next = nil }
+      if next != commandPayload {
+        commandPayload = next
+        do {
+          scrollRequest = try next.flatMap {
+            try JSONDecoder().decode(ScrollRequest?.self, from: Data($0.utf8))
+          }
+        } catch {
+          scrollRequest = nil
+          JournalExtensions.report(context: context, code: "diagnostic.nativePropsDecode")
+        }
+        commandNeedsDelivery = true
+      }
+      deliverScrollRequest()
+    }
+
+    private func deliverScrollRequest() {
+      guard active, !dirty, commandNeedsDelivery, let onScrollRequest else { return }
+      commandNeedsDelivery = false
+      onScrollRequest(snapshot == nil ? nil : scrollRequest)
     }
 
     func lease(for key: String) -> RowLease? {
@@ -263,12 +337,206 @@ import Observation
     }
   }
 
+  @MainActor private final class TopScroll: ObservableObject {
+    var active = false
+    var handledToken: Int64 = 0
+    private var userInteracting = false
+    private var atTop = false
+    #if os(iOS)
+    weak var scrollView: UIScrollView?
+    weak var cover: UIView?
+    private enum Phase { case fadingOut, jumping, waitingForLayout, fadingIn }
+    private var phase: Phase?
+    private var pending: (id: UUID, token: Int64, complete: (Int64, String) -> Void)?
+    private var reduced = false
+    private var deadline: Task<Void, Never>?
+    #endif
+
+    func accept(_ token: Int64) -> Bool {
+      guard active, token > handledToken else { return false }
+      handledToken = token
+      cancel()
+      return true
+    }
+
+    func interactionChanged(_ interacting: Bool) {
+      userInteracting = interacting
+      if interacting { cancel() }
+    }
+
+    func geometryChanged(_ top: Bool) {
+      atTop = top
+      #if os(iOS)
+      if top, phase == .waitingForLayout, let id = pending?.id { reveal(id) }
+      #endif
+    }
+
+    func cancel() {
+      #if os(iOS)
+      let previous = pending
+      pending = nil
+      phase = nil
+      deadline?.cancel()
+      deadline = nil
+      cover?.layer.removeAllAnimations()
+      UIView.performWithoutAnimation { cover?.alpha = 0 }
+      if let previous { previous.complete(previous.token, "cancelled") }
+      #endif
+    }
+
+    func reduceMotionChanged(_ value: Bool) {
+      #if os(iOS)
+      reduced = value
+      guard value, let id = pending?.id else { return }
+      phase = .jumping
+      cover?.layer.removeAllAnimations()
+      UIView.performWithoutAnimation { cover?.alpha = 0 }
+      jump(id)
+      #endif
+    }
+
+    #if os(iOS)
+    func start(token: Int64, reduced: Bool, complete: @escaping (Int64, String) -> Void) {
+      guard active, let scrollView, scrollView.window != nil, let cover,
+        !userInteracting, !scrollView.isTracking, !scrollView.isDragging else {
+        complete(token, "cancelled")
+        return
+      }
+      if scrollView.contentOffset.y + scrollView.adjustedContentInset.top <= 1 {
+        complete(token, "succeeded")
+        return
+      }
+      let id = UUID()
+      self.reduced = reduced
+      pending = (id, token, complete)
+      deadline = Task { @MainActor [weak self] in
+        try? await Task.sleep(for: .seconds(1))
+        guard !Task.isCancelled, self?.pending?.id == id else { return }
+        self?.cancel()
+      }
+      if reduced { jump(id); return }
+      phase = .fadingOut
+      UIView.animate(withDuration: 0.09, delay: 0,
+        options: [.curveEaseOut, .allowUserInteraction, .beginFromCurrentState]) {
+        cover.alpha = 1
+      } completion: { [weak self] finished in
+        guard let self, self.pending?.id == id, self.phase == .fadingOut else { return }
+        if finished { self.jump(id) } else { self.cancel() }
+      }
+    }
+
+    private func jump(_ id: UUID) {
+      guard active, pending?.id == id, let scrollView, scrollView.window != nil,
+        !scrollView.isTracking, !scrollView.isDragging else { cancel(); return }
+      phase = .jumping
+      UIView.performWithoutAnimation {
+        scrollView.setContentOffset(
+          CGPoint(x: scrollView.contentOffset.x, y: -scrollView.adjustedContentInset.top),
+          animated: false)
+        scrollView.layoutIfNeeded()
+      }
+      phase = .waitingForLayout
+      if atTop { reveal(id) }
+    }
+
+    private func reveal(_ id: UUID) {
+      guard active, pending?.id == id, phase == .waitingForLayout, let cover else { return }
+      phase = .fadingIn
+      if reduced {
+        UIView.performWithoutAnimation { cover.alpha = 0 }
+        finish(id)
+        return
+      }
+      UIView.animate(withDuration: 0.15, delay: 0,
+        options: [.curveEaseIn, .allowUserInteraction, .beginFromCurrentState]) {
+        cover.alpha = 0
+      } completion: { [weak self] finished in
+        guard let self, self.pending?.id == id, self.phase == .fadingIn else { return }
+        if finished { self.finish(id) } else { self.cancel() }
+      }
+    }
+
+    private func finish(_ id: UUID) {
+      guard let previous = pending, previous.id == id else { return }
+      pending = nil
+      phase = nil
+      deadline?.cancel()
+      deadline = nil
+      previous.complete(previous.token, "succeeded")
+    }
+    #endif
+  }
+
+  #if os(iOS)
+  /// Resolve the existing List scroll view once per mount; SwiftUI retains its
+  /// delegate, datasource, cells and sizing. The cover never intercepts touches.
+  private struct TopScrollAccess: UIViewRepresentable {
+    let owner: TopScroll
+
+    final class Anchor: UIView {
+      weak var owner: TopScroll?
+      private var resolving = false
+
+      override func didMoveToWindow() {
+        super.didMoveToWindow()
+        resolveIfNeeded()
+      }
+
+      override func layoutSubviews() {
+        super.layoutSubviews()
+        resolveIfNeeded()
+      }
+
+      func resolveIfNeeded() {
+        guard window != nil, owner?.scrollView?.window == nil, !resolving else { return }
+        resolving = true
+        DispatchQueue.main.async { [weak self] in
+          guard let self else { return }
+          defer { self.resolving = false }
+          guard self.window != nil, let owner = self.owner,
+            owner.scrollView?.window == nil else { return }
+          var ancestor = self.superview
+          while let candidate = ancestor, candidate !== self.window {
+            if let scrollView = self.findScrollView(candidate) {
+              owner.scrollView = scrollView
+              return
+            }
+            ancestor = candidate.superview
+          }
+        }
+      }
+
+      private func findScrollView(_ view: UIView) -> UIScrollView? {
+        if let scrollView = view as? UIScrollView { return scrollView }
+        for child in view.subviews {
+          if let scrollView = findScrollView(child) { return scrollView }
+        }
+        return nil
+      }
+    }
+
+    func makeUIView(context: Context) -> Anchor {
+      let anchor = Anchor()
+      anchor.isUserInteractionEnabled = false
+      anchor.accessibilityElementsHidden = true
+      anchor.backgroundColor = .systemBackground
+      anchor.alpha = 0
+      anchor.owner = owner
+      owner.cover = anchor
+      return anchor
+    }
+
+    func updateUIView(_ anchor: Anchor, context: Context) { anchor.resolveIfNeeded() }
+  }
+  #endif
+
   struct View: SwiftUI.View {
     let context: LUIAppleExtensionViewContext
     @StateObject private var prepared: PreparedState
-    @State private var handledScrollToken: Int64 = 0
     @State private var scrollProxy: ScrollViewProxy?
-    @State private var pendingScroll: (id: String, anchor: UnitPoint)?
+    @State private var pendingScroll: (request: ScrollRequest, id: String, anchor: UnitPoint)?
+    @StateObject private var topScroll = TopScroll()
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(context: LUIAppleExtensionViewContext) {
       self.context = context
@@ -303,6 +571,16 @@ import Observation
       emit(Event(type: "scroll_completed", token: token, outcome: outcome))
     }
 
+    private func observeScrollRequests() {
+      prepared.onScrollRequest = { request in
+        if let request { applyScrollRequest(request) }
+        else {
+          if pendingScroll != nil { pendingScroll = nil }
+          topScroll.cancel()
+        }
+      }
+    }
+
     /// Walk target.row_path from the section's top-level rows; intermediate
     /// elements descend into disclosure children.
     private func resolveTarget(_ target: ScrollRequest.Target) -> Row? {
@@ -322,38 +600,52 @@ import Observation
     }
 
     private func applyScrollRequest(_ request: ScrollRequest) {
-      let token = request.token
-      guard token > handledScrollToken else {
-        return
-      }
-      handledScrollToken = token
-      guard let properties else { return }
-      guard let row = resolveTarget(request.target) else {
-        completeScroll(request.token, "missing_target")
-        return
-      }
-      // A row hidden by a collapsed ancestor cannot be scrolled to; the OCaml
-      // decoder has no hidden_target variant, so report missing_target.
-      guard positions[row.key] != nil else {
-        completeScroll(request.token, "missing_target")
-        return
-      }
-      let anchor: UnitPoint =
-        switch request.anchor {
-        case "center": .center
-        case "bottom": .bottom
-        default: .top
+      guard let properties, topScroll.accept(request.token) else { return }
+      if request.target.row_path.isEmpty {
+        guard properties.sections.first?.key == request.target.section else {
+          completeScroll(request.token, "missing_target")
+          return
         }
-      pendingScroll = (id: row.key, anchor: anchor)
-      if properties.track_scroll_completion == true {
+        #if os(iOS)
+        topScroll.start(token: request.token, reduced: reduceMotion || request.animated != true) { token, outcome in
+          completeScroll(token, outcome)
+        }
+        #else
+        withoutAnimation { scrollProxy?.scrollTo(request.target.section, anchor: .top) }
         completeScroll(request.token, "succeeded")
+        #endif
+        return
       }
+      guard let row = resolveTarget(request.target), positions[row.key] != nil else {
+        completeScroll(request.token, "missing_target")
+        return
+      }
+      let anchor: UnitPoint = switch request.anchor {
+      case "center": .center
+      case "bottom": .bottom
+      default: .top
+      }
+      pendingScroll = (request, row.key, anchor)
+      // Capture can insert its target in this same content commit. Wait for
+      // SwiftUI to render the pending request with those rows before scrolling.
+    }
+
+    private func withoutAnimation(_ change: () -> Void) {
+      var transaction = Transaction(animation: nil)
+      transaction.disablesAnimations = true
+      withTransaction(transaction, change)
     }
 
     private func performPendingScroll() {
-      guard let pending = pendingScroll, let proxy = scrollProxy else { return }
-      pendingScroll = nil
-      proxy.scrollTo(pending.id, anchor: pending.anchor)
+      guard topScroll.active, let pending = pendingScroll,
+        pending.request.token == topScroll.handledToken, let proxy = scrollProxy else { return }
+      withoutAnimation { proxy.scrollTo(pending.id, anchor: pending.anchor) }
+      if !pending.request.target.row_path.isEmpty {
+        pendingScroll = nil
+        if properties?.track_scroll_completion == true {
+          completeScroll(pending.request.token, "succeeded")
+        }
+      }
     }
 
     private func separatorVisibility(_ name: String?) -> Visibility {
@@ -472,33 +764,49 @@ import Observation
                 childContent(footer)
               }
             }
+            .id(section.key)
             .listSectionSeparator(separatorVisibility(section.separator))
           }
         }
         .modifier(ListStyleModifier(style: style))
+        #if os(iOS)
+        .overlay(TopScrollAccess(owner: topScroll).ignoresSafeArea().allowsHitTesting(false).accessibilityHidden(true))
+        #endif
+        .onScrollGeometryChange(for: Bool.self) { geometry in
+          geometry.contentOffset.y + geometry.contentInsets.top <= 1
+        } action: { _, top in topScroll.geometryChanged(top) }
+        .onScrollPhaseChange { _, phase in
+          topScroll.interactionChanged(phase == .tracking || phase == .interacting)
+        }
         .onAppear {
+          topScroll.active = true
           prepared.bind(context)
           scrollProxy = proxy
           performPendingScroll()
-          if let request = properties?.scroll_request { applyScrollRequest(request) }
+          observeScrollRequests()
         }
-        .onChange(of: pendingScroll?.id) { _, _ in performPendingScroll() }
       }
       .onDisappear {
-        prepared.suspend()
+        topScroll.active = false
+        topScroll.interactionChanged(false)
+        topScroll.cancel()
         pendingScroll = nil
+        prepared.suspend()
         scrollProxy = nil
+        topScroll.geometryChanged(false)
       }
       .onChange(of: context.nodeID) { _, _ in
-        prepared.dispose()
-        handledScrollToken = 0
+        topScroll.interactionChanged(false)
+        topScroll.cancel()
         pendingScroll = nil
+        prepared.dispose()
+        topScroll.handledToken = 0
+        topScroll.geometryChanged(false)
         prepared.bind(context)
-        if let request = properties?.scroll_request { applyScrollRequest(request) }
+        observeScrollRequests()
       }
-      .onChange(of: properties?.scroll_request?.token) { _, _ in
-        if let request = properties?.scroll_request { applyScrollRequest(request) }
-      }
+      .onChange(of: reduceMotion) { _, reduced in topScroll.reduceMotionChanged(reduced) }
+      .onChange(of: pendingScroll?.request.token) { _, _ in performPendingScroll() }
     }
   }
 

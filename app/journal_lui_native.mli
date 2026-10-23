@@ -3,11 +3,12 @@
    Replaces the [Ui.Native_widget.Extension] registrations that previously
    carried kinds 2103, 2104 and 2106 over the bonsai_swiftui
    native-widget channel, plus the native collection.
-   Each component ships its properties as one [payload] string field holding
+   Components ship their content as one [payload] string field holding
    the same JSON object the Swift [Properties] structs already decode, and
    reports events through one ["event"] extension event with [id] (int) and
    [payload] (JSON string) fields, matching the old
-   [BonsaiNativeEvent(id, payload)] contract. *)
+   [BonsaiNativeEvent(id, payload)] contract. Native lists carry their independent
+   scroll command in a separate [scroll_request] string property. *)
 
 (** Lui extension identifiers (slugs). *)
 val chrome_identifier : string
@@ -46,6 +47,8 @@ val mount
 val list
   :  ?key:string
   -> payload:string
+  -> ?scroll_request:string
+  -> ?scroll_request_signal:string Signal.signal
   -> ?on_event:(event -> unit)
   -> Lui_elements.t list
   -> Lui_elements.t

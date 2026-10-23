@@ -19,6 +19,7 @@ let view
       ~test_id
       ~rows
       ~scroll_target
+      ?scroll_target_signal
       ~on_scroll_completed
       ~actions_enabled
       ~on_visible_range
@@ -27,6 +28,7 @@ let view
       ~on_delete
       ~on_copy
       ~children
+      ()
   =
   let indexed =
     List.map (fun (row, child) -> row.slot_index, row, child) (List.combine rows children)
@@ -137,27 +139,35 @@ let view
                 }))
       | _ -> ())
   in
-  let scroll_request =
+  let scroll_request target =
     Option.map
       (fun (token, section, row) ->
+         let date = String.equal row ("day:" ^ section) in
          V.Native_list.scroll_request
            ~token
            ~target:
              (V.Native_list.target
                 ~section:(Ui.Key.string section)
-                ~row_path:[ Ui.Key.string row ])
+                ~row_path:(if date then [] else [ Ui.Key.string row ]))
            ~anchor:Top
-           ~animated:false
+           ~animated:date
            ())
-      scroll_target
+      target
   in
-  V.Native_list.vertical
+  let list ?scroll_request_signal () = V.Native_list.vertical
     ~key
     ~style:Plain
-    ?scroll_request
+    ?scroll_request:(scroll_request scroll_target)
+    ?scroll_request_signal
     ~on_scroll_completed
     ~on_visible_range
-    sections
+    sections in
+  (match scroll_target_signal with
+   | None -> list ()
+   | Some source -> V.of_lui (fun context parent ->
+       let requests = Signal.map scroll_request source in
+       Signal.on_dispose context.Lui_ui.ui_scope (fun () -> Signal.dispose_signal requests);
+       Ui.mount (list ~scroll_request_signal:requests ()) context parent))
   |> V.Viewport.Vertical.with_test_id test_id
   |> V.Viewport.Vertical.overlay
        ~key:(Ui.Key.string "journal-empty-presentation")

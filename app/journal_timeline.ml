@@ -42,9 +42,11 @@ module Store = struct
   type t =
     { rows : (string, row) Hashtbl.t
     ; listeners : (string, (int, listener) Hashtbl.t) Hashtbl.t
+    ; scroll_listeners : (int, listener) Hashtbl.t
+    ; mutable scroll_target : (int64 * int * string) option
     ; observe : string -> unit
     ; mutable last : Timeline.t option
-    ; mutable shape : (int * (int64 * int * string) option * shape list) option
+    ; mutable shape : (int * shape list) option
     ; mutable revision : int
     ; mutable epoch : int
     ; mutable serial : int
@@ -53,6 +55,8 @@ module Store = struct
   let create ?(observe = fun _ -> ()) () =
     { rows = Hashtbl.create 64
     ; listeners = Hashtbl.create 64
+    ; scroll_listeners = Hashtbl.create 2
+    ; scroll_target = None
     ; observe
     ; last = None
     ; shape = None
@@ -63,6 +67,26 @@ module Store = struct
   ;;
 
   let find t block_id = Hashtbl.find_opt t.rows block_id
+
+  let scroll_target t = t.scroll_target
+
+  let subscribe_scroll t callback =
+    t.serial <- t.serial + 1;
+    let id = t.serial in
+    let listener = { epoch = t.epoch; active = true; callback } in
+    Hashtbl.add t.scroll_listeners id listener;
+    fun () ->
+      listener.active <- false;
+      Hashtbl.remove t.scroll_listeners id
+  ;;
+
+  let publish_scroll t target =
+    if t.scroll_target <> target then (
+      t.scroll_target <- target;
+      let listeners = Hashtbl.fold (fun _ value rest -> value :: rest) t.scroll_listeners [] in
+      List.iter (fun listener ->
+        if listener.active && listener.epoch = t.epoch then listener.callback ()) listeners)
+  ;;
 
   let subscribe t block_id callback =
     let bucket =
@@ -102,6 +126,7 @@ module Store = struct
   (* Only a changed timeline presentation reaches this traversal. Media,
      navigation, draft and visible-demand writes do not scan retained rows. *)
   let synchronize t state =
+    publish_scroll t (Timeline.scroll_target state);
     let same =
       Option.fold
         ~none:false
@@ -158,7 +183,7 @@ module Store = struct
           []
       in
       List.iter (Hashtbl.remove t.rows) removed;
-      let shape = Some (Timeline.today state, Timeline.scroll_target state, shape) in
+      let shape = Some (Timeline.today state, shape) in
       if t.shape <> shape
       then (
         t.shape <- shape;
@@ -169,6 +194,7 @@ module Store = struct
   ;;
 
   let reset t =
+    publish_scroll t None;
     t.epoch <- t.epoch + 1;
     t.last <- None;
     t.shape <- None;
@@ -321,14 +347,25 @@ let view
     else presented
   in
   let rows, children = List.split presented in
-  Journal_native_collection.view
+  let scroll_target target =
+    Option.bind target (fun (token, day, row) ->
+      let section = string_of_int day in
+      if String.equal row ("day:" ^ section) then
+        (* Empty Today can be synthesized before future slots. Resolve the
+           top intent from the actual presentation, preserving Capture rows. *)
+        (match rows with
+         | [] -> None
+         | (first : Journal_native_collection.row) :: _ ->
+           Some (token, first.section, "day:" ^ first.section))
+      else Some (token, section, row))
+  in
+  let collection ?scroll_target_signal target =
+    Journal_native_collection.view
     ~key:(Ui.Key.string "journal-timeline-list")
     ~test_id:(Ui.Test_id.string "journal-timeline")
     ~rows
-    ~scroll_target:
-      (Option.map
-         (fun (token, day, row) -> token, string_of_int day, row)
-         (Timeline.scroll_target state))
+    ~scroll_target:target
+    ?scroll_target_signal
     ~on_scroll_completed
     ~actions_enabled:(delete_enabled && actions_enabled)
     ~on_visible_range
@@ -337,6 +374,19 @@ let view
     ~on_delete
     ~on_copy
     ~children
+    ()
+  in
+  (match store with
+   | None -> collection (scroll_target (Timeline.scroll_target state))
+   | Some store -> V.of_lui (fun context parent ->
+       let command = Signal.state context.Lui_ui.ui_scheduler
+         (scroll_target (Store.scroll_target store)) in
+       let unsubscribe = Store.subscribe_scroll store (fun () ->
+         Signal.set command (scroll_target (Store.scroll_target store))) in
+       Signal.on_dispose context.ui_scope (fun () ->
+         unsubscribe ();
+         Signal.dispose_signal (Signal.value command));
+       Ui.mount (collection ~scroll_target_signal:(Signal.value command) None) context parent))
   |> V.Body.Vertical.fill
   |> fun content -> V.Body.Vertical.create [ content ]
 ;;

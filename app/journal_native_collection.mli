@@ -13,6 +13,7 @@ val view
   -> test_id:Ui.Test_id.t
   -> rows:row list
   -> scroll_target:(int64 * string * string) option
+  -> ?scroll_target_signal:(int64 * string * string) option Signal.signal
   -> on_scroll_completed:Ui.Event.Handler.t
   -> actions_enabled:bool
   -> on_visible_range:Ui.Event.Handler.t
@@ -21,4 +22,5 @@ val view
   -> on_delete:Ui.Event.Handler.t
   -> on_copy:Ui.Event.Handler.t
   -> children:Ui.View.t list
+  -> unit
   -> Ui.View.Viewport.Vertical.t

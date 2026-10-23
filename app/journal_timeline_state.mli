@@ -41,8 +41,8 @@ val replace_timeline_entry_page
 
 val prepend_timeline_entry : t -> Journal_graph_projection.timeline_entry -> t
 
-(** Equality of the rendered slots, date/error presentation and scroll command.
-    Demand windows and recovery bookkeeping do not affect this comparison. *)
+(** Equality of rendered content. Scroll commands, demand windows and recovery
+    bookkeeping do not affect this comparison. *)
 val equal_presentation : t -> t -> bool
 
 val observe_visible_range : t -> first_index:int -> last_exclusive:int -> t
@@ -77,6 +77,10 @@ val fail_day_request
 val retry_day : t -> day:int -> t
 val first_visible_index : t -> int
 val scroll_generation : t -> int64
+(** Request the first date, coalescing an outstanding native scroll. *)
+val request_top : t -> t
+val cancel_scroll : t -> t
+
 val scroll_target : t -> (int64 * int * string) option
 val scroll_outcome : t -> Journal_view.View.Native_list.outcome option
 

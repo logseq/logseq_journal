@@ -231,6 +231,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     }
 
     var body: some SwiftUI.View {
+      let properties = self.properties
       switch properties?.mode {
       case .page:
         if let properties, context.childIDs.count == 3,

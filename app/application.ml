@@ -373,9 +373,20 @@ let favorites_event state event =
 
 let select_destination state destination =
   if Journal_routes.destination state.routes = destination
-  then state
+  then (
+    if destination = Journal_routes.Journals
+       && Journal_routes.route state.routes = Timeline
+       && state.modal = No_modal
+       && state.graph_ready
+    then
+      let timeline = Journal_timeline_state.request_top state.timeline in
+      if timeline == state.timeline then state else { state with timeline }
+    else state)
   else
-    { state with routes = Journal_routes.select_destination state.routes destination }
+    { state with
+      routes = Journal_routes.select_destination state.routes destination
+    ; timeline = Journal_timeline_state.cancel_scroll state.timeline
+    }
     |> fun state ->
     favorites_event state (Select (destination = Journal_routes.Favorites))
 ;;
@@ -5715,7 +5726,11 @@ let start
           ~request_generation:generation
       in
       with_direct_request
-        { snapshot with routes; next_request_generation = Int64.succ generation }
+        { snapshot with
+          routes
+        ; timeline = Journal_timeline_state.cancel_scroll snapshot.timeline
+        ; next_request_generation = Int64.succ generation
+        }
         (Journal_graph_request.Load_detail
            { block_id; after = None; limit = 128; request_generation = generation })
     in
