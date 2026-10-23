@@ -119,6 +119,35 @@ let selected_graph selected_graph =
   selected, Core.admitted_graph_scope selected.next |> Option.get
 ;;
 
+(* Invalid/stale submission scenarios still carry a genuine challenge, obtained
+   through production events rather than a test constructor. *)
+let fixture_challenge = lazy (
+  let selected, scope = selected_graph encrypted_graph in
+  let absent = Core.step selected.next (Core.Mirror_inspected (Core.Mirror_absent scope)) in
+  let prepare = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Load_and_unlock_graph_key _)) ->
+      Some (Core.step absent.next (Core.Runner_completed
+        (Core.Completion (ticket, Error (Core.Effect_failed "synthetic missing key")))))
+    | _ -> None) absent.effects |> Option.get in
+  let graph_key = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_graph_key _)) ->
+      Some (Core.step prepare.next (Core.Runner_completed
+        (Core.Completion (ticket, Ok "encrypted-graph-key"))))
+    | _ -> None) prepare.effects |> Option.get in
+  let prompt = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_user_keys _)) ->
+      Some (Core.step graph_key.next (Core.Runner_completed
+        (Core.Completion (ticket, Ok "private-key-package"))))
+    | _ -> None) graph_key.effects |> Option.get in
+  Core.unlock_challenge (Core.state prompt.next).snapshot.unlock |> Option.get)
+;;
+
+let password_event core password =
+  let challenge = Core.unlock_challenge (Core.state core).snapshot.unlock
+    |> Option.value ~default:(Lazy.force fixture_challenge) in
+  Core.E2ee_password_submitted (challenge, password)
+;;
+
 let other_graph_id =
   Logseq_db_types.Graph_types.Uuid.of_string "99999999-9999-4999-8999-999999999999"
   |> Result.get_ok
@@ -656,7 +685,7 @@ let warm_encrypted_graph_online_recovery_attaches_existing_mirror () =
     |> Option.get
   in
   let private_key_unlock =
-    Core.step password_prompt.next (Core.E2ee_password_submitted "password")
+    Core.step password_prompt.next (password_event password_prompt.next "password")
   in
   let graph_key_unlock =
     List.find_map
@@ -742,7 +771,7 @@ let e2ee_password_retry_recovers_after_failed_unlock () =
       user_key_fetch.effects
     |> Option.get
   in
-  let first = Core.step prompt.next (Core.E2ee_password_submitted "wrong-synthetic") in
+  let first = Core.step prompt.next (password_event prompt.next "wrong-synthetic") in
   let rejected, repeat_rejected =
     List.find_map
       (function
@@ -763,7 +792,7 @@ let e2ee_password_retry_recovers_after_failed_unlock () =
     true
     ((Core.state rejected.next).snapshot.startup.failure = Some During_e2ee);
   let corrected =
-    Core.step rejected.next (Core.E2ee_password_submitted " corrected-synthetic ")
+    Core.step rejected.next (password_event rejected.next " corrected-synthetic ")
   in
   let requests =
     List.filter_map
@@ -802,7 +831,7 @@ let e2ee_password_retry_recovers_after_failed_unlock () =
     true
     ((Core.state corrected.next).snapshot.startup.failure = None);
   let duplicate =
-    Core.step corrected.next (Core.E2ee_password_submitted "duplicate-synthetic")
+    Core.step corrected.next (password_event corrected.next "duplicate-synthetic")
   in
   Alcotest.(check int) "pending duplicate is inert" 0 (List.length duplicate.effects);
   let stale = Core.step duplicate.next repeat_rejected in
@@ -814,7 +843,7 @@ let e2ee_password_retry_recovers_after_failed_unlock () =
     "repeated failure remains retryable"
     true
     (Core.state again.next).snapshot.startup.awaiting_e2ee_password;
-  let final = Core.step again.next (Core.E2ee_password_submitted "final-synthetic") in
+  let final = Core.step again.next (password_event again.next "final-synthetic") in
   let unlocked =
     List.find_map
       (function
@@ -854,7 +883,7 @@ let e2ee_password_retry_recovers_after_failed_unlock () =
        resumed.effects);
   let picker = Core.step rejected.next Core.Graph_picker_requested in
   let abandoned =
-    Core.step picker.next (Core.E2ee_password_submitted "abandoned-synthetic")
+    Core.step picker.next (password_event picker.next "abandoned-synthetic")
   in
   Alcotest.(check int)
     "picker discards password challenge"
@@ -864,7 +893,7 @@ let e2ee_password_retry_recovers_after_failed_unlock () =
     Core.step rejected.next (Core.Account_authenticated { user_id = Some "other-user" })
   in
   let abandoned =
-    Core.step account.next (Core.E2ee_password_submitted "other-account-synthetic")
+    Core.step account.next (password_event account.next "other-account-synthetic")
   in
   Alcotest.(check int)
     "account switch discards password challenge"
@@ -936,7 +965,7 @@ let encrypted_graph_recovery_fetches_and_unlocks_key_before_bootstrap () =
     true
     (Core.state password_prompt.next).snapshot.startup.awaiting_e2ee_password;
   let private_key_unlock =
-    Core.step password_prompt.next (Core.E2ee_password_submitted "password")
+    Core.step password_prompt.next (password_event password_prompt.next "password")
   in
   let graph_key_unlock =
     List.find_map
@@ -972,6 +1001,15 @@ let encrypted_graph_recovery_fetches_and_unlocks_key_before_bootstrap () =
       graph_key_unlock.effects
     |> Option.get
   in
+  Alcotest.(check bool)
+    "bootstrap phase is published before waiting for metadata"
+    true
+    (List.exists
+       (function
+         | Core.Publish (Core.State_changed state) ->
+           (match state.snapshot.unlock with Core.Unlock_bootstrapping _ -> true | _ -> false)
+         | _ -> false)
+       bootstrapping.effects);
   Alcotest.(check bool)
     "unlocked graph key resumes snapshot bootstrap"
     true
@@ -1013,8 +1051,32 @@ let begin_snapshot_bootstrap ?(graphs = [ graph ]) () =
   missing, scope
 ;;
 
+let snapshot_activation_request effects =
+  List.find_map (function Core.Delegate (Core.Activate_snapshot request) -> Some request
+    | _ -> None) effects |> Option.get
+;;
+
+let snapshot_activation_fixture () =
+  let requested, _ = begin_snapshot_bootstrap () in
+  let downloading = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
+      Some (Core.step requested.next (Core.Runner_completed (Core.Completion
+        (ticket, Ok {|{"ok":true,"t":42,"url":"https://example.com/synthetic"}|}))))
+    | _ -> None) requested.effects |> Option.get in
+  let activating = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Download_snapshot request)) ->
+      let artifact = Core.stage_snapshot_download request ~path:"/tmp/synthetic-activation"
+        ~expected_rows:1 |> Result.get_ok in
+      Some (Core.step downloading.next (Core.Runner_completed (Core.Completion (ticket, Ok artifact))))
+    | _ -> None) downloading.effects |> Option.get in
+  activating
+;;
+
+let fixture_snapshot_activation = lazy (snapshot_activation_request (snapshot_activation_fixture ()).effects)
+;;
+
 let snapshot_catchup_fixture () =
-  let requested, scope = begin_snapshot_bootstrap () in
+  let requested, _scope = begin_snapshot_bootstrap () in
   Alcotest.(check bool)
     "bootstrap starts with exactly one metadata request and no preliminary pull"
     true
@@ -1043,13 +1105,9 @@ let snapshot_catchup_fixture () =
           Alcotest.(check int)
             "download retains configured bound"
             (1024 * 1024)
-            request.maximum_bytes;
+            (Core.snapshot_download_maximum_bytes request);
           let artifact =
-            Core.staged_artifact
-              ~id:"snapshot"
-              ~scope
-              ~path:"/tmp/snapshot.sqlite"
-              ~expected_rows:10
+            Core.stage_snapshot_download request ~path:"/tmp/snapshot.sqlite" ~expected_rows:10 |> Result.get_ok
           in
           Some
             (Core.step
@@ -1070,15 +1128,15 @@ let snapshot_catchup_fixture () =
   Alcotest.(check cursor_testable)
     "activation uses metadata cursor"
     (server_cursor_of_int 42)
-    activation.applied_server_t;
+    (Core.snapshot_activation_cursor activation);
   Alcotest.(check bool)
     "plain snapshot has no graph key"
     true
-    (Option.is_none activation.key);
+    (Option.is_none (Core.snapshot_activation_key activation));
   Alcotest.(check (option cursor_testable))
     "download completion cannot publish an uncommitted cursor"
     None (Core.state activated.next).snapshot.applied_server_t;
-  let activated_snapshot = Core.step activated.next (Core.Snapshot_activated { scope }) in
+  let activated_snapshot = Core.step activated.next (Core.Snapshot_activated (Core.snapshot_activation_completed activation)) in
   let mirror = inspect_mirror_request activated_snapshot.effects in
   let attaching =
     Core.step
@@ -2335,13 +2393,9 @@ let local_cache_deletion_rejects_unopened_graphs () =
   let activating =
     List.find_map
       (function
-        | Core.Run (Core.Request (ticket, Core.Download_snapshot _)) ->
+        | Core.Run (Core.Request (ticket, Core.Download_snapshot download_request)) ->
           let artifact =
-            Core.staged_artifact
-              ~id:"deletion-admission"
-              ~scope
-              ~path:"/tmp/snapshot.sqlite"
-              ~expected_rows:10
+            Core.stage_snapshot_download download_request ~path:"/tmp/snapshot.sqlite" ~expected_rows:10 |> Result.get_ok
           in
           Some
             (Core.step
@@ -2351,7 +2405,8 @@ let local_cache_deletion_rejects_unopened_graphs () =
       downloading.effects
     |> Option.get
   in
-  let activated = Core.step activating.next (Core.Snapshot_activated { scope }) in
+  let activated = Core.step activating.next (Core.Snapshot_activated
+    (Core.snapshot_activation_completed (snapshot_activation_request activating.effects))) in
   let attaching =
     Core.step
       activated.next
@@ -2478,12 +2533,12 @@ let deletion_blocked_events (scope : Core.graph_scope) sync =
   ; Core.Timeline_presented {startup={account_generation=scope.account.account_generation;presentation_generation=scope.account.presentation_generation};graph_id=scope.graph_id;graph_generation=scope.graph_generation}
   ; Core.Catalog_refresh_requested {account_generation=scope.account.account_generation;presentation_generation=scope.account.presentation_generation}
   ; Core.Account_authenticated { user_id = Some "user" }
-  ; Core.E2ee_password_submitted "ignored"
+  ; Core.E2ee_password_submitted (Lazy.force fixture_challenge, "ignored")
   ; Core.Foreground_changed { foreground = true; lifecycle_generation = 98L }
   ; Core.Foreground_changed { foreground = false; lifecycle_generation = 99L }
   ; Core.Graph_attached { scope; sync }
   ; Core.Sync_inspected { scope; sync }
-  ; Core.Snapshot_activated { scope }
+  ; Core.Snapshot_activated (Core.snapshot_activation_completed (Lazy.force fixture_snapshot_activation))
   ; Core.Mirror_inspected (Core.Mirror_available { graph; scope })
   ; Core.Websocket_opened { graph = scope; connection_generation = 1 }
   ; Core.Websocket_closed
@@ -5076,7 +5131,7 @@ let e2ee_preparation_failure_retries fetch_user () =
   let failed = if fetch_user then
     e2ee_finish_user_fetch (e2ee_finish_graph_fetch preparation (Ok "wrapped")) error
     else e2ee_finish_graph_fetch preparation error in
-  let rejected = Core.step failed.next (Core.E2ee_password_submitted "unused-synthetic") in
+  let rejected = Core.step failed.next (password_event failed.next "unused-synthetic") in
   Alcotest.(check bool) "no challenge is advertised" false
     (Core.state rejected.next).snapshot.startup.awaiting_e2ee_password;
   Alcotest.(check int) "password without challenge starts no work" 0
@@ -5108,7 +5163,7 @@ let e2ee_invalidated_challenge_is_not_advertised () =
     | _ -> None) refresh.effects |> Option.get in
   Alcotest.(check bool) "cleared key package cannot advertise a challenge" false
     (Core.state failed.next).snapshot.startup.awaiting_e2ee_password;
-  let submit = Core.step failed.next (Core.E2ee_password_submitted "unused-synthetic") in
+  let submit = Core.step failed.next (password_event failed.next "unused-synthetic") in
   Alcotest.(check int) "invalidated challenge starts no crypto" 0 (List.length submit.effects)
 ;;
 
@@ -5226,7 +5281,7 @@ let e2ee_auto_preparation_failure_is_bounded fetch_user message () =
     snapshot.startup.awaiting_e2ee_password;
   Alcotest.(check bool) "failure does not automatically retry" false
     (List.exists (function Core.Run _ -> true | _ -> false) failed.effects);
-  let blocked = Core.step failed.next (Core.E2ee_password_submitted "unused") in
+  let blocked = Core.step failed.next (password_event failed.next "unused") in
   Alcotest.(check int) "no unusable password submission" 0 (List.length blocked.effects);
   let retry = Core.step failed.next (Core.Online_recovery_requested (timeline_scope failed.next)) in
   Alcotest.(check bool) "explicit Retry can reacquire materials" true
@@ -5247,7 +5302,7 @@ let e2ee_late_preparation_cannot_reopen_challenge stage cancel result () =
       if stage = 1 then user_fetch, (fun origin ->
         e2ee_finish_user_fetch { user_fetch with next = origin } result)
       else let prompt = e2ee_finish_user_fetch user_fetch (Ok "old-package") in
-        let unlocking = Core.step prompt.next (Core.E2ee_password_submitted "synthetic") in
+        let unlocking = Core.step prompt.next (password_event prompt.next "synthetic") in
         let completion = List.find_map (function
           | Core.Run (Core.Request (ticket, Core.Unlock_private_key _)) ->
             Some (Core.Runner_completed (Core.Completion (ticket,
@@ -5262,7 +5317,7 @@ let e2ee_late_preparation_cannot_reopen_challenge stage cancel result () =
   Alcotest.(check bool) "late completion preserves current public state" true
     (before = Core.state late.next);
   Alcotest.(check int) "late completion starts no next phase" 0 (List.length late.effects);
-  let submit = Core.step late.next (Core.E2ee_password_submitted "abandoned") in
+  let submit = Core.step late.next (password_event late.next "abandoned") in
   Alcotest.(check int) "obsolete challenge cannot submit" 0 (List.length submit.effects)
 ;;
 
@@ -5401,7 +5456,7 @@ let appearance_is_scoped_and_authentication_is_required () =
 let cancelled_local_key_crypto_still_completes () =
   let preparation, scope = e2ee_preparation_fixture () in
   let prompt = e2ee_finish_user_fetch (e2ee_finish_graph_fetch preparation (Ok "wrapped")) (Ok "private-package") in
-  let unlocking = Core.step prompt.next (Core.E2ee_password_submitted "synthetic") in
+  let unlocking = Core.step prompt.next (password_event prompt.next "synthetic") in
   let finish_private (result : (unit, Core.effect_error) result) core = List.find_map (function
     | Core.Run (Core.Request (ticket, Core.Unlock_private_key _)) ->
       Some (Core.step core (Core.Runner_completed (Core.Completion (ticket, result))))
@@ -5691,7 +5746,7 @@ let snapshot_live_stream_catchup_keeps_metadata_cursor () =
 let snapshot_failure_and_retry_keep_cursor_uncommitted () =
   List.iter
     (fun activation_failure ->
-       let requested, scope = begin_snapshot_bootstrap () in
+       let requested, _scope = begin_snapshot_bootstrap () in
        let download =
          List.find_map
            (function
@@ -5712,13 +5767,9 @@ let snapshot_failure_and_retry_keep_cursor_uncommitted () =
        let failed, late_completion =
          List.find_map
            (function
-             | Core.Run (Core.Request (ticket, Core.Download_snapshot _)) ->
+             | Core.Run (Core.Request (ticket, Core.Download_snapshot download_request)) ->
                let artifact =
-                 Core.staged_artifact
-                   ~id:"synthetic-failure"
-                   ~scope
-                   ~path:"/tmp/synthetic-snapshot"
-                   ~expected_rows:1
+                 Core.stage_snapshot_download download_request ~path:"/tmp/synthetic-snapshot" ~expected_rows:1 |> Result.get_ok
                in
                let completion =
                  Core.Runner_completed (Core.Completion (ticket, Ok artifact))
@@ -5729,10 +5780,9 @@ let snapshot_failure_and_retry_keep_cursor_uncommitted () =
                    let activating = Core.step download.next completion in
                    Core.step
                      activating.next
-                     (Core.Snapshot_activation_failed
-                        { scope = Core.effect_scope_of_graph scope
-                        ; message = "synthetic activation failure"
-                        }))
+                     (Core.Snapshot_activation_failed (Core.snapshot_activation_failed
+                       (snapshot_activation_request activating.effects)
+                       ~message:"synthetic activation failure")))
                  else
                    Core.step
                      download.next
@@ -5802,7 +5852,7 @@ let replaced_snapshot_completions_are_inert () =
     Logseq_db_types.Graph_types.Uuid.of_string "22222222-2222-4222-8222-222222222222"
     |> Result.get_ok } in
   List.iter (fun download_pending ->
-    let requested, old_scope = begin_snapshot_bootstrap ~graphs:[graph; other] () in
+    let requested, _old_scope = begin_snapshot_bootstrap ~graphs:[graph; other] () in
     let metadata (result : (Core.snapshot_metadata, Core.effect_error) result) = List.find_map (function
       | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
         Some (Core.Runner_completed (Core.Completion (ticket, result)))
@@ -5812,9 +5862,8 @@ let replaced_snapshot_completions_are_inert () =
         let downloading = Core.step requested.next
           (metadata (Ok {|{"ok":true,"t":42,"url":"https://example.com/old"}|})) in
         List.find_map (function
-          | Core.Run (Core.Request (ticket, Core.Download_snapshot _)) ->
-            let artifact = Core.staged_artifact ~id:"old" ~scope:old_scope
-              ~path:"/tmp/synthetic-old" ~expected_rows:1 in
+          | Core.Run (Core.Request (ticket, Core.Download_snapshot download_request)) ->
+            let artifact = Core.stage_snapshot_download download_request ~path:"/tmp/synthetic-old" ~expected_rows:1 |> Result.get_ok in
             Some (downloading.next,
               [Core.Runner_completed (Core.Completion (ticket, Ok artifact))],
               Core.Runner_completed (Core.Completion
@@ -5841,20 +5890,76 @@ let replaced_snapshot_completions_are_inert () =
       List.find_map (function
         | Core.Run (Core.Request (ticket, Core.Download_snapshot request)) ->
           Alcotest.(check bool) "fresh download retains graph and URL" true
-            (request.scope = inspection.scope && request.uri = Uri.of_string "https://example.com/current");
-          let artifact = Core.staged_artifact ~id:"current" ~scope:inspection.scope
-            ~path:"/tmp/synthetic-current" ~expected_rows:1 in
+            (Core.snapshot_download_scope request = inspection.scope && Core.snapshot_download_uri request = Uri.of_string "https://example.com/current");
+          let artifact = Core.stage_snapshot_download request ~path:"/tmp/synthetic-current" ~expected_rows:1 |> Result.get_ok in
           Some (Core.step fresh.next (Core.Runner_completed
             (Core.Completion (ticket, Ok artifact))))
         | _ -> None) fresh.effects |> Option.get |> fun activation ->
       Alcotest.(check bool) "fresh activation keeps its own graph and cursor" true
         (List.exists (function
           | Core.Delegate (Core.Activate_snapshot request) ->
-            request.scope = inspection.scope && request.applied_server_t = server_cursor_of_int 84
+            Core.snapshot_activation_scope request = inspection.scope && Core.snapshot_activation_cursor request = server_cursor_of_int 84
           | _ -> false) activation.effects)) (successes @ [failure])) [false; true]
 ;;
 
 let scenarios = scenarios @ [ Alcotest.test_case
   "replaced snapshot metadata and download completions are inert" `Quick
   replaced_snapshot_completions_are_inert ]
+;;
+
+let snapshot_artifact_from_retried_attempt_is_rejected () =
+  let requested, _ = begin_snapshot_bootstrap () in
+  let metadata (origin : Core.transition) cursor =
+    List.find_map (function
+      | Core.Run (Core.Request (ticket, Core.Fetch_snapshot_metadata _)) ->
+        Some (Core.step origin.next (Core.Runner_completed (Core.Completion
+          (ticket, Ok (Printf.sprintf "{\"ok\":true,\"t\":%d,\"url\":\"https://example.com/snapshot\"}" cursor)))))
+      | _ -> None) origin.effects |> Option.get in
+  let old = metadata requested 42 in
+  let failed, old_artifact, old_scope = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Download_snapshot request)) ->
+      let artifact = Core.stage_snapshot_download request ~path:"/tmp/synthetic-attempt-a"
+        ~expected_rows:1 |> Result.get_ok in
+      Some (Core.step old.next (Core.Runner_completed (Core.Completion
+        (ticket, Error (Core.Effect_failed "synthetic interrupted stream")))), artifact,
+        Core.snapshot_download_scope request)
+    | _ -> None) old.effects |> Option.get in
+  let retry = Core.step failed.next (Core.Online_recovery_requested (timeline_scope failed.next)) in
+  let mirror = inspect_mirror_request retry.effects in
+  let missing = Core.step retry.next (Core.Mirror_inspected (Core.Mirror_absent mirror.scope)) in
+  let current = metadata missing 84 in
+  let mismatch = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Download_snapshot request)) ->
+      Alcotest.(check bool) "retry changes the generation of this production graph scope" false
+        (Core.snapshot_download_scope request = old_scope);
+      Some (Core.step current.next (Core.Runner_completed (Core.Completion (ticket, Ok old_artifact))))
+    | _ -> None) current.effects |> Option.get in
+  Alcotest.(check bool) "foreign attempt cannot activate" false
+    (List.exists (function Core.Delegate (Core.Activate_snapshot _) -> true | _ -> false) mismatch.effects);
+  Alcotest.(check bool) "mismatch terminates bootstrap with visible failure" true
+    ((Core.state mismatch.next).snapshot.startup.failure = Some Core.During_bootstrap)
+;;
+
+let scenarios = scenarios @ [ Alcotest.test_case
+  "old snapshot artifact cannot complete a fresh request" `Quick
+  snapshot_artifact_from_retried_attempt_is_rejected ]
+;;
+
+let failed_snapshot_activation_receipts_are_inert () =
+  let activating = snapshot_activation_fixture () in
+  let request = snapshot_activation_request activating.effects in
+  let failure = Core.Snapshot_activation_failed
+    (Core.snapshot_activation_failed request ~message:"synthetic activation failure") in
+  let failed = Core.step activating.next failure in
+  let success = Core.Snapshot_activated (Core.snapshot_activation_completed request) in
+  List.iter (fun event ->
+    let late = Core.step failed.next event in
+    check_observed "retired activation" "old receipt preserves failed owner"
+      (observe failed.next) (observe late.next);
+    check_instructions "retired activation receipt" [] late.effects) [success; failure]
+;;
+
+let scenarios = scenarios @ [ Alcotest.test_case
+  "late activation success and failure cannot reopen failed bootstrap" `Quick
+  failed_snapshot_activation_receipts_are_inert ]
 ;;

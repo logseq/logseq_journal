@@ -6,6 +6,16 @@ let get = function
   | Error e -> failwith e
 ;;
 
+let version checksum =
+  get (Logseq_db_types.Asset_descriptor.version ~checksum ~file_type:"bin")
+;;
+
+let decoded result =
+  result
+  |> Result.map C.verified_bytes
+  |> Result.map_error C.decode_error_message
+;;
+
 let bytes = "\000PNG\255\128binary\000"
 let iv = String.make 12 '\001'
 let ciphertext = String.make 16 '\002' ^ bytes
@@ -25,12 +35,31 @@ let crypto : C.crypto =
 let envelope = T.to_string (Transit_core.Json.Array [ Binary iv; Binary ciphertext ])
 
 let decode ?(key = Some "key") ?(limit = 32) ?(checksum = C.checksum bytes) wire =
-  C.decode ~maximum_plaintext_bytes:limit ~crypto ~key ~expected_checksum:checksum wire
+  C.decode ~maximum_plaintext_bytes:limit ~crypto ~key ~expected:(version checksum) wire |> decoded
 ;;
 
 let rejects result = Alcotest.(check bool) "rejected" true (Result.is_error result)
 
+let finite_decode_errors () =
+  let run ~key ~expected wire =
+    C.decode ~maximum_plaintext_bytes:32 ~crypto ~key ~expected:(version expected) wire
+  in
+  (match run ~key:(Some "wrong") ~expected:(C.checksum envelope) envelope with
+   | Error (C.Decryption_failed _) -> ()
+   | _ -> Alcotest.fail "authentication failure must remain a typed failure, never raw");
+  (match run ~key:None ~expected:(String.make 64 'a') bytes with
+   | Error C.Checksum_mismatch -> ()
+   | _ -> Alcotest.fail "checksum has a stable domain classification");
+  let expected = version (C.checksum bytes) in
+  match C.decode ~maximum_plaintext_bytes:32 ~crypto ~key:None ~expected bytes with
+  | Error error -> Alcotest.fail (C.decode_error_message error)
+  | Ok verified ->
+    Alcotest.(check bool) "verified retains the expected version" true
+      (Logseq_db_types.Asset_descriptor.equal_version expected (C.verified_version verified))
+;;
+
 let raw_bytes () =
+  finite_decode_errors ();
   Alcotest.(check string) "raw bytes after decrypt" bytes (get (decode envelope));
   Alcotest.(check string)
     "upstream envelope"
@@ -72,8 +101,8 @@ let bounded_envelope_shape () =
           ~maximum_plaintext_bytes:1048576
           ~crypto:guarded
           ~key:(Some "key")
-          ~expected_checksum:(C.checksum bytes)
-          wire
+          ~expected:(version (C.checksum bytes))
+          wire |> decoded
       with
       | Stack_overflow -> Alcotest.fail "untrusted envelope exhausted the stack"
     in
@@ -149,8 +178,8 @@ let non_transit_raw_assets () =
              ~maximum_plaintext_bytes:256
              ~crypto:guarded
              ~key:(Some "PRIVATE_KEY")
-             ~expected_checksum:(C.checksum wire)
-             wire)
+             ~expected:(version (C.checksum wire))
+             wire |> decoded)
        in
        Alcotest.(check string) "raw bytes preserved" wire (get result);
        Alcotest.(check string)
@@ -180,8 +209,8 @@ let raw_assets_keep_validation () =
           ~maximum_plaintext_bytes:maximum
           ~crypto
           ~key:(Some "key")
-          ~expected_checksum:expected
-          wire)
+          ~expected:(version expected)
+          wire |> decoded)
     in
     Alcotest.(check (result string string))
       "common validation is retained"
@@ -223,8 +252,8 @@ let transit_failures_never_become_raw () =
           ~maximum_plaintext_bytes:1048576
           ~crypto:crypt
           ~key:(Some "wrong")
-          ~expected_checksum:(C.checksum wire)
-          wire)
+          ~expected:(version (C.checksum wire))
+          wire |> decoded)
     in
     rejects result;
     Alcotest.(check string) "no raw fallback even when raw checksum matches" "" log;

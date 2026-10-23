@@ -4005,7 +4005,8 @@ let test_unlock_crypto_classification () =
         | Core.Run (Core.Request (ticket, Core.Fetch_e2ee_user_keys _)) ->
           Some (Core.step graph_key.next (Core.Runner_completed (Core.Completion (ticket, Ok "LOG_SECRET_PACKAGE"))))
         | _ -> None) graph_key.effects |> Option.get in
-      let unlock = Core.step private_key.next (Core.E2ee_password_submitted "LOG_SECRET_PASSWORD") in
+      let unlock = Core.step private_key.next (Core.E2ee_password_submitted
+    (Core.unlock_challenge (Core.state private_key.next).snapshot.unlock |> Option.get, "LOG_SECRET_PASSWORD")) in
       let request = List.find_map (function
         | Core.Run (Core.Request (_, Core.Unlock_private_key _) as request) -> Some request
         | _ -> None) unlock.effects |> Option.get in

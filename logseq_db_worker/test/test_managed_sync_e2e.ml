@@ -276,7 +276,9 @@ let handle_public_state context state =
   if snapshot.startup.awaiting_e2ee_password && not context.password_submitted
   then (
     context.password_submitted <- true;
-    send_command context (Submit_e2ee_password context.credentials.e2ee_password))
+    send_command context (Submit_e2ee_password
+      (Logseq_sync_pure_reducer.Core.unlock_challenge snapshot.unlock |> Option.get,
+       context.credentials.e2ee_password)))
 ;;
 
 let handle_graph_state context state =

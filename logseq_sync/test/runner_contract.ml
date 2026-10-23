@@ -804,7 +804,8 @@ let private_key_unlock_and_sign_out () =
       user_key_fetch.effects
     |> Option.get
   in
-  let unlocking = Core.step password_prompt.next (E2ee_password_submitted "password") in
+  let unlocking = Core.step password_prompt.next (Core.E2ee_password_submitted
+    (Core.unlock_challenge (Core.state password_prompt.next).snapshot.unlock |> Option.get, "password")) in
   let unlock =
     List.find_map
       (function

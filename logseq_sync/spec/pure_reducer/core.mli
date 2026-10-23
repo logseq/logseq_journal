@@ -69,12 +69,38 @@ type local_deletion =
   | Deletion_in_progress of local_deletion_stage
   | Deletion_failed of local_deletion_stage
 
+(** Evidence is created by Core's package/crypto/attachment owners, never from
+    UI booleans. Phases are projections; Core rechecks identity and current scope. *)
+type unlock_challenge
+type unlock_submission
+type unlock_attached
+
+type unlock_recovery =
+  | Retry_password of unlock_challenge * string
+  | Retry_preparation of string
+
+type unlock_phase =
+  | Unlock_inactive
+  | Unlock_challenge of unlock_challenge
+  | Unlock_running of unlock_submission
+  | Unlock_bootstrapping of unlock_submission
+  | Unlock_presentable of unlock_attached
+  | Unlock_failed of unlock_recovery
+  | Unlock_cancelled of unlock_submission
+
+val unlock_challenge : unlock_phase -> unlock_challenge option
+val equal_unlock_challenge : unlock_challenge -> unlock_challenge -> bool
+val unlock_submission_challenge : unlock_submission -> unlock_challenge
+val equal_unlock_submission : unlock_submission -> unlock_submission -> bool
+val unlock_attached_submission : unlock_attached -> unlock_submission
+
 type snapshot =
   { sync_phase : sync_phase
   ; catalog : graph list
   ; selected_graph : graph_id option
   ; applied_server_t : Logseq_db_types.Server_cursor.t option
   ; timeline_presentation_pending : bool
+  ; unlock : unlock_phase
   ; startup : startup_facts
   ; last_error : string option
   ; local_deletion : local_deletion option
@@ -154,6 +180,7 @@ type effect_error =
   | Crypto_failed of crypto_failure_kind * string
 
 type graph_key_handle
+type snapshot_download
 type staged_artifact
 type catalog_cache
 
@@ -161,15 +188,22 @@ val graph_key_handle : id:string -> scope:graph_scope -> graph_key_handle
 val graph_key_handle_id : graph_key_handle -> string
 val graph_key_handle_scope : graph_key_handle -> graph_scope
 
-val staged_artifact
-  :  id:string
-  -> scope:graph_scope
-  -> path:string
-  -> expected_rows:int
-  -> staged_artifact
+(** The download producer must carry the exact admitted request. This receipt
+    binds its artifact to the metadata attempt; Core also checks identity/current
+    scope on completion. Disk/stream validation remains the producer's job. *)
+val stage_snapshot_download
+  : snapshot_download -> path:string -> expected_rows:int -> (staged_artifact, string) result
+
+val snapshot_download_scope : snapshot_download -> graph_scope
+val snapshot_download_uri : snapshot_download -> Uri.t
+val snapshot_download_expected_bytes : snapshot_download -> int64 option
+val snapshot_download_maximum_bytes : snapshot_download -> int
 
 val staged_artifact_path : staged_artifact -> string
 val staged_artifact_expected_rows : staged_artifact -> int
+val unlock_challenge_scope : unlock_challenge -> graph_scope
+val unlock_attached_scope : unlock_attached -> graph_scope
+
 val effect_scope_of_account : account_scope -> effect_scope
 val effect_scope_of_graph : graph_scope -> effect_scope
 
@@ -202,13 +236,6 @@ type decryption_batch =
 type decrypted_values = string list
 type snapshot_baseline = string
 type snapshot_metadata = string
-
-type snapshot_download =
-  { scope : graph_scope
-  ; uri : Uri.t
-  ; expected_bytes : int64 option
-  ; maximum_bytes : int
-  }
 
 type graph_key_request =
   { scope : graph_scope
@@ -436,12 +463,13 @@ type mirror_request =
   ; scope : graph_scope
   }
 
-type snapshot_activation_request =
-  { artifact : staged_artifact
-  ; scope : graph_scope
-  ; applied_server_t : Logseq_db_types.Server_cursor.t
-  ; key : graph_key_handle option
-  }
+(** Constructed only by Core after matching the active attempt and its artifact.
+    Consumers cannot replace its graph scope, metadata cursor or key independently. *)
+type snapshot_activation_request
+val snapshot_activation_scope : snapshot_activation_request -> graph_scope
+val snapshot_activation_cursor : snapshot_activation_request -> Logseq_db_types.Server_cursor.t
+val snapshot_activation_artifact : snapshot_activation_request -> staged_artifact
+val snapshot_activation_key : snapshot_activation_request -> graph_key_handle option
 
 type mirror_deletion =
   { account : account_scope
@@ -532,7 +560,12 @@ type outbox_transition_result =
   ; sync : Logseq_overlay_db.Types.sync_view
   }
 
-type snapshot_activation = { scope : graph_scope }
+(** Completion/failure producers must return the exact delegated activation.
+    Same-scope retries still have different attempt identities. *)
+type snapshot_activation
+type snapshot_activation_error
+val snapshot_activation_completed : snapshot_activation_request -> snapshot_activation
+val snapshot_activation_failed : snapshot_activation_request -> message:string -> snapshot_activation_error
 
 type startup_scope =
   { account_generation : account_generation
@@ -560,7 +593,7 @@ type event =
   | Online_recovery_requested of timeline_scope
   | Online_cancelled of startup_scope
   | Local_account_unavailable of startup_scope * local_unavailability
-  | E2ee_password_submitted of string
+  | E2ee_password_submitted of unlock_challenge * string
   | Local_cache_deletion_requested of graph_id
   | Foreground_changed of
       { foreground : bool
@@ -581,7 +614,7 @@ type event =
   | Authoritative_batch_deferred of authoritative_deferred_result
   | Authoritative_batch_failed of scoped_error
   | Snapshot_activated of snapshot_activation
-  | Snapshot_activation_failed of scoped_error
+  | Snapshot_activation_failed of snapshot_activation_error
   | Runner_completed of runner_completion
   | Snapshot_download_progress of bootstrap_progress
   | Websocket_opened of connection_scope

@@ -24,6 +24,25 @@ type connection_generation = int
 type presentation_generation = int
 type lifecycle_generation = int64
 
+type account_scope =
+  { managed_sync_origin : Uri.t
+  ; user_id : string
+  ; account_generation : account_generation
+  ; presentation_generation : presentation_generation
+  ; lifecycle_generation : lifecycle_generation
+  }
+
+type graph_scope =
+  { account : account_scope
+  ; graph_id : graph_id
+  ; graph_generation : graph_generation
+  }
+
+type connection_scope =
+  { graph : graph_scope
+  ; connection_generation : connection_generation
+  }
+
 type sync_phase =
   | Offline
   | Connecting
@@ -81,12 +100,58 @@ type local_deletion =
   | Deletion_in_progress of local_deletion_stage
   | Deletion_failed of local_deletion_stage
 
+type unlock_challenge =
+  { challenge_scope : graph_scope
+  ; challenge_id : int
+  ; encrypted_graph_key : string
+  ; private_key_package : string
+  }
+
+type unlock_stage = Private_key of int | Graph_key of int | Attachment
+
+type unlock_submission =
+  { challenge : unlock_challenge
+  ; operation_id : int
+  ; stage : unlock_stage
+  }
+
+type unlock_attached = { submission : unlock_submission; attached_scope : graph_scope }
+
+type unlock_recovery =
+  | Retry_password of unlock_challenge * string
+  | Retry_preparation of string
+
+type unlock_phase =
+  | Unlock_inactive
+  | Unlock_challenge of unlock_challenge
+  | Unlock_running of unlock_submission
+  | Unlock_bootstrapping of unlock_submission
+  | Unlock_presentable of unlock_attached
+  | Unlock_failed of unlock_recovery
+  | Unlock_cancelled of unlock_submission
+
+let unlock_challenge = function
+  | Unlock_challenge challenge | Unlock_failed (Retry_password (challenge, _)) -> Some challenge
+  | _ -> None
+;;
+
+let equal_unlock_challenge a b =
+  a.challenge_id = b.challenge_id && a.challenge_scope = b.challenge_scope
+let unlock_challenge_scope challenge = challenge.challenge_scope
+let unlock_submission_challenge submission = submission.challenge
+let equal_unlock_submission a b =
+  a.operation_id = b.operation_id && equal_unlock_challenge a.challenge b.challenge
+;;
+let unlock_attached_submission receipt = receipt.submission
+let unlock_attached_scope receipt = receipt.attached_scope
+
 type snapshot =
   { sync_phase : sync_phase
   ; catalog : graph list
   ; selected_graph : graph_id option
   ; applied_server_t : Server_cursor.t option
   ; timeline_presentation_pending : bool
+  ; unlock : unlock_phase
   ; startup : startup_facts
   ; last_error : string option
   ; local_deletion : local_deletion option
@@ -149,25 +214,6 @@ type invalidation =
   ; changed_uuids_truncated : bool
   }
 
-type account_scope =
-  { managed_sync_origin : Uri.t
-  ; user_id : string
-  ; account_generation : account_generation
-  ; presentation_generation : presentation_generation
-  ; lifecycle_generation : lifecycle_generation
-  }
-
-type graph_scope =
-  { account : account_scope
-  ; graph_id : graph_id
-  ; graph_generation : graph_generation
-  }
-
-type connection_scope =
-  { graph : graph_scope
-  ; connection_generation : connection_generation
-  }
-
 type effect_scope =
   { account_generation : account_generation option
   ; graph_generation : graph_generation option
@@ -191,13 +237,21 @@ type graph_key_handle =
   ; handle_scope : graph_scope
   }
 
+type snapshot_download =
+  { scope : graph_scope
+  ; uri : Uri.t
+  ; expected_bytes : int64 option
+  ; maximum_bytes : int
+  ; metadata_cursor : Server_cursor.t
+  ; attempt_id : effect_id
+  ; download_id : effect_id
+  }
+
 type staged_artifact =
-  { artifact_id : string
-  ; artifact_scope : graph_scope
+  { download : snapshot_download
   ; artifact_path : string
   ; artifact_expected_rows : int
   }
-[@@warning "-69"]
 
 type catalog_cache =
   { cache_user_id : string
@@ -210,13 +264,15 @@ let graph_key_handle ~id ~scope = { handle_id = id; handle_scope = scope }
 let graph_key_handle_id handle = handle.handle_id
 let graph_key_handle_scope handle = handle.handle_scope
 
-let staged_artifact ~id ~scope ~path ~expected_rows =
-  { artifact_id = id
-  ; artifact_scope = scope
-  ; artifact_path = path
-  ; artifact_expected_rows = expected_rows
-  }
+let stage_snapshot_download download ~path ~expected_rows =
+  if path = "" || expected_rows < 0 then Error "Invalid staged snapshot artifact"
+  else Ok { download; artifact_path = path; artifact_expected_rows = expected_rows }
 ;;
+
+let snapshot_download_scope request = request.scope
+let snapshot_download_uri request = request.uri
+let snapshot_download_expected_bytes request = request.expected_bytes
+let snapshot_download_maximum_bytes request = request.maximum_bytes
 
 let staged_artifact_path artifact = artifact.artifact_path
 let staged_artifact_expected_rows artifact = artifact.artifact_expected_rows
@@ -301,13 +357,6 @@ type decryption_batch =
 type decrypted_values = string list
 type snapshot_baseline = string
 type snapshot_metadata = string
-
-type snapshot_download =
-  { scope : graph_scope
-  ; uri : Uri.t
-  ; expected_bytes : int64 option
-  ; maximum_bytes : int
-  }
 
 type graph_key_request =
   { scope : graph_scope
@@ -591,6 +640,30 @@ type snapshot_activation_request =
   ; key : graph_key_handle option
   }
 
+let snapshot_activation_scope request = request.scope
+let snapshot_activation_cursor request = request.applied_server_t
+let snapshot_activation_artifact request = request.artifact
+let snapshot_activation_key request = request.key
+
+(* Each phase owns all evidence needed by the next phase. Effect ids identify
+   attempts at runtime; sharing an OCaml type never establishes identity. *)
+type bootstrap =
+  | No_bootstrap
+  | Preparing_snapshot of graph_scope
+  | Awaiting_snapshot_metadata of graph_scope * effect_id
+  | Downloading_snapshot of snapshot_download
+  | Activating_snapshot of snapshot_activation_request
+
+let bootstrap_scope = function
+  | No_bootstrap -> None
+  | Preparing_snapshot scope | Awaiting_snapshot_metadata (scope, _) -> Some scope
+  | Downloading_snapshot request -> Some request.scope
+  | Activating_snapshot request -> Some request.scope
+;;
+
+let bootstrap_downloading = function Downloading_snapshot _ -> true | _ -> false
+let bootstrap_activating = function Activating_snapshot _ -> true | _ -> false
+
 type mirror_deletion =
   { account : account_scope
   ; graph_id : graph_id
@@ -678,7 +751,10 @@ type outbox_transition_result =
   ; sync : Overlay.sync_view
   }
 
-type snapshot_activation = { scope : graph_scope }
+type snapshot_activation = snapshot_activation_request
+type snapshot_activation_error = { activation : snapshot_activation_request; message : string }
+let snapshot_activation_completed (request : snapshot_activation_request) : snapshot_activation = request
+let snapshot_activation_failed activation ~message = { activation; message }
 
 type startup_scope =
   { account_generation : account_generation
@@ -706,7 +782,7 @@ type event =
   | Online_recovery_requested of timeline_scope
   | Online_cancelled of startup_scope
   | Local_account_unavailable of startup_scope * local_unavailability
-  | E2ee_password_submitted of string
+  | E2ee_password_submitted of unlock_challenge * string
   | Local_cache_deletion_requested of graph_id
   | Foreground_changed of
       { foreground : bool
@@ -724,7 +800,7 @@ type event =
   | Authoritative_batch_deferred of authoritative_deferred_result
   | Authoritative_batch_failed of scoped_error
   | Snapshot_activated of snapshot_activation
-  | Snapshot_activation_failed of scoped_error
+  | Snapshot_activation_failed of snapshot_activation_error
   | Runner_completed of runner_completion
   | Snapshot_download_progress of bootstrap_progress
   | Websocket_opened of connection_scope
@@ -779,6 +855,11 @@ let asset_retirement_key (scope : graph_scope) retirement =
     (retirement_id_to_string retirement)
 ;;
 
+type unlock_preparation =
+  | No_unlock_preparation
+  | Fetching_graph_key of graph_scope * effect_id
+  | Fetching_user_keys of graph_scope * string * effect_id
+
 type t =
   { asset_retirement_observed : unit Asset_retirement_set.t
   ; asset_known_scopes : graph_scope list
@@ -802,12 +883,8 @@ type t =
   ; pending_mirror_inspection : mirror_request option
   ; pending_selected_download : graph_scope option
   ; pending_attachment : mirror_request option
-  ; pending_encrypted_graph_key : string option
-  ; pending_private_key_package : string option
-  ; snapshot_scope : graph_scope option
-  ; snapshot_server_t : Server_cursor.t option
-  ; active_snapshot_download : graph_scope option
-  ; pending_snapshot_activation : graph_scope option
+  ; unlock_preparation : unlock_preparation
+  ; bootstrap : bootstrap
   ; sync_view : Overlay.sync_view option
   ; pending_sync_inspection : graph_scope option
   ; pending_outbox_transition : outbox_transition_request option
@@ -855,6 +932,7 @@ let initial config =
     ; selected_graph = None
     ; applied_server_t = None
     ; timeline_presentation_pending = false
+    ; unlock = Unlock_inactive
     ; startup = initial_startup
     ; last_error = None
     }
@@ -882,12 +960,8 @@ let initial config =
     ; pending_graph_open = None
     ; pending_mirror_inspection = None
     ; pending_attachment = None
-    ; pending_encrypted_graph_key = None
-    ; pending_private_key_package = None
-    ; snapshot_scope = None
-    ; snapshot_server_t = None
-    ; active_snapshot_download = None
-      ; pending_snapshot_activation = None
+    ; unlock_preparation = No_unlock_preparation
+    ; bootstrap = No_bootstrap
     ; sync_view = None
     ; pending_sync_inspection = None
     ; pending_outbox_transition = None
@@ -930,6 +1004,14 @@ let publish core = Publish (State_changed core.public_state)
 
 let set_snapshot core (snapshot : snapshot) =
   let previous = core.public_state.snapshot.startup in
+  let unlock =
+    if previous.account_generation <> snapshot.startup.account_generation
+       || previous.graph_generation <> snapshot.startup.graph_generation
+    then Unlock_inactive else snapshot.unlock
+  in
+  let snapshot = { snapshot with unlock; startup = { snapshot.startup with
+    awaiting_e2ee_password = Option.is_some (unlock_challenge unlock) } } in
+  let previous = core.public_state.snapshot.startup in
   let diagnostics =
     if previous.account_generation <> snapshot.startup.account_generation
        || previous.graph_generation <> snapshot.startup.graph_generation
@@ -961,7 +1043,8 @@ let local_unavailable core reason message =
   let startup={snapshot.startup with local_access=Local_unavailable reason;
     restoring_local=false;bootstrapping=false;catalog_loading=false;awaiting_e2ee_password=false;
     failure=Some (if reason=Local_catalog_unavailable then During_catalog else During_local_restore)} in
-  let next=set_snapshot core {snapshot with startup;last_error=Some message;sync_phase=Offline} in
+  let next=set_snapshot core {snapshot with startup; unlock = Unlock_failed (Retry_preparation message);
+      last_error=Some message;sync_phase=Offline} in
   {next;effects=[publish next]}
 ;;
 
@@ -982,6 +1065,7 @@ let fail core stage message =
     { core.public_state.snapshot with
       sync_phase = Failed
     ; startup
+    ; unlock = Unlock_failed (Retry_preparation message)
     ; last_error = Some message
     }
   in
@@ -994,12 +1078,8 @@ let fail core stage message =
     ; pending_mirror_inspection = None
     ; pending_selected_download = None
     ; pending_attachment = None
-    ; pending_encrypted_graph_key = None
-    ; pending_private_key_package = None
-    ; snapshot_scope = None
-    ; snapshot_server_t = None
-    ; active_snapshot_download = None
-      ; pending_snapshot_activation = None
+    ; unlock_preparation = No_unlock_preparation
+    ; bootstrap = No_bootstrap
     ; pending_sync_inspection = None
     ; pending_outbox_transition = None
     ; active_authoritative_batch = None
@@ -1056,7 +1136,7 @@ let issue_request : type a. t -> a runner_request -> t * runner_effect =
   let ticket =
     { id = core.next_effect_id
     ; scope =
-        (match request, core.snapshot_scope with
+        (match request, (bootstrap_scope core.bootstrap) with
          | (Fetch_e2ee_user_keys _ | Unlock_private_key _), Some graph ->
            (* Shared account material is requested for this graph's challenge. *)
            effect_scope_of_graph graph
@@ -1073,21 +1153,25 @@ let issue_request : type a. t -> a runner_request -> t * runner_effect =
 
 let begin_snapshot_bootstrap core scope =
   if not (network_allowed core) then local_unavailable core Local_mirror_unavailable "This graph is not downloaded. Connect to download it." else
-  let core = { core with snapshot_scope = Some scope; snapshot_server_t = None } in
+  let unlock = match core.public_state.snapshot.unlock with
+    | Unlock_running submission when submission.stage = Attachment -> Unlock_bootstrapping submission
+    | phase -> phase in
+  let core = set_snapshot
+    { core with bootstrap = Awaiting_snapshot_metadata (scope, core.next_effect_id) }
+    { core.public_state.snapshot with unlock } in
   let next, request = issue_request core (Fetch_snapshot_metadata scope) in
-  { next; effects = [ Run request ] }
+  let effects = match unlock with
+    | Unlock_bootstrapping _ -> [ publish next; Run request ]
+    | _ -> [ Run request ] in
+  { next; effects }
 ;;
 
 let begin_e2ee_key_access core scope =
   if not (network_allowed core) then local_unavailable core Local_key_unavailable "The local encryption key is unavailable. Connect to recover access." else
-  let core =
-    { core with
-      snapshot_scope = Some scope
-    ; snapshot_server_t = None
-    ; pending_encrypted_graph_key = None
-    ; pending_private_key_package = None
-    }
-  in
+  let core = set_snapshot
+    { core with bootstrap = Preparing_snapshot scope
+      ; unlock_preparation = Fetching_graph_key (scope, core.next_effect_id) }
+    { core.public_state.snapshot with unlock = Unlock_inactive } in
   let next, request = issue_request core (Fetch_e2ee_graph_key scope) in
   { next; effects = [ Run request ] }
 ;;
@@ -1182,12 +1266,8 @@ let reset_graph_operations core =
     graph_key = None
   ; pending_graph_open = None
   ; pending_attachment = None
-  ; pending_encrypted_graph_key = None
-  ; pending_private_key_package = None
-  ; snapshot_scope = None
-  ; snapshot_server_t = None
-  ; active_snapshot_download = None
-  ; pending_snapshot_activation = None
+  ; unlock_preparation = No_unlock_preparation
+  ; bootstrap = No_bootstrap
   ; sync_view = None
   ; pending_sync_inspection = None
   ; pending_outbox_transition = None
@@ -1478,7 +1558,7 @@ let mirror_inspected core = function
         let snapshot = core.public_state.snapshot in
         let startup = { snapshot.startup with authenticated = false;
           restoring_local = false; bootstrapping = true } in
-        let next = set_snapshot { core with snapshot_scope = Some scope }
+        let next = set_snapshot { core with bootstrap = Preparing_snapshot scope }
             { snapshot with startup } in
         { next; effects = [publish next] }
       else
@@ -1511,6 +1591,12 @@ let graph_attached core (attachment : graph_attachment) =
         sync_phase = (if network_allowed core then Current else Offline)
       ; applied_server_t = Some (Overlay.sync_view_checkpoint attachment.sync)
       ; timeline_presentation_pending = true
+      ; unlock = (match core.public_state.snapshot.unlock with
+          | (Unlock_running submission | Unlock_bootstrapping submission)
+            when submission.stage = Attachment
+              && submission.challenge.challenge_scope = attachment.scope ->
+            Unlock_presentable { submission; attached_scope = attachment.scope }
+          | phase -> phase)
       ; startup
       ; last_error = None
       }
@@ -2325,13 +2411,35 @@ let consume_ticket : type a. t -> a effect_ticket -> t option =
 
 let snapshot_ticket_is_current : type a. t -> a effect_ticket -> bool =
   fun core ticket ->
+  let current scope = graph_scope_is_current core scope
+    && ticket.scope = effect_scope_of_graph scope in
   match ticket.kind with
-  | Fetch_snapshot_baseline_kind | Fetch_snapshot_metadata_kind | Download_snapshot_kind ->
-    (match core.snapshot_scope with
-     | Some scope ->
-       graph_scope_is_current core scope
-       && ticket.scope = effect_scope_of_graph scope
-     | None -> false)
+  | Fetch_snapshot_metadata_kind ->
+    (match core.bootstrap with
+     | Awaiting_snapshot_metadata (scope, id) -> current scope && ticket.id = id
+     | _ -> false)
+  | Download_snapshot_kind ->
+    (match core.bootstrap with
+     | Downloading_snapshot request -> current request.scope && ticket.id = request.download_id
+     | _ -> false)
+  | Fetch_snapshot_baseline_kind ->
+    Option.fold ~none:false ~some:current (bootstrap_scope core.bootstrap)
+  | Fetch_e2ee_graph_key_kind ->
+    (match core.unlock_preparation with
+     | Fetching_graph_key (scope, id) -> current scope && id = ticket.id
+     | _ -> false)
+  | Fetch_e2ee_user_keys_kind ->
+    (match core.unlock_preparation with
+     | Fetching_user_keys (scope, _, id) -> current scope && id = ticket.id
+     | _ -> false)
+  | Unlock_private_key_kind | Fetch_and_unlock_graph_key_kind ->
+    (match core.public_state.snapshot.unlock with
+     | Unlock_running submission | Unlock_cancelled submission ->
+       current submission.challenge.challenge_scope
+       && (match submission.stage with
+           | Private_key id | Graph_key id -> id = ticket.id
+           | Attachment -> false)
+     | _ -> false)
   | _ -> true
 ;;
 
@@ -2376,6 +2484,7 @@ let clear_selected_graph_for_catalog core catalog =
     ; selected_graph = None
     ; applied_server_t = None
     ; timeline_presentation_pending = false
+    ; unlock = Unlock_inactive
     ; startup
     ; last_error = None
     }
@@ -2534,102 +2643,84 @@ let complete_runner : type a. t -> a effect_ticket -> a -> transition =
   | Save_catalog_kind -> deletion_selection_saved core
   | Fetch_catalog_kind -> apply_fetched_catalog core value
   | Fetch_snapshot_baseline_kind ->
-    (match
-       decode_snapshot_baseline value, core.current_graph_scope, core.snapshot_scope
-     with
-     | Ok server_t, Some graph, Some scope when scope = graph ->
-       let next, request_effect = issue_request core (Fetch_snapshot_metadata scope) in
-       { next = { next with snapshot_server_t = Some server_t }
-       ; effects = [ Run request_effect ]
-       }
-     | Error message, _, _ -> fail core During_bootstrap message
-     | Ok _, _, _ -> unchanged core)
+    (match decode_snapshot_baseline value, bootstrap_scope core.bootstrap with
+     | Ok _, Some scope when graph_scope_is_current core scope ->
+       begin_snapshot_bootstrap core scope
+     | Error message, _ -> fail core During_bootstrap message
+     | _ -> unchanged core)
   | Fetch_snapshot_metadata_kind ->
-    (match decode_snapshot_uri value, core.snapshot_scope with
-     | Ok (uri, server_t), Some scope ->
+    (match decode_snapshot_uri value, core.bootstrap with
+     | Ok (uri, metadata_cursor), Awaiting_snapshot_metadata (scope, attempt_id) ->
        let request =
-         { scope
-         ; uri
+         { scope; uri; metadata_cursor; attempt_id; download_id = core.next_effect_id
          ; expected_bytes = None
-         ; maximum_bytes = core.config.limits.maximum_artifact_bytes
-         }
+         ; maximum_bytes = core.config.limits.maximum_artifact_bytes }
        in
        let next, request_effect = issue_request core (Download_snapshot request) in
-       (* Metadata precedes a live stream that may contain later writes. Keep
-          this cursor so catchup replays all intervening journal entries. *)
-       { next =
-           { next with active_snapshot_download = Some scope
-           ; snapshot_server_t = Some server_t
-           }
-       ; effects = [ Run request_effect ]
-       }
+       (* Metadata is a lower bound for the live stream, never its maximum t. *)
+       { next = { next with bootstrap = Downloading_snapshot request }
+       ; effects = [ Run request_effect ] }
      | Error message, _ -> fail core During_bootstrap message
-     | Ok _, None -> unchanged core)
+     | _ -> unchanged core)
   | Download_snapshot_kind ->
-    let core = { core with active_snapshot_download = None } in
-    (match
-       core.current_graph_scope, core.snapshot_server_t, core.selected_graph_value
-     with
-     | Some scope, Some applied_server_t, Some graph when graph.encrypted ->
-       (match core.graph_key with
-        | Some key when graph_key_handle_scope key = scope ->
-          { next = { core with pending_snapshot_activation = Some scope }
-          ; effects =
-              [ Delegate
-                  (Activate_snapshot
-                     { artifact = value; scope; applied_server_t; key = Some key })
-              ]
-          }
-        | None ->
+    (match core.bootstrap, core.selected_graph_value with
+     | Downloading_snapshot request, Some graph
+       when graph_scope_is_current core request.scope
+            && value.download.attempt_id = request.attempt_id
+            && value.download = request ->
+       let key = if graph.encrypted then core.graph_key else None in
+       (match key with
+        | None when graph.encrypted ->
           fail core During_bootstrap "encrypted snapshot requires a graph key handle"
-        | Some _ ->
-          fail
-            core
-            During_bootstrap
-            "graph key handle is outside the selected graph scope")
-     | Some scope, Some applied_server_t, Some _ ->
-       { next = { core with pending_snapshot_activation = Some scope }
-       ; effects =
-           [ Delegate
-               (Activate_snapshot
-                  { artifact = value; scope; applied_server_t; key = None })
-           ]
-       }
+        | Some key when graph_key_handle_scope key <> request.scope ->
+          fail core During_bootstrap "graph key handle is outside the selected graph scope"
+        | _ ->
+          let activation =
+            { artifact = value; scope = request.scope
+            ; applied_server_t = request.metadata_cursor; key }
+          in
+          { next = { core with bootstrap = Activating_snapshot activation }
+          ; effects = [ Delegate (Activate_snapshot activation) ] })
+     | Downloading_snapshot _, _ ->
+       fail core During_bootstrap "snapshot artifact is outside the active attempt"
      | _ -> unchanged core)
   | Load_and_unlock_graph_key_kind -> graph_key_loaded core value
   | Fetch_e2ee_graph_key_kind ->
-    (match core.snapshot_scope with
-     | Some scope ->
-       let core = { core with pending_encrypted_graph_key = Some value } in
-       let account = scope.account in
-       let next, request = issue_request core (Fetch_e2ee_user_keys account) in
+    (match core.unlock_preparation with
+     | Fetching_graph_key (scope, _) ->
+       let core = { core with unlock_preparation =
+         Fetching_user_keys (scope, value, core.next_effect_id) } in
+       let next, request = issue_request core (Fetch_e2ee_user_keys scope.account) in
        { next; effects = [ Run request ] }
-     | None -> unchanged core)
+     | _ -> unchanged core)
   | Fetch_e2ee_user_keys_kind ->
-    let startup =
-      { core.public_state.snapshot.startup with
-        awaiting_e2ee_password = true
-      ; failure = None
-      }
-    in
-    let next =
-      set_snapshot
-        { core with pending_private_key_package = Some value }
-        { core.public_state.snapshot with startup; last_error = None }
-    in
-    { next; effects = [ publish next ] }
+    (match core.unlock_preparation with
+     | Fetching_user_keys (scope, encrypted_graph_key, _) ->
+       let challenge = { challenge_scope = scope; challenge_id = ticket.id
+         ; encrypted_graph_key; private_key_package = value } in
+       let next = set_snapshot { core with unlock_preparation = No_unlock_preparation }
+         { core.public_state.snapshot with unlock = Unlock_challenge challenge; last_error = None
+           ; startup = { core.public_state.snapshot.startup with failure = None } } in
+       { next; effects = [ publish next ] }
+     | _ -> unchanged core)
   | Unlock_private_key_kind ->
-    (match core.snapshot_scope, core.pending_encrypted_graph_key with
-     | Some scope, Some encrypted_graph_key ->
-       let next, request =
-         issue_request core (Fetch_and_unlock_graph_key { scope; encrypted_graph_key })
-       in
+    (match core.public_state.snapshot.unlock with
+     | (Unlock_running submission | Unlock_cancelled submission) as phase ->
+       let scope = submission.challenge.challenge_scope in
+       let submission = { submission with stage = Graph_key core.next_effect_id } in
+       let unlock = match phase with Unlock_cancelled _ -> Unlock_cancelled submission
+         | _ -> Unlock_running submission in
+       let core = set_snapshot core { core.public_state.snapshot with unlock } in
+       let next, request = issue_request core (Fetch_and_unlock_graph_key
+         { scope; encrypted_graph_key = submission.challenge.encrypted_graph_key }) in
        { next; effects = [ Run request ] }
      | _ -> unchanged core)
   | Fetch_and_unlock_graph_key_kind ->
-    let core =
-      { core with pending_encrypted_graph_key = None; pending_private_key_package = None }
-    in
+    let unlock = match core.public_state.snapshot.unlock with
+      | Unlock_running submission -> Unlock_running { submission with stage = Attachment }
+      | Unlock_cancelled submission -> Unlock_cancelled { submission with stage = Attachment }
+      | phase -> phase in
+    let core = set_snapshot core { core.public_state.snapshot with unlock } in
     graph_key_loaded core value
   | Delete_account_secrets_kind -> unchanged core
   | Encrypt_protected_values_kind -> unchanged core
@@ -2646,11 +2737,6 @@ let consume_completion core = function
        (match result with
         | Ok value -> complete_runner core ticket value
         | Error (Effect_failed message | Crypto_failed (_, message)) ->
-          let core =
-            match ticket.kind with
-            | Download_snapshot_kind -> { core with active_snapshot_download = None }
-            | _ -> core
-          in
           (match ticket.kind with
            | Save_catalog_kind ->
              (match core.public_state.snapshot.local_deletion with
@@ -2695,24 +2781,14 @@ let consume_completion core = function
            | Unlock_private_key_kind when core.public_state.snapshot.startup.network_phase = Local_only ->
              fail core During_e2ee message
            | Unlock_private_key_kind ->
-             (* A rejected password leaves the encrypted challenge available for
-             another attempt. No password or unlocked key is retained. *)
-             let failed = fail core During_e2ee message in
-             let startup =
-               { failed.next.public_state.snapshot.startup with
-                 awaiting_e2ee_password = true
-               }
-             in
-             let next =
-               set_snapshot
-                 { failed.next with
-                   snapshot_scope = core.snapshot_scope
-                 ; pending_encrypted_graph_key = core.pending_encrypted_graph_key
-                 ; pending_private_key_package = core.pending_private_key_package
-                 }
-                 { failed.next.public_state.snapshot with startup }
-             in
-             { next; effects = [ publish next ] }
+             (match core.public_state.snapshot.unlock with
+              | Unlock_running submission ->
+                let failed = fail core During_e2ee message in
+                let next = set_snapshot { failed.next with bootstrap = core.bootstrap }
+                  { failed.next.public_state.snapshot with
+                    unlock = Unlock_failed (Retry_password (submission.challenge, message)) } in
+                { next; effects = [ publish next ] }
+              | _ -> fail core During_e2ee message)
            | Fetch_e2ee_graph_key_kind
            | Fetch_e2ee_user_keys_kind
            | Fetch_and_unlock_graph_key_kind -> fail core During_e2ee message
@@ -2825,7 +2901,7 @@ let begin_local_deletion core graph_id =
       && not snapshot.startup.bootstrapping
       && not snapshot.startup.awaiting_e2ee_password
       && core.pending_attachment = None
-      && core.active_snapshot_download = None ->
+      && not (bootstrap_downloading core.bootstrap) ->
     let account = account_scope core user_id in
     (* A private flight identity leaves the live graph's generations untouched. *)
     let account = { account with lifecycle_generation = Int64.of_int core.next_effect_id } in
@@ -2915,12 +2991,12 @@ let step core event =
         || List.exists (fun (Pending_effect ticket) -> match ticket.kind with
              | Load_and_unlock_graph_key_kind | Fetch_and_unlock_graph_key_kind
              | Unlock_private_key_kind -> true | _ -> false) local_pending
-        || Option.is_some next.pending_snapshot_activation
+        || bootstrap_activating next.bootstrap
       in
       let local_access = match snapshot.startup.local_access with
         | Local_pending when not local_restore_pending ->
           Local_unavailable (if Option.is_some next.pending_graph_open
-            then Local_key_unavailable else if Option.is_some next.snapshot_scope
+            then Local_key_unavailable else if Option.is_some (bootstrap_scope next.bootstrap)
             then Local_mirror_unavailable else Local_restore_failed)
         | access -> access
       in
@@ -2935,13 +3011,15 @@ let step core event =
       let next = set_snapshot { next with
         pending_selected_download = None;
         pending_effects = local_pending; websocket_live = false; deferred_catalog_reconciliation = false;
-        pending_encrypted_graph_key = (if List.exists (fun (Pending_effect ticket) ->
-          match ticket.kind with Unlock_private_key_kind -> true | _ -> false) local_pending
-          then next.pending_encrypted_graph_key else None); pending_private_key_package = None;
-        active_snapshot_download = None; pull_wanted = None;
+        unlock_preparation = No_unlock_preparation;
+        bootstrap = (if bootstrap_downloading next.bootstrap then No_bootstrap else next.bootstrap); pull_wanted = None;
         pull_owner = (match next.pull_owner with
           | Some {pull_stage=Applying_pull; _} as owner -> owner | _ -> None)
-      } { snapshot with timeline_presentation_pending = false; startup; sync_phase = Offline } in
+      } { snapshot with timeline_presentation_pending = false; startup; sync_phase = Offline
+        ; unlock = (match snapshot.unlock with
+            | Unlock_running submission | Unlock_bootstrapping submission -> Unlock_cancelled submission
+            | Unlock_cancelled _ as phase -> phase
+            | _ -> Unlock_inactive) } in
       let scope = { account_generation = Some snapshot.startup.account_generation;
         graph_generation = None; connection_generation = None;
         presentation_generation = None; lifecycle_generation = None } in
@@ -3001,20 +3079,21 @@ let step core event =
     | Authoritative_batch_applied result -> authoritative_applied core result
     | Authoritative_batch_deferred result -> authoritative_deferred core result
     | Snapshot_activated activation ->
-      (match core.selected_graph_value with
-       | Some graph when graph_scope_is_current core activation.scope ->
+      (match core.bootstrap, core.selected_graph_value with
+       | Activating_snapshot pending, Some graph
+         when pending = activation && graph_scope_is_current core activation.scope ->
          let request = { graph; scope = activation.scope } in
-         { next = { core with pending_mirror_inspection = Some request; pending_snapshot_activation = None }
+         { next = { core with pending_mirror_inspection = Some request; bootstrap = Preparing_snapshot activation.scope }
          ; effects = [ Delegate (Inspect_mirror request) ]
          }
        | _ -> unchanged core)
     | Snapshot_download_progress progress ->
-      (match core.active_snapshot_download with
-       | Some scope
+      (match core.bootstrap with
+       | Downloading_snapshot { scope; _ }
          when graph_scope_is_current core scope
               && Logseq_db_types.Graph_types.Uuid.equal scope.graph_id progress.graph_id
          -> { next = core; effects = [ Publish (Bootstrap_progressed progress) ] }
-       | None | Some _ -> unchanged core)
+       | _ -> unchanged core)
     | Graph_picker_requested -> return_to_graph_picker core
     | Catalog_refresh_requested scope when not (startup_scope_is_current core scope) -> unchanged core
     | Catalog_refresh_requested _ ->
@@ -3106,42 +3185,31 @@ let step core event =
       let core=network_phase core Online_after_timeline in
       let next=set_snapshot core {core.public_state.snapshot with timeline_presentation_pending=false} in
       {next;effects=[publish next]}
+    | Snapshot_activation_failed error ->
+      (match core.bootstrap with
+       | Activating_snapshot pending
+         when pending = error.activation && graph_scope_is_current core pending.scope ->
+         fail core During_bootstrap error.message
+       | _ -> unchanged core)
     | Graph_attachment_failed error
     | Authoritative_batch_failed error
-    | Snapshot_activation_failed error
       when scoped_error_is_current core error ->
       fail core (if core.public_state.snapshot.startup.restoring_local then During_local_restore else During_bootstrap) error.message
     | Graph_attachment_failed _
-    | Authoritative_batch_failed _
-    | Snapshot_activation_failed _ -> unchanged core
-    | E2ee_password_submitted password ->
-      (match
-         ( core.snapshot_scope
-         , core.pending_private_key_package
-         , core.public_state.snapshot.startup.awaiting_e2ee_password )
-       with
-       | Some graph, Some private_key_package, true ->
-         let startup =
-           { core.public_state.snapshot.startup with
-             awaiting_e2ee_password = false
-           ; failure = None
-           }
-         in
-         let core =
-           set_snapshot
-             core
-             { core.public_state.snapshot with
-               startup
-             ; sync_phase = Offline
-             ; last_error = None
-             }
-         in
-         let scope = graph.account in
-         let next, request =
-           issue_request
-             core
-             (Unlock_private_key { scope; password; private_key_package })
-         in
+    | Authoritative_batch_failed _ -> unchanged core
+    | E2ee_password_submitted (challenge, password) ->
+      (match unlock_challenge core.public_state.snapshot.unlock with
+       | Some current when equal_unlock_challenge current challenge
+           && graph_scope_is_current core challenge.challenge_scope ->
+         let submission = { challenge; operation_id = core.next_effect_id
+           ; stage = Private_key core.next_effect_id } in
+         let core = set_snapshot core
+           { core.public_state.snapshot with unlock = Unlock_running submission
+             ; sync_phase = Offline; last_error = None
+             ; startup = { core.public_state.snapshot.startup with failure = None } } in
+         let next, request = issue_request core (Unlock_private_key
+           { scope = challenge.challenge_scope.account; password
+             ; private_key_package = challenge.private_key_package }) in
          { next; effects = [ publish next; Run request ] }
        | _ -> unchanged core)
     | Outbox_transition_failed { request; message } ->
@@ -3212,8 +3280,7 @@ let step core event =
           ; pending_graph_open = None
           ; pending_mirror_inspection = None
           ; pending_attachment = None
-          ; active_snapshot_download = None
-      ; pending_snapshot_activation = None
+          ; bootstrap = No_bootstrap
           ; pending_sync_inspection = None
           ; pending_outbox_transition = None
           ; submission_owner = None

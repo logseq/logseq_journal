@@ -98,6 +98,19 @@ let sealed_public_interface () =
   positive
     root
     "module C = Logseq_sync_pure_reducer__Core\nlet carry (x : C.runner_effect) = x\n";
+  negative root (prefix ^ "let bypass = C.staged_artifact\n") "Unbound value";
+  negative root
+    (prefix ^ "let forge (artifact : C.staged_artifact) (scope : C.graph_scope) cursor : C.snapshot_activation_request = { artifact; scope; applied_server_t = cursor; key = None }\n")
+    "Unbound record field";
+  negative root
+    (prefix ^ "let forge (value : bool) : C.unlock_attached = value\n")
+    "but an expression was expected of type";
+  negative root
+    (prefix ^ "let forge (value : string) : C.unlock_challenge = value\n")
+    "but an expression was expected of type";
+  negative root
+    "let forge (value : string) : Logseq_sync_effect_runner.Asset_codec.verified = value\n"
+    "but an expression was expected of type";
   negative root (prefix ^ "let forge scope = C.Cancel_effects scope\n") "private type";
   negative
     root

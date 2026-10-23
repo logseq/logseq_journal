@@ -375,7 +375,9 @@ module Asset_cache = struct
     if needed > t.budget then Error Full else evict usage candidates
   ;;
 
-  let publish t ~asset ~(version : Asset.version) ~current ~plaintext =
+  let publish t ~asset ~current ~verified =
+    let version = Asset_codec.verified_version verified in
+    let plaintext = Asset_codec.verified_bytes verified in
     protect (fun () ->
       if t.closed || not (current ())
       then Error Stale

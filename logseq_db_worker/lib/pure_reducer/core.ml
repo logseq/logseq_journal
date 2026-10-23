@@ -477,8 +477,7 @@ let step state event =
              translate_sync
                (Sync.step
                   state.sync_core
-                  (Sync.Snapshot_activation_failed
-                     { scope = Sync.effect_scope_of_graph request.scope; message }))
+                  (Sync.Snapshot_activation_failed (Sync.snapshot_activation_failed request ~message)))
                state
            | Some (Sync.Apply_authoritative_batch request) ->
              let transitioned =
