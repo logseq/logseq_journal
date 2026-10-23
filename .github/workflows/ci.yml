@@ -29,7 +29,7 @@ jobs:
       CI_COMPILER: ocaml-base-compiler.5.5.0
       # This commit binds compiler source checksums, patches, build commands and
       # every repository package recipe. Update deliberately with the toolchain.
-      CI_OPAM_REPOSITORY: git+https://github.com/ocaml/opam-repository.git#7b5e9a2b084fe7ff750c4a9449289065ef9f9216
+      CI_OPAM_REPOSITORY: git+https://github.com/ocaml/opam-repository.git#922f67e068446a8d8e809a40251a259bd0549552
       CI_OPAM_VERSION: 2.6.1
       HOMEBREW_NO_AUTO_UPDATE: 1
       OPAMJOBS: 3
