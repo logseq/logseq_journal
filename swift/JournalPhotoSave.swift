@@ -3,7 +3,7 @@ import Foundation
 /// Owns one add-only save operation independently of the preview/graph lifetime.
 @MainActor final class JournalPhotoSave {
   enum Authorization { case notDetermined, authorized, denied, restricted }
-  enum Feedback: Equatable { case saved, denied, restricted, notImage, failed }
+  enum Feedback: Equatable { case saved, denied, restricted, notImage; case failed(JournalAssetDiagnostic) }
   enum StageError: Error { case notImage }
 
   final class FileLease {
@@ -22,7 +22,7 @@ import Foundation
     let authorization: () -> Authorization
     let requestAuthorization: (@escaping @MainActor (Authorization) -> Void) -> Void
     let stage: (URL) throws -> FileLease
-    let write: (URL, @escaping @MainActor (Bool) -> Void) -> Void
+    let write: (URL, @escaping @MainActor (Result<Void, JournalAssetDiagnostic>) -> Void) -> Void
     let feedback: (Feedback) -> Void
   }
 
@@ -51,7 +51,7 @@ import Foundation
     let file: FileLease
     do { file = try dependencies.stage(selectedURL) }
     catch StageError.notImage { dependencies.feedback(.notImage); return }
-    catch { dependencies.feedback(.failed); return }
+    catch { dependencies.feedback(.failed(.classify(error, stage: .photoStage))); return }
     let current = Operation(file: file)
     operation = current
     onBusyChanged?(true)
@@ -70,9 +70,12 @@ import Foundation
     case .authorized:
       current.writing = true
       // Completion retains this owner and file even if the UI disappears.
-      dependencies.write(current.file.url) { [self, current] success in
+      dependencies.write(current.file.url) { [self, current] result in
         guard operation === current else { return }
-        finish(current, feedback: success ? .saved : .failed)
+        switch result {
+        case .success: finish(current, feedback: .saved)
+        case .failure(let reason): finish(current, feedback: .failed(reason))
+        }
       }
     case .denied, .notDetermined: finish(current, feedback: .denied)
     case .restricted: finish(current, feedback: .restricted)

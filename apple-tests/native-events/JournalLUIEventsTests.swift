@@ -26,6 +26,8 @@ private func platformResponse(_ bytes: UnsafePointer<UInt8>?, _ length: Int32) -
 @_silgen_name("journal_ocaml_platform_failure")
 private func platformFailure(_ bytes: UnsafePointer<UInt8>?, _ length: Int32) -> Int32
 
+@_silgen_name("journal_ocaml_failure_reason") private func failureReason(_ operation:Int32) -> Int32
+nonisolated(unsafe) private var nestedFailure = false
 nonisolated(unsafe) private var patches: [String] = []
 nonisolated(unsafe) private var callbackFailure: String?
 nonisolated(unsafe) private var reenter = false
@@ -36,6 +38,11 @@ private let receivePatch: PatchCallback = { source in
   // Applying a real backend patch synchronously delivers deferred UI events.
   // Even a read-only bridge call must be able to reacquire the OCaml runtime.
   if rootNode() != 42 { callbackFailure = "callback could not query the runtime" }
+  if nestedFailure {
+    nestedFailure = false
+    if MainActor.assumeIsolated({JournalLUIEvents.dispatch(.textChanged(node:42,text:"raise"))}) != 0
+      || failureReason(7) != 2 { callbackFailure = "nested reason unavailable" }
+  }
   if reenter {
     reenter = false
     if MainActor.assumeIsolated({
@@ -118,9 +125,19 @@ private let receivePatch: PatchCallback = { source in
       JournalLUIEvents.dispatch(.textChanged(node: node, text: "raise")) == 0,
       "OCaml exception reported success")
     try check(patches.isEmpty, "OCaml exception emitted a patch")
+    try check(failureReason(7) == 2 && failureReason(3) == 0, "reason must belong to the exact operation")
+    for (text, reason) in [("raise-startup",Int32(5)),("raise-worker",6),("raise-mount",7)] {
+      try check(JournalLUIEvents.dispatch(.textChanged(node:node,text:text)) == 0,
+        "typed startup exception was accepted")
+      try check(failureReason(7) == reason, "fixed startup exception reason was lost")
+    }
     try check(
       JournalLUIEvents.dispatch(.press(node: node)) == 1 && patches.count == 1,
       "runtime did not recover after an exception")
+    try check(failureReason(7) == 0, "success must clear old reason")
+    nestedFailure = true
+    try check(JournalLUIEvents.dispatch(.press(node:node)) == 1 && failureReason(7) == 0,
+      "outer success must restore its own result after nested failure")
     patches.removeAll()
     reenter = true
     try check(JournalLUIEvents.dispatch(.press(node: node)) == 1, "outer dispatch failed")

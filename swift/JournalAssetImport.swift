@@ -9,35 +9,6 @@ import UniformTypeIdentifiers
 import UIKit
 #endif
 
-private actor JournalAssetStaging {
-  static let shared = JournalAssetStaging()
-
-  nonisolated static func discard(_ file: URL) {
-    do { try FileManager.default.removeItem(at: file) }
-    catch let error as CocoaError where error.code == .fileNoSuchFile { } // Idempotent cleanup.
-    catch {
-      Logger(subsystem: "com.logseq.journal", category: "cleanup")
-        .error("Temporary attachment cleanup could not finish (assetImport.cleanup.failed)")
-    }
-  }
-
-  func copy(_ source: URL) -> URL? {
-    let scoped = source.startAccessingSecurityScopedResource()
-    defer { if scoped { source.stopAccessingSecurityScopedResource() } }
-    let ext = source.pathExtension.lowercased()
-    let name = "journal-import-" + UUID().uuidString.lowercased() + (ext.isEmpty ? "" : "." + ext)
-    let dest = FileManager.default.temporaryDirectory.appendingPathComponent(name)
-    do { try FileManager.default.copyItem(at: source, to: dest); return dest }
-    catch { Self.discard(dest); return nil }
-  }
-
-  func write(_ data: Data, ext: String) -> URL? {
-    let dest = FileManager.default.temporaryDirectory.appendingPathComponent("journal-import-" + UUID().uuidString.lowercased() + "." + ext)
-    do { try data.write(to: dest); return dest }
-    catch { Self.discard(dest); return nil }
-  }
-}
-
 @MainActor enum JournalAssetImport {
   struct Request: Codable, Equatable {
     let id: Int
@@ -195,11 +166,11 @@ private actor JournalAssetStaging {
       for item in items { JournalAssetStaging.discard(URL(fileURLWithPath: item.path)) }
     }
 
-    private func emitBatch(_ items: [Pick], failures: Int, request: Request, epoch: Int) {
+    private func emitBatch(_ items: [Pick], failures: [JournalAssetDiagnostic], request: Request, epoch: Int) {
       guard !Task.isCancelled, isCurrent(request, epoch: epoch) else { discard(items); return }
       handled = true
       let payload = Event(action: "picked-batch", items: items, request: request,
-        error: failures > 0 ? "\(failures) selected item(s) could not be added. Your other attachments are kept." : nil)
+        error: JournalAssetDiagnostic.summary(failures))
       if !emit(payload) {
         discard(items)
         error = "The destination is no longer available. Select the files again."
@@ -220,14 +191,18 @@ private actor JournalAssetStaging {
       }
       var items: [Pick] = []
       var seen = Set((properties?.pending ?? []).compactMap(\.sourceIdentity))
-      var failures = 0
+      var failures: [JournalAssetDiagnostic] = []
       let remaining = max(0, request.maxSelections ?? sources.count)
       for source in sources {
         let identity = "files:" + source.standardizedFileURL.absoluteString
         guard seen.insert(identity).inserted else { continue }
-        guard items.count < remaining else { failures += 1; continue }
+        guard items.count < remaining else { failures.append(.init(stage: .selection, category: .selectionLimit)); continue }
         guard !Task.isCancelled, isCurrent(request, epoch: epoch) else { discard(items); return }
-        guard let copy = await JournalAssetStaging.shared.copy(source) else { failures += 1; continue }
+        let copy: URL
+        switch await JournalAssetStaging.shared.copy(source) {
+        case .success(let staged): copy = staged
+        case .failure(let reason): failures.append(reason); continue
+        }
         guard !Task.isCancelled, isCurrent(request, epoch: epoch) else {
           JournalAssetStaging.discard(copy); discard(items); return
         }
@@ -237,27 +212,40 @@ private actor JournalAssetStaging {
       emitBatch(items, failures: failures, request: request, epoch: epoch)
     }
 
-    private func stageData(_ data: Data, ext: String, title: String, identity: String) async -> Pick? {
-      guard let dest = await JournalAssetStaging.shared.write(data, ext: ext) else { return nil }
-      return pick(path: dest.path(percentEncoded: false), title: title, type: ext, identity: identity)
+    private func stageData(_ data: Data, ext: String, title: String, identity: String) async -> Result<Pick, JournalAssetDiagnostic> {
+      switch await JournalAssetStaging.shared.write(data, ext: ext) {
+      case .success(let dest):
+        return .success(pick(path: dest.path(percentEncoded: false), title: title, type: ext, identity: identity))
+      case .failure(let reason): return .failure(reason)
+      }
     }
 
     private func importPhotos(_ selected: [PhotosPickerItem], request: Request, epoch: Int) async {
       var items: [Pick] = []
       var seen = Set((properties?.pending ?? []).compactMap(\.sourceIdentity))
-      var failures = 0
+      var failures: [JournalAssetDiagnostic] = []
       let remaining = max(0, request.maxSelections ?? selected.count)
       for item in selected {
         guard !Task.isCancelled, isCurrent(request, epoch: epoch) else { discard(items); return }
         if let identifier = item.itemIdentifier, seen.contains("photos:" + identifier) { continue }
-        guard items.count < remaining else { failures += 1; continue }
-        guard let data = try? await item.loadTransferable(type: Data.self) else { failures += 1; continue }
+        guard items.count < remaining else { failures.append(.init(stage: .selection, category: .selectionLimit)); continue }
+        let data: Data
+        do {
+          guard let loaded = try await item.loadTransferable(type: Data.self) else {
+            failures.append(.init(stage: .photoLoad, category: .dataUnavailable)); continue
+          }
+          data = loaded
+        } catch {
+          failures.append(.classify(error, stage: .photoLoad)); continue
+        }
         guard !Task.isCancelled, isCurrent(request, epoch: epoch) else { discard(items); return }
         let identity = "photos:" + (item.itemIdentifier ?? SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined())
         guard seen.insert(identity).inserted else { continue }
         let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "jpg"
-        if let staged = await stageData(data, ext: ext, title: "photo." + ext, identity: identity) { items.append(staged) }
-        else { failures += 1 }
+        switch await stageData(data, ext: ext, title: "photo." + ext, identity: identity) {
+        case .success(let staged): items.append(staged)
+        case .failure(let reason): failures.append(reason)
+        }
       }
       emitBatch(items, failures: failures, request: request, epoch: epoch)
     }
@@ -284,7 +272,7 @@ private actor JournalAssetStaging {
         case .failure(let failure):
           selection.release()
           if (failure as NSError).code == NSUserCancelledError { emitDismissed() }
-          else if isCurrent(request, epoch: epoch) { emitUnavailable("Unable to access the selected files. Please try again.", request: request) }
+          else if isCurrent(request, epoch: epoch) { emitUnavailable("Unable to access the selected files. Please try again. (\(JournalAssetDiagnostic.classify(failure, stage: .fileSelection)))", request: request) }
         }
       }
       .photosPicker(isPresented: $photosPresented, selection: $photoItems,
@@ -297,11 +285,14 @@ private actor JournalAssetStaging {
           let epoch = self.epoch
           importTask?.cancel()
           importTask = Task {
-            let item: Pick?
+            let result: Result<Pick, JournalAssetDiagnostic>
             if let data = image.jpegData(compressionQuality: 0.9) {
-              item = await stageData(data, ext: "jpg", title: "camera.jpg", identity: "camera:" + UUID().uuidString.lowercased())
-            } else { item = nil }
-            emitBatch(item.map { [$0] } ?? [], failures: item == nil ? 1 : 0, request: request, epoch: epoch)
+              result = await stageData(data, ext: "jpg", title: "camera.jpg", identity: "camera:" + UUID().uuidString.lowercased())
+            } else { result = .failure(.init(stage: .cameraEncode, category: .dataUnavailable)) }
+            switch result {
+            case .success(let item): emitBatch([item], failures: [], request: request, epoch: epoch)
+            case .failure(let reason): emitBatch([], failures: [reason], request: request, epoch: epoch)
+            }
           }
         }, onCancel: emitDismissed)
         #else

@@ -70,6 +70,73 @@ import Foundation
     await failed.submit()
     precondition(failed.canSubmit && failed.message != nil && !failed.message!.contains("SECRET"),
       "Authentication errors must be sanitized and retryable")
+    // The native presentation owner owns this failure mapping. These public
+    // submit/cancel paths cannot be reproduced by the OCaml graph reducer.
+    let known: [JournalCognitoError] = [.configuration, .callback, .expired,
+      .invalidToken, .storage, .unavailable, .request, .invalidGrant]
+    for reason in known {
+      let knownAPI = API()
+      knownAPI.failure = reason
+      let knownModel = JournalAuthentication(api: knownAPI)
+      await knownModel.submit()
+      precondition(knownModel.message == reason.errorDescription && knownModel.canSubmit,
+        "Known browser failure must retain its fixed recovery reason")
+      knownAPI.failure = nil
+      knownAPI.preparationFailure = reason
+      await knownModel.submit()
+      precondition(knownModel.message == reason.errorDescription && knownModel.canSubmit,
+        "Known preparation failure must retain its fixed recovery reason")
+    }
+    let detailedAPI = API()
+    let detailed = JournalCognitoFailure(category: .request,
+      detail: .init(source: .token, reason: .httpStatus, httpStatus: 401, oauth: .invalid_client))
+    detailedAPI.failure = detailed
+    let detailedModel = JournalAuthentication(api: detailedAPI)
+    await detailedModel.submit()
+    precondition(detailedModel.message == detailed.errorDescription
+      && detailedModel.message!.contains("token.httpStatus")
+      && detailedModel.message!.contains("http 401")
+      && detailedModel.canSubmit && !detailedModel.complete,
+      "Known safe upstream detail must survive direct sign-in presentation")
+    detailedAPI.failure = nil
+    detailedAPI.preparationFailure = detailed
+    await detailedModel.submit()
+    precondition(detailedModel.message == detailed.errorDescription && detailedModel.canSubmit,
+      "Known safe upstream detail must survive preparation presentation")
+    let kinds: [JournalAccountIssue.Kind] = [.unsupportedFormat, .corruptBinding,
+      .secureStorageUnavailable, .network, .signInRequired, .accountChangeBlocked, .unavailable]
+    for kind in kinds {
+      let issue = JournalAccountIssue(kind: kind, stage: .identityLookup)
+      let issueAPI = API()
+      issueAPI.failure = issue
+      let issueModel = JournalAuthentication(api: issueAPI)
+      await issueModel.submit()
+      precondition(issueModel.message == issue.errorDescription,
+        "Known account issue must retain its fixed recovery reason")
+      issueAPI.failure = nil
+      issueAPI.preparationFailure = issue
+      await issueModel.submit()
+      precondition(issueModel.message == issue.errorDescription,
+        "Known account preparation issue must retain its fixed recovery reason")
+    }
+    let cancelledAPI = API()
+    cancelledAPI.suspended = true
+    let cancelledModel = JournalAuthentication(api: cancelledAPI)
+    let cancelledSubmit = Task { await cancelledModel.submit() }
+    while cancelledAPI.hold == nil { await Task.yield() }
+    cancelledModel.cancel()
+    cancelledAPI.hold!.resume(throwing: JournalCognitoError.storage)
+    await cancelledSubmit.value
+    precondition(cancelledModel.message == nil && !cancelledModel.complete && !cancelledModel.busy,
+      "Retired known error cannot overwrite a cancelled presentation")
+    let unknownPreparation = API()
+    unknownPreparation.accountPreparationMessage = nil
+    unknownPreparation.preparationFailure = NSError(domain: "fixture", code: 1,
+      userInfo: [NSLocalizedDescriptionKey: "token=SECRET password=SECRET"])
+    let unknownModel = JournalAuthentication(api: unknownPreparation)
+    await unknownModel.submit()
+    precondition(unknownModel.message == "Unable to complete your account connection. Please try again.",
+      "Unknown preparation error must keep the safe fallback")
     print("PASS credential-free presentation, error retry, cancel, duplicate and retired completion")
   }
 }

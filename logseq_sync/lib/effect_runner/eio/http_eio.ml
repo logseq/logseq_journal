@@ -102,9 +102,11 @@ let with_attempt ~sw ~authenticator ~network ~clock ~response_budget request ~co
                 | Some host -> host
                 | None -> fail "HTTPS host is missing"
               in
+              let dns_failure = ref None in
               let flow =
                 match
-                  Tls_client_eio.connect
+                  Tls_client_eio.connect_diagnosed
+                    ~on_diagnostic:(fun source -> dns_failure := Some source)
                     ~sw:owner
                     ~authenticator
                     ~network
@@ -113,7 +115,23 @@ let with_attempt ~sw ~authenticator ~network ~clock ~response_budget request ~co
                     ~port:(port request.uri)
                 with
                 | Ok flow -> flow
-                | Error _ -> fail "TLS connection setup failed"
+                | Error Tls_client_eio.Invalid_dns_host ->
+                  fail "TLS setup failed: invalid DNS host"
+                | Error Tls_client_eio.No_network_address ->
+                  fail ("TLS setup failed: no network address"
+                    ^ Option.fold ~none:"" ~some:(fun source -> " (" ^ source ^ ")") !dns_failure)
+                | Error Tls_client_eio.Authentication_failed ->
+                  fail "TLS authentication failed"
+                | Error (Tls_client_eio.Setup_failed "invalid TLS configuration") ->
+                  fail "TLS setup failed: invalid TLS configuration"
+                | Error (Tls_client_eio.Setup_failed "all resolved addresses failed") ->
+                  fail "TLS setup failed: all resolved addresses failed"
+                | Error (Tls_client_eio.Setup_failed "DNS/TCP dial timed out") ->
+                  fail "TLS setup failed: DNS/TCP dial timed out"
+                | Error (Tls_client_eio.Setup_failed source) ->
+                  (match Tls_client_eio.safe_setup_detail source with
+                   | Some detail -> fail ("TLS setup failed: " ^ detail)
+                   | None -> fail "TLS connection setup failed")
               in
               let started = Eio.Time.now clock in
               Fun.protect

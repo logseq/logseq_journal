@@ -191,6 +191,11 @@ let create ~sw ~config ~runner_dependencies =
 ;;
 
 let post t event = route_event t event
+let report_asset_diagnostic t ~scope ~operation ~request_operation diagnostic =
+  if not t.stopped then
+    Effect_runner.report_asset_diagnostic t.runner ~scope ~operation ~request_operation diagnostic
+;;
+
 let view t = Pure_reducer.view !(t.state)
 let graph_state t = (view t).graph
 

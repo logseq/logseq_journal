@@ -106,6 +106,51 @@ enum JournalLocalAccountBindingStore {
   }
 
   @MainActor static func main() async throws {
+    // Configuration encoding is owned by the native startup producer before
+    // any OCaml request. These strings do not access the filesystem/network.
+    for (path,origin) in [("SECRET-relative-path","https://example.invalid"),
+      ("/tmp/native-synthetic","http://example.invalid"),
+      ("/"+String(repeating:"x",count:4097),"https://example.invalid")] {
+      do {
+        _ = try JournalNativeServices.startupPayload(applicationSupportPath:path,managedSyncOrigin:origin)
+        preconditionFailure("invalid startup configuration was admitted")
+      } catch {
+        precondition((error as? LocalizedError)?.errorDescription ==
+          "The native startup configuration is invalid. Reopen Journal.",
+          "native startup producer discarded its known configuration reason")
+      }
+    }
+    let expectedStartup = try JournalStartupConfiguration.encode(applicationSupportPath:"/tmp/native-synthetic",
+      managedSyncOrigin:"https://example.invalid")
+    let actualStartup = try JournalNativeServices.startupPayload(applicationSupportPath:"/tmp/native-synthetic",
+      managedSyncOrigin:"https://example.invalid")
+    let expectedJSON = try JSONSerialization.jsonObject(with:Data(expectedStartup.dropFirst(8))) as! NSDictionary
+    let actualJSON = try JSONSerialization.jsonObject(with:Data(actualStartup.dropFirst(8))) as! NSDictionary
+    precondition(actualStartup.prefix(8) == expectedStartup.prefix(8) && actualJSON.isEqual(expectedJSON),
+      "startup header and payload facts must remain unchanged")
+    // The native recovery owner must distinguish format/shape while retaining
+    // both the canonical binding and opaque recovery bytes on every rejection.
+    for mode in ["format", "corrupt"] {
+      let bytes = mode == "format" ? try JSONSerialization.data(withJSONObject: [
+        "version": 9, "id": UUID().uuidString, "replacement": Data("private-token-sentinel".utf8).base64EncodedString()
+      ]) : Data("private-token-sentinel".utf8)
+      let original = JournalLocalAccountBindingStore.state.withLock { state in
+        state.recovery = bytes; return state.value
+      }
+      let owner = JournalNativeServices.makePlatformServices()
+      do { _ = try await owner.response(for: .localAccount); preconditionFailure("Rejected recovery was exposed") }
+      catch let issue as JournalAccountIssue {
+        precondition(issue.kind == .unavailable && issue.stage == .bindingWrite && issue.offersSignIn)
+        let expected = mode == "format" ? "recovery.unsupportedFormat" : "recovery.invalidRecord"
+        precondition(issue.diagnostic.contains(expected), "recovery cause was discarded: \(issue.diagnostic)")
+        if mode == "format" { precondition(issue.diagnostic.contains("format 9")) }
+        precondition(!issue.diagnostic.contains("private-"))
+      }
+      precondition(JournalLocalAccountBindingStore.state.withLock { $0.value == original && $0.recovery == bytes },
+        "Invalid recovery must fail closed without changing original bytes")
+    }
+    JournalLocalAccountBindingStore.state.withLock { $0.recovery = nil }
+    print("PASS recovery unsupported format vs invalid record, retained bytes and unchanged recovery policy")
     let platform = JournalNativeServices.makePlatformServices()
     let initial = try await platform.response(for: .localAccount)
     precondition(initial == .localAccount(userID: "fixture-user", origin: "https://api.logseq.io"))

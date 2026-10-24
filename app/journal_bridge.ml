@@ -81,8 +81,16 @@ let platform_failure payload = (hooks ()).platform_failure payload
 let dispose () = (hooks ()).dispose ()
 let root_node () = (hooks ()).root_node ()
 
+let classify_exception = function
+  | Failure message when message = "application.decodeStartup.failed" -> 5
+  | Failure message when message = "application.startWorker.failed" -> 6
+  | Failure message when message = "application.mount.failed" -> 7
+  | _ -> 2
+;;
+
 let register hooks =
   current := Some hooks;
+  Callback.register "journal_ocaml_classify_exception" classify_exception;
   Callback.register "lui_ocaml_init" initialize;
   Callback.register "lui_ocaml_appear" appear;
   Callback.register "lui_ocaml_press" press;
@@ -110,4 +118,76 @@ let register hooks =
   Callback.register "journal_ocaml_platform_event" platform_event;
   Callback.register "journal_ocaml_platform_response" platform_response;
   Callback.register "journal_ocaml_platform_failure" platform_failure
+;;
+
+let platform_reasons =
+  [ 1, "cancelled", "The native request was cancelled."
+  ; 2, "requestDecode", "The native request format could not be read."
+  ; 3, "responseEncode", "The native response could not be encoded."
+  ; 4, "clipboardUnavailable", "The clipboard could not accept the copied text."
+  ; 5, "serviceUnavailable", "The native service is currently unavailable. Retry the operation."
+  ; 6, "serviceFailed", "The native service could not complete the request. Retry the operation."
+  ; 7, "authenticationRequired", "Sign in again to complete the request."
+  ; 8, "invalidBinding", "The saved account connection could not be read."
+  ; 9, "network", "The native account request could not connect. Check your connection and retry."
+  ; 10, "secureStorage", "Secure account storage is unavailable. Unlock your device and retry."
+  ; 11, "invalidPacket", "The native service returned an invalid response."
+  ]
+;;
+
+let platform_failure_message code =
+  match List.find_opt (fun (_,reason,_)->code="native.platform."^reason) platform_reasons with
+  | Some (_,_,message) -> code ^ " · " ^ message
+  | None -> "native.platform.unknown · The native request could not finish. Retry the operation."
+;;
+
+let decode_platform_failure payload =
+  let bytes=Bytes.of_string payload in
+  let size=Bytes.length bytes in
+  let known tag=List.mem tag [6;8;10;13;20;22;28;30;32] in
+  if size=24 && String.sub payload 0 4="LJF1" then (
+    let tag=Bytes.get_uint16_le bytes 4 and reason=Bytes.get_uint16_le bytes 6 in
+    let account=Bytes.get_int64_le bytes 8 and presentation=Bytes.get_int64_le bytes 16 in
+    match List.find_opt (fun (value,_,_)->value=reason) platform_reasons with
+    | Some (_,name,_) when (known tag || (tag=0 && reason=2)) && account>=0L && presentation>=0L
+        && account<=Int64.of_int max_int && presentation<=Int64.of_int max_int ->
+      Some(tag,"native.platform."^name,Some(account,presentation))
+    | _ -> None)
+  else if size>=32 && size<=32+262144 && String.sub payload 0 4="LJP2"
+      && Bytes.get_uint16_le bytes 4=2
+      && String.sub payload 8 16=String.make 16 '\000'
+      && String.sub payload 28 4=String.make 4 '\000'
+      && Int32.equal (Bytes.get_int32_le bytes 24) (Int32.of_int(size-32)) then (
+    let tag=Bytes.get_uint16_le bytes 6 in
+    if known tag then Some(tag,"native.platform.serviceFailed",None) else None)
+  else None
+;;
+
+let native_diagnostic source =
+  let families=
+    ["diagnostic.nativePropsDecode","decodeNativeProps";
+     "diagnostic.nativeScrollDecode","decodeNativeScroll";
+     "diagnostic.nativeEventDelivery","deliverNativeEvent";
+     "diagnostic.nativeEventEncode","encodeNativeEvent"] in
+  match List.find_opt (fun (prefix,_)->source=prefix || String.starts_with ~prefix:(prefix^".") source) families with
+  | None -> None
+  | Some(prefix,operation) ->
+    let suffix=if source=prefix then "unknown" else String.sub source (String.length prefix+1) (String.length source-String.length prefix-1) in
+    let reason,message = match suffix with
+      | "missingPayload" -> suffix,"The required native payload is missing."
+      | "typeMismatch" -> suffix,"A native field has an unexpected type."
+      | "keyNotFound" -> suffix,"A required native field is missing."
+      | "valueNotFound" -> suffix,"A required native value is missing."
+      | "dataCorrupted" -> suffix,"The native payload format is invalid."
+      | "invalidPayload" -> suffix,"The native payload is unsupported."
+      | "backendUnsupportedProperty" -> suffix,"The native backend rejected an unsupported property."
+      | "backendUnknownNode" -> suffix,"The native backend could not find the destination node."
+      | "backendUnknownExtension" -> suffix,"The native extension is not registered."
+      | "backendFingerprintMismatch" -> suffix,"The native extension schema does not match."
+      | "backendInvalidHierarchy" -> suffix,"The native node hierarchy is invalid."
+      | "backendInvalidEvent" -> suffix,"The native event schema is invalid."
+      | "backendRegistryInvalid" -> suffix,"The native extension registry is invalid."
+      | "backendInvalidBatch" -> suffix,"The native backend rejected the event batch."
+      | _ -> "unknown","The native operation could not finish. Retry the operation."
+    in Some(operation,"native."^operation^"."^reason^" · "^message)
 ;;

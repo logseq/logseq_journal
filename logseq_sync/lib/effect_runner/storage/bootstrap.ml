@@ -1,3 +1,9 @@
+module Failure_diagnostic = Logseq_db_types.Failure_diagnostic
+
+let failure_message ~reason:reason_name source =
+  Failure_diagnostic.(of_source ~operation:"decodeSnapshot" ~reason:reason_name source |> message)
+;;
+
 type progress =
   { received_bytes : int
   ; total_bytes : int option
@@ -20,7 +26,15 @@ let artifact_row_count headers =
 
 let remove_if_exists path =
   try Sys.remove path with
-  | Sys_error _ -> ()
+  | Sys_error _ as error ->
+    (* Missing artifacts are normal idempotent cleanup. Preserve the original
+       unit completion if an artifact remains, but retain a safe support cause. *)
+    if Sys.file_exists path then (
+      let detail = Failure_diagnostic.of_source ~operation:"decodeSnapshot"
+        ~reason:"cleanupFailed" (Printexc.to_string error) in
+      try Printf.eprintf
+        "journal: phase=cleanup operation=removeSnapshotArtifact code=cleanupPending source=%s\n%!"
+        (Failure_diagnostic.source_class detail) with _ -> ())
 ;;
 
 let cleanup = List.iter remove_if_exists
@@ -38,7 +52,8 @@ let gzip_signature path =
          with
          | End_of_file -> Ok false)
   with
-  | Sys_error message -> Error message
+  | Sys_error _ as error ->
+    Error (failure_message ~reason:"resourceFailed" (Printexc.to_string error))
 ;;
 
 let copy_file ~maximum_bytes source destination =
@@ -71,12 +86,12 @@ let copy_file ~maximum_bytes source destination =
               loop ()));
     Ok ()
   with
-  | Sys_error message ->
+  | Failure source when source = "snapshot artifact exceeds its decompressed bound" ->
     remove_if_exists destination;
-    Error message
+    Error "snapshot artifact exceeds its decompressed bound"
   | exception_ ->
     remove_if_exists destination;
-    Error (Printexc.to_string exception_)
+    Error (failure_message ~reason:"resourceFailed" (Printexc.to_string exception_))
 ;;
 
 let nonempty path =
@@ -91,9 +106,15 @@ let decompress ~decompress_gzip ~maximum_bytes source destination =
   | 0 ->
     remove_if_exists destination;
     Error "snapshot gzip layer is empty"
-  | _ ->
+  | status ->
     remove_if_exists destination;
-    Error "snapshot gzip layer is invalid"
+    Error (match status with
+      | 1 -> "snapshot gzip input could not be opened"
+      | 2 -> "snapshot gzip output could not be opened"
+      | 3 -> "snapshot gzip decode failed"
+      | 4 -> "snapshot gzip output write failed"
+      | 5 -> "snapshot gzip decompressed limit exceeded"
+      | _ -> "snapshot gzip layer is invalid")
 ;;
 
 let peel_gzip_layers ~decompress_gzip ~maximum_bytes ~source ~destination ~temporary_paths
@@ -123,7 +144,8 @@ let peel_gzip_layers ~decompress_gzip ~maximum_bytes ~source ~destination ~tempo
                   cleanup [ second ];
                   Ok ()
                 with
-                | Sys_error message -> fail message)
+                | Sys_error _ as error ->
+                  fail (failure_message ~reason:"persistenceFailed" (Printexc.to_string error)))
              | Ok true ->
                (match decompress ~decompress_gzip ~maximum_bytes first second with
                 | Error message -> fail message
@@ -137,7 +159,8 @@ let peel_gzip_layers ~decompress_gzip ~maximum_bytes ~source ~destination ~tempo
                         cleanup [ first ];
                         Ok ()
                       with
-                      | Sys_error message -> fail message))))))
+                      | Sys_error _ as error ->
+                  fail (failure_message ~reason:"persistenceFailed" (Printexc.to_string error))))))))
     | [] | [ _ ] -> Error "two private gzip staging paths are required")
 ;;
 
@@ -196,11 +219,21 @@ module Asset_cache = struct
 
   let protect f =
     try f () with
-    | Sys_error message | Failure message -> Error (Io message)
-    | Yojson.Json_error message -> Error (Invalid message)
-    | Yojson.Safe.Util.Type_error (message, _) -> Error (Invalid message)
-    | Unix.Unix_error (error, operation, _) ->
-      Error (Io (operation ^ ": " ^ Unix.error_message error))
+    | Failure source as error ->
+      let diagnostic = Failure_diagnostic.of_source ~operation:"assetCache"
+        ~reason:"persistenceFailed" source in
+      let diagnostic =
+        if Failure_diagnostic.source_class diagnostic = "unknown"
+           && Option.is_none (Failure_diagnostic.decode source)
+        then Failure_diagnostic.of_source ~operation:"assetCache" ~reason:"persistenceFailed"
+          (Printexc.to_string error)
+        else diagnostic in
+      Error (Io (Failure_diagnostic.encode diagnostic))
+    | (Sys_error _ | Unix.Unix_error _) as error ->
+      Error (Io Failure_diagnostic.(of_source ~operation:"assetCache"
+        ~reason:"persistenceFailed" (Printexc.to_string error) |> encode))
+    | Yojson.Json_error _ | Yojson.Safe.Util.Type_error _ ->
+      Error (Invalid "Asset cache metadata shape is invalid")
   ;;
 
   let rec mkdir path =
@@ -285,34 +318,30 @@ module Asset_cache = struct
 
   let read_manifest directory file =
     let path = Filename.concat directory file in
-    let invalid () = Error (Invalid "Unsupported or invalid asset cache manifest") in
+    let invalid message = Error (Invalid message) in
     try
       if (Unix.stat path).st_size > 1024
-      then invalid ()
+      then invalid "Asset cache manifest exceeds size limit"
       else (
         match
           Logseq_db_types.Json_codec.decode
             manifest_of_yojson
             (Yojson.Safe.from_file path)
         with
-        | Error _ -> invalid ()
+        | Error _ -> invalid "Asset cache manifest shape is invalid"
         | Ok manifest ->
-          (match
-             Asset.version ~checksum:manifest.checksum ~file_type:manifest.file_type
-           with
-           | Ok version
-             when manifest.size >= 0L && name manifest.asset version ^ ".json" = file ->
-             Ok
-               { name = name manifest.asset version
-               ; file_type = version.file_type
-               ; checksum = version.checksum
-               ; size = manifest.size
-               ; touched = (Unix.stat path).st_mtime
-               ; pins = 0
-               }
-           | Ok _ | Error _ -> invalid ()))
+          (match Asset.version ~checksum:manifest.checksum ~file_type:manifest.file_type with
+           | Error _ -> invalid "Asset cache manifest asset version is invalid"
+           | Ok _ when manifest.size < 0L -> invalid "Asset cache manifest size is invalid"
+           | Ok version when name manifest.asset version ^ ".json" <> file ->
+             invalid "Asset cache manifest filename does not match its identity"
+           | Ok version ->
+             Ok { name = name manifest.asset version; file_type = version.file_type
+                ; checksum = version.checksum; size = manifest.size
+                ; touched = (Unix.stat path).st_mtime; pins = 0 }))
     with
-    | Yojson.Json_error _ | Failure _ | Invalid_argument _ -> invalid ()
+    | Yojson.Json_error _ -> invalid "Asset cache manifest JSON is invalid"
+    | Failure _ | Invalid_argument _ -> invalid "Asset cache manifest shape is invalid"
   ;;
 
   type account_identity = string * string [@@deriving to_yojson]
@@ -442,6 +471,22 @@ module Asset_cache = struct
     handle
   ;;
 
+  let report_cleanup ?(code="collectionPending") operation error =
+    let source = match error with
+      | Invalid source | Io source -> source
+      | Full -> "Asset staging storage is full"
+      | Stale -> "Asset staging scope is stale"
+      | Checksum_mismatch -> "Asset staging checksum mismatch" in
+    let diagnostic = Failure_diagnostic.of_source ~operation:"assetRelease"
+      ~reason:"cleanupFailed" source in
+    Printf.eprintf "journal: phase=cleanup operation=%s code=%s source=%s\n%!"
+      operation code (Failure_diagnostic.source_class diagnostic)
+  ;;
+
+  let report_cleanup_exception ?code operation error =
+    report_cleanup ?code operation (Io (Printexc.to_string error))
+  ;;
+
   let clean_retired_staging t record =
     let result = if record.retired && record.staged_pins = 0
     then
@@ -457,7 +502,7 @@ module Asset_cache = struct
     else Ok () in
     (match result with
      | Ok () -> ()
-     | Error _ -> Printf.eprintf "journal: phase=cleanup operation=releaseRetiredStaging code=cleanupPending\n%!");
+     | Error error -> report_cleanup ~code:"cleanupPending" "releaseRetiredStaging" error);
     result
   ;;
 
@@ -599,7 +644,9 @@ module Asset_cache = struct
           if not (Sys.file_exists canonical) || identity canonical <> captured
           then failwith "canonical asset identity changed";
           let error = rename_exclusive canonical data in
-          if error <> 0 then failwith ("asset retirement rename failed: " ^ string_of_int error);
+          if error <> 0 then (
+            Printf.eprintf "journal: phase=cleanup operation=prepareAssetRetirement code=renameFailed errno=%d\n%!" error;
+            failwith "asset retirement rename failed");
           sync_path (Filename.dirname canonical); sync_path (Filename.dirname data));
         write_retirement manifest (retirement_json captured "prepared");
         Ok ()))
@@ -621,7 +668,7 @@ module Asset_cache = struct
         if state = "account-deleted" then (
           (match remove_tree data with
            | Ok () -> ()
-           | Error _ -> Printf.eprintf "journal: phase=cleanup operation=collectDeletedAccountAssets code=collectionPending\n%!"); Ok ())
+           | Error error -> report_cleanup "collectDeletedAccountAssets" error); Ok ())
         else if state = "aborted" || state = "complete" then Ok ()
         else if commit then (
           if Sys.file_exists data && identity data <> captured then failwith "retired asset identity changed";
@@ -629,11 +676,11 @@ module Asset_cache = struct
           (* The producer owns deferred collection. A purge failure must not
              block a replacement cache or undo the durable commit decision. *)
           (match remove_tree data with
-           | Error _ -> Printf.eprintf "journal: phase=cleanup operation=collectRetiredAssets code=collectionPending\n%!"
+           | Error error -> report_cleanup "collectRetiredAssets" error
            | Ok () ->
              (try sync_path (Filename.dirname data);
-                  write_retirement manifest (retirement_json captured "complete") with _ ->
-                    Printf.eprintf "journal: phase=cleanup operation=completeRetirement code=cleanupPending\n%!"));
+                  write_retirement manifest (retirement_json captured "complete") with error ->
+                    report_cleanup_exception ~code:"cleanupPending" "completeRetirement" error));
           Ok ())
         else if state = "committed" then Ok ()
         else (
@@ -641,7 +688,9 @@ module Asset_cache = struct
             if identity data <> captured then failwith "retired asset identity changed";
             mkdir (Filename.dirname canonical);
             let error = rename_exclusive data canonical in
-            if error <> 0 then failwith ("asset restore conflict; retirement retained: " ^ string_of_int error);
+            if error <> 0 then (
+              Printf.eprintf "journal: phase=cleanup operation=restoreRetiredAssets code=renameFailed errno=%d\n%!" error;
+              failwith "asset restore conflict; retirement retained");
             sync_path (Filename.dirname canonical); sync_path (Filename.dirname data))
           else if captured <> "absent" &&
             (not (Sys.file_exists canonical) || identity canonical <> captured)
@@ -667,8 +716,8 @@ module Asset_cache = struct
               (match finish_graph_deletion ~root
                 ~deletion:(Core.asset_deletion_reference ~scope ~retirement) ~commit:true with
                | Ok () -> ()
-               | Error _ -> Printf.eprintf "journal: phase=cleanup operation=finishRetiredAssets code=collectionPending\n%!")
-          with _ -> Printf.eprintf "journal: phase=cleanup operation=collectRetiredAssets code=collectionPending\n%!") (Sys.readdir pending)
+               | Error error -> report_cleanup "finishRetiredAssets" error)
+          with error -> report_cleanup_exception "collectRetiredAssets" error) (Sys.readdir pending)
   ;;
 
   let delete_account ~root ~account =
@@ -688,13 +737,20 @@ module Asset_cache = struct
                 let captured, _ = retirement_state manifest in
                 write_retirement manifest (retirement_json captured "account-deleted"))) (Sys.readdir states);
             match remove_tree (Filename.concat folder "pending") with
-            | Ok () -> () | Error _ -> failwith "retired account assets remain") (Sys.readdir retired);
+            | Ok () -> () | Error error ->
+              report_cleanup "collectDeletedAccountAssets" error;
+              let source = match error with Invalid source | Io source -> source
+                | Full -> "Asset staging storage is full"
+                | Stale -> "Asset staging scope is stale"
+                | Checksum_mismatch -> "Asset staging checksum mismatch" in
+              failwith Failure_diagnostic.(of_source ~operation:"assetRelease"
+                ~reason:"cleanupFailed" source |> encode)) (Sys.readdir retired);
       remove_tree directory)
   ;;
 
   let create ~root ~(scope : Core.graph_scope) ~budget_bytes ~maximum_file_bytes =
-    (try collect_retired_assets ~root ~scope with _ ->
-       Printf.eprintf "journal: phase=cleanup operation=collectRetiredAssets code=collectionPending\n%!");
+    (try collect_retired_assets ~root ~scope with error ->
+       report_cleanup_exception "collectRetiredAssets" error);
     protect (fun () ->
       if
         budget_bytes < 0L

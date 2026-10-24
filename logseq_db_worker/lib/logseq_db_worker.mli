@@ -28,6 +28,17 @@ val create
   -> (t, create_error) result
 
 val post : t -> Pure_reducer.event -> unit
+
+(** Diagnostic-only receipt for an exact active asset operation. Retired or
+    unknown operations are ignored; the normal completion owns publication. *)
+val report_asset_diagnostic
+  :  t
+  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> operation:string
+  -> request_operation:string
+  -> Logseq_db_types.Failure_diagnostic.t
+  -> unit
+
 val view : t -> Pure_reducer.view
 val graph_state : t -> graph_state
 

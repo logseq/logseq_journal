@@ -435,6 +435,17 @@ let production_dependencies () =
 (* Diagnostic strings are internal signals, never display text. Unknown values
    receive a fixed fallback so exception/path/content strings cannot escape. *)
 let diagnostic_report = function
+  | code when String.starts_with ~prefix:Logseq_db_types.Failure_diagnostic.signal_prefix code ->
+    let module D=Logseq_db_types.Failure_diagnostic in
+    let prefix=D.signal_prefix in
+    (match D.decode(String.sub code (String.length prefix) (String.length code-String.length prefix)) with
+     | Some detail -> D.operation detail,D.phase detail,D.message detail
+     | None -> "workerOperation","worker","A Worker operation could not finish. Retry the operation or reopen Journal.")
+  | code when String.starts_with ~prefix:Logseq_db_types.Authoritative_diagnostic.integrity_signal_prefix code ->
+    let module D=Logseq_db_types.Authoritative_diagnostic in
+    let prefix=D.integrity_signal_prefix in
+    let source=String.sub code (String.length prefix) (String.length code-String.length prefix) in
+    "applyAuthoritative", "sync", D.message (D.integrity_of_source source)
   | code when String.starts_with ~prefix:Logseq_db_types.Authoritative_diagnostic.signal_prefix code ->
     let module Diagnostic = Logseq_db_types.Authoritative_diagnostic in
     let prefix=Diagnostic.signal_prefix in
@@ -498,6 +509,80 @@ let diagnostic_report = function
   | _ -> "workerOperation", "worker", "A Worker operation could not finish. Retry the operation or reopen Journal."
 ;;
 
+let diagnostic_code signal operation =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  if String.starts_with ~prefix:D.signal_prefix signal
+  then
+    Option.fold
+      ~none:(operation ^ ".failed")
+      ~some:D.code
+      (D.decode
+         (String.sub
+            signal
+            (String.length D.signal_prefix)
+            (String.length signal - String.length D.signal_prefix)))
+  else if operation = "applyAuthoritative"
+  then (
+    let prefix = "worker.applyAuthoritative." in
+    let categories =
+      [ "authoritativeDatabaseClosed"
+      ; "authoritativeSyncTokenConflict"
+      ; "authoritativeCursorDiscontinuous"
+      ; "authoritativeChecksumMismatch"
+      ; "authoritativeCryptoRequired"
+      ; "authoritativeCryptoUnexpected"
+      ; "authoritativeCryptoInvalid"
+      ; "authoritativeDecodeFailed"
+      ; "authoritativeOriginUnresolved"
+      ; "authoritativePreparationConsumed"
+      ; "authoritativePrepareBusy"
+      ; "authoritativeIntegrityFailure"
+      ; "authoritativeCommitDatabaseClosed"
+      ; "authoritativeCommitTokenConflict"
+      ; "authoritativeCommitGenerationInvalidated"
+      ; "authoritativeCommitBusy"
+      ; "authoritativeCommitPersistenceFailed"
+      ; "authoritativeCommitFatalState"
+      ]
+    in
+    match
+      List.find_opt
+        (fun category ->
+           signal = prefix ^ category
+           || String.starts_with ~prefix:(prefix ^ category ^ ":") signal)
+        categories
+    with
+    | Some category -> operation ^ "." ^ category
+    | None -> operation ^ ".failed")
+  else operation ^ ".failed"
+;;
+
+(* The service owns this projection; callers retain the original typed notice. *)
+let diagnostic_asset_notice notice =
+  let module D=Logseq_db_types.Failure_diagnostic in
+  let signal operation reason source =
+    let detail=match source with
+      | None->D.create ~operation ~reason ()
+      | Some source->D.of_source ~operation ~reason source in
+    Some(D.signal_prefix ^ D.encode detail) in
+  match notice with
+  | Asset_availability{availability=Failed{failure;retry_scheduled=false;_};_}->
+    let reason,source=match failure with
+      | Logseq_sync_pure_reducer.Asset_transfer.Network -> "networkFailed",None
+      | Not_found -> "notFound",None | Checksum_mismatch -> "checksumMismatch",None
+      | Authentication -> "authenticationFailed",None | Locked -> "locked",None
+      | Storage_full -> "storageFull",None | Invalid_content s -> "invalidContent",Some s in
+    signal "assetDownload" reason source
+  | Upload_status{status=Failed_upload failure;_}->
+    let reason,source=match failure with
+      | Logseq_db_worker_pure_reducer.Asset_upload.Network -> "networkFailed",None
+      | Authentication -> "authenticationFailed",None | Missing_source -> "missingSource",None
+      | Size_rejected -> "sizeRejected",None | Revoked_access -> "revokedAccess",None
+      | Invalid_content -> "invalidContent",None | Persistence_failed s -> "persistenceFailed",Some s in
+    signal "assetUpload" reason source
+  | _ -> None
+;;
+
 let publish context =
   let latest : state option ref = ref None in
   let owner = ref None in
@@ -519,7 +604,7 @@ let publish context =
       (Client_state_changed (with_reports state)) in
   let report code =
     let operation, phase, message = diagnostic_report code in
-    let value = Printf.sprintf "%s · phase=%s · code=%s.failed · %s" operation phase operation message in
+    let value = Printf.sprintf "%s · phase=%s · code=%s · %s" operation phase (diagnostic_code code operation) message in
     let rec take n = function [] -> [] | _ when n=0 -> [] | x::xs -> x::take (n-1) xs in
     reports := take 16 ((operation,value)::List.remove_assoc operation !reports);
     Option.iter emit !latest
@@ -529,10 +614,7 @@ let publish context =
     (match !latest with
      | Some current when current.snapshot.startup.account_generation=scope.account.account_generation
          && current.snapshot.startup.graph_generation=scope.graph_generation ->
-       (match notice with
-        | Asset_availability {availability=Failed {retry_scheduled=false;_};_} -> report "asset.download"
-        | Upload_status {status=Failed_upload _;_} -> report "asset.upload"
-        | _ -> ())
+       Option.iter report (diagnostic_asset_notice notice)
      | _ -> ());
     Journal_worker.Session_context.emit
       context
@@ -709,6 +791,10 @@ let create ~(dependencies : dependencies) =
     ~init:(fun context config ->
       let sw = Journal_worker.Session_context.switch context in
       let event_sink = ref (fun (_ : Pure.event) -> ()) in
+      let asset_diagnostic_sink =
+        ref (fun ~scope:_ ~operation:_ ~request_operation:_
+                 (_ : Logseq_db_types.Failure_diagnostic.t) -> ()) in
+
       let authenticated_user = ref None in
       let token_cache =
         Worker_runner.id_token_cache
@@ -744,7 +830,10 @@ let create ~(dependencies : dependencies) =
               | Error error -> Error (sync_dependency_error_message error)
               | Ok runner_dependencies ->
                 (match
-                   Sync_runner.create ~sw runner_dependencies ~post:(fun event ->
+                   Sync_runner.create ~sw runner_dependencies
+                     ~on_asset_diagnostic:(fun ~scope ~operation ~request_operation diagnostic ->
+                       !asset_diagnostic_sink ~scope ~operation ~request_operation diagnostic)
+                     ~post:(fun event ->
                      !event_sink (Pure.Sync_event event))
                  with
                  | Error error -> Error (sync_create_error_message error)
@@ -783,6 +872,7 @@ let create ~(dependencies : dependencies) =
                | Error (Db.Invalid_create message) -> Error message
                | Ok worker ->
                  event_sink := Db.post worker;
+                 asset_diagnostic_sink := Db.report_asset_diagnostic worker;
                  let auth_seen = ref false in
                  let auth_sequence = ref 0
                  and auth_enqueued_sequence = ref 0 in

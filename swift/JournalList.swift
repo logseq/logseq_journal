@@ -234,7 +234,7 @@ import UIKit
         payload = nextPayload
         snapshot = nextPayload.flatMap { Snapshot($0) }
         if snapshot == nil {
-          JournalExtensions.report(context: context, code: "diagnostic.nativePropsDecode")
+          JournalExtensions.report(context: context, code: "diagnostic.nativePropsDecode.invalidPayload")
         }
         let positions = snapshot?.positions ?? [:]
         rowIncarnations = positions.reduce(into: [:]) { result, entry in
@@ -270,16 +270,19 @@ import UIKit
         }
       }
       let next: String?
-      if case let .string(json) = value { next = json } else { next = nil }
+      if case let .string(json) = value { next = json } else {
+        next = nil
+        if value != nil { JournalExtensions.report(context:context,code:"diagnostic.nativeScrollDecode.typeMismatch") }
+      }
       if next != commandPayload {
         commandPayload = next
         do {
           scrollRequest = try next.flatMap {
-            try JSONDecoder().decode(ScrollRequest?.self, from: Data($0.utf8))
+            try JournalSafeDiagnostic.decode(ScrollRequest?.self, from: Data($0.utf8))
           }
         } catch {
           scrollRequest = nil
-          JournalExtensions.report(context: context, code: "diagnostic.nativePropsDecode")
+          JournalExtensions.report(context: context, code: "diagnostic.nativeScrollDecode." + JournalSafeDiagnostic.classify(error).rawValue)
         }
         commandNeedsDelivery = true
       }

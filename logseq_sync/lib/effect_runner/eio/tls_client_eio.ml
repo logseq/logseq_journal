@@ -35,7 +35,7 @@ let resolve ~clock ~deadline host port =
       ~finally:(fun () -> dns_close query)
       (fun () ->
          try
-           Eio.Time.with_timeout_exn
+           let addresses = Eio.Time.with_timeout_exn
              clock
              (max 0. (deadline -. Eio.Time.now clock))
              (fun () ->
@@ -43,14 +43,20 @@ let resolve ~clock ~deadline host port =
                   Eio_unix.await_readable (dns_fd query);
                   if dns_process query then dns_results query else receive ()
                 in
-                receive ())
+                receive ()) in
+           addresses, None
          with
          | Eio.Cancel.Cancelled _ as cancelled -> raise cancelled
-         | _ -> [])
+         | Eio.Time.Timeout -> [], Some "DNS resolution timed out"
+         | Unix.Unix_error ((Unix.EACCES | Unix.EPERM), _, _) ->
+           [], Some "DNS resolver permission denied"
+         | Unix.Unix_error _ -> [], Some "DNS resolver I/O failed"
+         | _ -> [], Some "DNS resolver operation failed")
   in
-  let ipv6, ipv4 = Eio.Fiber.pair (fun () -> family true) (fun () -> family false) in
-  List.sort_uniq String.compare (ipv6 @ ipv4)
-  |> List.map (fun address -> `Tcp (Eio.Net.Ipaddr.of_raw address, port))
+  let (ipv6, ipv6_error), (ipv4, ipv4_error) = Eio.Fiber.pair (fun () -> family true) (fun () -> family false) in
+  let addresses = List.sort_uniq String.compare (ipv6 @ ipv4)
+    |> List.map (fun address -> `Tcp (Eio.Net.Ipaddr.of_raw address, port)) in
+  addresses, (match ipv4_error with Some _ -> ipv4_error | None -> ipv6_error)
 ;;
 
 (* Eio may allocate a socket before connect raises. Keep each candidate in its
@@ -78,7 +84,37 @@ let connect_address ~sw ~network ~clock ~deadline ~tcp_seconds config peer_name 
   Eio.Promise.await result
 ;;
 
-let connect ~sw ~authenticator ~network ~clock ~host ~port =
+(* Never format exception payloads: transport context can contain addresses,
+   URLs and TLS peer metadata. This finite class is retained only for the final
+   failed address; trying subsequent addresses and their deadlines is unchanged. *)
+let setup_class = function
+  | Unix.Unix_error (Unix.ECONNREFUSED, _, _)
+  | Eio.Io (Eio.Net.E (Eio.Net.Connection_failure (Eio.Net.Refused _)), _) ->
+    "connection refused"
+  | Eio.Time.Timeout
+  | Unix.Unix_error (Unix.ETIMEDOUT, _, _)
+  | Eio.Io (Eio.Net.E (Eio.Net.Connection_failure Eio.Net.Timeout), _) -> "dial timed out"
+  | Unix.Unix_error ((Unix.ENETUNREACH | Unix.EHOSTUNREACH), _, _) -> "network unreachable"
+  | Unix.Unix_error ((Unix.EACCES | Unix.EPERM), _, _) -> "permission denied"
+  | Unix.Unix_error ((Unix.ECONNRESET | Unix.EPIPE), _, _)
+  | Eio.Io (Eio.Net.E (Eio.Net.Connection_reset _), _) -> "connection reset"
+  | Tls_eio.Tls_alert _ -> "TLS peer alert"
+  | Tls_eio.Tls_failure _ -> "TLS handshake failed"
+  | Failure _ -> "operation raised Failure"
+  | Invalid_argument _ -> "operation raised Invalid_argument"
+  | _ -> "external setup failure"
+;;
+
+let safe_setup_detail source =
+  let prefixes = ["all resolved addresses failed: "; "TLS connection setup failed: "] in
+  let classes = ["connection refused"; "dial timed out"; "network unreachable";
+    "permission denied"; "connection reset"; "TLS peer alert"; "TLS handshake failed";
+    "operation raised Failure"; "operation raised Invalid_argument"; "external setup failure"] in
+  if List.exists (fun prefix -> List.exists (fun value -> source = prefix ^ value) classes)
+    prefixes then Some source else None
+;;
+
+let connect_diagnosed ~on_diagnostic ~sw ~authenticator ~network ~clock ~host ~port =
   match host_name host with
   | Error _ as error -> error
   | Ok peer_name ->
@@ -89,9 +125,9 @@ let connect ~sw ~authenticator ~network ~clock ~host ~port =
      | Ok config ->
        let deadline = Eio.Time.now clock +. 30. in
        (try
-          let addresses = resolve ~clock ~deadline host port in
-          let rec attempt = function
-            | [] -> Error (Setup_failed "all resolved addresses failed")
+          let addresses, dns_failure = resolve ~clock ~deadline host port in
+          let rec attempt last_failure = function
+            | [] -> Error (Setup_failed ("all resolved addresses failed: " ^ last_failure))
             | address :: rest ->
               let remaining = deadline -. Eio.Time.now clock in
               if remaining <= 0.
@@ -112,10 +148,17 @@ let connect ~sw ~authenticator ~network ~clock ~host ~port =
                 | Error (Eio.Cancel.Cancelled _ as cancelled) -> raise cancelled
                 | Error (Tls_eio.Tls_failure (`Error (`AuthenticationFailure _))) ->
                   Error Authentication_failed
-                | Error _ -> attempt rest)
+                | Error error -> attempt (setup_class error) rest)
           in
-          if addresses = [] then Error No_network_address else attempt addresses
+          if addresses = [] then (
+            Option.iter (fun cause -> try on_diagnostic cause with _ -> ()) dns_failure;
+            Error No_network_address)
+          else attempt "external setup failure" addresses
         with
         | Eio.Cancel.Cancelled _ as cancelled -> raise cancelled
-        | _ -> Error (Setup_failed "TLS connection setup failed")))
+        | error -> Error (Setup_failed ("TLS connection setup failed: " ^ setup_class error))))
+;;
+
+let connect ~sw ~authenticator ~network ~clock ~host ~port =
+  connect_diagnosed ~on_diagnostic:(fun _ -> ()) ~sw ~authenticator ~network ~clock ~host ~port
 ;;

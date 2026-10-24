@@ -506,8 +506,10 @@ let connect
            in
            let setup () =
              let host = Option.get (Uri.host uri) in
+             let dns_failure = ref None in
              match
-               Tls_client_eio.connect
+               Tls_client_eio.connect_diagnosed
+                 ~on_diagnostic:(fun source -> dns_failure := Some source)
                  ~sw:owner
                  ~authenticator
                  ~network
@@ -517,7 +519,26 @@ let connect
              with
              | Error Tls_client_eio.Authentication_failed ->
                Error (Authentication_failed "WebSocket TLS authentication failed")
-             | Error _ -> Error (Connection_failed "WebSocket TLS setup failed")
+             | Error Tls_client_eio.Invalid_dns_host ->
+               Error (Connection_failed "WebSocket TLS setup failed: invalid DNS host")
+             | Error Tls_client_eio.No_network_address ->
+               Error (Connection_failed ("WebSocket TLS setup failed: no network address"
+                 ^ Option.fold ~none:"" ~some:(fun source -> " (" ^ source ^ ")") !dns_failure))
+             | Error (Tls_client_eio.Setup_failed "invalid TLS configuration") ->
+               Error
+                 (Connection_failed
+                    "WebSocket TLS setup failed: invalid TLS configuration")
+             | Error (Tls_client_eio.Setup_failed "all resolved addresses failed") ->
+               Error
+                 (Connection_failed
+                    "WebSocket TLS setup failed: all resolved addresses failed")
+             | Error (Tls_client_eio.Setup_failed "DNS/TCP dial timed out") ->
+               Error
+                 (Connection_failed "WebSocket TLS setup failed: DNS/TCP dial timed out")
+             | Error (Tls_client_eio.Setup_failed source) ->
+               Error (Connection_failed (match Tls_client_eio.safe_setup_detail source with
+                 | Some detail -> "WebSocket TLS setup failed: " ^ detail
+                 | None -> "WebSocket TLS setup failed"))
              | Ok flow ->
                Eio.Time.with_timeout_exn clock 30. (fun () ->
                  let opened, resolve_opened = Eio.Promise.create () in
@@ -534,7 +555,9 @@ let connect
                        (match Httpun.Status.to_code response.Httpun.Response.status with
                         | 401 -> Unauthorized
                         | 403 -> Forbidden
-                        | _ -> Connection_failed "WebSocket Upgrade rejected")
+                        | status ->
+                          Connection_failed
+                            (Printf.sprintf "WebSocket Upgrade rejected (HTTP %d)" status))
                      | `Malformed_response _ | `Invalid_response_body_length _ | `Exn _ ->
                        Protocol_failed "WebSocket protocol failed"
                    in

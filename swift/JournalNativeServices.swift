@@ -21,8 +21,16 @@ import OSLog
       in: .userDomainMask, appropriateFor: nil, create: true)
     // The existing Apple host uses this directory directly, without a suffix.
     let canonical = support.resolvingSymlinksInPath().path
-    return try JournalStartupConfiguration.encode(
-      applicationSupportPath: canonical, managedSyncOrigin: managedSyncOrigin)
+    return try startupPayload(applicationSupportPath:canonical,managedSyncOrigin:managedSyncOrigin)
+  }
+
+  static func startupPayload(applicationSupportPath:String,managedSyncOrigin:String) throws -> Data {
+    do {
+      return try JournalStartupConfiguration.encode(applicationSupportPath:applicationSupportPath,
+        managedSyncOrigin:managedSyncOrigin)
+    } catch JournalStartupConfiguration.Failure.invalidConfiguration {
+      throw JournalSafeDiagnostic.invalidStartupConfiguration
+    }
   }
 }
 
@@ -87,8 +95,9 @@ private final class JournalNativeAccountStorage: Sendable {
           if Self.acceptedRecovery == recovery.id {
             do { try await self.repairIfNeeded() }
             catch {
+              let reason = JournalAccountIssue.classify(error, stage: .bindingWrite).diagnostic
               Logger(subsystem: "com.logseq.journal", category: "account")
-                .error("Account binding cleanup is pending (account.bindingCleanup.failed)")
+                .error("Account binding cleanup is pending (account.bindingCleanup.failed): \(reason, privacy: .public)")
             }
           }
         }
@@ -110,9 +119,13 @@ private final class JournalNativeAccountStorage: Sendable {
     let recovery: Recovery
     do {
       recovery = try JSONDecoder().decode(Recovery.self, from: bytes)
-      guard recovery.version == 1 else { throw JournalPlatformServices.Failure.unavailable }
     } catch {
-      throw JournalAccountIssue(kind: .unavailable, stage: .bindingWrite)
+      throw JournalAccountIssue(kind: .unavailable, stage: .bindingWrite,
+        nativeDetail: .init(source: .recovery, reason: .invalidRecord))
+    }
+    guard recovery.version == 1 else {
+      throw JournalAccountIssue(kind: .unavailable, stage: .bindingWrite, formatVersion: recovery.version,
+        nativeDetail: .init(source: .recovery, reason: .unsupportedFormat))
     }
     let accepted = Self.acceptedRecovery == recovery.id
     try await perform {

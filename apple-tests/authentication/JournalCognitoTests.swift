@@ -13,6 +13,11 @@ import Security
   var browserError: Error?
   var tokenError: String?
   var status = 200
+  var tokenData: Data?
+  var jwksData: Data?
+  var jwksStatus = 200
+  var redirect = false
+  var transportError: Error?
   var tokenHold: CheckedContinuation<Void, Never>?
   var holdTokens = false
   var browserHold: CheckedContinuation<URL, Error>?
@@ -91,14 +96,16 @@ import Security
         if self.holdBrowser { return try await withCheckedThrowingContinuation { self.browserHold = $0 } }
         return self.callback()
       }, cancel: { self.cancellations += 1 }), transport: { request in
+        if let error = self.transportError { throw error }
         self.requests.append(request)
         var data = Data()
         var status = 200
-        if request.url!.path.hasSuffix("jwks.json") { data = self.jwks }
+        if request.url!.path.hasSuffix("jwks.json") { data = self.jwksData ?? self.jwks; status = self.jwksStatus }
         else if request.url!.path == "/oauth2/token" {
           if self.holdTokens { await withCheckedContinuation { self.tokenHold = $0 } }
           status = self.status
-          if let error = self.tokenError {
+          if let override = self.tokenData { data = override }
+          else if let error = self.tokenError {
             data = try JSONSerialization.data(withJSONObject: ["error": error, "error_description": "never display server secrets"])
           } else {
             var object: [String: Any] = ["id_token": try self.token("id"), "access_token": try self.token("access"),
@@ -107,7 +114,7 @@ import Security
             data = try JSONSerialization.data(withJSONObject: object)
           }
         }
-        return (data, HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!)
+        return (data, HTTPURLResponse(url: self.redirect ? URL(string: "https://secret.example/private?token=private-token-sentinel")! : request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!)
       }, now: { self.now })
   }
   var tokenRequests: [URLRequest] { requests.filter { $0.url?.path == "/oauth2/token" } }
@@ -172,6 +179,43 @@ import Security
     print("PASS network cancellation retires owned refresh/sign-in I/O and retains session for retry")
   }
   @MainActor static func main() async throws {
+    // Drive the production session's response boundary; never inject an already
+    // classified reason. The owner must retain safe transport/shape metadata.
+    for mode in ["tokenHTTP", "unknownOAuth", "tokenShape", "tokenSize", "redirect", "jwksHTTP", "jwksShape", "jwksSize"] {
+      let f = try Issuer()
+      let expected: [String]
+      switch mode {
+      case "tokenHTTP": f.status = 503; f.tokenError = "server_error"; expected = ["token.httpStatus", "http 503", "oauth.server_error"]
+      case "unknownOAuth": f.status = 401; f.tokenError = "private-token-sentinel"; expected = ["token.httpStatus", "http 401", "oauth.unknown"]
+      case "tokenShape": f.tokenData = Data("{\"id_token\":\"private-token-sentinel\"}".utf8); expected = ["token.responseShape"]
+      case "tokenSize": f.tokenData = Data(repeating: 65, count: 131073); expected = ["token.responseTooLarge"]
+      case "redirect": f.redirect = true; expected = ["token.redirect"]
+      case "jwksHTTP": f.jwksStatus = 502; expected = ["jwks.httpStatus", "http 502"]
+      case "jwksShape": f.jwksData = Data("private-token-sentinel".utf8); expected = ["jwks.responseShape"]
+      default: f.jwksData = Data(repeating: 65, count: 262145); expected = ["jwks.responseTooLarge"]
+      }
+      do { try await f.session().signIn(); preconditionFailure("Expected \(mode) rejection") }
+      catch {
+        let issue = JournalAccountIssue.classify(error, stage: .identityLookup)
+        for part in expected { precondition(issue.diagnostic.contains(part), "missing safe cause \(part): \(issue.diagnostic)") }
+        precondition(issue.kind == .unavailable && issue.offersSignIn, "diagnostics must preserve account policy")
+        precondition(!issue.diagnostic.contains("private-") && !issue.diagnostic.contains("https://"))
+      }
+      precondition(f.stored == nil, "failed token response persisted credentials")
+    }
+    print("PASS bounded token/JWKS HTTP, OAuth, shape, size and redirect reasons without bodies or URLs")
+    for (error, expectedKind, reason) in [
+      (URLError(.timedOut) as Error, JournalAccountIssue.Kind.network, "url -1001"),
+      (NSError(domain: NSOSStatusErrorDomain, code: -25308) as Error, .secureStorageUnavailable, "osstatus -25308"),
+      (NSError(domain: "private-token-sentinel", code: 77) as Error, .unavailable, "token.transport")] {
+      let f = try Issuer(); f.transportError = error
+      do { try await f.session().signIn(); preconditionFailure("transport failure admitted") }
+      catch {
+        let issue = JournalAccountIssue.classify(error, stage: .identityLookup)
+        precondition(issue.kind == expectedKind, "transport wrapper changed account recovery category")
+        precondition(issue.diagnostic.contains(reason) && !issue.diagnostic.contains("private-"))
+      }
+    }
     try await cancelledNetworkingRetainsSession()
     let issuer = try Issuer(), session = issuer.session(); try await session.signIn()
     let q = issuer.query(issuer.authorization!)

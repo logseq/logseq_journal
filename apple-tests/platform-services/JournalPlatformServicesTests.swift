@@ -4,6 +4,7 @@ import Foundation
   var user: String? = nil
   var token = "fixture-token"
   var failSignOut = false
+  var userFailure: Error?
   var userCalls = 0
   var tokenCalls = 0
   var signOutCalls = 0
@@ -14,6 +15,7 @@ import Foundation
   func currentUserID() async throws -> String? {
     userCalls += 1
     if holdUser { return try await withCheckedThrowingContinuation { heldUser = $0 } }
+    if let userFailure { throw userFailure }
     return user
   }
   func freshIDToken() async throws -> String { tokenCalls += 1; return token }
@@ -50,6 +52,49 @@ import Foundation
   static func require(_ condition: Bool) { precondition(condition) }
   @MainActor static func main() async throws {
     let origin = "https://api.logseq.io"
+    // The Swift account owner catches these failures before any OCaml event.
+    // Drive its real response boundary so its projected issue is verified.
+    let reasonAuth = Auth()
+    let reasonService = JournalPlatformServices(auth: reasonAuth, account: Store(nil).capability,
+      managedSyncOrigin: origin)
+    _ = try await reasonService.response(for: .onlineRequested)
+    let cognitoReasons: [(JournalCognitoError, String)] = [
+      (.configuration, "configuration"), (.callback, "callback"), (.expired, "expired"),
+      (.invalidToken, "invalidToken"), (.storage, "storage"), (.unavailable, "unavailable"),
+      (.request, "request"), (.invalidGrant, "invalidGrant")]
+    for (error, code) in cognitoReasons {
+      reasonAuth.userFailure = error
+      do { _ = try await reasonService.response(for: .authenticatedUser); fatalError("expected account failure") }
+      catch is JournalCognitoError {}
+      precondition(reasonService.accountIssue?.errorDescription == error.errorDescription,
+        "known Cognito reason must survive native account classification: \(code)")
+      precondition(reasonService.accountIssue?.diagnostic == "account.identityLookup.unavailable · cognito.\(code)")
+      precondition(reasonService.accountIssue?.offersSignIn == true, "preserve existing recovery policy")
+    }
+    let safeFallback = JournalAccountIssue(kind: .unavailable, stage: .identityLookup)
+    for (failure, expected, kind) in [
+      (URLError(.timedOut, userInfo: [NSURLErrorFailingURLErrorKey: URL(string: "https://private-token-sentinel")!]) as Error,
+       "url -1001", JournalAccountIssue.Kind.network),
+      (NSError(domain: NSOSStatusErrorDomain, code: -25308, userInfo: [NSLocalizedDescriptionKey: "private-token-sentinel"]) as Error,
+       "osstatus -25308", JournalAccountIssue.Kind.secureStorageUnavailable)] {
+      reasonAuth.userFailure = failure
+      do { _ = try await reasonService.response(for: .authenticatedUser); fatalError("expected native failure") }
+      catch { }
+      precondition(reasonService.accountIssue?.kind == kind)
+      precondition(reasonService.accountIssue?.diagnostic.contains(expected) == true, "native code was discarded")
+      precondition(reasonService.accountIssue?.diagnostic.contains("private-") == false)
+    }
+    reasonAuth.userFailure = NSError(domain: "private-account-sentinel", code: 73,
+      userInfo: [NSLocalizedDescriptionKey: "private-token-sentinel"])
+    do { _ = try await reasonService.response(for: .authenticatedUser); fatalError("expected unknown failure") }
+    catch { precondition((error as NSError).domain == "private-account-sentinel") }
+    precondition(reasonService.accountIssue == safeFallback, "unknown account error must keep safe fallback")
+    reasonAuth.userFailure = CancellationError()
+    do { _ = try await reasonService.response(for: .authenticatedUser); fatalError("expected cancellation") }
+    catch is CancellationError {}
+    precondition(reasonService.accountIssue == safeFallback, "cancellation must not publish a new account issue")
+    let existingIssue = JournalAccountIssue(kind: .unsupportedFormat, stage: .bindingRead, formatVersion: 9)
+    precondition(JournalAccountIssue.classify(existingIssue, stage: .identityLookup) == existingIssue)
     let old = JournalLocalAccount(userID: "offline-user", managedSyncOrigin: origin)
     let auth = Auth()
     let store = Store(old)

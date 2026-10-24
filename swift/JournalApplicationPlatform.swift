@@ -119,23 +119,31 @@ import AppKit
     return exchange
   }
 
-  /// Answers one LJP2 request envelope; `nil` suppresses the response (the
-  /// old bridge surfaced these as request failures).
+  /// Answers a request with LJP2 success or a bounded LJF1 failure. Only retired
+  /// or suppressed work returns nil; current cancellation still completes.
   func request(_ bytes: Data) async -> Data? {
     let identity = connection
+    guard connected else { return nil }
+    var failureScope = startupScope
+    func failed(_ reason:JournalPlatformWire.RequestFailure) -> Data? {
+      guard connected, connection == identity else { return nil }
+      return JournalPlatformWire.requestFailure(bytes,reason:reason,scope:failureScope)
+    }
     let request: JournalPlatformWire.Request
     do {
       request = try JournalPlatformWire.decodeRequest(bytes)
     } catch {
       FileHandle.standardError.write(
         Data("logseq_journal: decodeRequest failed bytes=\(bytes.count)\n".utf8))
-      return nil
+      return failed(.requestDecode)
     }
     if [.timelinePresented,.onlineRequested,.onlineCancelled].contains(request) {
       guard let scope=try? JournalPlatformWire.startupScope(bytes), scope>=startupScope else {return nil}
       if request != .onlineCancelled, !pending.acceptsOnlinePermission(scope) { return nil }
       if scope != startupScope { services.cancelAuthenticationPreparation(); startupScope=scope }
     }
+    let requestScope = startupScope
+    failureScope = requestScope
     requestObserver?(request)
     if request == .signOut {
       refresh?.cancel()
@@ -150,17 +158,18 @@ import AppKit
       UIPasteboard.general.string = text
       #elseif os(macOS)
       NSPasteboard.general.clearContents()
-      guard NSPasteboard.general.setString(text, forType: .string) else { return nil }
+      guard NSPasteboard.general.setString(text, forType: .string) else { return failed(.clipboardUnavailable) }
       #else
-      return nil
+      return failed(.clipboardUnavailable)
       #endif
-      return try? JournalPlatformWire.encodeResponse(.textCopied)
+      do { return try JournalPlatformWire.encodeResponse(.textCopied) }
+      catch { return failed(.responseEncode) }
     default:
       break
     }
     do {
       let response = try await services.response(for: request)
-      guard connected, connection == identity else { return nil }
+      guard connected, connection == identity, startupScope == requestScope else { return nil }
       accountIssue = services.accountIssue
       switch response {
       case .authenticatedUser(let user): authenticationRequired = user == nil
@@ -171,7 +180,9 @@ import AppKit
       case .noLocalAccount: localAccountAvailable = false; authenticationRequired=true
       default: break
       }
-      let encoded = try JournalPlatformWire.encodeResponse(response)
+      let encoded:Data
+      do { encoded = try JournalPlatformWire.encodeResponse(response) }
+      catch { return failed(.responseEncode) }
       if request == .onlineCancelled {
         refresh?.cancel()
         onlineWaiter?.resume(throwing:CancellationError());onlineWaiter=nil
@@ -184,12 +195,12 @@ import AppKit
       if request == .terminationReady { shutdown?.complete() }
       return encoded
     } catch JournalPlatformServices.Failure.authenticationRequired {
-      guard connected, connection == identity else { return nil }
+      guard connected, connection == identity, startupScope == requestScope else { return nil }
       authenticationRequired = true
       accountIssue = services.accountIssue
-      return nil
+      return failed(.authenticationRequired)
     } catch {
-      guard connected, connection == identity else { return nil }
+      guard connected, connection == identity, startupScope == requestScope else { return nil }
       if !(error is CancellationError) {
         switch request {
         case .localAccount, .authenticatedUser, .idToken:
@@ -197,7 +208,16 @@ import AppKit
         default: break
         }
       }
-      return nil
+      let reason:JournalPlatformWire.RequestFailure
+      switch error {
+      case is CancellationError: reason = .cancelled
+      case JournalPlatformServices.Failure.unavailable: reason = .serviceUnavailable
+      case JournalPlatformServices.Failure.invalidBinding: reason = .invalidBinding
+      case JournalPlatformWire.Failure.invalidPacket: reason = .invalidPacket
+      case is URLError: reason = .network
+      default: reason = (error as NSError).domain == NSOSStatusErrorDomain ? .secureStorage : .serviceFailed
+      }
+      return failed(reason)
     }
   }
 
@@ -269,9 +289,19 @@ import AppKit
   }
 
   func retryOnline() {
+    let identity = connection, scope = startupScope
     Task { [weak self] in
-      guard let self else {return}
-      do {try await beginOnline(); refreshAuthentication()} catch {}
+      guard let self, connected, connection == identity, startupScope == scope else { return }
+      do {
+        try await beginOnline()
+        guard connected, connection == identity, startupScope == scope else { return }
+        refreshAuthentication()
+      } catch {
+        if !(error is CancellationError), !Task.isCancelled,
+          connected, connection == identity, startupScope == scope {
+          accountIssue = .classify(error, stage: .identityLookup)
+        }
+      }
     }
   }
 

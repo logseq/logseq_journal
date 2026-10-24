@@ -84,3 +84,6 @@ val garbage_stats : callbacks -> (garbage_stats, error) result
 val collect_garbage : callbacks -> (unit, error) result
 val checkpoint : callbacks -> (unit, error) result
 val close : callbacks -> (unit, error) result
+
+(** A bounded stage/source diagnostic; omits storage addresses and raw text. *)
+val diagnostic_error : operation:string -> error -> string

@@ -298,3 +298,7 @@ val answer_token
   -> token_request
   -> (string, string) result
   -> Journal_worker.control_send_result
+
+(** Bounded ledger projection of a typed terminal asset failure. Retry/cancel
+    states return None; the original notice and its delivery remain unchanged. *)
+val diagnostic_asset_notice : asset_notice -> string option

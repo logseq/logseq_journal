@@ -1023,9 +1023,11 @@ let failure_source_message = function
 let record_failure_source state = function
   | Journal_graph_runtime.Worker_failure worker_failure ->
     record_runtime_worker_failure state worker_failure
-  | Projection_failure _ ->
+  | Projection_failure source ->
+    let diagnostic = Logseq_db_types.Failure_diagnostic.of_source
+        ~operation:"projectGraph" ~reason:"invalidContent" source in
     let error = Logseq_db_worker.Error.create ~code:Unsupported_semantics
-        ~message:"The graph view could not be prepared. Retry the operation." ~details:[]
+        ~message:(Logseq_db_types.Failure_diagnostic.message diagnostic) ~details:[]
       |> Result.get_ok in
     record_worker_error state ~operation:"projectGraph" ~phase:"presentation" error
 ;;
@@ -1056,11 +1058,30 @@ let service_error ~operation message =
 
 let report_ui_error ?(code = Logseq_db_worker.Error.Invalid_request) ?(message = "The operation could not finish. Retry the operation or reopen Journal.")
     ?recovery state ~operation ~phase =
-  if List.exists (fun (e:worker_error_occurrence) -> e.active && e.operation=operation
-       && e.phase=Some phase && e.graph_generation=state.graph_state.generation) state.worker_errors
+  let latest = List.find_opt (fun (e:worker_error_occurrence) ->
+    e.active && e.operation=operation && e.phase=Some phase
+    && e.graph_generation=state.graph_state.generation) state.worker_errors in
+  if Option.fold ~none:false ~some:(fun e ->
+       Logseq_db_worker.Error.code e.error = code
+       && String.equal (Logseq_db_worker.Error.message e.error) message) latest
   then state
   else record_worker_error state ~operation ~phase ?recovery
       (Logseq_db_worker.Error.create ~code ~message ~details:[] |> Result.get_ok)
+;;
+
+let report_decode_error state ~operation source =
+  let diagnostic = Logseq_db_types.Failure_diagnostic.of_source
+      ~operation ~reason:"parseFailed" source in
+  report_ui_error state ~operation ~phase:"native"
+    ~message:(Logseq_db_types.Failure_diagnostic.message diagnostic)
+;;
+
+let report_view_decode_error state source =
+  match Logseq_db_types.Failure_diagnostic.decode source with
+  | Some diagnostic -> report_decode_error state
+      ~operation:(Logseq_db_types.Failure_diagnostic.operation diagnostic) source
+  | None -> report_decode_error state ~operation:"decodeExtensionEvent"
+      "Native event shape is invalid"
 ;;
 
 let graph_lifecycle_owns_publication error =
@@ -3689,7 +3710,9 @@ let manager_page ?picker_signal state dispatch =
       unavailable ~title:"Unable to prepare your account" ~symbol:"person.crop.circle.badge.exclamationmark"
         ~message:"Retry to check your account and open your journal."
         ~actions:(capsule ~id:"journal-startup-retry" ~command:Startup_retry "Retry" "arrow.clockwise")
-      |> toolbar "Journals" []
+      |> toolbar "Journals"
+          [ V.Toolbar.item ~key:(Ui.Key.string "startup-diagnostics")
+              ~placement:Secondary_action diagnostics ]
     | Interaction {phase=Signed_out;_},None ->
       unavailable ~title:"Sign in to open a graph" ~symbol:"person.crop.circle"
         ~message:"Connect your account to access your graphs." ~actions:(V.empty ())
@@ -3940,6 +3963,7 @@ type app_context =
       (Graph_service.request, Graph_service.response, Graph_service.push) Worker.client
   ; send_action : action -> unit
   ; apply_platform : bytes -> unit Effect.t
+  ; fail_platform : int -> string -> (int64 * int64) option -> unit
   ; running : bool ref
   ; release_staging : unit -> unit
   }
@@ -6837,7 +6861,9 @@ let start
          k result
        | None -> ());
       (match result with
-       | Error _ when current -> report_ui_error model ~operation:"platformRequest" ~phase:"native"
+       | Error "native.platform.cancelled" when current -> model
+       | Error reason when current -> report_ui_error model ~operation:"platformRequest" ~phase:"native"
+           ~message:(Journal_bridge.platform_failure_message reason)
        | Ok _ | Error _ -> model)
     | Environment_changed snapshot ->
       prepare_presentation (sync_startup_presentation { model with environment = snapshot })
@@ -7010,8 +7036,8 @@ let start
       let on_event payload =
         match Journal_asset_import.decode_event payload with
         | Ok event -> dispatch.send (Capture_asset event)
-        | Error _ -> Effect.run (set_state (fun state ->
-            report_ui_error state ~operation:"decodeAttachmentSelection" ~phase:"native"))
+        | Error source -> Effect.run (set_state (fun state ->
+            report_decode_error state ~operation:"decodeAttachmentSelection" source))
       in
       let dispatch =
         match owner with
@@ -7606,8 +7632,26 @@ let start
     Hashtbl.iter (fun _ batch -> discard_import_batches [ batch ]) capture_staged_items;
     Hashtbl.clear capture_staged_items
   in
+  let fail_platform tag reason supplied_scope =
+    let owner_scope = startup_scope !state_ref in
+    let matches_scope () = match supplied_scope with
+      | None -> true (* Validated legacy host envelope. *)
+      | Some(account,presentation) -> account=Int64.of_int owner_scope.account_generation
+          && presentation=Int64.of_int owner_scope.presentation_generation in
+    let response_tag=response_tag tag in
+    let owner=Hashtbl.find_opt pending_platform response_tag in
+    if matches_scope () then Journal_pump.enqueue pump (fun () ->
+      if !running && startup_scope !state_ref=owner_scope then
+        if tag=0 then send_action(Update(fun state ->
+          report_ui_error state ~operation:"decodePlatformRequest" ~phase:"native"
+            ~message:(Journal_bridge.platform_failure_message reason),Effect.ignore))
+        else match owner,Hashtbl.find_opt pending_platform response_tag with
+          | Some expected,Some current when expected==current ->
+            send_action(Platform_response(response_tag,Error reason))
+          | _ -> ())
+  in
   let context =
-    { app; pump; client; send_action; apply_platform; running; release_staging }
+    { app; pump; client; send_action; apply_platform; fail_platform; running; release_staging }
   in
   current_app := Some context;
   ignore (dispatch_worker Graph_service.Get_graph_state : Worker.send_result);
@@ -7694,8 +7738,8 @@ let create
     (match !current_app with
      | Some { app; send_action; _ } ->
        Ui.with_event_error_handler
-         (fun operation -> send_action (Update (fun state ->
-           report_ui_error state ~operation ~phase:"native", Effect.ignore)))
+         (fun diagnostic -> send_action (Update (fun state ->
+           report_view_decode_error state diagnostic, Effect.ignore)))
          (fun () ->
            ignore (Lui_app.dispatch_event app event);
            ignore (Lui_app.flush app))
@@ -7707,8 +7751,8 @@ let create
     (match !current_app with
      | Some { app; send_action; _ } ->
        Ui.with_event_error_handler
-         (fun operation -> send_action (Update (fun state ->
-           report_ui_error state ~operation ~phase:"native", Effect.ignore)))
+         (fun diagnostic -> send_action (Update (fun state ->
+           report_view_decode_error state diagnostic, Effect.ignore)))
          (fun () ->
            (match Lui_runtime.extension_identifier (Lui_app.runtime app) node with
         | Some identifier ->
@@ -7717,9 +7761,11 @@ let create
             report_ui_error state ~operation ~phase:"native", Effect.ignore)) in
           (match name, Lui_protocol.String_map.find_opt "id" values,
               Lui_protocol.String_map.find_opt "payload" values with
-           | "event", Some (IntValue (-1)), Some (StringValue "diagnostic.nativePropsDecode") -> report "decodeNativeProps"
-           | "event", Some (IntValue (-1)), Some (StringValue "diagnostic.nativeEventEncode") -> report "encodeNativeEvent"
-           | "event", Some (IntValue (-1)), Some (StringValue "diagnostic.nativeEventDelivery") -> report "deliverNativeEvent"
+           | "event", Some (IntValue (-1)), Some (StringValue code) ->
+             (match Journal_bridge.native_diagnostic code with
+              | Some(operation,message) -> send_action (Update(fun state ->
+                  report_ui_error state ~operation ~phase:"native" ~message,Effect.ignore))
+              | None -> report "decodeNativeEvent")
            | "event", Some (IntValue _), Some (StringValue _) ->
              ignore (Lui_app.dispatch_event app
                (Lui_protocol.ExtensionEvent (node, identifier, name, values)))
@@ -7752,8 +7798,8 @@ let create
         then (
           match Journal_platform.decode_environment_event bytes with
           | Ok snapshot -> send_action (Environment_changed snapshot)
-          | Error _ -> send_action (Update (fun state ->
-              report_ui_error state ~operation:"decodeEnvironment" ~phase:"native", Effect.ignore)))
+          | Error source -> send_action (Update (fun state ->
+              report_decode_error state ~operation:"decodeEnvironment" source, Effect.ignore)))
         else Effect.run (apply_platform bytes))
     | None -> ()
   in
@@ -7773,17 +7819,12 @@ let create
   in
   let platform_failure payload =
     match !current_app with
-    | Some { pump; send_action; _ } ->
-      let bytes = Bytes.of_string payload in
-      if Bytes.length bytes >= 8
-      then (
-        let tag = response_tag (Bytes.get_uint16_le bytes 6) in
-        Journal_pump.enqueue pump (fun () ->
-          send_action
-            (Platform_response (tag, Error "application platform request failed"))))
-      else Journal_pump.enqueue pump (fun () ->
-        send_action (Update (fun state ->
-          report_ui_error state ~operation:"decodePlatformFailure" ~phase:"native", Effect.ignore)))
+    | Some { pump; send_action; fail_platform; running; _ } ->
+      (match Journal_bridge.decode_platform_failure payload with
+       | Some(tag,reason,scope) -> fail_platform tag reason scope
+       | None -> Journal_pump.enqueue pump (fun () ->
+           if !running then send_action(Update(fun state ->
+             report_ui_error state ~operation:"decodePlatformFailure" ~phase:"native",Effect.ignore))))
     | None -> ()
   in
   let dispose () =

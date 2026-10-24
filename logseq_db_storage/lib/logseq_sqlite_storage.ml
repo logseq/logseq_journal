@@ -684,3 +684,18 @@ let restore_database connection =
      | Invalid_argument message -> corrupt message
      | exn -> corrupt (Printexc.to_string exn))
 ;;
+
+(* Keep address/path/value text inside storage; expose only the typed stage and
+   the bounded source classification across the existing string boundary. *)
+let diagnostic_error ~operation error =
+  let reason,source=match error with
+    | Pragma_mismatch s -> "pragmaMismatch",s
+    | Corrupt_storage s -> "storageCorrupt",s
+    | Begin_failed s -> "storageBeginFailed",s
+    | Write_failed{message;_} -> "storageWriteFailed",message
+    | Commit_failed s -> "storageCommitFailed",s
+    | Checkpoint_failed s -> "storageCheckpointFailed",s
+    | Close_failed s -> "storageCloseFailed",s in
+  Logseq_db_types.Failure_diagnostic.of_source ~operation ~reason source
+  |> Logseq_db_types.Failure_diagnostic.encode
+;;

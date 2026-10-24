@@ -456,7 +456,7 @@ let prepare_snapshot_activation
       else (
         let root = Filename.dirname active_directory in
         if not (ensure_directory root)
-        then Error Types.Snapshot_state_error
+        then Error (Types.Snapshot_state_error Types.Snapshot_root_unavailable)
         else (
           match
             Mirror.stage
@@ -514,9 +514,9 @@ let next_snapshot_unprotection_batch preparation =
   if preparation.snapshot_canceled
   then Error Types.Snapshot_preparation_canceled
   else if preparation.snapshot_committed || Option.is_some preparation.snapshot_persisted
-  then Error Types.Snapshot_state_error
+  then Error (Types.Snapshot_state_error Types.Snapshot_next_after_persist_or_commit)
   else if preparation.snapshot_awaiting_crypto
-  then Error Types.Snapshot_state_error
+  then Error (Types.Snapshot_state_error Types.Snapshot_crypto_batch_pending)
   else (
     let maximum = preparation.snapshot_dependencies.limits.wire_batch_max_bytes in
     let rec take bytes reversed sequence =
@@ -574,7 +574,7 @@ let supply_snapshot_unprotection_batch preparation ~request ~plaintexts =
   if preparation.snapshot_canceled
   then Error Types.Snapshot_preparation_canceled
   else if preparation.snapshot_committed || Option.is_some preparation.snapshot_persisted
-  then Error Types.Snapshot_state_error
+  then Error (Types.Snapshot_state_error Types.Snapshot_supply_after_persist_or_commit)
   else (
     match request.unprotection_owner with
     | Snapshot_unprotection (owner, revision)
@@ -627,7 +627,7 @@ let persist_snapshot_activation preparation =
     | Some persisted -> Ok persisted
     | None ->
       if preparation.snapshot_awaiting_crypto
-      then Error Types.Snapshot_state_error
+      then Error (Types.Snapshot_state_error Types.Snapshot_persist_awaiting_crypto)
       else if not preparation.snapshot_crypto_complete
       then Error (Types.Snapshot_crypto_error "snapshot crypto input is incomplete")
       else (
@@ -651,7 +651,12 @@ let persist_snapshot_activation preparation =
                 ~schema:(Mirror.schema preparation.snapshot_staging)
                 ~applied_server_t:preparation.snapshot_cursor
                 ~checksum:digest
-              |> Result.map_error (fun _message -> Types.Snapshot_state_error)
+              |> Result.map_error (fun message ->
+                let reason = match message with
+                  | "sync schema version must be non-negative" -> `Schema_negative
+                  | "sync checksum must be 16 lowercase hexadecimal characters" -> `Checksum_invalid
+                  | _ -> `Unknown in
+                Types.Snapshot_state_error (Types.Snapshot_checkpoint_invalid reason))
             in
             Result.bind metadata (fun metadata ->
               match Mirror.persist preparation.snapshot_staging database metadata with
@@ -2168,7 +2173,15 @@ let close database =
     let ownership_result = Ownership.release database.ownership in
     match storage_result, ownership_result with
     | Ok (), Ok () -> Ok ()
-    | Error _, _ -> Error (Types.Close_failed "lower storage close failed")
+    | Error error, _ ->
+      let reason,source=match error with
+        | Logseq_db_storage.Storage_session.Closed -> "databaseClosed",None
+        | Fatal s -> "fatalState",Some s | Stage_failed s -> "storageWriteFailed",Some s
+        | Persistence_failed s -> "closeFailed",Some s | Already_consumed -> "preparationConsumed",None in
+      let module D=Logseq_db_types.Failure_diagnostic in
+      let diagnostic=match source with None->D.create ~operation:"closeDatabase" ~reason ()
+        | Some source->D.of_source ~operation:"closeDatabase" ~reason source in
+      Error (Types.Close_failed(D.encode diagnostic))
     | Ok (), Error message -> Error (Types.Close_failed message))
   else Ok ()
 ;;
@@ -5697,7 +5710,7 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
           | Error message -> Error (Types.Corrupt_outbox message)
           | Ok () ->
          (match Storage.open_database path with
-          | Error _ -> Error (Types.Restore_failed "unable to open mirror")
+          | Error error -> Error (Types.Restore_failed (Storage.diagnostic_error ~operation:"attachGraph" error))
           | Ok connection ->
             let callbacks = Storage.connection_callbacks connection in
             let transferred = ref false in
@@ -5713,8 +5726,8 @@ let open_owned ~sw dependencies inspection ~graph_name ownership =
                   ignore (Storage.close callbacks)))
               (fun () ->
                  match Storage.restore_database connection with
-                 | Error _ ->
-                   Error (Types.Restore_failed "unable to restore authoritative database")
+                 | Error error ->
+                   Error (Types.Restore_failed (Storage.diagnostic_error ~operation:"attachGraph" error))
                  | Ok authoritative_database ->
                    let authoritative_connection =
                      Datascript.Conn.from_db
@@ -7170,11 +7183,52 @@ let transaction_matches_record_at_cursor record cursor root_before transaction_d
       | Ok expected -> equal_transaction_data expected transaction_data)
 ;;
 
-let transaction_data_shape transaction_data =
-  transaction_data
-  |> List.map (fun (datom : Datascript.datom) ->
-    (if datom.added then "add:" else "retract:") ^ datom.a)
-  |> String.concat ","
+let integrity_record_context (record : outbox_record) =
+  let mutation =
+    match record.mutation with
+    | Types.Save_block _ -> "save-block"
+    | Insert_blocks _ -> "insert-blocks"
+    | Create_journal_page _ -> "create-journal-page"
+    | Delete_blocks _ -> "delete-blocks"
+    | Set_task_status _ -> "set-task-status"
+    | Clear_task_status _ -> "clear-task-status"
+    | Publish_asset _ -> "publish-asset"
+    | Set_asset_reference _ -> "set-asset-reference"
+  in
+  let state =
+    match record.transport_state with
+    | Types.Queued -> "queued"
+    | Submitted _ -> "submitted"
+    | Accepted_pending_authoritative _ -> "accepted"
+    | Stale_rejected_pending_authoritative _ -> "stale-rejected"
+    | Blocked -> "blocked"
+  in
+  [ "mutation", mutation; "outboxState", state ]
+  @ Option.to_list
+      (Option.map
+         (fun c -> "tBefore", Int64.to_string (Types.Server_cursor.to_int64 c))
+         record.submission_t_before)
+  @ Option.to_list
+      (Option.map (fun n -> "ordinal", string_of_int n) record.submission_ordinal)
+  @ Option.to_list
+      (Option.map (fun n -> "count", string_of_int n) record.submission_count)
+;;
+
+let integrity_source ?(context = []) ?record ~reason () =
+  let context = context @ Option.fold ~none:[] ~some:integrity_record_context record in
+  Authoritative_diagnostic.integrity ~reason ~context ()
+  |> Authoritative_diagnostic.encode
+;;
+
+let integrity_batch_source owner batch source =
+  Authoritative_diagnostic.integrity_of_source source
+  |> Authoritative_diagnostic.with_integrity_context
+       [ "checkpoint", Int64.to_string (Types.Server_cursor.to_int64 owner.checkpoint)
+       ; ( "through"
+         , Int64.to_string
+             (Types.Server_cursor.to_int64 (Types.authoritative_batch_through batch)) )
+       ]
+  |> Authoritative_diagnostic.encode
 ;;
 
 let validate_active_transaction_origin owner cursor root_before transaction_data =
@@ -7187,7 +7241,15 @@ let validate_active_transaction_origin owner cursor root_before transaction_data
   match matches with
   | [] -> Ok None
   | [ record ] -> Ok (Some (record.mutation_id, cursor))
-  | _ -> Error "authoritative transaction ambiguously matches local submissions"
+  | _ ->
+    Error
+      (integrity_source
+         ~reason:"multiple-local-matches"
+         ~context:
+           [ "matchingSubmissions", string_of_int (List.length matches)
+           ; "expectedCursor", Int64.to_string (Types.Server_cursor.to_int64 cursor)
+           ]
+         ())
 ;;
 
 let validate_active_transaction_origins owner batch transaction_data roots_after =
@@ -7198,7 +7260,16 @@ let validate_active_transaction_origins owner batch transaction_data roots_after
   if
     List.length cursors <> List.length transaction_data
     || List.length transaction_data <> List.length roots_after
-  then Error "authoritative transaction origins do not match their cursors"
+  then
+    Error
+      (integrity_source
+         ~reason:"origin-context-length"
+         ~context:
+           [ "cursorCount", string_of_int (List.length cursors)
+           ; "transactionCount", string_of_int (List.length transaction_data)
+           ; "rootCount", string_of_int (List.length roots_after)
+           ]
+         ())
   else (
     let rec contexts previous cursors transaction_data roots_after reversed =
       match cursors, transaction_data, roots_after with
@@ -7237,47 +7308,67 @@ let validate_active_transaction_origins owner batch transaction_data roots_after
         Result.bind result (fun () ->
           match record.transport_state with
           | Types.Accepted_pending_authoritative _ ->
-            Result.bind (expected_origin_cursor record) (fun expected ->
-              if Types.Server_cursor.compare expected previous_checkpoint <= 0
-              then (
-                match record.observed_origin_cursor with
-                | Some cursor when Types.Server_cursor.equal cursor expected -> Ok ()
-                | None | Some _ ->
-                  Error "accepted transaction has no durable origin evidence")
-              else if Types.Server_cursor.compare expected through <= 0
-              then
-                if
-                  List.exists
-                    (fun (origin, cursor) ->
-                       Graph.Uuid.equal origin record.mutation_id
-                       && Types.Server_cursor.equal cursor expected)
-                    validated
-                then Ok ()
-                else (
-                  let actual =
-                    contexts
-                    |> List.find_opt (fun (cursor, _, _) ->
-                      Types.Server_cursor.equal cursor expected)
-                    |> Option.map (fun (_, data, _) -> transaction_data_shape data)
-                    |> Option.value ~default:"missing-cursor"
-                  in
-                  let expected_shape =
-                    contexts
-                    |> List.find_opt (fun (cursor, _, _) ->
-                      Types.Server_cursor.equal cursor expected)
-                    |> fun context ->
-                    Option.bind context (fun (_, _, root_before) ->
-                      expected_record_transaction_data root_before record
-                      |> Result.to_option)
-                    |> Option.map transaction_data_shape
-                    |> Option.value ~default:"simulation-failed"
-                  in
-                  Error
-                    ("accepted transaction payload mismatch: expected="
-                     ^ expected_shape
-                     ^ "; actual="
-                     ^ actual))
-              else Ok ())
+            Result.bind
+              (expected_origin_cursor record
+               |> Result.map_error (fun source ->
+                 Authoritative_diagnostic.integrity_of_source source
+                 |> Authoritative_diagnostic.with_integrity_context
+                      (integrity_record_context record)
+                 |> Authoritative_diagnostic.encode))
+              (fun expected ->
+                 if Types.Server_cursor.compare expected previous_checkpoint <= 0
+                 then (
+                   match record.observed_origin_cursor with
+                   | Some cursor when Types.Server_cursor.equal cursor expected -> Ok ()
+                   | None | Some _ ->
+                     Error
+                       (integrity_source
+                          ~reason:"missing-durable-origin"
+                          ~record
+                          ~context:
+                            [ ( "expectedCursor"
+                              , Int64.to_string (Types.Server_cursor.to_int64 expected) )
+                            ]
+                          ()))
+                 else if Types.Server_cursor.compare expected through <= 0
+                 then
+                   if
+                     List.exists
+                       (fun (origin, cursor) ->
+                          Graph.Uuid.equal origin record.mutation_id
+                          && Types.Server_cursor.equal cursor expected)
+                       validated
+                   then Ok ()
+                   else (
+                     let context =
+                       List.find_opt
+                         (fun (cursor, _, _) -> Types.Server_cursor.equal cursor expected)
+                         contexts
+                     in
+                     let reason, counts =
+                       match context with
+                       | None -> "expected-cursor-missing", []
+                       | Some (_, actual, root_before) ->
+                         (match expected_record_transaction_data root_before record with
+                          | Error _ ->
+                            ( "expected-simulation-failed"
+                            , [ "actualDatoms", string_of_int (List.length actual) ] )
+                          | Ok expected ->
+                            ( "payload-mismatch"
+                            , [ "expectedDatoms", string_of_int (List.length expected)
+                              ; "actualDatoms", string_of_int (List.length actual)
+                              ] ))
+                     in
+                     Error
+                       (integrity_source
+                          ~reason
+                          ~record
+                          ~context:
+                            (( "expectedCursor"
+                             , Int64.to_string (Types.Server_cursor.to_int64 expected) )
+                             :: counts)
+                          ()))
+                 else Ok ())
           | Queued | Submitted _ | Stale_rejected_pending_authoritative _ | Blocked ->
             Ok ())
       in
@@ -7793,7 +7884,8 @@ let prepare_authoritative_candidate preparation ~decrypted =
              expected_tx_data
              roots_after
          with
-         | Error message -> Error (Types.Authoritative_integrity_failure message)
+         | Error message -> Error (Types.Authoritative_integrity_failure
+             (integrity_batch_source preparation.authoritative_owner preparation.authoritative_batch message))
          | Ok validated_origins ->
            preparation.authoritative_state <- Authoritative_consumed;
            Option.iter
@@ -7827,7 +7919,8 @@ let prepare_authoritative_candidate preparation ~decrypted =
                 transactions
                 roots_after
             with
-            | Error message -> Error (Types.Authoritative_integrity_failure message)
+            | Error message -> Error (Types.Authoritative_integrity_failure
+             (integrity_batch_source preparation.authoritative_owner preparation.authoritative_batch message))
             | Ok (stale_updates, stale_remote_won, stale_no_change, stale_blocked) ->
               let rec transaction_contexts previous transactions transaction_data roots =
                 match transactions, transaction_data, roots with
@@ -7854,7 +7947,8 @@ let prepare_authoritative_candidate preparation ~decrypted =
                 | None ->
                   Error
                     (Types.Authoritative_integrity_failure
-                       "submitted delete omitted its durable t_before")
+                       (integrity_source ~reason:"submitted-delete-missing-t-before" ~record ()
+                        |> integrity_batch_source preparation.authoritative_owner preparation.authoritative_batch))
                 | Some t_before ->
                   (match
                      List.find_opt

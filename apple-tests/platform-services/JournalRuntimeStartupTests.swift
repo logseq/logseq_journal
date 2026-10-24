@@ -16,7 +16,7 @@ let journalAppIcons: [String: String] = [:]
   func disconnect() { connected = false }
   func request(_ bytes: Data) async -> Data? {
     precondition(inside() == 0 && connected, "request before native start/connect finished")
-    precondition(Array(bytes) == [1, 2], "C bytes must be owned after callback")
+    precondition(Array(bytes) == [1, 2] || (bytes.count == 32 && bytes.prefix(8) == Data([76,74,80,50,2,0,6,0])), "C bytes must be owned after callback")
     begins += 1
     if hold { return await withCheckedContinuation { waiters.append($0) } }
     return bytes
@@ -25,7 +25,7 @@ let journalAppIcons: [String: String] = [:]
 @MainActor @main struct Test {
   static func main() async throws {
     let scenario = CommandLine.arguments[1]
-    mode(["rejected": 1, "patch-failure": 2, "worker": 3, "multiple": 4][scenario] ?? 0)
+    mode(["rejected": 1, "patch-failure": 2, "worker": 3, "multiple": 4,"same-tag":5][scenario] ?? 0)
     let p = JournalApplicationPlatform()
     let r = try JournalRuntime(
       platform: p, startupPayload: Data(), extensionRegistry: LUIAppleExtensionRegistry())
@@ -52,7 +52,19 @@ let journalAppIcons: [String: String] = [:]
       precondition(p.begins == count, "buffered requests were not delivered exactly once")
       precondition(!published, "root published before initial account request completed")
       precondition(calls() == 0 && reentrant() == 0)
-      if scenario == "cancelled" {
+      if scenario == "same-tag" {
+        emit() // Same tag enters the real C ingress while the first awaits.
+        while p.waiters.count < 2 { await Task.yield() }
+        let failure = Data([76,74,70,49,6,0,6,0]) + Data(repeating:0,count:16)
+        p.waiters.removeFirst().resume(returning:failure)
+        for _ in 0..<50 { await Task.yield() }
+        precondition(calls() == 0, "retired same-tag request completed its replacement")
+        p.waiters.removeFirst().resume(returning:failure)
+        try await boot.value
+        for _ in 0..<100 { if calls() == 1 { break }; await Task.yield() }
+        precondition(calls() == 1, "current same-tag failure did not complete")
+        r.stop()
+      } else if scenario == "cancelled" {
         boot.cancel()
         for _ in 0..<100 {
           if !p.connected { break }
@@ -93,7 +105,7 @@ let journalAppIcons: [String: String] = [:]
         for w in p.waiters { w.resume(returning: scenario == "nil-response" ? nil : Data([1, 2])) }
         p.waiters = []
         try await boot.value
-        precondition(published && calls() == count && reentrant() == 0)
+        precondition(published && calls() == (scenario == "nil-response" ? 0 : count) && reentrant() == 0)
         r.stop()
       }
     }

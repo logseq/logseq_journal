@@ -3,6 +3,24 @@ import Foundation
 /// The application-owned protocol shared with Journal_platform in OCaml.
 enum JournalPlatformWire {
   enum Failure: Error { case invalidPacket }
+  enum RequestFailure: UInt16 {
+    case cancelled=1, requestDecode=2, responseEncode=3, clipboardUnavailable=4
+    case serviceUnavailable=5, serviceFailed=6, authenticationRequired=7, invalidBinding=8
+    case network=9, secureStorage=10, invalidPacket=11
+  }
+  /// Versioned failure envelope: tag/reason plus account/presentation generations.
+  /// It never includes request bytes, challenges, account values or copied text.
+  static func requestFailure(_ request: Data, reason: RequestFailure, scope:StartupScope = .initial) -> Data {
+    let known: [UInt8] = [6,8,10,13,20,22,28,30,32]
+    let tag: UInt8 = request.count >= 8 && request.prefix(6) == Data([76,74,80,50,2,0])
+      && request[7] == 0 && known.contains(request[6]) ? request[6] : 0
+    var result=Data([76,74,70,49,tag,0,UInt8(reason.rawValue),0])
+    for value in [scope.accountGeneration,scope.presentationGeneration] {
+      let bits=UInt64(bitPattern:value)
+      result.append(contentsOf:(0..<8).map { UInt8(truncatingIfNeeded:bits >> ($0*8)) })
+    }
+    return result
+  }
   enum Request: Equatable {
     case authenticatedUser, signOut, terminationReady, localAccount, timelinePresented, onlineRequested, onlineCancelled
     case idToken(challengeID: String)

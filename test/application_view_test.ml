@@ -1572,10 +1572,36 @@ let run_favorites_native_visibility
          dispatch (Lui_protocol.Press (Option.get (find "text" "Diagnostics")));
          wait "actual mounted decoder reports to Diagnostics" (fun () ->
            Option.is_some (find "text" operation));
+         let expected_cause = if mode = `Extension then "Native event shape is invalid"
+           else "Native event JSON syntax is invalid" in
+         let expected_message = operation ^ ": Input could not be parsed. Cause: " ^ expected_cause ^ "." in
+         Alcotest.(check bool) "decoder preserves safe specific cause" true
+           (Option.is_some (find "text" expected_message));
          Alcotest.(check bool) "raw event never becomes diagnostic text" true
            (Option.is_none (find "text" "private-malformed-event"));
          dispatch (Lui_protocol.Press (Option.get
-           (find "accessibility-identifier" "journal-diagnostics-close")))) malformed_native_event;
+           (find "accessibility-identifier" "journal-diagnostics-close")));
+         if mode = `List then (
+           let list = Option.get (find "_extension" "journal-list") in
+           let duplicate = {|{"type":"visible_range","first":0,"first":1,"last":2}|} in
+           consume (hooks.extension_event list "event" (Yojson.Safe.to_string
+             (`Assoc ["id", `Int 1; "payload", `String duplicate])));
+           dispatch (Lui_protocol.Press (Option.get (find "text" "Diagnostics")));
+           wait "same operation retains a later distinct decoding cause" (fun () ->
+             Option.is_some (find "text"
+               "decodeListEvent: Input could not be parsed. Cause: duplicate JSON field."));
+           dispatch (Lui_protocol.Press (Option.get
+             (find "accessibility-identifier" "journal-diagnostics-close")));
+           let list = Option.get (find "_extension" "journal-list") in
+           consume (hooks.extension_event list "event" (Yojson.Safe.to_string
+             (`Assoc ["id", `Int 1; "payload", `String "private-malformed-event"])));
+           dispatch (Lui_protocol.Press (Option.get (find "text" "Diagnostics")));
+           let syntax_occurrences () = Hashtbl.fold (fun _ values count ->
+             if List.assoc_opt "text" values = Some (`String expected_message)
+             then count+1 else count) props 0 in
+           wait "returning to an earlier cause becomes a new latest occurrence" (fun () -> syntax_occurrences ()=2);
+           dispatch (Lui_protocol.Press (Option.get
+             (find "accessibility-identifier" "journal-diagnostics-close"))))) malformed_native_event;
        (* Delete admission is private to Application, absent from Root_navigation's
           public pure events. Use its existing public bridge and controlled Worker
           fixture to execute the actual UI admission/completion boundary. *)
@@ -5520,7 +5546,7 @@ let test_repeated_native_sign_in_intent_receives_permission () =
 
 (* Local-account completion and request continuations belong to Application,
    not Root_navigation. Drive a genuine failed platform request and its Retry. *)
-let test_local_account_failure_retries_local_discovery () =
+let test_local_account_failure_retries_local_discovery ?(typed_reason=false) ?(retired_scope=false) () =
   let requests = ref [] in
   let hooks, _, release, client = unlock_fixture ~cold_start:true
       ~on_platform_request:(fun bytes -> requests := !requests @ [Bytes.copy bytes]) () in
@@ -5554,11 +5580,28 @@ let test_local_account_failure_retries_local_discovery () =
       Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client) (fun () ->
     consume (hooks.init 2 2 config);
     wait "local discovery requested" (fun () -> local_requests () <> []);
-    hooks.platform_failure (Bytes.to_string (List.hd (local_requests ())));
+    let typed_failure account =
+      let bytes=Bytes.make 24 '\000' in
+      Bytes.blit_string "LJF1" 0 bytes 0 4;
+      Bytes.set_uint16_le bytes 4 20; Bytes.set_uint16_le bytes 6 9;
+      Bytes.set_int64_le bytes 8 account;
+      Bytes.to_string bytes in
+    if retired_scope then (
+      hooks.platform_failure (typed_failure 999L);
+      for _=1 to 20 do consume(hooks.pump()); Unix.sleepf 0.001 done;
+      Alcotest.(check bool) "retired native scope cannot fail current discovery" true
+        (Option.is_none(find "journal-startup-retry")));
+    hooks.platform_failure (if typed_reason then typed_failure 0L
+      else Bytes.to_string (List.hd (local_requests ())));
     wait "transient local failure retains a local Retry" (fun () -> Option.is_some (find "journal-startup-retry"));
-    let before=List.length (local_requests ()) in
-    consume (hooks.dispatch (Lui_protocol.Press (Option.get (find "journal-startup-retry"))));
-    wait "Retry reissues local discovery" (fun () -> List.length (local_requests ()) = before+1);
+    if typed_reason then (
+      consume(hooks.dispatch(Lui_protocol.Press(Option.get(find "journal-startup-diagnostics"))));
+      wait "typed platform reason reaches mounted diagnostics" (fun () -> Hashtbl.fold (fun _ props found -> found ||
+        List.assoc_opt "text" props=Some(`String "native.platform.network · The native account request could not connect. Check your connection and retry.")) props false))
+    else (
+      let before=List.length (local_requests ()) in
+      consume (hooks.dispatch (Lui_protocol.Press (Option.get (find "journal-startup-retry"))));
+      wait "Retry reissues local discovery" (fun () -> List.length (local_requests ()) = before+1));
     Alcotest.(check bool) "local retry requests no online permission" false
       (List.exists (fun bytes -> Bytes.get_uint16_le bytes 6 = 30) !requests))
 ;;
@@ -5647,7 +5690,8 @@ let capture_unlock_logs run =
 ;;
 
 let run_unlock_application ?(worker_failure = false) ?(queue_full = false)
-    ?(stopping = false) ?(check_diagnostics = false) ?(native_report = false) ?malformed_platform () =
+    ?(stopping = false) ?(check_diagnostics = false) ?(native_report = false)
+    ?(native_report_unknown = false) ?malformed_platform () =
   let hooks, submissions, release, client = unlock_fixture ~worker_failure ~queue_full () in
   let props = Hashtbl.create 64 in
   let track_teardown = track_json_wire_teardown (Hashtbl.remove props) in
@@ -5752,7 +5796,9 @@ let run_unlock_application ?(worker_failure = false) ?(queue_full = false)
            let extension = Hashtbl.fold (fun id values found ->
              if List.mem_assoc "payload" values then Some id else found) props None |> Option.get in
            consume (hooks.extension_event extension "event"
-             {|{"id":-1,"payload":"diagnostic.nativePropsDecode"}|}));
+             (if native_report_unknown then
+                {|{"id":-1,"payload":"diagnostic.nativePropsDecode.SECRET /private/token"}|}
+              else {|{"id":-1,"payload":"diagnostic.nativePropsDecode.keyNotFound"}|})));
          Option.iter (fun kind ->
            (if kind="response" then hooks.platform_response else hooks.platform_failure) "short";
            consume(hooks.pump())) malformed_platform;
@@ -5763,6 +5809,13 @@ let run_unlock_application ?(worker_failure = false) ?(queue_full = false)
                | Some "response" -> "decodePlatformResponse"
                | Some _ -> "decodePlatformFailure"
                | None -> if native_report then "decodeNativeProps" else "submitE2eePassword")));
+           if native_report then (
+             let message = if native_report_unknown then
+               "native.decodeNativeProps.unknown · The native operation could not finish. Retry the operation."
+               else "native.decodeNativeProps.keyNotFound · A required native field is missing." in
+             wait "native finite reason reaches the mounted ledger" (fun () -> Option.is_some(find "text" message));
+             Alcotest.(check bool) "unrecognized native suffix is not displayed" true
+               (Option.is_none(find "text" "diagnostic.nativePropsDecode.SECRET /private/token")));
            Alcotest.(check bool) "diagnostic excludes submitted password" true
              (Option.is_none (find "text" " synthetic-only "))))
        else (
@@ -6583,6 +6636,8 @@ let () =
             (fun () -> run_unlock_application ~queue_full:true ~check_diagnostics:true ())
         ; Alcotest.test_case "native extension failure reaches Diagnostics" `Quick
             (fun () -> run_unlock_application ~worker_failure:true ~native_report:true ())
+        ; Alcotest.test_case "unknown native suffix uses a safe reason" `Quick
+            (fun () -> run_unlock_application ~worker_failure:true ~native_report:true ~native_report_unknown:true ())
         ; Alcotest.test_case "short platform response reaches Diagnostics" `Quick
             (fun () -> run_unlock_application ~worker_failure:true ~malformed_platform:"response" ())
         ; Alcotest.test_case "short platform failure reaches Diagnostics" `Quick
@@ -6606,7 +6661,10 @@ let () =
             ; "pagination"
             ] )
     ; ("Favorites compact title",[Alcotest.test_case "Favorite Page uses shared reference lookup" `Quick test_favorite_page_uses_shared_reference_lookup; Alcotest.test_case "page property values keep name without duplication" `Quick test_detail_page_property_value_presentation; Alcotest.test_case "root Capture only in Journals" `Quick test_root_capture_placement; Alcotest.test_case "LUI titles icons and no arrow" `Quick test_favorites_compact_shared_titles; Alcotest.test_case "page outline click and native Back" `Quick (fun () -> run_favorites_native_visibility ~check_favorite_targets:true ())])
-    ; ( "local account retry", [Alcotest.test_case "transient failure retries local discovery" `Quick test_local_account_failure_retries_local_discovery])
+    ; ( "local account retry", [
+        Alcotest.test_case "transient failure retries local discovery" `Quick (fun () -> test_local_account_failure_retries_local_discovery ());
+        Alcotest.test_case "typed native reason completes local discovery" `Quick (fun () -> test_local_account_failure_retries_local_discovery ~typed_reason:true ());
+        Alcotest.test_case "retired native scope cannot fail local discovery" `Quick (fun () -> test_local_account_failure_retries_local_discovery ~retired_scope:true ())])
     ; ( "graph picker", [
         Alcotest.test_case "offline deletion is disabled with explanation" `Quick (test_graph_picker_controls `Offline);
         Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);

@@ -1,3 +1,30 @@
+(* Public native failure codec; these bytes contain no request body. *)
+let () =
+  let failure=Bytes.make 24 '\000' in
+  Bytes.blit_string "LJF1" 0 failure 0 4;
+  Bytes.set_uint16_le failure 4 6;
+  Bytes.set_uint16_le failure 6 6;
+  Bytes.set_int64_le failure 8 7L;
+  Bytes.set_int64_le failure 16 9L;
+  assert(Journal_bridge.decode_platform_failure(Bytes.to_string failure)=Some(6,"native.platform.serviceFailed",Some(7L,9L)));
+  assert(Journal_bridge.decode_platform_failure(String.sub(Bytes.to_string failure)0 23)=None);
+  Bytes.set_uint16_le failure 6 99;
+  assert(Journal_bridge.decode_platform_failure(Bytes.to_string failure)=None);
+  Bytes.set_uint16_le failure 6 1;
+  assert(Journal_bridge.decode_platform_failure(Bytes.to_string failure)=Some(6,"native.platform.cancelled",Some(7L,9L)));
+  Bytes.set_int64_le failure 8 (-1L);
+  assert(Journal_bridge.decode_platform_failure(Bytes.to_string failure)=None);
+  let legacy=Bytes.make 32 '\000' in
+  Bytes.blit_string "LJP2" 0 legacy 0 4;Bytes.set_uint16_le legacy 4 2;Bytes.set_uint16_le legacy 6 6;
+  assert(Journal_bridge.decode_platform_failure(Bytes.to_string legacy)=Some(6,"native.platform.serviceFailed",None));
+  Bytes.set_uint16_le legacy 4 3;assert(Journal_bridge.decode_platform_failure(Bytes.to_string legacy)=None);
+  assert(Journal_bridge.native_diagnostic "diagnostic.nativePropsDecode.keyNotFound"=
+    Some("decodeNativeProps","native.decodeNativeProps.keyNotFound · A required native field is missing."));
+  assert(Journal_bridge.native_diagnostic "diagnostic.nativeScrollDecode.SECRET /private/token"=
+    Some("decodeNativeScroll","native.decodeNativeScroll.unknown · The native operation could not finish. Retry the operation."));
+  assert(Journal_bridge.native_diagnostic "SECRET /private/token"=None)
+;;
+
 (* ABI ownership is in the host adapter, not the pure application reducer.
    These public hooks observe exactly what crossed the production C boundary. *)
 open Lui_protocol
@@ -37,6 +64,9 @@ let dispatch = function
   | Press node -> patch node "press"
   | LongPress node -> patch node "longPress"
   | TextChanged (_, "raise") -> failwith "native event fixture rejection"
+  | TextChanged (_, "raise-startup") -> failwith "application.decodeStartup.failed"
+  | TextChanged (_, "raise-worker") -> failwith "application.startWorker.failed"
+  | TextChanged (_, "raise-mount") -> failwith "application.mount.failed"
   | TextChanged (node, text) -> patch node ("textChanged:" ^ text)
   | Submit node -> patch node "submit"
   | Dismiss node -> patch node "dismiss"

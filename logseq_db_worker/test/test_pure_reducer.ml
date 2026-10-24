@@ -957,13 +957,29 @@ let test_upload_recovery_invalid_page () =
        (function
          | Core.Publish (Diagnostic _) -> true
          | _ -> false)
-       result.effects)
+       result.effects);
+  let module D=Logseq_db_types.Failure_diagnostic in
+  let diagnostic=List.find_map(function
+    | Core.Publish(Diagnostic signal) when String.starts_with ~prefix:D.signal_prefix signal ->
+      D.decode(String.sub signal (String.length D.signal_prefix) (String.length signal-String.length D.signal_prefix))
+    | _->None) result.effects in
+  Alcotest.(check (option string)) "invalid recovery page keeps its own reason" (Some "invalidContent")
+    (Option.map D.reason diagnostic)
 ;;
 
 let test_upload_recovery_failure () =
   let opened, _ = worker_open_graph_transition () in
   let ticket = Option.get (recovery_instruction opened) in
-  let failed = Core.step opened.next (Uploads_loaded (ticket, Error "unavailable")) in
+  let failed = Core.step opened.next (Uploads_loaded (ticket, Error "Failure(\"PRIVATE_SYNTHETIC_PAYLOAD\")")) in
+  let module D=Logseq_db_types.Failure_diagnostic in
+  let diagnostic=List.find_map(function
+    | Core.Publish(Diagnostic signal) when String.starts_with ~prefix:D.signal_prefix signal ->
+      D.decode(String.sub signal (String.length D.signal_prefix) (String.length signal-String.length D.signal_prefix))
+    | _->None) failed.effects in
+  Alcotest.(check (option string)) "recovery backend failure keeps a separate reason" (Some "persistenceFailed")
+    (Option.map D.reason diagnostic);
+  Alcotest.(check (option string)) "backend exception class retained without arguments" (Some "exception-failure")
+    (Option.map D.source_class diagnostic);
   Alcotest.(check bool)
     "recovery failure observable"
     true
@@ -1121,7 +1137,13 @@ let test_local_restore_worker_failures_are_terminal () =
     Alcotest.(check bool) "worker IO failure releases startup loading" true
       (not f.restoring_local && f.failure=Some Sync.During_local_restore);
     let duplicate = Core.step failed.next (Runner_completed (Sync_worker_effect_completed(ticket,Error error))) in
-    Alcotest.(check int) "duplicate failure is inert" 0 (List.length duplicate.effects)
+    Alcotest.(check int) "duplicate failure is inert" 0 (List.length duplicate.effects);
+    let retired=Core.step flight.next (Sync_event Sync.Graph_picker_requested) in
+    let late=Core.step retired.next (Runner_completed(Sync_worker_effect_completed(ticket,Error error))) in
+    Alcotest.(check bool) "retired local restore keeps sync state" true
+      ((Core.view late.next).sync=(Core.view retired.next).sync);
+    Alcotest.(check bool) "retired local restore cannot report into another graph" false
+      (List.exists(function Core.Publish(Diagnostic _)->true | _->false)late.effects)
   ) [false;true]
 ;;
 
@@ -1156,7 +1178,13 @@ let test_authoritative_failure_categories_reach_diagnostics () =
     Alcotest.(check bool) "local graph remains open" true
       ((Core.view failed.next).graph.phase=Graph_open && graph.graph_generation=(Core.view failed.next).graph.generation);
     Alcotest.(check int) "duplicate completion is inert" 0
-      (List.length (Core.step failed.next failure).effects))
+      (List.length (Core.step failed.next failure).effects);
+    let retired=Core.step pending.next (Sync_event Sync.Graph_picker_requested) in
+    let late=Core.step retired.next failure in
+    Alcotest.(check bool) "retired authoritative completion keeps sync state" true
+      ((Core.view late.next).sync=(Core.view retired.next).sync);
+    Alcotest.(check bool) "retired authoritative completion cannot report into another graph" false
+      (List.exists(function Core.Publish(Diagnostic _)->true | _->false)late.effects))
     [ Error.Closed_session, "authoritativeDatabaseClosed", "Authoritative database is closed."
     ; Conflict, "authoritativeSyncTokenConflict", "Authoritative sync version changed."
     ; Ambiguous_sync_state, "authoritativeCursorDiscontinuous", "Authoritative transaction cursors are not continuous."

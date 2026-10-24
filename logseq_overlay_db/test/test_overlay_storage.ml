@@ -405,8 +405,11 @@ let snapshot_import_error_does_not_disclose_payload () =
     match Database.prepare_snapshot_activation dependencies inspection ~path
         ~applied_server_cursor:(server_cursor 0) ~expected_checksum:None ~expected_rows:1 with
     | Error (Snapshot_parse_error message) ->
-      Alcotest.(check string) "raw parser payload is not user-facing"
-        "The downloaded graph snapshot could not be imported." message
+      let module D=Logseq_db_types.Failure_diagnostic in
+      let diagnostic=match D.decode message with Some d->d | None->Alcotest.fail "snapshot parser reason was discarded" in
+      Alcotest.(check string) "safe parser category survives" "parseFailed" (D.reason diagnostic);
+      Alcotest.(check bool) "raw parser body is excluded" false
+        (String.contains (D.message diagnostic) '{')
     | Error _ -> Alcotest.fail "malformed snapshot returned another category"
     | Ok prepared -> Database.cancel_snapshot_activation prepared;
       Alcotest.fail "malformed snapshot was admitted")
@@ -479,6 +482,44 @@ let canceled_snapshot_activation_removes_temporary_artifacts () =
     match Database.mirror_presence refreshed with
     | Absent _ -> ()
     | Available _ -> Alcotest.fail "canceled activation installed a mirror")
+;;
+
+(* The mutable snapshot preparation, not the pure reducer, owns these
+   protocol states. Drive its public calls with a synthetic on-disk snapshot. *)
+let snapshot_state_errors_keep_their_reason () =
+  let behavior = "snapshot state failures retain finite reasons" in
+  let expect expected = function
+    | Error (Snapshot_state_error actual) when actual = expected -> ()
+    | Error _ -> Alcotest.fail "snapshot state error lost its distinct reason"
+    | Ok _ -> Alcotest.fail "invalid snapshot operation was accepted"
+  in
+  T.with_temp_directory "overlay-snapshot-reasons-" (fun root ->
+    let support = Filename.concat root "target" in
+    Unix.mkdir support 0o700;
+    let _, _, prepared = prepare_snapshot ~behavior root support in
+    Fun.protect ~finally:(fun () -> Database.cancel_snapshot_activation prepared) (fun () ->
+      let request = Database.next_snapshot_unprotection_batch prepared
+        |> T.require_ok ~behavior |> Option.get in
+      expect Snapshot_crypto_batch_pending (Database.next_snapshot_unprotection_batch prepared);
+      expect Snapshot_persist_awaiting_crypto (Database.commit_snapshot_activation prepared);
+      let plaintexts = Database.unprotection_ciphertexts request in
+      Database.supply_snapshot_unprotection_batch prepared ~request ~plaintexts
+      |> T.require_ok ~behavior;
+      ignore (supply_snapshot_crypto ~behavior prepared 0);
+      ignore (Database.commit_snapshot_activation prepared |> T.require_ok ~behavior);
+      expect Snapshot_next_after_persist_or_commit (Database.next_snapshot_unprotection_batch prepared);
+      expect Snapshot_supply_after_persist_or_commit
+        (Database.supply_snapshot_unprotection_batch prepared ~request ~plaintexts)));
+  T.with_temp_directory "overlay-snapshot-root-reason-" (fun root ->
+    let support = Filename.concat root "target" in
+    Unix.mkdir support 0o700;
+    let dependencies, _, inspection = absent_inspection ~behavior support in
+    let path, applied_server_cursor, expected_checksum, expected_rows = snapshot_input_for root in
+    let blocked = Filename.concat support "logseq-db-worker" in
+    let channel = open_out_bin blocked in close_out channel;
+    expect Snapshot_root_unavailable
+      (Database.prepare_snapshot_activation dependencies inspection ~path ~applied_server_cursor
+         ~expected_checksum ~expected_rows))
 ;;
 
 let snapshot_crypto_results_are_validated_before_staging () =
@@ -3031,6 +3072,10 @@ let cases =
       "snapshot cancellation removes temporary artifacts"
       `Quick
       canceled_snapshot_activation_removes_temporary_artifacts
+  ; Alcotest.test_case
+      "snapshot state errors keep finite reasons"
+      `Quick
+      snapshot_state_errors_keep_their_reason
   ; Alcotest.test_case
       "snapshot crypto results are validated before staging"
       `Quick

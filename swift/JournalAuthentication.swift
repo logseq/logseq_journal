@@ -52,7 +52,14 @@ extension JournalAuthenticationAPI {
         let fallback = error is URLError
           ? "Unable to connect to sign-in. Please try again."
           : "Unable to complete your account connection. Please try again."
-        message = preparing ? (api.accountPreparationMessage ?? fallback) : fallback
+        let knownMessage: String?
+        switch error {
+        case let known as JournalCognitoFailure: knownMessage = known.errorDescription
+        case let known as JournalCognitoError: knownMessage = known.errorDescription
+        case let known as JournalAccountIssue: knownMessage = known.errorDescription
+        default: knownMessage = nil
+        }
+        message = knownMessage ?? (preparing ? (api.accountPreparationMessage ?? fallback) : fallback)
       }
     }
   }

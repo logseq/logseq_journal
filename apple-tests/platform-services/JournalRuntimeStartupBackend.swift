@@ -1,5 +1,6 @@
 import Foundation
 
+public enum LUIBackendError: Error { case invalidBatch(String) }
 public struct LUIEvent: Sendable {}
 public struct LUIAppleExtensionRegistry { public init() {} }
 @MainActor public final class LUIAppleBackend {

@@ -81,7 +81,7 @@ import OSLog
           try check(version, network: network)
           tokens = updated
           return updated
-        } catch JournalCognitoError.invalidGrant {
+        } catch where JournalCognitoFailure.category(of: error) == .invalidGrant {
           try check(version, network: network)
           tokens = nil; loaded = true
           try await storage.clear()
@@ -138,8 +138,9 @@ import OSLog
     signInID = nil
     do { try await storage.retireLegacy() }
     catch {
+      let reason = JournalAccountIssue.classify(error, stage: .bindingWrite).diagnostic
       Logger(subsystem: "com.logseq.journal", category: "account")
-        .error("Legacy credential cleanup is pending (account.retireLegacy.failed)")
+        .error("Legacy credential cleanup is pending (account.retireLegacy.failed): \(reason, privacy: .public)")
     }
     try check(savingVersion, network: network)
     NotificationCenter.default.post(name: Self.changed, object: self)
@@ -164,8 +165,9 @@ import OSLog
     if previous == nil {
       do { previous = try await storage.load() }
       catch {
+        let reason = JournalAccountIssue.classify(error, stage: .bindingRead).diagnostic
         Logger(subsystem: "com.logseq.journal", category: "account")
-          .error("Remote sign-out credentials unavailable (account.loadForRevocation.failed)")
+          .error("Remote sign-out credentials unavailable (account.loadForRevocation.failed): \(reason, privacy: .public)")
       }
     }
     tokens = nil; loaded = true
@@ -175,23 +177,44 @@ import OSLog
     if let previous {
       // Local cleanup succeeds offline. Revocation is bounded and best effort.
       do {
-        _ = try await performTransport(request(path: "/oauth2/revoke", values: ["client_id": configuration.clientID,
-          "token": previous.refreshToken]))
+        let revocation = request(path: "/oauth2/revoke", values: ["client_id": configuration.clientID,
+          "token": previous.refreshToken])
+        let (_, response) = try await performTransport(revocation, source: .revoke)
+        let reason: JournalAccountDiagnostic?
+        if response.url != revocation.url {
+          reason = .init(source: .revoke, reason: .redirect, httpStatus: response.statusCode)
+        } else if !(200...299).contains(response.statusCode) {
+          reason = .init(source: .revoke, reason: .httpStatus, httpStatus: response.statusCode)
+        } else { reason = nil }
+        if let reason {
+          Logger(subsystem: "com.logseq.journal", category: "account")
+            .error("Remote sign-out response was rejected (account.revoke.failed): \(reason.diagnostic, privacy: .public)")
+        }
       } catch {
+        let reason = JournalAccountIssue.classify(error, stage: .identityLookup).diagnostic
         Logger(subsystem: "com.logseq.journal", category: "account")
-          .error("Remote sign-out could not finish (account.revoke.failed)")
+          .error("Remote sign-out could not finish (account.revoke.failed): \(reason, privacy: .public)")
       }
     }
   }
-  private func performTransport(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+  private func performTransport(_ request: URLRequest, source: JournalAccountDiagnostic.Source) async throws -> (Data, HTTPURLResponse) {
     try Task.checkCancellation()
     let id = UUID()
     let task = Task { try await transport(request) }
     networkRequests[id] = task
     defer { networkRequests[id] = nil }
-    return try await withTaskCancellationHandler {
-      try await task.value
-    } onCancel: { task.cancel() }
+    do {
+      return try await withTaskCancellationHandler {
+        try await task.value
+      } onCancel: { task.cancel() }
+    } catch is CancellationError { throw CancellationError() }
+    catch {
+      if JournalCognitoFailure.category(of: error) != nil { throw error }
+      let prior = JournalAccountIssue.classify(error, stage: .identityLookup)
+      throw JournalCognitoFailure(category: .request, detail: .init(source: source,
+        reason: .transport, urlCode: prior.nativeDetail?.urlCode, osStatus: prior.nativeDetail?.osStatus),
+        accountKind: prior.kind)
+    }
   }
   private func request(path: String, values: [String: String]) -> URLRequest {
     var request = URLRequest(url: URL(string: "https://\(configuration.domain)\(path)")!)
@@ -204,22 +227,47 @@ import OSLog
 
   private func requestTokens(_ values: [String: String]) async throws -> JournalCognitoTokenResponse {
     let request = request(path: "/oauth2/token", values: values)
-    let (data, response) = try await performTransport(request)
-    guard response.url == request.url, data.count <= 131072 else { throw JournalCognitoError.request }
+    let (data, response) = try await performTransport(request, source: .token)
+    guard response.url == request.url else {
+      throw JournalCognitoFailure(category: .request, detail: .init(source: .token, reason: .redirect, httpStatus: response.statusCode))
+    }
+    guard data.count <= 131072 else {
+      throw JournalCognitoFailure(category: .request, detail: .init(source: .token, reason: .responseTooLarge, httpStatus: response.statusCode))
+    }
     guard response.statusCode == 200 else {
       let error = (try? JSONDecoder().decode(TokenFailure.self, from: data))?.error
-      if response.statusCode == 400, error == "invalid_grant" { throw JournalCognitoError.invalidGrant }
-      throw JournalCognitoError.request
+      let category: JournalCognitoError = response.statusCode == 400 && error == "invalid_grant" ? .invalidGrant : .request
+      throw JournalCognitoFailure(category: category, detail: .init(source: .token, reason: .httpStatus,
+        httpStatus: response.statusCode, oauth: error.map { .init(safeCode: $0) }))
     }
     do { return try JSONDecoder().decode(JournalCognitoTokenResponse.self, from: data) }
-    catch { throw JournalCognitoError.invalidToken }
+    catch {
+      throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .token, reason: .responseShape, httpStatus: response.statusCode))
+    }
   }
   private func validate(_ response: JournalCognitoTokenResponse, nonce: String?, previous: JournalCognitoTokens?) async throws -> JournalCognitoTokens {
     var request = URLRequest(url: URL(string: configuration.issuer + "/.well-known/jwks.json")!)
     request.timeoutInterval = 15
-    let (data, http) = try await performTransport(request)
-    guard http.statusCode == 200, http.url == request.url else { throw JournalCognitoError.request }
-    return try JournalCognitoTokenValidator(jwks: data).validate(response, configuration: configuration,
-      nonce: nonce, previous: previous, now: now())
+    let (data, http) = try await performTransport(request, source: .jwks)
+    guard http.statusCode == 200 else {
+      throw JournalCognitoFailure(category: .request, detail: .init(source: .jwks, reason: .httpStatus, httpStatus: http.statusCode))
+    }
+    guard http.url == request.url else {
+      throw JournalCognitoFailure(category: .request, detail: .init(source: .jwks, reason: .redirect, httpStatus: http.statusCode))
+    }
+    guard data.count <= 262144 else {
+      throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .jwks, reason: .responseTooLarge, httpStatus: http.statusCode))
+    }
+    let validator: JournalCognitoTokenValidator
+    do { validator = try JournalCognitoTokenValidator(jwks: data) }
+    catch {
+      throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .jwks, reason: .responseShape, httpStatus: http.statusCode))
+    }
+    do {
+      return try validator.validate(response, configuration: configuration,
+        nonce: nonce, previous: previous, now: now())
+    } catch {
+      throw JournalCognitoFailure(category: .invalidToken, detail: .init(source: .tokenValidation, reason: .verificationFailed))
+    }
   }
 }

@@ -14,22 +14,6 @@ struct JournalCognitoConfiguration: Sendable {
     region: "us-east-1", redirectURI: "logseqjournal://auth/callback")
 }
 
-enum JournalCognitoError: Error, LocalizedError {
-  case configuration, callback, expired, invalidToken, storage, unavailable, request, invalidGrant
-  var errorDescription: String? {
-    switch self {
-    case .configuration: "Web sign-in is not configured."
-    case .callback: "The sign-in response could not be verified. Please try again."
-    case .expired: "Sign-in timed out. Please try again."
-    case .invalidToken: "The account session could not be verified. Please sign in again."
-    case .storage: "Unable to save the account session securely. Please try again."
-    case .unavailable: "Unable to open the sign-in page. Please try again."
-    case .request: "Unable to connect to sign-in. Please try again."
-    case .invalidGrant: "Your account session expired. Please sign in again."
-    }
-  }
-}
-
 enum JournalCognitoOAuth {
   static func url64(_ data: Data) -> String {
     data.base64EncodedString().replacingOccurrences(of: "+", with: "-")

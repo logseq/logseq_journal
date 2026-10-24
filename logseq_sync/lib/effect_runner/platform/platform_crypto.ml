@@ -55,6 +55,8 @@ type request =
 type response =
   { ok : bool
   ; error : string option [@default None]
+  ; reason : string option [@default None]
+  ; cleanup_pending : bool option [@key "cleanupPending"] [@default None]
   ; value : string option [@default None]
   ; wrapped_keys_deleted : bool option [@key "wrappedKeysDeleted"] [@default None]
   ; private_key_deleted : bool option [@key "privateKeyDeleted"] [@default None]
@@ -63,21 +65,68 @@ type response =
   }
 [@@deriving yojson]
 
-let invoke request =
+let crypto_error_codes =
+  [ "cryptoInvalidRequest"; "cryptoAuthenticationFailed"; "cryptoInvalidPrivateKey"
+  ; "cryptoRSADecryptionFailed"; "cryptoInvalidGraphKeyLength"; "cryptoKeyStoreLocked"
+  ; "cryptoKeyStorePermissionDenied"; "cryptoKeyStoreUnavailable"; "cryptoKeyStoreDecodeFailed"
+  ; "cryptoKeyStoreFailed"; "cryptoKeyStoreInvalidType"; "cryptoOperationFailed"; "wrappedGraphKeyUnavailable"
+  ; "cryptoInvalidAESInput"; "cryptoEnginePrivateKeyUnavailable"; "cryptoAllocationFailed"
+  ; "cryptoNativeUnavailable"; "cryptoNativeResponseUnavailable"
+  ; "platform crypto unavailable" ]
+;;
+
+let diagnostic_message ~reason:reason_name source =
+  Logseq_db_types.Failure_diagnostic.(
+    of_source ~operation:"platformCrypto" ~reason:reason_name source |> message)
+;;
+
+let response_context fields =
+  let reason = match fields.reason with
+    | Some ("wrapped-key-absent" | "wrapped-key-cache-invalid" as reason) -> Some reason
+    | Some value when List.exists (fun code ->
+        value = "wrapped-key-verification-failed:" ^ code) crypto_error_codes -> Some value
+    | _ -> None in
+  let context = Option.fold ~none:"" ~some:(fun value -> " Context: " ^ value ^ ".") reason in
+  context ^ if fields.cleanup_pending = Some true then " Wrapped-key cleanup remains pending." else ""
+;;
+
+type invocation_failure = { recovery_code : string option; diagnostic : string }
+
+let failure ?recovery_code diagnostic = Error { recovery_code; diagnostic }
+
+let invoke_response request =
   try
-    match
-      let request = { request with diagnostic_operation =
-        (if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1"
-         then Eio.Fiber.get diagnostic_operation else None) } in
-      call_raw (request_to_yojson request |> Yojson.Safe.to_string)
-      |> Yojson.Safe.from_string
-      |> Logseq_db_types.Json_codec.decode response_of_yojson
-    with
-    | Ok { ok = true; _ } as result -> result
-    | Ok { ok = false; error = Some error; _ } -> Error error
-    | Ok _ | Error _ -> Error "platform crypto operation failed"
+    let request = { request with diagnostic_operation =
+      (if Sys.getenv_opt "JOURNAL_UNLOCK_DIAGNOSTICS" = Some "1"
+       then Eio.Fiber.get diagnostic_operation else None) } in
+    let source = call_raw (request_to_yojson request |> Yojson.Safe.to_string) in
+    let decoded = try Ok (Yojson.Safe.from_string source) with
+      | Yojson.Json_error _ -> failure (diagnostic_message ~reason:"parseFailed"
+          "platform crypto response JSON is invalid") in
+    Result.bind decoded (fun json ->
+      match Logseq_db_types.Json_codec.decode response_of_yojson json with
+      | Ok { ok = true; _ } as result -> result
+      (* This exact error selects the existing local-key recovery branch. *)
+      | Ok ({ ok = false; error = Some "localPrivateKeyUnavailable"; _ } as fields) ->
+        failure ~recovery_code:"localPrivateKeyUnavailable"
+          ("local private key is unavailable" ^ response_context fields)
+      | Ok ({ ok = false; error = Some error; _ } as fields) ->
+        let source = if List.mem error crypto_error_codes then error
+          else "platform crypto provider failed" in
+        let reason = if List.mem error ["platform crypto unavailable"; "cryptoNativeUnavailable";
+          "cryptoNativeResponseUnavailable"] then "unavailable" else "cryptoInvalid" in
+        failure (diagnostic_message ~reason source ^ response_context fields)
+      | Ok _ -> failure (diagnostic_message ~reason:"cryptoInvalid"
+          "platform crypto response error is missing")
+      | Error _ -> failure (diagnostic_message ~reason:"parseFailed"
+          "platform crypto response shape is invalid"))
   with
-  | _ -> Error "platform crypto is unavailable"
+  | error -> failure (diagnostic_message ~reason:"unavailable" (Printexc.to_string error))
+;;
+
+let invoke request =
+  invoke_response request |> Result.map_error (fun failure ->
+    Option.value failure.recovery_code ~default:failure.diagnostic)
 ;;
 
 let bind result f =
@@ -176,7 +225,7 @@ type wrapped_key_load_failure =
 
 let load_wrapped_graph_key ~managed_sync_origin ~user_id ~graph_id =
   match
-    invoke
+    invoke_response
       (graph_identity_request
          "loadAndVerifyWrappedGraphKey"
          ~managed_sync_origin
@@ -187,9 +236,9 @@ let load_wrapped_graph_key ~managed_sync_origin ~user_id ~graph_id =
     Result.map_error
       (fun diagnostic -> Wrapped_graph_key_unavailable diagnostic)
       (string_field fields)
-  | Error "localPrivateKeyUnavailable" ->
-    Error (Local_private_key_unavailable "local private key is unavailable")
-  | Error diagnostic -> Error (Wrapped_graph_key_unavailable diagnostic)
+  | Error { recovery_code = Some "localPrivateKeyUnavailable"; diagnostic } ->
+    Error (Local_private_key_unavailable diagnostic)
+  | Error failure -> Error (Wrapped_graph_key_unavailable failure.diagnostic)
 ;;
 
 let verify_and_save_wrapped_graph_key
@@ -212,7 +261,16 @@ let verify_and_save_wrapped_graph_key
 ;;
 
 let delete_account_secrets ~managed_sync_origin ~user_id =
-  bind
+  let result = bind
     (invoke (identity_request "deleteAccountSecrets" ~managed_sync_origin ~user_id))
-    (fun _ -> Ok ())
+    (fun _ -> Ok ()) in
+  (match result with
+   | Ok () -> ()
+   | Error diagnostic ->
+     (* [invoke] has already reduced native data to a bounded safe message.
+        Secondary account cleanup retains its original completion strategy. *)
+     (try Printf.eprintf
+       "journal: phase=cleanup operation=deleteAccountSecrets code=cleanupPending detail=%s\n%!"
+       diagnostic with _ -> ()));
+  result
 ;;
