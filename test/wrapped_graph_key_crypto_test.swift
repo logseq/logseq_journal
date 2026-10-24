@@ -65,13 +65,16 @@ private func unlockLogTest() throws {
     try? FileManager.default.removeItem(at: capture)
     unsetenv("JOURNAL_UNLOCK_DIAGNOSTICS")
   }
-  func invoke(_ object: [String: Any]) throws {
+  @discardableResult
+  func invoke(_ object: [String: Any]) throws -> JournalCryptoResponse {
     let data = try JSONSerialization.data(withJSONObject: object)
     let response = String(decoding: data, as: UTF8.self).withCString {
       logseqJournalCryptoJSON($0)
     }
     guard let response else { throw HarnessError.failed("missing crypto response") }
-    free(response)
+    defer { free(response) }
+    return try JSONDecoder().decode(
+      JournalCryptoResponse.self, from: Data(String(cString: response).utf8))
   }
   let secrets = ["LOG_SECRET_PASSWORD", "LOG_SECRET_USER", "LOG_SECRET_KEY",
     "LOG_SECRET_GRAPH", "LOG_SECRET_BODY", "LOG_SECRET_OPERATION"]
@@ -87,14 +90,28 @@ private func unlockLogTest() throws {
   let disabledLogs = try Data(contentsOf: capture)
   try require(disabledLogs.isEmpty, "diagnostics must be opt-in")
   setenv("JOURNAL_UNLOCK_DIAGNOSTICS", "1", 1)
-  try invoke(request)
+  let authenticationFailure = try invoke(request)
   var logs = try String(contentsOf: capture, encoding: .utf8)
   try require(logs.contains("source=crypto op=109 request=unlockPrivateKey phase=begin"),
     "native request must preserve the numeric runner operation ID")
   try require(logs.contains("stage=derive-private-key") && logs.contains("stage=open-private-key"),
     "native crypto must expose the actual failing stage")
-  try require(logs.contains("phase=end result=crypto-failed") && logs.contains("elapsed_ms="),
-    "native crypto must record a typed terminal result and duration")
+  try require(!authenticationFailure.ok
+      && authenticationFailure.error == "cryptoAuthenticationFailed",
+    "native crypto must return the precise authentication failure")
+  let terminalRecords = logs.split(separator: "\n").map { $0.split(separator: " ") }
+    .filter { $0.contains("source=crypto") && $0.contains("op=109")
+      && $0.contains("request=unlockPrivateKey") && $0.contains("phase=end") }
+  try require(terminalRecords.count == 1,
+    "native crypto must record exactly one terminal result for the request")
+  let terminal = terminalRecords[0]
+  try require(terminal.contains("result=cryptoAuthenticationFailed")
+      && terminal.contains("stage=open-private-key"),
+    "native crypto terminal result must preserve the response cause and failing stage")
+  let elapsed = terminal.first { $0.hasPrefix("elapsed_ms=") }?.dropFirst("elapsed_ms=".count)
+  try require(elapsed.map { !$0.isEmpty && $0.utf8.allSatisfy { $0 >= 48 && $0 <= 57 }
+      && (Int($0).map { $0 >= 0 } ?? false) } ?? false,
+    "native crypto terminal duration must be a nonnegative integer")
   try invoke(["operation": "loadAndVerifyWrappedGraphKey", "origin": "https://example.invalid",
     "userId": secrets[1], "graphId": "10000000-0000-4000-8000-000000000999",
     "diagnosticOperation": "110"])
