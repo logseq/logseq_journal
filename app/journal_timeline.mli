@@ -18,6 +18,7 @@ val view
   :  ?status_name:(Journal_model.task_state -> string)
   -> ?current_day:int
   -> ?store:Store.t
+  -> ?on_sync:Ui.Event.Handler.t
   -> ?on_region:(string -> unit)
   -> render_source:(string -> string)
   -> ?render_title:(string -> Journal_model.Title.t)

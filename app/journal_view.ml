@@ -1615,7 +1615,8 @@ module View = struct
       [@@deriving yojson]
       type props =
         { style : string; sections : section list
-        ; track_visible_range : bool; track_scroll_completion : bool }
+        ; track_visible_range : bool; track_scroll_completion : bool
+        ; sync_enabled : bool }
       [@@deriving yojson]
       type row_event = { row : string; key : string } [@@deriving yojson]
       type event =
@@ -1633,7 +1634,7 @@ module View = struct
     ;;
 
     (* Content indexes retain the native child ownership order. *)
-    let build sections ~style ~track_visible ~track_scroll =
+    let build sections ~style ~track_visible ~track_scroll ~sync_enabled =
       let contents = ref Rrbvec.empty in
       let next_content_index = ref 0 in
       let push element =
@@ -1660,7 +1661,7 @@ module View = struct
       in
       let wire : Json.props =
         { style = style_name style; sections = List.map section_wire sections
-        ; track_visible_range = track_visible; track_scroll_completion = track_scroll }
+        ; track_visible_range = track_visible; track_scroll_completion = track_scroll; sync_enabled }
       in
       Json.props_to_yojson wire |> Yojson.Safe.to_string, Rrbvec.to_list !contents
     ;;
@@ -1697,6 +1698,7 @@ module View = struct
           ?scroll_request_signal
           ?on_scroll_completed
           ?on_visible_range
+          ?on_sync
           sections
       =
       let payload, contents =
@@ -1705,6 +1707,7 @@ module View = struct
           ~style
           ~track_visible:(Option.is_some on_visible_range)
           ~track_scroll:(Option.is_some on_scroll_completed)
+          ~sync_enabled:(Option.is_some on_sync)
       in
       (* Expansion state arrives as {"type":"expanded","key":..,"expanded":bool};
        the owning row's handler receives Bool like the old disclosure callback. *)
@@ -1746,6 +1749,7 @@ module View = struct
         | Error source -> report_event_error "decodeListEvent" source
         | Ok wire ->
           match wire.event_type with
+          | "sync" -> Option.iter (fun handler -> invoke handler Event.Payload.Unit) on_sync
           | "visible_range" ->
             (match wire.first, wire.last with
              | Some first_index, Some last_exclusive
