@@ -2501,10 +2501,10 @@ let composer_content
       [ V.of_lui
           (Lui_elements.button_group ~gap:0 ~height:44 ~background:"glass"
              ~corner_radius:999
-             ([ action ~label:"文件" ~icon:"doc" Journal_asset_import.Files
-              ; action ~label:"照片" ~icon:"photo" Journal_asset_import.Photos ]
+             ([ action ~label:"Files" ~icon:"doc" Journal_asset_import.Files
+              ; action ~label:"Photos" ~icon:"photo" Journal_asset_import.Photos ]
               @ if assets.camera then
-                  [ action ~label:"相机" ~icon:"camera" Journal_asset_import.Camera ]
+                  [ action ~label:"Camera" ~icon:"camera" Journal_asset_import.Camera ]
                 else []))
         |> V.with_test_id (Ui.Test_id.string (scope ^ "-attach"))
       ]
@@ -2718,6 +2718,7 @@ let timeline_page
         ~status_name
         ?current_day
         ?store:timeline_store
+        ?on_sync:(if interaction_enabled then Some (bind_action on_account_action Begin_online_recovery) else None)
         ~on_region
         ~render_source
         ~render_title

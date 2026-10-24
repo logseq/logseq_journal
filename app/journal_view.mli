@@ -705,6 +705,7 @@ module View : sig
       -> ?scroll_request_signal:scroll_request option Signal.signal
       -> ?on_scroll_completed:Event.handler
       -> ?on_visible_range:Event.handler
+      -> ?on_sync:Event.handler
       -> section list
       -> t
   end

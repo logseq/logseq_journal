@@ -14,6 +14,7 @@ val view
   -> rows:row list
   -> scroll_target:(int64 * string * string) option
   -> ?scroll_target_signal:(int64 * string * string) option Signal.signal
+  -> ?on_sync:Ui.Event.Handler.t
   -> on_scroll_completed:Ui.Event.Handler.t
   -> actions_enabled:bool
   -> on_visible_range:Ui.Event.Handler.t

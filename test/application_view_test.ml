@@ -2068,7 +2068,7 @@ let run_favorites_native_visibility
                 scenario
                 [ "attachments"; "attachment-only"; "offscreen-attachments"; "selection-error"; "picker-owner"; "retry-imports"; "attachment-limit"; "interrupted-imports" ]
             then (
-              dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "文件")));
+              dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Files")));
               let adapter, request =
                 Hashtbl.fold
                   (fun id values found ->
@@ -2157,7 +2157,7 @@ let run_favorites_native_visibility
                   Alcotest.(check (option bool)) (label ^ " enabled matches capacity")
                     (Some enabled)
                     (Option.map Yojson.Safe.Util.to_bool
-                      (List.assoc_opt "enabled" (Hashtbl.find props node)))) ["文件";"照片";"相机"] in
+                      (List.assoc_opt "enabled" (Hashtbl.find props node)))) ["Files";"Photos";"Camera"] in
                 check false;
                 Alcotest.(check bool) "cap explains how to add another attachment" true
                   (Option.is_some (find "text" "9 attachments maximum. Remove one to add another."));
@@ -3642,7 +3642,7 @@ let run_favorites_native_visibility
               Two Worker lanes make accidental parallel submission observable. *)
            dispatch
              (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
-           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "文件")));
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Files")));
            let adapter =
              Hashtbl.fold
                (fun id values found ->
@@ -5131,6 +5131,22 @@ let test_reactive_header_current_controls () =
          "cleared error capability removes error action"
          true
          (Option.is_none (find AccessibilityLabel "Error info"));
+       let spinner = ref None in
+       List.iter (fun phase ->
+         ignore (Lui_app.send app {initial with sync_phase=Some phase});
+         ignore (Lui_app.flush app);
+         let current = find AccessibilityIdentifier "journal-header-sync-progress" in
+         (match !spinner with
+          | None -> spinner := current
+          | Some id -> Alcotest.(check (option int))
+              "all active phases retain the same existing spinner" (Some id) current);
+         Alcotest.(check bool) "shared active phase shows header progress" true
+           (Option.is_some current))
+         [Service.Connecting; Pulling; Submitting];
+       ignore (Lui_app.send app {initial with sync_phase=Some Service.Current});
+       ignore (Lui_app.flush app);
+       Alcotest.(check bool) "settled shared owner removes progress" true
+         (Option.is_none (find AccessibilityIdentifier "journal-header-sync-progress"));
        Alcotest.(check int)
          "control changes preserve body node identity"
          body

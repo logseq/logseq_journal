@@ -20,6 +20,7 @@ let view
       ~rows
       ~scroll_target
       ?scroll_target_signal
+      ?on_sync
       ~on_scroll_completed
       ~actions_enabled
       ~on_visible_range
@@ -161,6 +162,7 @@ let view
     ?scroll_request_signal
     ~on_scroll_completed
     ~on_visible_range
+    ?on_sync
     sections in
   (match scroll_target_signal with
    | None -> list ()

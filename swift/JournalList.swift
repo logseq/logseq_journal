@@ -79,6 +79,7 @@ import UIKit
     let sections: [SectionModel]
     let track_visible_range: Bool?
     let track_scroll_completion: Bool?
+    let sync_enabled: Bool?
   }
 
   /// One payload observation belongs to one mounted native list. Child-model
@@ -344,7 +345,7 @@ import UIKit
     var active = false
     var handledToken: Int64 = 0
     private var userInteracting = false
-    private var atTop = false
+    private(set) var atTop = false
     #if os(iOS)
     weak var scrollView: UIScrollView?
     weak var cover: UIView?
@@ -539,6 +540,8 @@ import UIKit
     @State private var scrollProxy: ScrollViewProxy?
     @State private var pendingScroll: (request: ScrollRequest, id: String, anchor: UnitPoint)?
     @StateObject private var topScroll = TopScroll()
+    @State private var pullEligible = false
+    @State private var pullHint = 0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(context: LUIAppleExtensionViewContext) {
@@ -750,6 +753,34 @@ import UIKit
       }
     }
 
+    private func cancelPull() {
+      pullEligible = false
+      pullHint = 0
+    }
+
+    private func scrollPhaseChanged(from previous: ScrollPhase, to phase: ScrollPhase) {
+      let wasTracking = previous == .tracking || previous == .interacting
+      let tracking = phase == .tracking || phase == .interacting
+      if tracking && !wasTracking {
+        pullEligible = properties?.sync_enabled == true && topScroll.atTop
+        pullHint = 0
+      }
+      if wasTracking && !tracking {
+        var cancelled = false
+        #if os(iOS)
+        let nativePhase = topScroll.scrollView?.panGestureRecognizer.state
+        cancelled = nativePhase == .cancelled || nativePhase == .failed
+        #endif
+        let trigger = pullEligible && pullHint == 2 && !cancelled
+          && (phase == .idle || phase == .decelerating)
+          && properties?.sync_enabled == true
+        cancelPull()
+        if trigger { emit(Event(type: "sync")) }
+      }
+      // The existing top-scroll owner retains interaction cancellation.
+      topScroll.interactionChanged(tracking)
+    }
+
     var body: some SwiftUI.View {
       ScrollViewReader { proxy in
         List {
@@ -775,11 +806,34 @@ import UIKit
         #if os(iOS)
         .overlay(TopScrollAccess(owner: topScroll).ignoresSafeArea().allowsHitTesting(false).accessibilityHidden(true))
         #endif
-        .onScrollGeometryChange(for: Bool.self) { geometry in
-          geometry.contentOffset.y + geometry.contentInsets.top <= 1
-        } action: { _, top in topScroll.geometryChanged(top) }
-        .onScrollPhaseChange { _, phase in
-          topScroll.interactionChanged(phase == .tracking || phase == .interacting)
+        .onScrollGeometryChange(for: CGFloat.self) { geometry in
+          geometry.contentOffset.y + geometry.contentInsets.top
+        } action: { _, offset in
+          topScroll.geometryChanged(offset <= 1)
+          if pullEligible {
+            // Only the three semantic hint states invalidate the view.
+            let hint = offset <= -72 ? 2 : offset <= -20 ? 1 : 0
+            if pullHint != hint { pullHint = hint }
+          }
+        }
+        .onScrollPhaseChange { previous, phase in
+          scrollPhaseChanged(from: previous, to: phase)
+        }
+        .overlay(alignment: .top) {
+          if pullEligible && pullHint > 0 {
+            Text(pullHint == 2 ? "Release to sync" : "Pull to sync")
+              .font(.footnote)
+              .foregroundStyle(.secondary)
+              .padding(.top, 12)
+              .allowsHitTesting(false)
+              .accessibilityIdentifier("journal-pull-sync-hint")
+              .transaction { $0.animation = nil }
+          }
+        }
+        .accessibilityActions {
+          if properties?.sync_enabled == true {
+            Button("Sync") { emit(Event(type: "sync")) }
+          }
         }
         .onAppear {
           topScroll.active = true
@@ -790,6 +844,7 @@ import UIKit
         }
       }
       .onDisappear {
+        cancelPull()
         topScroll.active = false
         topScroll.interactionChanged(false)
         topScroll.cancel()
@@ -799,6 +854,7 @@ import UIKit
         topScroll.geometryChanged(false)
       }
       .onChange(of: context.nodeID) { _, _ in
+        cancelPull()
         topScroll.interactionChanged(false)
         topScroll.cancel()
         pendingScroll = nil
