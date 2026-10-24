@@ -1243,6 +1243,7 @@ int32_t lui_ocaml_picked(int64_t n, const char *payload) { (void)n; (void)payloa
 int32_t journal_ocaml_extension_event(int64_t n, const char *name, const char *p)
   { (void)n; (void)name; (void)p; return 1; }
 int32_t journal_ocaml_pump(void) { return 1; }
+int32_t journal_ocaml_failure_reason(int32_t operation) { (void)operation; return 0; }
 void journal_ocaml_platform_event(const char *d, int32_t l) { (void)d; (void)l; }
 void journal_ocaml_platform_response(const char *d, int32_t l) { (void)d; (void)l; }
 void journal_ocaml_platform_failure(const char *d, int32_t l) { (void)d; (void)l; }

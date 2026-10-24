@@ -58,7 +58,7 @@ let journalAppIcons: [String: String] = [:]
       case "pump": runtime.pump()
       case "platform-event": runtime.sendPlatformEvent(Data([0, 1]))
       default:
-        platform.response = scenario == "platform-response" ? Data([0, 1]) : nil
+        platform.response = scenario == "platform-response" ? Data([0, 1]) : (Data([76,74,70,49,6,0,6,0])+Data(repeating:0,count:16))
         await runtime.deliverPlatformRequest(Data([0, 1]))
       }
       let expected: [String: JournalRuntime.Failure] = ["pump": .pump, "platform-event": .platformEvent,
@@ -76,6 +76,8 @@ let journalAppIcons: [String: String] = [:]
       let message = reported!.localizedDescription
       precondition(!message.contains("SENSITIVE"), "Native failure must exclude raw renderer details")
       precondition(message.contains("runtime."), "Native failure must identify its fixed stage/code")
+      precondition(message.contains(scenario == "invalid-patch" ? "backendUnsupportedProperty" : "callbackFailed"),
+        "native runtime must preserve the safe producer reason")
     }
     print("PASS runtime \(scenario)")
   }

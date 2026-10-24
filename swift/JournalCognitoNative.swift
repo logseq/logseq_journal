@@ -26,7 +26,9 @@ private final class JournalCognitoKeychain: Sendable {
       kSecAttrService: "com.amplify.awsCognitoAuthPlugin",
       kSecAttrAccount: "amplify.us-east-1_dtagLnju8.session", kSecUseDataProtectionKeychain: true]
     let status = SecItemDelete(legacy as CFDictionary)
-    guard status == errSecSuccess || status == errSecItemNotFound else { throw JournalCognitoError.storage }
+    guard status == errSecSuccess || status == errSecItemNotFound else {
+      throw JournalCognitoFailure(category: .storage, detail: .init(source: .legacyClear, reason: .status, osStatus: Int(status)))
+    }
   }
   func load() async throws -> JournalCognitoTokens? {
     try await perform {
@@ -35,27 +37,46 @@ private final class JournalCognitoKeychain: Sendable {
       var item: CFTypeRef?
       let status = SecItemCopyMatching(query as CFDictionary, &item)
       if status == errSecItemNotFound { return nil }
-      guard status == errSecSuccess, let data = item as? Data, data.count <= 131072
-      else { throw JournalCognitoError.storage }
-      return try JSONDecoder().decode(JournalCognitoTokens.self, from: data)
+      guard status == errSecSuccess else {
+        throw JournalCognitoFailure(category: .storage, detail: .init(source: .keychainLoad, reason: .status, osStatus: Int(status)))
+      }
+      guard let data = item as? Data else {
+        throw JournalCognitoFailure(category: .storage, detail: .init(source: .keychainLoad, reason: .wrongType))
+      }
+      guard data.count <= 131072 else {
+        throw JournalCognitoFailure(category: .storage, detail: .init(source: .keychainLoad, reason: .responseTooLarge))
+      }
+      do { return try JSONDecoder().decode(JournalCognitoTokens.self, from: data) }
+      catch { throw JournalCognitoFailure(category: .storage, detail: .init(source: .keychainLoad, reason: .invalidRecord)) }
     }
   }
   func save(_ tokens: JournalCognitoTokens) async throws {
     try await perform {
-      let data = try JSONEncoder().encode(tokens)
-      guard data.count <= 131072 else { throw JournalCognitoError.storage }
+      let data: Data
+      do { data = try JSONEncoder().encode(tokens) }
+      catch { throw JournalCognitoFailure(category: .storage, detail: .init(source: .keychainSave, reason: .invalidRecord)) }
+      guard data.count <= 131072 else {
+        throw JournalCognitoFailure(category: .storage, detail: .init(source: .keychainSave, reason: .responseTooLarge))
+      }
       let status = SecItemUpdate(Self.query as CFDictionary, [kSecValueData: data] as CFDictionary)
       if status == errSecItemNotFound {
         var query = Self.query
         query[kSecValueData] = data; query[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        guard SecItemAdd(query as CFDictionary, nil) == errSecSuccess else { throw JournalCognitoError.storage }
-      } else if status != errSecSuccess { throw JournalCognitoError.storage }
+        let added = SecItemAdd(query as CFDictionary, nil)
+        guard added == errSecSuccess else {
+          throw JournalCognitoFailure(category: .storage, detail: .init(source: .keychainAdd, reason: .status, osStatus: Int(added)))
+        }
+      } else if status != errSecSuccess {
+        throw JournalCognitoFailure(category: .storage, detail: .init(source: .keychainSave, reason: .status, osStatus: Int(status)))
+      }
     }
   }
   func clear() async throws {
     try await perform {
       let status = SecItemDelete(Self.query as CFDictionary)
-      guard status == errSecSuccess || status == errSecItemNotFound else { throw JournalCognitoError.storage }
+      guard status == errSecSuccess || status == errSecItemNotFound else {
+        throw JournalCognitoFailure(category: .storage, detail: .init(source: .keychainClear, reason: .status, osStatus: Int(status)))
+      }
     }
   }
   func retireLegacy() async throws { try await perform { try Self.clearLegacySession() } }
@@ -69,14 +90,18 @@ private final class JournalCognitoKeychain: Sendable {
   private var timer: Task<Void, Never>?
   private var anchor: ASPresentationAnchor?
   func authenticate(_ url: URL, scheme: String) async throws -> URL {
-    guard operation == nil else { throw JournalCognitoError.unavailable }
+    guard operation == nil else {
+      throw JournalCognitoFailure(category: .unavailable, detail: .init(source: .browser, reason: .operationInProgress))
+    }
     #if os(iOS)
     anchor = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
       .filter { $0.activationState == .foregroundActive }.flatMap(\.windows).first(where: \.isKeyWindow)
     #else
     anchor = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
     #endif
-    guard anchor != nil else { throw JournalCognitoError.unavailable }
+    guard anchor != nil else {
+      throw JournalCognitoFailure(category: .unavailable, detail: .init(source: .browser, reason: .missingAnchor))
+    }
     let id = UUID(); operation = id
     defer { if operation == id { finish(id, .failure(CancellationError()), cancel: true) } }
     return try await withTaskCancellationHandler {
@@ -88,7 +113,10 @@ private final class JournalCognitoKeychain: Sendable {
             if let callback { self?.finish(id, .success(callback)) }
             else if (error as? ASWebAuthenticationSessionError)?.code == .canceledLogin {
               self?.finish(id, .failure(CancellationError()))
-            } else { self?.finish(id, .failure(JournalCognitoError.unavailable)) }
+            } else {
+              self?.finish(id, .failure(JournalCognitoFailure(category: .unavailable,
+                detail: .init(source: .browser, reason: .browserFailed))))
+            }
           }
         }
         self.session = session
@@ -98,7 +126,10 @@ private final class JournalCognitoKeychain: Sendable {
           do { try await Task.sleep(for: .seconds(300)) } catch { return }
           self?.finish(id, .failure(JournalCognitoError.expired), cancel: true)
         }
-        if !session.start() { finish(id, .failure(JournalCognitoError.unavailable), cancel: true) }
+        if !session.start() {
+          finish(id, .failure(JournalCognitoFailure(category: .unavailable,
+            detail: .init(source: .browser, reason: .startRejected))), cancel: true)
+        }
       }
     } onCancel: { Task { @MainActor [weak self] in self?.finish(id, .failure(CancellationError()), cancel: true) } }
   }
@@ -135,7 +166,9 @@ private final class JournalOAuthRedirectPolicy: NSObject, URLSessionTaskDelegate
       browser: JournalCognitoBrowser(authenticate: { try await browser.authenticate($0, scheme: $1) }, cancel: { browser.cancel() }),
       transport: { request in
         let (data, response) = try await http.data(for: request)
-        guard let response = response as? HTTPURLResponse else { throw JournalCognitoError.request }
+        guard let response = response as? HTTPURLResponse else {
+          throw JournalCognitoFailure(category: .request, detail: .init(source: .network, reason: .responseShape))
+        }
         return (data, response)
       })
   }()

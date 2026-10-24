@@ -891,6 +891,7 @@ type t =
   ; submission_owner : submission_owner option
   ; pull_owner : pull_owner option
   ; pull_wanted : (graph_scope * Server_cursor.t) option
+  ; diagnostic_remote_cursor : (graph_scope * Server_cursor.t) option
   ; pull_retry_delay : float
   ; active_authoritative_batch : authoritative_batch option
   ; queued_authoritative_batch : authoritative_batch option
@@ -967,6 +968,7 @@ let initial config =
     ; pending_outbox_transition = None
     ; pull_owner = None
     ; pull_wanted = None
+    ; diagnostic_remote_cursor = None
     ; pull_retry_delay = 1.
     ; submission_owner = None
     ; active_authoritative_batch = None
@@ -1018,7 +1020,13 @@ let set_snapshot core (snapshot : snapshot) =
     then { groups = [] }
     else core.public_state.diagnostics
   in
-  { core with public_state = { snapshot; diagnostics } }
+  let diagnostic_remote_cursor =
+    if previous.account_generation <> snapshot.startup.account_generation
+       || previous.graph_generation <> snapshot.startup.graph_generation
+    then None
+    else core.diagnostic_remote_cursor
+  in
+  { core with public_state = { snapshot; diagnostics }; diagnostic_remote_cursor }
 ;;
 
 let network_allowed core =
@@ -1792,7 +1800,20 @@ let plan_submission core =
   | _ -> unchanged core
 ;;
 
+(* Retained observation only; synchronization still uses its existing owners and targets. *)
+let note_remote_cursor core graph through =
+  let diagnostic_remote_cursor =
+    match core.diagnostic_remote_cursor, through with
+    | Some (scope, old), Some cursor when scope = graph ->
+      Some (graph, if Server_cursor.compare old cursor >= 0 then old else cursor)
+    | _, Some cursor -> Some (graph, cursor)
+    | previous, None -> previous
+  in
+  { core with diagnostic_remote_cursor }
+;;
+
 let note_pull_target core graph through =
+  let core = note_remote_cursor core graph through in
   let previous =
     match core.pull_wanted with
     | Some (scope, target) when scope = graph -> Some target
@@ -2088,6 +2109,7 @@ let apply_accept core owner t checksum_value =
     (match checksum checksum_value with
      | Error _ -> fail core During_catalog "invalid acceptance checksum"
      | Ok checksum ->
+       let core = note_remote_cursor core owner.connection.graph (Some t) in
        let request =
          { expected = Overlay.sync_view_token sync
          ; key = core.graph_key
@@ -2177,6 +2199,7 @@ let apply_rejection core owner rejection =
     (match resolution with
      | Error message -> fail core During_catalog message
      | Ok resolution ->
+       let core = note_remote_cursor core owner.connection.graph rejection.t in
        let request =
          { expected = Overlay.sync_view_token sync
          ; key = core.graph_key
@@ -2651,6 +2674,7 @@ let complete_runner : type a. t -> a effect_ticket -> a -> transition =
   | Fetch_snapshot_metadata_kind ->
     (match decode_snapshot_uri value, core.bootstrap with
      | Ok (uri, metadata_cursor), Awaiting_snapshot_metadata (scope, attempt_id) ->
+       let core = note_remote_cursor core scope (Some metadata_cursor) in
        let request =
          { scope; uri; metadata_cursor; attempt_id; download_id = core.next_effect_id
          ; expected_bytes = None
@@ -2737,34 +2761,34 @@ let consume_completion core = function
        (match result with
         | Ok value -> complete_runner core ticket value
         | Error (Effect_failed message | Crypto_failed (_, message)) ->
+          let source = message in
+          let message = match Logseq_db_types.Failure_diagnostic.decode source with
+            | Some diagnostic -> Logseq_db_types.Failure_diagnostic.message diagnostic
+            | None -> message in
           (match ticket.kind with
            | Save_catalog_kind ->
+             (* Keep the existing advisory/deletion outcome. Only the safe
+                diagnostics projection retains the producer's specific cause. *)
+             let diagnostic = Logseq_db_types.Failure_diagnostic.of_source
+               ~operation:"saveCatalog" ~reason:"persistenceFailed" source in
+             let group =
+               { title = "Sync errors"
+               ; entries =
+                   [ "saveCatalog",
+                     "saveCatalog · phase=catalog · code=catalog.save.failed · " ^
+                     "Local graph selection could not be saved. Retry by " ^
+                     "refreshing or selecting the graph again. " ^
+                     Logseq_db_types.Failure_diagnostic.message diagnostic
+                   ]
+               } in
+             let next = { core with public_state =
+               { core.public_state with diagnostics =
+                 { groups = group :: List.filter
+                   (fun g -> g.title <> group.title) core.public_state.diagnostics.groups } } } in
              (match core.public_state.snapshot.local_deletion with
               | Some (Deletion_in_progress Clearing_selection) ->
-                deletion_failed core Clearing_selection
-              | None | Some _ ->
-                (* Advisory failure does not invalidate the open graph. Retain a
-                   safe report until this scope ends; never expose an IO path. *)
-                let group =
-                  { title = "Sync errors"
-                  ; entries =
-                      [ "saveCatalog",
-                        "saveCatalog · phase=catalog · code=catalog.save.failed · \
-                         Local graph selection could not be saved. Retry by \
-                         refreshing or selecting the graph again."
-                      ]
-                  }
-                in
-                let next =
-                  { core with public_state =
-                      { core.public_state with diagnostics =
-                          { groups = group :: List.filter
-                              (fun g -> g.title <> group.title)
-                              core.public_state.diagnostics.groups }
-                      }
-                  }
-                in
-                { next; effects = [ publish next ] })
+                deletion_failed next Clearing_selection
+              | None | Some _ -> { next; effects = [ publish next ] })
            | Load_catalog_kind ->
              fail
                { core with
@@ -3927,4 +3951,49 @@ let step core event =
     then enforce_websocket_owner core (start_websocket next scope.graph)
     else unchanged next
   | _ -> enforce_websocket_owner core (step_business core event)
+;;
+
+let with_sync_cursor_diagnostics core (state : state) =
+  let title = "Sync transactions" in
+  let other_groups = List.filter (fun group -> group.title <> title) state.diagnostics.groups in
+  let groups =
+    match state.snapshot.selected_graph with
+    | None -> other_groups
+    | Some graph_id ->
+      let remote =
+        match core.diagnostic_remote_cursor with
+        | Some (scope, cursor)
+          when scope.graph_id = graph_id
+               && scope.account.account_generation = state.snapshot.startup.account_generation
+               && scope.graph_generation = state.snapshot.startup.graph_generation -> Some cursor
+        | _ -> None
+      in
+      let format = Option.fold ~none:"Not available"
+        ~some:(fun cursor -> Int64.to_string (Server_cursor.to_int64 cursor)) in
+      { title
+      ; entries =
+          [ "Local tx", format state.snapshot.applied_server_t
+          ; "Remote tx", format remote
+          ]
+      } :: other_groups
+  in
+  { state with diagnostics = { groups } }
+;;
+
+let step_sync = step
+
+let step core event =
+  let transition = step_sync core event in
+  let public_state = with_sync_cursor_diagnostics transition.next transition.next.public_state in
+  let next = { transition.next with public_state } in
+  let effects = List.map (function
+    | Publish (State_changed state) -> Publish (State_changed (with_sync_cursor_diagnostics next state))
+    | instruction -> instruction) transition.effects in
+  let effects =
+    if public_state.diagnostics <> core.public_state.diagnostics
+       && not (List.exists (function Publish (State_changed _) -> true | _ -> false) effects)
+    then effects @ [ publish next ]
+    else effects
+  in
+  { next; effects }
 ;;

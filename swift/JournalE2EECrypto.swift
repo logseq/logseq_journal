@@ -16,6 +16,8 @@ private final class JournalUnlockTrace: NSObject {
   let request: String
   let began = ProcessInfo.processInfo.systemUptime
   var stage = "decode-request"
+  var failureReason: String?
+  var cleanupPending = false
 
   static var current: JournalUnlockTrace? {
     get { Thread.current.threadDictionary[threadKey] as? JournalUnlockTrace }
@@ -95,6 +97,8 @@ struct JournalCryptoRequest: Codable {
 struct JournalCryptoResponse: Codable {
   var ok: Bool
   var error: String? = nil
+  var reason: String? = nil
+  var cleanupPending: Bool? = nil
   var value: String? = nil
   var wrappedKeysDeleted: Bool? = nil
   var privateKeyDeleted: Bool? = nil
@@ -105,6 +109,13 @@ struct JournalCryptoResponse: Codable {
 enum JournalE2EECryptoError: Error {
   case invalidRequest
   case operationFailed
+  case keyStoreFailure(OSStatus)
+  case keyStoreInvalidType
+  case invalidPrivateKey
+  case rsaDecryptionFailed
+  case invalidGraphKeyLength
+  case invalidAESInput
+  case enginePrivateKeyUnavailable
   case wrappedGraphKeyUnavailable
   case localPrivateKeyUnavailable
 }
@@ -381,7 +392,7 @@ enum JournalE2EECrypto {
 
   private static func aesOpen(key: Data, iv: Data, ciphertextAndTag: Data) throws -> Data {
     guard key.count == 32, iv.count == 12, ciphertextAndTag.count >= 16 else {
-      throw JournalE2EECryptoError.operationFailed
+      throw JournalE2EECryptoError.invalidAESInput
     }
     let box = try AES.GCM.SealedBox(
       nonce: AES.GCM.Nonce(data: iv),
@@ -410,10 +421,12 @@ enum JournalE2EECrypto {
     var key = SecKeyCreateWithData(privateKeyData as CFData, attributes as CFDictionary, &error)
     if key == nil {
       error = nil
-      let pkcs1 = try unwrapPKCS8(privateKeyData)
+      let pkcs1: Data
+      do { pkcs1 = try unwrapPKCS8(privateKeyData) }
+      catch { throw JournalE2EECryptoError.invalidPrivateKey }
       key = SecKeyCreateWithData(pkcs1 as CFData, attributes as CFDictionary, &error)
     }
-    guard let key else { throw JournalE2EECryptoError.operationFailed }
+    guard let key else { throw JournalE2EECryptoError.invalidPrivateKey }
     return key
   }
 
@@ -426,7 +439,7 @@ enum JournalE2EECrypto {
       .rsaEncryptionOAEPSHA256,
       ciphertext as CFData,
       &error
-    ) else { throw JournalE2EECryptoError.operationFailed }
+    ) else { throw JournalE2EECryptoError.rsaDecryptionFailed }
     return plaintext as Data
   }
 
@@ -549,7 +562,7 @@ enum JournalE2EECrypto {
       )
     }
     guard status == errSecSuccess, let keychain else {
-      throw JournalE2EECryptoError.operationFailed
+      throw JournalE2EECryptoError.keyStoreFailure(status)
     }
     testFileKeychains[path] = keychain
     return keychain
@@ -635,11 +648,23 @@ enum JournalE2EECrypto {
       let addStatus = SecItemAdd(query as CFDictionary, nil)
       JournalUnlockTrace.keychain("private-key-add", addStatus)
       guard addStatus == errSecSuccess else {
-        throw JournalE2EECryptoError.operationFailed
+        throw JournalE2EECryptoError.keyStoreFailure(addStatus)
       }
     } else if status != errSecSuccess {
-      throw JournalE2EECryptoError.operationFailed
+      throw JournalE2EECryptoError.keyStoreFailure(status)
     }
+  }
+
+  // Keychain query result decoding owns no storage operation and never logs its value.
+  static func decodeKeyStoreData(status: OSStatus, result: CFTypeRef?) throws -> Data? {
+    if status == errSecItemNotFound { return nil }
+    guard status == errSecSuccess else {
+      throw JournalE2EECryptoError.keyStoreFailure(status)
+    }
+    guard let data = result as? Data else {
+      throw JournalE2EECryptoError.keyStoreInvalidType
+    }
+    return data
   }
 
   static func loadPrivateKey(
@@ -676,11 +701,7 @@ enum JournalE2EECrypto {
     var result: CFTypeRef?
     let status = SecItemCopyMatching(query as CFDictionary, &result)
     JournalUnlockTrace.keychain("private-key-copy", status)
-    if status == errSecItemNotFound { return nil }
-    guard status == errSecSuccess, let data = result as? Data else {
-      throw JournalE2EECryptoError.operationFailed
-    }
-    return data
+    return try decodeKeyStoreData(status: status, result: result)
   }
 
   private static func saveWrappedGraphKey(
@@ -732,10 +753,10 @@ enum JournalE2EECrypto {
       let addStatus = SecItemAdd(query as CFDictionary, nil)
       JournalUnlockTrace.keychain("wrapped-key-add", addStatus)
       guard addStatus == errSecSuccess else {
-        throw JournalE2EECryptoError.operationFailed
+        throw JournalE2EECryptoError.keyStoreFailure(addStatus)
       }
     } else if status != errSecSuccess {
-      throw JournalE2EECryptoError.operationFailed
+      throw JournalE2EECryptoError.keyStoreFailure(status)
     }
   }
 
@@ -771,7 +792,7 @@ enum JournalE2EECrypto {
     try searchQuery(&query, storage: storage)
     let status = SecItemDelete(query as CFDictionary)
     guard status == errSecSuccess || status == errSecItemNotFound else {
-      throw JournalE2EECryptoError.operationFailed
+      throw JournalE2EECryptoError.keyStoreFailure(status)
     }
   }
 
@@ -798,11 +819,7 @@ enum JournalE2EECrypto {
       var result: CFTypeRef?
       let status = SecItemCopyMatching(query as CFDictionary, &result)
       JournalUnlockTrace.keychain("wrapped-key-copy", status)
-      if status == errSecItemNotFound { return nil }
-      guard status == errSecSuccess, let data = result as? Data else {
-        throw JournalE2EECryptoError.operationFailed
-      }
-      return data
+      return try decodeKeyStoreData(status: status, result: result)
     }
     let encoded: Data?
     switch storage {
@@ -825,7 +842,12 @@ enum JournalE2EECrypto {
       guard decoded.identity == identity else { throw JournalE2EECryptoError.invalidRequest }
       return decoded.encryptedGraphKey
     } catch {
-      try? deleteWrappedGraphKey(identity: identity, environment: environment)
+      JournalUnlockTrace.current?.failureReason = "wrapped-key-cache-invalid"
+      do { try deleteWrappedGraphKey(identity: identity, environment: environment) }
+      catch {
+        JournalUnlockTrace.current?.cleanupPending = true
+        JournalUnlockTrace.mark("wrapped-key-cleanup-failed")
+      }
       throw JournalE2EECryptoError.operationFailed
     }
   }
@@ -844,7 +866,7 @@ enum JournalE2EECrypto {
       try searchQuery(&query, storage: storage)
       let status = SecItemDelete(query as CFDictionary)
       guard status == errSecSuccess || status == errSecItemNotFound else {
-        throw JournalE2EECryptoError.operationFailed
+        throw JournalE2EECryptoError.keyStoreFailure(status)
       }
     }
     let wrappedStorage = try secretStorage(
@@ -873,7 +895,7 @@ enum JournalE2EECrypto {
       try searchQuery(&query, storage: storage)
       let status = SecItemDelete(query as CFDictionary)
       guard status == errSecSuccess || status == errSecItemNotFound else {
-        throw JournalE2EECryptoError.operationFailed
+        throw JournalE2EECryptoError.keyStoreFailure(status)
       }
     }
     let privateStorage = try secretStorage(
@@ -930,14 +952,14 @@ enum JournalE2EECrypto {
         userID: identity.userID
       )
     else {
-      throw JournalE2EECryptoError.operationFailed
+      throw JournalE2EECryptoError.enginePrivateKeyUnavailable
     }
     JournalUnlockTrace.mark("unwrap-graph-key")
     let graphKey = try rsaOAEPDecrypt(
       privateKeyData: privateKey,
       ciphertext: try hexData(request.ciphertext)
     )
-    guard graphKey.count == 32 else { throw JournalE2EECryptoError.operationFailed }
+    guard graphKey.count == 32 else { throw JournalE2EECryptoError.invalidGraphKeyLength }
     return graphKey
   }
 
@@ -959,7 +981,7 @@ enum JournalE2EECrypto {
       privateKeyData: privateKey,
       ciphertext: try wrappedCiphertext(encryptedGraphKey)
     )
-    guard graphKey.count == 32 else { throw JournalE2EECryptoError.operationFailed }
+    guard graphKey.count == 32 else { throw JournalE2EECryptoError.invalidGraphKeyLength }
   }
 
   static func handle(_ request: JournalCryptoRequest) throws -> JournalCryptoResponse {
@@ -1048,20 +1070,28 @@ enum JournalE2EECrypto {
           identity: identity,
           environment: ProcessInfo.processInfo.environment
         )
-      else { throw JournalE2EECryptoError.wrappedGraphKeyUnavailable }
+      else {
+        JournalUnlockTrace.current?.failureReason = "wrapped-key-absent"
+        throw JournalE2EECryptoError.wrappedGraphKeyUnavailable
+      }
       do {
         try verifyWrappedGraphKey(identity: identity, encryptedGraphKey: encryptedGraphKey)
       } catch JournalE2EECryptoError.localPrivateKeyUnavailable {
-        try? deleteWrappedGraphKey(
-          identity: identity,
-          environment: ProcessInfo.processInfo.environment
-        )
+        do {
+          try deleteWrappedGraphKey(identity: identity, environment: ProcessInfo.processInfo.environment)
+        } catch {
+          JournalUnlockTrace.current?.cleanupPending = true
+          JournalUnlockTrace.mark("wrapped-key-cleanup-failed")
+        }
         throw JournalE2EECryptoError.localPrivateKeyUnavailable
       } catch {
-        try? deleteWrappedGraphKey(
-          identity: identity,
-          environment: ProcessInfo.processInfo.environment
-        )
+        JournalUnlockTrace.current?.failureReason = "wrapped-key-verification-failed:" + journalCryptoFailureCode(error)
+        do {
+          try deleteWrappedGraphKey(identity: identity, environment: ProcessInfo.processInfo.environment)
+        } catch {
+          JournalUnlockTrace.current?.cleanupPending = true
+          JournalUnlockTrace.mark("wrapped-key-cleanup-failed")
+        }
         throw JournalE2EECryptoError.wrappedGraphKeyUnavailable
       }
       return JournalCryptoResponse(ok: true, value: encryptedGraphKey)
@@ -1104,6 +1134,32 @@ enum JournalE2EECrypto {
   }
 }
 
+// Never serialize descriptions/userInfo: crypto errors can contain key material.
+func journalCryptoFailureCode(_ error: any Error) -> String {
+  if error is DecodingError { return "cryptoInvalidRequest" }
+  if let crypto = error as? CryptoKitError, case .authenticationFailure = crypto {
+    return "cryptoAuthenticationFailed"
+  }
+  switch error as? JournalE2EECryptoError {
+  case .invalidRequest: return "cryptoInvalidRequest"
+  case .invalidPrivateKey: return "cryptoInvalidPrivateKey"
+  case .rsaDecryptionFailed: return "cryptoRSADecryptionFailed"
+  case .invalidGraphKeyLength: return "cryptoInvalidGraphKeyLength"
+  case .invalidAESInput: return "cryptoInvalidAESInput"
+  case .enginePrivateKeyUnavailable: return "cryptoEnginePrivateKeyUnavailable"
+  case .keyStoreInvalidType: return "cryptoKeyStoreInvalidType"
+  case .keyStoreFailure(let status):
+    switch status {
+    case errSecInteractionNotAllowed: return "cryptoKeyStoreLocked"
+    case errSecAuthFailed, errSecMissingEntitlement: return "cryptoKeyStorePermissionDenied"
+    case errSecNotAvailable: return "cryptoKeyStoreUnavailable"
+    case errSecDecode: return "cryptoKeyStoreDecodeFailed"
+    default: return "cryptoKeyStoreFailed"
+    }
+  default: return "cryptoOperationFailed"
+  }
+}
+
 @_cdecl("logseq_journal_crypto_json")
 public func logseqJournalCryptoJSON(
   _ requestPointer: UnsafePointer<CChar>?
@@ -1120,21 +1176,19 @@ public func logseqJournalCryptoJSON(
         let data = String(cString: requestPointer).data(using: .utf8)
       else { throw JournalE2EECryptoError.invalidRequest }
       let request = try JSONDecoder().decode(JournalCryptoRequest.self, from: data)
-      if ProcessInfo.processInfo.environment["JOURNAL_UNLOCK_DIAGNOSTICS"] == "1" {
-        trace = JournalUnlockTrace(request)
-        JournalUnlockTrace.current = trace
-      }
+      trace = JournalUnlockTrace(request)
+      JournalUnlockTrace.current = trace
       response = try JournalE2EECrypto.handle(request)
     } catch JournalE2EECryptoError.localPrivateKeyUnavailable {
       diagnosticResult = "local-private-key-unavailable"
-      response = JournalCryptoResponse(ok: false, error: "localPrivateKeyUnavailable")
+      response = JournalCryptoResponse(ok: false, error: "localPrivateKeyUnavailable", cleanupPending: trace?.cleanupPending == true ? true : nil)
     } catch JournalE2EECryptoError.wrappedGraphKeyUnavailable {
       diagnosticResult = "wrapped-key-unavailable"
-      response = JournalCryptoResponse(ok: false, error: "wrappedGraphKeyUnavailable")
+      response = JournalCryptoResponse(ok: false, error: "wrappedGraphKeyUnavailable", reason: trace?.failureReason, cleanupPending: trace?.cleanupPending == true ? true : nil)
     } catch {
-      diagnosticResult = (error as? JournalE2EECryptoError) == .invalidRequest
-        ? "invalid-request" : "crypto-failed"
-      response = JournalCryptoResponse(ok: false, error: "cryptoOperationFailed")
+      let reason = journalCryptoFailureCode(error)
+      diagnosticResult = reason
+      response = JournalCryptoResponse(ok: false, error: reason, reason: trace?.failureReason, cleanupPending: trace?.cleanupPending == true ? true : nil)
     }
     if ProcessInfo.processInfo.environment["JOURNAL_UNLOCK_DIAGNOSTICS"] == "1" {
       if trace == nil { trace = JournalUnlockTrace(nil) }
@@ -1159,13 +1213,15 @@ public func logseqJournalCryptoBinary(
   _ outputLength: UnsafeMutablePointer<Int>?
 ) -> UnsafeMutablePointer<UInt8>? {
   autoreleasepool {
+    // Negative lengths are finite failure sentinels consumed only when returning nil.
+    outputLength?.pointee = -1
     guard let key, let input, let outputLength,
       keyLength == 32, inputLength >= 0,
       (sealing == 1 && ivLength == 0 && inputLength <= 8 * 1024 * 1024)
         || (sealing == 0 && ivLength == 12 && inputLength >= 16
           && inputLength <= 8 * 1024 * 1024 + 16)
     else { return nil }
-    outputLength.pointee = 0
+    outputLength.pointee = -4
     do {
       let symmetricKey = SymmetricKey(data: Data(bytes: key, count: keyLength))
       let data = Data(bytes: input, count: inputLength)
@@ -1175,17 +1231,25 @@ public func logseqJournalCryptoBinary(
         else { return nil }
         result = combined
       } else {
-        guard let iv else { return nil }
+        guard let iv else { outputLength.pointee = -1; return nil }
         let box = try AES.GCM.SealedBox(
           nonce: AES.GCM.Nonce(data: Data(bytes: iv, count: ivLength)),
           ciphertext: data.dropLast(16), tag: data.suffix(16))
         result = try AES.GCM.open(box, using: symmetricKey)
       }
-      guard let allocation = malloc(max(1, result.count)) else { return nil }
+      guard let allocation = malloc(max(1, result.count)) else {
+        outputLength.pointee = -3
+        return nil
+      }
       let output = allocation.assumingMemoryBound(to: UInt8.self)
       result.copyBytes(to: output, count: result.count)
       outputLength.pointee = result.count
       return output
-    } catch { return nil }
+    } catch {
+      if let crypto = error as? CryptoKitError, case .authenticationFailure = crypto {
+        outputLength.pointee = -2
+      }
+      return nil
+    }
   }
 }

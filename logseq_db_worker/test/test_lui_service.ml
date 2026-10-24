@@ -1372,6 +1372,112 @@ let test_authoritative_detail_rows () =
   T.require (not (contains legacy "PRIVATE_SYNTHETIC_PAYLOAD")) "legacy raw string leaked"
 ;;
 
+(* Integrity text originates below the pure reducer; this public publisher boundary
+   owns validating and displaying its bounded carrier. *)
+let test_asset_failure_rows () =
+  let module A=Logseq_sync_pure_reducer.Asset_transfer in
+  let module U=Logseq_db_worker_pure_reducer.Asset_upload in
+  let module D=Logseq_db_types.Failure_diagnostic in
+  let uuid=Logseq_db_types.Graph_types.Uuid.of_string "94000000-0000-4000-8000-000000000799" |> Result.get_ok in
+  let download ?(retry=false) failure = Service.Asset_availability
+    {consumer="PRIVATE_SYNTHETIC_PAYLOAD";asset=uuid;
+     availability=A.Failed{failure;attempts=2;retry_scheduled=retry}} in
+  let upload failure = Service.Upload_status{operation=uuid;asset=uuid;target=uuid;
+    title="PRIVATE_SYNTHETIC_PAYLOAD";status=U.Failed_upload failure} in
+  let cases=List.map(fun(failure,reason)->download failure,"assetDownload",reason)
+    A.[Network,"networkFailed";Not_found,"notFound";Checksum_mismatch,"checksumMismatch";
+       Authentication,"authenticationFailed";Locked,"locked";Storage_full,"storageFull";
+       Invalid_content "Failure(\"PRIVATE_SYNTHETIC_PAYLOAD\")","invalidContent"]
+    @ List.map(fun(failure,reason)->upload failure,"assetUpload",reason)
+      U.[Network,"networkFailed";Authentication,"authenticationFailed";Missing_source,"missingSource";
+         Size_rejected,"sizeRejected";Revoked_access,"revokedAccess";Invalid_content,"invalidContent";
+         Persistence_failed "Sys_error(\"/private/PRIVATE_SYNTHETIC_PAYLOAD\")","persistenceFailed"] in
+  List.iter(fun(notice,operation,reason)->
+    let signal=Service.diagnostic_asset_notice notice |> Option.get in
+    let prefix=D.signal_prefix in
+    T.require(String.starts_with ~prefix signal) "asset typed failure was erased";
+    let detail=D.decode(String.sub signal (String.length prefix) (String.length signal-String.length prefix)) |> Option.get in
+    T.require(D.operation detail=operation && D.reason detail=reason) "asset cause classification changed";
+    let _,_,message=Service.diagnostic_report signal in
+    T.require(message=D.message detail) "asset failure did not reach ledger";
+    T.require(not(String.contains message '/')) "asset source path leaked") cases;
+  T.require(Service.diagnostic_asset_notice(download ~retry:true A.Network)=None) "retry should stay quiet";
+  T.require(Service.diagnostic_asset_notice(Service.Asset_capacity_available)=None) "capacity is not an error"
+;;
+
+let test_safe_worker_failure_rows () =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  let diagnostic =
+    D.of_source
+      ~operation:"applyOutbox"
+      ~reason:"transitionInvalid"
+      "covered acceptance has no durable origin evidence"
+  in
+  let op, phase, message =
+    Service.diagnostic_report (D.signal_prefix ^ D.encode diagnostic)
+  in
+  T.require (op = "applyOutbox" && phase = "sync") "worker detail retained its operation";
+  T.require (message = D.message diagnostic) "worker detail was discarded";
+  let _, _, unsafe =
+    Service.diagnostic_report
+      (D.signal_prefix ^ {|worker-failure:v1:{"operation":"PRIVATE_SYNTHETIC_PAYLOAD"}|})
+  in
+  T.require (unsafe <> "PRIVATE_SYNTHETIC_PAYLOAD") "unknown worker detail leaked"
+;;
+
+let test_authoritative_integrity_rows () =
+  let prefix = "worker.applyAuthoritative.authoritativeIntegrityFailure:" in
+  let carrier = "authoritative-integrity:v1:" in
+  let source =
+    carrier
+    ^ {|{"stage":"integrity","reason":"payload-mismatch","checkpoint":"9223372036854775806","through":"9223372036854775807","expectedCursor":"9223372036854775807","tBefore":"9223372036854775806","ordinal":0,"count":1,"expectedDatoms":9,"actualDatoms":8,"outboxState":"accepted","mutation":"insert-blocks"}|}
+  in
+  let _, phase, message = Service.diagnostic_report (prefix ^ source) in
+  let contains text needle =
+    let rec loop i =
+      i + String.length needle <= String.length text
+      && (String.sub text i (String.length needle) = needle || loop (i + 1))
+    in
+    loop 0
+  in
+  T.require (phase = "sync") "integrity retains sync phase";
+  List.iter
+    (fun part -> T.require (contains message part) "integrity row omitted %s" part)
+    [ "reason=payload-mismatch"
+    ; "checkpoint=9223372036854775806"
+    ; "expectedCursor=9223372036854775807"
+    ; "tBefore=9223372036854775806"
+    ; "expectedDatoms=9"
+    ; "actualDatoms=8"
+    ; "outboxState=accepted"
+    ; "mutation=insert-blocks"
+    ];
+  List.iter
+    (fun bad ->
+       let _, _, message = Service.diagnostic_report (prefix ^ carrier ^ bad) in
+       T.require
+         (not (contains message "PRIVATE_SYNTHETIC_PAYLOAD"))
+         "integrity leaked source";
+       T.require
+         (not (contains message "reason=payload-mismatch"))
+         "invalid integrity partly accepted")
+    [ {|{"stage":"integrity","reason":"payload-mismatch","raw":"PRIVATE_SYNTHETIC_PAYLOAD"}|}
+    ; {|{"stage":"integrity","reason":"payload-mismatch","checkpoint":"-1"}|}
+    ; {|{"stage":"integrity","reason":"payload-mismatch","checkpoint":"9223372036854775808"}|}
+    ; {|{"stage":"integrity","reason":"payload-mismatch","checkpoint":1}|}
+    ; {|{"stage":"integrity","reason":"payload-mismatch","mutation":"PRIVATE_SYNTHETIC_PAYLOAD"}|}
+    ; {|{"stage":"decode","reason":"payload-mismatch"}|}
+    ; {|{"stage":"integrity","reason":"entity-shape"}|}
+    ; {|{"stage":"integrity","reason":"payload-mismatch","count":-1}|}
+    ; {|{"stage":"integrity","reason":"payload-mismatch","reason":"unknown"}|}
+    ; String.make 2048 'x'
+    ];
+  let _, _, legacy = Service.diagnostic_report (prefix ^ "PRIVATE_SYNTHETIC_PAYLOAD") in
+  T.require
+    (not (contains legacy "PRIVATE_SYNTHETIC_PAYLOAD"))
+    "raw integrity source leaked"
+;;
+
 let test_authoritative_detail_budget () =
   let module D = Logseq_db_types.Authoritative_diagnostic in
   let detail =
@@ -1406,7 +1512,10 @@ let test_authoritative_detail_budget () =
 let () =
   T.run
     "lui worker service"
-    [ T.case "authoritative detail byte budget" test_authoritative_detail_budget
+    [ T.case "typed asset failures reach ledger" test_asset_failure_rows
+    ; T.case "safe worker failure rows" test_safe_worker_failure_rows
+    ; T.case "authoritative integrity rows" test_authoritative_integrity_rows
+    ; T.case "authoritative detail byte budget" test_authoritative_detail_budget
     ; T.case "strict authoritative detail rows" test_authoritative_detail_rows
     ; T.case "authoritative category row allowlist" test_authoritative_diagnostic_rows
     ; T.case "ignored restore failure reaches scoped safe Diagnostics" test_restore_error_reaches_diagnostics

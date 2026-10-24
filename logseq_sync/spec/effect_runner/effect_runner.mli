@@ -112,7 +112,12 @@ val dependencies
   -> (dependencies, dependency_error) result
 
 val create
-  :  sw:Eio.Switch.t
+  :  ?on_asset_diagnostic:(scope:Logseq_sync_pure_reducer.Core.graph_scope
+       -> operation:string
+       -> request_operation:string
+       -> Logseq_db_types.Failure_diagnostic.t
+       -> unit)
+  -> sw:Eio.Switch.t
   -> dependencies
   -> post:(Logseq_sync_pure_reducer.Core.event -> unit)
   -> (t, create_error) result

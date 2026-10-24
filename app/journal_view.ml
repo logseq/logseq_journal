@@ -19,7 +19,18 @@ let with_event_error_handler handler f =
   Fun.protect ~finally:(fun () -> event_error_handler := previous) f
 ;;
 
-let report_event_error operation = !event_error_handler operation
+let event_decode_source = function
+  | ("invalid UTF-8 field name" | "duplicate JSON field" | "invalid UTF-8 string"
+    | "non-finite JSON number" | "nonstandard JSON value" | "JSON exceeds byte budget"
+    | "invalid JSON value" | "Native event JSON syntax is invalid") as source -> source
+  | _ -> "Native event shape is invalid"
+;;
+
+let report_event_error operation source =
+  let diagnostic = Logseq_db_types.Failure_diagnostic.create
+      ~operation ~reason:"parseFailed" ~source:(event_decode_source source) () in
+  !event_error_handler (Logseq_db_types.Failure_diagnostic.encode diagnostic)
+;;
 
 type toolbar_control_props = { mode : string; title : string } [@@deriving yojson]
 
@@ -1676,7 +1687,7 @@ module View = struct
     ;;
 
     let read_json decoder payload =
-      try Logseq_db_types.Json_codec.decode decoder (Yojson.Safe.from_string payload) with Yojson.Json_error _ -> Error "invalid native list event"
+      try Logseq_db_types.Json_codec.decode decoder (Yojson.Safe.from_string payload) with Yojson.Json_error _ -> Error "Native event JSON syntax is invalid"
     ;;
 
     let vertical
@@ -1728,11 +1739,11 @@ module View = struct
         match read_json Json.row_event_of_yojson payload with
         | Ok wire -> Option.iter (fun handler -> invoke handler Event.Payload.Unit)
             (Hashtbl.find_opt row_actions (wire.row, wire.key))
-        | Error _ -> report_event_error "decodeListRowEvent"
+        | Error source -> report_event_error "decodeListRowEvent" source
       in
       let on_event (event : Journal_lui_native.event) =
         match read_json Json.event_of_yojson event.payload with
-        | Error _ -> report_event_error "decodeListEvent"
+        | Error source -> report_event_error "decodeListEvent" source
         | Ok wire ->
           match wire.event_type with
           | "visible_range" ->
@@ -2107,7 +2118,7 @@ module Native_widget = struct
              payload
          with
          | Ok event -> callback event
-         | Error _ -> report_event_error "decodeExtensionEvent")
+         | Error source -> report_event_error "decodeExtensionEvent" source)
       | _ -> ())
   ;;
 
@@ -2120,7 +2131,7 @@ module Native_widget = struct
       ~on_event:(fun event ->
         match decode extension event with
         | Ok decoded -> on_event decoded
-        | Error _ -> report_event_error "decodeExtensionEvent")
+        | Error source -> report_event_error "decodeExtensionEvent" source)
       extension.Extension.identifier
       context
       parent

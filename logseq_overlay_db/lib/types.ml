@@ -824,13 +824,21 @@ type mirror_error =
   | Mirror_location_unavailable of string
   | Mirror_inspection_failed of string
 
+type snapshot_state_reason =
+  | Snapshot_root_unavailable
+  | Snapshot_next_after_persist_or_commit
+  | Snapshot_crypto_batch_pending
+  | Snapshot_supply_after_persist_or_commit
+  | Snapshot_persist_awaiting_crypto
+  | Snapshot_checkpoint_invalid of [ `Schema_negative | `Checksum_invalid | `Unknown ]
+
 type snapshot_activation_error =
   | Invalid_snapshot_path
   | Invalid_expected_rows
   | Snapshot_input_too_large
   | Mirror_exists
   | Stale_snapshot_inspection
-  | Snapshot_state_error
+  | Snapshot_state_error of snapshot_state_reason
   | Snapshot_crypto_result_error of crypto_result_error
   | Snapshot_crypto_error of string
   | Snapshot_parse_error of string

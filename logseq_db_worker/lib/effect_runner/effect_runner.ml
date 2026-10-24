@@ -335,6 +335,16 @@ type asset_waiter =
   ; mutable delivered : Sync.asset_output option
   ; mutable accepted : bool
   ; mutable reclaimed : bool
+  ; mutable diagnostic : Logseq_db_types.Failure_diagnostic.t option
+  }
+
+type notice_diagnostic_key = Upload_notice of Graph.Uuid.t | Download_notice of Graph.Uuid.t
+
+type notice_diagnostic =
+  { scope : Sync.graph_scope
+  ; key : notice_diagnostic_key
+  ; detail : Logseq_db_types.Failure_diagnostic.t
+  ; ticket_id : int
   }
 
 type protected_waiter =
@@ -367,6 +377,7 @@ type t =
   ; upload_operations : (Upload.ticket, unit Eio.Promise.u) Hashtbl.t
   ; protected_waiters : (string, protected_waiter) Hashtbl.t
   ; asset_waiters : (string, asset_waiter) Hashtbl.t
+  ; mutable notice_diagnostics : notice_diagnostic list
   ; asset_operations : (Logseq_sync_pure_reducer.Asset_transfer.ticket, string) Hashtbl.t
   ; mutable next_asset_operation : int64
   ; upload_staging_lock : Eio.Mutex.t
@@ -405,6 +416,7 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; upload_operations = Hashtbl.create 32
     ; protected_waiters = Hashtbl.create 32
     ; asset_waiters = Hashtbl.create 32
+    ; notice_diagnostics = []
     ; asset_operations = Hashtbl.create 8
     ; next_asset_operation = 0L
     ; upload_staging_lock = Eio.Mutex.create ()
@@ -478,11 +490,26 @@ let reclaim_waiter t waiter =
     Option.iter (reclaim_asset_output t) waiter.delivered)
 ;;
 
-let asset_call ?(started = fun _ -> ()) t ~scope action =
+let current_graph_scope t (scope : Sync.graph_scope) =
+  match t.latest_snapshot with
+  | Some snapshot -> not t.stopped
+      && snapshot.startup.account_generation = scope.account.account_generation
+      && snapshot.startup.graph_generation = scope.graph_generation
+      && snapshot.selected_graph = Some scope.graph_id
+  | None -> false
+;;
+
+let publish_scoped_asset_detail t scope detail =
+  if current_graph_scope t scope then (
+    let module D = Logseq_db_types.Failure_diagnostic in
+    try t.dependencies.publish (Core.Diagnostic (D.signal_prefix ^ D.encode detail)) with _ -> ())
+;;
+
+let asset_call ?(started = fun _ -> ()) ?on_diagnostic t ~scope action =
   let request = asset_request t ~scope action in
   let promise, resolve = Eio.Promise.create () in
   let waiter =
-    { request; resolve; delivered = None; accepted = false; reclaimed = false }
+    { request; resolve; delivered = None; accepted = false; reclaimed = false; diagnostic = None }
   in
   Hashtbl.add t.asset_waiters request.operation waiter;
   Fun.protect
@@ -497,6 +524,11 @@ let asset_call ?(started = fun _ -> ()) t ~scope action =
        post_asset_request t request;
        let output = Eio.Promise.await promise in
        waiter.accepted <- true;
+       (match output.Sync.result, waiter.diagnostic with
+        | Error Sync.Asset_cancelled, _ | Ok _, _ | _, None -> ()
+        | Error _, Some detail ->
+          (try (Option.value on_diagnostic ~default:(publish_scoped_asset_detail t scope)) detail with _ -> ()));
+       waiter.diagnostic <- None;
        output.Sync.result)
 ;;
 
@@ -540,7 +572,11 @@ let decrypt_protected_value t key source =
 ;;
 
 let asset_failure_message = function
-  | Sync.Asset_invalid_content message -> message
+  | Sync.Asset_invalid_content source ->
+    let module D = Logseq_db_types.Failure_diagnostic in
+    Option.value (D.decode source)
+      ~default:(D.of_source ~operation:"assetPreview" ~reason:"invalidContent" source)
+    |> D.message
   | Asset_network -> "Asset network request failed"
   | Asset_not_found | Asset_missing_source -> "Asset source is unavailable"
   | Asset_checksum_mismatch -> "Asset checksum mismatch"
@@ -552,11 +588,18 @@ let asset_failure_message = function
   | Asset_cancelled -> "Asset operation was cancelled"
 ;;
 
-let asset_unit t ~scope action =
-  match asset_call t ~scope action with
+let asset_unit ?(on_failure = fun _ -> ()) ?on_diagnostic t ~scope action =
+  let detail = ref None in
+  match asset_call ~on_diagnostic:(fun value -> detail := Some value) t ~scope action with
   | Ok Sync.Asset_unit -> Ok ()
-  | Error failure -> Error (asset_failure_message failure)
-  | Ok _ -> Error "Unexpected asset completion"
+  | Error failure ->
+    (try match !detail with
+      | Some detail -> (Option.value on_diagnostic ~default:(publish_scoped_asset_detail t scope)) detail
+      | None -> on_failure failure with _ -> ());
+    Error (asset_failure_message failure)
+  | Ok _ ->
+    (try on_failure (Sync.Asset_invalid_content "Unexpected asset completion") with _ -> ());
+    Error "Unexpected asset completion"
 ;;
 
 let with_staging_lock t action =
@@ -641,8 +684,177 @@ let worker_error ~code message =
   Logseq_db_worker_contract.Error.create ~code ~message ~details:[] |> Result.get_ok
 ;;
 
+let diagnostic_error
+      ?(code = Logseq_db_worker_contract.Error.Storage_busy)
+      ~operation
+      ~reason
+      ?source
+      ()
+  =
+  let module E = Logseq_db_worker_contract.Error in
+  let module D = Logseq_db_types.Failure_diagnostic in
+  let diagnostic =
+    match source with
+    | None -> D.create ~operation ~reason ()
+    | Some source -> D.of_source ~operation ~reason source
+  in
+  let message = D.message diagnostic in
+  let origin =
+    E.create_cause
+      ~component:E.Managed_sync
+      ~operation:(D.operation diagnostic)
+      ~code:(Some (D.reason diagnostic))
+      ~message
+    |> Result.get_ok
+  in
+  E.create_with_origin
+    ~code
+    ~message
+    ~details:[ E.{ name = D.detail_name; value = Detail_string (D.encode diagnostic) } ]
+    ~origin
+  |> Result.get_ok
+;;
+
+let crypto_result_reason = function
+  | Overlay.Crypto_result_missing_item _ -> "missing cryptographic item"
+  | Crypto_result_extra_item _ -> "extra cryptographic item"
+  | Crypto_result_duplicate_item _ -> "duplicate cryptographic item"
+  | Crypto_result_reordered -> "reordered cryptographic items"
+  | Crypto_result_stale -> "stale cryptographic result"
+  | Crypto_result_limit_exceeded -> "cryptographic result limit exceeded"
+;;
+
+let outbox_transition_error error =
+  let reason, source =
+    match error with
+    | Overlay.Outbox_database_closed | Outbox_commit_database_closed ->
+      "databaseClosed", None
+    | Outbox_sync_token_conflict | Outbox_commit_token_conflict -> "tokenConflict", None
+    | Outbox_transition_invalid s -> "transitionInvalid", Some s
+    | Outbox_dependency_ineligible _ -> "missingPrecondition", None
+    | Outbox_delete_requires_singleton -> "unsupportedFootprint", None
+    | Outbox_limit_exceeded -> "limitExceeded", None
+    | Outbox_crypto_required -> "cryptoRequired", None
+    | Outbox_crypto_unexpected -> "cryptoUnexpected", None
+    | Outbox_crypto_error e -> "cryptoInvalid", Some (crypto_result_reason e)
+    | Outbox_preparation_consumed -> "preparationConsumed", None
+    | Outbox_commit_generation_invalidated -> "generationInvalidated", None
+    | Outbox_commit_busy -> "busy", None
+    | Outbox_commit_persistence_failed s -> "persistenceFailed", Some s
+    | Outbox_commit_integrity_failure s -> "integrityFailed", Some s
+  in
+  diagnostic_error ~operation:"applyOutbox" ~reason ?source ()
+;;
+
+let mirror_error error =
+  let reason, source =
+    match error with
+    | Overlay.Invalid_application_support_directory -> "invalidPath", None
+    | Mirror_location_unavailable s -> "resourceFailed", Some s
+    | Mirror_inspection_failed s -> "inspectionFailed", Some s
+  in
+  diagnostic_error ~operation:"inspectMirror" ~reason ?source ()
+;;
+
+let snapshot_activation_error error =
+  let reason, source =
+    match error with
+    | Overlay.Invalid_snapshot_path -> "invalidPath", None
+    | Invalid_expected_rows -> "invalidExpectedRows", None
+    | Snapshot_input_too_large -> "inputTooLarge", None
+    | Mirror_exists -> "mirrorExists", None
+    | Stale_snapshot_inspection -> "staleInspection", None
+    | Snapshot_state_error state ->
+      let source = match state with
+        | Overlay.Snapshot_root_unavailable -> "snapshot root directory is unavailable"
+        | Snapshot_next_after_persist_or_commit -> "snapshot next batch requested after persist or commit"
+        | Snapshot_crypto_batch_pending -> "snapshot crypto batch is pending"
+        | Snapshot_supply_after_persist_or_commit -> "snapshot supply requested after persist or commit"
+        | Snapshot_persist_awaiting_crypto -> "snapshot persist requested while awaiting crypto"
+        | Snapshot_checkpoint_invalid `Schema_negative -> "sync schema version must be non-negative"
+        | Snapshot_checkpoint_invalid `Checksum_invalid -> "sync checksum must be 16 lowercase hexadecimal characters"
+        | Snapshot_checkpoint_invalid `Unknown -> "snapshot checkpoint is invalid" in
+      "stateError", Some source
+    | Snapshot_crypto_result_error e -> "cryptoInvalid", Some (crypto_result_reason e)
+    | Snapshot_crypto_error s -> "cryptoInvalid", Some s
+    | Snapshot_parse_error s -> "parseFailed", Some s
+    | Snapshot_limit_exceeded -> "limitExceeded", None
+    | Snapshot_preparation_canceled -> "cancelled", None
+    | Snapshot_commit_stale -> "staleCommit", None
+    | Snapshot_commit_consumed -> "commitConsumed", None
+    | Snapshot_commit_persistence_failed s -> "persistenceFailed", Some s
+  in
+  diagnostic_error ~operation:"activateSnapshot" ~reason ?source ()
+;;
+
+let open_error error =
+  let reason, source =
+    match error with
+    | Overlay.Mirror_absent -> "mirrorAbsent", None
+    | Invalid_graph_name -> "invalidRequest", None
+    | Ownership_conflict -> "ownershipConflict", None
+    | Attachment_stale -> "attachmentStale", None
+    | Restore_failed s -> "restoreFailed", Some s
+    | Corrupt_authoritative_store s -> "corruptStore", Some s
+    | Corrupt_outbox s -> "corruptOutbox", Some s
+    | Corrupt_mutation_receipt s -> "corruptReceipt", Some s
+    | Open_resource_failed s -> "resourceFailed", Some s
+  in
+  diagnostic_error ~operation:"attachGraph" ~reason ?source ()
+;;
+
+let listen_error error =
+  let reason, source =
+    match error with
+    | Overlay.Listen_database_closed -> "databaseClosed", None
+    | Subscription_inactive | Subscription_already_active -> "stateError", None
+    | Listen_capacity_unavailable -> "capacityUnavailable", None
+    | Listen_fatal_state s -> "fatalState", Some s
+  in
+  diagnostic_error ~operation:"attachGraph" ~reason ?source ()
+;;
+
+let sync_read_error = function
+  | Overlay.Sync_database_closed ->
+    diagnostic_error ~operation:"inspectSync" ~reason:"databaseClosed" ()
+  | Sync_fatal_state source ->
+    diagnostic_error ~operation:"inspectSync" ~reason:"fatalState" ~source ()
+;;
+
+let close_error = function
+  | Overlay.Close_failed source ->
+    diagnostic_error ~operation:"closeDatabase" ~reason:"closeFailed" ~source ()
+  | Fatal_close source ->
+    diagnostic_error ~operation:"closeDatabase" ~reason:"fatalState" ~source ()
+;;
+
+let local_commit_error error =
+  let code, reason, source =
+    match error with
+    | Overlay.Local_commit_busy ->
+      Logseq_db_worker_contract.Error.Storage_busy, "busy", None
+    | Local_commit_persistence_failed s -> Storage_busy, "persistenceFailed", Some s
+    | Local_commit_fatal_state s -> Storage_busy, "fatalState", Some s
+    | Local_database_closed -> Conflict, "databaseClosed", None
+    | Invalid_local_mutation s -> Conflict, "invalidMutation", Some s
+    | Mutation_identity_conflict -> Conflict, "identityConflict", None
+    | Missing_precondition _ -> Conflict, "missingPrecondition", None
+    | Target_precondition_conflict -> Conflict, "preconditionConflict", None
+    | Planner_limit_exceeded -> Conflict, "limitExceeded", None
+    | Delete_unsupported_for_footprint -> Conflict, "unsupportedFootprint", None
+  in
+  diagnostic_error ~code ~operation:"commitLocal" ~reason ?source ()
+;;
+
 let effect_error message =
-  worker_error ~code:Logseq_db_worker_contract.Error.Storage_busy message
+  let module D = Logseq_db_types.Failure_diagnostic in
+  let module E = Logseq_db_worker_contract.Error in
+  match D.decode message with
+  | None -> worker_error ~code:E.Storage_busy message
+  | Some detail ->
+    E.create ~code:E.Storage_busy ~message:(D.message detail)
+      ~details:[ E.{name=D.detail_name;value=Detail_string (D.encode detail)} ]
+    |> Result.get_ok
 ;;
 
 let failure request code message =
@@ -741,12 +953,94 @@ let publish_projection_change t session = function
 ;;
 
 let report_current_graph t (scope : Sync.graph_scope) code =
-  match t.latest_snapshot with
-  | Some snapshot when not t.stopped
-      && snapshot.startup.account_generation = scope.account.account_generation
-      && snapshot.startup.graph_generation = scope.graph_generation ->
+  if current_graph_scope t scope then
     t.dependencies.publish (Core.Diagnostic code)
-  | _ -> ()
+;;
+
+let failure_detail ?source ~operation ~reason () =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  match source with
+  | None -> D.create ~operation ~reason ()
+  | Some source -> D.of_source ~operation ~reason source
+;;
+
+let publish_failure report detail =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  try report (D.signal_prefix ^ D.encode detail) with _ -> ()
+;;
+
+let exception_failure ~operation ~reason error =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  let literal = match error with Failure source | Invalid_argument source -> Some source | _ -> None in
+  let detail = failure_detail ?source:literal ~operation ~reason () in
+  if D.source_class detail <> "unknown" then detail
+  else failure_detail ~source:(Printexc.to_string error) ~operation ~reason ()
+;;
+
+let asset_failure_detail ~operation failure =
+  let reason, source = match failure with
+    | Sync.Asset_network -> "networkFailed", None
+    | Asset_not_found -> "notFound", None
+    | Asset_missing_source -> "missingSource", None
+    | Asset_checksum_mismatch -> "checksumMismatch", None
+    | Asset_authentication -> "authenticationFailed", None
+    | Asset_locked -> "locked", None
+    | Asset_storage_full -> "storageFull", None
+    | Asset_size_rejected -> "sizeRejected", None
+    | Asset_revoked_access -> "revokedAccess", None
+    | Asset_cancelled -> "cancelled", None
+    | Asset_invalid_content source -> "invalidContent", Some source in
+  failure_detail ?source ~operation ~reason ()
+;;
+
+let report_asset_failure ?detail t scope operation = function
+  | Sync.Asset_cancelled -> ()
+  | failure ->
+    let detail = match detail with
+      | None -> asset_failure_detail ~operation failure
+      | Some detail ->
+        let module D = Logseq_db_types.Failure_diagnostic in
+        D.of_source ~operation ~reason:(D.reason detail) (D.encode detail) in
+    publish_failure (report_current_graph t scope) detail
+;;
+
+let report_source_failure t scope operation reason source =
+  publish_failure (report_current_graph t scope) (failure_detail ~source ~operation ~reason ())
+;;
+
+let clear_notice_diagnostic ?ticket_id t scope key =
+  t.notice_diagnostics <- List.filter (fun item -> item.scope <> scope || item.key <> key
+    || Option.fold ~none:false ~some:(fun id -> item.ticket_id<>id) ticket_id)
+    t.notice_diagnostics
+;;
+
+let queue_notice_diagnostic t scope key ticket_id detail =
+  clear_notice_diagnostic t scope key;
+  if current_graph_scope t scope then (
+    let module D = Logseq_db_types.Failure_diagnostic in
+    let operation = match key with Upload_notice _ -> "assetUpload" | Download_notice _ -> "assetDownload" in
+    let detail = D.of_source ~operation ~reason:(D.reason detail) (D.encode detail) in
+    let rec take n = function [] -> [] | _ when n=0 -> [] | x::xs -> x::take (n-1) xs in
+    t.notice_diagnostics <- take 64 ({scope;key;detail;ticket_id} ::
+      List.filter (fun item -> current_graph_scope t item.scope) t.notice_diagnostics))
+;;
+
+let publish_asset_notice t scope notice output =
+  let key, failed, settled = match notice with
+    | Core.Upload_status {operation;status;_} ->
+      Some (Upload_notice operation), (match status with Upload.Failed_upload _ -> true | _ -> false),
+      (match status with Upload.Uploaded | Cancelled -> true | _ -> false)
+    | Asset_availability {asset;availability;_} ->
+      Some (Download_notice asset), (match availability with
+        Logseq_sync_pure_reducer.Asset_transfer.Failed {retry_scheduled=false;_} -> true | _ -> false),
+      (match availability with Logseq_sync_pure_reducer.Asset_transfer.Ready _ -> true | _ -> false)
+    | Asset_demand_accepted _ | Asset_backpressure _ | Asset_capacity_available -> None, false, false in
+  let detail = Option.bind key (fun key ->
+    let found = List.find_opt (fun item -> item.scope=scope && item.key=key) t.notice_diagnostics in
+    if settled then clear_notice_diagnostic t scope key;
+    Option.map (fun item -> item.detail) found) in
+  if not t.stopped then t.dependencies.publish output;
+  if failed then Option.iter (publish_scoped_asset_detail t scope) detail
 ;;
 
 let close_database_by_id ?scope t database_id =
@@ -761,7 +1055,7 @@ let close_database_by_id ?scope t database_id =
     let result = Database.close session.database in
     (match result with
      | Ok () -> ()
-     | Error _ ->
+     | Error error ->
        Option.iter (fun (scope:Sync.graph_scope) ->
          match t.latest_snapshot with
          | Some snapshot when not t.stopped
@@ -770,12 +1064,15 @@ let close_database_by_id ?scope t database_id =
                  || snapshot.selected_graph=None) ->
            (* Returning to the picker advances graph_generation before its
               owned detach runs; a newly selected graph fences that close. *)
-           t.dependencies.publish (Core.Diagnostic "worker.closeDatabase")
+           let module D=Logseq_db_types.Failure_diagnostic in
+           let reason,source=match error with Overlay.Close_failed s->"closeFailed",s | Fatal_close s->"fatalState",s in
+           let detail=D.of_source ~operation:"closeDatabase" ~reason source in
+           t.dependencies.publish (Core.Diagnostic(D.signal_prefix ^ D.encode detail))
          | _ -> ()) scope;
        report_warning "journal: operation=closeDatabase code=cleanupPending\n");
     Hashtbl.remove t.databases database_id;
     Result.map_error
-      (fun _ -> effect_error "The overlay database failed to close.")
+      close_error
       result
 ;;
 
@@ -896,12 +1193,7 @@ let execute_mutation database request command =
      | Error message -> failure request Conflict message
      | Ok expected ->
        (match Database.commit_local database ~expected mutation with
-        | Error
-            ( Overlay.Local_commit_busy
-            | Local_commit_persistence_failed _
-            | Local_commit_fatal_state _ ) ->
-          failure request Storage_busy "The mutation could not be stored."
-        | Error _ -> failure request Conflict "The mutation precondition did not match."
+        | Error error -> Protocol.failed ~request_id:request.Protocol.request_id (local_commit_error error)
         | Ok (Overlay.Local_existing (Overlay.Existing_applied commit)) ->
           response request (committed_outcome commit)
         | Ok (Local_existing _) ->
@@ -925,15 +1217,24 @@ let inspect_admission database request =
          })
 ;;
 
-let read_failure request = function
+let read_failure ?code request error =
+  let fail default message = failure request (Option.value code ~default) message in
+  let safe_message reason source =
+    Logseq_db_types.Failure_diagnostic.of_source
+      ~operation:"workerOperation"
+      ~reason
+      source
+    |> Logseq_db_types.Failure_diagnostic.message
+  in
+  match error with
   | Overlay.Stale_read_cursor ->
-    failure request Stale_read_cursor "The read continuation is no longer current."
-  | Invalid_read_request message -> failure request Invalid_request message
+    fail Stale_read_cursor "The read continuation is no longer current."
+  | Invalid_read_request source -> fail Invalid_request (safe_message "invalidRequest" source)
   | Read_limit_exceeded ->
-    failure request Response_too_large "The read exceeded its resource limit."
+    fail Response_too_large "The read exceeded its resource limit."
   | Database_closed | Snapshot_released | Snapshot_generation_invalidated ->
-    failure request Closed_session "The read snapshot is no longer available."
-  | Fatal_read_state message -> failure request Corrupt_storage message
+    fail Closed_session "The read snapshot is no longer available."
+  | Fatal_read_state source -> fail Corrupt_storage (safe_message "fatalState" source)
 ;;
 
 let read_snapshot ~on_enrichment_error database request command =
@@ -976,7 +1277,7 @@ let read_snapshot ~on_enrichment_error database request command =
          match command with
          | Protocol.V2_graph_info ->
            (match Database.graph_info snapshot with
-            | Error _ -> failure request Corrupt_storage "Graph info is unavailable."
+            | Error error -> read_failure ~code:Corrupt_storage request error
             | Ok info ->
               let limits = info.Overlay.limits in
               response
@@ -1127,7 +1428,8 @@ let read_snapshot ~on_enrichment_error database request command =
                 (Protocol.V2_page_outcome
                    (V2_missing_page
                       { uuid; revision = Overlay.Page_state_revision.to_string revision }))
-            | Ok _ | Error _ -> failure request Corrupt_storage "The page lookup failed.")
+            | Error error -> read_failure ~code:Corrupt_storage request error
+            | Ok _ -> failure request Corrupt_storage "The page lookup failed.")
          | V2_get_outline_block { block; _ } ->
            (match Database.get_outline_blocks snapshot [ block ] with
             | Ok [ Overlay.Present_block { value; revision } ] ->
@@ -1144,7 +1446,8 @@ let read_snapshot ~on_enrichment_error database request command =
                 (Protocol.V2_block_outcome
                    (V2_missing_block
                       { uuid; revision = Overlay.Block_state_revision.to_string revision }))
-            | Ok _ | Error _ -> failure request Corrupt_storage "The block lookup failed.")
+            | Error error -> read_failure ~code:Corrupt_storage request error
+            | Ok _ -> failure request Corrupt_storage "The block lookup failed.")
          | V2_get_outline_block_summary { block; limit; cursor } ->
            let version = Database.snapshot_version snapshot in
            let summary lookup page scope_revision items next_cursor =
@@ -1227,7 +1530,8 @@ let read_snapshot ~on_enrichment_error database request command =
                     ""
                     []
                     None
-                | Ok _ | Error _ ->
+                | Error error -> read_failure ~code:Corrupt_storage request error
+                | Ok _ ->
                   failure request Corrupt_storage "The target page lookup failed.")
              | Error error -> read_failure request error
              | Ok _ -> failure request Corrupt_storage "The target block lookup failed.")
@@ -1461,6 +1765,16 @@ let authoritative_transition_error error =
   let diagnostic =
     match error with
     | Overlay.Authoritative_decode_failed source -> Diagnostic.decode source
+    | Overlay.Authoritative_integrity_failure source ->
+      Some (Diagnostic.integrity_of_source source)
+    | _ -> None
+  in
+  let bounded =
+    match error with
+    | Overlay.Authoritative_crypto_error e ->
+      Some ("cryptoInvalid", crypto_result_reason e)
+    | Authoritative_commit_persistence_failed s -> Some ("persistenceFailed", s)
+    | Authoritative_commit_fatal_state s -> Some ("fatalState", s)
     | _ -> None
   in
   let code, category, message =
@@ -1513,7 +1827,10 @@ let authoritative_transition_error error =
     | Overlay.Authoritative_integrity_failure _ ->
       ( Error.Ambiguous_sync_state
       , "authoritativeIntegrityFailure"
-      , "Authoritative integrity validation failed." )
+      , Option.fold
+          ~none:"Authoritative integrity validation failed."
+          ~some:Diagnostic.message
+          diagnostic )
     | Overlay.Authoritative_commit_database_closed ->
       ( Error.Closed_session
       , "authoritativeCommitDatabaseClosed"
@@ -1537,6 +1854,18 @@ let authoritative_transition_error error =
       , "authoritativeCommitFatalState"
       , "Authoritative storage requires recovery." )
   in
+  let bounded =
+    Option.map
+      (fun (reason, source) ->
+         Logseq_db_types.Failure_diagnostic.of_source
+           ~operation:"applyAuthoritative"
+           ~reason
+           source)
+      bounded
+  in
+  let message =
+    Option.fold ~none:message ~some:Logseq_db_types.Failure_diagnostic.message bounded
+  in
   let origin =
     Error.create_cause
       ~component:Error.Managed_sync
@@ -1555,6 +1884,15 @@ let authoritative_transition_error error =
           }
       ]
   in
+  let details =
+    details
+    @ Option.fold
+        ~none:[]
+        ~some:(fun value ->
+          let module D = Logseq_db_types.Failure_diagnostic in
+          [ Error.{ name = D.detail_name; value = Detail_string (D.encode value) } ])
+        bounded
+  in
   Error.create_with_origin ~code ~message ~details ~origin |> Result.get_ok
 ;;
 
@@ -1571,6 +1909,19 @@ let deletion_authorized t (request : Sync.mirror_deletion) =
 
 let deletion_current t request =
   (not t.stopped) && t.deletion_owner = Some request && deletion_authorized t request
+;;
+
+let report_asset_diagnostic t ~scope ~operation ~request_operation detail =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  let current = current_graph_scope t scope ||
+    Option.fold ~none:false ~some:(fun request ->
+      deletion_current t request && request.account=scope.Sync.account
+      && request.graph_id=scope.graph_id) t.deletion_owner in
+  match Hashtbl.find_opt t.asset_waiters request_operation with
+  | Some waiter when current && waiter.request.scope=scope
+      && not waiter.accepted && waiter.delivered=None && D.operation detail=operation ->
+    waiter.diagnostic <- Some detail
+  | Some _ | None -> ()
 ;;
 
 let sync_retirement_directory path =
@@ -1626,14 +1977,30 @@ let remove_local_retirement path =
   Unix.unlink path; sync_retirement_directory (Filename.dirname path)
 ;;
 
-let finish_local_retirement t scope deletion captured ~commit =
+let mirror_deletion_detail = function
+  | Overlay.Mirror_delete_busy -> failure_detail ~operation:"deleteMirror" ~reason:"busy" ()
+  | Mirror_delete_stale -> failure_detail ~operation:"deleteMirror" ~reason:"attachmentStale" ()
+  | Mirror_delete_failed source -> failure_detail ~source ~operation:"deleteMirror" ~reason:"deleteFailed" ()
+;;
+
+let finish_local_retirement ?(on_diagnostic = fun _ -> ()) t scope deletion captured ~commit =
   let ( let* ) = Result.bind in
-  let* () = if commit then with_upload_store t (fun db -> Logseq_db_storage.Asset_upload_store.delete_captured_graph db captured) else Ok () in
-  asset_unit t ~scope
+  let* () = if commit then
+    with_upload_store t (fun db -> Logseq_db_storage.Asset_upload_store.delete_captured_graph db captured)
+    |> Result.map_error (fun source ->
+      on_diagnostic (failure_detail ~source ~operation:"deleteMirror" ~reason:"persistenceFailed" ()); source)
+    else Ok () in
+  asset_unit ~on_failure:(fun failure ->
+    if failure <> Sync.Asset_cancelled then on_diagnostic (asset_failure_detail ~operation:"deleteMirror" failure))
+    ~on_diagnostic:(fun detail ->
+      let module D = Logseq_db_types.Failure_diagnostic in
+      on_diagnostic (D.of_source ~operation:"deleteMirror" ~reason:"cleanupFailed" (D.encode detail))) t ~scope
     (if commit then Sync.Commit_graph_asset_deletion deletion else Sync.Cancel_graph_asset_deletion deletion)
 ;;
 
-let recover_local_retirements t (scope : Sync.graph_scope) =
+let recover_local_retirements ?on_diagnostic t (scope : Sync.graph_scope) =
+  let report = Option.value on_diagnostic ~default:(fun detail ->
+    publish_failure (report_current_graph t scope) detail) in
   let ( let* ) = Result.bind in
   let directory = local_retirement_directory t scope in
   if not (Sys.file_exists directory) then Ok () else
@@ -1656,7 +2023,8 @@ let recover_local_retirements t (scope : Sync.graph_scope) =
       let* prepared, generation = Database.prepare_mirror_deletion
         ~application_support_directory:t.dependencies.config.application_support_directory
         ~graph_id:scope.graph_id ~retirement
-               |> Result.map_error (fun _ ->
+               |> Result.map_error (fun error ->
+                 report (mirror_deletion_detail error);
                  "Retirement recovery is blocked by mirror ownership or an unknown \
                   commit state.")
              in
@@ -1664,25 +2032,32 @@ let recover_local_retirements t (scope : Sync.graph_scope) =
         let committed = Database.mirror_deletion_committed prepared in
         let original = Overlay.Mirror_generation.equal generation expected in
                   if (not committed) && not original
-                  then
+                  then (
+                    report (failure_detail ~operation:"deleteMirror" ~reason:"ownershipConflict" ());
                     Error
                       "Retirement recovery conflict; the captured resources were \
-                       preserved."
+                       preserved.")
                   else (
           let deletion = Sync.asset_deletion_reference ~scope ~retirement in
                     let* () =
-                      finish_local_retirement t scope deletion captured ~commit:committed
+                      finish_local_retirement ~on_diagnostic:report t scope deletion captured ~commit:committed
                     in
                     if committed
                     then (
                       try remove_local_retirement journal_path with
-                      | _ -> report_warning "journal: phase=retirement operation=removeCoordinatorJournal code=cleanupPending\n")
+                      | error ->
+                        report (exception_failure ~operation:"deleteMirror" ~reason:"cleanupFailed" error);
+                        report_warning "journal: phase=retirement operation=removeCoordinatorJournal code=cleanupPending\n")
                     else remove_local_retirement journal_path;
                     Ok ()))
            with
-           | _ -> Error "Local copy recovery is incomplete; its resources were preserved."))
+           | error ->
+             report (exception_failure ~operation:"deleteMirror" ~reason:"restoreFailed" error);
+             Error "Local copy recovery is incomplete; its resources were preserved."))
       (Ok ())
-      (Sys.readdir directory)
+      (try Sys.readdir directory with error ->
+        report (exception_failure ~operation:"deleteMirror" ~reason:"restoreFailed" error);
+        raise error)
 ;;
 
 let handle_sync_worker_effect t = function
@@ -1697,7 +2072,7 @@ let handle_sync_worker_effect t = function
            t.dependencies.config.application_support_directory
          ~graph_id:request.graph.graph_id
      with
-     | Error _ -> Error (effect_error "The overlay mirror inspection failed.")
+     | Error error -> Error (mirror_error error)
      | Ok inspection ->
        Hashtbl.replace
          t.inspections
@@ -1723,15 +2098,14 @@ let handle_sync_worker_effect t = function
             ~expected_checksum:None
             ~expected_rows:(Sync.staged_artifact_expected_rows (Sync.snapshot_activation_artifact request))
         with
-        | Error (Overlay.Snapshot_parse_error message) -> Error (effect_error message)
-        | Error _ -> Error (effect_error "The snapshot activation could not start.")
+        | Error error -> Error (snapshot_activation_error error)
         | Ok prepared ->
           Fun.protect
             ~finally:(fun () -> Database.cancel_snapshot_activation prepared)
             (fun () ->
                let rec supply () =
                  match Database.next_snapshot_unprotection_batch prepared with
-                 | Error _ -> Error (effect_error "The snapshot crypto request failed.")
+                 | Error error -> Error (snapshot_activation_error error)
                  | Ok None -> Ok ()
                  | Ok (Some crypto_request) ->
                    let ciphertexts = Database.unprotection_ciphertexts crypto_request in
@@ -1757,14 +2131,14 @@ let handle_sync_worker_effect t = function
                            ~request:crypto_request
                            ~plaintexts
                        with
-                       | Error _ -> Error (effect_error "Snapshot crypto supply failed.")
+                       | Error error -> Error (snapshot_activation_error error)
                        | Ok () -> supply ()))
                in
                match supply () with
                | Error error -> Error error
                | Ok () ->
                  (match Database.commit_snapshot_activation prepared with
-                  | Error _ -> Error (effect_error "Snapshot activation did not commit.")
+                  | Error error -> Error (snapshot_activation_error error)
                   | Ok inspection ->
                     Hashtbl.replace t.inspections key inspection;
                     Ok
@@ -1774,19 +2148,26 @@ let handle_sync_worker_effect t = function
   | Delete_mirror request ->
     let ( let* ) = Result.bind in
     let current () = deletion_current t request in
+    let report detail =
+      if current () then publish_failure
+        (fun signal -> t.dependencies.publish (Core.Diagnostic signal)) detail in
     let scope : Sync.graph_scope = {account=request.account;graph_id=request.graph_id;graph_generation=0} in
     let result = try
       let* () = if current () then Ok () else Error "The graph account is no longer current." in
       let* () = match t.attached with
-        | Some (_, actual) when actual.graph_id = request.graph_id -> Error "Switch to another graph before deleting."
+        | Some (_, actual) when actual.graph_id = request.graph_id ->
+          report (failure_detail ~operation:"deleteMirror" ~reason:"busy" ());
+          Error "Switch to another graph before deleting."
         | _ -> Ok () in
-      let* () = with_staging_lock t (fun () -> recover_local_retirements t scope) in
+      let* () = with_staging_lock t (fun () -> recover_local_retirements ~on_diagnostic:report t scope) in
       let retirement = fresh_retirement () in
       (* Ownership is acquired before any asset retirement or intent mutation. *)
       let* prepared, expected = Database.prepare_mirror_deletion
         ~application_support_directory:t.dependencies.config.application_support_directory
         ~graph_id:request.graph_id ~retirement
-        |> Result.map_error (function
+        |> Result.map_error (fun error ->
+          report (mirror_deletion_detail error);
+          match error with
           | Overlay.Mirror_delete_busy -> "The local copy is still in use. Close attachment previews and try again."
           | _ -> "The local copy changed. Refresh and try again.") in
       Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion prepared) (fun () ->
@@ -1799,13 +2180,17 @@ let handle_sync_worker_effect t = function
           if not (current ()) then Error "The graph account is no longer current."
           else if not (Hashtbl.fold (fun (ticket : Upload.ticket) _ busy -> busy || same_target ticket.scope) t.upload_operations false)
           then Ok ()
-          else if attempts=0 then Error "The local copy is still in use. Try again."
+          else if attempts=0 then (
+            report (failure_detail ~operation:"deleteMirror" ~reason:"busy" ());
+            Error "The local copy is still in use. Try again.")
           else (t.dependencies.runtime.sleep 0.005; drain (attempts-1)) in
         let* () = drain 1000 in
         with_staging_lock t (fun () ->
           let* () = if current () then Ok () else Error "The graph account is no longer current." in
           let* captured = with_upload_store t (fun db -> Logseq_db_storage.Asset_upload_store.capture_graph db
-            ~origin:(Uri.to_string request.account.managed_sync_origin) ~account:request.account.user_id ~graph:request.graph_id) in
+            ~origin:(Uri.to_string request.account.managed_sync_origin) ~account:request.account.user_id ~graph:request.graph_id)
+            |> Result.map_error (fun source ->
+              report (failure_detail ~source ~operation:"deleteMirror" ~reason:"persistenceFailed" ()); source) in
           let directory = local_retirement_directory t scope in
           make_retirement_directory directory;
           let path = Filename.concat directory (Sync.retirement_id_to_string retirement ^ ".json") in
@@ -1815,38 +2200,50 @@ let handle_sync_worker_effect t = function
           let abort () =
                  if not !committed
                  then (
-              match finish_local_retirement t scope deletion captured ~commit:false with
+              match finish_local_retirement ~on_diagnostic:report t scope deletion captured ~commit:false with
               | Ok () -> remove_local_retirement path
                    | Error _ -> report_warning "journal: phase=retirement operation=abortLocalRetirement code=cleanupPending\n")
                in
           Fun.protect ~finally:abort (fun () ->
             let* () = match asset_call t ~scope (Sync.Prepare_graph_asset_deletion retirement) with
               | Ok (Sync.Asset_deletion_prepared actual) when actual=deletion -> Ok ()
-              | Error error -> Error (asset_failure_message error)
-              | _ -> Error "Unexpected attachment retirement response." in
+              | Error error ->
+                if error <> Sync.Asset_cancelled then report (asset_failure_detail ~operation:"deleteMirror" error);
+                Error (asset_failure_message error)
+              | _ ->
+                report (failure_detail ~source:"Unexpected attachment retirement response." ~operation:"deleteMirror" ~reason:"invalidContent" ());
+                Error "Unexpected attachment retirement response." in
             let* () = if current () then Ok () else Error "The graph account is no longer current." in
             let* _ = Database.commit_mirror_deletion prepared
-              |> Result.map_error (fun _ -> "Local deletion did not commit; its resources were preserved.") in
+              |> Result.map_error (fun error ->
+                report (mirror_deletion_detail error);
+                "Local deletion did not commit; its resources were preserved.") in
             committed := true;
-            let report code =
+            let report_code code =
               if not t.stopped && current () then t.dependencies.publish (Core.Diagnostic code) in
             if not (Database.mirror_deletion_committed prepared)
-            then report "worker.confirmMirrorRetirement";
+            then report_code "worker.confirmMirrorRetirement";
             (* The mirror receipt is the durable commit authority. Cleanup failure
                retains this coordinator journal for exact replay, not a broad sweep. *)
             (try
                     if Database.mirror_deletion_committed prepared
                     then (
-                 match finish_local_retirement t scope deletion captured ~commit:true with
+                 match finish_local_retirement ~on_diagnostic:report t scope deletion captured ~commit:true with
                  | Ok () -> remove_local_retirement path
-                      | Error _ -> report "worker.finishLocalRetirement")
+                      | Error _ -> report_code "worker.finishLocalRetirement")
                   with
-                  | _ -> report "worker.finishLocalRetirement");
+                  | error ->
+                    let detail = exception_failure ~operation:"deleteMirror" ~reason:"cleanupFailed" error in
+                    if current () then publish_failure
+                      (fun signal -> t.dependencies.publish (Core.Diagnostic signal)) detail;
+                    report_code "worker.finishLocalRetirement");
             Hashtbl.remove t.inspections (Graph.Uuid.to_string request.graph_id);
             Ok ())))
       with
       | Eio.Cancel.Cancelled _ as cancelled -> raise cancelled
-      | _ -> Error "The local copy could not be deleted. Check available storage and try again."
+      | error ->
+        report (exception_failure ~operation:"deleteMirror" ~reason:"deleteFailed" error);
+        Error "The local copy could not be deleted. Check available storage and try again."
     in
     Ok (sync_result ~event:(Sync.Mirror_deleted (request, result)) ())
   | Attach_graph request ->
@@ -1858,12 +2255,12 @@ let handle_sync_worker_effect t = function
        (match
           Database.open_ ~sw:t.sw t.dependencies.overlay inspection ~graph_name:request.graph.name
         with
-        | Error _ -> Error (effect_error "The overlay graph could not be opened.")
+        | Error error -> Error (open_error error)
         | Ok database ->
           (match Database.listen database with
-           | Error _ ->
+           | Error error ->
              ignore (Database.close database);
-             Error (effect_error "The overlay change listener could not start.")
+             Error (listen_error error)
            | Ok (subscription, predecessor) ->
              let version = Database.snapshot_version predecessor in
              Database.release_snapshot predecessor;
@@ -1884,18 +2281,18 @@ let handle_sync_worker_effect t = function
                 Database.activate_subscription subscription ~notify:(fun change ->
                   publish_projection_change t session change)
               with
-              | Error _ ->
+              | Error error ->
                 ignore (close_database_by_id t database_id);
-                Error (effect_error "The overlay change listener could not activate.")
+                Error (listen_error error)
               | Ok () ->
                 let sync = Database.inspect_sync database in
                 let opened =
                   Core.database_opened ~database_id ~graph_id:request.graph.graph_id
                 in
                 (match sync with
-                 | Error _ ->
+                 | Error error ->
                    ignore (close_database_by_id t database_id);
-                   Error (effect_error "The overlay Sync view is unavailable.")
+                   Error (sync_read_error error)
                  | Ok sync ->
                    Ok
                      (sync_result
@@ -1931,7 +2328,7 @@ let handle_sync_worker_effect t = function
      | None -> Error (effect_error "The overlay database is unavailable.")
      | Some session ->
        (match Database.inspect_sync session.database with
-        | Error _ -> Error (effect_error "The overlay Sync view is unavailable.")
+        | Error error -> Error (sync_read_error error)
         | Ok sync -> Ok (sync_result ~event:(Sync.Sync_inspected { scope; sync }) ())))
   | Apply_outbox_transition request ->
     (match attached_session t request.scope with
@@ -1943,7 +2340,7 @@ let handle_sync_worker_effect t = function
             ~expected:request.expected
             request.transition
         with
-        | Error _ -> Error (effect_error "The overlay outbox transition was rejected.")
+        | Error error -> Error (outbox_transition_error error)
         | Ok (prepared, crypto) ->
           let encrypted =
             match crypto with
@@ -1956,10 +2353,10 @@ let handle_sync_worker_effect t = function
              (match
                 Database.apply_outbox_transition session.database prepared ~encrypted
               with
-              | Error _ -> Error (effect_error "The overlay outbox transition failed.")
+              | Error error -> Error (outbox_transition_error error)
               | Ok commit ->
                 (match Database.inspect_sync session.database with
-                 | Error _ -> Error (effect_error "The overlay Sync view is unavailable.")
+                 | Error error -> Error (sync_read_error error)
                  | Ok sync ->
                    Ok
                      (sync_result
@@ -1972,7 +2369,7 @@ let handle_sync_worker_effect t = function
      | None -> Error (effect_error "The overlay database is unavailable.")
      | Some session ->
        (match Database.inspect_sync session.database with
-        | Error _ -> Error (effect_error "The overlay Sync view is unavailable.")
+        | Error error -> Error (sync_read_error error)
         | Ok sync ->
           (match
              Database.begin_authoritative
@@ -2051,33 +2448,39 @@ let complete t (Core.Request (ticket, request)) =
     t.post (Core.Runner_completed (Core.Sync_worker_effect_completed (ticket, result)))
 ;;
 
-let report_asset_error = report_current_graph
-;;
-
 let run_upload t (context : Sync.asset_context) instruction =
   let current ticket = (not t.stopped) && t.upload_current ticket in
+  let on_diagnostic ticket detail =
+    if current ticket then queue_notice_diagnostic t context.scope
+      (Upload_notice ticket.Upload.operation) ticket.id detail in
   let database ticket f =
     if not (current ticket)
     then Error Upload.Invalid_content
     else (
       match attached_session t ticket.Upload.scope with
-      | None -> Error Upload.Invalid_content
+      | None ->
+        on_diagnostic ticket (failure_detail ~operation:"assetUpload" ~reason:"databaseClosed" ());
+        Error Upload.Invalid_content
       | Some session -> f session.database)
   in
   let finish ticket result success =
     if current ticket
-    then
+    then (
+      if Result.is_ok result then clear_notice_diagnostic t context.scope (Upload_notice ticket.Upload.operation);
       t.post
         (Core.Upload_completed
            ( ticket
            , match result with
              | Ok () -> success
-             | Error error -> Upload.Failed error ))
+             | Error error -> Upload.Failed error )))
   in
   let changed () = t.post (Core.Sync_event Sync.Local_outbox_changed) in
   match instruction with
-  | Upload.Cancel_operation _ -> ()
+  | Upload.Cancel_operation ticket -> clear_notice_diagnostic ~ticket_id:ticket.id t context.scope (Upload_notice ticket.operation)
   | Release_staging intent ->
+    let detail = ref None in
+    let on_failure failure = detail := Some (asset_failure_detail ~operation:"assetRelease" failure) in
+    let on_diagnostic value = detail := Some value in
     (match
        let can_release =
          if intent.Logseq_db_types.Asset_upload_intent.phase = Cancelled
@@ -2090,9 +2493,9 @@ let run_upload t (context : Sync.asset_context) instruction =
                (Sync.Check_asset_cache (intent.asset, intent.version))
            with
            | Ok (Sync.Asset_cached (Some handle)) ->
-             asset_unit t ~scope:context.scope (Sync.Release_asset_file handle)
+             asset_unit ~on_failure ~on_diagnostic t ~scope:context.scope (Sync.Release_asset_file handle)
            | _ ->
-             asset_unit
+             asset_unit ~on_failure ~on_diagnostic
                t
                ~scope:context.scope
                (Sync.Publish_staged_asset
@@ -2102,18 +2505,20 @@ let run_upload t (context : Sync.asset_context) instruction =
                   }))
        in
        Result.bind can_release (fun () ->
-         asset_unit t ~scope:context.scope (Sync.Release_staged_file intent.staged_file))
+         asset_unit ~on_failure ~on_diagnostic t ~scope:context.scope (Sync.Release_staged_file intent.staged_file))
      with
      | Ok () -> ()
-     | Error _ ->
-       report_asset_error t context.scope "asset.release";
+     | Error source ->
+       let detail = Option.value !detail ~default:(failure_detail ~source ~operation:"assetRelease" ~reason:"cleanupFailed" ()) in
+       if Logseq_db_types.Failure_diagnostic.reason detail <> "cancelled" then
+         publish_failure (report_current_graph t context.scope) detail;
        report_warning "journal: operation=releaseUploadStaging code=cleanupPending\n" )
   | Persist (ticket, intent, expected) ->
     if current ticket then finish ticket (save_upload t intent expected) Upload.Persisted
   | Inspect (ticket, intent) ->
     if current ticket
     then (
-      let result = database ticket (fun db -> Upload_database.inspect db intent) in
+      let result = database ticket (fun db -> Upload_database.inspect ~on_diagnostic:(on_diagnostic ticket) db intent) in
       if current ticket
       then
         t.post
@@ -2125,7 +2530,7 @@ let run_upload t (context : Sync.asset_context) instruction =
   | Apply_local (ticket, intent) ->
     if current ticket
     then (
-      let result = database ticket (fun db -> Upload_database.apply_local db intent) in
+      let result = database ticket (fun db -> Upload_database.apply_local ~on_diagnostic:(on_diagnostic ticket) db intent) in
       (match result with
        | Ok () -> changed ()
        | Error _ -> ());
@@ -2133,18 +2538,20 @@ let run_upload t (context : Sync.asset_context) instruction =
   | Apply_metadata (ticket, intent) ->
     if current ticket
     then (
-      let result = database ticket (fun db -> Upload_database.apply_metadata db intent) in
+      let result = database ticket (fun db -> Upload_database.apply_metadata ~on_diagnostic:(on_diagnostic ticket) db intent) in
       (match result with
        | Ok () -> changed ()
        | Error _ -> ());
       finish ticket result Upload.Metadata_applied)
   | Put (ticket, intent) ->
     if current ticket
-    then
+    then (
+      let detail = ref None in
       finish
         ticket
         (match
            asset_call
+             ~on_diagnostic:(fun value -> detail := Some value)
              t
              ~scope:context.scope
              (Sync.Put_asset_file
@@ -2155,8 +2562,13 @@ let run_upload t (context : Sync.asset_context) instruction =
                 })
          with
          | Ok Sync.Asset_unit -> Ok ()
-         | Ok _ -> Error Upload.Invalid_content
+         | Ok _ ->
+           on_diagnostic ticket (failure_detail ~operation:"assetUpload" ~reason:"invalidContent" ());
+           Error Upload.Invalid_content
          | Error failure ->
+           if current ticket && failure <> Sync.Asset_cancelled then
+             on_diagnostic ticket (Option.value !detail
+               ~default:(asset_failure_detail ~operation:"assetUpload" failure));
            Error
              (match failure with
               | Sync.Asset_network -> Upload.Network
@@ -2168,27 +2580,29 @@ let run_upload t (context : Sync.asset_context) instruction =
               | Asset_storage_full
               | Asset_cancelled
               | Asset_invalid_content _ -> Invalid_content))
-        Upload.Put_succeeded
+        Upload.Put_succeeded)
   | Await_publication (ticket, intent) ->
     let rec await () =
       if current ticket
       then (
-        match database ticket (fun db -> Upload_database.inspect db intent) with
+        match database ticket (fun db -> Upload_database.inspect ~on_diagnostic:(on_diagnostic ticket) db intent) with
         | Ok Upload.Publication_acknowledged ->
           finish ticket (Ok ()) Upload.Publication_acked
         | Ok (Local_present | Metadata_present) ->
           t.dependencies.runtime.sleep 0.5;
           await ()
         | Ok (Absent | Entity_cancelled) ->
+          on_diagnostic ticket (failure_detail ~operation:"assetUpload" ~reason:"missingPrecondition" ());
           finish ticket (Error Upload.Invalid_content) Upload.Publication_acked
         | Error error -> finish ticket (Error error) Upload.Publication_acked)
     in
     await ()
 ;;
 
-let submit_upload t context instruction =
+let submit_upload t (context : Sync.asset_context) instruction =
   match instruction with
   | Upload.Cancel_operation ticket ->
+    clear_notice_diagnostic ~ticket_id:ticket.id t context.scope (Upload_notice ticket.operation);
     Option.iter
       (fun resolver -> ignore (Eio.Promise.try_resolve resolver () : bool))
       (Hashtbl.find_opt t.upload_operations ticket)
@@ -2202,6 +2616,7 @@ let submit_upload t context instruction =
   | Await_publication (ticket, _) ->
     if t.upload_current ticket && not (Hashtbl.mem t.upload_operations ticket)
     then (
+      clear_notice_diagnostic t context.scope (Upload_notice ticket.operation);
       let cancelled, resolve = Eio.Promise.create () in
       Hashtbl.add t.upload_operations ticket resolve;
       t.dependencies.runtime.fork ~sw:t.sw (fun () ->
@@ -2251,10 +2666,10 @@ let local_import t ~(scope : Sync.graph_scope) ~asset ~checksum ~current =
            else None)))
 ;;
 
-let lookup_local_asset t ~scope ~asset ~checksum ~current call =
+let lookup_local_asset t ~scope ~asset ~checksum ~current ~diagnostic call =
   match local_import t ~scope ~asset ~checksum ~current with
-  | Error _ ->
-    if current () then report_asset_error t scope "asset.metadata";
+  | Error source ->
+    if current () then report_source_failure t scope "assetMetadata" "persistenceFailed" source;
     Error Sync.Asset_cancelled
   | Ok None -> Ok (Sync.Asset_cached None)
   | Ok (Some intent) ->
@@ -2269,10 +2684,14 @@ let lookup_local_asset t ~scope ~asset ~checksum ~current call =
               (Sync.Publish_staged_asset
                  { asset; version = intent.version; file = intent.staged_file })
           in
+          let published_diagnostic = !diagnostic in
           (match published with
            | Error Sync.Asset_storage_full -> Ok (Sync.Asset_cached (Some lease))
            | _ ->
-             ignore (call (Sync.Release_asset_file lease));
+             (match call (Sync.Release_asset_file lease) with
+              | Error failure when current () -> report_asset_failure t scope "assetRelease" failure
+              | Ok _ | Error _ -> ());
+             diagnostic := published_diagnostic;
              (match published with
               | Ok Sync.Asset_unit ->
                 call (Sync.Check_asset_cache (asset, intent.version))
@@ -2296,31 +2715,40 @@ let run_asset t (context : Sync.asset_context) instruction =
     let valid () = (not t.stopped) && scope = context.scope && t.asset_current ticket in
     if valid () && not (Hashtbl.mem t.asset_operations ticket)
     then (
+      let asset = match ticket with Transfer.Lookup ticket -> ticket.asset | Download ticket -> ticket.asset in
+      let ticket_id = match ticket with Transfer.Lookup ticket -> ticket.id | Download ticket -> ticket.id in
+      clear_notice_diagnostic t context.scope (Download_notice asset);
       Hashtbl.add t.asset_operations ticket "";
       t.dependencies.runtime.fork ~sw:t.sw (fun () ->
         Fun.protect
           ~finally:(fun () -> Hashtbl.remove t.asset_operations ticket)
           (fun () ->
+             let detail = ref None in
              let result =
                if not (valid ())
                then Error Sync.Asset_cancelled
                else
-                 asset_call
-                   ~started:(fun operation ->
-                     Hashtbl.replace t.asset_operations ticket operation)
-                   t
-                   ~scope:context.scope
-                 |> action
+                 let call action =
+                   detail := None;
+                   asset_call ~on_diagnostic:(fun value -> detail := Some value)
+                     ~started:(fun operation -> Hashtbl.replace t.asset_operations ticket operation)
+                     t ~scope:context.scope action in
+                 action detail call
              in
              if valid ()
-             then
+             then (
+               let asset = match ticket with Transfer.Lookup ticket -> ticket.asset | Download ticket -> ticket.asset in
+               (match result with
+                | Error Sync.Asset_cancelled | Ok _ -> clear_notice_diagnostic t context.scope (Download_notice asset)
+                | Error failure -> queue_notice_diagnostic t context.scope (Download_notice asset) ticket_id
+                  (Option.value !detail ~default:(asset_failure_detail ~operation:"assetDownload" failure)));
                t.post
                  (Core.Asset_completed
                     ( context.scope
                     , success
                         (match result with
                          | Ok value -> Ok value
-                         | Error failure -> Error (transfer_failure failure)) ))
+                         | Error failure -> Error (transfer_failure failure)) )))
              else (
                match result with
                | Ok (Sync.Asset_cached (Some handle) | Asset_downloaded handle) ->
@@ -2332,7 +2760,7 @@ let run_asset t (context : Sync.asset_context) instruction =
     let work = Transfer.Lookup ticket in
     perform
       work
-      (fun call ->
+      (fun diagnostic call ->
          let local checksum =
            lookup_local_asset
              t
@@ -2340,6 +2768,7 @@ let run_asset t (context : Sync.asset_context) instruction =
              ~asset:ticket.asset
              ~checksum
              ~current:(fun () -> t.asset_current work)
+             ~diagnostic
              call
          in
          match ticket.source with
@@ -2359,7 +2788,7 @@ let run_asset t (context : Sync.asset_context) instruction =
   | Fetch ticket ->
     perform
       (Transfer.Download ticket)
-      (fun call ->
+      (fun _diagnostic call ->
          call
            (Sync.Fetch_asset
               { asset = ticket.asset
@@ -2374,6 +2803,8 @@ let run_asset t (context : Sync.asset_context) instruction =
                | _ -> Error (Transfer.Invalid_content "Unexpected download completion"))
            ))
   | Cancel ticket ->
+    let asset, id = match ticket with Transfer.Lookup ticket -> ticket.asset,ticket.id | Download ticket -> ticket.asset,ticket.id in
+    clear_notice_diagnostic ~ticket_id:id t context.scope (Download_notice asset);
     Option.iter
       (fun operation ->
          if operation <> ""
@@ -2441,7 +2872,9 @@ let submit t = function
     if not t.stopped then submit_upload t context instruction
   | Core.Run_asset (context, instruction) ->
     if not t.stopped then run_asset t context instruction
-  | Close_asset_scope scope -> send_asset t ~scope Sync.Close_asset_scope
+  | Close_asset_scope scope ->
+    t.notice_diagnostics <- List.filter (fun item -> item.scope<>scope) t.notice_diagnostics;
+    send_asset t ~scope Sync.Close_asset_scope
   | Core.Run_worker (Core.Request (_, Core.Handle_sync_worker_effect (Sync.Delete_mirror deletion)) as request) ->
     if deletion_authorized t deletion then t.deletion_owner <- Some deletion;
     if not t.stopped then t.dependencies.runtime.fork ~sw:t.sw (fun () -> complete t request)
@@ -2474,9 +2907,11 @@ let submit t = function
     then t.authorized_graphs <- List.fold_left (fun ids (graph : Sync.graph) ->
       Authorized_graphs.add (Graph.Uuid.to_string graph.graph_id) ids) Authorized_graphs.empty state.snapshot.catalog;
     t.latest_snapshot <- Some state.snapshot;
+    t.notice_diagnostics <- List.filter (fun item -> current_graph_scope t item.scope) t.notice_diagnostics;
     if not (Option.fold ~none:false ~some:(deletion_authorized t) t.deletion_owner)
     then t.deletion_owner <- None;
     if not t.stopped then t.dependencies.publish output
+  | Publish (Core.Asset_notice (scope, notice) as output) -> publish_asset_notice t scope notice output
   | Publish output -> if not t.stopped then t.dependencies.publish output
 ;;
 
@@ -2507,6 +2942,7 @@ let shutdown t =
   then (
     t.post (Core.Sync_event Sync.Shutdown);
     t.stopped <- true;
+    t.notice_diagnostics <- [];
     Hashtbl.iter
       (fun _ resolve -> ignore (Eio.Promise.try_resolve resolve () : bool))
       t.upload_operations;
@@ -2523,19 +2959,24 @@ let shutdown t =
 ;;
 
 let retain_asset_file t ~scope ~handle =
-  match asset_call t ~scope (Sync.Retain_asset_file handle) with
+  let detail = ref None in
+  match asset_call ~on_diagnostic:(fun value -> detail := Some value) t ~scope (Sync.Retain_asset_file handle) with
   | Ok (Sync.Asset_retained file) -> file
   | Error Sync.Asset_cancelled -> None
-  | Ok _ | Error _ -> report_asset_error t scope "asset.preview"; None
+  | Error failure -> report_asset_failure ?detail:!detail t scope "assetPreview" failure; None
+  | Ok _ -> report_source_failure t scope "assetPreview" "invalidContent" "Unexpected asset completion"; None
 ;;
 
 let release_asset_file t ~scope ~handle =
-  match asset_call t ~scope (Sync.Release_asset_file handle) with
+  let detail = ref None in
+  match asset_call ~on_diagnostic:(fun value -> detail := Some value) t ~scope (Sync.Release_asset_file handle) with
   | Ok Sync.Asset_unit | Error Sync.Asset_cancelled -> ()
-  | Ok _ | Error _ -> report_asset_error t scope "asset.release"
+  | Error failure -> report_asset_failure ?detail:!detail t scope "assetRelease" failure
+  | Ok _ -> report_source_failure t scope "assetRelease" "invalidContent" "Unexpected asset completion"
 ;;
 
 let prepare_import_unlocked
+      ~on_diagnostic
       t
       ~(context : Sync.asset_context)
       (request : Logseq_db_types.Asset_import.t)
@@ -2544,6 +2985,8 @@ let prepare_import_unlocked
   let module I = Logseq_db_types.Asset_upload_intent in
   let module A = Logseq_db_types.Asset_descriptor in
   let ( let* ) = Result.bind in
+  let source_error reason result = Result.map_error (fun source ->
+    on_diagnostic (failure_detail ~source ~operation:"assetMetadata" ~reason ()); source) result in
   let prepare version size staged_file =
     I.prepare
       ~replace_reference:request.replace_reference
@@ -2560,15 +3003,15 @@ let prepare_import_unlocked
       ~size
       ~staged_file
   in
-  let* version = A.version ~checksum:(String.make 64 '0') ~file_type:request.file_type in
-  let* _ = prepare version 0L "validation.bin" in
+  let* version = source_error "invalidRequest" (A.version ~checksum:(String.make 64 '0') ~file_type:request.file_type) in
+  let* _ = source_error "invalidRequest" (prepare version 0L "validation.bin") in
   if (not (current ())) || t.stopped
   then Error "The selected graph is no longer active"
   else
-    let* () = reconcile_staging t context.scope ~current in
+    let* () = source_error "restoreFailed" (reconcile_staging t context.scope ~current) in
     let* existing =
-      with_upload_store t (fun db ->
-        Logseq_db_storage.Asset_upload_store.read db ~operation:request.operation)
+      source_error "persistenceFailed" (with_upload_store t (fun db ->
+        Logseq_db_storage.Asset_upload_store.read db ~operation:request.operation))
     in
     match existing with
     | Some intent
@@ -2582,11 +3025,13 @@ let prepare_import_unlocked
            && intent.local_mutation = request.local_mutation
            && intent.replace_reference = request.replace_reference
            && intent.metadata_mutation = request.metadata_mutation -> Ok intent
-    | Some _ -> Error "This import identity is already in use"
+    | Some _ -> source_error "identityConflict" (Error "This import identity is already in use")
     | None ->
+      let detail = ref None in
       let* file, checksum, size =
         match
           asset_call
+            ~on_diagnostic:(fun value -> detail := Some value)
             t
             ~scope:context.scope
             (Sync.Stage_asset_file
@@ -2596,21 +3041,24 @@ let prepare_import_unlocked
                })
         with
         | Ok (Sync.Asset_staged { file; checksum; size }) -> Ok (file, checksum, size)
-        | Error failure -> Error (asset_failure_message failure)
-        | Ok _ -> Error "Unexpected staging completion"
+        | Error failure ->
+          if failure <> Sync.Asset_cancelled then
+            on_diagnostic (Option.value !detail ~default:(asset_failure_detail ~operation:"assetMetadata" failure));
+          Error (asset_failure_message failure)
+        | Ok _ -> source_error "invalidContent" (Error "Unexpected staging completion")
       in
       let persistence_attempted = ref false in
       let result =
-        let* version = A.version ~checksum ~file_type:request.file_type in
-        let* intent = prepare version size file in
+        let* version = source_error "invalidRequest" (A.version ~checksum ~file_type:request.file_type) in
+        let* intent = source_error "invalidRequest" (prepare version size file) in
         if (not (current ())) || t.stopped
         then Error "The selected graph is no longer active"
         else (
           persistence_attempted := true;
           let* () =
-            Eio.Cancel.protect (fun () ->
+            source_error "persistenceFailed" (Eio.Cancel.protect (fun () ->
               with_upload_store t (fun db ->
-                Logseq_db_storage.Asset_upload_store.save db ~expected:None intent))
+                Logseq_db_storage.Asset_upload_store.save db ~expected:None intent)))
           in
           Ok intent)
       in
@@ -2618,13 +3066,17 @@ let prepare_import_unlocked
        | Ok _ -> ()
        | Error _ when not !persistence_attempted ->
          Eio.Cancel.protect (fun () ->
-           ignore (asset_unit t ~scope:context.scope (Sync.Release_staged_file file)))
+           ignore (asset_unit
+             ~on_failure:(fun failure -> if current () then report_asset_failure t context.scope "assetRelease" failure)
+             t ~scope:context.scope (Sync.Release_staged_file file)))
        | Error _ -> ());
       result
 ;;
 
 let prepare_import t ~(context : Sync.asset_context) request ~current =
   with_staging_lock t (fun () ->
+    let on_diagnostic detail = if current () then
+      publish_failure (report_current_graph t context.scope) detail in
     Result.map
       (fun (intent : Logseq_db_types.Asset_upload_intent.t) ->
          Hashtbl.replace
@@ -2633,7 +3085,8 @@ let prepare_import t ~(context : Sync.asset_context) request ~current =
            intent.operation_id;
          if intent.phase <> Logseq_db_types.Asset_upload_intent.Cancelled && current ()
          then
-           (match asset_call
+           (let detail = ref None in
+            match asset_call ~on_diagnostic:(fun value -> detail := Some value)
                 t
                 ~scope:context.Sync.scope
                 (Sync.Publish_staged_asset
@@ -2642,10 +3095,10 @@ let prepare_import t ~(context : Sync.asset_context) request ~current =
                    ; file = intent.staged_file
                    }) with
             | Ok Sync.Asset_unit | Error Sync.Asset_cancelled -> ()
-            | Ok _ | Error _ ->
-              if current () then report_asset_error t context.scope "asset.preview");
+            | Error failure -> if current () then report_asset_failure ?detail:!detail t context.scope "assetPreview" failure
+            | Ok _ -> if current () then report_source_failure t context.scope "assetPreview" "invalidContent" "Unexpected asset completion");
          intent)
-      (prepare_import_unlocked t ~context request ~current))
+      (prepare_import_unlocked ~on_diagnostic t ~context request ~current))
 ;;
 
 let retain_imported_file t ~(scope : Sync.graph_scope) ~operation =
@@ -2661,10 +3114,12 @@ let retain_imported_file t ~(scope : Sync.graph_scope) ~operation =
            && intent.account = scope.account.user_id
            && intent.graph = scope.graph_id
            && intent.phase <> Logseq_db_types.Asset_upload_intent.Cancelled ->
-      (match asset_call t ~scope (Sync.Retain_staged_file intent.staged_file) with
+      (let detail = ref None in
+       match asset_call ~on_diagnostic:(fun value -> detail := Some value) t ~scope (Sync.Retain_staged_file intent.staged_file) with
        | Ok (Sync.Asset_retained file) -> file
        | Error Sync.Asset_cancelled -> None
-       | Ok _ | Error _ -> report_asset_error t scope "asset.preview"; None)
+       | Error failure -> report_asset_failure ?detail:!detail t scope "assetPreview" failure; None
+       | Ok _ -> report_source_failure t scope "assetPreview" "invalidContent" "Unexpected asset completion"; None)
     | Ok _ -> None
-    | Error _ -> report_asset_error t scope "asset.metadata"; None)
+    | Error source -> report_source_failure t scope "assetMetadata" "persistenceFailed" source; None)
 ;;

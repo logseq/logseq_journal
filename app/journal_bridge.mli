@@ -26,10 +26,10 @@ type hooks =
   ; (* Host -> OCaml: an LJP2 response envelope completing an earlier
         platform request. Binary-safe string. *)
     platform_response : string -> unit
-  ; (* Host -> OCaml: the platform could not answer a request (decode or
-        service failure). Carries the original request envelope; the pending
-        continuation resolves with an error, matching the old bridge's
-        request-failure path. *)
+  ; (* Host -> OCaml: the platform could not answer a request. Carries a finite
+        LJF1 reason/scope envelope; a validated original LJP2 request remains
+        supported for legacy hosts. Current cancellation still completes the
+        pending continuation but does not create a failure ledger row. *)
     platform_failure : string -> unit
   ; (* Tears the app down; returns the final patch batch. *)
     dispose : unit -> string
@@ -51,3 +51,13 @@ external wakeup : unit -> unit = "journal_ml_wakeup"
 (* Forwards one LJP2 request envelope to the host platform bridge (the host
     answers asynchronously through [platform_response]). *)
 external platform_request : string -> unit = "journal_ml_platform_request"
+
+(** Decode a versioned, finite native failure (LJF1) or a validated legacy LJP2
+    request. The result contains a known request tag and fixed reason code only;
+    no request body or exception text is returned. LJF1 also includes bounded
+    account/presentation generations. Tag zero is decode failure. *)
+val decode_platform_failure : string -> (int * string * (int64 * int64) option) option
+val platform_failure_message : string -> string
+(** Recognized native diagnostic family and finite subcause. Unrecognized
+    suffixes use a fixed unknown reason; arbitrary payloads are never echoed. *)
+val native_diagnostic : string -> (string * string) option

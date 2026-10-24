@@ -472,11 +472,13 @@ let runner
       ?(websocket_liveness = Runner.Disabled)
       ?network
       ?clock
+      ?(tls_authenticator = Runner.tls_authenticator (fun ?ip:_ ~host:_ _ -> Ok None))
       ?secrets_dependency
       ?crypto_dependency
       ?(acquire = fun _ -> Ok "fixture-token")
       ?(on_invalidate = fun _ -> ())
       ?(on_post = fun _ -> ())
+      ?on_asset_diagnostic
       ?asset_cache_budget_bytes
       ?asset_maximum_file_bytes
       ?asset_pending_budget_bytes
@@ -490,7 +492,7 @@ let runner
   let transport =
     Runner.transport
       ~websocket_liveness
-      ~tls_authenticator:(Runner.tls_authenticator (fun ?ip:_ ~host:_ _ -> Ok None))
+      ~tls_authenticator
       ~network:(Option.value network ~default:(Eio.Stdenv.net environment))
       ~clock:(Option.value clock ~default:(Eio.Stdenv.clock environment))
     |> Result.get_ok
@@ -522,7 +524,7 @@ let runner
            on_invalidate token))
     |> Result.get_ok
   in
-  Runner.create ~sw dependencies ~post:(fun event ->
+  Runner.create ?on_asset_diagnostic ~sw dependencies ~post:(fun event ->
     on_post event;
     posted := !posted @ [ event ])
   |> Result.get_ok
@@ -594,6 +596,7 @@ let http_test
       ?retained_download
       ?(segment = 16384)
       ?(eof = false)
+      ?failure_message
       wire
       ()
   =
@@ -613,6 +616,10 @@ let http_test
             prerr_endline message
           | Ok () -> ());
          Alcotest.(check bool) "response outcome" success (Result.is_ok result);
+         Option.iter (fun expected -> match result with
+           | Error (Core.Effect_failed actual) ->
+             Alcotest.(check string) "finite decoder cause" expected actual
+           | _ -> Alcotest.fail "expected decoder failure") failure_message;
          if download
          then (
            let staging = Filename.concat support "staging" in
@@ -1753,6 +1760,8 @@ let scenarios =
               ~download:true
               ~success
               ~payload
+              ?failure_message:(if name = "truncated gzip rejected" then
+                Some "snapshot gzip decode failed" else None)
               ?retained_download:(if success then None else Some body)
               (response ~headers body)))
       gzip_downloads
@@ -1905,7 +1914,10 @@ let asset_upload ~status ~refresh () =
     with_peer cases (fun ~environment ~sw ~support ~origin ->
       let posted = ref []
       and invalidations = ref 0 in
-      let runner = runner ~environment ~sw ~support ~posted ~invalidations () in
+      let diagnostics = ref [] in
+      let on_asset_diagnostic ~scope:_ ~operation ~request_operation detail =
+        diagnostics := (operation, request_operation, detail) :: !diagnostics in
+      let runner = runner ~on_asset_diagnostic ~environment ~sw ~support ~posted ~invalidations () in
       let selected, scope = bootstrap ~mirror_absent:false origin in
       let source_file = Filename.concat support "staged.bin" in
       Out_channel.with_open_bin source_file (fun out -> output_string out bytes);
@@ -1930,6 +1942,18 @@ let asset_upload ~status ~refresh () =
         | _ -> Error Core.Asset_network
       in
       Alcotest.(check bool) "explicit upload result" true (result = expected);
+      (match status, !diagnostics with
+       | 200, [] -> ()
+       | 200, _ -> Alcotest.fail "successful retry must not emit a failure diagnostic"
+       | _, [(operation, request_operation, detail)] ->
+         Alcotest.(check string) "finite diagnostic operation" "assetUpload" operation;
+         Alcotest.(check string) "exact request identity" "upload" request_operation;
+         let module D = Logseq_db_types.Failure_diagnostic in
+         Alcotest.(check bool) "safe numeric HTTP status survives" true
+           (String.ends_with ~suffix:(Printf.sprintf "(http=%d)." status) (D.message detail));
+         Alcotest.(check bool) "source status preserved by strict carrier" true
+           (D.decode (D.encode detail) |> Option.map D.message = Some (D.message detail))
+       | _ -> Alcotest.fail "one terminal failure diagnostic expected");
       Alcotest.(check int)
         "upload token refresh"
         (if refresh then 1 else 0)
@@ -4280,4 +4304,226 @@ let scenarios =
   scenarios
   @ [ Alcotest.test_case "HTTP default connection retires between requests"
         `Quick test_default_connection_sequence ]
+;;
+
+
+(* Core sees opaque transport completion text; its public reducer cannot execute
+   DNS validation, socket setup, TLS authentication, or Upgrade parsing. These
+   regressions enter through the real public Runner, with no fabricated result. *)
+let transport_failure_message ~websocket posted =
+  if websocket
+  then
+    List.find_map
+      (function
+        | Core.Websocket_closed (_, Core.Authentication_failure message) ->
+          Some (`Authentication, message)
+        | Core.Websocket_closed (_, Core.Recoverable_close (Some message)) ->
+          Some (`Recoverable, message)
+        | _ -> None)
+      posted
+  else (
+    match completed posted with
+    | Some (Error (Core.Effect_failed message)) -> Some (`Recoverable, message)
+    | _ -> None)
+;;
+
+let require_transport_failure ~websocket ~authentication ~expected posted invalidations =
+  match transport_failure_message ~websocket posted with
+  | None -> Alcotest.fail "transport did not return its existing typed failure"
+  | Some (kind, message) ->
+    Alcotest.(check string) "fixed safe transport reason" expected message;
+    Alcotest.(check bool)
+      "existing authentication/retry classification retained"
+      (websocket && authentication)
+      (kind = `Authentication);
+    Alcotest.(check int)
+      "TLS or non-401 Upgrade failure does not refresh tokens"
+      0
+      invalidations
+;;
+
+let test_tls_setup_reason ~websocket reason () =
+  with_support (fun support ->
+    Eio_main.run (fun environment ->
+      Eio.Switch.run (fun sw ->
+        let real_clock = Eio.Stdenv.clock environment in
+        let clock =
+          if reason = `No_address then scaled_clock real_clock 30. else real_clock
+        in
+        let attempts = ref 0 in
+        let network =
+          delayed_network (Eio.Stdenv.net environment) (fun () ->
+            incr attempts;
+            if reason = `Dial_refused then
+              raise (Unix.Unix_error (Unix.ECONNREFUSED, "LOG_SECRET_SOCKET", "LOG_SECRET_PATH"));
+            if reason = `Dial_timeout then raise Eio.Time.Timeout;
+            failwith
+              "LOG_SECRET_SOCKET https://LOG_SECRET_HOST/LOG_SECRET_PATH \
+               token=LOG_SECRET_TOKEN")
+        in
+        let host, detail =
+          match reason with
+          | `Invalid_host ->
+            String.make 64 'x' ^ ".LOG_SECRET_HOST.invalid", "invalid DNS host"
+          | `No_address ->
+            ( Printf.sprintf "log-secret-dns-%d-%d.local" (Unix.getpid ()) (Random.bits ())
+            , "no network address (DNS resolution timed out)" )
+          | `Dial_failed -> "localhost", "all resolved addresses failed: operation raised Failure"
+          | `Dial_refused -> "localhost", "all resolved addresses failed: connection refused"
+          | `Dial_timeout -> "localhost", "all resolved addresses failed: dial timed out"
+        in
+        let origin = Uri.of_string ("https://" ^ host ^ ":1") in
+        let posted = ref []
+        and invalidations = ref 0 in
+        let t =
+          runner
+            ~clock
+            ~network
+            ~acquire:(fun _ -> Ok "LOG_SECRET_TOKEN")
+            ~environment
+            ~sw
+            ~support
+            ~posted
+            ~invalidations
+            ()
+        in
+        Fun.protect
+          ~finally:(fun () -> Runner.shutdown t)
+          (fun () ->
+             Runner.submit
+               t
+               (if websocket
+                then websocket_start origin
+                else operation ~download:false origin);
+             wait real_clock (fun () ->
+               Option.is_some (transport_failure_message ~websocket !posted));
+             let prefix =
+               if websocket then "WebSocket TLS setup failed: " else "TLS setup failed: "
+             in
+             require_transport_failure
+               ~websocket
+               ~authentication:false
+               ~expected:(prefix ^ detail)
+               !posted
+               !invalidations;
+             if List.mem reason [`Dial_failed; `Dial_refused; `Dial_timeout]
+             then
+               Alcotest.(check bool)
+                 "real address attempts executed the failing network capability"
+                 true
+                 (!attempts > 0)
+             else
+               Alcotest.(check int) "invalid or unresolved host never dials" 0 !attempts))))
+;;
+
+let test_tls_authentication_reason ~websocket () =
+  let report =
+    with_peer
+      [ case (response "x") ]
+      (fun ~environment ~sw ~support ~origin ->
+         let posted = ref []
+         and invalidations = ref 0 in
+         let t =
+           runner
+             ~tls_authenticator:(Runner.system_tls_authenticator () |> Result.get_ok)
+             ~acquire:(fun _ -> Ok "LOG_SECRET_TOKEN")
+             ~environment
+             ~sw
+             ~support
+             ~posted
+             ~invalidations
+             ()
+         in
+         Fun.protect
+           ~finally:(fun () -> Runner.shutdown t)
+           (fun () ->
+              Runner.submit
+                t
+                (if websocket
+                 then websocket_start origin
+                 else operation ~download:false origin);
+              wait (Eio.Stdenv.clock environment) (fun () ->
+                Option.is_some (transport_failure_message ~websocket !posted));
+              require_transport_failure
+                ~websocket
+                ~authentication:true
+                ~expected:
+                  (if websocket
+                   then "WebSocket TLS authentication failed"
+                   else "TLS authentication failed")
+                !posted
+                !invalidations))
+  in
+  check_retired report
+;;
+
+let test_upgrade_rejection_reason () =
+  let report =
+    with_peer
+      [ case (response ~status:503 "LOG_SECRET_RESPONSE_BODY") ]
+      (fun ~environment ~sw ~support ~origin ->
+         let posted = ref []
+         and invalidations = ref 0 in
+         let t =
+           runner
+             ~acquire:(fun _ -> Ok "LOG_SECRET_TOKEN")
+             ~environment
+             ~sw
+             ~support
+             ~posted
+             ~invalidations
+             ()
+         in
+         Fun.protect
+           ~finally:(fun () -> Runner.shutdown t)
+           (fun () ->
+              Runner.submit t (websocket_start origin);
+              wait (Eio.Stdenv.clock environment) (fun () ->
+                Option.is_some (transport_failure_message ~websocket:true !posted));
+              require_transport_failure
+                ~websocket:true
+                ~authentication:false
+                ~expected:"WebSocket Upgrade rejected (HTTP 503)"
+                !posted
+                !invalidations))
+  in
+  check_retired report
+;;
+
+let scenarios =
+  scenarios
+  @ List.concat_map
+      (fun websocket ->
+         let prefix = if websocket then "WebSocket " else "HTTP " in
+         [ Alcotest.test_case
+             (prefix ^ "TLS diagnostic invalid host")
+             `Quick
+             (test_tls_setup_reason ~websocket `Invalid_host)
+         ; Alcotest.test_case
+             (prefix ^ "TLS diagnostic no address")
+             `Quick
+             (test_tls_setup_reason ~websocket `No_address)
+         ; Alcotest.test_case
+             (prefix ^ "TLS diagnostic failed dial")
+             `Quick
+             (test_tls_setup_reason ~websocket `Dial_failed)
+         ; Alcotest.test_case
+             (prefix ^ "TLS diagnostic refused errno")
+             `Quick
+             (test_tls_setup_reason ~websocket `Dial_refused)
+         ; Alcotest.test_case
+             (prefix ^ "TLS diagnostic dial timeout")
+             `Quick
+             (test_tls_setup_reason ~websocket `Dial_timeout)
+         ; Alcotest.test_case
+             (prefix ^ "TLS diagnostic authentication")
+             `Quick
+             (test_tls_authentication_reason ~websocket)
+         ])
+      [ false; true ]
+  @ [ Alcotest.test_case
+        "WebSocket Upgrade diagnostic status"
+        `Quick
+        test_upgrade_rejection_reason
+    ]
 ;;

@@ -99,13 +99,16 @@ enum JournalExtensionFingerprint {
   static func decode<Properties: Decodable>(
     _ type: Properties.Type, context: LUIAppleExtensionViewContext
   ) -> Properties? {
-    guard case let .string(json) = context.property("payload"),
-      let value = try? JSONDecoder().decode(type, from: Data(json.utf8))
-    else {
-      report(context: context, code: "diagnostic.nativePropsDecode")
+    let property = context.property("payload")
+    guard case let .string(json) = property else {
+      report(context:context,code:"diagnostic.nativePropsDecode." + (property == nil ? "missingPayload" : "typeMismatch"))
       return nil
     }
-    return value
+    do { return try JournalSafeDiagnostic.decode(type,from:Data(json.utf8)) }
+    catch {
+      report(context:context,code:"diagnostic.nativePropsDecode." + JournalSafeDiagnostic.classify(error).rawValue)
+      return nil
+    }
   }
 
   /// Reuse the registered event envelope for fixed diagnostic codes. The OCaml
@@ -141,7 +144,10 @@ enum JournalExtensionFingerprint {
       ])
       return true
     } catch {
-      report(context: context, code: "diagnostic.nativeEventDelivery")
+      let reason:JournalSafeDiagnostic
+      if case let LUIBackendError.invalidBatch(source) = error { reason = .backendBatch(source) }
+      else { reason = .classify(error) }
+      report(context: context, code: "diagnostic.nativeEventDelivery." + reason.rawValue)
       return false
     }
   }

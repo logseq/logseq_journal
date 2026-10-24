@@ -72,24 +72,30 @@ enum JournalLocalAccountBindingStore {
     value[kSecAttrAccount] = "pending-account-proposal"
     return value
   }
-  static func loadRecoveryData() throws -> Data? { try loadData(query: recoveryQuery()) }
-  static func writeRecoveryData(_ data: Data) throws { try writeData(data, query: recoveryQuery()) }
+  static func loadRecoveryData() throws -> Data? { try loadData(query: recoveryQuery(), source: .recoveryLoad) }
+  static func writeRecoveryData(_ data: Data) throws { try writeData(data, query: recoveryQuery(), source: .recoveryWrite, addition: .recoveryAdd) }
   static func clearRecoveryData() throws {
     let status = SecItemDelete(recoveryQuery() as CFDictionary)
     guard status == errSecSuccess || status == errSecItemNotFound else {
-      throw JournalAccountIssue(kind: .secureStorageUnavailable, stage: .bindingWrite)
+      throw JournalAccountIssue(kind: .secureStorageUnavailable, stage: .bindingWrite,
+        nativeDetail: .init(source: .recoveryClear, reason: .status, osStatus: Int(status)))
     }
   }
 
-  private static func loadData(query: [CFString: Any]) throws -> Data? {
+  private static func loadData(query: [CFString: Any], source: JournalAccountDiagnostic.Source = .bindingLoad) throws -> Data? {
     var lookup = query
     lookup[kSecReturnData] = kCFBooleanTrue
     lookup[kSecMatchLimit] = kSecMatchLimitOne
     var item: CFTypeRef?
     let status = SecItemCopyMatching(lookup as CFDictionary, &item)
     if status == errSecItemNotFound { return nil }
-    guard status == errSecSuccess, let data = item as? Data else {
-      throw JournalAccountIssue(kind: .secureStorageUnavailable, stage: .bindingRead)
+    guard status == errSecSuccess else {
+      throw JournalAccountIssue(kind: .secureStorageUnavailable, stage: .bindingRead,
+        nativeDetail: .init(source: source, reason: .status, osStatus: Int(status)))
+    }
+    guard let data = item as? Data else {
+      throw JournalAccountIssue(kind: .secureStorageUnavailable, stage: .bindingRead,
+        nativeDetail: .init(source: source, reason: .wrongType))
     }
     return data
   }
@@ -110,26 +116,32 @@ enum JournalLocalAccountBindingStore {
     try writeData(data, query: query())
   }
 
-  private static func writeData(_ data: Data, query: [CFString: Any]) throws {
+  private static func writeData(_ data: Data, query: [CFString: Any],
+    source: JournalAccountDiagnostic.Source = .bindingWrite,
+    addition additionSource: JournalAccountDiagnostic.Source = .bindingAdd) throws {
     // Keep the existing record if a replacement cannot be saved securely.
     var status = SecItemUpdate(query as CFDictionary, [kSecValueData: data] as CFDictionary)
+    var operation = source
     if status == errSecItemNotFound {
       var addition = query
       addition[kSecValueData] = data
       status = SecItemAdd(addition as CFDictionary, nil)
+      operation = additionSource
     }
     guard status == errSecSuccess else {
-      throw JournalAccountIssue(kind: .secureStorageUnavailable, stage: .bindingWrite)
+      throw JournalAccountIssue(kind: .secureStorageUnavailable, stage: .bindingWrite,
+        nativeDetail: .init(source: operation, reason: .status, osStatus: Int(status)))
     }
   }
 
   static func restoreData(_ data: Data?) throws {
-    if let data { try writeData(data) }
+    if let data { try writeData(data, query: query(), source: .bindingRestore, addition: .bindingRestore) }
     else {
       // Remove only the newly proposed item when no item existed beforehand.
       let status = SecItemDelete(query() as CFDictionary)
       guard status == errSecSuccess || status == errSecItemNotFound else {
-        throw JournalAccountIssue(kind: .secureStorageUnavailable, stage: .bindingWrite)
+        throw JournalAccountIssue(kind: .secureStorageUnavailable, stage: .bindingWrite,
+          nativeDetail: .init(source: .bindingRestore, reason: .status, osStatus: Int(status)))
       }
     }
   }
@@ -137,7 +149,9 @@ enum JournalLocalAccountBindingStore {
   static func clear() throws {
     let status = SecItemDelete(query() as CFDictionary)
     guard status == errSecSuccess || status == errSecItemNotFound else {
-      throw CocoaError(.fileWriteUnknown)
+      // Keep the prior generic/unavailable recovery policy of this failure.
+      throw JournalAccountIssue(kind: .unavailable, stage: .bindingWrite,
+        nativeDetail: .init(source: .bindingClear, reason: .status, osStatus: Int(status)))
     }
   }
 }

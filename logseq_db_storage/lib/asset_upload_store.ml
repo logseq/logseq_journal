@@ -71,8 +71,7 @@ let decode payload =
         Logseq_db_types.Json_codec.decode
           checkpoint_of_yojson
           (Yojson.Safe.from_string payload)
-        |> Result.map_error (fun error ->
-          "Unsupported or invalid upload checkpoint: " ^ error)
+        |> Result.map_error (fun _ -> "Upload checkpoint shape is invalid")
       in
       if value.format_version <> 1
       then Error "Unsupported upload checkpoint format"
@@ -81,6 +80,7 @@ let decode payload =
           Asset.version
             ~checksum:value.version.checksum
             ~file_type:value.version.file_type
+          |> Result.map_error (fun _ -> "Upload checkpoint asset version is invalid")
         in
         let* prepared =
           Intent.prepare
@@ -97,10 +97,13 @@ let decode payload =
             ~target:value.target
             ~local_mutation:value.local_mutation
             ~metadata_mutation:value.metadata_mutation
+          |> Result.map_error (fun _ -> "Upload checkpoint intent is invalid")
         in
         Intent.restore prepared ~phase:value.phase ~revision:value.revision
+        |> Result.map_error (fun _ -> "Upload checkpoint phase is invalid")
   with
-  | Yojson.Json_error _ | Failure _ -> Error "Unsupported or invalid upload checkpoint"
+  | Yojson.Json_error _ -> Error "Upload checkpoint JSON is invalid"
+  | Failure _ | Invalid_argument _ -> Error "Upload checkpoint shape is invalid"
 ;;
 
 let protect f =
@@ -287,22 +290,26 @@ let captured_graph_to_yojson capture =
 let captured_graph_of_yojson json =
   try
     let open Yojson.Safe.Util in
-    if json |> member "version" |> to_int <> 1 then failwith "Unsupported retirement capture";
+    let* () = if json |> member "version" |> to_int <> 1
+      then Error "Unsupported retirement capture format" else Ok () in
     let origin = json |> member "origin" |> to_string in
     let account = json |> member "account" |> to_string in
-    let* graph = json |> member "graph" |> Uuid.of_yojson in
+    let* graph = json |> member "graph" |> Uuid.of_yojson
+      |> Result.map_error (fun _ -> "Retirement capture graph identity is invalid") in
     let rec decode_rows acc = function
       | [] -> Ok acc
       | `List [id; `String payload] :: rest ->
-        let* id = Uuid.of_yojson id in let* intent = decode payload in
+        let* id = Uuid.of_yojson id
+          |> Result.map_error (fun _ -> "Retirement capture operation identity is invalid") in
+        let* intent = decode payload in
         if intent.origin <> origin || intent.account <> account || not (Uuid.equal graph intent.graph)
            || not (Uuid.equal id intent.operation_id) then Error "Retirement capture scope mismatch"
         else if Captured_rows.mem id acc then Error "Duplicate retirement checkpoint"
         else decode_rows (Captured_rows.add id payload acc) rest
-      | _ -> Error "Invalid retirement capture" in
+      | _ -> Error "Retirement capture row shape is invalid" in
     let* rows = decode_rows Captured_rows.empty (json |> member "rows" |> to_list) in
     Ok {captured_origin=origin;captured_account=account;captured_graph=graph;captured_rows=rows}
-  with _ -> Error "Invalid retirement capture"
+  with _ -> Error "Retirement capture shape is invalid"
 ;;
 
 let delete_captured_graph db capture =

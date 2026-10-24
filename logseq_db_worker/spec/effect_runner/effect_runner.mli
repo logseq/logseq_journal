@@ -64,6 +64,16 @@ val create
 
 val submit : t -> Logseq_db_worker_pure_reducer.Core.instruction -> unit
 
+(** Accept a bounded diagnostic only for its live scoped asset request. The
+    internal request identifier is used for correlation and is never displayed. *)
+val report_asset_diagnostic
+  :  t
+  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> operation:string
+  -> request_operation:string
+  -> Logseq_db_types.Failure_diagnostic.t
+  -> unit
+
 val await_reply
   :  t
   -> id:Logseq_db_worker_pure_reducer.Core.request_id

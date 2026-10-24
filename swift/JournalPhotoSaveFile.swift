@@ -9,8 +9,9 @@ enum JournalPhotoSaveFile {
     do { try FileManager.default.removeItem(at: directory) }
     catch let error as CocoaError where error.code == .fileNoSuchFile { } // Idempotent cleanup.
     catch {
+      let reason = JournalAssetDiagnostic.classify(error, stage: .cleanup)
       Logger(subsystem: "com.logseq.journal", category: "cleanup")
-        .error("Temporary photo cleanup could not finish (photoSave.cleanup.failed)")
+        .error("Temporary photo cleanup could not finish (photoSave.cleanup.failed; \(reason.description, privacy: .public))")
     }
   }
 

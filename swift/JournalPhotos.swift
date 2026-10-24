@@ -30,8 +30,11 @@ import Photos
           options.shouldMoveFile = false
           request.addResource(with: .photo, fileURL: url, options: options)
         }
-        let finished: @Sendable (Bool, (any Error)?) -> Void = { success, _ in
-          Task { @MainActor in completion(success) }
+        let finished: @Sendable (Bool, (any Error)?) -> Void = { success, error in
+          let result: Result<Void, JournalAssetDiagnostic> = success ? .success(())
+            : .failure(error.map { .classify($0, stage: .photoWrite) }
+              ?? .init(stage: .photoWrite, category: .failed))
+          Task { @MainActor in completion(result) }
         }
         PHPhotoLibrary.shared().performChanges(changes, completionHandler: finished)
       },

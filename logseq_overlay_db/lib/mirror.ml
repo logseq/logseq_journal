@@ -107,7 +107,7 @@ let import_snapshot_rows ~snapshot_path ~expected_rows database_path =
 
 let inspect_database database_path graph_id =
   match Storage.open_database database_path with
-  | Error _ -> Error "snapshot SQLite storage cannot be opened"
+  | Error error -> Error (Storage.diagnostic_error ~operation:"activateSnapshot" error)
   | Ok connection ->
     let callbacks = Storage.connection_callbacks connection in
     (match Storage.startup_metadata connection, Storage.restore_database connection with
@@ -131,9 +131,9 @@ let inspect_database database_path graph_id =
              | Ambiguous_sync_state -> "The downloaded graph has an invalid synchronization identity."
              | Unsupported_value -> "The downloaded graph contains unsupported values."
              | Corrupt_storage -> "The downloaded graph storage is corrupt."))
-     | Error _, _ | _, Error _ ->
+     | Error error, _ | _, Error error ->
        ignore (Storage.close callbacks);
-       Error "snapshot SQLite storage is corrupt")
+       Error (Storage.diagnostic_error ~operation:"activateSnapshot" error))
 ;;
 
 let stage ~root ~graph_id ~snapshot_path ~expected_rows =
@@ -146,7 +146,9 @@ let stage ~root ~graph_id ~snapshot_path ~expected_rows =
     Error message
   in
   match import_snapshot_rows ~snapshot_path ~expected_rows database_path with
-  | Error _ -> cleanup "The downloaded graph snapshot could not be imported."
+  | Error source ->
+    cleanup (Logseq_db_types.Failure_diagnostic.of_source ~operation:"activateSnapshot" ~reason:"parseFailed" source
+             |> Logseq_db_types.Failure_diagnostic.encode)
   | Ok () ->
     (match inspect_database database_path graph_id with
      | Error message -> cleanup message
@@ -326,10 +328,10 @@ let persist_database staged database metadata =
            Error message
          | Ok batch ->
            (match Storage.commit_batch callbacks batch with
-            | Error _ -> Error "snapshot database commit failed"
+            | Error error -> Error (Storage.diagnostic_error ~operation:"activateSnapshot" error)
             | Ok () ->
               (match Storage.commit_sync_metadata callbacks metadata with
-               | Error _ -> Error "snapshot metadata commit failed"
+               | Error error -> Error (Storage.diagnostic_error ~operation:"activateSnapshot" error)
                | Ok () -> Ok ()))
        with
        | exn ->

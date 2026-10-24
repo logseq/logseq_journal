@@ -1,13 +1,15 @@
 (** A bounded diagnostic containing no transaction values or exception text.
     String descriptors are reduced to finite allowlists by [create].
     [Application] records use [Application_exception] and omit [operation_index];
-    other stages do not use that reason. Invalid decoded combinations fail closed. *)
+    other stages do not use that reason. Integrity uses [integrity] and its
+    separate versioned carrier. Invalid decoded combinations fail closed. *)
 type t
 
 type stage =
   | Prepare
   | Decode
   | Application
+  | Integrity
 
 type reason =
   | Transit_syntax
@@ -62,3 +64,11 @@ val decode : string -> t option
 val message : t -> string
 val detail_name : string
 val signal_prefix : string
+
+(** Integrity reason and context are reduced to finite descriptors and bounded
+    counters. Cursors are canonical nonnegative decimal int64 strings. *)
+val integrity : reason:string -> ?context:(string * string) list -> unit -> t
+
+val integrity_of_source : string -> t
+val with_integrity_context : (string * string) list -> t -> t
+val integrity_signal_prefix : string

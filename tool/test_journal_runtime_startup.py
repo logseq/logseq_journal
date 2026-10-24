@@ -22,9 +22,9 @@ def run(c):subprocess.run(c,cwd=W,check=True)
 flags=['-swift-version','6','-module-cache-path',str(W/'modules')]
 run(['xcrun','swiftc',*flags,'-emit-module','-emit-library','-module-name','LUIAppleBackend',str(W/'Backend.swift'),'-o',str(W/'libLUIAppleBackend.dylib')])
 run(['xcrun','clang','-c',str(W/'bridge.c'),'-o',str(W/'bridge.o')])
-run(['xcrun','swiftc',*flags,'-Xfrontend','-disable-sandbox','-I',str(W),'-L',str(W),'-lLUIAppleBackend','-Xlinker','-rpath','-Xlinker',str(W),str(source.resolve()),str(W/'Tests.swift'),str(W/'bridge.o'),'-o',str(W/'tests')])
+run(['xcrun','swiftc',*flags,'-Xfrontend','-disable-sandbox','-I',str(W),'-L',str(W),'-lLUIAppleBackend','-Xlinker','-rpath','-Xlinker',str(W),str(ROOT/'swift/JournalSafeDiagnostic.swift'),str(ROOT/'swift/JournalPlatformWire.swift'),str(source.resolve()),str(W/'Tests.swift'),str(W/'bridge.o'),'-o',str(W/'tests')])
 rows=[]
-for scenario in ['normal','worker','multiple','repeated-start','rejected','patch-failure','stopped','cancelled','stale-cancel','nil-response']:
+for scenario in ['normal','worker','multiple','repeated-start','rejected','patch-failure','stopped','cancelled','stale-cancel','nil-response','same-tag']:
  r=subprocess.run([str(W/'tests'),scenario],capture_output=True,text=True,timeout=20)
  rows.append(r.returncode);print(scenario,r.returncode,r.stdout.strip(),r.stderr.splitlines()[:1],flush=True)
 

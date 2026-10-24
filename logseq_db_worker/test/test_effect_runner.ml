@@ -14,7 +14,7 @@ let account ?(generation = 1) user_id : Sync.account_scope =
 
 module Sync_runner = Logseq_sync_effect_runner.Effect_runner
 
-let asset_io_runner ~env ~sw ~support ~post =
+let asset_io_runner ?on_asset_diagnostic ?(token_failure = "test must not use network") ~env ~sw ~support ~post () =
   let module R = Sync_runner in
   let dependencies =
     R.dependencies
@@ -62,11 +62,28 @@ let asset_io_runner ~env ~sw ~support ~post =
          |> Result.get_ok)
       ~id_token_provider:
         (R.id_token_provider
-           ~acquire:(fun _ -> Error "test must not use network")
+           ~acquire:(fun _ -> Error token_failure)
            ~invalidate:(fun _ ~token:_ -> ()))
     |> Result.get_ok
   in
-  R.create ~sw dependencies ~post |> Result.get_ok
+  R.create ?on_asset_diagnostic ~sw dependencies ~post |> Result.get_ok
+;;
+
+let failure_details outputs =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  List.filter_map
+    (function
+      | Core.Diagnostic signal when String.starts_with ~prefix:D.signal_prefix signal ->
+        D.decode (String.sub signal (String.length D.signal_prefix)
+          (String.length signal - String.length D.signal_prefix))
+      | _ -> None)
+    outputs
+;;
+
+let has_failure_reason outputs operation reason =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  List.exists (fun detail -> D.operation detail = operation && D.reason detail = reason)
+    (failure_details outputs)
 ;;
 
 let test_unlock_runner_logging () =
@@ -89,7 +106,7 @@ let test_unlock_runner_logging () =
         let completions = ref [] in
         let runner = asset_io_runner ~env ~sw
           ~support:fixture.config.application_support_directory
-          ~post:(fun event -> completions := event :: !completions) in
+          ~post:(fun event -> completions := event :: !completions) () in
         let limits = Sync.limits ~maximum_response_bytes:1024 ~maximum_artifact_bytes:1024
           ~submission_batch_size:1 |> Result.get_ok in
         let config = Sync.config ~managed_sync_origin:(Uri.of_string "https://example.invalid")
@@ -599,10 +616,13 @@ let with_asset_bridge run =
         io_runner
         := Some
              (asset_io_runner
+                ~on_asset_diagnostic:(fun ~scope ~operation ~request_operation detail ->
+                  Runner.report_asset_diagnostic (Option.get !active_runner)
+                    ~scope ~operation ~request_operation detail)
                 ~env
                 ~sw
                 ~support:fixture.config.application_support_directory
-                ~post:(fun event -> post (Core.Sync_event event)));
+                ~post:(fun event -> post (Core.Sync_event event)) ());
         let sync_runner =
           Runner.sync_runner
             ~submit:(fun runnable -> Sync_runner.submit (Option.get !io_runner) runnable)
@@ -851,7 +871,7 @@ let test_db_shutdown_accepts_late_staging_completion () =
             Db.post (Option.get !db) (Core.Sync_event event)
           | event -> Db.post (Option.get !db) (Core.Sync_event event)
         in
-        io_runner := Some (asset_io_runner ~env ~sw ~support ~post);
+        io_runner := Some (asset_io_runner ~env ~sw ~support ~post ());
         let sync_runner =
           Runner.sync_runner
             ~submit:(function
@@ -1002,6 +1022,7 @@ let test_upload_checkpoint_io ?(closed_stderr = false) () =
     |> Result.get_ok
   in
   let state, instructions = U.step (U.create ~scope ~available:true) (Start intent) in
+  let active_upload = ref state in
   let instruction = List.hd instructions in
   T.with_managed (fun fixture ->
     Eio_main.run (fun env ->
@@ -1021,6 +1042,16 @@ let test_upload_checkpoint_io ?(closed_stderr = false) () =
         in
         let stage_calls = ref 0 in
         let active_runner = ref None in
+        let source_diagnostic ~scope ~operation ~request_operation detail =
+          let runner = Option.get !active_runner in
+          Runner.report_asset_diagnostic runner ~scope ~operation ~request_operation detail;
+          let wrong = Logseq_db_types.Failure_diagnostic.create ~operation ~reason:"unknown" () in
+          Runner.report_asset_diagnostic runner ~scope:{scope with graph_id=uuid 90}
+            ~operation ~request_operation wrong;
+          Runner.report_asset_diagnostic runner ~scope ~operation
+            ~request_operation:(request_operation ^ "-unrelated") wrong;
+          Runner.report_asset_diagnostic runner ~scope ~operation:"workerOperation"
+            ~request_operation wrong in
         let bridge_requests = ref 0 in
         let bridge_outputs = ref 0 in
         let io_runner = ref None in
@@ -1053,10 +1084,12 @@ let test_upload_checkpoint_io ?(closed_stderr = false) () =
         io_runner
         := Some
              (asset_io_runner
+                ~on_asset_diagnostic:source_diagnostic
+                ~token_failure:(Printexc.to_string (Unix.Unix_error (Unix.EACCES,"open","PRIVATE_TOKEN_SOURCE")))
                 ~env
                 ~sw
                 ~support:fixture.config.application_support_directory
-                ~post:(fun event -> post (Core.Sync_event event)));
+                ~post:(fun event -> post (Core.Sync_event event)) ());
         let sync_runner =
           Runner.sync_runner
             ~submit:(fun runner_effect ->
@@ -1086,7 +1119,7 @@ let test_upload_checkpoint_io ?(closed_stderr = false) () =
             dependencies
             ~post
             ~recovery_current:(fun _ -> false)
-            ~upload_current:(fun ticket -> !current && U.ticket_current state ticket)
+            ~upload_current:(fun ticket -> !current && U.ticket_current !active_upload ticket)
             ~asset_current:(fun ticket -> !transfer_ticket = Some ticket)
           |> Result.get_ok
         in
@@ -1276,6 +1309,91 @@ let test_upload_checkpoint_io ?(closed_stderr = false) () =
           "duplicate import never recopies picker source"
           1
           !stage_calls;
+        (* A real changed staged file fails in the sync interpreter before PUT;
+           the Worker must keep that reason while retaining Invalid_content. *)
+        let uploading = I.advance prepared Local_committed |> Result.get_ok
+          |> fun i -> I.advance i Uploading |> Result.get_ok in
+        let upload_state, observe = U.step (U.create ~scope ~available:true) (Restore uploading) in
+        let observe = match observe with [U.Inspect (ticket, _)] -> ticket
+          | _ -> Alcotest.fail "upload restore must inspect" in
+        let upload_state, put = U.step upload_state (Completed (observe, Inspected Local_present)) in
+        let put = match put with [U.Put _ as instruction] -> instruction
+          | _ -> Alcotest.fail "upload restore must resume PUT" in
+        active_upload := upload_state;
+        current := true;
+        Runner.submit runner (Core.Publish (Core.Sync_output (Sync.State_changed (Sync.state !sync_state))));
+        published := []; posted := [];
+        let original_path = staged_path prepared.staged_file in
+        Out_channel.with_open_bin original_path (fun output -> output_string output "changed fixture bytes");
+        Fun.protect
+          ~finally:(fun () -> Out_channel.with_open_bin original_path (fun output -> output_string output "file"))
+          (fun () ->
+            Runner.submit runner (Core.Run_upload (context, put));
+            Alcotest.(check bool) "PUT failure keeps original result category" true
+              (List.exists (function Core.Upload_completed (_, U.Failed U.Invalid_content) -> true | _ -> false) !posted);
+            if not closed_stderr then Alcotest.(check bool) "failure detail waits for its owner notice" false
+              (List.exists (fun detail -> Logseq_db_types.Failure_diagnostic.operation detail = "assetUpload")
+                (failure_details !published));
+            Runner.submit runner (Core.Publish (Core.Asset_notice (scope, Core.Upload_status
+              {operation=prepared.operation_id;asset=prepared.asset;target=prepared.target;title=prepared.title;
+               status=U.Failed_upload U.Invalid_content})));
+            if not closed_stderr then Alcotest.(check bool) "PUT failure has a safe scoped reason" true
+              (List.exists (fun detail -> Logseq_db_types.Failure_diagnostic.operation detail = "assetUpload")
+                (failure_details !published)));
+        let put_ticket = match put with U.Put (ticket, _) -> ticket | _ -> assert false in
+        let retry_state, _ = U.step upload_state (Completed (put_ticket, Failed Invalid_content)) in
+        let retry_state, retried = U.step retry_state Retry in
+        let retried = match retried with [U.Put _ as instruction] -> instruction
+          | _ -> Alcotest.fail "PUT retry must remain PUT" in
+        active_upload := retry_state;
+        published := []; posted := [];
+        Runner.submit runner (Core.Run_upload (context, retried));
+        Alcotest.(check bool) "token failure keeps authentication result" true
+          (List.exists (function Core.Upload_completed (_, U.Failed U.Authentication) -> true | _ -> false) !posted);
+        Runner.submit runner (Core.Publish (Core.Asset_notice (scope, Core.Upload_status
+          {operation=prepared.operation_id;asset=prepared.asset;target=prepared.target;title=prepared.title;
+           status=U.Failed_upload U.Authentication})));
+        Alcotest.(check bool) "exact active request keeps safe token source class" true
+          (List.exists (fun detail -> Logseq_db_types.Failure_diagnostic.operation detail="assetUpload"
+            && Logseq_db_types.Failure_diagnostic.source_class detail="io-permission") (failure_details !published));
+        (* Real transfer policy fans a terminal failure out to every consumer.
+           Every notice must be followed by the same current safe cause. *)
+        let remote_asset = uuid 71 in
+        let remote_version = Logseq_db_types.Asset_descriptor.version
+          ~checksum:(String.make 64 'b') ~file_type:"png" |> Result.get_ok in
+        let descriptor = Logseq_db_types.Asset_descriptor.create ~uuid:remote_asset
+          ~source:(Managed (Some remote_version)) ~current_checksum:None ~size:None ~dimensions:None
+          |> Result.get_ok in
+        let transfer = Transfer.create
+          (Transfer.config ~active:2 ~foreground_reserved:1 ~pending:3 ~retries:0 |> Result.get_ok)
+          ~scope ~online:true ~unlocked:true in
+        let transfer, work = Transfer.step transfer (Replace {consumer="first-view";priority=Foreground;assets=[descriptor]}) in
+        let transfer, _ = Transfer.step transfer (Replace {consumer="second-view";priority=Foreground;assets=[descriptor]}) in
+        let remote_lookup = List.find_map (function Transfer.Check_cache ticket -> Some ticket | _ -> None) work |> Option.get in
+        transfer_ticket := Some (Transfer.Lookup remote_lookup); posted := [];
+        Runner.submit runner (Core.Run_asset (context, Transfer.Check_cache remote_lookup));
+        let completion = List.find_map (function Core.Asset_completed (_, event) -> Some event | _ -> None) !posted |> Option.get in
+        let transfer, work = Transfer.step transfer completion in
+        let fetch = List.find_map (function Transfer.Fetch ticket -> Some ticket | _ -> None) work |> Option.get in
+        transfer_ticket := Some (Transfer.Download fetch); posted := [];
+        Runner.submit runner (Core.Run_asset (context, Transfer.Fetch fetch));
+        let completion = List.find_map (function Core.Asset_completed (_, event) -> Some event | _ -> None) !posted |> Option.get in
+        let _, work = Transfer.step transfer completion in
+        let failures = List.filter_map (function
+          | Transfer.Notify {consumer;asset;availability=Failed _ as availability} ->
+            Some (Core.Asset_availability {consumer;asset;availability})
+          | _ -> None) work in
+        Alcotest.(check int) "real terminal failure notifies both consumers" 2 (List.length failures);
+        List.iter (fun notice ->
+          published := [];
+          Runner.submit runner (Core.Publish (Core.Asset_notice (scope, notice)));
+          let latest = match !published with output::_ -> failure_details [output] | [] -> [] in
+          Alcotest.(check bool) "each failed consumer notice keeps its exact safe cause last" true
+            (List.exists (fun detail -> Logseq_db_types.Failure_diagnostic.operation detail="assetDownload"
+              && Logseq_db_types.Failure_diagnostic.source_class detail="io-permission") latest)) failures;
+        transfer_ticket := None;
+        active_upload := state;
+        current := false;
         Alcotest.(check bool)
           "changed identity payload is rejected"
           true
@@ -1368,10 +1486,13 @@ let test_upload_checkpoint_io ?(closed_stderr = false) () =
         io_runner
         := Some
              (asset_io_runner
+                ~on_asset_diagnostic:(fun ~scope ~operation ~request_operation detail ->
+                  Runner.report_asset_diagnostic (Option.get !active_runner)
+                    ~scope ~operation ~request_operation detail)
                 ~env
                 ~sw
                 ~support:fixture.config.application_support_directory
-                ~post:(fun event -> post (Core.Sync_event event)));
+                ~post:(fun event -> post (Core.Sync_event event)) ());
         let restarted =
           Runner.create
             ~sw
@@ -1413,6 +1534,25 @@ let test_upload_checkpoint_io ?(closed_stderr = false) () =
           !bridge_requests
           !bridge_outputs;
         Alcotest.(check bool) "asset bridge exercised" true (!bridge_requests > 0);
+        (* Real malformed private checkpoint schema: optional preview stays None
+           while the current graph receives only a safe storage class. *)
+        let db = Sqlite3.db_open checkpoint_path in
+        Sqlite3.Rc.check (Sqlite3.exec db
+          "DROP TABLE asset_upload_intents; CREATE TABLE asset_upload_intents (PRIVATE_COLUMN TEXT)");
+        ignore (Sqlite3.db_close db);
+        Runner.submit restarted (Core.Publish (Core.Sync_output (Sync.State_changed (Sync.state !sync_state))));
+        published := [];
+        Alcotest.(check bool) "bad metadata keeps optional preview unavailable" true
+          (Runner.retain_imported_file restarted ~scope ~operation:source.operation = None);
+        Alcotest.(check bool) "bad metadata keeps its storage reason" true
+          (List.exists (fun detail ->
+            Logseq_db_types.Failure_diagnostic.operation detail = "assetMetadata"
+            && Logseq_db_types.Failure_diagnostic.source_class detail = "sqlite-schema")
+            (failure_details !published));
+        List.iter (fun detail ->
+          Alcotest.(check bool) "metadata diagnostic excludes raw column/path" false
+            (let encoded = Logseq_db_types.Failure_diagnostic.encode detail in
+             String.contains encoded '/' || String.contains encoded 'P')) (failure_details !published);
         Runner.shutdown restarted)))
 ;;
 
@@ -1590,6 +1730,8 @@ let deletion_runtime_fixture ?deletion_case ?(journal_failure = false)
             Alcotest.(check int) "journal failure never retires assets" 0 !destructive_requests;
             Alcotest.(check bool) "journal failure preserves target mirror" true (Sys.file_exists first_database_path);
             Alcotest.(check bool) "current graph Worker stays open" true ((Db.graph_state db).phase = Db.Graph_open);
+            Alcotest.(check bool) "journal IO failure has a safe deletion reason" true
+              (has_failure_reason !published "deleteMirror" "deleteFailed");
             post (Sync.Catalog_refresh_requested
               (let f=(Db.view db).sync.snapshot.startup in
                {account_generation=f.account_generation;presentation_generation=f.presentation_generation}));
@@ -1601,6 +1743,8 @@ let deletion_runtime_fixture ?deletion_case ?(journal_failure = false)
               Alcotest.(check bool) "busy mirror reports failure" true
                 (Result.is_error (Db.delete_local_copy db ~account_generation:generation ~graph_id:first));
               Alcotest.(check int) "busy mirror never starts destructive asset work" 0 !destructive_requests;
+              Alcotest.(check bool) "busy mirror retains safe ownership reason" true
+                (has_failure_reason !published "deleteMirror" "busy");
               Alcotest.(check bool) "busy mirror remains usable" true (Sys.file_exists first_database_path)))
           else (
           let result, resolve = Eio.Promise.create () in
@@ -1768,6 +1912,121 @@ let test_authoritative_rejection_diagnostics kind () =
         |> Result.get_ok;
         Logseq_db_storage.Sync_outbox_store.initialize_database sqlite |> Result.get_ok;
         ignore (Sqlite3.db_close sqlite);
+        (match kind with
+         | `Integrity ->
+           let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+           let module Session = Logseq_db_storage.Storage_session in
+           let storage =
+             Storage.open_database (Filename.concat directory "db.sqlite")
+             |> Result.get_ok
+           in
+           let db = Storage.restore_database storage |> Result.get_ok in
+           let session =
+             Session.create
+               ~tail:
+                 (Datascript.Storage.restore_tail_groups
+                    (Storage.datascript_storage storage))
+               ~callbacks:(Storage.connection_callbacks storage)
+           in
+           let block = Datascript.Temp_id "diagnostic-synthetic-block" in
+           let page =
+             Datascript.Lookup_ref
+               ("block/uuid", Datascript.Uuid "11111111-1111-4111-8111-111111111111")
+           in
+           let staged =
+             Session.stage_transact
+               session
+               ~authoritative_before:db
+               [ Datascript.Add
+                   (block, "block/uuid", Uuid "22222222-2222-4222-8222-222222222224")
+               ; Add (block, "block/title", String "Synthetic initial block")
+               ; Add (block, "block/parent", Ref_to page)
+               ; Add (block, "block/page", Ref_to page)
+               ; Add (block, "block/order", String "a00000001")
+               ; Add (block, "block/created-at", Int64 1700000000000L)
+               ; Add (block, "block/updated-at", Int64 1700000000000L)
+               ]
+             |> Result.get_ok
+           in
+           Session.commit_staged session staged |> Result.get_ok;
+           Session.close session |> Result.get_ok;
+           let module O = Logseq_overlay_db.Types in
+           let module DB = Logseq_overlay_db.Database in
+           let inspection =
+             DB.inspect_mirror ~application_support_directory:root ~graph_id
+             |> Result.get_ok
+           in
+           let database =
+             DB.open_ ~sw fixture.overlay inspection ~graph_name:graph.name
+             |> Result.get_ok
+           in
+           Fun.protect
+             ~finally:(fun () -> ignore (DB.close database))
+             (fun () ->
+                let block =
+                  G.Uuid.of_string "22222222-2222-4222-8222-222222222224" |> Result.get_ok
+                in
+                let mutation_id =
+                  G.Uuid.of_string "94000000-0000-4000-8000-000000000709" |> Result.get_ok
+                in
+                let snapshot = DB.current_snapshot database |> Result.get_ok in
+                let revision =
+                  match DB.get_outline_blocks snapshot [ block ] |> Result.get_ok with
+                  | [ O.Present_block { revision; _ } ] -> revision
+                  | _ -> Alcotest.fail "synthetic block missing"
+                in
+                DB.release_snapshot snapshot;
+                let expected =
+                  DB.write_precondition ~blocks:[ block, revision ] ~pages:[] ~scopes:[]
+                  |> Result.get_ok
+                in
+                ignore
+                  (DB.commit_local
+                     database
+                     ~expected
+                     (O.Save_block
+                        { mutation_id; block; title = "PRIVATE_SYNTHETIC_PAYLOAD" })
+                   |> Result.get_ok);
+                let sync = DB.inspect_sync database |> Result.get_ok in
+                let prepared, crypto =
+                  DB.begin_outbox_transition
+                    database
+                    ~expected:(O.sync_view_token sync)
+                    (O.Submit_group [ mutation_id ])
+                  |> Result.get_ok
+                in
+                let crypto = Option.get crypto in
+                let encrypted =
+                  DB.protection_plaintexts crypto
+                  |> List.map (fun (id, plain) -> id, "synthetic:" ^ plain)
+                in
+                let commit =
+                  DB.apply_outbox_transition
+                    database
+                    prepared
+                    ~encrypted:(Some (crypto, encrypted))
+                  |> Result.get_ok
+                in
+                let batch = Option.get commit.submission_batch in
+                let sync = DB.inspect_sync database |> Result.get_ok in
+                let barrier =
+                  O.
+                    { through = cursor 1L
+                    ; checksum =
+                        Checksum.of_string "checksum:v1:0123456789abcdef" |> Result.get_ok
+                    }
+                in
+                let prepared, _ =
+                  DB.begin_outbox_transition
+                    database
+                    ~expected:(O.sync_view_token sync)
+                    (O.Accept_group { batch_id = O.submission_batch_id batch; barrier })
+                  |> Result.get_ok
+                in
+                ignore
+                  (DB.apply_outbox_transition database prepared ~encrypted:None
+                   |> Result.get_ok))
+         | _ -> ());
         let limits =
           Sync.limits
             ~maximum_response_bytes:
@@ -1837,7 +2096,13 @@ let test_authoritative_rejection_diagnostics kind () =
              | _ -> ());
             let transition = Core.step !state event in
             state := transition.next;
-            List.iter (Runner.submit runner) transition.effects
+            List.iter
+              (fun instruction ->
+                 (match instruction with
+                  | Core.Publish (Core.Reply _ as reply) -> emitted := reply :: !emitted
+                  | _ -> ());
+                 Runner.submit runner instruction)
+              transition.effects
           done
         in
         Fun.protect
@@ -1859,6 +2124,24 @@ let test_authoritative_rejection_diagnostics kind () =
              drive (Core.Sync_event (Sync.Websocket_opened connection));
              let t, payload, code, category, message, checks =
                match kind with
+               | `Integrity ->
+                 ( 1L
+                 , "[]"
+                 , Error.Ambiguous_sync_state
+                 , "authoritativeIntegrityFailure"
+                 , None
+                 , [ "reason=payload-mismatch"
+                   ; "checkpoint=0"
+                   ; "through=1"
+                   ; "expectedCursor=1"
+                   ; "tBefore=0"
+                   ; "ordinal=0"
+                   ; "count=1"
+                   ; "outboxState=accepted"
+                   ; "mutation=save-block"
+                   ; "expectedDatoms="
+                   ; "actualDatoms="
+                   ] )
                | `Cursor ->
                  ( 2L
                  , "[[\"~:db/retractEntity\",99999]]"
@@ -1905,121 +2188,212 @@ let test_authoritative_rejection_diagnostics kind () =
                (Core.Sync_event
                   (Sync.Websocket_message
                      (connection, Pull_ok { t = cursor t; checksum = None; txs })));
-             let empty_success=match kind with `Detail (("empty"|"second-transaction"),_,_) -> true | _ -> false in
-             if empty_success then (
-               Alcotest.(check bool) "legal empty authoritative batch succeeds" true (!failures=[]);
-               Alcotest.(check bool) "empty cursor reaches actual manager" true
-                 ((Core.view !state).sync.snapshot.applied_server_t=Some(cursor t));
-               Alcotest.(check (option string)) "successful empty pull has no Last error" None
-                 (Core.view !state).sync.snapshot.last_error;
-               Alcotest.(check bool) "successful empty pull keeps graph open" true
-                 ((Core.view !state).graph.phase=Graph_open)) else (
-             let error =
-               match !failures with
-               | [ error ] -> error
-               | _ -> Alcotest.fail "expected actual authoritative failure"
+             let empty_success =
+               match kind with
+               | `Detail (("empty" | "second-transaction"), _, _) -> true
+               | _ -> false
              in
-             Alcotest.(check bool)
-               "failure code reflects actual category"
-               true
-               (Error.code error = code);
-             let message_text = Error.message error in
-             let includes text needle =
-               let rec loop i =
-                 i + String.length needle <= String.length text
-                 && (String.sub text i (String.length needle) = needle || loop (i + 1))
-               in
-               loop 0
-             in
-             Option.iter
-               (fun expected ->
-                  Alcotest.(check string)
-                    "producer retains a fixed safe reason"
-                    expected
-                    message_text)
-               message;
-             List.iter
-               (fun expected ->
-                  let absent = String.starts_with ~prefix:"!" expected in
-                  let part =
-                    if absent
-                    then String.sub expected 1 (String.length expected - 1)
-                    else expected
-                  in
-                  Alcotest.(check bool)
-                    ("safe detail " ^ expected)
-                    (not absent)
-                    (includes message_text part))
-               checks;
-             Alcotest.(check (option string))
-               "typed origin retains category"
-               (Some category)
-               (Error.trace error).origin.code;
-             Alcotest.(check (option string))
-               "actual Last error retains category"
-               (Some message_text)
-               (Core.view !state).sync.snapshot.last_error;
-             Alcotest.(check bool)
-               "actual Worker diagnostic retains category"
-               true
-               (List.exists
-                  (function
-                    | Core.Diagnostic signal ->
-                      String.starts_with
-                        ~prefix:("worker.applyAuthoritative." ^ category)
-                        signal
-                    | _ -> false)
-                  !emitted);
-             if checks <> []
-             then
+             if empty_success
+             then (
                Alcotest.(check bool)
-                 "validated detail travels in actual diagnostic signal"
+                 "legal empty authoritative batch succeeds"
+                 true
+                 (!failures = []);
+               Alcotest.(check bool)
+                 "empty cursor reaches actual manager"
+                 true
+                 ((Core.view !state).sync.snapshot.applied_server_t = Some (cursor t));
+               Alcotest.(check (option string))
+                 "successful empty pull has no Last error"
+                 None
+                 (Core.view !state).sync.snapshot.last_error;
+               Alcotest.(check bool)
+                 "successful empty pull keeps graph open"
+                 true
+                 ((Core.view !state).graph.phase = Graph_open))
+             else (
+               let error =
+                 match !failures with
+                 | [ error ] -> error
+                 | _ -> Alcotest.fail "expected actual authoritative failure"
+               in
+               Alcotest.(check bool)
+                 "failure code reflects actual category"
+                 true
+                 (Error.code error = code);
+               let message_text = Error.message error in
+               let includes text needle =
+                 let rec loop i =
+                   i + String.length needle <= String.length text
+                   && (String.sub text i (String.length needle) = needle || loop (i + 1))
+                 in
+                 loop 0
+               in
+               Option.iter
+                 (fun expected ->
+                    Alcotest.(check string)
+                      "producer retains a fixed safe reason"
+                      expected
+                      message_text)
+                 message;
+               List.iter
+                 (fun expected ->
+                    let absent = String.starts_with ~prefix:"!" expected in
+                    let part =
+                      if absent
+                      then String.sub expected 1 (String.length expected - 1)
+                      else expected
+                    in
+                    Alcotest.(check bool)
+                      ("safe detail " ^ expected)
+                      (not absent)
+                      (includes message_text part))
+                 checks;
+               Alcotest.(check (option string))
+                 "typed origin retains category"
+                 (Some category)
+                 (Error.trace error).origin.code;
+               Alcotest.(check (option string))
+                 "actual Last error retains category"
+                 (Some message_text)
+                 (Core.view !state).sync.snapshot.last_error;
+               Alcotest.(check bool)
+                 "actual Worker diagnostic retains category"
                  true
                  (List.exists
                     (function
                       | Core.Diagnostic signal ->
-                        includes signal "authoritative-decode:v1:"
+                        String.starts_with
+                          ~prefix:("worker.applyAuthoritative." ^ category)
+                          signal
                       | _ -> false)
                     !emitted);
-             Alcotest.(check bool)
-               "failure precedes checkpoint advancement"
-               true
-               ((Core.view !state).sync.snapshot.applied_server_t = Some (cursor 0L));
-             let encoded =
-               Yojson.Safe.to_string (Error.to_yojson error)
-               ^ "\n"
-               ^ String.concat
-                   "\n"
-                   (List.filter_map
+               if checks <> []
+               then
+                 Alcotest.(check bool)
+                   "validated detail travels in actual diagnostic signal"
+                   true
+                   (List.exists
                       (function
-                        | Core.Diagnostic signal -> Some signal
+                        | Core.Diagnostic signal ->
+                          includes
+                            signal
+                            (match kind with
+                             | `Integrity -> "authoritative-integrity:v1:"
+                             | _ -> "authoritative-decode:v1:")
+                        | _ -> false)
+                      !emitted);
+               Alcotest.(check bool)
+                 "failure precedes checkpoint advancement"
+                 true
+                 ((Core.view !state).sync.snapshot.applied_server_t = Some (cursor 0L));
+               (match kind with
+                | `Integrity ->
+                  let module P = Logseq_db_worker.Protocol in
+                  drive
+                    (Core.Graph_request
+                       { id = Core.request_id_of_int64 3L
+                       ; request =
+                           { P.api_version = P.api_version
+                           ; request_id =
+                               G.Uuid.of_string "94000000-0000-4000-8000-000000000710"
+                               |> Result.get_ok
+                           ; command = P.V2_inspect_admission
+                           }
+                       });
+                  let active =
+                    List.find_map
+                      (function
+                        | Core.Reply
+                            ( _
+                            , P.V2_response
+                                { outcome = V2_admission_outcome { active_records; _ }
+                                ; _
+                                } ) -> Some active_records
                         | _ -> None)
-                      !emitted)
-             in
-             let contains needle =
-               let rec loop i =
-                 i + String.length needle <= String.length encoded
-                 && (String.sub encoded i (String.length needle) = needle || loop (i + 1))
+                      !emitted
+                    |> Option.get
+                  in
+                  Alcotest.(check int) "failed validation retains durable outbox" 1 active;
+                  Option.iter
+                    (fun path ->
+                       let signal =
+                         List.find_map
+                           (function
+                             | Core.Diagnostic s
+                               when String.starts_with
+                                      ~prefix:
+                                        "worker.applyAuthoritative.authoritativeIntegrityFailure:"
+                                      s -> Some s
+                             | _ -> None)
+                           !emitted
+                         |> Option.get
+                       in
+                       let groups =
+                         (Core.view !state).sync.diagnostics.groups
+                         |> List.filter_map (fun (g : Sync.diagnostic_group) ->
+                           if g.title = "Sync transactions"
+                           then
+                             Some
+                               (`Assoc
+                                   [ "title", `String g.title
+                                   ; ( "entries"
+                                     , `List
+                                         (List.map
+                                            (fun (k, v) -> `List [ `String k; `String v ])
+                                            g.entries) )
+                                   ])
+                           else None)
+                       in
+                       Yojson.Safe.to_file
+                         path
+                         (`Assoc
+                             [ "lastError", `String message_text
+                             ; "signal", `String signal
+                             ; "outboxRecords", `Int active
+                             ; "groups", `List groups
+                             ]))
+                    (Sys.getenv_opt "JOURNAL_DIAGNOSTIC_FIXTURE_OUTPUT")
+                | _ -> ());
+               let encoded =
+                 Yojson.Safe.to_string (Error.to_yojson error)
+                 ^ "\n"
+                 ^ String.concat
+                     "\n"
+                     (List.filter_map
+                        (function
+                          | Core.Diagnostic signal -> Some signal
+                          | _ -> None)
+                        !emitted)
                in
-               loop 0
-             in
-             List.iter
-               (fun secret ->
-                  Alcotest.(check bool) "source content excluded" false (contains secret))
-               ([ root
-                ; "PRIVATE_SYNTHETIC_PAYLOAD"
-                ; "99999999-9999-4999-8999-999999999999"
-                ; "Nothing found"
-                ; "Cannot store nil"
-                ]
-                @ if String.length payload > 30 then [ payload ] else []))))))
+               let contains needle =
+                 let rec loop i =
+                   i + String.length needle <= String.length encoded
+                   && (String.sub encoded i (String.length needle) = needle || loop (i + 1)
+                      )
+                 in
+                 loop 0
+               in
+               List.iter
+                 (fun secret ->
+                    Alcotest.(check bool)
+                      "source content excluded"
+                      false
+                      (contains secret))
+                 ([ root
+                  ; "PRIVATE_SYNTHETIC_PAYLOAD"
+                  ; "99999999-9999-4999-8999-999999999999"
+                  ; "Nothing found"
+                  ; "Cannot store nil"
+                  ]
+                  @ if String.length payload > 30 then [ payload ] else []))))))
 ;;
-
 
 let () =
   Alcotest.run
     "logseq db worker effect runner"
     [ ( "authoritative diagnostics", [
+        Alcotest.test_case "real own echo mismatch retains safe integrity reason" `Quick (test_authoritative_rejection_diagnostics `Integrity);
         Alcotest.test_case "real cursor rejection reaches Diagnostics" `Quick (test_authoritative_rejection_diagnostics `Cursor);
         Alcotest.test_case "real format rejection reaches Diagnostics" `Quick (test_authoritative_rejection_diagnostics `Format);
         Alcotest.test_case "apply format failure excludes raw source" `Quick (test_authoritative_rejection_diagnostics `Apply_format) ] @

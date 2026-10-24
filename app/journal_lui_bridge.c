@@ -22,6 +22,28 @@ typedef void (*journal_wakeup_callback)(void);
 typedef void (*journal_platform_request_callback)(const char *data,
                                                   int32_t length);
 
+/* Main-thread entries may synchronously reenter through a patch callback.
+   Each frame commits its own result AFTER callback delivery. The getter is
+   immediate and operation-matched; success clears a previous failure. */
+static _Thread_local int32_t failure_operation;
+static _Thread_local int32_t failure_reason;
+static int operation_for(const char *name) {
+  if (strcmp(name,"lui_ocaml_init")==0) return 1;
+  if (strcmp(name,"lui_ocaml_dispose")==0) return 2;
+  if (strcmp(name,"journal_ocaml_pump")==0) return 3;
+  if (strcmp(name,"journal_ocaml_platform_event")==0) return 4;
+  if (strcmp(name,"journal_ocaml_platform_response")==0) return 5;
+  if (strcmp(name,"journal_ocaml_platform_failure")==0) return 6;
+  if (strcmp(name,"lui_ocaml_root_node")==0) return 8;
+  return 7;
+}
+static void completed(int operation,int reason) {
+  failure_operation=operation; failure_reason=reason;
+}
+LUI_EXPORT int32_t journal_ocaml_failure_reason(int32_t operation) {
+  return operation == failure_operation ? failure_reason : 0;
+}
+
 static int runtime_started = 0;
 static lui_patch_callback patch_callback = NULL;
 static journal_wakeup_callback wakeup_callback = NULL;
@@ -34,18 +56,44 @@ static void report_ocaml_exception(const char *where, value result) {
   fprintf(stderr, "journal_lui_bridge: operation=%s code=ocamlCallbackFailed\n", where);
 }
 
+/* Only the OCaml owner's exact allowlist is queried. Never format an exception
+   or copy its body into the diagnostic channel. Classification itself may fail. */
+static int classify_exception(value result) {
+  const value *classify = caml_named_value("journal_ocaml_classify_exception");
+  if (classify == NULL) return 2;
+  CAMLparam0();
+  CAMLlocal2(exception, classified);
+  exception = Extract_exception(result);
+  classified = caml_callback_exn(*classify,exception);
+  int reason = 2;
+  if (!Is_exception_result(classified) && Is_long(classified)) {
+    int candidate = Int_val(classified);
+    if (candidate >= 5 && candidate <= 7) reason = candidate;
+  }
+  CAMLreturnT(int,reason);
+}
+
 typedef struct {
   int accepted;
   char *json;
   lui_patch_callback callback;
+  int operation;
+  int reason;
 } patch_response;
+
+static patch_response pending_response(const char *name, int invalid_input) {
+  patch_response response = {0,NULL,NULL,operation_for(name),invalid_input ? 4 : 1};
+  return response;
+}
 
 /* Called with the runtime held. Never hand an OCaml heap pointer to the host:
    applying a patch can synchronously dispatch another event and trigger GC. */
 static patch_response copy_patch(const char *where, value result) {
-  patch_response response = {0, NULL, patch_callback};
+  patch_response response = pending_response(where,0);
+  response.callback = patch_callback;
   if (Is_exception_result(result)) {
     report_ocaml_exception(where, result);
+    response.reason = classify_exception(result);
     return response;
   }
   size_t length = caml_string_length(result);
@@ -53,12 +101,14 @@ static patch_response copy_patch(const char *where, value result) {
     response.json = malloc(length + 1);
     if (response.json == NULL) {
       fprintf(stderr, "journal_lui_bridge: cannot copy patch in %s\n", where);
+      response.reason = 3;
       return response;
     }
     memcpy(response.json, String_val(result), length);
     response.json[length] = '\0';
   }
   response.accepted = 1;
+  response.reason = 0;
   return response;
 }
 
@@ -72,6 +122,7 @@ static int release_and_deliver(patch_response response) {
     response.callback(response.json);
     free(response.json);
   }
+  completed(response.operation,response.reason);
   return response.accepted;
 }
 
@@ -100,6 +151,7 @@ LUI_EXPORT int32_t lui_ocaml_start(
   const value *initialize = caml_named_value("lui_ocaml_init");
   if (initialize == NULL) {
     caml_enter_blocking_section();
+    completed(1,1);
     return 0;
   }
   CAMLparam0();
@@ -116,7 +168,7 @@ LUI_EXPORT int32_t lui_ocaml_start(
 }
 
 static int dispatch_long(const char *name, int64_t node) {
-  patch_response response = {0, NULL, NULL};
+  patch_response response = pending_response(name,0);
   caml_leave_blocking_section();
   const value *dispatch = caml_named_value(name);
   if (dispatch != NULL) {
@@ -142,7 +194,7 @@ LUI_EXPORT int32_t lui_ocaml_long_press(int64_t node) {
 static int dispatch_pointer(const char *name, int64_t node, double x, double y,
                             int32_t modifiers, int32_t button,
                             const char *target_class) {
-  patch_response response = {0, NULL, NULL};
+  patch_response response = pending_response(name,target_class == NULL);
   caml_leave_blocking_section();
   const value *dispatch = caml_named_value(name);
   if (dispatch != NULL && target_class != NULL) {
@@ -183,7 +235,7 @@ LUI_EXPORT int32_t lui_ocaml_pointer_leave(int64_t node) {
 }
 
 static int dispatch_string(const char *name, int64_t node, const char *text) {
-  patch_response response = {0, NULL, NULL};
+  patch_response response = pending_response(name,text == NULL);
   caml_leave_blocking_section();
   const value *dispatch = caml_named_value(name);
   if (dispatch != NULL && text != NULL) {
@@ -214,7 +266,7 @@ LUI_EXPORT int32_t lui_ocaml_double_press(int64_t node) {
 }
 
 LUI_EXPORT int32_t lui_ocaml_toggle_changed(int64_t node, int32_t checked) {
-  patch_response response = {0, NULL, NULL};
+  patch_response response = pending_response("lui_ocaml_toggle_changed",0);
   caml_leave_blocking_section();
   const value *dispatch = caml_named_value("lui_ocaml_toggle_changed");
   if (dispatch != NULL) {
@@ -229,7 +281,7 @@ LUI_EXPORT int32_t lui_ocaml_radio_changed(int64_t node) {
 }
 
 LUI_EXPORT int32_t lui_ocaml_slider_changed(int64_t node, double fraction) {
-  patch_response response = {0, NULL, NULL};
+  patch_response response = pending_response("lui_ocaml_slider_changed",0);
   caml_leave_blocking_section();
   const value *dispatch = caml_named_value("lui_ocaml_slider_changed");
   if (dispatch != NULL) {
@@ -241,7 +293,7 @@ LUI_EXPORT int32_t lui_ocaml_slider_changed(int64_t node, double fraction) {
 
 LUI_EXPORT int32_t lui_ocaml_scroll_completed(int64_t node, int64_t token,
                                             const char *outcome) {
-  patch_response response = {0, NULL, NULL};
+  patch_response response = pending_response("lui_ocaml_scroll_completed",outcome == NULL);
   caml_leave_blocking_section();
   const value *dispatch = caml_named_value("lui_ocaml_scroll_completed");
   if (dispatch != NULL && outcome != NULL) {
@@ -258,7 +310,7 @@ LUI_EXPORT int32_t lui_ocaml_scroll_completed(int64_t node, int64_t token,
 
 LUI_EXPORT int32_t lui_ocaml_visible_range(int64_t node, int64_t first,
                                          int64_t last) {
-  patch_response response = {0, NULL, NULL};
+  patch_response response = pending_response("lui_ocaml_visible_range",0);
   caml_leave_blocking_section();
   const value *dispatch = caml_named_value("lui_ocaml_visible_range");
   if (dispatch != NULL) {
@@ -273,7 +325,7 @@ LUI_EXPORT int32_t lui_ocaml_picked(int64_t node, const char *payload) {
 }
 
 LUI_EXPORT int32_t lui_ocaml_stop(void) {
-  patch_response response = {0, NULL, NULL};
+  patch_response response = pending_response("lui_ocaml_dispose",0);
   caml_leave_blocking_section();
   const value *dispose = caml_named_value("lui_ocaml_dispose");
   if (dispose != NULL) {
@@ -307,7 +359,7 @@ LUI_EXPORT int32_t journal_ocaml_extension_event(
     int64_t node,
     const char *name,
     const char *payload) {
-  patch_response response = {0, NULL, NULL};
+  patch_response response = pending_response("journal_ocaml_extension_event",name == NULL || payload == NULL);
   caml_leave_blocking_section();
   const value *dispatch = caml_named_value("journal_ocaml_extension_event");
   if (dispatch != NULL && name != NULL && payload != NULL) {
@@ -327,7 +379,7 @@ LUI_EXPORT int32_t journal_ocaml_extension_event(
    patches. The host schedules this on the UI thread when the wakeup callback
    fires. */
 LUI_EXPORT int32_t journal_ocaml_pump(void) {
-  patch_response response = {0, NULL, NULL};
+  patch_response response = pending_response("journal_ocaml_pump",0);
   caml_leave_blocking_section();
   const value *pump = caml_named_value("journal_ocaml_pump");
   if (pump != NULL) {
@@ -337,11 +389,11 @@ LUI_EXPORT int32_t journal_ocaml_pump(void) {
   return release_and_deliver(response);
 }
 
-/* Host -> OCaml LJP2 envelopes (binary safe). */
+/* Host -> OCaml LJP2/LJF1 envelopes (binary safe). */
 static int32_t deliver_platform(const char *name, const char *data,
                                 int32_t length) {
-  if (length < 0 || (length > 0 && data == NULL)) return 0;
-  int32_t accepted = 0;
+  if (length < 0 || (length > 0 && data == NULL)) { completed(operation_for(name),4); return 0; }
+  int32_t accepted = 0, reason = 1;
   caml_leave_blocking_section();
   const value *handler = caml_named_value(name);
   if (handler != NULL) {
@@ -349,11 +401,13 @@ static int32_t deliver_platform(const char *name, const char *data,
     value result = caml_callback_exn(*handler, payload);
     if (Is_exception_result(result)) {
       report_ocaml_exception(name, result);
+      reason = classify_exception(result);
     } else {
-      accepted = 1;
+      accepted = 1; reason = 0;
     }
   }
   caml_enter_blocking_section();
+  completed(operation_for(name),reason);
   return accepted;
 }
 
@@ -367,9 +421,8 @@ LUI_EXPORT int32_t journal_ocaml_platform_response(const char *data,
   return deliver_platform("journal_ocaml_platform_response", data, length);
 }
 
-/* The host reports a failed platform request by passing the original
-   request envelope; OCaml resolves the pending continuation with an
-   error instead of leaving it parked forever. */
+/* The host reports a failed platform request with a finite LJF1 envelope.
+   The legacy original-request form remains supported by the OCaml decoder. */
 LUI_EXPORT int32_t journal_ocaml_platform_failure(const char *data,
                                                  int32_t length) {
   return deliver_platform("journal_ocaml_platform_failure", data, length);

@@ -1,6 +1,7 @@
 module Core = Logseq_sync_pure_reducer.Core
 module Sync_protocol = Logseq_sync_pure_reducer.Sync_protocol
 module Asset_cache = Bootstrap.Asset_cache
+module Failure_diagnostic = Logseq_db_types.Failure_diagnostic
 
 type unlock_failure_category = Token | Transport | Http_status | Decode | Crypto
 
@@ -361,6 +362,8 @@ type t =
   { sw : Eio.Switch.t
   ; dependencies : dependencies
   ; post : Core.event -> unit
+  ; on_asset_diagnostic : scope:Core.graph_scope -> operation:string
+      -> request_operation:string -> Failure_diagnostic.t -> unit
   ; operations : (string, operation) Hashtbl.t
   ; submitted_operations : Submitted_effects.t
   ; keys : (string, key_entry) Hashtbl.t
@@ -380,11 +383,13 @@ type t =
   ; mutable closed : bool
   }
 
-let create ~sw dependencies ~post =
+let create ?(on_asset_diagnostic=(fun ~scope:_ ~operation:_ ~request_operation:_ _ -> ()))
+      ~sw dependencies ~post =
   Ok
     { sw
     ; dependencies
     ; post
+    ; on_asset_diagnostic
     ; operations = Hashtbl.create 32
     ; submitted_operations = Submitted_effects.create 32
     ; keys = Hashtbl.create 8
@@ -476,9 +481,12 @@ let load_catalog local_store account =
       in
       Core.decode_catalog_cache source
       |> Result.map Option.some
-      |> Result.map_error (fun message -> Core.Effect_failed message)
+      |> Result.map_error (fun source -> Core.Effect_failed
+        Failure_diagnostic.(of_source ~operation:"loadCatalog" ~reason:"parseFailed" source |> encode))
     with
-    | Sys_error _ -> Error (Core.Effect_failed "The local graph catalog could not be read."))
+    | Sys_error _ as error -> Error (Core.Effect_failed
+        Failure_diagnostic.(of_source ~operation:"loadCatalog" ~reason:"resourceFailed"
+          (Printexc.to_string error) |> encode)))
 ;;
 
 let ensure_directory path =
@@ -487,15 +495,17 @@ let ensure_directory path =
     then
       if Sys.is_directory path
       then Ok ()
-      else Error (Core.Effect_failed (path ^ " is not a directory"))
+      else Error (Core.Effect_failed Failure_diagnostic.(
+        create ~operation:"prepareCatalog" ~reason:"invalidPath"
+          ~source:"catalog directory is not a directory" () |> encode))
     else (
       Unix.mkdir path 0o700;
       Ok ())
   with
-  | Unix.Unix_error (error, operation, target) ->
-    Error
-      (Core.Effect_failed
-         (Printf.sprintf "%s(%s): %s" operation target (Unix.error_message error)))
+  | (Unix.Unix_error _ | Sys_error _) as error ->
+    Error (Core.Effect_failed Failure_diagnostic.(
+      of_source ~operation:"prepareCatalog" ~reason:"resourceFailed"
+        (Printexc.to_string error) |> encode))
 ;;
 
 let save_catalog local_store account cache =
@@ -518,7 +528,9 @@ let save_catalog local_store account cache =
                 Ok ()
               with exn -> close_out_noerr channel; raise exn)
            with
-           | Sys_error _ -> Error (Core.Effect_failed "The local graph catalog could not be saved."))))
+           | Sys_error _ as error -> Error (Core.Effect_failed Failure_diagnostic.(
+               of_source ~operation:"saveCatalog" ~reason:"persistenceFailed"
+                 (Printexc.to_string error) |> encode)))))
 ;;
 
 let effect_error message = Error (Core.Effect_failed message)
@@ -1315,6 +1327,60 @@ let shutdown t =
     Hashtbl.clear t.operations)
 ;;
 
+let asset_diagnostic_capture = Eio.Fiber.create_key ()
+
+let report_asset_failure ~reason source =
+  Option.iter (fun report -> report ~reason source)
+    (Eio.Fiber.get asset_diagnostic_capture)
+;;
+
+let asset_error_source = function
+  | Asset_cache.Invalid source | Io source -> source
+  | Full -> "Asset staging storage is full"
+  | Stale -> "Asset staging scope is stale"
+  | Checksum_mismatch -> "Asset staging checksum mismatch"
+;;
+
+let asset_diagnostic_operation = function
+  | Core.Put_asset_file _ -> "assetUpload"
+  | Core.Fetch_asset _ -> "assetDownload"
+  | Core.Release_asset_file _ | Release_staged_file _ | Close_asset_scope
+  | Prepare_graph_asset_deletion _ | Commit_graph_asset_deletion _
+  | Cancel_graph_asset_deletion _ | Delete_account_assets | Cancel_asset_operation _ -> "assetRelease"
+  | _ -> "assetPreview"
+;;
+
+let with_asset_diagnostics t (request : Core.asset_io_request) ~current work =
+  let operation = asset_diagnostic_operation request.action in
+  let captured = ref None in
+  let report ~reason:reason_name source =
+    captured := Some (Failure_diagnostic.of_source ~operation ~reason:reason_name source) in
+  let result = Eio.Fiber.with_binding asset_diagnostic_capture report work in
+  (match result with
+   | Error Core.Asset_cancelled | Ok _ -> ()
+   | Error failure when not t.closed && current () ->
+     let fallback = match failure with
+       | Core.Asset_network -> "networkFailed", ""
+       | Asset_not_found -> "notFound", ""
+       | Asset_checksum_mismatch -> "checksumMismatch", ""
+       | Asset_authentication -> "authenticationFailed", ""
+       | Asset_locked -> "locked", ""
+       | Asset_storage_full -> "storageFull", ""
+       | Asset_missing_source -> "missingSource", ""
+       | Asset_size_rejected -> "sizeRejected", ""
+       | Asset_revoked_access -> "revokedAccess", ""
+       | Asset_invalid_content source -> "invalidContent", source
+       | Asset_cancelled -> "cancelled", "" in
+     let reason_name, source = fallback in
+     let detail = Option.value !captured ~default:(
+       Failure_diagnostic.of_source ~operation ~reason:reason_name source) in
+     (* Diagnostics must never change an operation's completion or cleanup. *)
+     (try t.on_asset_diagnostic ~scope:request.context.scope ~operation
+       ~request_operation:request.operation detail with _ -> ())
+   | Error _ -> ());
+  result
+;;
+
 type asset_encryption =
   | Plaintext
   | Encrypted of Core.graph_key_handle option
@@ -1326,23 +1392,39 @@ let asset_cache_failure = function
   | Invalid message | Io message -> Core.Asset_invalid_content message
 ;;
 
-let asset_decode_failure = function
+let asset_decode_failure error =
+  let reason_name, source = match error with
+    | Asset_codec.Invalid_limit -> "sizeRejected", "Invalid plaintext size limit"
+    | Wire_too_large -> "sizeRejected", "Asset exceeds wire size limit"
+    | Plaintext_too_large -> "sizeRejected", "Asset exceeds plaintext size limit"
+    | Malformed_envelope -> "invalidContent", "Invalid asset AES-GCM envelope"
+    | Malformed_transit _ -> "parseFailed", "Asset Transit payload is invalid"
+    | Decryption_failed source -> "cryptoInvalid", source
+    | Checksum_mismatch -> "checksumMismatch", "Asset checksum mismatch" in
+  report_asset_failure ~reason:reason_name source;
+  match error with
   | Asset_codec.Checksum_mismatch -> Core.Asset_checksum_mismatch
-  | (Invalid_limit | Wire_too_large | Plaintext_too_large | Malformed_envelope
-    | Malformed_transit _ | Decryption_failed _) as error ->
-    Core.Asset_invalid_content (Asset_codec.decode_error_message error)
+  | _ -> Core.Asset_invalid_content Failure_diagnostic.(
+    of_source ~operation:"assetDownload" ~reason:reason_name source |> encode)
 ;;
 
 let asset_graph_key t scope = function
   | Plaintext -> Ok None
-  | Encrypted None -> Error Core.Asset_locked
+  | Encrypted None ->
+    report_asset_failure ~reason:"locked" "Asset graph key handle is missing";
+    Error Core.Asset_locked
   | Encrypted (Some handle) ->
     if Core.graph_key_handle_scope handle <> scope
-    then Error Core.Asset_locked
+    then (
+      report_asset_failure ~reason:"locked" "Asset graph key scope does not match";
+      Error Core.Asset_locked)
     else
       key t handle
       |> Result.map Option.some
-      |> Result.map_error (fun _ -> Core.Asset_locked)
+      |> Result.map_error (fun error ->
+        let source = match error with Core.Effect_failed source | Crypto_failed (_, source) -> source in
+        report_asset_failure ~reason:"locked" source;
+        Core.Asset_locked)
 ;;
 
 let with_asset_slot slots work =
@@ -1432,13 +1514,27 @@ let fetch_asset_admitted
             last_failure := Core.Asset_revoked_access;
             Error Forbidden
           | Ok response -> Ok response)
-      |> Result.map_error (fun _ -> !last_failure)
+      |> Result.map_error (fun cause ->
+        let reason = match !last_failure with
+          | Core.Asset_network -> "networkFailed"
+          | Asset_revoked_access -> "revokedAccess"
+          | _ -> "authenticationFailed" in
+        let source = match cause with
+          | "Authentication failed." -> "Asset HTTP status 401"
+          | "Authorization failed." -> "Asset HTTP status 403"
+          | source -> source in
+        report_asset_failure ~reason source;
+        !last_failure)
     in
     let* () =
       match response.status with
       | status when status >= 200 && status < 300 -> Ok ()
-      | 404 -> Error Core.Asset_not_found
-      | 408 | 429 | 500 | 502 | 503 | 504 -> Error Core.Asset_network
+      | 404 ->
+        report_asset_failure ~reason:"notFound" "Asset HTTP status 404";
+        Error Core.Asset_not_found
+      | (408 | 429 | 500 | 502 | 503 | 504) as status ->
+        report_asset_failure ~reason:"networkFailed" (Printf.sprintf "Asset HTTP status %d" status);
+        Error Core.Asset_network
       | status ->
         Error (Core.Asset_invalid_content (Printf.sprintf "Asset HTTP status %d" status))
     in
@@ -1626,18 +1722,24 @@ let read_upload_source ~maximum_plaintext_bytes source_file =
       (fun () ->
          let stat = Unix.fstat (Unix.descr_of_in_channel input) in
          if stat.st_kind <> Unix.S_REG
-         then Error (Core.Asset_invalid_content "Invalid upload content")
+         then Error (Core.Asset_invalid_content "Asset upload source is not a regular file")
          else if stat.st_size > maximum_plaintext_bytes
          then Error Core.Asset_size_rejected
          else (
            let bytes = really_input_string input stat.st_size in
            match input_char input with
-           | _ -> Error (Core.Asset_invalid_content "Invalid upload content")
+           | _ -> Error (Core.Asset_invalid_content "Asset upload source grew during reading")
            | exception End_of_file -> Ok bytes))
   with
-  | Sys_error _ | Unix.Unix_error (Unix.ENOENT, _, _) -> Error Core.Asset_missing_source
-  | End_of_file | Unix.Unix_error _ ->
-    Error (Core.Asset_invalid_content "Invalid upload content")
+  | (Sys_error _ | Unix.Unix_error (Unix.ENOENT, _, _)) as error ->
+    report_asset_failure ~reason:"missingSource" (Printexc.to_string error);
+    Error Core.Asset_missing_source
+  | End_of_file ->
+    Error (Core.Asset_invalid_content "Asset upload source ended during reading")
+  | Unix.Unix_error _ as error ->
+    Error (Core.Asset_invalid_content Failure_diagnostic.(
+      of_source ~operation:"assetUpload" ~reason:"invalidContent"
+        (Printexc.to_string error) |> encode))
 ;;
 
 let put_asset_admitted
@@ -1672,7 +1774,7 @@ let put_asset_admitted
               (String.equal
                  (Asset_codec.checksum plaintext)
                  version.Logseq_db_types.Asset_descriptor.checksum)
-          then Error (Core.Asset_invalid_content "Invalid upload content")
+          then Error (Core.Asset_invalid_content "Asset upload checksum mismatch")
           else (
             let crypto : Asset_codec.crypto =
               { encrypt = t.dependencies.crypto.encrypt_aes_gcm
@@ -1680,13 +1782,17 @@ let put_asset_admitted
               }
             in
             Asset_codec.encode ~maximum_plaintext_bytes ~crypto ~key:graph_key plaintext
-            |> Result.map_error (fun _ ->
-              Core.Asset_invalid_content "Invalid upload content")))
+            |> Result.map_error (fun source ->
+              Core.Asset_invalid_content Failure_diagnostic.(
+                of_source ~operation:"assetUpload" ~reason:(
+                  if source = "Asset exceeds plaintext size limit" then "sizeRejected" else "cryptoInvalid")
+                  source |> encode))))
     in
     let base_url = context.scope.account.managed_sync_origin in
     let* () =
       Http.validate_base_url base_url
-      |> Result.map_error (fun _ -> Core.Asset_invalid_content "Invalid upload content")
+      |> Result.map_error (fun _ ->
+        Core.Asset_invalid_content "Asset upload base URL is invalid")
     in
     let path =
       Printf.sprintf
@@ -1730,16 +1836,31 @@ let put_asset_admitted
               failure := Core.Asset_revoked_access;
               Error Forbidden
             | Ok response -> Ok response))
-      |> Result.map_error (fun _ -> !failure)
+      |> Result.map_error (fun cause ->
+        if !failure <> Core.Asset_cancelled then (
+          let reason = match !failure with
+            | Core.Asset_network -> "networkFailed"
+            | Asset_revoked_access -> "revokedAccess"
+            | _ -> "authenticationFailed" in
+          let source = match cause with
+            | "Authentication failed." -> "Asset HTTP status 401"
+            | "Authorization failed." -> "Asset HTTP status 403"
+            | source -> source in
+          report_asset_failure ~reason source);
+        !failure)
     in
     if not (valid ())
     then Error Core.Asset_cancelled
     else (
       match response.status with
       | status when status >= 200 && status < 300 -> Ok ()
-      | 413 -> Error Core.Asset_size_rejected
-      | 408 | 429 | 500 | 502 | 503 | 504 -> Error Core.Asset_network
-      | _ -> Error (Core.Asset_invalid_content "Invalid upload content")))
+      | 413 ->
+        report_asset_failure ~reason:"sizeRejected" "Asset HTTP status 413";
+        Error Core.Asset_size_rejected
+      | (408 | 429 | 500 | 502 | 503 | 504) as status ->
+        report_asset_failure ~reason:"networkFailed" (Printf.sprintf "Asset HTTP status %d" status);
+        Error Core.Asset_network
+      | status -> Error (Core.Asset_invalid_content (Printf.sprintf "Asset HTTP status %d" status))))
 ;;
 
 let put_asset
@@ -1774,16 +1895,32 @@ let staged_asset_path t ~scope ~file =
   then None
   else (
     match scoped_asset_cache t scope with
-    | Error _ -> None
+    | Error error ->
+      report_asset_failure ~reason:"unavailable" (asset_error_source error);
+      None
     | Ok cache -> Asset_cache.staged_path cache ~file)
 ;;
 
 let release_staged_asset t ~scope ~file =
   match scoped_asset_cache t scope with
-  | Error _ -> Error "Asset staging is unavailable"
+  | Error error ->
+    let source = match error with
+      | Asset_cache.Invalid source | Io source -> source
+      | Full -> "Asset staging storage is full"
+      | Stale -> "Asset staging scope is stale"
+      | Checksum_mismatch -> "Asset staging checksum mismatch" in
+    Error Failure_diagnostic.(of_source ~operation:"assetRelease"
+      ~reason:"unavailable" source |> encode)
   | Ok cache ->
     Result.map_error
-      (fun _ -> "Unable to release staged asset")
+      (fun error ->
+        let source = match error with
+          | Asset_cache.Invalid source | Io source -> source
+          | Full -> "Asset staging storage is full"
+          | Stale -> "Asset staging scope is stale"
+          | Checksum_mismatch -> "Asset staging checksum mismatch" in
+        Failure_diagnostic.(of_source ~operation:"assetRelease"
+          ~reason:"cleanupFailed" source |> encode))
       (Asset_cache.release_staged cache ~file)
 ;;
 
@@ -1808,7 +1945,9 @@ let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
   in
   let cache action =
     Result.bind
-      (scoped_asset_cache t scope |> Result.map_error asset_cache_failure)
+      (scoped_asset_cache t scope |> Result.map_error (fun error ->
+        report_asset_failure ~reason:"unavailable" (asset_error_source error);
+        asset_cache_failure error))
       action
   in
   let permitted = match request.action with
@@ -2020,7 +2159,8 @@ let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
                Eio.Fiber.first
                  (fun () ->
                     if not (current ()) then raise Runner_cancelled;
-                    execute_asset ~except_id:id t request ~current)
+                    with_asset_diagnostics t request ~current (fun () ->
+                      execute_asset ~except_id:id t request ~current))
                  (fun () ->
                     Eio.Promise.await cancelled;
                     raise Runner_cancelled)
@@ -2127,7 +2267,9 @@ let submit t instruction =
             Fun.protect
               ~finally:(fun () ->
                 if t.closed then close_asset_scope t request.context.scope)
-              (fun () -> execute_asset t request ~current:(fun () -> false))
+              (fun () -> with_asset_diagnostics t request
+                ~current:(fun () -> not t.closed)
+                (fun () -> execute_asset t request ~current:(fun () -> false)))
           with
           | error -> Error (Core.Asset_invalid_content (Printexc.to_string error))
         in

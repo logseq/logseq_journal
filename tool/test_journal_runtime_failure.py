@@ -14,13 +14,14 @@ with tempfile.TemporaryDirectory(prefix="journal-runtime-failure-") as directory
     backend.write_text('''
 import Foundation
 public struct LUIEvent: Sendable {}
+public enum LUIBackendError: Error { case invalidBatch(String) }
 public struct LUIAppleExtensionRegistry { public init() {} }
 @MainActor public final class LUIAppleBackend {
   public var rootIDs: [Int] = []
   public var onEvent: ((LUIEvent) -> Void)?
   public init(appIcons: [String: String], extensionRegistry: LUIAppleExtensionRegistry) throws {}
   public func apply(json: String) throws {
-    if json == "invalid" { throw NSError(domain: "SENSITIVE renderer content", code: 1) }
+    if json == "invalid" { throw LUIBackendError.invalidBatch("unsupported property") }
     rootIDs = [42]
   }
 }
@@ -29,6 +30,7 @@ public struct LUIAppleExtensionRegistry { public init() {} }
     bridge.write_text('''
 #include <stdint.h>
 static int mode;
+int32_t journal_ocaml_failure_reason(int32_t operation) { return 2; }
 static int stops;
 static int platform_calls;
 int32_t fixture_platform_count(void) { return platform_calls; }
@@ -54,7 +56,7 @@ int32_t journal_ocaml_platform_failure(const char *d,int32_t n) { platform_calls
     executable = work / "runtime-tests"
     run(["xcrun", "swiftc", "-swift-version", "6", "-Xfrontend", "-disable-sandbox", "-I", str(work), "-L", str(work),
          "-lLUIAppleBackend", "-Xlinker", "-rpath", "-Xlinker", str(work),
-         "-module-cache-path", str(work / "modules"), str(ROOT / "swift/JournalRuntime.swift"),
+         "-module-cache-path", str(work / "modules"), str(ROOT / "swift/JournalSafeDiagnostic.swift"), str(ROOT / "swift/JournalPlatformWire.swift"), str(ROOT / "swift/JournalRuntime.swift"),
          str(ROOT / "apple-tests/platform-services/JournalRuntimeFailureTests.swift"),
          str(work / "bridge.o"), "-o", str(executable)])
     failures = []

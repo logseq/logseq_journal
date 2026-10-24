@@ -28,8 +28,7 @@ struct JournalRuntimeHost: View {
         ContentUnavailableView {
           Label("Unable to open journal", systemImage: "exclamationmark.folder")
         } description: {
-          Text(runtime?.failure?.errorDescription ??
-            (failure as? JournalRuntime.Failure)?.errorDescription ??
+          Text(runtime?.failureDescription ?? failure.map { JournalRuntime.safeDescription($0,operation:"runtime.start.failed") } ??
             "Journal could not start (runtime.start.failed). Retry opening Journal.")
         } actions: {
           Button("Retry") {
@@ -193,11 +192,11 @@ struct JournalHost: View {
       switch setup {
       case .none:
         JournalStartupLoadingSurface(loading: false, initial: true, active: scenePhase != .background)
-      case .failure:
+      case .failure(let error):
         ContentUnavailableView {
           Label("Unable to open local application storage", systemImage: "exclamationmark.folder")
         } description: {
-          Text("Local storage setup could not finish (storage.setup.failed). Check available storage and retry.")
+          Text(JournalRuntime.safeDescription(error,operation:"storage.setup.failed"))
         } actions: {
           Button("Retry") { setup = nil; clock.restart(); retry += 1 }
             .accessibilityIdentifier("journal-storage-retry")

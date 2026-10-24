@@ -70,8 +70,14 @@ module Json = struct
 end
 
 let read_event payload =
-  try Logseq_db_types.Json_codec.decode Json.event_of_yojson (Yojson.Safe.from_string payload)
-  with Yojson.Json_error _ -> Error "Invalid attachment selection"
+  try
+    Logseq_db_types.Json_codec.decode Json.event_of_yojson (Yojson.Safe.from_string payload)
+    |> Result.map_error (function
+      | ("invalid UTF-8 field name" | "duplicate JSON field" | "invalid UTF-8 string"
+        | "non-finite JSON number" | "nonstandard JSON value" | "JSON exceeds byte budget"
+        | "invalid JSON value") as source -> source
+      | _ -> "Native event shape is invalid")
+  with Yojson.Json_error _ -> Error "Native event JSON syntax is invalid"
 ;;
 
 let staged_of_pick (pick : Json.pick) =

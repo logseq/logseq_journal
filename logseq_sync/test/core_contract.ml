@@ -1588,6 +1588,10 @@ let whole_batch_invalid_tx_partitions_every_member () =
 ;;
 
 let canonical_overlay_happy_path () =
+  let cursor_diagnostics local remote : Core.diagnostics =
+    { groups = [ { Core.title = "Sync transactions"
+                 ; entries = [ "Local tx", local; "Remote tx", remote ] } ] }
+  in
   let origin = initial () in
   let initial_state = Core.state origin in
   let authenticated_startup =
@@ -1682,8 +1686,8 @@ let canonical_overlay_happy_path () =
     }
   in
   let selected_state =
-    { catalogued_state with
-      snapshot =
+    { Core.diagnostics = cursor_diagnostics "Not available" "Not available"
+    ; snapshot =
         { catalogued_state.snapshot with
           selected_graph = Some graph_id
         ; startup = selected_startup
@@ -1739,8 +1743,8 @@ let canonical_overlay_happy_path () =
     { selected_startup with restoring_local = false; bootstrapping = false; local_access=Core.Local_available }
   in
   let attached_state =
-    { selected_state with
-      snapshot =
+    { Core.diagnostics = cursor_diagnostics "0" "Not available"
+    ; snapshot =
         { selected_state.snapshot with
           sync_phase = Core.Current
         ; applied_server_t = Some (server_cursor_of_int 0)
@@ -1814,10 +1818,15 @@ let canonical_overlay_happy_path () =
   in
   let hp09_event = Core.Websocket_message (connection, opening_message) in
   let hp09_preview = preview_step "HP09" hp08.next hp09_event in
+  let pulling_remote1_state =
+    { pulling0_state with diagnostics = cursor_diagnostics "0" "1" }
+  in
   let opening_batch =
     match hp09_preview.effects with
-    | [ Core.Delegate (Core.Apply_authoritative_batch request) ]
+    | [ Core.Delegate (Core.Apply_authoritative_batch request)
+      ; Core.Publish (Core.State_changed state) ]
       when request.scope = connection
+           && state = pulling_remote1_state
            && request.presentation_generation = 2
            && request.lifecycle_generation = 0L
            && request.key = None
@@ -1833,8 +1842,9 @@ let canonical_overlay_happy_path () =
       "HP09"
       hp08.next
       hp09_event
-      pulling0_observed
-      [ Core.Delegate (Core.Apply_authoritative_batch opening_batch) ]
+      { pulling0_observed with state = pulling_remote1_state }
+      [ Core.Delegate (Core.Apply_authoritative_batch opening_batch)
+      ; Core.Publish (Core.State_changed pulling_remote1_state) ]
   in
   let generation1 = token Overlay.Generation.of_string "generation:v1:hp-1" in
   let projection1 = token Overlay.Projection_revision.of_string "projection:v1:1" in
@@ -1854,8 +1864,8 @@ let canonical_overlay_happy_path () =
     }
   in
   let current1_state =
-    { pulling0_state with
-      snapshot =
+    { Core.diagnostics = cursor_diagnostics "1" "1"
+    ; snapshot =
         { pulling0_state.snapshot with
           sync_phase = Core.Current
         ; applied_server_t = Some (server_cursor_of_int 1)
@@ -2009,10 +2019,15 @@ let canonical_overlay_happy_path () =
           { t = server_cursor_of_int 2; checksum = Some "fedcba9876543210" } )
   in
   let hp14_preview = preview_step "HP14" hp13.next hp14_event in
+  let acknowledged_state =
+    { submitting_state with diagnostics = cursor_diagnostics "1" "2" }
+  in
   let accept_request =
     match hp14_preview.effects with
-    | [ Core.Delegate (Core.Apply_outbox_transition request) ]
+    | [ Core.Delegate (Core.Apply_outbox_transition request)
+      ; Core.Publish (Core.State_changed state) ]
       when request.scope = graph_scope
+           && state = acknowledged_state
            && request.key = None
            && Overlay.sync_token_equal request.expected sync_token2
            && request.transition
@@ -2031,8 +2046,9 @@ let canonical_overlay_happy_path () =
       "HP14"
       hp13.next
       hp14_event
-      submitting_observed
-      [ Core.Delegate (Core.Apply_outbox_transition accept_request) ]
+      { submitting_observed with state = acknowledged_state }
+      [ Core.Delegate (Core.Apply_outbox_transition accept_request)
+      ; Core.Publish (Core.State_changed acknowledged_state) ]
   in
   let sync_token3 = token Overlay.sync_token_of_string "sync-token:v1:hp-3" in
   let accepted_descriptor =
@@ -2056,8 +2072,8 @@ let canonical_overlay_happy_path () =
     }
   in
   let pulling1_state =
-    { submitting_state with
-      snapshot = { submitting_state.snapshot with sync_phase = Core.Pulling }
+    { Core.diagnostics = cursor_diagnostics "1" "2"
+    ; snapshot = { submitting_state.snapshot with sync_phase = Core.Pulling }
     }
   in
   let pulling1_observed =
@@ -2133,8 +2149,8 @@ let canonical_overlay_happy_path () =
     }
   in
   let current2_state =
-    { pulling1_state with
-      snapshot =
+    { Core.diagnostics = cursor_diagnostics "2" "2"
+    ; snapshot =
         { pulling1_state.snapshot with
           sync_phase = Core.Current
         ; applied_server_t = Some (server_cursor_of_int 2)
@@ -5962,4 +5978,151 @@ let failed_snapshot_activation_receipts_are_inert () =
 let scenarios = scenarios @ [ Alcotest.test_case
   "late activation success and failure cannot reopen failed bootstrap" `Quick
   failed_snapshot_activation_receipts_are_inert ]
+;;
+
+let sync_cursor_diagnostic core label =
+  (Core.state core).diagnostics.groups
+  |> List.concat_map (fun (group : Core.diagnostic_group) -> group.entries)
+  |> List.assoc_opt label
+;;
+
+let diagnostics_observe_remote_cursor_without_advancing_local () =
+  let selected, _ = selected_graph graph in
+  List.iter (fun label ->
+    Alcotest.(check (option string)) (label ^ " starts unknown")
+      (Some "Not available") (sync_cursor_diagnostic selected.next label))
+    ["Local tx"; "Remote tx"];
+  let opened, connection, _ = pull_fixture () in
+  let largest = Logseq_db_types.Server_cursor.of_int64 Int64.max_int |> Result.get_ok in
+  let observed = pull_message opened.next connection
+    (Protocol.Server.Hello { t = largest; checksum = None }) in
+  Alcotest.(check (option string)) "remote cursor retains all int64 digits"
+    (Some "9223372036854775807") (sync_cursor_diagnostic observed.next "Remote tx");
+  Alcotest.(check (option string)) "server notification is not a local commit"
+    (Some "0") (sync_cursor_diagnostic observed.next "Local tx");
+  Alcotest.(check bool) "new cursor is published while an existing pull is occupied" true
+    (List.exists (function
+      | Core.Publish (Core.State_changed state) ->
+        List.exists (fun (group : Core.diagnostic_group) ->
+          List.assoc_opt "Remote tx" group.entries = Some "9223372036854775807") state.diagnostics.groups
+      | _ -> false) observed.effects);
+  let lower = pull_message observed.next connection
+    (Protocol.Server.Changed { t = server_cursor_of_int 1 }) in
+  Alcotest.(check (option string)) "older notifications cannot lower known remote maximum"
+    (Some "9223372036854775807") (sync_cursor_diagnostic lower.next "Remote tx");
+  let failed = pull_message lower.next connection
+    (Protocol.Server.Error { message = "synthetic server failure" }) in
+  Alcotest.(check (option string)) "failure retains the last server observation"
+    (Some "9223372036854775807") (sync_cursor_diagnostic failed.next "Remote tx");
+  let catalog = refresh_catalog lower.next [graph; other_graph] in
+  let switched = Core.step catalog.next (Core.Graph_selected other_graph.graph_id) in
+  List.iter (fun label ->
+    Alcotest.(check (option string)) (label ^ " clears on graph switch")
+      (Some "Not available") (sync_cursor_diagnostic switched.next label))
+    ["Local tx"; "Remote tx"];
+  let stale = pull_message switched.next connection
+    (Protocol.Server.Changed { t = largest }) in
+  Alcotest.(check (option string)) "old graph messages cannot repopulate remote cursor"
+    (Some "Not available") (sync_cursor_diagnostic stale.next "Remote tx");
+  let account = Core.step observed.next (Core.Account_authenticated {user_id=Some "other-user"}) in
+  Alcotest.(check (option string)) "account switch removes old graph cursor rows"
+    None (sync_cursor_diagnostic account.next "Remote tx")
+;;
+
+let diagnostics_local_cursor_tracks_authoritative_commit () =
+  let opened, connection, _ = pull_fixture () in
+  let received = pull_response opened.next connection ~after:0 1 in
+  Alcotest.(check (option string)) "received authoritative data is not committed yet"
+    (Some "0") (sync_cursor_diagnostic received.next "Local tx");
+  Alcotest.(check (option string)) "pull response observes the remote cursor"
+    (Some "1") (sync_cursor_diagnostic received.next "Remote tx");
+  let sync = Overlay.sync_view
+    ~token:(token Overlay.sync_token_of_string "sync-token:v1:diagnostic-commit")
+    ~checkpoint:(server_cursor_of_int 1) ~submissions:[] in
+  let committed = recovery_apply received.next connection sync in
+  Alcotest.(check (option string)) "only authoritative completion advances local cursor"
+    (Some "1") (sync_cursor_diagnostic committed.next "Local tx");
+  Alcotest.(check (option string)) "completed catchup retains remote cursor"
+    (Some "1") (sync_cursor_diagnostic committed.next "Remote tx");
+  let selected, scope = selected_graph graph in
+  let inspected = Core.step selected.next
+    (Core.Mirror_inspected (Core.Mirror_available {graph;scope})) in
+  let largest = Logseq_db_types.Server_cursor.of_int64 Int64.max_int |> Result.get_ok in
+  let sync = Overlay.sync_view ~token:(Overlay.sync_view_token sync)
+    ~checkpoint:largest ~submissions:[] in
+  let attached = Core.step inspected.next (Core.Graph_attached {scope;sync}) in
+  Alcotest.(check (option string)) "restored checkpoint retains all int64 digits"
+    (Some "9223372036854775807") (sync_cursor_diagnostic attached.next "Local tx");
+  Alcotest.(check (option string)) "local checkpoint does not invent server evidence"
+    (Some "Not available") (sync_cursor_diagnostic attached.next "Remote tx")
+;;
+
+let scenarios = scenarios @
+  [ Alcotest.test_case "diagnostics observes scoped remote cursor" `Quick
+      diagnostics_observe_remote_cursor_without_advancing_local
+  ; Alcotest.test_case "diagnostics local cursor follows durable commit" `Quick
+      diagnostics_local_cursor_tracks_authoritative_commit
+  ]
+;;
+
+let diagnostics_snapshot_metadata_is_remote_evidence () =
+  let activating = snapshot_activation_fixture () in
+  Alcotest.(check (option string)) "snapshot metadata observes remote progress before activation"
+    (Some "42") (sync_cursor_diagnostic activating.next "Remote tx");
+  Alcotest.(check (option string)) "download cannot publish an uncommitted local checkpoint"
+    (Some "Not available") (sync_cursor_diagnostic activating.next "Local tx")
+;;
+
+let scenarios = scenarios @ [ Alcotest.test_case
+  "diagnostics snapshot metadata is remote evidence" `Quick
+  diagnostics_snapshot_metadata_is_remote_evidence ]
+;;
+
+let diagnostics_rejection_observes_remote_cursor () =
+  let core, connection = submitted_core () in
+  let rejection : Protocol.rejection =
+    { reason = Stale; t = Some (server_cursor_of_int 7); checksum = None
+    ; success_tx_ids = []; failed_tx_id = None; missing_block_uuids = []
+    ; error_detail = None; data = None } in
+  let rejected = pull_message core connection (Protocol.Server.Tx_reject rejection) in
+  Alcotest.(check (option string)) "valid stale rejection observes server progress"
+    (Some "7") (sync_cursor_diagnostic rejected.next "Remote tx");
+  Alcotest.(check (option string)) "rejection does not commit authoritative changes"
+    (Some "0") (sync_cursor_diagnostic rejected.next "Local tx")
+;;
+
+let scenarios = scenarios @ [ Alcotest.test_case
+  "diagnostics rejection observes remote cursor" `Quick
+  diagnostics_rejection_observes_remote_cursor ]
+;;
+
+(* Catalog advisory diagnostics are owned by this public reducer. A valid
+   producer error is not an injected incorrect external result. *)
+let catalog_save_keeps_the_safe_producer_cause () =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  let selected, _ = selected_graph graph in
+  let event = List.find_map (function
+    | Core.Run (Core.Request (ticket, Core.Save_catalog _)) ->
+      let diagnostic = D.create ~operation:"saveCatalog" ~reason:"persistenceFailed"
+        ~source:"Unix.Unix_error(Unix.ENOSPC,PRIVATE_PATH,PRIVATE_PATH)" () in
+      Some (Core.Runner_completed (Core.Completion (ticket, Error (Core.Effect_failed (D.encode diagnostic)))))
+    | _ -> None) selected.effects |> Option.get in
+  let transition = Core.step selected.next event in
+  ignore (check_replay "catalog-safe-error" selected.next event transition);
+  let before = Core.state selected.next and after = Core.state transition.next in
+  Alcotest.(check bool) "advisory failure preserves graph and startup state" true
+    (before.snapshot = after.snapshot);
+  let text = after.diagnostics.groups |> List.concat_map (fun (g:Core.diagnostic_group) -> List.map snd g.entries)
+    |> String.concat "\n" in
+  let contains text part =
+    let rec loop n = n + String.length part <= String.length text &&
+      (String.sub text n (String.length part)=part || loop(n+1)) in loop 0 in
+  Alcotest.(check bool) "catalog advisory preserves original safe reason" true
+    (contains text "Persistence failed" && contains text "Storage has no free space");
+  Alcotest.(check bool) "catalog advisory excludes raw path" false (contains text "PRIVATE_PATH");
+  Alcotest.(check bool) "catalog advisory displays message, not a wire carrier" false
+    (contains text "journal-failure:v1:")
+;;
+let scenarios = scenarios @ [Alcotest.test_case "catalog save retains safe producer cause" `Quick
+  catalog_save_keeps_the_safe_producer_cause]
 ;;

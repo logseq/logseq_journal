@@ -34,7 +34,12 @@ type wire_snapshot =
 
 let decode_json (json : Yojson.Basic.t) =
   let ( let* ) = Result.bind in
-  let* wire = Logseq_db_types.Json_codec.decode wire_snapshot_of_yojson (json :> Yojson.Safe.t) in
+  let* wire = Logseq_db_types.Json_codec.decode wire_snapshot_of_yojson (json :> Yojson.Safe.t)
+    |> Result.map_error (function
+      | ("invalid UTF-8 field name" | "duplicate JSON field" | "invalid UTF-8 string"
+        | "non-finite JSON number" | "nonstandard JSON value" | "JSON exceeds byte budget"
+        | "invalid JSON value") as source -> source
+      | _ -> "Native event shape is invalid") in
   let* brightness =
     match wire.brightness with
     | "light" -> Ok Light

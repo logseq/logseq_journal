@@ -382,6 +382,32 @@ let execute_completion state ticket result =
     }
 ;;
 
+let failure_diagnostic error =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  List.find_map
+    (fun (detail : Logseq_db_worker_contract.Error.detail) ->
+       match detail.name, detail.value with
+       | name, Detail_string source when name = D.detail_name -> D.decode source
+       | _ -> None)
+    (Logseq_db_worker_contract.Error.details error)
+;;
+
+let failure_signal fallback error =
+  let module D = Logseq_db_types.Failure_diagnostic in
+  Option.fold
+    ~none:fallback
+    ~some:(fun value -> D.signal_prefix ^ D.encode value)
+    (failure_diagnostic error)
+;;
+
+let report_sync_failure state transition signal =
+  (* Sync owns scope acceptance. An ignored completion must not be re-labelled
+     as an error belonging to whichever graph is now on screen. *)
+  if Sync.state transition.next.sync_core = Sync.state state.sync_core
+  then transition
+  else { transition with effects = Publish (Diagnostic signal) :: transition.effects }
+;;
+
 let step state event =
   if state.shutdown
   then (
@@ -462,23 +488,22 @@ let step state event =
              let changed=translate_sync
                (Sync.step state.sync_core (Sync.Graph_attachment_failed
                   {scope=Sync.effect_scope_of_graph request.scope;message})) state in
-             {changed with effects=Publish(Diagnostic "worker.inspectMirror")::changed.effects}
+             report_sync_failure state changed (failure_signal "worker.inspectMirror" error)
            | Some (Sync.Attach_graph request) ->
              let changed=translate_sync
                (Sync.step state.sync_core (Sync.Graph_attachment_failed
                   {scope=Sync.effect_scope_of_graph request.scope;message})) state in
-             {changed with effects=Publish(Diagnostic "worker.attachGraph")::changed.effects}
+             report_sync_failure state changed (failure_signal "worker.attachGraph" error)
            | Some (Sync.Inspect_sync scope) ->
              let changed=translate_sync
                (Sync.step state.sync_core (Sync.Graph_attachment_failed
                   {scope=Sync.effect_scope_of_graph scope;message})) state in
-             {changed with effects=Publish(Diagnostic "worker.inspectSync")::changed.effects}
+             report_sync_failure state changed (failure_signal "worker.inspectSync" error)
            | Some (Sync.Activate_snapshot request) ->
-             translate_sync
-               (Sync.step
-                  state.sync_core
-                  (Sync.Snapshot_activation_failed (Sync.snapshot_activation_failed request ~message)))
-               state
+             let changed=translate_sync
+               (Sync.step state.sync_core
+                  (Sync.Snapshot_activation_failed (Sync.snapshot_activation_failed request ~message))) state in
+             report_sync_failure state changed (failure_signal "worker.activateSnapshot" error)
            | Some (Sync.Apply_authoritative_batch request) ->
              let transitioned =
                translate_sync
@@ -491,21 +516,19 @@ let step state event =
              let origin = (Logseq_db_worker_contract.Error.trace error).origin in
              let signal =
                match origin.component, origin.operation, origin.code with
-               | Managed_sync, "applyAuthoritative", Some "authoritativeDecodeFailed" ->
+               | Managed_sync, "applyAuthoritative", Some ("authoritativeDecodeFailed" | "authoritativeIntegrityFailure" as category) ->
                  let module Diagnostic = Logseq_db_types.Authoritative_diagnostic in
                  let detail = List.find_map (fun (detail:Logseq_db_worker_contract.Error.detail) ->
                    match detail.name,detail.value with
                    | name,Detail_string source when name=Diagnostic.detail_name -> Diagnostic.decode source
                    | _ -> None) (Logseq_db_worker_contract.Error.details error) in
-                 Option.fold ~none:"worker.applyAuthoritative.authoritativeDecodeFailed"
-                   ~some:(fun value -> Diagnostic.signal_prefix ^ Diagnostic.encode value) detail
+                 Option.fold ~none:("worker.applyAuthoritative." ^ category)
+                   ~some:(fun value -> (if category="authoritativeIntegrityFailure" then Diagnostic.integrity_signal_prefix else Diagnostic.signal_prefix) ^ Diagnostic.encode value) detail
                | Managed_sync, "applyAuthoritative", Some category ->
                  "worker.applyAuthoritative." ^ category
                | _ -> "worker.applyAuthoritative"
              in
-             { next = transitioned.next
-             ; effects = Publish (Diagnostic signal) :: transitioned.effects
-             }
+             report_sync_failure state transitioned (failure_signal signal error)
            | Some (Sync.Apply_outbox_transition request) ->
              let transitioned =
                translate_sync
@@ -514,21 +537,15 @@ let step state event =
                     (Sync.Outbox_transition_failed { request; message }))
                  state
              in
-             { transitioned with
-               effects = Publish (Diagnostic "worker.applyOutbox") :: transitioned.effects
-             }
+             report_sync_failure state transitioned (failure_signal "worker.applyOutbox" error)
            | Some (Sync.Detach_graph scope) ->
-             translate_sync
-               (Sync.step
-                  state.sync_core
-                  (Sync.Graph_detached (scope, Error "Graph close failed.")))
-               state
+             let changed=translate_sync
+               (Sync.step state.sync_core (Sync.Graph_detached (scope, Error message))) state in
+             report_sync_failure state changed (failure_signal "worker.closeDatabase" error)
            | Some (Sync.Delete_mirror request) ->
-             translate_sync
-               (Sync.step
-                  state.sync_core
-                  (Sync.Mirror_deleted (request, Error "Mirror deletion failed.")))
-               state
+             let changed=translate_sync
+               (Sync.step state.sync_core (Sync.Mirror_deleted (request, Error message))) state in
+             report_sync_failure state changed (failure_signal "worker.deleteMirror" error)
            | Some _ | None ->
              let code = match worker_effect with
                | Some (Sync.Inspect_mirror _) -> "worker.inspectMirror"
@@ -537,7 +554,7 @@ let step state event =
                | Some (Sync.Reset_managed_account _) -> "worker.resetAccount"
                | Some _ | None -> "worker.operation"
              in
-             { next = state; effects = [ Publish (Diagnostic code) ] })
+             { next = state; effects = [ Publish (Diagnostic (failure_signal code error)) ] })
         | Ok result ->
           let state, lifecycle_effects =
             match state.graph.phase, worker_effect with
@@ -940,10 +957,13 @@ let step state event =
               restored.next, effects @ restored.effects)
            (state, [])
            intents
-       | Ok _ | Error _ ->
+       | (Ok _ | Error _) as failure ->
+         let module D=Logseq_db_types.Failure_diagnostic in
+         let diagnostic=match failure with
+           | Ok _ -> D.create ~operation:"restoreUploads" ~reason:"invalidContent" ()
+           | Error source -> D.of_source ~operation:"restoreUploads" ~reason:"persistenceFailed" source in
          ( { state with recovery = Some (ticket.scope, ticket.after, true) }
-         , [ Publish (Diagnostic "Upload recovery could not read a valid checkpoint page")
-           ] ))
+         , [ Publish (Diagnostic (D.signal_prefix ^ D.encode diagnostic)) ] ))
     | Sync_event (Sync.Online_recovery_requested _) ->
       (match asset_scope state with
        | None -> state, []

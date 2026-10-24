@@ -338,9 +338,9 @@ import UIKit
       case .notImage:
         title = Self.text("Cannot Save Image", "无法保存图片")
         message = Self.text("This file is not a supported image.", "此文件不是支持的图片格式。")
-      case .failed:
+      case .failed(let reason):
         title = Self.text("Save Failed", "保存失败")
-        message = Self.text("The image could not be saved. Please try again.", "未能保存图片，请重试。")
+        message = Self.text("The image could not be saved. Please try again.", "未能保存图片，请重试。") + " (\(reason.description))"
       }
       let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
       alert.addAction(UIAlertAction(title: Self.text("OK", "好"), style: .default))

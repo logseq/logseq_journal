@@ -170,23 +170,29 @@ let generated_checkpoint_validation () =
              Sqlite3.Rc.check (Sqlite3.bind_text stmt 1 payload);
              Sqlite3.Rc.check (Sqlite3.step stmt))
       in
-      let reject label payload =
+      let reject label expected payload =
         write payload;
-        Alcotest.(check bool)
-          label
-          true
-          (Result.is_error (S.read db ~operation:original.operation_id))
+        match S.read db ~operation:original.operation_id with
+        | Error message -> Alcotest.(check string) label expected message
+        | Ok _ -> Alcotest.fail "invalid checkpoint was accepted"
       in
+      reject "invalid JSON excludes sensitive input" "Upload checkpoint JSON is invalid"
+        "SENSITIVE-fixture-body";
+      reject "unsupported version" "Unsupported upload checkpoint format"
+        (replace "\"format_version\":1" "\"format_version\":2" !payload);
       Alcotest.(check bool) "generated phase variant" true (String.contains !payload '[');
       reject
         "old checkpoint phase rejected"
+        "Upload checkpoint shape is invalid"
         (replace "[\"Prepared\"]" "\"prepared\"" !payload);
       reject
         "invalid UUID rejected"
+        "Upload checkpoint shape is invalid"
         (replace (U.to_string original.graph) "not-a-uuid" !payload);
-      reject "negative asset size rejected" (replace "\"size\":4" "\"size\":-1" !payload);
+      reject "negative asset size rejected" "Upload checkpoint intent is invalid" (replace "\"size\":4" "\"size\":-1" !payload);
       reject
         "revision invariant rejected"
+        "Upload checkpoint phase is invalid"
         (replace "\"revision\":0" "\"revision\":-1" !payload);
       Alcotest.(check bool) "oversized encoded checkpoint rejected" true
         (Result.is_error (S.save db ~expected:None
@@ -233,13 +239,25 @@ let exact_retirement_survives_restart_and_replacement () =
         (get (S.read db ~operation:fresh.operation_id) = Some fresh)))
 ;;
 
+let retirement_capture_decode_causes () =
+  let check expected input = match S.captured_graph_of_yojson input with
+    | Error message -> Alcotest.(check string) "finite retirement cause" expected message
+    | Ok _ -> Alcotest.fail "invalid capture was accepted" in
+  check "Retirement capture shape is invalid" (`String "SENSITIVE-fixture-body");
+  check "Unsupported retirement capture format" (`Assoc ["version", `Int 2]);
+  check "Retirement capture graph identity is invalid"
+    (`Assoc ["version", `Int 1; "origin", `String "synthetic";
+      "account", `String "synthetic"; "graph", `String "SENSITIVE-invalid-uuid"])
+;;
+
 let () =
   Alcotest.run
     "asset upload storage"
     [ ( "SQLite"
       , List.map
           (fun (n, f) -> Alcotest.test_case n `Quick f)
-          [ "retirement preserves changed operations", exact_retirement_preserves_new_and_changed_operations
+          [ "retirement capture decode causes", retirement_capture_decode_causes
+          ; "retirement preserves changed operations", exact_retirement_preserves_new_and_changed_operations
           ; "retirement restart and replacement isolation", exact_retirement_survives_restart_and_replacement
           ; "generated checkpoint validation", generated_checkpoint_validation
           ; "scoped cleanup", scoped_cleanup

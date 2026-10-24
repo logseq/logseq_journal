@@ -42,7 +42,10 @@ let run () =
   in
   let requested = Core.step rejected.next request_event in
   (match requested.effects with
-   | [ Core.Delegate (Core.Apply_authoritative_batch _) ] -> ()
+   | [ Core.Delegate (Core.Apply_authoritative_batch _)
+     ; Core.Publish (Core.State_changed state) ]
+     when List.exists (fun (group : Core.diagnostic_group) ->
+       List.assoc_opt "Remote tx" group.entries = Some "1") state.diagnostics.groups -> ()
    | _ -> Alcotest.fail "BC06 did not create a valid authoritative owner");
   let accepted = Core.step requested.next completion in
   match accepted.effects with

@@ -2,6 +2,7 @@
 #  define _GNU_SOURCE
 #endif
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
@@ -19,7 +20,7 @@ CAMLprim value logseq_journal_crypto_call(value request) {
   char *request_copy = strdup(String_val(request));
   char *response = NULL;
   if (request_copy == NULL) {
-    CAMLreturn(caml_copy_string("{\"ok\":false,\"error\":\"platform crypto unavailable\"}"));
+    CAMLreturn(caml_copy_string("{\"ok\":false,\"error\":\"cryptoAllocationFailed\"}"));
   }
   caml_enter_blocking_section();
   logseq_journal_crypto_fn crypto =
@@ -30,7 +31,9 @@ CAMLprim value logseq_journal_crypto_call(value request) {
   caml_leave_blocking_section();
   free(request_copy);
   if (response == NULL) {
-    CAMLreturn(caml_copy_string("{\"ok\":false,\"error\":\"platform crypto unavailable\"}"));
+    CAMLreturn(caml_copy_string(crypto == NULL
+        ? "{\"ok\":false,\"error\":\"cryptoNativeUnavailable\"}"
+        : "{\"ok\":false,\"error\":\"cryptoNativeResponseUnavailable\"}"));
   }
   result = caml_copy_string(response);
   free(response);
@@ -41,7 +44,7 @@ CAMLprim value logseq_journal_crypto_call(value request) {
    The Swift callee returns malloc-owned bytes; NULL denotes failure. */
 typedef unsigned char *(*logseq_journal_binary_fn)(
     int, const unsigned char *, size_t, const unsigned char *, size_t,
-    const unsigned char *, size_t, size_t *);
+    const unsigned char *, size_t, intptr_t *);
 
 CAMLprim value logseq_journal_crypto_binary_call(
     value encrypt, value key, value iv, value input) {
@@ -53,11 +56,13 @@ CAMLprim value logseq_journal_crypto_binary_call(
   const size_t iv_length = caml_string_length(iv);
   const size_t input_length = caml_string_length(input);
   unsigned char *response = NULL;
-  size_t response_length = 0;
+  intptr_t response_length = 0;
+  const char *failure = "platform binary crypto invalid request";
   if (key_length == 32 && iv_length == (sealing ? 0 : 12) &&
       input_length <= limit + (sealing ? 0 : 16) &&
       (sealing || input_length >= 16)) {
     unsigned char *copy = malloc(key_length + iv_length + input_length);
+    failure = "platform binary crypto allocation failed";
     if (copy != NULL) {
       memcpy(copy, String_val(key), key_length);
       memcpy(copy + key_length, String_val(iv), iv_length);
@@ -65,23 +70,37 @@ CAMLprim value logseq_journal_crypto_binary_call(
       caml_enter_blocking_section();
       logseq_journal_binary_fn crypto = (logseq_journal_binary_fn)
           dlsym(RTLD_DEFAULT, "logseq_journal_crypto_binary");
+      failure = "platform binary crypto unavailable";
       if (crypto != NULL) {
         response = crypto(sealing, copy, key_length, copy + key_length,
                           iv_length, copy + key_length + iv_length,
                           input_length, &response_length);
+        failure = "platform binary crypto operation failed";
+        if (response == NULL) {
+          switch (response_length) {
+          case -1: failure = "platform binary crypto invalid request"; break;
+          case -2: failure = "platform binary crypto authentication failed"; break;
+          case -3: failure = "platform binary crypto allocation failed"; break;
+          default: break; /* Includes older native implementations returning zero. */
+          }
+        }
       }
       caml_leave_blocking_section();
       memset(copy, 0, key_length);
       free(copy);
     }
   }
-  const size_t expected = sealing ? input_length + 28 : input_length - 16;
-  if (response == NULL || response_length != expected) {
-    free(response);
-    payload = caml_copy_string("platform binary crypto failed");
+  /* Check signed sentinels before converting lengths or touching native bytes. */
+  if (response == NULL) {
+    payload = caml_copy_string(failure);
     result = caml_alloc(1, 1); /* Error */
+  } else if (response_length < 0 ||
+             (size_t)response_length != (sealing ? input_length + 28 : input_length - 16)) {
+    free(response);
+    payload = caml_copy_string("platform binary crypto invalid response");
+    result = caml_alloc(1, 1);
   } else {
-    payload = caml_alloc_initialized_string(response_length, (const char *)response);
+    payload = caml_alloc_initialized_string((size_t)response_length, (const char *)response);
     free(response);
     result = caml_alloc(1, 0); /* Ok */
   }

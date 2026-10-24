@@ -132,6 +132,16 @@ class CacheBoundaryTests(unittest.TestCase):
         cls.build = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.build)
 
+    def test_link_stub_exports_bounded_failure_getter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)/'stub.c'
+            source.write_text(self.build.STUB)
+            caller = Path(directory)/'caller.c'
+            caller.write_text('#include <stdint.h>\nextern int32_t journal_ocaml_failure_reason(int32_t);\nint main(void){return journal_ocaml_failure_reason(1);}\n')
+            executable = Path(directory)/'stub-test'
+            subprocess.run(['xcrun','clang',str(source),str(caller),'-o',str(executable)],check=True,capture_output=True)
+            subprocess.run([str(executable)],check=True)
+
     @contextmanager
     def pinned_switch(self):
         """Real offline switch; original source metadata deliberately has no url."""

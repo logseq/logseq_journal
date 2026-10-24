@@ -528,10 +528,25 @@ let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
              (Core.Decrypt_value (handle, ciphertext)) in
         if decryption_failure then
           Alcotest.(check bool) "crypto error excludes sensitive detail" true
-            (result = Error (Core.Effect_failed "The graph value could not be decrypted."))
+            (match result with
+             | Error (Core.Effect_failed message) ->
+               let module D = Logseq_db_types.Failure_diagnostic in
+               (match D.decode message with
+                | Some detail -> D.operation detail = "decryptValue"
+                    && D.reason detail = "cryptoInvalid"
+                    && not (String.contains (D.message detail) 'S')
+                | None -> false)
+             | _ -> false)
         else if malformed_plaintext then
           Alcotest.(check bool) "decrypted parser error excludes plaintext" true
-            (result = Error (Core.Effect_failed "The decrypted graph value is not valid Transit."))
+            (match result with
+             | Error (Core.Effect_failed message) ->
+               let module D = Logseq_db_types.Failure_diagnostic in
+               (match D.decode message with
+                | Some detail -> D.reason detail = "parseFailed"
+                    && String.ends_with ~suffix:"decrypted Transit is invalid." (D.message detail)
+                | None -> false)
+             | _ -> false)
         else
           Alcotest.(check bool) "returned handle decrypts with the raw graph key" true
             (result = Ok (Core.Decrypted_value "plaintext")))))
@@ -1374,7 +1389,8 @@ let scenarios =
 ;;
 
 (* Migrated asset cache public runner scenarios. *)
-let with_local_asset_cache ?(budget = 8L) ?(pending_budget = 8L) test =
+let with_local_asset_cache ?(budget = 8L) ?(pending_budget = 8L)
+      ?on_asset_diagnostic ?(acquire = fun _ -> Ok "token") test =
   with_support (fun support ->
     Eio_main.run (fun environment ->
       Eio.Switch.run (fun sw ->
@@ -1412,12 +1428,12 @@ let with_local_asset_cache ?(budget = 8L) ?(pending_budget = 8L) test =
             ~crypto:(crypto ())
             ~id_token_provider:
               (Runner.id_token_provider
-                 ~acquire:(fun _ -> Ok "token")
+                 ~acquire
                  ~invalidate:(fun _ ~token:_ -> ()))
           |> Result.get_ok
         in
         let runner =
-          Runner.create ~sw deps ~post:(fun event -> Queue.add event posted)
+          Runner.create ?on_asset_diagnostic ~sw deps ~post:(fun event -> Queue.add event posted)
           |> Result.get_ok
         in
         Fun.protect
@@ -2201,8 +2217,9 @@ let test_legacy_manifest_is_rejected_without_cleanup () =
       "unsupported manifest fails cache open"
       true
       (match request (Core.Check_asset_cache (graph_id (), version)) with
-       | Error _ -> true
-       | Ok _ -> false);
+       | Error (Core.Asset_invalid_content message) ->
+         message = "Asset cache manifest shape is invalid"
+       | _ -> false);
     cache_bool "unsupported manifest is retained" true (Sys.file_exists manifest);
     Alcotest.(check string)
       "unsupported bytes are not rewritten"
@@ -2320,4 +2337,121 @@ let test_staged_preview_cache_failure_is_not_missing_file () =
 ;;
 let scenarios = scenarios @ [Alcotest.test_case
   "staged preview cache IO failure stays an error" `Quick test_staged_preview_cache_failure_is_not_missing_file]
+;;
+
+(* The runner owns checksum verification after loading the staged source. A pure
+   completion would already contain the lost diagnostic rather than cause it. *)
+let test_upload_checksum_cause_is_preserved () =
+  with_local_asset_cache (fun support request ->
+    let source = Filename.concat support "SENSITIVE-fixture.bin" in
+    Out_channel.with_open_bin source (fun out -> output_string out "file");
+    let file, _, _ = cache_stage request source in
+    let version = Logseq_db_types.Asset_descriptor.version
+      ~checksum:(String.make 64 'a') ~file_type:"bin" |> Result.get_ok in
+    match request (Core.Put_asset_file
+      {asset=graph_id (); version; file; maximum_plaintext_bytes=4}) with
+    | Error (Core.Asset_invalid_content message) ->
+      Alcotest.(check string) "checksum stage survives"
+        "Asset upload checksum mismatch" message
+    | _ -> fail "checksum failure must retain invalid-content category")
+;;
+let scenarios = scenarios @ [Alcotest.test_case
+  "upload checksum cause is preserved" `Quick test_upload_checksum_cause_is_preserved]
+;;
+
+let test_catalog_io_causes_exclude_paths () =
+  let execute ~prepare ~instruction ~expected =
+    with_support (fun support ->
+      prepare support;
+      Eio_main.run (fun environment -> Eio.Switch.run (fun sw ->
+        let tasks = ref [] and posted = ref [] in
+        let deps = dependencies ~environment ~support
+          ~fork:(fun ~sw:_ task -> tasks := task :: !tasks) () in
+        let runner = Runner.create ~sw deps
+          ~post:(fun event -> posted := event :: !posted) |> Result.get_ok in
+        Runner.submit runner (instruction ());
+        List.iter (fun task -> task ()) (List.rev !tasks);
+        match !posted with
+        | [Core.Runner_completed (Core.Completion (_, Error (Core.Effect_failed message)))] ->
+          let message = match Logseq_db_types.Failure_diagnostic.decode message with
+            | Some detail -> Logseq_db_types.Failure_diagnostic.message detail
+            | None -> fail "catalog cause must be a safe forwarding carrier" in
+          Alcotest.(check bool) "safe operation and reason" true
+            (String.starts_with ~prefix:expected message);
+          Alcotest.(check bool) "no synthetic private path" false
+            (String.contains message '/');
+          Runner.shutdown runner
+        | _ -> fail "expected one catalog failure"))) in
+  execute
+    ~prepare:(fun support ->
+      let worker = Filename.concat support "logseq-db-worker" in Unix.mkdir worker 0o700;
+      let catalogs = Filename.concat worker "sync-catalogs" in Unix.mkdir catalogs 0o700;
+      Unix.mkdir (Filename.concat catalogs
+        "748ac0b0c274b30bc6fc1da756958deab4ebdef06a2d6373a377e2b4d8cec6df.json") 0o700)
+    ~instruction:load_catalog_effect ~expected:"loadCatalog: Resource could not be opened";
+  execute
+    ~prepare:(fun support -> Out_channel.with_open_bin
+      (Filename.concat support "logseq-db-worker") (fun out -> output_string out "private"))
+    ~instruction:(fun () ->
+      let authenticated = Core.step (core ()) (Core.Account_authenticated {user_id=Some "user-1"}) in
+      let catalog = List.find_map (function
+        | Core.Run (Core.Request (ticket, Core.Fetch_catalog _)) ->
+          Some (Core.step authenticated.next
+            (Core.Runner_completed (Core.Completion (ticket, Ok [encrypted_graph ()]))))
+        | _ -> None) authenticated.effects |> Option.get in
+      let selected = Core.step catalog.next (Core.Graph_selected (graph_id ())) in
+      List.find_map (function
+        | Core.Run (Core.Request (_, Core.Save_catalog _) as action) -> Some action
+        | _ -> None) selected.effects |> Option.get)
+    ~expected:"prepareCatalog: Storage path is invalid"
+;;
+let scenarios = scenarios @ [Alcotest.test_case
+  "catalog IO causes exclude paths" `Quick test_catalog_io_causes_exclude_paths]
+;;
+
+let test_platform_crypto_unavailable_has_safe_cause () =
+  with_support (fun support -> Eio_main.run (fun environment -> Eio.Switch.run (fun sw ->
+    let tasks = ref [] and posted = ref [] in
+    let deps = dependencies ~secrets_dependency:(Runner.apple_secrets () |> Result.get_ok)
+      ~environment ~support ~fork:(fun ~sw:_ task -> tasks := task :: !tasks) () in
+    let runner = Runner.create ~sw deps ~post:(fun event -> posted := event :: !posted)
+      |> Result.get_ok in
+    let _, instruction = cached_key_effect () in
+    Runner.submit runner instruction;
+    List.iter (fun task -> task ()) (List.rev !tasks);
+    (match !posted with
+     | [Core.Runner_completed (Core.Completion (_, Error (Core.Effect_failed message)))] ->
+       Alcotest.(check bool) "provider finite cause survives public runner" true
+         (String.starts_with ~prefix:"platformCrypto: Resource is unavailable" message)
+     | _ -> fail "expected unavailable host crypto failure");
+    Runner.shutdown runner)))
+;;
+let scenarios = scenarios @ [Alcotest.test_case
+  "platform crypto unavailable has safe cause" `Quick test_platform_crypto_unavailable_has_safe_cause]
+;;
+
+let test_asset_authentication_cause_is_scoped () =
+  let reports = ref [] in
+  let on_asset_diagnostic ~scope ~operation ~request_operation detail =
+    reports := (scope, operation, request_operation, detail) :: !reports in
+  with_local_asset_cache ~on_asset_diagnostic
+    ~acquire:(fun _ -> Error "SENSITIVE-fixture-token-error")
+    (fun _ request ->
+      let version = Logseq_db_types.Asset_descriptor.version
+        ~checksum:(String.make 64 'a') ~file_type:"bin" |> Result.get_ok in
+      Alcotest.(check bool) "original authentication category" true
+        (request (Core.Fetch_asset {asset=graph_id (); version; maximum_plaintext_bytes=4})
+          = Error Core.Asset_authentication);
+      match !reports with
+      | [(scope, operation, request_operation, detail)] ->
+        let module D = Logseq_db_types.Failure_diagnostic in
+        Alcotest.(check bool) "exact graph identity" true (scope.graph_id = graph_id ());
+        Alcotest.(check string) "finite operation" "assetDownload" operation;
+        Alcotest.(check string) "internal request identity" "cache-1" request_operation;
+        Alcotest.(check string) "source category" "authenticationFailed" (D.reason detail);
+        Alcotest.(check bool) "no raw auth text" false (String.contains (D.message detail) 'S')
+      | _ -> fail "expected one scoped authentication cause")
+;;
+let scenarios = scenarios @ [Alcotest.test_case
+  "asset authentication cause is scoped" `Quick test_asset_authentication_cause_is_scoped]
 ;;

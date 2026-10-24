@@ -20,6 +20,8 @@ private func luiOCamlStart(
   _ payload: UnsafePointer<CChar>?,
   _ payloadLength: Int32
 ) -> Int32
+@_silgen_name("journal_ocaml_failure_reason")
+private func journalOCamlFailureReason(_ operation:Int32) -> Int32
 @_silgen_name("lui_ocaml_stop")
 private func luiOCamlStop() -> Int32
 @_silgen_name("journal_ocaml_pump")
@@ -60,31 +62,46 @@ private let wakeup: WakeupCallback = {
 private final class JournalPlatformRequestIngress: @unchecked Sendable {
   private let lock = NSLock()
   private var owner: UUID?
-  private var pending: [Data] = []
-  private var receiver: (@Sendable (Data) -> Void)?
+  struct Request: Sendable {
+    let bytes:Data
+    let ticket:UUID
+    let tag:UInt8?
+  }
+  private var latest:[UInt8:UUID] = [:]
+  private var pending: [Request] = []
+  private var receiver: (@Sendable (Request) -> Void)?
   func begin(_ identity: UUID) {
     lock.lock(); defer { lock.unlock() }
-    owner = identity; pending = []; receiver = nil
+    owner = identity; pending = []; latest = [:]; receiver = nil
   }
   func submit(_ request: Data) {
     lock.lock()
     guard owner != nil else { lock.unlock(); return }
+    let tag:UInt8? = request.count >= 8 && request.prefix(6) == Data([76,74,80,50,2,0])
+      && request[7] == 0 && [6,8,10,13,20,22,28,30,32].contains(request[6]) ? request[6] : nil
+    let receipt=Request(bytes:request,ticket:UUID(),tag:tag)
+    if let tag { latest[tag] = receipt.ticket }
     let deliver = receiver
-    if deliver == nil { pending.append(request) }
+    if deliver == nil { pending.append(receipt) }
     lock.unlock()
-    deliver?(request)
+    deliver?(receipt)
   }
-  func activate(_ identity: UUID, receiver: @escaping @Sendable (Data) -> Void) -> [Data] {
+  func activate(_ identity: UUID, receiver: @escaping @Sendable (Request) -> Void) -> [Request] {
     lock.lock(); defer { lock.unlock() }
     guard owner == identity else { return [] }
     self.receiver = receiver
     let requests = pending; pending = []
     return requests
   }
+  func owns(_ identity:UUID, _ request:Request) -> Bool {
+    lock.lock(); defer { lock.unlock() }
+    guard owner == identity else { return false }
+    return request.tag.map { latest[$0] == request.ticket } ?? true
+  }
   func close(_ identity: UUID) {
     lock.lock(); defer { lock.unlock() }
     guard owner == identity else { return }
-    owner = nil; receiver = nil; pending = []
+    owner = nil; receiver = nil; pending = []; latest = [:]
   }
 }
 private let platformRequestIngress = JournalPlatformRequestIngress()
@@ -109,6 +126,44 @@ private let platformRequest: PlatformRequestCallback = { data, length in
       "Journal could not complete a native operation (\(rawValue)). Retry opening Journal."
     }
   }
+  struct FailureDetail: Error, LocalizedError {
+    let operation: Failure
+    let reason: JournalSafeDiagnostic
+    var errorDescription:String? {
+      "Journal could not complete a native operation (\(operation.rawValue) · \(reason.rawValue)). \(reason.errorDescription!)"
+    }
+  }
+  private(set) var failureReason: JournalSafeDiagnostic?
+  var failureDescription:String? {
+    failure.map { FailureDetail(operation:$0,reason:failureReason ?? .unknown).errorDescription! }
+  }
+  static func safeReason(_ error:Error) -> JournalSafeDiagnostic {
+    if case let LUIBackendError.invalidBatch(source) = error { return .backendBatch(source) }
+    return .classify(error)
+  }
+  static func safeDescription(_ error:Error, operation:String) -> String {
+    if let error = error as? FailureDetail { return error.errorDescription! }
+    let reason = safeReason(error)
+    return "Journal could not finish (\(operation) · \(reason.rawValue)). \(reason.errorDescription!)"
+  }
+  private func record(_ operation:Failure, _ reason:JournalSafeDiagnostic) {
+    failure = operation; failureReason = reason
+  }
+  private func bridgeReason(_ operation:Int32) -> JournalSafeDiagnostic {
+    switch journalOCamlFailureReason(operation) {
+    case 1: .missingHandler
+    case 2: .callbackFailed
+    case 3: .allocationFailed
+    case 4: .invalidInput
+    case 5: .startupDecodeFailed
+    case 6: .startupWorkerFailed
+    case 7: .startupMountFailed
+    default: .unknown
+    }
+  }
+  private var reportedFailure:FailureDetail? {
+    failure.map { FailureDetail(operation:$0,reason:failureReason ?? .unknown) }
+  }
   let backend: LUIAppleBackend
   let platform: JournalApplicationPlatform
   private let startupPayload: Data
@@ -128,10 +183,9 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   ) throws {
     self.platform = platform
     self.startupPayload = startupPayload
-    backend = try LUIAppleBackend(
-      appIcons: journalAppIcons,
-      extensionRegistry: extensionRegistry
-    )
+    do {
+      backend = try LUIAppleBackend(appIcons: journalAppIcons, extensionRegistry: extensionRegistry)
+    } catch { throw FailureDetail(operation:.start,reason:Self.safeReason(error)) }
     backend.onEvent = { [weak self] event in self?.handle(event) }
   }
 
@@ -139,7 +193,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   /// `lui_ocaml_start` so init receives it before the worker session begins.
   /// The platform event stream attaches afterwards.
   func start() throws {
-    if let failure { throw failure }
+    if let reportedFailure { throw reportedFailure }
     guard !started else { return }
     generation = UUID()
     let identity = generation
@@ -161,35 +215,37 @@ private let platformRequest: PlatformRequestCallback = { data, length in
         bytes.baseAddress?.assumingMemoryBound(to: CChar.self),
         Int32(bytes.count))
     }
+    guard generation == identity else { throw CancellationError() }
     guard accepted == 1 else {
+      record(.start,bridgeReason(1))
+      let reported = reportedFailure!
       _ = luiOCamlStop()
       activeRuntime = nil
-      failure = .start
-      throw Failure.start
+      throw reported
     }
-    if let failure {
+    if let reportedFailure {
       _ = luiOCamlStop()
       activeRuntime = nil
-      throw failure
+      throw reportedFailure
     }
     guard rootID != nil else {
       _ = luiOCamlStop()
       activeRuntime = nil
-      failure = .start
-      throw Failure.start
+      record(.start,.missingRoot)
+      throw reportedFailure!
     }
     started = true
     platform.connect(to: self)
     let requests = platformRequestIngress.activate(identity) { [weak self] request in
       Task { @MainActor [weak self] in
         guard let self, self.generation == identity else { return }
-        await self.deliverPlatformRequest(request)
+        await self.deliverPlatformRequest(request.bytes,receipt:request)
       }
     }
     initialPlatformTasks = requests.map { request in
       Task { @MainActor [weak self] in
         guard let self, self.generation == identity else { return }
-        await self.deliverPlatformRequest(request)
+        await self.deliverPlatformRequest(request.bytes,receipt:request)
       }
     }
   }
@@ -214,47 +270,59 @@ private let platformRequest: PlatformRequestCallback = { data, length in
   @discardableResult func stop() -> Bool {
     guard started || stopPending else { return true }
     platformRequestIngress.close(generation)
+    generation = UUID()
     for task in initialPlatformTasks { task.cancel() }
     initialPlatformTasks = []
     platform.disconnect()
     started = false
     activeRuntime = nil
     stopPending = luiOCamlStop() != 1
-    if stopPending { failure = .stop }
+    if stopPending { record(.stop,bridgeReason(2)) }
     return !stopPending
   }
 
   func apply(json: String) {
+    let identity = generation
     do {
       try backend.apply(json: json)
+      guard generation == identity else { return }
       rootID = backend.rootIDs.first
       appliedPatches += 1
     } catch {
-      failure = .patch
+      guard generation == identity else { return }
+      record(.patch,Self.safeReason(error))
     }
   }
 
   func pump() {
     guard started else { return }
-    if journalOCamlPump() != 1 { failure = .pump }
+    let identity = generation, accepted = journalOCamlPump()
+    if generation == identity, started, accepted != 1 { record(.pump,bridgeReason(3)) }
   }
 
   /// Marshals one LJP2 request onto the platform actor and ships its response
-  /// envelope back through the C entry. A nil response (decode or service
-  /// failure) reports the request as failed so OCaml resolves its pending
-  /// continuation instead of waiting forever.
+  /// envelope back through the C entry. Current failure/cancellation completes
+  /// the owned continuation via LJF1; nil belongs to retired/suppressed work.
   func deliverPlatformRequest(_ bytes: Data) async {
+    await deliverPlatformRequest(bytes,receipt:nil)
+  }
+  private func deliverPlatformRequest(_ bytes:Data, receipt:JournalPlatformRequestIngress.Request?) async {
     guard started else { return }
     let identity = generation
+    func ownsRequest() -> Bool {
+      generation == identity && (receipt.map { platformRequestIngress.owns(identity,$0) } ?? true)
+    }
+    guard ownsRequest() else { return }
     let response = await platform.request(bytes)
-    guard started, generation == identity, !Task.isCancelled else { return }
-    guard let response else {
-      let accepted = bytes.withUnsafeBytes { buffer in
-        journalOCamlPlatformFailure(
-          buffer.baseAddress?.assumingMemoryBound(to: CChar.self),
-          Int32(buffer.count))
+    guard started, ownsRequest(), !Task.isCancelled else { return }
+    // nil belongs to retired/suppressed work. Current cancellation is an LJF1
+    // result and still completes the original continuation without a ledger row.
+    guard let response else { return }
+    if response.prefix(4) == Data("LJF1".utf8) {
+      let accepted = response.withUnsafeBytes { buffer in
+        journalOCamlPlatformFailure(buffer.baseAddress?.assumingMemoryBound(to:CChar.self),Int32(buffer.count))
       }
-      if accepted != 1 { failure = .platformFailure }
+      if generation == identity, started, accepted != 1 { record(.platformFailure,bridgeReason(6)) }
       return
     }
     let accepted = response.withUnsafeBytes { buffer in
@@ -262,22 +330,24 @@ private let platformRequest: PlatformRequestCallback = { data, length in
         buffer.baseAddress?.assumingMemoryBound(to: CChar.self),
         Int32(buffer.count))
     }
-    if accepted != 1 { failure = .platformResponse }
+    if generation == identity, started, accepted != 1 { record(.platformResponse,bridgeReason(5)) }
   }
 
   /// Pushes one host-originated LJP2 event envelope to OCaml.
   func sendPlatformEvent(_ bytes: Data) {
     guard started else { return }
+    let identity = generation
     let accepted = bytes.withUnsafeBytes { buffer in
       journalOCamlPlatformEvent(
         buffer.baseAddress?.assumingMemoryBound(to: CChar.self),
         Int32(buffer.count))
     }
-    if accepted != 1 { failure = .platformEvent }
+    if generation == identity, started, accepted != 1 { record(.platformEvent,bridgeReason(4)) }
   }
 
   private func handle(_ event: LUIEvent) {
     guard started else { return }
-    if JournalLUIEvents.dispatch(event) != 1 { failure = .event }
+    let identity = generation, accepted = JournalLUIEvents.dispatch(event)
+    if generation == identity, started, accepted != 1 { record(.event,bridgeReason(7)) }
   }
 }

@@ -2,6 +2,7 @@ type stage =
   | Prepare
   | Decode
   | Application
+  | Integrity
 
 type reason =
   | Transit_syntax
@@ -24,7 +25,7 @@ type reason =
 
 type t = (string * Yojson.Safe.t) list
 
-let stages = [ "prepare"; "decode"; "application" ]
+let stages = [ "prepare"; "decode"; "application"; "integrity" ]
 
 let reasons =
   [ "transit-syntax"
@@ -45,6 +46,60 @@ let reasons =
   ; "application-exception"
   ; "unknown"
   ]
+;;
+
+let integrity_reasons =
+  [ "payload-mismatch"
+  ; "expected-simulation-failed"
+  ; "expected-cursor-missing"
+  ; "missing-durable-origin"
+  ; "multiple-local-matches"
+  ; "origin-context-length"
+  ; "missing-frozen-interval"
+  ; "cursor-overflow"
+  ; "negative-interval"
+  ; "stale-delete-non-delete"
+  ; "stale-delete-context-length"
+  ; "submitted-delete-missing-t-before"
+  ; "unknown"
+  ]
+;;
+
+let cursor_keys = [ "checkpoint"; "through"; "expectedCursor"; "tBefore" ]
+
+let integrity_counters =
+  [ "ordinal"
+  ; "count"
+  ; "expectedDatoms"
+  ; "actualDatoms"
+  ; "matchingSubmissions"
+  ; "cursorCount"
+  ; "transactionCount"
+  ; "rootCount"
+  ]
+;;
+
+let integrity_descriptors =
+  [ "outboxState", [ "queued"; "submitted"; "accepted"; "stale-rejected"; "blocked" ]
+  ; ( "mutation"
+    , [ "save-block"
+      ; "insert-blocks"
+      ; "create-journal-page"
+      ; "delete-blocks"
+      ; "set-task-status"
+      ; "clear-task-status"
+      ; "publish-asset"
+      ; "set-asset-reference"
+      ] )
+  ]
+;;
+
+let valid_cursor text =
+  try
+    let n = Int64.of_string text in
+    n >= 0L && Int64.to_string n = text
+  with
+  | Failure _ -> false
 ;;
 
 let operations =
@@ -100,7 +155,7 @@ let counter_keys =
 
 let string_lists =
   [ "stage", stages
-  ; "reason", reasons
+  ; "reason", List.sort_uniq String.compare (reasons @ integrity_reasons)
   ; "operation", operations
   ; "attribute", attributes
   ; "field", fields
@@ -122,10 +177,26 @@ let key_order =
   ; "field"
   ; "type"
   ; "exception"
+  ; "checkpoint"
+  ; "through"
+  ; "expectedCursor"
+  ; "tBefore"
+  ; "ordinal"
+  ; "count"
+  ; "expectedDatoms"
+  ; "actualDatoms"
+  ; "matchingSubmissions"
+  ; "cursorCount"
+  ; "transactionCount"
+  ; "rootCount"
+  ; "outboxState"
+  ; "mutation"
   ]
 ;;
 
 let prefix = "authoritative-decode:v1:"
+let integrity_prefix = "authoritative-integrity:v1:"
+let integrity_signal_prefix = "worker.applyAuthoritative.authoritativeIntegrityFailure:"
 let detail_name = "authoritativeDiagnostic"
 let signal_prefix = "worker.applyAuthoritative.authoritativeDecodeFailed:"
 let maximum_counter = 1_000_000_000
@@ -134,6 +205,7 @@ let stage_name = function
   | Prepare -> "prepare"
   | Decode -> "decode"
   | Application -> "application"
+  | Integrity -> "integrity"
 ;;
 
 let reason_name = function
@@ -249,9 +321,67 @@ let create
   |> canonical
 ;;
 
-let encode value = prefix ^ Yojson.Safe.to_string (`Assoc value)
+let integrity_context_value key value =
+  if List.mem key cursor_keys && valid_cursor value
+  then Some (`String value)
+  else if List.mem key integrity_counters
+  then (
+    try
+      let n = int_of_string value in
+      if n >= 0 && n <= maximum_counter && string_of_int n = value
+      then Some (`Int n)
+      else None
+    with
+    | Failure _ -> None)
+  else (
+    match List.assoc_opt key integrity_descriptors with
+    | Some values when List.mem value values -> Some (`String value)
+    | _ -> None)
+;;
+
+let with_integrity_context context value =
+  if List.assoc_opt "stage" value <> Some (`String "integrity")
+  then value
+  else (
+    let entries =
+      List.fold_left
+        (fun entries (key, value) ->
+           match integrity_context_value key value with
+           | None -> entries
+           | Some v -> (key, v) :: List.remove_assoc key entries)
+        value
+        context
+      |> canonical
+    in
+    (* Worker Error detail strings share its 512-byte display-safe budget. *)
+    let rec fit entries =
+      if
+        String.length integrity_prefix
+        + String.length (Yojson.Safe.to_string (`Assoc entries))
+        <= 512
+      then entries
+      else fit (List.rev (List.tl (List.rev entries)))
+    in
+    fit entries)
+;;
+
+let integrity ~reason ?(context = []) () =
+  [ "stage", `String "integrity"
+  ; "reason", `String (fixed integrity_reasons "unknown" reason)
+  ]
+  |> with_integrity_context context
+;;
+
+let encode value =
+  (if List.assoc_opt "stage" value = Some (`String "integrity")
+   then integrity_prefix
+   else prefix)
+  ^ Yojson.Safe.to_string (`Assoc value)
+;;
 
 let decode source =
+  let is_integrity = String.starts_with ~prefix:integrity_prefix source in
+  let prefix = if is_integrity then integrity_prefix else prefix in
   if String.length source > 512 || not (String.starts_with ~prefix source)
   then None
   else (
@@ -276,14 +406,43 @@ let decode source =
                   | None, `Int n when List.mem key counter_keys ->
                     (n >= if key = "transaction" || key = "operationIndex" then 1 else 0)
                     && n <= maximum_counter
+                  | None, `String s when is_integrity && List.mem key cursor_keys ->
+                    valid_cursor s
+                  | None, `Int n when is_integrity && List.mem key integrity_counters ->
+                    n >= 0 && n <= maximum_counter
+                  | None, `String s when is_integrity ->
+                    (match List.assoc_opt key integrity_descriptors with
+                     | Some allowed -> List.mem s allowed
+                     | None -> false)
                   | _ -> false)
                entries
           &&
-          if List.assoc_opt "stage" entries = Some (`String "application")
+          if is_integrity
           then
-            List.assoc_opt "reason" entries = Some (`String "application-exception")
-            && not (List.mem_assoc "operationIndex" entries)
-          else List.assoc_opt "reason" entries <> Some (`String "application-exception")
+            List.assoc_opt "stage" entries = Some (`String "integrity")
+            && (match List.assoc_opt "reason" entries with
+                | Some (`String r) -> List.mem r integrity_reasons
+                | _ -> false)
+            && List.for_all
+                 (fun (key, _) ->
+                    List.mem
+                      key
+                      ([ "stage"; "reason" ]
+                       @ cursor_keys
+                       @ integrity_counters
+                       @ List.map fst integrity_descriptors))
+                 entries
+          else
+            List.assoc_opt "stage" entries <> Some (`String "integrity")
+            && (match List.assoc_opt "reason" entries with
+                | Some (`String r) -> List.mem r reasons
+                | _ -> false)
+            &&
+            if List.assoc_opt "stage" entries = Some (`String "application")
+            then
+              List.assoc_opt "reason" entries = Some (`String "application-exception")
+              && not (List.mem_assoc "operationIndex" entries)
+            else List.assoc_opt "reason" entries <> Some (`String "application-exception")
         in
         if valid then Some (canonical entries) else None
       | _ -> None
@@ -301,5 +460,36 @@ let message value =
     | `Int n -> string_of_int n
     | _ -> "unknown"
   in
-  "Authoritative transaction rejected (" ^ String.concat "; " (List.map part value) ^ ")."
+  (if List.assoc_opt "stage" value = Some (`String "integrity")
+   then "Authoritative integrity validation failed ("
+   else "Authoritative transaction rejected (")
+  ^ String.concat "; " (List.map part value)
+  ^ ")."
+;;
+
+let integrity_of_source source =
+  match decode source with
+  | Some value when List.assoc_opt "stage" value = Some (`String "integrity") -> value
+  | _ ->
+    let reason =
+      match source with
+      | "accepted transaction has no durable origin evidence" -> "missing-durable-origin"
+      | "authoritative transaction ambiguously matches local submissions" ->
+        "multiple-local-matches"
+      | "authoritative transaction origins do not match their cursors" ->
+        "origin-context-length"
+      | "own transaction omitted its frozen submission interval" ->
+        "missing-frozen-interval"
+      | "server cursor interval overflows int64" -> "cursor-overflow"
+      | "negative server cursor interval" -> "negative-interval"
+      | "stale delete state contains a non-delete mutation" -> "stale-delete-non-delete"
+      | "authoritative transaction roots do not match their cursors" ->
+        "stale-delete-context-length"
+      | "submitted delete omitted its durable t_before" ->
+        "submitted-delete-missing-t-before"
+      | s when String.starts_with ~prefix:"accepted transaction payload mismatch:" s ->
+        "payload-mismatch"
+      | _ -> "unknown"
+    in
+    integrity ~reason ()
 ;;
