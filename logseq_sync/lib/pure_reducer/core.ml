@@ -896,6 +896,7 @@ type t =
   ; submission_owner : submission_owner option
   ; pull_owner : pull_owner option
   ; pull_wanted : (graph_scope * Server_cursor.t) option
+  ; force_pull_pending : bool
   ; diagnostic_remote_cursor : (graph_scope * Server_cursor.t) option
   ; pull_retry_delay : float
   ; active_authoritative_batch : authoritative_batch option
@@ -973,7 +974,7 @@ let initial config =
     ; pending_sync_inspection = None
     ; pending_outbox_transition = None
     ; pull_owner = None
-    ; pull_wanted = None
+    ; pull_wanted = None; force_pull_pending = false
     ; diagnostic_remote_cursor = None
     ; pull_retry_delay = 1.
     ; submission_owner = None
@@ -1091,7 +1092,7 @@ let fail core stage message =
     { core with
       pending_effects = []
     ; pull_owner = None
-    ; pull_wanted = None
+    ; pull_wanted = None; force_pull_pending = false
     ; pull_retry_delay = 1.
     ; pending_mirror_inspection = None
     ; pending_selected_download = None
@@ -1291,7 +1292,7 @@ let reset_graph_operations core =
   ; pending_outbox_transition = None
   ; submission_owner = None
   ; pull_owner = None
-  ; pull_wanted = None
+  ; pull_wanted = None; force_pull_pending = false
   ; pull_retry_delay = 1.
   ; active_authoritative_batch = None
   ; queued_authoritative_batch = None
@@ -1663,7 +1664,8 @@ let pull_target_pending core graph cursor =
 let pull_in_progress core =
   match core.current_graph_scope, core.public_state.snapshot.applied_server_t with
   | Some graph, Some cursor ->
-    Option.is_some core.pull_owner
+    core.force_pull_pending
+    || Option.is_some core.pull_owner
     || Option.is_some core.active_authoritative_batch
     || pull_target_pending core graph cursor
   | _ -> false
@@ -1854,7 +1856,11 @@ let request_pull ?through ?(force = false) core =
     if
       occupied
       || Option.is_some core.active_authoritative_batch
-      || not (force || pull_target_pending core graph cursor)
+      || (core.force_pull_pending && not force
+          && not (pull_target_pending core graph cursor)
+          && (Option.is_some core.pending_outbox_transition
+              || Option.is_some core.submission_owner))
+      || not (force || core.force_pull_pending || pull_target_pending core graph cursor)
     then unchanged core
     else (
       let connection = { graph; connection_generation = core.connection_generation } in
@@ -1863,6 +1869,7 @@ let request_pull ?through ?(force = false) core =
         set_snapshot
           { core with
             next_effect_id = timer + 1
+          ; force_pull_pending = false
           ; pull_owner =
               Some
                 { pull_connection = connection
@@ -3050,7 +3057,7 @@ let step core event =
         pending_selected_download = None;
         pending_effects = local_pending; websocket_live = false; deferred_catalog_reconciliation = false;
         unlock_preparation = No_unlock_preparation;
-        bootstrap = (if bootstrap_downloading next.bootstrap then No_bootstrap else next.bootstrap); pull_wanted = None;
+        bootstrap = (if bootstrap_downloading next.bootstrap then No_bootstrap else next.bootstrap); pull_wanted = None; force_pull_pending = false;
         pull_owner = (match next.pull_owner with
           | Some {pull_stage=Applying_pull; _} as owner -> owner | _ -> None)
       } { snapshot with timeline_presentation_pending = false; startup; sync_phase = Offline
@@ -3184,7 +3191,12 @@ let step core event =
          in
          let requested = begin_e2ee_key_access core scope in
          { requested with effects = publish requested.next :: requested.effects }
-       | Some scope, _ -> inspect_sync core scope
+       | Some scope, _ ->
+         (* The existing explicit-online entry owns manual freshness demand.
+            Busy work keeps a single intent until its response/commit retires. *)
+         let inspected = inspect_sync { core with force_pull_pending = true } scope in
+         let pulled = request_pull inspected.next in
+         { pulled with effects = inspected.effects @ pulled.effects }
        | None, _ -> unchanged core)
     | Local_cache_deletion_requested graph_id -> begin_local_deletion core graph_id
     | Foreground_changed { foreground = false; lifecycle_generation } ->
@@ -3323,7 +3335,7 @@ let step core event =
           ; pending_outbox_transition = None
           ; submission_owner = None
           ; pull_owner = None
-          ; pull_wanted = None
+          ; pull_wanted = None; force_pull_pending = false
           ; pull_retry_delay = 1.
           ; active_authoritative_batch = None
           ; queued_authoritative_batch = None
@@ -3998,6 +4010,14 @@ let step_sync = step
 
 let step core event =
   let transition = step_sync core event in
+  let transition =
+    if transition.next.force_pull_pending && transition.next.foreground
+       && not transition.next.closed && network_allowed transition.next
+    then
+      let pulled = request_pull transition.next in
+      { pulled with effects = transition.effects @ pulled.effects }
+    else transition
+  in
   let public_state = with_sync_cursor_diagnostics transition.next transition.next.public_state in
   let next = { transition.next with public_state } in
   let effects = List.map (function

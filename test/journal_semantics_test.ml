@@ -3077,8 +3077,31 @@ let test_status_property_identity_preserved () =
     [ G.Uuid.to_string (uuid 99); G.Uuid.to_string (uuid 100) ]
 ;;
 
+let test_native_sync_entry_is_bound_and_scoped () =
+  let calls = ref 0 in
+  let no_op = Ui.Event.Handler.create (fun _ -> ()) in
+  List.iter (fun enabled ->
+    let view = Journal_native_collection.view
+      ~key:(Ui.Key.string "sync-list") ~test_id:(Ui.Test_id.string "sync-list")
+      ~rows:[] ~scroll_target:None
+      ?on_sync:(if enabled then Some (Ui.Event.Handler.create (fun _ -> incr calls)) else None)
+      ~on_scroll_completed:no_op ~actions_enabled:true ~on_visible_range:no_op
+      ~on_open:no_op ~on_status:no_op ~on_delete:no_op ~on_copy:no_op ~children:[] ()
+      |> V.Body.Private.to_widget in
+    with_mounted view (fun app ops ->
+      let node = native_list_node (ops ()) in
+      let before = !calls in
+      dispatch_list_payload app node {|{"type":"sync"}|};
+      require (!calls = before + (if enabled then 1 else 0))
+        "native sync trigger did not use the mounted optional callback";
+      dispatch_list_payload app node {|{"type":"unknown-sync"}|};
+      require (!calls = before + (if enabled then 1 else 0))
+        "unknown native event triggered sync")) [false; true]
+;;
+
 let tests =
-  [ ( "Database status identity preserves complete detail"
+  [ "native sync entry binding", test_native_sync_entry_is_bound_and_scoped
+  ; ( "Database status identity preserves complete detail"
     , test_status_property_identity_preserved )
   ; ( "Typed properties omitted from Timeline"
     , test_property_values_are_not_timeline_children )

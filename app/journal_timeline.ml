@@ -208,6 +208,7 @@ let view
       ?status_name
       ?current_day
       ?store
+      ?on_sync
       ?(on_region = fun _ -> ())
       ~render_source
       ?render_title
@@ -366,6 +367,7 @@ let view
     ~rows
     ~scroll_target:target
     ?scroll_target_signal
+    ?on_sync
     ~on_scroll_completed
     ~actions_enabled:(delete_enabled && actions_enabled)
     ~on_visible_range

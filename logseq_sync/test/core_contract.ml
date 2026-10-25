@@ -3799,8 +3799,129 @@ let pull_shutdown_and_graph_retirement_cancel_demand () =
     [ Core.Shutdown; Core.Graph_picker_requested ]
 ;;
 
+(* The existing explicit-online event is the shared manual-sync entry. *)
+let manual_sync core =
+  Core.step core (Core.Online_recovery_requested (timeline_scope core))
+;;
+
+let manual_sync_online_forces_a_fresh_pull () =
+  let opened, connection, _ = pull_fixture () in
+  let current = pull_response opened.next connection ~after:0 0 in
+  let requested = manual_sync current.next in
+  check_pull_count "manual online sync sends a fresh pull" 1 requested.effects;
+  Alcotest.(check bool) "request is not prematurely Current" true
+    ((Core.state requested.next).snapshot.sync_phase = Core.Pulling);
+  let completed = pull_response requested.next connection ~after:0 0 in
+  check_pull_count "one confirmed empty response settles" 0 completed.effects;
+  Alcotest.(check bool) "confirmed empty pull is Current" true
+    ((Core.state completed.next).snapshot.sync_phase = Core.Current)
+;;
+
+let manual_sync_busy_force_is_coalesced () =
+  let opened, connection, _ = pull_fixture () in
+  let pending = ref opened.next in
+  for _ = 1 to 50 do
+    let requested = manual_sync !pending in
+    check_pull_count "busy gestures never send concurrently" 0 requested.effects;
+    pending := requested.next
+  done;
+  let received = pull_response !pending connection ~after:0 0 in
+  check_pull_count "force survives old empty response" 1 received.effects;
+  Alcotest.(check bool) "post-gesture probe remains Pulling" true
+    ((Core.state received.next).snapshot.sync_phase = Core.Pulling);
+  let confirmed = pull_response received.next connection ~after:0 0 in
+  check_pull_count "fifty gestures merge into one probe" 0 confirmed.effects;
+  Alcotest.(check bool) "new probe confirmation settles" true
+    ((Core.state confirmed.next).snapshot.sync_phase = Core.Current)
+;;
+
+let manual_sync_waits_for_authoritative_commit () =
+  let opened, connection, sync = pull_fixture () in
+  let received = pull_response opened.next connection ~after:0 1 in
+  let requested = manual_sync received.next in
+  check_pull_count "applying authoritative data keeps its owner" 0 requested.effects;
+  let committed = recovery_apply requested.next connection
+    (recovery_sync sync ~checkpoint:1 1 []) in
+  Alcotest.(check bool) "probe starts from committed cursor" true
+    (pull_sends committed.effects = [connection, Some (server_cursor_of_int 1)]);
+  Alcotest.(check bool) "no intermediate Current publication" false
+    (List.exists (function Core.Publish (Core.State_changed state) ->
+       state.snapshot.sync_phase = Core.Current | _ -> false) committed.effects);
+  let confirmed = pull_response committed.next connection ~after:1 1 in
+  Alcotest.(check bool) "commit plus fresh response settles" true
+    ((Core.state confirmed.next).snapshot.sync_phase = Core.Current)
+;;
+
+let manual_sync_offline_uses_existing_admission_and_socket_owner () =
+  let opened, connection, _ = pull_fixture () in
+  let current = pull_response opened.next connection ~after:0 0 in
+  let closed = Core.step current.next
+    (Core.Websocket_closed (connection, Core.Recoverable_close (Some "synthetic offline"))) in
+  let requested = manual_sync closed.next in
+  check_pull_count "offline never sends through old socket" 0 requested.effects;
+  (* Application's existing online request re-verifies the native identity. *)
+  let admitted = Core.step requested.next
+    (Core.Account_authenticated {user_id=Some "user"}) in
+  Alcotest.(check bool) "replacement waits for physical retirement" false
+    (List.exists (function Core.Run (Core.Start_websocket _) -> true | _ -> false) admitted.effects);
+  let retired = Core.step admitted.next (Core.Websocket_retired connection) in
+  let fresh = recovery_connection retired.effects in
+  let connected = Core.step retired.next (Core.Websocket_opened fresh) in
+  check_pull_count "recovered connection owns the single baseline pull" 1 connected.effects;
+  let late = pull_response connected.next connection ~after:0 5 in
+  check_pull_count "old socket response is fenced" 0 late.effects;
+  let completed = pull_response late.next fresh ~after:0 0 in
+  check_pull_count "recovery does not queue an extra manual pull" 0 completed.effects;
+  Alcotest.(check bool) "reconnected confirmation settles" true
+    ((Core.state completed.next).snapshot.sync_phase = Core.Current)
+;;
+
+let manual_sync_scope_and_retirement_fence_force () =
+  let opened, connection, _ = pull_fixture () in
+  let current = pull_response opened.next connection ~after:0 0 in
+  let scope = timeline_scope current.next in
+  let stale = {scope with startup={scope.startup with
+    presentation_generation=scope.startup.presentation_generation+1}} in
+  let ignored = Core.step current.next (Core.Online_recovery_requested stale) in
+  check_instructions "stale manual intent is inert" [] ignored.effects;
+  let requested = manual_sync opened.next in
+  List.iter (fun event ->
+    let retired = Core.step requested.next event in
+    let late = pull_response retired.next connection ~after:0 1 in
+    check_pull_count "retired force cannot restart pull" 0 late.effects)
+    [Core.Graph_picker_requested; Core.Shutdown;
+     Core.Online_cancelled (startup_scope requested.next)]
+;;
+
+let manual_sync_does_not_bypass_submission_owner () =
+  let submitted, connection, sync, batch = submitted_delete_recovery_fixture () in
+  let requested = manual_sync submitted.next in
+  check_pull_count "manual force waits for shared submission response" 0 requested.effects;
+  Alcotest.(check bool) "submission remains active" true
+    ((Core.state requested.next).snapshot.sync_phase = Core.Submitting);
+  let accepted = pull_message requested.next connection
+    (Protocol.Server.Tx_batch_ok {t=server_cursor_of_int 1;checksum=Some "0123456789abcdef"}) in
+  let request = recovery_request accepted.effects in
+  let accepted_sync = recovery_sync sync 3
+    (List.map (fun (item : Overlay.submission_descriptor) ->
+       {item with state=Overlay.Accepted_pending_authoritative (Overlay.submission_batch_id batch)})
+       (Overlay.sync_view_submissions sync)) in
+  let applied = Core.step accepted.next (recovery_commit request accepted_sync None) in
+  check_pull_count "acceptance joins the still-outstanding baseline pull" 0 applied.effects;
+  let received = pull_response applied.next connection ~after:0 1 in
+  let committed = recovery_apply received.next connection
+    (recovery_sync sync ~checkpoint:1 4 []) in
+  check_pull_count "submission and manual force drain through shared commit" 1 committed.effects
+;;
+
 let pull_singleflight_scenarios =
-  [ Alcotest.test_case
+  [ Alcotest.test_case "manual sync online fresh pull" `Quick manual_sync_online_forces_a_fresh_pull
+  ; Alcotest.test_case "manual sync busy force coalesces" `Quick manual_sync_busy_force_is_coalesced
+  ; Alcotest.test_case "manual sync waits for commit" `Quick manual_sync_waits_for_authoritative_commit
+  ; Alcotest.test_case "manual sync offline admission and owner" `Quick manual_sync_offline_uses_existing_admission_and_socket_owner
+  ; Alcotest.test_case "manual sync stale and retired scope" `Quick manual_sync_scope_and_retirement_fence_force
+  ; Alcotest.test_case "manual sync preserves submission owner" `Quick manual_sync_does_not_bypass_submission_owner
+  ; Alcotest.test_case
       "F5 opening and notification burst share one pull"
       `Quick
       pull_open_and_notifications_are_singleflight

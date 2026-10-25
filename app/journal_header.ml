@@ -190,6 +190,11 @@ type presentation =
   ; capture_enabled : bool
   }
 
+let sync_active = function
+  | Some (Graph_service.Connecting | Pulling | Submitting) -> true
+  | Some (Offline | Current | Paused | Failed) | None -> false
+;;
+
 let view_impl
       ~presentation_signal
       ~key
@@ -429,23 +434,21 @@ let view_impl
       ~key
       ~props_for:(fun presentation ->
         props ~mode:"page" ?title:(match context with Journals -> None | Favorites -> Some "Favorites")
-          ~connecting:(presentation.sync_phase = Some Graph_service.Connecting)
+          ~connecting:(sync_active presentation.sync_phase)
           ~controls:(controls presentation) ()) (* Keep absent slots mounted so the native child indexes stay stable. *)
       ~children:
         [ V.Body.Private.to_widget body
         ; cluster
         ; dynamic
             ~equal:(fun left right ->
-              left.sync_phase
-              = Some Graph_service.Connecting
-              = (right.sync_phase = Some Graph_service.Connecting))
+              sync_active left.sync_phase = sync_active right.sync_phase)
             (fun presentation ->
                V.column
-                 [ (if presentation.sync_phase = Some Graph_service.Connecting
+                 [ (if sync_active presentation.sync_phase
                     then
                       V.progress ~style:Circular ()
                       |> V.semantics
-                           ~properties:(Ui.Semantics.create ~label:"Connecting" ())
+                           ~properties:(Ui.Semantics.create ~label:"Syncing" ())
                       |> test_id "journal-header-sync-progress"
                     else V.empty ())
                  ])
