@@ -932,6 +932,17 @@ let publish_projection_change t session = function
          ; structure_interests =
              List.map structure_interest_to_protocol structure_interests
          };
+    (try
+       report_warning ("journal-timeline: " ^ Yojson.Safe.to_string (`Assoc
+         [ "stage", `String "worker-change-window"; "generation", `String generation
+         ; "window", `String id
+         ; "beforeProjection", `String (Overlay.Projection_revision.to_string before_revision)
+         ; "projection", `String (Overlay.Projection_revision.to_string after_revision)
+         ; "blockCount", `Int (List.length block_uuids)
+         ; "pageCount", `Int (List.length page_uuids)
+         ; "interestCount", `Int (List.length structure_interests)
+         ]) ^ "\n")
+     with _ -> ());
     t.post
       (Core.Projection_push
          (Protocol.V2_changes_available
@@ -1244,6 +1255,39 @@ let read_snapshot ~on_enrichment_error database request command =
     Fun.protect
       ~finally:(fun () -> Database.release_snapshot snapshot)
       (fun () ->
+         let query_evidence query ?target items has_continuation =
+           try
+             let version = Database.snapshot_version snapshot in
+             let fields =
+               [ "stage", `String "worker-query"; "query", `String query
+               ; "request", `String (Graph.Uuid.to_string request.request_id)
+               ; "generation", `String (Overlay.Generation.to_string version.generation)
+               ; "projection", `String (Overlay.Projection_revision.to_string version.projection_revision)
+               ; "itemCount", `Int (List.length items)
+               ; "items", `List (List.take 16 items |> List.map (fun u -> `String (Graph.Uuid.to_string u)))
+               ; "hasContinuation", `Bool has_continuation
+               ; "truncated", `Bool (List.length items > 16)
+               ] @ Option.fold ~none:[] ~some:(fun u -> ["target", `String (Graph.Uuid.to_string u)]) target in
+             report_warning ("journal-timeline: " ^ Yojson.Safe.to_string (`Assoc fields) ^ "\n")
+           with _ -> ()
+         in
+         let page_read_evidence result uuid =
+           try
+             let version = Database.snapshot_version snapshot in
+             report_warning
+               ("journal-page-read: "
+                ^ Yojson.Safe.to_string
+                    (`Assoc
+                       [ "result", `String result
+                       ; "request", `String (Graph.Uuid.to_string request.request_id)
+                       ; "target", `String (Graph.Uuid.to_string uuid)
+                       ; "generation", `String (Overlay.Generation.to_string version.generation)
+                       ; "projection", `String
+                           (Overlay.Projection_revision.to_string version.projection_revision)
+                       ])
+                ^ "\n")
+           with _ -> ()
+         in
          let titles = Hashtbl.create 16 in
          let block_record (value : Overlay.block_record) =
            let missing =
@@ -1400,6 +1444,9 @@ let read_snapshot ~on_enrichment_error database request command =
             with
             | Error error -> read_failure request error
             | Ok result ->
+              query_evidence "journals"
+                (List.map (fun (item : Overlay.journal_item) -> item.page.page.uuid) result.items)
+                (Option.is_some result.next_cursor);
               let items =
                 result.items
                 |> List.map (fun (item : Overlay.journal_item) ->
@@ -1415,6 +1462,7 @@ let read_snapshot ~on_enrichment_error database request command =
          | V2_get_page { page; _ } ->
            (match Database.get_pages snapshot [ page ] with
             | Ok [ Overlay.Present_page { value; revision } ] ->
+              page_read_evidence "present" value.page.uuid;
               response
                 request
                 (Protocol.V2_page_outcome
@@ -1423,6 +1471,7 @@ let read_snapshot ~on_enrichment_error database request command =
                       ; revision = Overlay.Page_state_revision.to_string revision
                       }))
             | Ok [ Missing_page { uuid; revision } ] ->
+              page_read_evidence "missing" uuid;
               response
                 request
                 (Protocol.V2_page_outcome
@@ -1542,6 +1591,9 @@ let read_snapshot ~on_enrichment_error database request command =
             | Ok
                 (Overlay.Children_result
                    { parent; revision_scope; scope_revision; items; next_cursor }) ->
+              query_evidence "children" ~target:parent
+                (List.map (fun (item : Overlay.child_member) -> item.block.block.uuid) items)
+                (Option.is_some next_cursor);
               response
                 request
                 (Protocol.V2_children_outcome
@@ -1569,6 +1621,9 @@ let read_snapshot ~on_enrichment_error database request command =
                 (Overlay.Page_tree { page; maximum_depth; limit; cursor })
             with
             | Ok (Overlay.Page_tree_result { page; maximum_depth; items; next_cursor }) ->
+              query_evidence "page-tree" ~target:page
+                (List.map (fun (item : Overlay.tree_member) -> item.block.block.uuid) items)
+                (Option.is_some next_cursor);
               response
                 request
                 (Protocol.V2_page_tree_outcome
