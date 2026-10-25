@@ -71,6 +71,13 @@ type delete_subtree =
   ; expected_revision : string
   }
 
+(** App-local traversal, independent of displayed date order. [before_day = None]
+    resumes at the latest date; [skipped_day] is the already-prioritized day. *)
+type feed_cursor =
+  { before_day : int option
+  ; skipped_day : int option
+  }
+
 type block_cursor =
   { after_sibling_order : string
   ; after_block_id : string
@@ -98,7 +105,9 @@ type day_feed =
 type feed =
   { days : day_feed list
   ; slot_count : int
-  ; has_more_days : bool
+  ; continuation : feed_cursor option
+  ; prioritized_day : int option
+    (** The initial scan has covered this day, even if it has no entries. *)
   }
 
 type block_page =

@@ -73,6 +73,11 @@ type delete_subtree =
   ; expected_revision : string
   }
 
+type feed_cursor =
+  { before_day : int option
+  ; skipped_day : int option
+  }
+
 type block_cursor =
   { after_sibling_order : string
   ; after_block_id : string
@@ -100,7 +105,8 @@ type day_feed =
 type feed =
   { days : day_feed list
   ; slot_count : int
-  ; has_more_days : bool
+  ; continuation : feed_cursor option
+  ; prioritized_day : int option
   }
 
 type block_page =

@@ -1,5 +1,5 @@
 type request =
-  | Feed of { before_day : int option }
+  | Feed of { cursor : Journal_graph_projection.feed_cursor option }
   | Day of
       { day : int
       ; after : Journal_graph_projection.block_cursor option
@@ -12,7 +12,7 @@ type slot =
       { day : int
       ; after : Journal_graph_projection.block_cursor option
       }
-  | Feed_continuation of { before_day : int }
+  | Feed_continuation of { cursor : Journal_graph_projection.feed_cursor }
 
 type t
 

@@ -117,6 +117,9 @@ type feed_scan =
   ; root_generation : int64
   ; root_start_day : int option
   ; root_before_day : int option
+  ; root_skipped_day : int option
+  ; mutable root_date_boundary : int option
+  ; mutable root_priority_pending : bool
   ; root_publish_partial : bool
   ; root_consumed_by_page : (string, int) Hashtbl.t
   ; mutable root_remaining : int
@@ -197,6 +200,7 @@ type reference_source =
 
 type operation =
   | Root_dates of feed_scan
+  | Root_today of feed_scan
   | Root_tree of root_batch
   | Root_preview of root_preview
   | Reference_read of
@@ -381,6 +385,7 @@ type t =
   ; root_pages : (string, unit) Hashtbl.t
   ; root_page_epochs : (string, int64) Hashtbl.t
   ; root_page_counts : (string, int) Hashtbl.t
+  ; root_page_following_days : (string, Projection.feed_cursor option) Hashtbl.t
   }
 
 type output =
@@ -465,6 +470,7 @@ let create ?(localtime = Unix.localtime) () =
   ; root_pages = Hashtbl.create 32
   ; root_page_epochs = Hashtbl.create 32
   ; root_page_counts = Hashtbl.create 32
+  ; root_page_following_days = Hashtbl.create 32
   }
 ;;
 
@@ -517,6 +523,7 @@ let reset t =
   Hashtbl.clear t.root_pages;
   Hashtbl.clear t.root_page_epochs;
   Hashtbl.clear t.root_page_counts;
+  Hashtbl.clear t.root_page_following_days;
   t.initial_feed_spec <- None;
   t.feed_session <- t.next_request
 ;;
@@ -1199,6 +1206,29 @@ let read_root_dates t scan =
        })
 ;;
 
+let root_date_continuation scan =
+  if scan.root_queued = [] && scan.root_journals_done
+  then None
+  else
+    Some
+      Projection.
+        { before_day = scan.root_date_boundary; skipped_day = scan.root_skipped_day }
+;;
+(* The first metadata packet usually covers Today. Probe its exact range only
+   when every discovered date is future and the catalog has more packets. *)
+let read_priority_today t scan =
+  let today = Option.get scan.root_skipped_day in
+  read
+    t
+    (Root_today scan)
+    (Protocol.V2_list_journals
+       { from_day = today
+       ; through_day = today
+       ; limit = 1
+       ; cursor = None
+       ; revision = None
+       })
+;;
 let root_feed_response scan complete =
   let days = scan.root_days in
   let feed : Projection.feed =
@@ -1208,12 +1238,15 @@ let root_feed_response scan complete =
           (fun n (d : Projection.day_feed) -> n + 1 + List.length d.entries)
           0
           days
-    ; has_more_days = scan.root_queued <> [] || not scan.root_journals_done
+    ; continuation =
+        (if List.exists (fun (d : Projection.day_feed) -> d.has_more_entries) days
+         then None
+         else root_date_continuation scan)
+    ; prioritized_day = scan.root_skipped_day
     }
   in
   response (Feed_loaded { request_generation = scan.root_generation; feed; complete })
 ;;
-
 let next_feed_batch t scan =
   if not (root_owner_current t (Feed_roots scan))
   then empty
@@ -1254,6 +1287,15 @@ let complete_root_batch t batch =
        with
        | Error message -> root_failure batch message
        | Ok projected ->
+         (match batch.root_owner with
+          | Changed_roots _ -> ()
+          | Feed_roots scan ->
+            if Some batch.root_page.day <> scan.root_skipped_day then
+              scan.root_date_boundary <- Some batch.root_page.day;
+            (* Date traversal belongs to the retained page, not the disposable
+               Worker structure cursor used by recovery and reconciliation. *)
+            Hashtbl.replace t.root_page_following_days batch.root_page.id
+              (root_date_continuation scan));
          if projected.entries <> [] then remember_page t batch.root_page;
          remember_tree_items t batch.root_page batch.root_members;
          remember_entries t batch.root_page projected.entries;
@@ -1563,7 +1605,8 @@ let receive_root_preview t preview parent revision items next_cursor =
            next_root_preview t { batch with root_members = batch.root_members @ selected }))
 ;;
 
-let start_feed_scan t ~before_day ~root_limit ~day_limit ~request_generation ?after () =
+let start_feed_scan t ~cursor ~root_limit ~day_limit ~request_generation ?after () =
+  let before_day = Option.bind cursor (fun c -> c.Projection.before_day) in
   let start_day = Option.map (fun ((page : Projection.page), _) -> page.day) after in
   if root_limit <= 0 || day_limit <= 0
   then (
@@ -1573,14 +1616,21 @@ let start_feed_scan t ~before_day ~root_limit ~day_limit ~request_generation ?af
     | Some day -> day_failure ~day request_generation "The root limit must be positive.")
   else (
     t.feed_session <- t.next_request;
-    if before_day = None && after = None
+    if cursor = None && after = None
     then t.initial_feed_spec <- Some (root_limit, day_limit);
     let scan =
       { root_session = t.feed_session
       ; root_generation = request_generation
       ; root_start_day = start_day
       ; root_before_day = before_day
-      ; root_publish_partial = before_day = None && after = None
+      ; root_skipped_day =
+          (match cursor, after with
+           | Some c, _ -> c.Projection.skipped_day
+           | None, None -> Option.map Journal_calendar.local_day t.calendar
+           | None, Some _ -> None)
+      ; root_date_boundary = before_day
+      ; root_priority_pending = cursor = None && after = None
+      ; root_publish_partial = cursor = None && after = None
       ; root_consumed_by_page = Hashtbl.create 32
       ; root_remaining = root_limit
       ; root_page_size = min root_limit Protocol.maximum_page_size
@@ -1588,7 +1638,7 @@ let start_feed_scan t ~before_day ~root_limit ~day_limit ~request_generation ?af
       ; root_days = []
       ; root_queued = []
       ; root_journal_cursor = None
-      ; root_journals_done = false
+      ; root_journals_done = after <> None && cursor = None
       }
     in
     match after with
@@ -1609,7 +1659,6 @@ let start_feed_scan t ~before_day ~root_limit ~day_limit ~request_generation ?af
             scan.root_page_size
         ])
 ;;
-
 let submit_unowned t (request : Journal_graph_request.t) =
   match request with
   | Load_task_statuses -> requests [ request_task_catalog t ]
@@ -1622,14 +1671,14 @@ let submit_unowned t (request : Journal_graph_request.t) =
       ]
   | Inspect_admission request ->
     requests [ read t (Admission_info request) Protocol.V2_inspect_admission ]
-  | Load_feed { before_day; root_limit; day_limit; request_generation } ->
-    start_feed_scan t ~before_day ~root_limit ~day_limit ~request_generation ()
+  | Load_feed { cursor; root_limit; day_limit; request_generation } ->
+    start_feed_scan t ~cursor ~root_limit ~day_limit ~request_generation ()
   | Load_day_blocks { day; after; limit; request_generation } ->
     (match page_by_day t day with
      | None -> day_failure ~day request_generation "The requested journal page is not retained."
      | Some page ->
        let day_limit = Option.fold ~none:7 ~some:snd t.initial_feed_spec in
-       start_feed_scan t ~before_day:(Some day) ~root_limit:limit ~day_limit
+       start_feed_scan t ~cursor:(Hashtbl.find_opt t.root_page_following_days page.id |> Option.join) ~root_limit:limit ~day_limit
          ~request_generation ~after:(page, after) ())
   | Load_detail { block_id; request_generation; limit; after } ->
     (match parse_uuid "block UUID" block_id with
@@ -2693,7 +2742,7 @@ let hydration_for_changes t ~request_generation windows =
       let output =
         plan_request
           t
-          (Journal_graph_request.Load_feed {before_day=None;root_limit;day_limit;request_generation})
+          (Journal_graph_request.Load_feed {cursor=None;root_limit;day_limit;request_generation})
       in
       { output with
         responses =
@@ -2732,7 +2781,7 @@ let rehydrate_current_interests t ~request_generation ~generation =
       let output =
         plan_request
           t
-          (Journal_graph_request.Load_feed {before_day=None;root_limit;day_limit;request_generation})
+          (Journal_graph_request.Load_feed {cursor=None;root_limit;day_limit;request_generation})
       in
       { output with
         responses =
@@ -2924,7 +2973,7 @@ let complete_child t (command : Projection.create_child) (page : Graph.page)
 ;;
 
 let operation_name = function
-  | Root_dates _ -> "listTimelineDates"
+  | Root_dates _ | Root_today _ -> "listTimelineDates"
   | Root_tree _ -> "readTimelineRoots"
   | Root_preview _ -> "readTimelinePreview"
   | Reference_read _ -> "readUuidReference"
@@ -3021,7 +3070,7 @@ let failure_output
         t
         (favorite_membership_key page)
         (responses [ response (Rejected (Worker_failure worker_failure)) ])
-  | Root_dates scan ->
+  | Root_dates scan | Root_today scan ->
     responses [response (match scan.root_start_day with
       | None -> Feed_failed {request_generation=scan.root_generation;failure=Worker_failure worker_failure}
       | Some day -> Day_blocks_failed {day;request_generation=scan.root_generation;stale_cursor=code=Error.Stale_read_cursor;failure=Worker_failure worker_failure})]
@@ -3127,7 +3176,7 @@ let receive_response t (protocol_response : Protocol.response) =
   let key = Graph.Uuid.to_string request_id in
   match Hashtbl.find_opt t.pending key with
   | None -> empty
-  | Some {operation=Root_dates scan;_} when not (root_owner_current t (Feed_roots scan)) ->
+  | Some {operation=(Root_dates scan|Root_today scan);_} when not (root_owner_current t (Feed_roots scan)) ->
     Hashtbl.remove t.pending key; empty
   | Some {operation=Root_tree batch;_} when not (root_batch_current t batch) ->
     Hashtbl.remove t.pending key; superseded_root_batch t batch
@@ -3146,17 +3195,68 @@ let receive_response t (protocol_response : Protocol.response) =
     let failure_output = failure_output ~source_epoch in
     Hashtbl.remove t.pending key;
     (match operation,outcome with
-     | Root_dates scan, Protocol.V2_journals_outcome {items;next_cursor} ->
-       List.iter (fun (item : Protocol.v2_journal_item) ->
-         Hashtbl.replace t.graph_pages (Graph.Uuid.to_string item.page.uuid) item.page;
-         remember_page_revision t item.page.uuid item.revision) items;
-       if next_cursor<>None && next_cursor=scan.root_journal_cursor then scan_failure scan "The date cursor did not advance."
-       else (
-         let pages=List.filter_map (fun (i:Protocol.v2_journal_item)->page_of_graph_page i.page) items
-           |> List.sort (fun a b->Int.compare b.Projection.day a.Projection.day) in
-         scan.root_queued <- pages;scan.root_journal_cursor <- next_cursor;
-         scan.root_journals_done <- next_cursor=None;
-         next_feed_batch t scan)
+      | Root_dates scan, Protocol.V2_journals_outcome { items; next_cursor } ->
+        List.iter
+          (fun (item : Protocol.v2_journal_item) ->
+             Hashtbl.replace t.graph_pages (Graph.Uuid.to_string item.page.uuid) item.page;
+             remember_page_revision t item.page.uuid item.revision)
+          items;
+        if next_cursor <> None && next_cursor = scan.root_journal_cursor
+        then scan_failure scan "The date cursor did not advance."
+        else (
+          let pages =
+            List.filter_map
+              (fun (i : Protocol.v2_journal_item) -> page_of_graph_page i.page)
+              items
+            |> List.sort (fun a b -> Int.compare b.Projection.day a.Projection.day)
+          in
+          let pages =
+            if scan.root_priority_pending
+            then pages
+            else
+              List.filter
+                (fun (p : Projection.page) -> Some p.day <> scan.root_skipped_day)
+                pages
+          in
+          scan.root_queued <- pages;
+          scan.root_journal_cursor <- next_cursor;
+          scan.root_journals_done <- next_cursor = None;
+          if scan.root_priority_pending
+          then (
+            scan.root_priority_pending <- false;
+            match
+              List.find_opt
+                (fun (p : Projection.page) -> Some p.day = scan.root_skipped_day)
+                pages
+            with
+            | Some today ->
+              scan.root_queued
+              <- today :: List.filter (fun (p : Projection.page) -> p.day <> today.day) pages;
+              next_feed_batch t scan
+            | None
+              when next_cursor <> None
+                   && List.for_all
+                        (fun (p : Projection.page) ->
+                           Option.fold
+                             ~none:false
+                             ~some:(fun day -> p.day > day)
+                             scan.root_skipped_day)
+                        pages -> requests [ read_priority_today t scan ]
+            | None -> next_feed_batch t scan)
+          else next_feed_batch t scan)
+      | Root_today scan, Protocol.V2_journals_outcome { items; _ } ->
+        List.iter
+          (fun (item : Protocol.v2_journal_item) ->
+             Hashtbl.replace t.graph_pages (Graph.Uuid.to_string item.page.uuid) item.page;
+             remember_page_revision t item.page.uuid item.revision)
+          items;
+        let today =
+          List.filter_map
+            (fun (i : Protocol.v2_journal_item) -> page_of_graph_page i.page)
+            items
+        in
+        scan.root_queued <- today @ scan.root_queued;
+        next_feed_batch t scan
      | Root_tree batch, V2_page_tree_outcome {items;next_cursor;_} ->
        List.iter (fun (i:Protocol.v2_tree_member)->
          Hashtbl.replace t.block_revisions (Graph.Uuid.to_string i.value.block.uuid) i.revision;
@@ -4272,7 +4372,7 @@ let receive t (protocol_response : Protocol.response) =
   let background = Hashtbl.mem t.hydration_active key in
   Hashtbl.remove t.hydration_active key;
   let root_current = match pending with
-    | Some {operation=Root_dates scan;_}->root_owner_current t (Feed_roots scan)
+    | Some {operation=(Root_dates scan|Root_today scan);_}->root_owner_current t (Feed_roots scan)
     | Some {operation=Root_tree batch;_}->root_batch_current t batch
     | Some {operation=Root_preview preview;_}->root_batch_current t preview.preview_batch
     | None | Some _->true in

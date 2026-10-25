@@ -92,9 +92,24 @@ let feed ?(more = false) days : Journal_graph_projection.feed =
       0
       days
   in
-  { days; slot_count; has_more_days = more }
+  { days
+  ; slot_count
+  ; continuation =
+      (if more
+       then
+         Option.map
+           (fun (d : Journal_graph_projection.day_feed) ->
+              Journal_graph_projection.
+                { before_day = Some d.page.day; skipped_day = None })
+           (List.sort
+              (fun (a : Journal_graph_projection.day_feed) b ->
+                 Int.compare a.page.day b.page.day)
+              days
+            |> List.find_opt (fun _ -> true))
+       else None)
+  ; prioritized_day = None
+  }
 ;;
-
 let continuation_of_entries ~more entries =
   if not more
   then None
@@ -136,10 +151,20 @@ let timeline_page ?(continuation = None) blocks
 ;;
 
 let begin_and_apply_feed ~generation ~before_day value state =
-  let state = Timeline.begin_request state ~generation (Timeline.Feed { before_day }) in
+  let state =
+    Timeline.begin_request
+      state
+      ~generation
+      (Timeline.Feed
+         { cursor =
+             Option.map
+               (fun day ->
+                  Journal_graph_projection.{ before_day = Some day; skipped_day = None })
+               before_day
+         })
+  in
   Timeline.apply_feed state ~generation value
 ;;
-
 let slot_keys state = retained_slots state |> List.map Timeline.slot_key
 
 let test_projection_order_today_suppression_and_continuations () =
@@ -501,7 +526,7 @@ let test_populated_feed_refresh_preserves_position () =
   let populated_anchor = Timeline.first_visible_index populated in
   let refreshed_parent = block ~child_count:1 ~order:"m" ~revision:"block-2" 42 in
   let refreshed =
-    Timeline.begin_request populated ~generation:3L (Timeline.Feed { before_day = None })
+    Timeline.begin_request populated ~generation:3L (Timeline.Feed { cursor = None })
     |> fun state ->
     Timeline.apply_feed
       state
@@ -532,10 +557,10 @@ let test_initial_feed_refresh_supersedes_pending_pagination () =
   let refreshing =
     Timeline.begin_request paging ~generation:2L day_request
     |> fun state ->
-    Timeline.begin_request state ~generation:3L (Timeline.Feed { before_day = None })
+    Timeline.begin_request state ~generation:3L (Timeline.Feed { cursor = None })
   in
   require
-    (Timeline.pending_request refreshing = Some (3L, Timeline.Feed { before_day = None }))
+    (Timeline.pending_request refreshing = Some (3L, Timeline.Feed { cursor = None }))
     "a foreground refresh did not supersede obsolete pagination"
 ;;
 
@@ -688,7 +713,7 @@ let test_repeated_staleness_stops_until_retry_and_does_not_block_feed () =
       ~last_exclusive:(Timeline.total_count failed)
   in
   require
-    (Timeline.next_request failed = Some (Feed { before_day = Some 20260809 }))
+    (Timeline.next_request failed = Some (Feed { cursor = Some {before_day=Some 20260809;skipped_day=None} }))
     "failed day blocked older days or automatically retried";
   let retried = Timeline.retry_day failed ~day:20260809 in
   require
@@ -1273,7 +1298,7 @@ let test_empty_day_pagination_and_failure () =
     [ "feed-continuation:20260808" ]
     "complete placeholder day was not removed";
   require
-    (Timeline.next_request completed = Some (Feed { before_day = Some 20260808 }))
+    (Timeline.next_request completed = Some (Feed { cursor = Some {before_day=Some 20260808;skipped_day=None} }))
     "hidden day stopped visible feed demand";
   let empty_batch =
     begin_and_apply_feed
@@ -1283,7 +1308,7 @@ let test_empty_day_pagination_and_failure () =
       completed
   in
   require
-    (Timeline.next_request empty_batch = Some (Feed { before_day = Some 20260807 }))
+    (Timeline.next_request empty_batch = Some (Feed { cursor = Some {before_day=Some 20260807;skipped_day=None} }))
     "empty batch did not advance by fetched boundary";
   let populated =
     begin_and_apply_feed
@@ -1692,7 +1717,7 @@ let test_sync_prefix_retains_history_and_anchor () =
   in
   let prefix = List.tl (List.take 31 roots) in
   let refreshed =
-    Timeline.begin_request loaded ~generation:2L (Timeline.Feed { before_day = None })
+    Timeline.begin_request loaded ~generation:2L (Timeline.Feed { cursor = None })
     |> fun state ->
     Timeline.refresh_feed
       state
@@ -1714,7 +1739,7 @@ let test_sync_prefix_retains_history_and_anchor () =
     (not (List.mem (Journal_model.id (List.hd roots)) (ids refreshed)))
     "deleted prefix root survived refresh";
   let exhausted =
-    Timeline.begin_request refreshed ~generation:3L (Timeline.Feed { before_day = None })
+    Timeline.begin_request refreshed ~generation:3L (Timeline.Feed { cursor = None })
     |> fun state ->
     Timeline.refresh_feed
       state
@@ -1757,7 +1782,7 @@ let test_older_feed_failure_releases_request () =
     |> begin_and_apply_feed ~generation:1L ~before_day:None
       (feed ~more:true [day_feed 20260809 "Today" [block 8000]])
     |> Timeline.observe_visible_range ~first_index:0 ~last_exclusive:2 in
-  let pending=Timeline.begin_request loaded ~generation:2L (Timeline.Feed {before_day=Some 20260809}) in
+  let pending=Timeline.begin_request loaded ~generation:2L (Timeline.Feed { cursor = Some {before_day=Some 20260809;skipped_day=None} }) in
   let ignored=Timeline.fail_feed_request pending ~generation:1L in
   require (ignored==pending) "old feed failure retired a newer request";
   let failed=Timeline.fail_feed_request pending ~generation:2L in
@@ -1765,7 +1790,7 @@ let test_older_feed_failure_releases_request () =
   require (Timeline.next_request failed=None) "older-date failure started an automatic retry loop";
   require (slot_keys failed=slot_keys loaded) "older-date failure discarded retained rows";
   let retried=Timeline.observe_visible_range failed ~first_index:0 ~last_exclusive:2 in
-  require (Timeline.next_request retried=Some (Timeline.Feed {before_day=Some 20260809})) "new visible demand cannot retry older dates"
+  require (Timeline.next_request retried=Some (Timeline.Feed { cursor = Some {before_day=Some 20260809;skipped_day=None} })) "new visible demand cannot retry older dates"
 ;;
 
 let prefix_root_ids state =
@@ -1802,7 +1827,7 @@ let load_prefix_history count =
 ;;
 
 let refresh_prefix state ~generation ~complete roots =
-  Timeline.begin_request state ~generation (Timeline.Feed {before_day=None})
+  Timeline.begin_request state ~generation (Timeline.Feed { cursor = None })
   |> fun state -> Timeline.refresh_feed state ~generation ~complete
     (feed [day_feed ~more:true 20260809 "Today" roots])
 ;;
@@ -1901,7 +1926,244 @@ let test_prefix_identity_merge () =
   require (!failures = []) "%s" (String.concat "\n" (List.rev !failures))
 ;;
 
+let test_today_priority_projection_and_refresh () =
+  let today = 20260808
+  and future = 20260809
+  and older = 20260807 in
+  let roots day start count =
+    List.init count (fun i -> block ~day ~order:(Printf.sprintf "%04d" i) (start + i))
+  in
+  let future_roots = roots future 15000 61
+  and today_roots = roots today 16000 61
+  and older_roots = roots older 17000 3 in
+  let cursor before_day =
+    Journal_graph_projection.{ before_day; skipped_day = Some today }
+  in
+  let priority ?continuation days =
+    { (feed days) with prioritized_day = Some today; continuation }
+  in
+  let all_ids state = prefix_root_ids state in
+  let assert_state state expected label =
+    let ids = all_ids state in
+    require
+      (List.sort String.compare ids
+       = List.sort String.compare (List.map Journal_model.id expected))
+      "%s lost or duplicated a root"
+      label;
+    let days =
+      Timeline.fold_slots
+        (fun xs -> function
+           | Timeline.Top_level e -> Journal_model.journal_day e.block :: xs
+           | _ -> xs)
+        []
+        state
+      |> List.rev
+    in
+    require
+      (days = List.sort (fun a b -> Int.compare b a) days)
+      "%s changed display date order"
+      label
+  in
+  let failures = ref [] in
+  let check name f =
+    try f () with
+    | Failure m -> failures := (name ^ ": " ^ m) :: !failures
+  in
+  check "deferred future pages precede loaded Today" (fun () ->
+    let initial =
+      Timeline.empty ~today
+      |> begin_and_apply_feed
+           ~generation:1L
+           ~before_day:None
+           (priority
+              ~continuation:(cursor None)
+              [ day_feed today "Today" (List.take 30 today_roots) ])
+    in
+    let initial =
+      Timeline.observe_visible_range initial ~first_index:5 ~last_exclusive:8
+    in
+    let anchor = prefix_anchor initial in
+    let next =
+      Timeline.begin_request initial ~generation:2L (Feed { cursor = Some (cursor None) })
+      |> fun state ->
+      Timeline.apply_feed
+        state
+        ~generation:2L
+        (priority
+           ~continuation:(cursor (Some future))
+           [ day_feed ~more:true future "Future" (List.take 30 future_roots) ])
+    in
+    assert_state
+      next
+      (List.take 30 future_roots @ List.take 30 today_roots)
+      "future date page";
+    require
+      (prefix_anchor next = anchor)
+      "inserting future dates moved the Today UUID anchor");
+  List.iter
+    (fun count ->
+       check (Printf.sprintf "refresh Today size %d" count) (fun () ->
+         let loaded =
+           Timeline.empty ~today
+           |> begin_and_apply_feed
+                ~generation:1L
+                ~before_day:None
+                (feed
+                   [ day_feed future "Future" future_roots
+                   ; day_feed today "Today" today_roots
+                   ; day_feed older "Older" older_roots
+                   ])
+         in
+         let loaded =
+           Timeline.observe_visible_range loaded ~first_index:72 ~last_exclusive:75
+         in
+         let anchor = prefix_anchor loaded in
+         let today_selected = List.take (min 30 count) today_roots in
+         let days =
+           (if count = 0
+            then []
+            else [ day_feed ~more:(count > 30) today "Today" today_selected ])
+           @
+           if count < 30
+           then
+             [ day_feed ~more:true future "Future" (List.take (30 - count) future_roots) ]
+           else []
+         in
+         let value =
+           priority
+             ~continuation:(cursor (if count >= 30 then None else Some future))
+             days
+         in
+         let loaded =
+           if count <> 1
+           then loaded
+           else (
+             let partial =
+               priority
+                 ~continuation:(cursor None)
+                 [ day_feed today "Today" today_selected ]
+             in
+             let staged =
+               Timeline.begin_request loaded ~generation:2L (Feed { cursor = None })
+               |> fun state ->
+               Timeline.refresh_feed state ~generation:2L ~complete:false partial
+             in
+             assert_state
+               staged
+               (future_roots @ today_selected @ older_roots)
+               "Today-first partial refresh";
+             staged)
+         in
+         let next =
+           Timeline.begin_request loaded ~generation:2L (Feed { cursor = None })
+           |> fun state -> Timeline.refresh_feed state ~generation:2L ~complete:true value
+         in
+         let retained_today =
+           if count > 30 then today_roots else List.take count today_roots
+         in
+         assert_state
+           next
+           (future_roots @ retained_today @ older_roots)
+           "priority refresh";
+         if count > 30
+         then
+           require
+             (prefix_anchor next = anchor)
+             "priority refresh moved retained UUID anchor";
+         require
+           (Timeline.refresh_feed next ~generation:1L ~complete:true value == next)
+           "retired priority response changed state"))
+    [ 0; 1; 30; 61 ];
+  List.iter
+    (fun toward_today ->
+       check
+         (if toward_today
+          then "future root moves to priority Today"
+          else "Today root moves to future prefix")
+         (fun () ->
+            let original_today = List.take 1 today_roots in
+            let loaded =
+              Timeline.empty ~today
+              |> begin_and_apply_feed
+                   ~generation:1L
+                   ~before_day:None
+                   (feed
+                      [ day_feed future "Future" future_roots
+                      ; day_feed today "Today" original_today
+                      ; day_feed older "Older" older_roots
+                      ])
+            in
+            let source =
+              if toward_today
+              then List.hd (List.rev future_roots)
+              else List.hd original_today
+            in
+            let source_id = Journal_model.id source in
+            let index =
+              List.find_index
+                (function
+                  | Timeline.Top_level e -> Journal_model.id e.block = source_id
+                  | _ -> false)
+                (retained_slots loaded)
+              |> Option.get
+            in
+            let loaded =
+              Timeline.observe_visible_range
+                loaded
+                ~first_index:index
+                ~last_exclusive:(index + 1)
+            in
+            let moved =
+              block
+                ~day:(if toward_today then today else future)
+                ~order:"-001"
+                ~source:"Moved root"
+                ~revision:"block-2"
+                (if toward_today then 15060 else 16000)
+            in
+            let future_after =
+              if toward_today then List.take 60 future_roots else moved :: future_roots
+            in
+            let today_after = if toward_today then moved :: original_today else [] in
+            let value =
+              priority
+                [ day_feed today "Today" today_after
+                ; day_feed
+                    ~more:true
+                    future
+                    "Future"
+                    (List.take (30 - List.length today_after) future_after)
+                ]
+            in
+            let next =
+              Timeline.begin_request loaded ~generation:2L (Feed { cursor = None })
+              |> fun state ->
+              Timeline.refresh_feed state ~generation:2L ~complete:true value
+            in
+            assert_state
+              next
+              (future_after @ today_after @ older_roots)
+              "cross-range UUID move";
+            require
+              (prefix_anchor next = prefix_anchor loaded)
+              "cross-range move lost its UUID anchor";
+            let cleared =
+              List.fold_left
+                (fun state root ->
+                   Timeline.remove_block state ~block_id:(Journal_model.id root))
+                next
+                future_after
+            in
+            assert_state cleared (today_after @ older_roots) "future deletion after move";
+            require
+              (not (List.mem ("day:" ^ string_of_int future) (slot_keys cleared)))
+              "cross-range move corrupted old-day count"))
+    [ true; false ];
+  if !failures <> [] then fail "%s" (String.concat "\n" (List.rev !failures))
+;;
+
 let () =
+  test_today_priority_projection_and_refresh ();
   test_prefix_identity_merge ();
   test_older_feed_failure_releases_request ();
   test_unified_batch_continues_across_days ();

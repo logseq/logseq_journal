@@ -550,10 +550,10 @@ let test_timeline_return_targets_presented_first_date () =
   List.iter (fun today_nonempty ->
     let feed : Journal_graph_projection.feed =
       { days = [ day future [ entry future 1 ]; day today (if today_nonempty then [ entry today 2 ] else []) ]
-      ; slot_count = (if today_nonempty then 4 else 3); has_more_days = false }
+      ; slot_count = (if today_nonempty then 4 else 3); continuation = None; prioritized_day = None }
     in
     let state = Timeline.empty ~today in
-    let state = Timeline.begin_request state ~generation:1L (Feed { before_day = None }) in
+    let state = Timeline.begin_request state ~generation:1L (Feed { cursor = None }) in
     let state = Timeline.apply_feed state ~generation:1L feed in
     List.iter (fun capture ->
       let state = if capture then Timeline.prepend_timeline_entry state (entry today 3)

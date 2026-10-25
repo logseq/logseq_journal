@@ -899,9 +899,9 @@ let apply_manager_state state (manager_state : Graph_service.state) =
 ;;
 
 let worker_request generation = function
-  | Journal_timeline_state.Feed { before_day } ->
+  | Journal_timeline_state.Feed { cursor } ->
     Journal_graph_request.Load_feed
-      { before_day; root_limit = feed_root_limit; day_limit = feed_day_limit
+      { cursor; root_limit = feed_root_limit; day_limit = feed_day_limit
       ; request_generation = generation }
   | Day { day; after } ->
     Journal_graph_request.Load_day_blocks
@@ -1168,7 +1168,7 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
      | Some calendar, _ when state.graph_ready ->
        { state with
          timeline = Journal_timeline_state.begin_request state.timeline
-           ~generation:request_generation (Feed {before_day=None})
+           ~generation:request_generation (Feed {cursor=None})
        ; feed_refresh =
            Some
              { generation = request_generation
@@ -1194,7 +1194,7 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
            Journal_timeline_state.set_today state.timeline ~today
            |> fun timeline ->
            Journal_timeline_state.begin_request timeline
-             ~generation:request_generation (Feed { before_day = None })
+             ~generation:request_generation (Feed { cursor = None })
          in
          let timeline =
            match refresh.cause with
@@ -1211,7 +1211,7 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
              Journal_timeline_state.begin_request
                timeline
                ~generation:request_generation
-               (Feed { before_day = None })
+               (Feed { cursor = None })
          in
          { state with
            timeline
@@ -1223,9 +1223,9 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
      | None | Some _ ->
        let accepted_initial_feed =
          match Journal_timeline_state.pending_request state.timeline with
-         | Some (expected_generation, Feed { before_day = None }) ->
+         | Some (expected_generation, Feed { cursor = None }) ->
            Int64.equal expected_generation request_generation
-         | Some (_, Feed { before_day = Some _ }) | Some (_, Day _) | None -> false
+         | Some (_, Feed { cursor = Some _ }) | Some (_, Day _) | None -> false
        in
        let timeline =
          Journal_timeline_state.apply_feed
@@ -1240,7 +1240,7 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
            Journal_timeline_state.begin_request
              timeline
              ~generation:request_generation
-             (Feed { before_day = None })
+             (Feed { cursor = None })
        in
        { state with
          timeline
@@ -4689,7 +4689,7 @@ let start
             | Some _ ->
               submit
                 (Journal_graph_request.Load_feed
-                   { before_day = None; root_limit = feed_root_limit
+                   { cursor = None; root_limit = feed_root_limit
                    ; day_limit = feed_day_limit
                    ; request_generation = feed_generation
                    })
@@ -4727,7 +4727,7 @@ let start
                      Journal_timeline_state.begin_request
                        timeline
                        ~generation:feed_generation
-                       (Feed { before_day = None }))
+                       (Feed { cursor = None }))
                 ; next_request_generation = Int64.succ feed_generation
                 })
           in
@@ -5432,8 +5432,8 @@ let start
       then None
       else if
         match Journal_timeline_state.pending_request state.timeline with
-        | Some (_, Feed { before_day = None }) -> true
-        | Some (_, Feed { before_day = Some _ }) | Some (_, Day _) | None -> false
+        | Some (_, Feed { cursor = None }) -> true
+        | Some (_, Feed { cursor = Some _ }) | Some (_, Day _) | None -> false
       then None
       else Some context
     | false, _ | true, None -> None
@@ -5448,12 +5448,12 @@ let start
       let output =
         submit
           (Journal_graph_request.Load_feed
-             { before_day = None; root_limit = feed_root_limit
+             { cursor = None; root_limit = feed_root_limit
              ; day_limit = feed_day_limit
              ; request_generation = generation
              })
       in
-      let request = Journal_timeline_state.Feed { before_day = None } in
+      let request = Journal_timeline_state.Feed { cursor = None } in
       let prepare =
         set_state (fun state ->
           if state.feed_loaded

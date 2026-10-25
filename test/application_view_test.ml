@@ -4955,10 +4955,10 @@ let test_timeline_relative_date_headers () =
           { Journal_graph_projection.page =
               { id = string_of_int day; day; title = "fallback" }
           ; entries = [{block=block day; child_summaries=[]}]; has_more_entries = false; continuation = None }) days
-      ; slot_count = 5; has_more_days = false }
+      ; slot_count = 5; continuation = None; prioritized_day = None }
     in
     let state = T.empty ~today
-      |> fun state -> T.begin_request state ~generation:1L (Feed {before_day=None})
+      |> fun state -> T.begin_request state ~generation:1L (Feed { cursor = None })
       |> fun state -> T.apply_feed state ~generation:1L feed
     in
     let build state = Journal_timeline.view ~state
@@ -6622,7 +6622,7 @@ let test_retired_feed_failure_does_not_publish_diagnostics projection =
   let module A = Application.Root_navigation in
   let runtime = R.create () in
   let output = R.submit runtime (Journal_graph_request.Load_feed
-    {before_day=None; day_limit=(if projection then 0 else 7); root_limit = 32; request_generation=9L}) in
+    {cursor=None; day_limit=(if projection then 0 else 7); root_limit = 32; request_generation=9L}) in
   let responses = if projection then output.responses else
     match output.requests with
     | [request] -> (R.fail_request runtime request ~message:"Retired transport failed.").responses

@@ -90,7 +90,7 @@ let seed_visible_block ?(record = record) runtime =
     Runtime.submit
       runtime
       (Journal_graph_request.Load_feed
-         { before_day = None
+         { cursor = None
          ; day_limit = 1
          ; root_limit = 2
 
@@ -784,7 +784,7 @@ let test_named_tags_reach_timeline_row () =
     Runtime.submit
       runtime
       (Journal_graph_request.Load_feed
-         { before_day = None
+         { cursor = None
          ; day_limit = 1
          ; root_limit = 2
 
