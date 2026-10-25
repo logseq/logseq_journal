@@ -1642,6 +1642,22 @@ module Root_navigation = struct
     | Local_copy_deleted
 
   let replace_graph state generation graph_id =
+    let retired_manager_scope =
+      match state.manager with
+      | Some manager ->
+        manager.startup.graph_generation = state.graph_state.generation
+        && manager.selected_graph = state.graph_state.graph_id
+      | None -> true
+    in
+    let manager_attention =
+      if retired_manager_scope then None else state.manager_attention
+    in
+    let sync_error =
+      match state.sync_error, manager_attention with
+      | Some ({ failure = Non_worker_sync_failure message; _ } as notice), Some retained
+        when String.equal message retained -> Some notice
+      | _ -> None
+    in
     let state = switch_draft_graph state graph_id in
     { state with
       favorites = Journal_routes.Favorites.create ~graph_generation:generation
@@ -1664,8 +1680,8 @@ module Root_navigation = struct
     ; capture_error_owner = None
     ; timeline_notice = None
     ; worker_errors = List.map (fun occurrence -> {occurrence with active=false}) state.worker_errors
-    ; manager_attention = None
-    ; sync_error = None
+    ; manager_attention
+    ; sync_error
     }
   ;;
 

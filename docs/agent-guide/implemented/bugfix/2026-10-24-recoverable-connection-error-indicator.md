@@ -82,3 +82,20 @@ the same complete suite passes with the required local-network execution access.
 The five invalid historical agent documents are byte-identical to main; both
 changed decision documents validate individually. No GUI revalidation or normal
 App installation was performed during PR preparation.
+
+## Review follow-up: asynchronous graph presentation scopes
+
+The initial PR118 head passed CI, but automated review identified a manager-first
+scope ordering gap. A new manager failure can arrive before the corresponding
+Worker graph state. Graph replacement must clear attention belonging to the
+retired manager/Worker scope, while preserving attention already admitted for a
+different/new manager scope. Its matching notice keeps its original sequence and
+expiry; old Worker notices are not carried forward.
+
+The existing mounted chrome test now retains realistic manager state and gates
+manager and graph publications independently. It failed on the original head
+when the delayed graph replacement cleared the new failure, then passes after
+the narrow presentation fix. Manager-first, graph-first and healthy-retirement
+controls pass, along with the full App149 suite, startup checks and @all build.
+No temporary trace code remains; no Feed, sync, retry, spec, Dune or GUI change is
+included in this review follow-up.

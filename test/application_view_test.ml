@@ -495,6 +495,8 @@ let run_favorites_native_visibility
   let publish_phase = Atomic.make None in
   let publish_error = Atomic.make None in
   let publish_attention = Atomic.make None in
+  let publish_graph_first = Atomic.make false in
+  let reported_graph_generation = Atomic.make None in
   let queried = Atomic.make [] in
   let feed_queried = Atomic.make false in
   let calendar_feed_reads = Atomic.make 0 in
@@ -717,6 +719,7 @@ let run_favorites_native_visibility
     ; diagnostics = { groups = [] }
     }
   in
+  let latest_error_manager = Atomic.make manager in
   let service =
     W.Service.create
       ~push_topic_count:6
@@ -757,15 +760,18 @@ let run_favorites_native_visibility
           let sync_phase = Atomic.exchange publish_phase None in
           let error = Atomic.exchange publish_error None in
           let attention = Atomic.exchange publish_attention None in
+          let manager = if check_error_control then Atomic.get latest_error_manager else manager in
           (* A current graph must carry the same manager generation. The
              startup owner deliberately rejects mixed old/new graph snapshots. *)
           if sync_phase <> None || error <> None
              || Atomic.get graph_generation <> manager.snapshot.startup.graph_generation
-          then
-            W.Request_context.emit
-              context
-              ~topic:Service.manager_topic
-              (Service.Client_state_changed
+          then (
+            if check_error_control && Atomic.exchange publish_graph_first false then
+              W.Request_context.emit context ~topic:Service.graph_state_topic
+                (Service.Graph_state_changed
+                   { generation = Atomic.get graph_generation; graph_id = Some (uuid 900)
+                   ; phase = Graph_open; error = None });
+            let next =
                  { manager with
                    snapshot =
                      { manager.snapshot with
@@ -775,10 +781,16 @@ let run_favorites_native_visibility
                      ; startup = { manager.snapshot.startup with
                          graph_generation = Atomic.get graph_generation }
                      }
-                 });
+                 } in
+            if check_error_control then Atomic.set latest_error_manager next;
+            W.Request_context.emit
+              context
+              ~topic:Service.manager_topic
+              (Service.Client_state_changed next));
           Ok
             (Service.Graph_state
-               { generation = Atomic.get graph_generation
+               { generation = Option.value (Atomic.get reported_graph_generation)
+                   ~default:(Atomic.get graph_generation)
                ; graph_id = Some (uuid 900)
                ; phase = Graph_open
                ; error = None
@@ -3925,7 +3937,30 @@ let run_favorites_native_visibility
            Atomic.set graph_generation 2;
            issue (Some Service.Transient_connection) (Some "Synthetic new-graph timeout");
            wait "new graph does not inherit serious attention" (fun () ->
-             Option.is_none (find "accessibility-label" "Error info")));
+             Option.is_none (find "accessibility-label" "Error info"));
+           Atomic.set graph_generation 3;
+           Atomic.set reported_graph_generation (Some 2);
+           issue (Some Service.Requires_attention) (Some "Synthetic new-scope integrity failure");
+           Atomic.set reported_graph_generation (Some 3);
+           ignore (W.send (Option.get !client) Service.Get_graph_state);
+           settle_worker ();
+           for _ = 1 to 10 do hooks.pump () |> consume; Unix.sleepf 0.001 done;
+           wait "manager-first graph replacement preserves its own attention" (fun () ->
+             Option.is_some (find "accessibility-label" "Error info"));
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Error info")));
+           wait "manager-first graph notice preserves the new reason" (fun () ->
+             Option.is_some (find "text" "Synthetic new-scope integrity failure"));
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-identifier" "journal-error-info-close")));
+           Atomic.set graph_generation 4;
+           Atomic.set reported_graph_generation None;
+           issue None None;
+           wait "healthy replacement clears previous graph attention" (fun () ->
+             Option.is_none (find "accessibility-label" "Error info"));
+           Atomic.set graph_generation 5;
+           Atomic.set publish_graph_first true;
+           issue (Some Service.Requires_attention) (Some "Synthetic graph-first TLS failure");
+           wait "graph-first replacement receives its own attention" (fun () ->
+             Option.is_some (find "accessibility-label" "Error info")));
 
          if check_generation
          then (
