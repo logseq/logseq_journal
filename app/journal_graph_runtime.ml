@@ -80,10 +80,6 @@ type payload =
       ; feed : Projection.feed
       ; complete : bool
       }
-  | Day_blocks_loaded of
-      { request_generation : int64
-      ; page : Projection.timeline_entry_page
-      }
   | Day_blocks_failed of
       { day : int
       ; request_generation : int64
@@ -116,20 +112,53 @@ type payload =
 
 type response = { payload : payload }
 
-type feed_pending =
-  { generation : int64
-  ; mutable remaining : int
-  ; mutable days : Projection.day_feed list
-  ; ordered_page_ids : string list
-  ; mutable resolved_page_ids : string list
-  ; mutable published : bool
-  ; has_more_days : bool
+type feed_scan =
+  { root_session : int64
+  ; root_generation : int64
+  ; root_start_day : int option
+  ; root_before_day : int option
+  ; root_publish_partial : bool
+  ; root_consumed_by_page : (string, int) Hashtbl.t
+  ; mutable root_remaining : int
+  ; mutable root_page_size : int
+  ; mutable root_list_size : int
+  ; mutable root_days : Projection.day_feed list
+  ; mutable root_queued : Projection.page list
+  ; mutable root_journal_cursor : Graph.Cursor.t option
+  ; mutable root_journals_done : bool
   }
 
-type feed_spec =
-  { day_limit : int
-  ; blocks_per_day : int
-  ; slot_limit : int
+type root_refresh =
+  { mutable refresh_remaining : int
+  ; mutable refresh_consumed : int
+  ; mutable refresh_entries : Projection.timeline_entry Rrbvec.t
+  ; refresh_anchor : (string * string) option
+  ; mutable refresh_anchor_reached : bool
+  }
+
+type root_owner =
+  | Feed_roots of feed_scan
+  | Changed_roots of root_refresh
+
+type root_batch =
+  { root_owner : root_owner
+  ; root_page : Projection.page
+  ; root_epoch : int64
+  ; root_limit : int
+  ; root_cursor : Graph.Cursor.t option
+  ; root_next : Graph.Cursor.t option
+  ; root_members : Projection.tree_member list
+  ; root_todo : Projection.tree_member list
+  }
+
+type root_preview =
+  { preview_batch : root_batch
+  ; preview_root : Projection.tree_member
+  ; preview_members : Projection.tree_member list
+  ; preview_cursor : Graph.Cursor.t option
+  ; preview_limit : int
+  ; preview_revision : string option
+  ; preview_retries : int
   }
 
 type refresh =
@@ -167,6 +196,9 @@ type reference_source =
   | Source_retryable
 
 type operation =
+  | Root_dates of feed_scan
+  | Root_tree of root_batch
+  | Root_preview of root_preview
   | Reference_read of
       { block_id : string
       ; depth : int
@@ -198,24 +230,6 @@ type operation =
       ; generation : string
       }
   | Acknowledge_changes
-  | List_feed_pages of
-      { before_day : int option
-      ; day_limit : int
-      ; blocks_per_day : int
-      ; slot_limit : int
-      ; request_generation : int64
-      ; pages : Projection.page list
-      }
-  | Feed_page_tree of
-      { page : Projection.page
-      ; pending : feed_pending
-      ; allocated_blocks : int
-      }
-  | Day_page_tree of
-      { page : Projection.page
-      ; generation : int64
-      ; limit : int
-      }
   | Detail_block of
       { generation : int64
       ; block_id : string
@@ -362,7 +376,11 @@ type t =
   ; favorite_loading_changes : (string, unit) Hashtbl.t
   ; mutable favorite_changes_overflow : bool
   ; target_read_epochs : (string, int64) Hashtbl.t
-  ; mutable initial_feed : feed_spec option
+  ; mutable initial_feed_spec : (int * int) option
+  ; mutable feed_session : int64
+  ; root_pages : (string, unit) Hashtbl.t
+  ; root_page_epochs : (string, int64) Hashtbl.t
+  ; root_page_counts : (string, int) Hashtbl.t
   }
 
 type output =
@@ -442,7 +460,11 @@ let create ?(localtime = Unix.localtime) () =
   ; favorite_loading_changes = Hashtbl.create 32
   ; favorite_changes_overflow = false
   ; target_read_epochs = Hashtbl.create 32
-  ; initial_feed = None
+  ; initial_feed_spec = None
+  ; feed_session = 0L
+  ; root_pages = Hashtbl.create 32
+  ; root_page_epochs = Hashtbl.create 32
+  ; root_page_counts = Hashtbl.create 32
   }
 ;;
 
@@ -492,7 +514,11 @@ let reset t =
   Hashtbl.clear t.favorite_loading_changes;
   t.favorite_changes_overflow <- false;
   Hashtbl.clear t.target_read_epochs;
-  t.initial_feed <- None
+  Hashtbl.clear t.root_pages;
+  Hashtbl.clear t.root_page_epochs;
+  Hashtbl.clear t.root_page_counts;
+  t.initial_feed_spec <- None;
+  t.feed_session <- t.next_request
 ;;
 
 let set_calendar t (calendar : Journal_calendar.t) =
@@ -953,25 +979,6 @@ let journal_title ~format day =
 
 let reject message = responses [ response (Rejected (Projection_failure message)) ]
 
-let take count values =
-  let rec loop remaining reversed = function
-    | _ when remaining = 0 -> List.rev reversed
-    | [] -> List.rev reversed
-    | value :: rest -> loop (remaining - 1) (value :: reversed) rest
-  in
-  loop count [] values
-;;
-
-let allocate_feed_page_limits ~blocks_per_day ~slot_limit pages =
-  let rec allocate extra = function
-    | [] -> []
-    | page :: rest ->
-      let additional = min (blocks_per_day - 1) extra in
-      (page, 1 + additional) :: allocate (extra - additional) rest
-  in
-  allocate (slot_limit - (2 * List.length pages)) pages
-;;
-
 let previous_journal_day day =
   if day <= 10101
   then 0
@@ -990,29 +997,6 @@ let previous_journal_day day =
     (year * 10000) + (month * 100) + last_day)
 ;;
 
-let feed_request
-      t
-      ~before_day
-      ~day_limit
-      ~blocks_per_day
-      ~slot_limit
-      ~request_generation
-      ~pages
-      ~cursor
-  =
-  read
-    t
-    (List_feed_pages
-       { before_day; day_limit; blocks_per_day; slot_limit; request_generation; pages })
-    (Protocol.V2_list_journals
-       { from_day = 0
-       ; through_day = Option.fold ~none:99_999_999 ~some:previous_journal_day before_day
-       ; limit = min Protocol.maximum_page_size (day_limit - List.length pages)
-       ; cursor
-       ; revision = None
-       })
-;;
-
 let page_tree t operation page ?cursor limit =
   match parse_uuid "page UUID" page.Projection.id with
   | Error message -> Error message
@@ -1024,65 +1008,6 @@ let page_tree t operation page ?cursor limit =
          operation
          (Protocol.V2_get_page_tree
             { page = page_uuid; maximum_depth = 1; limit; cursor; revision = None }))
-;;
-
-let feed_page_id (page : Projection.page) = page.id
-
-let feed_can_publish pending =
-  if pending.published
-  then true
-  else (
-    match pending.days with
-    | [] -> false
-    | days ->
-      let newest =
-        List.fold_left
-          (fun newest (day : Projection.day_feed) -> Int.max newest day.page.day)
-          min_int
-          days
-      in
-      let rec newer_pages_resolved = function
-        | [] -> true
-        | page_id :: rest ->
-          let day =
-            List.find_map
-              (fun (day : Projection.day_feed) ->
-                 if String.equal day.page.id page_id then Some day.page.day else None)
-              days
-          in
-          (match day with
-           | Some day when day = newest -> true
-           | Some _ -> newer_pages_resolved rest
-           | None ->
-             List.exists (String.equal page_id) pending.resolved_page_ids
-             && newer_pages_resolved rest)
-      in
-      newer_pages_resolved pending.ordered_page_ids)
-;;
-
-let feed_progress pending =
-  if not (feed_can_publish pending)
-  then []
-  else (
-    pending.published <- true;
-    let days =
-      List.sort
-        (fun left right -> Int.compare right.Projection.page.day left.page.day)
-        pending.days
-    in
-    let slot_count =
-      List.fold_left
-        (fun total (day : Projection.day_feed) -> total + 1 + List.length day.entries)
-        0
-        days
-    in
-    [ response
-        (Feed_loaded
-           { request_generation = pending.generation
-           ; feed = { days; slot_count; has_more_days = pending.has_more_days }
-           ; complete = pending.remaining = 0
-           })
-    ])
 ;;
 
 (* Admission identity follows only direct continuations of this operation.
@@ -1139,6 +1064,548 @@ let task_status_uuid t = function
   | Invalid_status _ -> Error "Choose a valid task status before saving."
 ;;
 
+(* Every Timeline batch budgets display roots; direct previews and transport
+   packet sizes have separate owners. Worker command semantics stay unchanged. *)
+let root_owner_current t = function
+  | Feed_roots scan -> scan.root_session = t.feed_session
+  | Changed_roots _ -> true
+;;
+
+let root_batch_current t batch =
+  root_owner_current t batch.root_owner
+  && Hashtbl.find_opt t.root_page_epochs batch.root_page.Projection.id
+     = Some batch.root_epoch
+;;
+
+let scan_failure scan message =
+  match scan.root_start_day with
+  | None -> feed_failure scan.root_generation message
+  | Some day -> day_failure ~day scan.root_generation message
+;;
+
+let root_failure batch message =
+  match batch.root_owner with
+  | Feed_roots scan -> scan_failure scan message
+  | Changed_roots _ -> reject message
+;;
+
+let superseded_root_batch t batch =
+  match batch.root_owner with
+  | Feed_roots scan when root_owner_current t batch.root_owner ->
+    (match scan.root_start_day with
+     | None ->
+       feed_failure
+         scan.root_generation
+         "The Timeline changed while loading. Retry to read the current prefix."
+     | Some day ->
+       responses
+         [ response
+             (Day_blocks_failed
+                { day
+                ; request_generation = scan.root_generation
+                ; stale_cursor = true
+                ; failure =
+                    Projection_failure "The root read was superseded by a refresh."
+                })
+         ])
+  | Feed_roots _ | Changed_roots _ -> empty
+;;
+
+let read_root_batch t owner (page : Projection.page) cursor limit =
+  Hashtbl.replace t.root_pages page.id ();
+  let retained_limit =
+    Option.fold
+      ~none:limit
+      ~some:(fun (i : page_tree_interest) -> max limit i.limit)
+      (Hashtbl.find_opt t.page_tree_interests page.id)
+  in
+  Hashtbl.replace t.page_tree_interests page.id { page; limit = retained_limit };
+  let epoch = t.next_request in
+  Hashtbl.replace t.root_page_epochs page.id epoch;
+  let batch =
+    { root_owner = owner
+    ; root_page = page
+    ; root_epoch = epoch
+    ; root_limit = limit
+    ; root_cursor = cursor
+    ; root_next = None
+    ; root_members = []
+    ; root_todo = []
+    }
+  in
+  read
+    t
+    (Root_tree batch)
+    (Protocol.V2_get_page_tree
+       { page = Graph.Uuid.of_string page.id |> Result.get_ok
+       ; maximum_depth = 0
+       ; limit
+       ; cursor
+       ; revision = None
+       })
+;;
+
+let read_changed_roots t page limit =
+  let target =
+    max
+      1
+      (Option.value
+         (Hashtbl.find_opt t.root_page_counts page.Projection.id)
+         ~default:limit)
+  in
+  let anchor =
+    Hashtbl.fold
+      (fun id block anchor ->
+         if
+           Journal_model.page_id block = page.id
+           && Journal_model.parent_id block = None
+           && id <> page.id
+         then (
+           let key = Journal_model.sibling_order block, id in
+           Some (Option.fold ~none:key ~some:(fun old -> max old key) anchor))
+         else anchor)
+      t.projected_blocks
+      None
+  in
+  read_root_batch
+    t
+    (Changed_roots
+       { refresh_remaining = target
+       ; refresh_consumed = 0
+       ; refresh_entries = Rrbvec.empty
+       ; refresh_anchor = anchor
+       ; refresh_anchor_reached = anchor = None
+       })
+    page
+    None
+    (min limit target)
+;;
+
+let read_root_dates t scan =
+  read
+    t
+    (Root_dates scan)
+    (Protocol.V2_list_journals
+       { from_day = 0
+       ; through_day =
+           Option.fold ~none:99_999_999 ~some:previous_journal_day scan.root_before_day
+       ; limit = scan.root_list_size
+       ; cursor = scan.root_journal_cursor
+       ; revision = None
+       })
+;;
+
+let root_feed_response scan complete =
+  let days = scan.root_days in
+  let feed : Projection.feed =
+    { days
+    ; slot_count =
+        List.fold_left
+          (fun n (d : Projection.day_feed) -> n + 1 + List.length d.entries)
+          0
+          days
+    ; has_more_days = scan.root_queued <> [] || not scan.root_journals_done
+    }
+  in
+  response (Feed_loaded { request_generation = scan.root_generation; feed; complete })
+;;
+
+let next_feed_batch t scan =
+  if not (root_owner_current t (Feed_roots scan))
+  then empty
+  else if scan.root_remaining = 0
+  then responses [ root_feed_response scan true ]
+  else (
+    match scan.root_queued with
+    | page :: rest ->
+      scan.root_queued <- rest;
+      requests
+        [ read_root_batch
+            t
+            (Feed_roots scan)
+            page
+            None
+            (min scan.root_page_size scan.root_remaining)
+        ]
+    | [] when scan.root_journals_done -> responses [ root_feed_response scan true ]
+    | [] -> requests [ read_root_dates t scan ])
+;;
+
+let complete_root_batch t batch =
+  if not (root_batch_current t batch)
+  then empty
+  else (
+    match projection_time_context t with
+    | Error message -> root_failure batch message
+    | Ok time_context ->
+      (match
+         Projection.timeline_entry_page
+           ~tag_titles:(fun id ->
+             Option.value
+               (Hashtbl.find_opt t.tag_titles (Graph.Uuid.to_string id))
+               ~default:[])
+           ~page:batch.root_page
+           ~time_context
+           Graph.{ items = batch.root_members; continuation = batch.root_next }
+       with
+       | Error message -> root_failure batch message
+       | Ok projected ->
+         if projected.entries <> [] then remember_page t batch.root_page;
+         remember_tree_items t batch.root_page batch.root_members;
+         remember_entries t batch.root_page projected.entries;
+         let consumed =
+           List.fold_left
+             (fun n (m : Projection.tree_member) -> if m.depth = 0 then n + 1 else n)
+             0
+             batch.root_members
+         in
+         (match batch.root_owner with
+          | Feed_roots scan ->
+            let previous =
+              if batch.root_cursor = None
+              then 0
+              else
+                Option.value
+                  (Hashtbl.find_opt scan.root_consumed_by_page batch.root_page.id)
+                  ~default:0
+            in
+            let consumed = previous + consumed in
+            Hashtbl.replace scan.root_consumed_by_page batch.root_page.id consumed;
+            let retained =
+              Option.value
+                (Hashtbl.find_opt t.root_page_counts batch.root_page.id)
+                ~default:0
+            in
+            Hashtbl.replace
+              t.root_page_counts
+              batch.root_page.id
+              (if batch.root_next = None then consumed else max retained consumed)
+          | Changed_roots _ -> ());
+         (match batch.root_owner with
+          | Changed_roots refresh ->
+            refresh.refresh_remaining <- refresh.refresh_remaining - consumed;
+            refresh.refresh_consumed <- refresh.refresh_consumed + consumed;
+            refresh.refresh_entries
+            <- Rrbvec.append_list refresh.refresh_entries projected.entries;
+            List.iter
+              (fun (m : Projection.tree_member) ->
+                 if
+                   m.depth = 0
+                   && Option.fold
+                        ~none:true
+                        ~some:(fun key ->
+                          compare (m.block.order, Graph.Uuid.to_string m.block.uuid) key
+                          >= 0)
+                        refresh.refresh_anchor
+                 then refresh.refresh_anchor_reached <- true)
+              batch.root_members;
+            (match batch.root_next with
+             | Some cursor
+               when refresh.refresh_remaining > 0
+                    || (not refresh.refresh_anchor_reached)
+                    || Rrbvec.is_empty refresh.refresh_entries ->
+               if Some cursor = batch.root_cursor
+               then root_failure batch "The refresh cursor did not advance."
+               else
+                 requests
+                   [ read_root_batch
+                       t
+                       batch.root_owner
+                       batch.root_page
+                       (Some cursor)
+                       (if refresh.refresh_remaining > 0
+                        then min batch.root_limit refresh.refresh_remaining
+                        else 1)
+                   ]
+             | None | Some _ ->
+               Hashtbl.replace
+                 t.root_page_counts
+                 batch.root_page.id
+                 refresh.refresh_consumed;
+               responses
+                 [ response
+                     (Page_tree_reconciled
+                        { page = batch.root_page
+                        ; value =
+                            { projected with
+                              entries = Rrbvec.to_list refresh.refresh_entries
+                            }
+                        })
+                 ])
+          | Feed_roots scan ->
+            let previous =
+              List.find_opt
+                (fun (d : Projection.day_feed) -> d.page.id = batch.root_page.id)
+                scan.root_days
+            in
+            let old =
+              Option.fold
+                ~none:[]
+                ~some:(fun (d : Projection.day_feed) -> d.entries)
+                previous
+            in
+            let old_ids =
+              List.map
+                (fun (e : Projection.timeline_entry) -> Journal_model.id e.block)
+                old
+            in
+            let added =
+              List.filter
+                (fun (e : Projection.timeline_entry) ->
+                   not (List.mem (Journal_model.id e.block) old_ids))
+                projected.entries
+            in
+            scan.root_remaining <- scan.root_remaining - List.length added;
+            let day : Projection.day_feed =
+              { page = batch.root_page
+              ; entries = old @ added
+              ; has_more_entries = Option.is_some projected.continuation
+              ; continuation = projected.continuation
+              }
+            in
+            scan.root_days
+            <- (match previous with
+                | None when day.entries = [] -> scan.root_days
+                | None -> scan.root_days @ [ day ]
+                | Some _ ->
+                  List.map
+                    (fun (d : Projection.day_feed) ->
+                       if d.page.id = day.page.id then day else d)
+                    scan.root_days);
+            let next =
+              match batch.root_next with
+              | Some cursor when scan.root_remaining > 0 ->
+                if Some cursor = batch.root_cursor
+                then root_failure batch "The root cursor did not advance."
+                else
+                  requests
+                    [ read_root_batch
+                        t
+                        batch.root_owner
+                        batch.root_page
+                        (Some cursor)
+                        (min scan.root_page_size scan.root_remaining)
+                    ]
+              | None | Some _ -> next_feed_batch t scan
+            in
+            if next.responses = [] && scan.root_publish_partial && scan.root_days <> []
+            then { next with responses = [ root_feed_response scan false ] }
+            else next)))
+;;
+
+let read_root_preview t preview =
+  read
+    t
+    (Root_preview preview)
+    (Protocol.V2_get_children
+       { parent = preview.preview_root.block.uuid
+       ; limit = preview.preview_limit
+       ; cursor = preview.preview_cursor
+       ; revision = None
+       })
+;;
+
+let next_root_preview t batch =
+  if not (root_batch_current t batch)
+  then empty
+  else (
+    match batch.root_todo with
+    | [] -> complete_root_batch t batch
+    | root :: rest ->
+      let preview =
+        { preview_batch = { batch with root_todo = rest }
+        ; preview_root = root
+        ; preview_members = []
+        ; preview_cursor = None
+        ; preview_limit = 3
+        ; preview_revision = None
+        ; preview_retries = 0
+        }
+      in
+      requests [ read_root_preview t preview ])
+;;
+
+let receive_root_tree t batch items next_cursor =
+  if not (root_batch_current t batch)
+  then empty
+  else if
+    List.exists
+      (fun (m : Protocol.v2_tree_member) ->
+         m.depth <> 0
+         || Graph.Uuid.to_string m.value.block.page <> batch.root_page.id
+         || Graph.Uuid.to_string m.value.block.parent <> batch.root_page.id)
+      items
+  then root_failure batch "The root query returned a foreign or nested block."
+  else (
+    let members =
+      List.map
+        (fun (m : Protocol.v2_tree_member) ->
+           Projection.{ block = m.value.block; revision = m.revision; depth = 0 })
+        items
+    in
+    match projection_time_context t with
+    | Error message -> root_failure batch message
+    | Ok time_context ->
+      (match
+         Projection.timeline_entry_page
+           ~tag_titles:(fun id ->
+             Option.value
+               (Hashtbl.find_opt t.tag_titles (Graph.Uuid.to_string id))
+               ~default:[])
+           ~page:batch.root_page
+           ~time_context
+           Graph.{ items = members; continuation = None }
+       with
+       | Error message -> root_failure batch message
+       | Ok projected ->
+         let ids =
+           List.map
+             (fun (e : Projection.timeline_entry) -> Journal_model.id e.block)
+             projected.entries
+         in
+         let todo =
+           List.filter
+             (fun (m : Projection.tree_member) ->
+                List.mem (Graph.Uuid.to_string m.block.uuid) ids)
+             members
+         in
+         next_root_preview
+           t
+           { batch with
+             root_members = members
+           ; root_todo = todo
+           ; root_next = next_cursor
+           }))
+;;
+
+let receive_root_preview t preview parent revision items next_cursor =
+  let batch = preview.preview_batch in
+  if not (root_batch_current t batch)
+  then empty
+  else if
+    (not (Graph.Uuid.equal parent preview.preview_root.block.uuid))
+    || List.exists
+         (fun (m : Protocol.v2_child_member) ->
+            (not (Graph.Uuid.equal m.value.block.parent parent))
+            || Graph.Uuid.to_string m.value.block.page <> batch.root_page.id)
+         items
+  then root_failure batch "The preview query returned a foreign child."
+  else if
+    Option.is_some preview.preview_revision && preview.preview_revision <> Some revision
+  then
+    if preview.preview_retries >= 2
+    then root_failure batch "The preview changed repeatedly while loading."
+    else
+      requests
+        [ read_root_preview
+            t
+            { preview with
+              preview_members = []
+            ; preview_cursor = None
+            ; preview_revision = None
+            ; preview_retries = preview.preview_retries + 1
+            }
+        ]
+  else (
+    let members =
+      preview.preview_members
+      @ List.map
+          (fun (m : Protocol.v2_child_member) ->
+             Projection.{ block = m.value.block; revision = m.revision; depth = 1 })
+          items
+    in
+    match projection_time_context t with
+    | Error message -> root_failure batch message
+    | Ok time_context ->
+      (match
+         Projection.timeline_entry_page
+           ~page:batch.root_page
+           ~time_context
+           Graph.{ items = preview.preview_root :: members; continuation = None }
+       with
+       | Error message -> root_failure batch message
+       | Ok projected ->
+         let summaries =
+           match projected.entries with
+           | [] -> []
+           | e :: _ -> e.child_summaries
+         in
+         let count = List.length summaries in
+         let selected =
+           List.filter
+             (fun (m : Projection.tree_member) ->
+                List.exists
+                  (fun (c : Projection.child_summary) ->
+                     c.block_id = Graph.Uuid.to_string m.block.uuid)
+                  summaries)
+             members
+         in
+         if count < 3 && Option.is_some next_cursor
+         then
+           if next_cursor = preview.preview_cursor
+           then root_failure batch "The child cursor did not advance."
+           else
+             requests
+               [ read_root_preview
+                   t
+                   { preview with
+                     preview_members = selected
+                   ; preview_cursor = next_cursor
+                   ; preview_revision = Some revision
+                   ; preview_limit = min preview.preview_limit (3 - count)
+                   }
+               ]
+         else
+           next_root_preview t { batch with root_members = batch.root_members @ selected }))
+;;
+
+let start_feed_scan t ~before_day ~root_limit ~day_limit ~request_generation ?after () =
+  let start_day = Option.map (fun ((page : Projection.page), _) -> page.day) after in
+  if root_limit <= 0 || day_limit <= 0
+  then (
+    match start_day with
+    | None ->
+      feed_failure request_generation "The root and date packet limits must be positive."
+    | Some day -> day_failure ~day request_generation "The root limit must be positive.")
+  else (
+    t.feed_session <- t.next_request;
+    if before_day = None && after = None
+    then t.initial_feed_spec <- Some (root_limit, day_limit);
+    let scan =
+      { root_session = t.feed_session
+      ; root_generation = request_generation
+      ; root_start_day = start_day
+      ; root_before_day = before_day
+      ; root_publish_partial = before_day = None && after = None
+      ; root_consumed_by_page = Hashtbl.create 32
+      ; root_remaining = root_limit
+      ; root_page_size = min root_limit Protocol.maximum_page_size
+      ; root_list_size = min day_limit Protocol.maximum_page_size
+      ; root_days = []
+      ; root_queued = []
+      ; root_journal_cursor = None
+      ; root_journals_done = false
+      }
+    in
+    match after with
+    | None -> next_feed_batch t scan
+    | Some (page, cursor) ->
+      if Option.is_some cursor
+      then
+        Hashtbl.replace
+          scan.root_consumed_by_page
+          page.id
+          (Option.value (Hashtbl.find_opt t.root_page_counts page.id) ~default:0);
+      requests
+        [ read_root_batch
+            t
+            (Feed_roots scan)
+            page
+            (Option.bind cursor (fun c -> c.Projection.protocol_cursor))
+            scan.root_page_size
+        ])
+;;
+
 let submit_unowned t (request : Journal_graph_request.t) =
   match request with
   | Load_task_statuses -> requests [ request_task_catalog t ]
@@ -1151,49 +1618,15 @@ let submit_unowned t (request : Journal_graph_request.t) =
       ]
   | Inspect_admission request ->
     requests [ read t (Admission_info request) Protocol.V2_inspect_admission ]
-  | Load_feed { before_day; day_limit; blocks_per_day; slot_limit; request_generation } ->
-    if day_limit <= 0
-    then feed_failure request_generation "The feed day limit must be positive."
-    else if blocks_per_day <= 0
-    then feed_failure request_generation "The feed block limit must be positive."
-    else if slot_limit < 2
-    then
-      feed_failure
-        request_generation
-        "The feed slot limit must reserve one day and one block."
-    else (
-      let day_limit = min day_limit (slot_limit / 2) in
-      let blocks_per_day = min Protocol.maximum_page_size blocks_per_day in
-      (match before_day with
-       | None -> t.initial_feed <- Some { day_limit; blocks_per_day; slot_limit }
-       | Some _ -> ());
-      requests
-        [ feed_request
-            t
-            ~before_day
-            ~day_limit
-            ~blocks_per_day
-            ~slot_limit
-            ~request_generation
-            ~pages:[]
-            ~cursor:None
-        ])
+  | Load_feed { before_day; root_limit; day_limit; request_generation } ->
+    start_feed_scan t ~before_day ~root_limit ~day_limit ~request_generation ()
   | Load_day_blocks { day; after; limit; request_generation } ->
     (match page_by_day t day with
-     | None ->
-       day_failure ~day request_generation "The requested journal page is not retained."
+     | None -> day_failure ~day request_generation "The requested journal page is not retained."
      | Some page ->
-       let cursor = Option.bind after (fun cursor -> cursor.Projection.protocol_cursor) in
-       (match
-          page_tree
-            t
-            (Day_page_tree { page; generation = request_generation; limit })
-            page
-            ?cursor
-            limit
-        with
-        | Ok request -> requests [ request ]
-        | Error message -> day_failure ~day request_generation message))
+       let day_limit = Option.fold ~none:7 ~some:snd t.initial_feed_spec in
+       start_feed_scan t ~before_day:(Some day) ~root_limit:limit ~day_limit
+         ~request_generation ~after:(page, after) ())
   | Load_detail { block_id; request_generation; limit; after } ->
     (match parse_uuid "block UUID" block_id with
      | Error message ->
@@ -2206,8 +2639,10 @@ let hydration_for_changes t ~request_generation windows =
       (function
         | Protocol.V2_page_tree_interest page ->
           Option.bind (registered_tree t page) (fun interest ->
-            page_tree t (Changed_page_tree interest.page) interest.page interest.limit
-            |> Result.to_option)
+            if Hashtbl.mem t.root_pages interest.page.id
+            then Some (read_changed_roots t interest.page interest.limit)
+            else page_tree t (Changed_page_tree interest.page) interest.page interest.limit
+              |> Result.to_option)
         | V2_children_interest _ | V2_journal_index_interest -> None)
       structures
   in
@@ -2249,18 +2684,12 @@ let hydration_for_changes t ~request_generation windows =
     || List.exists (fun page -> Option.is_some (registered_page t page)) pages
   in
   let journal =
-    match journal_changed, t.initial_feed with
-    | true, Some feed ->
+    match journal_changed, t.initial_feed_spec with
+    | true, Some (root_limit, day_limit) ->
       let output =
         plan_request
           t
-          (Journal_graph_request.Load_feed
-             { before_day = None
-             ; day_limit = feed.day_limit
-             ; blocks_per_day = feed.blocks_per_day
-             ; slot_limit = feed.slot_limit
-             ; request_generation
-             })
+          (Journal_graph_request.Load_feed {before_day=None;root_limit;day_limit;request_generation})
       in
       { output with
         responses =
@@ -2293,19 +2722,13 @@ let rehydrate_current_interests t ~request_generation ~generation =
   Hashtbl.clear t.task_lookup_epochs;
   let graph_info = read t Graph_info Protocol.V2_graph_info in
   let journal =
-    match t.initial_feed with
+    match t.initial_feed_spec with
     | None -> empty
-    | Some feed ->
+    | Some (root_limit, day_limit) ->
       let output =
         plan_request
           t
-          (Journal_graph_request.Load_feed
-             { before_day = None
-             ; day_limit = feed.day_limit
-             ; blocks_per_day = feed.blocks_per_day
-             ; slot_limit = feed.slot_limit
-             ; request_generation
-             })
+          (Journal_graph_request.Load_feed {before_day=None;root_limit;day_limit;request_generation})
       in
       { output with
         responses =
@@ -2318,6 +2741,8 @@ let rehydrate_current_interests t ~request_generation ~generation =
     |> List.filter_map (fun (interest : page_tree_interest) ->
       match parse_uuid "page UUID" interest.page.Projection.id with
       | Error _ -> None
+      | Ok _ when Hashtbl.mem t.root_pages interest.page.id ->
+        Some (read_changed_roots t interest.page interest.limit)
       | Ok page ->
         Some
           (read
@@ -2495,6 +2920,9 @@ let complete_child t (command : Projection.create_child) (page : Graph.page)
 ;;
 
 let operation_name = function
+  | Root_dates _ -> "listTimelineDates"
+  | Root_tree _ -> "readTimelineRoots"
+  | Root_preview _ -> "readTimelinePreview"
   | Reference_read _ -> "readUuidReference"
   | List_favorites _ -> "listFavorites"
   | Favorite_dependency _ -> "readFavoriteDependency"
@@ -2506,9 +2934,6 @@ let operation_name = function
   | Admission_info _ -> "inspectAdmission"
   | Pull_changes _ -> "pullChanges"
   | Acknowledge_changes -> "ackChanges"
-  | List_feed_pages _ -> "listFeedPages"
-  | Feed_page_tree _ -> "loadFeedPageTree"
-  | Day_page_tree _ -> "loadDayPageTree"
   | Detail_block _ -> "loadDetailBlock"
   | Detail_page _ -> "loadDetailPage"
   | Child_insert _ -> "appendChild"
@@ -2592,40 +3017,22 @@ let failure_output
         t
         (favorite_membership_key page)
         (responses [ response (Rejected (Worker_failure worker_failure)) ])
-  | List_feed_pages { request_generation; _ } ->
-    responses
-      [ response
-          (Feed_failed { request_generation; failure = Worker_failure worker_failure })
-      ]
-  | Feed_page_tree { pending; page; _ } ->
-    pending.remaining <- pending.remaining - 1;
-    pending.resolved_page_ids <- feed_page_id page :: pending.resolved_page_ids;
-    { requests = []
-    ; responses =
-        feed_progress pending
-        @ [ response
-              (Feed_failed
-                 { request_generation = pending.generation
-                 ; failure = Worker_failure worker_failure
-                 })
-          ]
-    }
+  | Root_dates scan ->
+    responses [response (match scan.root_start_day with
+      | None -> Feed_failed {request_generation=scan.root_generation;failure=Worker_failure worker_failure}
+      | Some day -> Day_blocks_failed {day;request_generation=scan.root_generation;stale_cursor=code=Error.Stale_read_cursor;failure=Worker_failure worker_failure})]
+  | Root_tree batch | Root_preview {preview_batch=batch;_} ->
+    (match batch.root_owner with
+     | Feed_roots scan -> responses [response (match scan.root_start_day with
+       | None -> Feed_failed {request_generation=scan.root_generation;failure=Worker_failure worker_failure}
+       | Some day -> Day_blocks_failed {day;request_generation=scan.root_generation;stale_cursor=code=Error.Stale_read_cursor;failure=Worker_failure worker_failure})]
+     | Changed_roots _ -> responses [response (Rejected (Worker_failure worker_failure))])
   | Mutation_refresh { page; refresh = Updated { block_id } } when code = Error.Conflict
     -> request_refresh t page (Update_conflict_refresh { block_id })
   | Graph_info -> responses [ response (Open_failed worker_failure) ]
   | Admission_info request -> responses [ response (Admission_unavailable request) ]
   | Pull_changes _ | Acknowledge_changes ->
     responses [ response (Rejected (Worker_failure worker_failure)) ]
-  | Day_page_tree { page; generation; _ } ->
-    responses
-      [ response
-          (Day_blocks_failed
-             { day = page.Projection.day
-             ; request_generation = generation
-             ; stale_cursor = code = Error.Stale_read_cursor
-             ; failure = Worker_failure worker_failure
-             })
-      ]
   | Detail_block { generation; block_id; _ } ->
     responses
       [ response
@@ -2711,88 +3118,17 @@ let children_result items continuation : Projection.block_member Graph.page_resu
   }
 ;;
 
-let feed_pages_response
-      t
-      ~before_day
-      ~day_limit
-      ~blocks_per_day
-      ~slot_limit
-      ~request_generation
-      ~retained
-      items
-      continuation
-  =
-  let pages =
-    retained
-    @ List.filter_map
-        (fun (item : Protocol.v2_journal_item) -> page_of_graph_page item.page)
-        items
-    |> List.filter (fun (page : Projection.page) ->
-      match before_day with
-      | None -> true
-      | Some before -> page.day < before)
-    |> List.sort (fun left right -> Int.compare right.Projection.day left.day)
-  in
-  if List.length pages < day_limit && Option.is_some continuation
-  then
-    requests
-      [ feed_request
-          t
-          ~before_day
-          ~day_limit
-          ~blocks_per_day
-          ~slot_limit
-          ~request_generation
-          ~pages
-          ~cursor:continuation
-      ]
-  else (
-    let has_more_days = Option.is_some continuation || List.length pages > day_limit in
-    let pages = take day_limit pages in
-    List.iter (remember_page t) pages;
-    let queued_pages = allocate_feed_page_limits ~blocks_per_day ~slot_limit pages in
-    let pending =
-      { generation = request_generation
-      ; remaining = List.length queued_pages
-      ; days = []
-      ; ordered_page_ids = List.map (fun (page, _) -> feed_page_id page) queued_pages
-      ; resolved_page_ids = []
-      ; published = false
-      ; has_more_days
-      }
-    in
-    if pages = []
-    then
-      responses
-        [ response
-            (Feed_loaded
-               { request_generation
-               ; feed = { days = []; slot_count = 0; has_more_days }
-               ; complete = true
-               })
-        ]
-    else (
-      let rec enqueue reversed = function
-        | [] -> requests (List.rev reversed)
-        | (page, allocated_blocks) :: rest ->
-          (match
-             page_tree
-               t
-               (Feed_page_tree { page; pending; allocated_blocks })
-               page
-               allocated_blocks
-           with
-           | Ok request -> enqueue (request :: reversed) rest
-           | Error message -> feed_failure request_generation message)
-      in
-      enqueue [] queued_pages))
-;;
-
 let receive_response t (protocol_response : Protocol.response) =
   let (Protocol.V2_response { request_id; outcome; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
   match Hashtbl.find_opt t.pending key with
   | None -> empty
+  | Some {operation=Root_dates scan;_} when not (root_owner_current t (Feed_roots scan)) ->
+    Hashtbl.remove t.pending key; empty
+  | Some {operation=Root_tree batch;_} when not (root_batch_current t batch) ->
+    Hashtbl.remove t.pending key; superseded_root_batch t batch
+  | Some {operation=Root_preview preview;_} when not (root_batch_current t preview.preview_batch) ->
+    Hashtbl.remove t.pending key; superseded_root_batch t preview.preview_batch
   | Some { operation = Target_summary summary; source_epoch; _ }
     when Hashtbl.find_opt t.target_read_epochs summary.block_id <> Some source_epoch ->
     Hashtbl.remove t.pending key;
@@ -2805,7 +3141,37 @@ let receive_response t (protocol_response : Protocol.response) =
   | Some { operation; source_epoch; _ } ->
     let failure_output = failure_output ~source_epoch in
     Hashtbl.remove t.pending key;
-    (match outcome with
+    (match operation,outcome with
+     | Root_dates scan, Protocol.V2_journals_outcome {items;next_cursor} ->
+       List.iter (fun (item : Protocol.v2_journal_item) ->
+         Hashtbl.replace t.graph_pages (Graph.Uuid.to_string item.page.uuid) item.page;
+         remember_page_revision t item.page.uuid item.revision) items;
+       if next_cursor<>None && next_cursor=scan.root_journal_cursor then scan_failure scan "The date cursor did not advance."
+       else (
+         let pages=List.filter_map (fun (i:Protocol.v2_journal_item)->page_of_graph_page i.page) items
+           |> List.sort (fun a b->Int.compare b.Projection.day a.Projection.day) in
+         scan.root_queued <- pages;scan.root_journal_cursor <- next_cursor;
+         scan.root_journals_done <- next_cursor=None;
+         next_feed_batch t scan)
+     | Root_tree batch, V2_page_tree_outcome {items;next_cursor;_} ->
+       List.iter (fun (i:Protocol.v2_tree_member)->
+         Hashtbl.replace t.block_revisions (Graph.Uuid.to_string i.value.block.uuid) i.revision;
+         Hashtbl.replace t.tag_titles (Graph.Uuid.to_string i.value.block.uuid) i.value.tag_titles) items;
+       receive_root_tree t batch items next_cursor
+     | Root_preview preview, V2_children_outcome {parent;scope_revision;items;next_cursor;_} ->
+       List.iter (fun (i:Protocol.v2_child_member)->
+         Hashtbl.replace t.block_revisions (Graph.Uuid.to_string i.value.block.uuid) i.revision;
+         Hashtbl.replace t.tag_titles (Graph.Uuid.to_string i.value.block.uuid) i.value.tag_titles) items;
+       receive_root_preview t preview parent scope_revision items next_cursor
+     | Root_dates scan, V2_failed {code="responseTooLarge";_} when scan.root_list_size>1 ->
+       scan.root_list_size <- max 1 (scan.root_list_size/2);requests [read_root_dates t scan]
+     | Root_tree batch, V2_failed {code="responseTooLarge";_} when batch.root_limit>1 ->
+       let limit=max 1 (batch.root_limit/2) in
+       (match batch.root_owner with Feed_roots scan->scan.root_page_size<-limit | _->());
+       requests [read_root_batch t batch.root_owner batch.root_page batch.root_cursor limit]
+     | Root_preview preview, V2_failed {code="responseTooLarge";_} when preview.preview_limit>1 ->
+       requests [read_root_preview t {preview with preview_limit=max 1 (preview.preview_limit/2)}]
+     | _ -> (match outcome with
      | Protocol.V2_assets_outcome _ ->
        failure_output t operation request_id "Unexpected asset query response."
      | Protocol.V2_favorites_outcome result ->
@@ -3067,31 +3433,13 @@ let receive_response t (protocol_response : Protocol.response) =
         | Admission_info request ->
           responses [ response (Admission_inspected { request; observation }) ]
         | _ -> failure_output t operation request_id "Unexpected admission response.")
-     | V2_journals_outcome { items; next_cursor } ->
+     | V2_journals_outcome { items; next_cursor = _ } ->
        List.iter
          (fun (item : Protocol.v2_journal_item) ->
             Hashtbl.replace t.graph_pages (Graph.Uuid.to_string item.page.uuid) item.page;
             remember_page_revision t item.page.uuid item.revision)
          items;
        (match operation with
-        | List_feed_pages
-            { before_day
-            ; day_limit
-            ; blocks_per_day
-            ; slot_limit
-            ; request_generation
-            ; pages
-            } ->
-          feed_pages_response
-            t
-            ~before_day
-            ~day_limit
-            ~blocks_per_day
-            ~slot_limit
-            ~request_generation
-            ~retained:pages
-            items
-            next_cursor
         | _ -> failure_output t operation request_id "Unexpected journal response.")
      | V2_page_outcome lookup ->
        (match lookup, operation with
@@ -3768,86 +4116,6 @@ let receive_response t (protocol_response : Protocol.response) =
          items;
        let result = tree_result items next_cursor in
        (match operation with
-        | Feed_page_tree { page; pending; allocated_blocks } ->
-          let finish_page () =
-            pending.remaining <- pending.remaining - 1;
-            pending.resolved_page_ids <- feed_page_id page :: pending.resolved_page_ids
-          in
-          let fail_page message =
-            finish_page ();
-            feed_failure pending.generation message
-          in
-          let roots =
-            List.fold_left
-              (fun count (item : Projection.tree_member) ->
-                 if item.depth = 0 then count + 1 else count)
-              0
-              result.items
-          in
-          if roots > allocated_blocks
-          then fail_page "The Worker page response exceeded its budget."
-          else (
-            remember_tree_items t page result.items;
-            match projection_time_context t with
-            | Error message -> fail_page message
-            | Ok time_context ->
-              (match
-                 Projection.timeline_entry_page
-                   ~tag_titles:(fun uuid ->
-                     Option.value
-                       (Hashtbl.find_opt t.tag_titles (Graph.Uuid.to_string uuid))
-                       ~default:[])
-                   ~page
-                   ~time_context
-                   result
-               with
-               | Error message -> fail_page message
-               | Ok projected ->
-                 (match projected.entries, result.continuation with
-                  | [], Some cursor ->
-                    (match page_tree t operation page ~cursor allocated_blocks with
-                     | Ok request -> requests [ request ]
-                     | Error message -> fail_page message)
-                  | _ ->
-                    finish_page ();
-                    remember_entries t page projected.entries;
-                    pending.days
-                    <- { Projection.page
-                       ; entries = projected.entries
-                       ; has_more_entries = Option.is_some projected.continuation
-                       ; continuation = projected.continuation
-                       }
-                       :: pending.days;
-                    { requests = []; responses = feed_progress pending })))
-        | Day_page_tree { page; generation; limit } ->
-          remember_tree_items t page result.items;
-          (match projection_time_context t with
-           | Error message -> day_failure ~day:page.Projection.day generation message
-           | Ok time_context ->
-             (match
-                Projection.timeline_entry_page
-                  ~tag_titles:(fun uuid ->
-                    Option.value
-                      (Hashtbl.find_opt t.tag_titles (Graph.Uuid.to_string uuid))
-                      ~default:[])
-                  ~page
-                  ~time_context
-                  result
-              with
-              | Ok projected ->
-                (match projected.entries, result.continuation with
-                 | [], Some cursor ->
-                   (match page_tree t operation page ~cursor limit with
-                    | Ok request -> requests [ request ]
-                    | Error message ->
-                      day_failure ~day:page.Projection.day generation message)
-                 | _ ->
-                   responses
-                     [ response
-                         (Day_blocks_loaded
-                            { request_generation = generation; page = projected })
-                     ])
-              | Error message -> day_failure ~day:page.Projection.day generation message))
         | Refresh_page_tree { page; refresh; retained_rev } ->
           remember_tree_items t page result.items;
           let block_id =
@@ -3986,7 +4254,7 @@ let receive_response t (protocol_response : Protocol.response) =
        (match operation with
         | Acknowledge_changes -> empty
         | _ ->
-          failure_output t operation request_id "Unexpected acknowledgement response."))
+          failure_output t operation request_id "Unexpected acknowledgement response.")))
 ;;
 
 let receive t (protocol_response : Protocol.response) =
@@ -3999,6 +4267,11 @@ let receive t (protocol_response : Protocol.response) =
   if not owned then empty else (
   let background = Hashtbl.mem t.hydration_active key in
   Hashtbl.remove t.hydration_active key;
+  let root_current = match pending with
+    | Some {operation=Root_dates scan;_}->root_owner_current t (Feed_roots scan)
+    | Some {operation=Root_tree batch;_}->root_batch_current t batch
+    | Some {operation=Root_preview preview;_}->root_batch_current t preview.preview_batch
+    | None | Some _->true in
   let output =
     scope_output
       t
@@ -4007,6 +4280,7 @@ let receive t (protocol_response : Protocol.response) =
   in
   let references =
     match pending, protocol_response with
+    | _ when not root_current -> empty
     | None, _ | Some { operation = Reference_read _; _ }, _ -> empty
     | Some pending, _ when not (favorite_request_current t pending) -> empty
     | Some { operation = Target_summary summary; source_epoch; _ }, _

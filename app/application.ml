@@ -451,6 +451,7 @@ let select_destination state destination =
 ;;
 
 let feed_day_limit = 7
+let feed_root_limit = 30
 let sync_error_card_lifetime = 5.
 
 let initial_state =
@@ -900,15 +901,11 @@ let apply_manager_state state (manager_state : Graph_service.state) =
 let worker_request generation = function
   | Journal_timeline_state.Feed { before_day } ->
     Journal_graph_request.Load_feed
-      { before_day
-      ; day_limit = feed_day_limit
-      ; blocks_per_day = 64
-      ; slot_limit = 128
-      ; request_generation = generation
-      }
+      { before_day; root_limit = feed_root_limit; day_limit = feed_day_limit
+      ; request_generation = generation }
   | Day { day; after } ->
     Journal_graph_request.Load_day_blocks
-      { day; after; limit = 64; request_generation = generation }
+      { day; after; limit = feed_root_limit; request_generation = generation }
 ;;
 
 let block_in_timeline timeline block_id =
@@ -1170,7 +1167,9 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
        state
      | Some calendar, _ when state.graph_ready ->
        { state with
-         feed_refresh =
+         timeline = Journal_timeline_state.begin_request state.timeline
+           ~generation:request_generation (Feed {before_day=None})
+       ; feed_refresh =
            Some
              { generation = request_generation
              ; context = feed_projection_context calendar
@@ -1192,24 +1191,18 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
        then (
          let today = refresh.context.local_day in
          let timeline =
-           match refresh.cause with
-           | Calendar_refresh ->
-             Journal_timeline_state.set_today state.timeline ~today
-             |> fun timeline ->
-             Journal_timeline_state.begin_request
-               timeline
-               ~generation:request_generation
-               (Feed { before_day = None })
-           | Sync_refresh ->
-             Journal_timeline_state.reset state.timeline ~today
-             |> fun timeline ->
-             Journal_timeline_state.begin_request
-               timeline
-               ~generation:request_generation
-               (Feed { before_day = None })
+           Journal_timeline_state.set_today state.timeline ~today
+           |> fun timeline ->
+           Journal_timeline_state.begin_request timeline
+             ~generation:request_generation (Feed { before_day = None })
          in
          let timeline =
-           Journal_timeline_state.apply_feed timeline ~generation:request_generation feed
+           match refresh.cause with
+           | Calendar_refresh ->
+             Journal_timeline_state.apply_feed timeline ~generation:request_generation feed
+           | Sync_refresh ->
+             Journal_timeline_state.refresh_feed timeline
+               ~generation:request_generation ~complete feed
          in
          let timeline =
            if complete
@@ -1257,14 +1250,6 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
             then Option.map feed_projection_context state.calendar
             else state.presented_feed_context)
        })
-  | Day_blocks_loaded { request_generation; page } ->
-    { state with
-      timeline =
-        Journal_timeline_state.apply_timeline_entry_page
-          state.timeline
-          ~generation:request_generation
-          page
-    }
   | Day_blocks_failed { day; request_generation; stale_cursor; failure } ->
     (match Journal_timeline_state.pending_request state.timeline with
      | Some (generation, Day request)
@@ -1298,6 +1283,16 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
       { state with routes }
   | Feed_failed { request_generation; failure } ->
     let accept_failure state =
+      let state =
+        { state with
+          timeline = Journal_timeline_state.fail_feed_request state.timeline
+            ~generation:request_generation
+        ; feed_refresh =
+            (match state.feed_refresh with
+             | Some refresh when refresh.generation = request_generation -> None
+             | refresh -> refresh)
+        }
+      in
       let state = record_failure_source state failure in
       let message = failure_source_message failure in
       match failure, state.feed_loaded with
@@ -1315,11 +1310,9 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
        accept_failure state
      | None | Some _ ->
        (match Journal_timeline_state.pending_request state.timeline with
-        | Some (generation, Feed { before_day = None })
-          when Int64.equal generation request_generation -> accept_failure state
-        | Some (_, Feed { before_day = Some _ })
-        | Some (_, Day _)
-        | Some (_, Feed { before_day = None })
+        | Some (generation, Feed _) when Int64.equal generation request_generation ->
+          accept_failure state
+        | Some _
         | None -> state))
   | Block_captured { block; timeline_entry_update } ->
     let completed_capture =
@@ -4696,10 +4689,8 @@ let start
             | Some _ ->
               submit
                 (Journal_graph_request.Load_feed
-                   { before_day = None
+                   { before_day = None; root_limit = feed_root_limit
                    ; day_limit = feed_day_limit
-                   ; blocks_per_day = 64
-                   ; slot_limit = 128
                    ; request_generation = feed_generation
                    })
           in
@@ -5457,10 +5448,8 @@ let start
       let output =
         submit
           (Journal_graph_request.Load_feed
-             { before_day = None
+             { before_day = None; root_limit = feed_root_limit
              ; day_limit = feed_day_limit
-             ; blocks_per_day = 64
-             ; slot_limit = 128
              ; request_generation = generation
              })
       in

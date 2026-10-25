@@ -25,9 +25,8 @@ type t =
   | Find_block of string
   | Load_feed of
       { before_day : int option
+      ; root_limit : int
       ; day_limit : int
-      ; blocks_per_day : int
-      ; slot_limit : int
       ; request_generation : int64
       }
   | Load_day_blocks of

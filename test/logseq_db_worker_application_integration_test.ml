@@ -92,8 +92,8 @@ let seed_visible_block ?(record = record) runtime =
       (Journal_graph_request.Load_feed
          { before_day = None
          ; day_limit = 1
-         ; blocks_per_day = 2
-         ; slot_limit = 4
+         ; root_limit = 2
+
          ; request_generation = 7L
          })
     |> fun output -> only "journal request" output.requests
@@ -109,17 +109,21 @@ let seed_visible_block ?(record = record) runtime =
             }))
     |> fun output -> only "page-tree request" output.requests
   in
-  Runtime.receive
+  let output = Runtime.receive
     runtime
     (respond
        tree
        (Protocol.V2_page_tree_outcome
           { page = page_uuid
-          ; maximum_depth = 1
+          ; maximum_depth = 0
           ; items =
               [ { value = record; revision = "block-1"; depth = 0; parent = page_uuid } ]
           ; next_cursor = None
-          }))
+          })) in
+  let child=only "bounded preview query" output.requests in
+  Runtime.receive runtime (respond child (Protocol.V2_children_outcome
+      {parent=record.block.uuid;revision_scope=V2_children_revision record.block.uuid;
+       scope_revision="children-1";items=[];next_cursor=None}))
 ;;
 
 let observe_graph_revision runtime projection_revision =
@@ -782,8 +786,8 @@ let test_named_tags_reach_timeline_row () =
       (Journal_graph_request.Load_feed
          { before_day = None
          ; day_limit = 1
-         ; blocks_per_day = 2
-         ; slot_limit = 4
+         ; root_limit = 2
+
          ; request_generation = 7L
          })
     |> fun out -> only "journals" out.requests
@@ -805,7 +809,7 @@ let test_named_tags_reach_timeline_row () =
          tree
          (Protocol.V2_page_tree_outcome
             { page = page_uuid
-            ; maximum_depth = 1
+            ; maximum_depth = 0
             ; items =
                 [ { value = record; revision = "block-1"; depth = 0; parent = page_uuid }
                 ]
@@ -834,6 +838,9 @@ let test_named_tags_reach_timeline_row () =
     | Error message -> Alcotest.failf "tag read rejected: %s" message
   in
   let output = Runtime.receive runtime response in
+  let child=only "tagged root preview" output.requests in
+  let output=Runtime.receive runtime (respond child (Protocol.V2_children_outcome
+      {parent=block_uuid;revision_scope=V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None})) in
   let entry =
     List.find_map
       (fun (r : Runtime.response) ->

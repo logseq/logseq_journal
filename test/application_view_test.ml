@@ -1176,11 +1176,11 @@ let run_favorites_native_visibility
                 ; next_cursor = None
                 }
             | V2_get_children { parent; limit; cursor; _ } ->
-              if (check_detail_discovery || check_detail_wait) && G.Uuid.equal parent (uuid 2)
+              if Atomic.get detail_fixture && (check_detail_discovery || check_detail_wait) && G.Uuid.equal parent (uuid 2)
               then Atomic.set discovery_reads (limit :: Atomic.get discovery_reads);
               (* Initial first pages complete before publication. The wait
                  scenario delays only a later explicit continuation read. *)
-              if check_detail_wait && G.Uuid.equal parent (uuid 2) && cursor <> None then
+              if Atomic.get detail_fixture && check_detail_wait && G.Uuid.equal parent (uuid 2) && cursor <> None then
                 while not (Atomic.get detail_wait_release) do
                   Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
                 done;
@@ -1191,7 +1191,7 @@ let run_favorites_native_visibility
                 ; items =
                     (if G.Uuid.equal parent favorites_page.uuid
                      then List.init 65 favorite_membership
-                     else if check_detail_wait && cursor = None
+                     else if Atomic.get detail_fixture && check_detail_wait && cursor = None
                           && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
                      then (
                        let value = timeline_block (if G.Uuid.equal parent (uuid 2) then 63 else 64) in
@@ -1201,7 +1201,7 @@ let run_favorites_native_visibility
                        ])
                      else [])
                 ; next_cursor =
-                    (if check_detail_wait && cursor = None
+                    (if Atomic.get detail_fixture && check_detail_wait && cursor = None
                         && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
                      then Some (G.Cursor.of_string "later-child-page" |> Result.get_ok)
                      else None)
@@ -4256,6 +4256,9 @@ let test_reference_outer_terminals cancel =
                       ]
                   ; next_cursor = None
                   })
+           | V2_get_children {parent;_} ->
+             completed request (V2_children_outcome
+               {parent;revision_scope=V2_children_revision parent;scope_revision="children";items=[];next_cursor=None})
            | V2_pull_changes _ ->
              completed
                request
@@ -6612,8 +6615,7 @@ let test_retired_feed_failure_does_not_publish_diagnostics projection =
   let module A = Application.Root_navigation in
   let runtime = R.create () in
   let output = R.submit runtime (Journal_graph_request.Load_feed
-    {before_day=None; day_limit=(if projection then 0 else 7);
-     blocks_per_day=32; slot_limit=64; request_generation=9L}) in
+    {before_day=None; day_limit=(if projection then 0 else 7); root_limit = 32; request_generation=9L}) in
   let responses = if projection then output.responses else
     match output.requests with
     | [request] -> (R.fail_request runtime request ~message:"Retired transport failed.").responses

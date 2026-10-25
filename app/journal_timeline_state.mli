@@ -20,6 +20,10 @@ val empty : today:int -> t
 val reset : t -> today:int -> t
 val begin_request : t -> generation:int64 -> request -> t
 val apply_feed : t -> generation:int64 -> Journal_graph_projection.feed -> t
+val fail_feed_request : t -> generation:int64 -> t
+
+val refresh_feed
+  : t -> generation:int64 -> complete:bool -> Journal_graph_projection.feed -> t
 
 val apply_timeline_entry_page
   :  t

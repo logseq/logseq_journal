@@ -75,10 +75,6 @@ type payload =
       ; feed : Journal_graph_projection.feed
       ; complete : bool
       }
-  | Day_blocks_loaded of
-      { request_generation : int64
-      ; page : Journal_graph_projection.timeline_entry_page
-      }
   | Day_blocks_failed of
       { day : int
       ; request_generation : int64

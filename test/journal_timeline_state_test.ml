@@ -106,6 +106,7 @@ let continuation_of_entries ~more entries =
         { Journal_graph_projection.after_sibling_order =
             Journal_model.sibling_order entry.block
         ; after_block_id = Journal_model.id entry.block
+
         ; protocol_cursor = None
         })
 ;;
@@ -406,6 +407,7 @@ let test_ten_thousand_record_projection_preserves_loaded_history () =
           { Journal_graph_projection.after_sibling_order =
               Journal_model.sibling_order last
           ; after_block_id = Journal_model.id last
+
           ; protocol_cursor = None
           }
       else None
@@ -1667,7 +1669,108 @@ let test_partial_day_parent_restore () =
   require (!failures = []) "%s" (String.concat "\n" (List.rev !failures))
 ;;
 
+let test_sync_prefix_retains_history_and_anchor () =
+  let roots = List.init 80 (fun i -> block ~order:(Printf.sprintf "%04d" i) (1000 + i)) in
+  let older =
+    List.init 10 (fun i ->
+      block ~day:20260808 ~order:(Printf.sprintf "%04d" i) (2000 + i))
+  in
+  let loaded =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed
+            [ day_feed ~more:true 20260809 "Today" roots
+            ; day_feed 20260808 "Yesterday" older
+            ])
+    |> Timeline.observe_visible_range ~first_index:65 ~last_exclusive:70
+  in
+  let anchor state =
+    Timeline.retained_slot state (Timeline.first_visible_index state)
+    |> Option.map Timeline.slot_key
+  in
+  let prefix = List.tl (List.take 31 roots) in
+  let refreshed =
+    Timeline.begin_request loaded ~generation:2L (Timeline.Feed { before_day = None })
+    |> fun state ->
+    Timeline.refresh_feed
+      state
+      ~generation:2L
+      ~complete:true
+      (feed ~more:true [ day_feed ~more:true 20260809 "Today" prefix ])
+  in
+  require (anchor refreshed = anchor loaded) "sync prefix lost the stable visible anchor";
+  let ids state =
+    retained_slots state
+    |> List.filter_map (function
+      | Timeline.Top_level e -> Some (Journal_model.id e.block)
+      | _ -> None)
+  in
+  require
+    (List.length (ids refreshed) = 89)
+    "sync prefix discarded loaded same-day or older suffix";
+  require
+    (not (List.mem (Journal_model.id (List.hd roots)) (ids refreshed)))
+    "deleted prefix root survived refresh";
+  let exhausted =
+    Timeline.begin_request refreshed ~generation:3L (Timeline.Feed { before_day = None })
+    |> fun state ->
+    Timeline.refresh_feed
+      state
+      ~generation:3L
+      ~complete:true
+      (feed [ day_feed 20260809 "Today" (List.take 10 roots) ])
+  in
+  require
+    (List.length (ids exhausted) = 10)
+    "authoritative exhaustion retained deleted suffix";
+  let unchanged =
+    Timeline.refresh_feed loaded ~generation:999L ~complete:true (feed [])
+  in
+  require (unchanged == loaded) "stale refresh modified the loaded timeline"
+;;
+
+let test_unified_batch_continues_across_days () =
+  let roots = List.init 40 (fun i -> block ~order:(Printf.sprintf "%04d" i) (3000+i)) in
+  let older = List.init 20 (fun i -> block ~day:20260808 ~order:(Printf.sprintf "%04d" i) (4000+i)) in
+  let loaded = Timeline.empty ~today:20260809
+    |> begin_and_apply_feed ~generation:1L ~before_day:None
+      (feed ~more:true [day_feed ~more:true 20260809 "Today" (List.take 30 roots);day_feed ~more:true 20260808 "Yesterday" (List.take 10 older)])
+    |> Timeline.observe_visible_range ~first_index:36 ~last_exclusive:39 in
+  let anchor state = Timeline.retained_slot state (Timeline.first_visible_index state) |> Option.map Timeline.slot_key in
+  let continuation = List.find_map (function Timeline.Day_continuation d -> Some d.after | _ -> None) (retained_slots loaded) |> Option.get in
+  let pending = Timeline.begin_request loaded ~generation:2L (Timeline.Day {day=20260809;after=continuation}) in
+  let batch = feed ~more:true [day_feed 20260809 "Today" (List.drop 30 roots);day_feed ~more:true 20260808 "Yesterday" older] in
+  let complete = Timeline.apply_feed pending ~generation:2L batch in
+  let ids state = retained_slots state |> List.filter_map (function Timeline.Top_level e -> Some (Journal_model.id e.block) | _ -> None) in
+  require (List.length (ids complete)=60) "continued batch did not append thirty roots across dates";
+  require (List.length (List.sort_uniq String.compare (ids complete))=60) "continued batch duplicated roots";
+  require (anchor complete=anchor loaded) "cross-date batch lost the visible UUID anchor";
+  require (Timeline.pending_request complete=None) "continued batch retained pending request";
+  let duplicate = Timeline.apply_feed complete ~generation:2L batch in
+  require (duplicate==complete) "duplicate batch completion changed Timeline"
+;;
+
+let test_older_feed_failure_releases_request () =
+  let loaded=Timeline.empty ~today:20260809
+    |> begin_and_apply_feed ~generation:1L ~before_day:None
+      (feed ~more:true [day_feed 20260809 "Today" [block 8000]])
+    |> Timeline.observe_visible_range ~first_index:0 ~last_exclusive:2 in
+  let pending=Timeline.begin_request loaded ~generation:2L (Timeline.Feed {before_day=Some 20260809}) in
+  let ignored=Timeline.fail_feed_request pending ~generation:1L in
+  require (ignored==pending) "old feed failure retired a newer request";
+  let failed=Timeline.fail_feed_request pending ~generation:2L in
+  require (Timeline.pending_request failed=None) "older-date failure left pagination pending";
+  require (Timeline.next_request failed=None) "older-date failure started an automatic retry loop";
+  require (slot_keys failed=slot_keys loaded) "older-date failure discarded retained rows";
+  let retried=Timeline.observe_visible_range failed ~first_index:0 ~last_exclusive:2 in
+  require (Timeline.next_request retried=Some (Timeline.Feed {before_day=Some 20260809})) "new visible demand cannot retry older dates"
+;;
+
 let () =
+  test_older_feed_failure_releases_request ();
+  test_unified_batch_continues_across_days ();
   test_partial_day_parent_restore ();
   test_parent_only_cards_and_point_updates ();
   test_capture_converges_with_later_pagination ();
@@ -1696,6 +1799,7 @@ let () =
   test_authoritative_timeline_entry_replaces_summary_by_stable_parent_id ();
   test_ten_thousand_record_projection_preserves_loaded_history ();
   test_block_replacement ();
+  test_sync_prefix_retains_history_and_anchor ();
   test_populated_feed_refresh_preserves_position ();
   test_initial_feed_refresh_supersedes_pending_pagination ();
   test_prepend_first_today_entry_before_older_days ();
