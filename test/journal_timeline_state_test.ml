@@ -1768,7 +1768,141 @@ let test_older_feed_failure_releases_request () =
   require (Timeline.next_request retried=Some (Timeline.Feed {before_day=Some 20260809})) "new visible demand cannot retry older dates"
 ;;
 
+let prefix_root_ids state =
+  Timeline.fold_slots (fun ids -> function
+    | Timeline.Top_level e -> Journal_model.id e.block :: ids
+    | _ -> ids) [] state |> List.rev
+;;
+
+let require_prefix_identity state expected =
+  let keys = slot_keys state in
+  require (List.length keys = List.length (List.sort_uniq String.compare keys))
+    "prefix/suffix merge duplicated a native slot key";
+  require_equal_string_list (prefix_root_ids state)
+    (List.map Journal_model.id expected) "prefix/suffix merge lost or reordered roots"
+;;
+
+let prefix_anchor state =
+  Timeline.retained_slot state (Timeline.first_visible_index state)
+  |> Option.map Timeline.slot_key
+;;
+
+let load_prefix_history count =
+  let roots = List.init count (fun i -> block ~order:(Printf.sprintf "%04d" i) (9000+i)) in
+  let first = List.take 30 roots in
+  let initial = Timeline.empty ~today:20260809
+    |> begin_and_apply_feed ~generation:1L ~before_day:None
+      (feed [day_feed ~more:true 20260809 "Today" first]) in
+  let after = continuation_of_entries ~more:true (List.map entry first) in
+  let loaded = Timeline.begin_request initial ~generation:2L (Timeline.Day {day=20260809;after})
+    |> fun state -> Timeline.apply_timeline_entry_page state ~generation:2L
+      (timeline_page (List.drop 30 roots)) in
+  require_prefix_identity loaded roots;
+  roots, loaded
+;;
+
+let refresh_prefix state ~generation ~complete roots =
+  Timeline.begin_request state ~generation (Timeline.Feed {before_day=None})
+  |> fun state -> Timeline.refresh_feed state ~generation ~complete
+    (feed [day_feed ~more:true 20260809 "Today" roots])
+;;
+
+let check_reordered_prefix ~partial ~delete () =
+  let count = if delete then 32 else 31 in
+  let roots, loaded = load_prefix_history count in
+  let loaded = Timeline.observe_visible_range loaded ~first_index:10 ~last_exclusive:13 in
+  let moved = block ~order:"-001" ~source:"Remote moved root" ~revision:"block-2" (9000+count-1) in
+  let expected = moved :: List.filteri (fun i _ -> i <> count-1 && (not delete || i <> 5)) roots in
+  let prefix = List.take (if partial then 10 else 30) expected in
+  let refreshed = refresh_prefix loaded ~generation:3L ~complete:(not partial) prefix in
+  require_prefix_identity refreshed expected;
+  require (Journal_model.source (Option.get (Timeline.find_block refreshed ~block_id:(Journal_model.id moved))) = "Remote moved root")
+    "old suffix content replaced the fresh prefix value";
+  require (prefix_anchor refreshed = prefix_anchor loaded) "reorder moved an unaffected UUID anchor";
+  require (Timeline.scroll_generation refreshed = Timeline.scroll_generation loaded)
+    "prefix refresh introduced a scroll command";
+  let refreshed = if partial then
+      refresh_prefix refreshed ~generation:3L ~complete:true (List.take 30 expected)
+    else refreshed in
+  require_prefix_identity refreshed expected;
+  let repeated = refresh_prefix refreshed ~generation:4L ~complete:true (List.take 30 expected) in
+  require_prefix_identity repeated expected;
+  require (retained_slots repeated = retained_slots refreshed) "same prefix refresh changed the presented slots";
+  let page_first = Timeline.replace_timeline_entry_page loaded
+      ~page:(page 20260809 "Today") (timeline_page expected) in
+  let prefix_after = refresh_prefix page_first ~generation:3L ~complete:true (List.take 30 expected) in
+  require_prefix_identity prefix_after expected;
+  require (prefix_anchor prefix_after = prefix_anchor loaded) "reverse refresh order moved the surviving anchor";
+  let reconciled = Timeline.replace_timeline_entry_page repeated
+      ~page:(page 20260809 "Today") (timeline_page (List.tl expected)) in
+  require_prefix_identity reconciled (List.tl expected);
+  require (prefix_anchor reconciled = prefix_anchor loaded) "authoritative deletion moved the surviving anchor"
+;;
+
+let check_cross_day_prefix_move ~complete_older () =
+  let today = List.init 30 (fun i -> block ~order:(Printf.sprintf "%04d" i) (9100+i)) in
+  let old = block ~day:20260808 ~order:"0000" 9200 in
+  let initial = Timeline.empty ~today:20260809
+    |> begin_and_apply_feed ~generation:1L ~before_day:None
+      (feed ~more:true [day_feed 20260809 "Today" today]) in
+  let loaded = initial |> begin_and_apply_feed ~generation:2L ~before_day:(Some 20260809)
+      (feed [day_feed ~more:(not complete_older) 20260808 "Yesterday" [old]])
+    |> Timeline.observe_visible_range ~first_index:31 ~last_exclusive:32 in
+  let moved = block ~order:"-001" ~revision:"block-2" ~source:"Moved into Today" 9200 in
+  let expected = moved :: today in
+  let refreshed = refresh_prefix loaded ~generation:3L ~complete:true (List.take 30 expected) in
+  require_prefix_identity refreshed expected;
+  require (prefix_anchor refreshed = prefix_anchor loaded) "cross-day move lost its visible UUID anchor";
+  require (Journal_model.journal_day (Option.get (Timeline.find_block refreshed ~block_id:(Journal_model.id moved))) = 20260809)
+    "old suffix copy won over the moved prefix root";
+  if complete_older then (
+    require (not (List.mem "day:20260808" (slot_keys refreshed))) "moving the last root left an empty old-day heading";
+    require_prefix_identity (Timeline.remove_block refreshed ~block_id:(Journal_model.id moved)) today)
+  else (
+    let after = continuation_of_entries ~more:true [entry old] in
+    require (List.exists (function Timeline.Day_continuation d -> d.day=20260808 && d.after=after | _ -> false)
+        (retained_slots refreshed)) "move discarded the unread old-day continuation";
+    let rest = [block ~day:20260808 ~order:"0001" 9201;block ~day:20260808 ~order:"0002" 9202] in
+    let completed = Timeline.begin_request refreshed ~generation:4L (Timeline.Day {day=20260808;after})
+      |> fun state -> Timeline.apply_timeline_entry_page state ~generation:4L (timeline_page rest) in
+    require_prefix_identity completed (expected @ rest);
+    require (prefix_anchor completed = prefix_anchor refreshed) "later page moved the retained UUID anchor";
+    let cleared = List.fold_left (fun state b -> Timeline.remove_block state ~block_id:(Journal_model.id b)) completed rest in
+    require_prefix_identity cleared expected;
+    require (not (List.mem "day:20260808" (slot_keys cleared))) "moved suffix identity corrupted the old-day count")
+;;
+
+let check_root_reordered_out_of_prefix () =
+  let roots, loaded = load_prefix_history 31 in
+  let loaded = Timeline.observe_visible_range loaded ~first_index:10 ~last_exclusive:13 in
+  let moved = block ~order:"9999" ~revision:"block-2" 9000 in
+  let first = List.tl roots in
+  let refreshed = refresh_prefix loaded ~generation:3L ~complete:true first in
+  require_prefix_identity refreshed first;
+  require (prefix_anchor refreshed = prefix_anchor loaded) "outward reorder moved an unaffected anchor";
+  let after = continuation_of_entries ~more:true (List.map entry first) in
+  let completed = Timeline.begin_request refreshed ~generation:4L (Timeline.Day {day=20260809;after})
+    |> fun state -> Timeline.apply_timeline_entry_page state ~generation:4L (timeline_page [moved]) in
+  require_prefix_identity completed (first @ [moved]);
+  require (prefix_anchor completed = prefix_anchor loaded) "pagination lost the surviving anchor";
+  let duplicate = Timeline.apply_timeline_entry_page completed ~generation:4L (timeline_page [moved]) in
+  require (duplicate == completed) "duplicate page completion changed the reordered history"
+;;
+
+let test_prefix_identity_merge () =
+  let failures = ref [] in
+  List.iter (fun (name, run) -> try run () with Failure message -> failures := (name ^ ": " ^ message) :: !failures)
+    [ "same-day reorder", check_reordered_prefix ~partial:false ~delete:false
+    ; "partial prefix reorder", check_reordered_prefix ~partial:true ~delete:false
+    ; "reorder and prefix deletion", check_reordered_prefix ~partial:false ~delete:true
+    ; "move from exhausted older day", check_cross_day_prefix_move ~complete_older:true
+    ; "move from paginated older day", check_cross_day_prefix_move ~complete_older:false
+    ; "reorder out of prefix then paginate", check_root_reordered_out_of_prefix ];
+  require (!failures = []) "%s" (String.concat "\n" (List.rev !failures))
+;;
+
 let () =
+  test_prefix_identity_merge ();
   test_older_feed_failure_releases_request ();
   test_unified_batch_continues_across_days ();
   test_partial_day_parent_restore ();

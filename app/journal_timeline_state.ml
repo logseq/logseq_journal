@@ -672,7 +672,25 @@ let refresh_feed (state : t) ~generation ~complete (feed : Journal_graph_project
               | _ -> true)
             |> Rrbvec.of_list
           in
-          let suffix = slice state.slots start (Rrbvec.length state.slots) in
+          let prefix_ids =
+            Rrbvec.fold_left
+              (fun ids -> function
+                 | Top_level e -> Entries.add (Journal_model.id e.block) () ids
+                 | _ -> ids)
+              Entries.empty
+              prefix
+          in
+          let moved_from = ref Days.empty in
+          let suffix =
+            slice state.slots start (Rrbvec.length state.slots)
+            |> filter_slots (function
+              | Top_level e when Entries.mem (Journal_model.id e.block) prefix_ids ->
+                let day = Journal_model.journal_day e.block in
+                moved_from := Days.update day
+                    (fun count -> Some (1 + Option.value count ~default:0)) !moved_from;
+                false
+              | _ -> true)
+          in
           let days =
             List.fold_left
               (fun days (d : Journal_graph_projection.day_feed) ->
@@ -701,6 +719,16 @@ let refresh_feed (state : t) ~generation ~complete (feed : Journal_graph_project
                    ; complete = old.complete
                    }))
                 days)
+          in
+          let days =
+            Days.fold
+              (fun day count days ->
+                 Days.update day
+                   (Option.map (fun knowledge ->
+                      { knowledge with block_count = max 0 (knowledge.block_count - count) }))
+                   days)
+              !moved_from
+              days
           in
           { state with
             slots = Rrbvec.append prefix suffix
