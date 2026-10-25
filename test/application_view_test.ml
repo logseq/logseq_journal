@@ -1938,10 +1938,22 @@ let run_favorites_native_visibility
                    if List.assoc_opt key values = Some (`String value) then id :: ids else ids)
                 props []
             in
-            let enter n =
-              let label =
-                Option.get (find "text" (Printf.sprintf "Timeline fixture %d" n))
+            (* A child preview may repeat a top-level title. Select the
+               retained UUID row before comparing its native content node. *)
+            let timeline_title n =
+              let row = "journal-row-label:" ^ G.Uuid.to_string (uuid (n + 1)) in
+              let rec in_row id =
+                let values = Option.value (Hashtbl.find_opt props id) ~default:[] in
+                match List.assoc_opt "accessibility-identifier" values with
+                | Some (`String value) when String.starts_with ~prefix:"journal-row-label:" value ->
+                  value = row
+                | _ -> Option.fold ~none:false ~some:in_row (Hashtbl.find_opt parents id)
               in
+              find ~accept:in_row "text" (Printf.sprintf "Timeline fixture %d" n)
+              |> Option.get
+            in
+            let enter n =
+              let label = timeline_title n in
               dispatch (Lui_protocol.Press (ancestor_property label "press-enabled"));
               wait "Detail root loads" (fun () ->
                 Option.is_some
@@ -1997,7 +2009,7 @@ let run_favorites_native_visibility
               hooks.extension_event nav "path-changed" (payload ()) |> consume;
               hooks.extension_event nav "settled" (payload ()) |> consume
             in
-            let original_root_content = Option.get (find "text" "Timeline fixture 1") in
+            let original_root_content = timeline_title 1 in
             enter 0;
             if scenario = "legacy-interrupted" then (
               (* No pure reducer owns native completion copy or the Worker queue.
@@ -2318,10 +2330,7 @@ let run_favorites_native_visibility
                        ~some:inside_body
                        (Hashtbl.find_opt parents id)
                 in
-                let root_content =
-                  find ~accept:(fun id -> navigation_page id = Some (`String "root"))
-                    "text" "Timeline fixture 1" |> Option.get
-                in
+                let root_content = timeline_title 1 in
                 Alcotest.(check bool)
                   "root feedback reserves space for the retained page content"
                   true
@@ -2343,9 +2352,7 @@ let run_favorites_native_visibility
                 Alcotest.(check int)
                   "feedback updates retain the root content"
                   retained_root
-                  (find
-                     ~accept:(fun id -> navigation_page id = Some (`String "root"))
-                     "text" "Timeline fixture 1" |> Option.get);
+                  (timeline_title 1);
                 enter 0;
                 dispatch (Lui_protocol.Press detail_actions);
                 settle_worker ();
