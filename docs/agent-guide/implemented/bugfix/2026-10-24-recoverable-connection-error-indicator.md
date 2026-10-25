@@ -72,3 +72,13 @@ checks before publishing. Preserve the isolated UI validation boundary above;
 no new Simulator/graph operations are required and the 6709 normal App is left
 untouched. Timeline/integrity investigations and diagnostic-only observers remain
 in a separate PR; no speculative sync or Feed repair is part of this change.
+
+Final main-reconciled validation passes @all plus application149, sync333, Worker
+runner50, Worker reducer20, startup and LUI service checks. PR115's newly added
+manual-sync fixture now supplies the conservative attention field required by the
+already approved Recoverable_close metadata; its retry assertions are unchanged.
+The first sandboxed Sync test run could not bind its localhost fixture sockets;
+the same complete suite passes with the required local-network execution access.
+The five invalid historical agent documents are byte-identical to main; both
+changed decision documents validate individually. No GUI revalidation or normal
+App installation was performed during PR preparation.

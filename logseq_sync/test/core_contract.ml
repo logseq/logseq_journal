@@ -3856,7 +3856,7 @@ let manual_sync_offline_uses_existing_admission_and_socket_owner () =
   let opened, connection, _ = pull_fixture () in
   let current = pull_response opened.next connection ~after:0 0 in
   let closed = Core.step current.next
-    (Core.Websocket_closed (connection, Core.Recoverable_close (Some "synthetic offline"))) in
+    (Core.Websocket_closed (connection, Core.Recoverable_close { message = Some "synthetic offline"; attention = Requires_attention })) in
   let requested = manual_sync closed.next in
   check_pull_count "offline never sends through old socket" 0 requested.effects;
   (* Application's existing online request re-verifies the native identity. *)
