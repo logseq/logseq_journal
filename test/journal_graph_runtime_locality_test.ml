@@ -7215,6 +7215,218 @@ let test_changed_point_ownership () =
   if !failures <> [] then Alcotest.fail (String.concat "\n" (List.rev !failures))
 ;;
 
+let test_resync_retires_changed_points () =
+  let failures = ref [] in
+  let check name f =
+    try f () with
+    | exn -> failures := (name ^ ": " ^ Printexc.to_string exn) :: !failures
+  in
+  let updates output =
+    List.filter_map
+      (fun (r : Runtime.response) ->
+         match r.payload with
+         | Block_updated { block; _ } -> Some block
+         | _ -> None)
+      output.Runtime.responses
+  in
+  let complete runtime request value =
+    Runtime.receive
+      runtime
+      (response
+         request
+         (V2_block_outcome (V2_present_block { value; revision = "point-before-resync" })))
+  in
+  let point ?(generation = "generation-1") runtime block_id =
+    let pull =
+      Runtime.reconcile_push
+        runtime
+        ~request_generation:803L
+        (Protocol.V2_changes_available
+           { api_version = Protocol.api_version; generation; through = "revision-2" })
+    in
+    let output =
+      Runtime.receive
+        runtime
+        (response
+           (only "point change pull" pull.requests)
+           (Protocol.V2_changes
+              { generation
+              ; from_exclusive = Some "revision-1"
+              ; through = "revision-2"
+              ; windows = [ window ~blocks:[ block_id ] () ]
+              ; next = None
+              }))
+    in
+    List.find
+      (fun (r : Protocol.request) ->
+         match r.command with
+         | V2_get_outline_block { block; _ } -> Graph.Uuid.equal block block_id
+         | _ -> false)
+      output.requests
+  in
+  let run boundary pending_context move_back =
+    let runtime = Runtime.create ~localtime:Unix.gmtime () in
+    set_priority_calendar runtime;
+    let source = normal_journal_fixture 29 2 0
+    and target = normal_journal_fixture 0 0 0 in
+    ignore (drive_roots runtime [ source ] (initial_roots runtime 801L));
+    let before = List.hd source.roots in
+    let moved =
+      { before with
+        block =
+          { before.block with
+            page = target.owner.uuid
+          ; parent = target.owner.uuid
+          ; title = "Before resync"
+          }
+      }
+    in
+    let old = point runtime before.block.uuid in
+    let held =
+      if pending_context
+      then (
+        let unresolved = complete runtime old moved in
+        Alcotest.(check int)
+          "unknown destination waits for metadata"
+          0
+          (List.length (updates unresolved));
+        List.find
+          (fun (r : Protocol.request) ->
+             match r.command with
+             | V2_get_page { page; _ } -> Graph.Uuid.equal page target.owner.uuid
+             | _ -> false)
+          unresolved.requests)
+      else old
+    in
+    let fresh =
+      let value = if move_back then before else moved in
+      { value with block = { value.block with title = "After resync" } }
+    in
+    let fixtures =
+      if move_back
+      then [ target; { source with roots = fresh :: List.tl source.roots } ]
+      else
+        [ { target with roots = [ fresh ] }
+        ; { source with roots = List.tl source.roots }
+        ]
+    in
+    (match boundary with
+     | `Reset -> Runtime.reset runtime
+     | (`Push | `Pull) as boundary ->
+       let start =
+         match boundary with
+         | `Push ->
+           Runtime.reconcile_push
+             runtime
+             ~request_generation:802L
+             (Protocol.V2_resync_required_push
+                { api_version = Protocol.api_version
+                ; generation = "generation-2"
+                ; reason = "retention overflow"
+                })
+         | `Pull ->
+           Runtime.receive
+             runtime
+             (response
+                (pull runtime)
+                (Protocol.V2_resync_required
+                   { generation = "generation-2"; reason = "retention overflow" }))
+       in
+       (* Hold unrelated graph-info work; complete the real Feed and retained
+          page requests before the previously issued point/context response. *)
+       let start =
+         { start with
+           requests =
+             List.filter
+               (fun (r : Protocol.request) ->
+                  match r.command with
+                  | V2_list_journals _ | V2_get_page_tree _ | V2_get_children _ -> true
+                  | _ -> false)
+               start.requests
+         }
+       in
+       let outputs, _ = drive_root_output runtime fixtures start in
+       let published =
+         List.concat_map
+           (fun (r : Runtime.response) ->
+              match r.payload with
+              | Feed_loaded { feed; complete = true; _ } ->
+                List.concat_map
+                  (fun (d : Journal_graph_projection.day_feed) -> d.entries)
+                  feed.days
+              | Page_tree_reconciled { value; _ } -> value.entries
+              | _ -> [])
+           outputs
+       in
+       let latest =
+         List.find
+           (fun (e : Journal_graph_projection.timeline_entry) ->
+              Journal_model.id e.block = Graph.Uuid.to_string before.block.uuid)
+           published
+       in
+       Alcotest.(check string)
+         "fresh roots publish before the late result"
+         "After resync"
+         (Journal_model.source latest.block);
+       Alcotest.(check string)
+         "fresh roots have the current page"
+         (Graph.Uuid.to_string fresh.block.page)
+         (Journal_model.page_id latest.block));
+    let late =
+      if pending_context
+      then
+        Runtime.receive
+          runtime
+          (response
+             held
+             (V2_page_outcome
+                (V2_present_page
+                   { page = target.owner; revision = "valid-late-page-metadata" })))
+      else complete runtime held moved
+    in
+    Alcotest.(check int)
+      "retired observation cannot publish the saved old value"
+      0
+      (List.length late.responses);
+    Alcotest.(check int)
+      "retired point cannot start a new context lookup"
+      0
+      (List.length late.requests);
+    if boundary <> `Reset
+    then (
+      let current =
+        complete runtime (point ~generation:"generation-2" runtime fresh.block.uuid) fresh
+      in
+      let block = only "a new point after resync still publishes" (updates current) in
+      Alcotest.(check string)
+        "new observation is not retired"
+        "After resync"
+        (Journal_model.source block))
+  in
+  List.iter
+    (fun boundary ->
+       List.iter
+         (fun pending_context ->
+            List.iter
+              (fun move_back ->
+                 check
+                   (Printf.sprintf
+                      "%s context=%b moved-back=%b"
+                      (if boundary = `Push then "push" else "pull")
+                      pending_context
+                      move_back)
+                   (fun () -> run boundary pending_context move_back))
+              [ false; true ])
+         [ false; true ])
+    [ `Push; `Pull ];
+  List.iter
+    (fun pending_context ->
+       check (Printf.sprintf "reset context=%b" pending_context) (fun () ->
+         run `Reset pending_context false))
+    [ false; true ];
+  if !failures <> [] then Alcotest.fail (String.concat "\n" (List.rev !failures))
+;;
+
 let test_initial_thirty_roots () =
   let runtime = Runtime.create ~localtime:Unix.gmtime () in
   set_calendar runtime;
@@ -7963,7 +8175,8 @@ let () =
             test_shorter_reference_path_discovers_nested_targets
         ; Alcotest.test_case "bounded burst" `Quick test_reference_burst_is_bounded
         ] )
-    ; ( "cross-page ownership", [Alcotest.test_case "point context and retirement" `Quick test_changed_point_ownership] )
+    ; ( "cross-page ownership", [Alcotest.test_case "point context and retirement" `Quick test_changed_point_ownership;
+        Alcotest.test_case "resync retires point observations" `Quick test_resync_retires_changed_points] )
     ; ( "initial thirty roots", [
         Alcotest.test_case "Today first within root budget" `Quick test_today_priority_batch;
         Alcotest.test_case "Today date traversal survives recovery" `Quick test_today_date_traversal_survives_recovery;

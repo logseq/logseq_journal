@@ -2778,6 +2778,7 @@ let hydration_for_changes t ~request_generation windows =
 ;;
 
 let rehydrate_current_interests t ~request_generation ~generation =
+  Hashtbl.clear t.changed_point_epochs;
   t.change_generation <- Some generation;
   t.change_cursor <- None;
   t.task_catalog_started <- false;
