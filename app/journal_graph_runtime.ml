@@ -1238,10 +1238,9 @@ let root_feed_response scan complete =
           (fun n (d : Projection.day_feed) -> n + 1 + List.length d.entries)
           0
           days
-    ; continuation =
-        (if List.exists (fun (d : Projection.day_feed) -> d.has_more_entries) days
-         then None
-         else root_date_continuation scan)
+    (* Keep the date entry point even while a day has its own cursor: a later
+       authoritative page reconciliation can legitimately remove that cursor. *)
+    ; continuation = root_date_continuation scan
     ; prioritized_day = scan.root_skipped_day
     }
   in

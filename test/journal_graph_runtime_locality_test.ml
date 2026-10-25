@@ -6828,13 +6828,35 @@ let test_today_date_traversal_survives_recovery () =
                   !fixtures
               in
               let edited = List.hd current.roots in
+              let roots =
+                if mode = "reconcile-delete"
+                then List.take (List.length current.roots - 1) current.roots
+                else if mode = "reconcile"
+                then
+                  { edited with
+                    block = { edited.block with title = "Normal remote edit" }
+                  }
+                  :: List.tl current.roots
+                else
+                  current.roots
+                  @ [ { edited with
+                        block =
+                          { edited.block with
+                            uuid =
+                              uuid (Printf.sprintf "a7300000-0000-4000-8000-%012d" !day)
+                          ; title = "Normal remote root insert"
+                          ; order = "z"
+                          }
+                      }
+                    ]
+              in
               let changed_page =
                 { current with
-                  roots =
-                    { edited with
-                      block = { edited.block with title = "Normal remote edit" }
+                  roots
+                ; owner =
+                    { current.owner with
+                      updated_at_ms = Int64.succ current.owner.updated_at_ms
                     }
-                    :: List.tl current.roots
                 }
               in
               fixtures
@@ -6844,7 +6866,7 @@ let test_today_date_traversal_survives_recovery () =
                       then changed_page
                       else f)
                    !fixtures;
-              if mode = "reconcile"
+              if mode = "reconcile" || mode = "reconcile-delete"
               then (
                 let outputs, _ =
                   drive_root_output
@@ -6991,7 +7013,7 @@ let test_today_date_traversal_survives_recovery () =
                 (List.sort (fun a b -> Int.compare b a) days)
                 days))
          [ 31; 61 ])
-    [ "stale"; "retry"; "reconcile"; "midnight" ];
+    [ "stale"; "retry"; "reconcile"; "reconcile-delete"; "midnight" ];
   if !failures <> [] then Alcotest.fail (String.concat "\n" (List.rev !failures))
 ;;
 
