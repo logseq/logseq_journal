@@ -3,7 +3,7 @@ module Core = Logseq_sync_pure_reducer.Core
 type connect_error =
   | Unauthorized
   | Forbidden
-  | Connection_failed of string
+  | Connection_failed of { message : string; attention : Logseq_sync_pure_reducer.Core.error_attention }
   | Protocol_failed of string
   | Authentication_failed of string
 
@@ -56,31 +56,34 @@ let close_timeout = 1.
 let protocol_error message = raise (Protocol_error message)
 
 let termination_message = function
-  | Core.Recoverable_close reason -> Option.value reason ~default:"WebSocket closed"
+  | Core.Recoverable_close { message = reason; _ } -> Option.value reason ~default:"WebSocket closed"
   | Core.Local_close -> "WebSocket closed locally"
   | Core.Authentication_failure message | Core.Protocol_failure message -> message
 ;;
 
+let connection_failed ?(attention = Core.Requires_attention) message = Connection_failed { message; attention }
+
 let connection_error = function
   | Core.Authentication_failure message -> Authentication_failed message
   | Core.Protocol_failure message -> Protocol_failed message
-  | reason -> Connection_failed (termination_message reason)
+  | Core.Recoverable_close { message; attention } -> connection_failed ~attention (Option.value message ~default:"WebSocket closed")
+  | reason -> connection_failed (termination_message reason)
 ;;
 
 let peer_termination payload =
   if String.length payload < 2
-  then Core.Recoverable_close None
+  then Core.Recoverable_close { message = None; attention = Requires_attention }
   else (
     match (Char.code payload.[0] lsl 8) lor Char.code payload.[1] with
     | 1002 | 1003 | 1007 | 1008 | 1009 | 1010 ->
       Core.Protocol_failure "WebSocket peer rejected the protocol or policy"
-    | _ -> Core.Recoverable_close None)
+    | _ -> Core.Recoverable_close { message = None; attention = Requires_attention })
 ;;
 
 let closed_reason t =
   if t.local_closing
   then Core.Local_close
-  else Option.value t.peer_termination ~default:(Core.Recoverable_close None)
+  else Option.value t.peer_termination ~default:(Core.Recoverable_close { message = None; attention = Requires_attention })
 ;;
 
 let stop t reason =
@@ -100,8 +103,8 @@ let await_retired t = Eio.Promise.await t.retired
 let activate t ~on_open =
   match t.terminal with
   | Some reason -> Error (connection_error reason)
-  | None when t.closing -> Error (Connection_failed "WebSocket closed before activation")
-  | None when t.activated -> Error (Connection_failed "WebSocket already activated")
+  | None when t.closing -> Error (connection_failed "WebSocket closed before activation")
+  | None when t.activated -> Error (connection_failed "WebSocket already activated")
   | None ->
     t.activated <- true;
     (try
@@ -141,6 +144,11 @@ let request_close t payload =
 let close t =
   t.local_closing <- true;
   request_close t "\x03\xe8"
+;;
+
+let failure_attention t = match t.terminal with
+  | Some (Core.Recoverable_close { attention; _ }) -> attention
+  | _ -> Core.Requires_attention
 ;;
 
 let send t payload =
@@ -236,7 +244,7 @@ let input_handlers t maximum =
       (match error with
        | Some _ -> Core.Protocol_failure "WebSocket protocol failed"
        | None when t.peer_closed && t.close_sent -> closed_reason t
-       | None -> Core.Recoverable_close (Some "WebSocket peer EOF"))
+       | None -> Core.Recoverable_close { message = Some "WebSocket peer EOF"; attention = Transient_connection })
   in
   { Httpun_ws.Websocket_connection.frame; eof }
 ;;
@@ -260,7 +268,7 @@ let read_loop t ~maximum_frame_bytes flow protocol =
       done;
       let before = t.read_progress in
       match Client.next_read_operation protocol with
-      | `Close -> stop t (Core.Recoverable_close (Some "WebSocket reader closed"))
+      | `Close -> stop t (Core.Recoverable_close { message = Some "WebSocket reader closed"; attention = Transient_connection })
       | `Yield ->
         let resumed, resume = Eio.Promise.create () in
         Client.yield_reader protocol (fun () ->
@@ -292,7 +300,7 @@ let read_loop t ~maximum_frame_bytes flow protocol =
               t
               (if t.peer_closed && t.close_sent
                then closed_reason t
-               else Core.Recoverable_close (Some "WebSocket peer EOF"))))
+               else Core.Recoverable_close { message = Some "WebSocket peer EOF"; attention = Transient_connection })))
   in
   loop 0 false
 ;;
@@ -370,7 +378,7 @@ let write_loop t flow protocol =
       | `Close _ ->
         drained ();
         if not t.closing
-        then stop t (Core.Recoverable_close (Some "WebSocket writer closed")))
+        then stop t (Core.Recoverable_close { message = Some "WebSocket writer closed"; attention = Transient_connection }))
   and wait () =
     let resumed, resume = Eio.Promise.create () in
     let wake () = ignore (Eio.Promise.try_resolve resume () : bool) in
@@ -420,7 +428,7 @@ let heartbeat t clock = function
          with
          | Eio.Time.Timeout ->
            if not t.closing
-           then stop t (Core.Recoverable_close (Some "WebSocket Pong deadline expired")));
+           then stop t (Core.Recoverable_close { message = Some "WebSocket Pong deadline expired"; attention = Transient_connection }));
         t.pong <- None)
     done
 ;;
@@ -437,7 +445,9 @@ let failure_reason = function
   | Protocol_error message -> Core.Protocol_failure message
   | Tls_eio.Tls_failure (`Error (`AuthenticationFailure _)) ->
     Core.Authentication_failure "WebSocket TLS authentication failed"
-  | exn -> Core.Recoverable_close (Some (failure_message exn))
+  | exn -> Core.Recoverable_close { message = Some (failure_message exn); attention =
+      (if (match exn with End_of_file -> true | _ -> false) || Option.is_some (Tls_client_eio.transient_failure exn)
+       then Transient_connection else Requires_attention) }
 ;;
 
 let connect
@@ -462,7 +472,7 @@ let connect
     (not valid_uri)
     || maximum_frame_bytes <= 0
     || maximum_frame_bytes > maximum_queue_bytes
-  then Error (Connection_failed "invalid WebSocket connection parameters")
+  then Error (connection_failed "invalid WebSocket connection parameters")
   else (
     let ready, resolve_ready = Eio.Promise.create () in
     let stopped, resolve_stopped = Eio.Promise.create () in
@@ -507,8 +517,10 @@ let connect
            let setup () =
              let host = Option.get (Uri.host uri) in
              let dns_failure = ref None in
+             let tls_attention = ref Core.Requires_attention in
              match
-               Tls_client_eio.connect_diagnosed
+               Tls_client_eio.connect_diagnosed_with_attention
+                 ~on_transient_failure:(fun _ -> tls_attention := Core.Transient_connection)
                  ~on_diagnostic:(fun source -> dns_failure := Some source)
                  ~sw:owner
                  ~authenticator
@@ -520,23 +532,23 @@ let connect
              | Error Tls_client_eio.Authentication_failed ->
                Error (Authentication_failed "WebSocket TLS authentication failed")
              | Error Tls_client_eio.Invalid_dns_host ->
-               Error (Connection_failed "WebSocket TLS setup failed: invalid DNS host")
+               Error (connection_failed ~attention:!tls_attention "WebSocket TLS setup failed: invalid DNS host")
              | Error Tls_client_eio.No_network_address ->
-               Error (Connection_failed ("WebSocket TLS setup failed: no network address"
+               Error (connection_failed ~attention:!tls_attention ("WebSocket TLS setup failed: no network address"
                  ^ Option.fold ~none:"" ~some:(fun source -> " (" ^ source ^ ")") !dns_failure))
              | Error (Tls_client_eio.Setup_failed "invalid TLS configuration") ->
                Error
-                 (Connection_failed
+                 (connection_failed ~attention:!tls_attention
                     "WebSocket TLS setup failed: invalid TLS configuration")
              | Error (Tls_client_eio.Setup_failed "all resolved addresses failed") ->
                Error
-                 (Connection_failed
+                 (connection_failed ~attention:!tls_attention
                     "WebSocket TLS setup failed: all resolved addresses failed")
              | Error (Tls_client_eio.Setup_failed "DNS/TCP dial timed out") ->
                Error
-                 (Connection_failed "WebSocket TLS setup failed: DNS/TCP dial timed out")
+                 (connection_failed ~attention:!tls_attention "WebSocket TLS setup failed: DNS/TCP dial timed out")
              | Error (Tls_client_eio.Setup_failed source) ->
-               Error (Connection_failed (match Tls_client_eio.safe_setup_detail source with
+               Error (connection_failed ~attention:!tls_attention (match Tls_client_eio.safe_setup_detail source with
                  | Some detail -> "WebSocket TLS setup failed: " ^ detail
                  | None -> "WebSocket TLS setup failed"))
              | Ok flow ->
@@ -556,7 +568,7 @@ let connect
                         | 401 -> Unauthorized
                         | 403 -> Forbidden
                         | status ->
-                          Connection_failed
+                          connection_failed
                             (Printf.sprintf "WebSocket Upgrade rejected (HTTP %d)" status))
                      | `Malformed_response _ | `Invalid_response_body_length _ | `Exn _ ->
                        Protocol_failed "WebSocket protocol failed"
@@ -610,7 +622,7 @@ let connect
              (guarded (fun () ->
                 Eio.Promise.await close_requested;
                 Eio.Time.sleep clock close_timeout;
-                stop t (Core.Recoverable_close (Some "WebSocket close deadline expired"))));
+                stop t (Core.Recoverable_close { message = Some "WebSocket close deadline expired"; attention = Transient_connection })));
            (* Setup and both pumps share this owner from before DNS through final
               retirement, including a failure before a handle can be returned. *)
            let setup_result =
@@ -628,7 +640,7 @@ let connect
                  | Forbidden -> Core.Authentication_failure "Authorization failed."
                  | Authentication_failed message -> Core.Authentication_failure message
                  | Protocol_failed message -> Core.Protocol_failure message
-                 | Connection_failed message -> Core.Recoverable_close (Some message))
+                 | Connection_failed { message; attention } -> Core.Recoverable_close { message = Some message; attention })
             | Ok () -> ignore (Eio.Promise.try_resolve resolve_ready (Ok t) : bool));
            Eio.Promise.await stopped;
            raise Stop_owner)
@@ -646,7 +658,7 @@ let connect
       let reason =
         Option.value
           t.terminal
-          ~default:(Core.Recoverable_close (Some "WebSocket owner stopped"))
+          ~default:(Core.Recoverable_close { message = Some "WebSocket owner stopped"; attention = Requires_attention })
       in
       ignore
         (Eio.Promise.try_resolve resolve_ready (Error (connection_error reason)) : bool);

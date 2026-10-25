@@ -145,6 +145,10 @@ let equal_unlock_submission a b =
 let unlock_attached_submission receipt = receipt.submission
 let unlock_attached_scope receipt = receipt.attached_scope
 
+(** Presentation only: retry eligibility is still determined by the original outcome.
+    Unknown and security failures require attention even when transport retries them. *)
+type error_attention = Transient_connection | Requires_attention
+
 type snapshot =
   { sync_phase : sync_phase
   ; catalog : graph list
@@ -154,6 +158,7 @@ type snapshot =
   ; unlock : unlock_phase
   ; startup : startup_facts
   ; last_error : string option
+  ; last_error_attention : error_attention option
   ; local_deletion : local_deletion option
   }
 
@@ -558,7 +563,7 @@ type websocket_send =
   }
 
 type websocket_termination =
-  | Recoverable_close of string option
+  | Recoverable_close of { message : string option; attention : error_attention }
   | Local_close
   | Authentication_failure of string
   | Protocol_failure of string
@@ -936,6 +941,7 @@ let initial config =
     ; unlock = Unlock_inactive
     ; startup = initial_startup
     ; last_error = None
+    ; last_error_attention = None
     }
   in
   Ok
@@ -1011,7 +1017,10 @@ let set_snapshot core (snapshot : snapshot) =
        || previous.graph_generation <> snapshot.startup.graph_generation
     then Unlock_inactive else snapshot.unlock
   in
-  let snapshot = { snapshot with unlock; startup = { snapshot.startup with
+  let last_error_attention = match snapshot.last_error with
+    | None -> None
+    | Some _ -> Some (Option.value snapshot.last_error_attention ~default:Requires_attention) in
+  let snapshot = { snapshot with unlock; last_error_attention; startup = { snapshot.startup with
     awaiting_e2ee_password = Option.is_some (unlock_challenge unlock) } } in
   let previous = core.public_state.snapshot.startup in
   let diagnostics =
@@ -1052,7 +1061,7 @@ let local_unavailable core reason message =
     restoring_local=false;bootstrapping=false;catalog_loading=false;awaiting_e2ee_password=false;
     failure=Some (if reason=Local_catalog_unavailable then During_catalog else During_local_restore)} in
   let next=set_snapshot core {snapshot with startup; unlock = Unlock_failed (Retry_preparation message);
-      last_error=Some message;sync_phase=Offline} in
+      last_error=Some message;last_error_attention=Some Requires_attention;sync_phase=Offline} in
   {next;effects=[publish next]}
 ;;
 
@@ -1074,6 +1083,7 @@ let fail core stage message =
       sync_phase = Failed
     ; startup
     ; unlock = Unlock_failed (Retry_preparation message)
+    ; last_error_attention = Some Requires_attention
     ; last_error = Some message
     }
   in
@@ -1101,7 +1111,7 @@ let fail core stage message =
 
 let cleanup_failed core message =
   let next =
-    set_snapshot core { core.public_state.snapshot with last_error = Some message }
+    set_snapshot core { core.public_state.snapshot with last_error = Some message; last_error_attention = Some Requires_attention }
   in
   { next; effects = [ publish next ] }
 ;;
@@ -1308,6 +1318,7 @@ let authenticate_new_account core user_id =
     ; applied_server_t = None
     ; startup
     ; last_error = None
+    ; last_error_attention = None
     }
   in
   let core =
@@ -2221,7 +2232,8 @@ let apply_rejection core owner rejection =
              set_snapshot
                next
                { next.public_state.snapshot with
-                 last_error = Some (rejection_message rejection)
+                 last_error_attention = Some Requires_attention
+               ; last_error = Some (rejection_message rejection)
                }
            in
            next, [ publish next ]
@@ -2510,6 +2522,7 @@ let clear_selected_graph_for_catalog core catalog =
     ; unlock = Unlock_inactive
     ; startup
     ; last_error = None
+    ; last_error_attention = None
     }
   in
   let next =
@@ -2637,6 +2650,7 @@ let deletion_failed core stage =
       { core with deletion_scope = None }
       { core.public_state.snapshot with
         local_deletion = None
+      ; last_error_attention = Some Requires_attention
       ; last_error = Some message
       }
   in
@@ -2825,11 +2839,11 @@ let consume_completion core = function
 ;;
 
 let websocket_closed core connection termination =
-  let message =
+  let message, last_error_attention =
     match termination with
-    | Recoverable_close message -> message
-    | Local_close -> None
-    | Authentication_failure message | Protocol_failure message -> Some message
+    | Recoverable_close { message; attention } -> message, Option.map (fun _ -> attention) message
+    | Local_close -> None, None
+    | Authentication_failure message | Protocol_failure message -> Some message, Some Requires_attention
   in
   if not (connection_is_current core connection)
   then unchanged core
@@ -2845,7 +2859,7 @@ let websocket_closed core connection termination =
         ; queued_authoritative_batch = None
         ; deferred_authoritative_owner = None
         }
-        { core.public_state.snapshot with sync_phase = Offline; last_error = message }
+        { core.public_state.snapshot with sync_phase = Offline; last_error = message; last_error_attention }
     in
     { next; effects = [ publish next ] })
 ;;
@@ -2979,7 +2993,7 @@ let mirror_deleted core (request : mirror_deletion) result =
          [ "Switch to another graph before deleting."
          ; "The local copy is still in use. Close attachment previews and try again." ]
        then
-         let next = set_snapshot failed.next { failed.next.public_state.snapshot with last_error = Some message } in
+         let next = set_snapshot failed.next { failed.next.public_state.snapshot with last_error = Some message; last_error_attention = Some Requires_attention } in
          { next; effects = [publish next] }
        else failed
      | Ok () ->

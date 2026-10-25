@@ -2558,7 +2558,7 @@ let deletion_blocked_events (scope : Core.graph_scope) sync =
   ; Core.Mirror_inspected (Core.Mirror_available { graph; scope })
   ; Core.Websocket_opened { graph = scope; connection_generation = 1 }
   ; Core.Websocket_closed
-      ({ graph = scope; connection_generation = 1 }, Core.Recoverable_close (Some "late"))
+      ({ graph = scope; connection_generation = 1 }, Core.Recoverable_close { message = Some "late"; attention = Requires_attention })
   ]
 ;;
 
@@ -3158,7 +3158,7 @@ let submitted_delete_survives_disconnect_reconnect () =
   let closed =
     Core.step
       submitted.next
-      (Core.Websocket_closed (connection, Core.Recoverable_close None))
+      (Core.Websocket_closed (connection, Core.Recoverable_close { message = None; attention = Requires_attention }))
   in
   let restarting = restart_after_retirement closed.next connection in
   let current_connection = recovery_connection restarting.effects in
@@ -3254,7 +3254,7 @@ let recovery_stale_connection_and_interrupted_retry () =
   in
   let request = recovery_request retry.effects in
   let closed =
-    Core.step retry.next (Core.Websocket_closed (connection, Core.Recoverable_close None))
+    Core.step retry.next (Core.Websocket_closed (connection, Core.Recoverable_close { message = None; attention = Requires_attention }))
   in
   let committed =
     Core.step closed.next (recovery_commit request sync (Some wire_batch))
@@ -4797,11 +4797,24 @@ let reconnect_fixture () =
 let reconnect_waits_for_retirement_and_consumes_retry () =
   let scope, core = reconnect_fixture () in
   let closed =
-    Core.step core (Core.Websocket_closed (scope, Core.Recoverable_close None))
+    Core.step core (Core.Websocket_closed (scope, Core.Recoverable_close { message = None; attention = Requires_attention }))
   in
   websocket_retirement_required scope closed.effects;
+  List.iter (fun attention ->
+    let message = Some "Synthetic closed transport" in
+    let terminated = Core.step core (Core.Websocket_closed (scope,
+      Core.Recoverable_close { message; attention })) in
+    let snapshot = (Core.state terminated.next).snapshot in
+    Alcotest.(check (option string)) "classification preserves exact message" message snapshot.last_error;
+    Alcotest.(check bool) "typed attention reaches public snapshot" true
+      (snapshot.last_error_attention = Some attention);
+    websocket_retirement_required scope terminated.effects;
+    let retired = Core.step terminated.next (Core.Websocket_retired scope) in
+    Alcotest.(check (float 0.)) "attention cannot alter retry delay" 1.
+      (websocket_retry_timer retired.effects).delay_seconds)
+    [Core.Transient_connection; Core.Requires_attention];
   let duplicate =
-    Core.step closed.next (Core.Websocket_closed (scope, Core.Recoverable_close None))
+    Core.step closed.next (Core.Websocket_closed (scope, Core.Recoverable_close { message = None; attention = Requires_attention }))
   in
   check_instructions "duplicate termination" [] duplicate.effects;
   let late = Core.step duplicate.next (Core.Websocket_opened scope) in
@@ -4834,7 +4847,7 @@ let reconnect_waits_for_retirement_and_consumes_retry () =
          []
          (Core.step expired.next event).effects)
     [ Core.Websocket_opened scope
-    ; Core.Websocket_closed (scope, Core.Recoverable_close (Some "late"))
+    ; Core.Websocket_closed (scope, Core.Recoverable_close { message = Some "late"; attention = Requires_attention })
     ; Core.Websocket_message
         ( scope
         , Logseq_sync_pure_reducer.Sync_protocol.Server.Changed
@@ -4859,7 +4872,7 @@ let reconnect_backoff_is_capped_and_not_reset_by_handshake () =
       let failed =
         Core.step
           core
-          (Core.Websocket_closed (scope, Core.Recoverable_close (Some "EOF")))
+          (Core.Websocket_closed (scope, Core.Recoverable_close { message = Some "EOF"; attention = Requires_attention }))
       in
       let retired = Core.step failed.next (Core.Websocket_retired scope) in
       let timer = websocket_retry_timer retired.effects in
@@ -4900,7 +4913,7 @@ let reconnect_terminal_failures_do_not_retry () =
 let reconnect_background_shutdown_and_scope_fence () =
   let scope, core = reconnect_fixture () in
   let closed =
-    Core.step core (Core.Websocket_closed (scope, Core.Recoverable_close None))
+    Core.step core (Core.Websocket_closed (scope, Core.Recoverable_close { message = None; attention = Requires_attention }))
   in
   let retired = Core.step closed.next (Core.Websocket_retired scope) in
   let timer = websocket_retry_timer retired.effects in
@@ -5037,7 +5050,7 @@ let reconnect_resets_backoff_after_durable_nonempty_pull () =
   let closed =
     Core.step
       opened.next
-      (Core.Websocket_closed (old_connection, Core.Recoverable_close None))
+      (Core.Websocket_closed (old_connection, Core.Recoverable_close { message = None; attention = Requires_attention }))
   in
   let restarting = restart_after_retirement closed.next old_connection in
   let connection = recovery_connection restarting.effects in
@@ -5053,7 +5066,7 @@ let reconnect_resets_backoff_after_durable_nonempty_pull () =
   let closed =
     Core.step
       committed.next
-      (Core.Websocket_closed (connection, Core.Recoverable_close None))
+      (Core.Websocket_closed (connection, Core.Recoverable_close { message = None; attention = Requires_attention }))
   in
   let retired = Core.step closed.next (Core.Websocket_retired connection) in
   Alcotest.(check (float 0.))

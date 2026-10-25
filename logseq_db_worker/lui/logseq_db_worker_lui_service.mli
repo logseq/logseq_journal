@@ -88,6 +88,10 @@ type local_deletion = Logseq_sync_pure_reducer.Core.local_deletion =
   | Deletion_in_progress of local_deletion_stage
   | Deletion_failed of local_deletion_stage
 
+type error_attention = Logseq_sync_pure_reducer.Core.error_attention =
+  | Transient_connection
+  | Requires_attention
+
 type snapshot =
   { sync_phase : sync_phase
   ; catalog : graph list
@@ -97,6 +101,7 @@ type snapshot =
   ; unlock : Unlock.unlock_phase
   ; startup : startup_facts
   ; last_error : string option
+  ; last_error_attention : error_attention option
   ; local_deletion : local_deletion option
   }
 
