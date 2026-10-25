@@ -499,6 +499,7 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
   in
   check_hydration_bound output.requests;
   let counts = Hashtbl.create 4 in
+  let complete_feeds = ref 0 and reconciled_pages = ref 0 in
   let rec drain = function
     | [] -> ()
     | (request : Protocol.request) :: rest ->
@@ -545,19 +546,29 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
         kind
         (1 + Option.value ~default:0 (Hashtbl.find_opt counts kind));
       let result = Production_runtime.receive runtime (response request outcome) in
+      List.iter (fun (r : Runtime.response) -> match r.payload with
+        | Feed_loaded { complete = true; _ } -> incr complete_feeds
+        | Page_tree_reconciled { value; _ } ->
+          incr reconciled_pages;
+          Alcotest.(check int) "retained page reconciliation is complete" 48
+            (List.length value.entries)
+        | _ -> ()) result.responses;
       let outstanding = rest @ result.requests in
       check_hydration_bound outstanding;
       drain outstanding
   in
   drain output.requests;
+  Alcotest.(check int) "resync prefix completes" 1 !complete_feeds;
+  Alcotest.(check int) "resync retained page also completes" 1 !reconciled_pages;
   List.iter
     (fun (kind, expected) ->
        Alcotest.(check int)
          kind
          expected
          (Option.value ~default:0 (Hashtbl.find_opt counts kind)))
-    (* 48 retained Detail reads plus 48 bounded Timeline previews. *)
-    [ "graph", 1; "journal", 1; "tree", 2; "children", 96; "block", 48; "page", 1 ]
+    (* 48 Detail reads plus 48 previews for each of the prefix and retained
+       page owners. Cancelling either Timeline owner is not a valid bound. *)
+    [ "graph", 1; "journal", 1; "tree", 2; "children", 144; "block", 48; "page", 1 ]
 ;;
 
 let test_queued_resync_announces_feed_refresh () =
@@ -6828,6 +6839,121 @@ let test_initial_refresh_after_restarting_prefix () =
     (List.length page.entries)
 ;;
 
+let load_ninety_roots runtime fixture =
+  set_calendar runtime;
+  let feed, _ = drive_roots runtime [ fixture ] (initial_roots runtime 77L) in
+  let day = ref (List.hd feed.days) in
+  for generation = 78 to 79 do
+    let output = Runtime.submit runtime
+        (Journal_graph_request.Load_day_blocks
+           { day = !day.page.day; after = !day.continuation; limit = 30
+           ; request_generation = Int64.of_int generation }) in
+    let feed, _ = drive_roots runtime [ fixture ] output in
+    day := List.hd feed.days
+  done
+;;
+
+let fixture_root_tree fixture (request : Protocol.request) =
+  match request.command with
+  | V2_get_page_tree { page; maximum_depth; limit; cursor; _ } ->
+    let selected, next_cursor = root_slice fixture.roots limit cursor in
+    Protocol.V2_page_tree_outcome
+      { page; maximum_depth
+      ; items = List.map (fun value ->
+          Protocol.{ value; revision = "root-1"; depth = 0; parent = page }) selected
+      ; next_cursor }
+  | _ -> Alcotest.fail "expected a retained root read"
+;;
+
+(* Both refresh owners are created by the public invalidation event. Hold the
+   reconciliation at each asynchronous boundary while the prefix finishes. *)
+let test_prefix_preserves_reconciliation ~resync stage () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  let fixture = root_fixture 0 90 0 in
+  load_ninety_roots runtime fixture;
+  let edited = List.nth fixture.roots 70 in
+  let deleted = List.nth fixture.roots 80 in
+  let fresh = { fixture with roots =
+    List.filter_map (fun (r : Protocol.v2_block_record) ->
+      if Graph.Uuid.equal r.block.uuid deleted.block.uuid then None
+      else if Graph.Uuid.equal r.block.uuid edited.block.uuid then
+        Some { r with block = { r.block with title = "Remote suffix edit" } }
+      else Some r) fixture.roots } in
+  let refresh =
+    if resync then Runtime.reconcile_push runtime ~request_generation:90L
+        (Protocol.V2_resync_required_push
+           { api_version = Protocol.api_version; generation = "generation-2"
+           ; reason = "overflow" })
+    else changed runtime (window ~scopes:
+        [ Protocol.V2_page_tree_interest fixture.owner.uuid
+        ; V2_journal_index_interest ] ())
+  in
+  let tree = List.find (fun (r : Protocol.request) -> match r.command with
+      | V2_get_page_tree _ -> true | _ -> false) refresh.requests in
+  let dates = List.find (fun (r : Protocol.request) -> match r.command with
+      | V2_list_journals _ -> true | _ -> false) refresh.requests in
+  let held = match stage with
+    | `Root -> { Runtime.requests = [tree]; responses = [] }
+    | `Preview | `Continuation ->
+      Runtime.receive runtime (response tree (fixture_root_tree fresh tree))
+  in
+  let held = match stage with
+    | `Root | `Preview -> held
+    | `Continuation ->
+      let rec finish_previews (output : Runtime.output) =
+        let request = only "one retained refresh continuation" output.requests in
+        match request.command with
+        | V2_get_page_tree _ -> output
+        | V2_get_children { parent; _ } ->
+          finish_previews (Runtime.receive runtime (response request
+              (Protocol.V2_children_outcome
+                 { parent; revision_scope = V2_children_revision parent
+                 ; scope_revision = "children-1"; items = []; next_cursor = None })))
+        | _ -> Alcotest.fail "unexpected reconciliation request"
+      in
+      finish_previews held
+  in
+  let prefix, _ = drive_roots runtime [fresh]
+      { Runtime.requests = [dates]; responses = [] } in
+  Alcotest.(check int) "prefix still publishes thirty roots" 30
+    (List.length (List.hd prefix.days).entries);
+  let outputs, _ = drive_root_output runtime [fresh] held in
+  let reconciled = List.filter_map (fun (r : Runtime.response) -> match r.payload with
+      | Page_tree_reconciled {value;_} -> Some value | _ -> None) outputs in
+  let value = only "retained suffix reconciliation must finish" reconciled in
+  Alcotest.(check int) "remote deletion removes a retained suffix root" 89
+    (List.length value.entries);
+  Alcotest.(check bool) "deleted suffix UUID is absent" false
+    (List.exists (fun (e : Journal_graph_projection.timeline_entry) ->
+       Journal_model.id e.block = Graph.Uuid.to_string deleted.block.uuid) value.entries);
+  let updated = List.find (fun (e : Journal_graph_projection.timeline_entry) ->
+      Journal_model.id e.block = Graph.Uuid.to_string edited.block.uuid) value.entries in
+  Alcotest.(check string) "retained suffix contains the remote edit"
+    "Remote suffix edit" (Journal_model.source updated.block)
+;;
+
+let test_newer_reconciliation_fences_old_results () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  let fixture = root_fixture 0 90 0 in
+  load_ninety_roots runtime fixture;
+  let refresh () = changed runtime
+      (window ~scopes:[Protocol.V2_page_tree_interest fixture.owner.uuid] ()) in
+  let old = only "held old reconciliation" (hydration_requests (refresh ())) in
+  let fresh, _ = drive_root_output runtime [fixture] (refresh ()) in
+  Alcotest.(check int) "newer reconciliation publishes once" 1
+    (List.length (List.filter (fun (r : Runtime.response) -> match r.payload with
+         | Page_tree_reconciled _ -> true | _ -> false) fresh));
+  let late = Runtime.receive runtime (response old (fixture_root_tree fixture old)) in
+  Alcotest.(check int) "older reconciliation cannot publish" 0 (List.length late.responses);
+  Alcotest.(check int) "older reconciliation cannot continue" 0 (List.length late.requests);
+  let old_graph = only "held retired graph reconciliation" (hydration_requests (refresh ())) in
+  Runtime.reset runtime;
+  let retired = Runtime.receive runtime
+      (response old_graph (fixture_root_tree fixture old_graph)) in
+  Alcotest.(check int) "retired graph cannot publish" 0 (List.length retired.responses);
+  Alcotest.(check int) "retired graph cannot continue" 0 (List.length retired.requests)
+;;
+
 let test_initial_later_read_superseded () =
   let runtime = Runtime.create ~localtime:Unix.gmtime () in
   set_calendar runtime;
@@ -7114,7 +7240,17 @@ let () =
         Alcotest.test_case "restart retains loaded suffix through insertion" `Quick test_initial_refresh_after_restarting_prefix;
         Alcotest.test_case "superseded continuation settles" `Quick test_initial_later_read_superseded;
         Alcotest.test_case "later batch fills across dates" `Quick test_later_thirty_crosses_dates;
-        Alcotest.test_case "later date cursor failure settles" `Quick test_later_date_cursor_no_progress_settles])
+        Alcotest.test_case "later date cursor failure settles" `Quick test_later_date_cursor_no_progress_settles;
+        Alcotest.test_case "resync prefix cannot cancel retained tree" `Quick
+          (test_prefix_preserves_reconciliation ~resync:true `Root);
+        Alcotest.test_case "resync prefix cannot cancel retained previews" `Quick
+          (test_prefix_preserves_reconciliation ~resync:true `Preview);
+        Alcotest.test_case "resync prefix cannot cancel retained continuation" `Quick
+          (test_prefix_preserves_reconciliation ~resync:true `Continuation);
+        Alcotest.test_case "journal change prefix cannot cancel retained tree" `Quick
+          (test_prefix_preserves_reconciliation ~resync:false `Root);
+        Alcotest.test_case "newer changes and graph reset still fence reconciliation" `Quick
+          test_newer_reconciliation_fences_old_results])
     ; ( "sparse tree pages"
       , [ Alcotest.test_case "children before a later root" `Quick (fun () ->
             test_child_only_day_pages `Found)

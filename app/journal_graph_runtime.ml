@@ -1073,8 +1073,10 @@ let root_owner_current t = function
 
 let root_batch_current t batch =
   root_owner_current t batch.root_owner
-  && Hashtbl.find_opt t.root_page_epochs batch.root_page.Projection.id
-     = Some batch.root_epoch
+  && Option.value
+       (Hashtbl.find_opt t.root_page_epochs batch.root_page.Projection.id)
+       ~default:0L
+     = batch.root_epoch
 ;;
 
 let scan_failure scan message =
@@ -1120,8 +1122,7 @@ let read_root_batch t owner (page : Projection.page) cursor limit =
       (Hashtbl.find_opt t.page_tree_interests page.id)
   in
   Hashtbl.replace t.page_tree_interests page.id { page; limit = retained_limit };
-  let epoch = t.next_request in
-  Hashtbl.replace t.root_page_epochs page.id epoch;
+  let epoch = Option.value (Hashtbl.find_opt t.root_page_epochs page.id) ~default:0L in
   let batch =
     { root_owner = owner
     ; root_page = page
@@ -1146,6 +1147,9 @@ let read_root_batch t owner (page : Projection.page) cursor limit =
 ;;
 
 let read_changed_roots t page limit =
+  (* One invalidation owns both the retained suffix and its concurrent feed
+     prefix. Only a newer invalidation fences their shared page observation. *)
+  Hashtbl.replace t.root_page_epochs page.Projection.id t.next_request;
   let target =
     max
       1
