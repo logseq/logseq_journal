@@ -2162,7 +2162,301 @@ let test_today_priority_projection_and_refresh () =
   if !failures <> [] then fail "%s" (String.concat "\n" (List.rev !failures))
 ;;
 
+let test_cross_page_ownership () =
+  let today = 20260808
+  and source = 20260807
+  and target = 20260809 in
+  let a = block ~day:source ~order:"a" 21001
+  and b = block ~day:source ~order:"b" 21002 in
+  let f1 = block ~day:target ~order:"a" 22001
+  and f2 = block ~day:target ~order:"b" 22002 in
+  let t = block ~day:today 23001 in
+  let moved = block ~day:target ~order:"-1" ~revision:"moved" 21001 in
+  let initial () =
+    Timeline.empty ~today
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed
+            [ day_feed target "Future" [ f1; f2 ]
+            ; day_feed today "Today" [ t ]
+            ; day_feed source "Past" [ a; b ]
+            ])
+  in
+  let root_entries state =
+    Timeline.fold_slots
+      (fun rows -> function
+         | Timeline.Top_level e -> e :: rows
+         | _ -> rows)
+      []
+      state
+    |> List.rev
+  in
+  let invariant label state =
+    let rows = root_entries state in
+    let ids =
+      List.map
+        (fun (e : Journal_graph_projection.timeline_entry) -> Journal_model.id e.block)
+        rows
+    in
+    require
+      (List.length ids = List.length (List.sort_uniq String.compare ids))
+      "%s published duplicate root UUIDs"
+      label;
+    List.iter
+      (fun (e : Journal_graph_projection.timeline_entry) ->
+         require
+           (Journal_model.parent_id e.block = None)
+           "%s published a child as a root"
+           label;
+         require
+           (Journal_model.page_id e.block = id "page" (Journal_model.journal_day e.block))
+           "%s published inconsistent page/date ownership"
+           label)
+      rows;
+    let order
+          (a : Journal_graph_projection.timeline_entry)
+          (b : Journal_graph_projection.timeline_entry)
+      =
+      let da = Journal_model.journal_day a.Journal_graph_projection.block
+      and db = Journal_model.journal_day b.Journal_graph_projection.block in
+      match Int.compare db da with
+      | 0 ->
+        compare
+          (Journal_model.sibling_order a.block, Journal_model.id a.block)
+          (Journal_model.sibling_order b.block, Journal_model.id b.block)
+      | n -> n
+    in
+    require (rows = List.sort order rows) "%s broke chronological/sibling grouping" label
+  in
+  let expect label state values =
+    invariant label state;
+    require
+      (List.sort
+         String.compare
+         (List.map
+            (fun (e : Journal_graph_projection.timeline_entry) ->
+               Journal_model.id e.block)
+            (root_entries state))
+       = List.sort String.compare (List.map Journal_model.id values))
+      "%s lost or duplicated roots"
+      label
+  in
+  let failures = ref [] in
+  let check name f =
+    try f () with
+    | Failure m -> failures := (name ^ ": " ^ m) :: !failures
+  in
+  List.iter
+    (fun order ->
+       check (String.concat "/" order) (fun () ->
+         let state = ref (initial ()) in
+         let anchor_index =
+           List.find_index
+             (function
+               | Timeline.Top_level e -> Journal_model.id e.block = Journal_model.id b
+               | _ -> false)
+             (retained_slots !state)
+           |> Option.get
+         in
+         state
+         := Timeline.observe_visible_range
+              !state
+              ~first_index:anchor_index
+              ~last_exclusive:(anchor_index + 1);
+         let anchor = prefix_anchor !state in
+         List.iter
+           (fun action ->
+              (state
+               := match action with
+                  | "point" -> Timeline.replace_block !state moved
+                  | "source" ->
+                    Timeline.replace_timeline_entry_page
+                      !state
+                      ~page:(page source "Past")
+                      (timeline_page [ b ])
+                  | "target" ->
+                    Timeline.replace_timeline_entry_page
+                      !state
+                      ~page:(page target "Future")
+                      (timeline_page [ moved; f1; f2 ])
+                  | _ -> assert false);
+              invariant action !state;
+              require
+                (prefix_anchor !state = anchor)
+                "%s lost surviving UUID anchor"
+                action)
+           order;
+         expect "move converged" !state [ moved; f1; f2; t; b ];
+         let edited =
+           block
+             ~day:source
+             ~order:"b"
+             ~source:"Normal P002 edit"
+             ~revision:"edited"
+             21002
+         in
+         state := Timeline.replace_block !state edited;
+         state
+         := Timeline.replace_timeline_entry_page
+              !state
+              ~page:(page source "Past")
+              (timeline_page [ edited ]);
+         expect "edit after move" !state [ moved; f1; f2; t; edited ];
+         let removed = Timeline.remove_block !state ~block_id:(Journal_model.id edited) in
+         require
+           (not (List.mem ("day:" ^ string_of_int source) (slot_keys removed)))
+           "source count retained an empty heading"))
+    [ [ "point"; "source"; "target" ]
+    ; [ "point"; "target"; "source" ]
+    ; [ "source"; "point"; "target" ]
+    ; [ "source"; "target"; "point" ]
+    ; [ "target"; "point"; "source" ]
+    ; [ "target"; "source"; "point" ]
+    ];
+  check "root becomes a child" (fun () ->
+    let child = block ~day:target ~parent_id:(Journal_model.id f1) ~order:"c" 21001 in
+    let state = Timeline.replace_block (initial ()) child in
+    expect "moved child" state [ f1; f2; t; b ]);
+  check "same-day reorder" (fun () ->
+    let reordered = block ~day:source ~order:"z" 21001 in
+    expect
+      "same-day order"
+      (Timeline.replace_block (initial ()) reordered)
+      [ f1; f2; t; b; reordered ]);
+  check "unrequested target range" (fun () ->
+    let today_roots =
+      List.init 29 (fun i ->
+        block ~day:today ~order:(Printf.sprintf "%04d" i) (26000 + i))
+    in
+    let visible_target = block ~day:target ~order:"0000" 24000
+    and unread_target = block ~day:target ~order:"0001" 24001 in
+    let cursor =
+      Journal_graph_projection.{ before_day = Some target; skipped_day = Some today }
+    in
+    let initial_feed =
+      { (feed
+           [ day_feed today "Today" today_roots
+           ; day_feed ~more:true target "Future" [ visible_target ]
+           ])
+        with
+        continuation = Some cursor
+      ; prioritized_day = Some today
+      }
+    in
+    let state =
+      Timeline.empty ~today
+      |> begin_and_apply_feed ~generation:1L ~before_day:None initial_feed
+    in
+    let size = Timeline.total_count state in
+    let state =
+      Timeline.observe_visible_range state ~first_index:(size - 2) ~last_exclusive:size
+    in
+    let request = Timeline.next_request state |> Option.get in
+    require
+      (request = Timeline.Feed { cursor = Some cursor })
+      "Today footer did not select the retained date continuation";
+    let state =
+      Timeline.begin_request state ~generation:2L request
+      |> fun state ->
+      Timeline.apply_feed state ~generation:2L (feed [ day_feed source "Past" [ a; b ] ])
+    in
+    let beyond = block ~day:target ~order:"9999" 21001 in
+    let state = Timeline.replace_block state beyond in
+    expect "outside loaded target prefix" state (visible_target :: b :: today_roots);
+    let state = Timeline.observe_visible_range state ~first_index:0 ~last_exclusive:4 in
+    let request = Timeline.next_request state |> Option.get in
+    require
+      (match request with
+       | Timeline.Day { day; _ } -> day = target
+       | _ -> false)
+      "Future cursor became unreachable";
+    let state =
+      Timeline.begin_request state ~generation:3L request
+      |> fun state ->
+      Timeline.apply_timeline_entry_page
+        state
+        ~generation:3L
+        (timeline_page [ unread_target; beyond ])
+    in
+    expect
+      "target continuation reaches moved root"
+      state
+      ([ visible_target; unread_target; beyond; b ] @ today_roots));
+  check "source partial prefix and counts" (fun () ->
+    let source_roots =
+      List.init 31 (fun i ->
+        block ~day:source ~order:(Printf.sprintf "%04d" i) (25000 + i))
+    in
+    let moved = block ~day:target ~order:"-1" 25027 in
+    let state =
+      Timeline.empty ~today
+      |> begin_and_apply_feed
+           ~generation:1L
+           ~before_day:None
+           (feed
+              [ day_feed today "Today" [ t ]
+              ; day_feed target "Future" [ f1 ]
+              ; day_feed ~more:true source "Past" (List.take 28 source_roots)
+              ])
+    in
+    let after =
+      continuation_of_entries ~more:true (List.map entry (List.take 28 source_roots))
+    in
+    let state =
+      Timeline.replace_timeline_entry_page
+        state
+        ~page:(page target "Future")
+        (timeline_page [ moved; f1 ])
+    in
+    invariant "target before partial source" state;
+    require
+      (List.exists
+         (function
+           | Timeline.Day_continuation c -> c.day = source && c.after = after
+           | _ -> false)
+         (retained_slots state))
+      "move removed unread source continuation";
+    let current =
+      List.filter
+        (fun root -> Journal_model.id root <> Journal_model.id moved)
+        source_roots
+    in
+    let selected = List.take 28 current in
+    let continuation = continuation_of_entries ~more:true (List.map entry selected) in
+    let state =
+      Timeline.replace_timeline_entry_page
+        state
+        ~page:(page source "Past")
+        (timeline_page ~continuation selected)
+    in
+    let state =
+      Timeline.begin_request
+        state
+        ~generation:2L
+        (Day { day = source; after = continuation })
+      |> fun state ->
+      Timeline.apply_timeline_entry_page
+        state
+        ~generation:2L
+        (timeline_page (List.drop 28 current))
+    in
+    expect "source continuation exact set" state (moved :: f1 :: t :: current);
+    let state =
+      List.fold_left
+        (fun state root -> Timeline.remove_block state ~block_id:(Journal_model.id root))
+        state
+        current
+    in
+    expect "source removal count" state [ moved; f1; t ];
+    require
+      (not (List.mem ("day:" ^ string_of_int source) (slot_keys state)))
+      "moved source prefix corrupted date count");
+  if !failures <> [] then fail "%s" (String.concat "\n" (List.rev !failures))
+;;
+
 let () =
+  test_cross_page_ownership ();
   test_today_priority_projection_and_refresh ();
   test_prefix_identity_merge ();
   test_older_feed_failure_releases_request ();

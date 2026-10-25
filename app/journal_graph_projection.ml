@@ -213,34 +213,37 @@ let block_in_context
       ~time_context
       (value : Graph.block)
   =
-  match creation_time time_context value.created_at_ms, task_state value with
-  | (Error _ as error), _ | _, (Error _ as error) -> error
-  | Ok creation_time, Ok task_state ->
-    let parent = Graph.Uuid.to_string value.parent in
-    Journal_model.create_on_page
-      ~id:(Graph.Uuid.to_string value.uuid)
-      ~page_id:(Graph.Uuid.to_string value.page)
-      ~journal_day
-      ~parent_id:(if String.equal parent page_id then None else Some parent)
-      ~sibling_order:value.order
-      ~source:value.title
-      ~task_state
-      ~child_count
-      ~creation_time
-      ~revision
-      ~last_mutation_id:"00000000-0000-0000-0000-000000000000"
-    |> Result.map (fun block ->
-      Journal_model.with_properties
-        ~localtime:time_context.localtime
-        block
-        ~properties:value.properties
-      |> fun block ->
-      Journal_model.with_asset_file_type block ~asset_file_type:(asset_file_type value)
-      |> fun block ->
-      Journal_model.with_content_metadata
-        block
-        ~tags_present:(value.tags <> [])
-        ~attachments_present:(attachment_reference value))
+  if Graph.Uuid.to_string value.page <> page_id
+  then Error "The block belongs to a different page."
+  else (
+    match creation_time time_context value.created_at_ms, task_state value with
+    | (Error _ as error), _ | _, (Error _ as error) -> error
+    | Ok creation_time, Ok task_state ->
+      let parent = Graph.Uuid.to_string value.parent in
+      Journal_model.create_on_page
+        ~id:(Graph.Uuid.to_string value.uuid)
+        ~page_id:(Graph.Uuid.to_string value.page)
+        ~journal_day
+        ~parent_id:(if String.equal parent page_id then None else Some parent)
+        ~sibling_order:value.order
+        ~source:value.title
+        ~task_state
+        ~child_count
+        ~creation_time
+        ~revision
+        ~last_mutation_id:"00000000-0000-0000-0000-000000000000"
+      |> Result.map (fun block ->
+        Journal_model.with_properties
+          ~localtime:time_context.localtime
+          block
+          ~properties:value.properties
+        |> fun block ->
+        Journal_model.with_asset_file_type block ~asset_file_type:(asset_file_type value)
+        |> fun block ->
+        Journal_model.with_content_metadata
+          block
+          ~tags_present:(value.tags <> [])
+          ~attachments_present:(attachment_reference value)))
 ;;
 
 let block ~page ~revision ~child_count ~time_context value =

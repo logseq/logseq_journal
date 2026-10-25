@@ -7017,6 +7017,204 @@ let test_today_date_traversal_survives_recovery () =
   if !failures <> [] then Alcotest.fail (String.concat "\n" (List.rev !failures))
 ;;
 
+let test_changed_point_ownership () =
+  let failures = ref [] in
+  let check name f =
+    try f () with
+    | exn -> failures := (name ^ ": " ^ Printexc.to_string exn) :: !failures
+  in
+  let updates output =
+    List.filter_map
+      (fun (r : Runtime.response) ->
+         match r.payload with
+         | Block_updated { block; _ } -> Some block
+         | _ -> None)
+      output.Runtime.responses
+  in
+  let point runtime block_id =
+    let output = changed runtime (window ~blocks:[ block_id ] ()) in
+    List.find
+      (fun (r : Protocol.request) ->
+         match r.command with
+         | V2_get_outline_block { block; _ } -> Graph.Uuid.equal block block_id
+         | _ -> false)
+      output.requests
+  in
+  let complete runtime request value =
+    Runtime.receive
+      runtime
+      (response
+         request
+         (V2_block_outcome (V2_present_block { value; revision = "changed-block" })))
+  in
+  let context_request output page =
+    List.find_opt
+      (fun (r : Protocol.request) ->
+         match r.command with
+         | V2_get_page { page = id; _ } -> Graph.Uuid.equal id page
+         | _ -> false)
+      output.Runtime.requests
+  in
+  let require_context output page =
+    match context_request output page with
+    | Some request -> request
+    | None -> Alcotest.fail "moved point must resolve its actual page"
+  in
+  let setup known =
+    let runtime = Runtime.create ~localtime:Unix.gmtime () in
+    set_priority_calendar runtime;
+    let source = normal_journal_fixture 29 2 0
+    and target = normal_journal_fixture 0 1 0 in
+    ignore
+      (drive_roots
+         runtime
+         (if known then [ target; source ] else [ source ])
+         (initial_roots runtime 701L));
+    runtime, source, target
+  in
+  List.iter
+    (fun (known, child, ordinary) ->
+       check
+         (Printf.sprintf "known=%b child=%b ordinary=%b" known child ordinary)
+         (fun () ->
+            let runtime, source, target = setup known in
+            let target =
+              if ordinary
+              then { target with owner = { target.owner with kind = Ordinary_page } }
+              else target
+            in
+            let before = List.hd source.roots in
+            let value =
+              { before with
+                block =
+                  { before.block with
+                    page = target.owner.uuid
+                  ; parent =
+                      (if child
+                       then (List.hd target.roots).block.uuid
+                       else target.owner.uuid)
+                  ; title = "Normal moved point"
+                  }
+              }
+            in
+            let first = complete runtime (point runtime before.block.uuid) value in
+            let output =
+              if known
+              then first
+              else (
+                Alcotest.(check int)
+                  "unknown page cannot publish a guessed date"
+                  0
+                  (List.length (updates first));
+                let request = require_context first target.owner.uuid in
+                Runtime.receive
+                  runtime
+                  (response
+                     request
+                     (V2_page_outcome
+                        (V2_present_page { page = target.owner; revision = "new-page" }))))
+            in
+            let block = only "one correctly contextualized update" (updates output) in
+            Alcotest.(check string)
+              "returned page owns the model"
+              (Graph.Uuid.to_string target.owner.uuid)
+              (Journal_model.page_id block);
+            Alcotest.(check (option int))
+              "date comes from the actual page"
+              (if ordinary then None else Some 20260930)
+              (Journal_model.journal_day_opt block);
+            Alcotest.(check (option string))
+              "root or child parent uses actual page"
+              (if child
+               then Some (Graph.Uuid.to_string (List.hd target.roots).block.uuid)
+               else None)
+              (Journal_model.parent_id block)))
+    [ true, false, false
+    ; true, true, false
+    ; false, false, false
+    ; false, true, false
+    ; false, false, true
+    ];
+  check "newer point retires an old point" (fun () ->
+    let runtime, source, target = setup true in
+    let before = List.hd source.roots in
+    let old = point runtime before.block.uuid in
+    let fresh = point runtime before.block.uuid in
+    let moved =
+      { before with
+        block =
+          { before.block with
+            page = target.owner.uuid
+          ; parent = target.owner.uuid
+          ; title = "New moved value"
+          }
+      }
+    in
+    ignore (complete runtime fresh moved);
+    let late =
+      complete
+        runtime
+        old
+        { before with block = { before.block with title = "Old source value" } }
+    in
+    Alcotest.(check int)
+      "old point cannot restore source ownership"
+      0
+      (List.length (updates late)));
+  check "newer point retires old page resolution" (fun () ->
+    let runtime, source, target = setup false in
+    let before = List.hd source.roots in
+    let moved =
+      { before with
+        block = { before.block with page = target.owner.uuid; parent = target.owner.uuid }
+      }
+    in
+    let unresolved = complete runtime (point runtime before.block.uuid) moved in
+    let lookup = require_context unresolved target.owner.uuid in
+    let back =
+      complete
+        runtime
+        (point runtime before.block.uuid)
+        { before with block = { before.block with title = "Moved back normally" } }
+    in
+    ignore (only "new source observation" (updates back));
+    let late =
+      Runtime.receive
+        runtime
+        (response
+           lookup
+           (V2_page_outcome
+              (V2_present_page { page = target.owner; revision = "old-target-page" })))
+    in
+    Alcotest.(check int)
+      "late context cannot resurrect old move"
+      0
+      (List.length (updates late)));
+  check "missing moved page does not publish mixed context" (fun () ->
+    let runtime, source, target = setup false in
+    let before = List.hd source.roots in
+    let value =
+      { before with
+        block = { before.block with page = target.owner.uuid; parent = target.owner.uuid }
+      }
+    in
+    let unresolved = complete runtime (point runtime before.block.uuid) value in
+    let lookup = require_context unresolved target.owner.uuid in
+    let missing =
+      Runtime.receive
+        runtime
+        (response
+           lookup
+           (V2_page_outcome
+              (V2_missing_page { uuid = target.owner.uuid; revision = "missing-page" })))
+    in
+    Alcotest.(check int)
+      "missing context never becomes a Timeline model"
+      0
+      (List.length (updates missing)));
+  if !failures <> [] then Alcotest.fail (String.concat "\n" (List.rev !failures))
+;;
+
 let test_initial_thirty_roots () =
   let runtime = Runtime.create ~localtime:Unix.gmtime () in
   set_calendar runtime;
@@ -7765,6 +7963,7 @@ let () =
             test_shorter_reference_path_discovers_nested_targets
         ; Alcotest.test_case "bounded burst" `Quick test_reference_burst_is_bounded
         ] )
+    ; ( "cross-page ownership", [Alcotest.test_case "point context and retirement" `Quick test_changed_point_ownership] )
     ; ( "initial thirty roots", [
         Alcotest.test_case "Today first within root budget" `Quick test_today_priority_batch;
         Alcotest.test_case "Today date traversal survives recovery" `Quick test_today_date_traversal_survives_recovery;

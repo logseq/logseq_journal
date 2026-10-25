@@ -250,13 +250,13 @@ type operation =
   | Child_read of Projection.create_child * Graph.page
   | Child_status of Projection.create_child * Graph.page
   | Child_parent of Projection.create_child * Graph.page * Projection.block_member
-  | Changed_block of
+  | Changed_block of { block_id : string }
+  | Changed_detail_block of { block_id : string }
+  | Changed_point_context of
       { block_id : string
-      ; page : Projection.page
-      }
-  | Changed_detail_block of
-      { block_id : string
-      ; page : Graph.page
+      ; value : Protocol.v2_block_record
+      ; revision : string
+      ; child_count : int
       }
   | Changed_detail_page of Graph.Uuid.t
   | Find_block_result
@@ -379,6 +379,7 @@ type t =
   ; favorite_resolved : (string, unit) Hashtbl.t
   ; favorite_loading_changes : (string, unit) Hashtbl.t
   ; mutable favorite_changes_overflow : bool
+  ; changed_point_epochs : (string, int64) Hashtbl.t
   ; target_read_epochs : (string, int64) Hashtbl.t
   ; mutable initial_feed_spec : (int * int) option
   ; mutable feed_session : int64
@@ -464,6 +465,7 @@ let create ?(localtime = Unix.localtime) () =
   ; favorite_resolved = Hashtbl.create 32
   ; favorite_loading_changes = Hashtbl.create 32
   ; favorite_changes_overflow = false
+  ; changed_point_epochs = Hashtbl.create 32
   ; target_read_epochs = Hashtbl.create 32
   ; initial_feed_spec = None
   ; feed_session = 0L
@@ -519,6 +521,7 @@ let reset t =
   Hashtbl.clear t.favorite_resolved;
   Hashtbl.clear t.favorite_loading_changes;
   t.favorite_changes_overflow <- false;
+  Hashtbl.clear t.changed_point_epochs;
   Hashtbl.clear t.target_read_epochs;
   Hashtbl.clear t.root_pages;
   Hashtbl.clear t.root_page_epochs;
@@ -554,10 +557,21 @@ let request_uuid t =
 
 let uuid value = Graph.Uuid.of_string value
 
+let changed_point_current t operation epoch =
+  match operation with
+  | Changed_block { block_id; _ }
+  | Changed_detail_block { block_id; _ }
+  | Changed_point_context { block_id; _ } ->
+    Hashtbl.find_opt t.changed_point_epochs block_id = Some epoch
+  | _ -> true
+;;
+
 let make_request ?source_epoch ?(background = false) t operation command =
   let source_epoch = Option.value source_epoch ~default:t.next_request in
   let request_id = request_uuid t in
   (match operation with
+   | Changed_block { block_id; _ } | Changed_detail_block { block_id; _ } ->
+     Hashtbl.replace t.changed_point_epochs block_id source_epoch
    | Task_definitions ids ->
      List.iter
        (fun uuid ->
@@ -2645,18 +2659,18 @@ let hydration_for_changes t ~request_generation windows =
              (Protocol.V2_get_page {page=block;revision=None})))
          else (
            match page_by_block t block_id with
-         | Some page ->
+         | Some _ ->
            Some
              (read
                 t
-                (Changed_block { block_id; page })
+                (Changed_block { block_id })
                 (Protocol.V2_get_outline_block { block; revision = None }))
          | None ->
            Option.map
-             (fun page ->
+             (fun _ ->
                 read
                   t
-                  (Changed_detail_block { block_id; page })
+                  (Changed_detail_block { block_id })
                   (Protocol.V2_get_outline_block { block; revision = None }))
                (Hashtbl.find_opt t.detail_pages block_id)))
       blocks
@@ -2835,7 +2849,7 @@ let rehydrate_current_interests t ~request_generation ~generation =
       let block_id = Graph.Uuid.to_string interest.root.block.uuid in
       read
         t
-        (Changed_detail_block { block_id; page = interest.page })
+        (Changed_detail_block { block_id })
         (Protocol.V2_get_outline_block { block = interest.root.block.uuid; revision = None }))
     |> List.of_seq
   in
@@ -2971,6 +2985,84 @@ let complete_child t (command : Projection.create_child) (page : Graph.page)
        | Error message, _ | _, Error message -> reject message))
 ;;
 
+let publish_changed_point
+      t
+      ~block_id
+      ~(value : Protocol.v2_block_record)
+      ~revision
+      ~child_count
+      ~(page : Graph.page)
+  =
+  match projection_time_context t with
+  | Error message -> reject message
+  | Ok time_context ->
+    (match
+       Projection.block_on_page
+         ~page
+         ~revision
+         ~child_count
+         ~time_context
+         value.Protocol.block
+     with
+     | Error message -> reject message
+     | Ok projected ->
+       let projected =
+         Journal_model.with_tag_titles projected ~tag_titles:value.tag_titles
+       in
+       Hashtbl.replace t.graph_pages (Graph.Uuid.to_string page.uuid) page;
+       (match page_of_graph_page page with
+        | Some journal ->
+          remember_page t journal;
+          remember_block_page t journal block_id
+        | None ->
+          t.block_pages <- List.filter (fun (id, _) -> id <> block_id) t.block_pages);
+       if Hashtbl.mem t.detail_pages block_id
+       then Hashtbl.replace t.detail_pages block_id page;
+       Option.iter
+         (fun (interest : children_interest) ->
+            Hashtbl.replace t.children_interests block_id { interest with page })
+         (Hashtbl.find_opt t.children_interests block_id);
+       remember_block_revision t value.block.uuid revision;
+       remember_detail_block t value.block revision;
+       Hashtbl.replace t.projected_blocks block_id projected;
+       responses
+         [ response (Block_updated { block = projected; timeline_entry_update = None }) ])
+;;
+
+let resolve_changed_point
+      t
+      ~source_epoch
+      ~block_id
+      ~(value : Protocol.v2_block_record)
+      ~revision
+  =
+  let child_count =
+    Hashtbl.find_opt t.projected_blocks block_id
+    |> Option.map Journal_model.child_count
+    |> Option.value ~default:0
+  in
+  let page =
+    match Hashtbl.find_opt t.graph_pages (Graph.Uuid.to_string value.block.page) with
+    | Some page -> Some page
+    | None ->
+      (match Hashtbl.find_opt t.detail_pages block_id with
+       | Some page when Graph.Uuid.equal page.uuid value.block.page -> Some page
+       | _ -> None)
+  in
+  match page with
+  | Some page when not page.recycled ->
+    publish_changed_point t ~block_id ~value ~revision ~child_count ~page
+  | Some _ -> reject "The changed block page is unavailable."
+  | None ->
+    requests
+      [ read
+          ~source_epoch
+          t
+          (Changed_point_context { block_id; value; revision; child_count })
+          (Protocol.V2_get_page { page = value.block.page; revision = None })
+      ]
+;;
+
 let operation_name = function
   | Root_dates _ | Root_today _ -> "listTimelineDates"
   | Root_tree _ -> "readTimelineRoots"
@@ -2994,6 +3086,7 @@ let operation_name = function
   | Child_parent _ -> "readAppendParent"
   | Changed_block _ -> "reconcileChangedBlock"
   | Changed_detail_block _ -> "reconcileChangedDetailBlock"
+  | Changed_point_context _ -> "resolveChangedBlockPage"
   | Changed_detail_page _ -> "reconcileChangedDetailPage"
   | Find_block_result -> "findBlock"
   | Detail_children _ -> "loadDetailChildren"
@@ -3121,7 +3214,7 @@ let failure_output
       ]
   | Reference_read { block_id; depth; _ } ->
     fail_reference_read t ~source_epoch ~block_id ~depth
-  | Changed_block { block_id; _ } | Changed_detail_block { block_id; _ } ->
+  | Changed_block { block_id; _ } | Changed_detail_block { block_id; _ } | Changed_point_context {block_id;_} ->
     let invalidation =
       if Hashtbl.mem t.reference_depths block_id
       then observe_reference_sources t ~source_epoch 0 [ block_id, None ]
@@ -3181,6 +3274,8 @@ let receive_response t (protocol_response : Protocol.response) =
     Hashtbl.remove t.pending key; superseded_root_batch t batch
   | Some {operation=Root_preview preview;_} when not (root_batch_current t preview.preview_batch) ->
     Hashtbl.remove t.pending key; superseded_root_batch t preview.preview_batch
+  | Some {operation;source_epoch;_} when not(changed_point_current t operation source_epoch)->
+    Hashtbl.remove t.pending key;empty
   | Some { operation = Target_summary summary; source_epoch; _ }
     when Hashtbl.find_opt t.target_read_epochs summary.block_id <> Some source_epoch ->
     Hashtbl.remove t.pending key;
@@ -3546,6 +3641,11 @@ let receive_response t (protocol_response : Protocol.response) =
         | _ -> failure_output t operation request_id "Unexpected journal response.")
      | V2_page_outcome lookup ->
        (match lookup, operation with
+        |V2_present_page{page;revision=page_revision},Changed_point_context{block_id;value;revision;child_count}
+          when Graph.Uuid.equal page.uuid value.block.page && not page.recycled->
+          remember_page_revision t page.uuid page_revision;
+          publish_changed_point t ~block_id ~value ~revision ~child_count ~page
+        |_,Changed_point_context _->reject "The changed block page is unavailable."
         | ( (V2_present_page _ | V2_missing_page _)
           , Reference_read { block_id; depth; lookup = Page_lookup } ) ->
           (match lookup with
@@ -3994,56 +4094,8 @@ let receive_response t (protocol_response : Protocol.response) =
            | _, Error message -> reject message)
         | V2_missing_block _, Find_block_result ->
           responses [ response (Block_found None) ]
-        | V2_present_block { value; revision }, Changed_block { block_id; page } ->
-          remember_block_revision t value.block.uuid revision;
-          remember_detail_block t value.block revision;
-          let child_count =
-            Hashtbl.find_opt t.projected_blocks block_id
-            |> Option.map Journal_model.child_count
-            |> Option.value ~default:0
-          in
-          (match projection_time_context t with
-           | Error message -> reject message
-           | Ok time_context ->
-             (match
-                Projection.block ~page ~revision ~child_count ~time_context value.block
-              with
-              | Error message -> reject message
-              | Ok block ->
-                let block =
-                  Journal_model.with_tag_titles block ~tag_titles:value.tag_titles
-                in
-                remember_block_page t page block_id;
-                Hashtbl.replace t.projected_blocks block_id block;
-                responses
-                  [ response (Block_updated { block; timeline_entry_update = None }) ]))
-        | V2_present_block { value; revision }, Changed_detail_block { block_id; page } ->
-          remember_block_revision t value.block.uuid revision;
-          remember_detail_block t value.block revision;
-          let child_count =
-            Hashtbl.find_opt t.projected_blocks block_id
-            |> Option.map Journal_model.child_count
-            |> Option.value ~default:0
-          in
-          (match projection_time_context t with
-           | Error message -> reject message
-           | Ok time_context ->
-             (match
-                Projection.block_on_page
-                  ~page
-                  ~revision
-                  ~child_count
-                  ~time_context
-                  value.block
-              with
-              | Error message -> reject message
-              | Ok block ->
-                let block =
-                  Journal_model.with_tag_titles block ~tag_titles:value.tag_titles
-                in
-                Hashtbl.replace t.projected_blocks block_id block;
-                responses
-                  [ response (Block_updated { block; timeline_entry_update = None }) ]))
+        |V2_present_block{value;revision},(Changed_block{block_id;_}|Changed_detail_block{block_id;_})->
+          resolve_changed_point t ~source_epoch ~block_id ~value ~revision
         | V2_missing_block { uuid; revision }, Changed_block { block_id; _ }
         | V2_missing_block { uuid; revision }, Changed_detail_block { block_id; _ } ->
           remember_block_revision t uuid revision;
@@ -4374,7 +4426,8 @@ let receive t (protocol_response : Protocol.response) =
     | Some {operation=(Root_dates scan|Root_today scan);_}->root_owner_current t (Feed_roots scan)
     | Some {operation=Root_tree batch;_}->root_batch_current t batch
     | Some {operation=Root_preview preview;_}->root_batch_current t preview.preview_batch
-    | None | Some _->true in
+    | Some {operation;source_epoch;_}->changed_point_current t operation source_epoch
+    | None->true in
   let output =
     scope_output
       t
