@@ -195,11 +195,11 @@ let test_admission_rows_are_compact_and_complete () =
     ; "Origin evidence", "256 B"
     ]
     (Application.admission_rows
-       (Application.Admission_refresh.Available admission_inspection));
+       (Journal_admission_refresh.Available admission_inspection));
   Alcotest.(check int)
     "unavailable row count"
     4
-    (List.length (Application.admission_rows Application.Admission_refresh.Unavailable))
+    (List.length (Application.admission_rows Journal_admission_refresh.Unavailable))
 ;;
 
 let test_byte_formatting () =
@@ -210,7 +210,7 @@ let test_byte_formatting () =
 ;;
 
 let test_admission_refresh_coalesces_and_fences_generations () =
-  let open Application.Admission_refresh in
+  let open Journal_admission_refresh in
   let request graph_generation request_generation
     : Journal_graph_request.admission_request
     =
