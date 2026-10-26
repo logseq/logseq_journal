@@ -7252,7 +7252,134 @@ let validate_active_transaction_origin owner cursor root_before transaction_data
          ())
 ;;
 
-let validate_active_transaction_origins owner batch transaction_data roots_after =
+(* Only schema identifiers in this list may leave the database in evidence.
+   Values, arbitrary attribute names and wire payloads must never be emitted. *)
+let integrity_evidence_attributes =
+  [ "block/uuid"; "block/title"; "block/name"; "block/journal-day"
+  ; "block/created-at"; "block/updated-at"; "block/tags"; "block/parent"
+  ; "block/page"; "block/order"; "block/refs"; "block/tx-id"
+  ]
+;;
+
+let integrity_evidence_value_type = function
+  | Datascript.Nil -> "nil"
+  | Int64 _ -> "integer"
+  | Float _ -> "float"
+  | String _ -> "string"
+  | Symbol _ -> "symbol"
+  | Bool _ -> "boolean"
+  | Keyword _ -> "keyword"
+  | Uuid _ -> "uuid"
+  | Instant _ -> "instant"
+  | Regex _ -> "regex"
+  | Ref _ | Ref_to _ -> "reference"
+  | List _ -> "list"
+  | Vector _ -> "vector"
+  | Map _ -> "map"
+  | Set _ -> "set"
+  | Tuple _ -> "tuple"
+  | TxRef -> "transaction-reference"
+;;
+
+let report_integrity_evidence owner batch record cursor root_before expected actual operations =
+  (* This best-effort observation must not affect validation or publication. *)
+  try
+    let target, day =
+      match record.mutation with
+      | Types.Create_journal_page { page; journal_day; _ } -> page, Some journal_day
+      | Insert_blocks { tree; _ } -> tree.uuid, None
+      | Delete_blocks { root; _ } -> root, None
+      | Save_block { block; _ } | Set_task_status { block; _ }
+      | Clear_task_status { block; _ } | Publish_asset { block; _ }
+      | Set_asset_reference { block; _ } -> block, None
+    in
+    let entity = entity_of_uuid root_before target in
+    let before_fields =
+      List.map
+        (fun attribute ->
+           let sample =
+             match entity with
+             | None -> []
+             | Some entity ->
+               Datascript.datoms root_before Datascript.Eavt ~e:entity ~a:attribute ()
+               |> Seq.take 4 |> List.of_seq
+           in
+           let values = List.map (fun (d : Datascript.datom) -> d.v) sample in
+           let types = List.map integrity_evidence_value_type values |> List.sort_uniq compare in
+           `Assoc
+             [ "attribute", `String attribute
+             ; "datoms", `Int (min 3 (List.length sample))
+             ; "distinct", `Int (min 3 (List.length (List.sort_uniq compare values)))
+             ; "types", `List (List.map (fun s -> `String s) types)
+             ; "truncated", `Bool (List.length sample > 3)
+             ])
+        integrity_evidence_attributes
+    in
+    let delta = Hashtbl.create 16 in
+    List.iter
+      (fun (datom : Datascript.datom) ->
+         let attribute =
+           if List.mem datom.a integrity_evidence_attributes then datom.a else "other"
+         in
+         let added, retracted = Option.value ~default:(0, 0) (Hashtbl.find_opt delta attribute) in
+         Hashtbl.replace delta attribute
+           (added + (if datom.added then 1 else 0), retracted + (if datom.added then 0 else 1)))
+      actual;
+    let pairs = Hashtbl.create 4 in
+    List.iter
+      (fun operation ->
+         let item =
+           match operation with
+           | Datascript.Add (entity, attribute, value) -> Some (entity, attribute, value, true)
+           | Retract (entity, attribute, Some value) -> Some (entity, attribute, value, false)
+           | _ -> None
+         in
+         match item with
+         | Some (entity, ("block/title" | "block/name" as attribute), value, added) ->
+           let key = entity, attribute, value in
+           let a, r = Option.value ~default:(false, false) (Hashtbl.find_opt pairs key) in
+           Hashtbl.replace pairs key (a || added, r || not added)
+         | _ -> ())
+      operations;
+    let pair_count attribute =
+      Hashtbl.fold
+        (fun (_, a, _) (added, retracted) count ->
+           if String.equal a attribute && added && retracted then count + 1 else count)
+        pairs 0
+    in
+    let str s = `String s in
+    let evidence =
+      `Assoc
+        ([ "reason", str "payload-mismatch"
+         ; "mutationId", str (Graph.Uuid.to_string record.mutation_id)
+         ; "target", str (Graph.Uuid.to_string target)
+         ; "graph", str (Graph.Uuid.to_string owner.graph_uuid)
+         ; "generation", str (Types.Generation.to_string owner.generation)
+         ; "projection", str (Types.Projection_revision.to_string (projection_revision owner.projection))
+         ; "checkpoint", str (Int64.to_string (Types.Server_cursor.to_int64 owner.checkpoint))
+         ; "through", str (Int64.to_string (Types.Server_cursor.to_int64 (Types.authoritative_batch_through batch)))
+         ; "expectedCursor", str (Int64.to_string (Types.Server_cursor.to_int64 cursor))
+         ; "expectedDatoms", `Int (List.length expected)
+         ; "actualDatoms", `Int (List.length actual)
+         ; "beforeFields", `List before_fields
+         ; "actualDelta", `List
+             (Hashtbl.to_seq delta |> List.of_seq |> List.sort compare
+              |> List.map (fun (attribute, (added, retracted)) ->
+                `Assoc [ "attribute", str attribute; "added", `Int added; "retracted", `Int retracted ]))
+         ; "protectedPairs", `Assoc
+             [ "block/title", `Int (pair_count "block/title")
+             ; "block/name", `Int (pair_count "block/name") ]
+         ]
+         @ List.map (fun (k, v) -> k, str v) (integrity_record_context record)
+         @ Option.fold ~none:[] ~some:(fun day -> [ "day", `Int day ]) day)
+    in
+    let encoded = Yojson.Safe.to_string evidence in
+    if String.length encoded <= 8192
+    then report_warning ("journal-integrity: " ^ encoded ^ "\n")
+  with _ -> report_warning "journal-integrity: {\"reason\":\"evidence-unavailable\"}\n"
+;;
+
+let validate_active_transaction_origins owner batch transaction_data roots_after decoded_transactions =
   let cursors =
     Types.authoritative_batch_transactions batch
     |> List.map Types.authoritative_transaction_cursor
@@ -7353,9 +7480,20 @@ let validate_active_transaction_origins owner batch transaction_data roots_after
                           | Error _ ->
                             ( "expected-simulation-failed"
                             , [ "actualDatoms", string_of_int (List.length actual) ] )
-                          | Ok expected ->
+                          | Ok expected_data ->
+                            let rec operations_at_cursor cursors transactions =
+                              match cursors, transactions with
+                              | cursor :: rest, operations :: more ->
+                                if Types.Server_cursor.equal cursor expected
+                                then operations
+                                else operations_at_cursor rest more
+                              | _ -> []
+                            in
+                            report_integrity_evidence owner batch record expected
+                              root_before expected_data actual
+                              (operations_at_cursor cursors decoded_transactions);
                             ( "payload-mismatch"
-                            , [ "expectedDatoms", string_of_int (List.length expected)
+                            , [ "expectedDatoms", string_of_int (List.length expected_data)
                               ; "actualDatoms", string_of_int (List.length actual)
                               ] ))
                      in
@@ -7883,6 +8021,7 @@ let prepare_authoritative_candidate preparation ~decrypted =
              preparation.authoritative_batch
              expected_tx_data
              roots_after
+             transactions
          with
          | Error message -> Error (Types.Authoritative_integrity_failure
              (integrity_batch_source preparation.authoritative_owner preparation.authoritative_batch message))
@@ -9263,8 +9402,43 @@ let replay_authoritative database prepared =
     | exn -> Error (Printexc.to_string exn))
 ;;
 
+let report_timeline_commit graph_uuid checkpoint_before (commit : Types.authoritative_commit) =
+  try
+    let kind, blocks, pages, interests = match commit.logical_change_summary with
+      | Types.No_logical_change -> "none", [], [], []
+      | Logical_resync_required _ -> "resync", [], [], []
+      | Exact_logical_change value ->
+        "exact", value.block_uuids, value.page_uuids, value.structure_interests
+    in
+    let uuids values = `List (List.take 16 values |> List.map (fun u -> `String (Graph.Uuid.to_string u))) in
+    let interest = function
+      | Types.Children_interest u -> `Assoc ["kind", `String "children"; "target", `String (Graph.Uuid.to_string u)]
+      | Page_tree_interest u -> `Assoc ["kind", `String "page-tree"; "target", `String (Graph.Uuid.to_string u)]
+      | Journal_index_interest -> `Assoc ["kind", `String "journal-index"]
+    in
+    let fields =
+      [ "stage", `String "overlay-commit"
+      ; "graph", `String (Graph.Uuid.to_string graph_uuid)
+      ; "generation", `String (Types.Generation.to_string commit.generation)
+      ; "checkpointBefore", `String (Int64.to_string (Types.Server_cursor.to_int64 checkpoint_before))
+      ; "checkpoint", `String (Int64.to_string (Types.Server_cursor.to_int64 commit.checkpoint))
+      ; "beforeProjection", `String (Types.Projection_revision.to_string commit.before_projection_revision)
+      ; "projection", `String (Types.Projection_revision.to_string commit.after_projection_revision)
+      ; "changeKind", `String kind
+      ; "blockCount", `Int (List.length blocks); "blocks", uuids blocks
+      ; "pageCount", `Int (List.length pages); "pages", uuids pages
+      ; "interestCount", `Int (List.length interests)
+      ; "interests", `List (List.take 16 interests |> List.map interest)
+      ; "truncated", `Bool (List.length blocks > 16 || List.length pages > 16 || List.length interests > 16)
+      ] in
+    let text = Yojson.Safe.to_string (`Assoc fields) in
+    if String.length text <= 8192 then report_warning ("journal-timeline: " ^ text ^ "\n")
+  with _ -> ()
+;;
+
 let commit_authoritative_candidate database prepared =
-  serialize_commit database (fun () ->
+  let checkpoint_before = ref None in
+  let outcome = serialize_commit database (fun () ->
     let change, outcome =
       Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
         let preparation = prepared.authoritative_preparation in
@@ -9726,6 +9900,7 @@ let commit_authoritative_candidate database prepared =
                database.durable_outbox <- durable_outbox;
                database.durable_sync_revision <- database.sync_revision + 1;
                preparation.authoritative_state <- Authoritative_consumed;
+               checkpoint_before := Some database.checkpoint;
                let before_projection = database.projection in
                let before_snapshot = snapshot_of_database database in
                (match replay_authoritative database prepared with
@@ -9818,7 +9993,11 @@ let commit_authoritative_candidate database prepared =
                       ; logical_change_summary
                       } )))))
     in
-    change, outcome)
+    change, outcome) in
+  (match outcome, !checkpoint_before with
+   | Ok commit, Some before -> report_timeline_commit database.graph_uuid before commit
+   | _ -> ());
+  outcome
 ;;
 
 let apply_authoritative database preparation ~decrypted =

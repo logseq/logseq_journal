@@ -1097,6 +1097,81 @@ let presentation_for_day _state day =
   Journal_calendar.present_journal_day day |> Result.to_option
 ;;
 
+let report_app_feed ?request_generation ?feed ?complete ?row_revision ~stage ~reason before after =
+  try
+    let uuid value = match Logseq_db_types.Graph_types.Uuid.of_string value with
+      | Ok u -> `String (Logseq_db_types.Graph_types.Uuid.to_string u)
+      | Error _ -> `String "invalid" in
+    let roots timeline = Journal_timeline_state.fold_slots
+      (fun (count, sample) -> function
+        | Journal_timeline_state.Top_level e ->
+          count + 1, (if count < 16 then uuid (Journal_model.id e.block) :: sample else sample)
+        | _ -> count, sample) (0, []) timeline in
+    let count, sample = roots after.timeline in
+    let incoming = Option.fold ~none:[] ~some:(fun (f : Journal_graph_projection.feed) ->
+      List.concat_map (fun (d : Journal_graph_projection.day_feed) ->
+        List.map (fun (e : Journal_graph_projection.timeline_entry) -> e.block) d.entries) f.days) feed in
+    let pending = match Journal_timeline_state.pending_request before.timeline with
+      | None -> `Null
+      | Some (g, _) -> `String (Int64.to_string g) in
+    let fields =
+      [ "stage", `String stage; "reason", `String reason
+      ; "graph", Option.fold ~none:`Null ~some:(fun u -> `String (Logseq_db_types.Graph_types.Uuid.to_string u)) after.graph_state.graph_id
+      ; "selectedGraph", Option.fold ~none:`Null ~some:(fun u -> `String (Logseq_db_types.Graph_types.Uuid.to_string u)) (current_graph_generation after)
+      ; "graphGeneration", Option.fold ~none:`Null ~some:(fun (m : Graph_service.snapshot) -> `Int m.startup.graph_generation) after.manager
+      ; "accountGeneration", Option.fold ~none:`Null ~some:(fun (m : Graph_service.snapshot) -> `Int m.startup.account_generation) after.manager
+      ; "workerGraphGeneration", `Int after.graph_state.generation
+      ; "requestGeneration", Option.fold ~none:`Null ~some:(fun g -> `String (Int64.to_string g)) request_generation
+      ; "pendingGeneration", pending
+      ; "refreshGeneration", Option.fold ~none:`Null ~some:(fun (r : feed_refresh) -> `String (Int64.to_string r.generation)) before.feed_refresh
+      ; "refreshGraph", Option.fold ~none:`Null
+          ~some:(fun u -> `String (Logseq_db_types.Graph_types.Uuid.to_string u))
+          (Option.bind before.feed_refresh (fun (r : feed_refresh) -> r.graph_generation))
+      ; "refreshGraphMatches", Option.fold ~none:`Null
+          ~some:(fun (r : feed_refresh) -> `Bool (r.graph_generation = current_graph_generation before)) before.feed_refresh
+      ; "refreshContextMatches", (match before.feed_refresh, before.calendar with
+          | Some r, Some c -> `Bool (equal_feed_projection_context r.context (feed_projection_context c))
+          | _ -> `Null)
+      ; "graphReady", `Bool before.graph_ready
+      ; "calendarAvailable", `Bool (Option.is_some before.calendar)
+      ; "day", Option.fold ~none:`Null ~some:(fun c -> `Int (Journal_calendar.local_day c)) after.calendar
+      ; "slotCount", `Int (Journal_timeline_state.retained_slot_count after.timeline)
+      ; "rootCount", `Int count; "roots", `List (List.rev sample)
+      ; "incomingRootCount", `Int (List.length incoming)
+      ; "incomingRoots", `List (List.take 16 incoming |> List.map (fun b -> uuid (Journal_model.id b)))
+      ; "timelineChanged", `Bool (before.timeline != after.timeline)
+      ; "truncated", `Bool (count > 16 || List.length incoming > 16)
+      ] @ Option.fold ~none:[] ~some:(fun v -> ["complete", `Bool v]) complete
+        @ Option.fold ~none:[] ~some:(fun v -> ["rowRevision", `Int v]) row_revision in
+    let text = Yojson.Safe.to_string (`Assoc fields) in
+    if String.length text <= 8192 then (output_string stderr ("journal-timeline: " ^ text ^ "\n"); flush stderr)
+  with _ -> ()
+;;
+
+let report_app_response before after (response : Journal_graph_runtime.response) =
+  try
+    match response.payload with
+    | Feed_refresh_started {request_generation} ->
+      let reason = match before.calendar, before.feed_refresh with
+        | _, Some r when r.generation > request_generation -> "discard-older-refresh"
+        | Some _, _ when before.graph_ready -> "accept-refresh"
+        | _ -> "discard-not-ready" in
+      report_app_feed ~request_generation ~stage:"app-feed-start" ~reason before after
+    | Feed_loaded {request_generation; feed; complete} ->
+      let reason =
+        if before.timeline != after.timeline then "accept-feed"
+        else match before.feed_refresh with
+        | Some r when r.generation = request_generation -> "discard-refresh-context"
+        | _ -> (match Journal_timeline_state.pending_request before.timeline with
+          | Some (g, Feed _) when g <> request_generation -> "discard-request-generation"
+          | Some (_, Day _) -> "discard-pending-day"
+          | None -> "discard-no-pending"
+          | Some (_, Feed _) -> "no-timeline-change") in
+      report_app_feed ~request_generation ~feed ~complete ~stage:"app-feed-result" ~reason before after
+    | _ -> ()
+  with _ -> ()
+;;
+
 let back_state state =
   let detail_root = Option.map Journal_detail.root (Journal_routes.detail state.routes) in
   let routes = Journal_routes.back state.routes in
@@ -4291,7 +4366,10 @@ let start
     in
     if state.timeline_structure_revision = timeline_structure_revision
     then state
-    else { state with timeline_structure_revision }
+    else (
+      report_app_feed ~row_revision:timeline_structure_revision ~stage:"app-row-store"
+        ~reason:"publish-row-store" state state;
+      { state with timeline_structure_revision })
   in
   ignore (Journal_timeline.Store.synchronize timeline_store initial_state.timeline : int);
   let media_context = ref None in
@@ -4558,7 +4636,10 @@ let start
             Some (request, Admission_refresh.Inspection_unavailable)
           | _ -> None in
         match completion with
-        | None -> Root_navigation.step state (Completed response), effects
+        | None ->
+          let next = Root_navigation.step state (Completed response) in
+          report_app_response state next response;
+          next, effects
         | Some (request, result) ->
                let admission_refresh, directive =
                  Admission_refresh.complete state.admission_refresh ~request ~result

@@ -3,6 +3,57 @@ module Protocol = Logseq_db_worker.Protocol
 module Error = Logseq_db_worker.Error
 module Projection = Journal_graph_projection
 
+let timeline_uuid value =
+  match Graph.Uuid.of_string value with
+  | Ok uuid -> `String (Graph.Uuid.to_string uuid)
+  | Error _ -> `String "invalid"
+;;
+
+let timeline_version value =
+  let digits s = s <> "" && String.length s <= 19
+    && String.for_all (fun c -> c >= '0' && c <= '9') s
+    && Option.is_some (Int64.of_string_opt s) in
+  let valid = String.length value <= 96 && match String.split_on_char ':' value with
+    | ["generation"; "v1"; epoch; sequence] -> digits epoch && digits sequence
+    | [("projection" | "change-window"); "v1"; number] -> digits number
+    | _ -> false in
+  `String (if valid then value else "invalid")
+;;
+
+let report_timeline stage fields =
+  try
+    let text = Yojson.Safe.to_string (`Assoc (("stage", `String stage) :: fields)) in
+    if String.length text <= 8192 then (
+      output_string stderr ("journal-timeline: " ^ text ^ "\n"); flush stderr)
+  with _ -> ()
+;;
+
+let report_capture_evidence ~stage ?result ?page_mutation ~request ~target
+    (command : Projection.capture) =
+  (* Capture IDs originate at the UI boundary. Never echo malformed input. *)
+  try
+    let capture_mutation =
+      match Graph.Uuid.of_string command.mutation_id with
+      | Ok uuid -> Graph.Uuid.to_string uuid
+      | Error _ -> "invalid"
+    in
+    let fields =
+      [ "stage", `String stage
+      ; "request", `String (Graph.Uuid.to_string request)
+      ; "target", `String (Graph.Uuid.to_string target)
+      ; "captureMutation", `String capture_mutation
+      ; "day", `Int (Journal_time.local_day command.creation_time)
+      ]
+      @ Option.fold ~none:[] ~some:(fun value -> [ "result", `String value ]) result
+      @ Option.fold ~none:[]
+          ~some:(fun uuid -> [ "pageMutation", `String (Graph.Uuid.to_string uuid) ])
+          page_mutation
+    in
+    output_string stderr ("journal-capture: " ^ Yojson.Safe.to_string (`Assoc fields) ^ "\n");
+    flush stderr
+  with _ -> ()
+;;
+
 type worker_failure =
   { operation : string
   ; request_id : Graph.Uuid.t
@@ -1155,16 +1206,33 @@ let read_root_batch t owner (page : Projection.page) cursor limit =
     ; root_todo = []
     }
   in
-  read
-    t
-    (Root_tree batch)
-    (Protocol.V2_get_page_tree
-       { page = Graph.Uuid.of_string page.id |> Result.get_ok
-       ; maximum_depth = 0
-       ; limit
-       ; cursor
-       ; revision = None
-       })
+  let request =
+    read
+      t
+      (Root_tree batch)
+      (Protocol.V2_get_page_tree
+         { page = Graph.Uuid.of_string page.id |> Result.get_ok
+         ; maximum_depth = 0
+         ; limit
+         ; cursor
+         ; revision = None
+         })
+  in
+  (match owner with
+   | Feed_roots scan ->
+     report_timeline
+       "runtime-feed-tree-request"
+       [ "request", `String (Graph.Uuid.to_string request.request_id)
+       ; "requestGeneration", `String (Int64.to_string scan.root_generation)
+       ; "target", timeline_uuid page.id
+       ; "day", `Int page.day
+       ; "limit", `Int limit
+       ; "maximumDepth", `Int 0
+       ; "hasContinuation", `Bool (Option.is_some cursor)
+       ; "kind", `String "roots"
+       ]
+   | Changed_roots _ -> ());
+  request
 ;;
 
 let read_changed_roots t page limit =
@@ -1207,17 +1275,30 @@ let read_changed_roots t page limit =
 ;;
 
 let read_root_dates t scan =
-  read
-    t
-    (Root_dates scan)
-    (Protocol.V2_list_journals
-       { from_day = 0
-       ; through_day =
-           Option.fold ~none:99_999_999 ~some:previous_journal_day scan.root_before_day
-       ; limit = scan.root_list_size
-       ; cursor = scan.root_journal_cursor
-       ; revision = None
-       })
+  let request =
+    read
+      t
+      (Root_dates scan)
+      (Protocol.V2_list_journals
+         { from_day = 0
+         ; through_day =
+             Option.fold ~none:99_999_999 ~some:previous_journal_day scan.root_before_day
+         ; limit = scan.root_list_size
+         ; cursor = scan.root_journal_cursor
+         ; revision = None
+         })
+  in
+  report_timeline
+    "runtime-feed-request"
+    [ "request", `String (Graph.Uuid.to_string request.request_id)
+    ; "requestGeneration", `String (Int64.to_string scan.root_generation)
+    ; "beforeDay", Option.fold ~none:`Null ~some:(fun d -> `Int d) scan.root_before_day
+    ; "dayLimit", `Int scan.root_list_size
+    ; "rootRemaining", `Int scan.root_remaining
+    ; "hasContinuation", `Bool (Option.is_some scan.root_journal_cursor)
+    ; "kind", `String "date-catalog"
+    ];
+  request
 ;;
 
 let root_date_continuation scan =
@@ -1232,16 +1313,29 @@ let root_date_continuation scan =
    when every discovered date is future and the catalog has more packets. *)
 let read_priority_today t scan =
   let today = Option.get scan.root_skipped_day in
-  read
-    t
-    (Root_today scan)
-    (Protocol.V2_list_journals
-       { from_day = today
-       ; through_day = today
-       ; limit = 1
-       ; cursor = None
-       ; revision = None
-       })
+  let request =
+    read
+      t
+      (Root_today scan)
+      (Protocol.V2_list_journals
+         { from_day = today
+         ; through_day = today
+         ; limit = 1
+         ; cursor = None
+         ; revision = None
+         })
+  in
+  report_timeline
+    "runtime-feed-request"
+    [ "request", `String (Graph.Uuid.to_string request.request_id)
+    ; "requestGeneration", `String (Int64.to_string scan.root_generation)
+    ; "day", `Int today
+    ; "dayLimit", `Int 1
+    ; "rootRemaining", `Int scan.root_remaining
+    ; "hasContinuation", `Bool false
+    ; "kind", `String "priority-today"
+    ];
+  request
 ;;
 let root_feed_response scan complete =
   let days = scan.root_days in
@@ -1252,12 +1346,41 @@ let root_feed_response scan complete =
           (fun n (d : Projection.day_feed) -> n + 1 + List.length d.entries)
           0
           days
-    (* Keep the date entry point even while a day has its own cursor: a later
+        (* Keep the date entry point even while a day has its own cursor: a later
        authoritative page reconciliation can legitimately remove that cursor. *)
     ; continuation = root_date_continuation scan
     ; prioritized_day = scan.root_skipped_day
     }
   in
+  report_timeline
+    "runtime-feed-result"
+    [ "requestGeneration", `String (Int64.to_string scan.root_generation)
+    ; "complete", `Bool complete
+    ; "dayCount", `Int (List.length days)
+    ; "slotCount", `Int feed.slot_count
+    ; "rootCount", `Int (feed.slot_count - List.length days)
+    ; "truncated", `Bool (List.length days > 16 || feed.slot_count - List.length days > 16)
+    ; ( "pages"
+      , `List
+          (List.take 16 days
+           |> List.map (fun (d : Projection.day_feed) ->
+             `Assoc
+               [ "page", timeline_uuid d.page.id
+               ; "day", `Int d.page.day
+               ; "rootCount", `Int (List.length d.entries)
+               ; "hasContinuation", `Bool d.has_more_entries
+               ])) )
+    ; ( "roots"
+      , `List
+          (List.concat_map
+             (fun (d : Projection.day_feed) ->
+                List.map
+                  (fun (e : Projection.timeline_entry) -> Journal_model.id e.block)
+                  d.entries)
+             days
+           |> List.take 16
+           |> List.map timeline_uuid) )
+    ];
   response (Feed_loaded { request_generation = scan.root_generation; feed; complete })
 ;;
 let next_feed_batch t scan =
@@ -1453,15 +1576,31 @@ let complete_root_batch t batch =
 ;;
 
 let read_root_preview t preview =
-  read
-    t
-    (Root_preview preview)
-    (Protocol.V2_get_children
-       { parent = preview.preview_root.block.uuid
-       ; limit = preview.preview_limit
-       ; cursor = preview.preview_cursor
-       ; revision = None
-       })
+  let request =
+    read
+      t
+      (Root_preview preview)
+      (Protocol.V2_get_children
+         { parent = preview.preview_root.block.uuid
+         ; limit = preview.preview_limit
+         ; cursor = preview.preview_cursor
+         ; revision = None
+         })
+  in
+  (match preview.preview_batch.root_owner with
+   | Feed_roots scan ->
+     report_timeline
+       "runtime-feed-tree-request"
+       [ "request", `String (Graph.Uuid.to_string request.request_id)
+       ; "requestGeneration", `String (Int64.to_string scan.root_generation)
+       ; "target", `String (Graph.Uuid.to_string preview.preview_root.block.uuid)
+       ; "day", `Int preview.preview_batch.root_page.day
+       ; "limit", `Int preview.preview_limit
+       ; "hasContinuation", `Bool (Option.is_some preview.preview_cursor)
+       ; "kind", `String "child-preview"
+       ]
+   | Changed_roots _ -> ());
+  request
 ;;
 
 let next_root_preview t batch =
@@ -2749,6 +2888,22 @@ let hydration_for_changes t ~request_generation windows =
       structures
     || List.exists (fun page -> Option.is_some (registered_page t page)) pages
   in
+  report_timeline "runtime-interest"
+    [ "requestGeneration", `String (Int64.to_string request_generation)
+    ; "journalChanged", `Bool journal_changed
+    ; "hasInitialFeed", `Bool (Option.is_some t.initial_feed_spec)
+    ; "registeredPageHit", `Bool (List.exists (fun page -> Option.is_some (registered_page t page)) pages)
+    ; "pageCount", `Int (List.length pages)
+    ; "pages", `List (List.take 16 pages |> List.map (fun u -> `String (Graph.Uuid.to_string u)))
+    ; "blockCount", `Int (List.length blocks)
+    ; "blocks", `List (List.take 16 blocks |> List.map (fun u -> `String (Graph.Uuid.to_string u)))
+    ; "interestCount", `Int (List.length structures)
+    ; "interests", `List (List.take 16 structures |> List.map (function
+        | Protocol.V2_journal_index_interest -> `Assoc ["kind", `String "journal-index"]
+        | V2_children_interest u -> `Assoc ["kind", `String "children"; "target", `String (Graph.Uuid.to_string u)]
+        | V2_page_tree_interest u -> `Assoc ["kind", `String "page-tree"; "target", `String (Graph.Uuid.to_string u)]))
+    ; "truncated", `Bool (List.length pages > 16 || List.length blocks > 16 || List.length structures > 16)
+    ];
   let journal =
     match journal_changed, t.initial_feed_spec with
     | true, Some (root_limit, day_limit) ->
@@ -3498,18 +3653,21 @@ let receive_response t (protocol_response : Protocol.response) =
           { requests = catalog; responses = [ response Graph_ready ] }
         | Capture_format { command; page_uuid; page_revision } ->
           let journal_day = Journal_time.local_day command.creation_time in
-          requests
-            [ mutate
+          let page_mutation = request_uuid t in
+          let request = mutate
                 t
                 (Capture_create_page { command; page_uuid })
                 (Protocol.V2_create_journal_page
-                   { mutation_id = request_uuid t
+                   { mutation_id = page_mutation
                    ; page = page_uuid
                    ; journal_day
                    ; title = journal_title ~format:journal_title_format journal_day
                    ; preconditions = preconditions ~pages:[ page_uuid, page_revision ] ()
                    })
-            ]
+          in
+          report_capture_evidence ~stage:"create-page" ~page_mutation
+            ~request:request.request_id ~target:page_uuid command;
+          requests [ request ]
         | _ -> failure_output t operation request_id "Unexpected graph-info response.")
      | V2_task_statuses_outcome { property_uuid; default_status; items; next_cursor } ->
        (match operation with
@@ -3775,6 +3933,8 @@ let receive_response t (protocol_response : Protocol.response) =
             Hashtbl.replace t.graph_pages (Graph.Uuid.to_string page.uuid) page;
             detail_children t ~generation ~page ~root ~limit ~after)
         | V2_present_page { page; revision }, Capture_page command ->
+          report_capture_evidence ~stage:"page-lookup" ~result:"present"
+            ~request:request_id ~target:page.uuid command;
           remember_page_revision t page.uuid revision;
           (match page_of_graph_page page with
            | None -> reject "The target journal page is unavailable."
@@ -3793,6 +3953,8 @@ let receive_response t (protocol_response : Protocol.response) =
                    })
             ]
         | V2_missing_page { uuid; revision }, Capture_page command ->
+          report_capture_evidence ~stage:"page-lookup" ~result:"missing"
+            ~request:request_id ~target:uuid command;
           remember_page_revision t uuid revision;
           requests
             [ read
@@ -4367,6 +4529,17 @@ let receive_response t (protocol_response : Protocol.response) =
      | V2_changes { generation; through; windows; _ } ->
        (match operation with
         | Pull_changes { request_generation; _ } ->
+          report_timeline "runtime-change-window"
+            [ "phase", `String "received"; "request", `String (Graph.Uuid.to_string request_id)
+            ; "requestGeneration", `String (Int64.to_string request_generation)
+            ; "generation", timeline_version generation; "through", timeline_version through
+            ; "windowCount", `Int (List.length windows)
+            ; "windows", `List (List.take 16 windows |> List.map (fun (w : Protocol.v2_change_window) ->
+                `Assoc ["id", timeline_version w.id; "predecessor", timeline_version w.predecessor;
+                  "successor", timeline_version w.successor; "blockCount", `Int (List.length w.block_uuids);
+                  "pageCount", `Int (List.length w.page_uuids); "interestCount", `Int (List.length w.structure_interests)]))
+            ; "truncated", `Bool (List.length windows > 16)
+            ];
           t.change_generation <- Some generation;
           t.change_cursor <- Some through;
           let acknowledgement =
@@ -4420,7 +4593,10 @@ let receive t (protocol_response : Protocol.response) =
   let owned = match pending with
     | Some { delivery = Dispatched; _ } -> true
     | None | Some _ -> false in
-  if not owned then empty else (
+  if not owned then (
+    report_timeline "runtime-response"
+      ["request", `String (Graph.Uuid.to_string request_id); "reason", `String "discard-not-owned"];
+    empty) else (
   let background = Hashtbl.mem t.hydration_active key in
   Hashtbl.remove t.hydration_active key;
   let root_current = match pending with
@@ -4649,6 +4825,18 @@ let abandon t (request : Protocol.request) =
 ;;
 
 let reconcile_push t ~request_generation push =
+  (match push with
+   | Protocol.V2_changes_available { generation; through; _ } ->
+     report_timeline "runtime-change-window"
+       [ "phase", `String "push"; "generation", timeline_version generation
+       ; "through", timeline_version through
+       ; "requestGeneration", `String (Int64.to_string request_generation)
+       ]
+   | V2_resync_required_push { generation; _ } ->
+     report_timeline "runtime-change-window"
+       [ "phase", `String "resync"; "generation", timeline_version generation
+       ; "requestGeneration", `String (Int64.to_string request_generation)
+       ]);
   let output =
     match push with
     | Protocol.V2_changes_available { generation; _ } ->
