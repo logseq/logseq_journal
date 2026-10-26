@@ -2455,7 +2455,383 @@ let test_cross_page_ownership () =
   if !failures <> [] then fail "%s" (String.concat "\n" (List.rev !failures))
 ;;
 
+let test_child_preview_point_updates () =
+  let module Graph = Logseq_db_types.Graph_types in
+  let module Projection = Journal_graph_projection in
+  let uuid value = Graph.Uuid.of_string value |> Result.get_ok in
+  let owner day =
+    Projection.
+      { id =
+          Printf.sprintf
+            "00000001-%04d-%04d-0000-000000000000"
+            (day / 10000)
+            (day mod 10000)
+      ; day
+      ; title = string_of_int day
+      }
+  in
+  let raw ?parent ?asset day index order title : Graph.block =
+    let page = uuid (owner day).id in
+    { uuid = uuid (id "block" index)
+    ; page
+    ; parent = Option.value parent ~default:page
+    ; title
+    ; order
+    ; created_at_ms = Journal_time.instant_unix_ms (creation_time ~day ())
+    ; updated_at_ms = Journal_time.instant_unix_ms (creation_time ~day ())
+    ; refs = []
+    ; tags = []
+    ; properties =
+        Option.fold
+          ~none:[]
+          ~some:(fun value ->
+            [ Graph.
+                { ident = "logseq.property.asset/type"
+                ; uuid = uuid (id "property" 1)
+                ; title = "Asset type"
+                ; schema =
+                    { property_type = String
+                    ; cardinality = One
+                    ; hidden = false
+                    ; public = false
+                    }
+                ; values = [ String_value value ]
+                ; values_truncated = false
+                }
+            ])
+          asset
+    }
+  in
+  let time_context = Projection.{ localtime = Unix.gmtime } in
+  let project day roots =
+    let items =
+      List.concat_map
+        (fun ((root : Graph.block), children) ->
+           Projection.{ block = root; revision = "root-1"; depth = 0 }
+           :: List.map
+                (fun child ->
+                   Projection.{ block = child; revision = "child-1"; depth = 1 })
+                children)
+        roots
+    in
+    Projection.timeline_entry_page
+      ~page:(owner day)
+      ~time_context
+      Graph.{ items; continuation = None }
+    |> Result.get_ok
+  in
+  let point day child =
+    Projection.block
+      ~page:(owner day)
+      ~time_context
+      ~revision:"child-2"
+      ~child_count:0
+      child
+    |> Result.get_ok
+  in
+  let root = raw 20260808 31000 "a" "Parent" in
+  let other = raw 20260808 32000 "b" "Other parent" in
+  let children =
+    List.init 4 (fun n ->
+      raw
+        ~parent:root.uuid
+        ?asset:(if n = 1 then Some "png" else None)
+        20260808
+        (31100 + n)
+        (string_of_int n)
+        (Printf.sprintf "Child %d" n))
+  in
+  let c1 = List.nth children 0
+  and c2 = List.nth children 1
+  and c4 = List.nth children 3 in
+  let initial () =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed
+            [ day_feed_entries
+                20260808
+                "Older"
+                (project 20260808 [ root, children; other, [] ]).entries
+            ])
+  in
+  let get state (root : Graph.block) =
+    Timeline.fold_slots
+      (fun result -> function
+         | Timeline.Top_level e
+           when Journal_model.id e.block = Graph.Uuid.to_string root.Graph.uuid -> Some e
+         | _ -> result)
+      None
+      state
+    |> Option.get
+  in
+  let expect state root (child : Graph.block) source asset =
+    let values = (get state root).child_summaries in
+    let summary =
+      List.find
+        (fun (c : Projection.child_summary) ->
+           c.block_id = Graph.Uuid.to_string child.Graph.uuid)
+        values
+    in
+    require (summary.source = source) "child preview retained stale source";
+    require (summary.asset_file_type = asset) "child preview retained stale asset type";
+    require (List.length values <= 3) "point update exceeded the three-child preview"
+  in
+  let same_layout before after =
+    require_equal_string_list
+      (slot_keys after)
+      (slot_keys before)
+      "child changed root/order/continuation keys";
+    let root_values state =
+      Timeline.fold_slots
+        (fun values -> function
+           | Timeline.Top_level e ->
+             let b = e.block in
+             ( Journal_model.id b
+             , Journal_model.source b
+             , Journal_model.child_count b
+             , Journal_model.sibling_order b
+             , Journal_model.page_id b )
+             :: values
+           | _ -> values)
+        []
+        state
+    in
+    require
+      (root_values before = root_values after)
+      "child changed root content or counts";
+    require
+      (Timeline.total_count before = Timeline.total_count after)
+      "child consumed a root slot";
+    let anchor state =
+      Timeline.retained_slot state (Timeline.first_visible_index state)
+      |> Option.map Timeline.slot_key
+    in
+    require (anchor before = anchor after) "child update moved the scroll anchor";
+    let clear state =
+      List.fold_left
+        (fun state (id, _, _, _, _) -> Timeline.remove_block state ~block_id:id)
+        state
+        (root_values state)
+      |> slot_keys
+    in
+    require (clear before = clear after) "child update changed retained day counts"
+  in
+  let failures = ref [] in
+  let check name f =
+    try
+      f ();
+      Printf.printf "child preview: PASS %s\n%!" name
+    with
+    | exn ->
+      Printf.printf "child preview: FAIL %s\n%!" name;
+      failures := (name ^ ": " ^ Printexc.to_string exn) :: !failures
+  in
+  check "visible title" (fun () ->
+    let before =
+      initial () |> Timeline.observe_visible_range ~first_index:1 ~last_exclusive:3
+    in
+    let changed = { c1 with title = "Child edited" } in
+    let after = Timeline.replace_block before (point 20260808 changed) in
+    expect after root c1 changed.title None;
+    same_layout before after;
+    require
+      (not (Timeline.equal_presentation before after))
+      "changed preview did not invalidate presentation");
+  List.iter
+    (fun asset ->
+       check
+         (if asset = None then "asset cleared" else "asset type changed")
+         (fun () ->
+            let before = initial () in
+            let changed = raw ~parent:root.uuid ?asset 20260808 31101 "1" c2.title in
+            let after = Timeline.replace_block before (point 20260808 changed) in
+            expect after root c2 c2.title asset;
+            same_layout before after))
+    [ Some "pdf"; None ];
+  check "retained same-day suffix after thirty roots" (fun () ->
+    let prefix =
+      List.init 30 (fun n ->
+        raw 20260808 (33000 + n) (Printf.sprintf "%04d" n) "Prefix", [])
+    in
+    let suffix = { root with order = "9999" } in
+    let entries = (project 20260808 prefix).entries in
+    let cursor = continuation_of_entries ~more:true entries in
+    let before =
+      Timeline.empty ~today:20260809
+      |> begin_and_apply_feed
+           ~generation:1L
+           ~before_day:None
+           (feed [ day_feed_entries ~more:true 20260808 "Older" entries ])
+      |> fun state ->
+      Timeline.begin_request state ~generation:2L (Day { day = 20260808; after = cursor })
+      |> fun state ->
+      Timeline.apply_timeline_entry_page
+        state
+        ~generation:2L
+        (project 20260808 [ suffix, children ])
+      |> Timeline.observe_visible_range ~first_index:0 ~last_exclusive:4
+    in
+    let after =
+      Timeline.replace_block before (point 20260808 { c1 with title = "Suffix edited" })
+    in
+    expect after suffix c1 "Suffix edited" None;
+    same_layout before after);
+  check "retained older day after thirty Today roots" (fun () ->
+    let today =
+      List.init 30 (fun n ->
+        raw 20260809 (34000 + n) (Printf.sprintf "%04d" n) "Today", [])
+    in
+    let before =
+      Timeline.empty ~today:20260809
+      |> begin_and_apply_feed
+           ~generation:1L
+           ~before_day:None
+           (feed
+              ~more:true
+              [ day_feed_entries 20260809 "Today" (project 20260809 today).entries ])
+      |> begin_and_apply_feed
+           ~generation:2L
+           ~before_day:(Some 20260809)
+           (feed
+              [ day_feed_entries
+                  20260808
+                  "Older"
+                  (project 20260808 [ root, children ]).entries
+              ])
+    in
+    let after =
+      Timeline.replace_block before (point 20260808 { c1 with title = "Older edited" })
+    in
+    expect after root c1 "Older edited" None;
+    same_layout before after);
+  check "repeat child edit then parent point" (fun () ->
+    let before = initial () in
+    let after =
+      Timeline.replace_block before (point 20260808 { c1 with title = "First edit" })
+      |> fun state ->
+      Timeline.replace_block state (point 20260808 { c1 with title = "Second edit" })
+    in
+    expect after root c1 "Second edit" None;
+    same_layout before after;
+    let parent =
+      Projection.block
+        ~page:(owner 20260808)
+        ~time_context
+        ~revision:"root-2"
+        ~child_count:4
+        { root with title = "Parent edited" }
+      |> Result.get_ok
+    in
+    let after = Timeline.replace_block after parent in
+    expect after root c1 "Second edit" None;
+    require
+      (Journal_model.source (get after root).block = "Parent edited")
+      "parent point stopped updating root");
+  check "hidden parent restored with current preview" (fun () ->
+    let model title =
+      Projection.block
+        ~page:(owner 20260808)
+        ~time_context
+        ~revision:"root-2"
+        ~child_count:4
+        { root with title }
+      |> Result.get_ok
+    in
+    let before =
+      initial ()
+      |> fun state ->
+      Timeline.remove_block state ~block_id:(Graph.Uuid.to_string other.uuid)
+      |> fun state -> Timeline.replace_block state (model "")
+    in
+    let changed =
+      Timeline.replace_block
+        before
+        (point 20260808 { c1 with title = "Hidden child edit" })
+    in
+    same_layout before changed;
+    let restored = Timeline.replace_block changed (model root.title) in
+    expect restored root c1 "Hidden child edit" None);
+  check "fourth child does not enter preview" (fun () ->
+    let before = initial () in
+    let after =
+      Timeline.replace_block before (point 20260808 { c4 with title = "Fourth edited" })
+    in
+    require
+      ((get before root).child_summaries = (get after root).child_summaries)
+      "fourth child replaced preview selection";
+    require
+      (Timeline.equal_presentation before after)
+      "non-preview child invalidated visible content";
+    same_layout before after);
+  check "point moved to another parent cannot rewrite old preview" (fun () ->
+    let before = initial () in
+    let moved = { c1 with parent = other.uuid; title = "Moved child" } in
+    let after = Timeline.replace_block before (point 20260808 moved) in
+    require
+      ((get before root).child_summaries = (get after root).child_summaries)
+      "moved point used the old parent";
+    require ((get after other).child_summaries = []) "point guessed a new child selection";
+    same_layout before after);
+  check "child of moved parent cannot rewrite old page preview" (fun () ->
+    let before = initial () in
+    let moved = { c1 with page = uuid (owner 20260809).id; title = "New page child" } in
+    let after = Timeline.replace_block before (point 20260809 moved) in
+    require
+      ((get before root).child_summaries = (get after root).child_summaries)
+      "child point mixed new page with old parent entry";
+    same_layout before after);
+  check "authoritative deletion refills bounded preview" (fun () ->
+    let before = initial () in
+    let children =
+      List.filter
+        (fun (c : Graph.block) -> not (Graph.Uuid.equal c.uuid c1.uuid))
+        children
+    in
+    let after =
+      Timeline.replace_timeline_entry_page
+        before
+        ~page:(owner 20260808)
+        (project 20260808 [ root, children; other, [] ])
+    in
+    let ids =
+      List.map
+        (fun (c : Projection.child_summary) -> c.block_id)
+        (get after root).child_summaries
+    in
+    require
+      (ids = List.map (fun (c : Graph.block) -> Graph.Uuid.to_string c.uuid) children)
+      "normal delete reconciliation did not refill from fourth child";
+    require (List.length ids = 3) "delete reconciliation exceeded preview budget");
+  check "authoritative movement replaces preview ownership" (fun () ->
+    let before = initial () in
+    let moved = { c1 with parent = other.uuid; title = "Moved child" } in
+    let children =
+      List.filter
+        (fun (c : Graph.block) -> not (Graph.Uuid.equal c.uuid c1.uuid))
+        children
+    in
+    let after =
+      Timeline.replace_timeline_entry_page
+        before
+        ~page:(owner 20260808)
+        (project 20260808 [ root, children; other, [ moved ] ])
+    in
+    require
+      (not
+         (List.exists
+            (fun (c : Projection.child_summary) ->
+               c.block_id = Graph.Uuid.to_string c1.uuid)
+            (get after root).child_summaries))
+      "old parent retained moved preview";
+    expect after other moved moved.title None;
+    require (slot_keys before = slot_keys after) "child movement changed root keys");
+  if !failures <> [] then fail "%s" (String.concat "\n" (List.rev !failures))
+;;
+
 let () =
+  test_child_preview_point_updates ();
   test_cross_page_ownership ();
   test_today_priority_projection_and_refresh ();
   test_prefix_identity_merge ();

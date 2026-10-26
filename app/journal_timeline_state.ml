@@ -1184,6 +1184,36 @@ let relocate_point (before : t) (entry : Journal_graph_projection.timeline_entry
   finish_change before state
 ;;
 
+let refresh_child_preview replacement (entry : Journal_graph_projection.timeline_entry) =
+  if
+    Journal_model.parent_id replacement = Some (Journal_model.id entry.block)
+    && Journal_model.page_id replacement = Journal_model.page_id entry.block
+  then (
+    let summary =
+      Journal_graph_projection.
+        { block_id = Journal_model.id replacement
+        ; source = Journal_model.source replacement
+        ; asset_file_type = Journal_model.asset_file_type replacement
+        }
+    in
+    if
+      List.exists
+        (fun (child : Journal_graph_projection.child_summary) ->
+           child.block_id = summary.block_id && child <> summary)
+        entry.child_summaries
+    then
+      Some
+        { entry with
+          child_summaries =
+            List.map
+              (fun (child : Journal_graph_projection.child_summary) ->
+                 if child.block_id = summary.block_id then summary else child)
+              entry.child_summaries
+        }
+    else None)
+  else None
+;;
+
 let replace_block (state : t) replacement =
   match point_entry state (Journal_model.id replacement) with
   | Some old when location_changed old.block replacement ->
@@ -1211,7 +1241,11 @@ let replace_block (state : t) replacement =
                then knowledge.block_count
                else max 1 knowledge.block_count)
           }
-        | _ -> knowledge)
+        | Some entry ->
+          (match refresh_child_preview replacement entry with
+           | Some entry -> { knowledge with hidden_entry = Some entry }
+           | None -> knowledge)
+        | None -> knowledge)
     in
     let slots =
       update_slots
@@ -1220,6 +1254,10 @@ let replace_block (state : t) replacement =
             when String.equal (Journal_model.id entry.block) replacement_id ->
             retained := true;
             Some (Top_level { entry with block = replacement })
+          | Top_level entry ->
+            Option.map
+              (fun entry -> Top_level entry)
+              (refresh_child_preview replacement entry)
           | _ -> None)
         state.slots
     in
