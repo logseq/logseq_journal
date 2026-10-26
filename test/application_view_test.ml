@@ -5329,7 +5329,8 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
     ?(attach_mirror = false) ?(graph_first = false)
     ?(attachment_stage = Atomic.make 0) ?(finish_attachment = Atomic.make true)
     ?(on_timeline_presented = fun _ -> ())
-    ?on_platform_request ?(on_auth_classified = fun _ -> ()) () =
+    ?on_platform_request ?(on_auth_classified = fun _ -> ())
+    ?(on_auth_handled = fun _ _ -> ()) () =
   let module W = Logseq_db_worker_lui.Journal_worker in
   let graph_id =
     Logseq_db_types.Graph_types.Uuid.of_string "00000000-0000-0000-0000-000000000901"
@@ -5542,6 +5543,9 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
         | Client_command (Select_graph _) ->
           publish manager;
           Ok Service.Client_command_completed
+        | Client_command (Reconcile_authenticated_user { user_id }) ->
+          on_auth_handled user_id (W.Request_context.request_id context);
+          Ok Service.Client_command_completed
         | Client_command _ | Asset_command _ | Release_asset_file _ ->
           Ok Service.Client_command_completed
         | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
@@ -5717,9 +5721,12 @@ let test_pending_auth_never_replays_older_identity ~newer_accepted () =
   let module W = Logseq_db_worker_lui.Journal_worker in
   let observed = ref [] in
   let ready = ref false in
+  let newer_request = Atomic.make None in
   let hooks, _, release, client = unlock_fixture ~queue_full:true
       ~on_platform_request:(fun bytes -> if Bytes.length bytes >= 8 && Bytes.get_uint16_le bytes 6 = 30 then ready := true)
-      ~on_auth_classified:(fun user -> observed := !observed @ [user]) () in
+      ~on_auth_classified:(fun user -> observed := !observed @ [user])
+      ~on_auth_handled:(fun user request_id ->
+        if user = Some "B" then Atomic.set newer_request (Some request_id)) () in
   let wait label predicate =
     let deadline = Unix.gettimeofday () +. 2. in
     while not (predicate ()) && Unix.gettimeofday () < deadline do Unix.sleepf 0.001 done;
@@ -5753,9 +5760,19 @@ let test_pending_auth_never_replays_older_identity ~newer_accepted () =
     wait "initial manager available" (fun () -> ignore (hooks.pump ());
       !ready && (match !client with Some c -> idle c | None -> false));
     let client = Option.get !client in
+    let completed_graph_reads = Hashtbl.create 64 in
+    let completed_commands = Hashtbl.create 4 in
+    W.on_event client (function
+      | W.Response { request_id; outcome = Completed (Service.Graph_state _); _ } ->
+        Hashtbl.replace completed_graph_reads request_id ()
+      | W.Response { request_id; outcome = Completed Service.Client_command_completed; _ } ->
+        Hashtbl.replace completed_commands request_id ()
+      | _ -> ());
+    let filled_requests = ref [] in
     let rec fill remaining = if remaining = 0 then failwith "fixture did not fill" else
       match W.send client Service.Get_graph_state with
-      | Accepted _ -> fill (remaining - 1) | Full -> () | _ -> failwith "fixture stopped" in
+      | Accepted request_id -> filled_requests := request_id :: !filled_requests; fill (remaining - 1)
+      | Full -> () | _ -> failwith "fixture stopped" in
     fill 128;
     hooks.platform_event (payload "A"); ignore (hooks.pump ());
     Alcotest.(check bool) "older native identity reached Full admission" true (List.mem (Some "A") !observed);
@@ -5767,7 +5784,15 @@ let test_pending_auth_never_replays_older_identity ~newer_accepted () =
     ignore (hooks.pump ());
     Alcotest.(check bool) "newer native identity reached admission" true (List.mem (Some "B") !observed);
     Atomic.set release true;
-    wait "deferred commands drained" (fun () -> ignore (hooks.pump ()); idle client);
+    (* Queue/active/output counts can all be zero between dequeue and handler
+       activation. Settle the actual accepted requests instead: B's response also
+       proves its Latest control barrier was applied before its data handler. *)
+    wait "deferred commands drained" (fun () ->
+      ignore (hooks.pump ());
+      List.for_all (Hashtbl.mem completed_graph_reads) !filled_requests
+      && match Atomic.get newer_request with
+         | None -> false
+         | Some request_id -> Hashtbl.mem completed_commands request_id);
     let rec after_newer = function [] -> [] | Some "B" :: rest -> rest | _ :: rest -> after_newer rest in
     Alcotest.(check bool) "older identity never re-enters Latest after newer verification" false
       (List.mem (Some "A") (after_newer !observed)))
