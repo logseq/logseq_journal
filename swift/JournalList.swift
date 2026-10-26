@@ -821,12 +821,15 @@ import UIKit
         }
         .overlay(alignment: .top) {
           if pullEligible && pullHint > 0 {
-            Text(pullHint == 2 ? "Release to sync" : "Pull to sync")
+            Image(systemName: pullHint == 2 ? "arrow.clockwise" : "arrow.down")
               .font(.footnote)
+              .frame(width: 24, height: 24)
               .foregroundStyle(.secondary)
               .padding(.top, 12)
               .allowsHitTesting(false)
+              .accessibilityLabel(pullHint == 2 ? "Release to sync" : "Pull to sync")
               .accessibilityIdentifier("journal-pull-sync-hint")
+              .contentTransition(.identity)
               .transaction { $0.animation = nil }
           }
         }
