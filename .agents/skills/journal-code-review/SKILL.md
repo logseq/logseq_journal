@@ -1,11 +1,13 @@
 ---
 name: journal-code-review
-description: 在请求审查 Journal 代码时使用，检查性能、UX 与类型约束。
+description: 只读审查 Journal 变更的性能、UX、类型约束与验证证据。
 ---
 
 # Journal Code Review
 
 只读审查请求范围内的代码，只报告问题，不修改代码或其他文件。
+
+先记录审查目标、base/head SHA（未提交修改另记 diff 身份）和文件范围。独立审查应由未实施该变更的审查者执行；只审查委托范围，不运行构建、安装、登录或远端写入。按需读取 [回归与最终验证范围](references/validation.md)，核对结论是否绑定最终源码。后续修改使相关结论失效时，补审受影响范围。
 
 ## 性能
 

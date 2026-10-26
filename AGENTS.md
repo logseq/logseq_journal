@@ -1,15 +1,17 @@
-- Use spec-dev-tool to manage agent decision documents; run `spec-dev-tool --help` and follow its AGENT WORKFLOW.
-- All changes must comply with `docs/ux-guidelines.md`.
-- Keep temporary review and test evidence, experiments, reports, screenshots, and generated hosts outside this repository in the current task's external evidence directory. Do not create a repository `review/` directory or temporary test directories. Reusable formal test source belongs in the existing test directories.
-- Before adding a bug regression test, identify the production state owner and attempt reproduction through its public pure reducer events, completions, state, and effects. If that boundary reproduces the defect, add only pure reducer regression tests for it; do not duplicate coverage in effect-runner, persistence, transport, integration, E2E, or UI tests. If it cannot, document the missing ownership boundary and test only the narrowest layer that executes the defect. Injecting an already incorrect external result is not a pure reproduction. Use deterministic public interfaces without bypassing `.mli` files or copying implementation logic. This rule does not authorize removing existing tests or moving production ownership for test classification.
-- When asked to find simplifications, run `spec-dev-tool guide find-simplifications` from inside this Git worktree and follow the emitted workflow.
-- When asked to find test simplifications, run `spec-dev-tool guide find-test-simplifications` from inside this Git worktree and follow the emitted workflow.
-- Do not modify any ocaml files under `spec/` during development unless explicitly asked to modify the `.mli` files under `spec/`.
-- Do not modify any dune file during development unless explicitly asked.
-- If development is blocked because the `.mli` definitions under `spec/` are unclear or unreasonable, stop development immediately and report the specific spec issue, suggested changes, and rationale.
-- Do not modify any ocaml files in bonsai_flutter repo
-- Prefer native bonsai-ui/SwiftUI components and their built-in layout, scrolling, and animation behavior. Do not recreate these behaviors using per-row geometry tracking, shared observable geometry state, or repeated collection scans during scrolling. If native APIs cannot satisfy a requirement, explain the limitation and obtain explicit approval before implementing custom UI coordination.
+# Journal repository guidance
 
-## Build
+- Follow [UX guidelines](docs/ux-guidelines.md). Prefer native bonsai-ui/SwiftUI layout, scrolling and animation. Custom coordination through per-row geometry, shared geometry state or repeated scrolling scans needs an explained native API limitation and explicit approval.
+- Protect existing work. Keep temporary evidence, reports, screenshots and generated hosts in the task's external evidence directory; reusable formal tests belong in existing test directories.
+- Do not edit OCaml under `spec/` without an explicit request to change its `.mli` contracts, or any Dune file without an explicit request. If a spec blocks development, report the contract issue, suggested change and rationale. Do not edit OCaml in bonsai_flutter.
+- Before adding a bug regression, follow [regression scope](.agents/skills/journal-code-review/references/validation.md#regression-scope): identify the production owner and reproduce through its public pure reducer boundary first.
+- Use `spec-dev-tool --help` for decision documents and its AGENT WORKFLOW. For simplification requests, run `spec-dev-tool guide find-simplifications` or `spec-dev-tool guide find-test-simplifications` inside this worktree as appropriate.
+- Repository guidance does not grant execution or external-action permission. Carry forward the user's existing authorization; ask only for a missing scope or required approval. Handoffs record the target, actual progress, evidence, remaining blockers and authorization boundary.
 
-Use `bash .agents/skills/journal-build/scripts/build_journal_apple.sh --help` as the Apple build entry point. Read [journal-build](.agents/skills/journal-build/SKILL.md) for target selection, prerequisites, cache/provenance, failure handling and acceptance limits.
+## Task routing
+
+| Task | Read |
+| --- | --- |
+| Apple build, dependency cache or native provenance | [journal-build](.agents/skills/journal-build/SKILL.md); entry: `bash .agents/skills/journal-build/scripts/build_journal_apple.sh --help` |
+| Requested or independent review | [journal-code-review](.agents/skills/journal-code-review/SKILL.md) |
+| Simulator interaction, screenshots or GUI acceptance | [testing-ios-simulator](.agents/skills/testing-ios-simulator/SKILL.md) |
+| Choose final checks for any change | [validation scope](.agents/skills/journal-code-review/references/validation.md#final-validation) |
