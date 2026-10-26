@@ -1,5 +1,5 @@
 type request =
-  | Feed of { before_day : int option }
+  | Feed of { cursor : Journal_graph_projection.feed_cursor option }
   | Day of
       { day : int
       ; after : Journal_graph_projection.block_cursor option
@@ -12,7 +12,7 @@ type slot =
       { day : int
       ; after : Journal_graph_projection.block_cursor option
       }
-  | Feed_continuation of { before_day : int }
+  | Feed_continuation of { cursor : Journal_graph_projection.feed_cursor }
 
 type recovery =
   { day : int
@@ -92,9 +92,14 @@ let slot_key = function
   | Day_heading page -> "day:" ^ string_of_int page.Journal_graph_projection.day
   | Top_level entry -> "block:" ^ Journal_model.id entry.block
   | Day_continuation { day; _ } -> "day-continuation:" ^ string_of_int day
-  | Feed_continuation { before_day } -> "feed-continuation:" ^ string_of_int before_day
+  | Feed_continuation { cursor } ->
+    "feed-continuation:"
+    ^ Option.fold ~none:"latest" ~some:string_of_int cursor.before_day
+    ^ Option.fold
+        ~none:""
+        ~some:(fun day -> ":skip:" ^ string_of_int day)
+        cursor.skipped_day
 ;;
-
 let slice slots start stop = Rrbvec.subvec slots start stop |> Option.get
 
 let splice slots start stop replacement =
@@ -110,13 +115,6 @@ let find_slot_index predicate slots =
        incr index;
        if predicate slot then Some !index else None)
     slots
-;;
-
-let span_end predicate slots start =
-  find_slot_index
-    (fun slot -> not (predicate slot))
-    (slice slots start (Rrbvec.length slots))
-  |> Option.fold ~none:(Rrbvec.length slots) ~some:(fun offset -> start + offset)
 ;;
 
 let slot_block = function
@@ -352,7 +350,7 @@ let finish_change before state =
 
 let begin_request (state : t) ~generation request =
   match state.pending, request with
-  | Some (pending_generation, _), Feed { before_day = None }
+  | Some (pending_generation, _), Feed { cursor = None }
     when Int64.compare generation pending_generation > 0 ->
     { state with
       pending = Some (generation, request)
@@ -360,13 +358,20 @@ let begin_request (state : t) ~generation request =
     ; day_failures = []
     }
   | Some _, _ -> state
-  | None, Feed { before_day = None } ->
+  | None, Feed { cursor = None } ->
     { state with
       pending = Some (generation, request)
     ; recovery = None
     ; day_failures = []
     }
   | None, _ -> { state with pending = Some (generation, request) }
+;;
+
+let fail_feed_request state ~generation =
+  match state.pending with
+  | Some (expected, Feed _) when generation = expected ->
+    {state with pending=None;visible_demand=Some []}
+  | _ -> state
 ;;
 
 let day_error (state : t) ~day = List.assoc_opt day state.day_failures
@@ -409,7 +414,7 @@ let start_recovery (state : t) ~day =
   ; recovery =
       Some
         { day
-        ; target_count = List.length day_entries + 64
+        ; target_count = List.length day_entries + 30
         ; anchor_ids
         ; entries = []
         ; next_cursor = None
@@ -470,17 +475,13 @@ let feed_slots ~today (feed : Journal_graph_projection.feed) =
       feed.days
   in
   let rows = List.concat_map (day_slots ~today) days in
-  let continuation =
-    match feed.has_more_days, List.rev days with
-    | true, last :: _ -> [ Feed_continuation { before_day = last.page.day } ]
-    | false, _ | true, [] -> []
-  in
+  let continuation = Option.fold ~none:[] ~some:(fun cursor -> [Feed_continuation {cursor}]) feed.continuation in
   rows @ continuation
 ;;
 
 let request_of_slot = function
   | Day_continuation { day; after } -> Some (Day { day; after })
-  | Feed_continuation { before_day } -> Some (Feed { before_day = Some before_day })
+  | Feed_continuation { cursor } -> Some (Feed { cursor = Some cursor })
   | Day_heading _ | Top_level _ -> None
 ;;
 
@@ -547,31 +548,131 @@ let stop_visible_drain state =
   else { state with visible_demand = Option.map (fun _ -> []) state.visible_demand }
 ;;
 
-let replace_slot (state : t) ~predicate replacement =
-  match find_slot_index predicate state.slots with
-  | None -> state
-  | Some index ->
-    let slots = splice state.slots index (index + 1) (Rrbvec.of_list replacement) in
-    { state with slots; pending = None }
+let merge_feed_days (state : t) incoming =
+  List.fold_left
+    (fun state (d : Journal_graph_projection.day_feed) ->
+       let old_last =
+         Rrbvec.fold_left
+           (fun last -> function
+              | Top_level e when Journal_model.journal_day e.block = d.page.day ->
+                Some e.block
+              | _ -> last)
+           None
+           state.slots
+       in
+       let old_cursor =
+         Rrbvec.find_map
+           (function
+             | Day_continuation c when c.day = d.page.day -> Some c.after
+             | _ -> None)
+           state.slots
+         |> Option.join
+       in
+       let fresh_last =
+         List.find_opt (fun _ -> true) (List.rev d.entries)
+         |> Option.map (fun (e : Journal_graph_projection.timeline_entry) -> e.block)
+       in
+       let continuation =
+         match old_last, fresh_last with
+         | Some old, Some fresh when compare_blocks old fresh > 0 -> old_cursor
+         | _ -> d.continuation
+       in
+       let fresh_ids =
+         List.fold_left
+           (fun ids (e : Journal_graph_projection.timeline_entry) ->
+              Entries.add (Journal_model.id e.block) () ids)
+           Entries.empty
+           d.entries
+       in
+       let removed = ref Days.empty in
+       let slots =
+         filter_slots
+           (function
+             | Top_level e when Entries.mem (Journal_model.id e.block) fresh_ids ->
+               let day = Journal_model.journal_day e.block in
+               removed
+               := Days.update day (fun n -> Some (1 + Option.value n ~default:0)) !removed;
+               false
+             | Day_continuation c when c.day = d.page.day -> false
+             | _ -> true)
+           state.slots
+       in
+       let slots = List.fold_left insert_entry slots d.entries in
+       let slots =
+         if
+           d.page.day <> state.today
+           && not
+                (Rrbvec.exists
+                   (function
+                     | Day_heading p -> p.day = d.page.day
+                     | _ -> false)
+                   slots)
+         then insert_day_slots slots d.page.day [ Day_heading d.page ]
+         else slots
+       in
+       let slots =
+         match continuation with
+         | None -> slots
+         | Some _ ->
+           let index =
+             find_slot_index
+               (fun slot ->
+                  Option.fold
+                    ~none:true
+                    ~some:(fun day -> day < d.page.day)
+                    (slot_day slot))
+               slots
+             |> Option.value ~default:(Rrbvec.length slots)
+           in
+           splice
+             slots
+             index
+             index
+             (Rrbvec.singleton
+                (Day_continuation { day = d.page.day; after = continuation }))
+       in
+       let days =
+         Days.fold
+           (fun day n ->
+              Days.update
+                day
+                (Option.map (fun k -> { k with block_count = max 0 (k.block_count - n) })))
+           !removed
+           state.days
+       in
+       let retained =
+         Option.fold
+           ~none:0
+           ~some:(fun k -> k.block_count)
+           (Days.find_opt d.page.day days)
+       in
+       let knowledge =
+         { (knowledge_of_feed d) with
+           block_count = retained + List.length d.entries
+         ; complete = Option.is_none continuation
+         }
+       in
+       { state with slots; days = Days.add d.page.day knowledge days })
+    state
+    incoming
 ;;
-
-let apply_feed (state : t) ~generation feed =
+let apply_feed_dates (state : t) ~generation feed =
   match state.pending with
-  | Some (expected_generation, Feed { before_day })
+  | Some (expected_generation, Feed { cursor })
     when Int64.equal expected_generation generation ->
     let before = state in
     let days =
       List.fold_left
         (fun days day ->
            Days.add day.Journal_graph_projection.page.day (knowledge_of_feed day) days)
-        (match before_day with
+        (match cursor with
          | None -> Days.empty
          | Some _ -> state.days)
         feed.Journal_graph_projection.days
     in
     let state = { state with days } in
     let projected = feed_slots ~today:state.today feed in
-    (match before_day with
+    (match cursor with
      | None when Rrbvec.is_empty state.slots ->
        { state with
          slots = Rrbvec.of_list projected
@@ -585,22 +686,31 @@ let apply_feed (state : t) ~generation feed =
      | None ->
        let slots = Rrbvec.of_list projected in
        { state with slots; visible_demand = None; pending = None } |> finish_change before
-     | Some expected_before_day ->
-       let request = Feed { before_day = Some expected_before_day } in
+     | Some expected_cursor ->
+       let request = Feed { cursor = Some expected_cursor } in
        let state =
-         replace_slot
-           state
-           ~predicate:(function
-             | Feed_continuation { before_day } -> before_day = expected_before_day
-             | _ -> false)
-           projected
-         |> finish_change before
+         if not (request_is_retained before request)
+         then before
+         else (
+           let state = merge_feed_days before feed.days in
+           let slots =
+             filter_slots
+               (function
+                 | Feed_continuation _ -> false
+                 | _ -> true)
+               state.slots
+           in
+           let slots =
+             match feed.continuation with
+             | None -> slots
+             | Some cursor -> Rrbvec.push_back slots (Feed_continuation { cursor })
+           in
+           { state with slots; pending = None } |> finish_change before)
        in
        let successor =
          List.find_map
            (function
-             | Feed_continuation { before_day } ->
-               Some (Feed { before_day = Some before_day })
+             | Feed_continuation { cursor } -> Some (Feed { cursor = Some cursor })
              | _ -> None)
            projected
        in
@@ -609,7 +719,252 @@ let apply_feed (state : t) ~generation feed =
        else complete_visible_request ?successor state request)
   | Some _ | None -> state
 ;;
+let refresh_chronological_feed (state : t) ~generation ~complete (feed : Journal_graph_projection.feed) =
+  match state.pending with
+  | Some (expected, Feed { cursor = None }) when expected = generation ->
+    let exhausted =
+      complete
+      && (Option.is_none feed.continuation)
+      && List.for_all
+           (fun (d : Journal_graph_projection.day_feed) -> not d.has_more_entries)
+           feed.days
+    in
+    let cutoff =
+      List.fold_left
+        (fun last (d : Journal_graph_projection.day_feed) ->
+           List.fold_left
+             (fun _ (e : Journal_graph_projection.timeline_entry) -> Some e.block)
+             last
+             d.entries)
+        None
+        feed.days
+    in
+    (match cutoff with
+     | None ->
+       if exhausted
+       then apply_feed_dates state ~generation feed
+       else { state with pending = None }
+     | Some _ when exhausted -> apply_feed_dates state ~generation feed
+     | Some cutoff ->
+       let day = Journal_model.journal_day cutoff in
+       let start =
+         find_slot_index
+           (function
+             | Top_level e ->
+               let candidate = Journal_model.journal_day e.block in
+               candidate < day || (candidate = day && compare_blocks e.block cutoff > 0)
+             | Day_heading p -> p.day < day
+             | Day_continuation d -> d.day < day
+             | Feed_continuation _ -> false)
+           state.slots
+       in
+       (match start with
+        | None -> apply_feed_dates state ~generation feed
+        | Some start ->
+          let same_day_tail =
+            match Rrbvec.nth state.slots start with
+            | Top_level e -> Journal_model.journal_day e.block = day
+            | _ -> false
+          in
+          let prefix =
+            feed_slots ~today:state.today feed
+            |> List.filter (function
+              | Feed_continuation _ -> false
+              | Day_continuation d when d.day = day && same_day_tail -> false
+              | _ -> true)
+            |> Rrbvec.of_list
+          in
+          let prefix_ids =
+            Rrbvec.fold_left
+              (fun ids -> function
+                 | Top_level e -> Entries.add (Journal_model.id e.block) () ids
+                 | _ -> ids)
+              Entries.empty
+              prefix
+          in
+          let moved_from = ref Days.empty in
+          let suffix =
+            slice state.slots start (Rrbvec.length state.slots)
+            |> filter_slots (function
+              | Top_level e when Entries.mem (Journal_model.id e.block) prefix_ids ->
+                let day = Journal_model.journal_day e.block in
+                moved_from := Days.update day
+                    (fun count -> Some (1 + Option.value count ~default:0)) !moved_from;
+                false
+              | _ -> true)
+          in
+          let days =
+            List.fold_left
+              (fun days (d : Journal_graph_projection.day_feed) ->
+                 Days.add d.page.day (knowledge_of_feed d) days)
+              state.days
+              feed.days
+          in
+          let days =
+            if not same_day_tail
+            then days
+            else (
+              let removed =
+                Rrbvec.fold_left
+                  (fun n -> function
+                     | Top_level e when Journal_model.journal_day e.block = day -> n + 1
+                     | _ -> n)
+                  0
+                  (slice state.slots 0 start)
+              in
+              let old = Days.find day state.days in
+              Days.update
+                day
+                (Option.map (fun fresh ->
+                   { fresh with
+                     block_count = fresh.block_count + max 0 (old.block_count - removed)
+                   ; complete = old.complete
+                   }))
+                days)
+          in
+          let days =
+            Days.fold
+              (fun day count days ->
+                 Days.update day
+                   (Option.map (fun knowledge ->
+                      { knowledge with block_count = max 0 (knowledge.block_count - count) }))
+                   days)
+              !moved_from
+              days
+          in
+          { state with
+            slots = Rrbvec.append prefix suffix
+          ; days
+          ; pending = None
+          ; visible_demand = None
+          }
+          |> finish_change state))
+  | _ -> state
+;;
 
+(* Today and the chronological prefix cover separate ranges. Refresh each
+   against its retained rows, then restore date order and the original UUID anchor. *)
+let refresh_feed (state : t) ~generation ~complete (feed : Journal_graph_projection.feed) =
+  match state.pending, feed.prioritized_day with
+  | Some (expected, Feed { cursor = None }), Some today when expected = generation ->
+    let fresh_ids =
+      List.fold_left
+        (fun ids (d : Journal_graph_projection.day_feed) ->
+           List.fold_left
+             (fun ids (e : Journal_graph_projection.timeline_entry) ->
+                Entries.add
+                  (Journal_model.id e.block)
+                  (Journal_model.journal_day e.block)
+                  ids)
+             ids
+             d.entries)
+        Entries.empty
+        feed.days
+    in
+    let removed = ref Days.empty in
+    let slots =
+      filter_slots
+        (function
+          | Top_level e ->
+            let day = Journal_model.journal_day e.block in
+            (match Entries.find_opt (Journal_model.id e.block) fresh_ids with
+             | Some target when target <> day ->
+               removed
+               := Days.update day (fun n -> Some (1 + Option.value n ~default:0)) !removed;
+               false
+             | _ -> true)
+          | _ -> true)
+        state.slots
+    in
+    let days =
+      Days.fold
+        (fun day n ->
+           Days.update
+             day
+             (Option.map (fun k -> { k with block_count = max 0 (k.block_count - n) })))
+        !removed
+        state.days
+    in
+    let cleaned = { state with slots; days } in
+    let today_slots =
+      filter_slots (fun slot -> slot_day slot = Some today) cleaned.slots
+    in
+    let today_state =
+      { cleaned with
+        slots = today_slots
+      ; days = Days.filter (fun day _ -> day = today) days
+      }
+    in
+    let today_feed =
+      List.find_opt
+        (fun (d : Journal_graph_projection.day_feed) -> d.page.day = today)
+        feed.days
+    in
+    let today_value =
+      { feed with
+        days = Option.to_list today_feed
+      ; continuation = None
+      ; prioritized_day = None
+      }
+    in
+    let today_state =
+      match today_feed with
+      | Some d when d.has_more_entries ->
+        refresh_chronological_feed today_state ~generation ~complete today_value
+      | _ -> apply_feed_dates today_state ~generation today_value
+    in
+    let chronological =
+      { cleaned with
+        slots = filter_slots (fun slot -> slot_day slot <> Some today) cleaned.slots
+      ; days = Days.remove today days
+      }
+    in
+    let chronological_days =
+      List.filter
+        (fun (d : Journal_graph_projection.day_feed) -> d.page.day <> today)
+        feed.days
+    in
+    let chronological_value =
+      { feed with days = chronological_days; prioritized_day = None }
+    in
+    let chronological =
+      if chronological_days = []
+      then { chronological with pending = None }
+      else
+        refresh_chronological_feed chronological ~generation ~complete chronological_value
+    in
+    let chronological =
+      if chronological_days <> []
+      then chronological
+      else (
+        let slots =
+          filter_slots
+            (function
+              | Feed_continuation _ -> false
+              | _ -> true)
+            chronological.slots
+        in
+        let slots =
+          match feed.continuation with
+          | None -> slots
+          | Some cursor -> Rrbvec.push_back slots (Feed_continuation { cursor })
+        in
+        { chronological with slots })
+    in
+    let index =
+      find_slot_index
+        (fun slot ->
+           Option.fold ~none:true ~some:(fun day -> day < today) (slot_day slot))
+        chronological.slots
+      |> Option.value ~default:(Rrbvec.length chronological.slots)
+    in
+    let slots = splice chronological.slots index index today_state.slots in
+    let days =
+      Days.union (fun _ _ today -> Some today) chronological.days today_state.days
+    in
+    { chronological with slots; days } |> finish_change state
+  | _ -> refresh_chronological_feed state ~generation ~complete feed
+;;
 let append_timeline_entry_page
       (state : t)
       ~generation
@@ -701,128 +1056,304 @@ let append_timeline_entry_page
   | Some _ | None -> state
 ;;
 
-let replace_block (state : t) replacement =
-  let state = invalidate_recovery_for_day state (Journal_model.journal_day replacement) in
-  let replacement_id = Journal_model.id replacement in
-  let before = state in
-  let retained = ref false in
-  let hidden_match = ref false in
-  let restore_in_place = ref false in
-  let state =
-    update_day state (Journal_model.journal_day replacement) (fun knowledge ->
-      match knowledge.hidden_entry with
-      | Some entry when String.equal (Journal_model.id entry.block) replacement_id ->
-        hidden_match := true;
-        restore_in_place := not knowledge.hidden;
-        let entry = { entry with block = replacement } in
-        { knowledge with
-          hidden_entry = Some entry
-        ; block_count =
-            (if empty_parent entry
-             then knowledge.block_count
-             else max 1 knowledge.block_count)
-        }
-      | _ -> knowledge)
-  in
-  let slots =
-    update_slots
+let point_entry (state : t) block_id =
+  match
+    Rrbvec.find_map
       (function
-        | Top_level entry when String.equal (Journal_model.id entry.block) replacement_id
-          ->
-          retained := true;
-          Some (Top_level { entry with block = replacement })
+        | Top_level e when Journal_model.id e.block = block_id -> Some e
         | _ -> None)
       state.slots
+  with
+  | Some _ as entry -> entry
+  | None ->
+    Days.fold
+      (fun _ k found ->
+         match found, k.hidden_entry with
+         | None, Some e when Journal_model.id e.block = block_id -> Some e
+         | _ -> found)
+      state.days
+      None
+;;
+
+let point_in_loaded_range (state : t) block =
+  match Journal_model.journal_day_opt block with
+  | None -> false
+  | Some day ->
+    (match Days.find_opt day state.days with
+     | Some k
+       when k.page.id = Journal_model.page_id block
+            && Journal_model.parent_id block = None ->
+       k.complete
+       ||
+       let key = Journal_model.sibling_order block, Journal_model.id block in
+       Rrbvec.exists
+         (function
+           | Top_level e when Journal_model.page_id e.block = k.page.id ->
+             compare key (Journal_model.sibling_order e.block, Journal_model.id e.block)
+             <= 0
+           | Day_continuation { day = candidate; after = Some cursor }
+             when candidate = day ->
+             compare key (cursor.after_sibling_order, cursor.after_block_id) <= 0
+           | _ -> false)
+         state.slots
+     | _ -> false)
+;;
+
+let location_changed old fresh =
+  Journal_model.page_id old <> Journal_model.page_id fresh
+  || Journal_model.journal_day_opt old <> Journal_model.journal_day_opt fresh
+  || Journal_model.parent_id old <> Journal_model.parent_id fresh
+  || Journal_model.sibling_order old <> Journal_model.sibling_order fresh
+;;
+
+let relocate_point (before : t) (entry : Journal_graph_projection.timeline_entry) =
+  let id = Journal_model.id entry.block in
+  let fits = point_in_loaded_range before entry.block && not (empty_parent entry) in
+  let removed = ref Days.empty in
+  let slots =
+    filter_slots
+      (function
+        | Top_level e when Journal_model.id e.block = id ->
+          let day = Journal_model.journal_day e.block in
+          removed
+          := Days.update day (fun n -> Some (1 + Option.value n ~default:0)) !removed;
+          false
+        | _ -> true)
+      before.slots
   in
-  let state = { state with slots } in
-  let entry =
-    match
-      Option.bind
-        (Days.find_opt (Journal_model.journal_day replacement) state.days)
-        (fun knowledge -> knowledge.hidden_entry)
-    with
-    | Some entry when Journal_model.id entry.block = replacement_id -> entry
-    | _ -> { Journal_graph_projection.block = replacement; child_summaries = [] }
+  let days =
+    Days.mapi
+      (fun day k ->
+         let hidden =
+           Option.fold
+             ~none:false
+             ~some:(fun (e : Journal_graph_projection.timeline_entry) ->
+               Journal_model.id e.block = id)
+             k.hidden_entry
+         in
+         { k with
+           block_count =
+             max
+               0
+               (k.block_count
+                - Option.value (Days.find_opt day !removed) ~default:0
+                - if hidden && k.hidden then 1 else 0)
+         ; hidden_entry = (if hidden then None else k.hidden_entry)
+         ; hidden = k.hidden && not hidden
+         })
+      before.days
+  in
+  let state = { before with slots; days } in
+  let state =
+    Days.fold (fun day _ state -> invalidate_recovery_for_day state day) !removed state
+    |> fun state ->
+    invalidate_recovery_for_day state (Journal_model.journal_day entry.block)
   in
   let state =
-    if
-      (not !retained)
-      && ((not !hidden_match) || !restore_in_place)
-      && Journal_model.parent_id replacement = None
-      && (not (empty_parent entry))
-      && Days.mem (Journal_model.journal_day replacement) state.days
-    then
-      { state with slots = insert_entry state.slots entry }
-      |> fun state ->
-      update_day state (Journal_model.journal_day replacement) (fun k ->
-        { k with
-          block_count = (k.block_count + if !hidden_match then 0 else 1)
-        ; hidden_entry = (if !hidden_match then None else k.hidden_entry)
-        })
-    else state
+    if not fits
+    then state
+    else (
+      let day = Journal_model.journal_day entry.block in
+      let slots = insert_entry state.slots entry in
+      let slots =
+        if
+          day <> state.today
+          && not
+               (Rrbvec.exists
+                  (function
+                    | Day_heading p -> p.day = day
+                    | _ -> false)
+                  slots)
+        then insert_day_slots slots day [ Day_heading (Days.find day state.days).page ]
+        else slots
+      in
+      { state with
+        slots
+      ; days =
+          Days.update
+            day
+            (Option.map (fun k ->
+               { k with
+                 block_count = k.block_count + 1
+               ; hidden = false
+               ; hidden_entry = None
+               }))
+            state.days
+      })
   in
   finish_change before state
+;;
+
+let refresh_child_preview replacement (entry : Journal_graph_projection.timeline_entry) =
+  if
+    Journal_model.parent_id replacement = Some (Journal_model.id entry.block)
+    && Journal_model.page_id replacement = Journal_model.page_id entry.block
+  then (
+    let summary =
+      Journal_graph_projection.
+        { block_id = Journal_model.id replacement
+        ; source = Journal_model.source replacement
+        ; asset_file_type = Journal_model.asset_file_type replacement
+        }
+    in
+    if
+      List.exists
+        (fun (child : Journal_graph_projection.child_summary) ->
+           child.block_id = summary.block_id && child <> summary)
+        entry.child_summaries
+    then
+      Some
+        { entry with
+          child_summaries =
+            List.map
+              (fun (child : Journal_graph_projection.child_summary) ->
+                 if child.block_id = summary.block_id then summary else child)
+              entry.child_summaries
+        }
+    else None)
+  else None
+;;
+
+let replace_block (state : t) replacement =
+  match point_entry state (Journal_model.id replacement) with
+  | Some old when location_changed old.block replacement ->
+    relocate_point state { old with block = replacement }
+  | _ ->
+    let state =
+      invalidate_recovery_for_day state (Journal_model.journal_day replacement)
+    in
+    let replacement_id = Journal_model.id replacement in
+    let before = state in
+    let retained = ref false in
+    let hidden_match = ref false in
+    let restore_in_place = ref false in
+    let state =
+      update_day state (Journal_model.journal_day replacement) (fun knowledge ->
+        match knowledge.hidden_entry with
+        | Some entry when String.equal (Journal_model.id entry.block) replacement_id ->
+          hidden_match := true;
+          restore_in_place := not knowledge.hidden;
+          let entry = { entry with block = replacement } in
+          { knowledge with
+            hidden_entry = Some entry
+          ; block_count =
+              (if empty_parent entry
+               then knowledge.block_count
+               else max 1 knowledge.block_count)
+          }
+        | Some entry ->
+          (match refresh_child_preview replacement entry with
+           | Some entry -> { knowledge with hidden_entry = Some entry }
+           | None -> knowledge)
+        | None -> knowledge)
+    in
+    let slots =
+      update_slots
+        (function
+          | Top_level entry
+            when String.equal (Journal_model.id entry.block) replacement_id ->
+            retained := true;
+            Some (Top_level { entry with block = replacement })
+          | Top_level entry ->
+            Option.map
+              (fun entry -> Top_level entry)
+              (refresh_child_preview replacement entry)
+          | _ -> None)
+        state.slots
+    in
+    let state = { state with slots } in
+    let entry =
+      match
+        Option.bind
+          (Days.find_opt (Journal_model.journal_day replacement) state.days)
+          (fun knowledge -> knowledge.hidden_entry)
+      with
+      | Some entry when Journal_model.id entry.block = replacement_id -> entry
+      | _ -> { Journal_graph_projection.block = replacement; child_summaries = [] }
+    in
+    let state =
+      if
+        (not !retained)
+        && ((not !hidden_match) || !restore_in_place)
+        && Journal_model.parent_id replacement = None
+        && (not (empty_parent entry))
+        && point_in_loaded_range state replacement
+      then
+        { state with slots = insert_entry state.slots entry }
+        |> fun state ->
+        update_day state (Journal_model.journal_day replacement) (fun k ->
+          { k with
+            block_count = (k.block_count + if !hidden_match then 0 else 1)
+          ; hidden_entry = (if !hidden_match then None else k.hidden_entry)
+          })
+      else state
+    in
+    finish_change before state
 ;;
 
 let replace_timeline_entry
       (state : t)
       (replacement : Journal_graph_projection.timeline_entry)
   =
-  let state =
-    invalidate_recovery_for_day
-      state
-      (Journal_model.journal_day replacement.Journal_graph_projection.block)
-  in
-  let replacement_id = Journal_model.id replacement.Journal_graph_projection.block in
-  let before = state in
-  let retained = ref false in
-  let hidden_match = ref false in
-  let restore_in_place = ref false in
-  let state =
-    update_day state (Journal_model.journal_day replacement.block) (fun knowledge ->
-      match knowledge.hidden_entry with
-      | Some entry when String.equal (Journal_model.id entry.block) replacement_id ->
-        hidden_match := true;
-        restore_in_place := not knowledge.hidden;
-        { knowledge with
-          hidden_entry = Some replacement
-        ; block_count =
-            (if empty_parent replacement
-             then knowledge.block_count
-             else max 1 knowledge.block_count)
-        }
-      | _ -> knowledge)
-  in
-  let slots =
-    update_slots
-      (function
-        | Top_level entry when String.equal (Journal_model.id entry.block) replacement_id
-          ->
-          retained := true;
-          Some (Top_level replacement)
-        | _ -> None)
-      state.slots
-  in
-  let state = { state with slots } in
-  let day = Journal_model.journal_day replacement.block in
-  let state =
-    if
-      (not !retained)
-      && ((not !hidden_match) || !restore_in_place)
-      && (not (empty_parent replacement))
-      && Journal_model.parent_id replacement.block = None
-      && Days.mem day state.days
-    then
-      { state with slots = insert_entry state.slots replacement }
-      |> fun state ->
-      update_day state day (fun k ->
-        { k with
-          block_count = (k.block_count + if !hidden_match then 0 else 1)
-        ; hidden_entry = (if !hidden_match then None else k.hidden_entry)
-        })
-    else state
-  in
-  finish_change before state
+  match point_entry state (Journal_model.id replacement.block) with
+  | Some old when location_changed old.block replacement.block ->
+    relocate_point state replacement
+  | _ ->
+    let state =
+      invalidate_recovery_for_day
+        state
+        (Journal_model.journal_day replacement.Journal_graph_projection.block)
+    in
+    let replacement_id = Journal_model.id replacement.Journal_graph_projection.block in
+    let before = state in
+    let retained = ref false in
+    let hidden_match = ref false in
+    let restore_in_place = ref false in
+    let state =
+      update_day state (Journal_model.journal_day replacement.block) (fun knowledge ->
+        match knowledge.hidden_entry with
+        | Some entry when String.equal (Journal_model.id entry.block) replacement_id ->
+          hidden_match := true;
+          restore_in_place := not knowledge.hidden;
+          { knowledge with
+            hidden_entry = Some replacement
+          ; block_count =
+              (if empty_parent replacement
+               then knowledge.block_count
+               else max 1 knowledge.block_count)
+          }
+        | _ -> knowledge)
+    in
+    let slots =
+      update_slots
+        (function
+          | Top_level entry
+            when String.equal (Journal_model.id entry.block) replacement_id ->
+            retained := true;
+            Some (Top_level replacement)
+          | _ -> None)
+        state.slots
+    in
+    let state = { state with slots } in
+    let day = Journal_model.journal_day replacement.block in
+    let state =
+      if
+        (not !retained)
+        && ((not !hidden_match) || !restore_in_place)
+        && (not (empty_parent replacement))
+        && Journal_model.parent_id replacement.block = None
+        && point_in_loaded_range state replacement.block
+      then
+        { state with slots = insert_entry state.slots replacement }
+        |> fun state ->
+        update_day state day (fun k ->
+          { k with
+            block_count = (k.block_count + if !hidden_match then 0 else 1)
+          ; hidden_entry = (if !hidden_match then None else k.hidden_entry)
+          })
+      else state
+    in
+    finish_change before state
 ;;
 
 let replace_timeline_entry_page
@@ -831,100 +1362,105 @@ let replace_timeline_entry_page
       (replacement : Journal_graph_projection.timeline_entry_page)
   =
   let before = state in
-  let state =
-    match Days.find_opt page.day state.days with
-    | Some knowledge when knowledge.hidden ->
-      let slots =
-        insert_day_slots
-          state.slots
-          page.day
-          ((if page.day = state.today then [] else [ Day_heading page ])
-           @ Option.to_list
-               (Option.map (fun entry -> Top_level entry) knowledge.hidden_entry))
-      in
-      { state with slots }
-    | _ -> state
+  let ids, body, count =
+    List.fold_left
+      (fun (ids, slots, count) (entry : Journal_graph_projection.timeline_entry) ->
+         ( Entries.add (Journal_model.id entry.block) () ids
+         , Rrbvec.push_back slots (Top_level entry)
+         , count + 1 ))
+      (Entries.empty, Rrbvec.empty, 0)
+      replacement.entries
   in
-  let state =
-    { state with
-      days =
-        Days.add
-          page.day
-          { page
-          ; block_count = List.length replacement.entries
-          ; complete = Option.is_none replacement.continuation
-          ; hidden = false
-          ; hidden_entry = None
-          }
-          state.days
-    }
+  let removed = ref Days.empty in
+  let slots =
+    filter_slots
+      (function
+        | Top_level e ->
+          let day = Journal_model.journal_day e.block in
+          if
+            Journal_model.page_id e.block = page.id
+            || day = page.day
+            || Entries.mem (Journal_model.id e.block) ids
+          then (
+            removed
+            := Days.update day (fun n -> Some (1 + Option.value n ~default:0)) !removed;
+            false)
+          else true
+        | Day_heading p -> p.id <> page.id && p.day <> page.day
+        | Day_continuation c -> c.day <> page.day
+        | Feed_continuation _ -> true)
+      state.slots
   in
+  let days =
+    Days.mapi
+      (fun day k ->
+         let hidden =
+           Option.fold
+             ~none:false
+             ~some:(fun (e : Journal_graph_projection.timeline_entry) ->
+               Entries.mem (Journal_model.id e.block) ids)
+             k.hidden_entry
+         in
+         { k with
+           block_count =
+             max
+               0
+               (k.block_count
+                - Option.value (Days.find_opt day !removed) ~default:0
+                - if hidden && k.hidden then 1 else 0)
+         ; hidden_entry = (if hidden then None else k.hidden_entry)
+         ; hidden = k.hidden && not hidden
+         })
+      state.days
+  in
+  let days =
+    Days.add
+      page.day
+      { page
+      ; block_count = count
+      ; complete = Option.is_none replacement.continuation
+      ; hidden = false
+      ; hidden_entry = None
+      }
+      days
+  in
+  let body =
+    if page.day = state.today
+    then body
+    else Rrbvec.append (Rrbvec.singleton (Day_heading page)) body
+  in
+  let body =
+    match replacement.continuation with
+    | None -> body
+    | Some after ->
+      Rrbvec.push_back body (Day_continuation { day = page.day; after = Some after })
+  in
+  let index =
+    find_slot_index
+      (fun slot ->
+         Option.fold ~none:true ~some:(fun day -> day < page.day) (slot_day slot))
+      slots
+    |> Option.value ~default:(Rrbvec.length slots)
+  in
+  let slots = splice slots index index body in
   let pending =
     match state.pending with
     | Some (_, Day { day; _ }) when day = page.day -> None
-    | pending -> pending
+    | value -> value
   in
-  let state =
-    { state with
-      pending
-    ; recovery =
-        (match state.recovery with
-         | Some recovery when recovery.day = page.day -> None
-         | value -> value)
-    ; day_failures = List.remove_assoc page.day state.day_failures
-    }
+  let recovery =
+    match state.recovery with
+    | Some r when r.day = page.day -> None
+    | value -> value
   in
-  let replacement_slots =
-    List.map (fun entry -> Top_level entry) replacement.entries
-    @
-    match replacement.continuation with
-    | None -> []
-    | Some after -> [ Day_continuation { day = page.day; after = Some after } ]
-  in
-  let belongs_to_page = function
-    | Top_level entry -> String.equal (Journal_model.page_id entry.block) page.id
-    | Day_continuation continuation -> continuation.day = page.day
-    | Day_heading _ | Feed_continuation _ -> false
-  in
-  let position =
-    find_slot_index
-      (function
-        | Day_heading candidate -> String.equal candidate.id page.id
-        | Top_level entry -> String.equal (Journal_model.page_id entry.block) page.id
-        | _ -> false)
-      state.slots
-  in
-  let position =
-    match position with
-    | Some index -> Some index
-    | None ->
-      if Days.mem page.day before.days
-      then
-        Some
-          (Option.value
-             ~default:(Rrbvec.length state.slots)
-             (find_slot_index
-                (fun slot ->
-                   match slot_day slot with
-                   | Some day -> day < page.day
-                   | None ->
-                     (match slot with
-                      | Feed_continuation _ -> true
-                      | _ -> false))
-                state.slots))
-      else None
-  in
-  match position with
-  | None -> before
-  | Some index ->
-    let start =
-      match Rrbvec.nth_opt state.slots index with
-      | Some (Day_heading _) -> index + 1
-      | _ -> index
-    in
-    let stop = span_end belongs_to_page state.slots start in
-    let slots = splice state.slots start stop (Rrbvec.of_list replacement_slots) in
-    { state with slots; pending } |> finish_change before
+  { state with
+    slots
+  ; days
+  ; pending
+  ; recovery
+  ; day_failures = List.remove_assoc page.day state.day_failures
+  }
+  |> finish_change before
 ;;
 
 let apply_timeline_entry_page
@@ -1039,6 +1575,50 @@ let apply_timeline_entry_page
   | _, None -> append_timeline_entry_page state ~generation page
 ;;
 
+let apply_feed (state : t) ~generation (feed : Journal_graph_projection.feed) =
+  match state.pending with
+  | Some (expected, Day { day; after }) when generation = expected ->
+    let first, older =
+      match feed.days with
+      | first :: rest when first.page.day = day -> Some first, rest
+      | days -> None, days
+    in
+    let page : Journal_graph_projection.timeline_entry_page =
+      match first with
+      | None -> { entries = []; continuation = None }
+      | Some first -> { entries = first.entries; continuation = first.continuation }
+    in
+    let updated = apply_timeline_entry_page state ~generation page in
+    if updated == state || updated.recovery <> None
+    then updated
+    else (
+      let merged = merge_feed_days updated older in
+      let slots =
+        filter_slots
+          (function
+            | Feed_continuation _ -> false
+            | _ -> true)
+          merged.slots
+      in
+      let slots =
+        match feed.continuation with
+        | Some cursor -> Rrbvec.push_back slots (Feed_continuation { cursor })
+        | None -> slots
+      in
+      let merged = { merged with slots } |> finish_change state in
+      let request = Day { day; after } in
+      let successor =
+        Rrbvec.fold_left
+          (fun next slot ->
+             match request_of_slot slot with
+             | Some r -> Some r
+             | None -> next)
+          None
+          slots
+      in
+      complete_visible_request ?successor merged request)
+  | _ -> apply_feed_dates state ~generation feed
+;;
 let next_request (state : t) =
   if Option.is_some state.pending
   then None

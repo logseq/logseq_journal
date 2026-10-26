@@ -92,9 +92,24 @@ let feed ?(more = false) days : Journal_graph_projection.feed =
       0
       days
   in
-  { days; slot_count; has_more_days = more }
+  { days
+  ; slot_count
+  ; continuation =
+      (if more
+       then
+         Option.map
+           (fun (d : Journal_graph_projection.day_feed) ->
+              Journal_graph_projection.
+                { before_day = Some d.page.day; skipped_day = None })
+           (List.sort
+              (fun (a : Journal_graph_projection.day_feed) b ->
+                 Int.compare a.page.day b.page.day)
+              days
+            |> List.find_opt (fun _ -> true))
+       else None)
+  ; prioritized_day = None
+  }
 ;;
-
 let continuation_of_entries ~more entries =
   if not more
   then None
@@ -106,6 +121,7 @@ let continuation_of_entries ~more entries =
         { Journal_graph_projection.after_sibling_order =
             Journal_model.sibling_order entry.block
         ; after_block_id = Journal_model.id entry.block
+
         ; protocol_cursor = None
         })
 ;;
@@ -135,10 +151,20 @@ let timeline_page ?(continuation = None) blocks
 ;;
 
 let begin_and_apply_feed ~generation ~before_day value state =
-  let state = Timeline.begin_request state ~generation (Timeline.Feed { before_day }) in
+  let state =
+    Timeline.begin_request
+      state
+      ~generation
+      (Timeline.Feed
+         { cursor =
+             Option.map
+               (fun day ->
+                  Journal_graph_projection.{ before_day = Some day; skipped_day = None })
+               before_day
+         })
+  in
   Timeline.apply_feed state ~generation value
 ;;
-
 let slot_keys state = retained_slots state |> List.map Timeline.slot_key
 
 let test_projection_order_today_suppression_and_continuations () =
@@ -406,6 +432,7 @@ let test_ten_thousand_record_projection_preserves_loaded_history () =
           { Journal_graph_projection.after_sibling_order =
               Journal_model.sibling_order last
           ; after_block_id = Journal_model.id last
+
           ; protocol_cursor = None
           }
       else None
@@ -499,7 +526,7 @@ let test_populated_feed_refresh_preserves_position () =
   let populated_anchor = Timeline.first_visible_index populated in
   let refreshed_parent = block ~child_count:1 ~order:"m" ~revision:"block-2" 42 in
   let refreshed =
-    Timeline.begin_request populated ~generation:3L (Timeline.Feed { before_day = None })
+    Timeline.begin_request populated ~generation:3L (Timeline.Feed { cursor = None })
     |> fun state ->
     Timeline.apply_feed
       state
@@ -530,10 +557,10 @@ let test_initial_feed_refresh_supersedes_pending_pagination () =
   let refreshing =
     Timeline.begin_request paging ~generation:2L day_request
     |> fun state ->
-    Timeline.begin_request state ~generation:3L (Timeline.Feed { before_day = None })
+    Timeline.begin_request state ~generation:3L (Timeline.Feed { cursor = None })
   in
   require
-    (Timeline.pending_request refreshing = Some (3L, Timeline.Feed { before_day = None }))
+    (Timeline.pending_request refreshing = Some (3L, Timeline.Feed { cursor = None }))
     "a foreground refresh did not supersede obsolete pagination"
 ;;
 
@@ -686,7 +713,7 @@ let test_repeated_staleness_stops_until_retry_and_does_not_block_feed () =
       ~last_exclusive:(Timeline.total_count failed)
   in
   require
-    (Timeline.next_request failed = Some (Feed { before_day = Some 20260809 }))
+    (Timeline.next_request failed = Some (Feed { cursor = Some {before_day=Some 20260809;skipped_day=None} }))
     "failed day blocked older days or automatically retried";
   let retried = Timeline.retry_day failed ~day:20260809 in
   require
@@ -1271,7 +1298,7 @@ let test_empty_day_pagination_and_failure () =
     [ "feed-continuation:20260808" ]
     "complete placeholder day was not removed";
   require
-    (Timeline.next_request completed = Some (Feed { before_day = Some 20260808 }))
+    (Timeline.next_request completed = Some (Feed { cursor = Some {before_day=Some 20260808;skipped_day=None} }))
     "hidden day stopped visible feed demand";
   let empty_batch =
     begin_and_apply_feed
@@ -1281,7 +1308,7 @@ let test_empty_day_pagination_and_failure () =
       completed
   in
   require
-    (Timeline.next_request empty_batch = Some (Feed { before_day = Some 20260807 }))
+    (Timeline.next_request empty_batch = Some (Feed { cursor = Some {before_day=Some 20260807;skipped_day=None} }))
     "empty batch did not advance by fetched boundary";
   let populated =
     begin_and_apply_feed
@@ -1667,7 +1694,1149 @@ let test_partial_day_parent_restore () =
   require (!failures = []) "%s" (String.concat "\n" (List.rev !failures))
 ;;
 
+let test_sync_prefix_retains_history_and_anchor () =
+  let roots = List.init 80 (fun i -> block ~order:(Printf.sprintf "%04d" i) (1000 + i)) in
+  let older =
+    List.init 10 (fun i ->
+      block ~day:20260808 ~order:(Printf.sprintf "%04d" i) (2000 + i))
+  in
+  let loaded =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed
+            [ day_feed ~more:true 20260809 "Today" roots
+            ; day_feed 20260808 "Yesterday" older
+            ])
+    |> Timeline.observe_visible_range ~first_index:65 ~last_exclusive:70
+  in
+  let anchor state =
+    Timeline.retained_slot state (Timeline.first_visible_index state)
+    |> Option.map Timeline.slot_key
+  in
+  let prefix = List.tl (List.take 31 roots) in
+  let refreshed =
+    Timeline.begin_request loaded ~generation:2L (Timeline.Feed { cursor = None })
+    |> fun state ->
+    Timeline.refresh_feed
+      state
+      ~generation:2L
+      ~complete:true
+      (feed ~more:true [ day_feed ~more:true 20260809 "Today" prefix ])
+  in
+  require (anchor refreshed = anchor loaded) "sync prefix lost the stable visible anchor";
+  let ids state =
+    retained_slots state
+    |> List.filter_map (function
+      | Timeline.Top_level e -> Some (Journal_model.id e.block)
+      | _ -> None)
+  in
+  require
+    (List.length (ids refreshed) = 89)
+    "sync prefix discarded loaded same-day or older suffix";
+  require
+    (not (List.mem (Journal_model.id (List.hd roots)) (ids refreshed)))
+    "deleted prefix root survived refresh";
+  let exhausted =
+    Timeline.begin_request refreshed ~generation:3L (Timeline.Feed { cursor = None })
+    |> fun state ->
+    Timeline.refresh_feed
+      state
+      ~generation:3L
+      ~complete:true
+      (feed [ day_feed 20260809 "Today" (List.take 10 roots) ])
+  in
+  require
+    (List.length (ids exhausted) = 10)
+    "authoritative exhaustion retained deleted suffix";
+  let unchanged =
+    Timeline.refresh_feed loaded ~generation:999L ~complete:true (feed [])
+  in
+  require (unchanged == loaded) "stale refresh modified the loaded timeline"
+;;
+
+let test_unified_batch_continues_across_days () =
+  let roots = List.init 40 (fun i -> block ~order:(Printf.sprintf "%04d" i) (3000+i)) in
+  let older = List.init 20 (fun i -> block ~day:20260808 ~order:(Printf.sprintf "%04d" i) (4000+i)) in
+  let loaded = Timeline.empty ~today:20260809
+    |> begin_and_apply_feed ~generation:1L ~before_day:None
+      (feed ~more:true [day_feed ~more:true 20260809 "Today" (List.take 30 roots);day_feed ~more:true 20260808 "Yesterday" (List.take 10 older)])
+    |> Timeline.observe_visible_range ~first_index:36 ~last_exclusive:39 in
+  let anchor state = Timeline.retained_slot state (Timeline.first_visible_index state) |> Option.map Timeline.slot_key in
+  let continuation = List.find_map (function Timeline.Day_continuation d -> Some d.after | _ -> None) (retained_slots loaded) |> Option.get in
+  let pending = Timeline.begin_request loaded ~generation:2L (Timeline.Day {day=20260809;after=continuation}) in
+  let batch = feed ~more:true [day_feed 20260809 "Today" (List.drop 30 roots);day_feed ~more:true 20260808 "Yesterday" older] in
+  let complete = Timeline.apply_feed pending ~generation:2L batch in
+  let ids state = retained_slots state |> List.filter_map (function Timeline.Top_level e -> Some (Journal_model.id e.block) | _ -> None) in
+  require (List.length (ids complete)=60) "continued batch did not append thirty roots across dates";
+  require (List.length (List.sort_uniq String.compare (ids complete))=60) "continued batch duplicated roots";
+  require (anchor complete=anchor loaded) "cross-date batch lost the visible UUID anchor";
+  require (Timeline.pending_request complete=None) "continued batch retained pending request";
+  let duplicate = Timeline.apply_feed complete ~generation:2L batch in
+  require (duplicate==complete) "duplicate batch completion changed Timeline"
+;;
+
+let test_older_feed_failure_releases_request () =
+  let loaded=Timeline.empty ~today:20260809
+    |> begin_and_apply_feed ~generation:1L ~before_day:None
+      (feed ~more:true [day_feed 20260809 "Today" [block 8000]])
+    |> Timeline.observe_visible_range ~first_index:0 ~last_exclusive:2 in
+  let pending=Timeline.begin_request loaded ~generation:2L (Timeline.Feed { cursor = Some {before_day=Some 20260809;skipped_day=None} }) in
+  let ignored=Timeline.fail_feed_request pending ~generation:1L in
+  require (ignored==pending) "old feed failure retired a newer request";
+  let failed=Timeline.fail_feed_request pending ~generation:2L in
+  require (Timeline.pending_request failed=None) "older-date failure left pagination pending";
+  require (Timeline.next_request failed=None) "older-date failure started an automatic retry loop";
+  require (slot_keys failed=slot_keys loaded) "older-date failure discarded retained rows";
+  let retried=Timeline.observe_visible_range failed ~first_index:0 ~last_exclusive:2 in
+  require (Timeline.next_request retried=Some (Timeline.Feed { cursor = Some {before_day=Some 20260809;skipped_day=None} })) "new visible demand cannot retry older dates"
+;;
+
+let prefix_root_ids state =
+  Timeline.fold_slots (fun ids -> function
+    | Timeline.Top_level e -> Journal_model.id e.block :: ids
+    | _ -> ids) [] state |> List.rev
+;;
+
+let require_prefix_identity state expected =
+  let keys = slot_keys state in
+  require (List.length keys = List.length (List.sort_uniq String.compare keys))
+    "prefix/suffix merge duplicated a native slot key";
+  require_equal_string_list (prefix_root_ids state)
+    (List.map Journal_model.id expected) "prefix/suffix merge lost or reordered roots"
+;;
+
+let prefix_anchor state =
+  Timeline.retained_slot state (Timeline.first_visible_index state)
+  |> Option.map Timeline.slot_key
+;;
+
+let load_prefix_history count =
+  let roots = List.init count (fun i -> block ~order:(Printf.sprintf "%04d" i) (9000+i)) in
+  let first = List.take 30 roots in
+  let initial = Timeline.empty ~today:20260809
+    |> begin_and_apply_feed ~generation:1L ~before_day:None
+      (feed [day_feed ~more:true 20260809 "Today" first]) in
+  let after = continuation_of_entries ~more:true (List.map entry first) in
+  let loaded = Timeline.begin_request initial ~generation:2L (Timeline.Day {day=20260809;after})
+    |> fun state -> Timeline.apply_timeline_entry_page state ~generation:2L
+      (timeline_page (List.drop 30 roots)) in
+  require_prefix_identity loaded roots;
+  roots, loaded
+;;
+
+let refresh_prefix state ~generation ~complete roots =
+  Timeline.begin_request state ~generation (Timeline.Feed { cursor = None })
+  |> fun state -> Timeline.refresh_feed state ~generation ~complete
+    (feed [day_feed ~more:true 20260809 "Today" roots])
+;;
+
+let check_reordered_prefix ~partial ~delete () =
+  let count = if delete then 32 else 31 in
+  let roots, loaded = load_prefix_history count in
+  let loaded = Timeline.observe_visible_range loaded ~first_index:10 ~last_exclusive:13 in
+  let moved = block ~order:"-001" ~source:"Remote moved root" ~revision:"block-2" (9000+count-1) in
+  let expected = moved :: List.filteri (fun i _ -> i <> count-1 && (not delete || i <> 5)) roots in
+  let prefix = List.take (if partial then 10 else 30) expected in
+  let refreshed = refresh_prefix loaded ~generation:3L ~complete:(not partial) prefix in
+  require_prefix_identity refreshed expected;
+  require (Journal_model.source (Option.get (Timeline.find_block refreshed ~block_id:(Journal_model.id moved))) = "Remote moved root")
+    "old suffix content replaced the fresh prefix value";
+  require (prefix_anchor refreshed = prefix_anchor loaded) "reorder moved an unaffected UUID anchor";
+  require (Timeline.scroll_generation refreshed = Timeline.scroll_generation loaded)
+    "prefix refresh introduced a scroll command";
+  let refreshed = if partial then
+      refresh_prefix refreshed ~generation:3L ~complete:true (List.take 30 expected)
+    else refreshed in
+  require_prefix_identity refreshed expected;
+  let repeated = refresh_prefix refreshed ~generation:4L ~complete:true (List.take 30 expected) in
+  require_prefix_identity repeated expected;
+  require (retained_slots repeated = retained_slots refreshed) "same prefix refresh changed the presented slots";
+  let page_first = Timeline.replace_timeline_entry_page loaded
+      ~page:(page 20260809 "Today") (timeline_page expected) in
+  let prefix_after = refresh_prefix page_first ~generation:3L ~complete:true (List.take 30 expected) in
+  require_prefix_identity prefix_after expected;
+  require (prefix_anchor prefix_after = prefix_anchor loaded) "reverse refresh order moved the surviving anchor";
+  let reconciled = Timeline.replace_timeline_entry_page repeated
+      ~page:(page 20260809 "Today") (timeline_page (List.tl expected)) in
+  require_prefix_identity reconciled (List.tl expected);
+  require (prefix_anchor reconciled = prefix_anchor loaded) "authoritative deletion moved the surviving anchor"
+;;
+
+let check_cross_day_prefix_move ~complete_older () =
+  let today = List.init 30 (fun i -> block ~order:(Printf.sprintf "%04d" i) (9100+i)) in
+  let old = block ~day:20260808 ~order:"0000" 9200 in
+  let initial = Timeline.empty ~today:20260809
+    |> begin_and_apply_feed ~generation:1L ~before_day:None
+      (feed ~more:true [day_feed 20260809 "Today" today]) in
+  let loaded = initial |> begin_and_apply_feed ~generation:2L ~before_day:(Some 20260809)
+      (feed [day_feed ~more:(not complete_older) 20260808 "Yesterday" [old]])
+    |> Timeline.observe_visible_range ~first_index:31 ~last_exclusive:32 in
+  let moved = block ~order:"-001" ~revision:"block-2" ~source:"Moved into Today" 9200 in
+  let expected = moved :: today in
+  let refreshed = refresh_prefix loaded ~generation:3L ~complete:true (List.take 30 expected) in
+  require_prefix_identity refreshed expected;
+  require (prefix_anchor refreshed = prefix_anchor loaded) "cross-day move lost its visible UUID anchor";
+  require (Journal_model.journal_day (Option.get (Timeline.find_block refreshed ~block_id:(Journal_model.id moved))) = 20260809)
+    "old suffix copy won over the moved prefix root";
+  if complete_older then (
+    require (not (List.mem "day:20260808" (slot_keys refreshed))) "moving the last root left an empty old-day heading";
+    require_prefix_identity (Timeline.remove_block refreshed ~block_id:(Journal_model.id moved)) today)
+  else (
+    let after = continuation_of_entries ~more:true [entry old] in
+    require (List.exists (function Timeline.Day_continuation d -> d.day=20260808 && d.after=after | _ -> false)
+        (retained_slots refreshed)) "move discarded the unread old-day continuation";
+    let rest = [block ~day:20260808 ~order:"0001" 9201;block ~day:20260808 ~order:"0002" 9202] in
+    let completed = Timeline.begin_request refreshed ~generation:4L (Timeline.Day {day=20260808;after})
+      |> fun state -> Timeline.apply_timeline_entry_page state ~generation:4L (timeline_page rest) in
+    require_prefix_identity completed (expected @ rest);
+    require (prefix_anchor completed = prefix_anchor refreshed) "later page moved the retained UUID anchor";
+    let cleared = List.fold_left (fun state b -> Timeline.remove_block state ~block_id:(Journal_model.id b)) completed rest in
+    require_prefix_identity cleared expected;
+    require (not (List.mem "day:20260808" (slot_keys cleared))) "moved suffix identity corrupted the old-day count")
+;;
+
+let check_root_reordered_out_of_prefix () =
+  let roots, loaded = load_prefix_history 31 in
+  let loaded = Timeline.observe_visible_range loaded ~first_index:10 ~last_exclusive:13 in
+  let moved = block ~order:"9999" ~revision:"block-2" 9000 in
+  let first = List.tl roots in
+  let refreshed = refresh_prefix loaded ~generation:3L ~complete:true first in
+  require_prefix_identity refreshed first;
+  require (prefix_anchor refreshed = prefix_anchor loaded) "outward reorder moved an unaffected anchor";
+  let after = continuation_of_entries ~more:true (List.map entry first) in
+  let completed = Timeline.begin_request refreshed ~generation:4L (Timeline.Day {day=20260809;after})
+    |> fun state -> Timeline.apply_timeline_entry_page state ~generation:4L (timeline_page [moved]) in
+  require_prefix_identity completed (first @ [moved]);
+  require (prefix_anchor completed = prefix_anchor loaded) "pagination lost the surviving anchor";
+  let duplicate = Timeline.apply_timeline_entry_page completed ~generation:4L (timeline_page [moved]) in
+  require (duplicate == completed) "duplicate page completion changed the reordered history"
+;;
+
+let test_prefix_identity_merge () =
+  let failures = ref [] in
+  List.iter (fun (name, run) -> try run () with Failure message -> failures := (name ^ ": " ^ message) :: !failures)
+    [ "same-day reorder", check_reordered_prefix ~partial:false ~delete:false
+    ; "partial prefix reorder", check_reordered_prefix ~partial:true ~delete:false
+    ; "reorder and prefix deletion", check_reordered_prefix ~partial:false ~delete:true
+    ; "move from exhausted older day", check_cross_day_prefix_move ~complete_older:true
+    ; "move from paginated older day", check_cross_day_prefix_move ~complete_older:false
+    ; "reorder out of prefix then paginate", check_root_reordered_out_of_prefix ];
+  require (!failures = []) "%s" (String.concat "\n" (List.rev !failures))
+;;
+
+let test_today_priority_projection_and_refresh () =
+  let today = 20260808
+  and future = 20260809
+  and older = 20260807 in
+  let roots day start count =
+    List.init count (fun i -> block ~day ~order:(Printf.sprintf "%04d" i) (start + i))
+  in
+  let future_roots = roots future 15000 61
+  and today_roots = roots today 16000 61
+  and older_roots = roots older 17000 3 in
+  let cursor before_day =
+    Journal_graph_projection.{ before_day; skipped_day = Some today }
+  in
+  let priority ?continuation days =
+    { (feed days) with prioritized_day = Some today; continuation }
+  in
+  let all_ids state = prefix_root_ids state in
+  let assert_state state expected label =
+    let ids = all_ids state in
+    require
+      (List.sort String.compare ids
+       = List.sort String.compare (List.map Journal_model.id expected))
+      "%s lost or duplicated a root"
+      label;
+    let days =
+      Timeline.fold_slots
+        (fun xs -> function
+           | Timeline.Top_level e -> Journal_model.journal_day e.block :: xs
+           | _ -> xs)
+        []
+        state
+      |> List.rev
+    in
+    require
+      (days = List.sort (fun a b -> Int.compare b a) days)
+      "%s changed display date order"
+      label
+  in
+  let failures = ref [] in
+  let check name f =
+    try f () with
+    | Failure m -> failures := (name ^ ": " ^ m) :: !failures
+  in
+  check "deferred future pages precede loaded Today" (fun () ->
+    let initial =
+      Timeline.empty ~today
+      |> begin_and_apply_feed
+           ~generation:1L
+           ~before_day:None
+           (priority
+              ~continuation:(cursor None)
+              [ day_feed today "Today" (List.take 30 today_roots) ])
+    in
+    let initial =
+      Timeline.observe_visible_range initial ~first_index:5 ~last_exclusive:8
+    in
+    let anchor = prefix_anchor initial in
+    let next =
+      Timeline.begin_request initial ~generation:2L (Feed { cursor = Some (cursor None) })
+      |> fun state ->
+      Timeline.apply_feed
+        state
+        ~generation:2L
+        (priority
+           ~continuation:(cursor (Some future))
+           [ day_feed ~more:true future "Future" (List.take 30 future_roots) ])
+    in
+    assert_state
+      next
+      (List.take 30 future_roots @ List.take 30 today_roots)
+      "future date page";
+    require
+      (prefix_anchor next = anchor)
+      "inserting future dates moved the Today UUID anchor");
+  List.iter
+    (fun count ->
+       check (Printf.sprintf "refresh Today size %d" count) (fun () ->
+         let loaded =
+           Timeline.empty ~today
+           |> begin_and_apply_feed
+                ~generation:1L
+                ~before_day:None
+                (feed
+                   [ day_feed future "Future" future_roots
+                   ; day_feed today "Today" today_roots
+                   ; day_feed older "Older" older_roots
+                   ])
+         in
+         let loaded =
+           Timeline.observe_visible_range loaded ~first_index:72 ~last_exclusive:75
+         in
+         let anchor = prefix_anchor loaded in
+         let today_selected = List.take (min 30 count) today_roots in
+         let days =
+           (if count = 0
+            then []
+            else [ day_feed ~more:(count > 30) today "Today" today_selected ])
+           @
+           if count < 30
+           then
+             [ day_feed ~more:true future "Future" (List.take (30 - count) future_roots) ]
+           else []
+         in
+         let value =
+           priority
+             ~continuation:(cursor (if count >= 30 then None else Some future))
+             days
+         in
+         let loaded =
+           if count <> 1
+           then loaded
+           else (
+             let partial =
+               priority
+                 ~continuation:(cursor None)
+                 [ day_feed today "Today" today_selected ]
+             in
+             let staged =
+               Timeline.begin_request loaded ~generation:2L (Feed { cursor = None })
+               |> fun state ->
+               Timeline.refresh_feed state ~generation:2L ~complete:false partial
+             in
+             assert_state
+               staged
+               (future_roots @ today_selected @ older_roots)
+               "Today-first partial refresh";
+             staged)
+         in
+         let next =
+           Timeline.begin_request loaded ~generation:2L (Feed { cursor = None })
+           |> fun state -> Timeline.refresh_feed state ~generation:2L ~complete:true value
+         in
+         let retained_today =
+           if count > 30 then today_roots else List.take count today_roots
+         in
+         assert_state
+           next
+           (future_roots @ retained_today @ older_roots)
+           "priority refresh";
+         if count > 30
+         then
+           require
+             (prefix_anchor next = anchor)
+             "priority refresh moved retained UUID anchor";
+         require
+           (Timeline.refresh_feed next ~generation:1L ~complete:true value == next)
+           "retired priority response changed state"))
+    [ 0; 1; 30; 61 ];
+  List.iter
+    (fun toward_today ->
+       check
+         (if toward_today
+          then "future root moves to priority Today"
+          else "Today root moves to future prefix")
+         (fun () ->
+            let original_today = List.take 1 today_roots in
+            let loaded =
+              Timeline.empty ~today
+              |> begin_and_apply_feed
+                   ~generation:1L
+                   ~before_day:None
+                   (feed
+                      [ day_feed future "Future" future_roots
+                      ; day_feed today "Today" original_today
+                      ; day_feed older "Older" older_roots
+                      ])
+            in
+            let source =
+              if toward_today
+              then List.hd (List.rev future_roots)
+              else List.hd original_today
+            in
+            let source_id = Journal_model.id source in
+            let index =
+              List.find_index
+                (function
+                  | Timeline.Top_level e -> Journal_model.id e.block = source_id
+                  | _ -> false)
+                (retained_slots loaded)
+              |> Option.get
+            in
+            let loaded =
+              Timeline.observe_visible_range
+                loaded
+                ~first_index:index
+                ~last_exclusive:(index + 1)
+            in
+            let moved =
+              block
+                ~day:(if toward_today then today else future)
+                ~order:"-001"
+                ~source:"Moved root"
+                ~revision:"block-2"
+                (if toward_today then 15060 else 16000)
+            in
+            let future_after =
+              if toward_today then List.take 60 future_roots else moved :: future_roots
+            in
+            let today_after = if toward_today then moved :: original_today else [] in
+            let value =
+              priority
+                [ day_feed today "Today" today_after
+                ; day_feed
+                    ~more:true
+                    future
+                    "Future"
+                    (List.take (30 - List.length today_after) future_after)
+                ]
+            in
+            let next =
+              Timeline.begin_request loaded ~generation:2L (Feed { cursor = None })
+              |> fun state ->
+              Timeline.refresh_feed state ~generation:2L ~complete:true value
+            in
+            assert_state
+              next
+              (future_after @ today_after @ older_roots)
+              "cross-range UUID move";
+            require
+              (prefix_anchor next = prefix_anchor loaded)
+              "cross-range move lost its UUID anchor";
+            let cleared =
+              List.fold_left
+                (fun state root ->
+                   Timeline.remove_block state ~block_id:(Journal_model.id root))
+                next
+                future_after
+            in
+            assert_state cleared (today_after @ older_roots) "future deletion after move";
+            require
+              (not (List.mem ("day:" ^ string_of_int future) (slot_keys cleared)))
+              "cross-range move corrupted old-day count"))
+    [ true; false ];
+  if !failures <> [] then fail "%s" (String.concat "\n" (List.rev !failures))
+;;
+
+let test_cross_page_ownership () =
+  let today = 20260808
+  and source = 20260807
+  and target = 20260809 in
+  let a = block ~day:source ~order:"a" 21001
+  and b = block ~day:source ~order:"b" 21002 in
+  let f1 = block ~day:target ~order:"a" 22001
+  and f2 = block ~day:target ~order:"b" 22002 in
+  let t = block ~day:today 23001 in
+  let moved = block ~day:target ~order:"-1" ~revision:"moved" 21001 in
+  let initial () =
+    Timeline.empty ~today
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed
+            [ day_feed target "Future" [ f1; f2 ]
+            ; day_feed today "Today" [ t ]
+            ; day_feed source "Past" [ a; b ]
+            ])
+  in
+  let root_entries state =
+    Timeline.fold_slots
+      (fun rows -> function
+         | Timeline.Top_level e -> e :: rows
+         | _ -> rows)
+      []
+      state
+    |> List.rev
+  in
+  let invariant label state =
+    let rows = root_entries state in
+    let ids =
+      List.map
+        (fun (e : Journal_graph_projection.timeline_entry) -> Journal_model.id e.block)
+        rows
+    in
+    require
+      (List.length ids = List.length (List.sort_uniq String.compare ids))
+      "%s published duplicate root UUIDs"
+      label;
+    List.iter
+      (fun (e : Journal_graph_projection.timeline_entry) ->
+         require
+           (Journal_model.parent_id e.block = None)
+           "%s published a child as a root"
+           label;
+         require
+           (Journal_model.page_id e.block = id "page" (Journal_model.journal_day e.block))
+           "%s published inconsistent page/date ownership"
+           label)
+      rows;
+    let order
+          (a : Journal_graph_projection.timeline_entry)
+          (b : Journal_graph_projection.timeline_entry)
+      =
+      let da = Journal_model.journal_day a.Journal_graph_projection.block
+      and db = Journal_model.journal_day b.Journal_graph_projection.block in
+      match Int.compare db da with
+      | 0 ->
+        compare
+          (Journal_model.sibling_order a.block, Journal_model.id a.block)
+          (Journal_model.sibling_order b.block, Journal_model.id b.block)
+      | n -> n
+    in
+    require (rows = List.sort order rows) "%s broke chronological/sibling grouping" label
+  in
+  let expect label state values =
+    invariant label state;
+    require
+      (List.sort
+         String.compare
+         (List.map
+            (fun (e : Journal_graph_projection.timeline_entry) ->
+               Journal_model.id e.block)
+            (root_entries state))
+       = List.sort String.compare (List.map Journal_model.id values))
+      "%s lost or duplicated roots"
+      label
+  in
+  let failures = ref [] in
+  let check name f =
+    try f () with
+    | Failure m -> failures := (name ^ ": " ^ m) :: !failures
+  in
+  List.iter
+    (fun order ->
+       check (String.concat "/" order) (fun () ->
+         let state = ref (initial ()) in
+         let anchor_index =
+           List.find_index
+             (function
+               | Timeline.Top_level e -> Journal_model.id e.block = Journal_model.id b
+               | _ -> false)
+             (retained_slots !state)
+           |> Option.get
+         in
+         state
+         := Timeline.observe_visible_range
+              !state
+              ~first_index:anchor_index
+              ~last_exclusive:(anchor_index + 1);
+         let anchor = prefix_anchor !state in
+         List.iter
+           (fun action ->
+              (state
+               := match action with
+                  | "point" -> Timeline.replace_block !state moved
+                  | "source" ->
+                    Timeline.replace_timeline_entry_page
+                      !state
+                      ~page:(page source "Past")
+                      (timeline_page [ b ])
+                  | "target" ->
+                    Timeline.replace_timeline_entry_page
+                      !state
+                      ~page:(page target "Future")
+                      (timeline_page [ moved; f1; f2 ])
+                  | _ -> assert false);
+              invariant action !state;
+              require
+                (prefix_anchor !state = anchor)
+                "%s lost surviving UUID anchor"
+                action)
+           order;
+         expect "move converged" !state [ moved; f1; f2; t; b ];
+         let edited =
+           block
+             ~day:source
+             ~order:"b"
+             ~source:"Normal P002 edit"
+             ~revision:"edited"
+             21002
+         in
+         state := Timeline.replace_block !state edited;
+         state
+         := Timeline.replace_timeline_entry_page
+              !state
+              ~page:(page source "Past")
+              (timeline_page [ edited ]);
+         expect "edit after move" !state [ moved; f1; f2; t; edited ];
+         let removed = Timeline.remove_block !state ~block_id:(Journal_model.id edited) in
+         require
+           (not (List.mem ("day:" ^ string_of_int source) (slot_keys removed)))
+           "source count retained an empty heading"))
+    [ [ "point"; "source"; "target" ]
+    ; [ "point"; "target"; "source" ]
+    ; [ "source"; "point"; "target" ]
+    ; [ "source"; "target"; "point" ]
+    ; [ "target"; "point"; "source" ]
+    ; [ "target"; "source"; "point" ]
+    ];
+  check "root becomes a child" (fun () ->
+    let child = block ~day:target ~parent_id:(Journal_model.id f1) ~order:"c" 21001 in
+    let state = Timeline.replace_block (initial ()) child in
+    expect "moved child" state [ f1; f2; t; b ]);
+  check "same-day reorder" (fun () ->
+    let reordered = block ~day:source ~order:"z" 21001 in
+    expect
+      "same-day order"
+      (Timeline.replace_block (initial ()) reordered)
+      [ f1; f2; t; b; reordered ]);
+  check "unrequested target range" (fun () ->
+    let today_roots =
+      List.init 29 (fun i ->
+        block ~day:today ~order:(Printf.sprintf "%04d" i) (26000 + i))
+    in
+    let visible_target = block ~day:target ~order:"0000" 24000
+    and unread_target = block ~day:target ~order:"0001" 24001 in
+    let cursor =
+      Journal_graph_projection.{ before_day = Some target; skipped_day = Some today }
+    in
+    let initial_feed =
+      { (feed
+           [ day_feed today "Today" today_roots
+           ; day_feed ~more:true target "Future" [ visible_target ]
+           ])
+        with
+        continuation = Some cursor
+      ; prioritized_day = Some today
+      }
+    in
+    let state =
+      Timeline.empty ~today
+      |> begin_and_apply_feed ~generation:1L ~before_day:None initial_feed
+    in
+    let size = Timeline.total_count state in
+    let state =
+      Timeline.observe_visible_range state ~first_index:(size - 2) ~last_exclusive:size
+    in
+    let request = Timeline.next_request state |> Option.get in
+    require
+      (request = Timeline.Feed { cursor = Some cursor })
+      "Today footer did not select the retained date continuation";
+    let state =
+      Timeline.begin_request state ~generation:2L request
+      |> fun state ->
+      Timeline.apply_feed state ~generation:2L (feed [ day_feed source "Past" [ a; b ] ])
+    in
+    let beyond = block ~day:target ~order:"9999" 21001 in
+    let state = Timeline.replace_block state beyond in
+    expect "outside loaded target prefix" state (visible_target :: b :: today_roots);
+    let state = Timeline.observe_visible_range state ~first_index:0 ~last_exclusive:4 in
+    let request = Timeline.next_request state |> Option.get in
+    require
+      (match request with
+       | Timeline.Day { day; _ } -> day = target
+       | _ -> false)
+      "Future cursor became unreachable";
+    let state =
+      Timeline.begin_request state ~generation:3L request
+      |> fun state ->
+      Timeline.apply_timeline_entry_page
+        state
+        ~generation:3L
+        (timeline_page [ unread_target; beyond ])
+    in
+    expect
+      "target continuation reaches moved root"
+      state
+      ([ visible_target; unread_target; beyond; b ] @ today_roots));
+  check "source partial prefix and counts" (fun () ->
+    let source_roots =
+      List.init 31 (fun i ->
+        block ~day:source ~order:(Printf.sprintf "%04d" i) (25000 + i))
+    in
+    let moved = block ~day:target ~order:"-1" 25027 in
+    let state =
+      Timeline.empty ~today
+      |> begin_and_apply_feed
+           ~generation:1L
+           ~before_day:None
+           (feed
+              [ day_feed today "Today" [ t ]
+              ; day_feed target "Future" [ f1 ]
+              ; day_feed ~more:true source "Past" (List.take 28 source_roots)
+              ])
+    in
+    let after =
+      continuation_of_entries ~more:true (List.map entry (List.take 28 source_roots))
+    in
+    let state =
+      Timeline.replace_timeline_entry_page
+        state
+        ~page:(page target "Future")
+        (timeline_page [ moved; f1 ])
+    in
+    invariant "target before partial source" state;
+    require
+      (List.exists
+         (function
+           | Timeline.Day_continuation c -> c.day = source && c.after = after
+           | _ -> false)
+         (retained_slots state))
+      "move removed unread source continuation";
+    let current =
+      List.filter
+        (fun root -> Journal_model.id root <> Journal_model.id moved)
+        source_roots
+    in
+    let selected = List.take 28 current in
+    let continuation = continuation_of_entries ~more:true (List.map entry selected) in
+    let state =
+      Timeline.replace_timeline_entry_page
+        state
+        ~page:(page source "Past")
+        (timeline_page ~continuation selected)
+    in
+    let state =
+      Timeline.begin_request
+        state
+        ~generation:2L
+        (Day { day = source; after = continuation })
+      |> fun state ->
+      Timeline.apply_timeline_entry_page
+        state
+        ~generation:2L
+        (timeline_page (List.drop 28 current))
+    in
+    expect "source continuation exact set" state (moved :: f1 :: t :: current);
+    let state =
+      List.fold_left
+        (fun state root -> Timeline.remove_block state ~block_id:(Journal_model.id root))
+        state
+        current
+    in
+    expect "source removal count" state [ moved; f1; t ];
+    require
+      (not (List.mem ("day:" ^ string_of_int source) (slot_keys state)))
+      "moved source prefix corrupted date count");
+  if !failures <> [] then fail "%s" (String.concat "\n" (List.rev !failures))
+;;
+
+let test_child_preview_point_updates () =
+  let module Graph = Logseq_db_types.Graph_types in
+  let module Projection = Journal_graph_projection in
+  let uuid value = Graph.Uuid.of_string value |> Result.get_ok in
+  let owner day =
+    Projection.
+      { id =
+          Printf.sprintf
+            "00000001-%04d-%04d-0000-000000000000"
+            (day / 10000)
+            (day mod 10000)
+      ; day
+      ; title = string_of_int day
+      }
+  in
+  let raw ?parent ?asset day index order title : Graph.block =
+    let page = uuid (owner day).id in
+    { uuid = uuid (id "block" index)
+    ; page
+    ; parent = Option.value parent ~default:page
+    ; title
+    ; order
+    ; created_at_ms = Journal_time.instant_unix_ms (creation_time ~day ())
+    ; updated_at_ms = Journal_time.instant_unix_ms (creation_time ~day ())
+    ; refs = []
+    ; tags = []
+    ; properties =
+        Option.fold
+          ~none:[]
+          ~some:(fun value ->
+            [ Graph.
+                { ident = "logseq.property.asset/type"
+                ; uuid = uuid (id "property" 1)
+                ; title = "Asset type"
+                ; schema =
+                    { property_type = String
+                    ; cardinality = One
+                    ; hidden = false
+                    ; public = false
+                    }
+                ; values = [ String_value value ]
+                ; values_truncated = false
+                }
+            ])
+          asset
+    }
+  in
+  let time_context = Projection.{ localtime = Unix.gmtime } in
+  let project day roots =
+    let items =
+      List.concat_map
+        (fun ((root : Graph.block), children) ->
+           Projection.{ block = root; revision = "root-1"; depth = 0 }
+           :: List.map
+                (fun child ->
+                   Projection.{ block = child; revision = "child-1"; depth = 1 })
+                children)
+        roots
+    in
+    Projection.timeline_entry_page
+      ~page:(owner day)
+      ~time_context
+      Graph.{ items; continuation = None }
+    |> Result.get_ok
+  in
+  let point day child =
+    Projection.block
+      ~page:(owner day)
+      ~time_context
+      ~revision:"child-2"
+      ~child_count:0
+      child
+    |> Result.get_ok
+  in
+  let root = raw 20260808 31000 "a" "Parent" in
+  let other = raw 20260808 32000 "b" "Other parent" in
+  let children =
+    List.init 4 (fun n ->
+      raw
+        ~parent:root.uuid
+        ?asset:(if n = 1 then Some "png" else None)
+        20260808
+        (31100 + n)
+        (string_of_int n)
+        (Printf.sprintf "Child %d" n))
+  in
+  let c1 = List.nth children 0
+  and c2 = List.nth children 1
+  and c4 = List.nth children 3 in
+  let initial () =
+    Timeline.empty ~today:20260809
+    |> begin_and_apply_feed
+         ~generation:1L
+         ~before_day:None
+         (feed
+            [ day_feed_entries
+                20260808
+                "Older"
+                (project 20260808 [ root, children; other, [] ]).entries
+            ])
+  in
+  let get state (root : Graph.block) =
+    Timeline.fold_slots
+      (fun result -> function
+         | Timeline.Top_level e
+           when Journal_model.id e.block = Graph.Uuid.to_string root.Graph.uuid -> Some e
+         | _ -> result)
+      None
+      state
+    |> Option.get
+  in
+  let expect state root (child : Graph.block) source asset =
+    let values = (get state root).child_summaries in
+    let summary =
+      List.find
+        (fun (c : Projection.child_summary) ->
+           c.block_id = Graph.Uuid.to_string child.Graph.uuid)
+        values
+    in
+    require (summary.source = source) "child preview retained stale source";
+    require (summary.asset_file_type = asset) "child preview retained stale asset type";
+    require (List.length values <= 3) "point update exceeded the three-child preview"
+  in
+  let same_layout before after =
+    require_equal_string_list
+      (slot_keys after)
+      (slot_keys before)
+      "child changed root/order/continuation keys";
+    let root_values state =
+      Timeline.fold_slots
+        (fun values -> function
+           | Timeline.Top_level e ->
+             let b = e.block in
+             ( Journal_model.id b
+             , Journal_model.source b
+             , Journal_model.child_count b
+             , Journal_model.sibling_order b
+             , Journal_model.page_id b )
+             :: values
+           | _ -> values)
+        []
+        state
+    in
+    require
+      (root_values before = root_values after)
+      "child changed root content or counts";
+    require
+      (Timeline.total_count before = Timeline.total_count after)
+      "child consumed a root slot";
+    let anchor state =
+      Timeline.retained_slot state (Timeline.first_visible_index state)
+      |> Option.map Timeline.slot_key
+    in
+    require (anchor before = anchor after) "child update moved the scroll anchor";
+    let clear state =
+      List.fold_left
+        (fun state (id, _, _, _, _) -> Timeline.remove_block state ~block_id:id)
+        state
+        (root_values state)
+      |> slot_keys
+    in
+    require (clear before = clear after) "child update changed retained day counts"
+  in
+  let failures = ref [] in
+  let check name f =
+    try
+      f ();
+      Printf.printf "child preview: PASS %s\n%!" name
+    with
+    | exn ->
+      Printf.printf "child preview: FAIL %s\n%!" name;
+      failures := (name ^ ": " ^ Printexc.to_string exn) :: !failures
+  in
+  check "visible title" (fun () ->
+    let before =
+      initial () |> Timeline.observe_visible_range ~first_index:1 ~last_exclusive:3
+    in
+    let changed = { c1 with title = "Child edited" } in
+    let after = Timeline.replace_block before (point 20260808 changed) in
+    expect after root c1 changed.title None;
+    same_layout before after;
+    require
+      (not (Timeline.equal_presentation before after))
+      "changed preview did not invalidate presentation");
+  List.iter
+    (fun asset ->
+       check
+         (if asset = None then "asset cleared" else "asset type changed")
+         (fun () ->
+            let before = initial () in
+            let changed = raw ~parent:root.uuid ?asset 20260808 31101 "1" c2.title in
+            let after = Timeline.replace_block before (point 20260808 changed) in
+            expect after root c2 c2.title asset;
+            same_layout before after))
+    [ Some "pdf"; None ];
+  check "retained same-day suffix after thirty roots" (fun () ->
+    let prefix =
+      List.init 30 (fun n ->
+        raw 20260808 (33000 + n) (Printf.sprintf "%04d" n) "Prefix", [])
+    in
+    let suffix = { root with order = "9999" } in
+    let entries = (project 20260808 prefix).entries in
+    let cursor = continuation_of_entries ~more:true entries in
+    let before =
+      Timeline.empty ~today:20260809
+      |> begin_and_apply_feed
+           ~generation:1L
+           ~before_day:None
+           (feed [ day_feed_entries ~more:true 20260808 "Older" entries ])
+      |> fun state ->
+      Timeline.begin_request state ~generation:2L (Day { day = 20260808; after = cursor })
+      |> fun state ->
+      Timeline.apply_timeline_entry_page
+        state
+        ~generation:2L
+        (project 20260808 [ suffix, children ])
+      |> Timeline.observe_visible_range ~first_index:0 ~last_exclusive:4
+    in
+    let after =
+      Timeline.replace_block before (point 20260808 { c1 with title = "Suffix edited" })
+    in
+    expect after suffix c1 "Suffix edited" None;
+    same_layout before after);
+  check "retained older day after thirty Today roots" (fun () ->
+    let today =
+      List.init 30 (fun n ->
+        raw 20260809 (34000 + n) (Printf.sprintf "%04d" n) "Today", [])
+    in
+    let before =
+      Timeline.empty ~today:20260809
+      |> begin_and_apply_feed
+           ~generation:1L
+           ~before_day:None
+           (feed
+              ~more:true
+              [ day_feed_entries 20260809 "Today" (project 20260809 today).entries ])
+      |> begin_and_apply_feed
+           ~generation:2L
+           ~before_day:(Some 20260809)
+           (feed
+              [ day_feed_entries
+                  20260808
+                  "Older"
+                  (project 20260808 [ root, children ]).entries
+              ])
+    in
+    let after =
+      Timeline.replace_block before (point 20260808 { c1 with title = "Older edited" })
+    in
+    expect after root c1 "Older edited" None;
+    same_layout before after);
+  check "repeat child edit then parent point" (fun () ->
+    let before = initial () in
+    let after =
+      Timeline.replace_block before (point 20260808 { c1 with title = "First edit" })
+      |> fun state ->
+      Timeline.replace_block state (point 20260808 { c1 with title = "Second edit" })
+    in
+    expect after root c1 "Second edit" None;
+    same_layout before after;
+    let parent =
+      Projection.block
+        ~page:(owner 20260808)
+        ~time_context
+        ~revision:"root-2"
+        ~child_count:4
+        { root with title = "Parent edited" }
+      |> Result.get_ok
+    in
+    let after = Timeline.replace_block after parent in
+    expect after root c1 "Second edit" None;
+    require
+      (Journal_model.source (get after root).block = "Parent edited")
+      "parent point stopped updating root");
+  check "hidden parent restored with current preview" (fun () ->
+    let model title =
+      Projection.block
+        ~page:(owner 20260808)
+        ~time_context
+        ~revision:"root-2"
+        ~child_count:4
+        { root with title }
+      |> Result.get_ok
+    in
+    let before =
+      initial ()
+      |> fun state ->
+      Timeline.remove_block state ~block_id:(Graph.Uuid.to_string other.uuid)
+      |> fun state -> Timeline.replace_block state (model "")
+    in
+    let changed =
+      Timeline.replace_block
+        before
+        (point 20260808 { c1 with title = "Hidden child edit" })
+    in
+    same_layout before changed;
+    let restored = Timeline.replace_block changed (model root.title) in
+    expect restored root c1 "Hidden child edit" None);
+  check "fourth child does not enter preview" (fun () ->
+    let before = initial () in
+    let after =
+      Timeline.replace_block before (point 20260808 { c4 with title = "Fourth edited" })
+    in
+    require
+      ((get before root).child_summaries = (get after root).child_summaries)
+      "fourth child replaced preview selection";
+    require
+      (Timeline.equal_presentation before after)
+      "non-preview child invalidated visible content";
+    same_layout before after);
+  check "point moved to another parent cannot rewrite old preview" (fun () ->
+    let before = initial () in
+    let moved = { c1 with parent = other.uuid; title = "Moved child" } in
+    let after = Timeline.replace_block before (point 20260808 moved) in
+    require
+      ((get before root).child_summaries = (get after root).child_summaries)
+      "moved point used the old parent";
+    require ((get after other).child_summaries = []) "point guessed a new child selection";
+    same_layout before after);
+  check "child of moved parent cannot rewrite old page preview" (fun () ->
+    let before = initial () in
+    let moved = { c1 with page = uuid (owner 20260809).id; title = "New page child" } in
+    let after = Timeline.replace_block before (point 20260809 moved) in
+    require
+      ((get before root).child_summaries = (get after root).child_summaries)
+      "child point mixed new page with old parent entry";
+    same_layout before after);
+  check "authoritative deletion refills bounded preview" (fun () ->
+    let before = initial () in
+    let children =
+      List.filter
+        (fun (c : Graph.block) -> not (Graph.Uuid.equal c.uuid c1.uuid))
+        children
+    in
+    let after =
+      Timeline.replace_timeline_entry_page
+        before
+        ~page:(owner 20260808)
+        (project 20260808 [ root, children; other, [] ])
+    in
+    let ids =
+      List.map
+        (fun (c : Projection.child_summary) -> c.block_id)
+        (get after root).child_summaries
+    in
+    require
+      (ids = List.map (fun (c : Graph.block) -> Graph.Uuid.to_string c.uuid) children)
+      "normal delete reconciliation did not refill from fourth child";
+    require (List.length ids = 3) "delete reconciliation exceeded preview budget");
+  check "authoritative movement replaces preview ownership" (fun () ->
+    let before = initial () in
+    let moved = { c1 with parent = other.uuid; title = "Moved child" } in
+    let children =
+      List.filter
+        (fun (c : Graph.block) -> not (Graph.Uuid.equal c.uuid c1.uuid))
+        children
+    in
+    let after =
+      Timeline.replace_timeline_entry_page
+        before
+        ~page:(owner 20260808)
+        (project 20260808 [ root, children; other, [ moved ] ])
+    in
+    require
+      (not
+         (List.exists
+            (fun (c : Projection.child_summary) ->
+               c.block_id = Graph.Uuid.to_string c1.uuid)
+            (get after root).child_summaries))
+      "old parent retained moved preview";
+    expect after other moved moved.title None;
+    require (slot_keys before = slot_keys after) "child movement changed root keys");
+  if !failures <> [] then fail "%s" (String.concat "\n" (List.rev !failures))
+;;
+
 let () =
+  test_child_preview_point_updates ();
+  test_cross_page_ownership ();
+  test_today_priority_projection_and_refresh ();
+  test_prefix_identity_merge ();
+  test_older_feed_failure_releases_request ();
+  test_unified_batch_continues_across_days ();
   test_partial_day_parent_restore ();
   test_parent_only_cards_and_point_updates ();
   test_capture_converges_with_later_pagination ();
@@ -1696,6 +2865,7 @@ let () =
   test_authoritative_timeline_entry_replaces_summary_by_stable_parent_id ();
   test_ten_thousand_record_projection_preserves_loaded_history ();
   test_block_replacement ();
+  test_sync_prefix_retains_history_and_anchor ();
   test_populated_feed_refresh_preserves_position ();
   test_initial_feed_refresh_supersedes_pending_pagination ();
   test_prepend_first_today_entry_before_older_days ();

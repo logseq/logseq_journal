@@ -1,6 +1,51 @@
 module Graph = Logseq_db_types.Graph_types
 module Protocol = Logseq_db_worker.Protocol
-module Runtime = Journal_graph_runtime
+module Production_runtime = Journal_graph_runtime
+
+(* Older domain fixtures describe a source tree in one value. Serve that
+   synthetic source through the production root-only and bounded-child API;
+   the pagination tests below still provide and inspect exact Worker packets. *)
+let fixture_requests = Hashtbl.create 32
+let fixture_days = Hashtbl.create 32
+
+module Runtime = struct
+  include Production_runtime
+
+  let receive runtime (Protocol.V2_response envelope as raw) =
+    let key = Graph.Uuid.to_string envelope.request_id in
+    match Hashtbl.find_opt fixture_requests key, envelope.outcome with
+    | Some (Protocol.V2_get_page_tree {maximum_depth=0;_}),
+      Protocol.V2_page_tree_outcome ({maximum_depth=1;items;page;_} as source) ->
+      Hashtbl.remove fixture_requests key;
+      let roots=List.filter (fun (m:Protocol.v2_tree_member)->m.depth=0) items in
+      let result=Production_runtime.receive runtime
+          (Protocol.V2_response {envelope with outcome=V2_page_tree_outcome {source with maximum_depth=0;items=roots}}) in
+      let rec serve (output:Production_runtime.output) =
+        List.fold_left (fun (kept:Production_runtime.output) (request:Protocol.request) ->
+          let outcome = match request.command with
+            | V2_get_children {parent;limit;cursor;_}
+              when limit <= 3 && List.exists (fun (m:Protocol.v2_tree_member)->Graph.Uuid.equal m.value.block.uuid parent) roots ->
+              let children=List.filter (fun (m:Protocol.v2_tree_member)->m.depth=1 && Graph.Uuid.equal m.parent parent) items
+                |> List.sort (fun (a:Protocol.v2_tree_member) (b:Protocol.v2_tree_member) -> compare (a.value.block.order,Graph.Uuid.to_string a.value.block.uuid) (b.value.block.order,Graph.Uuid.to_string b.value.block.uuid)) in
+              let offset=Option.fold ~none:0 ~some:(fun c->Scanf.sscanf (Graph.Cursor.to_string c) "preview:%d" Fun.id) cursor in
+              let selected=List.take limit (List.drop offset children) in
+              let next_cursor=if offset+List.length selected < List.length children then Some (Graph.Cursor.of_string (Printf.sprintf "preview:%d" (offset+List.length selected)) |> Result.get_ok) else None in
+              Some (Protocol.V2_children_outcome {parent;revision_scope=V2_children_revision parent;scope_revision="fixture-children";
+                items=List.map (fun (m:Protocol.v2_tree_member)->Protocol.{value=m.value;revision=m.revision}) selected;next_cursor})
+            | V2_list_journals {through_day;_}
+              when Option.fold ~none:false ~some:(fun day->through_day<day) (Hashtbl.find_opt fixture_days (Graph.Uuid.to_string page)) ->
+              Some (Protocol.V2_journals_outcome {items=[];next_cursor=None})
+            | _ -> None
+          in
+          match outcome with
+          | None -> {kept with requests=kept.requests@[request]}
+          | Some outcome ->
+            let next=serve (Production_runtime.receive runtime (Protocol.V2_response {api_version=Protocol.api_version;request_id=request.request_id;outcome})) in
+            {requests=kept.requests@next.requests;responses=kept.responses@next.responses})
+          {requests=[];responses=output.responses} output.requests
+      in serve result
+    | _ -> Production_runtime.receive runtime raw
+end
 
 let uuid value = Graph.Uuid.of_string value |> Result.get_ok
 
@@ -13,14 +58,18 @@ let only description = function
 let request_id (request : Protocol.request) = request.request_id
 
 let response request outcome =
+  Hashtbl.replace fixture_requests (Graph.Uuid.to_string request.Protocol.request_id) request.command;
+  (match outcome with
+   | Protocol.V2_journals_outcome {items;_} -> List.iter (fun (i:Protocol.v2_journal_item)->Hashtbl.replace fixture_days (Graph.Uuid.to_string i.page.uuid) i.journal_day) items
+   | _ -> ());
   Protocol.V2_response
     { api_version = Protocol.api_version; request_id = request_id request; outcome }
 ;;
 
-let set_calendar runtime =
+let set_calendar ?(clock=1_788_192_000.) runtime =
   let sampler =
     Journal_calendar.Sampler.create
-      ~clock:(fun () -> 1_788_192_000.)
+      ~clock:(fun () -> clock)
       ~localtime:Unix.gmtime
       ()
   in
@@ -68,10 +117,10 @@ let load_feed runtime =
   Runtime.submit
     runtime
     (Journal_graph_request.Load_feed
-       { before_day = None
+       { cursor = None
        ; day_limit = 3
-       ; blocks_per_day = 4
-       ; slot_limit = 16
+       ; root_limit = 4
+
        ; request_generation = 7L
        })
   |> fun output -> only "initial journal request" output.requests
@@ -182,10 +231,10 @@ let seed_large_feed runtime =
     Runtime.submit
       runtime
       (Journal_graph_request.Load_feed
-         { before_day = None
+         { cursor = None
          ; day_limit = 1
-         ; blocks_per_day = 64
-         ; slot_limit = 128
+         ; root_limit = 64
+
          ; request_generation = 1L
          })
     |> fun output -> only "large feed" output.requests
@@ -450,6 +499,7 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
   in
   check_hydration_bound output.requests;
   let counts = Hashtbl.create 4 in
+  let complete_feeds = ref 0 and reconciled_pages = ref 0 in
   let rec drain = function
     | [] -> ()
     | (request : Protocol.request) :: rest ->
@@ -465,10 +515,10 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
               { items = [ { page; journal_day = 20260901; revision = "page-2" } ]
               ; next_cursor = None
               } )
-        | V2_get_page_tree _ ->
+        | V2_get_page_tree {maximum_depth;_} ->
           ( "tree"
           , Protocol.V2_page_tree_outcome
-              { page = page_uuid; maximum_depth = 1; items; next_cursor = None } )
+              { page = page_uuid; maximum_depth; items=List.filter (fun (m:Protocol.v2_tree_member)->m.depth<=maximum_depth) items; next_cursor = None } )
         | V2_get_children { parent; _ } ->
           ( "children"
           , Protocol.V2_children_outcome
@@ -495,19 +545,30 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
         counts
         kind
         (1 + Option.value ~default:0 (Hashtbl.find_opt counts kind));
-      let result = Runtime.receive runtime (response request outcome) in
+      let result = Production_runtime.receive runtime (response request outcome) in
+      List.iter (fun (r : Runtime.response) -> match r.payload with
+        | Feed_loaded { complete = true; _ } -> incr complete_feeds
+        | Page_tree_reconciled { value; _ } ->
+          incr reconciled_pages;
+          Alcotest.(check int) "retained page reconciliation is complete" 48
+            (List.length value.entries)
+        | _ -> ()) result.responses;
       let outstanding = rest @ result.requests in
       check_hydration_bound outstanding;
       drain outstanding
   in
   drain output.requests;
+  Alcotest.(check int) "resync prefix completes" 1 !complete_feeds;
+  Alcotest.(check int) "resync retained page also completes" 1 !reconciled_pages;
   List.iter
     (fun (kind, expected) ->
        Alcotest.(check int)
          kind
          expected
          (Option.value ~default:0 (Hashtbl.find_opt counts kind)))
-    [ "graph", 1; "journal", 1; "tree", 2; "children", 48; "block", 48; "page", 1 ]
+    (* 48 Detail reads plus 48 previews for each of the prefix and retained
+       page owners. Cancelling either Timeline owner is not a valid bound. *)
+    [ "graph", 1; "journal", 1; "tree", 2; "children", 144; "block", 48; "page", 1 ]
 ;;
 
 let test_queued_resync_announces_feed_refresh () =
@@ -664,7 +725,7 @@ let test_page_tree_interest_refetches_only_matching_tree () =
   in
   require_ack output;
   match hydration_requests output with
-  | [ { Protocol.command = V2_get_page_tree { page; maximum_depth = 1; _ }; _ } ] ->
+  | [ { Protocol.command = V2_get_page_tree { page; maximum_depth = 0; _ }; _ } ] ->
     Alcotest.(check string)
       "hydrated page tree"
       (Graph.Uuid.to_string page_uuid)
@@ -801,16 +862,14 @@ let test_read_failure_conversion_preserves_category_and_ownership () =
               { day = 20260901; after = None; limit = 64; request_generation = 23L })
          |> fun output -> only "day read" output.requests
        in
-       let output =
-         Runtime.receive
-           runtime
-           (response
-              request
-              (Protocol.V2_failed
-                 { code = Logseq_db_worker.Error.code_string code
-                 ; message = "Read diagnostic"
-                 }))
+       let rec reject request =
+         let output = Runtime.receive runtime (response request
+             (Protocol.V2_failed {code=Logseq_db_worker.Error.code_string code;message="Read diagnostic"})) in
+         match output.requests with
+         | [retry] when code=Logseq_db_worker.Error.Response_too_large -> reject retry
+         | _ -> output
        in
+       let output = reject request in
        match (only "day failure" output.responses).payload with
        | Runtime.Day_blocks_failed
            { day; request_generation; stale_cursor; failure = Worker_failure failure } ->
@@ -848,10 +907,10 @@ let test_older_feed_uses_calendar_upper_bound () =
          Runtime.submit
            runtime
            (Journal_graph_request.Load_feed
-              { before_day = Some before_day
+              { cursor = Some {before_day=Some before_day;skipped_day=None}
               ; day_limit = 3
-              ; blocks_per_day = 4
-              ; slot_limit = 16
+              ; root_limit = 4
+
               ; request_generation = 7L
               })
        in
@@ -948,6 +1007,7 @@ let test_detail_forwards_child_cursor () =
   let after : Journal_graph_projection.block_cursor =
     { after_sibling_order = "m"
     ; after_block_id = Graph.Uuid.to_string unrelated_uuid
+
     ; protocol_cursor = Some cursor
     }
   in
@@ -1968,25 +2028,6 @@ let tree_page request items next_cursor =
        { page = page_uuid; maximum_depth = 1; items; next_cursor })
 ;;
 
-let child_members first count =
-  List.init count (fun offset ->
-    let index = first + offset in
-    let child =
-      { block with
-        uuid = uuid (Printf.sprintf "a1000000-0000-4000-b000-%012d" index)
-      ; parent = block_uuid
-      ; order = Printf.sprintf "a%04d" index
-      ; title = Printf.sprintf "Child %d" index
-      }
-    in
-    Protocol.
-      { value = { record with block = child }
-      ; revision = "child-1"
-      ; depth = 1
-      ; parent = block_uuid
-      })
-;;
-
 let initial_tree runtime =
   set_calendar runtime;
   let journals = load_feed runtime in
@@ -2011,7 +2052,7 @@ let check_tree_continuation output cursor =
    | Protocol.V2_get_page_tree
        { page = actual; maximum_depth; limit; cursor = Some actual_cursor; _ } ->
      Alcotest.(check bool) "same page" true (Graph.Uuid.equal page_uuid actual);
-     Alcotest.(check int) "same depth" 1 maximum_depth;
+     Alcotest.(check int) "root-only depth" 0 maximum_depth;
      Alcotest.(check int) "same page budget" 4 limit;
      Alcotest.(check string)
        "opaque cursor"
@@ -2029,7 +2070,7 @@ let test_child_only_day_pages outcome =
     { value = record; revision = "root-1"; depth = 0; parent = page_uuid }
   in
   let initial =
-    Runtime.receive runtime (tree_page tree (root :: child_members 1 3) (Some cursor))
+    Runtime.receive runtime (tree_page tree [root] (Some cursor))
   in
   let after =
     List.find_map
@@ -2054,7 +2095,7 @@ let test_child_only_day_pages outcome =
            Graph.Cursor.of_string (Printf.sprintf "children-after-%d" (first + 3))
            |> Result.get_ok
          in
-         Runtime.receive runtime (tree_page request (child_members first 4) (Some cursor))
+         Runtime.receive runtime (tree_page request [] (Some cursor))
          |> fun output -> check_tree_continuation output cursor)
       request
       [ 4; 8 ]
@@ -2082,7 +2123,7 @@ let test_child_only_day_pages outcome =
        else
          tree_page
            request
-           (if outcome = `Exhausted then child_members 12 2 else [ later ])
+           (if outcome = `Exhausted then [] else [ later ])
            None)
   in
   Alcotest.(check int) "no further read" 0 (List.length completed.requests);
@@ -2098,16 +2139,17 @@ let test_child_only_day_pages outcome =
      | _ -> Alcotest.fail "lost day failure")
   | `Found | `Exhausted ->
     (match (only "day completion" completed.responses).payload with
-     | Day_blocks_loaded { request_generation; page } ->
+     | Feed_loaded { request_generation; feed; complete=true } ->
+       let entries = List.concat_map (fun (d:Journal_graph_projection.day_feed)->d.entries) feed.days in
        Alcotest.(check int64) "original generation" 19L request_generation;
-       Alcotest.(check bool) "true exhaustion" true (page.continuation = None);
+       Alcotest.(check bool) "true exhaustion" true (Option.is_none feed.continuation);
        Alcotest.(check (list string))
          "visible roots"
          (if outcome = `Found then [ "Later root" ] else [])
          (List.map
             (fun (entry : Journal_graph_projection.timeline_entry) ->
                Journal_model.source entry.block)
-            page.entries)
+            entries)
      | _ -> Alcotest.fail "lost day completion")
 ;;
 
@@ -2123,12 +2165,12 @@ let test_feed_with_blank_root_continues () =
   in
   let cursor = Graph.Cursor.of_string "blank-root-children" |> Result.get_ok in
   let request =
-    Runtime.receive runtime (tree_page tree (blank :: child_members 1 3) (Some cursor))
+    Runtime.receive runtime (tree_page tree [blank] (Some cursor))
     |> fun output -> check_tree_continuation output cursor
   in
   let cursor = Graph.Cursor.of_string "blank-root-children-next" |> Result.get_ok in
   let request =
-    Runtime.receive runtime (tree_page request (child_members 4 4) (Some cursor))
+    Runtime.receive runtime (tree_page request [] (Some cursor))
     |> fun output -> check_tree_continuation output cursor
   in
   let visible =
@@ -2642,10 +2684,10 @@ let begin_reference_tree runtime generation =
     Runtime.submit
       runtime
       (Journal_graph_request.Load_feed
-         { before_day = None
+         { cursor = None
          ; day_limit = 3
-         ; blocks_per_day = 4
-         ; slot_limit = 16
+         ; root_limit = 4
+
          ; request_generation = generation
          })
     |> fun output -> only "reference journal request" output.requests
@@ -3834,14 +3876,14 @@ let test_projection_changes_are_owned () =
     (invalidates_favorites output)
 ;;
 
-let feed_window_request runtime ~days ~slots =
+let feed_window_request runtime ~days ~slots:_ =
   Runtime.submit
     runtime
     (Journal_graph_request.Load_feed
-       { before_day = None
+       { cursor = None
        ; day_limit = days
-       ; blocks_per_day = 1
-       ; slot_limit = slots
+       ; root_limit = 1
+
        ; request_generation = 7L
        })
   |> fun output -> only "journal window request" output.requests
@@ -3895,90 +3937,27 @@ let test_feed_window_fits_encoded_response_budget () =
 
 let test_feed_continuation_reads_only_missing_days () =
   let runtime = Runtime.create () in
-  set_calendar runtime;
-  let request = feed_window_request runtime ~days:3 ~slots:16 in
-  Alcotest.(check int)
-    "initial request needs three days"
-    3
-    (journal_request_limit request);
+  set_calendar ~clock:1_788_278_400. runtime;
+  let first = feed_window_request runtime ~days:3 ~slots:16 in
   let cursor = Graph.Cursor.of_string "journal-after-one" |> Result.get_ok in
-  let valid : Protocol.v2_journal_item =
-    { page; journal_day = 20260901; revision = "journal-first" }
-  in
-  let filtered n =
-    { valid with
-      page =
-        { page with
-          uuid = uuid (Printf.sprintf "a3000000-0000-4000-8000-%012d" (100 + n))
-        ; recycled = true
-        }
-    }
-  in
-  let output =
-    Runtime.receive
-      runtime
-      (response
-         request
-         (V2_journals_outcome
-            { items = [ valid; filtered 1; filtered 2 ]; next_cursor = Some cursor }))
-  in
-  Alcotest.(check int)
-    "no feed failure while listing continues"
-    0
-    (List.length output.responses);
-  let next = only "one sequential journal continuation" output.requests in
+  let valid : Protocol.v2_journal_item = {page;journal_day=20260901;revision="journal-first"} in
+  let output = Runtime.receive runtime (response first (V2_journals_outcome
+      {items=[valid;{valid with page={page with recycled=true}}];next_cursor=Some cursor})) in
+  let tree=only "resolve available date before fetching more metadata" output.requests in
+  let output=Runtime.receive runtime (response tree (V2_page_tree_outcome
+      {page=page_uuid;maximum_depth=0;items=[];next_cursor=None})) in
+  let next=only "continue journal cursor after empty date" output.requests in
   (match next.command with
-   | V2_list_journals { limit; cursor = Some actual; _ } ->
-     Alcotest.(check int) "only two valid days remain" 2 limit;
-     Alcotest.(check string)
-       "original opaque cursor"
-       (Graph.Cursor.to_string cursor)
-       (Graph.Cursor.to_string actual)
-   | _ -> Alcotest.fail "journal continuation lost its cursor");
-  let second n : Protocol.v2_journal_item =
-    let id = uuid (Printf.sprintf "a3000000-0000-4000-8000-%012d" n) in
-    let day = 20260831 - n in
-    { page = { page with uuid = id; kind = Journal_page { journal_day = day } }
-    ; journal_day = day
-    ; revision = "journal-next"
-    }
-  in
-  let more = Graph.Cursor.of_string "journal-more" |> Result.get_ok in
-  let trees =
-    Runtime.receive
-      runtime
-      (response
-         next
-         (V2_journals_outcome { items = [ second 1; second 2 ]; next_cursor = Some more }))
-  in
-  Alcotest.(check int)
-    "all three complete page records reach tree loading"
-    3
-    (List.length trees.requests);
-  let completed =
-    List.fold_left
-      (fun _ request ->
-         match request.Protocol.command with
-         | V2_get_page_tree { page; maximum_depth; _ } ->
-           Runtime.receive
-             runtime
-             (response
-                request
-                (V2_page_tree_outcome
-                   { page; maximum_depth; items = []; next_cursor = None }))
-         | _ -> Alcotest.fail "unexpected extra journal read")
-      trees
-      trees.requests
-  in
-  Alcotest.(check bool)
-    "older days remain available"
-    true
-    (List.exists
-       (fun (r : Runtime.response) ->
-          match r.payload with
-          | Feed_loaded { feed; _ } -> feed.has_more_days
-          | _ -> false)
-       completed.responses)
+   | V2_list_journals {limit;cursor=Some actual;_} ->
+     Alcotest.(check int) "metadata packet independent of root demand" 3 limit;
+     Alcotest.(check bool) "opaque date cursor retained" true (actual=cursor)
+   | _ -> Alcotest.fail "lost date continuation");
+  let completed=Runtime.receive runtime (response next (V2_journals_outcome {items=[];next_cursor=None})) in
+  match (only "exhausted empty dates complete" completed.responses).payload with
+  | Feed_loaded {feed;complete=true;_} ->
+    Alcotest.(check bool) "true exhaustion" false (Option.is_some feed.continuation);
+    Alcotest.(check int) "empty dates consume no roots" 0 (List.length feed.days)
+  | _ -> Alcotest.fail "lost complete empty feed"
 ;;
 
 let test_feed_window_bounds_and_singleton_failure () =
@@ -3990,7 +3969,7 @@ let test_feed_window_bounds_and_singleton_failure () =
          "day, slot and protocol bounds"
          expected
          (journal_request_limit request))
-    [ 1, 2, 1; 10, 6, 3; 500, 1000, Protocol.maximum_page_size ];
+    [ 1, 2, 1; 10, 6, 10; 500, 1000, Protocol.maximum_page_size ];
   let runtime = Runtime.create () in
   let request = feed_window_request runtime ~days:1 ~slots:2 in
   let oversized_page =
@@ -4039,7 +4018,7 @@ let test_feed_window_bounds_and_singleton_failure () =
   | Feed_failed { failure = Worker_failure failure; _ } ->
     Alcotest.(check string)
       "failure keeps operation identity"
-      "listFeedPages"
+      "listTimelineDates"
       failure.operation
   | _ -> Alcotest.fail "oversized singleton was hidden or truncated"
 ;;
@@ -4088,10 +4067,10 @@ let test_bounded_preview_tree_paths () =
     Runtime.submit
       runtime
       (Journal_graph_request.Load_feed
-         { before_day = None
+         { cursor = None
          ; day_limit = 1
-         ; blocks_per_day = 200
-         ; slot_limit = 201
+         ; root_limit = 200
+
          ; request_generation = 7L
          })
     |> fun o -> only "preview feed journals" o.requests
@@ -4118,7 +4097,7 @@ let test_bounded_preview_tree_paths () =
       feed.responses
     |> Option.get
   in
-  check_preview count (only "feed entry" day.entries);
+  check_preview 3 (only "feed entry" day.entries);
   let day_read =
     Runtime.submit
       runtime
@@ -4136,7 +4115,7 @@ let test_bounded_preview_tree_paths () =
    | _ -> Alcotest.fail "preview cap changed day paging");
   let day_result = Runtime.receive runtime (tree_page day_read items None) in
   (match (only "preview day result" day_result.responses).payload with
-   | Day_blocks_loaded { page; _ } -> check_preview count (only "day entry" page.entries)
+   | Feed_loaded {feed;complete=true;_} -> check_preview 3 (only "day entry" (List.hd feed.days).entries)
    | _ -> Alcotest.fail "preview day result lost owner");
   let changed_output =
     changed runtime (window ~scopes:[ Protocol.V2_page_tree_interest page_uuid ] ())
@@ -4145,7 +4124,7 @@ let test_bounded_preview_tree_paths () =
   let remote = Runtime.receive runtime (tree_page refresh items None) in
   (match (only "preview remote result" remote.responses).payload with
    | Page_tree_reconciled { value; _ } ->
-     check_preview count (only "remote entry" value.entries)
+     check_preview 3 (only "remote entry" value.entries)
    | _ -> Alcotest.fail "preview remote result lost owner");
   (* Delete conflict exercises the legacy page-tree refresh projection rather
      than canonical target-summary confirmation. *)
@@ -4243,10 +4222,10 @@ let test_preview_preserves_full_detail_and_copy () =
     Runtime.submit
       runtime
       (Journal_graph_request.Load_feed
-         { before_day = None
+         { cursor = None
          ; day_limit = 1
-         ; blocks_per_day = 200
-         ; slot_limit = 201
+         ; root_limit = 200
+
          ; request_generation = 7L
          })
     |> fun output -> only "hidden parent feed" output.requests
@@ -4280,7 +4259,7 @@ let test_preview_preserves_full_detail_and_copy () =
      Alcotest.(check int)
        "child image cannot retain empty parent"
        0
-       (List.length (List.hd feed.days).entries)
+       (List.fold_left (fun n (d:Journal_graph_projection.day_feed)->n+List.length d.entries) 0 feed.days)
    | _ -> Alcotest.fail "hidden parent feed failed");
   let root_read =
     Runtime.submit
@@ -4477,13 +4456,13 @@ let check_parent_visibility roots entries =
           }
         ]
     ; slot_count = 1 + List.length entries
-    ; has_more_days = false
+    ; continuation = None; prioritized_day = None
     }
   in
   let state =
     Journal_timeline_state.empty ~today:20260902
     |> fun s ->
-    Journal_timeline_state.begin_request s ~generation:1L (Feed { before_day = None })
+    Journal_timeline_state.begin_request s ~generation:1L (Feed { cursor = None })
     |> fun s -> Journal_timeline_state.apply_feed s ~generation:1L feed
   in
   let shown =
@@ -4509,10 +4488,10 @@ let test_parent_visibility_tree_paths () =
     Runtime.submit
       runtime
       (Journal_graph_request.Load_feed
-         { before_day = None
+         { cursor = None
          ; day_limit = 1
-         ; blocks_per_day = 200
-         ; slot_limit = 201
+         ; root_limit = 200
+
          ; request_generation = 7L
          })
     |> fun o -> only "visibility feed" o.requests
@@ -4553,7 +4532,7 @@ let test_parent_visibility_tree_paths () =
   in
   let output = Runtime.receive runtime (tree_page read items None) in
   (match (only "visibility day" output.responses).payload with
-   | Day_blocks_loaded { page; _ } -> check_parent_visibility roots page.entries
+   | Feed_loaded {feed;complete=true;_} -> check_parent_visibility roots (List.hd feed.days).entries
    | _ -> Alcotest.fail "visibility day owner lost");
   let refresh =
     changed runtime (window ~scopes:[ V2_page_tree_interest page_uuid ] ())
@@ -6324,6 +6303,1704 @@ let test_task_catalog_generation_and_deltas () =
   Alcotest.(check int) "old graph catalog ignored" 0 (List.length late.responses)
 ;;
 
+(* Exercise the production Runtime with valid bounded Worker pages. The fixture
+   is ordered input, not a second implementation of Timeline projection. *)
+type root_fixture =
+  { owner : Graph.page
+  ; roots : Protocol.v2_block_record list
+  ; descendants : (Graph.Uuid.t * Protocol.v2_block_record list) list
+  }
+
+let root_fixture index count child_count =
+  let day = 20260930 - index in
+  let owner =
+    { page with
+      uuid = uuid (Printf.sprintf "a7000000-0000-4000-8000-%012d" index)
+    ; title = Printf.sprintf "Journal %d" day
+    ; kind = Journal_page { journal_day = day }
+    }
+  in
+  let roots =
+    List.init count (fun n ->
+      { record with
+        block =
+          { block with
+            uuid = uuid (Printf.sprintf "a7100000-0000-4000-8000-%06d%06d" index n)
+          ; parent = owner.uuid
+          ; page = owner.uuid
+          ; title = Printf.sprintf "Root %d/%d" index n
+          ; order = Printf.sprintf "%06d" n
+          }
+      })
+  in
+  let descendants =
+    List.map
+      (fun (r : Protocol.v2_block_record) ->
+         ( r.block.uuid
+         , List.init child_count (fun n ->
+             { record with
+               block =
+                 { block with
+                   uuid =
+                     uuid
+                       (Printf.sprintf
+                          "a7200000-0000-4000-%04d-%012d"
+                          index
+                          ((int_of_string r.block.order * 100000) + n))
+                 ; parent = r.block.uuid
+                 ; page = owner.uuid
+                 ; title = Printf.sprintf "Child %d" n
+                 ; order = Printf.sprintf "%06d" n
+                 ; properties = (if n = 1 then [ asset_type_property ] else [])
+                 }
+             }) ))
+      roots
+  in
+  { owner; roots; descendants }
+;;
+
+let root_cursor n =
+  Graph.Cursor.of_string ("fixture-offset:" ^ string_of_int n) |> Result.get_ok
+;;
+
+let root_offset = function
+  | None -> 0
+  | Some cursor -> Scanf.sscanf (Graph.Cursor.to_string cursor) "fixture-offset:%d" Fun.id
+;;
+
+let root_slice values limit cursor =
+  let offset = root_offset cursor in
+  let values = List.filteri (fun i _ -> i >= offset) values in
+  let selected = List.take limit values in
+  ( selected
+  , if List.length values > List.length selected
+    then Some (root_cursor (offset + List.length selected))
+    else None )
+;;
+
+let initial_roots runtime generation =
+  Runtime.submit
+    runtime
+    (Journal_graph_request.Load_feed
+       { cursor = None; root_limit = 30; day_limit = 7; request_generation = generation })
+;;
+
+let drive_root_output ?(split_bytes = false) runtime fixtures (start : Runtime.output) =
+  let queue = Queue.create () in
+  let seen = ref []
+  and outputs = ref start.responses in
+  List.iter (fun r -> Queue.push r queue) start.requests;
+  let children = List.concat_map (fun f -> f.descendants) fixtures in
+  let ticks = ref 0 in
+  while not (Queue.is_empty queue) do
+    incr ticks;
+    if !ticks > 1000 then Alcotest.fail "initial feed did not converge";
+    let request : Protocol.request = Queue.pop queue in
+    seen := request :: !seen;
+    let outcome : Protocol.v2_outcome =
+      match request.command with
+      | V2_list_journals { limit; cursor; from_day; through_day; _ } ->
+        let fixtures = List.filter (fun f -> match f.owner.kind with Journal_page {journal_day} -> from_day <= journal_day && journal_day <= through_day | _ -> false) fixtures in
+        let selected, next_cursor = root_slice fixtures limit cursor in
+        V2_journals_outcome
+          { items =
+              List.map
+                (fun f ->
+                   let journal_day =
+                     match f.owner.kind with
+                     | Journal_page { journal_day } -> journal_day
+                     | _ -> assert false
+                   in
+                   Protocol.{ page = f.owner; journal_day; revision = "page-1" })
+                selected
+          ; next_cursor
+          }
+      | V2_get_page_tree { page; maximum_depth; limit; cursor; _ } ->
+        Alcotest.(check int) "roots do not consume child budget" 0 maximum_depth;
+        if split_bytes && limit > 2
+        then
+          V2_failed { code = "responseTooLarge"; message = "Fixture encoded byte limit" }
+        else (
+          let fixture =
+            List.find (fun f -> Graph.Uuid.equal page f.owner.uuid) fixtures
+          in
+          let selected, next_cursor = root_slice fixture.roots limit cursor in
+          V2_page_tree_outcome
+            { page
+            ; maximum_depth
+            ; items =
+                List.map
+                  (fun value ->
+                     Protocol.{ value; revision = "root-1"; depth = 0; parent = page })
+                  selected
+            ; next_cursor
+            })
+      | V2_get_children { parent; limit; cursor; _ } ->
+        Alcotest.(check bool) "preview requests stay bounded" true (limit <= 3);
+        if split_bytes && limit > 1
+        then
+          V2_failed { code = "responseTooLarge"; message = "Fixture preview byte limit" }
+        else (
+          let values = Option.value (List.assoc_opt parent children) ~default:[] in
+          let selected, next_cursor = root_slice values limit cursor in
+          V2_children_outcome
+            { parent
+            ; revision_scope = V2_children_revision parent
+            ; scope_revision = "children-1"
+            ; items =
+                List.map (fun value -> Protocol.{ value; revision = "child-1" }) selected
+            ; next_cursor
+            })
+      | V2_ack_changes _ ->
+        V2_changes_acknowledged { generation = "generation-1"; through = "revision-2" }
+      | _ -> Alcotest.fail "unexpected initial feed query"
+    in
+    let delivered = Runtime.receive runtime (response request outcome) in
+    Alcotest.(check int)
+      "duplicate completion is ignored"
+      0
+      (List.length (Runtime.receive runtime (response request outcome)).responses);
+    outputs := !outputs @ delivered.responses;
+    List.iter (fun r -> Queue.push r queue) delivered.requests
+  done;
+  !outputs, List.rev !seen
+;;
+
+let drive_roots ?(split_bytes = false) runtime fixtures start =
+  let outputs, seen = drive_root_output ~split_bytes runtime fixtures start in
+  let complete =
+    List.filter_map
+      (fun (r : Runtime.response) ->
+         match r.payload with
+         | Feed_loaded { feed; complete = true; _ } -> Some feed
+         | _ -> None)
+      outputs
+  in
+  only "one complete initial feed" complete, seen
+;;
+
+let normal_journal_fixture index count child_count =
+  let fixture = root_fixture index count child_count in
+  let day = if index = 30 then 20260831 else 20260930 - index in
+  let id =
+    uuid
+      (Printf.sprintf
+         "00000001-%04d-%04d-0000-000000000000"
+         (day / 10000)
+         (day mod 10000))
+  in
+  let owner =
+    { fixture.owner with
+      uuid = id
+    ; name = string_of_int day
+    ; title = string_of_int day
+    ; kind = Journal_page { journal_day = day }
+    }
+  in
+  let roots =
+    List.map
+      (fun (r : Protocol.v2_block_record) ->
+         { r with block = { r.block with parent = id; page = id } })
+      fixture.roots
+  in
+  let descendants =
+    List.map
+      (fun (root, values) ->
+         ( root
+         , List.map
+             (fun (r : Protocol.v2_block_record) ->
+                { r with block = { r.block with page = id } })
+             values ))
+      fixture.descendants
+  in
+  { owner; roots; descendants }
+;;
+
+let set_priority_calendar runtime =
+  let sampler =
+    Journal_calendar.Sampler.create
+      ~clock:(fun () -> 1_788_278_400.)
+      ~localtime:Unix.gmtime
+      ()
+  in
+  Runtime.set_calendar runtime (Journal_calendar.Sampler.sample sampler |> Result.get_ok)
+;;
+let test_today_priority_batch () =
+  let failures = ref [] in
+  let check name f =
+    try f () with
+    | exn -> failures := (name ^ ": " ^ Printexc.to_string exn) :: !failures
+  in
+  List.iter
+    (fun future_count ->
+       List.iter
+         (fun today_count ->
+            check
+              (Printf.sprintf "future=%d today=%d" future_count today_count)
+              (fun () ->
+                 let runtime = Runtime.create ~localtime:Unix.gmtime () in
+                 set_priority_calendar runtime;
+                 let future = normal_journal_fixture 0 future_count 4 in
+                 let today = normal_journal_fixture 29 (max 0 today_count) 4 in
+                 let older = normal_journal_fixture 30 3 0 in
+                 let older =
+                   { older with
+                     owner =
+                       { older.owner with
+                         kind = Journal_page { journal_day = 20260831 }
+                       ; name = "20260831"
+                       ; title = "2026-08-31"
+                       }
+                   }
+                 in
+                 let fixtures =
+                   if today_count < 0 then [ future; older ] else [ future; today; older ]
+                 in
+                 let feed, seen =
+                   drive_roots runtime fixtures (initial_roots runtime 501L)
+                 in
+                 let entries =
+                   List.concat_map
+                     (fun (d : Journal_graph_projection.day_feed) -> d.entries)
+                     feed.days
+                 in
+                 let today_entries =
+                   List.filter
+                     (fun (e : Journal_graph_projection.timeline_entry) ->
+                        Journal_model.journal_day e.block = 20260901)
+                     entries
+                 in
+                 Alcotest.(check int)
+                   "Today occupies first batch before future roots"
+                   (min 30 (max 0 today_count))
+                   (List.length today_entries);
+                 Alcotest.(check int)
+                   "one shared thirty-root budget"
+                   (min 30 (future_count + max 0 today_count + 3))
+                   (List.length entries);
+                 if today_count > 0
+                 then (
+                   let first_page =
+                     List.find_map
+                       (fun (r : Protocol.request) ->
+                          match r.command with
+                          | V2_get_page_tree { page; _ } -> Some page
+                          | _ -> None)
+                       seen
+                   in
+                   Alcotest.(check bool)
+                     "Today root read occurs first"
+                     true
+                     (first_page = Some today.owner.uuid));
+                 List.iter
+                   (fun (e : Journal_graph_projection.timeline_entry) ->
+                      if Journal_model.journal_day e.block <> 20260831
+                      then
+                        Alcotest.(check int)
+                          "priority keeps independent previews"
+                          3
+                          (List.length e.child_summaries))
+                   entries))
+         [ -1; 0; 1; 29; 30; 31; 61 ])
+    [ 0; 29; 30; 31 ];
+  check "multiple future dates" (fun () ->
+    let runtime = Runtime.create ~localtime:Unix.gmtime () in
+    set_priority_calendar runtime;
+    let older = normal_journal_fixture 30 1 0 in
+    let older =
+      { older with
+        owner =
+          { older.owner with
+            kind = Journal_page { journal_day = 20260831 }
+          ; name = "20260831"
+          ; title = "2026-08-31"
+          }
+      }
+    in
+    let fixtures =
+      List.init 10 (fun i -> normal_journal_fixture i 4 0) @ [ normal_journal_fixture 29 2 0; older ]
+    in
+    let feed, _ = drive_roots runtime fixtures (initial_roots runtime 502L) in
+    let today =
+      List.find_opt
+        (fun (d : Journal_graph_projection.day_feed) -> d.page.day = 20260901)
+        feed.days
+    in
+    Alcotest.(check int)
+      "Today outside metadata packet still loads first"
+      2
+      (Option.fold
+         ~none:0
+         ~some:(fun (d : Journal_graph_projection.day_feed) -> List.length d.entries)
+         today));
+  if !failures <> [] then Alcotest.fail (String.concat "\n" (List.rev !failures))
+;;
+let test_today_priority_continuations () =
+  let failures = ref [] in
+  let check name f =
+    try f () with
+    | exn -> failures := (name ^ ": " ^ Printexc.to_string exn) :: !failures
+  in
+  List.iter
+    (fun today_count ->
+       List.iter
+         (fun future_count ->
+            check
+              (Printf.sprintf "drain Today=%d future=%d" today_count future_count)
+              (fun () ->
+                 let runtime = Runtime.create ~localtime:Unix.gmtime () in
+                 set_priority_calendar runtime;
+                 let future = normal_journal_fixture 0 future_count 0
+                 and today = normal_journal_fixture 29 (max 0 today_count) 0 in
+                 let older = normal_journal_fixture 30 3 0 in
+                 let older =
+                   { older with
+                     owner =
+                       { older.owner with
+                         kind = Journal_page { journal_day = 20260831 }
+                       ; name = "20260831"
+                       ; title = "2026-08-31"
+                       }
+                   }
+                 in
+                 let fixtures =
+                   if today_count < 0 then [ future; older ] else [ future; today; older ]
+                 in
+                 let expected =
+                   List.concat_map (fun f -> f.roots) fixtures
+                   |> List.map (fun (r : Protocol.v2_block_record) ->
+                     Graph.Uuid.to_string r.block.uuid)
+                   |> List.sort String.compare
+                 in
+                 let rec drain generation output loaded =
+                   if generation > 520L
+                   then Alcotest.fail "priority pagination did not exhaust";
+                   let feed, _ = drive_roots runtime fixtures output in
+                   let entries =
+                     List.concat_map
+                       (fun (d : Journal_graph_projection.day_feed) -> d.entries)
+                       feed.days
+                   in
+                   Alcotest.(check bool)
+                     "each batch stays within thirty roots"
+                     true
+                     (List.length entries <= 30);
+                   let ids =
+                     List.map
+                       (fun (e : Journal_graph_projection.timeline_entry) ->
+                          Journal_model.id e.block)
+                       entries
+                   in
+                   Alcotest.(check bool)
+                     "subsequent batches never reread a selected root"
+                     true
+                     (List.for_all (fun id -> not (List.mem id loaded)) ids);
+                   let loaded = loaded @ ids in
+                   let next =
+                     match
+                       List.find_opt
+                         (fun (d : Journal_graph_projection.day_feed) ->
+                            d.has_more_entries)
+                         feed.days
+                     with
+                     | Some d ->
+                       Some
+                         (Journal_graph_request.Load_day_blocks
+                            { day = d.page.day
+                            ; after = d.continuation
+                            ; limit = 30
+                            ; request_generation = Int64.succ generation
+                            })
+                     | None ->
+                       Option.map
+                         (fun cursor ->
+                            Journal_graph_request.Load_feed
+                              { cursor = Some cursor
+                              ; root_limit = 30
+                              ; day_limit = 7
+                              ; request_generation = Int64.succ generation
+                              })
+                         feed.continuation
+                   in
+                   match next with
+                   | None -> loaded
+                   | Some request ->
+                     drain (Int64.succ generation) (Runtime.submit runtime request) loaded
+                 in
+                 let loaded = drain 501L (initial_roots runtime 501L) [] in
+                 Alcotest.(check (list string))
+                   "all deferred future and older roots eventually load exactly once"
+                   expected
+                   (List.sort String.compare loaded)))
+         [ 0; 29; 30; 31 ])
+    [ -1; 0; 1; 29; 30; 31; 61 ];
+  check "new day reselects priority" (fun () ->
+    let runtime = Runtime.create ~localtime:Unix.gmtime () in
+    let clock = ref 1_788_278_400. in
+    let sampler =
+      Journal_calendar.Sampler.create ~clock:(fun () -> !clock) ~localtime:Unix.gmtime ()
+    in
+    Runtime.set_calendar runtime (Journal_calendar.Sampler.sample sampler |> Result.get_ok);
+    let today = normal_journal_fixture 29 1 0
+    and tomorrow = normal_journal_fixture 28 31 0 in
+    ignore (drive_roots runtime [ tomorrow; today ] (initial_roots runtime 501L));
+    clock := !clock +. 86_400.;
+    Runtime.set_calendar runtime (Journal_calendar.Sampler.sample sampler |> Result.get_ok);
+    let feed, _ = drive_roots runtime [ tomorrow; today ] (initial_roots runtime 502L) in
+    let days =
+      List.concat_map
+        (fun (d : Journal_graph_projection.day_feed) ->
+           List.map (fun _ -> d.page.day) d.entries)
+        feed.days
+    in
+    Alcotest.(check (list int))
+      "midnight uses new Today within the same quota"
+      (List.init 30 (fun _ -> 20260902))
+      days);
+  if !failures <> [] then Alcotest.fail (String.concat "\n" (List.rev !failures))
+;;
+(* A normal remote structure edit can retire the Worker cursor. Exercise both
+   public owners: Timeline restarts the day, Runtime must retain later dates. *)
+let test_today_date_traversal_survives_recovery () =
+  let module T = Journal_timeline_state in
+  let failures = ref [] in
+  let check name f =
+    try f () with
+    | exn -> failures := (name ^ ": " ^ Printexc.to_string exn) :: !failures
+  in
+  List.iter
+    (fun mode ->
+       List.iter
+         (fun today_count ->
+            check (Printf.sprintf "%s Today=%d" mode today_count) (fun () ->
+              let runtime = Runtime.create ~localtime:Unix.gmtime () in
+              let clock = ref 1_788_278_400. in
+              let sampler =
+                Journal_calendar.Sampler.create
+                  ~clock:(fun () -> !clock)
+                  ~localtime:Unix.gmtime
+                  ()
+              in
+              Runtime.set_calendar
+                runtime
+                (Journal_calendar.Sampler.sample sampler |> Result.get_ok);
+              let future = normal_journal_fixture 0 31 0
+              and original_today = normal_journal_fixture 29 today_count 0
+              and older = normal_journal_fixture 30 3 0 in
+              let fixtures = ref [ future; original_today; older ] in
+              let first, _ = drive_roots runtime !fixtures (initial_roots runtime 601L) in
+              let state =
+                ref
+                  (T.empty ~today:20260901
+                   |> fun state ->
+                   T.begin_request state ~generation:601L (Feed { cursor = None })
+                   |> fun state -> T.apply_feed state ~generation:601L first)
+              in
+              let generation = ref 602L
+              and day = ref 20260901 in
+              if mode = "midnight"
+              then (
+                clock := !clock +. 86_400.;
+                Runtime.set_calendar
+                  runtime
+                  (Journal_calendar.Sampler.sample sampler |> Result.get_ok);
+                let new_today = normal_journal_fixture 28 today_count 0 in
+                fixtures := [ future; new_today; original_today; older ];
+                day := 20260902;
+                state := T.set_today !state ~today:!day;
+                let feed, _ =
+                  drive_roots runtime !fixtures (initial_roots runtime !generation)
+                in
+                (state
+                 := T.begin_request
+                      !state
+                      ~generation:!generation
+                      (Feed { cursor = None })
+                    |> fun state ->
+                    T.refresh_feed state ~generation:!generation ~complete:true feed);
+                generation := Int64.succ !generation);
+              let current =
+                List.find
+                  (fun f ->
+                     match f.owner.kind with
+                     | Journal_page { journal_day } -> journal_day = !day
+                     | _ -> false)
+                  !fixtures
+              in
+              let edited = List.hd current.roots in
+              let roots =
+                if mode = "reconcile-delete"
+                then List.take (List.length current.roots - 1) current.roots
+                else if mode = "reconcile"
+                then
+                  { edited with
+                    block = { edited.block with title = "Normal remote edit" }
+                  }
+                  :: List.tl current.roots
+                else
+                  current.roots
+                  @ [ { edited with
+                        block =
+                          { edited.block with
+                            uuid =
+                              uuid (Printf.sprintf "a7300000-0000-4000-8000-%012d" !day)
+                          ; title = "Normal remote root insert"
+                          ; order = "z"
+                          }
+                      }
+                    ]
+              in
+              let changed_page =
+                { current with
+                  roots
+                ; owner =
+                    { current.owner with
+                      updated_at_ms = Int64.succ current.owner.updated_at_ms
+                    }
+                }
+              in
+              fixtures
+              := List.map
+                   (fun f ->
+                      if Graph.Uuid.equal f.owner.uuid current.owner.uuid
+                      then changed_page
+                      else f)
+                   !fixtures;
+              if mode = "reconcile" || mode = "reconcile-delete"
+              then (
+                let outputs, _ =
+                  drive_root_output
+                    runtime
+                    !fixtures
+                    (changed
+                       runtime
+                       (window
+                          ~scopes:[ Protocol.V2_page_tree_interest current.owner.uuid ]
+                          ()))
+                in
+                let page, value =
+                  List.find_map
+                    (fun (r : Runtime.response) ->
+                       match r.payload with
+                       | Page_tree_reconciled { page; value } -> Some (page, value)
+                       | _ -> None)
+                    outputs
+                  |> Option.get
+                in
+                state := T.replace_timeline_entry_page !state ~page value)
+              else (
+                let count = T.retained_slot_count !state in
+                state
+                := T.observe_visible_range !state ~first_index:0 ~last_exclusive:count;
+                let request = T.next_request !state |> Option.get in
+                let command =
+                  match request with
+                  | T.Day { day; after } ->
+                    Journal_graph_request.Load_day_blocks
+                      { day; after; limit = 30; request_generation = !generation }
+                  | _ -> Alcotest.fail "Today continuation missing"
+                in
+                state := T.begin_request !state ~generation:!generation request;
+                let root =
+                  only "one continued root read" (Runtime.submit runtime command).requests
+                in
+                let code = if mode = "retry" then "unavailable" else "staleReadCursor" in
+                let failed =
+                  Runtime.receive
+                    runtime
+                    (response
+                       root
+                       (V2_failed
+                          { code; message = "Normal remote structure revision changed" }))
+                in
+                List.iter
+                  (fun (r : Runtime.response) ->
+                     match r.payload with
+                     | Day_blocks_failed { request_generation; day; stale_cursor; _ } ->
+                       state
+                       := T.fail_day_request
+                            !state
+                            ~generation:request_generation
+                            ~day
+                            ~stale_cursor
+                            ~message:"Remote update"
+                     | _ -> ())
+                  failed.responses;
+                if mode = "retry" then state := T.retry_day !state ~day:!day;
+                (match T.next_request !state with
+                 | Some (Day { after = None; _ }) -> ()
+                 | _ ->
+                   Alcotest.fail
+                     "recovery did not restart without the invalid root cursor");
+                generation := Int64.succ !generation);
+              let iterations = ref 0 in
+              let rec drain () =
+                incr iterations;
+                if !iterations > 15 then Alcotest.fail "recovery did not settle";
+                let size = T.retained_slot_count !state in
+                state
+                := T.observe_visible_range !state ~first_index:0 ~last_exclusive:size;
+                match T.next_request !state with
+                | None -> ()
+                | Some request ->
+                  let command =
+                    match request with
+                    | T.Day { day; after } ->
+                      Journal_graph_request.Load_day_blocks
+                        { day; after; limit = 30; request_generation = !generation }
+                    | Feed { cursor } ->
+                      Load_feed
+                        { cursor
+                        ; root_limit = 30
+                        ; day_limit = 7
+                        ; request_generation = !generation
+                        }
+                  in
+                  state := T.begin_request !state ~generation:!generation request;
+                  let feed, _ =
+                    drive_roots runtime !fixtures (Runtime.submit runtime command)
+                  in
+                  let anchor = T.retained_slot !state (T.first_visible_index !state) in
+                  state := T.apply_feed !state ~generation:!generation feed;
+                  (match anchor with
+                   | Some (T.Top_level old) ->
+                     let fresh = T.retained_slot !state (T.first_visible_index !state) in
+                     Alcotest.(check (option string))
+                       "recovery preserves the visible UUID anchor"
+                       (Some (Journal_model.id old.block))
+                       (match fresh with
+                        | Some (T.Top_level e) -> Some (Journal_model.id e.block)
+                        | _ -> None)
+                   | _ -> ());
+                  generation := Int64.succ !generation;
+                  drain ()
+              in
+              drain ();
+              let actual =
+                T.fold_slots
+                  (fun ids -> function
+                     | T.Top_level e -> Journal_model.id e.block :: ids
+                     | _ -> ids)
+                  []
+                  !state
+                |> List.sort String.compare
+              in
+              let expected =
+                List.concat_map
+                  (fun f ->
+                     List.map
+                       (fun (r : Protocol.v2_block_record) ->
+                          Graph.Uuid.to_string r.block.uuid)
+                       f.roots)
+                  !fixtures
+                |> List.sort String.compare
+              in
+              Alcotest.(check (list string))
+                "recovery preserves exact Today, deferred future and past UUID set"
+                expected
+                actual;
+              let days =
+                T.fold_slots
+                  (fun days -> function
+                     | T.Top_level e -> Journal_model.journal_day e.block :: days
+                     | _ -> days)
+                  []
+                  !state
+                |> List.rev
+              in
+              Alcotest.(check (list int))
+                "recovery keeps chronological display order"
+                (List.sort (fun a b -> Int.compare b a) days)
+                days))
+         [ 31; 61 ])
+    [ "stale"; "retry"; "reconcile"; "reconcile-delete"; "midnight" ];
+  if !failures <> [] then Alcotest.fail (String.concat "\n" (List.rev !failures))
+;;
+
+let test_changed_point_ownership () =
+  let failures = ref [] in
+  let check name f =
+    try f () with
+    | exn -> failures := (name ^ ": " ^ Printexc.to_string exn) :: !failures
+  in
+  let updates output =
+    List.filter_map
+      (fun (r : Runtime.response) ->
+         match r.payload with
+         | Block_updated { block; _ } -> Some block
+         | _ -> None)
+      output.Runtime.responses
+  in
+  let point runtime block_id =
+    let output = changed runtime (window ~blocks:[ block_id ] ()) in
+    List.find
+      (fun (r : Protocol.request) ->
+         match r.command with
+         | V2_get_outline_block { block; _ } -> Graph.Uuid.equal block block_id
+         | _ -> false)
+      output.requests
+  in
+  let complete runtime request value =
+    Runtime.receive
+      runtime
+      (response
+         request
+         (V2_block_outcome (V2_present_block { value; revision = "changed-block" })))
+  in
+  let context_request output page =
+    List.find_opt
+      (fun (r : Protocol.request) ->
+         match r.command with
+         | V2_get_page { page = id; _ } -> Graph.Uuid.equal id page
+         | _ -> false)
+      output.Runtime.requests
+  in
+  let require_context output page =
+    match context_request output page with
+    | Some request -> request
+    | None -> Alcotest.fail "moved point must resolve its actual page"
+  in
+  let setup known =
+    let runtime = Runtime.create ~localtime:Unix.gmtime () in
+    set_priority_calendar runtime;
+    let source = normal_journal_fixture 29 2 0
+    and target = normal_journal_fixture 0 1 0 in
+    ignore
+      (drive_roots
+         runtime
+         (if known then [ target; source ] else [ source ])
+         (initial_roots runtime 701L));
+    runtime, source, target
+  in
+  List.iter
+    (fun (known, child, ordinary) ->
+       check
+         (Printf.sprintf "known=%b child=%b ordinary=%b" known child ordinary)
+         (fun () ->
+            let runtime, source, target = setup known in
+            let target =
+              if ordinary
+              then { target with owner = { target.owner with kind = Ordinary_page } }
+              else target
+            in
+            let before = List.hd source.roots in
+            let value =
+              { before with
+                block =
+                  { before.block with
+                    page = target.owner.uuid
+                  ; parent =
+                      (if child
+                       then (List.hd target.roots).block.uuid
+                       else target.owner.uuid)
+                  ; title = "Normal moved point"
+                  }
+              }
+            in
+            let first = complete runtime (point runtime before.block.uuid) value in
+            let output =
+              if known
+              then first
+              else (
+                Alcotest.(check int)
+                  "unknown page cannot publish a guessed date"
+                  0
+                  (List.length (updates first));
+                let request = require_context first target.owner.uuid in
+                Runtime.receive
+                  runtime
+                  (response
+                     request
+                     (V2_page_outcome
+                        (V2_present_page { page = target.owner; revision = "new-page" }))))
+            in
+            let block = only "one correctly contextualized update" (updates output) in
+            Alcotest.(check string)
+              "returned page owns the model"
+              (Graph.Uuid.to_string target.owner.uuid)
+              (Journal_model.page_id block);
+            Alcotest.(check (option int))
+              "date comes from the actual page"
+              (if ordinary then None else Some 20260930)
+              (Journal_model.journal_day_opt block);
+            Alcotest.(check (option string))
+              "root or child parent uses actual page"
+              (if child
+               then Some (Graph.Uuid.to_string (List.hd target.roots).block.uuid)
+               else None)
+              (Journal_model.parent_id block)))
+    [ true, false, false
+    ; true, true, false
+    ; false, false, false
+    ; false, true, false
+    ; false, false, true
+    ];
+  check "newer point retires an old point" (fun () ->
+    let runtime, source, target = setup true in
+    let before = List.hd source.roots in
+    let old = point runtime before.block.uuid in
+    let fresh = point runtime before.block.uuid in
+    let moved =
+      { before with
+        block =
+          { before.block with
+            page = target.owner.uuid
+          ; parent = target.owner.uuid
+          ; title = "New moved value"
+          }
+      }
+    in
+    ignore (complete runtime fresh moved);
+    let late =
+      complete
+        runtime
+        old
+        { before with block = { before.block with title = "Old source value" } }
+    in
+    Alcotest.(check int)
+      "old point cannot restore source ownership"
+      0
+      (List.length (updates late)));
+  check "newer point retires old page resolution" (fun () ->
+    let runtime, source, target = setup false in
+    let before = List.hd source.roots in
+    let moved =
+      { before with
+        block = { before.block with page = target.owner.uuid; parent = target.owner.uuid }
+      }
+    in
+    let unresolved = complete runtime (point runtime before.block.uuid) moved in
+    let lookup = require_context unresolved target.owner.uuid in
+    let back =
+      complete
+        runtime
+        (point runtime before.block.uuid)
+        { before with block = { before.block with title = "Moved back normally" } }
+    in
+    ignore (only "new source observation" (updates back));
+    let late =
+      Runtime.receive
+        runtime
+        (response
+           lookup
+           (V2_page_outcome
+              (V2_present_page { page = target.owner; revision = "old-target-page" })))
+    in
+    Alcotest.(check int)
+      "late context cannot resurrect old move"
+      0
+      (List.length (updates late)));
+  check "missing moved page does not publish mixed context" (fun () ->
+    let runtime, source, target = setup false in
+    let before = List.hd source.roots in
+    let value =
+      { before with
+        block = { before.block with page = target.owner.uuid; parent = target.owner.uuid }
+      }
+    in
+    let unresolved = complete runtime (point runtime before.block.uuid) value in
+    let lookup = require_context unresolved target.owner.uuid in
+    let missing =
+      Runtime.receive
+        runtime
+        (response
+           lookup
+           (V2_page_outcome
+              (V2_missing_page { uuid = target.owner.uuid; revision = "missing-page" })))
+    in
+    Alcotest.(check int)
+      "missing context never becomes a Timeline model"
+      0
+      (List.length (updates missing)));
+  if !failures <> [] then Alcotest.fail (String.concat "\n" (List.rev !failures))
+;;
+
+let test_resync_retires_changed_points () =
+  let failures = ref [] in
+  let check name f =
+    try f () with
+    | exn -> failures := (name ^ ": " ^ Printexc.to_string exn) :: !failures
+  in
+  let updates output =
+    List.filter_map
+      (fun (r : Runtime.response) ->
+         match r.payload with
+         | Block_updated { block; _ } -> Some block
+         | _ -> None)
+      output.Runtime.responses
+  in
+  let complete runtime request value =
+    Runtime.receive
+      runtime
+      (response
+         request
+         (V2_block_outcome (V2_present_block { value; revision = "point-before-resync" })))
+  in
+  let point ?(generation = "generation-1") runtime block_id =
+    let pull =
+      Runtime.reconcile_push
+        runtime
+        ~request_generation:803L
+        (Protocol.V2_changes_available
+           { api_version = Protocol.api_version; generation; through = "revision-2" })
+    in
+    let output =
+      Runtime.receive
+        runtime
+        (response
+           (only "point change pull" pull.requests)
+           (Protocol.V2_changes
+              { generation
+              ; from_exclusive = Some "revision-1"
+              ; through = "revision-2"
+              ; windows = [ window ~blocks:[ block_id ] () ]
+              ; next = None
+              }))
+    in
+    List.find
+      (fun (r : Protocol.request) ->
+         match r.command with
+         | V2_get_outline_block { block; _ } -> Graph.Uuid.equal block block_id
+         | _ -> false)
+      output.requests
+  in
+  let run boundary pending_context move_back =
+    let runtime = Runtime.create ~localtime:Unix.gmtime () in
+    set_priority_calendar runtime;
+    let source = normal_journal_fixture 29 2 0
+    and target = normal_journal_fixture 0 0 0 in
+    ignore (drive_roots runtime [ source ] (initial_roots runtime 801L));
+    let before = List.hd source.roots in
+    let moved =
+      { before with
+        block =
+          { before.block with
+            page = target.owner.uuid
+          ; parent = target.owner.uuid
+          ; title = "Before resync"
+          }
+      }
+    in
+    let old = point runtime before.block.uuid in
+    let held =
+      if pending_context
+      then (
+        let unresolved = complete runtime old moved in
+        Alcotest.(check int)
+          "unknown destination waits for metadata"
+          0
+          (List.length (updates unresolved));
+        List.find
+          (fun (r : Protocol.request) ->
+             match r.command with
+             | V2_get_page { page; _ } -> Graph.Uuid.equal page target.owner.uuid
+             | _ -> false)
+          unresolved.requests)
+      else old
+    in
+    let fresh =
+      let value = if move_back then before else moved in
+      { value with block = { value.block with title = "After resync" } }
+    in
+    let fixtures =
+      if move_back
+      then [ target; { source with roots = fresh :: List.tl source.roots } ]
+      else
+        [ { target with roots = [ fresh ] }
+        ; { source with roots = List.tl source.roots }
+        ]
+    in
+    (match boundary with
+     | `Reset -> Runtime.reset runtime
+     | (`Push | `Pull) as boundary ->
+       let start =
+         match boundary with
+         | `Push ->
+           Runtime.reconcile_push
+             runtime
+             ~request_generation:802L
+             (Protocol.V2_resync_required_push
+                { api_version = Protocol.api_version
+                ; generation = "generation-2"
+                ; reason = "retention overflow"
+                })
+         | `Pull ->
+           Runtime.receive
+             runtime
+             (response
+                (pull runtime)
+                (Protocol.V2_resync_required
+                   { generation = "generation-2"; reason = "retention overflow" }))
+       in
+       (* Hold unrelated graph-info work; complete the real Feed and retained
+          page requests before the previously issued point/context response. *)
+       let start =
+         { start with
+           requests =
+             List.filter
+               (fun (r : Protocol.request) ->
+                  match r.command with
+                  | V2_list_journals _ | V2_get_page_tree _ | V2_get_children _ -> true
+                  | _ -> false)
+               start.requests
+         }
+       in
+       let outputs, _ = drive_root_output runtime fixtures start in
+       let published =
+         List.concat_map
+           (fun (r : Runtime.response) ->
+              match r.payload with
+              | Feed_loaded { feed; complete = true; _ } ->
+                List.concat_map
+                  (fun (d : Journal_graph_projection.day_feed) -> d.entries)
+                  feed.days
+              | Page_tree_reconciled { value; _ } -> value.entries
+              | _ -> [])
+           outputs
+       in
+       let latest =
+         List.find
+           (fun (e : Journal_graph_projection.timeline_entry) ->
+              Journal_model.id e.block = Graph.Uuid.to_string before.block.uuid)
+           published
+       in
+       Alcotest.(check string)
+         "fresh roots publish before the late result"
+         "After resync"
+         (Journal_model.source latest.block);
+       Alcotest.(check string)
+         "fresh roots have the current page"
+         (Graph.Uuid.to_string fresh.block.page)
+         (Journal_model.page_id latest.block));
+    let late =
+      if pending_context
+      then
+        Runtime.receive
+          runtime
+          (response
+             held
+             (V2_page_outcome
+                (V2_present_page
+                   { page = target.owner; revision = "valid-late-page-metadata" })))
+      else complete runtime held moved
+    in
+    Alcotest.(check int)
+      "retired observation cannot publish the saved old value"
+      0
+      (List.length late.responses);
+    Alcotest.(check int)
+      "retired point cannot start a new context lookup"
+      0
+      (List.length late.requests);
+    if boundary <> `Reset
+    then (
+      let current =
+        complete runtime (point ~generation:"generation-2" runtime fresh.block.uuid) fresh
+      in
+      let block = only "a new point after resync still publishes" (updates current) in
+      Alcotest.(check string)
+        "new observation is not retired"
+        "After resync"
+        (Journal_model.source block))
+  in
+  List.iter
+    (fun boundary ->
+       List.iter
+         (fun pending_context ->
+            List.iter
+              (fun move_back ->
+                 check
+                   (Printf.sprintf
+                      "%s context=%b moved-back=%b"
+                      (if boundary = `Push then "push" else "pull")
+                      pending_context
+                      move_back)
+                   (fun () -> run boundary pending_context move_back))
+              [ false; true ])
+         [ false; true ])
+    [ `Push; `Pull ];
+  List.iter
+    (fun pending_context ->
+       check (Printf.sprintf "reset context=%b" pending_context) (fun () ->
+         run `Reset pending_context false))
+    [ false; true ];
+  if !failures <> [] then Alcotest.fail (String.concat "\n" (List.rev !failures))
+;;
+
+let test_initial_thirty_roots () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let fixtures = [ root_fixture 0 20 4; root_fixture 1 20 4; root_fixture 2 20 4 ] in
+  let feed, _ = drive_roots runtime fixtures (initial_roots runtime 77L) in
+  let entries =
+    List.concat_map (fun (d : Journal_graph_projection.day_feed) -> d.entries) feed.days
+  in
+  Alcotest.(check int)
+    "headers and previews do not consume roots"
+    30
+    (List.length entries);
+  Alcotest.(check (list string))
+    "date and sibling order"
+    (List.map
+       (fun (r : Protocol.v2_block_record) -> Graph.Uuid.to_string r.block.uuid)
+       ((List.nth fixtures 0).roots @ List.take 10 (List.nth fixtures 1).roots))
+    (List.map
+       (fun (e : Journal_graph_projection.timeline_entry) -> Journal_model.id e.block)
+       entries);
+  List.iter
+    (fun (e : Journal_graph_projection.timeline_entry) ->
+       Alcotest.(check int)
+         "every selected root has its preview"
+         3
+         (List.length e.child_summaries);
+       Alcotest.(check bool)
+         "asset child metadata survives"
+         true
+         (List.exists
+            (fun (c : Journal_graph_projection.child_summary) ->
+               c.asset_file_type = Some "png")
+            e.child_summaries))
+    entries;
+  let last = List.hd (List.rev feed.days) in
+  Alcotest.(check bool)
+    "same-day continuation retained"
+    true
+    (Option.is_some last.continuation);
+  let output =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_day_blocks
+         { day = last.page.day
+         ; after = last.continuation
+         ; limit = 30
+         ; request_generation = 78L
+         })
+  in
+  match (only "later roots read" output.requests).command with
+  | V2_get_page_tree { maximum_depth; limit; cursor; _ } ->
+    Alcotest.(check int) "later quota is thirty" 30 limit;
+    Alcotest.(check int) "root cursor keeps root shape" 0 maximum_depth;
+    Alcotest.(check int) "same-day cursor follows tenth root" 10 (root_offset cursor)
+  | _ -> Alcotest.fail "later root cursor changed protocol shape"
+;;
+
+let test_later_thirty_crosses_dates () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let fixtures = [root_fixture 0 40 5;root_fixture 1 50 5] in
+  let feed,_ = drive_roots runtime fixtures (initial_roots runtime 77L) in
+  let day=List.hd feed.days in
+  let output=Runtime.submit runtime (Journal_graph_request.Load_day_blocks
+      {day=day.page.day;after=day.continuation;limit=30;request_generation=78L}) in
+  let feed,_=drive_roots runtime fixtures output in
+  Alcotest.(check int) "every later batch fills thirty roots across dates" 30
+    (List.fold_left (fun n (d:Journal_graph_projection.day_feed)->n+List.length d.entries) 0 feed.days);
+  Alcotest.(check (list int)) "same-day tail then older date" [10;20]
+    (List.map (fun (d:Journal_graph_projection.day_feed)->List.length d.entries) feed.days);
+  let last=List.hd (List.rev feed.days) in
+  let third,_=drive_roots runtime fixtures (Runtime.submit runtime (Journal_graph_request.Load_day_blocks
+      {day=last.page.day;after=last.continuation;limit=30;request_generation=79L})) in
+  Alcotest.(check int) "third batch remains thirty" 30
+    (List.fold_left (fun n (d:Journal_graph_projection.day_feed)->n+List.length d.entries) 0 third.days);
+  let ids feeds=List.concat_map (fun (f:Journal_graph_projection.feed)->
+      List.concat_map (fun (d:Journal_graph_projection.day_feed)->List.map
+          (fun (e:Journal_graph_projection.timeline_entry)->Journal_model.id e.block) d.entries) f.days) feeds in
+  let all=ids [feed;third] in
+  Alcotest.(check int) "continuations do not repeat roots" 60 (List.length (List.sort_uniq String.compare all))
+;;
+
+let test_later_date_cursor_no_progress_settles () =
+  let runtime=Production_runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let fixture=root_fixture 0 31 0 in
+  let feed,_=drive_roots runtime [fixture;root_fixture 1 1 0] (initial_roots runtime 77L) in
+  let day=List.hd feed.days in
+  let root=Runtime.submit runtime (Journal_graph_request.Load_day_blocks
+      {day=day.page.day;after=day.continuation;limit=30;request_generation=78L})
+    |> fun o->only "later tail query" o.requests in
+  let output=Production_runtime.receive runtime (response root (V2_page_tree_outcome
+      {page=fixture.owner.uuid;maximum_depth=0;items=[];next_cursor=None})) in
+  let listing=only "older date query" output.requests in
+  let cursor=root_cursor 1 in
+  let output=Production_runtime.receive runtime (response listing (V2_journals_outcome {items=[];next_cursor=Some cursor})) in
+  let repeated=only "next date packet" output.requests in
+  let output=Production_runtime.receive runtime (response repeated (V2_journals_outcome {items=[];next_cursor=Some cursor})) in
+  match (only "visible terminal failure" output.responses).payload with
+  | Day_blocks_failed {request_generation=78L;day=20260930;_}->()
+  | _ -> Alcotest.fail "date cursor failure lost its continuation owner"
+;;
+
+let test_initial_sparse_roots () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let fixtures =
+    List.init 18 (fun i -> root_fixture i (if i mod 3 = 0 then 0 else 3) 0)
+  in
+  let feed, seen = drive_roots runtime fixtures (initial_roots runtime 77L) in
+  Alcotest.(check int)
+    "sparse dates fill thirty"
+    30
+    (List.fold_left
+       (fun n (d : Journal_graph_projection.day_feed) -> n + List.length d.entries)
+       0
+       feed.days);
+  Alcotest.(check bool)
+    "continues beyond first seven dates"
+    true
+    (List.length
+       (List.filter
+          (fun r ->
+             match r.Protocol.command with
+             | V2_list_journals _ -> true
+             | _ -> false)
+          seen)
+     > 1)
+;;
+
+let test_initial_filtered_exhaustion () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let fixture = root_fixture 0 3 0 in
+  let hidden =
+    { record with
+      block =
+        { block with
+          uuid = unrelated_uuid
+        ; page = fixture.owner.uuid
+        ; parent = fixture.owner.uuid
+        ; title = ""
+        }
+    }
+  in
+  let fixtures = [ { fixture with roots = hidden :: fixture.roots } ] in
+  let feed, _ = drive_roots runtime fixtures (initial_roots runtime 77L) in
+  Alcotest.(check int)
+    "blank rows do not count"
+    3
+    (List.fold_left
+       (fun n (d : Journal_graph_projection.day_feed) -> n + List.length d.entries)
+       0
+       feed.days);
+  Alcotest.(check bool)
+    "exhausted feed has no false continuation"
+    false
+    (Option.is_some feed.continuation)
+;;
+
+let test_initial_wide_preview () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let fixture = root_fixture 0 1 10050 in
+  let parent, values = List.hd fixture.descendants in
+  let marker : Graph.property_summary =
+    { asset_type_property with
+      ident = "logseq.property/created-from-property"
+    ; values = [ Entity_value unrelated_uuid ]
+    }
+  in
+  let values =
+    List.mapi
+      (fun i (r : Protocol.v2_block_record) ->
+         if i < 3 then { r with block = { r.block with properties = [ marker ] } } else r)
+      values
+  in
+  let feed, seen =
+    drive_roots
+      runtime
+      [ { fixture with descendants = [ parent, values ] } ]
+      (initial_roots runtime 77L)
+  in
+  let entry = List.hd (List.hd feed.days).entries in
+  Alcotest.(check (list string))
+    "skip property values without draining branch"
+    [ "Child 3"; "Child 4"; "Child 5" ]
+    (List.map
+       (fun (c : Journal_graph_projection.child_summary) -> c.source)
+       entry.child_summaries);
+  Alcotest.(check int)
+    "two small child pages suffice"
+    2
+    (List.length
+       (List.filter
+          (fun r ->
+             match r.Protocol.command with
+             | V2_get_children _ -> true
+             | _ -> false)
+          seen))
+;;
+
+let test_initial_byte_splitting () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let feed, _ =
+    drive_roots
+      ~split_bytes:true
+      runtime
+      [ root_fixture 0 35 4 ]
+      (initial_roots runtime 77L)
+  in
+  let entries =
+    List.concat_map (fun (d : Journal_graph_projection.day_feed) -> d.entries) feed.days
+  in
+  Alcotest.(check int) "byte splitting still fills thirty" 30 (List.length entries);
+  List.iter
+    (fun (e : Journal_graph_projection.timeline_entry) ->
+       Alcotest.(check int)
+         "small packets retain three previews"
+         3
+         (List.length e.child_summaries))
+    entries
+;;
+
+let test_initial_reset_and_later_quota () =
+  let runtime = Runtime.create () in
+  let old = only "initial listing" (initial_roots runtime 77L).requests in
+  Runtime.reset runtime;
+  let delivered =
+    Runtime.receive
+      runtime
+      (response old (V2_journals_outcome { items = []; next_cursor = None }))
+  in
+  Alcotest.(check int) "reset fences old result" 0 (List.length delivered.responses);
+  let start =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_feed
+         { cursor = Some {before_day=Some 20260901;skipped_day=None}
+         ; day_limit = 7
+         ; root_limit = 30
+
+         ; request_generation = 78L
+         })
+  in
+  match (only "older dates still use existing request" start.requests).command with
+  | V2_list_journals { limit; through_day; _ } ->
+    Alcotest.(check int) "older metadata quota remains seven" 7 limit;
+    Alcotest.(check int) "calendar upper bound remains" 20260831 through_day
+  | _ -> Alcotest.fail "older feed changed shape"
+;;
+
+let test_initial_refresh_range split_bytes () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let fixtures = [ root_fixture 0 150 1 ] in
+  let feed, _ = drive_roots ~split_bytes runtime fixtures (initial_roots runtime 77L) in
+  let day = List.hd feed.days in
+  let expected = if split_bytes then 30 else 60 in
+  if not split_bytes
+  then (
+    let later =
+      Runtime.submit
+        runtime
+        (Journal_graph_request.Load_day_blocks
+           { day = day.page.day
+           ; after = day.continuation
+           ; limit = 30
+           ; request_generation = 78L
+           })
+    in
+    let results, _ = drive_root_output runtime fixtures later in
+    match
+      List.find_map
+        (fun (r : Runtime.response) ->
+           match r.payload with
+           | Feed_loaded { feed; complete=true; _ } -> Some (List.hd feed.days)
+           | _ -> None)
+        results
+    with
+    | Some page ->
+      Alcotest.(check int) "later batch is thirty" 30 (List.length page.entries)
+    | None -> Alcotest.fail "later roots never completed");
+  let refreshed =
+    changed
+      runtime
+      (window ~scopes:[ Protocol.V2_page_tree_interest (List.hd fixtures).owner.uuid ] ())
+  in
+  let results, _ = drive_root_output runtime fixtures refreshed in
+  let page =
+    List.find_map
+      (fun (r : Runtime.response) ->
+         match r.payload with
+         | Page_tree_reconciled { value; _ } -> Some value
+         | _ -> None)
+      results
+  in
+  match page with
+  | Some page ->
+    Alcotest.(check int)
+      "refresh preserves the loaded root prefix"
+      expected
+      (List.length page.entries)
+  | None -> Alcotest.fail "root reconciliation never completed"
+;;
+
+let test_initial_refresh_after_restarting_prefix () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let fixture = root_fixture 0 150 0 in
+  let feed, _ = drive_roots runtime [ fixture ] (initial_roots runtime 77L) in
+  let day = List.hd feed.days in
+  ignore
+    (drive_root_output
+       runtime
+       [ fixture ]
+       (Runtime.submit
+          runtime
+          (Journal_graph_request.Load_day_blocks
+             { day = day.page.day
+             ; after = day.continuation
+             ; limit = 30
+             ; request_generation = 78L
+             })));
+  let inserted =
+    { record with
+      block =
+        { block with
+          uuid = unrelated_uuid
+        ; parent = fixture.owner.uuid
+        ; page = fixture.owner.uuid
+        ; title = "New leading root"
+        ; order = "-0001"
+        }
+    }
+  in
+  let newer = { fixture with roots = inserted :: fixture.roots } in
+  ignore (drive_roots runtime [ newer ] (initial_roots runtime 79L));
+  let fresh =
+    changed
+      runtime
+      (window ~scopes:[ Protocol.V2_page_tree_interest fixture.owner.uuid ] ())
+  in
+  let outputs, _ = drive_root_output runtime [ newer ] fresh in
+  let page =
+    List.find_map
+      (fun (r : Runtime.response) ->
+         match r.payload with
+         | Page_tree_reconciled { value; _ } -> Some value
+         | _ -> None)
+      outputs
+    |> Option.get
+  in
+  Alcotest.(check int)
+    "new prefix keeps the previous suffix through its last root"
+    61
+    (List.length page.entries)
+;;
+
+let load_ninety_roots runtime fixture =
+  set_calendar runtime;
+  let feed, _ = drive_roots runtime [ fixture ] (initial_roots runtime 77L) in
+  let day = ref (List.hd feed.days) in
+  for generation = 78 to 79 do
+    let output = Runtime.submit runtime
+        (Journal_graph_request.Load_day_blocks
+           { day = !day.page.day; after = !day.continuation; limit = 30
+           ; request_generation = Int64.of_int generation }) in
+    let feed, _ = drive_roots runtime [ fixture ] output in
+    day := List.hd feed.days
+  done
+;;
+
+let fixture_root_tree fixture (request : Protocol.request) =
+  match request.command with
+  | V2_get_page_tree { page; maximum_depth; limit; cursor; _ } ->
+    let selected, next_cursor = root_slice fixture.roots limit cursor in
+    Protocol.V2_page_tree_outcome
+      { page; maximum_depth
+      ; items = List.map (fun value ->
+          Protocol.{ value; revision = "root-1"; depth = 0; parent = page }) selected
+      ; next_cursor }
+  | _ -> Alcotest.fail "expected a retained root read"
+;;
+
+(* Both refresh owners are created by the public invalidation event. Hold the
+   reconciliation at each asynchronous boundary while the prefix finishes. *)
+let test_prefix_preserves_reconciliation ~resync stage () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  let fixture = root_fixture 0 90 0 in
+  load_ninety_roots runtime fixture;
+  let edited = List.nth fixture.roots 70 in
+  let deleted = List.nth fixture.roots 80 in
+  let fresh = { fixture with roots =
+    List.filter_map (fun (r : Protocol.v2_block_record) ->
+      if Graph.Uuid.equal r.block.uuid deleted.block.uuid then None
+      else if Graph.Uuid.equal r.block.uuid edited.block.uuid then
+        Some { r with block = { r.block with title = "Remote suffix edit" } }
+      else Some r) fixture.roots } in
+  let refresh =
+    if resync then Runtime.reconcile_push runtime ~request_generation:90L
+        (Protocol.V2_resync_required_push
+           { api_version = Protocol.api_version; generation = "generation-2"
+           ; reason = "overflow" })
+    else changed runtime (window ~scopes:
+        [ Protocol.V2_page_tree_interest fixture.owner.uuid
+        ; V2_journal_index_interest ] ())
+  in
+  let tree = List.find (fun (r : Protocol.request) -> match r.command with
+      | V2_get_page_tree _ -> true | _ -> false) refresh.requests in
+  let dates = List.find (fun (r : Protocol.request) -> match r.command with
+      | V2_list_journals _ -> true | _ -> false) refresh.requests in
+  let held = match stage with
+    | `Root -> { Runtime.requests = [tree]; responses = [] }
+    | `Preview | `Continuation ->
+      Runtime.receive runtime (response tree (fixture_root_tree fresh tree))
+  in
+  let held = match stage with
+    | `Root | `Preview -> held
+    | `Continuation ->
+      let rec finish_previews (output : Runtime.output) =
+        let request = only "one retained refresh continuation" output.requests in
+        match request.command with
+        | V2_get_page_tree _ -> output
+        | V2_get_children { parent; _ } ->
+          finish_previews (Runtime.receive runtime (response request
+              (Protocol.V2_children_outcome
+                 { parent; revision_scope = V2_children_revision parent
+                 ; scope_revision = "children-1"; items = []; next_cursor = None })))
+        | _ -> Alcotest.fail "unexpected reconciliation request"
+      in
+      finish_previews held
+  in
+  let prefix, _ = drive_roots runtime [fresh]
+      { Runtime.requests = [dates]; responses = [] } in
+  Alcotest.(check int) "prefix still publishes thirty roots" 30
+    (List.length (List.hd prefix.days).entries);
+  let outputs, _ = drive_root_output runtime [fresh] held in
+  let reconciled = List.filter_map (fun (r : Runtime.response) -> match r.payload with
+      | Page_tree_reconciled {value;_} -> Some value | _ -> None) outputs in
+  let value = only "retained suffix reconciliation must finish" reconciled in
+  Alcotest.(check int) "remote deletion removes a retained suffix root" 89
+    (List.length value.entries);
+  Alcotest.(check bool) "deleted suffix UUID is absent" false
+    (List.exists (fun (e : Journal_graph_projection.timeline_entry) ->
+       Journal_model.id e.block = Graph.Uuid.to_string deleted.block.uuid) value.entries);
+  let updated = List.find (fun (e : Journal_graph_projection.timeline_entry) ->
+      Journal_model.id e.block = Graph.Uuid.to_string edited.block.uuid) value.entries in
+  Alcotest.(check string) "retained suffix contains the remote edit"
+    "Remote suffix edit" (Journal_model.source updated.block)
+;;
+
+let test_newer_reconciliation_fences_old_results () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  let fixture = root_fixture 0 90 0 in
+  load_ninety_roots runtime fixture;
+  let refresh () = changed runtime
+      (window ~scopes:[Protocol.V2_page_tree_interest fixture.owner.uuid] ()) in
+  let old = only "held old reconciliation" (hydration_requests (refresh ())) in
+  let fresh, _ = drive_root_output runtime [fixture] (refresh ()) in
+  Alcotest.(check int) "newer reconciliation publishes once" 1
+    (List.length (List.filter (fun (r : Runtime.response) -> match r.payload with
+         | Page_tree_reconciled _ -> true | _ -> false) fresh));
+  let late = Runtime.receive runtime (response old (fixture_root_tree fixture old)) in
+  Alcotest.(check int) "older reconciliation cannot publish" 0 (List.length late.responses);
+  Alcotest.(check int) "older reconciliation cannot continue" 0 (List.length late.requests);
+  let old_graph = only "held retired graph reconciliation" (hydration_requests (refresh ())) in
+  Runtime.reset runtime;
+  let retired = Runtime.receive runtime
+      (response old_graph (fixture_root_tree fixture old_graph)) in
+  Alcotest.(check int) "retired graph cannot publish" 0 (List.length retired.responses);
+  Alcotest.(check int) "retired graph cannot continue" 0 (List.length retired.requests)
+;;
+
+let test_initial_later_read_superseded () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let fixture = root_fixture 0 150 1 in
+  let feed, _ = drive_roots runtime [ fixture ] (initial_roots runtime 77L) in
+  let day = List.hd feed.days in
+  let pending =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_day_blocks
+         { day = day.page.day
+         ; after = day.continuation
+         ; limit = 30
+         ; request_generation = 78L
+         })
+  in
+  let old = only "held later request" pending.requests in
+  let fresh =
+    changed
+      runtime
+      (window ~scopes:[ Protocol.V2_page_tree_interest fixture.owner.uuid ] ())
+  in
+  ignore (drive_root_output runtime [ fixture ] fresh);
+  let values = List.take 30 (List.drop 30 fixture.roots) in
+  let stale =
+    Runtime.receive
+      runtime
+      (response
+         old
+         (V2_page_tree_outcome
+            { page = fixture.owner.uuid
+            ; maximum_depth = 0
+            ; items =
+                List.map
+                  (fun value ->
+                     Protocol.
+                       { value; revision = "old"; depth = 0; parent = fixture.owner.uuid })
+                  values
+            ; next_cursor = Some (root_cursor 60)
+            }))
+  in
+  Alcotest.(check bool)
+    "superseded later request settles rather than wedging pagination"
+    true
+    (List.exists
+       (fun (r : Runtime.response) ->
+          match r.payload with
+          | Day_blocks_failed { stale_cursor = true; _ } -> true
+          | _ -> false)
+       stale.responses)
+;;
+
+let test_initial_superseded_and_singleton () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let old = only "old listing" (initial_roots runtime 77L).requests in
+  let fresh = initial_roots runtime 78L in
+  let out =
+    Runtime.receive
+      runtime
+      (response old (V2_journals_outcome { items = []; next_cursor = None }))
+  in
+  Alcotest.(check int)
+    "superseded initial generation is ignored"
+    0
+    (List.length out.responses);
+  ignore (drive_roots runtime [ root_fixture 0 1 0 ] fresh);
+  let runtime = Runtime.create () in
+  let listing = only "singleton listing" (initial_roots runtime 77L).requests in
+  let out =
+    Runtime.receive
+      runtime
+      (response
+         listing
+         (V2_failed { code = "responseTooLarge"; message = "oversized metadata" }))
+  in
+  let rec exhaust output =
+    match output.Runtime.requests with
+    | [] -> output.responses
+    | request :: _ ->
+      exhaust
+        (Runtime.receive
+           runtime
+           (response
+              request
+              (V2_failed { code = "responseTooLarge"; message = "oversized singleton" })))
+  in
+  let results = exhaust out in
+  Alcotest.(check bool)
+    "singleton oversize is explicit, not an empty feed"
+    true
+    (List.exists
+       (fun (r : Runtime.response) ->
+          match r.payload with
+          | Feed_failed _ -> true
+          | _ -> false)
+       results)
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
@@ -6498,6 +8175,35 @@ let () =
             test_shorter_reference_path_discovers_nested_targets
         ; Alcotest.test_case "bounded burst" `Quick test_reference_burst_is_bounded
         ] )
+    ; ( "cross-page ownership", [Alcotest.test_case "point context and retirement" `Quick test_changed_point_ownership;
+        Alcotest.test_case "resync retires point observations" `Quick test_resync_retires_changed_points] )
+    ; ( "initial thirty roots", [
+        Alcotest.test_case "Today first within root budget" `Quick test_today_priority_batch;
+        Alcotest.test_case "Today date traversal survives recovery" `Quick test_today_date_traversal_survives_recovery;
+        Alcotest.test_case "Today priority continuations and midnight" `Quick test_today_priority_continuations;
+        Alcotest.test_case "thirty roots, previews, assets and continuation" `Quick test_initial_thirty_roots;
+        Alcotest.test_case "sparse dates continue past seven" `Quick test_initial_sparse_roots;
+        Alcotest.test_case "filtered roots and exhaustion" `Quick test_initial_filtered_exhaustion;
+        Alcotest.test_case "wide branches have bounded previews" `Quick test_initial_wide_preview;
+        Alcotest.test_case "encoded byte splitting preserves demand" `Quick test_initial_byte_splitting;
+        Alcotest.test_case "reset fences and later quotas" `Quick test_initial_reset_and_later_quota;
+        Alcotest.test_case "refresh after byte splitting" `Quick (test_initial_refresh_range true);
+        Alcotest.test_case "refresh retains later suffix" `Quick (test_initial_refresh_range false);
+        Alcotest.test_case "supersession and explicit singleton failure" `Quick test_initial_superseded_and_singleton;
+        Alcotest.test_case "restart retains loaded suffix through insertion" `Quick test_initial_refresh_after_restarting_prefix;
+        Alcotest.test_case "superseded continuation settles" `Quick test_initial_later_read_superseded;
+        Alcotest.test_case "later batch fills across dates" `Quick test_later_thirty_crosses_dates;
+        Alcotest.test_case "later date cursor failure settles" `Quick test_later_date_cursor_no_progress_settles;
+        Alcotest.test_case "resync prefix cannot cancel retained tree" `Quick
+          (test_prefix_preserves_reconciliation ~resync:true `Root);
+        Alcotest.test_case "resync prefix cannot cancel retained previews" `Quick
+          (test_prefix_preserves_reconciliation ~resync:true `Preview);
+        Alcotest.test_case "resync prefix cannot cancel retained continuation" `Quick
+          (test_prefix_preserves_reconciliation ~resync:true `Continuation);
+        Alcotest.test_case "journal change prefix cannot cancel retained tree" `Quick
+          (test_prefix_preserves_reconciliation ~resync:false `Root);
+        Alcotest.test_case "newer changes and graph reset still fence reconciliation" `Quick
+          test_newer_reconciliation_fences_old_results])
     ; ( "sparse tree pages"
       , [ Alcotest.test_case "children before a later root" `Quick (fun () ->
             test_child_only_day_pages `Found)

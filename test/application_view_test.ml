@@ -1176,11 +1176,11 @@ let run_favorites_native_visibility
                 ; next_cursor = None
                 }
             | V2_get_children { parent; limit; cursor; _ } ->
-              if (check_detail_discovery || check_detail_wait) && G.Uuid.equal parent (uuid 2)
+              if Atomic.get detail_fixture && (check_detail_discovery || check_detail_wait) && G.Uuid.equal parent (uuid 2)
               then Atomic.set discovery_reads (limit :: Atomic.get discovery_reads);
               (* Initial first pages complete before publication. The wait
                  scenario delays only a later explicit continuation read. *)
-              if check_detail_wait && G.Uuid.equal parent (uuid 2) && cursor <> None then
+              if Atomic.get detail_fixture && check_detail_wait && G.Uuid.equal parent (uuid 2) && cursor <> None then
                 while not (Atomic.get detail_wait_release) do
                   Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
                 done;
@@ -1191,7 +1191,7 @@ let run_favorites_native_visibility
                 ; items =
                     (if G.Uuid.equal parent favorites_page.uuid
                      then List.init 65 favorite_membership
-                     else if check_detail_wait && cursor = None
+                     else if Atomic.get detail_fixture && check_detail_wait && cursor = None
                           && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
                      then (
                        let value = timeline_block (if G.Uuid.equal parent (uuid 2) then 63 else 64) in
@@ -1201,7 +1201,7 @@ let run_favorites_native_visibility
                        ])
                      else [])
                 ; next_cursor =
-                    (if check_detail_wait && cursor = None
+                    (if Atomic.get detail_fixture && check_detail_wait && cursor = None
                         && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
                      then Some (G.Cursor.of_string "later-child-page" |> Result.get_ok)
                      else None)
@@ -1938,10 +1938,22 @@ let run_favorites_native_visibility
                    if List.assoc_opt key values = Some (`String value) then id :: ids else ids)
                 props []
             in
-            let enter n =
-              let label =
-                Option.get (find "text" (Printf.sprintf "Timeline fixture %d" n))
+            (* A child preview may repeat a top-level title. Select the
+               retained UUID row before comparing its native content node. *)
+            let timeline_title n =
+              let row = "journal-row-label:" ^ G.Uuid.to_string (uuid (n + 1)) in
+              let rec in_row id =
+                let values = Option.value (Hashtbl.find_opt props id) ~default:[] in
+                match List.assoc_opt "accessibility-identifier" values with
+                | Some (`String value) when String.starts_with ~prefix:"journal-row-label:" value ->
+                  value = row
+                | _ -> Option.fold ~none:false ~some:in_row (Hashtbl.find_opt parents id)
               in
+              find ~accept:in_row "text" (Printf.sprintf "Timeline fixture %d" n)
+              |> Option.get
+            in
+            let enter n =
+              let label = timeline_title n in
               dispatch (Lui_protocol.Press (ancestor_property label "press-enabled"));
               wait "Detail root loads" (fun () ->
                 Option.is_some
@@ -1997,7 +2009,7 @@ let run_favorites_native_visibility
               hooks.extension_event nav "path-changed" (payload ()) |> consume;
               hooks.extension_event nav "settled" (payload ()) |> consume
             in
-            let original_root_content = Option.get (find "text" "Timeline fixture 1") in
+            let original_root_content = timeline_title 1 in
             enter 0;
             if scenario = "legacy-interrupted" then (
               (* No pure reducer owns native completion copy or the Worker queue.
@@ -2318,10 +2330,7 @@ let run_favorites_native_visibility
                        ~some:inside_body
                        (Hashtbl.find_opt parents id)
                 in
-                let root_content =
-                  find ~accept:(fun id -> navigation_page id = Some (`String "root"))
-                    "text" "Timeline fixture 1" |> Option.get
-                in
+                let root_content = timeline_title 1 in
                 Alcotest.(check bool)
                   "root feedback reserves space for the retained page content"
                   true
@@ -2343,9 +2352,7 @@ let run_favorites_native_visibility
                 Alcotest.(check int)
                   "feedback updates retain the root content"
                   retained_root
-                  (find
-                     ~accept:(fun id -> navigation_page id = Some (`String "root"))
-                     "text" "Timeline fixture 1" |> Option.get);
+                  (timeline_title 1);
                 enter 0;
                 dispatch (Lui_protocol.Press detail_actions);
                 settle_worker ();
@@ -4256,6 +4263,9 @@ let test_reference_outer_terminals cancel =
                       ]
                   ; next_cursor = None
                   })
+           | V2_get_children {parent;_} ->
+             completed request (V2_children_outcome
+               {parent;revision_scope=V2_children_revision parent;scope_revision="children";items=[];next_cursor=None})
            | V2_pull_changes _ ->
              completed
                request
@@ -4945,10 +4955,10 @@ let test_timeline_relative_date_headers () =
           { Journal_graph_projection.page =
               { id = string_of_int day; day; title = "fallback" }
           ; entries = [{block=block day; child_summaries=[]}]; has_more_entries = false; continuation = None }) days
-      ; slot_count = 5; has_more_days = false }
+      ; slot_count = 5; continuation = None; prioritized_day = None }
     in
     let state = T.empty ~today
-      |> fun state -> T.begin_request state ~generation:1L (Feed {before_day=None})
+      |> fun state -> T.begin_request state ~generation:1L (Feed { cursor = None })
       |> fun state -> T.apply_feed state ~generation:1L feed
     in
     let build state = Journal_timeline.view ~state
@@ -6612,8 +6622,7 @@ let test_retired_feed_failure_does_not_publish_diagnostics projection =
   let module A = Application.Root_navigation in
   let runtime = R.create () in
   let output = R.submit runtime (Journal_graph_request.Load_feed
-    {before_day=None; day_limit=(if projection then 0 else 7);
-     blocks_per_day=32; slot_limit=64; request_generation=9L}) in
+    {cursor=None; day_limit=(if projection then 0 else 7); root_limit = 32; request_generation=9L}) in
   let responses = if projection then output.responses else
     match output.requests with
     | [request] -> (R.fail_request runtime request ~message:"Retired transport failed.").responses
