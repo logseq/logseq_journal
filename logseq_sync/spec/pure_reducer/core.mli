@@ -94,6 +94,10 @@ val unlock_submission_challenge : unlock_submission -> unlock_challenge
 val equal_unlock_submission : unlock_submission -> unlock_submission -> bool
 val unlock_attached_submission : unlock_attached -> unlock_submission
 
+(** Presentation only: retry eligibility is still determined by the original outcome.
+    Unknown and security failures require attention even when transport retries them. *)
+type error_attention = Transient_connection | Requires_attention
+
 type snapshot =
   { sync_phase : sync_phase
   ; catalog : graph list
@@ -103,6 +107,7 @@ type snapshot =
   ; unlock : unlock_phase
   ; startup : startup_facts
   ; last_error : string option
+  ; last_error_attention : error_attention option
   ; local_deletion : local_deletion option
   }
 
@@ -423,7 +428,7 @@ type websocket_send =
 (** Only recoverable peer closure or transport failure is eligible for retry.
     Local closure, authentication rejection and protocol failure do not retry. *)
 type websocket_termination =
-  | Recoverable_close of string option
+  | Recoverable_close of { message : string option; attention : error_attention }
   | Local_close
   | Authentication_failure of string
   | Protocol_failure of string

@@ -3,7 +3,7 @@ type t
 type connect_error =
   | Unauthorized
   | Forbidden
-  | Connection_failed of string
+  | Connection_failed of { message : string; attention : Logseq_sync_pure_reducer.Core.error_attention }
   | Protocol_failed of string
   | Authentication_failed of string
 
@@ -32,6 +32,9 @@ val connect
 val activate : t -> on_open:(unit -> unit) -> (unit, connect_error) result
 
 (** Success means local queue admission. Driver failures use the terminal callback. *)
+(** Presentation classification of an already observed terminal cause. *)
+val failure_attention : t -> Logseq_sync_pure_reducer.Core.error_attention
+
 val send : t -> string -> (unit, string) result
 
 (** Initiate a bounded close exchange without waiting for the owner. *)

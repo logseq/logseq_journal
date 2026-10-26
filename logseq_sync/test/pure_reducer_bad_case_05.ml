@@ -10,7 +10,7 @@ open Pure_reducer_bad_case_support
 let run () =
   let fixture = connected_fixture () in
   let closed_event =
-    Core.Websocket_closed (fixture.connection, Core.Recoverable_close (Some "closed"))
+    Core.Websocket_closed (fixture.connection, Core.Recoverable_close { message = Some "closed"; attention = Requires_attention })
   in
   let closed = Core.step fixture.opened.next closed_event in
   let late_message =

@@ -113,6 +113,7 @@ let startup_snapshot
         ; presentation_generation = 5
         }
     ; local_deletion = None
+    ; last_error_attention = None
     ; last_error = Option.map (fun _ -> "startup failed") failure
     }
 ;;

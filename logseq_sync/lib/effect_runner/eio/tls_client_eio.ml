@@ -4,6 +4,19 @@ type error =
   | Setup_failed of string
   | Authentication_failed
 
+type transient_failure = Connection_refused | Connection_timeout | Network_unreachable | Connection_reset
+
+let transient_failure = function
+  | Unix.Unix_error (Unix.ECONNREFUSED, _, _)
+  | Eio.Io (Eio.Net.E (Eio.Net.Connection_failure (Eio.Net.Refused _)), _) -> Some Connection_refused
+  | Eio.Time.Timeout | Unix.Unix_error (Unix.ETIMEDOUT, _, _)
+  | Eio.Io (Eio.Net.E (Eio.Net.Connection_failure Eio.Net.Timeout), _) -> Some Connection_timeout
+  | Unix.Unix_error ((Unix.ENETUNREACH | Unix.EHOSTUNREACH), _, _) -> Some Network_unreachable
+  | Unix.Unix_error ((Unix.ECONNRESET | Unix.EPIPE), _, _)
+  | Eio.Io (Eio.Net.E (Eio.Net.Connection_reset _), _) | End_of_file -> Some Connection_reset
+  | _ -> None
+;;
+
 type dns_query
 
 external dns_start : string -> bool -> dns_query = "logseq_transport_dns_start"
@@ -47,16 +60,19 @@ let resolve ~clock ~deadline host port =
            addresses, None
          with
          | Eio.Cancel.Cancelled _ as cancelled -> raise cancelled
-         | Eio.Time.Timeout -> [], Some "DNS resolution timed out"
+         | Eio.Time.Timeout -> [], Some ("DNS resolution timed out", Some Connection_timeout)
          | Unix.Unix_error ((Unix.EACCES | Unix.EPERM), _, _) ->
-           [], Some "DNS resolver permission denied"
-         | Unix.Unix_error _ -> [], Some "DNS resolver I/O failed"
-         | _ -> [], Some "DNS resolver operation failed")
+           [], Some ("DNS resolver permission denied", None)
+         | Unix.Unix_error _ -> [], Some ("DNS resolver I/O failed", None)
+         | _ -> [], Some ("DNS resolver operation failed", None))
   in
   let (ipv6, ipv6_error), (ipv4, ipv4_error) = Eio.Fiber.pair (fun () -> family true) (fun () -> family false) in
   let addresses = List.sort_uniq String.compare (ipv6 @ ipv4)
     |> List.map (fun address -> `Tcp (Eio.Net.Ipaddr.of_raw address, port)) in
-  addresses, (match ipv4_error with Some _ -> ipv4_error | None -> ipv6_error)
+  let transient = match ipv4_error, ipv6_error with
+    | Some (_, Some a), Some (_, Some _) -> Some a
+    | _ -> None in
+  addresses, Option.map fst (match ipv4_error with Some _ -> ipv4_error | None -> ipv6_error), transient
 ;;
 
 (* Eio may allocate a socket before connect raises. Keep each candidate in its
@@ -114,7 +130,7 @@ let safe_setup_detail source =
     prefixes then Some source else None
 ;;
 
-let connect_diagnosed ~on_diagnostic ~sw ~authenticator ~network ~clock ~host ~port =
+let connect_diagnosed_with_attention ~on_transient_failure ~on_diagnostic ~sw ~authenticator ~network ~clock ~host ~port =
   match host_name host with
   | Error _ as error -> error
   | Ok peer_name ->
@@ -125,13 +141,18 @@ let connect_diagnosed ~on_diagnostic ~sw ~authenticator ~network ~clock ~host ~p
      | Ok config ->
        let deadline = Eio.Time.now clock +. 30. in
        (try
-          let addresses, dns_failure = resolve ~clock ~deadline host port in
-          let rec attempt last_failure = function
-            | [] -> Error (Setup_failed ("all resolved addresses failed: " ^ last_failure))
+          let addresses, dns_failure, dns_transient = resolve ~clock ~deadline host port in
+          let report transient = Option.iter (fun cause ->
+            try on_transient_failure cause with _ -> ()) transient in
+          let rec attempt last_failure transient attention_required = function
+            | [] ->
+              if not attention_required then report transient;
+              Error (Setup_failed ("all resolved addresses failed: " ^ last_failure))
             | address :: rest ->
               let remaining = deadline -. Eio.Time.now clock in
               if remaining <= 0.
-              then Error (Setup_failed "DNS/TCP dial timed out")
+              then (if not attention_required then report (Some Connection_timeout);
+                Error (Setup_failed "DNS/TCP dial timed out"))
               else (
                 match
                   connect_address
@@ -148,15 +169,25 @@ let connect_diagnosed ~on_diagnostic ~sw ~authenticator ~network ~clock ~host ~p
                 | Error (Eio.Cancel.Cancelled _ as cancelled) -> raise cancelled
                 | Error (Tls_eio.Tls_failure (`Error (`AuthenticationFailure _))) ->
                   Error Authentication_failed
-                | Error error -> attempt (setup_class error) rest)
+                | Error error ->
+                  let transient = transient_failure error in
+                  attempt (setup_class error) transient (attention_required || transient = None) rest)
           in
           if addresses = [] then (
             Option.iter (fun cause -> try on_diagnostic cause with _ -> ()) dns_failure;
+            report dns_transient;
             Error No_network_address)
-          else attempt "external setup failure" addresses
+          else attempt "external setup failure" None false addresses
         with
         | Eio.Cancel.Cancelled _ as cancelled -> raise cancelled
-        | error -> Error (Setup_failed ("TLS connection setup failed: " ^ setup_class error))))
+        | error ->
+          Option.iter (fun cause -> try on_transient_failure cause with _ -> ()) (transient_failure error);
+          Error (Setup_failed ("TLS connection setup failed: " ^ setup_class error))))
+;;
+
+let connect_diagnosed ~on_diagnostic ~sw ~authenticator ~network ~clock ~host ~port =
+  connect_diagnosed_with_attention ~on_transient_failure:(fun _ -> ()) ~on_diagnostic
+    ~sw ~authenticator ~network ~clock ~host ~port
 ;;
 
 let connect ~sw ~authenticator ~network ~clock ~host ~port =

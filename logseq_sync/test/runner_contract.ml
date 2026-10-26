@@ -2165,7 +2165,7 @@ let test_pull_without_registered_socket_reports_closed () =
           "transport failure retains its connection identity"
           true
           (match !posted with
-           | [ Core.Websocket_closed (scope, Core.Recoverable_close (Some _)) ] ->
+           | [ Core.Websocket_closed (scope, Core.Recoverable_close { message = Some _; _ }) ] ->
              scope = connection
            | _ -> false);
         Runner.shutdown runner)))
