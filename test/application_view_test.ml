@@ -124,7 +124,7 @@ let test_diagnostic_phase_rows_retain_current_error () =
   let snapshot : Service.snapshot =
     { sync_phase = Failed; catalog = []; selected_graph = None; applied_server_t = None
     ; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
-        ; timeline_presentation_pending = false; local_deletion = None; last_error = Some message
+        ; timeline_presentation_pending = false; local_deletion = None; last_error_attention = None; last_error = Some message
     ; startup = { authenticated = true; local_access=Service.Local_available; network_phase=Service.Online_by_user; catalog_loading = false; awaiting_selection = false
         ; restoring_local = false; bootstrapping = true; awaiting_e2ee_password = false
         ; failure = Some During_bootstrap; account_generation = 1; graph_generation = 1
@@ -148,7 +148,7 @@ let test_diagnostic_identity_comes_from_worker () =
     { sync_phase = Offline; catalog = []; selected_graph = Some selected
     ; applied_server_t = None; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
         ; timeline_presentation_pending = false
-    ; local_deletion = None; last_error = None
+    ; local_deletion = None; last_error_attention = None; last_error = None
     ; startup = { authenticated = true; catalog_loading = false
         ; awaiting_selection = false; restoring_local = false; bootstrapping = false
         ; awaiting_e2ee_password = false; failure = None; account_generation = 1
@@ -494,6 +494,9 @@ let run_favorites_native_visibility
   let shutdown_called = Atomic.make false in
   let publish_phase = Atomic.make None in
   let publish_error = Atomic.make None in
+  let publish_attention = Atomic.make None in
+  let publish_graph_first = Atomic.make false in
+  let reported_graph_generation = Atomic.make None in
   let queried = Atomic.make [] in
   let feed_queried = Atomic.make false in
   let calendar_feed_reads = Atomic.make 0 in
@@ -710,12 +713,13 @@ let run_favorites_native_visibility
             ; graph_generation = 1
             ; presentation_generation = 1
             }
-        ; last_error = None
+        ; last_error_attention = None; last_error = None
         ; local_deletion = None
         }
     ; diagnostics = { groups = [] }
     }
   in
+  let latest_error_manager = Atomic.make manager in
   let service =
     W.Service.create
       ~push_topic_count:6
@@ -755,27 +759,38 @@ let run_favorites_native_visibility
             (Atomic.exchange media_notices []);
           let sync_phase = Atomic.exchange publish_phase None in
           let error = Atomic.exchange publish_error None in
+          let attention = Atomic.exchange publish_attention None in
+          let manager = if check_error_control then Atomic.get latest_error_manager else manager in
           (* A current graph must carry the same manager generation. The
              startup owner deliberately rejects mixed old/new graph snapshots. *)
           if sync_phase <> None || error <> None
              || Atomic.get graph_generation <> manager.snapshot.startup.graph_generation
-          then
-            W.Request_context.emit
-              context
-              ~topic:Service.manager_topic
-              (Service.Client_state_changed
+          then (
+            if check_error_control && Atomic.exchange publish_graph_first false then
+              W.Request_context.emit context ~topic:Service.graph_state_topic
+                (Service.Graph_state_changed
+                   { generation = Atomic.get graph_generation; graph_id = Some (uuid 900)
+                   ; phase = Graph_open; error = None });
+            let next =
                  { manager with
                    snapshot =
                      { manager.snapshot with
                        sync_phase = Option.value sync_phase ~default:Service.Current
+                     ; last_error_attention = Option.value attention ~default:None
                      ; last_error = Option.value error ~default:None
                      ; startup = { manager.snapshot.startup with
                          graph_generation = Atomic.get graph_generation }
                      }
-                 });
+                 } in
+            if check_error_control then Atomic.set latest_error_manager next;
+            W.Request_context.emit
+              context
+              ~topic:Service.manager_topic
+              (Service.Client_state_changed next));
           Ok
             (Service.Graph_state
-               { generation = Atomic.get graph_generation
+               { generation = Option.value (Atomic.get reported_graph_generation)
+                   ~default:(Atomic.get graph_generation)
                ; graph_id = Some (uuid 900)
                ; phase = Graph_open
                ; error = None
@@ -3889,7 +3904,71 @@ let run_favorites_native_visibility
            Alcotest.(check int)
              "clearing error does not construct Timeline"
              0
-             (Option.value (Hashtbl.find_opt regions "timeline") ~default:0));
+             (Option.value (Hashtbl.find_opt regions "timeline") ~default:0);
+           let issue attention message =
+             Atomic.set publish_error (Some message);
+             Atomic.set publish_attention (Some attention);
+             ignore (W.send (Option.get !client) Service.Get_graph_state);
+             settle_worker ();
+             for _ = 1 to 10 do hooks.pump () |> consume; Unix.sleepf 0.001 done
+           in
+           issue (Some Service.Transient_connection) (Some "Synthetic connection timeout");
+           Alcotest.(check bool) "transient connection does not expose error control" true
+             (Option.is_none (find "accessibility-label" "Error info"));
+           Alcotest.(check bool) "transient connection does not show short error notice" true
+             (Option.is_none (find "text" "Synthetic connection timeout"));
+           issue (Some Service.Requires_attention) (Some "Synthetic integrity failure");
+           wait "integrity failure requires attention" (fun () ->
+             Option.is_some (find "accessibility-label" "Error info"));
+           for n = 1 to 40 do
+             issue (Some Service.Transient_connection) (Some ("Synthetic connection reset " ^ string_of_int n))
+           done;
+           Alcotest.(check bool) "transient repetition cannot hide integrity attention" true
+             (Option.is_some (find "accessibility-label" "Error info"));
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Error info")));
+           wait "error details retain serious cause during transient interruption" (fun () ->
+             Option.is_some (find "text" "Synthetic integrity failure"));
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-identifier" "journal-error-info-close")));
+           issue None None;
+           wait "matching recovery clears attention" (fun () ->
+             Option.is_none (find "accessibility-label" "Error info"));
+           List.iter (fun message ->
+             issue (Some Service.Requires_attention) (Some message);
+             wait "security/authentication failures remain visible" (fun () ->
+               Option.is_some (find "accessibility-label" "Error info"));
+             issue None None)
+             ["Synthetic TLS certificate failure"; "Synthetic authentication needs sign-in"];
+           issue None (Some "Synthetic unknown failure");
+           wait "unknown classification is conservative" (fun () ->
+             Option.is_some (find "accessibility-label" "Error info"));
+           Atomic.set graph_generation 2;
+           issue (Some Service.Transient_connection) (Some "Synthetic new-graph timeout");
+           wait "new graph does not inherit serious attention" (fun () ->
+             Option.is_none (find "accessibility-label" "Error info"));
+           Atomic.set graph_generation 3;
+           Atomic.set reported_graph_generation (Some 2);
+           issue (Some Service.Requires_attention) (Some "Synthetic new-scope integrity failure");
+           Atomic.set reported_graph_generation (Some 3);
+           ignore (W.send (Option.get !client) Service.Get_graph_state);
+           settle_worker ();
+           for _ = 1 to 10 do hooks.pump () |> consume; Unix.sleepf 0.001 done;
+           wait "manager-first graph replacement preserves its own attention" (fun () ->
+             Option.is_some (find "accessibility-label" "Error info"));
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Error info")));
+           wait "manager-first graph notice preserves the new reason" (fun () ->
+             Option.is_some (find "text" "Synthetic new-scope integrity failure"));
+           dispatch (Lui_protocol.Press (Option.get (find "accessibility-identifier" "journal-error-info-close")));
+           Atomic.set graph_generation 4;
+           Atomic.set reported_graph_generation None;
+           issue None None;
+           wait "healthy replacement clears previous graph attention" (fun () ->
+             Option.is_none (find "accessibility-label" "Error info"));
+           Atomic.set graph_generation 5;
+           Atomic.set publish_graph_first true;
+           issue (Some Service.Requires_attention) (Some "Synthetic graph-first TLS failure");
+           wait "graph-first replacement receives its own attention" (fun () ->
+             Option.is_some (find "accessibility-label" "Error info")));
+
          if check_generation
          then (
            let previous = Option.get (find "_extension" "journal-list") in
@@ -4124,7 +4203,7 @@ let test_reference_outer_terminals cancel =
             ; graph_generation = 1
             ; presentation_generation = 1
             }
-        ; last_error = None
+        ; last_error_attention = None; last_error = None
         ; local_deletion = None
         }
     ; diagnostics = { groups = [] }
@@ -4724,7 +4803,7 @@ let test_favorite_page_uses_shared_reference_lookup () =
         ; startup = { authenticated = true; local_access=Service.Local_available; network_phase=Service.Online_by_user; catalog_loading = false; awaiting_selection = false
             ; restoring_local = false; bootstrapping = false; awaiting_e2ee_password = false
             ; failure = None; account_generation = 1; graph_generation = 1; presentation_generation = 1 }
-        ; last_error = None; local_deletion = None }
+        ; last_error_attention = None; last_error = None; local_deletion = None }
     ; diagnostics = { groups = [] } } in
   let target_reads = Atomic.make 0 in
   let service = W.Service.create ~push_topic_count:6 ~concurrency:(Concurrent { max_in_flight = 2 })
@@ -5285,7 +5364,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
             ; graph_generation = 1
             ; presentation_generation = (C.state !core).snapshot.startup.presentation_generation
             }
-        ; last_error = None
+        ; last_error_attention = None; last_error = None
         ; local_deletion = None
         }
     ; diagnostics = { groups = [] }
@@ -5361,7 +5440,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
                       awaiting_e2ee_password = false
                     ; failure = None
                     }
-                ; last_error = None
+                ; last_error_attention = None; last_error = None
                 }
             };
           let delay =
@@ -5397,7 +5476,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
                 ; startup = { old.snapshot.startup with
                     awaiting_e2ee_password = false; restoring_local = false
                   ; local_access = Service.Local_available; failure = None }
-                ; last_error = None } }
+                ; last_error_attention = None; last_error = None } }
             in
             let manager_changed () = publish attached in
             let graph_changed () =
@@ -6175,7 +6254,7 @@ let test_graph_picker_controls scenario () =
         ; startup = { authenticated = scenario <> `Offline; local_access=Service.Local_available; network_phase=(if scenario = `Offline then Service.Local_only else Service.Online_by_user); catalog_loading = false; awaiting_selection = false
           ; restoring_local = false; bootstrapping = false; awaiting_e2ee_password = false
           ; failure = None; account_generation = 1; graph_generation = 1; presentation_generation = 1 }
-        ; last_error = None; local_deletion = None }
+        ; last_error_attention = None; last_error = None; local_deletion = None }
     ; diagnostics = { groups = [] } } in
   let current = Atomic.make manager and commands = Atomic.make [] in
   let inspections = Atomic.make 0 and deletions = Atomic.make [] in
@@ -6617,6 +6696,28 @@ let test_detail_reconciliation_diagnostics mode =
 
 (* Root_navigation owns acceptance of feed completions and its issue ledger.
    Generate the failure through the real graph runtime, then retire its owner. *)
+let test_integrity_attention_survives_unrelated_read_success () =
+  let module A = Application.Root_navigation in
+  let module G = Logseq_db_types.Graph_types in
+  let request_id = G.Uuid.of_string "e1000000-0000-4000-8000-000000000001" |> Result.get_ok in
+  let error = Logseq_db_worker.Error.create ~code:Corrupt_storage
+    ~message:"Synthetic integrity issue" ~details:[] |> Result.get_ok in
+  let failed = A.step (A.create ~graph_generation:7)
+    (Completed {payload=Rejected (Worker_failure {operation="applyAuthoritative"; request_id; error})}) in
+  let read_success = A.step failed (Completed {payload=Graph_ready}) in
+  Alcotest.(check (option string)) "ordinary read cannot resolve integrity attention"
+    (Some "Active") (List.assoc_opt "Status" (A.diagnostic_rows read_success));
+  let busy = Logseq_db_worker.Error.create ~code:Storage_busy
+    ~message:"Synthetic retryable read" ~details:[] |> Result.get_ok in
+  let flooded = List.fold_left (fun state _ -> A.step state
+    (Completed {payload=Rejected (Worker_failure {operation="read"; request_id; error=busy})}))
+    read_success (List.init 40 Fun.id) in
+  Alcotest.(check bool) "bounded history retains active integrity evidence" true
+    (List.mem ("Reason", "Synthetic integrity issue") (A.diagnostic_rows flooded));
+  Alcotest.(check (list (pair string string))) "scope retirement clears diagnostics" []
+    (A.diagnostic_rows (A.step flooded Account_cleared))
+;;
+
 let test_retired_feed_failure_does_not_publish_diagnostics projection =
   let module R = Journal_graph_runtime in
   let module A = Application.Root_navigation in
@@ -6645,6 +6746,7 @@ let () =
     "application view"
     [ ( "diagnostic identity", [ Alcotest.test_case "actual worker identity" `Quick test_diagnostic_identity_comes_from_worker ])
     ; ( "diagnostic failure", [
+      Alcotest.test_case "integrity attention survives read success and bounded history" `Quick test_integrity_attention_survives_unrelated_read_success;
       Alcotest.test_case "retired feed Worker failure is ignored" `Quick
         (fun () -> test_retired_feed_failure_does_not_publish_diagnostics false);
       Alcotest.test_case "retired feed projection failure is ignored" `Quick

@@ -16,9 +16,7 @@ scope/version tokens, finite attribute/type labels, counts and boolean flags.
 Never print values, plaintext/ciphertext, exception strings, tokens or keys.
 Keep existing errors and their 512-byte carriers intact. Do not modify sync,
 retry, commit or validation decisions. No protected spec interface change is
-needed. Keep this work on a separate local branch; no push/PR/release.
-
-## Decision
+needed. The initial investigation stayed local; later publication authorization is recorded below.
 
 Implement the three private observation points without changing public interfaces
 or synchronization decisions. The overlay database owns the immutable replay

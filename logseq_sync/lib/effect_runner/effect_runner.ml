@@ -1233,8 +1233,8 @@ let submit_nonasset t instruction =
                   | Websocket_eio.Authentication_failed message ->
                     Core.Authentication_failure message
                   | Websocket_eio.Protocol_failed message -> Core.Protocol_failure message
-                  | Websocket_eio.Connection_failed message ->
-                    Core.Recoverable_close (Some message)
+                  | Websocket_eio.Connection_failed { message; attention } ->
+                    Core.Recoverable_close { message = Some message; attention }
                 in
                 let connect_with_token () =
                   match
@@ -1298,13 +1298,13 @@ let submit_nonasset t instruction =
                 | Error message ->
                   t.post
                     (Core.Websocket_closed
-                       (request.scope, Core.Recoverable_close (Some message)))))
+                       (request.scope, Core.Recoverable_close { message = Some message; attention = Websocket_eio.failure_attention websocket }))))
            t.websockets;
          if not !sent
          then
            t.post
              (Core.Websocket_closed
-                (request.scope, Core.Recoverable_close (Some "WebSocket is unavailable"))))
+                (request.scope, Core.Recoverable_close { message = Some "WebSocket is unavailable"; attention = Requires_attention })))
     | Close_websocket scope -> retire_websocket_owner t scope)
 ;;
 

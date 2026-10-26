@@ -383,6 +383,7 @@ type state =
   ; feed_refresh : feed_refresh option
   ; graph_error : graph_error option
   ; sync_error : sync_error_notice option
+  ; manager_attention : string option
   ; manager : Graph_service.snapshot option
   ; graph_picker_open : bool
   ; graph_catalog : Graph_service.graph Rrbvec.t
@@ -499,6 +500,7 @@ let initial_state =
   ; feed_refresh = None
   ; graph_error = None
   ; sync_error = None
+  ; manager_attention = None
   ; manager = None
   ; graph_picker_open = false
   ; graph_catalog = Rrbvec.empty
@@ -610,6 +612,20 @@ let equal_feed_projection_context left right =
   && Journal_calendar.equal_projection_fingerprint
        left.projection_fingerprint
        right.projection_fingerprint
+;;
+
+let integrity_attention (occurrence : worker_error_occurrence) =
+  match Logseq_db_worker.Error.code occurrence.error with
+  | Corrupt_storage | Ambiguous_sync_state -> true
+  | _ -> false
+;;
+
+let error_info_available state =
+  List.exists (fun (e : worker_error_occurrence) -> e.active
+    && e.graph_generation = state.graph_state.generation
+    && e.graph_id = state.graph_state.graph_id) state.worker_errors
+  || Option.is_some state.manager_attention
+  || Option.is_some (operation_failure state.timeline_notice)
 ;;
 
 let show_sync_error state failure =
@@ -728,6 +744,7 @@ let clear_account_drafts state =
     draft_graph = None
   ; graph_drafts = Graph_drafts.empty
   ; worker_errors = []
+  ; manager_attention = None
   ; sync_error = None
   }
 ;;
@@ -805,7 +822,7 @@ let apply_manager_state state (manager_state : Graph_service.state) =
     | None -> true in
   let state =
     if owner_changed && Option.is_some state.manager
-    then {state with worker_errors=[]; sync_error=None}
+    then {state with worker_errors=[]; sync_error=None; manager_attention=None}
     else state
   in
   let state =
@@ -825,6 +842,8 @@ let apply_manager_state state (manager_state : Graph_service.state) =
       { state with local_copies = forget snapshot.selected_graph copies })
     else state
   in
+  let previous_attention_message = state.manager_attention in
+  let previous_attention = Option.bind state.manager (fun manager -> manager.last_error_attention) in
   let previous_sync_error =
     Option.bind state.manager (fun manager -> manager.last_error)
   in
@@ -881,6 +900,13 @@ let apply_manager_state state (manager_state : Graph_service.state) =
     ; unlock = reconcile_unlock (if owner_changed || graph_context_changed then Unlock_idle else state.unlock) snapshot
     ; next_local_sequence
     ; modal
+    ; manager_attention =
+        (let retained = if owner_changed || graph_context_changed then None else state.manager_attention in
+         match snapshot.last_error, snapshot.last_error_attention, snapshot.sync_phase with
+         | Some _, Some Graph_service.Transient_connection, _ -> retained
+         | Some message, (None | Some Requires_attention), _ -> Some message
+         | None, _, Current -> None
+         | None, _, _ -> retained)
     ; graph_ready = state.graph_ready && not graph_context_changed
     ; graph_error = state.graph_error
     }
@@ -893,8 +919,14 @@ let apply_manager_state state (manager_state : Graph_service.state) =
     (unlock_pending state.unlock) is_awaiting_password (unlock_failure snapshot.startup.failure)
     snapshot.startup.account_generation snapshot.startup.graph_generation;
   match snapshot.last_error with
-  | Some message when previous_sync_error <> Some message ->
+  | Some _ when snapshot.last_error_attention = Some Graph_service.Transient_connection -> state
+  | Some message when previous_sync_error <> Some message || previous_attention <> snapshot.last_error_attention ->
     show_sync_error state (Non_worker_sync_failure message)
+  | None when snapshot.sync_phase = Graph_service.Current ->
+    (match state.sync_error with
+     | Some { failure = Non_worker_sync_failure message; _ } when Some message = previous_sync_error || Some message = previous_attention_message ->
+       { state with sync_error = None }
+     | _ -> state)
   | None | Some _ -> state
 ;;
 
@@ -995,8 +1027,10 @@ let record_worker_error state ~operation ?request_id ?phase
   in
   { state with
     next_worker_error_sequence = Int64.succ state.next_worker_error_sequence
-  ; worker_errors = occurrence :: state.worker_errors
-      |> List.to_seq |> Seq.take 32 |> List.of_seq
+  ; worker_errors = (let all = occurrence :: state.worker_errors in
+         let critical, other = List.partition (fun e -> e.active && integrity_attention e) all in
+         (critical @ other |> List.to_seq |> Seq.take 32 |> List.of_seq)
+         |> List.sort (fun (a : worker_error_occurrence) b -> Int64.compare b.sequence a.sequence))
   }
 ;;
 
@@ -1032,7 +1066,8 @@ let record_failure_source state = function
 let resolve_worker_errors state =
   { state with
     worker_errors =
-      List.map (fun occurrence -> { occurrence with active = false }) state.worker_errors
+      List.map (fun occurrence ->
+        if integrity_attention occurrence then occurrence else { occurrence with active = false }) state.worker_errors
   }
 ;;
 
@@ -1675,6 +1710,22 @@ module Root_navigation = struct
     | Local_copy_deleted
 
   let replace_graph state generation graph_id =
+    let retired_manager_scope =
+      match state.manager with
+      | Some manager ->
+        manager.startup.graph_generation = state.graph_state.generation
+        && manager.selected_graph = state.graph_state.graph_id
+      | None -> true
+    in
+    let manager_attention =
+      if retired_manager_scope then None else state.manager_attention
+    in
+    let sync_error =
+      match state.sync_error, manager_attention with
+      | Some ({ failure = Non_worker_sync_failure message; _ } as notice), Some retained
+        when String.equal message retained -> Some notice
+      | _ -> None
+    in
     let state = switch_draft_graph state graph_id in
     { state with
       favorites = Journal_routes.Favorites.create ~graph_generation:generation
@@ -1696,6 +1747,9 @@ module Root_navigation = struct
     ; capture_error = None
     ; capture_error_owner = None
     ; timeline_notice = None
+    ; worker_errors = List.map (fun occurrence -> {occurrence with active=false}) state.worker_errors
+    ; manager_attention
+    ; sync_error
     }
   ;;
 
@@ -6983,11 +7037,6 @@ let start
       left.calendar
       right.calendar
   in
-  let error_info_available state =
-    state.worker_errors <> []
-    || Option.is_some (Option.bind state.manager (fun manager -> manager.last_error))
-    || Option.is_some (operation_failure state.timeline_notice)
-  in
   let equal_root_presentation left right =
     let picker state = state.graph_picker_open || Option.fold ~none:false
       ~some:(fun manager -> manager.Graph_service.startup.awaiting_selection) state.manager in
@@ -7001,6 +7050,7 @@ let start
             && left.startup.authenticated = right.startup.authenticated
             && left.startup.catalog_loading = right.startup.catalog_loading
             && left.last_error = right.last_error
+            && left.last_error_attention = right.last_error_attention
       | _ -> false
     else if (not left.graph_ready) || not right.graph_ready
     then left == right
@@ -7318,10 +7368,7 @@ let start
             ~on_copy:(prefix_action dispatch (fun value -> Copy_block value))
             ~on_copy_favorite:(prefix_action dispatch (fun value -> Favorite_copy value))
             ~error_info_available:
-              (state.worker_errors <> []
-               || Option.is_some
-                    (Option.bind state.manager (fun manager -> manager.last_error))
-               || Option.is_some (operation_failure state.timeline_notice))
+              (error_info_available state)
             ~on_error_info:(bind_action dispatch Open_error_info)
             ~account_menu_available:true
             ~on_account_action:dispatch
@@ -7534,18 +7581,24 @@ let start
           current
       | Cache_reset_confirmation _ -> None
       | Diagnostics ->
+        let diagnostics = match state.manager_attention with
+          | None -> state.diagnostics
+          | Some message ->
+            let groups = Option.fold ~none:[] ~some:(fun d -> d.Graph_service.groups) state.diagnostics in
+            Some {Graph_service.groups = {title="Needs attention"; entries=["Reason", message]} :: groups}
+        in
         Some
           (diagnostics_page
              ~errors:state.worker_errors
              ~snapshot:state.manager
              ~graph:state.graph_state
              ~admission:(Admission_refresh.observation state.admission_refresh)
-             state.diagnostics
+             diagnostics
              dispatch)
       | Error_info ->
         Some
           (error_info_page
-             ~sync_error:(Option.bind state.manager (fun manager -> manager.last_error))
+             ~sync_error:state.manager_attention
              ~operation_failure:
                (operation_failure
                   ~can_retry_imports:(state.failed_capture_imports <> [])
@@ -7644,10 +7697,7 @@ let start
                  (fun notice -> sync_failure_message notice.failure)
                  state.sync_error
            ; error_available =
-               state.worker_errors <> []
-               || Option.is_some
-                    (Option.bind state.manager (fun manager -> manager.last_error))
-               || Option.is_some (operation_failure state.timeline_notice)
+               error_info_available state
            ; local_deletion_available = local_deletion_available state
            ; capture_enabled =
                state.write_enabled

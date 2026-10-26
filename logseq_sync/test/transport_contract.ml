@@ -3571,7 +3571,7 @@ let test_runtime_single_owner_and_scope_switch ?(eof = false) ?(reset = false) (
          Eio.Stream.add events (Core.Websocket_opened first);
          Eio.Stream.add
            events
-           (Core.Websocket_closed (first, Core.Recoverable_close None));
+           (Core.Websocket_closed (first, Core.Recoverable_close { message = None; attention = Requires_attention }));
          Eio.Stream.add
            events
            (Core.Websocket_message
@@ -4317,7 +4317,7 @@ let transport_failure_message ~websocket posted =
       (function
         | Core.Websocket_closed (_, Core.Authentication_failure message) ->
           Some (`Authentication, message)
-        | Core.Websocket_closed (_, Core.Recoverable_close (Some message)) ->
+        | Core.Websocket_closed (_, Core.Recoverable_close { message = Some message; _ }) ->
           Some (`Recoverable, message)
         | _ -> None)
       posted
@@ -4406,6 +4406,15 @@ let test_tls_setup_reason ~websocket reason () =
                ~expected:(prefix ^ detail)
                !posted
                !invalidations;
+             if websocket then (
+               let attention = List.find_map (function
+                 | Core.Websocket_closed (_, Core.Recoverable_close { attention; _ }) -> Some attention
+                 | _ -> None) !posted in
+               let expected = match reason with
+                 | `No_address | `Dial_refused | `Dial_timeout -> Core.Transient_connection
+                 | `Invalid_host | `Dial_failed -> Core.Requires_attention in
+               Alcotest.(check bool) "typed transport presentation preserves transient vs unknown" true
+                 (attention = Some expected));
              if List.mem reason [`Dial_failed; `Dial_refused; `Dial_timeout]
              then
                Alcotest.(check bool)
