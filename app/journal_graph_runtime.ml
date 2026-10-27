@@ -5,6 +5,7 @@ module Projection = Journal_graph_projection
 module Reference = Journal_graph_reference_plan
 module Favorites = Journal_graph_favorites_plan
 module Feed = Journal_graph_feed_plan
+module Confirmation = Journal_graph_mutation_confirmation
 
 let timeline_version value =
   let digits s = s <> "" && String.length s <= 19
@@ -160,7 +161,7 @@ type payload =
 
 type response = { payload : payload }
 
-type refresh =
+type refresh = Confirmation.purpose =
   | Captured of { block_id : string }
   | Updated of { block_id : string }
   | Update_conflict_refresh of { block_id : string }
@@ -175,14 +176,6 @@ type children_interest =
   { page : Graph.page
   ; root : Projection.block_member
   ; limit : int
-  }
-
-type target_summary =
-  { refresh : refresh
-  ; block_id : string
-  ; children : Protocol.v2_child_member Rrbvec.t
-  ; version : (string * string * string) option
-  ; retries : int
   }
 
 type operation =
@@ -261,7 +254,7 @@ type operation =
       { command : Projection.capture
       ; page : Projection.page
       }
-  | Target_summary of target_summary
+  | Target_summary of Confirmation.read
   | Refresh_page_tree of
       { page : Projection.page
       ; refresh : refresh
@@ -331,7 +324,7 @@ type t =
   ; detail_children : (string, Projection.block_member Graph.page_result) Hashtbl.t
   ; favorites : Favorites.t
   ; changed_point_epochs : (string, int64) Hashtbl.t
-  ; target_read_epochs : (string, int64) Hashtbl.t
+  ; confirmations : Confirmation.t
   ; feed : Feed.t
   }
 
@@ -390,7 +383,7 @@ let create ?(localtime = Unix.localtime) () =
   ; detail_children = Hashtbl.create 32
   ; favorites = Favorites.create ()
   ; changed_point_epochs = Hashtbl.create 32
-  ; target_read_epochs = Hashtbl.create 32
+  ; confirmations = Confirmation.create ()
   ; feed = Feed.create ()
   }
 ;;
@@ -425,7 +418,7 @@ let reset t =
   Hashtbl.clear t.detail_children;
   Favorites.reset t.favorites;
   Hashtbl.clear t.changed_point_epochs;
-  Hashtbl.clear t.target_read_epochs;
+  Confirmation.reset t.confirmations;
   Feed.reset t.feed ~now:(fun () -> t.next_request)
 ;;
 
@@ -1036,38 +1029,20 @@ let request_refresh t page refresh =
   | Error message -> reject message
 ;;
 
-let target_summary_read t summary cursor =
-  match parse_uuid "block UUID" summary.block_id with
-  | Error message -> reject message
-  | Ok block ->
-    Hashtbl.replace t.target_read_epochs summary.block_id t.next_request;
-    requests
-      [ read
-          t
-          (Target_summary summary)
-          (Protocol.V2_get_outline_block_summary
-             { block; limit = Protocol.default_page_size; cursor })
-      ]
+let confirmation_ports t =
+  Confirmation.
+    { now = (fun () -> t.next_request)
+    ; plan_read = (fun ~source_epoch value command ->
+        read ~source_epoch t (Target_summary value) command) }
 ;;
-
+let confirmation_planning = function
+  | Ok request -> requests [request]
+  | Error message -> reject message
+;;
 let request_target_summary t page refresh =
-  (* Keep the structural subscription established by the old confirmation read,
-     including changes arriving before this target query completes. *)
-  Hashtbl.replace
-    t.page_tree_interests
-    page.Projection.id
-    { page; limit = Protocol.maximum_page_size };
-  let block_id =
-    match refresh with
-    | Captured { block_id }
-    | Updated { block_id }
-    | Update_conflict_refresh { block_id }
-    | Delete_conflict_refresh { block_id } -> block_id
-  in
-  target_summary_read
-    t
-    { refresh; block_id; children = Rrbvec.empty; version = None; retries = 0 }
-    None
+  (* Retain the structural subscription before the first target confirmation. *)
+  Hashtbl.replace t.page_tree_interests page.Projection.id {page;limit=Protocol.maximum_page_size};
+  Confirmation.start t.confirmations ~ports:(confirmation_ports t) refresh |> confirmation_planning
 ;;
 
 let capture_tree (command : Projection.capture) =
@@ -2013,7 +1988,7 @@ let receive_response t (protocol_response : Protocol.response) =
   | Some {operation;source_epoch;_} when not(changed_point_current t operation source_epoch)->
     Hashtbl.remove t.pending key;empty
   | Some { operation = Target_summary summary; source_epoch; _ }
-    when Hashtbl.find_opt t.target_read_epochs summary.block_id <> Some source_epoch ->
+    when not (Confirmation.current t.confirmations summary) ->
     Hashtbl.remove t.pending key;
     failure_output
       ~source_epoch
@@ -2046,16 +2021,10 @@ let receive_response t (protocol_response : Protocol.response) =
             "The Worker returned an unknown failure code."
         | Some failure_code ->
           (match operation with
-           | Target_summary summary
-             when failure_code = Error.Stale_read_cursor && summary.retries < 2 ->
-             target_summary_read
-               t
-               { summary with
-                 children = Rrbvec.empty
-               ; version = None
-               ; retries = summary.retries + 1
-               }
-               None
+           | Target_summary summary when failure_code = Error.Stale_read_cursor ->
+             (match Confirmation.retry_stale t.confirmations ~ports:(confirmation_ports t) summary with
+              | Some planned -> confirmation_planning planned
+              | None -> failure_output ~code:failure_code t operation request_id message)
            | Capture_insert { command; page; conflict_retries }
              when String.equal code (Error.code_string Error.Conflict)
                   && conflict_retries < 2 ->
@@ -2365,45 +2334,11 @@ let receive_response t (protocol_response : Protocol.response) =
          } ->
        (match operation with
         | Target_summary summary ->
-          let version = generation, projection_revision, scope_revision in
-          if Option.is_some summary.version && summary.version <> Some version
-          then
-            if summary.retries < 2
-            then
-              target_summary_read
-                t
-                { summary with
-                  children = Rrbvec.empty
-                ; version = None
-                ; retries = summary.retries + 1
-                }
-                None
-            else
-              failure_output
-                t
-                operation
-                request_id
-                "The target changed repeatedly during confirmation."
-          else (
-            match lookup, page with
-            | ( V2_present_block { value; revision }
-              , Some (V2_present_page { page; revision = page_revision }) )
-              when String.equal (Graph.Uuid.to_string value.block.uuid) summary.block_id
-                   && Graph.Uuid.equal value.block.page page.uuid
-                   && List.for_all
-                        (fun (item : Protocol.v2_child_member) ->
-                           Graph.Uuid.equal item.value.block.parent value.block.uuid
-                           && Graph.Uuid.equal item.value.block.page page.uuid)
-                        items ->
-              let children = Rrbvec.append_list summary.children items in
-              (match next_cursor with
-               | Some cursor ->
-                 target_summary_read
-                   t
-                   { summary with children; version = Some version }
-                   (Some cursor)
-               | None ->
-                 let children = Rrbvec.to_list children in
+          (match Confirmation.receive_summary t.confirmations ~ports:(confirmation_ports t) summary
+            ~lookup ~page ~items ~next_cursor ~scope_revision ~generation ~projection_revision with
+           | Continue planned -> confirmation_planning planned
+           | Failed message -> failure_output t operation request_id message
+           | Confirmed {purpose;block_id;value;revision;page;page_revision;scope_revision;children} ->
                  (match projection_time_context t with
                   | Error message -> failure_output t operation request_id message
                   | Ok time_context ->
@@ -2411,7 +2346,7 @@ let receive_response t (protocol_response : Protocol.response) =
                        Projection.block_on_page
                          ~page
                          ~revision
-                         ~child_count:(List.length children)
+                         ~child_count:(Rrbvec.length children)
                          ~time_context
                          value.block
                      with
@@ -2424,16 +2359,11 @@ let receive_response t (protocol_response : Protocol.response) =
                          match page_of_graph_page page with
                          | Some journal when Graph.Uuid.equal value.block.parent page.uuid
                            ->
-                           let items : Projection.tree_member list =
-                             { block = value.block; revision; depth = 0 }
-                             :: List.map
-                                  (fun (item : Protocol.v2_child_member) ->
-                                     Projection.
-                                       { block = item.value.block
-                                       ; revision = item.revision
-                                       ; depth = 1
-                                       })
-                                  children
+                           let items =
+                             Seq.cons Projection.{block=value.block;revision;depth=0}
+                               (Rrbvec.to_seq children |> Seq.map (fun (item:Protocol.v2_child_member)->
+                                  Projection.{block=item.value.block;revision=item.revision;depth=1}))
+                             |> List.of_seq
                            in
                            Result.map
                              (fun result -> List.nth_opt result.Projection.entries 0)
@@ -2455,21 +2385,21 @@ let receive_response t (protocol_response : Protocol.response) =
                             t.page_revisions
                             (Graph.Uuid.to_string page.uuid)
                             page_revision;
-                          Hashtbl.replace t.block_revisions summary.block_id revision;
+                          Hashtbl.replace t.block_revisions block_id revision;
                           Hashtbl.replace
                             t.scope_revisions
                             (scope_key (Protocol.V2_children_scope value.block.uuid))
                             scope_revision;
-                          Hashtbl.replace t.tag_titles summary.block_id value.tag_titles;
-                          Hashtbl.replace t.projected_blocks summary.block_id block;
+                          Hashtbl.replace t.tag_titles block_id value.tag_titles;
+                          Hashtbl.replace t.projected_blocks block_id block;
                           Option.iter
                             (fun journal ->
                                Hashtbl.replace
                                  t.page_tree_interests
                                  journal.Projection.id
                                  { page = journal; limit = Protocol.maximum_page_size };
-                               remember_block_page t journal summary.block_id;
-                               List.iter
+                               remember_block_page t journal block_id;
+                               Rrbvec.iter
                                  (fun (item : Protocol.v2_child_member) ->
                                     remember_block_page
                                       t
@@ -2477,7 +2407,7 @@ let receive_response t (protocol_response : Protocol.response) =
                                       (Graph.Uuid.to_string item.value.block.uuid))
                                  children)
                             (page_of_graph_page page);
-                          List.iter
+                          Rrbvec.iter
                             (fun (item : Protocol.v2_child_member) ->
                                Hashtbl.replace
                                  t.block_revisions
@@ -2488,7 +2418,7 @@ let receive_response t (protocol_response : Protocol.response) =
                                  (Graph.Uuid.to_string item.value.block.uuid)
                                  item.value.tag_titles)
                             children;
-                          (match summary.refresh with
+                          (match purpose with
                            | Captured _ ->
                              responses
                                [ response
@@ -2505,13 +2435,8 @@ let receive_response t (protocol_response : Protocol.response) =
                                t
                                operation
                                request_id
-                               "Unexpected target confirmation owner.")))))
-            | _ ->
-              failure_output
-                t
-                operation
-                request_id
-                "The canonical mutation target is unavailable or mismatched.")
+                               "Unexpected target confirmation owner."))))
+          )
         | _ -> failure_output t operation request_id "Unexpected target summary response.")
      | V2_block_outcome lookup ->
        (match lookup with
@@ -2885,8 +2810,8 @@ let receive t (protocol_response : Protocol.response) =
     | _ when not root_current -> empty
     | None, _ | Some { operation = Reference_read _; _ }, _ -> empty
     | Some pending, _ when not (favorite_request_current t pending) -> empty
-    | Some { operation = Target_summary summary; source_epoch; _ }, _
-      when Hashtbl.find_opt t.target_read_epochs summary.block_id <> Some source_epoch ->
+    | Some { operation = Target_summary summary; _ }, _
+      when not (Confirmation.current t.confirmations summary) ->
       empty
     | Some { operation; source_epoch; _ }, Protocol.V2_response { outcome; _ } ->
       let block (value : Protocol.v2_block_record) = Reference.Block value.block in
@@ -2901,12 +2826,11 @@ let receive t (protocol_response : Protocol.response) =
                  (fun response -> match response.payload with
                     | Block_captured _ | Block_updated _ -> true | _ -> false)
                  output.responses ->
-          let retained = match operation with
-            | Target_summary summary -> summary.children | _ -> Rrbvec.empty in
-          Rrbvec.push_front
-            (Rrbvec.map (fun (item : Protocol.v2_child_member) -> block item.value)
-               (Rrbvec.append_list retained items))
-            (block value)
+          let fragment = match operation with
+            | Target_summary summary -> Confirmation.reference_fragment summary ~target:value ~final_children:items
+            | _ -> Rrbvec.push_front
+                (Rrbvec.of_list items |> Rrbvec.map (fun (item:Protocol.v2_child_member)->item.value)) value in
+          Rrbvec.map block fragment
         | V2_page_outcome (V2_present_page { page; _ }) ->
           let detail_owner = match operation with
             | Detail_block { block_id; _ } -> block_id = Graph.Uuid.to_string page.uuid
