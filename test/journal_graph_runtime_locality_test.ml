@@ -7702,8 +7702,7 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
        let same_day =
          let id = uuid "00000002-2026-0901-0000-000000000000" in
          let root = only "fixture root" first.roots in
-         { first with
-           owner = { first.owner with uuid = id }
+         { owner = { first.owner with uuid = id }
          ; roots =
              [ { root with
                  block =
@@ -7741,8 +7740,8 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
           | _ -> Alcotest.fail "expected only a date catalog read");
          request
        in
-       let complete_date listing fixture next_cursor expected_limit through =
-         let tree = dates listing [ fixture ] next_cursor
+       let complete_date request fixture next_cursor expected_limit through =
+         let tree = dates request [ fixture ] next_cursor
            |> fun output -> only "date root read" output.requests in
          (match tree.command with
           | V2_get_page_tree { limit; _ } ->
