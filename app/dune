@@ -36,6 +36,7 @@
   journal_media_view
   journal_native_collection
   journal_platform
+  journal_platform_requests
   journal_routes
   journal_row
   journal_startup
