@@ -6770,6 +6770,125 @@ let test_retired_feed_failure_does_not_publish_diagnostics projection =
     (A.diagnostic_rows state)
 ;;
 
+module Admission_fixture = struct
+  module Worker = Logseq_db_worker_lui.Journal_worker
+  module Id = Logseq_db_worker_lui.Journal_worker_ids.Worker.Request_id
+  module Protocol = Logseq_db_worker.Protocol
+
+  type t =
+    { owner : Journal_worker_admission.t
+    ; sent : Service.request list ref
+    ; cancelled : Id.t list ref
+    ; observed : Protocol.request list ref
+    ; finished : Logseq_db_types.Graph_types.Uuid.t list ref
+    ; refused : (Service.request * Worker.send_result) list ref
+    ; results : Worker.send_result list ref
+    ; events : string list ref
+    ; observe_hook : (Protocol.request -> unit) ref
+    }
+
+  let create () =
+    let sent = ref [] and cancelled = ref [] and observed = ref [] and finished = ref [] in
+    let refused = ref [] and results = ref [] and events = ref [] and next = ref 0L in
+    let observe_hook = ref (fun _ -> ()) in
+    let owner = Journal_worker_admission.create
+      ~send:(fun request ->
+        sent := !sent @ [request];next := Int64.succ !next;
+        match !results with
+        | result::rest -> results:=rest;result
+        | [] -> Worker.Accepted (Id.of_int64 !next))
+      ~cancel:(fun request_id -> cancelled:= !cancelled @ [request_id];events:= !events @ ["cancel"])
+      ~projection_accepted:(fun request -> observed:= !observed @ [request]; !observe_hook request)
+      ~projection_finished:(fun request_id -> finished:= !finished @ [request_id];events:= !events @ ["finished"])
+      ~refused:(fun request result -> refused:= !refused @ [request,result]) in
+    {owner;sent;cancelled;observed;finished;refused;results;events;observe_hook}
+  ;;
+
+  let request index : Protocol.request =
+    {api_version=Protocol.api_version
+    ;request_id=Logseq_db_types.Graph_types.Uuid.of_string
+      (Printf.sprintf "91000000-0000-4000-a000-%012d" index) |> Result.get_ok
+    ;command=V2_graph_info}
+  ;;
+end
+
+let test_worker_admission_owner () =
+  let module F = Admission_fixture in
+  let module A = Journal_worker_admission in
+  let module W = F.Worker in
+  let failures = ref [] in
+  let require condition message = if not condition then failwith message in
+  let check name f = try f () with error ->
+    Printf.eprintf "ADMISSION_OWNER_RED %s: %s\n%!" name (Printexc.to_string error);
+    failures:=name::!failures in
+  let wid n = F.Id.of_int64 (Int64.of_int n) in
+  let dispatch f request = A.dispatch f.F.owner (Service.Graph_request request) in
+  check "duplicate never sends or diagnoses transport refusal" (fun () ->
+    let f=F.create () in let request=F.request 1 in
+    require (A.dispatch f.owner ~observe_projection:true (Graph_request request)=W.Accepted(wid 1)) "first send refused";
+    require (dispatch f request=W.Full) "duplicate protocol ID accepted";
+    require (List.length !(f.sent)=1 && !(f.refused)=[]) "duplicate entered transport or refusal callback";
+    require (!(f.observed)=[request]) "accepted observer changed");
+  check "real refusals never reserve lease" (fun () ->
+    List.iter (fun refusal ->
+      let f=F.create () in let request=F.request 1 in
+      f.results:=[refusal];
+      require (A.dispatch f.owner ~observe_projection:true (Graph_request request)=refusal) "refusal changed";
+      require (!(f.refused)=[Graph_request request,refusal] && !(f.observed)=[]) "refusal notification/observer changed";
+      require (dispatch f request=W.Accepted(wid 2)) "refusal reserved protocol ID";
+      A.cancel_graph_leases f.owner;
+      require (!(f.cancelled)=[wid 2]) "refusal created a worker lease") [W.Full;Not_ready;Stopping]);
+  check "cancel permits reuse and late response cannot erase new mapping" (fun () ->
+    let f=F.create () in let request=F.request 1 in
+    ignore(dispatch f request);A.cancel_graph_leases f.owner;
+    require (!(f.cancelled)=[wid 1] && !(f.finished)=[request.request_id]) "cancel lost resource owner";
+    require (dispatch f request=W.Accepted(wid 2)) "cancel retained protocol admission";
+    require (A.retire f.owner (wid 1)) "late old lease was not retired";
+    require (dispatch f request=W.Full && List.length !(f.sent)=2) "old response erased new protocol mapping";
+    require (not(A.retire f.owner (wid 2))) "active response incorrectly marked retired";
+    require (dispatch f request=W.Accepted(wid 3)) "completed active lease retained protocol mapping");
+  check "cancel idempotence retains tombstones until response" (fun () ->
+    let f=F.create () in let request=F.request 1 in
+    ignore(dispatch f request);A.cancel_graph_leases f.owner;A.cancel_graph_leases f.owner;
+    require (!(f.cancelled)=[wid 1] && !(f.finished)=[request.request_id]) "repeated cancel repeated resource release";
+    require (A.retire f.owner (wid 1)) "cancel cleared late-response tombstone";
+    require (not(A.retire f.owner (wid 1))) "retired response retained tombstone");
+  check "unobserved projection still finishes when cancelled" (fun () ->
+    let f=F.create () in let request=F.request 1 in
+    ignore(dispatch f request);
+    require (!(f.observed)=[]) "default request gained accepted observer";
+    A.cancel_graph_leases f.owner;
+    require (!(f.finished)=[request.request_id]) "cancel added incorrect observe-only guard";
+    require (!(f.events)=["finished";"cancel"]) "forget/cancel order changed");
+  check "accepted observer runs after both admission mappings" (fun () ->
+    let f=F.create () in let request=F.request 1 in
+    let nested=ref None in
+    f.observe_hook := (fun _ -> nested:=Some(dispatch f request));
+    ignore(A.dispatch f.owner ~observe_projection:true (Graph_request request));
+    require (!nested=Some W.Full && List.length !(f.sent)=1) "observer reentry preceded registration";
+    require (!(f.refused)=[]) "observer duplicate generated transport diagnostic");
+  check "non-graph service calls have no graph lease" (fun () ->
+    let f=F.create () in
+    require (A.dispatch f.owner Service.Get_graph_state=W.Accepted(wid 1)) "first service call refused";
+    require (A.dispatch f.owner Service.Get_graph_state=W.Accepted(wid 2)) "service call deduplicated";
+    A.cancel_graph_leases f.owner;
+    require (!(f.cancelled)=[] && !(f.finished)=[]) "service call acquired graph lease";
+    require (not(A.retire f.owner (wid 1))) "service call acquired tombstone");
+  check "unknown response cannot erase current mapping" (fun () ->
+    let f=F.create () in let request=F.request 1 in
+    ignore(dispatch f request);
+    require (not(A.retire f.owner (wid 99))) "unknown response marked retired";
+    require (dispatch f request=W.Full) "unknown response erased live mapping");
+  check "all graph consumers share the admission owner" (fun () ->
+    let f=F.create () in let first=F.request 1 and second=F.request 2 in
+    ignore(dispatch f first);
+    require (A.dispatch f.owner ~observe_projection:true (Graph_request first)=W.Full) "projection path gained separate owner";
+    require (dispatch f second=W.Accepted(wid 2)) "different protocol request blocked";
+    A.cancel_graph_leases f.owner;
+    require (List.length !(f.cancelled)=2 && List.length !(f.finished)=2) "shared owner lost consumer leases");
+  Alcotest.(check int) "all Worker admission lifecycle cases" 0 (List.length !failures)
+;;
+
 let () =
   if Sys.getenv_opt "JOURNAL_UNLOCK_SYNTHETIC_HOST" = Some "1"
   then (
@@ -6777,7 +6896,8 @@ let () =
     Journal_bridge.register hooks)
   else Alcotest.run
     "application view"
-    [ ( "diagnostic identity", [ Alcotest.test_case "actual worker identity" `Quick test_diagnostic_identity_comes_from_worker ])
+    [ ( "Worker admission owner", [Alcotest.test_case "single owner lifecycle" `Quick test_worker_admission_owner])
+    ; ( "diagnostic identity", [ Alcotest.test_case "actual worker identity" `Quick test_diagnostic_identity_comes_from_worker ])
     ; ( "diagnostic failure", [
       Alcotest.test_case "integrity attention survives read success and bounded history" `Quick test_integrity_attention_survives_unrelated_read_success;
       Alcotest.test_case "retired feed Worker failure is ignored" `Quick

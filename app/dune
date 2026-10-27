@@ -37,6 +37,7 @@
   journal_native_collection
   journal_platform
   journal_platform_requests
+  journal_worker_admission
   journal_routes
   journal_row
   journal_startup
