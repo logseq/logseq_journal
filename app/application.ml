@@ -255,6 +255,9 @@ module Task_catalog = struct
   ;;
 end
 
+type cleanup = Discard_staged_file of Journal_asset_import.staged
+type cleanup_plan = cleanup Rrbvec.t
+
 type state =
   { favorites : Journal_routes.Favorites.t
   ; favorites_media_roots : string Rrbvec.t
@@ -342,6 +345,39 @@ let favorites_event state event =
     ; favorites_media_roots
     ; favorites_requests = state.favorites_requests @ requests
     }
+;;
+
+(* This collector is synchronous and state-specific: its callback must not
+   escape into an effect, queue, subscription, thread, or returned closure. *)
+let with_cleanup (transition : discard:(Journal_asset_import.staged -> unit) -> state)
+  : state * cleanup_plan
+  =
+  let cleanup = ref Rrbvec.empty in
+  let state = transition ~discard:(fun staged ->
+    cleanup := Rrbvec.push_back !cleanup (Discard_staged_file staged)) in
+  state, !cleanup
+;;
+
+let run_cleanup cleanup =
+  Rrbvec.iter (function
+    | Discard_staged_file staged -> Journal_asset_import.discard_staged_file staged)
+    cleanup
+;;
+
+let finish_cleanup (state, cleanup) =
+  run_cleanup cleanup;
+  state
+;;
+
+let cleanup_files items =
+  List.to_seq items |> Seq.map (fun staged -> Discard_staged_file staged) |> Rrbvec.of_seq
+;;
+
+let cleanup_batches batches =
+  List.to_seq batches
+  |> Seq.flat_map (fun batch -> List.to_seq batch.batch_items)
+  |> Seq.map (fun staged -> Discard_staged_file staged)
+  |> Rrbvec.of_seq
 ;;
 
 let select_destination state destination =
@@ -494,16 +530,16 @@ let set_composer_error state owner error =
   | None -> state
 ;;
 
-let discard_import_batches batches =
+let discard_import_batches ~discard batches =
   List.iter
-    (fun batch -> List.iter Journal_asset_import.discard_staged_file batch.batch_items)
+    (fun batch -> List.iter discard batch.batch_items)
     batches
 ;;
 
-let retain_import_failure state batch =
+let retain_import_failure ~discard state batch =
   if batch.batch_generation <> state.graph_state.generation
   then (
-    discard_import_batches [ batch ];
+    discard_import_batches ~discard [ batch ];
     state)
   else { state with failed_capture_imports = state.failed_capture_imports @ [ batch ] }
 ;;
@@ -570,17 +606,17 @@ let track_capture_session state =
     else { state with next_local_sequence = next }
 ;;
 
-let clear_graph_surface ?(discard_capture = true) state =
-  discard_import_batches state.failed_capture_imports;
+let clear_graph_surface ~discard ?(discard_capture = true) state =
+  discard_import_batches ~discard state.failed_capture_imports;
   if discard_capture
   then
     List.iter
-      Journal_asset_import.discard_staged_file
+      discard
       (Journal_routes.pending_attachments state.routes);
   (match state.direct_capture with
    | Some capture when discard_capture ->
      List.iter
-       Journal_asset_import.discard_staged_file
+       discard
        (Journal_capture.pending_attachments capture)
    | None | Some _ -> ());
   { state with
@@ -620,7 +656,7 @@ let clear_graph_surface ?(discard_capture = true) state =
   }
 ;;
 
-let discard_local_graph_state state =
+let discard_local_graph_state ~discard state =
   let graph_drafts =
     match state.draft_graph with
     | None -> state.graph_drafts
@@ -629,23 +665,23 @@ let discard_local_graph_state state =
         (Logseq_db_types.Graph_types.Uuid.to_string id)
         state.graph_drafts
   in
-  { (clear_graph_surface state) with draft_graph = None; graph_drafts }
+  { (clear_graph_surface ~discard state) with draft_graph = None; graph_drafts }
 ;;
 
-let clear_account_drafts state =
+let clear_account_drafts ~discard state =
   Graph_drafts.iter
     (fun _ draft ->
        Option.iter
          (fun capture ->
             List.iter
-              Journal_asset_import.discard_staged_file
+              discard
               (Journal_capture.pending_attachments capture))
          draft.capture_draft;
        List.iter
-         Journal_asset_import.discard_staged_file
+         discard
          (Journal_routes.retained_attachments draft.append_drafts))
     state.graph_drafts;
-  { (clear_graph_surface state) with
+  { (clear_graph_surface ~discard state) with
     draft_graph = None
   ; graph_drafts = Graph_drafts.empty
   ; worker_errors = []
@@ -654,7 +690,7 @@ let clear_account_drafts state =
   }
 ;;
 
-let switch_draft_graph state graph_id =
+let switch_draft_graph ~discard state graph_id =
   let graph_drafts =
     match state.draft_graph with
     | None -> state.graph_drafts
@@ -678,7 +714,7 @@ let switch_draft_graph state graph_id =
         state.graph_drafts
   in
   let state =
-    clear_graph_surface ~discard_capture:(Option.is_none state.draft_graph) state
+    clear_graph_surface ~discard ~discard_capture:(Option.is_none state.draft_graph) state
   in
   let retained =
     Option.bind graph_id (fun id ->
@@ -714,8 +750,7 @@ let local_deletion_available state =
   | None -> false
 ;;
 
-let apply_manager_state state (manager_state : Graph_service.state) =
-  let e2ee_submission_was_pending = (unlock_pending state.unlock) in
+let apply_manager_state ~discard state (manager_state : Graph_service.state) =
   let snapshot = manager_state.snapshot in
   let graph_catalog = match state.manager with
     | Some previous when previous.catalog == snapshot.catalog -> state.graph_catalog
@@ -734,7 +769,7 @@ let apply_manager_state state (manager_state : Graph_service.state) =
     match state.manager with
     | Some previous
       when previous.startup.account_generation <> snapshot.startup.account_generation ->
-      { (clear_account_drafts state) with
+      { (clear_account_drafts ~discard state) with
         local_copies = Local_copies.empty; local_copy_check = None
       ; local_copy_deleting = None; local_copy_message = None }
     | None | Some _ -> state
@@ -764,7 +799,7 @@ let apply_manager_state state (manager_state : Graph_service.state) =
   in
   let state =
     if graph_context_changed
-    then switch_draft_graph state snapshot.selected_graph
+    then switch_draft_graph ~discard state snapshot.selected_graph
     else state
   in
   let was_awaiting_password =
@@ -816,13 +851,6 @@ let apply_manager_state state (manager_state : Graph_service.state) =
     ; graph_error = state.graph_error
     }
   in
-  if (unlock_pending state.unlock) <> e2ee_submission_was_pending
-  then
-    unlock_log
-      "phase=state pending=%b challenge_advertised=%b failure=%s account_generation=%d \
-       graph_generation=%d"
-    (unlock_pending state.unlock) is_awaiting_password (unlock_failure snapshot.startup.failure)
-    snapshot.startup.account_generation snapshot.startup.graph_generation;
   match snapshot.last_error with
   | Some _ when snapshot.last_error_attention = Some Graph_service.Transient_connection -> state
   | Some message when previous_sync_error <> Some message || previous_attention <> snapshot.last_error_attention ->
@@ -861,9 +889,9 @@ let capture_failure_message = function
   | Local_capture_failure message -> message
 ;;
 
-let commit_deleted state block_id =
+let commit_deleted ~discard state block_id =
   let routes, released = Journal_routes.commit_delete state.routes ~block_id in
-  List.iter Journal_asset_import.discard_staged_file released;
+  List.iter discard released;
   favorites_event
     { state with
       routes
@@ -1124,7 +1152,7 @@ let back_state state =
   { state with routes; timeline }
 ;;
 
-let apply_worker_response state (response : Journal_graph_runtime.response) =
+let apply_worker_response ~discard state (response : Journal_graph_runtime.response) =
   match response.payload with
   | Projection_changes _ | Projection_resync -> state
   | Task_statuses_changed { items; default_status; complete; error } ->
@@ -1395,7 +1423,7 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
           ~some:(Journal_timeline_state.replace_timeline_entry state.timeline)
           timeline_entry_update
     }
-  | Block_removed { block_id } -> commit_deleted state block_id
+  | Block_removed { block_id } -> commit_deleted ~discard state block_id
   | Page_tree_reconciled { page; value } ->
     { state with
       timeline =
@@ -1483,7 +1511,7 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
   | Subtree_deleted { block_id; parent; timeline_entry_update; _ } ->
     (match state.pending_delete with
      | Some pending when String.equal pending.block_id block_id ->
-       let state = commit_deleted state block_id in
+       let state = commit_deleted ~discard state block_id in
        { state with
          timeline =
            Option.fold
@@ -1611,7 +1639,7 @@ module Root_navigation = struct
     | Account_cleared
     | Local_copy_deleted
 
-  let replace_graph state generation graph_id =
+  let replace_graph ~discard state generation graph_id =
     let retired_manager_scope =
       match state.manager with
       | Some manager ->
@@ -1628,7 +1656,7 @@ module Root_navigation = struct
         when String.equal message retained -> Some notice
       | _ -> None
     in
-    let state = switch_draft_graph state graph_id in
+    let state = switch_draft_graph ~discard state graph_id in
     { state with
       favorites = Journal_routes.Favorites.create ~graph_generation:generation
     ; favorites_media_roots = Rrbvec.empty
@@ -1653,9 +1681,15 @@ module Root_navigation = struct
 
   let diagnostic_rows state = application_error_rows state.worker_errors
 
-  let create ~graph_generation = replace_graph initial_state graph_generation None
+  let create ~graph_generation =
+    (* Initial state has no owned resources, so creation cannot emit cleanup. *)
+    let state, cleanup = with_cleanup (fun ~discard ->
+      replace_graph ~discard initial_state graph_generation None) in
+    assert (Rrbvec.length cleanup = 0);
+    state
+  ;;
 
-  let step state event =
+  let step_transition ~discard state event =
     let state =
       match event with
       | Select destination -> select_destination state destination
@@ -1682,7 +1716,7 @@ module Root_navigation = struct
         (match state.direct_capture with
          | Some capture when Journal_capture.phase capture = Journal_capture.Editing ->
            List.iter
-             Journal_asset_import.discard_staged_file
+             discard
              (Journal_capture.pending_attachments capture);
            { state with
              modal = No_modal
@@ -1723,7 +1757,7 @@ module Root_navigation = struct
                       (Journal_asset_import.staged_path pick)
                       (Journal_asset_import.staged_path item))
                  owned)
-          then Journal_asset_import.discard_staged_file item
+          then discard item
         in
         (match composer_capture state owner with
          | Some capture
@@ -1825,14 +1859,18 @@ module Root_navigation = struct
         (match state.direct_capture with
          | Some previous when previous == capture -> state
          | _ -> { state with direct_capture = Some capture })
-      | Completed response -> apply_worker_response state response
+      | Completed response -> apply_worker_response ~discard state response
       | Graph_replaced { generation; graph_id } ->
-        let state = replace_graph state generation graph_id in
+        let state = replace_graph ~discard state generation graph_id in
         { state with graph_state = { state.graph_state with graph_id } }
-      | Account_cleared -> clear_account_drafts state
-      | Local_copy_deleted -> discard_local_graph_state state
+      | Account_cleared -> clear_account_drafts ~discard state
+      | Local_copy_deleted -> discard_local_graph_state ~discard state
     in
     track_capture_session state
+  ;;
+
+  let step state event =
+    with_cleanup (fun ~discard -> step_transition ~discard state event)
   ;;
 
   let destination state = Journal_routes.destination state.routes
@@ -1845,6 +1883,34 @@ let application_theme () = Ui.Theme.create ~mode:System ()
 
 let secondary_text value =
   V.text ~style:(Ui.Style.Text_style.create ~foreground:Secondary ()) value
+;;
+
+(* App-only adapters interpret cleanup at the old transition boundary, before
+   Update publishes state_ref. Never suppress a plan when the state is unchanged. *)
+let step_root state event = finish_cleanup (Root_navigation.step state event)
+
+let worker_response_transition state response =
+  finish_cleanup (with_cleanup (fun ~discard -> apply_worker_response ~discard state response))
+;;
+
+let manager_state_transition state (manager : Graph_service.state) =
+  let was_pending = unlock_pending state.unlock in
+  let state =
+    finish_cleanup (with_cleanup (fun ~discard -> apply_manager_state ~discard state manager))
+  in
+  let snapshot = manager.snapshot in
+  if unlock_pending state.unlock <> was_pending then
+    unlock_log
+      "phase=state pending=%b challenge_advertised=%b failure=%s account_generation=%d \
+       graph_generation=%d"
+      (unlock_pending state.unlock) snapshot.startup.awaiting_e2ee_password
+      (unlock_failure snapshot.startup.failure)
+      snapshot.startup.account_generation snapshot.startup.graph_generation;
+  state
+;;
+
+let import_failure_transition state batch =
+  finish_cleanup (with_cleanup (fun ~discard -> retain_import_failure ~discard state batch))
 ;;
 
 type command =
@@ -3454,13 +3520,14 @@ let start
             else next ()
         in next ())));
   let discard_graph_copy_draft state graph_id =
+    finish_cleanup (with_cleanup (fun ~discard ->
     let key = Logseq_db_types.Graph_types.Uuid.to_string graph_id in
     Option.iter (fun draft ->
       Option.iter (fun capture ->
-        List.iter Journal_asset_import.discard_staged_file (Journal_capture.pending_attachments capture)) draft.capture_draft;
-      List.iter Journal_asset_import.discard_staged_file (Journal_routes.retained_attachments draft.append_drafts))
+        List.iter discard (Journal_capture.pending_attachments capture)) draft.capture_draft;
+      List.iter discard (Journal_routes.retained_attachments draft.append_drafts))
       (Graph_drafts.find_opt key state.graph_drafts);
-    { state with graph_drafts = Graph_drafts.remove key state.graph_drafts }
+    { state with graph_drafts = Graph_drafts.remove key state.graph_drafts }))
   in
   let submit request = Journal_graph_runtime.submit graph_runtime request in
   let fail_graph_transport state message =
@@ -3507,7 +3574,7 @@ let start
           | _ -> None in
         match completion with
         | None ->
-          let next = Root_navigation.step state (Completed response) in
+          let next = step_root state (Completed response) in
           report_app_response state next response;
           next, effects
         | Some (request, result) ->
@@ -3540,7 +3607,7 @@ let start
   let apply_delivery_responses state delivery =
     let state =
       List.fold_left
-        (fun state response -> apply_worker_response state response)
+        (fun state response -> worker_response_transition state response)
         state
         delivery.Journal_graph_transport.responses
     in
@@ -3597,7 +3664,7 @@ let start
             state.graph_state.generation <> graph_state.generation
             || state.graph_state.graph_id <> graph_state.graph_id
           then
-            Root_navigation.step
+            step_root
               state
               (Graph_replaced
                  { generation = graph_state.generation; graph_id = graph_state.graph_id })
@@ -3730,7 +3797,7 @@ let start
     if (manager.startup.local_access=Graph_service.Local_pending && not manager.startup.restoring_local && not manager.startup.authenticated) || (owner_changed && not graph_already_current)
     then (retire_graph_scope (); started_graph_generation := None);
     if not manager.startup.authenticated then cancel_copy ();
-    let update = set_state (fun state -> apply_manager_state state manager_state) in
+    let update = set_state (fun state -> manager_state_transition state manager_state) in
     let sign_out =
       if (not manager.Graph_service.startup.authenticated) && !sign_out_in_flight
       then (
@@ -3893,7 +3960,7 @@ let start
                   ~f:(fun delivery ->
                     set_state (fun state ->
                       let state =
-                        List.fold_left apply_worker_response state delivery.responses
+                        List.fold_left worker_response_transition state delivery.responses
                       in
                       match delivery.error with
                       | Some message -> fail_feed_transport state message
@@ -4006,9 +4073,9 @@ let start
              Hashtbl.remove capture_staged_items operation;
              (match result with
               | Ok _ ->
-                discard_import_batches [ batch ];
+                run_cleanup (cleanup_batches [ batch ]);
                 Effect.ignore
-              | Error _ -> set_state (fun state -> retain_import_failure state batch)))
+              | Error _ -> set_state (fun state -> import_failure_transition state batch)))
         | None -> Effect.ignore
       in
       let completion =
@@ -4095,7 +4162,7 @@ let start
         | None -> Effect.ignore
         | Some batch ->
           Hashtbl.remove capture_staged_items operation;
-          set_state (fun state -> retain_import_failure state batch)
+          set_state (fun state -> import_failure_transition state batch)
       in
       let completion =
         set_state (fun state ->
@@ -4443,7 +4510,7 @@ let start
             set_state (fun state ->
               let state =
                 List.fold_left
-                  (fun state response -> Root_navigation.step state (Completed response))
+                  (fun state response -> step_root state (Completed response))
                   state
                   delivery.responses
               in
@@ -4602,7 +4669,7 @@ let start
         Effect.bind
           (set_state (fun state ->
              let state =
-               retain_import_failure
+               import_failure_transition
                  state
                  { batch_generation = generation
                  ; batch_target = Logseq_db_types.Graph_types.Uuid.to_string target
@@ -4631,7 +4698,7 @@ let start
         ~f:(fun () ->
           match Logseq_db_types.Graph_types.Uuid.of_string batch.batch_target with
           | Error _ ->
-            List.iter Journal_asset_import.discard_staged_file batch.batch_items;
+            run_cleanup (cleanup_files batch.batch_items);
             Effect.ignore
           | Ok target ->
             List.iter
@@ -4838,7 +4905,7 @@ let start
             | None -> Effect.ignore
             | Some request ->
               with_direct_request
-                (Root_navigation.step snapshot (Capture_admitted capture))
+                (step_root snapshot (Capture_admitted capture))
                 request)
          | Editing ->
            if not (Journal_capture.can_save capture)
@@ -4880,7 +4947,7 @@ let start
                 | Ok (_, None) -> Effect.ignore
                 | Ok (capture, Some request) ->
                   with_direct_request
-                    (Root_navigation.step
+                    (step_root
                        { snapshot with
                          calendar = Some calendar
                        ; next_local_sequence = Int64.succ number
@@ -4958,7 +5025,7 @@ let start
     | Native_payload (Ui.Event.Payload.Text_edit edit) ->
       update (fun state ->
         match state.modal, state.manager with
-        | Capture_sheet, _ -> Root_navigation.step state (Capture_native_edit edit)
+        | Capture_sheet, _ -> step_root state (Capture_native_edit edit)
         | Append_sheet, _ ->
           (match Journal_routes.detail state.routes with
            | None -> state
@@ -4984,9 +5051,9 @@ let start
          admit_direct_capture (Journal_capture.source capture)
        | _ -> Effect.ignore)
     | Select_journals ->
-      update (fun state -> Root_navigation.step state (Select Journal_routes.Journals))
+      update (fun state -> step_root state (Select Journal_routes.Journals))
     | Select_favorites ->
-      update (fun state -> Root_navigation.step state (Select Journal_routes.Favorites))
+      update (fun state -> step_root state (Select Journal_routes.Favorites))
     | Favorites_retry -> update (fun state -> favorites_event state Retry)
     | Native_payload
         (Ui.Event.Payload.Int64_pair { first = first_index; second = last_exclusive })
@@ -5057,7 +5124,7 @@ let start
           ; admission_refresh = Admission_refresh.close state.admission_refresh
           }
         | No_modal -> state
-        | Capture_sheet -> Root_navigation.step state Capture_closed
+        | Capture_sheet -> step_root state Capture_closed
         | Append_sheet | Status_sheet _ | Error_info | Cache_reset_confirmation _ ->
           { state with modal = No_modal })
     | Media_range (owner, first, last)
@@ -5215,10 +5282,10 @@ let start
       when snapshot.write_enabled
            && snapshot.pending_delete = None
            && snapshot.pending_status = None ->
-      update (fun state -> Root_navigation.step state Capture_opened)
-    | Close_composer -> update (fun state -> Root_navigation.step state Capture_closed)
+      update (fun state -> step_root state Capture_opened)
+    | Close_composer -> update (fun state -> step_root state Capture_closed)
     | Discard_capture ->
-      update (fun state -> Root_navigation.step state Capture_discarded)
+      update (fun state -> step_root state Capture_discarded)
     | Capture_attach value ->
       update (fun state ->
         match current_composer_owner state with
@@ -5231,7 +5298,7 @@ let start
                     ~none:false
                     ~some:Journal_capture.can_attach
                     (composer_capture state owner) ->
-          Root_navigation.step state (Capture_picker_requested value)
+          step_root state (Capture_picker_requested value)
         | _ -> state)
     | Capture_asset value ->
       (match value with
@@ -5250,26 +5317,26 @@ let start
              (picker_owner state)
              (Some (Local_capture_failure message)))
        | Journal_asset_import.Removed token ->
-         update (fun state ->
+         update (fun state -> finish_cleanup (with_cleanup (fun ~discard ->
            match current_composer_owner state with
            | Some owner when not (composer_saving state owner) ->
              map_composer_capture state owner ~f:(fun capture ->
                List.iter
                  (fun staged ->
                     if String.equal (Journal_asset_import.staged_token staged) token
-                    then Journal_asset_import.discard_staged_file staged)
+                    then discard staged)
                  (Journal_capture.pending_attachments capture);
                Journal_capture.remove_attachment capture ~token)
-           | _ -> state)
+           | _ -> state)))
        | Journal_asset_import.Picked_batch (items, request_id, error) ->
          update (fun state ->
-           Root_navigation.step state (Capture_assets_picked (items, request_id, error)))
+           step_root state (Capture_assets_picked (items, request_id, error)))
        | Journal_asset_import.Picked (staged, request_id) ->
          update (fun state ->
-           Root_navigation.step state (Capture_asset_picked (staged, request_id))))
+           step_root state (Capture_asset_picked (staged, request_id))))
     | (Capture_task_on | Capture_task_off) as action ->
       update (fun state ->
-        Root_navigation.step state (Capture_task_intent (action = Capture_task_on)))
+        step_root state (Capture_task_intent (action = Capture_task_on)))
     | Open_append
       when snapshot.write_enabled
            && snapshot.pending_delete = None
@@ -5328,7 +5395,7 @@ let start
           List.iter
             (fun batch ->
                match Logseq_db_types.Graph_types.Uuid.of_string batch.batch_target with
-               | Error _ -> discard_import_batches [ batch ]
+               | Error _ -> run_cleanup (cleanup_batches [ batch ])
                | Ok target ->
                  List.iter
                    (fun staged ->
@@ -5339,12 +5406,12 @@ let start
             batches;
           !drain_capture_imports ())
     | Dismiss_operation_error ->
-      update (fun state ->
+      update (fun state -> finish_cleanup (with_cleanup (fun ~discard ->
         match state.timeline_notice with
         | Some (Delete_failed _ | Status_failed _ | Copy_failed _ | Import_failed _) ->
-          discard_import_batches state.failed_capture_imports;
+          discard_import_batches ~discard state.failed_capture_imports;
           { state with timeline_notice = None; failed_capture_imports = [] }
-        | None -> state)
+        | None -> state)))
     | Close_error_info -> update (fun state -> { state with modal = No_modal })
     | Switch_graph ->
       cancel_copy ();
@@ -5397,7 +5464,7 @@ let start
       started_graph_generation := None;
       sign_out_in_flight := true;
       Effect.many
-        [ update (fun state -> let state=Root_navigation.step state Account_cleared in
+        [ update (fun state -> let state=step_root state Account_cleared in
             {state with startup_presentation=Journal_startup.Presentation.step state.startup_presentation Signed_out})
         ; send_manager (Graph_service.Reconcile_authenticated_user { user_id = None })
         ]
@@ -6558,12 +6625,12 @@ let start
   prev_startup_loading_key := startup_loading_key initial_state;
   Option.iter arm_startup_loading_timer !prev_startup_loading_key;
   let release_staging () =
-    ignore (clear_account_drafts !state_ref);
+    ignore (finish_cleanup (with_cleanup (fun ~discard -> clear_account_drafts ~discard !state_ref)));
     Queue.iter
-      (fun (_, _, staged) -> Journal_asset_import.discard_staged_file staged)
+      (fun (_, _, staged) -> run_cleanup (Rrbvec.singleton (Discard_staged_file staged)))
       capture_import_queue;
     Queue.clear capture_import_queue;
-    Hashtbl.iter (fun _ batch -> discard_import_batches [ batch ]) capture_staged_items;
+    Hashtbl.iter (fun _ batch -> run_cleanup (cleanup_batches [ batch ])) capture_staged_items;
     Hashtbl.clear capture_staged_items
   in
   let fail_platform tag reason supplied_scope =

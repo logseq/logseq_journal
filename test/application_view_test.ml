@@ -1,3 +1,11 @@
+module Root_state = struct
+  include Application.Root_navigation
+  let step state event =
+    let next, cleanup = Application.Root_navigation.step state event in
+    Alcotest.(check int) "state-only fixture has no resources to retire" 0 (Rrbvec.length cleanup);
+    next
+end
+
 let server_cursor_of_int value =
   Logseq_db_types.Server_cursor.of_int64 (Int64.of_int value) |> Result.get_ok
 ;;
@@ -351,7 +359,7 @@ let test_block_identity_serialization_and_native_entropy () =
 ;;
 
 let test_root_navigation_capture_lifecycle () =
-  let module R = Application.Root_navigation in
+  let module R = Root_state in
   let initial = R.create ~graph_generation:3 in
   Alcotest.(check bool)
     "Journals on launch"
@@ -6647,7 +6655,7 @@ let test_detail_reconciliation_diagnostics mode =
   let module G = Logseq_db_types.Graph_types in
   let module P = Logseq_db_worker.Protocol in
   let module R = Journal_graph_runtime in
-  let module A = Application.Root_navigation in
+  let module A = Root_state in
   let uuid s = G.Uuid.of_string s |> Result.get_ok in
   let page_id = uuid "f1000000-0000-4000-8000-000000000001" in
   let block_id = uuid "f1000000-0000-4000-9000-000000000001" in
@@ -6722,7 +6730,7 @@ let test_detail_reconciliation_diagnostics mode =
 (* Root_navigation owns acceptance of feed completions and its issue ledger.
    Generate the failure through the real graph runtime, then retire its owner. *)
 let test_integrity_attention_survives_unrelated_read_success () =
-  let module A = Application.Root_navigation in
+  let module A = Root_state in
   let module G = Logseq_db_types.Graph_types in
   let request_id = G.Uuid.of_string "e1000000-0000-4000-8000-000000000001" |> Result.get_ok in
   let error = Logseq_db_worker.Error.create ~code:Corrupt_storage
@@ -6745,7 +6753,7 @@ let test_integrity_attention_survives_unrelated_read_success () =
 
 let test_retired_feed_failure_does_not_publish_diagnostics projection =
   let module R = Journal_graph_runtime in
-  let module A = Application.Root_navigation in
+  let module A = Root_state in
   let runtime = R.create () in
   let output = R.submit runtime (Journal_graph_request.Load_feed
     {cursor=None; day_limit=(if projection then 0 else 7); root_limit = 32; request_generation=9L}) in
