@@ -1296,7 +1296,7 @@ let () =
     ; "Journal_composer_view.content"
     ; "if favorites_selected"
     ; "Journal_detail_view.view"
-    ; "Journal_header.startup"
+    ; "Journal_manager_view.view"
     ];
   require_text
     root
@@ -1385,6 +1385,9 @@ let () =
     [ "Ui.Theme.create"; "~mode:System"; "Journal_composer_view.content" ];
   require_text root "app/journal_composer_view.ml" [ "V.composer" ];
   require_text root "app/journal_detail_view.ml" [ "Detail_list.view"; "journal-detail-route" ];
+  require_text root "app/journal_manager_view.ml"
+    [ "Journal_header.startup"; "V.secure_field"; "graph_picker_list"; "graph-picker-list"
+    ; "e2ee-password-cancel"; "Refresh the authorized graph catalog"; "journal-startup-diagnostics" ];
   forbid_text root "app/journal_header.ml" [ "V.divider" ];
   forbid_text
     root
@@ -1549,17 +1552,12 @@ let () =
     [ "Timeline_open_block"
     ; "Favorite_open_block"
     ; "Detail_submit"
-    ; "V.secure_field"
     ; "Graph_service.Submit_e2ee_password"
     ; "Request_local_cache_reset"
     ; "Action \"cancel\""
     ; "V.Confirmation.alert"
     ; "Graph_service.Delete_local_copy"
     ; "Graph_service.Return_to_graph_picker"
-    ; "graph_picker_list"
-    ; "graph-picker-list"
-    ; "e2ee-password-cancel"
-    ; "Refresh the authorized graph catalog"
     ; "Unsynced changes, drafts"
     ; "Your cloud copy will be"
     ; "Lui_app.create_with_extensions"
@@ -1866,7 +1864,7 @@ let () =
   require_text
     root
     "app/application.ml"
-    [ "Open_diagnostics"; "Close_diagnostics"; "journal-startup-diagnostics" ];
+    [ "Open_diagnostics"; "Close_diagnostics"; "Journal_manager_view.view" ];
   require_text
     root
     "app/journal_diagnostics_view.ml"

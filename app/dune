@@ -8,6 +8,7 @@
   journal_status_view
   journal_composer_view
   journal_detail_view
+  journal_manager_view
   journal_page_layout
   journal_bridge
   journal_environment

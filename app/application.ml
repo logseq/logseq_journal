@@ -31,8 +31,6 @@ let unlock_failure = function
   | Some During_bootstrap -> "bootstrap"
 ;;
 
-type unlock_chrome_props = { mode : string; title : string; pending : bool; error : string option [@default None] }
-[@@deriving yojson]
 
 (* Shim replacing [Bonsai.Effect]: an effect is just a thunk scheduled by
    the reducer plumbing. Effects run inline on the app thread. *)
@@ -1916,14 +1914,6 @@ let bind_action dispatch action =
 
 module Presentation = Journal_page_layout
 
-let graph_picker_list ?header ?on_visible_range rows =
-  V.Native_list.vertical ~key:(Ui.Key.string "graph-list") ~style:Plain ?on_visible_range
-    [ V.Native_list.section ~key:(Ui.Key.string "graphs") ?header ~separator:Hidden rows ]
-  |> fun list -> V.column ~spacing:0. [list]
-  |> V.with_test_id (Ui.Test_id.string "graph-picker-list")
-  |> V.frame ~max_width:Fill ~max_height:Fill
-  |> V.Body.static
-;;
 
 let dismiss_toolbar ~test_id ~command dispatch body =
   Presentation.dismiss_toolbar ~test_id ~on_close:(bind_action dispatch command) body
@@ -2663,467 +2653,143 @@ let detail_page ~media_store ?(on_region = fun _ -> ()) ~state ~on_scroll_comple
       | Import_asset payload -> local (Import_asset payload))
 ;;
 
-let manager_page ?picker_signal state dispatch =
-  let button ?(role = V.Button_role.Normal) ?(enabled = true) ~id ~command title symbol =
-    V.button
-      ~key:(Ui.Key.string id)
-      ~role
-      ~enabled
-      ~on_press:(bind_action dispatch command)
-      ~child:(V.label ~title:(V.text title) ~icon:(V.symbol ~name:symbol ()) ())
-      ()
-    |> V.with_test_id (Ui.Test_id.string id)
-  in
-  let capsule ~id ~command title symbol =
-    V.buttons
-      ~actions:
-        [ V.buttons_action
-            ~label:title
-            ~icon:symbol
-            ~text:title
-            ~on_press:(bind_action dispatch command)
-            ()
-        ]
-      ()
-    |> V.with_test_id (Ui.Test_id.string id)
-  in
-  let diagnostics =
-    button
-      ~id:"journal-startup-diagnostics"
-      ~command:Open_diagnostics
-      "Diagnostics"
-      "stethoscope"
-  in
-  let account_menu ?(sign_out = false) () =
-      V.buttons
-        ~actions:
-          [ V.buttons_menu_action
-              ~label:"Account menu"
-              ~icon:"ellipsis"
-              ~on_select:
-                (Ui.Event.Handler.create (function
-                   | Ui.Event.Payload.Int64 1L -> dispatch.send Open_diagnostics
-                   | Int64 2L when sign_out -> dispatch.send Sign_out
-                   | _ -> ()))
-              ([ V.Menu.action ~id:1L ~title:"Diagnostics" ~icon:"stethoscope" () ]
-               @
-               if sign_out
-               then
-                 [ V.Menu.action
-                     ~id:2L
-                     ~title:"Sign out"
-                     ~icon:"rectangle.portrait.and.arrow.right"
-                     ()
-                 ]
-               else [])
-          ]
-        ()
-      |> V.with_test_id (Ui.Test_id.string "journal-startup-menu")
-  in
-  let toolbar ?(sign_out = false) title actions body =
-    let account_menu = account_menu ~sign_out () in
-    body
-    |> V.Body.toolbar
-         ~items:
-           ((V.Toolbar.item
-               ~key:(Ui.Key.string "startup-title")
-               ~placement:Principal
-               (V.text title)
-             :: actions)
-            @ [ V.Toolbar.item
-                  ~key:(Ui.Key.string "startup-menu")
-                  ~placement:Primary_action
-                  account_menu
-              ])
-  in
-  let unavailable ~title ~symbol ~message ~actions =
-    Presentation.unavailable ~title ~symbol ~message ~actions
-    |> V.frame ~max_width:Fill ~max_height:Fill
-    |> V.Body.static
-  in
-  let choose_graph =
-    capsule
-      ~id:"graph-picker-choose"
-      ~command:Switch_graph
-      "Choose another graph"
-      "folder"
-  in
+let manager_picker_live state : Journal_manager_view.picker_live =
+  let status = match state.local_copy_deleting, state.local_copy_check, state.local_copy_message with
+    | Some _, _, _ -> "Deleting local copy…"
+    | _, Some _, _ -> "Checking local copy…"
+    | _, _, Some message -> message
+    | _ -> (match state.manager with
+      | Some manager -> (match manager.last_error with
+        | Some message -> message
+        | None when manager.startup.catalog_loading -> "Refreshing graphs…"
+        | None -> "")
+      | None -> "") in
+  let copies = state.local_copies in
+  { status
+  ; authenticated = Option.exists (fun manager -> manager.Graph_service.startup.authenticated) state.manager
+  ; checking = Option.is_some state.local_copy_check
+  ; deleting = state.local_copy_deleting
+  ; presence = (fun id -> Local_copies.find_opt id copies)
+  }
+;;
+
+let manager_props state dispatch : Journal_manager_view.props =
   let can_choose_graph =
-    Option.fold
-      ~none:false
-      ~some:(fun (snapshot : Graph_service.snapshot) ->
-        (snapshot.startup.authenticated || snapshot.startup.local_access=Graph_service.Local_available || snapshot.catalog<>[])
-        && Option.is_some snapshot.selected_graph
-        && Option.is_none snapshot.local_deletion)
-      state.manager
-  in
+    Option.fold ~none:false ~some:(fun (snapshot : Graph_service.snapshot) ->
+      (snapshot.startup.authenticated || snapshot.startup.local_access=Graph_service.Local_available || snapshot.catalog<>[])
+      && Option.is_some snapshot.selected_graph && Option.is_none snapshot.local_deletion) state.manager in
   let busy ?value ?(allow_graph_selection = false) _title message =
-    Journal_header.startup
-      ~loading:(Journal_startup.Presentation.loading_indicator state.startup_presentation)
-      ~initial:(Journal_startup.Presentation.initial_attempt state.startup_presentation)
-      ~active:(Journal_startup.Presentation.foreground state.startup_presentation)
-      ?value ~message
-      (if allow_graph_selection && can_choose_graph then choose_graph else V.empty ())
-  in
-  let graph_picker snapshot =
-    let reactive ?grow ~equal build =
-      match picker_signal with
-      | None -> build state
-      | Some signal -> V.of_lui
-          (Lui_elements.stack ?grow
-             [Lui_elements.dyn ~equal (fun current -> Ui.mount (build current)) signal])
-    in
-    let icon_button ?(enabled = true) ?tooltip ~id ~command ~label icon =
-      V.of_lui (Lui_elements.button ~key:id ~accessibility_identifier:id
-        ~text:"" ~label ~icon ~size:`icon ~variant:`ghost ~disabled:(not enabled) ?tooltip
-        ~on_press:(fun _ -> dispatch.send command) [])
-    in
-    let refresh = reactive
-      ~equal:(fun left right -> left.local_copy_deleting = right.local_copy_deleting)
-      (fun owner -> icon_button ~enabled:(owner.local_copy_deleting = None)
-        ~id:"graph-picker-refresh" ~command:Refresh_catalog ~label:"Refresh graphs"
-        ~tooltip:"Refresh the authorized graph catalog" `refresh_cw)
-    in
-    let projected context project = Option.map (fun source ->
-      let signal = Signal.map project source in
-      Signal.on_dispose context.Lui_ui.ui_scope (fun () -> Signal.dispose_signal signal);
-      signal) picker_signal in
-    let status_text current =
-      match current.local_copy_deleting, current.local_copy_check, current.local_copy_message with
-      | Some _, _, _ -> "Deleting local copy…"
-      | _, Some _, _ -> "Checking local copy…"
-      | _, _, Some message -> message
-      | _ ->
-        (match current.manager with
-         | Some manager ->
-           (match manager.last_error with
-            | Some message -> message
-            | None when manager.startup.catalog_loading -> "Refreshing graphs…"
-            | None -> "")
-         | None -> "") in
-    let status = V.of_lui (fun context parent ->
-      Lui_elements.text ~value:(status_text state)
-        ?value_signal:(projected context status_text)
-        ~foreground:"error-foreground" ~accessibility_identifier:"graph-picker-local-copy-status" [] context parent)
-    in
-    let content =
-      match snapshot.Graph_service.catalog with
-      | [] -> unavailable ~title:"No graphs available" ~symbol:"folder"
-          ~message:"Refresh to check for graphs available to your account." ~actions:(V.empty ())
-      | graphs ->
-        let rows = List.map (fun (graph : Graph_service.graph) ->
-          let id = Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id in
-          let current = snapshot.selected_graph = Some graph.graph_id in
-          let presence owner = Local_copies.find_opt id owner.local_copies in
-          let subtitle owner =
-            if current then "Current graph"
-            else if Option.fold ~none:false ~some:(fun request -> request.Graph_service.graph_id = graph.graph_id) owner.local_copy_deleting
-            then "Deleting local copy…"
-                 else (
-                   match presence owner with
-              | Some (Ok Graph_service.Not_downloaded) -> "Download and open"
-              | Some (Error _) -> "Unable to check local copy"
-                   | _ -> "")
-               in
-          let selection_enabled owner = owner.local_copy_deleting = None in
-          let deletion_enabled owner =
-            Option.exists (fun manager -> manager.Graph_service.startup.authenticated) owner.manager
-            && not current && owner.local_copy_check = None
-            && owner.local_copy_deleting = None && presence owner <> Some (Ok Graph_service.Not_downloaded) in
-          (* Native List cells retain their interactive children. Property signals
-             update status and enabled state without replacing callback owners. *)
-          let row = V.of_lui (fun context parent ->
-            let select = V.Navigation_link.create ~key:(Ui.Key.string ("graph-picker:" ^ id))
-                ~activation_id:id ~disclosure:false ~enabled:(selection_enabled state)
-                ?enabled_signal:(projected context selection_enabled)
-                ~on_activate:(bind_action dispatch (Select_graph id))
-                ~label:(V.row ~spacing:12.
-                  [ V.symbol ~name:(if graph.encrypted then "lock.doc" else "folder") ()
-                  ; V.column ~spacing:3. ~alignment:Leading
-                      [V.text graph.name; V.of_lui (fun context parent ->
-                        Lui_elements.text ~value:(subtitle state)
-                          ?value_signal:(projected context subtitle)
-                          ~foreground:"secondary" [] context parent)]
-                    |> V.frame ~max_width:Fill
-                  ; (if current then V.symbol ~name:"checkmark.circle" ()
-                     else reactive ~equal:(fun left right -> presence left = presence right)
-                       (fun owner -> if presence owner = Some (Ok Graph_service.Not_downloaded)
-                         then V.symbol ~name:"icloud.and.arrow.down" () else V.column [])) ]
-                  |> V.frame ~max_width:Fill ~min_height:44.)
-                () |> V.with_test_id (Ui.Test_id.string ("graph-picker:" ^ id))
-                |> V.frame ~max_width:Fill in
-            let options = V.buttons ~key:(Ui.Key.string ("graph-picker-options:" ^ id))
-                ~actions:[V.buttons_menu_action ~label:("Options for " ^ graph.name) ~icon:"ellipsis"
-                  ~on_select:(Ui.Event.Handler.create (function
-                    | Ui.Event.Payload.Int64 1L -> dispatch.send (Request_graph_local_cache_reset id)
-                    | _ -> ()))
-                  ([V.Menu.action ~id:1L ~title:"Delete local copy" ~icon:"trash" ~role:Destructive
-                      ~enabled:(deletion_enabled state) ?enabled_signal:(projected context deletion_enabled)
-                      ~test_id:(Ui.Test_id.string ("graph-picker-delete:" ^ id)) ()]
-                   @ if current then [V.Menu.action ~id:2L
-                       ~title:"Switch graphs first." ~enabled:false ()]
-                     else if not snapshot.startup.authenticated then [V.Menu.action ~id:2L
-                       ~title:"Connect your account to manage local copies." ~enabled:false ()]
-                     else [])]
-                () |> V.with_test_id (Ui.Test_id.string ("graph-picker-options:" ^ id)) in
-            Ui.mount (V.row ~spacing:8. [select; options] |> V.frame ~max_width:Fill) context parent)
-          in
-          V.Native_list.row ~key:(Ui.Key.string id) ~separator:Hidden row
-        ) graphs in
-        graph_picker_list ~header:status
-          ~on_visible_range:(Ui.Event.Handler.create (function
-            | Ui.Event.Payload.Visible_range range ->
-              dispatch.send (Graph_picker_visible (range.first_index, range.last_exclusive))
-            | _ -> ())) rows
-    in
-    Journal_header.graph_picker
-      ~leading:(V.column (if Option.is_some snapshot.selected_graph then
-        [icon_button ~id:"graph-picker-close" ~command:Close_graph_picker ~label:"Close" `x]
-        else []))
-      ~controls:(V.row ~spacing:8. [refresh; account_menu ~sign_out:snapshot.startup.authenticated ()])
-      content
-  in
+    Journal_manager_view.Busy
+      { loading = Journal_startup.Presentation.loading_indicator state.startup_presentation
+      ; initial = Journal_startup.Presentation.initial_attempt state.startup_presentation
+      ; active = Journal_startup.Presentation.foreground state.startup_presentation
+      ; value; message; choose_graph = allow_graph_selection && can_choose_graph } in
+  let graph_picker (snapshot : Graph_service.snapshot) =
+    Journal_manager_view.Picker
+      { graphs = state.graph_catalog; selected_graph = snapshot.selected_graph
+      ; live = manager_picker_live state } in
   let unlock error =
-    let error = match (unlock_ui_error state.unlock) with
-      | Some _ as error -> error | None -> error in
-    let pending = (unlock_pending state.unlock) in
+    let error = match unlock_ui_error state.unlock with Some _ as error -> error | None -> error in
+    let pending = unlock_pending state.unlock in
     let challenge_ready = Option.is_some
       (Option.bind state.manager (fun manager -> Unlock.unlock_challenge manager.unlock)) in
-    let password = state.e2ee_password in
-    let ignored = Ui.Event.Handler.create (fun _ -> ()) in
-    let submit = bind_action dispatch Submit_e2ee_password in
-    let editor =
-      V.secure_field
-        ~label:"Encryption password"
-        ~prompt:"Enter password"
-        ~appearance:Ui.Text_editing.Field_appearance.Plain
-        ~key:(Ui.Key.string "e2ee-password-editor")
-        ~enabled:(not pending)
-        ~keyboard:Ui.Text_editing.Keyboard.Text
-        ~submit_label:Ui.Text_editing.Submit_label.Go
-        ~autofocus:(not pending)
-        ~max_utf8_bytes:4096
-        ~session_id:(Journal_capture.session_id password)
-        ~document_revision:(Journal_capture.document_revision password)
-        ~accepted_local_revision:(Journal_capture.accepted_local_revision password)
-        ~update_mode:(Journal_capture.update_mode password)
-        ~value:(Journal_capture.value password)
-        ~on_edit:dispatch.native
-        ~on_submit:submit
-        ~on_focus_changed:ignored
-        ~on_limit_reached:ignored
-        ()
-      |> V.with_test_id (Ui.Test_id.string "e2ee-password-editor")
-    in
     let graph_name =
       Option.bind state.manager (fun snapshot ->
         Option.bind snapshot.selected_graph (fun selected ->
-          List.find_opt
-            (fun (graph : Graph_service.graph) ->
-               Logseq_db_types.Graph_types.Uuid.equal graph.graph_id selected)
-            snapshot.catalog))
+          List.find_opt (fun (graph : Graph_service.graph) ->
+            Logseq_db_types.Graph_types.Uuid.equal graph.graph_id selected) snapshot.catalog))
       |> Option.map (fun (graph : Graph_service.graph) -> graph.name)
-      |> Option.value ~default:"Encrypted graph"
-    in
-    let unlock_button =
-      V.of_lui
-        (Lui_elements.button
-           ~key:"unlock-submit"
-           ~variant:`primary
-           ~size:`lg
-           ~text_alignment:`center
-           ~grow:1.
-           ~min_height:44
-           ~disabled:(pending || not challenge_ready || not (Journal_capture.can_save password))
-           ~on_press:(fun _ -> dispatch.send Submit_e2ee_password)
-           ~text:(if pending then "Unlocking…" else "Unlock graph")
-           [])
-      |> V.frame ~max_width:Fill
-      |> V.with_test_id (Ui.Test_id.string "e2ee-password-submit")
-    in
-    let choose_graph =
-      V.button
-        ~key:(Ui.Key.string "unlock-cancel")
-        ~style:Plain
-        ~on_press:(bind_action dispatch Switch_graph)
-        ~child:(V.text "Change graph")
-        ()
-      |> V.frame ~min_height:44.
-      |> V.with_test_id (Ui.Test_id.string "e2ee-password-cancel")
-    in
-    let chrome =
-      Ui.Native_widget.Extension.create
-        ~kind_id:(Journal_ids.Native_widget.Kind_id.of_int 2103)
-        ~version:2
-        ~capabilities:[ Stateful; Semantics ]
-        ~encode_props:(fun props -> unlock_chrome_props_to_yojson props |> Yojson.Safe.to_string |> Bytes.of_string)
-        ~decode_event:(fun ~event_id:_ _ -> Error "Unlock uses child control events")
-        ()
-    in
-    Ui.Native_widget.widget
-      chrome
-      ~key:(Ui.Key.string "graph-unlock")
-      ~props:{ mode = "unlock"; title = graph_name; pending; error }
-      ~on_event:(fun _ -> ())
-      ~children:[ editor; unlock_button; choose_graph; diagnostics ]
-      ()
-    |> V.Body.static
-    |> V.Body.toolbar
-         ~items:
-           [ V.Toolbar.item
-               ~key:(Ui.Key.string "startup-diagnostics")
-               ~placement:Secondary_action
-               diagnostics
-           ]
-  in
+      |> Option.value ~default:"Encrypted graph" in
+    Journal_manager_view.Unlock
+      { graph_name; password = state.e2ee_password; pending; challenge_ready; error } in
   let presentation = Journal_startup.Presentation.screen state.startup_presentation in
-  let body =
-    match presentation,state.manager with
-    | Account_failure,_ ->
-      unavailable ~title:"Unable to prepare your account" ~symbol:"person.crop.circle.badge.exclamationmark"
-        ~message:"Retry to check your account and open your journal."
-        ~actions:(capsule ~id:"journal-startup-retry" ~command:Startup_retry "Retry" "arrow.clockwise")
-      |> toolbar "Journals"
-          [ V.Toolbar.item ~key:(Ui.Key.string "startup-diagnostics")
-              ~placement:Secondary_action diagnostics ]
-    | Interaction {phase=Signed_out;_},None ->
-      unavailable ~title:"Sign in to open a graph" ~symbol:"person.crop.circle"
-        ~message:"Connect your account to access your graphs." ~actions:(V.empty ())
-      |> toolbar "Journals" []
-    | _,None -> busy "Loading journal" "" |> toolbar "" []
-    | _,Some snapshot ->
-      let startup = match presentation with
-        | Interaction startup -> startup
-        | _ -> Journal_startup.derive ~snapshot ~graph:state.graph_state in
-      (match startup.phase with
-       | _ when state.graph_picker_open -> graph_picker snapshot
-       | _ when (unlock_pending state.unlock) -> unlock None
-       | Awaiting_selection -> graph_picker snapshot
-       | Awaiting_e2ee_password -> unlock None
-       | Failed
-         when Option.fold
-                ~none:false
-                ~some:(fun (error : Journal_startup.startup_error) ->
-                  error.recovery = Some Submit_e2ee_password)
-                startup.error ->
-         unlock
-           (Option.map
-              (fun (error : Journal_startup.startup_error) -> error.message)
-              startup.error)
-       | Signed_out when presentation=Waiting ->
-         busy ~allow_graph_selection:true "Loading journal" "" |> toolbar "" []
-       | Signed_out ->
-         unavailable
-           ~title:"Sign in to open a graph"
-           ~symbol:"person.crop.circle"
-           ~message:"Connect your account to access your graphs."
-           ~actions:(V.empty ())
-         |> toolbar "Journals" []
-       | Loading_catalog ->
-         busy ~allow_graph_selection:true "Loading your graphs" ""
-         |> toolbar "" []
-       | _
-         when Option.is_some state.graph_error
-              && state.graph_state.phase = Graph_open
-              && state.graph_state.generation = snapshot.startup.graph_generation
-              && Option.equal
-                   Logseq_db_types.Graph_types.Uuid.equal
-                   state.graph_state.graph_id
-                   snapshot.selected_graph ->
-         graph_unavailable_view
-           ~message:(graph_error_message (Option.get state.graph_error))
-           ~on_details:
-             (if state.worker_errors = []
-              then None
-              else Some (bind_action dispatch Open_error_info))
-           ~on_diagnostics:(bind_action dispatch Open_diagnostics)
-           ~on_choose_graph:(Some (bind_action dispatch Switch_graph))
-         |> V.frame ~max_width:Fill ~max_height:Fill
-         |> V.Body.static
-         |> toolbar "Journals" []
-       | Ready ->
-         busy ~allow_graph_selection:true "Opening journal" "" |> toolbar "" []
-       | Restoring_local ->
-         busy ~allow_graph_selection:true "Restoring your graph" ""
-         |> toolbar "" []
-       | Deleting_local ->
-         let message =
-           match snapshot.local_deletion with
-           | Some (Deletion_in_progress Closing_graph) -> "Closing the local graph"
-           | Some (Deletion_in_progress Deleting_mirror) -> "Deleting the local copy"
-           | Some (Deletion_in_progress Clearing_selection) ->
-             "Clearing the saved selection"
-           | None | Some (Deletion_failed _) -> "Deleting the local copy"
-         in
-         busy message "" |> toolbar "" []
-       | Bootstrapping ->
-         let value, message =
-           match state.bootstrap_progress with
-           | None -> None, "Preparing the local mirror"
-           | Some progress ->
-             let value =
-               Option.bind progress.Graph_service.total_bytes (fun total ->
-                 if total <= 0L || progress.received_bytes < 0L
-                 then None
-                 else
-                   Some
-                     (Float.min
-                        1.
-                        (Int64.to_float progress.received_bytes /. Int64.to_float total)))
-             in
-             value, Printf.sprintf "Downloaded %Ld bytes" progress.received_bytes
-         in
-         busy ?value ~allow_graph_selection:true "Downloading graph" message
-         |> toolbar "" []
-       | Failed ->
-         let message, recovery =
-           match startup.error with
-           | None -> "Unable to open graph", None
-           | Some error -> error.message, error.recovery
-         in
-         let actions =
-           match recovery with
-           | Some Refresh_catalog ->
-             capsule
-               ~id:"graph-picker-retry"
-               ~command:Refresh_catalog
-               "Retry"
-               "arrow.clockwise"
-           | Some Retry_graph_open ->
-             (match snapshot.selected_graph with
-              | None -> V.empty ()
-              | Some graph_id -> capsule ~id:"graph-picker-retry"
-                  ~command:(Select_graph (Logseq_db_types.Graph_types.Uuid.to_string graph_id)) "Retry local open" "arrow.clockwise")
-           | Some Begin_online_recovery ->
-             capsule
-               ~id:"graph-picker-retry"
-               ~command:Begin_online_recovery
-               (match snapshot.startup.local_access with
-                | Graph_service.Local_unavailable Local_mirror_unavailable -> "Download graph"
-                | Local_unavailable Local_key_unavailable -> "Recover encryption key"
-                | _ -> "Retry")
-               "arrow.clockwise"
-           | Some Submit_e2ee_password | Some Sign_in | None -> V.empty ()
-         in
-         let actions =
-           if
-             Option.is_some snapshot.selected_graph
-             && Option.is_none snapshot.local_deletion
-           then V.column ~spacing:12. [ actions; choose_graph ]
-           else actions
-         in
-         let actions =
-           V.of_lui
-             (Lui_elements.row ~gap:0 ~main:`center ~cross:`center [ Ui.mount actions ])
-         in
-         unavailable
-           ~title:"Unable to open graph"
-           ~symbol:"questionmark.folder"
-           ~message
-           ~actions
-         |> toolbar "Journals" [])
-  in
-  body |> V.Body.with_test_id (Ui.Test_id.string "sync-manager-route")
+  match presentation, state.manager with
+  | Account_failure, _ -> Account_failure
+  | Interaction { phase=Signed_out; _ }, None -> Signed_out
+  | _, None -> busy "Loading journal" ""
+  | _, Some snapshot ->
+    let startup = match presentation with
+      | Interaction startup -> startup
+      | _ -> Journal_startup.derive ~snapshot ~graph:state.graph_state in
+    (match startup.phase with
+     | _ when state.graph_picker_open -> graph_picker snapshot
+     | _ when unlock_pending state.unlock -> unlock None
+     | Awaiting_selection -> graph_picker snapshot
+     | Awaiting_e2ee_password -> unlock None
+     | Failed when Option.fold ~none:false
+         ~some:(fun (error : Journal_startup.startup_error) -> error.recovery = Some Submit_e2ee_password)
+         startup.error ->
+       unlock (Option.map (fun (error : Journal_startup.startup_error) -> error.message) startup.error)
+     | Signed_out when presentation=Waiting -> busy ~allow_graph_selection:true "Loading journal" ""
+     | Signed_out -> Signed_out
+     | Loading_catalog -> busy ~allow_graph_selection:true "Loading your graphs" ""
+     | _ when Option.is_some state.graph_error && state.graph_state.phase = Graph_open
+         && state.graph_state.generation = snapshot.startup.graph_generation
+         && Option.equal Logseq_db_types.Graph_types.Uuid.equal state.graph_state.graph_id snapshot.selected_graph ->
+       Graph_unavailable (graph_unavailable_view
+         ~message:(graph_error_message (Option.get state.graph_error))
+         ~on_details:(if state.worker_errors=[] then None else Some (bind_action dispatch Open_error_info))
+         ~on_diagnostics:(bind_action dispatch Open_diagnostics)
+         ~on_choose_graph:(Some (bind_action dispatch Switch_graph)))
+     | Ready -> busy ~allow_graph_selection:true "Opening journal" ""
+     | Restoring_local -> busy ~allow_graph_selection:true "Restoring your graph" ""
+     | Deleting_local ->
+       let message = match snapshot.local_deletion with
+         | Some (Deletion_in_progress Closing_graph) -> "Closing the local graph"
+         | Some (Deletion_in_progress Deleting_mirror) -> "Deleting the local copy"
+         | Some (Deletion_in_progress Clearing_selection) -> "Clearing the saved selection"
+         | None | Some (Deletion_failed _) -> "Deleting the local copy" in
+       busy message ""
+     | Bootstrapping ->
+       let value, message = match state.bootstrap_progress with
+         | None -> None, "Preparing the local mirror"
+         | Some progress ->
+           let value = Option.bind progress.Graph_service.total_bytes (fun total ->
+             if total <= 0L || progress.received_bytes < 0L then None
+             else Some (Float.min 1. (Int64.to_float progress.received_bytes /. Int64.to_float total))) in
+           value, Printf.sprintf "Downloaded %Ld bytes" progress.received_bytes in
+       busy ?value ~allow_graph_selection:true "Downloading graph" message
+     | Failed ->
+       let message, recovery = match startup.error with
+         | None -> "Unable to open graph", None
+         | Some error -> error.message, error.recovery in
+       let recovery : Journal_manager_view.recovery option = match recovery with
+         | Some Refresh_catalog -> Some Refresh
+         | Some Retry_graph_open -> Option.map (fun id ->
+             Journal_manager_view.Retry_local (Logseq_db_types.Graph_types.Uuid.to_string id)) snapshot.selected_graph
+         | Some Begin_online_recovery -> Some (Recover_online
+             (match snapshot.startup.local_access with
+              | Graph_service.Local_unavailable Local_mirror_unavailable -> "Download graph"
+              | Local_unavailable Local_key_unavailable -> "Recover encryption key"
+              | _ -> "Retry"))
+         | Some Submit_e2ee_password | Some Sign_in | None -> None in
+       Failed { message; recovery
+              ; choose_graph = Option.is_some snapshot.selected_graph && Option.is_none snapshot.local_deletion })
+;;
+
+let manager_page ?picker_signal state dispatch =
+  let props = manager_props state dispatch in
+  let on_action = function
+    | Journal_manager_view.Startup_retry -> dispatch.send Startup_retry
+    | Refresh_catalog -> dispatch.send Refresh_catalog
+    | Begin_online_recovery -> dispatch.send Begin_online_recovery
+    | Select_graph id -> dispatch.send (Select_graph id)
+    | Switch_graph -> dispatch.send Switch_graph
+    | Close_picker -> dispatch.send Close_graph_picker
+    | Visible_range (first, last) -> dispatch.send (Graph_picker_visible (first, last))
+    | Request_local_copy_reset id -> dispatch.send (Request_graph_local_cache_reset id)
+    | Sign_out -> dispatch.send Sign_out
+    | Submit_password -> dispatch.send Submit_e2ee_password
+    | Edit_password edit -> Ui.Event.Handler.Private.invoke dispatch.native (Ui.Event.Payload.Text_edit edit)
+    | Diagnostics -> dispatch.send Open_diagnostics in
+  match props, picker_signal with
+  | Journal_manager_view.Picker _, Some source ->
+    V.of_lui (fun context parent ->
+      let picker_signal = Signal.map manager_picker_live source in
+      Signal.on_dispose context.Lui_ui.ui_scope (fun () -> Signal.dispose_signal picker_signal);
+      Ui.mount (Journal_manager_view.view ~picker_signal props ~on_action) context parent)
+    |> V.Body.static
+  | _ -> Journal_manager_view.view props ~on_action
 ;;
 
 let identity_sequence = ref 0L
