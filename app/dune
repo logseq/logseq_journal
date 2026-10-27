@@ -29,6 +29,7 @@
   journal_graph_request
   journal_graph_runtime
   journal_graph_reference_plan
+  journal_graph_favorites_plan
   journal_graph_transport
   journal_header
   journal_model
