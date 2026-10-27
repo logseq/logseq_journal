@@ -7696,26 +7696,54 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
   List.iter
     (fun ending ->
        let runtime = Production_runtime.create ~localtime:Unix.gmtime () in
-       set_calendar runtime;
+       set_calendar ~clock:1_788_307_200. runtime;
        let first = normal_journal_fixture 29 1 0 in
        let older = normal_journal_fixture 30 1 0 in
-       let listing =
-         Production_runtime.submit runtime (Journal_graph_request.Load_feed
-             { cursor = None; root_limit = 3; day_limit = 1; request_generation = 77L })
-         |> fun output -> only "initial date catalog" output.requests
+       let same_day =
+         let id = uuid "00000002-2026-0901-0000-000000000000" in
+         let root = only "fixture root" first.roots in
+         { first with
+           owner = { first.owner with uuid = id }
+         ; roots =
+             [ { root with
+                 block =
+                   { root.block with
+                     uuid = uuid "00000002-2026-0901-0000-000000000001"
+                   ; parent = id
+                   ; page = id
+                   }
+               } ]
+         ; descendants = []
+         }
        in
-       let complete_date listing fixture next_cursor expected_limit =
-         let journal_day =
-           match fixture.owner.kind with
-           | Journal_page { journal_day } -> journal_day
-           | _ -> assert false
-         in
-         let tree =
-           Production_runtime.receive runtime (response listing (V2_journals_outcome
-               { items = [ { page = fixture.owner; journal_day; revision = "page-1" } ]
-               ; next_cursor }))
-           |> fun output -> only "date root read" output.requests
-         in
+       let day fixture =
+         match fixture.owner.kind with
+         | Journal_page { journal_day } -> journal_day
+         | _ -> assert false
+       in
+       let dates request fixtures next_cursor =
+         Production_runtime.receive runtime (response request (V2_journals_outcome
+             { items = List.map (fun f -> ({ page = f.owner; journal_day = day f
+                                            ; revision = "page-1" } : Protocol.v2_journal_item))
+                   fixtures
+             ; next_cursor }))
+       in
+       let listing ?(quiet = true) (output : Production_runtime.output) cursor through =
+         if quiet then
+           Alcotest.(check int) "date recovery publishes nothing" 0
+             (List.length output.responses);
+         let request = only "one date catalog read" output.requests in
+         (match request.command with
+          | V2_list_journals { cursor = actual; through_day; limit; _ } ->
+            Alcotest.(check bool) "date continuation" true (actual = cursor);
+            Alcotest.(check int) "date query bound" through through_day;
+            Alcotest.(check int) "bounded metadata packet" 1 limit
+          | _ -> Alcotest.fail "expected only a date catalog read");
+         request
+       in
+       let complete_date listing fixture next_cursor expected_limit through =
+         let tree = dates listing [ fixture ] next_cursor
+           |> fun output -> only "date root read" output.requests in
          (match tree.command with
           | V2_get_page_tree { limit; _ } ->
             Alcotest.(check int) "retains remaining root quota" expected_limit limit
@@ -7729,53 +7757,52 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
                ; next_cursor = None }))
            |> fun output -> only "root preview" output.requests
          in
-         Production_runtime.receive runtime (response preview (V2_children_outcome
+         let output = Production_runtime.receive runtime (response preview (V2_children_outcome
              { parent = root.block.uuid
              ; revision_scope = V2_children_revision root.block.uuid
-             ; scope_revision = "children-1"; items = []; next_cursor = None }))
+             ; scope_revision = "children-1"; items = []; next_cursor = None })) in
+         listing ~quiet:false output next_cursor through
        in
        let stale request =
          Production_runtime.receive runtime (response request (V2_failed
              { code = "staleReadCursor"; message = "The read continuation is no longer current." }))
        in
-       let recover request through_day =
-         let output = stale request in
-         Alcotest.(check int) "recoverable stale read is not published" 0
-           (List.length output.responses);
-         let retry = only "bounded date recovery" output.requests in
-         (match retry.command with
-          | V2_list_journals { cursor; through_day = actual; limit; _ } ->
-            Alcotest.(check bool) "discard obsolete worker cursor" true (cursor = None);
-            Alcotest.(check int) "resume strictly after consumed dates" through_day actual;
-            Alcotest.(check int) "retain bounded metadata packet" 1 limit
-          | _ -> Alcotest.fail "expected date recovery");
+       (* Recovery rereads the oldest observed date inclusively. *)
+       let recover request =
+         let retry = listing (stale request) None 20260901 in
          let duplicate = stale request in
          Alcotest.(check int) "duplicate failure cannot retry" 0
            (List.length duplicate.requests + List.length duplicate.responses);
          retry
        in
-       let output = complete_date listing first (Some (root_cursor 1)) 3 in
-       let retry = recover (only "first date continuation" output.requests) 20260831 in
-       let output = complete_date retry older (Some (root_cursor 2)) 2 in
-       let retry = recover (only "second date continuation" output.requests) 20260830 in
+       let replay request fixtures cursor =
+         listing (dates request fixtures (Some cursor)) (Some cursor) 20260901
+       in
+       let initial =
+         Production_runtime.submit runtime (Journal_graph_request.Load_feed
+             { cursor = None; root_limit = 4; day_limit = 1; request_generation = 77L })
+         |> fun output -> listing ~quiet:false output None 99_999_999
+       in
+       let next = complete_date initial first (Some (root_cursor 1)) 4 99_999_999 in
+       let next = replay (recover next) [ first ] (root_cursor 2) in
+       let next = complete_date next same_day (Some (root_cursor 3)) 3 20260901 in
+       let next = replay (recover next) [ first ] (root_cursor 4) in
+       let next = replay next [ same_day ] (root_cursor 5) in
+       let next = complete_date next older (Some (root_cursor 6)) 2 20260901 in
        match ending with
        | `Complete ->
-         let output = Production_runtime.receive runtime
-             (response retry (V2_journals_outcome { items = []; next_cursor = None })) in
+         let output = dates next [] None in
          (match (only "recovered feed completion" output.responses).payload with
           | Feed_loaded { request_generation = 77L; feed; complete = true } ->
-            Alcotest.(check (list string)) "preserve prefix without duplicate roots"
+            Alcotest.(check (list string)) "same-day pages once, consumed roots once"
               (List.map (fun f -> Graph.Uuid.to_string (only "fixture root" f.roots).block.uuid)
-                 [ first; older ])
+                 [ first; same_day; older ])
               (List.concat_map (fun (day : Journal_graph_projection.day_feed) ->
                    List.map (fun (entry : Journal_graph_projection.timeline_entry) ->
                        Journal_model.id entry.block) day.entries) feed.days)
           | _ -> Alcotest.fail "date recovery lost feed ownership")
        | `Exhaust ->
-         let output = Production_runtime.receive runtime
-             (response retry (V2_journals_outcome
-                 { items = []; next_cursor = Some (root_cursor 3) })) in
-         let output = stale (only "third date continuation" output.requests) in
+         let output = stale next in
          Alcotest.(check int) "finite recovery budget" 0 (List.length output.requests);
          (match (only "terminal stale cursor failure" output.responses).payload with
           | Feed_failed { request_generation = 77L; failure = Worker_failure failure } ->
@@ -7784,9 +7811,8 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
           | _ -> Alcotest.fail "retry exhaustion lost failure ownership")
        | `Supersede ->
          ignore (Production_runtime.submit runtime (Journal_graph_request.Load_feed
-             { cursor = None; root_limit = 3; day_limit = 1; request_generation = 78L }));
-         let output = Production_runtime.receive runtime
-             (response retry (V2_journals_outcome { items = []; next_cursor = None })) in
+             { cursor = None; root_limit = 4; day_limit = 1; request_generation = 78L }));
+         let output = dates next [] None in
          Alcotest.(check int) "superseded recovery cannot publish or continue" 0
            (List.length output.requests + List.length output.responses))
     [ `Complete; `Exhaust; `Supersede ]
