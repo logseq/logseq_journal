@@ -4,6 +4,8 @@
  (modules
   application
   journal_admission_refresh
+  journal_diagnostics_view
+  journal_page_layout
   journal_bridge
   journal_environment
   journal_ids

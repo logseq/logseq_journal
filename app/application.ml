@@ -1914,72 +1914,19 @@ let bind_action dispatch action =
   Ui.Event.Handler.create ~name:"journal-action" (fun _payload -> dispatch.send action)
 ;;
 
-module Presentation = struct
-  let keyed children =
-    List.mapi
-      (fun index child ->
-         let key =
-           match V.For_testing.key child, V.For_testing.test_id child with
-           | Some key, _ -> key
-           | None, Some id -> id
-           | None, None -> string_of_int index
-         in
-         V.Keyed.create ~key child)
-      children
-  ;;
+module Presentation = Journal_page_layout
 
-  let form children =
-    V.Form.vertical ~key:(Ui.Key.string "form") (keyed children)
-    |> V.Body.Vertical.fill
-    |> fun content -> V.Body.Vertical.create [ content ]
-  ;;
-
-  let list ?header ?on_visible_range rows =
-    V.Native_list.vertical ~key:(Ui.Key.string "graph-list") ~style:Plain ?on_visible_range
-      [ V.Native_list.section ~key:(Ui.Key.string "graphs") ?header ~separator:Hidden rows ]
-    |> fun list -> V.column ~spacing:0. [list]
-    |> V.with_test_id (Ui.Test_id.string "graph-picker-list")
-    |> V.frame ~max_width:Fill ~max_height:Fill
-    |> V.Body.static
-  ;;
-
-  let unavailable ~title ~symbol ~message ~actions =
-    V.content_unavailable
-      ~label:(V.label ~title:(V.text title) ~icon:(V.symbol ~name:symbol ()) ())
-      ~description:(V.text message |> V.text_selection ~enabled:true)
-      ~actions
-      ()
-  ;;
-
-  let section ?key title children =
-    V.Section.create
-      ~key:(Option.value key ~default:(Ui.Key.string title))
-      ~header_text:title
-      (keyed children)
-  ;;
-
-  let labeled label content =
-    V.labeled_content
-      ~key:(Ui.Key.string label)
-      ~label:(V.text label)
-      ~value:(V.text_selection ~enabled:true content)
-      ()
-  ;;
-end
+let graph_picker_list ?header ?on_visible_range rows =
+  V.Native_list.vertical ~key:(Ui.Key.string "graph-list") ~style:Plain ?on_visible_range
+    [ V.Native_list.section ~key:(Ui.Key.string "graphs") ?header ~separator:Hidden rows ]
+  |> fun list -> V.column ~spacing:0. [list]
+  |> V.with_test_id (Ui.Test_id.string "graph-picker-list")
+  |> V.frame ~max_width:Fill ~max_height:Fill
+  |> V.Body.static
+;;
 
 let dismiss_toolbar ~test_id ~command dispatch body =
-  let close =
-    V.button
-      ~style:Plain
-      ~on_press:(bind_action dispatch command)
-      ~child:(V.label ~title:(V.text "Close") ~icon:(V.symbol ~name:"xmark" ()) ())
-      ()
-    |> V.with_test_id (Ui.Test_id.string test_id)
-  in
-  V.Body.toolbar
-    ~items:
-      [ V.Toolbar.item ~key:(Ui.Key.string test_id) ~placement:Cancellation_action close ]
-    body
+  Presentation.dismiss_toolbar ~test_id ~on_close:(bind_action dispatch command) body
 ;;
 
 let task_status_name state =
@@ -2817,127 +2764,12 @@ let timeline_page
     ~body:content
 ;;
 
-let diagnostic_rows (diagnostics : Graph_service.diagnostics) =
-  List.concat_map
-    (fun (group : Graph_service.diagnostic_group) -> group.entries)
-    diagnostics.groups
-;;
-
-let sync_phase_name : Graph_service.sync_phase -> string = function
-  | Offline -> "Offline"
-  | Connecting -> "Connecting"
-  | Pulling -> "Pulling"
-  | Submitting -> "Submitting"
-  | Current -> "Current"
-  | Paused -> "Paused"
-  | Failed -> "Failed"
-;;
-
-let startup_phase_name : Journal_startup.startup_phase -> string = function
-  | Signed_out -> "Signed out"
-  | Loading_catalog -> "Loading catalog"
-  | Awaiting_selection -> "Awaiting selection"
-  | Restoring_local -> "Restoring local"
-  | Deleting_local -> "Deleting local copy"
-  | Bootstrapping -> "Bootstrapping"
-  | Awaiting_e2ee_password -> "Awaiting E2EE password"
-  | Ready -> "Ready"
-  | Failed -> "Failed"
-;;
-
-let graph_phase_name : Logseq_db_worker.graph_phase -> string = function
-  | Graph_closed -> "Closed"
-  | Graph_opening -> "Opening"
-  | Graph_open -> "Open"
-  | Graph_closing -> "Closing"
-  | Graph_failed -> "Failed"
-;;
-
-let diagnostic_phase_rows ~snapshot ~(graph : Logseq_db_worker.graph_state) =
-  let worker_rows =
-    [ "Graph phase", graph_phase_name graph.phase
-    ; "Worker graph UUID",
-      Option.fold ~none:"Not available"
-        ~some:Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id
-    ; "Worker graph generation", string_of_int graph.generation
-    ]
-  in
-  match snapshot with
-  | None ->
-    [ "Sync phase", "Not available"
-    ; "Startup phase", "Not available"
-    ]
-    @ worker_rows
-  | Some snapshot ->
-    let startup = Journal_startup.derive ~snapshot ~graph in
-    [ "Sync phase", sync_phase_name snapshot.sync_phase
-    ; "Startup phase", startup_phase_name startup.phase
-    ]
-    @ worker_rows
-    @ Option.fold ~none:[] ~some:(fun message -> [ "Last error", message ]) snapshot.last_error
-;;
-
-let format_bytes bytes =
-  let bytes = max 0 bytes in
-  let format_scaled divisor suffix =
-    if bytes mod divisor = 0
-    then Printf.sprintf "%d %s" (bytes / divisor) suffix
-    else Printf.sprintf "%.1f %s" (Float.of_int bytes /. Float.of_int divisor) suffix
-  in
-  if bytes < 1024
-  then Printf.sprintf "%d B" bytes
-  else if bytes < 1024 * 1024
-  then format_scaled 1024 "KB"
-  else format_scaled (1024 * 1024) "MB"
-;;
-
-let admission_rows observation =
-  let values =
-    match (observation : Admission_refresh.observation) with
-    | Available inspection ->
-      [ Printf.sprintf "%d / %d" inspection.active_records inspection.maximum_records
-      ; Printf.sprintf
-          "%s / %s"
-          (format_bytes inspection.active_bytes)
-          (format_bytes inspection.maximum_bytes)
-      ; format_bytes inspection.protected_wire_bytes
-      ; format_bytes inspection.retained_origin_evidence_bytes
-      ]
-    | Loading -> List.init 4 (fun _ -> "Loading")
-    | Unavailable -> List.init 4 (fun _ -> "Not available")
-  in
-  List.combine
-    [ "Outbox records"; "Outbox bytes"; "Protected payload"; "Origin evidence" ]
-    values
-;;
-
-let diagnostic_groups diagnostics =
-  let unavailable labels = List.map (fun label -> label, "Not available") labels in
-  match diagnostics with
-  | None ->
-    [ "Manager", unavailable [ "Last error" ]
-    ; ( "Scope fences"
-      , unavailable
-          [ "Account generation"
-          ; "Graph generation"
-          ; "Presentation generation"
-          ; "Connection generation"
-          ] )
-    ; ( "Graph"
-      , unavailable [ "Graph selected"; "Selected graph"; "Applied server transaction" ] )
-    ; "Transport", unavailable [ "Transport scope"; "Transport"; "WebSocket initialized" ]
-    ; "Pull", unavailable [ "Pull" ]
-    ; "Submission", unavailable [ "Submission" ]
-    ; "Recovery", unavailable [ "Reconnect attempt"; "Uncertain transactions" ]
-    ; "Serialization", unavailable [ "Serialization" ]
-    ; "Authorization", unavailable [ "Pending token challenges" ]
-    ]
-  | Some (diagnostics : Graph_service.diagnostics) ->
-    diagnostics.groups
-    |> List.filter_map (fun (group : Graph_service.diagnostic_group) ->
-      let entries = group.entries in
-      if entries = [] then None else Some (group.title, entries))
-;;
+let diagnostic_rows = Journal_diagnostics_view.diagnostic_rows
+let sync_phase_name = Journal_diagnostics_view.sync_phase_name
+let graph_phase_name = Journal_diagnostics_view.graph_phase_name
+let diagnostic_phase_rows = Journal_diagnostics_view.diagnostic_phase_rows
+let format_bytes = Journal_diagnostics_view.format_bytes
+let admission_rows = Journal_diagnostics_view.admission_rows
 
 let worker_error_detail_value = function
   | Logseq_db_worker.Error.Detail_string value -> value
@@ -3049,31 +2881,11 @@ let error_info_page ~sync_error ~operation_failure occurrences dispatch =
 ;;
 
 let diagnostics_page ?(errors = []) ~snapshot ~graph ~admission diagnostics dispatch =
-  let groups =
-    [ "Phases", diagnostic_phase_rows ~snapshot ~graph
-    ; "Overlay DB", admission_rows admission
-    ]
-    @ diagnostic_groups diagnostics
-    @ (if errors=[] then [] else
-        [ "Application errors",
-          application_error_rows errors
-        ])
-  in
-  Presentation.form
-    (List.map
-       (fun (title, rows) ->
-          Presentation.section
-            title
-            (List.map
-               (fun (label, value) ->
-                  V.column ~spacing:4. ~alignment:Leading [ V.text label; V.text value ])
-               rows))
-       groups)
-  |> dismiss_toolbar
-       ~test_id:"journal-diagnostics-close"
-       ~command:Close_diagnostics
-       dispatch
-  |> V.Body.with_test_id (Ui.Test_id.string "journal-diagnostics-dialog-page")
+  Journal_diagnostics_view.view
+    { snapshot; graph; admission; diagnostics
+    ; application_errors = application_error_rows errors
+    }
+    ~on_close:(bind_action dispatch Close_diagnostics)
 ;;
 
 module Cache_confirmation = struct
@@ -3620,7 +3432,7 @@ let manager_page ?picker_signal state dispatch =
           in
           V.Native_list.row ~key:(Ui.Key.string id) ~separator:Hidden row
         ) graphs in
-        Presentation.list ~header:status
+        graph_picker_list ~header:status
           ~on_visible_range:(Ui.Event.Handler.create (function
             | Ui.Event.Payload.Visible_range range ->
               dispatch.send (Graph_picker_visible (range.first_index, range.last_exclusive))
