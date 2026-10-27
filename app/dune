@@ -3,6 +3,7 @@
  (wrapped false)
  (modules
   application
+  journal_admission_refresh
   journal_bridge
   journal_environment
   journal_ids
