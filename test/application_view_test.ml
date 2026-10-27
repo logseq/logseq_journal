@@ -74,7 +74,7 @@ let test_phase_names () =
   in
   List.iter
     (fun (phase, expected) ->
-       Alcotest.(check string) expected expected (Application.sync_phase_name phase))
+       Alcotest.(check string) expected expected (Journal_diagnostics_view.sync_phase_name phase))
     sync_phases;
   let graph_phases =
     [ Logseq_db_worker.Graph_closed, "Closed"
@@ -86,7 +86,7 @@ let test_phase_names () =
   in
   List.iter
     (fun (phase, expected) ->
-       Alcotest.(check string) expected expected (Application.graph_phase_name phase))
+       Alcotest.(check string) expected expected (Journal_diagnostics_view.graph_phase_name phase))
     graph_phases
 ;;
 
@@ -101,7 +101,7 @@ let test_current_diagnostic_rows () =
   check_pairs
     "current diagnostic rows"
     [ "Last error", "None"; "Selected graph", "Fixture" ]
-    (Application.diagnostic_rows diagnostics)
+    (Journal_diagnostics_view.diagnostic_rows diagnostics)
 ;;
 
 let test_missing_snapshot_keeps_graph_lifecycle_visible () =
@@ -116,7 +116,7 @@ let test_missing_snapshot_keeps_graph_lifecycle_visible () =
     ; "Worker graph UUID", "Not available"
     ; "Worker graph generation", "4"
     ]
-    (Application.diagnostic_phase_rows ~snapshot:None ~graph)
+    (Journal_diagnostics_view.diagnostic_phase_rows ~snapshot:None ~graph)
 ;;
 
 let test_diagnostic_phase_rows_retain_current_error () =
@@ -131,10 +131,10 @@ let test_diagnostic_phase_rows_retain_current_error () =
         ; presentation_generation = 1 } } in
   let graph : Logseq_db_worker.graph_state =
     { generation = 1; graph_id = None; phase = Graph_closed; error = None } in
-  let rows = Application.diagnostic_phase_rows ~snapshot:(Some snapshot) ~graph in
+  let rows = Journal_diagnostics_view.diagnostic_phase_rows ~snapshot:(Some snapshot) ~graph in
   Alcotest.(check (option string)) "current error visible without diagnostic groups"
     (Some message) (List.assoc_opt "Last error" rows);
-  let cleared = Application.diagnostic_phase_rows
+  let cleared = Journal_diagnostics_view.diagnostic_phase_rows
       ~snapshot:(Some {snapshot with last_error = None}) ~graph in
   Alcotest.(check bool) "retry does not retain obsolete error" false
     (List.mem_assoc "Last error" cleared)
@@ -158,7 +158,7 @@ let test_diagnostic_identity_comes_from_worker () =
   let graph : Logseq_db_worker.graph_state =
     { generation = 7; graph_id = Some actual; phase = Graph_open; error = None }
   in
-  let rows = Application.diagnostic_phase_rows ~snapshot:(Some snapshot) ~graph in
+  let rows = Journal_diagnostics_view.diagnostic_phase_rows ~snapshot:(Some snapshot) ~graph in
   Alcotest.(check (option string)) "worker identity, not selected graph"
     (Some "60000000-0000-4000-8000-000000000002")
     (List.assoc_opt "Worker graph UUID" rows);
@@ -166,11 +166,11 @@ let test_diagnostic_identity_comes_from_worker () =
     (List.assoc_opt "Worker graph generation" rows);
   Alcotest.(check bool) "different worker cannot appear ready" false
     (List.assoc_opt "Startup phase" rows = Some "Ready");
-  let ready = Application.diagnostic_phase_rows
+  let ready = Journal_diagnostics_view.diagnostic_phase_rows
       ~snapshot:(Some { snapshot with selected_graph = Some actual }) ~graph in
   Alcotest.(check (option string)) "matching worker is ready" (Some "Ready")
     (List.assoc_opt "Startup phase" ready);
-  let closed = Application.diagnostic_phase_rows ~snapshot:(Some snapshot)
+  let closed = Journal_diagnostics_view.diagnostic_phase_rows ~snapshot:(Some snapshot)
       ~graph:{graph with graph_id = None; phase = Graph_closed} in
   Alcotest.(check (option string)) "no selected-graph fallback when worker closed"
     (Some "Not available") (List.assoc_opt "Worker graph UUID" closed)
@@ -194,18 +194,18 @@ let test_admission_rows_are_compact_and_complete () =
     ; "Protected payload", "512 B"
     ; "Origin evidence", "256 B"
     ]
-    (Application.admission_rows
+    (Journal_diagnostics_view.admission_rows
        (Journal_admission_refresh.Available admission_inspection));
   Alcotest.(check int)
     "unavailable row count"
     4
-    (List.length (Application.admission_rows Journal_admission_refresh.Unavailable))
+    (List.length (Journal_diagnostics_view.admission_rows Journal_admission_refresh.Unavailable))
 ;;
 
 let test_byte_formatting () =
   List.iter
     (fun (bytes, expected) ->
-       Alcotest.(check string) expected expected (Application.format_bytes bytes))
+       Alcotest.(check string) expected expected (Journal_diagnostics_view.format_bytes bytes))
     [ 0, "0 B"; 1, "1 B"; 1536, "1.5 KB"; 8 * 1024 * 1024, "8 MB" ]
 ;;
 

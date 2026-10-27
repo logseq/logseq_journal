@@ -1554,7 +1554,7 @@ let () =
     ; "V.Confirmation.alert"
     ; "Graph_service.Delete_local_copy"
     ; "Graph_service.Return_to_graph_picker"
-    ; "Presentation.list"
+    ; "graph_picker_list"
     ; "graph-picker-list"
     ; "e2ee-password-cancel"
     ; "Refresh the authorized graph catalog"
@@ -1864,10 +1864,11 @@ let () =
   require_text
     root
     "app/application.ml"
-    [ "Open_diagnostics"
-    ; "Close_diagnostics"
-    ; "journal-startup-diagnostics"
-    ; "journal-diagnostics-dialog-page"
+    [ "Open_diagnostics"; "Close_diagnostics"; "journal-startup-diagnostics" ];
+  require_text
+    root
+    "app/journal_diagnostics_view.ml"
+    [ "journal-diagnostics-dialog-page"
     ; "Overlay DB"
     ; "Outbox records"
     ; "Protected payload"
