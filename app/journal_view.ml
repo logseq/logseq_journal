@@ -803,10 +803,7 @@ module View = struct
       t
   ;;
 
-  let clip ?key:_ ?corner_radius:_ ?antialiased:_ t = t
-  let layout_priority ?key:_ _ t = t
   let offset ?key:_ ?x:_ ?y:_ t = t
-  let animated_opacity ?key:_ ?duration:_ value t = opacity value t
 
   let button
         ?key

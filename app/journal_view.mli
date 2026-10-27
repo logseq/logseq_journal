@@ -393,10 +393,7 @@ module View : sig
   val safe_area_padding : ?key:Key.t -> insets:Layout.Edge_insets.t -> t -> t
   val theme : ?key:Key.t -> data:Theme.t -> t -> t
   val background : ?key:Key.t -> ?corner_radius:float -> color:Style.Color.t -> t -> t
-  val clip : ?key:Key.t -> ?corner_radius:float -> ?antialiased:bool -> t -> t
-  val layout_priority : ?key:Key.t -> float -> t -> t
   val offset : ?key:Key.t -> ?x:float -> ?y:float -> t -> t
-  val animated_opacity : ?key:Key.t -> ?duration:float -> float -> t -> t
 
   val button
     :  ?key:Key.t
