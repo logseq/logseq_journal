@@ -1160,6 +1160,7 @@ let prepare_paged_refresh kind =
                  ; creation_time
                  ; children = []
                  ; status_confirmation = false
+                 ; status_intent_revision = 0L
                  }
              })
         |> next "capture page lookup"
@@ -2251,6 +2252,7 @@ let capture_format_read ~journal_day =
              ; creation_time
              ; children = []
              ; status_confirmation = false
+             ; status_intent_revision = 0L
              }
          })
     |> fun output -> only "capture page lookup" output.requests
@@ -2908,6 +2910,7 @@ let test_submit_rejections_keep_admitted_identity () =
            ; creation_time
            ; children = []
            ; status_confirmation = false
+           ; status_intent_revision = 0L
            }
        })
 ;;
@@ -5853,6 +5856,7 @@ let test_invalid_status_precedes_insert () =
                   ; creation_time
                   ; children = []
                   ; status_confirmation = false
+                  ; status_intent_revision = 0L
                   }
               })
        in
@@ -5960,6 +5964,183 @@ let test_catalog_and_lookup_cross_fences () =
     (List.length stale.responses)
 ;;
 
+let capture_identity_status_a = "00000002-1615-5853-7700-000000000000"
+let capture_identity_status_b = "00000002-1827-5820-8200-000000000000"
+let capture_identity_owner_a = "a1000000-0000-4000-a000-0000000000c1"
+let capture_identity_owner_b = "a1000000-0000-4000-a000-0000000000c2"
+
+let capture_identity_runtime ?default () =
+  let runtime = Production_runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  Option.iter
+    (fun default_status ->
+       let catalog = Production_runtime.submit runtime Journal_graph_request.Load_task_statuses
+         |> fun output -> only "identity catalog" output.requests in
+       let definition id : Graph.task_status_definition =
+         {uuid=uuid id;title=id;ident=None;order=id;checkbox_state=None} in
+       ignore (Production_runtime.receive runtime
+         (response catalog (Protocol.V2_task_statuses_outcome
+           {property_uuid=Some page_uuid;default_status=Some (uuid default_status);
+            items=List.map definition [capture_identity_status_a;capture_identity_status_b];next_cursor=None}))))
+    default;
+  runtime
+;;
+
+let capture_identity_noise runtime =
+  let request = Production_runtime.submit runtime
+      (Journal_graph_request.Find_block (Graph.Uuid.to_string unrelated_uuid))
+    |> fun output -> only "unrelated identity read" output.requests in
+  Production_runtime.abandon runtime request
+;;
+
+(* Drive the production public boundary through an idempotent insert replay to
+   the actual persistent status command. No private allocator or DB is patched. *)
+let capture_identity_status_command ?command runtime ~owner ~target task_state =
+  let next description output = only description output.Production_runtime.requests in
+  let creation_time = Journal_time.create ~instant_unix_ms:1_788_192_000_000L
+      ~local_day:20260901 ~local_minute_of_day:0 |> Result.get_ok in
+  let command = Option.value command ~default:
+      Journal_graph_projection.{mutation_id=owner;block_id=target;sibling_order="a";
+        source="Retained task";task_state;creation_time;children=[];status_confirmation=true;status_intent_revision=0L} in
+  let lookup = Production_runtime.submit runtime (Journal_graph_request.Capture
+      {calendar_generation=1L;command})
+    |> next "identity capture page" in
+  let target_page = match lookup.command with
+    | Protocol.V2_get_page {page=id;_} -> {page with uuid=id}
+    | _ -> Alcotest.fail "Capture did not read page" in
+  let receive request outcome = Production_runtime.receive runtime (response request outcome) in
+  let children = receive lookup
+      (V2_page_outcome (V2_present_page {page=target_page;revision="page-1"}))
+    |> next "identity capture scope" in
+  let insert = receive children (V2_children_outcome
+      {parent=target_page.uuid;revision_scope=V2_children_revision target_page.uuid;
+       scope_revision="children-1";items=[];next_cursor=None})
+    |> next "identity capture insertion" in
+  let mutation_id = match insert.command with
+    | V2_insert_blocks {mutation_id;_} -> mutation_id
+    | _ -> Alcotest.fail "Capture did not insert" in
+  let read = receive insert (V2_mutation_committed
+      {mutation_id;status=V2_already_applied;generation="g";
+       before_projection_revision="p";after_projection_revision="p"})
+    |> next "identity capture canonical block" in
+  receive read (V2_block_outcome (V2_present_block
+      {value={record with block={block with uuid=uuid target;page=target_page.uuid};task_status=None};
+       revision="block-current"}))
+  |> next "identity capture status"
+;;
+
+let capture_identity_of_status (request:Protocol.request) = match request.command with
+  | V2_set_task_status {mutation_id;_} | V2_clear_task_status {mutation_id;_} -> mutation_id
+  | _ -> Alcotest.fail "Expected actual persistent task status command"
+;;
+
+let test_capture_status_identity_reselected_intent () =
+  let module Capture = Journal_capture in
+  let creation_time = Journal_time.create ~instant_unix_ms:1_788_192_000_000L
+      ~local_day:20260901 ~local_minute_of_day:0 |> Result.get_ok in
+  let draft = Capture.create ~session_number:1L ~source:"Retained task"
+    |> fun draft -> Capture.with_task_state draft (Status capture_identity_status_a) in
+  let draft, first = Capture.admit_save draft ~mutation_id:capture_identity_owner_a
+      ~block_id:(Graph.Uuid.to_string block_uuid) ~sibling_order:"a"
+      ~calendar_generation:1L ~creation_time in
+  let identity request =
+    let command = match request with
+      | Journal_graph_request.Capture {command;_} -> command
+      | _ -> Alcotest.fail "Expected Capture owner's request" in
+    capture_identity_status_command ~command (capture_identity_runtime ())
+      ~owner:command.mutation_id ~target:command.block_id command.task_state
+    |> capture_identity_of_status in
+  let first = identity (Option.get first) in
+  let failed = Capture.fail draft ~message:"Status committed; confirmation unavailable" in
+  let unchanged, retry = Capture.retry failed in
+  Alcotest.check Alcotest.bool "same intent retry retains identity" true
+    (Graph.Uuid.equal first (identity (Option.get retry)));
+  let choose draft state =
+    let draft = Capture.fail draft ~message:"Confirmation unavailable"
+      |> fun draft -> Capture.with_task_state draft state in
+    let draft, request = Capture.retry draft in
+    draft, identity (Option.get request) in
+  let second_draft, second = choose unchanged (Status capture_identity_status_b) in
+  let _, reselected = choose second_draft (Status capture_identity_status_a) in
+  Alcotest.check Alcotest.bool "changed intent has its own identity" false (Graph.Uuid.equal first second);
+  Alcotest.check Alcotest.bool "A after B is a new operation, not replay of first A" false
+    (Graph.Uuid.equal first reselected)
+;;
+
+let test_capture_status_identity_cross_runtime () =
+  let first=capture_identity_runtime () and second=capture_identity_runtime () in
+  let a=capture_identity_status_command first ~owner:capture_identity_owner_a
+      ~target:(Graph.Uuid.to_string block_uuid) (Status capture_identity_status_a) in
+  let b=capture_identity_status_command second ~owner:capture_identity_owner_b
+      ~target:(Graph.Uuid.to_string unrelated_uuid) (Status capture_identity_status_a) in
+  Alcotest.(check bool) "same read schedule control" true (Graph.Uuid.equal a.request_id b.request_id);
+  Alcotest.(check bool) "new Runtime and different Capture cannot reuse persistent status identity"
+    false (Graph.Uuid.equal (capture_identity_of_status a) (capture_identity_of_status b))
+;;
+
+let test_capture_status_identity_retry_same_runtime () =
+  let runtime=capture_identity_runtime () in
+  let status ()=capture_identity_status_command runtime ~owner:capture_identity_owner_a
+      ~target:(Graph.Uuid.to_string block_uuid) (Status capture_identity_status_a) in
+  let first=status () in
+  ignore (Production_runtime.fail_request runtime first ~message:"Response unavailable");
+  capture_identity_noise runtime;
+  let retry=status () in
+  Alcotest.(check bool) "same business retry must keep its persistent status identity" true
+    (Graph.Uuid.equal (capture_identity_of_status first) (capture_identity_of_status retry))
+;;
+
+let test_capture_status_identity_independent_reads () =
+  let read noise =
+    let runtime=capture_identity_runtime () in
+    for _=1 to noise do capture_identity_noise runtime done;
+    capture_identity_status_command runtime ~owner:capture_identity_owner_a
+      ~target:(Graph.Uuid.to_string block_uuid) (Status capture_identity_status_a)
+  in
+  let before=read 0 and after=read 3 in
+  Alcotest.(check bool) "noise changes protocol request identity" false (Graph.Uuid.equal before.request_id after.request_id);
+  Alcotest.(check bool) "same Capture survives a new Runtime and unrelated reads" true
+    (Graph.Uuid.equal (capture_identity_of_status before) (capture_identity_of_status after))
+;;
+
+let test_capture_status_identity_intent () =
+  let identity ~owner ~target state =
+    capture_identity_status_command (capture_identity_runtime ()) ~owner ~target state
+    |> capture_identity_of_status in
+  let target=Graph.Uuid.to_string block_uuid in
+  let a=identity ~owner:capture_identity_owner_a ~target (Status capture_identity_status_a) in
+  let b=identity ~owner:capture_identity_owner_a ~target (Status capture_identity_status_b) in
+  let clear=identity ~owner:capture_identity_owner_a ~target No_status in
+  let another_owner=identity ~owner:capture_identity_owner_b ~target (Status capture_identity_status_a) in
+  let another_target=identity ~owner:capture_identity_owner_a ~target:(Graph.Uuid.to_string unrelated_uuid) (Status capture_identity_status_a) in
+  let ids=[a;b;clear;another_owner;another_target] |> List.map Graph.Uuid.to_string in
+  Alcotest.(check int) "set A/set B/clear/other owner/other target are separate business intents"
+    5 (List.length (List.sort_uniq String.compare ids))
+;;
+
+let test_capture_status_identity_canonical_uuid () =
+  let identity owner target status =
+    capture_identity_status_command (capture_identity_runtime ()) ~owner ~target (Status status)
+    |> capture_identity_of_status in
+  let target=Graph.Uuid.to_string block_uuid in
+  let a=identity capture_identity_owner_a target capture_identity_status_a in
+  let b=identity (String.uppercase_ascii capture_identity_owner_a)
+      (String.uppercase_ascii target) (String.uppercase_ascii capture_identity_status_a) in
+  Alcotest.(check bool) "UUID spelling does not change the same status intent" true (Graph.Uuid.equal a b)
+;;
+
+let test_capture_status_identity_resolved_default () =
+  let identity default state =
+    let runtime=capture_identity_runtime ~default () in
+    capture_identity_status_command runtime ~owner:capture_identity_owner_a
+      ~target:(Graph.Uuid.to_string block_uuid) state |> capture_identity_of_status in
+  let default_a=identity capture_identity_status_a Default_status in
+  let explicit_a=identity capture_identity_status_a (Status capture_identity_status_a) in
+  let default_b=identity capture_identity_status_b Default_status in
+  Alcotest.(check bool) "same resolved status matches explicit choice" true (Graph.Uuid.equal default_a explicit_a);
+  Alcotest.(check bool) "changed default is a different status intent" false (Graph.Uuid.equal default_a default_b)
+;;
+
 let test_capture_recovery_explicit_clear () =
   let runtime = Runtime.create () in
   set_calendar runtime;
@@ -5982,6 +6163,7 @@ let test_capture_recovery_explicit_clear () =
              ; sibling_order = "a"
              ; source = "Retained"
              ; task_state = No_status
+             ; status_intent_revision = 0L
              ; status_confirmation = true
              ; creation_time
              ; children = []
@@ -8109,6 +8291,15 @@ let () =
             "bounds and oversized singleton remain explicit"
             `Quick
             test_feed_window_bounds_and_singleton_failure
+        ] )
+    ; ( "Capture persistent status identity"
+      , [ Alcotest.test_case "distinct owners across Runtime restart" `Quick test_capture_status_identity_cross_runtime
+        ; Alcotest.test_case "same owner retry after lost response" `Quick test_capture_status_identity_retry_same_runtime
+        ; Alcotest.test_case "independent of unrelated read schedule" `Quick test_capture_status_identity_independent_reads
+        ; Alcotest.test_case "separate status clear owner and target intents" `Quick test_capture_status_identity_intent
+        ; Alcotest.test_case "canonical UUID spelling" `Quick test_capture_status_identity_canonical_uuid
+        ; Alcotest.test_case "resolved default status intent" `Quick test_capture_status_identity_resolved_default
+        ; Alcotest.test_case "reselecting earlier intent after partial commit" `Quick test_capture_status_identity_reselected_intent
         ] )
     ; ( "copy subtree"
       , [ Alcotest.test_case

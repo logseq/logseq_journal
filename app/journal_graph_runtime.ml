@@ -1109,6 +1109,37 @@ let capture_children t command page conflict_retries =
       ]
 ;;
 
+let capture_status_mutation_id (command : Projection.capture) ~block status =
+  (* A persistent sub-operation belongs to the Capture intent, not the lifetime
+     of the request counter. Resolve Default_status before deriving the identity
+     so retrying one choice is stable. The Capture-owned revision distinguishes
+     choosing A again after B from replaying the first A operation. *)
+  let intent =
+    match status with
+    | None -> "clear"
+    | Some status -> "set:" ^ Graph.Uuid.to_string status
+  in
+  let bytes =
+    Printf.sprintf
+      "logseq-journal:capture-status:v1:%s:%s:%Ld:%s"
+      (String.lowercase_ascii command.mutation_id)
+      (Graph.Uuid.to_string block)
+      command.status_intent_revision
+      intent
+    |> Digest.BLAKE128.string
+    |> Bytes.of_string
+  in
+  (* Custom UUID version 8; keep the variant bits and remaining digest bits. *)
+  Bytes.set bytes 6 (Char.chr ((Char.code (Bytes.get bytes 6) land 0x0f) lor 0x80));
+  Bytes.set bytes 8 (Char.chr ((Char.code (Bytes.get bytes 8) land 0x3f) lor 0x80));
+  let hex = Digest.BLAKE128.to_hex (Bytes.to_string bytes) in
+  Printf.sprintf "%s-%s-%s-%s-%s"
+    (String.sub hex 0 8) (String.sub hex 8 4) (String.sub hex 12 4)
+    (String.sub hex 16 4) (String.sub hex 20 12)
+  |> Graph.Uuid.of_string
+  |> Result.get_ok
+;;
+
 let capture_status t (command : Projection.capture) page =
   match task_status_uuid t command.task_state with
   | Error message -> reject message
@@ -1121,7 +1152,7 @@ let capture_status t (command : Projection.capture) page =
        (match block_preconditions t block with
         | Error message -> reject message
         | Ok preconditions ->
-          let mutation_id = request_uuid t in
+          let mutation_id = capture_status_mutation_id command ~block status in
           let command_status =
             match status with
             | None -> Protocol.V2_clear_task_status { mutation_id; block; preconditions }

@@ -62,6 +62,7 @@ let capture : Journal_graph_projection.capture =
       |> Result.get_ok
   ; children = []
   ; status_confirmation = false
+  ; status_intent_revision = 0L
 }
 ;;
 
