@@ -3,6 +3,7 @@ module Protocol = Logseq_db_worker.Protocol
 module Error = Logseq_db_worker.Error
 module Projection = Journal_graph_projection
 module Reference = Journal_graph_reference_plan
+module Favorites = Journal_graph_favorites_plan
 
 let timeline_uuid value =
   match Graph.Uuid.of_string value with
@@ -247,20 +248,7 @@ type operation =
   | Root_tree of root_batch
   | Root_preview of root_preview
   | Reference_read of Reference.read
-  | List_favorites of Journal_graph_request.favorites_request
-  | Favorite_dependency of
-      { epoch : int64
-      ; uuid : Graph.Uuid.t
-      ; seen : string list
-      ; page : bool
-      }
-  | Favorite_page_candidate of Graph.Uuid.t
-  | Favorite_memberships of
-      { epoch : int64
-      ; page : Graph.Uuid.t
-      ; consumed : int
-      ; seen : string list
-      }
+  | Favorite_read of Favorites.read
   | Task_catalog of
       { epoch : int64
       ; seen : string Rrbvec.t
@@ -401,19 +389,7 @@ type t =
   ; children_interests : (string, children_interest) Hashtbl.t
   ; detail_pages : (string, Graph.page) Hashtbl.t
   ; detail_children : (string, Projection.block_member Graph.page_result) Hashtbl.t
-  ; mutable favorite_epoch : int64
-  ; mutable favorites_initialized : bool
-  ; mutable favorites_page : Graph.Uuid.t option
-  ; favorite_dependencies : (string, unit) Hashtbl.t
-  ; favorite_members : (string, unit) Hashtbl.t
-  ; favorite_targets : (string, Protocol.v2_favorite_target) Hashtbl.t
-  ; favorite_blocks : (string, Protocol.v2_block_record) Hashtbl.t
-  ; favorite_pages : (string, Graph.page) Hashtbl.t
-  ; favorite_dirty : (string, unit) Hashtbl.t
-  ; favorite_pending : (string, unit) Hashtbl.t
-  ; favorite_resolved : (string, unit) Hashtbl.t
-  ; favorite_loading_changes : (string, unit) Hashtbl.t
-  ; mutable favorite_changes_overflow : bool
+  ; favorites : Favorites.t
   ; changed_point_epochs : (string, int64) Hashtbl.t
   ; target_read_epochs : (string, int64) Hashtbl.t
   ; mutable initial_feed_spec : (int * int) option
@@ -483,19 +459,7 @@ let create ?(localtime = Unix.localtime) () =
   ; children_interests = Hashtbl.create 32
   ; detail_pages = Hashtbl.create 32
   ; detail_children = Hashtbl.create 32
-  ; favorite_epoch = 0L
-  ; favorites_initialized = false
-  ; favorites_page = None
-  ; favorite_dependencies = Hashtbl.create 32
-  ; favorite_members = Hashtbl.create 32
-  ; favorite_targets = Hashtbl.create 32
-  ; favorite_blocks = Hashtbl.create 32
-  ; favorite_pages = Hashtbl.create 32
-  ; favorite_dirty = Hashtbl.create 32
-  ; favorite_pending = Hashtbl.create 32
-  ; favorite_resolved = Hashtbl.create 32
-  ; favorite_loading_changes = Hashtbl.create 32
-  ; favorite_changes_overflow = false
+  ; favorites = Favorites.create ()
   ; changed_point_epochs = Hashtbl.create 32
   ; target_read_epochs = Hashtbl.create 32
   ; initial_feed_spec = None
@@ -535,19 +499,7 @@ let reset t =
   Hashtbl.clear t.children_interests;
   Hashtbl.clear t.detail_pages;
   Hashtbl.clear t.detail_children;
-  t.favorite_epoch <- Int64.succ t.favorite_epoch;
-  t.favorites_initialized <- false;
-  t.favorites_page <- None;
-  Hashtbl.clear t.favorite_dependencies;
-  Hashtbl.clear t.favorite_members;
-  Hashtbl.clear t.favorite_targets;
-  Hashtbl.clear t.favorite_blocks;
-  Hashtbl.clear t.favorite_pages;
-  Hashtbl.clear t.favorite_pending;
-  Hashtbl.clear t.favorite_dirty;
-  Hashtbl.clear t.favorite_resolved;
-  Hashtbl.clear t.favorite_loading_changes;
-  t.favorite_changes_overflow <- false;
+  Favorites.reset t.favorites;
   Hashtbl.clear t.changed_point_epochs;
   Hashtbl.clear t.target_read_epochs;
   Hashtbl.clear t.root_pages;
@@ -614,6 +566,28 @@ let make_request ?source_epoch ?(background = false) t operation command =
 
 let read = make_request
 let mutate = make_request
+let favorites_ports t =
+  Favorites.
+    { plan_read = (fun value command -> read t (Favorite_read value) command)
+    ; remember_page = (fun (page : Graph.page) ->
+        Hashtbl.replace t.graph_pages (Graph.Uuid.to_string page.uuid) page)
+    }
+;;
+
+let favorites_output (value : Favorites.output) =
+  { requests = Rrbvec.to_list value.requests
+  ; responses = Rrbvec.to_list (Rrbvec.map
+      (function
+        | Favorites.Favorites_loaded (request, result) -> response (Favorites_loaded (request, result))
+        | Favorites_failed (request, stale, message) -> response (Favorites_failed (request, stale, message))
+        | Favorites_invalidated -> response Favorites_invalidated
+        | Rejected (Projection_rejection message) -> response (Rejected (Projection_failure message))
+        | Rejected (Worker_rejection { operation; request_id; error }) ->
+          response (Rejected (Worker_failure { operation; request_id; error })))
+      value.responses)
+  }
+;;
+
 (* Only a public output boundary issues a demand. Internal completions never
    reserve a hydration slot or return an already dispatched request. *)
 let issue_request t (request : Protocol.request) =
@@ -1532,12 +1506,7 @@ let submit_unowned t (request : Journal_graph_request.t) =
   match request with
   | Load_task_statuses -> requests [ request_task_catalog t ]
   | Load_favorites request ->
-    requests
-      [ read
-          t
-          (List_favorites request)
-          (Protocol.V2_list_favorites { limit = request.limit; cursor = request.cursor })
-      ]
+    requests [ Favorites.load ~ports:(favorites_ports t) request ]
   | Inspect_admission request ->
     requests [ read t (Admission_info request) Protocol.V2_inspect_admission ]
   | Load_feed { cursor; root_limit; day_limit; request_generation } ->
@@ -1575,9 +1544,7 @@ let submit_unowned t (request : Journal_graph_request.t) =
                 })
              (if Hashtbl.mem t.graph_pages block_id
                 ||
-                match Hashtbl.find_opt t.favorite_targets block_id with
-                | Some (V2_favorite_page _) -> true
-                | _ -> false
+                Favorites.is_page_target t.favorites block_id
               then Protocol.V2_get_page { page = block; revision = None }
               else Protocol.V2_get_outline_block { block; revision = None })
          ])
@@ -2069,8 +2036,7 @@ let maximum_active_hydration = 4
 
 let favorite_request_current t pending =
   match pending.operation with
-  | Favorite_dependency { epoch; _ } | Favorite_memberships { epoch; _ } ->
-    epoch = t.favorite_epoch
+  | Favorite_read value -> Favorites.current t.favorites value
   | _ -> true
 ;;
 
@@ -2116,153 +2082,6 @@ let dispatch_output t output =
 ;;
 
 let submit t request = dispatch_output t (plan_request t request)
-
-(* Session bounds keep adversarial reference chains/bursts finite. Unresolved
-   tokens remain literal. Point reads use the Worker's indexed UUID lookup. *)
-let maximum_reference_targets = 4096
-
-let register_favorite_dependency t uuid =
-  let key = Graph.Uuid.to_string uuid in
-  if
-    (not (Hashtbl.mem t.favorite_dependencies key))
-    && Hashtbl.length t.favorite_dependencies >= maximum_reference_targets
-  then invalid_arg "Favorite dependencies exceed the bounded read limit.";
-  Hashtbl.replace t.favorite_dependencies key ()
-;;
-
-let favorite_dependency_read ?(refresh = false) t ~page ~seen uuid =
-  let key = Graph.Uuid.to_string uuid in
-  register_favorite_dependency t uuid;
-  if Hashtbl.mem t.favorite_pending key
-  then (
-    if refresh then Hashtbl.replace t.favorite_dirty key ();
-    None)
-  else if (not refresh) && Hashtbl.mem t.favorite_resolved key
-  then None
-  else (
-    if Hashtbl.length t.favorite_pending >= maximum_reference_targets
-    then invalid_arg "Favorite pending reads exceed the bounded read limit.";
-    Hashtbl.replace t.favorite_pending key ();
-    Some
-      (read
-         t
-         (Favorite_dependency { epoch = t.favorite_epoch; uuid; seen; page })
-         (if page
-          then Protocol.V2_get_page { page = uuid; revision = None }
-          else Protocol.V2_get_outline_block { block = uuid; revision = None })))
-;;
-
-let recheck_dirty_favorite_dependency t ~uuid ~seen ~page =
-  let key = Graph.Uuid.to_string uuid in
-  Hashtbl.remove t.favorite_dirty key;
-  Hashtbl.remove t.favorite_pending key;
-  (* The held response predates an owned change. Retire its single slot and
-     replace it with a current point read before considering its old snapshot. *)
-  background_demands
-    t
-    { requests =
-        Option.to_list (favorite_dependency_read ~refresh:true t ~page ~seen uuid)
-    ; responses = []
-    }
-;;
-
-let favorite_deleted (block : Graph.block) =
-  List.filter
-    (fun (property : Graph.property_summary) ->
-       String.equal property.ident "logseq.property/deleted-at")
-    block.properties
-;;
-
-let favorite_block_changed
-      t
-      key
-      (before : Protocol.v2_block_record)
-      (after : Protocol.v2_block_record)
-  =
-  before.block.parent <> after.block.parent
-  || before.block.page <> after.block.page
-  || favorite_deleted before.block <> favorite_deleted after.block
-  || (Hashtbl.mem t.favorite_targets key
-      && (before.block.title <> after.block.title
-          || before.task_status <> after.task_status))
-;;
-
-let favorite_dependency_changed t uuid =
-  Hashtbl.mem t.favorite_loading_changes (Graph.Uuid.to_string uuid)
-;;
-
-let complete_favorite_dependency_key t key output =
-  Hashtbl.remove t.favorite_pending key;
-  Hashtbl.remove t.favorite_dirty key;
-  Hashtbl.replace t.favorite_resolved key ();
-  if Hashtbl.length t.favorite_pending = 0
-  then (
-    Hashtbl.clear t.favorite_loading_changes;
-    let overflow = t.favorite_changes_overflow in
-    t.favorite_changes_overflow <- false;
-    if overflow
-    then { output with responses = response Favorites_invalidated :: output.responses }
-    else output)
-  else output
-;;
-
-let complete_favorite_dependency t uuid output =
-  complete_favorite_dependency_key t (Graph.Uuid.to_string uuid) output
-;;
-
-let favorite_membership_key uuid = "memberships:" ^ Graph.Uuid.to_string uuid
-
-let favorite_changes t blocks pages structures =
-  let membership uuid = Hashtbl.mem t.favorite_members (Graph.Uuid.to_string uuid) in
-  let favorites_scope uuid =
-    Option.fold ~none:false ~some:(Graph.Uuid.equal uuid) t.favorites_page
-  in
-  let changed =
-    List.exists membership blocks
-    || List.exists favorites_scope pages
-    || List.exists
-         (function
-           | Protocol.V2_children_interest parent | V2_page_tree_interest parent ->
-             favorites_scope parent
-           | V2_journal_index_interest -> false)
-         structures
-  in
-  let rechecks =
-    List.filter_map
-      (fun (uuid, page) ->
-         if
-           Hashtbl.mem t.favorite_dependencies (Graph.Uuid.to_string uuid)
-           && (not (membership uuid))
-           && not (favorites_scope uuid)
-         then favorite_dependency_read ~refresh:true t ~page ~seen:[] uuid
-         else None)
-      (List.map (fun uuid -> uuid, false) blocks @ List.map (fun uuid -> uuid, true) pages)
-  in
-  if Hashtbl.length t.favorite_pending > 0
-  then
-    List.iter
-      (fun uuid ->
-         let key = Graph.Uuid.to_string uuid in
-         if Hashtbl.length t.favorite_loading_changes < maximum_reference_targets
-         then Hashtbl.replace t.favorite_loading_changes key ()
-         else t.favorite_changes_overflow <- true)
-      (blocks @ pages);
-  let candidates =
-    if t.favorites_initialized && t.favorites_page = None
-    then
-      List.map
-        (fun page ->
-           read
-             t
-             (Favorite_page_candidate page)
-             (Protocol.V2_get_page { page; revision = None }))
-        pages
-    else []
-  in
-  { requests = rechecks @ candidates
-  ; responses = (if changed then [ response Favorites_invalidated ] else [])
-  }
-;;
 
 let remember_detail_members t ~page ~(root : Projection.block_member) children =
   let key = Graph.Uuid.to_string root.Projection.block.uuid in
@@ -2317,7 +2136,11 @@ let reference_output (value : Reference.output) =
 
 let hydration_for_changes t ~request_generation windows =
   let blocks, pages, structures = changed_interests windows in
-  let favorites = favorite_changes t blocks pages structures in
+  let favorites =
+    Favorites.changes t.favorites ~ports:(favorites_ports t)
+      ~blocks:(Rrbvec.of_list blocks) ~pages:(Rrbvec.of_list pages)
+      ~structures:(Rrbvec.of_list structures) |> favorites_output
+  in
   (* Fence old fragments before issuing the shared or dedicated point reads. *)
   List.iter (fun block -> Reference.fence t.references ~now:(fun () -> t.next_request) (Graph.Uuid.to_string block)) blocks;
   List.iter (fun page -> Reference.fence t.references ~now:(fun () -> t.next_request) (Graph.Uuid.to_string page)) pages;
@@ -2749,10 +2572,7 @@ let operation_name = function
   | Root_tree _ -> "readTimelineRoots"
   | Root_preview _ -> "readTimelinePreview"
   | Reference_read _ -> "readUuidReference"
-  | List_favorites _ -> "listFavorites"
-  | Favorite_dependency _ -> "readFavoriteDependency"
-  | Favorite_page_candidate _ -> "findFavoritePage"
-  | Favorite_memberships _ -> "readFavoriteMemberships"
+  | Favorite_read value -> Favorites.operation_name value
   | Task_catalog _ -> "listTaskStatuses"
   | Task_definitions _ -> "readTaskStatuses"
   | Graph_info -> "graphInfo"
@@ -2824,25 +2644,8 @@ let failure_output
            Hashtbl.remove t.task_lookup_epochs id))
       ids;
     if !current then responses [ task_catalog_response ~error:message t ] else empty
-  | List_favorites request ->
-    responses
-      [ response (Favorites_failed (request, code = Error.Stale_read_cursor, message)) ]
-  | Favorite_dependency { epoch; uuid; _ } ->
-    if epoch <> t.favorite_epoch
-    then empty
-    else
-      complete_favorite_dependency
-        t
-        uuid
-        (responses [ response (Rejected (Worker_failure worker_failure)) ])
-  | Favorite_memberships { epoch; page; _ } ->
-    if epoch <> t.favorite_epoch
-    then empty
-    else
-      complete_favorite_dependency_key
-        t
-        (favorite_membership_key page)
-        (responses [ response (Rejected (Worker_failure worker_failure)) ])
+  | Favorite_read value ->
+    Favorites.fail t.favorites value ~request_id ~code ~message ~error |> favorites_output
   | Root_dates scan | Root_today scan ->
     responses [response (match scan.root_start_day with
       | None -> Feed_failed {request_generation=scan.root_generation;failure=Worker_failure worker_failure}
@@ -2906,7 +2709,6 @@ let failure_output
         response (Rejected (Worker_failure worker_failure)) :: invalidation.responses
     }
   | Find_block_result
-  | Favorite_page_candidate _
   | Changed_detail_page _
   | Changed_children _
   | Capture_page _
@@ -3055,79 +2857,9 @@ let receive_response t (protocol_response : Protocol.response) =
        failure_output t operation request_id "Unexpected asset query response."
      | Protocol.V2_favorites_outcome result ->
        (match operation with
-        | List_favorites request ->
-          (try
-             if request.cursor = None
-             then (
-               t.favorite_epoch <- Int64.succ t.favorite_epoch;
-               Hashtbl.clear t.favorite_dependencies;
-               Hashtbl.clear t.favorite_members;
-               Hashtbl.clear t.favorite_targets;
-               Hashtbl.clear t.favorite_blocks;
-               Hashtbl.clear t.favorite_pages;
-               Hashtbl.clear t.favorite_pending;
-               Hashtbl.clear t.favorite_dirty;
-               Hashtbl.clear t.favorite_resolved;
-               Hashtbl.clear t.favorite_loading_changes;
-               t.favorite_changes_overflow <- false);
-             t.favorites_initialized <- true;
-             t.favorites_page <- result.favorites_page;
-             Option.iter
-               (fun uuid -> register_favorite_dependency t uuid)
-               result.favorites_page;
-             (* Register the complete page before creating any pending reads. A
-                limit failure must not leave unscheduled request constructors. *)
-             List.iter
-               (fun (item : Protocol.v2_favorite_item) ->
-                  register_favorite_dependency t item.membership_uuid;
-                  match item.target with
-                  | V2_favorite_page { uuid; _ } | V2_favorite_block { uuid; _ } ->
-                    register_favorite_dependency t uuid)
-               result.items;
-             let dependencies =
-               List.filter_map
-                 (fun (item : Protocol.v2_favorite_item) ->
-                    register_favorite_dependency t item.membership_uuid;
-                    Hashtbl.replace
-                      t.favorite_members
-                      (Graph.Uuid.to_string item.membership_uuid)
-                      ();
-                    match item.target with
-                    | V2_favorite_page { uuid; _ } ->
-                      Hashtbl.replace
-                        t.favorite_targets
-                        (Graph.Uuid.to_string uuid)
-                        item.target;
-                      favorite_dependency_read t ~page:true ~seen:[] uuid
-                    | V2_favorite_block { uuid; _ } ->
-                      Hashtbl.replace
-                        t.favorite_targets
-                        (Graph.Uuid.to_string uuid)
-                        item.target;
-                      favorite_dependency_read t ~page:false ~seen:[] uuid)
-                 result.items
-             in
-             let memberships =
-               match request.cursor, result.favorites_page with
-               | None, Some page ->
-                 Hashtbl.replace t.favorite_pending (favorite_membership_key page) ();
-                 [ read
-                     t
-                     (Favorite_memberships
-                        { epoch = t.favorite_epoch; page; consumed = 0; seen = [] })
-                     (Protocol.V2_get_children
-                        { parent = page; limit = 200; cursor = None; revision = None })
-                 ]
-               | _ -> []
-             in
-             background_demands
-               t
-               { requests = dependencies @ memberships
-               ; responses = [ response (Favorites_loaded (request, result)) ]
-               }
-           with
-           | Invalid_argument message ->
-             responses [ response (Favorites_failed (request, false, message)) ])
+        | Favorite_read value when Favorites.accepts_list value ->
+          Favorites.receive_list t.favorites ~ports:(favorites_ports t) value result
+          |> favorites_output |> background_demands t
         | _ -> failure_output t operation request_id "Unexpected favorites response.")
      | Protocol.V2_failed { code; message } ->
        (match Error.code_of_string code with
@@ -3349,40 +3081,10 @@ let receive_response t (protocol_response : Protocol.response) =
           remember_page_revision t page.uuid revision;
           Hashtbl.replace t.graph_pages command.parent_block_id page;
           complete_child t command page child (page_root_member page revision)
-        | _, Favorite_dependency { epoch; _ } when epoch <> t.favorite_epoch -> empty
-        | _, Favorite_dependency { uuid; seen; page; _ }
-          when Hashtbl.mem t.favorite_dirty (Graph.Uuid.to_string uuid) ->
-          recheck_dirty_favorite_dependency t ~uuid ~seen ~page
-        | V2_present_page { page; _ }, Favorite_dependency { uuid; page = true; _ } ->
-          let key = Graph.Uuid.to_string uuid in
-          let changed =
-            match Hashtbl.find_opt t.favorite_pages key with
-            | Some before ->
-              before.recycled <> page.recycled
-              || (Hashtbl.mem t.favorite_targets key && before.title <> page.title)
-            | None ->
-              page.recycled
-              ||
-                (match Hashtbl.find_opt t.favorite_targets key with
-                | Some (V2_favorite_page target) -> target.title <> page.title
-                | _ -> false)
-          in
-          Hashtbl.replace t.favorite_pages key page;
-          Hashtbl.replace t.graph_pages (Graph.Uuid.to_string page.uuid) page;
-          complete_favorite_dependency
-            t
-            uuid
-            (if changed then responses [ response Favorites_invalidated ] else empty)
-        | V2_missing_page _, Favorite_dependency { uuid; page = true; _ } ->
-          complete_favorite_dependency
-            t
-            uuid
-            (responses [ response Favorites_invalidated ])
-        | V2_present_page { page; _ }, Favorite_page_candidate _ ->
-          if String.equal page.name "$$$favorites" && not page.recycled
-          then responses [ response Favorites_invalidated ]
-          else empty
-        | V2_missing_page _, Favorite_page_candidate _ -> empty
+        | _, Favorite_read value when Favorites.accepts_page t.favorites value ->
+          let planned = Favorites.receive_page t.favorites ~ports:(favorites_ports t) value lookup in
+          let output = favorites_output planned in
+          if planned.background then background_demands t output else output
         | V2_present_page { page; revision }, Changed_detail_page _ when not page.recycled ->
           Hashtbl.replace t.graph_pages (Graph.Uuid.to_string page.uuid) page;
           remember_page_revision t page.uuid revision;
@@ -3646,63 +3348,10 @@ let receive_response t (protocol_response : Protocol.response) =
             value.tag_titles
         | V2_missing_block _ -> ());
        (match lookup, operation with
-        | _, Favorite_dependency { epoch; _ } when epoch <> t.favorite_epoch -> empty
-        | _, Favorite_dependency { uuid; seen; page; _ }
-          when Hashtbl.mem t.favorite_dirty (Graph.Uuid.to_string uuid) ->
-          recheck_dirty_favorite_dependency t ~uuid ~seen ~page
-        | ( V2_present_block { value; _ }
-          , Favorite_dependency { uuid; seen; page = false; _ } ) ->
-          let key = Graph.Uuid.to_string uuid in
-          let parent = value.block.parent in
-          if
-            (not (Graph.Uuid.equal value.block.uuid uuid))
-            || List.length seen >= 256
-            || List.mem key seen
-            || List.mem (Graph.Uuid.to_string parent) (key :: seen)
-          then
-            complete_favorite_dependency
-              t
-              uuid
-              (reject "Favorite ancestry is cyclic or exceeds the read limit.")
-          else (
-            let changed =
-              match Hashtbl.find_opt t.favorite_blocks key with
-              | Some before -> favorite_block_changed t key before value
-              | None ->
-                favorite_deleted value.block <> []
-                ||
-                  (match Hashtbl.find_opt t.favorite_targets key with
-                  | Some (V2_favorite_block target) ->
-                    target.title <> value.block.title
-                    || target.task_status <> value.task_status
-                  | _ -> false)
-            in
-            Hashtbl.replace t.favorite_blocks key value;
-            try
-              let request =
-                favorite_dependency_read
-                  t
-                  ~page:(Graph.Uuid.equal parent value.block.page)
-                  ~seen:(key :: seen)
-                  parent
-              in
-              let output =
-                background_demands
-                  t
-                  { requests = Option.to_list request
-                  ; responses =
-                      (if changed then [ response Favorites_invalidated ] else [])
-                  }
-              in
-              complete_favorite_dependency t uuid output
-            with
-            | Invalid_argument message ->
-              complete_favorite_dependency t uuid (reject message))
-        | V2_missing_block _, Favorite_dependency { uuid; page = false; _ } ->
-          complete_favorite_dependency
-            t
-            uuid
-            (responses [ response Favorites_invalidated ])
+        | _, Favorite_read value when Favorites.accepts_block t.favorites value ->
+          let planned = Favorites.receive_block t.favorites ~ports:(favorites_ports t) value lookup in
+          let output = favorites_output planned in
+          if planned.background then background_demands t output else output
         | ( V2_present_block { value; revision }
           , Detail_block { generation; limit; after; _ } ) ->
           remember_block_revision t value.block.uuid revision;
@@ -3839,74 +3488,11 @@ let receive_response t (protocol_response : Protocol.response) =
                          ; failure = Projection_failure message
                          })
                   ]))
-        | Favorite_memberships { epoch; _ } when epoch <> t.favorite_epoch -> empty
-        | Favorite_memberships { epoch; page; consumed; seen } ->
-          if List.length items > 200 || consumed + List.length items > 10_000
-          then
-            complete_favorite_dependency_key
-              t
-              (favorite_membership_key page)
-              (reject "Favorite memberships exceed the bounded read limit.")
-          else (
-            try
-              List.iter
-                (fun (item : Protocol.v2_child_member) ->
-                   register_favorite_dependency t item.value.block.uuid;
-                   Hashtbl.replace
-                     t.favorite_members
-                     (Graph.Uuid.to_string item.value.block.uuid)
-                     ())
-                items;
-              let changed =
-                List.exists
-                  (fun (item : Protocol.v2_child_member) ->
-                     favorite_dependency_changed t item.value.block.uuid)
-                  items
-              in
-              let output =
-                if changed then responses [ response Favorites_invalidated ] else empty
-              in
-              match next_cursor with
-              | None ->
-                complete_favorite_dependency_key t (favorite_membership_key page) output
-              | Some cursor ->
-                let key = Graph.Cursor.to_string cursor in
-                if
-                  List.mem key seen
-                  || List.length seen >= 128
-                  || consumed + List.length items >= 10_000
-                then
-                  complete_favorite_dependency_key
-                    t
-                    (favorite_membership_key page)
-                    (reject "Favorite membership cursor exceeds the bounded read limit.")
-                else
-                  background_demands
-                    t
-                    { output with
-                      requests =
-                        [ read
-                            t
-                            (Favorite_memberships
-                               { epoch
-                               ; page
-                               ; consumed = consumed + List.length items
-                               ; seen = key :: seen
-                               })
-                            (Protocol.V2_get_children
-                               { parent = page
-                               ; limit = 200
-                               ; cursor = Some cursor
-                               ; revision = None
-                               })
-                        ]
-                    }
-            with
-            | Invalid_argument message ->
-              complete_favorite_dependency_key
-                t
-                (favorite_membership_key page)
-                (reject message))
+        | Favorite_read value when Favorites.accepts_memberships value ->
+          let planned = Favorites.receive_memberships t.favorites ~ports:(favorites_ports t)
+            value items next_cursor in
+          let output = favorites_output planned in
+          if planned.background then background_demands t output else output
         | Changed_children { page; root; _ } ->
           let children = children_result items next_cursor in
           let interest =
