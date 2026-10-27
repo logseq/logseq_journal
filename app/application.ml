@@ -1930,142 +1930,28 @@ let dismiss_toolbar ~test_id ~command dispatch body =
 ;;
 
 let task_status_name state =
-  Journal_model.status_name ~lookup:(fun id ->
-    Option.map
-      (fun (d : Logseq_db_types.Graph_types.task_status_definition) -> d.title)
-      (Reference_sources.find_opt id state.task_status_definitions))
+  Journal_status_view.status_name
+    ~lookup:(fun id -> Reference_sources.find_opt id state.task_status_definitions)
 ;;
 
 let status_sheet_options state =
-  Rrbvec.to_seq state.task_statuses
-  |> Seq.drop
-       (min state.task_status_page (max 0 ((Rrbvec.length state.task_statuses - 1) / 100))
-        * 100)
-  |> Seq.take 100
-  |> Seq.map (fun (definition : Logseq_db_types.Graph_types.task_status_definition) ->
-    let uuid = Logseq_db_types.Graph_types.Uuid.to_string definition.uuid in
-    uuid, Journal_model.Status uuid)
-  |> List.of_seq
-  |> fun choices -> choices @ [ "clear", Journal_model.No_status ]
+  Journal_status_view.options ~catalog:state.task_statuses ~page:state.task_status_page
 ;;
 
 let status_sheet_page ~state:snapshot ~tokens ~current ~id dispatch =
-  let status_icon state =
-    let palette = Journal_visual_tokens.status_colors tokens state in
-    Journal_symbols.create
-      ~color:(if state = Journal_model.No_status then palette.foreground else palette.background)
-      (match state with
-       | Journal_model.Status uuid ->
-         (match Reference_sources.find_opt uuid snapshot.task_status_definitions with
-          | Some { checkbox_state = Some true; _ } -> Journal_symbols.Done
-          | _ -> Journal_symbols.for_task_state state)
-       | _ -> Journal_symbols.for_task_state state)
-    |> Ui.mount
-  in
-  let option (tag, state) =
-    let selected = state = current in
-    let title =
-      if state = Journal_model.No_status then "Clear" else task_status_name snapshot state
-    in
-    let label =
-      if selected then title ^ ", current status"
-      else if state = Journal_model.No_status then "Clear status"
-      else "Set status to " ^ title
-    in
-    V.of_lui
-      (Lui_elements.list_item
-         ~key:("status:" ^ tag)
-         ~selected
-         ~min_height:44
-         ~padding_horizontal:12
-         ~padding_vertical:4
-         ~corner_radius:12
-         ~separator:`hidden
-         ~on_press:(fun _ -> dispatch.send (Status_sheet_select tag))
-         [ Lui_elements.row ~grow:1.0 ~gap:12
-             ([ status_icon state; Lui_elements.text ~value:title ~grow:1.0 ~text_alignment:`start [] ]
-              @ if selected then [ Lui_elements.icon ~name:`check ~foreground:"primary" [] ] else []) ])
-    |> V.with_test_id (Ui.Test_id.string ("journal-status-sheet-option:" ^ tag))
-    |> V.semantics ~properties:(Ui.Semantics.create ~label ())
-    |> Ui.mount
-  in
-  let choices =
-    List.map (fun ((_, state) as choice) ->
-      if state = Journal_model.No_status then
-        Lui_elements.column ~cross:`stretch ~gap:6
-          [ Lui_elements.separator ~orientation:`horizontal ~margin_horizontal:10 []
-          ; option choice ]
-         else option choice)
-      (status_sheet_options snapshot)
-  in
-  let page =
-    min
-      snapshot.task_status_page
-      (max 0 ((Rrbvec.length snapshot.task_statuses - 1) / 100))
-  in
-  let page_control id label command =
-    Lui_elements.button
-      ~key:id
-      ~accessibility_identifier:id
-      ~on_press:(fun _ -> dispatch.send command)
-      [ Lui_elements.text ~value:label [] ]
-  in
-  let pagination =
-    (if page > 0
-     then
-       [ page_control
-           "journal-status-previous"
-           "Previous statuses"
-           (Status_catalog_page (page - 1))
-       ]
-     else [])
-    @ (if (page + 1) * 100 < Rrbvec.length snapshot.task_statuses
-       then
-         [ page_control
-             "journal-status-next"
-             "More statuses"
-             (Status_catalog_page (page + 1))
-         ]
-       else [])
-    @
-    if snapshot.task_statuses_error <> None
-    then [ page_control "journal-status-retry" "Retry statuses" Status_catalog_retry ]
-    else []
-  in
-  V.of_lui
-    (Lui_elements.scroll ~orientation:`vertical ~padding:20
-       [ Lui_elements.column ~cross:`stretch ~gap:18
-           [ Lui_elements.column ~cross:`start ~gap:7
-               [ Lui_elements.text ~value:"TASK STATUS" ~style_class:"caption" ~foreground:"secondary" []
-               ; Lui_elements.text ~value:"Choose a status" ~style_class:"title2 semibold" []
-               ; Lui_elements.text ~value:"Tap a different status to apply." ~foreground:"secondary" [] ]
-           ; Lui_elements.row ~gap:10 ~padding:12 ~background:"secondary" ~corner_radius:12
-               [ status_icon current
-               ; Lui_elements.text
-                   ~value:("Current · " ^ task_status_name snapshot current)
-                   []
-               ]
-           ; Lui_elements.text
-               ~value:
-                 (match snapshot.task_statuses_error with
-                  | Some error -> error
-                  | None when not snapshot.task_statuses_complete -> "Loading statuses…"
-                  | None when Rrbvec.is_empty snapshot.task_statuses ->
-                    "This graph has no available task statuses."
-                  | None -> "")
-               ~foreground:"secondary"
-               []
-           ; Lui_elements.card
-               ~padding:6
-               ~corner_radius:18
-               ~border_width:0
-               ~background:"secondary"
-               [ Lui_elements.column ~cross:`stretch ~gap:0 choices ]
-           ; Lui_elements.row ~gap:12 pagination
-           ; Lui_elements.text ~value:"Clear removes the status from this block."
-               ~style_class:"caption" ~foreground:"secondary" [] ] ])
-  |> dismiss_toolbar ~test_id:"journal-status-close" ~command:Close_status dispatch
-  |> V.Body.with_test_id (Ui.Test_id.string ("journal-status-sheet-page:" ^ id))
+  Journal_status_view.view
+    { catalog = snapshot.task_statuses
+    ; page = snapshot.task_status_page
+    ; error = snapshot.task_statuses_error
+    ; complete = snapshot.task_statuses_complete
+    ; lookup_status = (fun uuid -> Reference_sources.find_opt uuid snapshot.task_status_definitions)
+    ; current; id; tokens
+    }
+    ~on_action:(function
+      | Select tag -> dispatch.send (Status_sheet_select tag)
+      | Page page -> dispatch.send (Status_catalog_page page)
+      | Retry -> dispatch.send Status_catalog_retry
+      | Close -> dispatch.send Close_status)
 ;;
 
 let live_region_text value =
