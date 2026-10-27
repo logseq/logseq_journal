@@ -34,6 +34,7 @@
   journal_row
   journal_startup
   journal_time
+  journal_title
   journal_timeline
   journal_timeline_state
   journal_validation
