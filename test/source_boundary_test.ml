@@ -1522,11 +1522,11 @@ let () =
   require_text
     root
     "app/application.ml"
-    [ "V.Sheet.create"
-    ; "journal-status-sheet-page:"
-    ; "journal-status-sheet-option:"
-    ; "Set status"
-    ];
+    [ "V.Sheet.create"; "Set status" ];
+  require_text
+    root
+    "app/journal_status_view.ml"
+    [ "journal-status-sheet-page:"; "journal-status-sheet-option:" ];
   List.iter
     (fun relative ->
        forbid_text
