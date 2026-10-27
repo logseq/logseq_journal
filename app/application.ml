@@ -2085,29 +2085,6 @@ let media_detail_roots state =
     (Lui_navigation.Path.entries (Journal_routes.path state.routes))
 ;;
 
-let media_label
-      ~store
-      ?(on_region = fun _ -> ())
-      ?(detail = false)
-      ?(known_images = [])
-      state
-      dispatch
-      ~title
-      ~root
-      child
-  =
-  let scope = media_presentation_scope state ~detail in
-  Journal_media_view.view
-    ~store
-    ~on_region
-    ~scope
-    ~title
-    ~root
-    ~known_images
-    ~on_event:(fun event -> dispatch.send (Media (scope, event)))
-    child
-;;
-
 let row_media_label
       ~store
       ?(on_region = fun _ -> ())
@@ -2628,299 +2605,62 @@ module Detail_outline = struct
   ;;
 end
 
-module Detail_list = struct
-  let view
-        ~key
-        ~detail
-        ~enabled
-        ~on_action
-        ~on_scroll_completed
-        ~on_visible_range
-        ~children
-    =
-    let rows =
-      List.map2 (fun row label ->
-        let row_key = Ui.Key.string (Journal_detail.row_key row) in
-        let item =
-          match row with
-          | Journal_detail.More _ ->
-            V.Native_list.row ~key:row_key ~separator:Hidden label
-          | Block { block; _ } ->
-            let id = Journal_model.id block in
-            let delete = bind_action on_action (Detail_delete id) in
-            let open_block = bind_action on_action (Detail_open id) in
-            let context_menu =
-              V.Context_menu.create
-                ~actions:
-                  ((if id = Journal_model.page_id block then [] else [ V.Context_menu.action
-                      ~key:(Ui.Key.string "open")
-                      ~title:"Open block"
-                      ~symbol:"arrow.up.right.square"
-                      ~on_press:open_block
-                      ()
-                  ; V.Context_menu.action
-                      ~key:(Ui.Key.string "delete")
-                      ~enabled
-                      ~role:Destructive
-                      ~title:"Delete block and descendants"
-                      ~symbol:"trash"
-                      ~on_press:delete
-                      ()
-                  ]) @ [ V.Context_menu.action
-                      ~key:(Ui.Key.string "copy")
-                      ~enabled
-                      ~title:"Copy"
-                      ~symbol:"doc.on.doc"
-                      ~on_press:(bind_action on_action (Copy_block id))
-                      ()
-                  ])
-                ()
-            in
-            V.Native_list.row ~key:row_key ~separator:Hidden ~context_menu label
-        in
-        item)
-        (Journal_detail.rows detail) children
-    in
-    let scroll_request =
-      Option.map
-        (fun id ->
-           V.Native_list.scroll_request
-             ~token:(Journal_detail.composer_revision detail)
-             ~target:
-               (V.Native_list.target
-                  ~section:(Ui.Key.string "outline")
-                  ~row_path:
-                    [ Ui.Key.string ("block:" ^ id) ])
-             ~anchor:Bottom
-             ~animated:false
-             ())
-        (Journal_detail.reveal_id detail)
-    in
-    V.Native_list.vertical
-      ~key
-      ~style:Detail
-      ?scroll_request
-      ~on_scroll_completed
-      ~on_visible_range
-      [ V.Native_list.section ~key:(Ui.Key.string "outline") ~separator:Hidden rows ]
-    |> V.Viewport.Vertical.with_test_id (Ui.Test_id.string "journal-detail-outline")
-    |> V.Body.Vertical.fill
-    |> fun content -> V.Body.Vertical.create [ content ]
-  ;;
-end
-
-let detail_page
-      ~media_store
-      ?(on_region = fun _ -> ())
-      ~state
-      ~on_scroll_completed
-      dispatch
-  =
+let detail_page ~media_store ?(on_region = fun _ -> ()) ~state ~on_scroll_completed dispatch =
   let detail = Journal_routes.detail state.routes in
-  let enabled =
-    state.write_enabled && state.pending_delete = None && state.pending_status = None
-  in
-  let saving =
-    Option.fold
-      ~none:false
-      ~some:(fun detail -> Journal_detail.mode detail = Saving_child)
-      detail
-  in
   let scope = Detail_outline.scope state.routes in
-  let local =
-    { dispatch with send = (fun action -> dispatch.send (Detail_action (scope, action))) }
-  in
-  let on_action action = bind_action local action in
-  let button ?(enabled = true) ~id ~command ~symbol title =
-    V.button
-      ~enabled
-      ~on_press:(on_action command)
-      ~child:(V.label ~title:(V.text title) ~icon:(V.symbol ~name:symbol ()) ())
-      ()
-    |> V.with_test_id (Ui.Test_id.string id)
-  in
-  let rows detail =
-    List.map
-      (function
-        | Journal_detail.More { parent_id; loading; enabled; error; _ } ->
-          if loading
-          then V.loading ~message:"Loading children" ()
-          else
-            V.column
-              (Option.to_list (Option.map live_region_text error)
-               @ [ button
-                     ~enabled
-                     ~id:("detail-more:" ^ parent_id)
-                     ~command:(Detail_more parent_id)
-                     ~symbol:
-                       (if Option.is_some error then "arrow.clockwise" else "ellipsis")
-                     (if Option.is_some error
-                      then "Retry loading children"
-                      else "Load more")
-                 ]
-               @ if enabled
-                 then []
-                 else [ V.text "Waiting for another branch to finish" ])
-        | Block { block; depth; _ } ->
-          let source = Journal_model.source block in
-          let id = "detail-block:" ^ Journal_model.id block in
-          let module Graph = Logseq_db_types.Graph_types in
-          let created_from block =
-            List.find_map (fun (p : Graph.property_summary) ->
-              if p.ident = "logseq.property/created-from-property" then
-                   List.find_map
-                     (function
-                       | Graph.Entity_value uuid -> Some uuid
-                       | _ -> None)
-                     p.values
-              else None) (Journal_model.properties block)
-          in
-          let value_id = function
-            | Graph.Default_value id when Journal_validation.is_uuid id -> Some id
-            | Node_value uuid | Entity_value uuid | Asset_value uuid
-            | Any_value (Internal_uuid uuid) -> Some (Graph.Uuid.to_string uuid)
-            | _ -> None
-          in
-          let property_parent_id block =
-            match Journal_model.parent_id block with
-            | Some _ as parent -> parent
-            | None when Journal_model.id block <> Journal_model.page_id block ->
-              Some (Journal_model.page_id block)
-            | None -> None
-          in
-          let owned_value property_uuid value =
-            Option.fold ~none:false ~some:(fun id ->
-              match Journal_detail.find_block detail ~block_id:id with
-              | Some child -> property_parent_id child = Some (Journal_model.id block)
-                && Journal_model.page_id child = Journal_model.page_id block
-                && Option.fold ~none:false ~some:(Graph.Uuid.equal property_uuid) (created_from child)
-              | None -> false) (value_id value)
-          in
-          let named_sources =
-            Journal_model.display_properties block
-            |> List.map (fun (p : Graph.property_summary) ->
-              { p with values = List.filter (fun value -> not (owned_value p.uuid value)) p.values })
-            |> Journal_model.property_sources
-          in
-          let property_name =
-            Option.bind (created_from block) (fun property_uuid ->
-              Option.bind (property_parent_id block) (fun parent_id ->
-                Option.bind (Journal_detail.find_block detail ~block_id:parent_id) (fun parent ->
-                  List.find_map (fun (p : Graph.property_summary) ->
-                    if Graph.Uuid.equal p.uuid property_uuid
-                      && List.exists (fun value -> value_id value = Some (Journal_model.id block)) p.values
-                    then Some p.title else None) (Journal_model.properties parent))))
-          in
-          let property_value = Option.is_some (created_from block) in
-          let field ~key name value =
-            V.column ~spacing:4. ~alignment:Leading
-              [ V.of_lui (Lui_elements.text ~value:name ~style_class:"caption" ~foreground:"secondary" [])
-              ; Journal_header.detail_text ~title:(render_title state value)
-                  ~id:key ~depth:2 value ]
-          in
-          let text =
-            if property_value then field ~key:id (Option.value property_name ~default:"Property") source
-            else Journal_header.detail_text ~title:(render_title state source)
-              ~id ~depth source
-          in
-          let fields = List.map (fun (name, value) ->
-            field ~key:("detail-property:" ^ Journal_model.id block ^ ":" ^ name) name value) named_sources in
-          V.column ~spacing:8. ~alignment:Leading
-            ((text :: Journal_row.metadata ~status_name:(task_status_name state) block)
-             @ fields)
-          |> V.with_test_id (Ui.Test_id.string id)
-          |> media_label
-               ~store:media_store
-               ~on_region
-               ~detail:true
-               ~known_images:(Option.fold ~none:[]
-                 ~some:(fun file_type -> [Journal_model.id block, file_type])
-                 (Journal_model.asset_file_type block))
-               state
-               dispatch
-               ~title:(Journal_model.source block)
-               ~root:(Journal_model.id block)
-          |> Journal_header.detail_row ~depth)
-      (Journal_detail.rows detail)
-  in
-  let content =
+  let media_scope = media_presentation_scope state ~detail:true in
+  let sources = state.reference_sources in
+  let statuses = state.task_status_definitions in
+  let content : Journal_detail_view.content =
     match detail with
-    | Some detail ->
-      Detail_list.view
-        ~key:(Ui.Key.string scope)
-        ~detail
-        ~enabled:(enabled && not saving)
-        ~on_action:local
-        ~on_scroll_completed
-        ~on_visible_range:
-          (Ui.Event.Handler.create (function
-             | Ui.Event.Payload.Visible_range range ->
-               local.send (Detail_visible_range (range.first_index, range.last_exclusive));
-               dispatch.send
-                 (Media_range
-                    ( media_presentation_scope state ~detail:true
-                    , range.first_index
-                    , range.last_exclusive ))
-             | _ -> ()))
-        ~children:(rows detail)
+    | Some detail -> Ready detail
     | None ->
       (match Journal_routes.route state.routes with
-       | Detail_loading ->
-         if Journal_routes.loading_indicator state.routes
-         then V.loading ~centered:true ~message:"Loading block" ()
-         else V.column []
-       | Missing_detail ->
-         Presentation.unavailable
-           ~title:"Block unavailable"
-           ~symbol:"doc"
-           ~message:"This block may have been deleted or moved."
-           ~actions:(V.empty ())
-       | Failed_detail message ->
-         Presentation.unavailable
-           ~title:"Unable to open block"
-           ~symbol:"exclamationmark.triangle"
-           ~message
-           ~actions:
-             (button
-                ~id:"detail-retry"
-                ~command:Detail_retry
-                ~symbol:"arrow.clockwise"
-                "Retry")
-       | Detail | Timeline -> V.empty ())
-      |> V.Body.static
+       | Detail_loading -> Loading (Journal_routes.loading_indicator state.routes)
+       | Missing_detail -> Missing
+       | Failed_detail message -> Failed message
+       | Detail | Timeline -> Empty)
   in
-  let actions_enabled = enabled && Option.is_some detail && not saving in
-  content
-  |> Journal_header.detail
-       ~capture_enabled:actions_enabled
-       ~on_capture:(on_action Open_append)
-       ~copy_enabled:(state.graph_ready && Option.is_some detail)
-       ~on_copy:(on_action (Copy_block
-         (Option.fold ~none:"" ~some:(fun d -> Journal_model.id (Journal_detail.root d)) detail)))
-       ~copy_feedback:(Option.bind state.detail_copy_feedback (fun feedback ->
-         if feedback.copy_scope <> scope then None else Some
-           (match feedback.copy_phase with
-            | Copying -> "Copying block and descendants…"
-            | Copied -> "Copied block and descendants"
-            | Copy_failed_detail message -> "Copy failed: " ^ message)))
-  |> Journal_asset_import.view
-       ~key:(Ui.Key.string (scope ^ "import"))
-       ~enabled:actions_enabled
-       ~completion:state.import_completion
-       ~request:
-         (Journal_asset_import.file_request
-            ~id:
-              (if
-                 state.asset_import_owner
-                 = Option.map
-                     (fun id -> id, Journal_routes.detail_request_generation state.routes)
-                     (Journal_routes.active_entry_id state.routes)
-               then state.asset_import_request
-               else 0))
-       ~pending:[]
-       ~on_select:(fun payload -> local.send (Import_asset payload))
-  |> V.Body.static
-  |> V.Body.with_test_id (Ui.Test_id.string "journal-detail-route")
+  let props : Journal_detail_view.props =
+    { content; scope
+    ; enabled = state.write_enabled && state.pending_delete = None && state.pending_status = None
+    ; copy_enabled = state.graph_ready && Option.is_some detail
+    ; copy_feedback = Option.bind state.detail_copy_feedback (fun feedback ->
+        if feedback.copy_scope <> scope then None else Some
+          (match feedback.copy_phase with
+           | Copying -> "Copying block and descendants…"
+           | Copied -> "Copied block and descendants"
+           | Copy_failed_detail message -> "Copy failed: " ^ message))
+    ; import_request = Journal_asset_import.file_request
+        ~id:(if state.asset_import_owner
+          = Option.map (fun id -> id, Journal_routes.detail_request_generation state.routes)
+              (Journal_routes.active_entry_id state.routes)
+          then state.asset_import_request else 0)
+    ; import_completion = state.import_completion
+    ; render_title = Journal_model.Title.render
+        ~lookup:(fun id -> Reference_sources.find_opt id sources)
+    ; status_name = Journal_status_view.status_name
+        ~lookup:(fun id -> Reference_sources.find_opt id statuses)
+    }
+  in
+  let local command = dispatch.send (Detail_action (scope, command)) in
+  Journal_detail_view.view props
+    ~render_media:(fun ~known_images ~title ~root child ->
+      Journal_media_view.view ~store:media_store ~on_region ~scope:media_scope
+        ~known_images ~title ~root
+        ~on_event:(fun event -> dispatch.send (Media (media_scope, event))) child)
+    ~on_scroll_completed
+    ~on_action:(function
+      | Append -> local Open_append
+      | Open_block id -> local (Detail_open id)
+      | Delete_block id -> local (Detail_delete id)
+      | Copy_block id -> local (Copy_block id)
+      | Load_more id -> local (Detail_more id)
+      | Retry -> local Detail_retry
+      | Visible_range (first, last) ->
+        local (Detail_visible_range (first, last));
+        dispatch.send (Media_range (media_scope, first, last))
+      | Import_asset payload -> local (Import_asset payload))
 ;;
 
 let manager_page ?picker_signal state dispatch =

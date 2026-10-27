@@ -1295,7 +1295,7 @@ let () =
     ; "V.Sheet.create"
     ; "Journal_composer_view.content"
     ; "if favorites_selected"
-    ; "Detail_list.view"
+    ; "Journal_detail_view.view"
     ; "Journal_header.startup"
     ];
   require_text
@@ -1384,6 +1384,7 @@ let () =
     "app/application.ml"
     [ "Ui.Theme.create"; "~mode:System"; "Journal_composer_view.content" ];
   require_text root "app/journal_composer_view.ml" [ "V.composer" ];
+  require_text root "app/journal_detail_view.ml" [ "Detail_list.view"; "journal-detail-route" ];
   forbid_text root "app/journal_header.ml" [ "V.divider" ];
   forbid_text
     root
@@ -1566,7 +1567,7 @@ let () =
     ; "V.Sheet.create"
     ; "V.button"
     ; "local-cache-reset-confirmation"
-    ; "journal-detail-route"
+    ; "Journal_detail_view.view"
     ];
   forbid_text
     root

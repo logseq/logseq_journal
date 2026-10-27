@@ -7,6 +7,7 @@
   journal_diagnostics_view
   journal_status_view
   journal_composer_view
+  journal_detail_view
   journal_page_layout
   journal_bridge
   journal_environment
