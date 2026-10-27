@@ -1293,7 +1293,7 @@ let () =
     ; "arrow.clockwise"
     ; "V.Navigation_stack.create"
     ; "V.Sheet.create"
-    ; "V.composer"
+    ; "Journal_composer_view.content"
     ; "if favorites_selected"
     ; "Detail_list.view"
     ; "Journal_header.startup"
@@ -1382,7 +1382,8 @@ let () =
   require_text
     root
     "app/application.ml"
-    [ "Ui.Theme.create"; "~mode:System"; "V.composer" ];
+    [ "Ui.Theme.create"; "~mode:System"; "Journal_composer_view.content" ];
+  require_text root "app/journal_composer_view.ml" [ "V.composer" ];
   forbid_text root "app/journal_header.ml" [ "V.divider" ];
   forbid_text
     root
