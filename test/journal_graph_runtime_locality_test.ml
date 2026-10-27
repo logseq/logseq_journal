@@ -7691,6 +7691,107 @@ let test_later_thirty_crosses_dates () =
   Alcotest.(check int) "continuations do not repeat roots" 60 (List.length (List.sort_uniq String.compare all))
 ;;
 
+let test_date_cursor_recovery_is_bounded_and_owned () =
+  (* Worker failures exercise recovery, not storage cursor invalidation. *)
+  List.iter
+    (fun ending ->
+       let runtime = Production_runtime.create ~localtime:Unix.gmtime () in
+       set_calendar runtime;
+       let first = normal_journal_fixture 29 1 0 in
+       let older = normal_journal_fixture 30 1 0 in
+       let listing =
+         Production_runtime.submit runtime (Journal_graph_request.Load_feed
+             { cursor = None; root_limit = 3; day_limit = 1; request_generation = 77L })
+         |> fun output -> only "initial date catalog" output.requests
+       in
+       let complete_date listing fixture next_cursor expected_limit =
+         let journal_day =
+           match fixture.owner.kind with
+           | Journal_page { journal_day } -> journal_day
+           | _ -> assert false
+         in
+         let tree =
+           Production_runtime.receive runtime (response listing (V2_journals_outcome
+               { items = [ { page = fixture.owner; journal_day; revision = "page-1" } ]
+               ; next_cursor }))
+           |> fun output -> only "date root read" output.requests
+         in
+         (match tree.command with
+          | V2_get_page_tree { limit; _ } ->
+            Alcotest.(check int) "retains remaining root quota" expected_limit limit
+          | _ -> Alcotest.fail "expected root query");
+         let root = only "fixture root" fixture.roots in
+         let preview =
+           Production_runtime.receive runtime (response tree (V2_page_tree_outcome
+               { page = fixture.owner.uuid; maximum_depth = 0
+               ; items = [ { value = root; revision = "root-1"; depth = 0
+                           ; parent = fixture.owner.uuid } ]
+               ; next_cursor = None }))
+           |> fun output -> only "root preview" output.requests
+         in
+         Production_runtime.receive runtime (response preview (V2_children_outcome
+             { parent = root.block.uuid
+             ; revision_scope = V2_children_revision root.block.uuid
+             ; scope_revision = "children-1"; items = []; next_cursor = None }))
+       in
+       let stale request =
+         Production_runtime.receive runtime (response request (V2_failed
+             { code = "staleReadCursor"; message = "The read continuation is no longer current." }))
+       in
+       let recover request through_day =
+         let output = stale request in
+         Alcotest.(check int) "recoverable stale read is not published" 0
+           (List.length output.responses);
+         let retry = only "bounded date recovery" output.requests in
+         (match retry.command with
+          | V2_list_journals { cursor; through_day = actual; limit; _ } ->
+            Alcotest.(check bool) "discard obsolete worker cursor" true (cursor = None);
+            Alcotest.(check int) "resume strictly after consumed dates" through_day actual;
+            Alcotest.(check int) "retain bounded metadata packet" 1 limit
+          | _ -> Alcotest.fail "expected date recovery");
+         let duplicate = stale request in
+         Alcotest.(check int) "duplicate failure cannot retry" 0
+           (List.length duplicate.requests + List.length duplicate.responses);
+         retry
+       in
+       let output = complete_date listing first (Some (root_cursor 1)) 3 in
+       let retry = recover (only "first date continuation" output.requests) 20260831 in
+       let output = complete_date retry older (Some (root_cursor 2)) 2 in
+       let retry = recover (only "second date continuation" output.requests) 20260830 in
+       match ending with
+       | `Complete ->
+         let output = Production_runtime.receive runtime
+             (response retry (V2_journals_outcome { items = []; next_cursor = None })) in
+         (match (only "recovered feed completion" output.responses).payload with
+          | Feed_loaded { request_generation = 77L; feed; complete = true } ->
+            Alcotest.(check (list string)) "preserve prefix without duplicate roots"
+              (List.map (fun f -> Graph.Uuid.to_string (only "fixture root" f.roots).block.uuid)
+                 [ first; older ])
+              (List.concat_map (fun (day : Journal_graph_projection.day_feed) ->
+                   List.map (fun (entry : Journal_graph_projection.timeline_entry) ->
+                       Journal_model.id entry.block) day.entries) feed.days)
+          | _ -> Alcotest.fail "date recovery lost feed ownership")
+       | `Exhaust ->
+         let output = Production_runtime.receive runtime
+             (response retry (V2_journals_outcome
+                 { items = []; next_cursor = Some (root_cursor 3) })) in
+         let output = stale (only "third date continuation" output.requests) in
+         Alcotest.(check int) "finite recovery budget" 0 (List.length output.requests);
+         (match (only "terminal stale cursor failure" output.responses).payload with
+          | Feed_failed { request_generation = 77L; failure = Worker_failure failure } ->
+            Alcotest.(check string) "terminal operation retained" "listTimelineDates"
+              failure.operation
+          | _ -> Alcotest.fail "retry exhaustion lost failure ownership")
+       | `Supersede ->
+         ignore (Production_runtime.submit runtime (Journal_graph_request.Load_feed
+             { cursor = None; root_limit = 3; day_limit = 1; request_generation = 78L }));
+         let output = Production_runtime.receive runtime
+             (response retry (V2_journals_outcome { items = []; next_cursor = None })) in
+         Alcotest.(check int) "superseded recovery cannot publish or continue" 0
+           (List.length output.requests + List.length output.responses))
+    [ `Complete; `Exhaust; `Supersede ]
+;;
+
 let test_later_date_cursor_no_progress_settles () =
   let runtime=Production_runtime.create ~localtime:Unix.gmtime () in
   set_calendar runtime;
@@ -8384,6 +8485,7 @@ let () =
         Alcotest.test_case "restart retains loaded suffix through insertion" `Quick test_initial_refresh_after_restarting_prefix;
         Alcotest.test_case "superseded continuation settles" `Quick test_initial_later_read_superseded;
         Alcotest.test_case "later batch fills across dates" `Quick test_later_thirty_crosses_dates;
+        Alcotest.test_case "date cursor recovery is bounded and owned" `Quick test_date_cursor_recovery_is_bounded_and_owned;
         Alcotest.test_case "later date cursor failure settles" `Quick test_later_date_cursor_no_progress_settles;
         Alcotest.test_case "resync prefix cannot cancel retained tree" `Quick
           (test_prefix_preserves_reconciliation ~resync:true `Root);

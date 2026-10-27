@@ -13,7 +13,7 @@ type feed_scan =
   { root_session : int64
   ; root_generation : int64
   ; root_start_day : int option
-  ; root_before_day : int option
+  ; mutable root_before_day : int option
   ; root_skipped_day : int option
   ; mutable root_date_boundary : int option
   ; mutable root_priority_pending : bool
@@ -25,6 +25,8 @@ type feed_scan =
   ; mutable root_days : day_feed Rrbvec.t
   ; mutable root_queued : Projection.page Rrbvec.t
   ; mutable root_journal_cursor : Graph.Cursor.t option
+  ; mutable root_journal_boundary : int option
+  ; mutable root_date_retries : int
   ; mutable root_journals_done : bool
   }
 
@@ -735,6 +737,8 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
       ; root_days = Rrbvec.empty
       ; root_queued = Rrbvec.empty
       ; root_journal_cursor = None
+      ; root_journal_boundary = before_day
+      ; root_date_retries = 0
       ; root_journals_done = after <> None && cursor = None
       }
     in
@@ -777,6 +781,8 @@ let handles operation outcome = match operation,outcome with
   | Root_tree _, Protocol.V2_page_tree_outcome _
   | Root_preview _, Protocol.V2_children_outcome _ -> true
   | Root_dates scan, Protocol.V2_failed {code="responseTooLarge";_} -> scan.root_list_size > 1
+  | Root_dates scan, Protocol.V2_failed {code="staleReadCursor";_} ->
+    Option.is_some scan.root_journal_cursor && scan.root_date_retries < 2
   | Root_tree batch, Protocol.V2_failed {code="responseTooLarge";_} -> batch.root_limit > 1
   | Root_preview preview, Protocol.V2_failed {code="responseTooLarge";_} -> preview.preview_limit > 1
   | _ -> false
@@ -803,6 +809,12 @@ let receive t ~ports operation outcome =
                 pages
           in
           scan.root_queued <- pages;
+          (* Catalog progress includes Today, even when the feed continuation skips it. *)
+          scan.root_journal_boundary <-
+            Rrbvec.fold_left
+              (fun boundary (item : Protocol.v2_journal_item) ->
+                 Some (Option.fold ~none:item.journal_day ~some:(min item.journal_day) boundary))
+              scan.root_journal_boundary items;
           scan.root_journal_cursor <- next_cursor;
           scan.root_journals_done <- next_cursor = None;
           if scan.root_priority_pending
@@ -844,6 +856,12 @@ let receive t ~ports operation outcome =
      | Root_preview preview, V2_children_outcome {parent;scope_revision;items;next_cursor;_} ->
        ports.observe_packet (Preview (List.to_seq items));
        receive_root_preview t ~ports preview parent scope_revision items next_cursor
+     | Root_dates scan, V2_failed {code="staleReadCursor";_} ->
+       if not (root_owner_current t (Feed_roots scan)) then empty else (
+         scan.root_date_retries <- scan.root_date_retries + 1;
+         scan.root_before_day <- scan.root_journal_boundary;
+         scan.root_journal_cursor <- None;
+         requests [read_root_dates ~ports scan])
      | Root_dates scan, V2_failed {code="responseTooLarge";_} when scan.root_list_size>1 ->
        scan.root_list_size <- max 1 (scan.root_list_size/2);requests [read_root_dates ~ports scan]
      | Root_tree batch, V2_failed {code="responseTooLarge";_} when batch.root_limit>1 ->
