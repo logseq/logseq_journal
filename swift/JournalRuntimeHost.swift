@@ -202,16 +202,16 @@ struct JournalHost: View {
             .accessibilityIdentifier("journal-storage-retry")
         }
       case .success(let setup):
-        JournalRuntimeHost(platform: platform, payload: setup.payload, extensions: setup.extensions)
-          .font(.body)
-          .safeAreaInset(edge: .top, spacing: 0) {
-            if platform.authenticationRequired || platform.accountIssue != nil {
-              JournalAccountRecoveryView(issue: platform.accountIssue,
-                signInAvailable: platform.authenticationRequired || platform.accountIssue?.offersSignIn == true,
-                signIn: { signInStartsImmediately = true; signInPresented = true },
-                retry: platform.accountIssue?.stage == .bindingRead ? nil : { platform.retryOnline() })
-            }
+        VStack(spacing: 0) {
+          if platform.authenticationRequired || platform.accountIssue != nil {
+            JournalAccountRecoveryView(issue: platform.accountIssue,
+              signInAvailable: platform.authenticationRequired || platform.accountIssue?.offersSignIn == true,
+              signIn: { signInStartsImmediately = true; signInPresented = true },
+              retry: platform.accountIssue?.stage == .bindingRead ? nil : { platform.retryOnline() })
           }
+          JournalRuntimeHost(platform: platform, payload: setup.payload, extensions: setup.extensions)
+            .font(.body)
+        }
       }
     }
     .environment(\.journalStartupClock, clock)
