@@ -260,8 +260,141 @@ let test_account_fields_are_required () =
     (String.concat "; " malformed)
 ;;
 
+type requests_fixture =
+  { owner : Journal_platform_requests.t
+  ; queue : (unit -> unit) Queue.t
+  ; scope : Logseq_db_worker_lui.Logseq_db_worker_lui_service.startup_scope ref
+  ; running : bool ref
+  ; emitted : bytes list ref
+  ; responses : (int * Journal_platform_requests.response) list ref
+  ; decoded : string list ref
+  ; emit_hook : (bytes -> unit) ref
+  }
+
+let requests_fixture () =
+  let queue = Queue.create () in
+  let scope : Logseq_db_worker_lui.Logseq_db_worker_lui_service.startup_scope ref =
+    ref ({account_generation=1;presentation_generation=2} : Journal_platform_requests.scope) in
+  let running = ref true and emitted = ref [] and responses = ref [] and decoded = ref [] in
+  let emit_hook = ref (fun _ -> ()) in
+  let owner = Journal_platform_requests.create
+    ~emit:(fun bytes -> emitted := !emitted @ [bytes]; !emit_hook bytes)
+    ~enqueue:(fun work -> Queue.add work queue)
+    ~is_running:(fun () -> !running) ~current_scope:(fun () -> !scope)
+    ~send_response:(fun tag result -> responses := !responses @ [tag,result])
+    ~decode_failure:(fun reason -> decoded := !decoded @ [reason]) in
+  {owner;queue;scope;running;emitted;responses;decoded;emit_hook}
+;;
+
+let drain_requests fixture =
+  let rec loop () = match Queue.take_opt fixture.queue with
+    | None -> () | Some work -> work ();loop () in
+  loop ()
+;;
+
+let request_packet tag =
+  let packet = Bytes.make 8 '\000' in
+  Bytes.set_uint16_le packet 6 tag;packet
+;;
+
+let test_platform_requests_lifecycle () =
+  let module R = Journal_platform_requests in
+  let failures = ref [] in
+  let check name f = try f () with error ->
+    Printf.eprintf "PLATFORM_OWNER_RED %s: %s\n%!" name (Printexc.to_string error);
+    failures := name :: !failures in
+  check "response tag mapping and registration before host emit" (fun () ->
+    List.iter (fun (request_tag,response_tag) ->
+      let f = requests_fixture () in
+      let delivered = ref false in
+      f.emit_hook := (fun _ -> require
+        (R.resolve f.owner ~response_tag (Ok Bytes.empty)) "host observed unregistered continuation");
+      R.emit f.owner ~on_result:(fun _ -> delivered := true) (request_packet request_tag);
+      require !delivered "tag mapping did not deliver")
+      [6,7;8,9;10,11;13,14;20,21;22,23;25,26;28,29;30,31;32,33;77,77]);
+  check "short packet still emits without registering" (fun () ->
+    let f = requests_fixture () in
+    R.emit f.owner ~on_result:(fun _ -> fail "short packet registered") (Bytes.of_string "tiny");
+    require (List.length !(f.emitted)=1) "short packet was not emitted";
+    require (not (R.resolve f.owner ~response_tag:7 (Ok Bytes.empty))) "short packet acquired owner");
+  check "same tag replaces previous continuation" (fun () ->
+    let f = requests_fixture () in let seen = ref [] in
+    R.emit f.owner ~on_result:(fun _ -> seen := !seen @ [1]) (request_packet 6);
+    R.emit f.owner ~on_result:(fun _ -> seen := !seen @ [2]) (request_packet 6);
+    require (R.resolve f.owner ~response_tag:7 (Ok Bytes.empty)) "replacement missing";
+    require (!seen=[2]) "old continuation ran");
+  check "remove before callback preserves callback re-emission" (fun () ->
+    let f = requests_fixture () in let seen = ref [] in
+    R.emit f.owner ~on_result:(fun _ ->
+      seen := !seen @ [1];
+      R.emit f.owner ~on_result:(fun _ -> seen := !seen @ [2]) (request_packet 6)) (request_packet 6);
+    require (R.resolve f.owner ~response_tag:7 (Ok Bytes.empty)) "first callback missing";
+    require (R.resolve f.owner ~response_tag:7 (Ok Bytes.empty)) "new callback was removed";
+    require (!seen=[1;2]) "callback order changed";
+    require (not (R.resolve f.owner ~response_tag:7 (Ok Bytes.empty))) "completed callback retained");
+  check "legacy failure queues response rather than calling continuation" (fun () ->
+    let f = requests_fixture () in let calls = ref 0 in
+    R.emit f.owner ~on_result:(fun _ -> incr calls) (request_packet 6);
+    R.fail f.owner ~request_tag:6 ~reason:"native.platform.cancelled" ~supplied_scope:None;
+    require (Queue.length f.queue=1 && !calls=0) "failure bypassed pump";
+    drain_requests f;
+    require (!(f.responses)=[7,Error "native.platform.cancelled"] && !calls=0)
+      "failure did not dispatch original completion";
+    require (R.resolve f.owner ~response_tag:7 (Error "native.platform.cancelled") && !calls=1)
+      "queued response did not resolve owner");
+  check "queued failure cannot resolve replacement callback" (fun () ->
+    let f = requests_fixture () in
+    let old_calls = ref 0 and new_calls = ref 0 in
+    R.emit f.owner ~on_result:(fun _ -> incr old_calls) (request_packet 6);
+    R.fail f.owner ~request_tag:6 ~reason:"old" ~supplied_scope:None;
+    require (Queue.length f.queue=1) "failure was not queued";
+    R.emit f.owner ~on_result:(fun _ -> incr new_calls) (request_packet 6);
+    drain_requests f;
+    require (!(f.responses)=[]) "old failure acquired replacement owner");
+  check "scope changes while queued retire failure" (fun () ->
+    let f = requests_fixture () in
+    R.emit f.owner ~on_result:(fun _ -> ()) (request_packet 6);
+    R.fail f.owner ~request_tag:6 ~reason:"old" ~supplied_scope:(Some (1L,2L));
+    require (Queue.length f.queue=1) "matching failure was not queued";
+    f.scope := {!(f.scope) with presentation_generation=3};drain_requests f;
+    require (!(f.responses)=[]) "retired scope received failure");
+  check "supplied scope mismatch never queues" (fun () ->
+    let f = requests_fixture () in
+    R.emit f.owner ~on_result:(fun _ -> ()) (request_packet 6);
+    R.fail f.owner ~request_tag:6 ~reason:"wrong" ~supplied_scope:(Some (9L,2L));
+    require (Queue.length f.queue=0) "wrong host scope queued work");
+  check "stopped app ignores already queued failure" (fun () ->
+    let f = requests_fixture () in
+    R.emit f.owner ~on_result:(fun _ -> ()) (request_packet 6);
+    R.fail f.owner ~request_tag:6 ~reason:"old" ~supplied_scope:None;
+    require (Queue.length f.queue=1) "failure not queued";
+    f.running := false;drain_requests f;
+    require (!(f.responses)=[]) "stopped app received completion");
+  check "tag zero decode failure preserves special dispatch" (fun () ->
+    let f = requests_fixture () in
+    R.fail f.owner ~request_tag:0 ~reason:"malformed" ~supplied_scope:None;
+    require (Queue.length f.queue=1) "decode failure not queued";
+    drain_requests f;
+    require (!(f.decoded)=["malformed"] && !(f.responses)=[]) "decode failure acquired continuation");
+  check "successful response keeps existing unfenced behavior" (fun () ->
+    let f = requests_fixture () in let delivered = ref false in
+    R.emit f.owner ~on_result:(fun _ -> delivered:=true) (request_packet 6);
+    f.scope := {!(f.scope) with account_generation=9};
+    require (R.resolve f.owner ~response_tag:7 (Ok Bytes.empty) && !delivered)
+      "successful response gained a new scope fence");
+  check "callback exception cannot retain old registration" (fun () ->
+    let f = requests_fixture () in let expected = Failure "callback sentinel" in
+    R.emit f.owner ~on_result:(fun _ -> raise expected) (request_packet 6);
+    let caught = try ignore(R.resolve f.owner ~response_tag:7 (Ok Bytes.empty));false
+      with actual when actual==expected -> true in
+    require caught "callback exception changed";
+    require (not(R.resolve f.owner ~response_tag:7 (Ok Bytes.empty))) "throwing callback retained");
+  require (!failures=[]) "%d platform owner cases failed" (List.length !failures)
+;;
+
 let tests =
-  [ "scoped authenticated identity", test_scoped_authentication_preserves_identity
+  [ "platform continuation lifecycle", test_platform_requests_lifecycle
+  ; "scoped authenticated identity", test_scoped_authentication_preserves_identity
   ; "required account fields", test_account_fields_are_required
   ; "generated native decoders", test_generated_native_decoders_reject_untyped_payloads
   ; "generated environment roundtrip", test_generated_environment_roundtrip

@@ -3022,20 +3022,6 @@ let timeline_scope state : Graph_service.timeline_scope option =
     ({startup=startup_scope state;graph_id;graph_generation=m.startup.graph_generation} : Graph_service.timeline_scope)) m.selected_graph)
 ;;
 
-let response_tag = function
-  | 6 -> 7
-  | 8 -> 9
-  | 10 -> 11
-  | 13 -> 14
-  | 20 -> 21
-  | 22 -> 23
-  | 25 -> 26
-  | 28 -> 29
-  | 30 -> 31
-  | 32 -> 33
-  | tag -> tag
-;;
-
 type graph_worker_lease =
   { protocol_request : Logseq_db_worker.Protocol.request
   ; mutable retired : bool
@@ -3091,20 +3077,22 @@ let start
      [platform_response] hook, or reports a failed request through
      [platform_failure]; both resolve the continuation registered under the
      matching response tag. *)
-  let pending_platform : (int, (bytes, string) result -> unit) Hashtbl.t =
-    Hashtbl.create 8
-  in
-  let emit_platform_request ?k request =
-    (match k, Bytes.length request >= 8 with
-     | Some k, true ->
-       let tag = Bytes.get_uint16_le request 6 in
-       Hashtbl.replace pending_platform (response_tag tag) k
-     | Some _, false | None, _ -> ());
-    on_platform_request request;
-    Journal_bridge.platform_request (Bytes.to_string request)
+  let platform_requests =
+    Journal_platform_requests.create
+      ~emit:(fun request ->
+        on_platform_request request;
+        Journal_bridge.platform_request (Bytes.to_string request))
+      ~enqueue:(Journal_pump.enqueue pump)
+      ~is_running:(fun () -> !running)
+      ~current_scope:(fun () -> startup_scope !state_ref)
+      ~send_response:(fun tag result -> send_action (Platform_response (tag,result)))
+      ~decode_failure:(fun reason -> send_action (Update (fun state ->
+        report_ui_error state ~operation:"decodePlatformRequest" ~phase:"native"
+          ~message:(Journal_bridge.platform_failure_message reason),Effect.ignore)))
   in
   let platform_request request ~f : unit Effect.t =
-    fun () -> emit_platform_request ~k:(fun result -> Effect.run (f result)) request
+    fun () -> Journal_platform_requests.emit platform_requests
+      ~on_result:(fun result -> Effect.run (f result)) request
   in
   let copy_state = ref Journal_copy.initial in
   let copy_owner = ref None in
@@ -5862,12 +5850,7 @@ let start
       state_ref := model;
       model
     | Platform_response (tag, result) ->
-      let current = Hashtbl.mem pending_platform tag in
-      (match Hashtbl.find_opt pending_platform tag with
-       | Some k ->
-         Hashtbl.remove pending_platform tag;
-         k result
-       | None -> ());
+      let current = Journal_platform_requests.resolve platform_requests ~response_tag:tag result in
       (match result with
        | Error "native.platform.cancelled" when current -> model
        | Error reason when current -> report_ui_error model ~operation:"platformRequest" ~phase:"native"
@@ -6634,22 +6617,7 @@ let start
     Hashtbl.clear capture_staged_items
   in
   let fail_platform tag reason supplied_scope =
-    let owner_scope = startup_scope !state_ref in
-    let matches_scope () = match supplied_scope with
-      | None -> true (* Validated legacy host envelope. *)
-      | Some(account,presentation) -> account=Int64.of_int owner_scope.account_generation
-          && presentation=Int64.of_int owner_scope.presentation_generation in
-    let response_tag=response_tag tag in
-    let owner=Hashtbl.find_opt pending_platform response_tag in
-    if matches_scope () then Journal_pump.enqueue pump (fun () ->
-      if !running && startup_scope !state_ref=owner_scope then
-        if tag=0 then send_action(Update(fun state ->
-          report_ui_error state ~operation:"decodePlatformRequest" ~phase:"native"
-            ~message:(Journal_bridge.platform_failure_message reason),Effect.ignore))
-        else match owner,Hashtbl.find_opt pending_platform response_tag with
-          | Some expected,Some current when expected==current ->
-            send_action(Platform_response(response_tag,Error reason))
-          | _ -> ())
+    Journal_platform_requests.fail platform_requests ~request_tag:tag ~reason ~supplied_scope
   in
   let context =
     { app; pump; client; send_action; apply_platform; fail_platform; running; release_staging }
