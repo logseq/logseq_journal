@@ -235,6 +235,26 @@ type detail_copy_feedback =
   ; copy_phase : detail_copy_phase
   }
 
+(* The graph owns this catalog; the status sheet owns its independent page. *)
+module Task_catalog = struct
+  type t =
+    { items : Logseq_db_types.Graph_types.task_status_definition Rrbvec.t
+    ; definitions : Logseq_db_types.Graph_types.task_status_definition Reference_sources.t
+    ; default_status : Logseq_db_types.Graph_types.Uuid.t option
+    ; complete : bool
+    ; error : string option
+    }
+
+  let empty : t =
+    { items = Rrbvec.empty
+    ; definitions = Reference_sources.empty
+    ; default_status = None
+    ; complete = false
+    ; error = None
+    }
+  ;;
+end
+
 type state =
   { favorites : Journal_routes.Favorites.t
   ; favorites_media_roots : string Rrbvec.t
@@ -253,13 +273,8 @@ type state =
   ; asset_offline : (Journal_asset_policy.offline * Journal_asset_policy.offline) option
   ; uploads : Journal_uploads.t
   ; asset_settings_open : bool
-  ; task_statuses : Logseq_db_types.Graph_types.task_status_definition Rrbvec.t
-  ; task_status_definitions :
-      Logseq_db_types.Graph_types.task_status_definition Reference_sources.t
-  ; task_default_status : Logseq_db_types.Graph_types.Uuid.t option
+  ; task_catalog : Task_catalog.t
   ; task_status_page : int
-  ; task_statuses_complete : bool
-  ; task_statuses_error : string option
   ; reference_sources : string Reference_sources.t
   ; import_completion : (string * string option) option
   ; asset_import_request : int
@@ -371,12 +386,8 @@ let initial_state =
   ; asset_offline = None
   ; uploads = Journal_uploads.empty
   ; asset_settings_open = false
-  ; task_statuses = Rrbvec.empty
-  ; task_status_definitions = Reference_sources.empty
-  ; task_default_status = None
+  ; task_catalog = Task_catalog.empty
   ; task_status_page = 0
-  ; task_statuses_complete = false
-  ; task_statuses_error = None
   ; reference_sources = Reference_sources.empty
   ; import_completion = None
   ; asset_import_request = 0
@@ -588,12 +599,8 @@ let clear_graph_surface ?(discard_capture = true) state =
   ; routes = Journal_routes.create ()
   ; timeline = Journal_timeline_state.empty ~today:0
   ; feed_loaded = false
-  ; task_statuses = Rrbvec.empty
-  ; task_status_definitions = Reference_sources.empty
-  ; task_default_status = None
+  ; task_catalog = Task_catalog.empty
   ; task_status_page = 0
-  ; task_statuses_complete = false
-  ; task_statuses_error = None
   ; reference_sources = Reference_sources.empty
   ; direct_capture = None
   ; pending_delete = None
@@ -1122,10 +1129,10 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
   | Projection_changes _ | Projection_resync -> state
   | Task_statuses_changed { items; default_status; complete; error } ->
     if
-      Seq.equal ( = ) (Rrbvec.to_seq state.task_statuses) (Rrbvec.to_seq items)
-      && state.task_default_status = default_status
-      && state.task_statuses_complete = complete
-      && state.task_statuses_error = error
+      Seq.equal ( = ) (Rrbvec.to_seq state.task_catalog.items) (Rrbvec.to_seq items)
+      && state.task_catalog.default_status = default_status
+      && state.task_catalog.complete = complete
+      && state.task_catalog.error = error
     then state
     else (
       let names =
@@ -1139,11 +1146,8 @@ let apply_worker_response state (response : Journal_graph_runtime.response) =
           items
       in
       { state with
-        task_statuses = items
-      ; task_status_definitions = names
-      ; task_default_status = default_status
-      ; task_statuses_complete = complete
-      ; task_statuses_error = error
+        task_catalog =
+          { items; definitions = names; default_status; complete; error }
       })
   | Reference_sources_changed updates ->
     let reference_sources =
@@ -1632,12 +1636,8 @@ module Root_navigation = struct
     ; pending_delete = None
     ; pending_status = None
     ; timeline = Journal_timeline_state.empty ~today:0
-    ; task_statuses = Rrbvec.empty
-    ; task_status_definitions = Reference_sources.empty
-    ; task_default_status = None
+    ; task_catalog = Task_catalog.empty
     ; task_status_page = 0
-    ; task_statuses_complete = false
-    ; task_statuses_error = None
     ; reference_sources = Reference_sources.empty
     ; graph_state = { state.graph_state with generation }
     ; graph_ready = false
@@ -1787,7 +1787,7 @@ module Root_navigation = struct
              then capture
              else if selected
              then (
-               match state.task_default_status with
+               match state.task_catalog.default_status with
                | Some uuid ->
                  Journal_capture.with_task_state
                    capture
@@ -1797,7 +1797,7 @@ module Root_navigation = struct
            in
            if
              selected
-             && state.task_default_status = None
+             && state.task_catalog.default_status = None
              && Journal_capture.task_state capture = No_status
            then { state with modal = Status_sheet "capture-draft" }
            else if next == capture
@@ -1921,20 +1921,20 @@ let dismiss_toolbar ~test_id ~command dispatch body =
 
 let task_status_name state =
   Journal_status_view.status_name
-    ~lookup:(fun id -> Reference_sources.find_opt id state.task_status_definitions)
+    ~lookup:(fun id -> Reference_sources.find_opt id state.task_catalog.definitions)
 ;;
 
 let status_sheet_options state =
-  Journal_status_view.options ~catalog:state.task_statuses ~page:state.task_status_page
+  Journal_status_view.options ~catalog:state.task_catalog.items ~page:state.task_status_page
 ;;
 
 let status_sheet_page ~state:snapshot ~tokens ~current ~id dispatch =
   Journal_status_view.view
-    { catalog = snapshot.task_statuses
+    { catalog = snapshot.task_catalog.items
     ; page = snapshot.task_status_page
-    ; error = snapshot.task_statuses_error
-    ; complete = snapshot.task_statuses_complete
-    ; lookup_status = (fun uuid -> Reference_sources.find_opt uuid snapshot.task_status_definitions)
+    ; error = snapshot.task_catalog.error
+    ; complete = snapshot.task_catalog.complete
+    ; lookup_status = (fun uuid -> Reference_sources.find_opt uuid snapshot.task_catalog.definitions)
     ; current; id; tokens
     }
     ~on_action:(function
@@ -2600,7 +2600,7 @@ let detail_page ~media_store ?(on_region = fun _ -> ()) ~state ~on_scroll_comple
   let scope = Detail_outline.scope state.routes in
   let media_scope = media_presentation_scope state ~detail:true in
   let sources = state.reference_sources in
-  let statuses = state.task_status_definitions in
+  let statuses = state.task_catalog.definitions in
   let content : Journal_detail_view.content =
     match detail with
     | Some detail -> Ready detail
@@ -4795,7 +4795,7 @@ let start
               then detail
               else if selecting
               then (
-                match state.task_default_status with
+                match state.task_catalog.default_status with
                 | Some uuid ->
                   Journal_detail.set_child_task
                     detail
@@ -4807,7 +4807,7 @@ let start
             { state with
               routes = Journal_routes.update_detail state.routes detail
             ; modal =
-                (if selecting && state.task_default_status = None
+                (if selecting && state.task_catalog.default_status = None
                  then Status_sheet "append-draft"
                  else state.modal)
             })
@@ -5877,7 +5877,7 @@ let start
       && Journal_routes.destination left.routes = Journal_routes.destination right.routes
       && same_actions left right
       && left.reference_sources == right.reference_sources
-      && left.task_status_definitions == right.task_status_definitions
+      && left.task_catalog.definitions == right.task_catalog.definitions
       && left.feed_loaded = right.feed_loaded
       && left.graph_error == right.graph_error
       && (Option.is_none left.graph_error
@@ -5906,7 +5906,7 @@ let start
          (Journal_routes.detail right.routes)
     && same_actions left right
     && left.reference_sources == right.reference_sources
-    && left.task_status_definitions == right.task_status_definitions
+    && left.task_catalog.definitions == right.task_catalog.definitions
     && left.import_completion = right.import_completion
     && left.asset_import_request = right.asset_import_request
     && left.asset_import_owner = right.asset_import_owner
