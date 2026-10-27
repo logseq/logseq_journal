@@ -4124,7 +4124,7 @@ let start
   let platform_request request ~f : unit Effect.t =
     fun () -> emit_platform_request ~k:(fun result -> Effect.run (f result)) request
   in
-  let copy_state = ref Journal_graph_runtime.Copy.initial in
+  let copy_state = ref Journal_copy.initial in
   let copy_owner = ref None in
   let copy_sequence = ref 0L in
   let copy_worker_requests = Hashtbl.create 2 in
@@ -4197,7 +4197,7 @@ let start
     Hashtbl.clear admitted_protocol_ids
   in
   let cancel_copy () =
-    let state, _ = Journal_graph_runtime.Copy.step !copy_state Cancel in
+    let state, _ = Journal_copy.step !copy_state Cancel in
     copy_state := state;
     copy_owner := None;
     set_state (fun state -> { state with detail_copy_feedback = None }) ();
@@ -4231,11 +4231,11 @@ let start
       cancel_copy ();
       Effect.ignore)
     else (
-      let state, actions = Journal_graph_runtime.Copy.step !copy_state event in
+      let state, actions = Journal_copy.step !copy_state event in
       copy_state := state;
       Effect.many (List.map (copy_action owner) actions))
   and copy_action owner = function
-    | Journal_graph_runtime.Copy.Failed message -> copy_error owner message
+    | Journal_copy.Failed message -> copy_error owner message
     | Copied text ->
       (match Journal_platform.copy_text_request ~text with
        | Error message -> copy_error owner message
@@ -4920,7 +4920,7 @@ let start
           then
             observe_projection_response (Logseq_db_worker.Protocol.V2_response response)
           else forget_projection_request protocol_id;
-          Journal_graph_runtime.Copy.Completed (ticket, response.outcome)
+          Journal_copy.Completed (ticket, response.outcome)
         | _ ->
           forget_projection_request protocol_id;
           Read_failed (ticket, "The copy request was cancelled or failed.")

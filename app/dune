@@ -17,6 +17,7 @@
   journal_asset_policy
   journal_calendar
   journal_capture
+  journal_copy
   journal_detail
   journal_graph_projection
   journal_graph_request

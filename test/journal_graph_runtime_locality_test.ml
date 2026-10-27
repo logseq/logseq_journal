@@ -2967,7 +2967,7 @@ let test_child_failure_retains_admitted_child () =
     (List.length duplicate.responses)
 ;;
 
-module Copy = Runtime.Copy
+module Copy = Journal_copy
 
 let copy_read = function
   | [ Copy.Read (ticket, command) ] -> ticket, command
