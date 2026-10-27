@@ -1,3 +1,17 @@
+(* These existing cases assert state transitions; cleanup cases below use the
+   complete public result and assert its plan separately. *)
+module Root_state = struct
+  include Application.Root_navigation
+  let step state event = fst (Application.Root_navigation.step state event)
+end
+
+let cleanup_paths plan =
+  Rrbvec.to_seq plan
+  |> Seq.map (function
+    | Application.Discard_staged_file staged -> Journal_asset_import.staged_path staged)
+  |> List.of_seq
+;;
+
 module ID = Journal_ids
 module Ui = Journal_view
 
@@ -88,7 +102,7 @@ let with_status_catalog state =
   let definition : Graph.task_status_definition =
     { uuid; title = "Todo"; ident = None; order = "b01"; checkbox_state = Some false }
   in
-  Application.Root_navigation.step
+  Root_state.step
     state
     (Completed
        { payload =
@@ -102,11 +116,11 @@ let with_status_catalog state =
 ;;
 
 let root_navigation ~graph_generation =
-  Application.Root_navigation.create ~graph_generation |> with_status_catalog
+  Root_state.create ~graph_generation |> with_status_catalog
 ;;
 
 let test_native_composer_dismissal_and_edit_fences () =
-  let module R = Application.Root_navigation in
+  let module R = Root_state in
   let initial = root_navigation ~graph_generation:3 in
   let opened = R.step initial Capture_opened in
   require (R.capture_presented opened) "Capture opener must present a native sheet";
@@ -379,7 +393,7 @@ let test_direct_capture_pending_attachments () =
 ;;
 
 let test_collapse_retains_complete_capture () =
-  let module R = Application.Root_navigation in
+  let module R = Root_state in
   let state = root_navigation ~graph_generation:3 |> fun s -> R.step s Capture_opened in
   let original = Option.get (R.capture state) in
   let edited =
@@ -1325,7 +1339,7 @@ let test_detached_append_completion_and_failure () =
 ;;
 
 let test_graph_draft_retention_and_privacy () =
-  let module R = Application.Root_navigation in
+  let module R = Root_state in
   let graph id = Logseq_db_types.Graph_types.Uuid.of_string id |> Result.get_ok in
   let first = graph "70000000-0000-4000-b000-000000000001" in
   let second = graph "70000000-0000-4000-b000-000000000002" in
@@ -1409,7 +1423,7 @@ let test_graph_draft_retention_and_privacy () =
 ;;
 
 let test_graph_interruption_preserves_capture_attempt () =
-  let module R = Application.Root_navigation in
+  let module R = Root_state in
   let graph_id =
     Logseq_db_types.Graph_types.Uuid.of_string "70000000-0000-4000-b000-000000000001"
     |> Result.get_ok
@@ -1487,7 +1501,7 @@ let test_graph_retained_append_owner () =
 ;;
 
 let test_late_capture_completion_preserves_newer_edit () =
-  let module R = Application.Root_navigation in
+  let module R = Root_state in
   let start =
     root_navigation ~graph_generation:1
     |> fun state -> R.step state (Capture_edited "Original")
@@ -1688,7 +1702,7 @@ let test_retained_task_append_keeps_recovery_identity () =
 ;;
 
 let test_capture_editor_sessions_are_not_reused () =
-  let module R = Application.Root_navigation in
+  let module R = Root_state in
   let initial =
     root_navigation ~graph_generation:1 |> fun state -> R.step state Capture_opened
   in
@@ -1956,7 +1970,7 @@ let test_favorites_hidden_rows_do_not_block_pagination () =
 ;;
 
 let test_root_noops_preserve_observable_owner () =
-  let module R = Application.Root_navigation in
+  let module R = Root_state in
   let unchanged state event label =
     require (R.step state event == state) "%s published an unchanged root model" label
   in
@@ -2476,12 +2490,8 @@ let multiselect_staged index path source_identity =
   | _ -> fail "valid generated selection did not decode"
 ;;
 
-let with_multiselect_files count f =
-  let files = List.init count (fun _ -> Filename.temp_file "journal-import-" ".png") in
-  Fun.protect
-    ~finally:(fun () ->
-      List.iter (fun path -> if Sys.file_exists path then Sys.remove path) files)
-    (fun () -> f files)
+let with_multiselect_paths count f =
+  f (List.init count (fun index -> Printf.sprintf "/pure-fixture/selection-%02d.png" index))
 ;;
 
 let test_multiselect_batch_boundary () =
@@ -2526,8 +2536,8 @@ let test_multiselect_batch_boundary () =
 ;;
 
 let test_multiselect_order_duplicates_and_readd () =
-  let module R = Application.Root_navigation in
-  with_multiselect_files 4 (function
+  let module R = Root_state in
+  with_multiselect_paths 4 (function
     | [ a; b; c; duplicate ] ->
       let picks =
         List.mapi
@@ -2545,12 +2555,12 @@ let test_multiselect_order_duplicates_and_readd () =
         (List.map Journal_asset_import.staged_path (current selected) = [ a; b; c ])
         "selection order was lost";
       let duplicate_pick = multiselect_staged 4 duplicate "files:1" in
-      let deduped = R.step selected (Capture_asset_picked (duplicate_pick, Some 1)) in
+      let deduped, plan = Application.Root_navigation.step selected (Capture_asset_picked (duplicate_pick, Some 1)) in
       require (current deduped = picks) "same source added a duplicate attachment";
-      require (not (Sys.file_exists duplicate)) "duplicate staging copy was leaked";
-      let repeated = R.step deduped (Capture_asset_picked (List.hd picks, Some 1)) in
+      require (cleanup_paths plan = [duplicate]) "duplicate copy was not retired";
+      let repeated, plan = Application.Root_navigation.step deduped (Capture_asset_picked (List.hd picks, Some 1)) in
       require
-        (current repeated = picks && Sys.file_exists a)
+        (current repeated = picks && Rrbvec.length plan = 0)
         "replayed event removed an owned source or added a duplicate";
       let removed =
         Journal_capture.remove_attachment
@@ -2568,8 +2578,8 @@ let test_multiselect_order_duplicates_and_readd () =
 ;;
 
 let test_multiselect_rejected_resource_ownership () =
-  let module R = Application.Root_navigation in
-  with_multiselect_files (Journal_capture.attachment_limit + 2) (fun files ->
+  let module R = Root_state in
+  with_multiselect_paths (Journal_capture.attachment_limit + 2) (fun files ->
     let picks =
       List.mapi
         (fun i path -> multiselect_staged i path ("files:" ^ string_of_int i))
@@ -2587,14 +2597,14 @@ let test_multiselect_rejected_resource_ownership () =
         (List.filteri (fun i _ -> i < Journal_capture.attachment_limit) picks)
     in
     let overflow = List.nth picks Journal_capture.attachment_limit in
-    let next = R.step full (Capture_asset_picked (overflow, Some 1)) in
+    let next, plan = Application.Root_navigation.step full (Capture_asset_picked (overflow, Some 1)) in
     require
       (List.length (Journal_capture.pending_attachments (Option.get (R.capture next)))
        = Journal_capture.attachment_limit)
       "capacity changed";
     require
-      (not (Sys.file_exists (Journal_asset_import.staged_path overflow)))
-      "capacity rejection leaked its staging copy";
+      (cleanup_paths plan = [Journal_asset_import.staged_path overflow])
+      "capacity rejection did not retire its staging copy";
     let saving =
       Journal_capture.update_source (Option.get (R.capture start)) ~source:"Saving owner"
       |> fun capture ->
@@ -2608,25 +2618,25 @@ let test_multiselect_rejected_resource_ownership () =
            ~creation_time:(creation_time 1))
     in
     let rejected = List.nth picks (Journal_capture.attachment_limit + 1) in
-    let after =
-      R.step
+    let after, plan =
+      Application.Root_navigation.step
         (R.step start (Capture_admitted saving))
         (Capture_asset_picked (rejected, Some 1))
     in
     require (R.capture after = Some saving) "saving capture accepted an async attachment";
     require
-      (not (Sys.file_exists (Journal_asset_import.staged_path rejected)))
-      "saving rejection leaked its staging copy")
+      (cleanup_paths plan = [Journal_asset_import.staged_path rejected])
+      "saving rejection did not retire its staging copy")
 ;;
 
 let test_multiselect_graph_owner_and_cancel () =
-  let module R = Application.Root_navigation in
+  let module R = Root_state in
   let graph index =
     Logseq_db_types.Graph_types.Uuid.of_string
       (Printf.sprintf "71000000-0000-4000-b000-%012d" index)
     |> Result.get_ok
   in
-  with_multiselect_files 2 (function
+  with_multiselect_paths 2 (function
     | [ kept; late ] ->
       let start =
         root_navigation ~graph_generation:1
@@ -2640,38 +2650,35 @@ let test_multiselect_graph_owner_and_cancel () =
       require
         (Journal_asset_import.is_dismissal {|{"action":"dismissed","request":{"id":1}}|})
         "picker cancellation did not decode";
-      let collapsed = R.step selected Capture_closed in
+      let collapsed, plan = Application.Root_navigation.step selected Capture_closed in
       require
-        (R.capture collapsed = R.capture selected && Sys.file_exists kept)
+        (R.capture collapsed = R.capture selected && Rrbvec.length plan = 0)
         "cancellation/collapse erased owned attachments";
-      let other =
-        R.step collapsed (Graph_replaced { graph_id = Some (graph 2); generation = 2 })
-        |> fun s -> R.step s Capture_opened
-      in
-      require
-        (Sys.file_exists kept)
-        "graph retention deleted a retained draft's attachment";
-      let stale =
-        R.step
+      let switched, plan = Application.Root_navigation.step collapsed
+        (Graph_replaced { graph_id = Some (graph 2); generation = 2 }) in
+      let other = R.step switched Capture_opened in
+      require (Rrbvec.length plan = 0) "graph retention retired owned attachment";
+      let stale, plan =
+        Application.Root_navigation.step
           other
           (Capture_asset_picked (multiselect_staged 2 late "photos:late", Some 1))
       in
       require
         (Journal_capture.pending_attachments (Option.get (R.capture stale)) = [])
         "old graph completion acquired a new draft";
-      require (not (Sys.file_exists late)) "old graph completion leaked its staging copy";
-      let returned =
-        R.step stale (Graph_replaced { graph_id = Some (graph 1); generation = 3 })
+      require (cleanup_paths plan = [late]) "old graph completion did not retire orphan";
+      let returned, plan =
+        Application.Root_navigation.step stale (Graph_replaced { graph_id = Some (graph 1); generation = 3 })
       in
       require
         (Journal_capture.pending_attachments (Option.get (R.capture returned)) = [ pick ]
-         && Sys.file_exists kept)
+         && Rrbvec.length plan = 0)
         "returning graph lost staged ownership";
       let other =
         R.step returned (Graph_replaced { graph_id = Some (graph 2); generation = 4 })
       in
-      ignore (R.step other Account_cleared);
-      require (not (Sys.file_exists kept)) "sign-out leaked retained graph staging"
+      let _, plan = Application.Root_navigation.step other Account_cleared in
+      require (cleanup_paths plan = [kept]) "sign-out did not retire retained graph staging"
     | _ -> assert false)
 ;;
 
@@ -3912,8 +3919,177 @@ let test_page_detail_append_matches_exact_page () =
     "route deletion confused a page owner with the deleted outline child"
 ;;
 
+let test_root_cleanup_plan_contract () =
+  let module R = Application.Root_navigation in
+  let failures = ref [] in
+  let check name f =
+    try f () with error ->
+      Printf.eprintf "CLEANUP_PLAN_RED %s: %s\n%!" name (Printexc.to_string error);
+      failures := name :: !failures
+  in
+  let pick index source =
+    multiselect_staged index (Printf.sprintf "/pure-fixture/cleanup-%02d.png" index) source
+  in
+  let a = pick 0 "files:a" in
+  let b = pick 1 "files:b" in
+  let c = pick 2 "files:c" in
+  let paths items = List.map Journal_asset_import.staged_path items in
+  let expect expected plan =
+    require (cleanup_paths plan = paths expected) "expected cleanup [%s], got [%s]"
+      (String.concat ";" (paths expected)) (String.concat ";" (cleanup_paths plan))
+  in
+  let step state event =
+    let next, plan = R.step state event in
+    expect [] plan;
+    next
+  in
+  let fresh () = R.create ~graph_generation:1 |> fun s -> step s Capture_opened in
+  let select state items =
+    step state (Capture_picker_requested Files)
+    |> fun state -> step state (Capture_assets_picked (items, Some 1, None))
+  in
+  let owned state = Journal_capture.pending_attachments (Option.get (R.capture state)) in
+  let own state items =
+    let capture = List.fold_left Journal_capture.add_attachment (Option.get (R.capture state)) items in
+    step state (Capture_admitted capture)
+  in
+  let graph index = Logseq_db_types.Graph_types.Uuid.of_string
+    (Printf.sprintf "71000000-0000-4000-b000-%012d" index) |> Result.get_ok in
+  let switch state index generation =
+    step state (Graph_replaced {graph_id=Some (graph index); generation}) in
+  check "close retains; discard emits attachment order" (fun () ->
+    let selected = select (fresh ()) [a;b] in
+    let old_session = Journal_capture.session_id (Option.get (R.capture selected)) in
+    let closed = step selected Capture_closed in
+    require (owned closed = [a;b]) "Close changed owned attachments";
+    let opened = step closed Capture_opened in
+    let next, plan = R.step opened Capture_discarded in
+    expect [a;b] plan;
+    require (R.capture next = None) "Discard kept Capture";
+    let reopened = step next Capture_opened in
+    require (Journal_capture.session_id (Option.get (R.capture reopened)) <> old_session)
+      "Discard reused old input session");
+  check "stale completion same-state carries cleanup without dedup" (fun () ->
+    let state = fresh () in
+    let next, plan = R.step state (Capture_assets_picked ([c;c],Some 99,None)) in
+    require (next == state) "stale completion changed model identity";
+    expect [c;c] plan);
+  check "same path replay owns by path rather than token" (fun () ->
+    let selected = select (fresh ()) [a] in
+    let replay = multiselect_staged 9 (Journal_asset_import.staged_path a) "different-source" in
+    let next, plan = R.step selected (Capture_asset_picked (replay,Some 99)) in
+    require (next == selected && owned next = [a]) "replay changed current owner";
+    expect [] plan);
+  check "duplicate source independent copy retires only copy" (fun () ->
+    let selected = select (fresh ()) [a] in
+    let armed = step selected (Capture_picker_requested Files) in
+    let duplicate = pick 3 "files:a" in
+    let next, plan = R.step armed (Capture_asset_picked (duplicate,Some 2)) in
+    require (owned next = [a]) "duplicate replaced original";
+    expect [duplicate] plan);
+  check "batch ownership updates before subsequent replay" (fun () ->
+    let state = step (fresh ()) (Capture_picker_requested Files) in
+    let duplicate = pick 3 "files:a" in
+    let next, plan = R.step state (Capture_assets_picked ([a;a;duplicate;b],Some 1,None)) in
+    require (owned next = [a;b]) "ordered accepted siblings changed";
+    expect [duplicate] plan);
+  check "capacity emits ordered overflow only" (fun () ->
+    let state = step (fresh ()) (Capture_picker_requested Files) in
+    let items = List.init (Journal_capture.attachment_limit+2)
+      (fun i -> pick i ("files:" ^ string_of_int i)) in
+    let next, plan = R.step state (Capture_assets_picked (items,Some 1,None)) in
+    require (List.length (owned next) = Journal_capture.attachment_limit) "capacity changed";
+    expect (List.filteri (fun i _ -> i >= Journal_capture.attachment_limit) items) plan);
+  check "Saving rejects orphan but keeps current path" (fun () ->
+    let selected = select (fresh ()) [a] in
+    let capture = Journal_capture.update_source (Option.get (R.capture selected)) ~source:"Saving" in
+    let saving, request = Journal_capture.admit_save capture
+      ~mutation_id:"71000000-0000-4000-9000-000000000090"
+      ~block_id:"71000000-0000-4000-a000-000000000090" ~sibling_order:"z"
+      ~calendar_generation:1L ~creation_time:(creation_time 1) in
+    require (Option.is_some request) "saving fixture not admitted";
+    let admitted = step selected (Capture_admitted saving) in
+    let next, plan = R.step admitted (Capture_assets_picked ([a;c],Some 1,None)) in
+    require (next == admitted && R.capture next = Some saving) "Saving accepted async pick";
+    expect [c] plan;
+    let unchanged = step admitted Capture_discarded in
+    require (unchanged == admitted) "Discard cancelled Saving";
+    let failed = step admitted (Capture_admitted (Journal_capture.fail saving ~message:"interrupted")) in
+    require (step failed Capture_discarded == failed) "Discard cancelled Failed attempt");
+  check "named graphs retain and account clears in graph then active order" (fun () ->
+    let one = switch (R.create ~graph_generation:1) 1 1
+      |> fun s -> own (step s Capture_opened) [a] in
+    let two = switch one 2 2 |> fun s -> own (step s Capture_opened) [b] in
+    let three = switch two 3 3 |> fun s -> own (step s Capture_opened) [c] in
+    let next, plan = R.step three Account_cleared in
+    expect [a;b;c] plan;
+    require (R.capture next = None) "account retained active draft";
+    let returned = switch next 1 4 in
+    require (R.capture returned = None) "account retained prior graph draft");
+  check "unnamed graph replacement retires active draft" (fun () ->
+    let selected = select (fresh ()) [a;b] in
+    let next, plan = R.step selected (Graph_replaced {graph_id=Some (graph 1);generation=2}) in
+    expect [a;b] plan;
+    require (R.capture next = None) "anonymous draft gained named ownership");
+  check "local delete keeps other retained graph owner" (fun () ->
+    let one = switch (R.create ~graph_generation:1) 1 1
+      |> fun s -> own (step s Capture_opened) [a] in
+    let two = switch one 2 2 |> fun s -> own (step s Capture_opened) [b] in
+    let deleted, plan = R.step two Local_copy_deleted in
+    expect [b] plan;
+    let returned = switch deleted 1 3 in
+    require (owned returned = [a]) "local deletion erased another graph owner";
+    let _, plan = R.step returned Account_cleared in expect [a] plan);
+  check "public reducer defers actual unlink until adapter" (fun () ->
+    let path = Filename.temp_file "journal-import-cleanup-" ".png" in
+    Fun.protect ~finally:(fun () -> if Sys.file_exists path then Sys.remove path)
+      (fun () ->
+        let staged = multiselect_staged 50 path "files:purity-boundary" in
+        let state = select (fresh ()) [staged] in
+        let next, plan = R.step state Capture_discarded in
+        require (R.capture next = None) "Discard did not change state";
+        require (Sys.file_exists path) "public reducer performed unlink before adapter";
+        expect [staged] plan;
+        Rrbvec.iter (function Application.Discard_staged_file item ->
+          Journal_asset_import.discard_staged_file item) plan;
+        require (not (Sys.file_exists path)) "adapter did not apply returned plan"));
+  check "ordinary no-op has empty plan and stable identity" (fun () ->
+    let state = R.create ~graph_generation:1 in
+    let next, plan = R.step state Capture_closed in
+    require (next == state) "closed no-op changed state";
+    expect [] plan);
+  require (!failures = []) "%d cleanup contract cases failed" (List.length !failures)
+;;
+
+let test_staged_file_adapter_guard_and_failures () =
+  let dir = Filename.temp_file "journal-cleanup-adapter-" "" in
+  Sys.remove dir; Unix.mkdir dir 0o700;
+  let owned = Filename.concat dir "journal-import-owned.png" in
+  let kept = Filename.concat dir "keep.png" in
+  let blocked = Filename.concat dir "journal-import-directory" in
+  let descriptor index path = multiselect_staged index path ("adapter:" ^ string_of_int index) in
+  Fun.protect ~finally:(fun () ->
+    List.iter (fun path -> if Sys.file_exists path then Sys.remove path) [owned;kept];
+    if Sys.file_exists blocked then Unix.rmdir blocked;
+    Unix.rmdir dir)
+    (fun () ->
+      List.iter (fun path -> let out = open_out_bin path in output_string out "synthetic";close_out out)
+        [owned;kept];
+      Unix.mkdir blocked 0o700;
+      Journal_asset_import.discard_staged_file (descriptor 0 kept);
+      require (Sys.file_exists kept) "non-import file removed";
+      Journal_asset_import.discard_staged_file (descriptor 1 blocked);
+      Journal_asset_import.discard_staged_file (descriptor 2 owned);
+      require (not (Sys.file_exists owned)) "matched file not removed after previous failure";
+      Journal_asset_import.discard_staged_file (descriptor 2 owned);
+      Journal_asset_import.discard_staged_file (descriptor 3 (Filename.concat dir "journal-import-missing"));
+      require (Sys.file_exists kept && Sys.is_directory blocked) "adapter crossed guarded resource scope")
+;;
+
 let tests =
-  [ "Page append exact page ownership", test_page_detail_append_matches_exact_page
+  [ "pure Root cleanup plan contract", test_root_cleanup_plan_contract
+  ; "staging adapter guard and failures", test_staged_file_adapter_guard_and_failures
+  ; "Page append exact page ownership", test_page_detail_append_matches_exact_page
   ; ( "Initial staging refresh and delete review regressions"
     , test_initial_staging_refresh_and_delete )
   ]

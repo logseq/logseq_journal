@@ -77,6 +77,9 @@ end
 
 val native_hooks : Journal_bridge.hooks
 
+type cleanup = Discard_staged_file of Journal_asset_import.staged
+type cleanup_plan = cleanup Rrbvec.t
+
 module Root_navigation : sig
   type t
 
@@ -103,7 +106,9 @@ module Root_navigation : sig
 
   val diagnostic_rows : t -> (string * string) list
   val create : graph_generation:int -> t
-  val step : t -> event -> t
+  (** Compute state and ordered cleanup without executing file operations.
+      An unchanged state can still return cleanup for an unowned completion. *)
+  val step : t -> event -> t * cleanup_plan
   val destination : t -> Journal_routes.destination
   val capture_presented : t -> bool
   val capture : t -> Journal_capture.t option
