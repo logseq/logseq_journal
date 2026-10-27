@@ -3022,11 +3022,6 @@ let timeline_scope state : Graph_service.timeline_scope option =
     ({startup=startup_scope state;graph_id;graph_generation=m.startup.graph_generation} : Graph_service.timeline_scope)) m.selected_graph)
 ;;
 
-type graph_worker_lease =
-  { protocol_request : Logseq_db_worker.Protocol.request
-  ; mutable retired : bool
-  }
-
 let start
       ~on_view_region
       ~on_platform_request
@@ -3100,71 +3095,43 @@ let start
   let copy_worker_requests = Hashtbl.create 2 in
   let projection_request_accepted = ref (fun _ -> ()) in
   let projection_request_finished = ref (fun _ -> ()) in
-  (* Own admission once for every DB Worker API consumer. Business reducers
-     keep their tickets; this registry owns only delivery and scope lifetime. *)
-  let admitted_graph_requests = Hashtbl.create 32 in
-  let admitted_protocol_ids = Hashtbl.create 32 in
-  let dispatch_worker ?(observe_projection = false) request =
-    let protocol = match request with
-      | Graph_service.Graph_request request -> Some request
-      | _ -> None in
-    let duplicate = Option.fold ~none:false ~some:(fun request ->
-      Hashtbl.mem admitted_protocol_ids request.Logseq_db_worker.Protocol.request_id) protocol in
-    if duplicate
-    then Worker.Full
-    else (
-      match Worker.send client request with
-      | Accepted worker_id as accepted ->
-        Option.iter (fun protocol ->
-          Hashtbl.add admitted_graph_requests worker_id
-            { protocol_request = protocol; retired = false };
-          Hashtbl.add admitted_protocol_ids protocol.Logseq_db_worker.Protocol.request_id worker_id;
-          if observe_projection then !projection_request_accepted protocol) protocol;
-        accepted
-      | (Full | Not_ready | Stopping) as refused ->
-        (* Latest authentication is staged before the data reservation. Full
-           does not discard that control intent; do not diagnose it as lost. *)
-        (match request, refused with
-         | Graph_service.Client_command (Reconcile_authenticated_user _), Full -> ()
-         | _ ->
-           let operation = match request with
-             | Graph_service.Client_command (Submit_e2ee_password _) -> "submitE2eePassword"
-             | Client_command (Restore_local_account _) -> "restoreLocalAccount"
-             | Client_command (Select_graph _) -> "selectGraph"
-             | Client_command (Refresh_catalog _) -> "refreshCatalog"
-             | Client_command (Begin_online_recovery _) -> "recoverOnline"
-             | Client_command (Set_foreground _) -> "setForeground"
-             | Client_command Return_to_graph_picker -> "returnToGraphPicker"
-             | Client_command _ -> "clientCommand"
-             | Graph_request _ -> "graphRequest"
-             | Import_asset _ -> "importAsset"
-             | Inspect_local_copy _ -> "inspectLocalCopy"
-             | Delete_local_copy _ -> "deleteLocalCopy"
-             | Asset_command _ -> "assetCommand"
-             | Acquire_imported_file _ | Acquire_asset_file _ -> "acquireAssetFile"
-             | Release_asset_file _ -> "releaseAssetFile"
-             | Get_graph_state -> "getGraphState"
-           in
-           Effect.run (set_state (fun state -> report_ui_error state ~operation ~phase:"admission")));
-        refused)
+  let report_worker_refusal (request : Graph_service.request) (refused : Worker.send_result) =
+    (* Full keeps the staged latest-authentication control intent. *)
+    match request, refused with
+    | Graph_service.Client_command (Reconcile_authenticated_user _), Full -> ()
+    | _ ->
+      let operation = match request with
+        | Graph_service.Client_command (Submit_e2ee_password _) -> "submitE2eePassword"
+        | Client_command (Restore_local_account _) -> "restoreLocalAccount"
+        | Client_command (Select_graph _) -> "selectGraph"
+        | Client_command (Refresh_catalog _) -> "refreshCatalog"
+        | Client_command (Begin_online_recovery _) -> "recoverOnline"
+        | Client_command (Set_foreground _) -> "setForeground"
+        | Client_command Return_to_graph_picker -> "returnToGraphPicker"
+        | Client_command _ -> "clientCommand"
+        | Graph_request _ -> "graphRequest"
+        | Import_asset _ -> "importAsset"
+        | Inspect_local_copy _ -> "inspectLocalCopy"
+        | Delete_local_copy _ -> "deleteLocalCopy"
+        | Asset_command _ -> "assetCommand"
+        | Acquire_imported_file _ | Acquire_asset_file _ -> "acquireAssetFile"
+        | Release_asset_file _ -> "releaseAssetFile"
+        | Get_graph_state -> "getGraphState"
+      in
+      Effect.run (set_state (fun state -> report_ui_error state ~operation ~phase:"admission"))
   in
-  let retire_worker_lease worker_id =
-    match Hashtbl.find_opt admitted_graph_requests worker_id with
-    | None -> false
-    | Some lease ->
-      let protocol_id = lease.protocol_request.request_id in
-      if Hashtbl.find_opt admitted_protocol_ids protocol_id = Some worker_id then
-        Hashtbl.remove admitted_protocol_ids protocol_id;
-      Hashtbl.remove admitted_graph_requests worker_id;
-      lease.retired
+  (* One admission owner serves every DB Worker API consumer. Business ticket
+     registries stay with Copy/media/assets; this owns delivery and lease life. *)
+  let worker_admission =
+    Journal_worker_admission.create
+      ~send:(Worker.send client)
+      ~cancel:(fun request_id -> Worker.cancel client ~request_id)
+      ~projection_accepted:(fun request -> !projection_request_accepted request)
+      ~projection_finished:(fun request_id -> !projection_request_finished request_id)
+      ~refused:report_worker_refusal
   in
-  let cancel_graph_leases () =
-    Hashtbl.iter (fun worker_id lease ->
-      if not lease.retired then (
-        lease.retired <- true;
-        !projection_request_finished lease.protocol_request.request_id;
-        Worker.cancel client ~request_id:worker_id)) admitted_graph_requests;
-    Hashtbl.clear admitted_protocol_ids
+  let dispatch_worker ?observe_projection request =
+    Journal_worker_admission.dispatch worker_admission ?observe_projection request
   in
   let cancel_copy () =
     let state, _ = Journal_copy.step !copy_state Cancel in
@@ -3547,7 +3514,7 @@ let start
       output
   in
   let retire_graph_scope () =
-    cancel_graph_leases ();
+    Journal_worker_admission.cancel_graph_leases worker_admission;
     Hashtbl.clear graph_worker_requests;
     Journal_graph_runtime.reset graph_runtime
   in
@@ -3826,7 +3793,7 @@ let start
   in
   let handle_worker_event event =
     let retired = match event with
-      | Worker.Response { request_id; _ } -> retire_worker_lease request_id
+      | Worker.Response { request_id; _ } -> Journal_worker_admission.retire worker_admission request_id
       | _ -> false in
     Journal_asset_runtime.pump asset_runtime;
     sync_media !state_ref;
