@@ -592,6 +592,7 @@ let capture worker runtime ordinal task_state =
              ; creation_time
              ; children = []
              ; status_confirmation = false
+             ; status_intent_revision = 0L
 }
          })
   in

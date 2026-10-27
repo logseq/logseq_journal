@@ -240,7 +240,12 @@ let with_task_state t task_state =
         (function
           | Journal_graph_request.Capture capture ->
             Journal_graph_request.Capture
-              { capture with command = { capture.command with task_state } }
+              { capture with command =
+                  { capture.command with
+                    task_state
+                  ; status_intent_revision = Int64.succ capture.command.status_intent_revision
+                  }
+              }
           | request -> request)
         t.pending
     in
@@ -281,6 +286,7 @@ let admit_save t ~mutation_id ~block_id ~sibling_order ~calendar_generation ~cre
       ; source
       ; task_state = t.task_state
       ; status_confirmation = t.task_state <> Journal_model.No_status
+      ; status_intent_revision = 0L
       ; creation_time
       ; children = []
       }
