@@ -195,7 +195,7 @@ they do not replace source-level correctness checks.
 ### Current validation and remaining evidence
 
 - Full source build and `dune runtest --force` pass on the current implementation.
-  Coverage includes 343 sync tests, resident worker routing/teardown, per-scope
+  Coverage includes 344 sync tests, resident worker routing/teardown, per-scope
   push coalescing and 150 application tests.
 - A real iOS Simulator App builds through the maintained importer. It uses
   experimental host-restamped OCaml, with `cross_abi_validated=false`.
@@ -212,3 +212,17 @@ they do not replace source-level correctness checks.
   hidden server synchronization. A recording of that scenario and save-in-flight
   graph switching still require actual acceptance. Native scroll-position
   retention across graph focus also remains unverified.
+
+### Real transport follow-up
+
+The first remote CI run for the initial PR head was cancelled before any step
+executed because GitHub could not allocate a hosted macOS ARM64 runner. This
+was a runner-capacity failure, not a source test result.
+
+A pinned-certificate loopback fixture subsequently reproduced an additional
+physical routing defect: the socket table still used the constant diagnostic
+string `start-websocket` as its key. It now uses the complete connection scope,
+and running websocket operations have graph/connection-specific identities.
+The regression verifies two real TLS sockets, separate baseline responses, a
+hidden graph notification and its own Pull, and a successful B retry Pull/response after
+A retires. This does not claim authoritative DB application or GUI acceptance.

@@ -367,7 +367,7 @@ type t =
   ; operations : (string, operation) Hashtbl.t
   ; submitted_operations : Submitted_effects.t
   ; keys : (string, key_entry) Hashtbl.t
-  ; websockets : (string, Core.connection_scope * Websocket_eio.t) Hashtbl.t
+  ; websockets : (Core.connection_scope, Websocket_eio.t) Hashtbl.t
   ; websocket_owners : (Core.graph_scope, websocket_owner) Hashtbl.t
   ; mutable retired_websockets : Core.connection_scope list
   ; asset_download_slots : Eio.Semaphore.t
@@ -923,8 +923,8 @@ let zeroize bytes = Bytes.fill bytes 0 (Bytes.length bytes) '\000'
 let retire_websockets ?(remove = true) t matches retire =
   let selected =
     Hashtbl.fold
-      (fun key (scope, websocket) selected ->
-         if matches scope then (key, websocket) :: selected else selected)
+      (fun scope websocket selected ->
+         if matches scope then (scope, websocket) :: selected else selected)
       t.websockets
       []
   in
@@ -1157,7 +1157,11 @@ let submit_nonasset t instruction =
                   ( request.scope
                   , Core.Protocol_failure "Previous WebSocket owner has not retired" )))
        | None ->
-         let key = Core.runner_effect_diagnostic instruction in
+         let scope=request.scope in
+         let key=Printf.sprintf "websocket:%d:%s:%d:%d"
+           scope.graph.account.account_generation
+           (Logseq_db_types.Graph_types.Uuid.to_string scope.graph.graph_id)
+           scope.graph.graph_generation scope.connection_generation in
          let cancelled, resolve_cancelled = Eio.Promise.create () in
          let finished, resolve_finished = Eio.Promise.create () in
          let pending = ref None in
@@ -1209,7 +1213,7 @@ let submit_nonasset t instruction =
                           | Error error ->
                             t.post (Core.Websocket_protocol_error (request.scope, error))))
                       ~on_close:(fun termination ->
-                        Hashtbl.remove t.websockets key;
+                        Hashtbl.remove t.websockets request.scope;
                         if (not t.closed) && not operation.cancelled
                         then
                           Eio.Fiber.first
@@ -1266,7 +1270,7 @@ let submit_nonasset t instruction =
                               t.dependencies.transport.activate_websocket
                                 handle
                                 ~on_open:(fun () ->
-                                  Hashtbl.replace t.websockets key (request.scope, handle);
+                                  Hashtbl.replace t.websockets request.scope handle;
                                   registered := true;
                                   t.post (Core.Websocket_opened request.scope))
                             with
@@ -1286,7 +1290,7 @@ let submit_nonasset t instruction =
        | Ok payload ->
          let sent = ref false in
          Hashtbl.iter
-           (fun _ (scope, websocket) ->
+           (fun scope websocket ->
               if scope = request.scope
               then (
                 sent := true;
