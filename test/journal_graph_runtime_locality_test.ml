@@ -6707,6 +6707,74 @@ let set_priority_calendar runtime =
   in
   Runtime.set_calendar runtime (Journal_calendar.Sampler.sample sampler |> Result.get_ok)
 ;;
+let test_empty_today_sync_retires_initial_feed () =
+  List.iter
+    (fun history_first ->
+       let runtime = Runtime.create ~localtime:Unix.gmtime () in
+       set_priority_calendar runtime;
+       let today = normal_journal_fixture 29 0 0
+       and synced_today = normal_journal_fixture 29 3 0
+       and older = normal_journal_fixture 30 1 0 in
+       let dates = only "initial Today query" (initial_roots runtime 7L).requests in
+       let tree =
+         Runtime.receive runtime
+           (response dates
+              (Protocol.V2_journals_outcome
+                 { items = [ { page = today.owner; journal_day = 20260901; revision = "page-1" } ]
+                 ; next_cursor = Some (root_cursor 1)
+                 }))
+         |> fun output -> only "empty Today roots" output.requests
+       in
+       let history =
+         Runtime.receive runtime
+           (response tree
+              (Protocol.V2_page_tree_outcome
+                 { page = today.owner.uuid; maximum_depth = 0; items = []; next_cursor = None }))
+         |> fun output -> only "held initial history query" output.requests
+       in
+       let refresh =
+         changed runtime
+           (window ~pages:[ today.owner.uuid ]
+              ~scopes:[ Protocol.V2_page_tree_interest today.owner.uuid ] ())
+       in
+       let fixtures = [ synced_today; older ] in
+       let finish_history () =
+         drive_root_output runtime fixtures { Runtime.requests = [ history ]; responses = [] }
+         |> fst
+       in
+       let outputs =
+         if history_first then (
+           let history = finish_history () in
+           let refreshed, _ = drive_root_output runtime fixtures refresh in
+           history @ refreshed)
+         else (
+           let refreshed, _ = drive_root_output runtime fixtures refresh in
+           refreshed @ finish_history ())
+       in
+       let final_feed =
+         List.fold_left
+           (fun feed (r : Runtime.response) ->
+              match r.payload with
+              | Feed_loaded { feed; complete = true; _ } -> Some feed
+              | _ -> feed)
+           None
+           outputs
+         |> function Some feed -> feed | None -> Alcotest.fail "No completed feed after sync"
+       in
+       let today_ids =
+         List.concat_map
+           (fun (day : Journal_graph_projection.day_feed) ->
+              if day.page.id = Graph.Uuid.to_string today.owner.uuid
+              then List.map (fun (e : Journal_graph_projection.timeline_entry) -> Journal_model.id e.block) day.entries
+              else [])
+           final_feed.days
+       in
+       Alcotest.(check (list string))
+         (Printf.sprintf "synced Today survives initial history (history_first=%b)" history_first)
+         (List.map (fun (r : Protocol.v2_block_record) -> Graph.Uuid.to_string r.block.uuid) synced_today.roots)
+         today_ids)
+    [ true; false ]
+;;
 let test_today_priority_batch () =
   let failures = ref [] in
   let check name f =
@@ -8508,6 +8576,7 @@ let () =
         Alcotest.test_case "refresh retains later suffix" `Quick (test_initial_refresh_range false);
         Alcotest.test_case "supersession and explicit singleton failure" `Quick test_initial_superseded_and_singleton;
         Alcotest.test_case "restart retains loaded suffix through insertion" `Quick test_initial_refresh_after_restarting_prefix;
+        Alcotest.test_case "empty Today sync retires initial feed" `Quick test_empty_today_sync_retires_initial_feed;
         Alcotest.test_case "superseded continuation settles" `Quick test_initial_later_read_superseded;
         Alcotest.test_case "later batch fills across dates" `Quick test_later_thirty_crosses_dates;
         Alcotest.test_case "date cursor recovery is bounded and owned" `Quick test_date_cursor_recovery_is_bounded_and_owned;
