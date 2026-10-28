@@ -775,7 +775,7 @@ let feed_ports t =
             Hashtbl.replace t.block_revisions (Graph.Uuid.to_string i.value.block.uuid) i.revision;
             Hashtbl.replace t.tag_titles (Graph.Uuid.to_string i.value.block.uuid) i.value.tag_titles) items)
     ; remember_fragment = (fun {page;members;entries}->
-        if not (Rrbvec.is_empty entries) then remember_page t page;
+        remember_page t page;
         Rrbvec.iter (fun (item:Projection.tree_member)->
           remember_block_page t page (Graph.Uuid.to_string item.block.uuid)) members;
         Rrbvec.iter (fun (entry:Projection.timeline_entry)->
