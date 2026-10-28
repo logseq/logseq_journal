@@ -90,3 +90,7 @@ val graph_picker
   -> controls:Journal_view.View.t
   -> Journal_view.View.Body.t
   -> Journal_view.View.Body.t
+
+val graph_pages : enabled:bool -> page_id:string -> target_id:string option
+  -> on_prepare:(unit -> unit) -> on_commit:(unit -> unit) -> on_cancel:(unit -> unit)
+  -> current:Journal_view.View.t -> preview:Journal_view.View.t -> Journal_view.View.t

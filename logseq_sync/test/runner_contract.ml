@@ -2455,3 +2455,45 @@ let test_asset_authentication_cause_is_scoped () =
 let scenarios = scenarios @ [Alcotest.test_case
   "asset authentication cause is scoped" `Quick test_asset_authentication_cause_is_scoped]
 ;;
+
+(* Physical socket admission is owned by Runner, not the pure instruction producer. *)
+let test_resident_websocket_owners_are_independent () =
+  with_support(fun support->Eio_main.run(fun environment->Eio.Switch.run(fun sw->
+    let ids=[Core_contract.graph_id;Core_contract.other_graph_id] in
+    let configured=Core.step (Core_contract.resident_catalog ()) (Core.Resident_graphs_changed ids) in
+    let cache=Core_contract.save_catalog_cache configured.effects in
+    let restoring=Core.step (Core_contract.cold_start ()) (Core.Restore_local_account {user_id="user"}) in
+    let restored=Core.step restoring.next (Core_contract.load_catalog_completion restoring.effects (Some cache)) in
+    let attached=List.fold_left(fun current id->
+      let scope=Core.scope_for_graph current ~graph_id:id |> Option.get in
+      let request=List.find_map(function Core.Delegate(Core.Inspect_mirror request) when request.scope=scope -> Some request|_->None) restored.effects |> Option.get in
+      let attaching=Core.step current (Core.Mirror_inspected(Core.Mirror_available request)) in
+      let token=Logseq_overlay_db.Types.sync_token_of_string "sync-token:v1:resident-runner" |> Result.get_ok in
+      let sync=Logseq_overlay_db.Types.sync_view ~token ~checkpoint:(Core_contract.server_cursor_of_int 0) ~submissions:[] in
+      (Core.step attaching.next (Core.Graph_attached {scope;sync})).next) restored.next ids in
+    let shown=Core.step attached (Core.Timeline_presented(Core_contract.timeline_ticket attached)) in
+    let online=Core.step shown.next (Core.Account_authenticated {user_id=Some "user"}) in
+    let current=ref online.next in
+    let starts=List.filter_map(function Core.Run(Core.Start_websocket _ as instruction)->Some instruction|_->None) online.effects in
+    Alcotest.(check int) "reducer requests both physical connections" 2 (List.length starts);
+    let queued=Queue.create () and posted=ref [] and acquired=ref 0 in
+    let token=Runner.id_token_provider ~acquire:(fun _->incr acquired;Error "Synthetic blocked network") ~invalidate:(fun _ ~token:_->()) in
+    let deps=dependencies ~environment ~support ~fork:(fun ~sw:_ callback->Queue.add callback queued) ~id_token_dependency:token () in
+    let runner=Runner.create ~sw deps ~post:(fun event->posted:=event::!posted) |> Result.get_ok in
+    List.iter(Runner.submit runner) starts;
+    while not(Queue.is_empty queued) do (Queue.take queued) () done;
+    Alcotest.(check int) "both graph owners reach independent token/connect path" 2 !acquired;
+    Alcotest.(check bool) "no graph blocks another physical owner" false
+      (List.exists(function Core.Websocket_closed(_,Core.Protocol_failure _)->true|_->false) !posted);
+    List.iter(fun instruction->match instruction with
+      | Core.Start_websocket request ->
+        let transition=Core.step !current (Core.Websocket_closed(request.scope,Core.Authentication_failure "Synthetic blocked network")) in
+        current:=transition.next;List.iter(function Core.Run runnable->Runner.submit runner runnable|_->()) transition.effects
+      | _->()) starts;
+    while not(Queue.is_empty queued) do (Queue.take queued) () done;
+    Alcotest.(check int) "both graph owners retire separately" 2
+      (List.length(List.filter(function Core.Websocket_retired _->true|_->false) !posted));
+    Runner.shutdown runner)))
+;;
+let scenarios=scenarios @ [Alcotest.test_case "resident physical sockets admit and retire independently" `Quick test_resident_websocket_owners_are_independent]
+;;

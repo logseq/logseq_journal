@@ -96,6 +96,8 @@ type snapshot =
   { sync_phase : sync_phase
   ; catalog : graph list
   ; selected_graph : graph_id option
+  ; resident_graphs : graph_id list
+  ; resident_scopes : Unlock.graph_scope list
   ; applied_server_t : Logseq_db_types.Server_cursor.t option
   ; timeline_presentation_pending : bool
   ; unlock : Unlock.unlock_phase
@@ -140,6 +142,8 @@ type client_command =
       ; token : string
       }
   | Reject_token of token_request
+  | Configure_resident_graphs of graph_id list
+  | Focus_resident_graph of graph_id
   | Select_graph of graph_id
   | Return_to_graph_picker
   | Refresh_catalog of startup_scope
@@ -213,6 +217,10 @@ type local_copy_request =
   }
 
 type request =
+  | Graph_request_at of timeline_scope * Logseq_db_worker.Protocol.request
+  | Get_graph_state_at of timeline_scope
+  | Asset_command_at of timeline_scope * asset_command
+  | Import_asset_at of timeline_scope * Logseq_db_types.Asset_import.t
   | Inspect_local_copy of local_copy_request
   | Delete_local_copy of local_copy_request
   | Import_asset of
@@ -251,6 +259,9 @@ type response =
 type asset_notice_batch
 
 type push =
+  | Graph_pushes of (asset_scope * Logseq_db_worker.Protocol.push) list
+  | Graph_states of (asset_scope * Logseq_db_worker.graph_state) list
+  | Session_states of (asset_scope * state) list
   | Asset_notices of asset_notice_batch
   | Graph_push of Logseq_db_worker.Protocol.push
   | Client_state_changed of state

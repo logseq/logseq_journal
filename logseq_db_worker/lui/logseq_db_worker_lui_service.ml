@@ -94,6 +94,8 @@ type snapshot =
   { sync_phase : sync_phase
   ; catalog : graph list
   ; selected_graph : graph_id option
+  ; resident_graphs : graph_id list
+  ; resident_scopes : Unlock.graph_scope list
   ; applied_server_t : Logseq_db_types.Server_cursor.t option
   ; timeline_presentation_pending : bool
   ; unlock : Unlock.unlock_phase
@@ -166,6 +168,8 @@ let snapshot (value : Sync.snapshot) =
   { sync_phase = sync_phase value.sync_phase
   ; catalog = value.catalog
   ; selected_graph = value.selected_graph
+  ; resident_graphs = value.resident_graphs
+  ; resident_scopes = []
   ; applied_server_t = value.applied_server_t
   ; timeline_presentation_pending = value.timeline_presentation_pending
   ; unlock = value.unlock
@@ -209,6 +213,8 @@ type client_command =
       ; token : string
       }
   | Reject_token of token_request
+  | Configure_resident_graphs of graph_id list
+  | Focus_resident_graph of graph_id
   | Select_graph of Sync.graph_id
   | Return_to_graph_picker
   | Refresh_catalog of startup_scope
@@ -282,6 +288,10 @@ type local_copy_request =
   }
 
 type request =
+  | Graph_request_at of timeline_scope * Logseq_db_worker.Protocol.request
+  | Get_graph_state_at of timeline_scope
+  | Asset_command_at of timeline_scope * asset_command
+  | Import_asset_at of timeline_scope * Logseq_db_types.Asset_import.t
   | Inspect_local_copy of local_copy_request
   | Delete_local_copy of local_copy_request
   | Import_asset of
@@ -336,6 +346,9 @@ type asset_notice_batch =
   }
 
 type push =
+  | Graph_pushes of (asset_scope * Logseq_db_worker.Protocol.push) list
+  | Graph_states of (asset_scope * Logseq_db_worker.graph_state) list
+  | Session_states of (asset_scope * state) list
   | Asset_notices of asset_notice_batch
   | Graph_push of Protocol.push
   | Client_state_changed of state
@@ -352,6 +365,7 @@ let auth_topic = ID.Worker.Push_topic.of_int 2
 let bootstrap_topic = ID.Worker.Push_topic.of_int 3
 let graph_state_topic = ID.Worker.Push_topic.of_int 4
 let asset_topic = ID.Worker.Push_topic.of_int 5
+let session_topic = ID.Worker.Push_topic.of_int 6
 
 let asset_notices = function
   | Asset_notice (scope, notice) -> [ scope, notice ]
@@ -383,8 +397,17 @@ let add_asset_fact batch (scope, notice) =
   }
 ;;
 
+let merge_scoped previous next =
+  let merged=List.fold_left (fun entries (scope,value) ->
+    List.filter (fun (owner,_) -> owner<>scope) entries @ [scope,value]) previous next in
+  if List.length merged>128 then failwith "Worker pending graph scope limit exceeded";
+  merged
 let coalesce_push ~topic previous next =
-  if not (ID.Worker.Push_topic.equal topic asset_topic)
+  match previous,next with
+  | Graph_pushes previous,Graph_pushes next -> Graph_pushes (merge_scoped previous next)
+  | Graph_states previous,Graph_states next -> Graph_states (merge_scoped previous next)
+  | Session_states previous,Session_states next -> Session_states (merge_scoped previous next)
+  | _ -> if not (ID.Worker.Push_topic.equal topic asset_topic)
   then next
   else (
     match previous, next with
@@ -591,6 +614,7 @@ let diagnostic_asset_notice notice =
 
 let publish context =
   let latest : state option ref = ref None in
+  let resident_scopes = ref [] in
   let owner = ref None in
   let reports = ref [] in
   let with_reports (state : state) =
@@ -627,6 +651,10 @@ let publish context =
       ~topic:asset_topic
       (Asset_notice (scope, notice))
   | Pure.Reply _ -> ()
+  | Pure.Scoped_graph_push (scope,push) ->
+    Journal_worker.Session_context.emit context ~topic:invalidation_topic (Graph_pushes [scope,push])
+  | Pure.Scoped_graph_state_changed (scope,state) ->
+    Journal_worker.Session_context.emit context ~topic:graph_state_topic (Graph_states [scope,state])
   | Graph_push push ->
     Journal_worker.Session_context.emit
       context
@@ -636,6 +664,7 @@ let publish context =
     (match output with
      | State_changed state ->
        let state = client_state state in
+       let state = {state with snapshot={state.snapshot with resident_scopes= !resident_scopes}} in
        let scope = state.snapshot.startup.account_generation, state.snapshot.startup.graph_generation in
        if !owner <> Some scope then reports := [];
        owner := Some scope;
@@ -646,6 +675,13 @@ let publish context =
          context
          ~topic:bootstrap_topic
          (Bootstrap_progress (bootstrap_progress progress))
+     | Resident_scopes_changed scopes ->
+       resident_scopes:=scopes;
+       (match !latest with None->() | Some state->
+         let state={state with snapshot={state.snapshot with resident_scopes=scopes}} in
+         latest:=Some state;emit state)
+     | Session_state_changed (scope,state) ->
+       Journal_worker.Session_context.emit context ~topic:session_topic (Session_states [scope,client_state state])
      | Asset_finished _ | Protected_finished _ -> ())
   | Graph_state_changed state ->
     Journal_worker.Session_context.emit
@@ -713,6 +749,8 @@ let client_event = function
   | Local_account_unavailable (scope,reason) -> Pure.Sync_event (Sync.Local_account_unavailable (scope,reason))
   | Provide_token _ | Reject_token _ ->
     invalid_arg "token commands are handled by the service"
+  | Configure_resident_graphs ids -> Pure.Sync_event (Sync.Resident_graphs_changed ids)
+  | Focus_resident_graph id -> Pure.Sync_event (Sync.Visible_graph_changed id)
   | Select_graph graph_id -> Pure.Sync_event (Sync.Graph_selected graph_id)
   | Return_to_graph_picker -> Pure.Sync_event Sync.Graph_picker_requested
   | Refresh_catalog scope -> Pure.Sync_event (Sync.Catalog_refresh_requested scope)
@@ -758,7 +796,7 @@ let create ~(dependencies : dependencies) =
   end
   in
   Journal_worker.Service.create
-    ~push_topic_count:6
+    ~push_topic_count:7
     ~merge_push:coalesce_push
     ~concurrency:(Journal_worker.Service.Concurrent { max_in_flight = 2 })
     ~data_directory:(fun config -> Ok config.Db.Config.application_support_directory)
@@ -924,7 +962,30 @@ let create ~(dependencies : dependencies) =
                      ; auth_wake
                      }))))
     ~handle:(fun context session request ->
+      let resolve (owner:timeline_scope) = List.find_opt (fun (scope:Sync.graph_scope) ->
+        scope.account.account_generation=owner.startup.account_generation && scope.graph_id=owner.graph_id
+          && scope.graph_generation=owner.graph_generation) (Db.graph_scopes session.worker) in
       match request with
+      | Graph_request_at (owner,request) ->
+        (match resolve owner with
+         | Some scope -> Ok (Graph_response (Db.request_for_scope session.worker ~scope request))
+         | None -> Error "The graph session is no longer open.")
+      | Get_graph_state_at owner ->
+        (match Option.bind (resolve owner) (fun scope->Db.graph_state_for_scope session.worker ~scope) with
+         | Some state -> Ok (Graph_state state) | None -> Error "The graph session is no longer open.")
+      | Import_asset_at (owner,source) ->
+        (match resolve owner with Some scope -> Ok (Asset_imported (Db.import_asset session.worker ~graph_generation:scope.graph_generation source))
+         | None -> Error "The graph session is no longer open.")
+      | Asset_command_at (owner,command) ->
+        (match resolve owner with
+         | None -> Error "The graph session is no longer open."
+         | Some scope ->
+           let event=match command with
+             | Retry_upload operation -> Pure.Upload_requested_for_scope (scope,operation,Logseq_db_worker_pure_reducer.Asset_upload.Retry)
+             | Replace_asset_demand {consumer;priority;assets} -> Pure.Asset_requested_for_scope (scope,Logseq_sync_pure_reducer.Asset_transfer.Replace {consumer;priority;assets})
+             | Release_asset_demand consumer -> Pure.Asset_requested_for_scope (scope,Release consumer)
+             | Retry_asset asset -> Pure.Asset_requested_for_scope (scope,Retry asset) in
+           Db.post session.worker event;Ok Client_command_completed)
       | Delete_local_copy request ->
         Eio.Condition.loop_no_mutex session.auth_wake (fun () ->
           if !(session.auth_enqueued_sequence) >= !(session.auth_sequence) then Some () else None);

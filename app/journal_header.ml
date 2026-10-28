@@ -540,3 +540,14 @@ let reactive_view
     ~capture_expanded
     ~body
 ;;
+
+let graph_pages ~enabled ~page_id ~target_id ~on_prepare ~on_commit ~on_cancel ~current ~preview =
+  let payload=Yojson.Safe.to_string (`Assoc
+    ["mode",`String "graph-pages";"enabled",`Bool enabled;"pageID",`String page_id;
+     "targetID",(match target_id with None->`Null | Some id->`String id)]) in
+  V.of_lui (Journal_lui_native.mount ~key:"journal-graph-pages" ~payload
+    ~on_event:(fun event->match event.Journal_lui_native.payload with
+      | "prepare"->on_prepare () | "commit"->on_commit () | "cancel"->on_cancel () | _->())
+    ~children:[Lui_elements.stack ~grow:1. [Ui.mount current];
+      Lui_elements.stack ~grow:1. [Ui.mount preview]] Journal_lui_native.chrome_identifier)
+;;

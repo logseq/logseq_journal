@@ -1191,10 +1191,95 @@ let test_authoritative_failure_categories_reach_diagnostics () =
     ; Unsupported_semantics, "authoritativeDecodeFailed", "Authoritative transaction format is unsupported." ]
 ;;
 
+
+let resident_worker_fixture () =
+  let ready, first_scope = worker_open_graph () in
+  let first_id=first_scope.Sync.graph_id in
+  let second_id=uuid "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" in
+  let snapshot=(Core.view ready).sync.snapshot in
+  let second : Sync.graph = {(List.hd snapshot.catalog) with graph_id=second_id;name="Second synthetic graph"} in
+  let requested=Core.step ready (Sync_event (Sync.Catalog_refresh_requested (startup_scope ready))) in
+  let fetched=List.find_map (function
+    | Core.Run_sync (Sync.Request (ticket,Sync.Fetch_catalog _)) ->
+      Some (Core.Sync_event (Sync.Runner_completed (Sync.Completion (ticket,Ok (snapshot.catalog @ [second])))))
+    | _ -> None) requested.effects |> Option.get in
+  let catalog=Core.step requested.next fetched in
+  let configured=Core.step catalog.next (Sync_event (Sync.Resident_graphs_changed [first_id;second_id])) in
+  let rec open_requests core = function
+    | [] -> core
+    | Core.Run_worker (Core.Request (ticket,Core.Handle_sync_worker_effect (Sync.Inspect_mirror request))) :: rest ->
+      let next=Core.step core (Runner_completed (Sync_worker_effect_completed (ticket,
+        Ok {event=Some (Sync.Mirror_inspected (Mirror_available request));lifecycle=Lifecycle_unchanged}))) in
+      open_requests next.next (next.effects @ rest)
+    | Core.Run_worker (Core.Request (ticket,Core.Handle_sync_worker_effect (Sync.Attach_graph request))) :: rest ->
+      let database_id="resident-" ^ Logseq_db_types.Graph_types.Uuid.to_string request.scope.graph_id in
+      let database=Core.database_opened ~database_id ~graph_id:request.scope.graph_id in
+      let module O=Logseq_overlay_db.Types in
+      let sync=O.sync_view ~token:(O.sync_token_of_string "sync-token:v1:resident" |> Result.get_ok)
+        ~checkpoint:(O.Server_cursor.of_int64 0L |> Result.get_ok) ~submissions:[] in
+      let next=Core.step core (Runner_completed (Sync_worker_effect_completed (ticket,
+        Ok {event=Some (Sync.Graph_attached {scope=request.scope;sync});
+          lifecycle=Lifecycle_opened (database,request.scope.graph_generation)}))) in
+      open_requests next.next rest
+    | _ :: rest -> open_requests core rest in
+  let opened=open_requests configured.next configured.effects in
+  opened,first_scope,second_id
+;;
+let test_resident_worker_routes_by_scope () =
+  let opened,first_scope,second_id=resident_worker_fixture () in
+  Alcotest.(check int) "two independent DB scopes remain open" 2 (List.length (Core.graph_scopes opened));
+  let second_scope=List.find (fun (scope:Sync.graph_scope)->scope.graph_id=second_id) (Core.graph_scopes opened) in
+  let request=graph_info_request () in
+  let started=Core.step opened (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 101L;request}) in
+  let execution=List.find_map (function Core.Run_worker ((Core.Request (_,Execute_request _)) as instruction)->Some instruction | _->None) started.effects |> Option.get in
+  let focused=Core.step started.next (Sync_event (Sync.Visible_graph_changed second_id)) in
+  let hidden=Core.step focused.next (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 102L;request}) in
+  Alcotest.(check bool) "hidden request still targets first database" true
+    (List.exists (function Core.Run_worker (Core.Request (_,Execute_request {database;_}))->
+      Core.database_handle_id database="db-delete" | _->false) hidden.effects);
+  let second=Core.step hidden.next (Graph_request_for_scope {scope=second_scope;id=Core.request_id_of_int64 103L;request}) in
+  Alcotest.(check bool) "visible request targets its own database" true
+    (List.exists (function Core.Run_worker (Core.Request (_,Execute_request {database;_}))->
+      Core.database_handle_id database="resident-" ^ Logseq_db_types.Graph_types.Uuid.to_string second_id | _->false) second.effects);
+  let completion=Core.complete_execute execution (Error (Logseq_db_worker.Error.create
+    ~code:Closed_session ~message:"Synthetic terminal read." ~details:[] |> Result.get_ok)) |> Option.get in
+  let completed=Core.step second.next completion in
+  Alcotest.(check bool) "late completion replies to original request exactly once" true
+    (List.exists (function Core.Publish (Reply (id,_))->Core.request_id_to_int64 id=101L | _->false) completed.effects);
+  let duplicate=Core.step completed.next completion in
+  Alcotest.(check bool) "duplicate completion cannot reply twice" false
+    (List.exists (function Core.Publish (Reply _)->true | _->false) duplicate.effects)
+;;
+
+let test_resident_worker_closes_every_scope () =
+  List.iter (fun event ->
+    let opened,_,_=resident_worker_fixture () in
+    let closing=Core.step opened event in
+    let detached=List.filter_map (function
+      | Core.Run_worker (Core.Request (ticket,Handle_sync_worker_effect (Sync.Detach_graph scope))) -> Some(ticket,scope)
+      | _->None) closing.effects in
+    Alcotest.(check int) "every removed DB independently drains and detaches" 2 (List.length detached);
+    let terminal=List.fold_left (fun state (ticket,scope)->
+      (Core.step state (Runner_completed (Sync_worker_effect_completed (ticket,
+        Ok {event=Some(Sync.Graph_detached(scope,Ok()));lifecycle=Lifecycle_closed scope.graph_generation})))).next)
+      closing.next detached in
+    Alcotest.(check int) "no removed graph remains admitted" 0 (List.length(Core.graph_scopes terminal)))
+    [Core.Sync_event(Sync.Resident_graphs_changed []);Core.Sync_event(Sync.Account_authenticated{user_id=None})]
+let test_resident_worker_shutdown_closes_all_databases () =
+  let opened,_,_=resident_worker_fixture () in
+  let stopped=Core.step opened Shutdown in
+  let databases=List.filter_map (function
+    | Core.Run_worker(Core.Request(_,Close_database database))->Some(Core.database_handle_id database)
+    | _->None) stopped.effects in
+  Alcotest.(check int) "shutdown closes both resident databases" 2 (List.length(List.sort_uniq String.compare databases))
+;;
 let () =
   Alcotest.run
     "logseq db worker pure reducer"
-    [ ( "authoritative diagnostics", [Alcotest.test_case "four categories propagate without closing graph" `Quick test_authoritative_failure_categories_reach_diagnostics])
+    [ ( "resident graphs", [Alcotest.test_case "scope routes and delayed replies survive focus" `Quick test_resident_worker_routes_by_scope;
+        Alcotest.test_case "all removals and logout detach each graph" `Quick test_resident_worker_closes_every_scope;
+        Alcotest.test_case "shutdown closes every resident database" `Quick test_resident_worker_shutdown_closes_all_databases])
+    ; ( "authoritative diagnostics", [Alcotest.test_case "four categories propagate without closing graph" `Quick test_authoritative_failure_categories_reach_diagnostics])
     ; ( "snapshot failure", [
         Alcotest.test_case "terminal failure and explicit retry" `Quick test_snapshot_failure_is_terminal_and_retryable;
         Alcotest.test_case "success and late graph switch completions" `Quick test_snapshot_success_and_late_switch_completions ])

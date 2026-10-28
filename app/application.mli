@@ -97,6 +97,7 @@ module Root_navigation : sig
     | Capture_edited of string
     | Capture_admitted of Journal_capture.t
     | Completed of Journal_graph_runtime.response
+    | Graph_focused of { generation : int; graph_id : Logseq_db_types.Graph_types.Uuid.t }
     | Graph_replaced of
         { generation : int
         ; graph_id : Logseq_db_types.Graph_types.Uuid.t option
@@ -104,6 +105,7 @@ module Root_navigation : sig
     | Account_cleared
     | Local_copy_deleted
 
+  val next_graph : current:Logseq_db_types.Graph_types.Uuid.t -> Logseq_db_types.Graph_types.Uuid.t list -> Logseq_db_types.Graph_types.Uuid.t option
   val diagnostic_rows : t -> (string * string) list
   val create : graph_generation:int -> t
   (** Compute state and ordered cleanup without executing file operations.

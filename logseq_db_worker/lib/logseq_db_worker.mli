@@ -87,3 +87,7 @@ val retain_imported_file
   -> scope:Logseq_sync_pure_reducer.Core.graph_scope
   -> operation:Logseq_db_types.Graph_types.Uuid.t
   -> (string * string) option
+
+val request_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> Protocol.request -> Protocol.response
+val graph_scopes : t -> Logseq_sync_pure_reducer.Core.graph_scope list
+val graph_state_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> graph_state option

@@ -25,6 +25,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
 @MainActor enum JournalChrome {
   private enum Mode: String, Decodable {
     case page, header, detail, unlock, startup
+    case graphPages = "graph-pages"
     case graphPicker = "graph-picker"
     case toolbarControl = "toolbar-control"
     case detailText = "detail-text"
@@ -48,9 +49,126 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let active: Bool?
     let value: Double?
     let message: String?
+    let enabled: Bool?
+    let pageID: String?
+    let targetID: String?
   }
 
   /// Syntax and reference resolution belong to OCaml; this maps presentation data.
+  #if os(iOS)
+  /// Native direction admission fails before vertical List scrolling is claimed.
+  private struct RightGraphPan: UIGestureRecognizerRepresentable {
+    let enabled: Bool
+    let changed: (UIPanGestureRecognizer) -> Void
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+      var enabled = false
+      func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
+        guard enabled, let pan = recognizer as? UIPanGestureRecognizer else { return false }
+        let velocity = pan.velocity(in: pan.view)
+        return velocity.x > 0 && velocity.x > abs(velocity.y) * 1.4
+      }
+      func gestureRecognizer(_ recognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        var view = touch.view
+        while let current = view {
+          if current is UIControl || current is UITextView || current is UITextField { return false }
+          view = current.superview
+        }
+        return enabled
+      }
+    }
+    func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator { Coordinator() }
+    func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer {
+      let pan = UIPanGestureRecognizer()
+      pan.maximumNumberOfTouches = 1
+      pan.delegate = context.coordinator
+      context.coordinator.enabled = enabled
+      return pan
+    }
+    func updateUIGestureRecognizer(_ recognizer: UIPanGestureRecognizer, context: Context) {
+      context.coordinator.enabled = enabled
+      // Do not cancel a gesture merely because its preview is being populated.
+      if recognizer.state == .possible { recognizer.isEnabled = enabled }
+    }
+    func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
+      changed(recognizer)
+    }
+  }
+  private struct GraphPages: SwiftUI.View {
+    let context: LUIAppleExtensionViewContext
+    let properties: Properties
+    let current: AnyView
+    let preview: AnyView
+    @State private var translation: CGFloat = 0
+    @State private var dragging = false
+    @State private var settling = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private func emit(_ action: String) {
+      JournalExtensions.emit(context: context, payload: Data(action.utf8))
+    }
+    private func handle(_ pan: UIPanGestureRecognizer, width: CGFloat) {
+      switch pan.state {
+      case .began:
+        guard properties.enabled == true, !settling else { return }
+        dragging = true
+        emit("prepare")
+        translation = min(width, max(0, pan.translation(in: pan.view).x))
+      case .changed where dragging:
+        translation = min(width, max(0, pan.translation(in: pan.view).x))
+      case .ended where dragging:
+        dragging = false
+        let distance = pan.translation(in: pan.view).x
+        let velocity = pan.velocity(in: pan.view).x
+        let commit = distance > width * 0.3 || (distance > 30 && velocity > 650)
+        settling = true
+        withAnimation(reduceMotion ? .linear(duration: 0.01) : .smooth(duration: 0.24), completionCriteria: .logicallyComplete) {
+          translation = commit ? width : 0
+        } completion: {
+          emit(commit ? "commit" : "cancel")
+          if !commit { settling = false }
+        }
+      case .cancelled, .failed:
+        guard dragging else { return }
+        dragging = false
+        withAnimation(.smooth(duration: 0.2)) { translation = 0 }
+        emit("cancel")
+      default: break
+      }
+    }
+    var body: some SwiftUI.View {
+      GeometryReader { bounds in
+        ZStack(alignment: .topLeading) {
+          preview
+            .frame(width: bounds.size.width, height: bounds.size.height)
+            .offset(x: translation - bounds.size.width)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+          current
+            .frame(width: bounds.size.width, height: bounds.size.height)
+            .offset(x: translation)
+        }
+        .clipped()
+        .gesture(RightGraphPan(enabled: properties.enabled == true && !settling) {
+          handle($0, width: bounds.size.width)
+        })
+      }
+      .onChange(of: properties.pageID) { _, _ in
+        translation = 0; dragging = false; settling = false
+      }
+      .onChange(of: properties.targetID) { _, target in
+        if target == nil && !dragging { translation = 0; settling = false }
+      }
+      .onChange(of: properties.enabled) { _, enabled in
+        if enabled != true && dragging {
+          dragging = false
+          withAnimation(.smooth(duration: 0.2)) { translation = 0 }
+          emit("cancel")
+        }
+      }
+    }
+  }
+  #endif
+
   private struct TitleRun: Decodable {
     let text: String
     let styles: [String]
@@ -233,6 +351,14 @@ struct JournalSheetDismissButton: SwiftUI.View {
     var body: some SwiftUI.View {
       let properties = self.properties
       switch properties?.mode {
+      case .graphPages:
+        if let properties, context.childIDs.count == 2 {
+          #if os(iOS)
+          GraphPages(context: context, properties: properties, current: child(0), preview: child(1))
+          #else
+          child(0)
+          #endif
+        }
       case .page:
         if let properties, context.childIDs.count == 3,
           properties.connecting != nil, properties.controls != nil {

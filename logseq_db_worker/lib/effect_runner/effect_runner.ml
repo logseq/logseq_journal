@@ -362,7 +362,8 @@ type change_window =
   }
 
 type database_session =
-  { database : Database.t
+  { graph_scope : Sync.graph_scope
+  ; database : Database.t
   ; subscription : Database.subscription
   ; mutable generation : string
   ; mutable next_window : int
@@ -381,8 +382,8 @@ type t =
   ; asset_operations : (Logseq_sync_pure_reducer.Asset_transfer.ticket, string) Hashtbl.t
   ; mutable next_asset_operation : int64
   ; upload_staging_lock : Eio.Mutex.t
-  ; mutable staging_reconciled : Sync.graph_scope option
-  ; local_imports : (Graph.Uuid.t * string, Graph.Uuid.t) Hashtbl.t
+  ; mutable staging_reconciled : Sync.graph_scope list
+  ; local_imports : (Sync.graph_scope * Graph.Uuid.t * string, Graph.Uuid.t) Hashtbl.t
   ; recovery_current : Core.upload_recovery_ticket -> bool
   ; upload_current : Upload.ticket -> bool
   ; asset_current : Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool
@@ -390,6 +391,8 @@ type t =
   ; inspections : (string, Database.mirror_inspection) Hashtbl.t
   ; waiters : (int64, waiter) Hashtbl.t
   ; waiter_lock : Eio.Mutex.t
+  ; attachments : (Sync.graph_scope, string) Hashtbl.t
+  ; session_snapshots : (Sync.graph_scope, Sync.snapshot) Hashtbl.t
   ; mutable attached : (string * Sync.graph_scope) option
   ; mutable next_database_id : int64
   ; mutable stopped : bool
@@ -420,12 +423,14 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; asset_operations = Hashtbl.create 8
     ; next_asset_operation = 0L
     ; upload_staging_lock = Eio.Mutex.create ()
-    ; staging_reconciled = None
+    ; staging_reconciled = []
     ; local_imports = Hashtbl.create 32
     ; databases = Hashtbl.create 4
     ; inspections = Hashtbl.create 4
     ; waiters = Hashtbl.create 32
     ; waiter_lock = Eio.Mutex.create ()
+    ; attachments = Hashtbl.create 3
+    ; session_snapshots = Hashtbl.create 3
     ; attached = None
     ; next_database_id = 0L
     ; stopped = false
@@ -494,8 +499,12 @@ let current_graph_scope t (scope : Sync.graph_scope) =
   match t.latest_snapshot with
   | Some snapshot -> not t.stopped
       && snapshot.startup.account_generation = scope.account.account_generation
-      && snapshot.startup.graph_generation = scope.graph_generation
-      && snapshot.selected_graph = Some scope.graph_id
+      && (if snapshot.resident_graphs=[] then
+        snapshot.startup.graph_generation=scope.graph_generation && snapshot.selected_graph=Some scope.graph_id
+        else List.mem scope.graph_id snapshot.resident_graphs
+          && (match Hashtbl.find_opt t.session_snapshots scope with
+              | Some own -> own.selected_graph=Some scope.graph_id && own.startup.graph_generation=scope.graph_generation
+              | None -> Hashtbl.mem t.attachments scope))
   | None -> false
 ;;
 
@@ -609,20 +618,20 @@ let with_staging_lock t action =
     (fun () ->
        match action () with
        | result ->
-         if Result.is_error result then t.staging_reconciled <- None;
+         if Result.is_error result then t.staging_reconciled <- [];
          result
        | exception error ->
-         t.staging_reconciled <- None;
+         t.staging_reconciled <- [];
          raise error)
 ;;
 
 let reconcile_staging t (scope : Sync.graph_scope) ~current =
   if (not (current ())) || t.stopped
   then Error "Stale staging recovery"
-  else if t.staging_reconciled = Some scope
+  else if List.mem scope t.staging_reconciled
   then Ok ()
   else (
-    Hashtbl.clear t.local_imports;
+    Hashtbl.filter_map_inplace (fun (owner,_,_) operation -> if owner=scope then None else Some operation) t.local_imports;
     let keep =
       with_upload_store t (fun db ->
         let rec read after reversed =
@@ -644,7 +653,7 @@ let reconcile_staging t (scope : Sync.graph_scope) ~current =
                         let module I = Logseq_db_types.Asset_upload_intent in
                         if intent.I.phase <> I.Cancelled then
                           Hashtbl.replace t.local_imports
-                            (intent.asset, intent.version.checksum) intent.operation_id;
+                            (scope, intent.asset, intent.version.checksum) intent.operation_id;
                         intent.staged_file :: files)
                      reversed
                      intents
@@ -667,7 +676,7 @@ let reconcile_staging t (scope : Sync.graph_scope) ~current =
         | Ok (Sync.Asset_pruned _) ->
           if current ()
           then (
-            t.staging_reconciled <- Some scope;
+            t.staging_reconciled <- scope :: t.staging_reconciled;
             Ok ())
           else Error "Stale staging recovery"
         | Error failure -> Error (asset_failure_message failure)
@@ -944,8 +953,8 @@ let publish_projection_change t session = function
          ]) ^ "\n")
      with _ -> ());
     t.post
-      (Core.Projection_push
-         (Protocol.V2_changes_available
+      (Core.Projection_push_for_scope
+         (session.graph_scope, Protocol.V2_changes_available
             { api_version = Protocol.api_version; generation; through = id }))
   | Overlay.Projection_resync_required { generation; reason; _ } ->
     let generation = Overlay.Generation.to_string generation in
@@ -955,8 +964,8 @@ let publish_projection_change t session = function
     session.acknowledged_through
     <- Printf.sprintf "change-window:v1:%d" (session.next_window - 1);
     t.post
-      (Core.Projection_push
-         (Protocol.V2_resync_required_push
+      (Core.Projection_push_for_scope
+         (session.graph_scope, Protocol.V2_resync_required_push
             { api_version = Protocol.api_version
             ; generation
             ; reason = resync_reason reason
@@ -1082,6 +1091,8 @@ let close_database_by_id ?scope t database_id =
          | _ -> ()) scope;
        report_warning "journal: operation=closeDatabase code=cleanupPending\n");
     Hashtbl.remove t.databases database_id;
+    Hashtbl.filter_map_inplace (fun _ id -> if id=database_id then None else Some id) t.attachments;
+    (match t.attached with Some (id,_) when id=database_id -> t.attached <- None | _ -> ());
     Result.map_error
       close_error
       result
@@ -1770,10 +1781,7 @@ let sync_result ?event ?(lifecycle = Core.Lifecycle_unchanged) () =
 ;;
 
 let attached_session t scope =
-  match t.attached with
-  | Some (database_id, attached_scope) when attached_scope = scope ->
-    Hashtbl.find_opt t.databases database_id
-  | Some _ | None -> None
+  Option.bind (Hashtbl.find_opt t.attachments scope) (Hashtbl.find_opt t.databases)
 ;;
 
 let protected_envelope (iv, ciphertext) =
@@ -2209,11 +2217,11 @@ let handle_sync_worker_effect t = function
     let scope : Sync.graph_scope = {account=request.account;graph_id=request.graph_id;graph_generation=0} in
     let result = try
       let* () = if current () then Ok () else Error "The graph account is no longer current." in
-      let* () = match t.attached with
-        | Some (_, actual) when actual.graph_id = request.graph_id ->
+      let* () = match Hashtbl.fold (fun (actual:Sync.graph_scope) _ found -> found || actual.graph_id=request.graph_id) t.attachments false with
+        | true ->
           report (failure_detail ~operation:"deleteMirror" ~reason:"busy" ());
           Error "Switch to another graph before deleting."
-        | _ -> Ok () in
+        | false -> Ok () in
       let* () = with_staging_lock t (fun () -> recover_local_retirements ~on_diagnostic:report t scope) in
       let retirement = fresh_retirement () in
       (* Ownership is acquired before any asset retirement or intent mutation. *)
@@ -2302,7 +2310,9 @@ let handle_sync_worker_effect t = function
     in
     Ok (sync_result ~event:(Sync.Mirror_deleted (request, result)) ())
   | Attach_graph request ->
-    ignore (close_attached t);
+    (match t.latest_snapshot with
+     | Some snapshot when snapshot.resident_graphs<>[] -> ()
+     | _ -> ignore (close_attached t));
     let key = Graph.Uuid.to_string request.graph.graph_id in
     (match Hashtbl.find_opt t.inspections key with
      | None -> Error (effect_error "The graph attachment inspection is stale.")
@@ -2322,7 +2332,8 @@ let handle_sync_worker_effect t = function
              let database_id = "managed-" ^ Int64.to_string t.next_database_id in
              t.next_database_id <- Int64.succ t.next_database_id;
              let session =
-               { database
+               { graph_scope = request.scope
+               ; database
                ; subscription
                ; generation = Overlay.Generation.to_string version.generation
                ; next_window = 1
@@ -2331,6 +2342,7 @@ let handle_sync_worker_effect t = function
                }
              in
              Hashtbl.replace t.databases database_id session;
+             Hashtbl.replace t.attachments request.scope database_id;
              t.attached <- Some (database_id, request.scope);
              (match
                 Database.activate_subscription subscription ~notify:(fun change ->
@@ -2357,10 +2369,9 @@ let handle_sync_worker_effect t = function
                         ()))))))
   | Detach_graph scope ->
     let closed =
-      match t.attached with
-      | Some (_, attached) when attached = scope -> close_attached t
+      match Hashtbl.find_opt t.attachments scope with
+      | Some database_id -> close_database_by_id ~scope t database_id
       | None -> Ok ()
-      | Some _ -> Error (effect_error "The graph close scope is stale.")
     in
     Result.map
       (fun () ->
@@ -2370,14 +2381,11 @@ let handle_sync_worker_effect t = function
            ())
       closed
   | Reset_managed_account account ->
-    let lifecycle =
-      match t.attached with
-      | Some (_, scope) when scope.account = account ->
-        ignore (close_attached t);
-        Core.Lifecycle_closed scope.graph_generation
-      | Some _ | None -> Core.Lifecycle_unchanged
-    in
-    Ok (sync_result ~lifecycle ())
+    let owned=Hashtbl.fold (fun (scope:Sync.graph_scope) id result ->
+      if scope.account.user_id=account.user_id && scope.account.managed_sync_origin=account.managed_sync_origin
+         && scope.account.account_generation=account.account_generation then (scope,id)::result else result) t.attachments [] in
+    List.iter (fun (scope,id)->ignore(close_database_by_id ~scope t id)) owned;
+    Ok (sync_result ())
   | Inspect_sync scope ->
     (match attached_session t scope with
      | None -> Error (effect_error "The overlay database is unavailable.")
@@ -2479,10 +2487,7 @@ let run_request t (type a) (request : a Core.runner_request)
        Ok
          (execute_database
             ~on_enrichment_error:(fun () ->
-              match t.attached with
-              | Some (id, scope) when id=Core.database_handle_id database ->
-                report_current_graph t scope "worker.readTagTitles"
-              | _ -> ())
+              report_current_graph t session.graph_scope "worker.readTagTitles")
             session
             ~response_budget_bytes:t.dependencies.config.response_budget_bytes
             request))
@@ -2699,7 +2704,7 @@ let local_import t ~(scope : Sync.graph_scope) ~asset ~checksum ~current =
   with_staging_lock t (fun () ->
     let ( let* ) = Result.bind in
     let* () = reconcile_staging t scope ~current in
-    match Hashtbl.find_opt t.local_imports (asset, checksum) with
+    match Hashtbl.find_opt t.local_imports (scope, asset, checksum) with
     | None -> Ok None
     | Some operation ->
       let* intent =
@@ -2957,11 +2962,18 @@ let submit t = function
     t.dependencies.sync_runner.submit sync_effect
   | Run_sync sync_effect ->
     if not t.stopped then t.dependencies.sync_runner.submit sync_effect
+  | Publish (Core.Sync_output (Sync.Session_state_changed (scope,state)) as output) ->
+    if state.snapshot.selected_graph=Some scope.graph_id then Hashtbl.replace t.session_snapshots scope state.snapshot
+    else Hashtbl.remove t.session_snapshots scope;
+    if not t.stopped then t.dependencies.publish output
   | Publish (Core.Sync_output (Sync.State_changed state) as output) ->
     if not (Option.fold ~none:false ~some:(fun old -> old.Sync.catalog == state.snapshot.catalog) t.latest_snapshot)
     then t.authorized_graphs <- List.fold_left (fun ids (graph : Sync.graph) ->
       Authorized_graphs.add (Graph.Uuid.to_string graph.graph_id) ids) Authorized_graphs.empty state.snapshot.catalog;
     t.latest_snapshot <- Some state.snapshot;
+    Hashtbl.filter_map_inplace (fun (scope:Sync.graph_scope) own ->
+      if scope.account.account_generation=state.snapshot.startup.account_generation
+        && List.mem scope.graph_id state.snapshot.resident_graphs then Some own else None) t.session_snapshots;
     t.notice_diagnostics <- List.filter (fun item -> current_graph_scope t item.scope) t.notice_diagnostics;
     if not (Option.fold ~none:false ~some:(deletion_authorized t) t.deletion_owner)
     then t.deletion_owner <- None;
@@ -3136,7 +3148,7 @@ let prepare_import t ~(context : Sync.asset_context) request ~current =
       (fun (intent : Logseq_db_types.Asset_upload_intent.t) ->
          Hashtbl.replace
            t.local_imports
-           (intent.asset, intent.version.checksum)
+           (context.scope, intent.asset, intent.version.checksum)
            intent.operation_id;
          if intent.phase <> Logseq_db_types.Asset_upload_intent.Cancelled && current ()
          then

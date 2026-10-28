@@ -6260,3 +6260,173 @@ let catalog_save_keeps_the_safe_producer_cause () =
 let scenarios = scenarios @ [Alcotest.test_case "catalog save retains safe producer cause" `Quick
   catalog_save_keeps_the_safe_producer_cause]
 ;;
+
+(* Resident membership is independent of graph lifetime and presentation. *)
+let third_graph = { other_graph with graph_id =
+  Logseq_db_types.Graph_types.Uuid.of_string "33333333-3333-4333-8333-333333333333" |> Result.get_ok }
+let fourth_graph = { other_graph with graph_id =
+  Logseq_db_types.Graph_types.Uuid.of_string "44444444-4444-4444-8444-444444444444" |> Result.get_ok }
+let resident_catalog () =
+  let selected, _ = selected_graph graph in
+  (refresh_catalog selected.next [graph;other_graph;third_graph;fourth_graph]).next
+let resident_scope core id = Core.scope_for_graph core ~graph_id:id |> Option.get
+let resident_ids = [graph.graph_id;other_graph.graph_id;third_graph.graph_id]
+let check_residents expected core =
+  Alcotest.(check bool) "configured resident order" true (Core.resident_graphs core = expected)
+let resident_membership_limits_and_order () =
+  let original = resident_catalog () in
+  let one = Core.step original (Core.Resident_graphs_changed [graph.graph_id]) in
+  check_residents [graph.graph_id] one.next;
+  let two = Core.step one.next (Core.Resident_graphs_changed [graph.graph_id;other_graph.graph_id]) in
+  check_residents [graph.graph_id;other_graph.graph_id] two.next;
+  let three = Core.step two.next (Core.Resident_graphs_changed resident_ids) in
+  check_residents resident_ids three.next;
+  List.iter (fun invalid ->
+    let result = Core.step three.next (Core.Resident_graphs_changed invalid) in
+    check_residents resident_ids result.next;
+    check_instructions "invalid configuration emits no work" [] result.effects)
+    [resident_ids @ [fourth_graph.graph_id];[graph.graph_id;graph.graph_id];[fourth_graph.graph_id;Logseq_db_types.Graph_types.Uuid.of_string "55555555-5555-4555-8555-555555555555" |> Result.get_ok]];
+  let reordered = Core.step three.next (Core.Resident_graphs_changed (List.rev resident_ids)) in
+  check_residents (List.rev resident_ids) reordered.next
+let resident_focus_preserves_lifetimes () =
+  let configured = Core.step (resident_catalog ()) (Core.Resident_graphs_changed resident_ids) in
+  let owners = List.map (resident_scope configured.next) resident_ids in
+  let focused = List.fold_left (fun core id ->
+    let next = Core.step core (Core.Visible_graph_changed id) in
+    Alcotest.(check bool) "focus does not close/cancel graph operations" false
+      (List.exists (function Core.Delegate (Core.Detach_graph _) | Run (Core.Close_websocket _ | Cancel_effects _) -> true | _ -> false) next.effects);
+    Alcotest.(check bool) "requested graph becomes visible" true
+      ((Core.state next.next).snapshot.selected_graph = Some id);
+    List.iter2 (fun id owner -> Alcotest.(check bool) "original graph lifetime survives focus" true
+      (Core.scope_for_graph next.next ~graph_id:id = Some owner)) resident_ids owners;
+    next.next) configured.next (resident_ids @ [graph.graph_id]) in
+  check_residents resident_ids focused
+let resident_removal_reopen_and_late_callback () =
+  let configured = Core.step (resident_catalog ()) (Core.Resident_graphs_changed resident_ids) in
+  let old = resident_scope configured.next other_graph.graph_id in
+  let removed = Core.step configured.next (Core.Resident_graphs_changed [graph.graph_id;third_graph.graph_id]) in
+  Alcotest.(check bool) "removal revokes only removed graph" true
+    (Core.scope_for_graph removed.next ~graph_id:other_graph.graph_id = None);
+  Alcotest.(check bool) "removal never deletes mirror/account" false
+    (List.exists (function Core.Delegate (Core.Delete_mirror _ | Reset_managed_account _) | Run (Core.Request (_, Core.Delete_account_secrets _)) -> true | _ -> false) removed.effects);
+  let reopened = Core.step removed.next (Core.Resident_graphs_changed resident_ids) in
+  let fresh = resident_scope reopened.next other_graph.graph_id in
+  Alcotest.(check bool) "reopened graph gets fresh lifetime" true (old <> fresh);
+  let late = Core.step reopened.next (Core.Graph_attached {scope=old;sync=Overlay.sync_view ~token:(Overlay.sync_token_of_string "sync-token:v1:1" |> Result.get_ok) ~checkpoint:(server_cursor_of_int 0) ~submissions:[]}) in
+  Alcotest.(check bool) "late old attachment cannot replace fresh scope" true
+    (Core.scope_for_graph late.next ~graph_id:other_graph.graph_id = Some fresh)
+let resident_logout_clears_membership () =
+  let configured = Core.step (resident_catalog ()) (Core.Resident_graphs_changed resident_ids) in
+  let cleared = Core.step configured.next (Core.Account_authenticated {user_id=None}) in
+  check_residents [] cleared.next;
+  List.iter (fun id -> Alcotest.(check bool) "account retirement removes all scopes" true
+    (Core.scope_for_graph cleared.next ~graph_id:id = None)) resident_ids
+let resident_catalog_codec_keeps_order () =
+  let configured = Core.step (resident_catalog ()) (Core.Resident_graphs_changed resident_ids) in
+  let focused = Core.step configured.next (Core.Visible_graph_changed other_graph.graph_id) in
+  let cache = List.find_map (function Core.Run (Core.Request (_, Core.Save_catalog {cache;_})) -> Some cache | _ -> None) focused.effects |> Option.get in
+  let decoded = Core.decode_catalog_cache (Core.encode_catalog_cache cache) |> Result.get_ok in
+  Alcotest.(check bool) "codec preserves resident order" true (Core.catalog_cache_resident_graphs decoded = resident_ids);
+  Alcotest.(check bool) "codec preserves visible graph" true (Core.catalog_cache_selected_graph decoded = Some other_graph.graph_id);
+  let old = Core.catalog_cache ~user_id:"user" ~graphs:[graph] ~selected_graph:(Some graph.graph_id) in
+  Alcotest.(check bool) "legacy single selection migrates" true (Core.catalog_cache_resident_graphs old = [graph.graph_id])
+let scenarios = scenarios @
+  [ Alcotest.test_case "resident membership limits and order" `Quick resident_membership_limits_and_order
+  ; Alcotest.test_case "resident focus preserves lifetimes" `Quick resident_focus_preserves_lifetimes
+  ; Alcotest.test_case "resident remove reopen fences callbacks" `Quick resident_removal_reopen_and_late_callback
+  ; Alcotest.test_case "resident logout clears membership" `Quick resident_logout_clears_membership
+  ; Alcotest.test_case "resident catalog codec preserves order" `Quick resident_catalog_codec_keeps_order ]
+;;
+
+let resident_restart_restores_membership_and_focus () =
+  let configured=Core.step (resident_catalog ()) (Core.Resident_graphs_changed (List.rev resident_ids)) in
+  let focused=Core.step configured.next (Core.Visible_graph_changed other_graph.graph_id) in
+  let cache=save_catalog_cache focused.effects |> Core.encode_catalog_cache |> Core.decode_catalog_cache |> Result.get_ok in
+  let restoring=Core.step (cold_start ()) (Core.Restore_local_account {user_id="user"}) in
+  let restored=Core.step restoring.next (load_catalog_completion restoring.effects (Some cache)) in
+  check_residents (List.rev resident_ids) restored.next;
+  Alcotest.(check bool) "restart restores selected resident" true
+    ((Core.state restored.next).snapshot.selected_graph=Some other_graph.graph_id);
+  List.iter (fun id -> Alcotest.(check bool) "restart creates each independent scope" true
+    (Option.is_some(Core.scope_for_graph restored.next ~graph_id:id))) resident_ids
+;;
+let resident_cache_rejects_invalid_membership () =
+  let configured=Core.step (resident_catalog ()) (Core.Resident_graphs_changed resident_ids) in
+  let cache=save_catalog_cache configured.effects |> Core.encode_catalog_cache |> Yojson.Safe.from_string in
+  let fields=Yojson.Safe.Util.to_assoc cache in
+  let uuid id=Logseq_db_types.Graph_types.Uuid.to_string id |> fun value -> `String value in
+  List.iter (fun ids ->
+    let source=`Assoc (("cache_resident_graphs",`List(List.map uuid ids))::List.remove_assoc "cache_resident_graphs" fields)
+      |> Yojson.Safe.to_string in
+    Alcotest.(check bool) "invalid durable membership is rejected" true
+      (Result.is_error(Core.decode_catalog_cache source)))
+    [resident_ids @ [fourth_graph.graph_id];[graph_id;graph_id];[third_graph.graph_id]]
+;;
+let resident_hidden_graphs_receive_shared_network_permission () =
+  let configured=Core.step (resident_catalog ()) (Core.Resident_graphs_changed [graph_id;other_graph_id]) in
+  let cache=save_catalog_cache configured.effects in
+  let restoring=Core.step (cold_start ()) (Core.Restore_local_account {user_id="user"}) in
+  let restored=Core.step restoring.next (load_catalog_completion restoring.effects (Some cache)) in
+  let attached=List.fold_left (fun core id ->
+    let scope=resident_scope core id in
+    let request=List.find_map (function Core.Delegate(Core.Inspect_mirror request) when request.scope=scope -> Some request|_->None) restored.effects |> Option.get in
+    let attaching=Core.step core (Core.Mirror_inspected(Core.Mirror_available request)) in
+    let token=Overlay.sync_token_of_string ("sync-token:v1:" ^ Logseq_db_types.Graph_types.Uuid.to_string id) |> Result.get_ok in
+    Core.step attaching.next (Core.Graph_attached {scope;sync=Overlay.sync_view ~token ~checkpoint:(server_cursor_of_int 0) ~submissions:[]})
+      |> fun result->result.next) restored.next [graph_id;other_graph_id] in
+  let shown=Core.step attached (Core.Timeline_presented(timeline_ticket attached)) in
+  let online=Core.step shown.next (Core.Account_authenticated {user_id=Some "user"}) in
+  Alcotest.(check bool) "shared permission does not retire a connection still opening" false
+    (List.exists(function Core.Run(Core.Close_websocket _)->true|_->false) online.effects);
+  let sockets=List.filter_map (function Core.Run(Core.Start_websocket request)->Some request.scope.graph.graph_id|_->None) online.effects in
+  Alcotest.(check bool) "visible and hidden graph start independent sockets" true
+    (List.sort_uniq compare sockets=List.sort compare [graph_id;other_graph_id]);
+  List.iter (fun id -> let scope=resident_scope online.next id in
+    let state=Core.state_for_scope online.next scope |> Option.get in
+    Alcotest.(check bool) "network permission shared with hidden graph" true
+      (state.snapshot.startup.network_phase<>Core.Local_only)) [graph_id;other_graph_id]
+;;
+let scenarios=scenarios @
+  [Alcotest.test_case "resident restart restores order and focus" `Quick resident_restart_restores_membership_and_focus
+  ;Alcotest.test_case "resident durable membership validation" `Quick resident_cache_rejects_invalid_membership
+  ;Alcotest.test_case "resident hidden network permission" `Quick resident_hidden_graphs_receive_shared_network_permission]
+;;
+
+let resident_online_fixture () =
+  let configured=Core.step (resident_catalog ()) (Core.Resident_graphs_changed [graph_id;other_graph_id]) in
+  let cache=save_catalog_cache configured.effects in
+  let restoring=Core.step (cold_start ()) (Core.Restore_local_account {user_id="user"}) in
+  let restored=Core.step restoring.next (load_catalog_completion restoring.effects (Some cache)) in
+  let attached=List.fold_left (fun core id ->
+    let scope=resident_scope core id in
+    let request=List.find_map (function Core.Delegate(Core.Inspect_mirror request) when request.scope=scope -> Some request|_->None) restored.effects |> Option.get in
+    let attaching=Core.step core (Core.Mirror_inspected(Core.Mirror_available request)) in
+    let token=Overlay.sync_token_of_string ("sync-token:v1:" ^ Logseq_db_types.Graph_types.Uuid.to_string id) |> Result.get_ok in
+    Core.step attaching.next (Core.Graph_attached {scope;sync=Overlay.sync_view ~token ~checkpoint:(server_cursor_of_int 0) ~submissions:[]})
+      |> fun result->result.next) restored.next [graph_id;other_graph_id] in
+  let shown=Core.step attached (Core.Timeline_presented(timeline_ticket attached)) in
+  Core.step shown.next (Core.Account_authenticated {user_id=Some "user"})
+
+;;
+let resident_online_cancel_retires_and_resumes_hidden () =
+  let online=resident_online_fixture () in
+  let scopes=List.filter_map(function Core.Run(Core.Start_websocket request)->Some request.scope|_->None) online.effects in
+  let opened=List.fold_left(fun core scope->(Core.step core (Core.Websocket_opened scope)).next) online.next scopes in
+  let cancelled=Core.step opened (Core.Online_cancelled(startup_ticket opened)) in
+  let closes=List.filter_map(function Core.Run(Core.Close_websocket scope)->Some scope|_->None) cancelled.effects in
+  Alcotest.(check int) "all graph policies enter physical retirement" 2 (List.length(List.sort_uniq compare closes));
+  List.iter(fun early->
+    let authenticated core=let sign_in=Core.step core (Core.Sign_in_requested(startup_ticket core)) in
+      Core.step sign_in.next (Core.Account_authenticated {user_id=Some "user"}) in
+    let ready,initial_effects=if early then let auth=authenticated cancelled.next in auth.next,auth.effects
+      else cancelled.next,[] in
+    let retired=List.fold_left(fun result scope->
+      let part=Core.step result.Core.next (Core.Websocket_retired scope) in
+      {Core.next=part.next;effects=result.effects @ part.effects}) {Core.next=ready;effects=initial_effects} scopes in
+    let resumed=if early then retired else let auth=authenticated retired.next in {auth with effects=retired.effects @ auth.effects} in
+    let starts=List.filter_map(function Core.Run(Core.Start_websocket request)->Some request.scope.graph.graph_id|_->None) resumed.effects in
+    Alcotest.(check bool) "hidden graph resumes both before and after terminal retirement" true
+      (List.sort_uniq compare starts=List.sort compare [graph_id;other_graph_id])) [false;true]
+;;
+let scenarios=scenarios @ [Alcotest.test_case "resident online cancellation resumes every graph" `Quick resident_online_cancel_retires_and_resumes_hidden]
+;;
