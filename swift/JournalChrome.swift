@@ -52,6 +52,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let enabled: Bool?
     let pageID: String?
     let targetID: String?
+    let targetPageID: String?
+    let residentPageIDs: [String]?
   }
 
   /// Syntax and reference resolution belong to OCaml; this maps presentation data.
@@ -101,6 +103,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     @State private var translation: CGFloat = 0
     @State private var dragging = false
     @State private var settling = false
+    @Environment(\.journalGraphScrollOffsets) private var graphScrollOffsets
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private func emit(_ action: String) {
@@ -139,11 +142,13 @@ struct JournalSheetDismissButton: SwiftUI.View {
       GeometryReader { bounds in
         ZStack(alignment: .topLeading) {
           preview
+            .environment(\.journalGraphScrollScope, properties.targetPageID.map { JournalGraphScrollScope(pageID: $0, records: false) })
             .frame(width: bounds.size.width, height: bounds.size.height)
             .offset(x: translation - bounds.size.width)
             .allowsHitTesting(false)
             .accessibilityHidden(true)
           current
+            .environment(\.journalGraphScrollScope, properties.pageID.map { JournalGraphScrollScope(pageID: $0, records: true) })
             .frame(width: bounds.size.width, height: bounds.size.height)
             .offset(x: translation)
         }
@@ -152,6 +157,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
           handle($0, width: bounds.size.width)
         })
       }
+      .onAppear { graphScrollOffsets?.retain(properties.residentPageIDs ?? []) }
+      .onChange(of: properties.residentPageIDs) { _, ids in graphScrollOffsets?.retain(ids ?? []) }
       .onChange(of: properties.pageID) { _, _ in
         translation = 0; dragging = false; settling = false
       }

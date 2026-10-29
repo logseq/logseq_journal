@@ -6264,6 +6264,8 @@ let start
     left.graph_preview=right.graph_preview && left.graph_preview_revision=right.graph_preview_revision
     && graph_switch_enabled left=graph_switch_enabled right
     && next_resident_owner left=next_resident_owner right
+    && Option.map (fun (m:Graph_service.snapshot)->m.resident_scopes) left.manager
+       = Option.map (fun (m:Graph_service.snapshot)->m.resident_scopes) right.manager
     && left.graph_state.generation = right.graph_state.generation
     && left.graph_state.graph_id = right.graph_state.graph_id
     && left.environment.platform = right.environment.platform
@@ -6840,7 +6842,12 @@ let start
         save_runtime ();List.iter (fun restore->restore ()) restore;active_runtime:=previous;content
       | _->V.empty () in
     let can_switch=graph_switch_enabled state in
+    let resident_page_ids = Option.fold ~none:[] ~some:(fun (manager:Graph_service.snapshot)->
+      List.map (fun (scope:Graph_service.asset_scope)->owner_key
+        {startup={account_generation=scope.account.account_generation;presentation_generation=scope.account.presentation_generation};
+         graph_id=scope.graph_id;graph_generation=scope.graph_generation}) manager.resident_scopes) state.manager in
     let body=Journal_header.graph_pages ~enabled:can_switch
+      ~resident_page_ids ~target_page_id:(Option.map owner_key (next_resident_owner state))
       ~page_id:(Option.value (model_key state) ~default:"startup")
       ~target_id:state.graph_preview ~on_prepare:(fun ()->dispatch.send Graph_swipe_prepare)
       ~on_commit:(fun ()->dispatch.send Graph_swipe_commit) ~on_cancel:(fun ()->dispatch.send Graph_swipe_cancel)

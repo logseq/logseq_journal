@@ -6287,6 +6287,43 @@ let test_application_token_control ~saturated ~failure () =
 
 (* Picker presentation and native controls are owned by Application; Root_navigation
    has no public picker event. Exercise its mounted public hooks and worker lane. *)
+let test_picker_presence_native_patch_lifecycle () =
+  let module M = Journal_manager_view in
+  let ids=List.init 4 (fun n->Printf.sprintf "96000000-0000-4000-8000-%012d" (n+1)) in
+  let uuid id=Logseq_db_types.Graph_types.Uuid.of_string id |> Result.get_ok in
+  let live : M.picker_live={residents=List.filteri(fun n _->n<3)ids;replacement=None;status="";
+    authenticated=true;checking=false;deleting=None;presence=(fun _->None)} in
+  let graphs=List.map(fun id->({graph_id=uuid id;name="Synthetic graph " ^ id;
+    schema={major=65;minor=33;exact=true};encrypted=false}:Service.graph))ids |> List.to_seq |> Rrbvec.of_seq in
+  let snapshot=M.{graphs;selected_graph=Some(uuid(List.hd ids));live} in
+  let nodes=Hashtbl.create 256 and parents=Hashtbl.create 256 in
+  let teardown=track_json_wire_teardown ~parents (Hashtbl.remove nodes) in
+  let backend : Lui_protocol.backend={backend_profile=Lui_native_bridge.profile 2 2;
+    apply_batch=(fun batch->
+      let open Yojson.Safe.Util in
+      Lui_wire.encode_batch batch |> Yojson.Safe.from_string |> member "ops" |> to_list
+      |> List.iter(fun op->
+        let kind=member "op" op |> to_string in
+        let require field=let id=member field op |> to_int in
+          if not(Hashtbl.mem nodes id) then failwith(Printf.sprintf "native picker %s references missing %s %d" kind field id) in
+        (match kind with
+         | "create-node" | "create-extension" -> Hashtbl.replace nodes (member "id" op |> to_int) ()
+         | "insert-child" | "move-child" | "remove-child" -> require "parent";require "child"
+         | "set-prop" | "set-extension-prop" | "detach-subtree" | "drop-node" | "drop-extension" -> require "id"
+         | _->());
+        teardown op);true)} in
+  let app=Lui_app.create_with_extensions backend Journal_lui_native.registry live (fun _ next->next)
+    (fun _ signal _->Journal_view.mount(Journal_view.View.Body.Private.to_widget
+      (M.view ~picker_signal:signal (M.Picker snapshot) ~on_action:ignore))) in
+  Fun.protect ~finally:(fun()->ignore(Lui_app.dispose app)) (fun()->
+    ignore(Lui_app.start app);ignore(Lui_app.flush app);
+    List.iter(fun presence->
+      ignore(Lui_app.send app {live with presence=(fun _->presence)});
+      ignore(Lui_app.flush app))
+      [Some(Ok Service.Downloaded);Some(Ok Service.Not_downloaded);Some(Error "Synthetic presence error");
+       Some(Ok Service.Downloaded);None;Some(Ok Service.Not_downloaded);Some(Ok Service.Downloaded)])
+;;
+
 let test_graph_picker_controls scenario () =
   let module W = Logseq_db_worker_lui.Journal_worker in
   let module P = Logseq_db_worker.Protocol in
@@ -6302,8 +6339,10 @@ let test_graph_picker_controls scenario () =
   let manager : Service.state =
     { snapshot =
         { sync_phase = Current;
-          resident_graphs=(if (scenario=`Current || scenario=`Retry_local || scenario=`Retry_graph_phase) then [first;second] else []);
-          resident_scopes=(if (scenario=`Current || scenario=`Retry_local || scenario=`Retry_graph_phase) then [resident_scope first 1;resident_scope second 2] else []); catalog = [graph first "Current synthetic graph"; graph second long_name]
+          resident_graphs=(if scenario=`Current then [first;second;uuid 3] else if scenario=`Retry_local || scenario=`Retry_graph_phase then [first;second] else []);
+          resident_scopes=(if scenario=`Current then [resident_scope first 1;resident_scope second 2;resident_scope (uuid 3) 3] else if scenario=`Retry_local || scenario=`Retry_graph_phase then [resident_scope first 1;resident_scope second 2] else []);
+          catalog = [graph first "Current synthetic graph"; graph second long_name]
+            @ (if scenario=`Current then [graph (uuid 3) "Third synthetic graph";graph (uuid 4) "Fourth synthetic graph"] else [])
         ; selected_graph = Some first; applied_server_t = Some (server_cursor_of_int 0)
         ; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
         ; timeline_presentation_pending = false
@@ -6443,6 +6482,10 @@ let test_graph_picker_controls scenario () =
     if source <> "" then
       let open Yojson.Safe.Util in
       Yojson.Safe.from_string source |> member "ops" |> to_list |> List.iter (fun op ->
+        let kind = member "op" op |> to_string in
+        if List.mem kind ["drop-node";"drop-extension";"detach-subtree"] then
+          Alcotest.(check bool) "picker teardown only references mounted native nodes" true
+            (Hashtbl.mem props (member "id" op |> to_int));
         teardown op;
         match member "op" op |> to_string with
         | "create-node" | "create-extension" ->
@@ -6450,8 +6493,15 @@ let test_graph_picker_controls scenario () =
         | "set-prop" | "set-extension-prop" ->
           let id = member "id" op |> to_int in
           let key = member "property" op |> to_string in
-          let old = Option.value (Hashtbl.find_opt props id) ~default:[] in
+          (* Swift rejects mutations of detached native nodes. Do not silently
+             recreate their shadow entries when the shell and picker reconcile. *)
+          Alcotest.(check bool) "picker patch only updates live native nodes" true (Hashtbl.mem props id);
+          let old = Hashtbl.find props id in
           Hashtbl.replace props id ((key, member "value" op) :: List.remove_assoc key old)
+        | "insert-child" | "move-child" ->
+          List.iter (fun field -> Alcotest.(check bool)
+            ("picker patch references live native " ^ field) true
+            (Hashtbl.mem props (member field op |> to_int))) ["parent";"child"]
         | _ -> ()) in
   let find key value = Hashtbl.fold (fun id values found ->
     if List.assoc_opt key values = Some (`String value) then Some id else found) props None in
@@ -6504,6 +6554,11 @@ let test_graph_picker_controls scenario () =
       Alcotest.(check int) "native page retains both content and empty preview slots" 2
         (Hashtbl.to_seq_values page_parents |> Seq.filter((=)page) |> Seq.length);
       wait "graph list mounts" (fun () -> Option.is_some (find "accessibility-identifier" "graph-picker-list"));
+      if scenario = `Current then (
+        let list = Option.get (find "_extension" "journal-list") in
+        consume (hooks.extension_event list "event"
+          {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":3,\"last\":7}"}|});
+        wait "visible resident local presence checks complete" (fun () -> Atomic.get inspections >= 4));
       if scenario = `Late_presence then (
         let list = Option.get (find "_extension" "journal-list") in
         consume (hooks.extension_event list "event"
@@ -7004,12 +7059,13 @@ let () =
         Alcotest.test_case "typed native reason completes local discovery" `Quick (fun () -> test_local_account_failure_retries_local_discovery ~typed_reason:true ());
         Alcotest.test_case "retired native scope cannot fail local discovery" `Quick (fun () -> test_local_account_failure_retries_local_discovery ~retired_scope:true ())])
     ; ( "graph picker", [
+        Alcotest.test_case "presence updates preserve native node lifecycle" `Quick test_picker_presence_native_patch_lifecycle;
         Alcotest.test_case "failed resident local retry restarts open" `Quick (test_graph_picker_controls `Retry_local);
         Alcotest.test_case "failed worker local retry restarts retained mirror" `Quick (test_graph_picker_controls `Retry_graph_phase);
         Alcotest.test_case "offline deletion is disabled with explanation" `Quick (test_graph_picker_controls `Offline);
         Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);
         Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);
-        Alcotest.test_case "current marker and long names" `Quick (test_graph_picker_controls `Current);
+        Alcotest.test_case "resident picker keeps native patch references alive" `Quick (test_graph_picker_controls `Current);
         Alcotest.test_case "close retains current session" `Quick (test_graph_picker_controls `Close);
         Alcotest.test_case "name switches graph" `Quick (test_graph_picker_controls `Select);
         Alcotest.test_case "old graph cancellation cannot publish a new-scope error" `Quick

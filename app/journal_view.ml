@@ -1613,7 +1613,7 @@ module View = struct
       type props =
         { style : string; sections : section list
         ; track_visible_range : bool; track_scroll_completion : bool
-        ; sync_enabled : bool }
+        ; sync_enabled : bool; retention_key : string option [@default None] }
       [@@deriving yojson]
       type row_event = { row : string; key : string } [@@deriving yojson]
       type event =
@@ -1631,7 +1631,7 @@ module View = struct
     ;;
 
     (* Content indexes retain the native child ownership order. *)
-    let build sections ~style ~track_visible ~track_scroll ~sync_enabled =
+    let build sections ~style ~track_visible ~track_scroll ~sync_enabled ~retention_key =
       let contents = ref Rrbvec.empty in
       let next_content_index = ref 0 in
       let push element =
@@ -1658,7 +1658,7 @@ module View = struct
       in
       let wire : Json.props =
         { style = style_name style; sections = List.map section_wire sections
-        ; track_visible_range = track_visible; track_scroll_completion = track_scroll; sync_enabled }
+        ; track_visible_range = track_visible; track_scroll_completion = track_scroll; sync_enabled; retention_key }
       in
       Json.props_to_yojson wire |> Yojson.Safe.to_string, Rrbvec.to_list !contents
     ;;
@@ -1696,6 +1696,7 @@ module View = struct
           ?on_scroll_completed
           ?on_visible_range
           ?on_sync
+          ?retention_key
           sections
       =
       let payload, contents =
@@ -1705,6 +1706,7 @@ module View = struct
           ~track_visible:(Option.is_some on_visible_range)
           ~track_scroll:(Option.is_some on_scroll_completed)
           ~sync_enabled:(Option.is_some on_sync)
+          ~retention_key
       in
       (* Expansion state arrives as {"type":"expanded","key":..,"expanded":bool};
        the owning row's handler receives Bool like the old disclosure callback. *)

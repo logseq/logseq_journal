@@ -171,28 +171,21 @@ let view ?picker_signal props ~on_action =
       (if choose then choose_graph else V.empty ())
   in
   let graph_picker snapshot =
-    let reactive ?grow ~equal build =
-      match picker_signal with
-      | None -> build snapshot.live
-      | Some signal -> V.of_lui
-          (Lui_elements.stack ?grow
-             [Lui_elements.dyn ~equal (fun current -> Ui.mount (build current)) signal])
-    in
-    let icon_button ?(enabled = true) ?tooltip ~id ~command ~label icon =
+    let icon_button ?(enabled = true) ?disabled_signal ?tooltip ~id ~command ~label icon =
       V.of_lui (Lui_elements.button ~key:id ~accessibility_identifier:id
-        ~text:"" ~label ~icon ~size:`icon ~variant:`ghost ~disabled:(not enabled) ?tooltip
+        ~text:"" ~label ~icon ~size:`icon ~variant:`ghost ~disabled:(not enabled) ?disabled_signal ?tooltip
         ~on_press:(fun _ -> on_action command) [])
-    in
-    let refresh = reactive
-      ~equal:(fun left right -> left.deleting = right.deleting)
-      (fun owner -> icon_button ~enabled:(owner.deleting = None)
-        ~id:"graph-picker-refresh" ~command:Refresh_catalog ~label:"Refresh graphs"
-        ~tooltip:"Refresh the authorized graph catalog" `refresh_cw)
     in
     let projected context project = Option.map (fun source ->
       let signal = Signal.map project source in
       Signal.on_dispose context.Lui_ui.ui_scope (fun () -> Signal.dispose_signal signal);
       signal) picker_signal in
+    let refresh = V.of_lui (fun context parent ->
+      Ui.mount (icon_button ~enabled:(snapshot.live.deleting = None)
+        ?disabled_signal:(projected context (fun owner -> owner.deleting <> None))
+        ~id:"graph-picker-refresh" ~command:Refresh_catalog ~label:"Refresh graphs"
+        ~tooltip:"Refresh the authorized graph catalog" `refresh_cw) context parent)
+    in
     let status_text current = current.status in
     let status = V.of_lui (fun context parent ->
       Lui_elements.text ~value:(status_text snapshot.live)
@@ -265,9 +258,7 @@ let view ?picker_signal props ~on_action =
                           ~foreground:"secondary" [] context parent)]
                     |> V.frame ~max_width:Fill
                   ; (if current then V.symbol ~name:"checkmark.circle" ()
-                     else reactive ~equal:(fun left right -> presence left = presence right)
-                       (fun owner -> if presence owner = Some (Ok Graph_service.Not_downloaded)
-                         then V.symbol ~name:"icloud.and.arrow.down" () else V.column [])) ]
+                     else V.empty ()) ]
                   |> V.frame ~max_width:Fill ~min_height:44.)
                 () |> V.with_test_id (Ui.Test_id.string ("graph-picker:" ^ id))
                 |> V.frame ~max_width:Fill in

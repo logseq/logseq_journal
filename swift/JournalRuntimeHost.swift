@@ -17,6 +17,7 @@ struct JournalRuntimeHost: View {
   @State private var runtime: JournalRuntime?
   @State private var startingRuntime: JournalRuntime?
   @State private var fallbackClock = JournalStartupClock()
+  @State private var graphScrollOffsets = JournalGraphScrollOffsets()
   @Environment(\.journalStartupClock) private var inheritedClock
   @State private var failure: Error?
   @State private var retry = 0
@@ -33,7 +34,7 @@ struct JournalRuntimeHost: View {
         } actions: {
           Button("Retry") {
             guard runtime?.stop() != false, startingRuntime?.stop() != false else { return }
-            runtime = nil; startingRuntime = nil; failure = nil; clock.restart(); retry += 1
+            runtime = nil; startingRuntime = nil; failure = nil; graphScrollOffsets.retain([]); clock.restart(); retry += 1
           }
             .accessibilityIdentifier("journal-runtime-retry")
         }
@@ -60,6 +61,7 @@ struct JournalRuntimeHost: View {
       #endif
     }
     .environment(\.journalStartupClock, clock)
+    .environment(\.journalGraphScrollOffsets, graphScrollOffsets)
     .background(JournalEnvironmentObserver { platform.pushEnvironment($0) })
     .task(id: retry) {
       if runtime == nil && startingRuntime == nil {
@@ -100,6 +102,7 @@ struct JournalRuntimeHost: View {
       }
     }
     .onDisappear {
+      graphScrollOffsets.retain([])
       runtime?.stop()
       if startingRuntime?.stop() == false { failure = startingRuntime?.failure }
     }

@@ -97,3 +97,16 @@ The final main-aligned acceptance uses main `efb97631d9f1814803abe814bd3305fc6d1
 The Git-external runner also toggles an outer sign-in notice with exactly the production App.swift safeAreaInset shape. This verifies insertion/removal and native Back geometry; it does not claim to execute a real account authentication failure. That fixture-only method is not part of this repository test file.
 
 The current-main unmodified control reproduces 17 sharp top frames in 348 matching normal-content frames across two native Back operations; the coherent soft candidate has zero in 301. Final image/top/menu/rotation/preview and software-keyboard acceptance also pass. With the outer notice and no diagnostic overlay, the collection container reports isHittable=false before and after navigation while actual menu taps and a second Detail navigation from root text succeed. This container flag alone is not an acceptance criterion for those fixture controls.
+
+## Resident graph scroll ownership
+
+`JournalResidentGraphAcceptance.swift` exercises the isolated four-catalog,
+three-resident full-runtime host with native right swipes, cancellation, vertical
+scrolling and the Switch graph controls. Supply the current loopback fixture's
+certificate pin through `JOURNAL_SYNTHETIC_TLS_SHA256`; use synthetic data only.
+The List's pixel offset cannot be reproduced by the pure OCaml reducer. The
+original native regression loses row8's offset after a complete graph cycle.
+SwiftUI `ScrollPosition` did not restore this List in the same failing case, so
+restoration reuses the existing resolved `UIScrollView` and native offset API.
+`JournalListSnapshotTests.swift` additionally verifies runtime separation,
+resident-generation retirement and rejection of late offset writes after logout.

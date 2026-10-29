@@ -158,6 +158,7 @@ let view
   let list ?scroll_request_signal () = V.Native_list.vertical
     ~key
     ~style:Plain
+    ~retention_key:"timeline"
     ?scroll_request:(scroll_request scroll_target)
     ?scroll_request_signal
     ~on_scroll_completed

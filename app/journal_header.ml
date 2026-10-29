@@ -541,10 +541,12 @@ let reactive_view
     ~body
 ;;
 
-let graph_pages ~enabled ~page_id ~target_id ~on_prepare ~on_commit ~on_cancel ~current ~preview =
+let graph_pages ~enabled ~page_id ~resident_page_ids ~target_page_id ~target_id ~on_prepare ~on_commit ~on_cancel ~current ~preview =
   let payload=Yojson.Safe.to_string (`Assoc
     ["mode",`String "graph-pages";"enabled",`Bool enabled;"pageID",`String page_id;
-     "targetID",(match target_id with None->`Null | Some id->`String id)]) in
+     "targetID",(match target_id with None->`Null | Some id->`String id);
+     "residentPageIDs",`List(List.map(fun id->`String id) resident_page_ids);
+     "targetPageID",(match target_page_id with None->`Null | Some id->`String id)]) in
   V.of_lui (Journal_lui_native.mount ~key:"journal-graph-pages" ~payload
     ~on_event:(fun event->match event.Journal_lui_native.payload with
       | "prepare"->on_prepare () | "commit"->on_commit () | "cancel"->on_cancel () | _->())
