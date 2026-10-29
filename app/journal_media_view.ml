@@ -19,6 +19,7 @@ module Store = struct
     { epoch : int
     ; mutable active : bool
     ; callback : unit -> unit
+    ; mutable pending : string option
     }
 
   type t =
@@ -27,6 +28,9 @@ module Store = struct
     ; items : (string * string, (int, listener) Hashtbl.t) Hashtbl.t
     ; observe : string -> unit
     ; mutable epoch : int
+    ; mutable active : bool
+    ; mutable interactive : bool
+    ; interactions : (int, unit -> unit) Hashtbl.t
     ; mutable serial : int
     }
 
@@ -36,6 +40,9 @@ module Store = struct
     ; items = Hashtbl.create 64
     ; observe
     ; epoch = 0
+    ; active = true
+    ; interactive = true
+    ; interactions = Hashtbl.create 8
     ; serial = 0
     }
   ;;
@@ -58,7 +65,7 @@ module Store = struct
     in
     t.serial <- t.serial + 1;
     let id = t.serial in
-    let listener = { epoch = t.epoch; active = true; callback } in
+    let listener = { epoch = t.epoch; active = true; callback; pending=None } in
     Hashtbl.add bucket id listener;
     fun () ->
       if listener.active
@@ -77,12 +84,41 @@ module Store = struct
     | Some bucket ->
       let listeners = Hashtbl.fold (fun _ listener acc -> listener :: acc) bucket [] in
       List.iter
-        (fun listener ->
+        (fun (listener:listener) ->
            if listener.active && listener.epoch = t.epoch
            then (
-             t.observe name;
-             listener.callback ()))
+             if t.active then (t.observe name;listener.callback ())
+             else listener.pending <- Some name))
         listeners
+  ;;
+
+  let set_active t active =
+    if t.active <> active then (
+      t.active <- active;
+      if active then (
+        let collect table = Hashtbl.fold (fun _ bucket rest->
+          Hashtbl.fold (fun _ listener rest->listener::rest) bucket rest) table [] in
+        let pending=collect t.structure @ collect t.items in
+        List.iter (fun listener->match listener.pending with
+          | Some name when listener.active && listener.epoch=t.epoch && t.active ->
+            listener.pending<-None;t.observe name;listener.callback ()
+          | _ when not listener.active || listener.epoch<>t.epoch ->listener.pending<-None
+          | _->()) pending))
+  ;;
+
+  let interactive t = t.interactive
+
+  let subscribe_interaction t callback =
+    t.serial<-t.serial+1;let id=t.serial in
+    Hashtbl.add t.interactions id callback;
+    fun ()->Hashtbl.remove t.interactions id
+  ;;
+
+  let set_interactive t interactive =
+    if t.interactive<>interactive then (
+      t.interactive<-interactive;
+      let listeners=Hashtbl.to_seq t.interactions |> List.of_seq in
+      List.iter(fun(id,callback)->if Hashtbl.mem t.interactions id then callback ()) listeners)
   ;;
 
   let shape = function
@@ -249,7 +285,7 @@ let view_content
       in
       let selected_slot = root ^ ":" ^ item.token in
       let selected = owner, item.token, path, selected_slot in
-      if unchanged selected
+      if Store.interactive store && unchanged selected
       then (
         let group =
           if is_image_type item.file_type
@@ -301,7 +337,10 @@ let view_content
         unsubscribe_preview
         := fun () -> List.iter (fun unsubscribe -> unsubscribe ()) subscriptions)
     in
-    Signal.on_dispose context.ui_scope close_preview;
+    let stop_interaction=Store.subscribe_interaction store (fun ()->
+      if not(Store.interactive store) && (!selected_preview<>[] || Signal.sample(Signal.value preview)<>None)
+      then close_preview ()) in
+    Signal.on_dispose context.ui_scope (fun ()->stop_interaction ();close_preview ());
     let reactive_item (item : Journal_media_runtime.item) render =
       fun context parent ->
       let owner = asset_root item.token in

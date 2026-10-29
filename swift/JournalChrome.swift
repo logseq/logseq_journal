@@ -5,101 +5,30 @@ import UIKit
 #endif
 
 #if os(iOS)
-/// Bridges one completed swipe until the replacement List has restored layout.
-/// The cover contains only this window's pixels and never leaves memory.
+/// Fences one gesture and a committed focus request by its original owners.
+/// The target page stays mounted while Save may defer the focus publication.
 @MainActor final class JournalGraphHandoff: ObservableObject {
   struct Request { let id: UUID; let source: String; let target: String }
   @Published private(set) var request: Request?
-  weak var anchor: Anchor?
-  private var deadline: Task<Void, Never>?
   private var gestureID: UUID?
-  private var reachedTarget = false
-
-  func startGesture() -> UUID { cancel(); let id = UUID(); gestureID = id; return id }
+  func startGesture() -> UUID { cancel(); let id=UUID();gestureID=id;return id }
   func acceptsGesture(_ id: UUID) -> Bool { gestureID == id }
   var currentGesture: UUID? { gestureID }
-
-  final class Anchor: UIImageView {
-    weak var owner: JournalGraphHandoff?
-    override func didMoveToWindow() {
-      super.didMoveToWindow()
-      if window == nil { owner?.cancel() }
-    }
-    override func layoutSubviews() {
-      super.layoutSubviews()
-      if let image, abs(image.size.width - bounds.width) > 0.5 || abs(image.size.height - bounds.height) > 0.5,
-        let request = owner?.request {
-        Task { @MainActor [weak owner] in owner?.invalidate(request.id) }
-      }
-    }
-  }
-
-  func capture() -> UIImage? {
-    guard let anchor, let window = anchor.window, anchor.bounds.width > 0,
-      anchor.bounds.height > 0 else { return nil }
-    let frame = anchor.convert(anchor.bounds, to: window)
-    var drawn = false
-    let image = UIGraphicsImageRenderer(size: anchor.bounds.size).image { _ in
-      drawn = window.drawHierarchy(in: CGRect(origin: CGPoint(x: -frame.minX, y: -frame.minY),
-        size: window.bounds.size), afterScreenUpdates: false)
-    }
-    return drawn ? image : nil
-  }
-
-  @discardableResult func begin(source: String, target: String, image: UIImage?) -> UUID? {
-    cancel()
-    guard let image else { return nil }
-    let id = UUID()
-    anchor?.image = image
-    reachedTarget = false
-    request = Request(id: id, source: source, target: target)
-    return id
+  @discardableResult func begin(source: String, target: String) -> UUID {
+    cancel();let id=UUID();request=Request(id:id,source:source,target:target);return id
   }
   func finish(_ id: UUID, page: String, current: String?) -> Bool {
-    guard let request, request.id == id, request.target == page, current == page else { return false }
-    cancel()
-    return true
+    guard let request,request.id==id,request.target==page,current==page else {return false}
+    cancel();return true
   }
   func focusChanged(_ page: String?) {
-    guard let request else { cancel(); return }
-    if page == request.target {
-      guard !reachedTarget else { return }
-      reachedTarget = true
-      let id = request.id
-      // Focus can be queued behind a Save. Until it commits, removing the
-      // landed target would reveal the source again. Only target layout has
-      // a deadline; its loading/error UI is safe to reveal after focus.
-      deadline = Task { @MainActor [weak self] in
-        do { try await Task.sleep(for: .seconds(2)) } catch { return }
-        self?.expire(id)
-      }
-    } else if reachedTarget || page != request.source { cancel() }
+    guard let request else {cancel();return}
+    if page != request.source {cancel()}
   }
-  func expire(_ id: UUID) { if request?.id == id && reachedTarget { cancel() } }
-  func invalidate(_ id: UUID) { if request?.id == id { cancel() } }
-  func retain(_ pages: [String]) {
-    if let request, !pages.contains(request.source) || !pages.contains(request.target) { cancel() }
+  func retain(_ pages:[String]) {
+    if let request,!pages.contains(request.source) || !pages.contains(request.target) {cancel()}
   }
-  func cancel() {
-    deadline?.cancel(); deadline = nil
-    gestureID = nil; reachedTarget = false
-    anchor?.image = nil
-    request = nil
-  }
-}
-
-private struct JournalGraphHandoffAccess: UIViewRepresentable {
-  let owner: JournalGraphHandoff
-  func makeUIView(context: Context) -> JournalGraphHandoff.Anchor {
-    let view = JournalGraphHandoff.Anchor()
-    view.isUserInteractionEnabled = false
-    view.accessibilityElementsHidden = true
-    view.contentMode = .scaleToFill
-    view.owner = owner
-    owner.anchor = view
-    return view
-  }
-  func updateUIView(_ view: JournalGraphHandoff.Anchor, context: Context) {}
+  func cancel(){gestureID=nil;request=nil}
 }
 #endif
 
@@ -125,6 +54,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
   private enum Mode: String, Decodable {
     case page, header, detail, unlock, startup
     case graphPages = "graph-pages"
+    case timelineHost = "timeline-host"
     case graphPicker = "graph-picker"
     case toolbarControl = "toolbar-control"
     case detailText = "detail-text"
@@ -153,6 +83,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let targetID: String?
     let targetPageID: String?
     let residentPageIDs: [String]?
+    let slotOwners: [String]?
+    let ownerID: String?
+    let visible: Bool?
   }
 
   /// Syntax and reference resolution belong to OCaml; this maps presentation data.
@@ -195,132 +128,246 @@ struct JournalSheetDismissButton: SwiftUI.View {
     }
   }
   private struct GraphPages: SwiftUI.View {
-    let context: LUIAppleExtensionViewContext
-    let properties: Properties
-    let current: AnyView
-    let preview: AnyView
-    @State private var translation: CGFloat = 0
-    @State private var dragging = false
-    @State private var settling = false
-    @StateObject private var handoff = JournalGraphHandoff()
+    let context:LUIAppleExtensionViewContext
+    let properties:Properties
+    @State private var translation:CGFloat=0
+    @State private var dragging=false
+    @State private var settling=false
+    @State private var committing=false
+    @State private var source:String?
+    @State private var target:String?
+    @StateObject private var handoff=JournalGraphHandoff()
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.journalGraphScrollOffsets) private var graphScrollOffsets
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private func emit(_ action: String) {
-      JournalExtensions.emit(context: context, payload: Data(action.utf8))
+    /// A native containment boundary keeps each retained NavigationStack's
+    /// UIKit accessibility tree and hit testing isolated without disabled tint.
+    private struct Pane:UIViewControllerRepresentable {
+      let context:LUIAppleExtensionViewContext
+      let owner:String
+      let node:Int
+      let records:Bool
+      let shown:Bool
+      let interactive:Bool
+
+      struct Style:Equatable {
+        let scene:ScenePhase
+        let scheme:ColorScheme
+        let contrast:ColorSchemeContrast
+        let scale:CGFloat
+        let size:DynamicTypeSize
+        let direction:LayoutDirection
+        let reduceMotion:Bool
+        let locale:Locale
+        let timeZone:TimeZone
+        let inset:CGFloat?
+        let frame:CGRect?
+        init(_ environment:EnvironmentValues) {
+          scene=environment.scenePhase;scheme=environment.colorScheme
+          contrast=environment.colorSchemeContrast;scale=environment.displayScale
+          size=environment.dynamicTypeSize
+          direction=environment.layoutDirection;reduceMotion=environment.accessibilityReduceMotion
+          locale=environment.locale;timeZone=environment.timeZone
+          inset=environment.journalContainerTopInset
+          frame=environment.journalStartupContainerFrame
+        }
+        nonisolated static func ==(a:Self,b:Self)->Bool {
+          a.scene==b.scene && a.scheme==b.scheme && a.contrast==b.contrast && a.scale==b.scale
+            && a.size==b.size && a.direction==b.direction
+            && a.reduceMotion==b.reduceMotion && a.locale==b.locale && a.timeZone==b.timeZone
+            && a.inset==b.inset && a.frame==b.frame
+        }
+      }
+      final class Controller:UIViewController {
+        let host:UIHostingController<AnyView>
+        var records=false
+        var interactive=false
+        var node = -1
+        var style:Style?
+        init(rootView:AnyView) {
+          host=UIHostingController(rootView:rootView)
+          super.init(nibName:nil,bundle:nil)
+        }
+        required init?(coder:NSCoder) {fatalError("init(coder:) is not supported")}
+        override func viewDidLoad() {
+          super.viewDidLoad()
+          view.backgroundColor = .clear
+          view.isOpaque=false
+          view.isAccessibilityElement=false
+          addChild(host)
+          host.view.backgroundColor = .clear
+          host.view.isOpaque=false
+          host.view.translatesAutoresizingMaskIntoConstraints=false
+          view.addSubview(host.view)
+          NSLayoutConstraint.activate([
+            host.view.leadingAnchor.constraint(equalTo:view.leadingAnchor),
+            host.view.trailingAnchor.constraint(equalTo:view.trailingAnchor),
+            host.view.topAnchor.constraint(equalTo:view.topAnchor),
+            host.view.bottomAnchor.constraint(equalTo:view.bottomAnchor)])
+          host.didMove(toParent:self)
+        }
+        func setRole(shown:Bool,interactive:Bool) {
+          // The child is not the view managed by SwiftUI's representable, so
+          // parent visibility updates cannot overwrite this UIKit boundary.
+          host.view.isHidden = !shown
+          view.accessibilityElements = interactive ? nil : []
+          view.accessibilityElementsHidden = !interactive
+          view.isUserInteractionEnabled=interactive
+          host.view.accessibilityElementsHidden = !interactive
+          host.view.isUserInteractionEnabled=interactive
+        }
+        func detach() {
+          host.willMove(toParent:nil)
+          host.view.removeFromSuperview()
+          host.removeFromParent()
+        }
+      }
+      private func content(_ environment:EnvironmentValues)->AnyView {
+        AnyView(context.content(for:node)
+          .environment(\.colorScheme,environment.colorScheme)
+          .environment(\.dynamicTypeSize,environment.dynamicTypeSize)
+          .environment(\.layoutDirection,environment.layoutDirection)
+          .environment(\.locale,environment.locale)
+          .environment(\.timeZone,environment.timeZone)
+          .environment(\.displayScale,environment.displayScale)
+          .environment(\.scenePhase,environment.scenePhase)
+          .environment(\.journalContainerTopInset,environment.journalContainerTopInset)
+          .environment(\.journalStartupContainerFrame,environment.journalStartupContainerFrame)
+          .environment(\.journalStartupClock,environment.journalStartupClock)
+          .environment(\.journalGraphScrollOffsets,environment.journalGraphScrollOffsets)
+          .environment(\.journalGraphScrollScope,JournalGraphScrollScope(pageID:owner,records:records))
+          .accessibilityHidden(!interactive))
+      }
+      func makeUIViewController(context:Context)->Controller {
+        let controller=Controller(rootView:content(context.environment))
+        controller.records=records;controller.interactive=interactive;controller.node=node;controller.style=Style(context.environment)
+        controller.setRole(shown:shown,interactive:interactive)
+        return controller
+      }
+      func updateUIViewController(_ controller:Controller,context:Context) {
+        let style=Style(context.environment)
+        if controller.node != node || controller.records != records || controller.interactive != interactive || controller.style != style {
+          controller.node=node;controller.records=records;controller.interactive=interactive;controller.style=style
+          withTransaction(Transaction(animation:nil)) {controller.host.rootView=content(context.environment)}
+        }
+        controller.setRole(shown:shown,interactive:interactive)
+      }
+      static func dismantleUIViewController(_ controller:Controller,coordinator:()) {
+        controller.view.accessibilityElementsHidden=true
+        controller.view.isUserInteractionEnabled=false
+        controller.detach()
+      }
     }
-    private func handle(_ pan: UIPanGestureRecognizer, width: CGFloat) {
+    private var slots:[(owner:String,node:Int)] {
+      let owners=properties.slotOwners ?? []
+      return owners.enumerated().compactMap { index,owner in
+        index<context.childIDs.count ? (owner,context.childIDs[index]) : nil
+      }
+    }
+    private func emit(_ action:String,source:String?=nil,target:String?=nil) {
+      guard let source=source ?? properties.pageID else {return}
+      var value=["action":action,"source":source]
+      if let target=target ?? self.target ?? properties.targetPageID {value["target"]=target}
+      guard let data=try? JSONEncoder().encode(value) else {return}
+      JournalExtensions.emit(context:context,payload:data)
+    }
+    private func reset(notify:Bool) {
+      if notify,source==properties.pageID {emit("cancel",source:source,target:target)}
+      handoff.cancel()
+      withTransaction(Transaction(animation:nil)) {
+        translation=0;dragging=false;settling=false;committing=false;source=nil;target=nil
+      }
+    }
+    private func acknowledge() {
+      if properties.visible==true,slots.contains(where:{$0.owner==properties.pageID}) {emit("presented")}
+    }
+    private func handle(_ pan:UIPanGestureRecognizer,width:CGFloat) {
       switch pan.state {
       case .began:
-        guard properties.enabled == true, !settling else { return }
-        handoff.startGesture()
-        dragging = true
-        emit("prepare")
-        translation = min(width, max(0, pan.translation(in: pan.view).x))
+        guard properties.enabled==true,!settling,
+          let from=properties.pageID,let to=properties.targetPageID,
+          from != to,(properties.residentPageIDs ?? []).contains(to) else {return}
+        _=handoff.startGesture();source=from;target=to;dragging=true
+        emit("prepare",source:from,target:to)
+        translation=min(width,max(0,pan.translation(in:pan.view).x))
       case .changed where dragging:
-        translation = min(width, max(0, pan.translation(in: pan.view).x))
+        translation=min(width,max(0,pan.translation(in:pan.view).x))
       case .ended where dragging:
-        guard let gesture = handoff.currentGesture else { return }
-        dragging = false
-        let distance = pan.translation(in: pan.view).x
-        let velocity = pan.velocity(in: pan.view).x
-        let commit = distance > width * 0.3 || (distance > 30 && velocity > 650)
-        settling = true
-        // Focus dispatch synchronously rebuilds the native page. Wait until the
-        // spring is removed so that work cannot interrupt its visible tail.
-        withAnimation(reduceMotion ? .linear(duration: 0.01) : .smooth(duration: 0.24), completionCriteria: .removed) {
-          translation = commit ? width : 0
+        guard properties.enabled==true,let gesture=handoff.currentGesture,source==properties.pageID,
+          target==properties.targetPageID else {reset(notify:true);return}
+        dragging=false
+        let distance=pan.translation(in:pan.view).x,velocity=pan.velocity(in:pan.view).x
+        let commit=distance>width*0.3 || (distance>30 && velocity>650)
+        settling=true;committing=commit
+        withAnimation(reduceMotion ? .linear(duration:0.01) : .smooth(duration:0.24),completionCriteria:.removed) {
+          translation=commit ? width : 0
         } completion: {
-          guard handoff.acceptsGesture(gesture) else { return }
-          if commit, let source = properties.pageID, let target = properties.targetPageID {
-            handoff.begin(source: source, target: target, image: handoff.capture())
-          }
-          emit(commit ? "commit" : "cancel")
-          if !commit { settling = false }
+          guard properties.enabled==true,handoff.acceptsGesture(gesture),let source,let target,
+            source==properties.pageID,target==properties.targetPageID else {return}
+          if commit {
+            _=handoff.begin(source:source,target:target)
+            emit("commit",source:source,target:target)
+          } else {reset(notify:true)}
         }
-      case .cancelled, .failed:
-        guard dragging else { return }
-        handoff.cancel()
-        dragging = false
-        withAnimation(.smooth(duration: 0.2)) { translation = 0 }
-        emit("cancel")
-      default: break
+      case .cancelled,.failed:reset(notify:true)
+      default:break
       }
     }
-    private var presentationNonce: UUID? {
-      guard let request = handoff.request, request.target == properties.pageID else { return nil }
-      return request.id
-    }
-    private var presentationReady: (@MainActor @Sendable (String) -> Void)? {
-      guard let id = presentationNonce else { return nil }
-      return { page in _ = handoff.finish(id, page: page, current: properties.pageID) }
-    }
-    var body: some SwiftUI.View {
+    var body:some SwiftUI.View {
       GeometryReader { bounds in
-        ZStack(alignment: .topLeading) {
-          preview
-            .environment(\.journalGraphScrollScope, properties.targetPageID.map { JournalGraphScrollScope(pageID: $0, records: false) })
-            .frame(width: bounds.size.width, height: bounds.size.height)
-            .offset(x: translation - bounds.size.width)
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
-          current
-            .environment(\.journalGraphScrollScope, properties.pageID.map { JournalGraphScrollScope(pageID: $0, records: true) })
-            .environment(\.journalGraphPresentationNonce, presentationNonce)
-            .environment(\.journalGraphPresentationReady, presentationReady)
-            .frame(width: bounds.size.width, height: bounds.size.height)
-            .offset(x: translation)
-            .allowsHitTesting(handoff.request == nil)
-            .accessibilityHidden(handoff.request != nil)
+        ZStack(alignment:.topLeading) {
+          ForEach(slots,id:\.owner) { slot in
+            let current=slot.owner==properties.pageID
+            let ownsMotion=source==properties.pageID
+            let incoming=ownsMotion && slot.owner==target && (dragging || settling)
+            let shown=properties.visible==true && (current || incoming)
+            Pane(context:context,owner:slot.owner,node:slot.node,
+              records:current && properties.visible==true && !(settling && committing),
+              shown:shown,
+              interactive:current && properties.visible==true && !(settling && committing))
+              .frame(width:bounds.size.width,height:bounds.size.height)
+              .offset(x:current ? (ownsMotion ? translation : 0) : incoming ? translation-bounds.size.width : -bounds.size.width)
+              .opacity(shown ? 1 : 0)
+              .zIndex(current ? 1 : incoming ? 0 : -1)
+          }
         }
-        .overlay(JournalGraphHandoffAccess(owner: handoff)
-          .frame(width: bounds.size.width, height: bounds.size.height)
-          .allowsHitTesting(false).accessibilityHidden(true))
         .clipped()
-        .gesture(RightGraphPan(enabled: properties.enabled == true && !settling) {
-          handle($0, width: bounds.size.width)
-        })
+        .gesture(RightGraphPan(enabled:properties.enabled==true && !settling) {handle($0,width:bounds.size.width)})
+        .onChange(of:bounds.size) { _,_ in reset(notify:true) }
       }
-      .onAppear { graphScrollOffsets?.retain(properties.residentPageIDs ?? []) }
-      .onChange(of: properties.residentPageIDs) { _, ids in
+      // Each native hosting root owns the same window-sized canvas as the
+      // original app root; its own UIKit safe area is applied exactly once.
+      .ignoresSafeArea(.container)
+      .onAppear {graphScrollOffsets?.retain(properties.residentPageIDs ?? []);acknowledge()}
+      .onChange(of:properties.slotOwners) { _,_ in acknowledge() }
+      .onChange(of:properties.residentPageIDs) { _,ids in
         graphScrollOffsets?.retain(ids ?? [])
-        handoff.retain(ids ?? [])
+        if let source,let target,!(ids ?? []).contains(source) || !(ids ?? []).contains(target) {reset(notify:false)}
       }
-      .onChange(of: properties.pageID) { _, page in
-        handoff.focusChanged(page)
-        withTransaction(Transaction(animation: nil)) {
-          translation = 0; dragging = false
-          if handoff.request == nil { settling = false }
-        }
+      .onChange(of:properties.pageID) { _,page in
+        if let request=handoff.request,page==request.target {
+          _=handoff.finish(request.id,page:request.target,current:page)
+        } else {handoff.focusChanged(page)}
+        reset(notify:false);acknowledge()
       }
-      .onChange(of: properties.targetID) { _, target in
-        if target == nil && !dragging && handoff.request == nil { translation = 0; settling = false }
+      .onChange(of:properties.targetPageID) { _,next in
+        if let target,target != next {reset(notify:true)}
       }
-      .onChange(of: handoff.request?.id) { _, id in
-        if id == nil {
-          withTransaction(Transaction(animation: nil)) { translation = 0; settling = false }
-        }
+      .onChange(of:properties.enabled) { _,enabled in
+        if enabled != true && handoff.request == nil {reset(notify:true)}
       }
-      .onChange(of: scenePhase) { _, phase in
-        if phase != .active {
-          let wasSwitching = dragging || settling
-          handoff.cancel()
-          translation = 0; dragging = false; settling = false
-          if wasSwitching { emit("cancel") }
-        }
+      .onChange(of:properties.targetID) { _,prepared in
+        if prepared == nil && source==properties.pageID && (dragging || settling) {reset(notify:false)}
       }
-      .onDisappear { handoff.cancel() }
-      .onChange(of: properties.enabled) { _, enabled in
-        if enabled != true && dragging {
-          handoff.cancel()
-          dragging = false
-          withAnimation(.smooth(duration: 0.2)) { translation = 0 }
-          emit("cancel")
-        }
+      .onChange(of:properties.visible) { _,visible in
+        if visible != true {reset(notify:true)} else {acknowledge()}
       }
+      .onChange(of:scenePhase) { _,phase in if phase != .active {reset(notify:true)} }
+      .onDisappear {reset(notify:false)}
     }
   }
+
   #endif
 
   private struct TitleRun: Decodable {
@@ -506,13 +553,24 @@ struct JournalSheetDismissButton: SwiftUI.View {
       let properties = self.properties
       switch properties?.mode {
       case .graphPages:
-        if let properties, context.childIDs.count == 2 {
+        if let properties {
           #if os(iOS)
-          GraphPages(context: context, properties: properties, current: child(0), preview: child(1))
+          GraphPages(context:context,properties:properties)
           #else
-          child(0)
+          ZStack {
+            ForEach(Array((properties.slotOwners ?? []).enumerated()),id:\.element) { index,owner in
+              child(index)
+                .environment(\.journalGraphScrollScope,JournalGraphScrollScope(pageID:owner,
+                  records:owner==properties.pageID && properties.visible==true))
+                .opacity(owner==properties.pageID && properties.visible==true ? 1 : 0)
+                .allowsHitTesting(owner==properties.pageID && properties.visible==true)
+                .accessibilityHidden(owner != properties.pageID || properties.visible != true)
+            }
+          }
           #endif
         }
+      case .timelineHost:
+        if context.childIDs.count==1 {child(0)}
       case .page:
         if let properties, context.childIDs.count == 3,
           properties.connecting != nil, properties.controls != nil {

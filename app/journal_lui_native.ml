@@ -103,10 +103,14 @@ let decode_event = function
   | _ -> None
 ;;
 
-let mount ?key ~payload ~children ?on_event identifier context parent =
+let mount ?key ~payload ?payload_signal ~children ?on_event identifier context parent =
   let node = Lui_ui.extension context identifier in
   Option.iter (Lui_ui.key context node) key;
   Lui_ui.extension_property context node "payload" (StringValue payload);
+  Option.iter (fun source ->
+    let values=Signal.map (fun value->StringValue value) source in
+    Signal.on_dispose context.Lui_ui.ui_scope (fun ()->Signal.dispose_signal values);
+    Lui_ui.extension_property_signal context node "payload" values) payload_signal;
   Option.iter
     (fun handler ->
        Lui_ui.on_event context node (fun raw ->

@@ -5,7 +5,7 @@ import Observation
 import UIKit
 #endif
 
-struct JournalGraphScrollScope {
+struct JournalGraphScrollScope:Equatable {
   let pageID: String
   let records: Bool
 }
