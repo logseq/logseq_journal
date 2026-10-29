@@ -12,7 +12,21 @@ struct JournalGraphScrollScope {
 private struct JournalGraphScrollScopeKey: EnvironmentKey {
   static let defaultValue: JournalGraphScrollScope? = nil
 }
+private struct JournalGraphPresentationReadyKey: EnvironmentKey {
+  static let defaultValue: (@MainActor @Sendable (String) -> Void)? = nil
+}
+private struct JournalGraphPresentationNonceKey: EnvironmentKey {
+  static let defaultValue: UUID? = nil
+}
 extension EnvironmentValues {
+  var journalGraphPresentationNonce: UUID? {
+    get { self[JournalGraphPresentationNonceKey.self] }
+    set { self[JournalGraphPresentationNonceKey.self] = newValue }
+  }
+  var journalGraphPresentationReady: (@MainActor @Sendable (String) -> Void)? {
+    get { self[JournalGraphPresentationReadyKey.self] }
+    set { self[JournalGraphPresentationReadyKey.self] = newValue }
+  }
   var journalGraphScrollScope: JournalGraphScrollScope? {
     get { self[JournalGraphScrollScopeKey.self] }
     set { self[JournalGraphScrollScopeKey.self] = newValue }
@@ -386,6 +400,8 @@ extension EnvironmentValues {
     var active = false
     var handledToken: Int64 = 0
     private var userInteracting = false
+    var presentationLayout: (() -> Void)?
+    private var reportingLayout = false
     private(set) var atTop = false
     #if os(iOS)
     weak var scrollView: UIScrollView?
@@ -411,8 +427,20 @@ extension EnvironmentValues {
       UIView.performWithoutAnimation {
         scrollView.setContentOffset(CGPoint(x: scrollView.contentOffset.x,
           y: y - scrollView.adjustedContentInset.top), animated: false)
+        scrollView.layoutIfNeeded()
       }
       request.complete(y)
+    }
+    func reportPresentationLayout() {
+      guard active, presentationLayout != nil, restoredOffset == nil, !reportingLayout,
+        let scrollView, scrollView.window != nil, scrollView.bounds.height > 0,
+        scrollView.contentSize.height > 0 else { return }
+      reportingLayout = true
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.reportingLayout = false
+        if self.active, self.restoredOffset == nil { self.presentationLayout?() }
+      }
     }
     private var reduced = false
     private var deadline: Task<Void, Never>?
@@ -563,6 +591,7 @@ extension EnvironmentValues {
 
       func resolveIfNeeded() {
         owner?.applyRestoredOffset()
+        owner?.reportPresentationLayout()
         guard window != nil, owner?.scrollView?.window == nil, !resolving else { return }
         resolving = true
         DispatchQueue.main.async { [weak self] in
@@ -575,6 +604,7 @@ extension EnvironmentValues {
             if let scrollView = self.findScrollView(candidate) {
               owner.scrollView = scrollView
               owner.applyRestoredOffset()
+              owner.reportPresentationLayout()
               return
             }
             ancestor = candidate.superview
@@ -619,8 +649,11 @@ extension EnvironmentValues {
     @State private var restorationY: CGFloat?
     @State private var scrollMounted = false
     @State private var boundScrollIdentity: String?
+    @State private var presentedScrollIdentity: String?
     @Environment(\.journalGraphScrollScope) private var graphScrollScope
     @Environment(\.journalGraphScrollOffsets) private var graphScrollOffsets
+    @Environment(\.journalGraphPresentationReady) private var presentationReady
+    @Environment(\.journalGraphPresentationNonce) private var presentationNonce
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(context: LUIAppleExtensionViewContext) {
@@ -638,6 +671,7 @@ extension EnvironmentValues {
     }
 
     private func restoreScrollPosition() {
+      presentedScrollIdentity = nil
       restoringPosition = true
       restorationY = nil
       boundScrollIdentity = scrollIdentity
@@ -661,6 +695,33 @@ extension EnvironmentValues {
         #endif
       } else {
         restoringPosition = false
+      }
+    }
+
+    private func reportPresentationLayout() {
+      guard scrollMounted, presentationNonce != nil,
+        let identity = boundScrollIdentity, identity == scrollIdentity,
+        presentedScrollIdentity != identity, let scope = graphScrollScope, scope.records,
+        properties?.retention_key != nil, let presentationReady else { return }
+      #if os(iOS)
+      guard let scroll = topScroll.scrollView else { return }
+      let offset = scroll.contentOffset.y + scroll.adjustedContentInset.top
+      if let expected = restorationY {
+        guard abs(offset - expected) <= 1 else { return }
+        restorationY = nil
+        restoringPosition = false
+      }
+      #endif
+      guard !restoringPosition else { return }
+      presentedScrollIdentity = identity
+      presentationReady(scope.pageID)
+    }
+
+    private func bindPresentationLayout() {
+      if presentationNonce != nil {
+        topScroll.presentationLayout = { reportPresentationLayout() }
+      } else {
+        topScroll.presentationLayout = nil
       }
     }
 
@@ -965,6 +1026,7 @@ extension EnvironmentValues {
         }
         .onAppear {
           topScroll.active = true
+          bindPresentationLayout()
           prepared.bind(context)
           scrollMounted = true
           restoreScrollPosition()
@@ -974,6 +1036,8 @@ extension EnvironmentValues {
         }
       }
       .onDisappear {
+        topScroll.presentationLayout = nil
+        presentedScrollIdentity = nil
         scrollMounted = false
         boundScrollIdentity = nil
         restoringPosition = true
@@ -991,6 +1055,7 @@ extension EnvironmentValues {
         topScroll.geometryChanged(false)
       }
       .onChange(of: context.nodeID) { _, _ in
+        bindPresentationLayout()
         restoringPosition = true
         boundScrollIdentity = nil
         cancelPull()
@@ -1002,12 +1067,28 @@ extension EnvironmentValues {
         topScroll.geometryChanged(false)
         prepared.bind(context)
         restoreScrollPosition()
+        #if os(iOS)
+        topScroll.reportPresentationLayout()
+        #endif
         observeScrollRequests()
       }
       .onChange(of: scrollIdentity) { _, _ in
-        if scrollMounted && boundScrollIdentity != scrollIdentity { restoreScrollPosition() }
+        if scrollMounted && boundScrollIdentity != scrollIdentity {
+          bindPresentationLayout()
+          restoreScrollPosition()
+          #if os(iOS)
+          topScroll.reportPresentationLayout()
+          #endif
+        }
       }
       .onChange(of: reduceMotion) { _, reduced in topScroll.reduceMotionChanged(reduced) }
+      .onChange(of: presentationNonce) { _, _ in
+        presentedScrollIdentity = nil
+        bindPresentationLayout()
+        #if os(iOS)
+        if scrollMounted { topScroll.reportPresentationLayout() }
+        #endif
+      }
       .onChange(of: pendingScroll?.request.token) { _, _ in performPendingScroll() }
     }
   }

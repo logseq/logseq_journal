@@ -1,6 +1,9 @@
 import Foundation
 import SwiftUI
 import Combine
+#if os(iOS)
+import UIKit
+#endif
 @testable import LUIAppleBackend
 
 // Native payload parsing/lifecycle ownership is not reachable through an OCaml
@@ -35,6 +38,67 @@ import Combine
   }
   static func settle() async { for _ in 0..<10 { await Task.yield() } }
   static func main() async throws {
+    #if os(iOS)
+    let handoff = JournalGraphHandoff()
+    let cancelledGesture = handoff.startGesture()
+    handoff.cancel()
+    check(!handoff.acceptsGesture(cancelledGesture), "scene cancellation rejects an animation completion")
+    let laterGesture = handoff.startGesture()
+    check(!handoff.acceptsGesture(cancelledGesture) && handoff.acceptsGesture(laterGesture), "new gesture fences old completion")
+    handoff.cancel()
+    let changedFocusGesture = handoff.startGesture()
+    handoff.focusChanged("B")
+    check(!handoff.acceptsGesture(changedFocusGesture), "external focus change before cover rejects old animation completion")
+    let image = UIGraphicsImageRenderer(size: CGSize(width: 1, height: 1)).image { _ in }
+    let firstHandoff = handoff.begin(source: "A", target: "B", image: image)!
+    check(!handoff.finish(firstHandoff, page: "A", current: "B"), "source list cannot uncover target")
+    check(!handoff.finish(firstHandoff, page: "B", current: "A"), "target ready cannot uncover wrong focused page")
+    check(handoff.finish(firstHandoff, page: "B", current: "B"), "matching native layout uncovers target")
+    let second = handoff.begin(source: "B", target: "A", image: image)!
+    _ = handoff.begin(source: "A", target: "B", image: image)!
+    check(!handoff.finish(firstHandoff, page: "B", current: "B"), "repeated page ID rejects old ready nonce")
+    handoff.expire(second)
+    check(handoff.request != nil, "old timeout cannot cancel a later handoff")
+    let waiting = handoff.request!.id
+    handoff.expire(waiting)
+    check(handoff.request?.id == waiting, "a layout timeout must not expose source while focus is still queued")
+    handoff.focusChanged("B")
+    handoff.expire(waiting)
+    check(handoff.request == nil, "missing target layout fails open after focus and clears input lock")
+    check(handoff.begin(source: "A", target: "B", image: nil) == nil, "failed snapshot cannot enter waiting phase")
+    _ = handoff.begin(source: "A", target: "B", image: image)
+    handoff.focusChanged("C")
+    check(handoff.request == nil, "unexpected focus fences the old cover")
+    _ = handoff.begin(source: "A", target: "B", image: image)
+    handoff.focusChanged("B")
+    handoff.focusChanged("A")
+    check(handoff.request == nil, "leaving an observed target cancels its cover even on return to source")
+    _ = handoff.begin(source: "A", target: "B", image: image)
+    handoff.retain(["A", "B", "C"])
+    check(handoff.request != nil, "unchanged resident set retains pending focus")
+    handoff.retain(["A", "C"])
+    check(handoff.request == nil, "closing pending target cancels its cover")
+    _ = handoff.begin(source: "A", target: "B", image: image)
+    handoff.cancel()
+    check(handoff.request == nil, "window or scene cancellation clears handoff")
+    _ = handoff.begin(source: "A", target: "B", image: image)
+    try await Task.sleep(for: .milliseconds(2100))
+    check(handoff.request != nil, "queued focus is not a missing native layout")
+    handoff.focusChanged("B")
+    for _ in 0..<80 {
+      if handoff.request == nil { break }
+      try await Task.sleep(for: .milliseconds(50))
+    }
+    check(handoff.request == nil, "missing target List layout actually expires after focus")
+    let anchor = JournalGraphHandoff.Anchor()
+    anchor.owner = handoff
+    handoff.anchor = anchor
+    anchor.bounds = CGRect(x: 0, y: 0, width: 2, height: 2)
+    _ = handoff.begin(source: "A", target: "B", image: image)
+    anchor.layoutSubviews()
+    for _ in 0..<10 { await Task.yield() }
+    check(handoff.request == nil, "size invalidation cancels a cover even before focus commits")
+    #endif
     let offsets = JournalGraphScrollOffsets()
     offsets.retain(["account1:A:g1", "account1:B:g2"])
     offsets.write(page: "account1:A:g1", list: "timeline", y: 515)

@@ -4,6 +4,105 @@ import SwiftUI
 import UIKit
 #endif
 
+#if os(iOS)
+/// Bridges one completed swipe until the replacement List has restored layout.
+/// The cover contains only this window's pixels and never leaves memory.
+@MainActor final class JournalGraphHandoff: ObservableObject {
+  struct Request { let id: UUID; let source: String; let target: String }
+  @Published private(set) var request: Request?
+  weak var anchor: Anchor?
+  private var deadline: Task<Void, Never>?
+  private var gestureID: UUID?
+  private var reachedTarget = false
+
+  func startGesture() -> UUID { cancel(); let id = UUID(); gestureID = id; return id }
+  func acceptsGesture(_ id: UUID) -> Bool { gestureID == id }
+  var currentGesture: UUID? { gestureID }
+
+  final class Anchor: UIImageView {
+    weak var owner: JournalGraphHandoff?
+    override func didMoveToWindow() {
+      super.didMoveToWindow()
+      if window == nil { owner?.cancel() }
+    }
+    override func layoutSubviews() {
+      super.layoutSubviews()
+      if let image, abs(image.size.width - bounds.width) > 0.5 || abs(image.size.height - bounds.height) > 0.5,
+        let request = owner?.request {
+        Task { @MainActor [weak owner] in owner?.invalidate(request.id) }
+      }
+    }
+  }
+
+  func capture() -> UIImage? {
+    guard let anchor, let window = anchor.window, anchor.bounds.width > 0,
+      anchor.bounds.height > 0 else { return nil }
+    let frame = anchor.convert(anchor.bounds, to: window)
+    var drawn = false
+    let image = UIGraphicsImageRenderer(size: anchor.bounds.size).image { _ in
+      drawn = window.drawHierarchy(in: CGRect(origin: CGPoint(x: -frame.minX, y: -frame.minY),
+        size: window.bounds.size), afterScreenUpdates: false)
+    }
+    return drawn ? image : nil
+  }
+
+  @discardableResult func begin(source: String, target: String, image: UIImage?) -> UUID? {
+    cancel()
+    guard let image else { return nil }
+    let id = UUID()
+    anchor?.image = image
+    reachedTarget = false
+    request = Request(id: id, source: source, target: target)
+    return id
+  }
+  func finish(_ id: UUID, page: String, current: String?) -> Bool {
+    guard let request, request.id == id, request.target == page, current == page else { return false }
+    cancel()
+    return true
+  }
+  func focusChanged(_ page: String?) {
+    guard let request else { cancel(); return }
+    if page == request.target {
+      guard !reachedTarget else { return }
+      reachedTarget = true
+      let id = request.id
+      // Focus can be queued behind a Save. Until it commits, removing the
+      // landed target would reveal the source again. Only target layout has
+      // a deadline; its loading/error UI is safe to reveal after focus.
+      deadline = Task { @MainActor [weak self] in
+        do { try await Task.sleep(for: .seconds(2)) } catch { return }
+        self?.expire(id)
+      }
+    } else if reachedTarget || page != request.source { cancel() }
+  }
+  func expire(_ id: UUID) { if request?.id == id && reachedTarget { cancel() } }
+  func invalidate(_ id: UUID) { if request?.id == id { cancel() } }
+  func retain(_ pages: [String]) {
+    if let request, !pages.contains(request.source) || !pages.contains(request.target) { cancel() }
+  }
+  func cancel() {
+    deadline?.cancel(); deadline = nil
+    gestureID = nil; reachedTarget = false
+    anchor?.image = nil
+    request = nil
+  }
+}
+
+private struct JournalGraphHandoffAccess: UIViewRepresentable {
+  let owner: JournalGraphHandoff
+  func makeUIView(context: Context) -> JournalGraphHandoff.Anchor {
+    let view = JournalGraphHandoff.Anchor()
+    view.isUserInteractionEnabled = false
+    view.accessibilityElementsHidden = true
+    view.contentMode = .scaleToFill
+    view.owner = owner
+    owner.anchor = view
+    return view
+  }
+  func updateUIView(_ view: JournalGraphHandoff.Anchor, context: Context) {}
+}
+#endif
+
 /// The form sheet's native card transform still leaves at least a 44pt target.
 struct JournalSheetDismissButton: SwiftUI.View {
   var label: LocalizedStringKey = "Close"
@@ -103,6 +202,8 @@ struct JournalSheetDismissButton: SwiftUI.View {
     @State private var translation: CGFloat = 0
     @State private var dragging = false
     @State private var settling = false
+    @StateObject private var handoff = JournalGraphHandoff()
+    @Environment(\.scenePhase) private var scenePhase
     @Environment(\.journalGraphScrollOffsets) private var graphScrollOffsets
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -113,30 +214,43 @@ struct JournalSheetDismissButton: SwiftUI.View {
       switch pan.state {
       case .began:
         guard properties.enabled == true, !settling else { return }
+        handoff.startGesture()
         dragging = true
         emit("prepare")
         translation = min(width, max(0, pan.translation(in: pan.view).x))
       case .changed where dragging:
         translation = min(width, max(0, pan.translation(in: pan.view).x))
       case .ended where dragging:
+        guard let gesture = handoff.currentGesture else { return }
         dragging = false
         let distance = pan.translation(in: pan.view).x
         let velocity = pan.velocity(in: pan.view).x
         let commit = distance > width * 0.3 || (distance > 30 && velocity > 650)
         settling = true
-        withAnimation(reduceMotion ? .linear(duration: 0.01) : .smooth(duration: 0.24), completionCriteria: .logicallyComplete) {
+        // Focus dispatch synchronously rebuilds the native page. Wait until the
+        // spring is removed so that work cannot interrupt its visible tail.
+        withAnimation(reduceMotion ? .linear(duration: 0.01) : .smooth(duration: 0.24), completionCriteria: .removed) {
           translation = commit ? width : 0
         } completion: {
+          guard handoff.acceptsGesture(gesture) else { return }
+          if commit, let source = properties.pageID, let target = properties.targetPageID {
+            handoff.begin(source: source, target: target, image: handoff.capture())
+          }
           emit(commit ? "commit" : "cancel")
           if !commit { settling = false }
         }
       case .cancelled, .failed:
         guard dragging else { return }
+        handoff.cancel()
         dragging = false
         withAnimation(.smooth(duration: 0.2)) { translation = 0 }
         emit("cancel")
       default: break
       }
+    }
+    private var presentationNonce: UUID? {
+      guard let request = handoff.request, request.target == properties.pageID else { return nil }
+      return request.id
     }
     var body: some SwiftUI.View {
       GeometryReader { bounds in
@@ -149,24 +263,55 @@ struct JournalSheetDismissButton: SwiftUI.View {
             .accessibilityHidden(true)
           current
             .environment(\.journalGraphScrollScope, properties.pageID.map { JournalGraphScrollScope(pageID: $0, records: true) })
+            .environment(\.journalGraphPresentationNonce, presentationNonce)
+            .environment(\.journalGraphPresentationReady, { [id = presentationNonce] page in
+              if let id { _ = handoff.finish(id, page: page, current: properties.pageID) }
+            })
             .frame(width: bounds.size.width, height: bounds.size.height)
             .offset(x: translation)
+            .allowsHitTesting(handoff.request == nil)
+            .accessibilityHidden(handoff.request != nil)
         }
+        .overlay(JournalGraphHandoffAccess(owner: handoff)
+          .frame(width: bounds.size.width, height: bounds.size.height)
+          .allowsHitTesting(false).accessibilityHidden(true))
         .clipped()
         .gesture(RightGraphPan(enabled: properties.enabled == true && !settling) {
           handle($0, width: bounds.size.width)
         })
       }
       .onAppear { graphScrollOffsets?.retain(properties.residentPageIDs ?? []) }
-      .onChange(of: properties.residentPageIDs) { _, ids in graphScrollOffsets?.retain(ids ?? []) }
-      .onChange(of: properties.pageID) { _, _ in
-        translation = 0; dragging = false; settling = false
+      .onChange(of: properties.residentPageIDs) { _, ids in
+        graphScrollOffsets?.retain(ids ?? [])
+        handoff.retain(ids ?? [])
+      }
+      .onChange(of: properties.pageID) { _, page in
+        handoff.focusChanged(page)
+        withTransaction(Transaction(animation: nil)) {
+          translation = 0; dragging = false
+          if handoff.request == nil { settling = false }
+        }
       }
       .onChange(of: properties.targetID) { _, target in
-        if target == nil && !dragging { translation = 0; settling = false }
+        if target == nil && !dragging && handoff.request == nil { translation = 0; settling = false }
       }
+      .onChange(of: handoff.request?.id) { _, id in
+        if id == nil {
+          withTransaction(Transaction(animation: nil)) { translation = 0; settling = false }
+        }
+      }
+      .onChange(of: scenePhase) { _, phase in
+        if phase != .active {
+          let wasSwitching = dragging || settling
+          handoff.cancel()
+          translation = 0; dragging = false; settling = false
+          if wasSwitching { emit("cancel") }
+        }
+      }
+      .onDisappear { handoff.cancel() }
       .onChange(of: properties.enabled) { _, enabled in
         if enabled != true && dragging {
+          handoff.cancel()
           dragging = false
           withAnimation(.smooth(duration: 0.2)) { translation = 0 }
           emit("cancel")

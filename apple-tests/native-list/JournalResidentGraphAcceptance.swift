@@ -2,9 +2,10 @@ import XCTest
 /// Run only against the isolated four-catalog / three-resident synthetic host.
 /// Native pixel offset is owned by List; the public reducer cannot reproduce it.
 final class JournalResidentGraphAcceptance: XCTestCase {
-  @MainActor private func host() -> XCUIApplication {
+  @MainActor private func host(delay: Bool = false) -> XCUIApplication {
     let app=XCUIApplication(bundleIdentifier:"org.logseq.journal.resident-sync-probe")
     app.launchEnvironment=["LOGSEQ_JOURNAL_E2EE_TEST_PRIVATE_KEY_STORAGE":"memory","LOGSEQ_JOURNAL_E2EE_TEST_WRAPPED_KEY_STORAGE":"memory","JOURNAL_SYNTHETIC_TLS_SHA256":ProcessInfo.processInfo.environment["JOURNAL_SYNTHETIC_TLS_SHA256"] ?? ""]
+    if delay { app.launchEnvironment["JOURNAL_SYNTHETIC_CAPTURE_DELAY_SECONDS"] = "8" }
     app.launchArguments=["--fixture",ProcessInfo.processInfo.environment["JOURNAL_SYNTHETIC_FIXTURE"] ?? "authoritative-v2/fixture.json","--support-root",ProcessInfo.processInfo.environment["JOURNAL_SYNTHETIC_SUPPORT_ROOT"] ?? "authoritative-v2/resident-sync-support","--application-only"]
     app.launch(); _ = app.collectionViews.firstMatch.waitForExistence(timeout:25)
     Thread.sleep(forTimeInterval:5)
@@ -33,6 +34,25 @@ final class JournalResidentGraphAcceptance: XCTestCase {
     for graph in [2,3,1] {
       right(app);XCTAssertTrue(title(graph,app).waitForExistence(timeout:10));XCTAssertTrue(title(graph,app).isHittable);record("Native right swipe graph\(graph)",app)
     }
+  }
+  @MainActor func test21SavingFocusWaitPreservesLandedTarget() {
+    continueAfterFailure = false
+    let app = host(delay: true)
+    tapID("journal-capture-open", app)
+    let editor = app.textFields["field.composer"]
+    XCTAssertTrue(editor.waitForExistence(timeout: 10))
+    editor.tap(); editor.typeText("Handoff queued focus " + UUID().uuidString)
+    tapID("button.send", app)
+    XCTAssertTrue(app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS %@", "Saving")).firstMatch.exists)
+    app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3)).tap()
+    drag(app, 0.15, 0.85)
+    Thread.sleep(forTimeInterval: 2.2)
+    XCTAssertFalse(title(1, app).isHittable,
+      "Queued focus must keep the landed target rather than uncovering the source after 2s")
+    record("Landed target while Save delays focus", app)
+    let ready = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true AND enabled == true"), object: title(2, app))
+    XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 12), .completed)
+    record("Queued focus commits to the restored target", app)
   }
   @MainActor private func drag(_ app:XCUIApplication,_ from:CGFloat,_ to:CGFloat) {
     app.coordinate(withNormalizedOffset:CGVector(dx:from,dy:0.53)).press(forDuration:0.05,thenDragTo:app.coordinate(withNormalizedOffset:CGVector(dx:to,dy:0.53)),withVelocity:.slow,thenHoldForDuration:0.2)
