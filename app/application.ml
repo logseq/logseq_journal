@@ -3295,19 +3295,18 @@ let start
      | _->());
     result
   in
-  let pending_focus_refresh = ref None in
+  let pending_scope_refreshes = Hashtbl.create 3 in
   let try_focus_refresh owner =
     match dispatch_worker (Graph_service.Get_graph_state_at owner) with
-    | Worker.Accepted _ | Stopping -> pending_focus_refresh:=None
-    | Full | Not_ready -> pending_focus_refresh:=Some owner
+    | Worker.Accepted _ | Stopping -> Hashtbl.remove pending_scope_refreshes (owner_key owner)
+    | Full | Not_ready -> Hashtbl.replace pending_scope_refreshes (owner_key owner) owner
   in
   let drain_focus_refresh () =
     Effect.of_thunk (fun () ->
-      match !pending_focus_refresh with
-      | Some owner when runtime_owner_is_live !state_ref owner
-          && model_key !state_ref=Some(owner_key owner) -> try_focus_refresh owner
-      | Some _ -> pending_focus_refresh:=None
-      | None -> ())
+      Hashtbl.to_seq_values pending_scope_refreshes |> List.of_seq
+      |> List.iter (fun owner ->
+        if runtime_owner_is_live !state_ref owner then try_focus_refresh owner
+        else Hashtbl.remove pending_scope_refreshes (owner_key owner)))
   in
   let cancel_copy () =
     let state, _ = Journal_copy.step !copy_state Cancel in
@@ -3838,9 +3837,9 @@ let start
     then cancel_copy ();
     let start_graph =
       match graph_state.phase with
-      | Graph_open when Option.is_some !processing_owner
-          && Option.map owner_key !processing_owner <> Option.map owner_key !visible_owner
-          && Option.map owner_key !processing_owner <> !preview_owner -> Effect.ignore
+      (* Prepare each resident's first feed once, without mounting its UI.
+         A first swipe can then display its own data even while another graph
+         has a pending save. Later hidden invalidations remain deferred. *)
       | Graph_open ->
         let graph_key =
           Option.map Logseq_db_types.Graph_types.Uuid.to_string graph_state.graph_id
@@ -3966,6 +3965,12 @@ let start
   let termination_in_flight = ref false in
   let apply_manager_transition set_state set_state_and_effect manager_state =
     let manager = manager_state.Graph_service.snapshot in
+    let previous_scopes = match !state_ref.manager with
+      | None -> []
+      | Some previous -> List.map (fun scope -> owner_key (timeline_owner_of_scope scope)) previous.resident_scopes
+    in
+    let admitted_scopes = List.filter (fun scope ->
+      not (List.mem (owner_key (timeline_owner_of_scope scope)) previous_scopes)) manager.resident_scopes in
     retire_absent_runtimes { !state_ref with manager=Some manager };
     let previous_owner =
       Option.map
@@ -4028,18 +4033,20 @@ let start
     Effect.bind update ~f:(fun () ->
       let snapshot = !state_ref in
       Effect.many
-        [ (* A new graph's open push can precede the membership publication
-             and be fenced by the old scope list. Pull its state on focus. *)
-          (if owner_changed && not graph_already_current then
-             Effect.of_thunk (fun () ->
-               Option.iter (fun graph_id ->
-                 let owner : Graph_service.timeline_scope =
-                   {startup={account_generation=manager.startup.account_generation;
-                     presentation_generation=manager.startup.presentation_generation};
-                    graph_id;graph_generation=manager.startup.graph_generation} in
-                 try_focus_refresh owner)
-                 manager.selected_graph)
-           else Effect.ignore)
+        [ (* Open can precede membership and be fenced. Refresh every newly
+             admitted owner once, including hidden graphs, without mounting UI. *)
+          Effect.of_thunk (fun () ->
+            List.iter (fun scope -> try_focus_refresh (timeline_owner_of_scope scope)) admitted_scopes;
+            if owner_changed && not graph_already_current then
+              Option.iter (fun graph_id ->
+                let owner : Graph_service.timeline_scope =
+                  {startup={account_generation=manager.startup.account_generation;
+                    presentation_generation=manager.startup.presentation_generation};
+                   graph_id;graph_generation=manager.startup.graph_generation} in
+                if not (List.exists (fun scope ->
+                  owner_key (timeline_owner_of_scope scope)=owner_key owner) admitted_scopes)
+                then try_focus_refresh owner)
+                manager.selected_graph)
         ; sign_out
         ; termination_ready
         ; observe_graph_state set_state set_state_and_effect snapshot.graph_state
@@ -5719,7 +5726,7 @@ let start
         | _ -> state, Effect.ignore)
     | Sign_out ->
       pending_startup_commands:=[];
-      pending_focus_refresh:=None;
+      Hashtbl.clear pending_scope_refreshes;
       cancel_copy ();
       retire_graph_scope ();
       started_graph_generation := None;
@@ -6908,7 +6915,10 @@ let start
         ;"targetID",(match state.graph_preview with Some id->`String id | None->`Null)
         ;"targetPageID",(match next_resident_owner state with Some owner->`String(owner_key owner) | None->`Null)
         ;"residentPageIDs",`List(List.map(fun owner->`String(owner_key owner))live)
-        ;"slotOwners",`List(List.map(fun owner->`String(owner_key owner))next)]) in
+        ;"slotOwners",`List(List.map(fun owner->`String(owner_key owner))next)
+        ;"loadingPageIDs",`List(List.filter_map(fun owner->let model=host_model state owner in
+            if not model.feed_loaded || Option.is_some model.graph_error
+            then Some(`String(owner_key owner)) else None)next)]) in
       if Signal.sample (Signal.value payload)<>json then Signal.set payload json
     in
     let host owner_source host_context parent =

@@ -30,6 +30,164 @@ import UIKit
   }
   func cancel(){gestureID=nil;request=nil}
 }
+
+/// Cold pages are constructed under a real native transition. Warm pages never
+/// allocate a snapshot or wait for this layout handshake.
+@MainActor final class JournalGraphColdMotion:ObservableObject {
+  struct Ticket {let id:UUID;let source:String;let target:String}
+  @Published private(set) var ticket:Ticket?
+  @Published private(set) var layoutNonce:UUID?
+  private final class WeakView {weak var value:UIView?;init(_ value:UIView){self.value=value}}
+  final class Surface:UIView {
+    let canvas=UIView()
+    let image=UIImageView()
+    override init(frame:CGRect) {
+      super.init(frame:frame)
+      backgroundColor = .clear;isUserInteractionEnabled=false;accessibilityElementsHidden=true
+      canvas.backgroundColor = .systemBackground;canvas.isUserInteractionEnabled=false
+      canvas.accessibilityElementsHidden=true;canvas.isHidden=true
+      canvas.frame=bounds;canvas.autoresizingMask=[.flexibleWidth,.flexibleHeight]
+      image.frame=canvas.bounds;image.autoresizingMask=[.flexibleWidth,.flexibleHeight]
+      image.contentMode = .scaleToFill
+      addSubview(canvas);canvas.addSubview(image)
+    }
+    required init?(coder:NSCoder){fatalError("init(coder:) is not supported")}
+  }
+  private var views:[String:WeakView]=[:]
+  private weak var surface:Surface?
+  private var moved=false
+  private var laidOut=false
+  private var revealing=false
+  private var reduced=false
+  private var fallback:Task<Void,Never>?
+  func attach(_ surface:Surface){self.surface=surface}
+  func register(_ owner:String,view:UIView){views[owner]=WeakView(view)}
+  func unregister(_ owner:String,view:UIView) {
+    if views[owner]?.value === view {views.removeValue(forKey:owner)}
+    if ticket?.source==owner || ticket?.target==owner {cancel()}
+  }
+  func retain(_ owners:[String]) {
+    views=views.filter{owners.contains($0.key)}
+    if let ticket,(!owners.contains(ticket.source) || !owners.contains(ticket.target)){cancel()}
+  }
+  func begin(source:String,target:String)->Bool {
+    guard let view=views[source]?.value,view.window != nil,let surface,
+      view.bounds.width>0,view.bounds.height>0 else{return false}
+    cancel()
+    let format=UIGraphicsImageRendererFormat()
+    format.scale=view.window?.screen.scale ?? 1
+    var drawn=false
+    let image=UIGraphicsImageRenderer(bounds:view.bounds,format:format).image{_ in
+      drawn=view.drawHierarchy(in:view.bounds,afterScreenUpdates:false)
+    }
+    guard drawn else{return false}
+    ticket=Ticket(id:UUID(),source:source,target:target)
+    moved=false;laidOut=false;revealing=false
+    surface.canvas.alpha=1;surface.canvas.isHidden=false
+    surface.image.image=image;surface.image.transform = .identity
+    return true
+  }
+  func move(_ x:CGFloat) {
+    guard ticket != nil,let surface else{return}
+    UIView.performWithoutAnimation{surface.image.transform=CGAffineTransform(translationX:x,y:0)}
+  }
+  func commit(width:CGFloat,reduced:Bool,prepare:@escaping()->Void,complete:@escaping()->Void,cancelled:@escaping()->Void) {
+    guard let ticket,let surface else{return}
+    self.reduced=reduced
+    UIView.animate(withDuration:reduced ? 0.01 : 0.24,delay:0,
+      options:[.curveEaseOut,.allowUserInteraction,.beginFromCurrentState]) {
+      surface.image.transform=CGAffineTransform(translationX:width,y:0)
+    } completion:{[weak self] finished in
+      guard let self,self.ticket?.id==ticket.id else{return}
+      guard finished else{self.cancel();cancelled();return}
+      self.moved=true;self.laidOut=false;self.layoutNonce=UUID()
+      complete();self.revealIfReady()
+    }
+    // Commit the source-only native motion before constructing the cold page.
+    // This is not evidence that preparation itself stopped blocking the CPU.
+    CATransaction.flush()
+    DispatchQueue.main.async{[weak self] in
+      guard self?.ticket?.id==ticket.id else{return};prepare()
+    }
+  }
+  func returnToSource(reduced:Bool,complete:@escaping()->Void) {
+    guard let ticket,let surface else{complete();return}
+    UIView.animate(withDuration:reduced ? 0.01 : 0.24,delay:0,
+      options:[.curveEaseOut,.allowUserInteraction,.beginFromCurrentState]) {
+      surface.image.transform = .identity
+    } completion:{[weak self] _ in
+      guard self?.ticket?.id==ticket.id else{return};self?.cancel();complete()
+    }
+  }
+  func ready(page:String,nonce:UUID) {
+    guard let ticket,layoutNonce==nonce,ticket.target==page else{return}
+    laidOut=true;revealIfReady()
+  }
+  func focused(_ page:String?) {
+    guard let ticket,ticket.target==page else{return}
+    fallback?.cancel()
+    fallback=Task{@MainActor [weak self] in
+      try? await Task.sleep(for:.seconds(1))
+      guard !Task.isCancelled,self?.ticket?.id==ticket.id else{return}
+      // Reveal the real focused Loading/error content if it has no List.
+      self?.laidOut=true;self?.revealIfReady()
+    }
+  }
+  private func revealIfReady() {
+    guard moved,laidOut,!revealing,let ticket,let surface else{return}
+    revealing=true;fallback?.cancel();fallback=nil
+    if reduced {cancel();return}
+    UIView.animate(withDuration:0.15,delay:0,
+      options:[.curveEaseIn,.allowUserInteraction,.beginFromCurrentState]) {
+      surface.canvas.alpha=0
+    } completion:{[weak self] _ in
+      guard self?.ticket?.id==ticket.id else{return};self?.cancel()
+    }
+  }
+  func cancel() {
+    fallback?.cancel();fallback=nil
+    surface?.canvas.layer.removeAllAnimations();surface?.image.layer.removeAllAnimations()
+    if let surface {UIView.performWithoutAnimation{
+      surface.canvas.isHidden=true;surface.canvas.alpha=1
+      surface.image.image=nil;surface.image.transform = .identity
+    }}
+    moved=false;laidOut=false;revealing=false;layoutNonce=nil;ticket=nil
+  }
+}
+/// The target's own Loading/error body has no List readiness callback.
+/// Report only a fresh post-slide native layout, never mere view creation.
+private struct JournalGraphLoadingLayout:UIViewRepresentable {
+  let nonce:UUID
+  let ready:()->Void
+  final class Anchor:UIView {
+    var nonce:UUID?
+    var reported:UUID?
+    var ready:(()->Void)?
+    override func layoutSubviews() {
+      super.layoutSubviews()
+      guard let nonce,reported != nonce,window != nil,bounds.width>0,bounds.height>0 else{return}
+      reported=nonce
+      DispatchQueue.main.async{[weak self] in
+        guard let self,self.nonce==nonce,self.window != nil else{return};self.ready?()
+      }
+    }
+  }
+  func makeUIView(context:Context)->Anchor {
+    let view=Anchor();view.isUserInteractionEnabled=false;view.accessibilityElementsHidden=true;return view
+  }
+  func updateUIView(_ view:Anchor,context:Context) {
+    view.nonce=nonce;view.ready=ready;view.setNeedsLayout()
+  }
+  static func dismantleUIView(_ view:Anchor,coordinator:()) {view.nonce=nil;view.ready=nil}
+}
+private struct JournalGraphColdSurface:UIViewRepresentable {
+  let owner:JournalGraphColdMotion
+  func makeUIView(context:Context)->JournalGraphColdMotion.Surface {
+    let view=JournalGraphColdMotion.Surface();owner.attach(view);return view
+  }
+  func updateUIView(_ view:JournalGraphColdMotion.Surface,context:Context){}
+}
+
 #endif
 
 /// The form sheet's native card transform still leaves at least a 44pt target.
@@ -84,6 +242,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let targetPageID: String?
     let residentPageIDs: [String]?
     let slotOwners: [String]?
+    let loadingPageIDs: [String]?
     let ownerID: String?
     let visible: Bool?
   }
@@ -137,6 +296,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     @State private var source:String?
     @State private var target:String?
     @StateObject private var handoff=JournalGraphHandoff()
+    @StateObject private var coldMotion=JournalGraphColdMotion()
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.journalGraphScrollOffsets) private var graphScrollOffsets
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -150,6 +310,13 @@ struct JournalSheetDismissButton: SwiftUI.View {
       let records:Bool
       let shown:Bool
       let interactive:Bool
+      let coldMotion:JournalGraphColdMotion
+      let coldNonce:UUID?
+      let loading:Bool
+      private var presentationReady:(@MainActor @Sendable (String)->Void)? {
+        guard let coldNonce else{return nil}
+        return {page in coldMotion.ready(page:page,nonce:coldNonce)}
+      }
 
       struct Style:Equatable {
         let scene:ScenePhase
@@ -179,13 +346,30 @@ struct JournalSheetDismissButton: SwiftUI.View {
             && a.inset==b.inset && a.frame==b.frame
         }
       }
+      @MainActor final class LoadingGate {
+        var token=UUID()
+        var enabled=false
+        var owner:String?
+        var nonce:UUID?
+        weak var motion:JournalGraphColdMotion?
+        func ready(token:UUID,owner:String,nonce:UUID) {
+          guard self.token==token,enabled,self.owner==owner,self.nonce==nonce else{return}
+          motion?.ready(page:owner,nonce:nonce)
+        }
+      }
       final class Controller:UIViewController {
         let host:UIHostingController<AnyView>
+        let loadingGate:LoadingGate
         var records=false
         var interactive=false
         var node = -1
         var style:Style?
-        init(rootView:AnyView) {
+        var coldNonce:UUID?
+        var loading=false
+        var owner:String?
+        weak var coldMotion:JournalGraphColdMotion?
+        init(rootView:AnyView,loadingGate:LoadingGate) {
+          self.loadingGate=loadingGate
           host=UIHostingController(rootView:rootView)
           super.init(nibName:nil,bundle:nil)
         }
@@ -223,8 +407,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
           host.removeFromParent()
         }
       }
-      private func content(_ environment:EnvironmentValues)->AnyView {
-        AnyView(context.content(for:node)
+      private func content(_ environment:EnvironmentValues,gate:LoadingGate)->AnyView {
+        let loadingToken=gate.token
+        return AnyView(context.content(for:node)
           .environment(\.colorScheme,environment.colorScheme)
           .environment(\.dynamicTypeSize,environment.dynamicTypeSize)
           .environment(\.layoutDirection,environment.layoutDirection)
@@ -237,25 +422,39 @@ struct JournalSheetDismissButton: SwiftUI.View {
           .environment(\.journalStartupClock,environment.journalStartupClock)
           .environment(\.journalGraphScrollOffsets,environment.journalGraphScrollOffsets)
           .environment(\.journalGraphScrollScope,JournalGraphScrollScope(pageID:owner,records:records))
-          .accessibilityHidden(!interactive))
+          .environment(\.journalGraphPresentationNonce,coldNonce)
+          .environment(\.journalGraphPresentationReady,presentationReady)
+          .accessibilityHidden(!interactive)
+          .background {
+            if loading,let coldNonce {
+              JournalGraphLoadingLayout(nonce:loadingToken) {gate.ready(token:loadingToken,owner:owner,nonce:coldNonce)}
+            }
+          })
       }
       func makeUIViewController(context:Context)->Controller {
-        let controller=Controller(rootView:content(context.environment))
+        let gate=LoadingGate();gate.enabled=loading;gate.owner=owner;gate.nonce=coldNonce;gate.motion=coldMotion
+        let controller=Controller(rootView:content(context.environment,gate:gate),loadingGate:gate)
         controller.records=records;controller.interactive=interactive;controller.node=node;controller.style=Style(context.environment)
+        controller.coldNonce=coldNonce;controller.loading=loading;controller.owner=owner;controller.coldMotion=coldMotion
         controller.setRole(shown:shown,interactive:interactive)
+        coldMotion.register(owner,view:controller.view)
         return controller
       }
       func updateUIViewController(_ controller:Controller,context:Context) {
         let style=Style(context.environment)
-        if controller.node != node || controller.records != records || controller.interactive != interactive || controller.style != style {
-          controller.node=node;controller.records=records;controller.interactive=interactive;controller.style=style
-          withTransaction(Transaction(animation:nil)) {controller.host.rootView=content(context.environment)}
+        if controller.node != node || controller.records != records || controller.interactive != interactive || controller.style != style || controller.coldNonce != coldNonce || controller.loading != loading {
+          controller.loadingGate.token=UUID();controller.loadingGate.enabled=loading
+          controller.loadingGate.owner=owner;controller.loadingGate.nonce=coldNonce
+          controller.node=node;controller.records=records;controller.interactive=interactive;controller.style=style;controller.coldNonce=coldNonce;controller.loading=loading
+          withTransaction(Transaction(animation:nil)) {controller.host.rootView=content(context.environment,gate:controller.loadingGate)}
         }
         controller.setRole(shown:shown,interactive:interactive)
       }
       static func dismantleUIViewController(_ controller:Controller,coordinator:()) {
+        controller.loadingGate.enabled=false;controller.loadingGate.token=UUID();controller.loadingGate.nonce=nil
         controller.view.accessibilityElementsHidden=true
         controller.view.isUserInteractionEnabled=false
+        if let owner=controller.owner {controller.coldMotion?.unregister(owner,view:controller.view)}
         controller.detach()
       }
     }
@@ -272,27 +471,32 @@ struct JournalSheetDismissButton: SwiftUI.View {
       guard let data=try? JSONEncoder().encode(value) else {return}
       JournalExtensions.emit(context:context,payload:data)
     }
-    private func reset(notify:Bool) {
+    private func reset(notify:Bool,preserveCold:Bool=false) {
       if notify,source==properties.pageID {emit("cancel",source:source,target:target)}
       handoff.cancel()
+      if !preserveCold {coldMotion.cancel()}
       withTransaction(Transaction(animation:nil)) {
         translation=0;dragging=false;settling=false;committing=false;source=nil;target=nil
       }
     }
     private func acknowledge() {
-      if properties.visible==true,slots.contains(where:{$0.owner==properties.pageID}) {emit("presented")}
+      if properties.visible==true,coldMotion.ticket?.target != properties.pageID,
+        slots.contains(where:{$0.owner==properties.pageID}) {emit("presented")}
     }
     private func handle(_ pan:UIPanGestureRecognizer,width:CGFloat) {
       switch pan.state {
       case .began:
-        guard properties.enabled==true,!settling,
+        guard properties.enabled==true,!settling,coldMotion.ticket==nil,
           let from=properties.pageID,let to=properties.targetPageID,
           from != to,(properties.residentPageIDs ?? []).contains(to) else {return}
         _=handoff.startGesture();source=from;target=to;dragging=true
-        emit("prepare",source:from,target:to)
+        let cold = !slots.contains(where:{$0.owner==to}) && coldMotion.begin(source:from,target:to)
+        if !cold {emit("prepare",source:from,target:to)}
         translation=min(width,max(0,pan.translation(in:pan.view).x))
+        coldMotion.move(translation)
       case .changed where dragging:
         translation=min(width,max(0,pan.translation(in:pan.view).x))
+        coldMotion.move(translation)
       case .ended where dragging:
         guard properties.enabled==true,let gesture=handoff.currentGesture,source==properties.pageID,
           target==properties.targetPageID else {reset(notify:true);return}
@@ -300,6 +504,22 @@ struct JournalSheetDismissButton: SwiftUI.View {
         let distance=pan.translation(in:pan.view).x,velocity=pan.velocity(in:pan.view).x
         let commit=distance>width*0.3 || (distance>30 && velocity>650)
         settling=true;committing=commit
+        if coldMotion.ticket != nil {
+          if commit {
+            withTransaction(Transaction(animation:nil)){translation=width}
+            coldMotion.commit(width:width,reduced:reduceMotion,
+              prepare:{emit("prepare",source:source,target:target)},complete:{
+                guard properties.enabled==true,handoff.acceptsGesture(gesture),let source,let target,
+                  source==properties.pageID,target==properties.targetPageID else{return}
+                _=handoff.begin(source:source,target:target)
+                emit("commit",source:source,target:target)
+              },cancelled:{reset(notify:true)})
+          } else {
+            withTransaction(Transaction(animation:nil)){translation=0}
+            coldMotion.returnToSource(reduced:reduceMotion){reset(notify:true)}
+          }
+          return
+        }
         withAnimation(reduceMotion ? .linear(duration:0.01) : .smooth(duration:0.24),completionCriteria:.removed) {
           translation=commit ? width : 0
         } completion: {
@@ -322,18 +542,23 @@ struct JournalSheetDismissButton: SwiftUI.View {
             let ownsMotion=source==properties.pageID
             let incoming=ownsMotion && slot.owner==target && (dragging || settling)
             let shown=properties.visible==true && (current || incoming)
+            let covered=coldMotion.ticket?.target==slot.owner
+            let coldNonce=covered ? coldMotion.layoutNonce : nil
             Pane(context:context,owner:slot.owner,node:slot.node,
-              records:current && properties.visible==true && !(settling && committing),
+              records:current && properties.visible==true && !(settling && committing) && !covered,
               shown:shown,
-              interactive:current && properties.visible==true && !(settling && committing))
+              interactive:current && properties.visible==true && !(settling && committing) && !covered,
+              coldMotion:coldMotion,coldNonce:coldNonce,loading:(properties.loadingPageIDs ?? []).contains(slot.owner))
               .frame(width:bounds.size.width,height:bounds.size.height)
               .offset(x:current ? (ownsMotion ? translation : 0) : incoming ? translation-bounds.size.width : -bounds.size.width)
               .opacity(shown ? 1 : 0)
               .zIndex(current ? 1 : incoming ? 0 : -1)
           }
         }
+        .background(Color(uiColor:.systemBackground))
         .clipped()
-        .gesture(RightGraphPan(enabled:properties.enabled==true && !settling) {handle($0,width:bounds.size.width)})
+        .overlay{JournalGraphColdSurface(owner:coldMotion).allowsHitTesting(false).accessibilityHidden(true)}
+        .gesture(RightGraphPan(enabled:properties.enabled==true && !settling && coldMotion.ticket==nil) {handle($0,width:bounds.size.width)})
         .onChange(of:bounds.size) { _,_ in reset(notify:true) }
       }
       // Each native hosting root owns the same window-sized canvas as the
@@ -341,21 +566,26 @@ struct JournalSheetDismissButton: SwiftUI.View {
       .ignoresSafeArea(.container)
       .onAppear {graphScrollOffsets?.retain(properties.residentPageIDs ?? []);acknowledge()}
       .onChange(of:properties.slotOwners) { _,_ in acknowledge() }
+      .onChange(of:coldMotion.ticket?.id) { _,id in if id==nil {acknowledge()} }
       .onChange(of:properties.residentPageIDs) { _,ids in
+        coldMotion.retain(ids ?? [])
         graphScrollOffsets?.retain(ids ?? [])
         if let source,let target,!(ids ?? []).contains(source) || !(ids ?? []).contains(target) {reset(notify:false)}
       }
       .onChange(of:properties.pageID) { _,page in
+        let keepCold=committing && coldMotion.ticket?.target==page
         if let request=handoff.request,page==request.target {
           _=handoff.finish(request.id,page:request.target,current:page)
         } else {handoff.focusChanged(page)}
-        reset(notify:false);acknowledge()
+        reset(notify:false,preserveCold:keepCold)
+        if keepCold {coldMotion.focused(page)}
+        acknowledge()
       }
       .onChange(of:properties.targetPageID) { _,next in
-        if let target,target != next {reset(notify:true)}
+        if source==properties.pageID,let target,target != next {reset(notify:true)}
       }
       .onChange(of:properties.enabled) { _,enabled in
-        if enabled != true && handoff.request == nil {reset(notify:true)}
+        if enabled != true && handoff.request == nil && coldMotion.ticket?.target != properties.pageID {reset(notify:true)}
       }
       .onChange(of:properties.targetID) { _,prepared in
         if prepared == nil && source==properties.pageID && (dragging || settling) {reset(notify:false)}

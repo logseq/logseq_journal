@@ -24,7 +24,7 @@ Adapt obsolete preview-tree and handoff-cover expectations to the fixed-host con
 The attempted additional product regression write was rejected by automatic review under the user's latest testing constraint; it did not execute and is not retried. Existing native run82 supplies the observed repeated mount/restore and ancestry failure before implementation.
 Retain the existing color and native gesture checks; verify fixed-host lifecycle with temporary external diagnostics and actual GUI evidence.
 Run full source build and regression on final production bytes, independent review and actual synthetic Simulator acceptance.
-Compare the same optimized fixture, image data, native gestures and time windows against profiles79/80 and lightweight run82; count patch operations, mount/restore callbacks and display gaps, without adding animation duration or a handoff cover.
+Compare the same optimized fixture, image data, native gestures and time windows against profiles79/80 and lightweight run82; count patch operations, mount/restore callbacks and display gaps, without increasing warm-switch animation duration. The user later explicitly approved a native first-open preparation transition; measure that cold path separately from warm switching.
 
 Validation uses the existing checks and preserved pre-change failure evidence; no new test cases are added.
 
@@ -45,7 +45,7 @@ Mount the shared picker/startup overlay outside the hosts, so opening it does no
 Retain real data updates and resource cleanup.
 8. In swift/JournalChrome.swift, render fixed owner-keyed native panes at stable ForEach positions.
 Change translation, input and accessibility roles only; keep image enabled appearance, right-only direction admission, cancel and fast-gesture fences.
-Remove snapshot-based handoff work from the transition path.
+Remove the old preview-to-navigation handoff. Warm switches have no snapshot or readiness wait; an unopened page may use one transient source-only native snapshot and a bounded reveal after its own current List layout.
 Keep per-pane scroll scope immutable, with only its records role changing.
 9. Adapt native lifecycle checks to the retained-host contract, run GREEN, then simplify only after the affected regressions pass.
 10. Build the final experimental optimized Simulator fixture with the maintained private toolchain and exact source manifest.
@@ -65,6 +65,10 @@ All generated hosts, logs, artifacts and reports stay in evidence/fixed-timeline
 - Host identity is account generation, graph UUID and graph generation; presentation tickets remain current without changing host identity.
 - At most three native page/navigation hosts exist, with lazy initial presentation construction.
 - Hidden DB/sync remains live; row, media and header presentation subscriptions freeze.
+- Read each newly admitted full scope once to recover open pushes that preceded membership. Prepare its first metadata/feed without mounting a hidden page; later hidden invalidations stay deferred.
+- An unopened target prepares on committed release, after source-only UIKit motion is submitted. The source snapshot follows the real pan, cancels back without preparation, and is released after the real target List has laid out its current payload. Warm targets retain direct page translation.
+- A queued Save can delay asset-file acquisition; render the target's real cached text and dimensioned image placeholders instead of a blank screen. Do not claim those placeholders are loaded images.
+- A closed graph keeps only lightweight known-scope cleanup ownership until admitted resource releases finish; stale-account cleanup is pruned. Physical lease-table diagnostics must demonstrate release, not just cancelled callers.
 - Late callbacks retain their original owner and cannot route to the visible graph.
 - Cancellation, external selection, graph removal, account exit and scene changes fence stale animations.
 - No new visible Timeline UI, left-swipe switching, graph eviction or persistent credentials.
