@@ -301,7 +301,9 @@ let handle_push context = function
   | Graph_state_changed state -> handle_graph_state context state
   | Asset_notice _ | Asset_notices _ ->
     fail_worker context "assets" "unexpected asset notice without demand"
-  | Graph_push _ -> context.last_event <- "graph-push"
+  | Graph_push _ | Graph_pushes _ -> context.last_event <- "graph-push"
+  | Graph_states states -> List.iter (fun (_,state)->handle_graph_state context state) states
+  | Session_states _ -> ()
 ;;
 
 let handle_event context = function

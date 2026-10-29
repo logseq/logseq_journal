@@ -1250,3 +1250,5 @@ let imported t ~current (receipt : Logseq_db_worker.import_receipt) =
       notify t g);
   pump t
 ;;
+
+let idle t = t.queued = []

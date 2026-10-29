@@ -43,3 +43,5 @@ val notice
 
 val pump : t -> unit
 val reject : t -> request_id:Logseq_db_types.Graph_types.Uuid.t -> unit
+
+val idle : t -> bool

@@ -25,3 +25,5 @@ val retire : t -> Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id -> b
 (** Cancel each live lease once, forgetting projection ownership first. Protocol
     IDs are reopened; worker-ID tombstones remain until their response arrives. *)
 val cancel_graph_leases : t -> unit
+
+val cancel_graph_scope : t -> Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope option -> unit

@@ -93,6 +93,8 @@ type output =
   | Graph_push of Logseq_db_worker_contract.Protocol.push
   | Sync_output of Logseq_sync_pure_reducer.Core.output
   | Graph_state_changed of graph_state
+  | Scoped_graph_state_changed of Logseq_sync_pure_reducer.Core.graph_scope * graph_state
+  | Scoped_graph_push of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_worker_contract.Protocol.push
   | Diagnostic of string
 
 type upload_recovery_ticket =
@@ -131,9 +133,9 @@ let instruction_diagnostic = function
     "run-worker:Handle_sync_worker_effect"
   | Run_sync sync_effect -> "run-sync:" ^ Sync.runner_effect_diagnostic sync_effect
   | Publish (Reply _) -> "publish:reply"
-  | Publish (Graph_push _) -> "publish:graph-push"
+  | Publish (Graph_push _ | Scoped_graph_push _) -> "publish:graph-push"
   | Publish (Sync_output _) -> "publish:sync-output"
-  | Publish (Graph_state_changed _) -> "publish:graph-state"
+  | Publish (Graph_state_changed _ | Scoped_graph_state_changed _) -> "publish:graph-state"
   | Publish (Diagnostic _) -> "publish:diagnostic"
 ;;
 
@@ -180,8 +182,25 @@ type pending =
   | Pending_execute of request_id * Logseq_db_worker_contract.Protocol.request * ticket
   | Pending_sync_worker of ticket * Sync.worker_effect
 
+type graph_session =
+  { owner : Sync.graph_scope
+  ; saved_graph : graph_state
+  ; saved_assets : (Sync.asset_context * Logseq_sync_pure_reducer.Asset_transfer.t) option
+  ; saved_recovery : (Sync.graph_scope * Logseq_db_types.Graph_types.Uuid.t option * bool) option
+  ; saved_recovery_pending : upload_recovery_ticket option
+  ; saved_recovery_serial : int
+  ; saved_uploads : (Sync.asset_context * Logseq_db_types.Graph_types.Uuid.t * Asset_upload.t) list
+  ; saved_database : database_handle option
+  ; saved_deferred_detach : Sync.graph_scope option
+  ; saved_pending : pending list
+  }
+
 type state =
-  { graph : graph_state
+  { account_reset : Sync.account_scope option
+  ; resident_mode : bool
+  ; active_scope : Sync.graph_scope option
+  ; graph_sessions : graph_session list
+  ; graph : graph_state
   ; sync_core : Sync.t
   ; assets : (Sync.asset_context * Logseq_sync_pure_reducer.Asset_transfer.t) option
   ; recovery :
@@ -205,7 +224,11 @@ let initial config =
   Sync.initial config
   |> Result.map_error (fun (Sync.Invalid_create message) -> Invalid_create message)
   |> Result.map (fun sync_core ->
-    { graph = { generation = 0; graph_id = None; phase = Graph_closed; error = None }
+    { account_reset = None
+    ; resident_mode = false
+    ; active_scope = None
+    ; graph_sessions = []
+    ; graph = { generation = 0; graph_id = None; phase = Graph_closed; error = None }
     ; sync_core
     ; assets = None
     ; recovery = None
@@ -255,6 +278,14 @@ type event =
   | Asset_completed of
       Logseq_sync_pure_reducer.Core.graph_scope
       * Logseq_sync_pure_reducer.Asset_transfer.event
+  | Graph_request_for_scope of
+      { scope : Logseq_sync_pure_reducer.Core.graph_scope
+      ; id : request_id
+      ; request : Logseq_db_worker_contract.Protocol.request
+      }
+  | Projection_push_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_worker_contract.Protocol.push
+  | Asset_requested_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_sync_pure_reducer.Asset_transfer.event
+  | Upload_requested_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_types.Graph_types.Uuid.t * Asset_upload.event
   | Start
   | Graph_request of
       { id : request_id
@@ -300,10 +331,72 @@ let unavailable_response request message =
     (worker_error ~code:Closed_session ~message)
 ;;
 
+
+let graph_pending = function
+  | Pending_sync_worker (_,(Sync.Reset_managed_account _ | Sync.Delete_mirror _)) -> false
+  | _ -> true
+let freeze_graph owner state =
+  {owner
+  ; saved_graph = state.graph
+  ; saved_assets = state.assets
+  ; saved_recovery = state.recovery
+  ; saved_recovery_pending = state.recovery_pending
+  ; saved_recovery_serial = state.recovery_serial
+  ; saved_uploads = state.uploads
+  ; saved_database = state.database
+  ; saved_deferred_detach = state.deferred_detach
+  ; saved_pending = List.filter graph_pending state.pending
+  }
+let remember_graph state =
+  let owner=match state.active_scope,state.graph.graph_id with
+    | Some scope,_ -> Some scope
+    | None,Some id -> (match Sync.scope_for_graph state.sync_core ~graph_id:id with
+        | Some scope when scope.graph_generation=state.graph.generation -> Some scope | _ -> None)
+    | None,None -> None in
+  match owner with
+  | None -> state
+  | Some owner -> {state with active_scope=Some owner;
+      graph_sessions=freeze_graph owner state :: List.filter (fun s->s.owner<>owner) state.graph_sessions}
+let load_graph state (owner:Sync.graph_scope) =
+  let state=remember_graph state in
+  match List.find_opt (fun s->s.owner=owner) state.graph_sessions with
+  | Some saved -> {state with active_scope=Some owner
+    ; graph = saved.saved_graph
+    ; assets = saved.saved_assets
+    ; recovery = saved.saved_recovery
+    ; recovery_pending = saved.saved_recovery_pending
+    ; recovery_serial = saved.saved_recovery_serial
+    ; uploads = saved.saved_uploads
+    ; database = saved.saved_database
+    ; deferred_detach = saved.saved_deferred_detach
+    ; pending = List.filter (fun p->not(graph_pending p)) state.pending @ saved.saved_pending
+    }
+  | None -> {state with active_scope=Some owner;
+      graph={generation=owner.graph_generation;graph_id=Some owner.graph_id;phase=Graph_opening;error=None};
+      assets=None;recovery=None;recovery_pending=None;recovery_serial=0;uploads=[];
+      database=None;deferred_detach=None;pending=[]}
+let restore_visible_graph state =
+  match Sync.admitted_graph_scope state.sync_core with
+  | Some scope -> load_graph state scope
+  | None -> state
+let graph_publication state graph =
+  match state.active_scope with
+  | Some scope when state.resident_mode ->
+    Publish (Scoped_graph_state_changed (scope,graph))
+  | _ -> Publish (Graph_state_changed graph)
+let worker_effect_scope = function
+  | Sync.Inspect_mirror {scope;_} | Attach_graph {scope;_} | Detach_graph scope
+  | Inspect_sync scope | Apply_outbox_transition {scope;_} -> Some scope
+  | Activate_snapshot activation -> Some (Sync.snapshot_activation_scope activation)
+  | Apply_authoritative_batch {scope;_} -> Some scope.graph
+  | Reset_managed_account _ | Delete_mirror _ -> None
+;;
+
 let translate_sync transition state =
-  let state = { state with sync_core = transition.Sync.next } in
+  let resident_mode=state.resident_mode || (Sync.state transition.Sync.next).snapshot.resident_graphs<>[] in
+  let state = { (remember_graph state) with sync_core = transition.Sync.next;resident_mode } in
   let rec loop state reversed = function
-    | [] -> { next = state; effects = List.rev reversed }
+    | [] -> { next = remember_graph state; effects = List.rev reversed }
     | Sync.Run sync_effect :: rest -> loop state (Run_sync sync_effect :: reversed) rest
     | Sync.Publish (Sync.Protected_finished output) :: rest ->
       loop state (Deliver_protected_result output :: reversed) rest
@@ -312,12 +405,27 @@ let translate_sync transition state =
     | Sync.Publish output :: rest ->
       loop state (Publish (Sync_output output) :: reversed) rest
     | Sync.Delegate (Sync.Detach_graph scope) :: rest ->
+      let state = if not state.resident_mode then state else load_graph state scope in
       let graph = { state.graph with phase = Graph_closing } in
       loop
         { state with graph; deferred_detach = Some scope }
-        (Publish (Graph_state_changed graph) :: reversed)
+        (graph_publication state graph :: reversed)
         rest
+    | Sync.Delegate (Sync.Reset_managed_account account) :: rest ->
+      let state=remember_graph state in
+      let sessions=List.map (fun session ->
+        if session.saved_database=None then session else
+          {session with saved_graph={session.saved_graph with phase=Graph_closing};
+            saved_deferred_detach=Some session.owner}) state.graph_sessions in
+      let state={state with account_reset=Some account;graph_sessions=sessions} in
+      let state=match state.active_scope with
+        | None->state | Some scope ->
+          (match List.find_opt (fun s->s.owner=scope) sessions with
+           | None->state | Some session->{state with graph=session.saved_graph;deferred_detach=session.saved_deferred_detach}) in
+      loop state reversed rest
     | Sync.Delegate worker_effect :: rest ->
+      let state = if not state.resident_mode then state
+        else Option.fold ~none:state ~some:(load_graph state) (worker_effect_scope worker_effect) in
       let ticket, state = fresh_ticket state in
       let state =
         { state with
@@ -340,15 +448,15 @@ let apply_lifecycle state = function
       { generation; graph_id = Some opened.graph_id; phase = Graph_open; error = None }
     in
     ( { state with graph; database = Some opened.database }
-    , [ Publish (Graph_state_changed graph) ] )
+    , [ graph_publication state graph ] )
   | Lifecycle_closed generation ->
     let graph = { generation; graph_id = None; phase = Graph_closed; error = None } in
-    { state with graph; database = None }, [ Publish (Graph_state_changed graph) ]
+    { state with graph; database = None }, [ graph_publication state graph ]
   | Lifecycle_failed (generation, error) ->
     let graph =
       { state.graph with generation; phase = Graph_failed; error = Some error }
     in
-    { state with graph; database = None }, [ Publish (Graph_state_changed graph) ]
+    { state with graph; database = None }, [ graph_publication state graph ]
 ;;
 
 let execute_completion state ticket result =
@@ -374,7 +482,9 @@ let execute_completion state ticket result =
       match response with
       | Logseq_db_worker_contract.Protocol.V2_response
           { outcome = V2_mutation_committed _; _ } ->
-        translate_sync (Sync.step state.sync_core Sync.Local_outbox_changed) state
+        translate_sync (Sync.step state.sync_core (match state.active_scope with
+          | Some scope when state.resident_mode -> Sync.Local_graph_outbox_changed scope
+          | _ -> Sync.Local_outbox_changed)) state
       | V2_response _ -> no_effects state
     in
     { next = transitioned.next
@@ -424,6 +534,8 @@ let step state event =
     | Upload_completed _
     | Asset_requested _
     | Asset_completed _ -> no_effects state
+    | Graph_request_for_scope _ | Projection_push_for_scope _
+    | Asset_requested_for_scope _ | Upload_requested_for_scope _ -> no_effects state
     | Start -> no_effects state
     | Projection_push push ->
       if
@@ -467,8 +579,10 @@ let step state event =
     | Runner_completed (Close_database_completed _) -> no_effects state
     | Runner_completed (Sync_worker_effect_completed (ticket, result)) ->
       if
-        ticket.generation <> state.graph.generation
-        || not (has_pending ticket.id state.pending)
+        not (has_pending ticket.id state.pending)
+        || (ticket.generation <> state.graph.generation && not (List.exists (function
+          | Pending_sync_worker (candidate,(Sync.Reset_managed_account _ | Sync.Delete_mirror _))->candidate.id=ticket.id
+          | _->false) state.pending))
       then no_effects state
       else (
         let worker_effect =
@@ -594,14 +708,14 @@ let step state event =
    Their replies still finish; Sync rejects their superseded graph events. *)
 let step state event =
   let transition = step state event in
-  match transition.next.deferred_detach, transition.next.pending with
+  match transition.next.deferred_detach, List.filter graph_pending transition.next.pending with
   | Some scope, [] when not transition.next.shutdown ->
     let ticket, next = fresh_ticket transition.next in
     let worker_effect = Sync.Detach_graph scope in
     { next =
         { next with
           deferred_detach = None
-        ; pending = [ Pending_sync_worker (ticket, worker_effect) ]
+        ; pending = Pending_sync_worker (ticket, worker_effect) :: List.filter (fun p->not(graph_pending p)) next.pending
         }
     ; effects =
         transition.effects
@@ -622,15 +736,19 @@ module Transfer = Logseq_sync_pure_reducer.Asset_transfer
 let asset_scope state =
   if state.shutdown || state.graph.phase <> Graph_open
   then None
-  else Sync.asset_context state.sync_core
+  else match state.active_scope with
+    | Some scope when state.resident_mode -> Sync.asset_context_for_scope state.sync_core scope
+    | _ -> Sync.asset_context state.sync_core
 ;;
 
 let asset_online state =
+  let sync=Option.value (Option.bind state.active_scope (Sync.state_for_scope state.sync_core))
+    ~default:(Sync.state state.sync_core) in
   state.foreground
-  && (let f=(Sync.state state.sync_core).snapshot.startup in
+  && (let f=sync.snapshot.startup in
       f.authenticated && f.network_phase<>Sync.Local_only)
   &&
-  match (Sync.state state.sync_core).snapshot.sync_phase with
+  match sync.snapshot.sync_phase with
   | Offline | Paused | Failed -> false
   | Connecting | Pulling | Submitting | Current -> true
 ;;
@@ -1017,4 +1135,104 @@ let import_context state ~graph_generation =
     when context.scope.graph_generation = graph_generation
          && List.length state.uploads + reserved < 32 -> Some context
   | _ -> None
+;;
+
+
+let step_session = step
+let graph_scopes state =
+  List.filter_map (fun id -> Sync.scope_for_graph state.sync_core ~graph_id:id)
+    (Sync.resident_graphs state.sync_core)
+let graph_state_for_scope state (scope:Sync.graph_scope) =
+  if Sync.scope_for_graph state.sync_core ~graph_id:scope.graph_id <> Some scope then None
+  else Some (load_graph state scope).graph
+let session_for_ticket state ticket =
+  List.find_opt (fun s -> has_pending ticket.id s.saved_pending) (remember_graph state).graph_sessions
+let scope_of_event state = function
+  | Graph_request_for_scope {scope;_} | Projection_push_for_scope (scope,_)
+  | Asset_requested_for_scope (scope,_) | Upload_requested_for_scope (scope,_,_)
+  | Asset_completed (scope,_) -> Some scope
+  | Upload_completed (ticket,_) -> Some ticket.Asset_upload.scope
+  | Uploads_loaded (ticket,_) -> Some ticket.scope
+  | Sync_event event -> Sync.event_graph_scope state.sync_core event
+  | Runner_completed (Execute_request_completed (ticket,_) | Close_database_completed (ticket,_)
+      | Sync_worker_effect_completed (ticket,_)) ->
+    Option.map (fun s->s.owner) (session_for_ticket state ticket)
+  | _ -> None
+let step state event =
+  let state=match event with Sync_event (Sync.Resident_graphs_changed _) -> {state with resident_mode=true} | _->state in
+  let known=state.resident_mode in
+  let admitted (scope:Sync.graph_scope)=Sync.scope_for_graph state.sync_core ~graph_id:scope.Sync.graph_id=Some scope in
+  let owner=match event with
+    | Graph_request_for_scope {scope;_} | Projection_push_for_scope (scope,_)
+    | Asset_requested_for_scope (scope,_) | Upload_requested_for_scope (scope,_,_)
+        when not(admitted scope) -> None
+    | _ -> scope_of_event state event in
+  let owner=Option.bind owner (fun scope->if admitted scope || state.active_scope=Some scope
+    || List.exists(fun session->session.owner=scope) state.graph_sessions then Some scope else None) in
+  let state=match owner with Some scope when known->load_graph state scope | _->state in
+  let event=match event with
+    | Graph_request_for_scope {scope;id;request} ->
+      if Sync.scope_for_graph state.sync_core ~graph_id:scope.graph_id = Some scope
+      then Graph_request {id;request}
+      else Graph_request_for_scope {scope;id;request}
+    | Asset_requested_for_scope (scope,event) when admitted scope -> Asset_requested {graph_generation=scope.graph_generation;event}
+    | Upload_requested_for_scope (scope,operation,event) when admitted scope -> Upload_requested {graph_generation=scope.graph_generation;operation;event}
+    | Projection_push_for_scope (scope,push) when Sync.scope_for_graph state.sync_core ~graph_id:scope.graph_id=Some scope -> Projection_push push
+    | event -> event in
+  let transition=match event with
+    | Graph_request_for_scope {id;request;_} ->
+      {next=state;effects=[Publish (Reply (id,unavailable_response request "The graph scope is no longer open."))]}
+    | _ -> step_session state event in
+  let transition=match event with
+    | Set_foreground _ | Shutdown when known ->
+      let sessions=(remember_graph state).graph_sessions in
+      List.fold_left (fun result session ->
+        if state.active_scope=Some session.owner then result else
+        let loaded=load_graph result.next session.owner in
+        let loaded=if event=Shutdown then {loaded with shutdown=false} else loaded in
+        let part=step_session loaded (if event=Shutdown then Shutdown else Start) in
+        {next=remember_graph part.next;effects=result.effects @ part.effects}) transition sessions
+    | _->transition in
+  let next=remember_graph transition.next in
+  let next,drains=List.fold_left (fun (next,effects) session ->
+    if session.saved_deferred_detach<>None && session.saved_pending=[] then
+      let drained=step_session (load_graph next session.owner) Start in
+      remember_graph drained.next,effects @ drained.effects
+    else next,effects) (next,[]) next.graph_sessions in
+  let next,account_effects=match next.account_reset with
+    | Some account when List.for_all (fun session->session.saved_database=None
+        && session.saved_deferred_detach=None && session.saved_pending=[]) next.graph_sessions ->
+      let ticket,next=fresh_ticket next in
+      let request=Sync.Reset_managed_account account in
+      {next with account_reset=None;pending=Pending_sync_worker(ticket,request)::next.pending},
+        [Run_worker(Request(ticket,Handle_sync_worker_effect request))]
+    | _->next,[] in
+  let effects=List.map (function
+    | Publish (Graph_push push) when known ->
+      (match owner with Some scope->Publish (Scoped_graph_push (scope,push)) | None->Publish (Graph_push push))
+    | instruction -> instruction) (transition.effects @ drains @ account_effects) in
+  let next={next with graph_sessions=List.filter (fun session ->
+    session.saved_database<>None || session.saved_graph.phase<>Graph_closed
+    || session.saved_pending<>[] || session.saved_deferred_detach<>None) next.graph_sessions} in
+  let next=if next.graph.phase=Graph_closed && next.database=None && List.filter graph_pending next.pending=[]
+    then {next with active_scope=None} else next in
+  {next=(if known || (Sync.state next.sync_core).snapshot.resident_graphs<>[] then restore_visible_graph next else next);effects}
+let asset_ticket_current_single = asset_ticket_current
+let asset_ticket_current state ticket =
+  let scope=match ticket with Transfer.Lookup t->t.scope | Download t->t.scope in
+  asset_ticket_current_single (load_graph state scope) ticket
+let asset_scope_current_single = asset_scope_current
+let asset_scope_current state scope = asset_scope_current_single (load_graph state scope) scope
+let upload_ticket_current_single = upload_ticket_current
+let upload_ticket_current state (ticket:Asset_upload.ticket) = upload_ticket_current_single (load_graph state ticket.scope) ticket
+let upload_recovery_current_single = upload_recovery_current
+let upload_recovery_current state ticket = upload_recovery_current_single (load_graph state ticket.scope) ticket
+let import_context_single = import_context
+let import_context state ~graph_generation =
+  match List.find_opt (fun (scope:Sync.graph_scope)->scope.graph_generation=graph_generation) (graph_scopes state) with
+  | Some scope -> import_context_single (load_graph state scope) ~graph_generation
+  | None -> import_context_single state ~graph_generation
+let import_context_for_scope state (scope:Sync.graph_scope) =
+  if Sync.scope_for_graph state.sync_core ~graph_id:scope.graph_id<>Some scope then None
+  else import_context_single (load_graph state scope) ~graph_generation:scope.graph_generation
 ;;

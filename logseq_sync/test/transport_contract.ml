@@ -4536,3 +4536,202 @@ let scenarios =
         test_upgrade_rejection_reason
     ]
 ;;
+
+(* A real transport table can collide even when pure Core emits correctly scoped
+   instructions. This peer exercises simultaneous TLS channels and their traffic;
+   it does not stand in for an authoritative DB transaction or GUI acceptance. *)
+module Resident_network_fixture = struct
+module C = Core
+module R = Runner
+module O = Logseq_overlay_db.Types
+module U = Logseq_db_types.Graph_types.Uuid
+let peer = {resident_peer|
+import base64, hashlib, json, os, pathlib, socket, ssl, struct, select, subprocess, sys, threading, time
+root = pathlib.Path(sys.argv[1])
+key, cert = root/'ephemeral-key.pem', root/'ephemeral-cert.pem'
+subprocess.run(['openssl','req','-x509','-newkey','ec','-pkeyopt','ec_paramgen_curve:P-256',
+ '-nodes','-keyout',str(key),'-out',str(cert),'-days','1','-subj','/CN=localhost',
+ '-addext','subjectAltName=DNS:localhost'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);context.load_cert_chain(cert,key)
+listener=socket.socket(socket.AF_INET6);listener.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,1);listener.bind(('::1',0));listener.listen(2)
+listener4=socket.socket();listener4.bind(('127.0.0.1',listener.getsockname()[1]));listener4.listen(2)
+(root/'ready').write_text(str(listener.getsockname()[1]))
+lock=threading.Lock();barrier=threading.Barrier(2);events=[];active=set();peak=0;threads=[]
+def note(kind,graph,**values):
+ with lock:
+  events.append(dict(kind=kind,graph=graph,**values))
+  (root/'peer-progress.json').write_text(json.dumps({'peak_simultaneous_sockets':peak,'events':events},indent=2)+'\n')
+def send(conn,value):
+ data=json.dumps(value,separators=(',',':')).encode();length=len(data)
+ conn.sendall(bytes([0x81,length]) + data if length<126 else bytes([0x81,126])+struct.pack('!H',length)+data)
+def receive(conn):
+ def exact(n):
+  data=b''
+  while len(data)<n:
+   part=conn.recv(n-len(data))
+   if not part:raise EOFError()
+   data+=part
+  return data
+ head=exact(2);length=head[1]&127
+ if length==126:length=int.from_bytes(exact(2),'big')
+ elif length==127:length=int.from_bytes(exact(8),'big')
+ mask=exact(4) if head[1]&128 else b'';data=exact(length)
+ if mask:data=bytes(v^mask[i%4] for i,v in enumerate(data))
+ return head[0]&15,data
+def serve(raw):
+ global peak
+ graph='unknown';conn=None
+ try:
+  conn=context.wrap_socket(raw,server_side=True);conn.settimeout(15)
+  request=b''
+  while b'\r\n\r\n' not in request:request+=conn.recv(16384)
+  lines=request.split(b'\r\n');path=lines[0].split()[1].decode();graph='B' if '99999999-9999-4999-8999-999999999999' in path else 'A'
+  headers={k.lower():v.strip() for k,v in (line.split(b':',1) for line in lines[1:] if b':' in line)}
+  if headers.get(b'authorization')!=b'Bearer synthetic-local-fixture':raise RuntimeError('unexpected local fixture token')
+  accept=base64.b64encode(hashlib.sha1(headers[b'sec-websocket-key']+b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest())
+  conn.sendall(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '+accept+b'\r\n\r\n')
+  with lock:active.add(graph);peak=max(peak,len(active))
+  note('opened',graph);barrier.wait(timeout=10)
+  send(conn,{'type':'hello','t':0})
+  injected=False
+  while not (root/'stop').exists():
+   if graph=='B' and (root/'inject').exists() and not injected:
+    injected=True;send(conn,{'type':'changed','t':1});note('remote-changed',graph,cursor=1)
+   conn.settimeout(.1)
+   try:opcode,data=receive(conn)
+   except socket.timeout:continue
+   if opcode==8:
+    conn.sendall(bytes([0x88,len(data)])+data);break
+   if opcode==1:
+    value=json.loads(data);phase='after-A' if (root/'after-A').exists() else ('after-injection' if injected else 'baseline');note('client-message',graph,phase=phase,message=value)
+    if value.get('type')=='pull':
+     send(conn,{'type':'pull/ok','t':0,'txs':[]});note('reply-sent',graph,phase=phase)
+ except (EOFError,ssl.SSLError,OSError) as error:note('closed-io',graph,error=type(error).__name__)
+ except Exception as error:note('failure',graph,error=str(error))
+ finally:
+  if conn:conn.close()
+  else:raw.close()
+  with lock:active.discard(graph)
+  note('retired',graph)
+  (root/('retired-'+graph)).touch()
+try:
+ for _ in range(2):
+  readable,_,_=select.select([listener,listener4],[],[],15)
+  if not readable:raise RuntimeError('no loopback connection')
+  raw,_=readable[0].accept();thread=threading.Thread(target=serve,args=(raw,));thread.start();threads.append(thread)
+ for thread in threads:thread.join(20)
+ if any(t.is_alive() for t in threads):raise RuntimeError('fixture peer did not retire')
+finally:
+ listener.close();listener4.close()
+ (root/'peer-report.json').write_text(json.dumps({'peak_simultaneous_sockets':peak,'events':events},indent=2)+'\n')
+ key.unlink(missing_ok=True)
+|resident_peer}
+let read file=In_channel.with_open_bin file In_channel.input_all
+let touch file=Out_channel.with_open_bin file (fun _->())
+let require label condition=if not condition then failwith label
+let cursor n=Logseq_db_types.Server_cursor.of_int64 (Int64.of_int n) |> Result.get_ok
+let graphs : C.graph list=List.map(fun(id,name)->({graph_id=U.of_string id |> Result.get_ok;name;
+  schema={major=65;minor=33;exact=true};encrypted=false}:C.graph))
+  ["11111111-1111-4111-8111-111111111111","Synthetic A";"99999999-9999-4999-8999-999999999999","Synthetic B"]
+let startup core : C.startup_scope=let f=(C.state core).snapshot.startup in
+  {account_generation=f.account_generation;presentation_generation=f.presentation_generation}
+let run ()=with_support(fun root->
+ let path file=Filename.concat root file in
+ Eio_main.run(fun env->Eio.Switch.run(fun sw->
+ let clock=Eio.Stdenv.clock env in
+ let wait label predicate=Eio.Time.with_timeout_exn clock 10. (fun()->
+   while not(predicate()) do Eio.Time.sleep clock 0.01 done);Printf.printf "PASS %s\n%!" label in
+ let process=Eio.Process.spawn ~sw (Eio.Stdenv.process_mgr env) ["python3";"-c";peer;root] in
+ wait "loopback TLS peer ready" (fun()->Sys.file_exists(path "ready"));
+ let port=int_of_string(read(path "ready")) in
+ let origin=Uri.of_string(Printf.sprintf "https://localhost:%d" port) in
+ let limits=C.limits ~maximum_response_bytes:Logseq_db_types.Limits.maximum_response_bytes ~maximum_artifact_bytes:1048576 ~submission_batch_size:32 |> Result.get_ok in
+ let initial=C.config ~managed_sync_origin:origin ~limits |> Result.get_ok |> C.initial |> Result.get_ok in
+ let signed=C.step initial (C.Sign_in_requested(startup initial)) in
+ let auth=C.step signed.next (C.Account_authenticated {user_id=Some "synthetic-local-user"}) in
+ let catalog=List.find_map(function C.Run(C.Request(ticket,C.Fetch_catalog _))->
+   Some(C.step auth.next (C.Runner_completed(C.Completion(ticket,Ok graphs))))|_->None) auth.effects |> Option.get in
+ let selected=C.step catalog.next (C.Graph_selected(List.hd graphs).graph_id) in
+ let configured=C.step selected.next (C.Resident_graphs_changed(List.map(fun(g:C.graph)->g.graph_id) graphs)) in
+ let inspections=selected.effects @ configured.effects in
+ let current,starts=List.fold_left(fun(core,starts)(graph:C.graph)->
+   let scope=C.scope_for_graph core ~graph_id:graph.graph_id |> Option.get in
+   let request=List.find_map(function C.Delegate(C.Inspect_mirror request) when request.scope=scope ->Some request|_->None) inspections |> Option.get in
+   let inspected=C.step core (C.Mirror_inspected(C.Mirror_available request)) in
+   let token=O.sync_token_of_string("sync-token:v1:" ^ U.to_string graph.graph_id) |> Result.get_ok in
+   let sync=O.sync_view ~token ~checkpoint:(cursor 0) ~submissions:[] in
+   let attached=C.step inspected.next (C.Graph_attached {scope;sync}) in
+   attached.next,starts @ List.filter_map(function C.Run(C.Start_websocket _ as runnable)->Some runnable|_->None) attached.effects)
+   (configured.next,[]) graphs in
+ require "two real graph connect instructions" (List.length starts=2);
+ let core=ref current and events=Eio.Stream.create 128 and opened=ref [] and messages=ref [] in
+ let cert=X509.Certificate.decode_pem(read(path "ephemeral-cert.pem")) |> Result.get_ok in
+ let fingerprint=X509.Certificate.fingerprint `SHA256 cert in
+ let authenticator=X509.Authenticator.cert_fingerprint ~time:(fun()->Some(Ptime_clock.now())) ~hash:`SHA256 ~fingerprint in
+ let secrets=R.secrets ~unlock_private_key:(fun ~managed_sync_origin:_ ~user_id:_ ~password:_ ~private_key_package:_->Error "Unused")
+   ~unlock_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~encrypted_graph_key:_->Error "Unused")
+   ~load_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_->Error(R.Wrapped_graph_key_unavailable "Unused"))
+   ~verify_and_save_wrapped_graph_key:(fun ~managed_sync_origin:_ ~user_id:_ ~graph_id:_ ~encrypted_graph_key:_->Error "Unused")
+   ~delete_account_secrets:(fun ~managed_sync_origin:_ ~user_id:_->Ok()) |> Result.get_ok in
+ let crypto=R.crypto ~encrypt_aes_gcm:(fun ~key:_ ~plaintext:_->Error "Unused")
+   ~decrypt_aes_gcm:(fun ~key:_ ~iv:_ ~ciphertext:_->Error "Unused") |> Result.get_ok in
+ let deps=R.dependencies ~runtime:(R.runtime ~fork:Eio.Fiber.fork ~sleep:(Eio.Time.sleep clock) |> Result.get_ok)
+   ~transport:(R.transport ~websocket_liveness:R.Disabled ~tls_authenticator:(R.tls_authenticator authenticator)
+     ~network:(Eio.Stdenv.net env) ~clock |> Result.get_ok)
+   ~local_store:(R.local_store ~application_support_directory:root () |> Result.get_ok)
+   ~artifact_store:(R.artifact_store ~staging_directory:(path "staging") |> Result.get_ok)
+   ~secrets ~crypto ~id_token_provider:(R.id_token_provider ~acquire:(fun account->
+      require "synthetic token stays on loopback" (account.C.managed_sync_origin=origin);Ok "synthetic-local-fixture")
+     ~invalidate:(fun _ ~token:_->())) |> Result.get_ok in
+ let runner=R.create ~sw deps ~post:(fun event->
+   (match event with C.Websocket_closed(_,C.Recoverable_close{message;_})->Printf.eprintf "CLOSED %s\n%!" (Option.value message ~default:"none")
+    | Websocket_closed(_,(Authentication_failure message|Protocol_failure message))->Printf.eprintf "CLOSED %s\n%!" message
+    | _->());Eio.Stream.add events event) |> Result.get_ok in
+ let run=function
+   | C.Start_websocket _ | Send_websocket _ | Close_websocket _ | Cancel_effects _ | Cancel_network_effects _ | Schedule_timer _ as op->R.submit runner op
+   | Request _ | Asset_io _ | Protected_io _ -> () in
+ let running=ref true in
+ Eio.Fiber.fork ~sw (fun()->while !running do
+   let event=Eio.Stream.take events in
+   (match event with C.Websocket_opened scope->opened:=scope::!opened
+    | Websocket_message(scope,message)->messages:=(scope,message)::!messages|_->());
+   let next=C.step !core event in core:=next.next;
+   List.iter(function C.Run instruction->run instruction|_->()) next.effects
+ done);
+ List.iter run starts;
+ wait "two concurrent authenticated TLS WebSockets" (fun()->List.length !opened=2);
+ wait "baseline pull responses received for both graphs" (fun()->List.filter_map(function (scope:C.connection_scope),Logseq_sync_pure_reducer.Sync_protocol.Server.Pull_ok _->Some scope.graph.graph_id|_->None) !messages |> List.sort_uniq compare |> List.length = 2);
+ let a=(List.nth graphs 0).graph_id and b=(List.nth graphs 1).graph_id in
+ require "A remains visible before remote injection" ((C.state !core).snapshot.selected_graph=Some a);
+ touch(path "inject");
+ wait "hidden B receives real server Changed at cursor 1" (fun()->List.exists(function (scope:C.connection_scope),Logseq_sync_pure_reducer.Sync_protocol.Server.Changed {t}->scope.C.graph.graph_id=b && t=cursor 1|_->false) !messages);
+ require "remote B event does not focus B" ((C.state !core).snapshot.selected_graph=Some a);
+ Eio.Time.sleep clock 0.05;
+ let removal=C.step !core (C.Resident_graphs_changed [b]) in core:=removal.next;
+ List.iter(function C.Run instruction->run instruction|_->()) removal.effects;
+ wait "closing A retires only its real socket" (fun()->Sys.file_exists(path "retired-A"));
+ let b_responses ()=List.length(List.filter(function (scope:C.connection_scope),Logseq_sync_pure_reducer.Sync_protocol.Server.Pull_ok _->scope.graph.graph_id=b|_->false) !messages) in
+ let before=b_responses () in touch(path "after-A");
+ wait "B completes a real retry pull/response after A retires" (fun()->
+   b_responses ()>before && (try
+     let progress=path "peer-progress.json" in
+     let open Yojson.Safe.Util in Yojson.Safe.from_file progress |> member "events" |> to_list
+     |> List.exists(fun event->member "kind" event=`String "reply-sent" && member "graph" event=`String "B"
+       && member "phase" event=`String "after-A") with _->false));
+ require "B remains open after successful independent roundtrip" (not(Sys.file_exists(path "retired-B")));
+ R.shutdown runner;touch(path "stop");running:=false;Eio.Stream.add events C.Shutdown;
+ Eio.Time.with_timeout_exn clock 10. (fun()->Eio.Process.await_exn process);
+ let report=Yojson.Safe.from_file(path "peer-report.json") in
+ let open Yojson.Safe.Util in
+ require "server observed real overlap" (member "peak_simultaneous_sockets" report |> to_int=2);
+ require "hidden B sent its own pull after notification" (member "events" report |> to_list |> List.exists(fun event->
+   member "graph" event=`String "B" && member "phase" event=`String "after-injection"
+   && (event |> member "message" |> member "type") = `String "pull"));
+ print_endline "PASS hidden graph real TLS notification, scoped pull, and independent retirement";
+ print_endline "LIMIT transport/core acceptance only; no DB transaction or GUI rendering claimed")))
+;;
+end
+let scenarios=scenarios @ [Alcotest.test_case
+  "resident real TLS channels keep hidden pull and retirement independent"
+  `Quick Resident_network_fixture.run]
+;;

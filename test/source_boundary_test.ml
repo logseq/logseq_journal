@@ -160,7 +160,7 @@ let test_sync_error_card_is_temporary_and_error_only root =
          then fail "sync-error timeout behavior is missing %S" required)
       [ "let sync_error_card_lifetime = 5."
       ; "let arm_sync_error_timer sequence ="
-      ; "let sync_error_timer_generation = ref 0 in"
+      ; "let sync_error_timer_generation = graph_ref (fun () -> 0) in"
       ; "schedule_after sync_error_card_lifetime"
       ; "!sync_error_timer_generation = generation"
       ]

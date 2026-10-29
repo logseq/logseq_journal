@@ -61,3 +61,5 @@ val reject : t -> ticket -> unit
 val notice : t -> Service.asset_scope -> Service.asset_notice -> unit
 val pump : t -> unit
 val imported : t -> current:bool -> Logseq_db_worker.import_receipt -> unit
+
+val idle : t -> bool

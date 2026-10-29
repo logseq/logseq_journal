@@ -1509,10 +1509,22 @@ let test_authoritative_detail_budget () =
 ;;
 
 
+
+let test_resident_invalidations_survive_coalescing () =
+  let scope=asset_scope 1 and other=asset_scope 2 in
+  let push n=Logseq_db_worker.Protocol.V2_changes_available {api_version=Logseq_db_worker.Protocol.api_version;
+    generation="generation:v1:1:1";through="change-window:v1:" ^ string_of_int n} in
+  let merged=Service.coalesce_push ~topic:Service.invalidation_topic
+    (Service.Graph_pushes [scope,push 1]) (Service.Graph_pushes [other,push 2]) in
+  T.require (merged=Service.Graph_pushes [scope,push 1;other,push 2]) "hidden graph invalidation was overwritten";
+  let latest=Service.coalesce_push ~topic:Service.invalidation_topic merged (Service.Graph_pushes [scope,push 3]) in
+  T.require (latest=Service.Graph_pushes [other,push 2;scope,push 3]) "latest update must replace only its exact graph scope"
+;;
 let () =
   T.run
     "lui worker service"
-    [ T.case "typed asset failures reach ledger" test_asset_failure_rows
+    [ T.case "resident invalidations preserve all graphs" test_resident_invalidations_survive_coalescing
+    ; T.case "typed asset failures reach ledger" test_asset_failure_rows
     ; T.case "safe worker failure rows" test_safe_worker_failure_rows
     ; T.case "authoritative integrity rows" test_authoritative_integrity_rows
     ; T.case "authoritative detail byte budget" test_authoritative_detail_budget

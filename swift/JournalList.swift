@@ -5,6 +5,46 @@ import Observation
 import UIKit
 #endif
 
+struct JournalGraphScrollScope {
+  let pageID: String
+  let records: Bool
+}
+private struct JournalGraphScrollScopeKey: EnvironmentKey {
+  static let defaultValue: JournalGraphScrollScope? = nil
+}
+extension EnvironmentValues {
+  var journalGraphScrollScope: JournalGraphScrollScope? {
+    get { self[JournalGraphScrollScopeKey.self] }
+    set { self[JournalGraphScrollScopeKey.self] = newValue }
+  }
+}
+
+/// Native offsets survive graph view remounts, bounded by live runtime scopes.
+/// Retired views cannot repopulate an account or graph after its removal.
+@MainActor final class JournalGraphScrollOffsets {
+  private var live: Set<String> = []
+  private var offsets: [String: [String: CGFloat]] = [:]
+  func retain(_ pages: [String]) {
+    live = Set(pages)
+    offsets = offsets.filter { live.contains($0.key) }
+  }
+  func read(page: String, list: String) -> CGFloat? { offsets[page]?[list] }
+  func write(page: String, list: String, y: CGFloat) {
+    guard live.contains(page), y.isFinite else { return }
+    offsets[page, default: [:]][list] = max(0, y)
+  }
+}
+
+private struct JournalGraphScrollOffsetsKey: EnvironmentKey {
+  static let defaultValue: JournalGraphScrollOffsets? = nil
+}
+extension EnvironmentValues {
+  var journalGraphScrollOffsets: JournalGraphScrollOffsets? {
+    get { self[JournalGraphScrollOffsetsKey.self] }
+    set { self[JournalGraphScrollOffsetsKey.self] = newValue }
+  }
+}
+
 /// SwiftUI host for the `journal-list` extension — the lui replacement for
 /// bonsai's `Native_list` family (grouped sections, disclosure rows, scroll
 /// position requests, visible-range paging, context actions).
@@ -80,6 +120,7 @@ import UIKit
     let track_visible_range: Bool?
     let track_scroll_completion: Bool?
     let sync_enabled: Bool?
+    let retention_key: String?
   }
 
   /// One payload observation belongs to one mounted native list. Child-model
@@ -352,6 +393,27 @@ import UIKit
     private enum Phase { case fadingOut, jumping, waitingForLayout, fadingIn }
     private var phase: Phase?
     private var pending: (id: UUID, token: Int64, complete: (Int64, String) -> Void)?
+    private var restoredOffset: (y: CGFloat, complete: (CGFloat) -> Void)?
+    func cancelRestore() { restoredOffset = nil }
+    func restoreOffset(_ y: CGFloat, complete: @escaping (CGFloat) -> Void) {
+      restoredOffset = (y, complete)
+      applyRestoredOffset()
+    }
+    func applyRestoredOffset() {
+      guard active, !userInteracting, let request = restoredOffset,
+        let scrollView, scrollView.window != nil, scrollView.contentSize.height > 0,
+        !scrollView.isTracking, !scrollView.isDragging else { return }
+      scrollView.layoutIfNeeded()
+      let maximum = max(0, scrollView.contentSize.height - scrollView.bounds.height
+        + scrollView.adjustedContentInset.top + scrollView.adjustedContentInset.bottom)
+      let y = min(maximum, max(0, request.y))
+      restoredOffset = nil
+      UIView.performWithoutAnimation {
+        scrollView.setContentOffset(CGPoint(x: scrollView.contentOffset.x,
+          y: y - scrollView.adjustedContentInset.top), animated: false)
+      }
+      request.complete(y)
+    }
     private var reduced = false
     private var deadline: Task<Void, Never>?
     #endif
@@ -359,13 +421,21 @@ import UIKit
     func accept(_ token: Int64) -> Bool {
       guard active, token > handledToken else { return false }
       handledToken = token
+      #if os(iOS)
+      cancelRestore()
+      #endif
       cancel()
       return true
     }
 
     func interactionChanged(_ interacting: Bool) {
       userInteracting = interacting
-      if interacting { cancel() }
+      if interacting {
+        #if os(iOS)
+        cancelRestore()
+        #endif
+        cancel()
+      }
     }
 
     func geometryChanged(_ top: Bool) {
@@ -492,6 +562,7 @@ import UIKit
       }
 
       func resolveIfNeeded() {
+        owner?.applyRestoredOffset()
         guard window != nil, owner?.scrollView?.window == nil, !resolving else { return }
         resolving = true
         DispatchQueue.main.async { [weak self] in
@@ -503,6 +574,7 @@ import UIKit
           while let candidate = ancestor, candidate !== self.window {
             if let scrollView = self.findScrollView(candidate) {
               owner.scrollView = scrollView
+              owner.applyRestoredOffset()
               return
             }
             ancestor = candidate.superview
@@ -542,6 +614,13 @@ import UIKit
     @StateObject private var topScroll = TopScroll()
     @State private var pullEligible = false
     @State private var pullHint = 0
+    @State private var retainedPosition = ScrollPosition()
+    @State private var restoringPosition = true
+    @State private var restorationY: CGFloat?
+    @State private var scrollMounted = false
+    @State private var boundScrollIdentity: String?
+    @Environment(\.journalGraphScrollScope) private var graphScrollScope
+    @Environment(\.journalGraphScrollOffsets) private var graphScrollOffsets
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(context: LUIAppleExtensionViewContext) {
@@ -551,6 +630,38 @@ import UIKit
 
     private var properties: Properties? {
       prepared.snapshot?.properties
+    }
+
+    private var scrollIdentity: String? {
+      guard let scope = graphScrollScope, let key = properties?.retention_key else { return nil }
+      return "\(context.nodeID):\(scope.pageID):\(key)"
+    }
+
+    private func restoreScrollPosition() {
+      restoringPosition = true
+      restorationY = nil
+      boundScrollIdentity = scrollIdentity
+      retainedPosition = ScrollPosition()
+      #if os(iOS)
+      topScroll.cancelRestore()
+      #endif
+      if let scope = graphScrollScope, let key = properties?.retention_key,
+        let y = graphScrollOffsets?.read(page: scope.pageID, list: key) {
+        restorationY = y
+        #if os(iOS)
+        // SwiftUI List does not honor ScrollPosition point restoration here.
+        // Reuse its existing native scroll view without replacing the List.
+        let identity = boundScrollIdentity
+        topScroll.restoreOffset(y) { resolved in
+          guard scrollMounted, boundScrollIdentity == identity else { return }
+          restorationY = resolved
+        }
+        #else
+        retainedPosition.scrollTo(y: y)
+        #endif
+      } else {
+        restoringPosition = false
+      }
     }
 
     private func emit(_ event: Event) {
@@ -607,6 +718,8 @@ import UIKit
 
     private func applyScrollRequest(_ request: ScrollRequest) {
       guard let properties, topScroll.accept(request.token) else { return }
+      restorationY = nil
+      restoringPosition = false
       if request.target.row_path.isEmpty {
         guard properties.sections.first?.key == request.target.section else {
           completeScroll(request.token, "missing_target")
@@ -759,9 +872,12 @@ import UIKit
     }
 
     private func scrollPhaseChanged(from previous: ScrollPhase, to phase: ScrollPhase) {
+      guard scrollMounted, boundScrollIdentity == scrollIdentity else { return }
       let wasTracking = previous == .tracking || previous == .interacting
       let tracking = phase == .tracking || phase == .interacting
       if tracking && !wasTracking {
+        restorationY = nil
+        restoringPosition = false
         pullEligible = properties?.sync_enabled == true && topScroll.atTop
         pullHint = 0
       }
@@ -803,13 +919,22 @@ import UIKit
           }
         }
         .modifier(ListStyleModifier(style: style))
+        .scrollPosition($retainedPosition)
         #if os(iOS)
         .overlay(TopScrollAccess(owner: topScroll).ignoresSafeArea().allowsHitTesting(false).accessibilityHidden(true))
         #endif
         .onScrollGeometryChange(for: CGFloat.self) { geometry in
           geometry.contentOffset.y + geometry.contentInsets.top
         } action: { _, offset in
+          guard scrollMounted, boundScrollIdentity == scrollIdentity else { return }
           topScroll.geometryChanged(offset <= 1)
+          if let target = restorationY, abs(offset - target) <= 1 {
+            restorationY = nil
+            restoringPosition = false
+          }
+          if !restoringPosition, let scope = graphScrollScope, scope.records, let key = properties?.retention_key {
+            graphScrollOffsets?.write(page: scope.pageID, list: key, y: offset)
+          }
           if pullEligible {
             // Only the three semantic hint states invalidate the view.
             let hint = offset <= -72 ? 2 : offset <= -20 ? 1 : 0
@@ -841,14 +966,23 @@ import UIKit
         .onAppear {
           topScroll.active = true
           prepared.bind(context)
+          scrollMounted = true
+          restoreScrollPosition()
           scrollProxy = proxy
           performPendingScroll()
           observeScrollRequests()
         }
       }
       .onDisappear {
+        scrollMounted = false
+        boundScrollIdentity = nil
+        restoringPosition = true
+        restorationY = nil
         cancelPull()
         topScroll.active = false
+        #if os(iOS)
+        topScroll.cancelRestore()
+        #endif
         topScroll.interactionChanged(false)
         topScroll.cancel()
         pendingScroll = nil
@@ -857,6 +991,8 @@ import UIKit
         topScroll.geometryChanged(false)
       }
       .onChange(of: context.nodeID) { _, _ in
+        restoringPosition = true
+        boundScrollIdentity = nil
         cancelPull()
         topScroll.interactionChanged(false)
         topScroll.cancel()
@@ -865,7 +1001,11 @@ import UIKit
         topScroll.handledToken = 0
         topScroll.geometryChanged(false)
         prepared.bind(context)
+        restoreScrollPosition()
         observeScrollRequests()
+      }
+      .onChange(of: scrollIdentity) { _, _ in
+        if scrollMounted && boundScrollIdentity != scrollIdentity { restoreScrollPosition() }
       }
       .onChange(of: reduceMotion) { _, reduced in topScroll.reduceMotionChanged(reduced) }
       .onChange(of: pendingScroll?.request.token) { _, _ in performPendingScroll() }

@@ -102,6 +102,7 @@ type snapshot =
   { sync_phase : sync_phase
   ; catalog : graph list
   ; selected_graph : graph_id option
+  ; resident_graphs : graph_id list
   ; applied_server_t : Logseq_db_types.Server_cursor.t option
   ; timeline_presentation_pending : bool
   ; unlock : unlock_phase
@@ -523,6 +524,8 @@ type output =
   | Asset_finished of asset_output
   | Protected_finished of protected_output
   | State_changed of state
+  | Resident_scopes_changed of graph_scope list
+  | Session_state_changed of graph_scope * state
   | Bootstrap_progressed of bootstrap_progress
 
 type instruction =
@@ -590,6 +593,9 @@ type event =
   | Account_authenticated of { user_id : string option }
   | Local_feed_acknowledged
   | Local_outbox_changed
+  | Resident_graphs_changed of graph_id list
+  | Visible_graph_changed of graph_id
+  | Local_graph_outbox_changed of graph_scope
   | Timeline_presented of timeline_scope
   | Graph_selected of graph_id
   | Graph_picker_requested
@@ -648,3 +654,12 @@ type transition =
   }
 
 val step : t -> event -> transition
+
+(** Ordered, currently resident graphs; at most three unique authorized entries. *)
+val resident_graphs : t -> graph_id list
+val scope_for_graph : t -> graph_id:graph_id -> graph_scope option
+val catalog_cache_resident_graphs : catalog_cache -> graph_id list
+
+val state_for_scope : t -> graph_scope -> state option
+val asset_context_for_scope : t -> graph_scope -> asset_context option
+val event_graph_scope : t -> event -> graph_scope option

@@ -153,6 +153,7 @@ type snapshot =
   { sync_phase : sync_phase
   ; catalog : graph list
   ; selected_graph : graph_id option
+  ; resident_graphs : graph_id list
   ; applied_server_t : Server_cursor.t option
   ; timeline_presentation_pending : bool
   ; unlock : unlock_phase
@@ -262,6 +263,7 @@ type catalog_cache =
   { cache_user_id : string
   ; cache_graphs : graph list
   ; cache_selected_graph : graph_id option
+  ; cache_resident_graphs : graph_id list option [@default None]
   }
 [@@deriving yojson]
 
@@ -307,12 +309,15 @@ let catalog_cache ~user_id ~graphs ~selected_graph =
   { cache_user_id = user_id
   ; cache_graphs = graphs
   ; cache_selected_graph = selected_graph
+  ; cache_resident_graphs = None
   }
 ;;
 
 let catalog_cache_user_id cache = cache.cache_user_id
 let catalog_cache_graphs cache = cache.cache_graphs
 let catalog_cache_selected_graph cache = cache.cache_selected_graph
+let catalog_cache_resident_graphs cache =
+  Option.value cache.cache_resident_graphs ~default:(Option.to_list cache.cache_selected_graph)
 let encode_catalog_cache cache = catalog_cache_to_yojson cache |> Yojson.Safe.to_string
 
 let decode_catalog_cache source =
@@ -332,6 +337,14 @@ let decode_catalog_cache source =
     | Ok cache ->
       if
         (not (bounded_text cache.cache_user_id))
+        || (match cache.cache_resident_graphs with
+            | None -> false
+            | Some ids -> List.length ids > 3
+              || List.length (List.sort_uniq compare ids) <> List.length ids
+              || List.exists (fun id -> not (List.exists (fun (graph:graph) -> graph.graph_id=id) cache.cache_graphs)) ids
+              || (match cache.cache_selected_graph with
+                  | Some id -> not (List.mem id ids)
+                  | None -> ids <> []))
         || List.exists
              (fun (graph : graph) ->
                 (not (bounded_text graph.name))
@@ -714,6 +727,8 @@ type output =
   | Asset_finished of asset_output
   | Protected_finished of protected_output
   | State_changed of state
+  | Resident_scopes_changed of graph_scope list
+  | Session_state_changed of graph_scope * state
   | Bootstrap_progressed of bootstrap_progress
 
 type instruction =
@@ -779,6 +794,9 @@ type event =
   | Account_authenticated of { user_id : string option }
   | Local_feed_acknowledged
   | Local_outbox_changed
+  | Resident_graphs_changed of graph_id list
+  | Visible_graph_changed of graph_id
+  | Local_graph_outbox_changed of graph_scope
   | Timeline_presented of timeline_scope
   | Graph_selected of graph_id
   | Graph_picker_requested
@@ -854,6 +872,7 @@ type websocket_owner =
   }
 
 module Asset_retirement_set = Map.Make (String)
+module Pending_id_set = Set.Make (Int)
 let asset_retirement_key (scope : graph_scope) retirement =
   Printf.sprintf "%S:%S:%S:%S" (Uri.to_string scope.account.managed_sync_origin)
     scope.account.user_id (Logseq_db_types.Graph_types.Uuid.to_string scope.graph_id)
@@ -865,8 +884,55 @@ type unlock_preparation =
   | Fetching_graph_key of graph_scope * effect_id
   | Fetching_user_keys of graph_scope * string * effect_id
 
+type graph_session =
+  { saved_identity : graph_scope
+  ; saved_snapshot : snapshot
+  ; saved_diagnostics : diagnostics
+  ; saved_pending_effects : pending_effect list
+  ; saved_asset_retirement_observed : unit Asset_retirement_set.t
+  ; saved_asset_known_scopes : graph_scope list
+  ; saved_protected_pending : protected_ticket list
+  ; saved_assets_pending : pending_asset list
+  ; saved_selected_graph_value : graph option
+  ; saved_current_graph_scope : graph_scope option
+  ; saved_connection_generation : connection_generation
+  ; saved_graph_key : graph_key_handle option
+  ; saved_pending_graph_open : mirror_request option
+  ; saved_pending_mirror_inspection : mirror_request option
+  ; saved_pending_selected_download : graph_scope option
+  ; saved_pending_attachment : mirror_request option
+  ; saved_unlock_preparation : unlock_preparation
+  ; saved_bootstrap : bootstrap
+  ; saved_sync_view : Overlay.sync_view option
+  ; saved_pending_sync_inspection : graph_scope option
+  ; saved_pending_outbox_transition : outbox_transition_request option
+  ; saved_submission_owner : submission_owner option
+  ; saved_pull_owner : pull_owner option
+  ; saved_pull_wanted : (graph_scope * Server_cursor.t) option
+  ; saved_force_pull_pending : bool
+  ; saved_diagnostic_remote_cursor : (graph_scope * Server_cursor.t) option
+  ; saved_pull_retry_delay : float
+  ; saved_active_authoritative_batch : authoritative_batch option
+  ; saved_queued_authoritative_batch : authoritative_batch option
+  ; saved_deferred_authoritative_owner : Overlay.submission_batch_id option
+  ; saved_websocket_live : bool
+  ; saved_foreground : bool
+  ; saved_foreground_generation : lifecycle_generation option
+  ; saved_websocket_owner : websocket_owner option
+  ; saved_wanted_websocket : websocket_request option
+  ; saved_reconnect_timer : (timer_id * connection_scope) option
+  ; saved_reconnect_pending : bool
+  ; saved_reconnect_delay : float
+  ; saved_closed : bool
+  }
+
 type t =
-  { asset_retirement_observed : unit Asset_retirement_set.t
+  { resident_order : graph_id list
+  ; resident_sessions : graph_session list
+  ; resident_next_generation : int
+  ; resident_enabled : bool
+  ; restored_residents : graph_id list option
+  ; asset_retirement_observed : unit Asset_retirement_set.t
   ; asset_known_scopes : graph_scope list
   ; protected_pending : protected_ticket list
   ; assets_pending : pending_asset list
@@ -937,6 +1003,7 @@ let initial config =
     ; sync_phase = Offline
     ; catalog = []
     ; selected_graph = None
+    ; resident_graphs = []
     ; applied_server_t = None
     ; timeline_presentation_pending = false
     ; unlock = Unlock_inactive
@@ -946,7 +1013,12 @@ let initial config =
     }
   in
   Ok
-    { asset_retirement_observed = Asset_retirement_set.empty
+    { resident_order = []
+    ; resident_sessions = []
+    ; resident_next_generation = 0
+    ; resident_enabled = false
+    ; restored_residents = None
+    ; asset_retirement_observed = Asset_retirement_set.empty
     ; asset_known_scopes = []
     ; protected_pending = []
     ; assets_pending = []
@@ -1272,6 +1344,7 @@ let save_cache core =
         ~graphs:core.public_state.snapshot.catalog
         ~selected_graph:core.cached_selected_graph
     in
+    let cache = if core.resident_enabled then { cache with cache_resident_graphs = Some core.resident_order } else cache in
     let next, request =
       issue_request core (Save_catalog { account = account_scope core user_id; cache })
     in
@@ -1481,7 +1554,7 @@ let is_graph_key_access (Pending_effect ticket) =
 let select_graph_transition core ~persist graph_id =
   match core.user_id, graph_in_catalog core.public_state.snapshot.catalog graph_id with
   | Some user_id, Some graph ->
-    let graph_generation = core.public_state.snapshot.startup.graph_generation + 1 in
+    let graph_generation = max core.resident_next_generation core.public_state.snapshot.startup.graph_generation + 1 in
     let startup =
       { core.public_state.snapshot.startup with
         awaiting_selection = false
@@ -1511,6 +1584,8 @@ let select_graph_transition core ~persist graph_id =
       set_snapshot
         { (reset_graph_operations core) with
           cached_selected_graph = Some graph_id
+        ; resident_next_generation = graph_generation
+        ; websocket_live = false
         ; pending_effects = List.filter (fun pending -> not (is_graph_key_access pending)) core.pending_effects
         ; selected_graph_value = Some graph
         ; current_graph_scope = Some scope
@@ -2523,6 +2598,7 @@ let clear_selected_graph_for_catalog core catalog =
     { local_deletion = None
     ; sync_phase = Offline
     ; catalog
+    ; resident_graphs = []
     ; selected_graph = None
     ; applied_server_t = None
     ; timeline_presentation_pending = false
@@ -2628,7 +2704,8 @@ let complete_catalog_load core cache =
   in
   let loaded =
     set_snapshot
-      { core with catalog_cache_loading = false; cached_selected_graph }
+      { core with catalog_cache_loading = false; cached_selected_graph
+        ; restored_residents = Option.bind cache (fun cache -> cache.cache_resident_graphs) }
       { core.public_state.snapshot with catalog; selected_graph = None; startup }
   in
   let restored =
@@ -3313,6 +3390,7 @@ let step core event =
           | _ -> submission_timeout ())
        | _ -> submission_timeout ())
     | Asset_requested _ | Protected_requested _ -> unchanged core
+    | Resident_graphs_changed _ | Visible_graph_changed _ | Local_graph_outbox_changed _
     | Local_feed_acknowledged -> unchanged core
     | Shutdown ->
       let scope =
@@ -4030,4 +4108,360 @@ let step core event =
     else effects
   in
   { next; effects }
+;;
+
+
+(* Resident sessions use the existing graph policy as a lens. Account/catalog
+   fields and the global effect serial are never stored in graph_session. *)
+let graph_pending (Pending_effect ticket) = ticket.scope.graph_generation <> None
+let freeze_session identity core =
+  { saved_identity = identity
+  ; saved_snapshot = core.public_state.snapshot
+  ; saved_diagnostics = core.public_state.diagnostics
+  ; saved_pending_effects = List.filter graph_pending core.pending_effects
+  ; saved_asset_retirement_observed = core.asset_retirement_observed
+  ; saved_asset_known_scopes = core.asset_known_scopes
+  ; saved_protected_pending = core.protected_pending
+  ; saved_assets_pending = core.assets_pending
+  ; saved_selected_graph_value = core.selected_graph_value
+  ; saved_current_graph_scope = core.current_graph_scope
+  ; saved_connection_generation = core.connection_generation
+  ; saved_graph_key = core.graph_key
+  ; saved_pending_graph_open = core.pending_graph_open
+  ; saved_pending_mirror_inspection = core.pending_mirror_inspection
+  ; saved_pending_selected_download = core.pending_selected_download
+  ; saved_pending_attachment = core.pending_attachment
+  ; saved_unlock_preparation = core.unlock_preparation
+  ; saved_bootstrap = core.bootstrap
+  ; saved_sync_view = core.sync_view
+  ; saved_pending_sync_inspection = core.pending_sync_inspection
+  ; saved_pending_outbox_transition = core.pending_outbox_transition
+  ; saved_submission_owner = core.submission_owner
+  ; saved_pull_owner = core.pull_owner
+  ; saved_pull_wanted = core.pull_wanted
+  ; saved_force_pull_pending = core.force_pull_pending
+  ; saved_diagnostic_remote_cursor = core.diagnostic_remote_cursor
+  ; saved_pull_retry_delay = core.pull_retry_delay
+  ; saved_active_authoritative_batch = core.active_authoritative_batch
+  ; saved_queued_authoritative_batch = core.queued_authoritative_batch
+  ; saved_deferred_authoritative_owner = core.deferred_authoritative_owner
+  ; saved_websocket_live = core.websocket_live
+  ; saved_foreground = core.foreground
+  ; saved_foreground_generation = core.foreground_generation
+  ; saved_websocket_owner = core.websocket_owner
+  ; saved_wanted_websocket = core.wanted_websocket
+  ; saved_reconnect_timer = core.reconnect_timer
+  ; saved_reconnect_pending = core.reconnect_pending
+  ; saved_reconnect_delay = core.reconnect_delay
+  ; saved_closed = core.closed
+  }
+let restore_session core session =
+  let shared = core.public_state.snapshot in
+  let snapshot = session.saved_snapshot in
+  let snapshot = {snapshot with catalog=shared.catalog;resident_graphs=core.resident_order;
+    startup={snapshot.startup with authenticated=shared.startup.authenticated;
+      account_generation=shared.startup.account_generation;catalog_loading=shared.startup.catalog_loading;
+      presentation_generation=max shared.startup.presentation_generation snapshot.startup.presentation_generation}} in
+  {core with public_state={snapshot;diagnostics=session.saved_diagnostics};
+    pending_effects = List.filter (fun p -> not (graph_pending p)) core.pending_effects @ session.saved_pending_effects
+  ; asset_retirement_observed = session.saved_asset_retirement_observed
+  ; asset_known_scopes = session.saved_asset_known_scopes
+  ; protected_pending = session.saved_protected_pending
+  ; assets_pending = session.saved_assets_pending
+  ; selected_graph_value = session.saved_selected_graph_value
+  ; current_graph_scope = session.saved_current_graph_scope
+  ; connection_generation = session.saved_connection_generation
+  ; graph_key = session.saved_graph_key
+  ; pending_graph_open = session.saved_pending_graph_open
+  ; pending_mirror_inspection = session.saved_pending_mirror_inspection
+  ; pending_selected_download = session.saved_pending_selected_download
+  ; pending_attachment = session.saved_pending_attachment
+  ; unlock_preparation = session.saved_unlock_preparation
+  ; bootstrap = session.saved_bootstrap
+  ; sync_view = session.saved_sync_view
+  ; pending_sync_inspection = session.saved_pending_sync_inspection
+  ; pending_outbox_transition = session.saved_pending_outbox_transition
+  ; submission_owner = session.saved_submission_owner
+  ; pull_owner = session.saved_pull_owner
+  ; pull_wanted = session.saved_pull_wanted
+  ; force_pull_pending = session.saved_force_pull_pending
+  ; diagnostic_remote_cursor = session.saved_diagnostic_remote_cursor
+  ; pull_retry_delay = session.saved_pull_retry_delay
+  ; active_authoritative_batch = session.saved_active_authoritative_batch
+  ; queued_authoritative_batch = session.saved_queued_authoritative_batch
+  ; deferred_authoritative_owner = session.saved_deferred_authoritative_owner
+  ; websocket_live = session.saved_websocket_live
+  ; foreground = session.saved_foreground
+  ; foreground_generation = session.saved_foreground_generation
+  ; websocket_owner = session.saved_websocket_owner
+  ; wanted_websocket = session.saved_wanted_websocket
+  ; reconnect_timer = session.saved_reconnect_timer
+  ; reconnect_pending = session.saved_reconnect_pending
+  ; reconnect_delay = session.saved_reconnect_delay
+  ; closed = session.saved_closed
+  }
+let remember_session identity core =
+  let saved = freeze_session identity core in
+  {core with resident_sessions=saved :: List.filter (fun s -> s.saved_identity <> identity) core.resident_sessions}
+let remember_current core =
+  match core.current_graph_scope with None -> core | Some identity -> remember_session identity core
+let resident_graphs core =
+  if core.resident_enabled then core.resident_order else Option.to_list core.public_state.snapshot.selected_graph
+let scope_for_graph core ~graph_id =
+  if not core.resident_enabled then Option.bind core.current_graph_scope
+    (fun scope -> if scope.graph_id=graph_id then Some scope else None)
+  else if not (List.mem graph_id core.resident_order) then None
+  else List.find_map (fun session ->
+    if session.saved_identity.graph_id=graph_id && session.saved_current_graph_scope=Some session.saved_identity
+    then Some session.saved_identity else None) (remember_current core).resident_sessions
+let state_for_scope core (scope : graph_scope) =
+  if scope_for_graph core ~graph_id:scope.graph_id <> Some scope then None
+  else if core.current_graph_scope=Some scope then Some core.public_state
+  else Option.map (fun session -> (restore_session core session).public_state)
+    (List.find_opt (fun s -> s.saved_identity=scope) core.resident_sessions)
+let asset_context_for_scope core (scope : graph_scope) =
+  if scope_for_graph core ~graph_id:scope.graph_id <> Some scope then None
+  else if core.current_graph_scope=Some scope then asset_context core
+  else Option.bind (List.find_opt (fun s -> s.saved_identity=scope) core.resident_sessions)
+    (fun session -> asset_context (restore_session core session))
+let session_for_effect core (scope : effect_scope) =
+  List.find_opt (fun session ->
+    let s=session.saved_identity in
+    (scope.graph_generation=Some s.graph_generation && scope.account_generation=Some s.account.account_generation)
+    || List.exists (fun (Pending_effect ticket)->ticket.scope=scope) session.saved_pending_effects)
+    (remember_current core).resident_sessions
+let event_graph_scope core = function
+  | Asset_requested ({scope;action;_} as request) when asset_cleanup_action action ->
+    (match List.find_opt (fun session->List.mem scope session.saved_asset_known_scopes)
+      (remember_current core).resident_sessions with
+     | Some session->Some session.saved_identity | None->Some request.scope)
+  | Local_graph_outbox_changed scope | Asset_requested {scope;_}
+  | Protected_requested {protected_scope=scope;_} | Graph_detached (scope,_)
+  | Mirror_inspected (Mirror_absent scope) -> Some scope
+  | Mirror_inspected (Mirror_available {scope;_}) | Graph_attached {scope;_}
+  | Sync_inspected {scope;_} | Outbox_transition_applied {scope;_}
+  | Authoritative_batch_applied {scope;_} | Authoritative_batch_deferred {scope;_}
+  | Outbox_transition_failed {request={scope;_};_} -> Some scope
+  | Snapshot_activated activation -> Some activation.scope
+  | Snapshot_activation_failed error -> Some error.activation.scope
+  | Websocket_opened {graph;_} | Websocket_message ({graph;_},_)
+  | Websocket_protocol_error ({graph;_},_) | Websocket_closed ({graph;_},_) -> Some graph
+  | Websocket_retired connection ->
+    (match List.find_opt (fun session->Option.fold ~none:false
+      ~some:(fun owner->owner.physical_scope=connection) session.saved_websocket_owner)
+      (remember_current core).resident_sessions with
+     | Some session->Some session.saved_identity | None->Some connection.graph)
+  | E2ee_password_submitted (challenge,_) -> Some challenge.challenge_scope
+  | Graph_attachment_failed {scope;_} | Authoritative_batch_failed {scope;_} ->
+    Option.map (fun s -> s.saved_identity) (session_for_effect core scope)
+  | Runner_completed (Completion (ticket,_)) ->
+    List.find_map (fun session->if List.exists (fun (Pending_effect pending)->
+      pending.id=ticket.id && pending.scope=ticket.scope) session.saved_pending_effects
+      then Some session.saved_identity else None) (remember_current core).resident_sessions
+  | Runner_completed (Asset_completion (ticket,_)) ->
+    List.find_map (fun session->if List.exists (fun pending->pending.asset_ticket=ticket) session.saved_assets_pending
+      then Some session.saved_identity else None) (remember_current core).resident_sessions
+  | Runner_completed (Protected_completion (ticket,_)) ->
+    List.find_map (fun session->if List.mem ticket session.saved_protected_pending
+      then Some session.saved_identity else None) (remember_current core).resident_sessions
+  | Timeline_presented scope | Online_recovery_requested scope -> scope_for_graph core ~graph_id:scope.graph_id
+  | Timer_elapsed id ->
+    List.find_map (fun s ->
+      let timer = Option.fold ~none:false ~some:(fun (timer,_) -> timer=id) s.saved_reconnect_timer
+        || Option.fold ~none:false ~some:(fun owner -> owner.response_timer=Some id) s.saved_submission_owner
+        || Option.fold ~none:false ~some:(fun owner -> match owner.pull_stage with
+          | Awaiting_pull_response timer | Awaiting_pull_retry timer -> timer=id | Applying_pull -> false) s.saved_pull_owner in
+      if timer then Some s.saved_identity else None) (remember_current core).resident_sessions
+  | _ -> None
+let step_graph_policy = step
+let scoped_publications (scope : graph_scope) effects = List.map (function
+  | Publish (State_changed state) -> Publish (Session_state_changed (scope,state))
+  | instruction -> instruction) effects
+let visible_identity core = core.public_state.snapshot.selected_graph
+let restore_visible core id =
+  match id with
+  | Some id -> (match List.find_opt (fun s -> s.saved_identity.graph_id=id
+      && List.mem id core.resident_order && s.saved_current_graph_scope=Some s.saved_identity) core.resident_sessions with
+    | Some session -> restore_session core session | None -> core)
+  | None -> core
+let run_session core (identity : graph_scope) event =
+  let core=remember_current core in
+  match List.find_opt (fun s -> s.saved_identity=identity) core.resident_sessions with
+  | None -> unchanged core
+  | Some session ->
+    let visible=visible_identity core in
+    let shared=core.public_state.snapshot in
+    let transition=step_graph_policy (restore_session core session) event in
+    let snapshot=transition.next.public_state.snapshot in
+    let snapshot={snapshot with catalog=shared.catalog;
+      startup={snapshot.startup with authenticated=shared.startup.authenticated;
+        catalog_loading=shared.startup.catalog_loading;account_generation=shared.startup.account_generation}} in
+    let _,account_pending=List.fold_left (fun (ids,pending) (Pending_effect ticket as obligation)->
+      if graph_pending obligation || Pending_id_set.mem ticket.id ids then ids,pending
+      else Pending_id_set.add ticket.id ids,obligation::pending)
+      (Pending_id_set.empty,[]) (core.pending_effects @ transition.next.pending_effects) in
+    let updated={transition.next with public_state={transition.next.public_state with snapshot};
+      pending_effects=List.rev account_pending @ List.filter graph_pending transition.next.pending_effects} in
+    let fresh=Option.value updated.current_graph_scope ~default:identity in
+    let updated=if fresh=identity then updated else {updated with
+      resident_sessions=List.filter(fun session->session.saved_identity<>identity) updated.resident_sessions} in
+    let next=remember_session fresh updated |> fun core -> restore_visible core visible in
+    {next;effects=if visible=Some fresh.graph_id then transition.effects
+      else scoped_publications fresh transition.effects}
+let empty_session core =
+  let blank=initial core.config |> Result.get_ok in
+  let identity=Option.get core.current_graph_scope in
+  let empty=freeze_session identity blank in
+  let next=restore_session core empty in
+  {next with public_state={next.public_state with snapshot={next.public_state.snapshot with
+    startup={next.public_state.snapshot.startup with
+      graph_generation=core.resident_next_generation;network_phase=core.public_state.snapshot.startup.network_phase}}}}
+let valid_residents core ids =
+  List.length ids<=3 && List.length (List.sort_uniq compare ids)=List.length ids
+  && List.for_all (fun id -> Option.is_some (graph_in_catalog core.public_state.snapshot.catalog id)) ids
+let configure_residents core ids =
+  if not (valid_residents core ids) then unchanged core else
+  let old_visible=visible_identity core in
+  let core=remember_current {core with resident_enabled=true} in
+  let removed=List.filter (fun s -> List.mem s.saved_identity.graph_id core.resident_order
+    && not (List.mem s.saved_identity.graph_id ids)) core.resident_sessions in
+  let core={core with resident_order=ids} in
+  let core,effects=List.fold_left (fun (core,effects) session ->
+    let closed=step_graph_policy (restore_session core session) Graph_picker_requested in
+    let next=remember_session session.saved_identity closed.next in
+    next,effects @ scoped_publications session.saved_identity closed.effects) (core,[]) removed in
+  let core,effects=List.fold_left (fun (core,effects) id ->
+    if Option.is_some (scope_for_graph core ~graph_id:id) then core,effects else
+    let base = match core.current_graph_scope with
+      | Some _ -> empty_session core
+      | None -> let blank=initial core.config |> Result.get_ok in
+        let base={blank with user_id=core.user_id;next_effect_id=core.next_effect_id;
+          resident_order=core.resident_order;resident_enabled=true;resident_sessions=core.resident_sessions;
+          resident_next_generation=core.resident_next_generation;foreground=core.foreground;
+          lifecycle_generation=core.lifecycle_generation;public_state=core.public_state} in
+        {base with public_state={base.public_state with snapshot={base.public_state.snapshot with
+          startup={base.public_state.snapshot.startup with graph_generation=core.resident_next_generation}}}} in
+    let opened=select_graph_transition base ~persist:false id in
+    let snapshot=opened.next.public_state.snapshot in
+    let opened={opened with next={opened.next with public_state={opened.next.public_state with
+      snapshot={snapshot with startup={snapshot.startup with network_phase=base.public_state.snapshot.startup.network_phase}}}}} in
+    let scope=Option.get opened.next.current_graph_scope in
+    let next=remember_current {opened.next with resident_next_generation=scope.graph_generation} in
+    next,effects @ scoped_publications scope opened.effects) (core,effects) ids in
+  let visible=match old_visible with Some id when List.mem id ids -> Some id | _ -> List.nth_opt ids 0 in
+  let next=restore_visible core visible in
+  let snapshot={next.public_state.snapshot with selected_graph=visible;resident_graphs=ids} in
+  let next={next with cached_selected_graph=visible;public_state={next.public_state with snapshot}} in
+  let next,saved=save_cache next in
+  {next;effects=effects @ [publish next] @ saved}
+let resume_resident_network core =
+  let shared=core.public_state.snapshot in
+  if shared.startup.network_phase=Local_only then unchanged core else
+  let original=visible_identity core in
+  let sessions=(remember_current core).resident_sessions in
+  let next,effects=List.fold_left (fun (core,effects) session ->
+    if not (List.mem session.saved_identity.graph_id core.resident_order) then core,effects else
+    let loaded=restore_session core session |> fun c -> network_phase c shared.startup.network_phase in
+    let resumed = if not shared.startup.authenticated then unchanged loaded else
+      match loaded.current_graph_scope,loaded.sync_view with
+      | Some scope,Some _ when not loaded.websocket_live && (match loaded.websocket_owner with
+          | None | Some {phase=Retiring;_} -> true | Some _ -> false) -> enforce_websocket_owner loaded (start_websocket loaded scope)
+      | Some scope,None when loaded.pending_selected_download=Some scope && loaded.public_state.snapshot.startup.bootstrapping ->
+        begin_missing_mirror_bootstrap loaded scope
+      | Some scope,None when loaded.public_state.snapshot.startup.local_access=Local_unavailable Local_key_unavailable
+          && loaded.public_state.snapshot.startup.failure=Some During_local_restore -> begin_e2ee_key_access loaded scope
+      | _ -> unchanged loaded in
+    let next=remember_session session.saved_identity resumed.next in
+    next,effects @ (if original=Some session.saved_identity.graph_id then resumed.effects
+      else scoped_publications session.saved_identity resumed.effects)) (remember_current core,[]) sessions in
+  {next=restore_visible next original;effects}
+let prune_sessions core =
+  {core with resident_sessions=List.filter (fun s ->
+    List.mem s.saved_identity.graph_id core.resident_order || s.saved_current_graph_scope<>None
+    || s.saved_websocket_owner<>None || s.saved_pending_effects<>[]
+    || s.saved_assets_pending<>[] || s.saved_protected_pending<>[]) core.resident_sessions}
+let step core event =
+  match event with
+  | Resident_graphs_changed ids -> configure_residents core ids
+  | Graph_selected id when core.resident_enabled && List.mem id core.resident_order ->
+    let focused=restore_visible (remember_current core) (Some id) in
+    (match scope_for_graph focused ~graph_id:id with
+     | Some identity->run_session focused identity event | None->unchanged core)
+  | Visible_graph_changed id when List.mem id (resident_graphs core) ->
+    let core=remember_current core in
+    let next=restore_visible core (Some id) in
+    let next={next with cached_selected_graph=Some id} in
+    let next,effects=save_cache next in
+    {next;effects=publish next :: effects}
+  | Visible_graph_changed _ -> unchanged core
+  | Local_cache_deletion_requested id when List.mem id (resident_graphs core) -> unchanged core
+  | _ when not core.resident_enabled ->
+    let transition=step_graph_policy core event in
+    let next={transition.next with resident_next_generation=max core.resident_next_generation transition.next.public_state.snapshot.startup.graph_generation} in
+    (match next.restored_residents with
+     | Some ids when ids<>[] ->
+       let restored=configure_residents {next with restored_residents=None} ids in
+       {restored with effects=transition.effects @ restored.effects}
+     | _ -> {transition with next})
+  | Local_graph_outbox_changed scope -> run_session core scope Local_outbox_changed
+  | Account_authenticated {user_id} when user_id=None || user_id<>core.user_id ->
+    let retired=List.filter (fun s -> List.mem s.saved_identity.graph_id core.resident_order) (remember_current core).resident_sessions in
+    let closes=List.concat_map (fun s -> (step_graph_policy (restore_session core s) Graph_picker_requested).effects
+      |> scoped_publications s.saved_identity) retired in
+    let signed_out=step_graph_policy core event in
+    {next={signed_out.next with resident_order=[];resident_sessions=[];
+      public_state={signed_out.next.public_state with snapshot={signed_out.next.public_state.snapshot with resident_graphs=[]}}};
+      effects=closes @ signed_out.effects}
+  | Online_cancelled scope when startup_scope_is_current core scope ->
+    let visible=visible_identity core in
+    let sessions=(remember_current core).resident_sessions in
+    let next,effects=List.fold_left(fun(core,effects) session->
+      let loaded=restore_session core session in
+      let startup=loaded.public_state.snapshot.startup in
+      let part=step_graph_policy loaded (Online_cancelled
+        {account_generation=startup.account_generation;presentation_generation=startup.presentation_generation}) in
+      remember_session session.saved_identity part.next,
+        effects @ (if visible=Some session.saved_identity.graph_id then part.effects
+          else scoped_publications session.saved_identity part.effects)) (remember_current core,[]) sessions in
+    let next=restore_visible next visible in
+    let effects=List.filter (function Publish(State_changed _)->false | _->true) effects in
+    {next;effects=effects @ [publish next]}
+  | Foreground_changed _ | Shutdown ->
+    let sessions=(remember_current core).resident_sessions in
+    let transition=List.fold_left (fun transition s ->
+      let part=run_session transition.next s.saved_identity event in
+      {next=part.next;effects=transition.effects @ part.effects}) (unchanged core) sessions in
+    if event=Shutdown then {transition with next={transition.next with resident_order=[];
+      public_state={transition.next.public_state with snapshot={transition.next.public_state.snapshot with resident_graphs=[];selected_graph=None}}}}
+    else transition
+  | _ ->
+    match event_graph_scope core event with
+    | Some identity -> run_session core identity event
+    | None ->
+      let transition=step_graph_policy core event in
+      let next=match core.current_graph_scope,transition.next.current_graph_scope with
+        | Some old,Some fresh when old<>fresh && old.graph_id=fresh.graph_id ->
+          remember_current {transition.next with resident_sessions=List.filter
+            (fun session->session.saved_identity<>old) transition.next.resident_sessions}
+        | _->remember_current transition.next in
+      let resumed=resume_resident_network next in
+      let transition={next=resumed.next;effects=transition.effects @ resumed.effects} in
+      let next=transition.next in
+      (* Catalog/authentication have one authority. Revoke removed sessions. *)
+      let ids=List.filter (fun id -> Option.is_some (graph_in_catalog next.public_state.snapshot.catalog id)) next.resident_order in
+      if ids<>next.resident_order then
+        let reconciled=configure_residents next ids in
+        {reconciled with effects=transition.effects @ reconciled.effects}
+      else {transition with next}
+;;
+
+let step core event = let transition=step core event in
+  {transition with next=prune_sessions transition.next}
+
+let step core event =
+  let transition=step core event in
+  let scopes c=List.filter_map (fun id->scope_for_graph c ~graph_id:id) (resident_graphs c) in
+  let changed=transition.next.resident_enabled && scopes core<>scopes transition.next in
+  if changed then {transition with effects=transition.effects @ [Publish(Resident_scopes_changed(scopes transition.next))]}
+  else transition
 ;;

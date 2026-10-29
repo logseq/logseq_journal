@@ -703,6 +703,7 @@ module View : sig
       -> ?on_scroll_completed:Event.handler
       -> ?on_visible_range:Event.handler
       -> ?on_sync:Event.handler
+      -> ?retention_key:string
       -> section list
       -> t
   end

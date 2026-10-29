@@ -4,7 +4,9 @@ module Graph_service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Presentation = Journal_page_layout
 
 type picker_live =
-  { status : string
+  { residents : string list
+  ; replacement : string option
+  ; status : string
   ; authenticated : bool
   ; checking : bool
   ; deleting : Graph_service.local_copy_request option
@@ -49,6 +51,10 @@ type action =
   | Startup_retry
   | Refresh_catalog
   | Begin_online_recovery
+  | Remove_resident of string
+  | Move_resident of int * int
+  | Replace_resident of string
+  | Cancel_replacement
   | Select_graph of string
   | Switch_graph
   | Close_picker
@@ -66,9 +72,9 @@ let handler on_action action =
 type unlock_chrome_props = { mode : string; title : string; pending : bool; error : string option [@default None] }
 [@@deriving yojson]
 
-let graph_picker_list ?header ?on_visible_range rows =
+let graph_picker_list ?header ?(residents=[]) ?on_visible_range rows =
   V.Native_list.vertical ~key:(Ui.Key.string "graph-list") ~style:Plain ?on_visible_range
-    [ V.Native_list.section ~key:(Ui.Key.string "graphs") ?header ~separator:Hidden rows ]
+    (residents @ [ V.Native_list.section ~key:(Ui.Key.string "graphs") ?header ~separator:Hidden rows ])
   |> fun list -> V.column ~spacing:0. [list]
   |> V.with_test_id (Ui.Test_id.string "graph-picker-list")
   |> V.frame ~max_width:Fill ~max_height:Fill
@@ -165,34 +171,53 @@ let view ?picker_signal props ~on_action =
       (if choose then choose_graph else V.empty ())
   in
   let graph_picker snapshot =
-    let reactive ?grow ~equal build =
-      match picker_signal with
-      | None -> build snapshot.live
-      | Some signal -> V.of_lui
-          (Lui_elements.stack ?grow
-             [Lui_elements.dyn ~equal (fun current -> Ui.mount (build current)) signal])
-    in
-    let icon_button ?(enabled = true) ?tooltip ~id ~command ~label icon =
+    let icon_button ?(enabled = true) ?disabled_signal ?tooltip ~id ~command ~label icon =
       V.of_lui (Lui_elements.button ~key:id ~accessibility_identifier:id
-        ~text:"" ~label ~icon ~size:`icon ~variant:`ghost ~disabled:(not enabled) ?tooltip
+        ~text:"" ~label ~icon ~size:`icon ~variant:`ghost ~disabled:(not enabled) ?disabled_signal ?tooltip
         ~on_press:(fun _ -> on_action command) [])
-    in
-    let refresh = reactive
-      ~equal:(fun left right -> left.deleting = right.deleting)
-      (fun owner -> icon_button ~enabled:(owner.deleting = None)
-        ~id:"graph-picker-refresh" ~command:Refresh_catalog ~label:"Refresh graphs"
-        ~tooltip:"Refresh the authorized graph catalog" `refresh_cw)
     in
     let projected context project = Option.map (fun source ->
       let signal = Signal.map project source in
       Signal.on_dispose context.Lui_ui.ui_scope (fun () -> Signal.dispose_signal signal);
       signal) picker_signal in
+    let refresh = V.of_lui (fun context parent ->
+      Ui.mount (icon_button ~enabled:(snapshot.live.deleting = None)
+        ?disabled_signal:(projected context (fun owner -> owner.deleting <> None))
+        ~id:"graph-picker-refresh" ~command:Refresh_catalog ~label:"Refresh graphs"
+        ~tooltip:"Refresh the authorized graph catalog" `refresh_cw) context parent)
+    in
     let status_text current = current.status in
     let status = V.of_lui (fun context parent ->
       Lui_elements.text ~value:(status_text snapshot.live)
         ?value_signal:(projected context status_text)
         ~foreground:"error-foreground" ~accessibility_identifier:"graph-picker-local-copy-status" [] context parent)
     in
+    let resident_name id = Rrbvec.to_seq snapshot.graphs |> Seq.find_map (fun (graph:Graph_service.graph)->
+      if Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id=id then Some graph.name else None)
+      |> Option.value ~default:"Graph" in
+    let resident_rows=List.init 3 (fun index ->
+      let slot=string_of_int(index+1) in
+      let assigned=List.nth_opt snapshot.live.residents index in
+      let content=match assigned with
+        | None -> V.row ~spacing:12. [V.symbol ~name:"plus.circle" ();V.column ~alignment:Leading
+            [V.text ("Slot " ^ slot);V.text ~style:(Ui.Style.Text_style.create ~foreground:Secondary ()) "Choose a graph below"]]
+        | Some id -> V.row ~spacing:10.
+            [V.text slot;V.text(resident_name id) |> V.frame ~max_width:Fill
+            ; (match snapshot.live.replacement with
+               | Some _ -> button ~id:("graph-resident-replace:" ^ id) ~command:(Replace_resident id) "Replace" "arrow.triangle.2.circlepath"
+               | None -> V.row ~spacing:4.
+                   [icon_button ~enabled:(index>0) ~id:("graph-resident-up:" ^ id) ~command:(Move_resident (index,-1))
+                      ~label:("Move " ^ resident_name id ^ " earlier") `arrow_up
+                   ;icon_button ~id:("graph-resident-remove:" ^ id) ~command:(Remove_resident id)
+                      ~label:("Close " ^ resident_name id) `x]) ] in
+      V.Native_list.row ~key:(Ui.Key.string ("resident-slot:" ^ slot)) ~separator:Hidden
+        (content |> V.frame ~max_width:Fill ~min_height:44.)) in
+    let resident_header=V.column ~alignment:Leading ~spacing:6.
+      ([V.text "Resident graphs · up to 3"] @ match snapshot.live.replacement with
+       | None -> [] | Some id -> [V.text ("Choose a slot to replace with " ^ resident_name id);
+           button ~id:"graph-resident-replace-cancel" ~command:Cancel_replacement "Cancel replacement" "xmark"]) in
+    let residents=[V.Native_list.section ~key:(Ui.Key.string "resident-graphs")
+      ~header:resident_header ~separator:Hidden resident_rows] in
     let content =
       match Rrbvec.is_empty snapshot.graphs with
       | true -> unavailable ~title:"No graphs available" ~symbol:"folder"
@@ -215,7 +240,7 @@ let view ?picker_signal props ~on_action =
           let selection_enabled owner = owner.deleting = None in
           let deletion_enabled owner =
             owner.authenticated
-            && not current && not owner.checking
+            && not current && not (List.mem id owner.residents) && not owner.checking
             && owner.deleting = None && presence owner <> Some (Ok Graph_service.Not_downloaded) in
           (* Native List cells retain their interactive children. Property signals
              update status and enabled state without replacing callback owners. *)
@@ -233,9 +258,7 @@ let view ?picker_signal props ~on_action =
                           ~foreground:"secondary" [] context parent)]
                     |> V.frame ~max_width:Fill
                   ; (if current then V.symbol ~name:"checkmark.circle" ()
-                     else reactive ~equal:(fun left right -> presence left = presence right)
-                       (fun owner -> if presence owner = Some (Ok Graph_service.Not_downloaded)
-                         then V.symbol ~name:"icloud.and.arrow.down" () else V.column [])) ]
+                     else V.empty ()) ]
                   |> V.frame ~max_width:Fill ~min_height:44.)
                 () |> V.with_test_id (Ui.Test_id.string ("graph-picker:" ^ id))
                 |> V.frame ~max_width:Fill in
@@ -257,10 +280,11 @@ let view ?picker_signal props ~on_action =
           in
           V.Native_list.row ~key:(Ui.Key.string id) ~separator:Hidden row
         ) (Rrbvec.to_seq snapshot.graphs) |> List.of_seq in
-        graph_picker_list ~header:status
+        graph_picker_list ~header:status ~residents
           ~on_visible_range:(Ui.Event.Handler.create (function
             | Ui.Event.Payload.Visible_range range ->
-              on_action (Visible_range (range.first_index, range.last_exclusive))
+              on_action (Visible_range (Int64.max 0L (Int64.sub range.first_index 3L),
+                Int64.max 0L (Int64.sub range.last_exclusive 3L)))
             | _ -> ())) rows
     in
     Journal_header.graph_picker

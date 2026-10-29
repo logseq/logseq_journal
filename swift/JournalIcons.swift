@@ -33,6 +33,7 @@ let journalIconNames: [String] = [
     "person.crop.circle",
     "photo",
     "plus",
+    "plus.circle",
     "questionmark.folder",
     "rectangle.portrait.and.arrow.right",
     "slider.horizontal.3",

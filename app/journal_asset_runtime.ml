@@ -747,7 +747,8 @@ let shutdown t =
   Hashtbl.clear t.dependency_waiting;
   t.favorites_page <- None;
   t.favorite_members <- Uuids.empty;
-  Queue.clear t.queued;
+  retain_releases t;
+  pump t;
   t.configuration <- None;
   t.generation <- None;
   publish t
@@ -847,3 +848,5 @@ let notice
     | Asset_availability { consumer; asset; availability } ->
       dispatch t (Availability { consumer; asset; availability }))
 ;;
+
+let idle t = Queue.is_empty t.queued

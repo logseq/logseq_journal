@@ -35,6 +35,20 @@ import Combine
   }
   static func settle() async { for _ in 0..<10 { await Task.yield() } }
   static func main() async throws {
+    let offsets = JournalGraphScrollOffsets()
+    offsets.retain(["account1:A:g1", "account1:B:g2"])
+    offsets.write(page: "account1:A:g1", list: "timeline", y: 515)
+    offsets.write(page: "account1:B:g2", list: "timeline", y: 220)
+    check(offsets.read(page: "account1:A:g1", list: "timeline") == 515, "graph offsets remain independent")
+    offsets.retain(["account1:B:g2", "account1:A:g3"])
+    offsets.write(page: "account1:A:g1", list: "timeline", y: 999)
+    check(offsets.read(page: "account1:A:g1", list: "timeline") == nil, "retired generation cannot restore or write")
+    check(offsets.read(page: "account1:B:g2", list: "timeline") == 220, "unrelated resident retains native offset")
+    check(offsets.read(page: "account1:A:g3", list: "timeline") == nil, "reopened graph starts with a fresh native offset")
+    offsets.retain([])
+    offsets.write(page: "account1:B:g2", list: "timeline", y: 999)
+    check(offsets.read(page: "account1:B:g2", list: "timeline") == nil, "logout fences late geometry")
+    check(JournalGraphScrollOffsets().read(page: "account1:B:g2", list: "timeline") == nil, "runtime instances never share offsets")
     var captured: LUIAppleExtensionViewContext?
     let registry = LUIAppleExtensionRegistry()
     try registry.register(LUIAppleExtension(identifier: "journal-list", fingerprint: "snapshot-test",

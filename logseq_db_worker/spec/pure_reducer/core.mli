@@ -91,6 +91,8 @@ type output =
   | Graph_push of Logseq_db_worker_contract.Protocol.push
   | Sync_output of Logseq_sync_pure_reducer.Core.output
   | Graph_state_changed of graph_state
+  | Scoped_graph_state_changed of Logseq_sync_pure_reducer.Core.graph_scope * graph_state
+  | Scoped_graph_push of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_worker_contract.Protocol.push
   | Diagnostic of string
 
 type upload_recovery_ticket = private
@@ -156,6 +158,14 @@ type event =
   | Asset_completed of
       Logseq_sync_pure_reducer.Core.graph_scope
       * Logseq_sync_pure_reducer.Asset_transfer.event
+  | Graph_request_for_scope of
+      { scope : Logseq_sync_pure_reducer.Core.graph_scope
+      ; id : request_id
+      ; request : Logseq_db_worker_contract.Protocol.request
+      }
+  | Projection_push_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_worker_contract.Protocol.push
+  | Asset_requested_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_sync_pure_reducer.Asset_transfer.event
+  | Upload_requested_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_types.Graph_types.Uuid.t * Asset_upload.event
   | Start
   | Graph_request of
       { id : request_id
@@ -188,3 +198,8 @@ val import_context
   :  state
   -> graph_generation:int
   -> Logseq_sync_pure_reducer.Core.asset_context option
+
+val graph_scopes : state -> Logseq_sync_pure_reducer.Core.graph_scope list
+
+val graph_state_for_scope : state -> Logseq_sync_pure_reducer.Core.graph_scope -> graph_state option
+val import_context_for_scope : state -> Logseq_sync_pure_reducer.Core.graph_scope -> Logseq_sync_pure_reducer.Core.asset_context option

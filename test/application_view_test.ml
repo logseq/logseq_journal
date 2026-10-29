@@ -1,3 +1,15 @@
+(* Existing single-graph service fixtures retain their behavior while accepting
+   the production caller's explicit graph owner. Multi-graph routing is tested
+   through the public Worker reducer and real service. *)
+let fixture_request = function
+  | Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_request_at (_,request) -> Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_request request
+  | Get_graph_state_at _ -> Get_graph_state
+  | Asset_command_at (owner,command) -> Asset_command {graph_generation=owner.graph_generation;command}
+  | Import_asset_at (owner,source) -> Import_asset {graph_generation=owner.graph_generation;source}
+  | Client_command (Focus_resident_graph id) -> Client_command (Select_graph id)
+  | request -> request
+;;
+
 module Root_state = struct
   include Application.Root_navigation
   let step state event =
@@ -130,7 +142,7 @@ let test_missing_snapshot_keeps_graph_lifecycle_visible () =
 let test_diagnostic_phase_rows_retain_current_error () =
   let message = "Graph schema 65.29 is not supported. Journal requires schema 65.33 or later." in
   let snapshot : Service.snapshot =
-    { sync_phase = Failed; catalog = []; selected_graph = None; applied_server_t = None
+    { sync_phase = Failed; catalog = []; resident_graphs=[];resident_scopes=[]; selected_graph = None; applied_server_t = None
     ; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
         ; timeline_presentation_pending = false; local_deletion = None; last_error_attention = None; last_error = Some message
     ; startup = { authenticated = true; local_access=Service.Local_available; network_phase=Service.Online_by_user; catalog_loading = false; awaiting_selection = false
@@ -153,7 +165,7 @@ let test_diagnostic_identity_comes_from_worker () =
   let selected = uuid "60000000-0000-4000-8000-000000000001" in
   let actual = uuid "60000000-0000-4000-8000-000000000002" in
   let snapshot : Service.snapshot =
-    { sync_phase = Offline; catalog = []; selected_graph = Some selected
+    { sync_phase = Offline; catalog = []; resident_graphs=[];resident_scopes=[]; selected_graph = Some selected
     ; applied_server_t = None; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
         ; timeline_presentation_pending = false
     ; local_deletion = None; last_error_attention = None; last_error = None
@@ -705,6 +717,7 @@ let run_favorites_native_visibility
     { snapshot =
         { sync_phase = Current
         ; catalog = []
+    ; resident_graphs=[];resident_scopes=[]
         ; selected_graph = Some (uuid 900)
         ; applied_server_t = Some (server_cursor_of_int 0)
         ; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
@@ -744,7 +757,8 @@ let run_favorites_native_visibility
           (Service.Client_state_changed manager);
         Ok ())
       ~handle:(fun context () request ->
-        match request with
+        match fixture_request request with
+        | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
         | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
           if Atomic.get import_probe then Atomic.set import_probed true;
@@ -4195,6 +4209,7 @@ let test_reference_outer_terminals cancel =
     { snapshot =
         { sync_phase = Current
         ; catalog = []
+    ; resident_graphs=[];resident_scopes=[]
         ; selected_graph = Some (uuid 900)
         ; applied_server_t = Some (server_cursor_of_int 0)
         ; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
@@ -4240,7 +4255,8 @@ let test_reference_outer_terminals cancel =
                   ; outcome
                   }))
         in
-        match request with
+        match fixture_request request with
+        | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
         | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
           if Atomic.exchange refresh false
@@ -4805,7 +4821,7 @@ let test_favorite_page_uses_shared_reference_lookup () =
     ; order = "a"; created_at_ms = 0L; updated_at_ms = 0L; refs = []; tags = []; properties = [] } in
   let manager : Service.state =
     { snapshot =
-        { sync_phase = Current; catalog = []; selected_graph = Some (uuid 9)
+        { sync_phase = Current; catalog = []; resident_graphs=[];resident_scopes=[]; selected_graph = Some (uuid 9)
         ; applied_server_t = Some (server_cursor_of_int 0); unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
         ; timeline_presentation_pending = false
         ; startup = { authenticated = true; local_access=Service.Local_available; network_phase=Service.Online_by_user; catalog_loading = false; awaiting_selection = false
@@ -4818,7 +4834,7 @@ let test_favorite_page_uses_shared_reference_lookup () =
     ~init:(fun context _ ->
       W.Session_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed manager);
       Ok ())
-    ~handle:(fun _ () -> function
+    ~handle:(fun _ () request -> match fixture_request request with
       | Service.Get_graph_state -> Ok (Service.Graph_state
           { generation = 1; graph_id = Some (uuid 9); phase = Graph_open; error = None })
       | Client_command _ -> Ok Service.Client_command_completed
@@ -5350,6 +5366,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
   let manager : Service.state =
     { snapshot =
         { sync_phase = Offline
+        ; resident_graphs=[];resident_scopes=[]
         ; catalog =
             [ { graph_id
               ; name = "Private Journal"
@@ -5417,7 +5434,8 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
             ~topic:Service.manager_topic
             (Service.Client_state_changed value)
         in
-        match request with
+        match fixture_request request with
+        | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
         | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
           if queue_full && Atomic.fetch_and_add graph_reads 1 > 0
@@ -6269,7 +6287,45 @@ let test_application_token_control ~saturated ~failure () =
 
 (* Picker presentation and native controls are owned by Application; Root_navigation
    has no public picker event. Exercise its mounted public hooks and worker lane. *)
+let test_picker_presence_native_patch_lifecycle () =
+  let module M = Journal_manager_view in
+  let ids=List.init 4 (fun n->Printf.sprintf "96000000-0000-4000-8000-%012d" (n+1)) in
+  let uuid id=Logseq_db_types.Graph_types.Uuid.of_string id |> Result.get_ok in
+  let live : M.picker_live={residents=List.filteri(fun n _->n<3)ids;replacement=None;status="";
+    authenticated=true;checking=false;deleting=None;presence=(fun _->None)} in
+  let graphs=List.map(fun id->({graph_id=uuid id;name="Synthetic graph " ^ id;
+    schema={major=65;minor=33;exact=true};encrypted=false}:Service.graph))ids |> List.to_seq |> Rrbvec.of_seq in
+  let snapshot=M.{graphs;selected_graph=Some(uuid(List.hd ids));live} in
+  let nodes=Hashtbl.create 256 and parents=Hashtbl.create 256 in
+  let teardown=track_json_wire_teardown ~parents (Hashtbl.remove nodes) in
+  let backend : Lui_protocol.backend={backend_profile=Lui_native_bridge.profile 2 2;
+    apply_batch=(fun batch->
+      let open Yojson.Safe.Util in
+      Lui_wire.encode_batch batch |> Yojson.Safe.from_string |> member "ops" |> to_list
+      |> List.iter(fun op->
+        let kind=member "op" op |> to_string in
+        let require field=let id=member field op |> to_int in
+          if not(Hashtbl.mem nodes id) then failwith(Printf.sprintf "native picker %s references missing %s %d" kind field id) in
+        (match kind with
+         | "create-node" | "create-extension" -> Hashtbl.replace nodes (member "id" op |> to_int) ()
+         | "insert-child" | "move-child" | "remove-child" -> require "parent";require "child"
+         | "set-prop" | "set-extension-prop" | "detach-subtree" | "drop-node" | "drop-extension" -> require "id"
+         | _->());
+        teardown op);true)} in
+  let app=Lui_app.create_with_extensions backend Journal_lui_native.registry live (fun _ next->next)
+    (fun _ signal _->Journal_view.mount(Journal_view.View.Body.Private.to_widget
+      (M.view ~picker_signal:signal (M.Picker snapshot) ~on_action:ignore))) in
+  Fun.protect ~finally:(fun()->ignore(Lui_app.dispose app)) (fun()->
+    ignore(Lui_app.start app);ignore(Lui_app.flush app);
+    List.iter(fun presence->
+      ignore(Lui_app.send app {live with presence=(fun _->presence)});
+      ignore(Lui_app.flush app))
+      [Some(Ok Service.Downloaded);Some(Ok Service.Not_downloaded);Some(Error "Synthetic presence error");
+       Some(Ok Service.Downloaded);None;Some(Ok Service.Not_downloaded);Some(Ok Service.Downloaded)])
+;;
+
 let test_graph_picker_controls scenario () =
+  let reordered=scenario=`Reordered_open || scenario=`Reordered_full in
   let module W = Logseq_db_worker_lui.Journal_worker in
   let module P = Logseq_db_worker.Protocol in
   let uuid n = Logseq_db_types.Graph_types.Uuid.of_string
@@ -6278,15 +6334,22 @@ let test_graph_picker_controls scenario () =
   let long_name = "Synthetic very long graph name — 工作笔记 and attachments across multiple lines" in
   let graph graph_id name : Service.graph =
     { graph_id; name; schema = { major = 65; minor = 33; exact = true }; encrypted = false } in
+  let resident_scope graph_id graph_generation : Service.asset_scope =
+    {account={managed_sync_origin=Uri.of_string "https://example.invalid";user_id="synthetic";
+      account_generation=1;presentation_generation=1;lifecycle_generation=0L};graph_id;graph_generation} in
   let manager : Service.state =
     { snapshot =
-        { sync_phase = Current; catalog = [graph first "Current synthetic graph"; graph second long_name]
+        { sync_phase = Current;
+          resident_graphs=(if reordered then [first] else if scenario=`Current then [first;second;uuid 3] else if scenario=`Retry_local || scenario=`Retry_graph_phase then [first;second] else []);
+          resident_scopes=(if reordered then [resident_scope first 1] else if scenario=`Current then [resident_scope first 1;resident_scope second 2;resident_scope (uuid 3) 3] else if scenario=`Retry_local || scenario=`Retry_graph_phase then [resident_scope first 1;resident_scope second 2] else []);
+          catalog = [graph first "Current synthetic graph"; graph second long_name]
+            @ (if scenario=`Current then [graph (uuid 3) "Third synthetic graph";graph (uuid 4) "Fourth synthetic graph"] else [])
         ; selected_graph = Some first; applied_server_t = Some (server_cursor_of_int 0)
         ; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
         ; timeline_presentation_pending = false
-        ; startup = { authenticated = scenario <> `Offline; local_access=Service.Local_available; network_phase=(if scenario = `Offline then Service.Local_only else Service.Online_by_user); catalog_loading = false; awaiting_selection = false
+        ; startup = { authenticated = scenario <> `Offline; local_access=(if scenario=`Retry_local then Service.Local_unavailable Local_restore_failed else Service.Local_available); network_phase=(if scenario = `Offline then Service.Local_only else Service.Online_by_user); catalog_loading = false; awaiting_selection = false
           ; restoring_local = false; bootstrapping = false; awaiting_e2ee_password = false
-          ; failure = None; account_generation = 1; graph_generation = 1; presentation_generation = 1 }
+          ; failure = (if scenario=`Retry_local then Some Service.During_local_restore else None); account_generation = 1; graph_generation = 1; presentation_generation = 1 }
         ; last_error_attention = None; last_error = None; local_deletion = None }
     ; diagnostics = { groups = [] } } in
   let current = Atomic.make manager and commands = Atomic.make [] in
@@ -6301,6 +6364,8 @@ let test_graph_picker_controls scenario () =
   let graph_read_cancelling = Atomic.make false and release_graph_terminal = Atomic.make false in
   let graph_read_worker = Atomic.make None in
   let graph_opens = Atomic.make 0 in
+  let early_graph_observed=Atomic.make false in
+  let refresh_full=Atomic.make false and release_refresh=Atomic.make false in
   let root_renders = ref 0 in
   let client = ref None in
   let service = W.Service.create ~push_topic_count:6
@@ -6313,7 +6378,8 @@ let test_graph_picker_controls scenario () =
         let publish value =
           Atomic.set current value;
           W.Request_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed value) in
-        match request with
+        match (match request with Service.Client_command _ when scenario=`Retry_local || scenario=`Retry_graph_phase -> request | _ -> fixture_request request) with
+        | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
         | Service.Inspect_local_copy request ->
           let index = Atomic.fetch_and_add inspections 1 in
           if scenario = `Late_presence && index = 0
@@ -6338,8 +6404,10 @@ let test_graph_picker_controls scenario () =
         | Service.Get_graph_state ->
           let value = Atomic.get current in
           Ok (Service.Graph_state { generation = value.snapshot.startup.graph_generation
-            ; graph_id = value.snapshot.selected_graph; phase = Graph_open; error = None })
+            ; graph_id = value.snapshot.selected_graph; phase = (if scenario=`Retry_local || scenario=`Retry_graph_phase then Graph_failed else Graph_open); error = None })
         | Client_command command ->
+          if scenario=`Reordered_full && command=Service.Set_foreground true && Atomic.get refresh_full then
+            while not(Atomic.get release_refresh) do Eio.Fiber.yield () done;
           Atomic.set commands (command :: Atomic.get commands);
           let previous = Atomic.get current in
           (match command with
@@ -6352,10 +6420,20 @@ let test_graph_picker_controls scenario () =
            | Refresh_catalog _ when scenario = `Refresh_failure || scenario = `Refresh_after_presence_failure ->
              publish { previous with snapshot = { previous.snapshot with
                last_error = Some "Synthetic catalog refresh failed. Try again." } }
+           (* Root_navigation has no manager/worker delivery input. Exercise
+              this ordering through the public application service boundary. *)
+           | Configure_resident_graphs ids when reordered ->
+             W.Request_context.emit context ~topic:Service.graph_state_topic
+               (Service.Graph_states [resident_scope second 2,
+                 {generation=2;graph_id=Some second;phase=Graph_open;error=None}]);
+             while not(Atomic.get early_graph_observed) do Eio.Fiber.yield () done;
+             publish {previous with snapshot={previous.snapshot with resident_graphs=ids;
+               resident_scopes=[resident_scope first 1;resident_scope second 2]}}
            | Select_graph id ->
              let generation = previous.snapshot.startup.graph_generation + 1 in
              publish { previous with snapshot = { previous.snapshot with selected_graph = Some id
                ; startup = { previous.snapshot.startup with awaiting_selection = false; graph_generation = generation } } };
+             if not reordered then
              W.Request_context.emit context ~topic:Service.graph_state_topic
                (Service.Graph_state_changed { generation; graph_id = Some id; phase = Graph_open; error = None })
            | _ -> ());
@@ -6401,6 +6479,19 @@ let test_graph_picker_controls scenario () =
     ~on_client:(fun value ->
       client := Some value;
       W.on_event value (function
+        | W.Push {payload=Service.Client_state_changed state;_}
+            when scenario=`Reordered_full && state.snapshot.selected_graph=Some second
+              && not(Atomic.get refresh_full) ->
+          (* Fill the real bounded Worker lane before Application receives the
+             focus publication; the first accepted filler holds the service. *)
+          Atomic.set refresh_full true;
+          let rec fill count = if count>1024 then failwith "fixture lane did not fill" else
+            match W.send value (Service.Client_command (Set_foreground true)) with
+            | W.Accepted _ -> fill (count+1)
+            | W.Full -> ()
+            | Not_ready | Stopping -> failwith "fixture worker not ready" in
+          fill 0
+        | W.Push {payload=Service.Graph_states _;_} -> Atomic.set early_graph_observed true
         | W.Response { outcome = Completed (Service.Local_copy_deleted _); _ } ->
           deletion_terminal := true
         | W.Response { request_id; outcome = Cancelled; _ } ->
@@ -6411,13 +6502,18 @@ let test_graph_picker_controls scenario () =
         | _ -> ())) service in
   let props = Hashtbl.create 128 in
   let retained_select = ref None and select_detached = ref false in
-  let teardown = track_json_wire_teardown (fun id ->
+  let page_parents=Hashtbl.create 128 in
+  let teardown = track_json_wire_teardown ~parents:page_parents (fun id ->
     if !retained_select = Some id then select_detached := true;
     Hashtbl.remove props id) in
   let consume source =
     if source <> "" then
       let open Yojson.Safe.Util in
       Yojson.Safe.from_string source |> member "ops" |> to_list |> List.iter (fun op ->
+        let kind = member "op" op |> to_string in
+        if List.mem kind ["drop-node";"drop-extension";"detach-subtree"] then
+          Alcotest.(check bool) "picker teardown only references mounted native nodes" true
+            (Hashtbl.mem props (member "id" op |> to_int));
         teardown op;
         match member "op" op |> to_string with
         | "create-node" | "create-extension" ->
@@ -6425,8 +6521,15 @@ let test_graph_picker_controls scenario () =
         | "set-prop" | "set-extension-prop" ->
           let id = member "id" op |> to_int in
           let key = member "property" op |> to_string in
-          let old = Option.value (Hashtbl.find_opt props id) ~default:[] in
+          (* Swift rejects mutations of detached native nodes. Do not silently
+             recreate their shadow entries when the shell and picker reconcile. *)
+          Alcotest.(check bool) "picker patch only updates live native nodes" true (Hashtbl.mem props id);
+          let old = Hashtbl.find props id in
           Hashtbl.replace props id ((key, member "value" op) :: List.remove_assoc key old)
+        | "insert-child" | "move-child" ->
+          List.iter (fun field -> Alcotest.(check bool)
+            ("picker patch references live native " ^ field) true
+            (Hashtbl.mem props (member field op |> to_int))) ["parent";"child"]
         | _ -> ()) in
   let find key value = Hashtbl.fold (fun id values found ->
     if List.assoc_opt key values = Some (`String value) then Some id else found) props None in
@@ -6446,6 +6549,7 @@ let test_graph_picker_controls scenario () =
       ~response_budget_bytes:P.maximum_response_bytes ~default_page_size:P.default_page_size
       |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
   Fun.protect ~finally:(fun () ->
+    Atomic.set release_refresh true;
     Atomic.set finish_deletion true;
     Atomic.set release_automatic_inspection true;
     Atomic.set release_graph_read true;
@@ -6453,17 +6557,41 @@ let test_graph_picker_controls scenario () =
     ignore (hooks.dispose ()); Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client)
     (fun () ->
       consume (hooks.init 2 2 config);
+      if scenario=`Retry_local || scenario=`Retry_graph_phase then (
+        wait "failed resident offers local retry" (fun()->Option.is_some(find "accessibility-identifier" "graph-picker-retry"));
+        press(node "graph-picker-retry");
+        wait "local retry actually restarts resident open" (fun()->List.exists(function Service.Select_graph id->id=first|_->false)(Atomic.get commands));
+        Alcotest.(check bool) "retry retains second resident" true (List.mem second (Atomic.get current).snapshot.resident_graphs)
+      ) else (
       wait "Switch graph action mounts" (fun () -> Option.is_some (find "text" "Switch graph"));
+      if scenario=`Current then
+        wait "native swipe admission follows graph readiness" (fun () ->
+          Hashtbl.to_seq_values props |> Seq.exists(fun fields->match List.assoc_opt "payload" fields with
+          | Some(`String payload)->(try let open Yojson.Safe.Util in let json=Yojson.Safe.from_string payload in
+              member "mode" json=`String "graph-pages" && member "enabled" json=`Bool true with _->false)
+          | _->false));
       if scenario = `Late_graph_cancel then (
         wait "Favorites action mounts" (fun () -> Option.is_some (find "accessibility-label" "Favorites"));
         press (Option.get (find "accessibility-label" "Favorites"));
         wait "old graph Favorite read is genuinely in flight" (fun () -> Atomic.get graph_read_started));
       press (Option.get (find "text" "Switch graph"));
+      let page=Hashtbl.to_seq props |> Seq.find_map(fun(id,fields)->
+        match List.assoc_opt "payload" fields with
+        | Some (`String payload) when String.contains payload 'g' ->
+          (try if Yojson.Safe.Util.(Yojson.Safe.from_string payload |> member "mode" |> to_string)="graph-pages" then Some id else None with _->None)
+        | _->None) |> Option.get in
+      Alcotest.(check int) "native page retains both content and empty preview slots" 2
+        (Hashtbl.to_seq_values page_parents |> Seq.filter((=)page) |> Seq.length);
       wait "graph list mounts" (fun () -> Option.is_some (find "accessibility-identifier" "graph-picker-list"));
+      if scenario = `Current then (
+        let list = Option.get (find "_extension" "journal-list") in
+        consume (hooks.extension_event list "event"
+          {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":3,\"last\":7}"}|});
+        wait "visible resident local presence checks complete" (fun () -> Atomic.get inspections >= 4));
       if scenario = `Late_presence then (
         let list = Option.get (find "_extension" "journal-list") in
         consume (hooks.extension_event list "event"
-          {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":1,\"last\":2}"}|});
+          {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":4,\"last\":5}"}|});
         wait "automatic inspection is held in flight" (fun () -> Atomic.get inspections = 1));
       match scenario with
       | `Offline ->
@@ -6503,6 +6631,7 @@ let test_graph_picker_controls scenario () =
         for _ = 1 to 10 do range (); consume (hooks.pump ()) done;
         Alcotest.(check int) "same viewport reuses presence observations" 2 (Atomic.get inspections);
         Alcotest.(check int) "presence does not reconstruct the graph catalog" before !root_renders
+      | `Retry_local | `Retry_graph_phase -> ()
       | `Current ->
         Alcotest.(check bool) "current marker stays in catalog row" true
           (Option.is_some (find "text" "Current graph"));
@@ -6519,6 +6648,16 @@ let test_graph_picker_controls scenario () =
                 | Service.Return_to_graph_picker -> true
                 | _ -> false)
               (Atomic.get commands))
+      | `Reordered_open | `Reordered_full ->
+        let before=Atomic.get graph_opens in
+        press(node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        wait "early graph state was observed before membership admission" (fun()->Atomic.get early_graph_observed);
+        if scenario=`Reordered_full then (
+          wait "real worker queue is full during focus" (fun()->Atomic.get refresh_full);
+          for _=1 to 4 do consume(hooks.pump()) done;
+          Atomic.set release_refresh true);
+        wait "focused graph presents even when its initial push preceded membership" (fun()->
+          (Atomic.get current).snapshot.selected_graph=Some second && Atomic.get graph_opens>before)
       | `Select ->
         press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
         wait "name selection reaches worker" (fun () ->
@@ -6646,7 +6785,7 @@ let test_graph_picker_controls scenario () =
       | `Current_menu ->
         ignore (node ("graph-picker-options:" ^ Logseq_db_types.Graph_types.Uuid.to_string first));
         Alcotest.(check bool) "current protection explains switching first" true
-          (Option.is_some (find "text" "Switch graphs first.")))
+          (Option.is_some (find "text" "Switch graphs first."))))
 ;;
 
 (* Compose the production runtime's public completions with the Application
@@ -6829,6 +6968,19 @@ let test_worker_admission_owner () =
     require (dispatch f request=W.Full) "duplicate protocol ID accepted";
     require (List.length !(f.sent)=1 && !(f.refused)=[]) "duplicate entered transport or refusal callback";
     require (!(f.observed)=[request]) "accepted observer changed");
+  check "same protocol UUID is independently admitted per graph lifetime" (fun () ->
+    let f=F.create () and request=F.request 1 in
+    let scope n : Service.timeline_scope =
+      {startup={account_generation=1;presentation_generation=1};graph_id=(F.request n).request_id;graph_generation=n} in
+    let first=scope 1 and second=scope 2 in
+    require (A.dispatch f.owner (Graph_request_at(first,request))=W.Accepted(wid 1)) "first graph refused";
+    require (A.dispatch f.owner (Graph_request_at(second,request))=W.Accepted(wid 2)) "second graph UUID collided";
+    require (A.dispatch f.owner (Graph_request_at(first,request))=W.Full) "same graph duplicate admitted";
+    A.cancel_graph_scope f.owner (Some first);
+    require (!(f.cancelled)=[wid 1]) "closing one graph cancelled another";
+    require (A.dispatch f.owner (Graph_request_at(second,request))=W.Full) "closing first erased second admission";
+    ignore(A.retire f.owner (wid 1));
+    require (A.dispatch f.owner (Graph_request_at(second,request))=W.Full) "late completion erased second admission");
   check "real refusals never reserve lease" (fun () ->
     List.iter (fun refusal ->
       let f=F.create () in let request=F.request 1 in
@@ -6946,11 +7098,16 @@ let () =
         Alcotest.test_case "typed native reason completes local discovery" `Quick (fun () -> test_local_account_failure_retries_local_discovery ~typed_reason:true ());
         Alcotest.test_case "retired native scope cannot fail local discovery" `Quick (fun () -> test_local_account_failure_retries_local_discovery ~retired_scope:true ())])
     ; ( "graph picker", [
+        Alcotest.test_case "presence updates preserve native node lifecycle" `Quick test_picker_presence_native_patch_lifecycle;
+        Alcotest.test_case "failed resident local retry restarts open" `Quick (test_graph_picker_controls `Retry_local);
+        Alcotest.test_case "failed worker local retry restarts retained mirror" `Quick (test_graph_picker_controls `Retry_graph_phase);
         Alcotest.test_case "offline deletion is disabled with explanation" `Quick (test_graph_picker_controls `Offline);
         Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);
         Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);
-        Alcotest.test_case "current marker and long names" `Quick (test_graph_picker_controls `Current);
+        Alcotest.test_case "resident picker keeps native patch references alive" `Quick (test_graph_picker_controls `Current);
         Alcotest.test_case "close retains current session" `Quick (test_graph_picker_controls `Close);
+        Alcotest.test_case "focus graph-state refresh survives full Worker lane" `Quick (test_graph_picker_controls `Reordered_full);
+        Alcotest.test_case "graph open before membership still presents after focus" `Quick (test_graph_picker_controls `Reordered_open);
         Alcotest.test_case "name switches graph" `Quick (test_graph_picker_controls `Select);
         Alcotest.test_case "old graph cancellation cannot publish a new-scope error" `Quick
           (test_graph_picker_controls `Late_graph_cancel);

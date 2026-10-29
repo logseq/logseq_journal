@@ -4194,6 +4194,36 @@ let tests =
   ]
 ;;
 
+
+let test_resident_focus_preserves_graph_drafts_and_saving () =
+  let module R=Root_state in
+  let id n=Logseq_db_types.Graph_types.Uuid.of_string (Printf.sprintf "77777777-7777-4777-8777-%012d" n) |> Result.get_ok in
+  require (R.next_graph ~current:(id 1) [id 1]=None) "one graph intercepted cycle";
+  require (R.next_graph ~current:(id 2) [id 1;id 2]=Some(id 1)) "two graph wrap failed";
+  require (R.next_graph ~current:(id 3) [id 1;id 2;id 3]=Some(id 1)) "three to one wrap failed";
+  let focus state n=R.step state (Graph_focused {generation=n;graph_id=id n}) in
+  let one=focus (R.create ~graph_generation:1) 1 |> fun s->R.step s Capture_opened
+    |> fun s->R.step s (Capture_edited "draft one") in
+  let two=focus one 2 |> fun s->R.step s Capture_opened |> fun s->R.step s (Capture_edited "draft two") in
+  let three=focus two 3 |> fun s->R.step s Capture_opened |> fun s->R.step s (Capture_edited "draft three") in
+  List.iter (fun (n,text)->
+    let restored=focus three n in
+    require (Option.map Journal_capture.source (R.capture restored)=Some text) "resident draft crossed or disappeared")
+    [1,"draft one";2,"draft two";3,"draft three"];
+  let capture=Option.get (R.capture one) in
+  let saving,request=Journal_capture.admit_save capture
+    ~mutation_id:"77777777-7777-4777-9777-000000000001"
+    ~block_id:"77777777-7777-4777-a777-000000000001" ~sibling_order:"z"
+    ~calendar_generation:1L ~creation_time:(creation_time 1) in
+  require (Option.is_some request) "saving fixture did not admit";
+  let saving=R.step one (Capture_admitted saving) in
+  let returned=focus (focus saving 2) 1 in
+  require (Option.map Journal_capture.phase (R.capture returned)=Some Journal_capture.Saving)
+    "visible focus interrupted in-flight Capture";
+  let cleared=R.step three Account_cleared in
+  require (R.capture (focus cleared 1)=None) "logout retained resident draft"
+let tests=tests @ ["resident focus keeps per-graph drafts and pending Capture",test_resident_focus_preserves_graph_drafts_and_saving]
+;;
 let () = test_native_composer_dismissal_and_edit_fences ()
 let () = test_collapse_retains_complete_capture ()
 

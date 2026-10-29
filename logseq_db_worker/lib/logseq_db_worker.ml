@@ -204,7 +204,7 @@ let delete_local_copy t ~account_generation ~graph_id =
   if t.stopped || t.local_deletion_waiter <> None
      || not snapshot.startup.authenticated
      || snapshot.startup.account_generation <> account_generation
-     || snapshot.selected_graph = Some graph_id
+     || List.exists (fun (scope:Sync.graph_scope)->scope.graph_id=graph_id) (Pure_reducer.graph_scopes !(t.state))
      || not (List.exists (fun (graph : Sync.graph) -> graph.graph_id = graph_id) snapshot.catalog)
   then Error "This local copy cannot be deleted now."
   else (
@@ -300,11 +300,9 @@ let import_asset t ~graph_generation request =
          in
          dispatch
            t
-           (Pure_reducer.Upload_requested
-              { graph_generation
-              ; operation = intent.Logseq_db_types.Asset_upload_intent.operation_id
-              ; event = Logseq_db_worker_pure_reducer.Asset_upload.Restore intent
-              });
+           (Pure_reducer.Upload_requested_for_scope
+              (context.scope, intent.Logseq_db_types.Asset_upload_intent.operation_id,
+                Logseq_db_worker_pure_reducer.Asset_upload.Restore intent));
          { operation = intent.operation_id
          ; graph_generation
          ; scope = context.scope
@@ -321,3 +319,11 @@ let retain_imported_file t ~scope ~operation =
   then None
   else Effect_runner.retain_imported_file t.runner ~scope ~operation
 ;;
+
+let request_for_scope t ~scope request =
+  let id=Pure_reducer.request_id_of_int64 t.next_request_id in
+  t.next_request_id <- Int64.succ t.next_request_id;
+  Effect_runner.await_reply t.runner ~id ~request ~post:(fun () ->
+    post t (Pure_reducer.Graph_request_for_scope {scope;id;request}))
+let graph_scopes t = Pure_reducer.graph_scopes !(t.state)
+let graph_state_for_scope t ~scope = Pure_reducer.graph_state_for_scope !(t.state) scope

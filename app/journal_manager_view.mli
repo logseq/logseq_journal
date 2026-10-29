@@ -1,5 +1,7 @@
 type picker_live =
-  { status : string
+  { residents : string list
+  ; replacement : string option
+  ; status : string
   ; authenticated : bool
   ; checking : bool
   ; deleting : Logseq_db_worker_lui.Logseq_db_worker_lui_service.local_copy_request option
@@ -46,6 +48,10 @@ type action =
   | Startup_retry
   | Refresh_catalog
   | Begin_online_recovery
+  | Remove_resident of string
+  | Move_resident of int * int
+  | Replace_resident of string
+  | Cancel_replacement
   | Select_graph of string
   | Switch_graph
   | Close_picker
