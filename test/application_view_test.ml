@@ -6325,6 +6325,7 @@ let test_picker_presence_native_patch_lifecycle () =
 ;;
 
 let test_graph_picker_controls scenario () =
+  let reordered=scenario=`Reordered_open || scenario=`Reordered_full in
   let module W = Logseq_db_worker_lui.Journal_worker in
   let module P = Logseq_db_worker.Protocol in
   let uuid n = Logseq_db_types.Graph_types.Uuid.of_string
@@ -6339,8 +6340,8 @@ let test_graph_picker_controls scenario () =
   let manager : Service.state =
     { snapshot =
         { sync_phase = Current;
-          resident_graphs=(if scenario=`Current then [first;second;uuid 3] else if scenario=`Retry_local || scenario=`Retry_graph_phase then [first;second] else []);
-          resident_scopes=(if scenario=`Current then [resident_scope first 1;resident_scope second 2;resident_scope (uuid 3) 3] else if scenario=`Retry_local || scenario=`Retry_graph_phase then [resident_scope first 1;resident_scope second 2] else []);
+          resident_graphs=(if reordered then [first] else if scenario=`Current then [first;second;uuid 3] else if scenario=`Retry_local || scenario=`Retry_graph_phase then [first;second] else []);
+          resident_scopes=(if reordered then [resident_scope first 1] else if scenario=`Current then [resident_scope first 1;resident_scope second 2;resident_scope (uuid 3) 3] else if scenario=`Retry_local || scenario=`Retry_graph_phase then [resident_scope first 1;resident_scope second 2] else []);
           catalog = [graph first "Current synthetic graph"; graph second long_name]
             @ (if scenario=`Current then [graph (uuid 3) "Third synthetic graph";graph (uuid 4) "Fourth synthetic graph"] else [])
         ; selected_graph = Some first; applied_server_t = Some (server_cursor_of_int 0)
@@ -6363,6 +6364,8 @@ let test_graph_picker_controls scenario () =
   let graph_read_cancelling = Atomic.make false and release_graph_terminal = Atomic.make false in
   let graph_read_worker = Atomic.make None in
   let graph_opens = Atomic.make 0 in
+  let early_graph_observed=Atomic.make false in
+  let refresh_full=Atomic.make false and release_refresh=Atomic.make false in
   let root_renders = ref 0 in
   let client = ref None in
   let service = W.Service.create ~push_topic_count:6
@@ -6403,6 +6406,8 @@ let test_graph_picker_controls scenario () =
           Ok (Service.Graph_state { generation = value.snapshot.startup.graph_generation
             ; graph_id = value.snapshot.selected_graph; phase = (if scenario=`Retry_local || scenario=`Retry_graph_phase then Graph_failed else Graph_open); error = None })
         | Client_command command ->
+          if scenario=`Reordered_full && command=Service.Set_foreground true && Atomic.get refresh_full then
+            while not(Atomic.get release_refresh) do Eio.Fiber.yield () done;
           Atomic.set commands (command :: Atomic.get commands);
           let previous = Atomic.get current in
           (match command with
@@ -6415,10 +6420,20 @@ let test_graph_picker_controls scenario () =
            | Refresh_catalog _ when scenario = `Refresh_failure || scenario = `Refresh_after_presence_failure ->
              publish { previous with snapshot = { previous.snapshot with
                last_error = Some "Synthetic catalog refresh failed. Try again." } }
+           (* Root_navigation has no manager/worker delivery input. Exercise
+              this ordering through the public application service boundary. *)
+           | Configure_resident_graphs ids when reordered ->
+             W.Request_context.emit context ~topic:Service.graph_state_topic
+               (Service.Graph_states [resident_scope second 2,
+                 {generation=2;graph_id=Some second;phase=Graph_open;error=None}]);
+             while not(Atomic.get early_graph_observed) do Eio.Fiber.yield () done;
+             publish {previous with snapshot={previous.snapshot with resident_graphs=ids;
+               resident_scopes=[resident_scope first 1;resident_scope second 2]}}
            | Select_graph id ->
              let generation = previous.snapshot.startup.graph_generation + 1 in
              publish { previous with snapshot = { previous.snapshot with selected_graph = Some id
                ; startup = { previous.snapshot.startup with awaiting_selection = false; graph_generation = generation } } };
+             if not reordered then
              W.Request_context.emit context ~topic:Service.graph_state_topic
                (Service.Graph_state_changed { generation; graph_id = Some id; phase = Graph_open; error = None })
            | _ -> ());
@@ -6464,6 +6479,19 @@ let test_graph_picker_controls scenario () =
     ~on_client:(fun value ->
       client := Some value;
       W.on_event value (function
+        | W.Push {payload=Service.Client_state_changed state;_}
+            when scenario=`Reordered_full && state.snapshot.selected_graph=Some second
+              && not(Atomic.get refresh_full) ->
+          (* Fill the real bounded Worker lane before Application receives the
+             focus publication; the first accepted filler holds the service. *)
+          Atomic.set refresh_full true;
+          let rec fill count = if count>1024 then failwith "fixture lane did not fill" else
+            match W.send value (Service.Client_command (Set_foreground true)) with
+            | W.Accepted _ -> fill (count+1)
+            | W.Full -> ()
+            | Not_ready | Stopping -> failwith "fixture worker not ready" in
+          fill 0
+        | W.Push {payload=Service.Graph_states _;_} -> Atomic.set early_graph_observed true
         | W.Response { outcome = Completed (Service.Local_copy_deleted _); _ } ->
           deletion_terminal := true
         | W.Response { request_id; outcome = Cancelled; _ } ->
@@ -6521,6 +6549,7 @@ let test_graph_picker_controls scenario () =
       ~response_budget_bytes:P.maximum_response_bytes ~default_page_size:P.default_page_size
       |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
   Fun.protect ~finally:(fun () ->
+    Atomic.set release_refresh true;
     Atomic.set finish_deletion true;
     Atomic.set release_automatic_inspection true;
     Atomic.set release_graph_read true;
@@ -6619,6 +6648,16 @@ let test_graph_picker_controls scenario () =
                 | Service.Return_to_graph_picker -> true
                 | _ -> false)
               (Atomic.get commands))
+      | `Reordered_open | `Reordered_full ->
+        let before=Atomic.get graph_opens in
+        press(node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        wait "early graph state was observed before membership admission" (fun()->Atomic.get early_graph_observed);
+        if scenario=`Reordered_full then (
+          wait "real worker queue is full during focus" (fun()->Atomic.get refresh_full);
+          for _=1 to 4 do consume(hooks.pump()) done;
+          Atomic.set release_refresh true);
+        wait "focused graph presents even when its initial push preceded membership" (fun()->
+          (Atomic.get current).snapshot.selected_graph=Some second && Atomic.get graph_opens>before)
       | `Select ->
         press (node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
         wait "name selection reaches worker" (fun () ->
@@ -7067,6 +7106,8 @@ let () =
         Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);
         Alcotest.test_case "resident picker keeps native patch references alive" `Quick (test_graph_picker_controls `Current);
         Alcotest.test_case "close retains current session" `Quick (test_graph_picker_controls `Close);
+        Alcotest.test_case "focus graph-state refresh survives full Worker lane" `Quick (test_graph_picker_controls `Reordered_full);
+        Alcotest.test_case "graph open before membership still presents after focus" `Quick (test_graph_picker_controls `Reordered_open);
         Alcotest.test_case "name switches graph" `Quick (test_graph_picker_controls `Select);
         Alcotest.test_case "old graph cancellation cannot publish a new-scope error" `Quick
           (test_graph_picker_controls `Late_graph_cancel);

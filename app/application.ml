@@ -3293,6 +3293,20 @@ let start
      | _->());
     result
   in
+  let pending_focus_refresh = ref None in
+  let try_focus_refresh owner =
+    match dispatch_worker (Graph_service.Get_graph_state_at owner) with
+    | Worker.Accepted _ | Stopping -> pending_focus_refresh:=None
+    | Full | Not_ready -> pending_focus_refresh:=Some owner
+  in
+  let drain_focus_refresh () =
+    Effect.of_thunk (fun () ->
+      match !pending_focus_refresh with
+      | Some owner when runtime_owner_is_live !state_ref owner
+          && model_key !state_ref=Some(owner_key owner) -> try_focus_refresh owner
+      | Some _ -> pending_focus_refresh:=None
+      | None -> ())
+  in
   let cancel_copy () =
     let state, _ = Journal_copy.step !copy_state Cancel in
     copy_state := state;
@@ -4003,7 +4017,19 @@ let start
     Effect.bind update ~f:(fun () ->
       let snapshot = !state_ref in
       Effect.many
-        [ sign_out
+        [ (* A new graph's open push can precede the membership publication
+             and be fenced by the old scope list. Pull its state on focus. *)
+          (if owner_changed && not graph_already_current then
+             Effect.of_thunk (fun () ->
+               Option.iter (fun graph_id ->
+                 let owner : Graph_service.timeline_scope =
+                   {startup={account_generation=manager.startup.account_generation;
+                     presentation_generation=manager.startup.presentation_generation};
+                    graph_id;graph_generation=manager.startup.graph_generation} in
+                 try_focus_refresh owner)
+                 manager.selected_graph)
+           else Effect.ignore)
+        ; sign_out
         ; termination_ready
         ; observe_graph_state set_state set_state_and_effect snapshot.graph_state
         ; trigger_admission
@@ -5680,6 +5706,7 @@ let start
         | _ -> state, Effect.ignore)
     | Sign_out ->
       pending_startup_commands:=[];
+      pending_focus_refresh:=None;
       cancel_copy ();
       retire_graph_scope ();
       started_graph_generation := None;
@@ -6939,7 +6966,9 @@ let start
   Worker.on_event client (fun event ->
     Journal_pump.enqueue pump (fun () ->
       drain_retired_runtimes ();
-      let deliver event=Effect.bind (handle_worker_event event) ~f:drain_startup_commands in
+      let deliver event=Effect.bind
+        (Effect.bind (handle_worker_event event) ~f:drain_startup_commands)
+        ~f:drain_focus_refresh in
       match event with
       | Worker.Response {request_id;_} ->
         let owner=Hashtbl.find_opt worker_owners request_id in
