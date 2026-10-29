@@ -86,7 +86,7 @@ final class JournalResidentGraphAcceptance: XCTestCase {
     tapID("graph-resident-up:"+gid(3),app);record("Configured order A C B",app)
     tapID("graph-picker:"+gid(4),app);XCTAssertTrue(app.staticTexts["Choose a slot to replace with Native encrypted graph 4"].waitForExistence(timeout:10));record("Full set requires explicit replacement",app)
     tapID("graph-resident-replace:"+gid(2),app);XCTAssertTrue(title(4,app).waitForExistence(timeout:20));record("Explicit replacement opens D",app)
-    picker(app);tapID("graph-resident-remove:"+gid(4),app);record("D closed without deleting local copy",app);tapID("graph-picker:"+gid(4),app);XCTAssertTrue(title(4,app).waitForExistence(timeout:20));record("Reopen D local copy",app)
+    picker(app);tapID("graph-resident-remove:"+gid(4),app);record("D closed without deleting local copy",app);picker(app);tapID("graph-picker:"+gid(4),app);XCTAssertTrue(title(4,app).waitForExistence(timeout:20));record("Reopen D local copy",app)
     app.terminate();app.launch();XCTAssertTrue(title(4,app).waitForExistence(timeout:20));record("Resident selection after process restart",app)
     for n in [1,3,4] {right(app);XCTAssertTrue(title(n,app).isHittable);record("Persisted cycle graph\(n)",app)}
   }
