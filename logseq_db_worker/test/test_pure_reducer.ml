@@ -1273,10 +1273,49 @@ let test_resident_worker_shutdown_closes_all_databases () =
     | _->None) stopped.effects in
   Alcotest.(check int) "shutdown closes both resident databases" 2 (List.length(List.sort_uniq String.compare databases))
 ;;
+let test_resident_worker_cold_restore_keeps_open_tickets () =
+ List.iter(fun count->
+  let graphs=List.init count(fun n->({graph_id=uuid(Printf.sprintf "65000000-0000-4000-8000-%012d" (n+1));name="Cached synthetic";
+    schema={major=65;minor=33;exact=true};encrypted=false}:Sync.graph)) in
+  let ids=List.map(fun(g:Sync.graph)->g.graph_id) graphs in
+  let selected=List.nth ids (count-1) in
+  let cache=Sync.catalog_cache ~user_id:"cached-resident" ~graphs ~selected_graph:(Some selected)
+    |> Sync.encode_catalog_cache |> Yojson.Safe.from_string |> Yojson.Safe.Util.to_assoc in
+  let cache=`Assoc(("cache_resident_graphs",`List(List.map(fun id->`String(Logseq_db_types.Graph_types.Uuid.to_string id)) ids))::cache)
+    |> Yojson.Safe.to_string |> Sync.decode_catalog_cache |> Result.get_ok in
+  let restoring=Core.step (raw_initial ()) (Sync_event(Sync.Restore_local_account{user_id="cached-resident"})) in
+  let completion=List.find_map(function Core.Run_sync(Sync.Request(ticket,Sync.Load_catalog _))->
+    Some(Core.Sync_event(Sync.Runner_completed(Sync.Completion(ticket,Ok(Some cache)))))|_->None) restoring.effects |> Option.get in
+  let restored=Core.step restoring.next completion in
+  let inspections=List.filter_map(function Core.Run_worker(Core.Request(ticket,Handle_sync_worker_effect(Sync.Inspect_mirror request)))->Some(ticket,request)|_->None) restored.effects in
+  Alcotest.(check int) "one cold local inspection per resident" count (List.length inspections);
+  let opened=List.fold_left(fun state (ticket,(request:Sync.mirror_request))->
+    let attaching=Core.step state (Runner_completed(Sync_worker_effect_completed(ticket,
+      Ok{event=Some(Sync.Mirror_inspected(Mirror_available request));lifecycle=Lifecycle_unchanged}))) in
+    let attachment=List.find_map(function Core.Run_worker(Core.Request(ticket,Handle_sync_worker_effect(Sync.Attach_graph _)))->Some ticket|_->None) attaching.effects in
+    Alcotest.(check bool) "cached inspection ticket survives session restore" true (Option.is_some attachment);
+    let database=Core.database_opened ~database_id:("cached-" ^ Logseq_db_types.Graph_types.Uuid.to_string request.scope.graph_id) ~graph_id:request.scope.graph_id in
+    let module O=Logseq_overlay_db.Types in
+    let sync=O.sync_view ~token:(O.sync_token_of_string "sync-token:v1:cached" |> Result.get_ok)
+      ~checkpoint:(O.Server_cursor.of_int64 0L |> Result.get_ok) ~submissions:[] in
+    (Core.step attaching.next (Runner_completed(Sync_worker_effect_completed(Option.get attachment,
+      Ok{event=Some(Sync.Graph_attached{scope=request.scope;sync});lifecycle=Lifecycle_opened(database,request.scope.graph_generation)})))).next)
+    restored.next (List.rev inspections) in
+  Alcotest.(check bool) "cold restore preserves last focused graph" true ((Core.view opened).sync.snapshot.selected_graph=Some selected);
+  List.iter(fun scope->
+    Alcotest.(check bool) "each restored graph really opens" true
+      (Option.fold ~none:false ~some:(fun(g:Core.graph_state)->g.phase=Core.Graph_open) (Core.graph_state_for_scope opened scope));
+    let read=Core.step opened (Graph_request_for_scope{scope;id=Core.request_id_of_int64 901L;request=graph_info_request()}) in
+    Alcotest.(check bool) "restored scope executes against its own DB" true
+      (List.exists(function Core.Run_worker(Core.Request(_,Execute_request{database;_}))->
+        Core.database_handle_id database="cached-" ^ Logseq_db_types.Graph_types.Uuid.to_string scope.graph_id|_->false) read.effects)) (Core.graph_scopes opened)) [1;2;3]
+;;
+
 let () =
   Alcotest.run
     "logseq db worker pure reducer"
-    [ ( "resident graphs", [Alcotest.test_case "scope routes and delayed replies survive focus" `Quick test_resident_worker_routes_by_scope;
+    [ ( "resident graphs", [Alcotest.test_case "cold cached membership opens every DB" `Quick test_resident_worker_cold_restore_keeps_open_tickets;
+        Alcotest.test_case "scope routes and delayed replies survive focus" `Quick test_resident_worker_routes_by_scope;
         Alcotest.test_case "all removals and logout detach each graph" `Quick test_resident_worker_closes_every_scope;
         Alcotest.test_case "shutdown closes every resident database" `Quick test_resident_worker_shutdown_closes_all_databases])
     ; ( "authoritative diagnostics", [Alcotest.test_case "four categories propagate without closing graph" `Quick test_authoritative_failure_categories_reach_diagnostics])

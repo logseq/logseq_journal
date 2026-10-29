@@ -6430,3 +6430,183 @@ let resident_online_cancel_retires_and_resumes_hidden () =
 ;;
 let scenarios=scenarios @ [Alcotest.test_case "resident online cancellation resumes every graph" `Quick resident_online_cancel_retires_and_resumes_hidden]
 ;;
+
+(* PR142 recovery must preserve resident lifetime and account presentation rules. *)
+let resident_recovery_allocates_above_all_live_generations () =
+  let configured=Core.step (resident_catalog ()) (Core.Resident_graphs_changed resident_ids) in
+  let owners=List.map(resident_scope configured.next) resident_ids in
+  let a=List.hd owners in
+  let failed=Core.step configured.next (Core.Graph_attachment_failed {scope=Core.effect_scope_of_graph a;message="Synthetic local open failure"}) in
+  let recovered=Core.step failed.next (Core.Online_recovery_requested(timeline_scope failed.next)) in
+  let fresh=inspect_mirror_request recovered.effects in
+  Alcotest.(check bool) "recovery allocates above every resident, not the failing session" true
+    (List.for_all(fun (owner:Core.graph_scope)->fresh.scope.graph_generation>owner.graph_generation) owners);
+  Alcotest.(check bool) "fresh recovery scope remains admitted" true
+    (Core.scope_for_graph recovered.next ~graph_id=Some fresh.scope);
+  List.iter(fun (owner:Core.graph_scope)->if owner.graph_id<>graph_id then
+    Alcotest.(check bool) "other lifetimes unchanged" true
+      (Core.scope_for_graph recovered.next ~graph_id:owner.graph_id=Some owner)) owners;
+  let stale=Core.step recovered.next (Core.Mirror_inspected(Core.Mirror_available {fresh with scope=a})) in
+  Alcotest.(check bool) "old recovery callback cannot attach" false
+    (List.exists(function Core.Delegate(Core.Attach_graph _)->true|_->false) stale.effects);
+  let attached=Core.step stale.next (Core.Mirror_inspected(Core.Mirror_available fresh)) in
+  Alcotest.(check bool) "new recovery callback keeps its graph" true
+    (List.exists(function Core.Delegate(Core.Attach_graph r)->r.scope=fresh.scope|_->false) attached.effects)
+;;
+let resident_focus_keeps_native_presentation_monotonic () =
+  let configured=Core.step (resident_catalog ()) (Core.Resident_graphs_changed resident_ids) in
+  let owners=List.map(resident_scope configured.next) resident_ids in
+  let newer=Core.step configured.next (Core.Visible_graph_changed graph_id) in
+  let native=startup_scope newer.next in
+  let focused=Core.step newer.next (Core.Visible_graph_changed other_graph_id) in
+  let visible=startup_scope focused.next in
+  Alcotest.(check bool) "native scope never regresses on focus" true
+    (visible.presentation_generation>=native.presentation_generation);
+  List.iter2(fun id scope->Alcotest.(check bool) "presentation refresh preserves graph lifetime" true
+    (Core.scope_for_graph focused.next ~graph_id:id=Some scope)) resident_ids owners;
+  let cancel=Core.step focused.next (Core.Online_cancelled visible) in
+  Alcotest.(check bool) "native current-scope cancellation reaches focused graph" true
+    ((Core.state cancel.next).snapshot.startup.network_phase=Core.Local_only);
+  let stale=Core.step cancel.next (Core.Sign_in_requested visible) in
+  Alcotest.(check bool) "cancel retires old presentation tickets" true
+    ((Core.state stale.next).snapshot.startup.network_phase=Core.Local_only);
+  let resumed=Core.step cancel.next (Core.Sign_in_requested(startup_scope cancel.next)) in
+  Alcotest.(check bool) "fresh native authentication can resume" true
+    ((Core.state resumed.next).snapshot.startup.network_phase=Core.Online_by_user)
+;;
+let resident_local_retry_restarts_only_failed_graph () =
+  let configured=Core.step (resident_catalog ()) (Core.Resident_graphs_changed resident_ids) in
+  let old=resident_scope configured.next graph_id in
+  let failed=Core.step configured.next (Core.Graph_attachment_failed {scope=Core.effect_scope_of_graph old;message="Synthetic read failure"}) in
+  let retry=Core.step failed.next (Core.Graph_selected graph_id) in
+  let request=inspect_mirror_request retry.effects in
+  Alcotest.(check bool) "retry admits its new local-open scope" true
+    (Core.scope_for_graph retry.next ~graph_id=Some request.scope);
+  Alcotest.(check bool) "retry renews only failed lifetime" true (request.scope<>old);
+  Alcotest.(check bool) "retry retains configured order" true (Core.resident_graphs retry.next=resident_ids);
+  let inspected=Core.step retry.next (Core.Mirror_inspected(Core.Mirror_available request)) in
+  Alcotest.(check bool) "retried mirror advances to attachment" true
+    (List.exists(function Core.Delegate(Core.Attach_graph r)->r.scope=request.scope|_->false) inspected.effects)
+;;
+let scenarios=scenarios @ [
+ Alcotest.test_case "resident recovery uses global lifetime allocator" `Quick resident_recovery_allocates_above_all_live_generations;
+ Alcotest.test_case "resident focus preserves native presentation scope" `Quick resident_focus_keeps_native_presentation_monotonic;
+ Alcotest.test_case "resident local retry keeps renewed scope admitted" `Quick resident_local_retry_restarts_only_failed_graph]
+;;
+
+let resident_authentication_recovery_renews_scope () =
+ let configured=Core.step (resident_catalog ()) (Core.Resident_graphs_changed resident_ids) in
+ let old=resident_scope configured.next graph_id in
+ let cancelled=Core.step configured.next (Core.Online_cancelled(startup_scope configured.next)) in
+ let failed=Core.step cancelled.next (Core.Graph_attachment_failed{scope=Core.effect_scope_of_graph old;message="Synthetic local restore failure"}) in
+ let online=Core.step failed.next (Core.Sign_in_requested(startup_scope failed.next)) in
+ let recovered=Core.step online.next (Core.Account_authenticated{user_id=Some "user"}) in
+ let request=inspect_mirror_request recovered.effects in
+ Alcotest.(check bool) "authentication recovery registers fresh graph lifetime" true
+  (Core.scope_for_graph recovered.next ~graph_id=Some request.scope);
+ List.iter(fun id->let owner=resident_scope configured.next id in
+  Alcotest.(check bool) "authentication recovery generation unique" true
+   (request.scope.graph_generation>owner.graph_generation)) resident_ids
+;;
+let scenarios=scenarios @ [Alcotest.test_case "resident authentication recovery uses global lifetime" `Quick resident_authentication_recovery_renews_scope]
+;;
+
+let resident_recovery_keeps_other_graph_completion () =
+ let catalog=refresh_catalog (resident_catalog ()) [graph;{other_graph with encrypted=true};third_graph] in
+ let configured=Core.step catalog.next (Core.Resident_graphs_changed resident_ids) in
+ let b=resident_scope configured.next other_graph_id in
+ let b_request=List.find_map(function Core.Delegate(Core.Inspect_mirror r) when r.scope=b->Some r|_->None) configured.effects |> Option.get in
+ let unlocking=Core.step configured.next (Core.Mirror_inspected(Core.Mirror_available b_request)) in
+ let fail_b=List.find_map(function Core.Run(Core.Request(ticket,Core.Load_and_unlock_graph_key _))->
+    Some(Core.Runner_completed(Core.Completion(ticket,Ok(Core.graph_key_handle ~id:"synthetic-B-key" ~scope:b))))|_->None) unlocking.effects |> Option.get in
+ let a=resident_scope unlocking.next graph_id in
+ let failed=Core.step unlocking.next (Core.Graph_attachment_failed{scope=Core.effect_scope_of_graph a;message="Synthetic A open failure"}) in
+ let recovered=Core.step failed.next (Core.Online_recovery_requested(timeline_scope failed.next)) in
+ let fresh=inspect_mirror_request recovered.effects in
+ let completed=Core.step recovered.next fail_b in
+ Alcotest.(check bool) "B completion advances only B attachment after A recovery" true
+  (List.exists(function Core.Delegate(Core.Attach_graph request)->request.scope=b|_->false) completed.effects);
+ Alcotest.(check bool) "B completion keeps A recovery pending" true
+  ((Core.state completed.next).snapshot.startup.restoring_local);
+ Alcotest.(check bool) "A scope still admits its own mirror response" true
+  (Core.scope_for_graph completed.next ~graph_id=Some fresh.scope)
+;;
+let scenarios=scenarios @ [Alcotest.test_case "resident recovery preserves other key completion" `Quick resident_recovery_keeps_other_graph_completion]
+;;
+
+let resident_reopened_lifetime_finishes_owned_retirement () =
+ let online=resident_online_fixture () in
+ let sockets=List.filter_map(function Core.Run(Core.Start_websocket r)->Some r.scope|_->None) online.effects in
+ let opened=List.fold_left(fun c socket->(Core.step c (Core.Websocket_opened socket)).next) online.next sockets in
+ let old=resident_scope opened graph_id in
+ let pending,ticket,_=asset_issue opened old "old-resident-lease" (Core.Retain_asset_file "source") in
+ let replaced=Core.step pending.next (Core.Graph_selected graph_id) in
+ let mirror=inspect_mirror_request replaced.effects in
+ let stale=Core.step replaced.next (Core.Local_graph_outbox_changed old) in
+ check_instructions "retired outbox cannot request work in new lifetime" [] stale.effects;
+ let late=asset_complete stale.next ticket (Ok(Core.Asset_retained(Some("late-resident-lease","synthetic-path")))) in
+ Alcotest.(check int) "retired success never publishes the resource" 0 (List.length(asset_outputs late.effects));
+ let cleanup=List.find_map(function Core.Run(Core.Asset_io(ticket,request)) when request.action=Core.Release_asset_file "late-resident-lease"->Some ticket|_->None) late.effects in
+ Alcotest.(check bool) "new lifetime retains exact old asset cleanup owner" true (Option.is_some cleanup);
+ let released=asset_complete late.next (Option.get cleanup) (Ok Core.Asset_unit) in
+ let duplicate=asset_complete released.next ticket (Ok(Core.Asset_retained(Some("late-resident-lease","synthetic-path")))) in
+ check_instructions "retired asset completion is consumed once" [] duplicate.effects;
+ let attaching=Core.step duplicate.next (Core.Mirror_inspected(Core.Mirror_available mirror)) in
+ let module O=Logseq_overlay_db.Types in
+ let sync=O.sync_view ~token:(O.sync_token_of_string "sync-token:v1:reopened" |> Result.get_ok)
+   ~checkpoint:(server_cursor_of_int 0) ~submissions:[] in
+ let attached=Core.step attaching.next (Core.Graph_attached{scope=mirror.scope;sync}) in
+ let shown=Core.step attached.next (Core.Timeline_presented(timeline_scope attached.next)) in
+ let authenticated=Core.step shown.next (Core.Account_authenticated{user_id=Some "user"}) in
+ let socket=List.find(fun(s:Core.connection_scope)->s.graph=old) sockets in
+ let retired=Core.step authenticated.next (Core.Websocket_retired socket) in
+ Alcotest.(check int) "old physical retirement starts new socket once" 1
+  (List.length(List.filter(function Core.Run(Core.Start_websocket r)->r.scope.graph=mirror.scope|_->false) retired.effects));
+ check_instructions "duplicate old physical retirement is inert" [] (Core.step retired.next (Core.Websocket_retired socket)).effects
+;;
+let scenarios=scenarios @ [Alcotest.test_case "resident refreshed lifetime drains exact old owners" `Quick resident_reopened_lifetime_finishes_owned_retirement]
+;;
+
+let resident_cancel_publishes_final_presentation () =
+ List.iter(fun count->let ids=List.filteri(fun i _->i<count) resident_ids in
+  List.iter(fun visible->
+   let configured=Core.step (resident_catalog ()) (Core.Resident_graphs_changed ids) in
+   let focused=Core.step configured.next (Core.Visible_graph_changed visible) in
+   let cancelled=Core.step focused.next (Core.Online_cancelled(startup_scope focused.next)) in
+   let published=List.fold_left(fun state->function Core.Publish(Core.State_changed value)->Some value|_->state) None cancelled.effects |> Option.get in
+   Alcotest.(check bool) "native receives final account presentation after every cancellation order" true
+    (published.snapshot.startup=(Core.state cancelled.next).snapshot.startup)) ids) [1;2;3]
+;;
+let resident_retry_retains_new_catalog_completion () =
+ let configured=Core.step (resident_catalog ()) (Core.Resident_graphs_changed resident_ids) in
+ let retry=Core.step configured.next (Core.Graph_selected graph_id) in
+ let error=Core.Effect_failed "Synthetic resident catalog persistence failure" in
+ let completion=List.find_map(function Core.Run(Core.Request(ticket,Core.Save_catalog _))->
+  Some(Core.Runner_completed(Core.Completion(ticket,Error error)))|_->None) retry.effects |> Option.get in
+ let failed=Core.step retry.next completion in
+ Alcotest.(check bool) "new retry catalog ticket preserves persistence failure diagnostic" true
+  ((Core.state failed.next).diagnostics<>(Core.state retry.next).diagnostics);
+ check_instructions "catalog persistence completion consumed once" [] (Core.step failed.next completion).effects
+;;
+let scenarios=scenarios @ [
+ Alcotest.test_case "resident cancellation publishes final native scope" `Quick resident_cancel_publishes_final_presentation;
+ Alcotest.test_case "resident retry preserves catalog persistence ticket" `Quick resident_retry_retains_new_catalog_completion]
+;;
+
+let resident_graph_failure_preserves_account_catalog_request () =
+ let configured=Core.step (resident_catalog ()) (Core.Resident_graphs_changed resident_ids) in
+ let requested=Core.step configured.next (Core.Account_authenticated{user_id=Some "user"}) in
+ let updated_graph={graph with name="Authoritative catalog update"} in
+ let completion=List.find_map(function Core.Run(Core.Request(ticket,Core.Fetch_catalog _))->
+  Some(Core.Runner_completed(Core.Completion(ticket,Ok[updated_graph;other_graph;third_graph;fourth_graph])))|_->None) requested.effects |> Option.get in
+ let hidden=resident_scope requested.next other_graph_id in
+ let failed=Core.step requested.next (Core.Graph_attachment_failed{scope=Core.effect_scope_of_graph hidden;message="Synthetic hidden graph failure"}) in
+ let completed=Core.step failed.next completion in
+ Alcotest.(check bool) "hidden graph failure cannot discard shared account catalog completion" true
+  (List.exists(fun(g:Core.graph)->g.graph_id=graph_id && g.name=updated_graph.name)(Core.state completed.next).snapshot.catalog);
+ Alcotest.(check bool) "shared catalog completion releases loading" false
+  (Core.state completed.next).snapshot.startup.catalog_loading;
+ check_instructions "catalog request completion consumed once" [] (Core.step completed.next completion).effects
+;;
+let scenarios=scenarios @ [Alcotest.test_case "resident graph failure preserves account catalog ticket" `Quick resident_graph_failure_preserves_account_catalog_request]
+;;

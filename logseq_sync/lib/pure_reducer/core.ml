@@ -872,6 +872,7 @@ type websocket_owner =
   }
 
 module Asset_retirement_set = Map.Make (String)
+module Pending_id_set = Set.Make (Int)
 let asset_retirement_key (scope : graph_scope) retirement =
   Printf.sprintf "%S:%S:%S:%S" (Uri.to_string scope.account.managed_sync_origin)
     scope.account.user_id (Logseq_db_types.Graph_types.Uuid.to_string scope.graph_id)
@@ -1553,7 +1554,7 @@ let is_graph_key_access (Pending_effect ticket) =
 let select_graph_transition core ~persist graph_id =
   match core.user_id, graph_in_catalog core.public_state.snapshot.catalog graph_id with
   | Some user_id, Some graph ->
-    let graph_generation = core.public_state.snapshot.startup.graph_generation + 1 in
+    let graph_generation = max core.resident_next_generation core.public_state.snapshot.startup.graph_generation + 1 in
     let startup =
       { core.public_state.snapshot.startup with
         awaiting_selection = false
@@ -1583,6 +1584,8 @@ let select_graph_transition core ~persist graph_id =
       set_snapshot
         { (reset_graph_operations core) with
           cached_selected_graph = Some graph_id
+        ; resident_next_generation = graph_generation
+        ; websocket_live = false
         ; pending_effects = List.filter (fun pending -> not (is_graph_key_access pending)) core.pending_effects
         ; selected_graph_value = Some graph
         ; current_graph_scope = Some scope
@@ -4157,7 +4160,8 @@ let restore_session core session =
   let snapshot = session.saved_snapshot in
   let snapshot = {snapshot with catalog=shared.catalog;resident_graphs=core.resident_order;
     startup={snapshot.startup with authenticated=shared.startup.authenticated;
-      account_generation=shared.startup.account_generation;catalog_loading=shared.startup.catalog_loading}} in
+      account_generation=shared.startup.account_generation;catalog_loading=shared.startup.catalog_loading;
+      presentation_generation=max shared.startup.presentation_generation snapshot.startup.presentation_generation}} in
   {core with public_state={snapshot;diagnostics=session.saved_diagnostics};
     pending_effects = List.filter (fun p -> not (graph_pending p)) core.pending_effects @ session.saved_pending_effects
   ; asset_retirement_observed = session.saved_asset_retirement_observed
@@ -4223,9 +4227,14 @@ let asset_context_for_scope core (scope : graph_scope) =
 let session_for_effect core (scope : effect_scope) =
   List.find_opt (fun session ->
     let s=session.saved_identity in
-    scope.graph_generation=Some s.graph_generation && scope.account_generation=Some s.account.account_generation)
+    (scope.graph_generation=Some s.graph_generation && scope.account_generation=Some s.account.account_generation)
+    || List.exists (fun (Pending_effect ticket)->ticket.scope=scope) session.saved_pending_effects)
     (remember_current core).resident_sessions
 let event_graph_scope core = function
+  | Asset_requested ({scope;action;_} as request) when asset_cleanup_action action ->
+    (match List.find_opt (fun session->List.mem scope session.saved_asset_known_scopes)
+      (remember_current core).resident_sessions with
+     | Some session->Some session.saved_identity | None->Some request.scope)
   | Local_graph_outbox_changed scope | Asset_requested {scope;_}
   | Protected_requested {protected_scope=scope;_} | Graph_detached (scope,_)
   | Mirror_inspected (Mirror_absent scope) -> Some scope
@@ -4236,14 +4245,25 @@ let event_graph_scope core = function
   | Snapshot_activated activation -> Some activation.scope
   | Snapshot_activation_failed error -> Some error.activation.scope
   | Websocket_opened {graph;_} | Websocket_message ({graph;_},_)
-  | Websocket_protocol_error ({graph;_},_) | Websocket_closed ({graph;_},_)
-  | Websocket_retired {graph;_} -> Some graph
+  | Websocket_protocol_error ({graph;_},_) | Websocket_closed ({graph;_},_) -> Some graph
+  | Websocket_retired connection ->
+    (match List.find_opt (fun session->Option.fold ~none:false
+      ~some:(fun owner->owner.physical_scope=connection) session.saved_websocket_owner)
+      (remember_current core).resident_sessions with
+     | Some session->Some session.saved_identity | None->Some connection.graph)
   | E2ee_password_submitted (challenge,_) -> Some challenge.challenge_scope
-  | Graph_attachment_failed {scope;_} | Authoritative_batch_failed {scope;_}
-  | Runner_completed (Completion ({scope;_},_)) ->
+  | Graph_attachment_failed {scope;_} | Authoritative_batch_failed {scope;_} ->
     Option.map (fun s -> s.saved_identity) (session_for_effect core scope)
-  | Runner_completed (Asset_completion (ticket,_)) -> Some ticket.asset_request.context.scope
-  | Runner_completed (Protected_completion (ticket,_)) -> Some ticket.protected_input.protected_scope
+  | Runner_completed (Completion (ticket,_)) ->
+    List.find_map (fun session->if List.exists (fun (Pending_effect pending)->
+      pending.id=ticket.id && pending.scope=ticket.scope) session.saved_pending_effects
+      then Some session.saved_identity else None) (remember_current core).resident_sessions
+  | Runner_completed (Asset_completion (ticket,_)) ->
+    List.find_map (fun session->if List.exists (fun pending->pending.asset_ticket=ticket) session.saved_assets_pending
+      then Some session.saved_identity else None) (remember_current core).resident_sessions
+  | Runner_completed (Protected_completion (ticket,_)) ->
+    List.find_map (fun session->if List.mem ticket session.saved_protected_pending
+      then Some session.saved_identity else None) (remember_current core).resident_sessions
   | Timeline_presented scope | Online_recovery_requested scope -> scope_for_graph core ~graph_id:scope.graph_id
   | Timer_elapsed id ->
     List.find_map (fun s ->
@@ -4271,17 +4291,23 @@ let run_session core (identity : graph_scope) event =
   | Some session ->
     let visible=visible_identity core in
     let shared=core.public_state.snapshot in
-    let account_pending=List.filter (fun pending->not(graph_pending pending)) core.pending_effects in
     let transition=step_graph_policy (restore_session core session) event in
     let snapshot=transition.next.public_state.snapshot in
     let snapshot={snapshot with catalog=shared.catalog;
       startup={snapshot.startup with authenticated=shared.startup.authenticated;
         catalog_loading=shared.startup.catalog_loading;account_generation=shared.startup.account_generation}} in
+    let _,account_pending=List.fold_left (fun (ids,pending) (Pending_effect ticket as obligation)->
+      if graph_pending obligation || Pending_id_set.mem ticket.id ids then ids,pending
+      else Pending_id_set.add ticket.id ids,obligation::pending)
+      (Pending_id_set.empty,[]) (core.pending_effects @ transition.next.pending_effects) in
     let updated={transition.next with public_state={transition.next.public_state with snapshot};
-      pending_effects=account_pending @ List.filter graph_pending transition.next.pending_effects} in
-    let next=remember_session identity updated |> fun core -> restore_visible core visible in
-    {next;effects=if visible=Some identity.graph_id then transition.effects
-      else scoped_publications identity transition.effects}
+      pending_effects=List.rev account_pending @ List.filter graph_pending transition.next.pending_effects} in
+    let fresh=Option.value updated.current_graph_scope ~default:identity in
+    let updated=if fresh=identity then updated else {updated with
+      resident_sessions=List.filter(fun session->session.saved_identity<>identity) updated.resident_sessions} in
+    let next=remember_session fresh updated |> fun core -> restore_visible core visible in
+    {next;effects=if visible=Some fresh.graph_id then transition.effects
+      else scoped_publications fresh transition.effects}
 let empty_session core =
   let blank=initial core.config |> Result.get_ok in
   let identity=Option.get core.current_graph_scope in
@@ -4357,6 +4383,10 @@ let prune_sessions core =
 let step core event =
   match event with
   | Resident_graphs_changed ids -> configure_residents core ids
+  | Graph_selected id when core.resident_enabled && List.mem id core.resident_order ->
+    let focused=restore_visible (remember_current core) (Some id) in
+    (match scope_for_graph focused ~graph_id:id with
+     | Some identity->run_session focused identity event | None->unchanged core)
   | Visible_graph_changed id when List.mem id (resident_graphs core) ->
     let core=remember_current core in
     let next=restore_visible core (Some id) in
@@ -4393,7 +4423,9 @@ let step core event =
       remember_session session.saved_identity part.next,
         effects @ (if visible=Some session.saved_identity.graph_id then part.effects
           else scoped_publications session.saved_identity part.effects)) (remember_current core,[]) sessions in
-    {next=restore_visible next visible;effects}
+    let next=restore_visible next visible in
+    let effects=List.filter (function Publish(State_changed _)->false | _->true) effects in
+    {next;effects=effects @ [publish next]}
   | Foreground_changed _ | Shutdown ->
     let sessions=(remember_current core).resident_sessions in
     let transition=List.fold_left (fun transition s ->
@@ -4407,7 +4439,11 @@ let step core event =
     | Some identity -> run_session core identity event
     | None ->
       let transition=step_graph_policy core event in
-      let next=remember_current transition.next in
+      let next=match core.current_graph_scope,transition.next.current_graph_scope with
+        | Some old,Some fresh when old<>fresh && old.graph_id=fresh.graph_id ->
+          remember_current {transition.next with resident_sessions=List.filter
+            (fun session->session.saved_identity<>old) transition.next.resident_sessions}
+        | _->remember_current transition.next in
       let resumed=resume_resident_network next in
       let transition={next=resumed.next;effects=transition.effects @ resumed.effects} in
       let next=transition.next in

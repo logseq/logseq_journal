@@ -393,7 +393,8 @@ let worker_effect_scope = function
 ;;
 
 let translate_sync transition state =
-  let state = { (remember_graph state) with sync_core = transition.Sync.next } in
+  let resident_mode=state.resident_mode || (Sync.state transition.Sync.next).snapshot.resident_graphs<>[] in
+  let state = { (remember_graph state) with sync_core = transition.Sync.next;resident_mode } in
   let rec loop state reversed = function
     | [] -> { next = remember_graph state; effects = List.rev reversed }
     | Sync.Run sync_effect :: rest -> loop state (Run_sync sync_effect :: reversed) rest

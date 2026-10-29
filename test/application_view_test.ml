@@ -6302,14 +6302,14 @@ let test_graph_picker_controls scenario () =
   let manager : Service.state =
     { snapshot =
         { sync_phase = Current;
-          resident_graphs=(if scenario=`Current then [first;second] else []);
-          resident_scopes=(if scenario=`Current then [resident_scope first 1;resident_scope second 2] else []); catalog = [graph first "Current synthetic graph"; graph second long_name]
+          resident_graphs=(if (scenario=`Current || scenario=`Retry_local || scenario=`Retry_graph_phase) then [first;second] else []);
+          resident_scopes=(if (scenario=`Current || scenario=`Retry_local || scenario=`Retry_graph_phase) then [resident_scope first 1;resident_scope second 2] else []); catalog = [graph first "Current synthetic graph"; graph second long_name]
         ; selected_graph = Some first; applied_server_t = Some (server_cursor_of_int 0)
         ; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
         ; timeline_presentation_pending = false
-        ; startup = { authenticated = scenario <> `Offline; local_access=Service.Local_available; network_phase=(if scenario = `Offline then Service.Local_only else Service.Online_by_user); catalog_loading = false; awaiting_selection = false
+        ; startup = { authenticated = scenario <> `Offline; local_access=(if scenario=`Retry_local then Service.Local_unavailable Local_restore_failed else Service.Local_available); network_phase=(if scenario = `Offline then Service.Local_only else Service.Online_by_user); catalog_loading = false; awaiting_selection = false
           ; restoring_local = false; bootstrapping = false; awaiting_e2ee_password = false
-          ; failure = None; account_generation = 1; graph_generation = 1; presentation_generation = 1 }
+          ; failure = (if scenario=`Retry_local then Some Service.During_local_restore else None); account_generation = 1; graph_generation = 1; presentation_generation = 1 }
         ; last_error_attention = None; last_error = None; local_deletion = None }
     ; diagnostics = { groups = [] } } in
   let current = Atomic.make manager and commands = Atomic.make [] in
@@ -6336,7 +6336,7 @@ let test_graph_picker_controls scenario () =
         let publish value =
           Atomic.set current value;
           W.Request_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed value) in
-        match fixture_request request with
+        match (match request with Service.Client_command _ when scenario=`Retry_local || scenario=`Retry_graph_phase -> request | _ -> fixture_request request) with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
         | Service.Inspect_local_copy request ->
           let index = Atomic.fetch_and_add inspections 1 in
@@ -6362,7 +6362,7 @@ let test_graph_picker_controls scenario () =
         | Service.Get_graph_state ->
           let value = Atomic.get current in
           Ok (Service.Graph_state { generation = value.snapshot.startup.graph_generation
-            ; graph_id = value.snapshot.selected_graph; phase = Graph_open; error = None })
+            ; graph_id = value.snapshot.selected_graph; phase = (if scenario=`Retry_local || scenario=`Retry_graph_phase then Graph_failed else Graph_open); error = None })
         | Client_command command ->
           Atomic.set commands (command :: Atomic.get commands);
           let previous = Atomic.get current in
@@ -6478,6 +6478,12 @@ let test_graph_picker_controls scenario () =
     ignore (hooks.dispose ()); Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client)
     (fun () ->
       consume (hooks.init 2 2 config);
+      if scenario=`Retry_local || scenario=`Retry_graph_phase then (
+        wait "failed resident offers local retry" (fun()->Option.is_some(find "accessibility-identifier" "graph-picker-retry"));
+        press(node "graph-picker-retry");
+        wait "local retry actually restarts resident open" (fun()->List.exists(function Service.Select_graph id->id=first|_->false)(Atomic.get commands));
+        Alcotest.(check bool) "retry retains second resident" true (List.mem second (Atomic.get current).snapshot.resident_graphs)
+      ) else (
       wait "Switch graph action mounts" (fun () -> Option.is_some (find "text" "Switch graph"));
       if scenario=`Current then
         wait "native swipe admission follows graph readiness" (fun () ->
@@ -6541,6 +6547,7 @@ let test_graph_picker_controls scenario () =
         for _ = 1 to 10 do range (); consume (hooks.pump ()) done;
         Alcotest.(check int) "same viewport reuses presence observations" 2 (Atomic.get inspections);
         Alcotest.(check int) "presence does not reconstruct the graph catalog" before !root_renders
+      | `Retry_local | `Retry_graph_phase -> ()
       | `Current ->
         Alcotest.(check bool) "current marker stays in catalog row" true
           (Option.is_some (find "text" "Current graph"));
@@ -6684,7 +6691,7 @@ let test_graph_picker_controls scenario () =
       | `Current_menu ->
         ignore (node ("graph-picker-options:" ^ Logseq_db_types.Graph_types.Uuid.to_string first));
         Alcotest.(check bool) "current protection explains switching first" true
-          (Option.is_some (find "text" "Switch graphs first.")))
+          (Option.is_some (find "text" "Switch graphs first."))))
 ;;
 
 (* Compose the production runtime's public completions with the Application
@@ -6997,6 +7004,8 @@ let () =
         Alcotest.test_case "typed native reason completes local discovery" `Quick (fun () -> test_local_account_failure_retries_local_discovery ~typed_reason:true ());
         Alcotest.test_case "retired native scope cannot fail local discovery" `Quick (fun () -> test_local_account_failure_retries_local_discovery ~retired_scope:true ())])
     ; ( "graph picker", [
+        Alcotest.test_case "failed resident local retry restarts open" `Quick (test_graph_picker_controls `Retry_local);
+        Alcotest.test_case "failed worker local retry restarts retained mirror" `Quick (test_graph_picker_controls `Retry_graph_phase);
         Alcotest.test_case "offline deletion is disabled with explanation" `Quick (test_graph_picker_controls `Offline);
         Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);
         Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);

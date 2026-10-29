@@ -5472,7 +5472,16 @@ let start
        | Ok graph_id ->
          let ids=Option.fold ~none:[] ~some:(fun (m:Graph_service.snapshot)->
            if m.resident_graphs=[] then Option.to_list m.selected_graph else m.resident_graphs) snapshot.manager in
-         if not (List.mem graph_id ids) && List.length ids>=3 then
+         let retry_local=Option.fold ~none:false ~some:(fun (m:Graph_service.snapshot)->
+           m.selected_graph=Some graph_id &&
+           Option.fold ~none:false ~some:(fun (error:Journal_startup.startup_error)->
+             error.recovery=Some Journal_startup.Retry_graph_open)
+             (Journal_startup.derive ~snapshot:m ~graph:snapshot.graph_state).error) snapshot.manager in
+         if retry_local then
+           Effect.bind (update (fun state->{state with graph_picker_open=false;resident_replacement=None;
+             local_copy_check=None;local_copy_message=None;modal=No_modal}))
+             ~f:(fun ()->send_manager (Graph_service.Select_graph graph_id))
+         else if not (List.mem graph_id ids) && List.length ids>=3 then
            update (fun state->{state with resident_replacement=Some value})
          else Effect.bind (update (fun state->{state with graph_picker_open=false;resident_replacement=None;
            local_copy_check=None;local_copy_message=None;modal=No_modal})) ~f:(fun ()->
