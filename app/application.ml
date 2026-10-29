@@ -6863,7 +6863,9 @@ let start
         let target=graph_model state owner in
         ignore(Journal_timeline.Store.synchronize (!timeline_store_cell) target.timeline : int);
         let inert={send=(fun _->());native=Ui.Event.Handler.create(fun _->())} in
-        let content=render_graph_timeline ~interactive:false ~header_signal:None
+        (* Native GraphPages blocks hit testing and accessibility for this pane;
+           inert dispatch prevents actions. Keep permission-derived row visuals. *)
+        let content=render_graph_timeline ~interactive:true ~header_signal:None
           ~store:(!timeline_store_cell) ~media_store:(!media_store_cell) ~dispatch:inert target
           |> V.Body.Private.to_widget in
         save_runtime ();List.iter (fun restore->restore ()) restore;active_runtime:=previous;content

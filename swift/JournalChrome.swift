@@ -252,6 +252,10 @@ struct JournalSheetDismissButton: SwiftUI.View {
       guard let request = handoff.request, request.target == properties.pageID else { return nil }
       return request.id
     }
+    private var presentationReady: (@MainActor @Sendable (String) -> Void)? {
+      guard let id = presentationNonce else { return nil }
+      return { page in _ = handoff.finish(id, page: page, current: properties.pageID) }
+    }
     var body: some SwiftUI.View {
       GeometryReader { bounds in
         ZStack(alignment: .topLeading) {
@@ -264,9 +268,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
           current
             .environment(\.journalGraphScrollScope, properties.pageID.map { JournalGraphScrollScope(pageID: $0, records: true) })
             .environment(\.journalGraphPresentationNonce, presentationNonce)
-            .environment(\.journalGraphPresentationReady, { [id = presentationNonce] page in
-              if let id { _ = handoff.finish(id, page: page, current: properties.pageID) }
-            })
+            .environment(\.journalGraphPresentationReady, presentationReady)
             .frame(width: bounds.size.width, height: bounds.size.height)
             .offset(x: translation)
             .allowsHitTesting(handoff.request == nil)
