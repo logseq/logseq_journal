@@ -11,6 +11,13 @@ private func start(
 private func picked(_ node: Int64, _ payload: UnsafePointer<CChar>?) -> Int32
 @_silgen_name("lui_ocaml_root_node")
 private func rootNode() -> Int64
+@_silgen_name("lui_ocaml_virtual_rows_version")
+private func virtualRowsVersion() -> Int32
+@_silgen_name("lui_ocaml_virtual_window")
+private func virtualWindow(
+  _ node: Int64, _ generation: Int64, _ first: Int64, _ last: Int64,
+  _ pins: UnsafePointer<Int64>?, _ count: Int32
+) -> Int32
 @_silgen_name("journal_ocaml_pump")
 private func pump() -> Int32
 @_silgen_name("lui_ocaml_stop")
@@ -64,6 +71,7 @@ private let receivePatch: PatchCallback = { source in
   }
 
   static func main() throws {
+    try check(virtualRowsVersion() == 1, "bounded-row capability unavailable")
     try check("{}".withCString { start(receivePatch, 2, 2, $0, 2) } == 1, "runtime failed to start")
     try check(patches.count == 1 && callbackFailure == nil, "startup callback failed")
     let node = (1 << 40) + 7
@@ -100,6 +108,13 @@ private let receivePatch: PatchCallback = { source in
       ),
       (.visibleRange(node: node, first: 0, last: 14), "visibleRange:0:14"),
       (.visibleRange(node: node, first: -1, last: -1), "visibleRange:-1:-1"),
+      (.virtualWindow(node: node, generation: node + 1, first: 10, last: 10, pins: []),
+        "virtualWindow:\(node + 1):10:10:"),
+      (.virtualWindow(node: node, generation: node + 1, first: 0, last: 14, pins: []),
+        "virtualWindow:\(node + 1):0:14:"),
+      (.virtualWindow(node: node, generation: node + 1, first: node + 2, last: node + 3,
+        pins: [node + 4, node + 5]),
+        "virtualWindow:\(node + 1):\(node + 2):\(node + 3):\(node + 4),\(node + 5)"),
       (.picked(node: node, payload: payload), "picked:" + payload),
       (
         .extension(
@@ -119,6 +134,20 @@ private let receivePatch: PatchCallback = { source in
       try check(callbackFailure == nil, "callback reentry failed: \(event)")
     }
     patches.removeAll()
+    for (id, generation, first, last, count) in [
+      (Int64(0), Int64(1), Int64(0), Int64(1), Int32(0)),
+      (Int64.max, 1, 0, 1, 0), (Int64(node), 0, 0, 1, 0),
+      (Int64(node), 1, -1, 1, 0), (Int64(node), 1, 2, 1, 0),
+      (Int64(node), 1, 0, 1, -1), (Int64(node), 1, 0, 1, 1),
+    ] {
+      try check(virtualWindow(id, generation, first, last, nil, count) == 0 && patches.isEmpty,
+        "invalid virtual window reached the runtime")
+    }
+    for invalidPin in [Int64(0), -1, Int64.max] {
+      var pin = invalidPin
+      try check(virtualWindow(Int64(node), 1, 0, 1, &pin, 1) == 0 && patches.isEmpty,
+        "invalid virtual pin reached the runtime")
+    }
     try check(picked(Int64(node), nil) == 0 && patches.isEmpty, "null payload produced an event")
     try check(extensionEvent(Int64(node), nil, nil) == 0, "null extension accepted")
     try check(

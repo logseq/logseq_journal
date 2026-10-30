@@ -324,6 +324,52 @@ LUI_EXPORT int32_t lui_ocaml_picked(int64_t node, const char *payload) {
   return dispatch_string("lui_ocaml_picked", node, payload);
 }
 
+LUI_EXPORT int32_t lui_ocaml_virtual_rows_version(void) {
+  return 1;
+}
+
+LUI_EXPORT int32_t lui_ocaml_virtual_window(int64_t node, int64_t generation,
+                                          int64_t first, int64_t last,
+                                          const int64_t *pins, int32_t count) {
+  const char *name = "lui_ocaml_virtual_window";
+  if (!runtime_started || node <= 0 || node > Max_long || generation <= 0 ||
+      generation > Max_long || first < 0 || last < first || last > Max_long ||
+      count < 0 || (count > 0 && pins == NULL)) {
+    completed(operation_for(name),4);
+    return 0;
+  }
+  for (int32_t index = 0; index < count; index++) {
+    if (pins[index] <= 0 || pins[index] > Max_long) {
+      completed(operation_for(name),4);
+      return 0;
+    }
+  }
+  patch_response response = pending_response(name,0);
+  caml_leave_blocking_section();
+  const value *dispatch = caml_named_value(name);
+  if (dispatch != NULL) {
+    CAMLparam0();
+    CAMLlocal3(list, cell, result);
+    CAMLlocalN(arguments, 5);
+    list = Val_emptylist;
+    for (int32_t index = count; index > 0; index--) {
+      cell = caml_alloc_small(2,0);
+      Field(cell,0) = Val_long(pins[index - 1]);
+      Field(cell,1) = list;
+      list = cell;
+    }
+    arguments[0] = Val_long(node);
+    arguments[1] = Val_long(generation);
+    arguments[2] = Val_long(first);
+    arguments[3] = Val_long(last);
+    arguments[4] = list;
+    result = caml_callbackN_exn(*dispatch,5,arguments);
+    response = copy_patch(name,result);
+    CAMLdrop;
+  }
+  return release_and_deliver(response);
+}
+
 LUI_EXPORT int32_t lui_ocaml_stop(void) {
   patch_response response = pending_response("lui_ocaml_dispose",0);
   caml_leave_blocking_section();

@@ -1239,6 +1239,9 @@ int32_t lui_ocaml_scroll_completed(int64_t n, int64_t token, const char *outcome
   { (void)n; (void)token; (void)outcome; return 1; }
 int32_t lui_ocaml_visible_range(int64_t n, int64_t first, int64_t last)
   { (void)n; (void)first; (void)last; return 1; }
+int32_t lui_ocaml_virtual_window(int64_t n, int64_t generation, int64_t first,
+    int64_t last, const int64_t *pins, int32_t count)
+  { (void)n; (void)generation; (void)first; (void)last; (void)pins; (void)count; return 1; }
 int32_t lui_ocaml_picked(int64_t n, const char *payload) { (void)n; (void)payload; return 1; }
 int32_t journal_ocaml_extension_event(int64_t n, const char *name, const char *p)
   { (void)n; (void)name; (void)p; return 1; }
