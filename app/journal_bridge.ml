@@ -72,6 +72,10 @@ let visible_range node first last =
   dispatch_lui (Lui_protocol.VisibleRange (node, first, last))
 ;;
 
+let virtual_window node generation first last pins =
+  dispatch_lui (Lui_protocol.VirtualWindow (node, generation, first, last, pins))
+;;
+
 let picked node payload = dispatch_lui (Lui_protocol.Picked (node, payload))
 let extension_event node name payload = (hooks ()).extension_event node name payload
 let pump () = (hooks ()).pump ()
@@ -110,6 +114,7 @@ let register hooks =
   Callback.register "lui_ocaml_slider_changed" slider_changed;
   Callback.register "lui_ocaml_scroll_completed" scroll_completed;
   Callback.register "lui_ocaml_visible_range" visible_range;
+  Callback.register "lui_ocaml_virtual_window" virtual_window;
   Callback.register "lui_ocaml_picked" picked;
   Callback.register "lui_ocaml_dispose" dispose;
   Callback.register "lui_ocaml_root_node" root_node;

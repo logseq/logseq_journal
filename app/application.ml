@@ -7032,6 +7032,7 @@ let start
   in
   let app =
     Lui_app.create_with_extensions
+      ~virtual_rows:(Lui_native_bridge.virtual_rows_supported host_code)
       backend
       Journal_lui_native.registry
       initial_state

@@ -54,6 +54,11 @@ private func luiOCamlScrollCompleted(
 ) -> Int32
 @_silgen_name("lui_ocaml_visible_range")
 private func luiOCamlVisibleRange(_ node: Int64, _ first: Int64, _ last: Int64) -> Int32
+@_silgen_name("lui_ocaml_virtual_window")
+private func luiOCamlVirtualWindow(
+  _ node: Int64, _ generation: Int64, _ first: Int64, _ last: Int64,
+  _ pins: UnsafePointer<Int64>?, _ count: Int32
+) -> Int32
 @_silgen_name("lui_ocaml_picked")
 private func luiOCamlPicked(_ node: Int64, _ payload: UnsafePointer<CChar>?) -> Int32
 @_silgen_name("journal_ocaml_extension_event")
@@ -99,6 +104,12 @@ private func journalOCamlExtensionEvent(
       return outcome.withCString { luiOCamlScrollCompleted(Int64(node), Int64(token), $0) }
     case .visibleRange(let node, let first, let last):
       return luiOCamlVisibleRange(Int64(node), Int64(first), Int64(last))
+    case .virtualWindow(let node, let generation, let first, let last, let pins):
+      guard pins.count <= Int32.max else { return 0 }
+      return pins.map(Int64.init).withUnsafeBufferPointer {
+        luiOCamlVirtualWindow(Int64(node), Int64(generation), Int64(first), Int64(last),
+          $0.baseAddress, Int32($0.count))
+      }
     case .picked(let node, let payload):
       return payload.withCString { luiOCamlPicked(Int64(node), $0) }
     case .extension(let node, _, let name, let values):

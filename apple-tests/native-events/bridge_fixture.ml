@@ -78,6 +78,9 @@ let dispatch = function
     patch node (Printf.sprintf "scrollCompleted:%d:%s" token outcome)
   | VisibleRange (node, first, last) ->
     patch node (Printf.sprintf "visibleRange:%d:%d" first last)
+  | VirtualWindow (node, generation, first, last, pins) ->
+    patch node (Printf.sprintf "virtualWindow:%d:%d:%d:%s" generation first last
+      (String.concat "," (List.map string_of_int pins)))
   | Picked (node, payload) -> patch node ("picked:" ^ payload)
   | PressModifiers (node, modifiers) -> patch node ("pressModifiers:" ^ string_of_int modifiers)
   | PressDetail (node, detail) -> pointer_patch "pressDetail" node detail
@@ -87,6 +90,9 @@ let dispatch = function
   | PointerLeave node -> patch node "pointerLeave"
   | ContextMenuPress (node, detail) -> pointer_patch "contextMenuPress" node detail
   | Load node -> patch node "load"
+  | NavigatePrevious _ | NavigateNext _ | NavigationKey _ | ScrollEdges _
+  | PointerMove _ | PointerCancel _ | ToggleChangedDetail _ ->
+    failwith "event is not emitted by the Apple host"
   | ExtensionEvent _ -> failwith "extension bypassed its host hook"
 ;;
 
