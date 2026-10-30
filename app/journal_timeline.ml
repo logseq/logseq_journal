@@ -33,6 +33,7 @@ module Store = struct
     { epoch : int
     ; mutable active : bool
     ; callback : unit -> unit
+    ; mutable pending : bool
     }
 
   type shape =
@@ -49,6 +50,7 @@ module Store = struct
     ; mutable shape : (int * shape list) option
     ; mutable revision : int
     ; mutable epoch : int
+    ; mutable active : bool
     ; mutable serial : int
     }
 
@@ -62,6 +64,7 @@ module Store = struct
     ; shape = None
     ; revision = 0
     ; epoch = 0
+    ; active = true
     ; serial = 0
     }
   ;;
@@ -73,7 +76,7 @@ module Store = struct
   let subscribe_scroll t callback =
     t.serial <- t.serial + 1;
     let id = t.serial in
-    let listener = { epoch = t.epoch; active = true; callback } in
+    let listener = { epoch = t.epoch; active = true; callback; pending=false } in
     Hashtbl.add t.scroll_listeners id listener;
     fun () ->
       listener.active <- false;
@@ -84,8 +87,9 @@ module Store = struct
     if t.scroll_target <> target then (
       t.scroll_target <- target;
       let listeners = Hashtbl.fold (fun _ value rest -> value :: rest) t.scroll_listeners [] in
-      List.iter (fun listener ->
-        if listener.active && listener.epoch = t.epoch then listener.callback ()) listeners)
+      List.iter (fun (listener:listener) ->
+        if listener.active && listener.epoch = t.epoch then
+          if t.active then listener.callback () else listener.pending<-true) listeners)
   ;;
 
   let subscribe t block_id callback =
@@ -99,7 +103,7 @@ module Store = struct
     in
     t.serial <- t.serial + 1;
     let id = t.serial in
-    let listener = { epoch = t.epoch; active = true; callback } in
+    let listener = { epoch = t.epoch; active = true; callback; pending=false } in
     Hashtbl.add bucket id listener;
     fun () ->
       if listener.active
@@ -114,13 +118,25 @@ module Store = struct
       (fun bucket ->
          let listeners = Hashtbl.fold (fun _ value rest -> value :: rest) bucket [] in
          List.iter
-           (fun listener ->
+           (fun (listener:listener) ->
               if listener.active && listener.epoch = t.epoch
               then (
-                t.observe "timeline-item-notify";
-                listener.callback ()))
+                if t.active then (t.observe "timeline-item-notify";listener.callback ())
+                else listener.pending<-true))
            listeners)
       (Hashtbl.find_opt t.listeners block_id)
+  ;;
+
+  let set_active t active =
+    if t.active<>active then (
+      t.active<-active;
+      if active then (
+        let rows=Hashtbl.fold(fun _ bucket rest->
+          Hashtbl.fold(fun _ listener rest->listener::rest) bucket rest) t.listeners [] in
+        let pending=Hashtbl.fold(fun _ listener rest->listener::rest) t.scroll_listeners rows in
+        List.iter(fun (listener:listener)->
+          if listener.pending && listener.active && listener.epoch=t.epoch && t.active then (
+            listener.pending<-false;listener.callback ())) pending))
   ;;
 
   (* Only a changed timeline presentation reaches this traversal. Media,

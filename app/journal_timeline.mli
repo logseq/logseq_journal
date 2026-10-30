@@ -5,6 +5,7 @@ module Store : sig
 
   val create : ?observe:(string -> unit) -> unit -> t
   val synchronize : t -> Journal_timeline_state.t -> int
+  val set_active : t -> bool -> unit
 
   (* Return the native collection's structural presentation revision. Only
       actual timeline changes reconcile retained slots; item publications go

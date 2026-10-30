@@ -10,6 +10,10 @@ module Store : sig
   val find : t -> string -> Journal_media_runtime.view option
   val update : t -> root:string -> Journal_media_runtime.view option -> unit
 
+  (** Data keeps advancing while hidden; each dirty subscription catches up once. *)
+  val set_active : t -> bool -> unit
+  val set_interactive : t -> bool -> unit
+
   (* Reset presentation and fence subscribers from the previous graph/session. *)
   val reset : t -> unit
 end

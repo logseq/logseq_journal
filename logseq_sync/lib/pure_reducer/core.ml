@@ -4287,7 +4287,13 @@ let restore_visible core id =
 let run_session core (identity : graph_scope) event =
   let core=remember_current core in
   match List.find_opt (fun s -> s.saved_identity=identity) core.resident_sessions with
-  | None -> unchanged core
+  | None ->
+    (match event with
+     | Asset_requested request ->
+       {next=core;effects=[asset_output request (Error Asset_cancelled)]}
+     | Protected_requested request ->
+       {next=core;effects=[protected_output request (Error(Effect_failed "Protected-value request expired"))]}
+     | _->unchanged core)
   | Some session ->
     let visible=visible_identity core in
     let shared=core.public_state.snapshot in
@@ -4306,6 +4312,9 @@ let run_session core (identity : graph_scope) event =
     let updated=if fresh=identity then updated else {updated with
       resident_sessions=List.filter(fun session->session.saved_identity<>identity) updated.resident_sessions} in
     let next=remember_session fresh updated |> fun core -> restore_visible core visible in
+    (* A cleanup-only lens must not replace the account's picker or startup
+       authority when no graph is visible. Its tickets still advance above. *)
+    let next=if visible=None then {next with public_state=core.public_state} else next in
     {next;effects=if visible=Some fresh.graph_id then transition.effects
       else scoped_publications fresh transition.effects}
 let empty_session core =
@@ -4375,11 +4384,27 @@ let resume_resident_network core =
     next,effects @ (if original=Some session.saved_identity.graph_id then resumed.effects
       else scoped_publications session.saved_identity resumed.effects)) (remember_current core,[]) sessions in
   {next=restore_visible next original;effects}
+let cleanup_session core session =
+  let empty=freeze_session session.saved_identity (initial core.config |> Result.get_ok) in
+  {empty with saved_asset_known_scopes=session.saved_asset_known_scopes;
+    saved_asset_retirement_observed=session.saved_asset_retirement_observed;
+    saved_assets_pending=session.saved_assets_pending;
+    saved_protected_pending=session.saved_protected_pending}
 let prune_sessions core =
-  {core with resident_sessions=List.filter (fun s ->
-    List.mem s.saved_identity.graph_id core.resident_order || s.saved_current_graph_scope<>None
-    || s.saved_websocket_owner<>None || s.saved_pending_effects<>[]
-    || s.saved_assets_pending<>[] || s.saved_protected_pending<>[]) core.resident_sessions}
+  {core with resident_sessions=List.filter_map (fun session ->
+    if List.mem session.saved_identity.graph_id core.resident_order
+       || session.saved_current_graph_scope<>None || session.saved_websocket_owner<>None
+       || session.saved_pending_effects<>[] || session.saved_assets_pending<>[]
+       || session.saved_protected_pending<>[]
+    then Some session
+    else if session.saved_asset_known_scopes=[]
+      || session.saved_identity.account.account_generation<>core.public_state.snapshot.startup.account_generation
+    then None
+    else (
+      (* Retained native pages may release their admitted file leases after
+         the graph has closed. Keep only cleanup ownership and retirement
+         fences; the closed graph's snapshot, key and network state are gone. *)
+      Some(cleanup_session core session))) core.resident_sessions}
 let step core event =
   match event with
   | Resident_graphs_changed ids -> configure_residents core ids
@@ -4405,11 +4430,19 @@ let step core event =
      | _ -> {transition with next})
   | Local_graph_outbox_changed scope -> run_session core scope Local_outbox_changed
   | Account_authenticated {user_id} when user_id=None || user_id<>core.user_id ->
-    let retired=List.filter (fun s -> List.mem s.saved_identity.graph_id core.resident_order) (remember_current core).resident_sessions in
-    let closes=List.concat_map (fun s -> (step_graph_policy (restore_session core s) Graph_picker_requested).effects
-      |> scoped_publications s.saved_identity) retired in
+    let retired=(remember_current core).resident_sessions in
+    let closed,closes=List.fold_left(fun(sessions,effects) session ->
+      if not(List.mem session.saved_identity.graph_id core.resident_order) then session::sessions,effects
+      else let part=step_graph_policy (restore_session core session) Graph_picker_requested in
+        freeze_session session.saved_identity part.next::sessions,
+        effects @ scoped_publications session.saved_identity part.effects) ([],[]) retired in
     let signed_out=step_graph_policy core event in
-    {next={signed_out.next with resident_order=[];resident_sessions=[];
+    (* Account cleanup owns the old physical files. Already admitted requests
+       must still receive their completion while their native owners retire. *)
+    let cleanup=List.filter_map(fun session ->
+      if session.saved_assets_pending=[] && session.saved_protected_pending=[] then None
+      else Some(cleanup_session signed_out.next session)) closed in
+    {next={signed_out.next with resident_order=[];resident_sessions=cleanup;
       public_state={signed_out.next.public_state with snapshot={signed_out.next.public_state.snapshot with resident_graphs=[]}}};
       effects=closes @ signed_out.effects}
   | Online_cancelled scope when startup_scope_is_current core scope ->

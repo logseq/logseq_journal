@@ -6535,6 +6535,13 @@ let test_graph_picker_controls scenario () =
     if List.assoc_opt key values = Some (`String value) then Some id else found) props None in
   let node name = match find "accessibility-identifier" name with
     | Some id -> id | None -> failwith ("Missing " ^ name) in
+  let picker_list () =
+    let marker=node "graph-picker-list" in
+    let rec belongs id = id=marker || match Hashtbl.find_opt page_parents id with
+      | None->false | Some parent->belongs parent in
+    Hashtbl.to_seq props |> Seq.find_map(fun(id,fields)->
+      if List.assoc_opt "_extension" fields=Some(`String "journal-list") && belongs id then Some id else None)
+    |> Option.get in
   let press id = consume (hooks.dispatch (Lui_protocol.Press id)) in
   let wait label predicate =
     let deadline = Unix.gettimeofday () +. 3. in
@@ -6580,16 +6587,16 @@ let test_graph_picker_controls scenario () =
         | Some (`String payload) when String.contains payload 'g' ->
           (try if Yojson.Safe.Util.(Yojson.Safe.from_string payload |> member "mode" |> to_string)="graph-pages" then Some id else None with _->None)
         | _->None) |> Option.get in
-      Alcotest.(check int) "native page retains both content and empty preview slots" 2
+      Alcotest.(check int) "native page retains its materialized graph while picker covers it" 1
         (Hashtbl.to_seq_values page_parents |> Seq.filter((=)page) |> Seq.length);
       wait "graph list mounts" (fun () -> Option.is_some (find "accessibility-identifier" "graph-picker-list"));
       if scenario = `Current then (
-        let list = Option.get (find "_extension" "journal-list") in
+        let list = picker_list () in
         consume (hooks.extension_event list "event"
           {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":3,\"last\":7}"}|});
         wait "visible resident local presence checks complete" (fun () -> Atomic.get inspections >= 4));
       if scenario = `Late_presence then (
-        let list = Option.get (find "_extension" "journal-list") in
+        let list = picker_list () in
         consume (hooks.extension_event list "event"
           {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":4,\"last\":5}"}|});
         wait "automatic inspection is held in flight" (fun () -> Atomic.get inspections = 1));
@@ -6622,7 +6629,7 @@ let test_graph_picker_controls scenario () =
           (Option.is_some (find "text" long_name))
       | `Visible ->
         let before = !root_renders in
-        let list = Option.get (find "_extension" "journal-list") in
+        let list = picker_list () in
         let range () = consume (hooks.extension_event list "event"
           {|{"id":1,"payload":"{\"type\":\"visible_range\",\"first\":0,\"last\":9223372036854775807}"}|}) in
         range ();

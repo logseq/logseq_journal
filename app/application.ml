@@ -3158,6 +3158,8 @@ let start
   let processing_owner : Graph_service.timeline_scope option ref = ref None in
   let visible_owner : Graph_service.timeline_scope option ref = ref None in
   let preview_owner = ref None in
+  let landed_owner = ref None in
+  let presentation_enabled = ref true in
   let pending_graph_pushes = Hashtbl.create 3 in
   let graph_cells : ((unit -> unit -> unit) * (unit -> unit)) list ref = ref [] in
   let graph_ref make =
@@ -3293,19 +3295,18 @@ let start
      | _->());
     result
   in
-  let pending_focus_refresh = ref None in
+  let pending_scope_refreshes = Hashtbl.create 3 in
   let try_focus_refresh owner =
     match dispatch_worker (Graph_service.Get_graph_state_at owner) with
-    | Worker.Accepted _ | Stopping -> pending_focus_refresh:=None
-    | Full | Not_ready -> pending_focus_refresh:=Some owner
+    | Worker.Accepted _ | Stopping -> Hashtbl.remove pending_scope_refreshes (owner_key owner)
+    | Full | Not_ready -> Hashtbl.replace pending_scope_refreshes (owner_key owner) owner
   in
   let drain_focus_refresh () =
     Effect.of_thunk (fun () ->
-      match !pending_focus_refresh with
-      | Some owner when runtime_owner_is_live !state_ref owner
-          && model_key !state_ref=Some(owner_key owner) -> try_focus_refresh owner
-      | Some _ -> pending_focus_refresh:=None
-      | None -> ())
+      Hashtbl.to_seq_values pending_scope_refreshes |> List.of_seq
+      |> List.iter (fun owner ->
+        if runtime_owner_is_live !state_ref owner then try_focus_refresh owner
+        else Hashtbl.remove pending_scope_refreshes (owner_key owner)))
   in
   let cancel_copy () =
     let state, _ = Journal_copy.step !copy_state Cancel in
@@ -3424,7 +3425,12 @@ let start
   let timeline_store_cell = graph_ref (fun () ->
     Journal_timeline.Store.create ~observe:on_view_region ()) in
   let timeline_store_generation = graph_ref (fun () -> initial_state.graph_state.generation) in
+  let presentation_owner () = match !landed_owner with
+    | Some key->Some key | None->Option.map owner_key !visible_owner in
   let prepare_presentation state =
+    let owner=model_key state in
+    let active=(owner=presentation_owner () && !presentation_enabled) || (owner<>None && owner= !preview_owner) in
+    Journal_timeline.Store.set_active (!timeline_store_cell) active;
     if !timeline_store_generation <> state.graph_state.generation
     then (
       timeline_store_generation := state.graph_state.generation;
@@ -3474,6 +3480,10 @@ let start
         if media_key state <> context
         then state
         else (
+          let owner=Option.map owner_key (current_owner ()) in
+          let active = (owner=presentation_owner () && !presentation_enabled)
+            || (owner<>None && owner= !preview_owner) in
+          Journal_media_view.Store.set_active (!media_store_cell) active;
           List.iter
             (fun (root, (view : Journal_media_runtime.view)) ->
                let empty = view.items = [] && view.error = None && not view.more in
@@ -3827,9 +3837,9 @@ let start
     then cancel_copy ();
     let start_graph =
       match graph_state.phase with
-      | Graph_open when Option.is_some !processing_owner
-          && Option.map owner_key !processing_owner <> Option.map owner_key !visible_owner
-          && Option.map owner_key !processing_owner <> !preview_owner -> Effect.ignore
+      (* Prepare each resident's first feed once, without mounting its UI.
+         A first swipe can then display its own data even while another graph
+         has a pending save. Later hidden invalidations remain deferred. *)
       | Graph_open ->
         let graph_key =
           Option.map Logseq_db_types.Graph_types.Uuid.to_string graph_state.graph_id
@@ -3955,6 +3965,12 @@ let start
   let termination_in_flight = ref false in
   let apply_manager_transition set_state set_state_and_effect manager_state =
     let manager = manager_state.Graph_service.snapshot in
+    let previous_scopes = match !state_ref.manager with
+      | None -> []
+      | Some previous -> List.map (fun scope -> owner_key (timeline_owner_of_scope scope)) previous.resident_scopes
+    in
+    let admitted_scopes = List.filter (fun scope ->
+      not (List.mem (owner_key (timeline_owner_of_scope scope)) previous_scopes)) manager.resident_scopes in
     retire_absent_runtimes { !state_ref with manager=Some manager };
     let previous_owner =
       Option.map
@@ -4017,18 +4033,20 @@ let start
     Effect.bind update ~f:(fun () ->
       let snapshot = !state_ref in
       Effect.many
-        [ (* A new graph's open push can precede the membership publication
-             and be fenced by the old scope list. Pull its state on focus. *)
-          (if owner_changed && not graph_already_current then
-             Effect.of_thunk (fun () ->
-               Option.iter (fun graph_id ->
-                 let owner : Graph_service.timeline_scope =
-                   {startup={account_generation=manager.startup.account_generation;
-                     presentation_generation=manager.startup.presentation_generation};
-                    graph_id;graph_generation=manager.startup.graph_generation} in
-                 try_focus_refresh owner)
-                 manager.selected_graph)
-           else Effect.ignore)
+        [ (* Open can precede membership and be fenced. Refresh every newly
+             admitted owner once, including hidden graphs, without mounting UI. *)
+          Effect.of_thunk (fun () ->
+            List.iter (fun scope -> try_focus_refresh (timeline_owner_of_scope scope)) admitted_scopes;
+            if owner_changed && not graph_already_current then
+              Option.iter (fun graph_id ->
+                let owner : Graph_service.timeline_scope =
+                  {startup={account_generation=manager.startup.account_generation;
+                    presentation_generation=manager.startup.presentation_generation};
+                   graph_id;graph_generation=manager.startup.graph_generation} in
+                if not (List.exists (fun scope ->
+                  owner_key (timeline_owner_of_scope scope)=owner_key owner) admitted_scopes)
+                then try_focus_refresh owner)
+                manager.selected_graph)
         ; sign_out
         ; termination_ready
         ; observe_graph_state set_state set_state_and_effect snapshot.graph_state
@@ -5457,17 +5475,19 @@ let start
       (match next_resident_owner snapshot with
        | None->Effect.ignore
        | Some owner ->
-         preview_owner:=Some(owner_key owner);
+         landed_owner:=None;preview_owner:=Some(owner_key owner);
          Effect.bind (update(fun state->{state with graph_preview=Some(Logseq_db_types.Graph_types.Uuid.to_string owner.graph_id)}))
            ~f:(fun ()->Effect.of_thunk(fun ()->run_owned (Some owner) (fun ()->Effect.of_thunk(fun ()->
              ignore(dispatch_worker Graph_service.Get_graph_state : Worker.send_result))))))
     | Graph_swipe_commit ->
       (match next_resident_owner snapshot with
        | Some owner when snapshot.graph_preview=Some(Logseq_db_types.Graph_types.Uuid.to_string owner.graph_id) ->
-         send_manager(Graph_service.Focus_resident_graph owner.graph_id)
+         landed_owner:=Some(owner_key owner);
+         Effect.bind (update(fun state->{state with graph_preview_revision=state.graph_preview_revision+1}))
+           ~f:(fun ()->send_manager(Graph_service.Focus_resident_graph owner.graph_id))
        | _->update(fun state->{state with graph_preview=None}))
     | Graph_swipe_cancel ->
-      preview_owner:=None;update(fun state->{state with graph_preview=None})
+      landed_owner:=None;preview_owner:=None;update(fun state->{state with graph_preview=None})
     | Cancel_resident_replacement -> update (fun state->{state with resident_replacement=None})
     | Remove_resident value ->
       let ids=Option.fold ~none:[] ~some:(fun (m:Graph_service.snapshot)->
@@ -5706,7 +5726,7 @@ let start
         | _ -> state, Effect.ignore)
     | Sign_out ->
       pending_startup_commands:=[];
-      pending_focus_refresh:=None;
+      Hashtbl.clear pending_scope_refreshes;
       cancel_copy ();
       retire_graph_scope ();
       started_graph_generation := None;
@@ -5986,25 +6006,6 @@ let start
           send (Native_payload payload))
     }
   in
-  let timeline_scroll_completed =
-    Ui.Event.Handler.create ~name:"timeline-scroll-completed" (fun payload ->
-      let generation = !state_ref.graph_state.generation in
-      Effect.run
-        (match V.Native_list.completion_of_payload payload with
-         | None -> Effect.ignore
-         | Some completion ->
-           set_state (fun state ->
-             if state.graph_state.generation <> generation
-             then state
-             else (
-               let timeline =
-                 Journal_timeline_state.complete_scroll
-                   state.timeline
-                   ~token:completion.token
-                   ~outcome:completion.outcome
-               in
-               if timeline == state.timeline then state else { state with timeline }))))
-  in
   (* Every [Edge.on_change] of the bonsai version becomes a post-update key
      comparison: the key is recomputed from the new model and the callback
      fires when it differs from the previous post-update value. *)
@@ -6106,7 +6107,7 @@ let start
       | Some saved -> saved
       | None -> step_root initial_state (Graph_focused {generation=owner.graph_generation;graph_id=owner.graph_id}) in
     let manager=match saved.manager,root.manager with
-      | Some saved,Some shared -> Some {saved with catalog=shared.catalog;resident_graphs=shared.resident_graphs;
+      | Some saved,Some shared -> Some {saved with catalog=shared.catalog;resident_graphs=shared.resident_graphs;resident_scopes=shared.resident_scopes;
           startup={saved.startup with authenticated=shared.startup.authenticated;account_generation=shared.startup.account_generation}}
       | None,Some shared -> Some {shared with selected_graph=Some owner.graph_id;
           startup={shared.startup with graph_generation=owner.graph_generation;presentation_generation=owner.startup.presentation_generation}}
@@ -6121,7 +6122,9 @@ let start
     Option.iter activate_runtime (timeline_scope model);
     let previous= !processing_owner in
     processing_owner:=timeline_scope model;
-    if visible then visible_owner:=timeline_scope model;
+    if visible then (
+      visible_owner:=timeline_scope model;
+      if model.graph_preview=None then preview_owner:=None);
     let model=track_capture_session model in
     state_ref:=model;
     Option.iter (fun calendar->Journal_graph_runtime.set_calendar (!graph_runtime_cell) calendar) model.calendar;
@@ -6287,17 +6290,14 @@ let start
       && left.capture_error_owner = right.capture_error_owner
     | _ -> left == right
   in
-  let equal_shell_presentation left right =
-    left.graph_preview=right.graph_preview && left.graph_preview_revision=right.graph_preview_revision
-    && graph_switch_enabled left=graph_switch_enabled right
-    && next_resident_owner left=next_resident_owner right
-    && Option.map (fun (m:Graph_service.snapshot)->m.resident_scopes) left.manager
-       = Option.map (fun (m:Graph_service.snapshot)->m.resident_scopes) right.manager
-    && left.graph_state.generation = right.graph_state.generation
-    && left.graph_state.graph_id = right.graph_state.graph_id
-    && left.environment.platform = right.environment.platform
+  let equal_host_shell left right =
+    left.graph_state.generation=right.graph_state.generation
+    && left.graph_state.graph_id=right.graph_state.graph_id
+    && Option.map (fun (manager:Graph_service.snapshot)->manager.startup.account_generation) left.manager
+       = Option.map (fun (manager:Graph_service.snapshot)->manager.startup.account_generation) right.manager
+    && left.environment.platform=right.environment.platform
   in
-  let body_view model_signal header_signal state dispatch timeline_scroll_completed =
+  let body_view ~graph_host ~timeline_store ~media_store ~set_state model_signal header_signal state dispatch timeline_scroll_completed =
     let region name ~equal build =
       V.of_lui
         (Lui_elements.stack
@@ -6542,16 +6542,14 @@ let start
     in
     let root =
       region "root" ~equal:equal_root_presentation (fun state ->
-        match Journal_startup.Presentation.screen state.startup_presentation with
-        | _ when state.graph_picker_open -> manager_page ~picker_signal:model_signal state dispatch
-        | Waiting | Interaction _ | Account_failure -> manager_page ~picker_signal:model_signal state dispatch
-        | Timeline ->
-          render_graph_timeline ~interactive:true ~header_signal:(Some header_signal)
-            ~store:(!timeline_store_cell) ~media_store:(!media_store_cell) ~dispatch state
-          |> fun content -> V.of_lui (Lui_elements.stack ~grow:1.
-              ~on_appear:(fun _ -> Option.iter (fun scope ->
+        if not graph_host then manager_page ~picker_signal:model_signal state dispatch else
+        render_graph_timeline ~interactive:true ~header_signal:(Some header_signal)
+          ~store:timeline_store ~media_store ~dispatch state
+        |> fun content -> V.of_lui (Lui_elements.stack ~grow:1.
+            ~on_appear:(fun _ -> Option.iter (fun scope ->
+              if model_key !state_ref=Some(owner_key scope) then
                 Effect.run (send_manager (Graph_service.Acknowledge_timeline_presented scope))) (timeline_scope state))
-              [Ui.mount content]))
+            [Ui.mount content]))
     in
     let capture_adapter =
       region "capture-import" ~equal:equal_capture_presentation (fun current ->
@@ -6679,7 +6677,7 @@ let start
                        in
                        Journal_view.mount
                          (detail_page
-                            ~media_store:(!media_store_cell)
+                            ~media_store
                             ~on_region:on_view_region
                             ~state:focused
                             ~on_scroll_completed:completion
@@ -6856,71 +6854,173 @@ let start
         ; settings
         ]
     in
-    let preview=match state.graph_preview,next_resident_owner state with
-      | Some id,Some owner when id=Logseq_db_types.Graph_types.Uuid.to_string owner.graph_id ->
-        let restore=snapshot_cells () and previous= !active_runtime in
-        activate_runtime owner;
-        let target=graph_model state owner in
-        ignore(Journal_timeline.Store.synchronize (!timeline_store_cell) target.timeline : int);
-        let inert={send=(fun _->());native=Ui.Event.Handler.create(fun _->())} in
-        let content=render_graph_timeline ~interactive:false ~header_signal:None
-          ~store:(!timeline_store_cell) ~media_store:(!media_store_cell) ~dispatch:inert target
-          |> V.Body.Private.to_widget in
-        save_runtime ();List.iter (fun restore->restore ()) restore;active_runtime:=previous;content
-      | _->V.empty () in
-    let can_switch=graph_switch_enabled state in
-    let resident_page_ids = Option.fold ~none:[] ~some:(fun (manager:Graph_service.snapshot)->
-      List.map (fun (scope:Graph_service.asset_scope)->owner_key
-        {startup={account_generation=scope.account.account_generation;presentation_generation=scope.account.presentation_generation};
-         graph_id=scope.graph_id;graph_generation=scope.graph_generation}) manager.resident_scopes) state.manager in
-    let body=Journal_header.graph_pages ~enabled:can_switch
-      ~resident_page_ids ~target_page_id:(Option.map owner_key (next_resident_owner state))
-      ~page_id:(Option.value (model_key state) ~default:"startup")
-      ~target_id:state.graph_preview ~on_prepare:(fun ()->dispatch.send Graph_swipe_prepare)
-      ~on_commit:(fun ()->dispatch.send Graph_swipe_commit) ~on_cancel:(fun ()->dispatch.send Graph_swipe_cancel)
-      ~current:body ~preview in
     V.Body.theme ~data:(application_theme ()) (V.Body.static body)
   in
+  let show_graphs state =
+    not state.graph_picker_open &&
+    match Journal_startup.Presentation.screen state.startup_presentation with
+    | Timeline -> true
+    | Waiting | Interaction _ | Account_failure -> false
+  in
+  let live_owners state = match state.manager with
+    | None -> []
+    | Some manager when manager.resident_graphs=[] -> Option.to_list (timeline_scope state)
+    | Some manager -> List.filter_map (fun id->
+        List.find_opt (fun (scope:Graph_service.asset_scope)->scope.graph_id=id
+          && scope.account.account_generation=manager.startup.account_generation) manager.resident_scopes
+        |> Option.map timeline_owner_of_scope) manager.resident_graphs
+  in
+  let header state =
+    { Journal_header.sync_phase=Option.map (fun (m:Graph_service.snapshot)->m.sync_phase) state.manager
+    ; sync_error=Option.map (fun notice->sync_failure_message notice.failure) state.sync_error
+    ; error_available=error_info_available state
+    ; local_deletion_available=local_deletion_available state
+    ; capture_enabled=state.write_enabled && state.pending_delete=None && state.pending_status=None && not(capture_saving state) }
+  in
   let view context model_signal _send =
-    let header_signal =
-      Signal.map
-        (fun state ->
-           { Journal_header.sync_phase =
-               Option.map
-                 (fun (manager : Graph_service.snapshot) -> manager.sync_phase)
-                 state.manager
-           ; sync_error =
-               Option.map
-                 (fun notice -> sync_failure_message notice.failure)
-                 state.sync_error
-           ; error_available =
-               error_info_available state
-           ; local_deletion_available = local_deletion_available state
-           ; capture_enabled =
-               state.write_enabled
-               && Option.is_none state.pending_delete
-               && Option.is_none state.pending_status
-               && not (capture_saving state)
-           })
-        model_signal
+    let materialized=ref [] in
+    let owners=Signal.state context.Lui_ui.ui_scheduler [] in
+    let payload=Signal.state context.ui_scheduler "{}" in
+    let refreshers=Hashtbl.create 3 in
+    let root ()=Signal.sample model_signal in
+    let host_model state owner =
+      let model=graph_model state owner in
+      {model with graph_picker_open=false;resident_replacement=None;graph_preview=None;graph_preview_revision=0} in
+    let eligible state owner =
+      show_graphs state && (presentation_owner ()=Some(owner_key owner)
+        || (!preview_owner=Some(owner_key owner) && state.graph_preview<>None)) in
+    let with_runtime owner build =
+      let restore=snapshot_cells () and previous= !active_runtime in
+      activate_runtime owner;
+      Fun.protect ~finally:(fun ()->save_runtime ();List.iter (fun restore->restore ()) restore;active_runtime:=previous) build in
+    let refresh state =
+      if state.graph_preview=None then (preview_owner:=None;landed_owner:=None);
+      presentation_enabled:=show_graphs state;
+      let live=live_owners state in
+      let selected=model_key state in
+      let wanted owner = List.mem (owner_key owner) !materialized
+        || (selected=Some(owner_key owner) && show_graphs state)
+        || (!preview_owner=Some(owner_key owner) && state.graph_preview<>None) in
+      let next=List.filter wanted live in
+      materialized:=List.map owner_key next;
+      Signal.set owners next;
+      List.iter (fun owner ->
+        match Hashtbl.find_opt refreshers (owner_key owner) with
+        | None->()
+        | Some refresh->refresh state) next;
+      let json=Yojson.Safe.to_string (`Assoc
+        ["mode",`String "graph-pages";"visible",`Bool(show_graphs state)
+        ;"enabled",`Bool(graph_switch_enabled state)
+        ;"pageID",(match selected with Some id->`String id | None->`Null)
+        ;"targetID",(match state.graph_preview with Some id->`String id | None->`Null)
+        ;"targetPageID",(match next_resident_owner state with Some owner->`String(owner_key owner) | None->`Null)
+        ;"residentPageIDs",`List(List.map(fun owner->`String(owner_key owner))live)
+        ;"slotOwners",`List(List.map(fun owner->`String(owner_key owner))next)
+        ;"loadingPageIDs",`List(List.filter_map(fun owner->let model=host_model state owner in
+            if not model.feed_loaded || Option.is_some model.graph_error
+            then Some(`String(owner_key owner)) else None)next)]) in
+      if Signal.sample (Signal.value payload)<>json then Signal.set payload json
     in
-    Signal.on_dispose context.Lui_ui.ui_scope (fun () ->
-      Signal.dispose_signal header_signal);
-    (* Dynamic elements mount under a parent, so the root must be a static
-       container. *)
-    Lui_elements.column
-      [ Lui_elements.dyn
-          ~equal:equal_shell_presentation
-          (fun model ->
-             Journal_view.mount
-               (body_view
-                  model_signal
-                  header_signal
-                  model
-                  dispatch
-                  timeline_scroll_completed))
-          model_signal
-      ]
+    let host owner_source host_context parent =
+      let owner=Signal.sample owner_source in
+      let key=owner_key owner in
+      let initial=host_model (root ()) owner in
+      let timeline_store,media_store=with_runtime owner (fun ()-> !timeline_store_cell,!media_store_cell) in
+      let presentation_state=Signal.state host_context.Lui_ui.ui_scheduler initial in
+      let source=Signal.value presentation_state in
+      let presentation_header=Signal.map header source in
+      let hide_presenters state =
+        {state with modal=No_modal;asset_settings_open=false;capture_picker_armed=false} in
+      let update state =
+        let active=eligible state owner in
+        let focused=model_key state=Some key && presentation_owner ()=Some key && show_graphs state in
+        Journal_media_view.Store.set_interactive media_store focused;
+        Journal_media_view.Store.set_active media_store active;
+        Journal_timeline.Store.set_active timeline_store active;
+        if active then (
+          let next=host_model state owner in
+          let next=if focused then next else hide_presenters next in
+          let timeline_structure_revision=Journal_timeline.Store.synchronize timeline_store next.timeline in
+          Signal.set presentation_state {next with timeline_structure_revision})
+        else (
+          let frozen=Signal.sample source in
+          if frozen.modal<>No_modal || frozen.asset_settings_open || frozen.capture_picker_armed then
+            Signal.set presentation_state (hide_presenters frozen)) in
+      (* A host owns every callback even while another graph is focused. *)
+      let latest_owner () =
+        let state=root () in
+        if model_key state=Some key then timeline_scope state
+        else List.find_opt (fun candidate->owner_key candidate=key) (live_owners state) in
+      let owned_update transition ()=Option.iter (fun owner->run_owned (Some owner)
+        (fun ()->set_state transition)) (latest_owner ()) in
+      let send action =
+        let current=root () in
+        let focused=model_key current=Some key && presentation_owner ()=Some key && show_graphs current in
+        let permitted = focused || match action with
+          | Capture_asset _ -> true
+          | Media (_,event) -> (not event.Journal_media_view.visible)
+            || (event.action<>Journal_media_view.Preview && eligible current owner)
+          | Native_payload (Ui.Event.Payload.Int64_pair _ | Visible_range _) -> eligible current owner
+          | Native_payload (Ui.Event.Payload.Bool false) -> true
+          | _->false in
+        if permitted then Option.iter (fun scope->
+          if runtime_owner_is_live current scope then run_owned (Some scope) (fun ()->handle_dispatch action)) (latest_owner ()) in
+      let owned_dispatch={send;native=Ui.Event.Handler.create(fun value->send(Native_payload value))} in
+      let scroll=Ui.Event.Handler.create(fun value->
+        match V.Native_list.completion_of_payload value with
+        | None->() | Some completion -> owned_update (fun state->
+          let timeline=Journal_timeline_state.complete_scroll state.timeline ~token:completion.token ~outcome:completion.outcome in
+          if timeline==state.timeline then state else {state with timeline}) ()) in
+      Hashtbl.replace refreshers key update;
+      update (root ());
+      Signal.on_dispose host_context.ui_scope (fun ()->
+        Hashtbl.remove refreshers key;
+        Journal_media_view.Store.set_interactive media_store false;
+        Journal_media_view.Store.set_active media_store false;
+        Journal_timeline.Store.set_active timeline_store false;
+        Signal.dispose_signal presentation_header;
+        Signal.dispose_signal source);
+      let body=Lui_elements.dyn ~equal:equal_host_shell
+        (fun current->Journal_view.mount(body_view ~graph_host:true ~timeline_store ~media_store ~set_state:owned_update
+          source presentation_header current owned_dispatch scroll)) source in
+      Journal_view.mount (Journal_header.timeline_host ~owner:key (V.of_lui body)) host_context parent
+    in
+    refresh (root ());
+    let unsubscribe=Signal.subscribe model_signal refresh in
+    Signal.on_dispose context.ui_scope (fun ()->
+      Signal.dispose_subscription unsubscribe;Hashtbl.clear refreshers;
+      Signal.dispose_signal (Signal.value owners);Signal.dispose_signal (Signal.value payload));
+    let graph_event raw =
+      try
+        let open Yojson.Safe.Util in
+        let event=Yojson.Safe.from_string raw and state=root () in
+        let action=member "action" event |> to_string
+        and source=member "source" event |> to_string in
+        if model_key state=Some source then (
+          if action="presented" then Option.iter (fun scope->
+            Effect.run(send_manager(Graph_service.Acknowledge_timeline_presented scope))) (timeline_scope state)
+          else let target=member "target" event |> to_string in
+            match action with
+            | "cancel" when !preview_owner=Some target -> dispatch.send Graph_swipe_cancel
+            | "prepare" when graph_switch_enabled state
+                && Option.map owner_key (next_resident_owner state)=Some target -> dispatch.send Graph_swipe_prepare
+            | "commit" when !preview_owner=Some target
+                && Option.map owner_key (next_resident_owner state)=Some target ->
+              dispatch.send (if graph_switch_enabled state then Graph_swipe_commit else Graph_swipe_cancel)
+            | _->())
+      with Yojson.Json_error _ | Yojson.Safe.Util.Type_error _ -> () in
+    let pages=Journal_header.graph_pages ~payload_signal:(Signal.value payload) ~on_event:graph_event
+      ~children:[Lui_elements.keyed ~source:(Signal.value owners) ~key:owner_key ~cmp:String.compare ~mount:host] in
+    let global_header=Signal.map header model_signal in
+    Signal.on_dispose context.ui_scope (fun ()->Signal.dispose_signal global_header);
+    let overlay=Lui_elements.dyn ~equal:(fun left right->
+      show_graphs left=show_graphs right && (show_graphs left || equal_host_shell left right))
+      (fun current -> if show_graphs current then Lui_elements.stack []
+        else Journal_view.mount(body_view ~graph_host:false ~timeline_store:(!timeline_store_cell)
+          ~media_store:(!media_store_cell) ~set_state model_signal global_header current dispatch
+          (Ui.Event.Handler.create(fun _->())))) model_signal in
+    Lui_elements.stack ~key:"journal-persistent-pages"
+      [Journal_view.mount pages;overlay]
   in
   let backend =
     { Lui_protocol.backend_profile = Lui_native_bridge.profile platform_code host_code

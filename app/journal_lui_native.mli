@@ -35,6 +35,7 @@ type event =
 val mount
   :  ?key:string
   -> payload:string
+  -> ?payload_signal:string Signal.signal
   -> children:Lui_elements.t list
   -> ?on_event:(event -> unit)
   -> string

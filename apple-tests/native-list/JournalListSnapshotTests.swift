@@ -1,6 +1,9 @@
 import Foundation
 import SwiftUI
 import Combine
+#if os(iOS)
+import UIKit
+#endif
 @testable import LUIAppleBackend
 
 // Native payload parsing/lifecycle ownership is not reachable through an OCaml
@@ -35,6 +38,48 @@ import Combine
   }
   static func settle() async { for _ in 0..<10 { await Task.yield() } }
   static func main() async throws {
+    #if os(iOS)
+    let handoff = JournalGraphHandoff()
+    let cancelledGesture = handoff.startGesture()
+    handoff.cancel()
+    check(!handoff.acceptsGesture(cancelledGesture), "scene cancellation rejects an animation completion")
+    let laterGesture = handoff.startGesture()
+    check(!handoff.acceptsGesture(cancelledGesture) && handoff.acceptsGesture(laterGesture), "new gesture fences old completion")
+    handoff.cancel()
+    let changedFocusGesture = handoff.startGesture()
+    handoff.focusChanged("B")
+    check(!handoff.acceptsGesture(changedFocusGesture), "external focus change before cover rejects old animation completion")
+    // Retained pages no longer have snapshot/layout deadlines. Preserve the
+    // existing owner/nonce/cancel checks against the new focus-only handoff.
+    let firstHandoff = handoff.begin(source: "A", target: "B")
+    check(!handoff.finish(firstHandoff, page: "A", current: "B"), "source cannot finish target focus")
+    check(!handoff.finish(firstHandoff, page: "B", current: "A"), "target cannot finish while Save still queues focus")
+    check(handoff.finish(firstHandoff, page: "B", current: "B"), "matching focus completes the retained page transition")
+    let second = handoff.begin(source: "B", target: "A")
+    let currentHandoff = handoff.begin(source: "A", target: "B")
+    check(!handoff.finish(firstHandoff, page: "B", current: "B"), "repeated page ID rejects old completion nonce")
+    check(!handoff.finish(second, page: "A", current: "A"), "old focus cannot complete a later transition")
+    check(handoff.request?.id == currentHandoff, "stale callbacks leave current target intact")
+    handoff.focusChanged("A")
+    check(handoff.request?.id == currentHandoff, "source remains selected while Save queues focus")
+    try await Task.sleep(for: .milliseconds(2100))
+    check(handoff.request?.id == currentHandoff, "queued focus is not expired by a presentation timeout")
+    check(handoff.finish(currentHandoff, page: "B", current: "B"), "queued focus completes after Save publication")
+    _ = handoff.begin(source: "A", target: "B")
+    handoff.focusChanged("C")
+    check(handoff.request == nil, "external selection fences the pending transition")
+    _ = handoff.begin(source: "A", target: "B")
+    handoff.retain(["A", "B", "C"])
+    check(handoff.request != nil, "unchanged resident set retains pending focus")
+    handoff.retain(["A", "C"])
+    check(handoff.request == nil, "closing pending target cancels its transition")
+    _ = handoff.begin(source: "A", target: "B")
+    handoff.cancel()
+    check(handoff.request == nil, "scene or size cancellation clears pending transition")
+    _ = handoff.begin(source: "A", target: "B")
+    handoff.retain([])
+    check(handoff.request == nil, "account exit clears all pending page owners")
+    #endif
     let offsets = JournalGraphScrollOffsets()
     offsets.retain(["account1:A:g1", "account1:B:g2"])
     offsets.write(page: "account1:A:g1", list: "timeline", y: 515)
