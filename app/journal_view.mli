@@ -49,13 +49,6 @@ module Event : sig
       ; last_exclusive : int64
       }
 
-    type native_event =
-      { kind_id : Journal_ids.Native_widget.Kind_id.t
-      ; version : int
-      ; event_id : int
-      ; payload : bytes
-      }
-
     type confirmation_result =
       | Action of string
       | Dismissed
@@ -97,7 +90,6 @@ module Event : sig
       | Scroll of scroll
       | Visible_range of visible_range
       | Navigation_path_changed of Journal_ids.Navigation.Page_key.t list
-      | Native_event of native_event
       | Native_list_completion of native_list_completion
       | Event of Lui_protocol.event
   end
@@ -805,25 +797,11 @@ module View : sig
 end
 
 module Native_widget : sig
-  module Capability : sig
-    type t =
-      | Stateful
-      | Resource
-      | Semantics
-      | Semantics_canvas
-      | Virtualized
-
-    val bit : t -> int64
-    val bits : t list -> int64
-  end
-
   module Extension : sig
     type ('props, 'event) t
 
     val create
       :  kind_id:Journal_ids.Native_widget.Kind_id.t
-      -> version:int
-      -> capabilities:Capability.t list
       -> encode_props:('props -> bytes)
       -> decode_event:
            (event_id:Journal_ids.Native_widget.Event_id.t
@@ -833,27 +811,12 @@ module Native_widget : sig
       -> ('props, 'event) t
   end
 
-  val event_handler
-    :  ?name:string
-    -> ('props, 'event) Extension.t
-    -> ('event -> unit)
-    -> Event.handler
-
   val widget
     :  ('props, 'event) Extension.t
     -> ?key:Key.t
     -> props:'props
     -> ?props_signal:'props Signal.signal
     -> on_event:('event -> unit)
-    -> ?children:View.t list
-    -> unit
-    -> View.t
-
-  val widget_with_handler
-    :  ('props, 'event) Extension.t
-    -> ?key:Key.t
-    -> props:'props
-    -> on_event:Event.handler
     -> ?children:View.t list
     -> unit
     -> View.t

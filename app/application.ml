@@ -284,8 +284,6 @@ type state =
   ; task_status_page : int
   ; reference_sources : string Reference_sources.t
   ; import_completion : (string * string option) option
-  ; asset_import_request : int
-  ; asset_import_owner : (string * int64) option
   ; capture_pick_request : int
   ; capture_picker_armed : bool
   ; capture_pick_owner : composer_owner option
@@ -434,8 +432,6 @@ let initial_state =
   ; task_status_page = 0
   ; reference_sources = Reference_sources.empty
   ; import_completion = None
-  ; asset_import_request = 0
-  ; asset_import_owner = None
   ; capture_pick_request = 0
   ; capture_picker_armed = false
   ; capture_pick_owner = None
@@ -2731,11 +2727,7 @@ let detail_page ~media_store ?(on_region = fun _ -> ()) ~state ~on_scroll_comple
            | Copying -> "Copying block and descendants…"
            | Copied -> "Copied block and descendants"
            | Copy_failed_detail message -> "Copy failed: " ^ message))
-    ; import_request = Journal_asset_import.file_request
-        ~id:(if state.asset_import_owner
-          = Option.map (fun id -> id, Journal_routes.detail_request_generation state.routes)
-              (Journal_routes.active_entry_id state.routes)
-          then state.asset_import_request else 0)
+    ; import_request = Journal_asset_import.file_request ~id:0
     ; import_completion = state.import_completion
     ; render_title = Journal_model.Title.render
         ~lookup:(fun id -> Reference_sources.find_opt id sources)
@@ -6263,8 +6255,6 @@ let start
     && left.reference_sources == right.reference_sources
     && left.task_catalog.definitions == right.task_catalog.definitions
     && left.import_completion = right.import_completion
-    && left.asset_import_request = right.asset_import_request
-    && left.asset_import_owner = right.asset_import_owner
     && left.graph_ready = right.graph_ready
     && left.detail_copy_feedback = right.detail_copy_feedback
     && operation_failure left.timeline_notice = operation_failure right.timeline_notice
@@ -6406,6 +6396,33 @@ let start
                  (Some (capture_assets state ~camera:(state.environment.platform = "ios"))))
           (Journal_detail.child_capture detail))
     in
+    let capture_composer state ~render =
+      Option.map
+        (fun capture ->
+           render
+             ~kind:Journal_composer_view.Capture
+             ~capture
+             ~saving:(Journal_capture.phase capture = Journal_capture.Saving)
+             ~enabled:state.write_enabled
+             ~on_edit:dispatch
+             ~on_toggle:
+               (Ui.Event.Handler.create (function
+                  | Ui.Event.Payload.Bool selected ->
+                    dispatch.send
+                      (if selected then Capture_task_on else Capture_task_off)
+                  | _ -> ()))
+             ~on_save:(bind_action dispatch Capture_submit)
+             ~error:
+               (match composer_error state Timeline_composer with
+                | Some failure -> Some (capture_failure_message failure)
+                | None ->
+                  (match Journal_capture.phase capture with
+                   | Failed message -> Some message
+                   | Editing | Saving -> None))
+             ~assets:
+               (Some (capture_assets state ~camera:(state.environment.platform = "ios"))))
+        state.direct_capture
+    in
     let floating_capture state =
       (* On iOS the capture composer expands directly into the bottom bar
            instead of presenting a sheet. It is mounted through the body
@@ -6415,32 +6432,8 @@ let start
       match state.modal with
       | Capture_sheet when state.environment.platform = "ios" ->
         Option.map
-          (fun capture ->
-             V.column
-               ~spacing:0.
-               [ composer_content
-                   ~kind:Journal_composer_view.Capture
-                   ~saving:(Journal_capture.phase capture = Journal_capture.Saving)
-                   ~capture
-                   ~enabled:state.write_enabled
-                   ~on_edit:dispatch
-                   ~on_toggle:
-                     (Ui.Event.Handler.create (function
-                        | Ui.Event.Payload.Bool selected ->
-                          dispatch.send
-                            (if selected then Capture_task_on else Capture_task_off)
-                        | _ -> ()))
-                   ~on_save:(bind_action dispatch Capture_submit)
-                   ~error:
-                     (match composer_error state Timeline_composer with
-                      | Some failure -> Some (capture_failure_message failure)
-                      | None ->
-                        (match Journal_capture.phase capture with
-                         | Failed message -> Some message
-                         | Editing | Saving -> None))
-                   ~assets:(Some (capture_assets state ~camera:true))
-               ])
-          state.direct_capture
+          (fun content -> V.column ~spacing:0. [ content ])
+          (capture_composer state ~render:composer_content)
       | Append_sheet when state.environment.platform = "ios" ->
         append_composer state ~render:composer_content
       | _ -> None
@@ -6708,33 +6701,9 @@ let start
         if state.environment.platform = "ios"
         then None
         else
-          Option.map
-            (fun capture ->
-               composer_page
-                 ~kind:Journal_composer_view.Capture
-                 ~saving:(Journal_capture.phase capture = Journal_capture.Saving)
-                 ~capture
-                 ~enabled:state.write_enabled
-                 ~on_edit:dispatch
-                 ~on_toggle:
-                   (Ui.Event.Handler.create (function
-                      | Ui.Event.Payload.Bool selected ->
-                        dispatch.send
-                          (if selected then Capture_task_on else Capture_task_off)
-                      | _ -> ()))
-                 ~on_save:(bind_action dispatch Capture_submit)
-                 ~on_close:(bind_action dispatch Close_composer)
-                 ~error:
-                   (match composer_error state Timeline_composer with
-                    | Some failure -> Some (capture_failure_message failure)
-                    | None ->
-                      (match Journal_capture.phase capture with
-                       | Failed message -> Some message
-                       | Editing | Saving -> None))
-                 ~assets:
-                   (Some
-                      (capture_assets state ~camera:(state.environment.platform = "ios"))))
-            state.direct_capture
+          capture_composer
+            state
+            ~render:(composer_page ~on_close:(bind_action dispatch Close_composer))
       | Append_sheet ->
         append_composer
           state

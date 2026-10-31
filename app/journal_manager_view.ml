@@ -351,8 +351,6 @@ let view ?picker_signal props ~on_action =
     let chrome =
       Ui.Native_widget.Extension.create
         ~kind_id:(Journal_ids.Native_widget.Kind_id.of_int 2103)
-        ~version:2
-        ~capabilities:[ Stateful; Semantics ]
         ~encode_props:(fun props -> unlock_chrome_props_to_yojson props |> Yojson.Safe.to_string |> Bytes.of_string)
         ~decode_event:(fun ~event_id:_ _ -> Error "Unlock uses child control events")
         ()

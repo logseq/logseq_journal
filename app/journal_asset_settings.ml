@@ -36,8 +36,6 @@ end
 let extension =
   Ui.Native_widget.Extension.create
     ~kind_id:(Journal_ids.Native_widget.Kind_id.of_int 2106)
-    ~version:1
-    ~capabilities:[ Stateful; Semantics ]
     ~encode_props:(fun props -> Json.props_to_yojson props |> Yojson.Safe.to_string |> Bytes.of_string)
     ~decode_event:(fun ~event_id:_ bytes -> Ok (Bytes.to_string bytes))
     ()

@@ -4,6 +4,38 @@ let rc_result db rc =
   if Sqlite3.Rc.is_success rc then Ok () else Error (Sqlite3.errmsg db)
 ;;
 
+let bind_checkpoint statement checkpoint =
+  Sqlite3.Rc.check
+    (Sqlite3.bind_int statement 1 checkpoint.Sync_checkpoint.format_version);
+  Sqlite3.Rc.check
+    (Sqlite3.bind_text
+       statement
+       2
+       (Graph_types.Uuid.to_string checkpoint.graph_id));
+  Sqlite3.Rc.check (Sqlite3.bind_int statement 3 checkpoint.schema.major);
+  Sqlite3.Rc.check (Sqlite3.bind_int statement 4 checkpoint.schema.minor);
+  Sqlite3.Rc.check
+    (Sqlite3.bind_int64
+       statement
+       5
+       (Server_cursor.to_int64 checkpoint.applied_server_t));
+  Sqlite3.Rc.check (Sqlite3.bind_text statement 6 checkpoint.checksum);
+  Sqlite3.Rc.check
+    (Sqlite3.bind_text
+       statement
+       7
+       (match checkpoint.status with
+        | Sync_checkpoint.Active -> "active"
+        | Sync_checkpoint.Paused -> "paused"));
+  Sqlite3.Rc.check
+    (Sqlite3.bind
+       statement
+       8
+       (match checkpoint.last_error with
+        | None -> Sqlite3.Data.NULL
+        | Some value -> TEXT value))
+;;
+
 let initialize_database db checkpoint =
   let create_sql =
     "CREATE TABLE sync_meta(singleton INTEGER PRIMARY KEY CHECK(singleton = \
@@ -28,35 +60,7 @@ let initialize_database db checkpoint =
     Fun.protect
       ~finally:(fun () -> ignore (Sqlite3.finalize statement))
       (fun () ->
-         Sqlite3.Rc.check
-           (Sqlite3.bind_int statement 1 checkpoint.Sync_checkpoint.format_version);
-         Sqlite3.Rc.check
-           (Sqlite3.bind_text
-              statement
-              2
-              (Graph_types.Uuid.to_string checkpoint.graph_id));
-         Sqlite3.Rc.check (Sqlite3.bind_int statement 3 checkpoint.schema.major);
-         Sqlite3.Rc.check (Sqlite3.bind_int statement 4 checkpoint.schema.minor);
-         Sqlite3.Rc.check
-           (Sqlite3.bind_int64
-              statement
-              5
-              (Server_cursor.to_int64 checkpoint.applied_server_t));
-         Sqlite3.Rc.check (Sqlite3.bind_text statement 6 checkpoint.checksum);
-         Sqlite3.Rc.check
-           (Sqlite3.bind_text
-              statement
-              7
-              (match checkpoint.status with
-               | Sync_checkpoint.Active -> "active"
-               | Sync_checkpoint.Paused -> "paused"));
-         Sqlite3.Rc.check
-           (Sqlite3.bind
-              statement
-              8
-              (match checkpoint.last_error with
-               | None -> Sqlite3.Data.NULL
-               | Some value -> TEXT value));
+         bind_checkpoint statement checkpoint;
          rc_result db (Sqlite3.step statement))
 ;;
 
@@ -172,35 +176,7 @@ let update_database db checkpoint =
       Fun.protect
         ~finally:(fun () -> ignore (Sqlite3.finalize statement))
         (fun () ->
-           Sqlite3.Rc.check
-             (Sqlite3.bind_int statement 1 checkpoint.Sync_checkpoint.format_version);
-           Sqlite3.Rc.check
-             (Sqlite3.bind_text
-                statement
-                2
-                (Graph_types.Uuid.to_string checkpoint.graph_id));
-           Sqlite3.Rc.check (Sqlite3.bind_int statement 3 checkpoint.schema.major);
-           Sqlite3.Rc.check (Sqlite3.bind_int statement 4 checkpoint.schema.minor);
-           Sqlite3.Rc.check
-             (Sqlite3.bind_int64
-                statement
-                5
-                (Server_cursor.to_int64 checkpoint.applied_server_t));
-           Sqlite3.Rc.check (Sqlite3.bind_text statement 6 checkpoint.checksum);
-           Sqlite3.Rc.check
-             (Sqlite3.bind_text
-                statement
-                7
-                (match checkpoint.status with
-                 | Sync_checkpoint.Active -> "active"
-                 | Sync_checkpoint.Paused -> "paused"));
-           Sqlite3.Rc.check
-             (Sqlite3.bind
-                statement
-                8
-                (match checkpoint.last_error with
-                 | None -> Sqlite3.Data.NULL
-                 | Some value -> TEXT value));
+           bind_checkpoint statement checkpoint;
            rc_result db (Sqlite3.step statement))
   with
   | exn -> Error (Printexc.to_string exn)
