@@ -87,6 +87,21 @@ let read_mutation db key =
          | exn -> Error (Printexc.to_string exn)))
 ;;
 
+let insert_receipts db statement receipts =
+  let rec insert = function
+    | [] -> Ok ()
+    | (key, receipt) :: rest ->
+      Sqlite3.Rc.check (Sqlite3.reset statement);
+      Sqlite3.Rc.check (Sqlite3.bind_text statement 1 key);
+      Sqlite3.Rc.check (Sqlite3.bind_text statement 2 receipt);
+      (match rc_result db (Sqlite3.step statement) with
+       | Error _ as error -> error
+       | Ok () -> insert rest)
+  in
+  try insert receipts with
+  | exn -> Error (Printexc.to_string exn)
+;;
+
 let upsert_mutations db receipts =
   match List.find_opt (fun (key, _) -> not (valid_key key)) receipts with
   | Some _ -> Error "mutation receipt key must be a lowercase SHA-256 value"
@@ -99,19 +114,7 @@ let upsert_mutations db receipts =
     in
     Fun.protect
       ~finally:(fun () -> ignore (Sqlite3.finalize statement))
-      (fun () ->
-         let rec insert = function
-           | [] -> Ok ()
-           | (key, receipt) :: rest ->
-             Sqlite3.Rc.check (Sqlite3.reset statement);
-             Sqlite3.Rc.check (Sqlite3.bind_text statement 1 key);
-             Sqlite3.Rc.check (Sqlite3.bind_text statement 2 receipt);
-             (match rc_result db (Sqlite3.step statement) with
-              | Error _ as error -> error
-              | Ok () -> insert rest)
-         in
-         try insert receipts with
-         | exn -> Error (Printexc.to_string exn))
+      (fun () -> insert_receipts db statement receipts)
 ;;
 
 let read_terminal_batch db key =
@@ -150,17 +153,5 @@ let upsert_terminal_batches db receipts =
     in
     Fun.protect
       ~finally:(fun () -> ignore (Sqlite3.finalize statement))
-      (fun () ->
-         let rec insert = function
-           | [] -> Ok ()
-           | (key, receipt) :: rest ->
-             Sqlite3.Rc.check (Sqlite3.reset statement);
-             Sqlite3.Rc.check (Sqlite3.bind_text statement 1 key);
-             Sqlite3.Rc.check (Sqlite3.bind_text statement 2 receipt);
-             (match rc_result db (Sqlite3.step statement) with
-              | Error _ as error -> error
-              | Ok () -> insert rest)
-         in
-         try insert receipts with
-         | exn -> Error (Printexc.to_string exn))
+      (fun () -> insert_receipts db statement receipts)
 ;;

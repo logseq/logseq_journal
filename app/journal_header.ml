@@ -34,8 +34,6 @@ let props ~mode ?title ?connecting ?controls ?text ?id ?level ?loading ?initial 
 let chrome =
   Ui.Native_widget.Extension.create
     ~kind_id:(Journal_ids.Native_widget.Kind_id.of_int 2103)
-    ~version:2
-    ~capabilities:[ Stateful; Semantics ]
     ~encode_props:(fun props -> Json.props_to_yojson props |> Yojson.Safe.to_string |> Bytes.of_string)
     ~decode_event:(fun ~event_id:_ _ -> Error "Chrome uses child control events")
     ()

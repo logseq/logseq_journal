@@ -175,13 +175,6 @@ module Event = struct
       ; last_exclusive : int64
       }
 
-    type native_event =
-      { kind_id : Journal_ids.Native_widget.Kind_id.t
-      ; version : int
-      ; event_id : int
-      ; payload : bytes
-      }
-
     type confirmation_result =
       | Action of string
       | Dismissed
@@ -223,7 +216,6 @@ module Event = struct
       | Scroll of scroll
       | Visible_range of visible_range
       | Navigation_path_changed of Journal_ids.Navigation.Page_key.t list
-      | Native_event of native_event
       | Native_list_completion of native_list_completion
       | Event of Lui_protocol.event
   end
@@ -2049,36 +2041,9 @@ module View = struct
 end
 
 module Native_widget = struct
-  module Capability = struct
-    type t =
-      | Stateful
-      | Resource
-      | Semantics
-      | Semantics_canvas
-      | Virtualized
-
-    let bit = function
-      | Stateful -> 0L
-      | Resource -> 1L
-      | Semantics -> 2L
-      | Semantics_canvas -> 3L
-      | Virtualized -> 4L
-    ;;
-
-    let bits capabilities =
-      List.fold_left
-        (fun acc capability ->
-           Int64.logor acc (Int64.shift_left 1L (Int64.to_int (bit capability))))
-        0L
-        capabilities
-    ;;
-  end
-
   module Extension = struct
     type ('props, 'event) t =
       { identifier : string
-      ; kind_id : Journal_ids.Native_widget.Kind_id.t
-      ; version : int
       ; encode_props : 'props -> bytes
       ; decode_event :
           event_id:Journal_ids.Native_widget.Event_id.t
@@ -2094,10 +2059,8 @@ module Native_widget = struct
       | other -> invalid_arg ("unregistered journal extension kind " ^ string_of_int other)
     ;;
 
-    let create ~kind_id ~version ~capabilities:_ ~encode_props ~decode_event () =
+    let create ~kind_id ~encode_props ~decode_event () =
       { identifier = identifier_of_kind_id kind_id
-      ; kind_id
-      ; version
       ; encode_props
       ; decode_event
       }
@@ -2109,20 +2072,6 @@ module Native_widget = struct
       ~event_id:
         (Journal_ids.Native_widget.Event_id.of_int event.Journal_lui_native.event_id)
       (Bytes.of_string event.Journal_lui_native.payload)
-  ;;
-
-  let event_handler ?name:_ extension callback =
-    Event.Handler.create (fun payload ->
-      match payload with
-      | Event.Payload.Native_event { event_id; payload; _ } ->
-        (match
-           extension.Extension.decode_event
-             ~event_id:(Journal_ids.Native_widget.Event_id.of_int event_id)
-             payload
-         with
-         | Ok event -> callback event
-         | Error source -> report_event_error "decodeExtensionEvent" source)
-      | _ -> ())
   ;;
 
   let mount extension ?key ~props ~on_event ~children context parent =
@@ -2157,26 +2106,5 @@ module Native_widget = struct
            Lui_ui.extension_property_signal context node "payload" payload)
         props_signal;
       node)
-  ;;
-
-  let widget_with_handler extension ?key ~props ~on_event ?(children = []) () =
-    element ?key (fun context parent ->
-      let payload = Bytes.to_string (extension.Extension.encode_props props) in
-      Journal_lui_native.mount
-        ?key
-        ~payload
-        ~children:(List.map (fun element -> element.mount) children)
-        ~on_event:(fun event ->
-          Event.Handler.Private.invoke
-            on_event
-            (Event.Payload.Native_event
-               { kind_id = extension.Extension.kind_id
-               ; version = extension.Extension.version
-               ; event_id = event.Journal_lui_native.event_id
-               ; payload = Bytes.of_string event.Journal_lui_native.payload
-               }))
-        extension.Extension.identifier
-        context
-        parent)
   ;;
 end
