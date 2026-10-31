@@ -6851,6 +6851,26 @@ let start
     let owners=Signal.state context.Lui_ui.ui_scheduler [] in
     let payload=Signal.state context.ui_scheduler "{}" in
     let refreshers=Hashtbl.create 3 in
+    (* Resolve the at-most-three resident names only when the catalog or resident
+       set changes; typing and worker refreshes must not scan the full catalog. *)
+    let name_catalog = ref None and name_residents = ref [] in
+    let resident_names = Hashtbl.create 3 in
+    let target_graph_name state =
+      match state.manager, next_resident_owner state with
+      | Some manager, Some owner ->
+        let same_catalog = match !name_catalog with
+          | Some previous -> previous == state.graph_catalog | None -> false in
+        if not same_catalog || !name_residents <> manager.resident_graphs then (
+          name_catalog := Some state.graph_catalog;
+          name_residents := manager.resident_graphs;
+          Hashtbl.clear resident_names;
+          Rrbvec.to_seq state.graph_catalog |> Seq.iter (fun (graph:Graph_service.graph) ->
+            if List.mem graph.graph_id manager.resident_graphs then
+              Hashtbl.replace resident_names graph.graph_id graph.name));
+        (match Hashtbl.find_opt resident_names owner.graph_id with
+         | Some name -> `String name | None -> `Null)
+      | _ -> name_catalog := None; name_residents := []; Hashtbl.clear resident_names; `Null
+    in
     let root ()=Signal.sample model_signal in
     let host_model state owner =
       let model=graph_model state owner in
@@ -6883,6 +6903,7 @@ let start
         ;"pageID",(match selected with Some id->`String id | None->`Null)
         ;"targetID",(match state.graph_preview with Some id->`String id | None->`Null)
         ;"targetPageID",(match next_resident_owner state with Some owner->`String(owner_key owner) | None->`Null)
+        ;"targetGraphName",target_graph_name state
         ;"residentPageIDs",`List(List.map(fun owner->`String(owner_key owner))live)
         ;"slotOwners",`List(List.map(fun owner->`String(owner_key owner))next)
         ;"loadingPageIDs",`List(List.filter_map(fun owner->let model=host_model state owner in

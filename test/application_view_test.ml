@@ -6577,6 +6577,19 @@ let test_graph_picker_controls scenario () =
           | Some(`String payload)->(try let open Yojson.Safe.Util in let json=Yojson.Safe.from_string payload in
               member "mode" json=`String "graph-pages" && member "enabled" json=`Bool true with _->false)
           | _->false));
+      if scenario = `Current then (
+        (* Graph names are owned by the catalog and transported by the native
+           renderer, outside the pure route reducer's state/effects. *)
+        let page = Hashtbl.to_seq_values props |> Seq.find_map (fun fields ->
+          match List.assoc_opt "payload" fields with
+          | Some (`String payload) ->
+            (try let json = Yojson.Safe.from_string payload in
+              if Yojson.Safe.Util.member "mode" json = `String "graph-pages"
+              then Some json else None with _ -> None)
+          | _ -> None) |> Option.get in
+        Alcotest.(check (option string)) "swipe target carries its full catalog name"
+          (Some long_name)
+          (Yojson.Safe.Util.member "targetGraphName" page |> Yojson.Safe.Util.to_string_option));
       if scenario = `Late_graph_cancel then (
         wait "Favorites action mounts" (fun () -> Option.is_some (find "accessibility-label" "Favorites"));
         press (Option.get (find "accessibility-label" "Favorites"));

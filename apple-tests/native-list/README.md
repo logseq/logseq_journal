@@ -110,3 +110,22 @@ SwiftUI `ScrollPosition` did not restore this List in the same failing case, so
 restoration reuses the existing resolved `UIScrollView` and native offset API.
 `JournalListSnapshotTests.swift` additionally verifies runtime separation,
 resident-generation retirement and rejection of late offset writes after logout.
+
+## Graph name feedback
+
+`JournalGraphNameAcceptance.swift` drives the actual native right-swipe capsule
+through an isolated three-resident offline warm-start host. Supply its bundle ID
+via `JOURNAL_GRAPH_NAME_APP` (default `org.logseq.journal.graph-name-probe`).
+Install generated `valid.json` and `support-valid` in that bundle's Documents;
+for the long-name case use `long.json` and an independent `support-long` with
+catalog graph 2 named `Reading & Research — 工作笔记 and long-term notes`.
+The tests cover target identity, commit/fade, cancellation, a full resident
+cycle, native dark appearance, long-name bounds and touches reaching Options.
+Transient timing and smooth page motion also require local screen-recording
+inspection; XCTest idle waits alone are not a timing/performance measurement.
+
+Run `python3 tool/test_graph_name.py` for deterministic native feedback ownership:
+delayed focus, cancellation, stale fade IDs, external selection, catalog names
+and retired graph/account scopes. This small native presentation owner is
+outside the OCaml reducer; catalog-to-native name transport is covered once at
+the real Application renderer in `application_view_test.ml`.
