@@ -240,6 +240,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
     let pageID: String?
     let targetID: String?
     let targetPageID: String?
+    let targetGraphName: String?
     let residentPageIDs: [String]?
     let slotOwners: [String]?
     let loadingPageIDs: [String]?
@@ -295,6 +296,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
     @State private var committing=false
     @State private var source:String?
     @State private var target:String?
+    @State private var graphName = JournalGraphNameFeedback()
+    @Environment(\.journalContainerTopInset) private var containerTopInset
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @StateObject private var handoff=JournalGraphHandoff()
     @StateObject private var coldMotion=JournalGraphColdMotion()
     @Environment(\.scenePhase) private var scenePhase
@@ -471,12 +475,15 @@ struct JournalSheetDismissButton: SwiftUI.View {
       guard let data=try? JSONEncoder().encode(value) else {return}
       JournalExtensions.emit(context:context,payload:data)
     }
-    private func reset(notify:Bool,preserveCold:Bool=false) {
+    private func reset(notify:Bool,preserveCold:Bool=false,preserveName:Bool=false) {
       if notify,source==properties.pageID {emit("cancel",source:source,target:target)}
       handoff.cancel()
       if !preserveCold {coldMotion.cancel()}
       withTransaction(Transaction(animation:nil)) {
         translation=0;dragging=false;settling=false;committing=false;source=nil;target=nil
+      }
+      if !preserveName {
+        withAnimation(reduceMotion ? nil : .easeOut(duration:0.16)) { graphName.cancel() }
       }
     }
     private func acknowledge() {
@@ -490,6 +497,9 @@ struct JournalSheetDismissButton: SwiftUI.View {
           let from=properties.pageID,let to=properties.targetPageID,
           from != to,(properties.residentPageIDs ?? []).contains(to) else {return}
         _=handoff.startGesture();source=from;target=to;dragging=true
+        withAnimation(reduceMotion ? nil : .easeOut(duration:0.12)) {
+          graphName.show(source:from,target:to,name:properties.targetGraphName)
+        }
         let cold = !slots.contains(where:{$0.owner==to}) && coldMotion.begin(source:from,target:to)
         if !cold {emit("prepare",source:from,target:to)}
         translation=min(width,max(0,pan.translation(in:pan.view).x))
@@ -504,6 +514,7 @@ struct JournalSheetDismissButton: SwiftUI.View {
         let distance=pan.translation(in:pan.view).x,velocity=pan.velocity(in:pan.view).x
         let commit=distance>width*0.3 || (distance>30 && velocity>650)
         settling=true;committing=commit
+        if commit,let source,let target { graphName.commit(source:source,target:target) }
         if coldMotion.ticket != nil {
           if commit {
             withTransaction(Transaction(animation:nil)){translation=width}
@@ -558,6 +569,16 @@ struct JournalSheetDismissButton: SwiftUI.View {
         .background(Color(uiColor:.systemBackground))
         .clipped()
         .overlay{JournalGraphColdSurface(owner:coldMotion).allowsHitTesting(false).accessibilityHidden(true)}
+        .overlay(alignment:.top) {
+          if let name = graphName.presentation?.name {
+            nameCapsule(name)
+              // Reserve the full 44pt menu + progress + spacing on either side.
+              .frame(maxWidth:min(240,max(0,bounds.size.width-192)))
+              .padding(.top,containerTopInset+4)
+              .transition(.opacity)
+              .allowsHitTesting(false)
+          }
+        }
         .gesture(RightGraphPan(enabled:properties.enabled==true && !settling && coldMotion.ticket==nil) {handle($0,width:bounds.size.width)})
         .onChange(of:bounds.size) { _,_ in reset(notify:true) }
       }
@@ -568,24 +589,32 @@ struct JournalSheetDismissButton: SwiftUI.View {
       .onChange(of:properties.slotOwners) { _,_ in acknowledge() }
       .onChange(of:coldMotion.ticket?.id) { _,id in if id==nil {acknowledge()} }
       .onChange(of:properties.residentPageIDs) { _,ids in
+        graphName.retain(ids ?? [])
         coldMotion.retain(ids ?? [])
         graphScrollOffsets?.retain(ids ?? [])
         if let source,let target,!(ids ?? []).contains(source) || !(ids ?? []).contains(target) {reset(notify:false)}
       }
       .onChange(of:properties.pageID) { _,page in
+        graphName.focusChanged(page)
+        let keepName = graphName.presentation?.phase == .confirmed
         let keepCold=committing && coldMotion.ticket?.target==page
         if let request=handoff.request,page==request.target {
           _=handoff.finish(request.id,page:request.target,current:page)
         } else {handoff.focusChanged(page)}
-        reset(notify:false,preserveCold:keepCold)
+        reset(notify:false,preserveCold:keepCold,preserveName:keepName)
         if keepCold {coldMotion.focused(page)}
         acknowledge()
+      }
+      .onChange(of:properties.targetGraphName) { _,name in
+        graphName.updateName(target:properties.targetPageID,name:name)
       }
       .onChange(of:properties.targetPageID) { _,next in
         if source==properties.pageID,let target,target != next {reset(notify:true)}
       }
       .onChange(of:properties.enabled) { _,enabled in
-        if enabled != true && handoff.request == nil && coldMotion.ticket?.target != properties.pageID {reset(notify:true)}
+        if enabled != true && handoff.request == nil && coldMotion.ticket?.target != properties.pageID {
+          reset(notify:true,preserveName:graphName.presentation?.phase == .confirmed)
+        }
       }
       .onChange(of:properties.targetID) { _,prepared in
         if prepared == nil && source==properties.pageID && (dragging || settling) {reset(notify:false)}
@@ -595,6 +624,38 @@ struct JournalSheetDismissButton: SwiftUI.View {
       }
       .onChange(of:scenePhase) { _,phase in if phase != .active {reset(notify:true)} }
       .onDisappear {reset(notify:false)}
+      .task(id:graphName.presentation?.id) {
+        guard let name = graphName.presentation,name.phase == .confirmed else { return }
+        if UIAccessibility.isVoiceOverRunning {
+          UIAccessibility.post(notification:.announcement,argument:name.name)
+        }
+        do { try await Task.sleep(for:.milliseconds(1100)) } catch { return }
+        withAnimation(reduceMotion ? nil : .easeOut(duration:0.2)) { graphName.dismiss(name.id) }
+      }
+    }
+
+    private func nameLabel(_ name:String,font:Font) -> some SwiftUI.View {
+      HStack(spacing:6) {
+        Image(systemName:"square.stack").font(.system(size:12)).accessibilityHidden(true)
+        Text(name).font(font).lineLimit(1).truncationMode(.tail)
+          .accessibilityIdentifier("graph-switch-name")
+      }
+      .padding(.horizontal,12).padding(.vertical,5)
+      .fixedSize(horizontal:false,vertical:true)
+    }
+
+    @ViewBuilder private func nameCapsule(_ name:String) -> some SwiftUI.View {
+      // This transient HUD shares the fixed gap above the date. Native fitting
+      // preserves that slot at accessibility sizes; VoiceOver retains the full name.
+      let label = ViewThatFits(in:.vertical) {
+        nameLabel(name,font:.subheadline.weight(.semibold))
+        nameLabel(name,font:.system(size:17,weight:.semibold))
+      }.frame(height:32)
+      if reduceTransparency {
+        label.background(Color(uiColor:.secondarySystemBackground),in:Capsule())
+      } else {
+        label.glassEffect(.regular,in:.capsule)
+      }
     }
   }
 
