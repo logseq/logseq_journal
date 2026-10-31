@@ -575,13 +575,34 @@ let protected_values ?(allow_empty = false) source =
     loop 1 [] operations)
 ;;
 
+let drop_conflicted_protected_retracts operations =
+  (* Match Logseq's drop-conflicted-encrypted-retracts after decryption. *)
+  let added = Hashtbl.create 16 in
+  List.iter
+    (function
+      | Add (entity, attribute, value) when List.mem attribute protected_attributes ->
+        Hashtbl.replace added (entity, attribute, value) ()
+      | _ -> ())
+    operations;
+  if Hashtbl.length added = 0
+  then operations
+  else
+    List.filter
+      (function
+        | Retract (entity, attribute, Some value)
+          when List.mem attribute protected_attributes ->
+          not (Hashtbl.mem added (entity, attribute, value))
+        | _ -> true)
+      operations
+;;
+
 let decode ?(allow_empty = false) ~db ~decrypted_values source =
   bind (parse ~allow_empty source) (fun operations ->
     let operation_count = List.length operations in
     let rec loop index decoded plaintexts = function
       | [] ->
         if plaintexts = []
-        then Ok (List.rev decoded)
+        then Ok (drop_conflicted_protected_retracts (List.rev decoded))
         else diagnostic_error Decrypted_value_count
       | operation :: rest ->
         bind
