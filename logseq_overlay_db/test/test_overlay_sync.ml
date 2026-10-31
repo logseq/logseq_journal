@@ -4103,6 +4103,185 @@ let rejected_status_rename_restores_catalog database =
     (title ())
 ;;
 
+(* The sync reducer carries opaque wires; the public Database boundary owns
+   decryption, transaction preview, origin validation and durable replay. *)
+let accepted_journal_protected_retractions
+      ~attribute
+      ~retract_after_add
+      ~copies
+      ~source_tx
+      ~different_value
+      database
+  =
+  let behavior = "accepted journal protected retractions" in
+  let module J = Transit_core.Json in
+  let module Codec = Transit_native.Transit.Json in
+  let title = "2026-09-02" in
+  let protected = attribute = "block/title" || attribute = "block/name" in
+  let initial_value = if protected then J.String title else J.Int 1_704_067_200_000 in
+  let stub = J.String "journal-stub" in
+  T.apply_test_transaction
+    database
+    ~cursor:1
+    [ J.Array
+        [ J.Keyword "db/add"
+        ; stub
+        ; J.Keyword "block/uuid"
+        ; J.Uuid (Graph.Uuid.to_string T.missing_page_uuid)
+        ]
+    ; J.Array [ J.Keyword "db/add"; stub; J.Keyword attribute; initial_value ]
+    ];
+  let local = stale_commit database (T.create_journal_page ~ordinal:930 ()) behavior in
+  let submitted = submit_one database local behavior in
+  let accepted, _ =
+    Database.begin_outbox_transition
+      database
+      ~expected:(sync_view_token (stale_view database behavior))
+      (Accept_group
+         { batch_id = submission_batch_id submitted
+         ; barrier = { through = server_cursor 2; checksum = checksum "1111111111111111" }
+         })
+    |> T.require_ok ~behavior
+  in
+  ignore
+    (Database.apply_outbox_transition database accepted ~encrypted:None
+     |> T.require_ok ~behavior);
+  let entity =
+    J.Array [ J.Keyword "block/uuid"; J.Uuid (Graph.Uuid.to_string T.missing_page_uuid) ]
+  in
+  let operation op attr value =
+    J.Array
+      ([ J.Keyword op; entity; J.Keyword attr; value ]
+       @ if source_tx then [ J.Int 1 ] else [])
+  in
+  let operations =
+    match Codec.of_string (submitted_transaction submitted) with
+    | J.Array operations ->
+      List.concat_map
+        (function
+          | J.Array [ J.Keyword "db/add"; _; J.Keyword attr; value ] ->
+            let value =
+              if different_value && attr = attribute
+              then J.String ("encrypted:" ^ Codec.to_string (J.String "Different title"))
+              else value
+            in
+            List.init
+              (if attr = attribute then copies else 1)
+              (fun _ -> operation "db/add" attr value)
+          | _ -> Alcotest.fail "journal submission contained an unexpected operation")
+        operations
+    | _ -> Alcotest.fail "journal submission was not an array"
+  in
+  let old_value =
+    if protected
+    then
+      (* A different synthetic ciphertext envelope decrypts to the same string. *)
+      J.String ("encrypted: " ^ Codec.to_string (J.String title))
+    else initial_value
+  in
+  let retracts = List.init copies (fun _ -> operation "db/retract" attribute old_value) in
+  let wire =
+    Codec.to_string
+      ~mode:Codec.Verbose
+      (J.Array
+         (if retract_after_add then operations @ retracts else retracts @ operations))
+  in
+  let batch =
+    authoritative_batch
+      ~maximum_count:16
+      ~maximum_bytes:16384
+      ~transactions:
+        [ authoritative_transaction
+            ~cursor:(server_cursor 2)
+            ~transaction:(encoded ~maximum_bytes:16384 wire)
+        ]
+      ~through:(server_cursor 2)
+      ~checksum:None
+    |> T.require_ok ~behavior
+  in
+  let before = stale_view database behavior in
+  let prepared, crypto =
+    Database.begin_authoritative database ~expected:(sync_view_token before) batch
+    |> T.require_ok ~behavior
+  in
+  let decrypted =
+    Option.map (fun request -> decrypt_submitted_request request behavior) crypto
+  in
+  let result = Database.apply_authoritative database prepared ~decrypted in
+  if protected && not different_value
+  then (
+    let committed =
+      match result with
+      | Ok (Authoritative_applied commit) -> commit
+      | Error (Authoritative_integrity_failure message) ->
+        Alcotest.failf "same-value protected rewrite failed: %s" message
+      | _ -> Alcotest.fail "same-value protected rewrite did not commit"
+    in
+    T.require
+      (List.exists
+         (fun (terminal : terminal_receipt) ->
+            match terminal.receipt with
+            | Applied_receipt value ->
+              Graph.Uuid.equal value.mutation_id local.mutation_id
+            | _ -> false)
+         committed.terminal_receipts)
+      "normalized rewrite did not acknowledge the accepted mutation";
+    let after = stale_view database behavior in
+    T.require
+      (sync_view_checkpoint after = server_cursor 2)
+      "normalized rewrite did not advance checkpoint";
+    T.require
+      (sync_view_submissions after = [])
+      "normalized rewrite retained the accepted outbox";
+    let snapshot = Database.current_snapshot database |> T.require_ok ~behavior in
+    Fun.protect
+      ~finally:(fun () -> Database.release_snapshot snapshot)
+      (fun () ->
+         match
+           Database.get_pages snapshot [ T.missing_page_uuid ] |> T.require_ok ~behavior
+         with
+         | [ Present_page { value; _ } ] ->
+           T.require
+             (value.page.title = title && value.page.name = title)
+             "normalized journal lost a protected field"
+         | _ -> Alcotest.fail "normalized journal page is missing"))
+  else (
+    (match result with
+     | Error (Authoritative_integrity_failure _) -> ()
+     | _ -> Alcotest.fail "non-equivalent or unprotected rewrite bypassed integrity");
+    let after = stale_view database behavior in
+    T.require
+      (sync_view_checkpoint before = sync_view_checkpoint after
+       && sync_view_submissions before = sync_view_submissions after)
+      "failed rewrite changed checkpoint or accepted outbox")
+;;
+
+let protected_retraction_cases =
+  [ "title before add, four fields", "block/title", false, 1, false, false
+  ; "name before add, source tx", "block/name", false, 1, true, false
+  ; "title after add, source tx", "block/title", true, 1, true, false
+  ; "name after add, four fields", "block/name", true, 1, false, false
+  ; "duplicate protected operations", "block/title", false, 2, true, false
+  ; "different protected values still reject", "block/title", false, 1, true, true
+  ; ( "unprotected same-value operations still reject"
+    , "block/created-at"
+    , false
+    , 1
+    , true
+    , false )
+  ]
+  |> List.map
+       (fun (name, attribute, retract_after_add, copies, source_tx, different_value) ->
+          T.database_case
+            name
+            (accepted_journal_protected_retractions
+               ~attribute
+               ~retract_after_add
+               ~copies
+               ~source_tx
+               ~different_value))
+;;
+
 let pure_cases =
   [ Alcotest.test_case
       "numeric cursor construction and comparison"
@@ -4329,5 +4508,7 @@ let () =
       ; Alcotest.test_case "storage failure rolls back mixed batch" `Quick (empty_authoritative_failure_is_atomic ~storage:true)
       ; T.database_case "empty payload keeps both token guards" empty_authoritative_keeps_token_guards
       ; T.database_case "malformed neighbours and empty outer batch reject" empty_authoritative_keeps_invalid_input_rejection ]
-    ; "validated wire inputs", pure_cases; "durable sync view", database_cases ]
+    ; "validated wire inputs", pure_cases
+    ; "protected same-value rewrites", protected_retraction_cases
+    ; "durable sync view", database_cases ]
 ;;
