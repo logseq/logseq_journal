@@ -1,15 +1,11 @@
 # App specification container
 
-Each specification area lives in its own subdirectory with its own wrapped Dune
-virtual library. This directory does not define a combined library or recursively
-include future specification modules.
+Each area under this directory is an independent wrapped Dune virtual library.
+Do not use recursive `include_subdirs` to merge future specifications into one
+library. Add another area only when it has actual contracts and consumers.
 
-The current area is [Worker coordination](worker_coordination/README.md):
-
-- Source: `app/spec/worker_coordination/`
-- Library: `journal_worker_coordination`
-- Public name: `logseq_journal.worker_coordination`
-- Modules: `Worker_api`, `Worker_coordinator`, `Worker_effect_runner`
-
-Other areas are added only when they have actual contracts. No placeholder UI,
-Timeline, Capture, implementation or adapter libraries are created here.
+- [worker_coordination](worker_coordination/README.md): the target App/Worker
+  interaction boundary, exported as `logseq_journal.worker_coordination`.
+  It covers typed queries/mutations/assets, real-client bootstrap, exclusive reply
+  routing, observation and host lifecycle handoff. It does not specify all App UI
+  or business algorithms and has no runtime implementation linked by today's App.

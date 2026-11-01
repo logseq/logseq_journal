@@ -1,59 +1,168 @@
 # App/Worker coordination contracts
 
-`logseq_journal.worker_coordination` is a compiled Dune virtual library, following the
-interface-only structure in `logseq_sync/spec`. It has **no default implementation**.
-The current `app` and Worker service do not implement/link this target contract.
-This PR does not migrate runtime code, fix the Capture failure, or include the
-separate Force Delete implementation.
+This independent wrapped Dune virtual library is the target boundary for migrating
+App/Worker interaction. It has **no implementation or default implementation**;
+the current App does not link it. `Worker_effect_runner` will interpret the pure
+coordinator directly against the existing Service/client, without an adapter or a
+second transport. UI layout, navigation, feed planning, Capture choice/order and
+media rendering remain with their business reducers.
 
-`Worker_coordinator` covers Worker request/observation/session/result coordination only. Its view
-is not the entire App model: navigation, Timeline/feed planning, Favorites, media,
-Capture editing and other business/UI state remain with their current owners.
+## Construction, consumption and ownership
 
-The eventual `app/impl/worker_effect_runner.ml` connects directly to the existing typed
-`Journal_worker` client and `Logseq_db_worker_lui_service`. There is no extra
-worker_adapter directory, generic WORKER module, or dependencies factory. Application
-owns the shared client, pump and event delivery and forwards actual envelopes to
-`Worker_effect_runner.on_event`; the runner does not install an unremovable second handler
-or stop the client on shutdown. It uses existing runtime epoch/worker generation
-and Accepted mailbox IDs for lifetime checks and cancellation.
+1. The host creates `Worker_coordinator.initial` and borrows its verified existing
+   client through `Worker_effect_runner.create`. The existing pump remains the only
+   `Mailbox.on_event` owner. Runner callbacks enqueue later serialized Core turns.
+2. `Worker_bound` identifies a fresh **binding** within the real mailbox
+   epoch/generation. Its pure transition emits `Bootstrap`. Registration plus an
+   authoritative baseline/replay yields `Bootstrap_received(binding, Ready p)`.
+   Not-ready, failed, revoked and empty-ready are distinct; even an old failure on
+   the same mailbox cannot overwrite a replacement binding.
+3. The baseline issues usable Open sessions, per-session capability/byte limits,
+   all resident phases, selection and deletion progress at one version. The
+   client obtains its first session here, never from a test-supplied sealed value.
+4. `Worker_coordinator.request` returns the exact typed ticket **and** transition.
+   Apply that transition before planning another request, then interpret its
+   instructions. This also works for identical concurrent requests; there is no
+   existential ticket recovery or inference from emitted instruction order.
+5. Runner records the actual Accepted mailbox ID before the next pump drain.
+   Its `delivery` always retains disposition, including owned failures/cancels.
+   The shared host router routes each terminal response to exactly one registered
+   owner. Unregistered IDs never fall through to Application's generic failure
+   branch. Push/Terminal fanout is separate and must not double-process this runner.
+6. Typed replies expose bounded existing Graph_types/Protocol DTOs. Their full
+   revisions, parent/page/order, timestamps, properties, task status and reference
+   data can feed the current Journal_graph_projection functions. Normalized UUIDs
+   and checked budgets do not grant graph execution authority.
+7. Query, observation and changefeed ownership are distinct. Empty data is
+   observable. Ordinary read failure does not release an interest, supersede
+   retained reconciliation or ACK a change window. A migrated interest has one
+   invalidation owner; the legacy runtime and new runner cannot both rehydrate/ACK
+   it. Release/registration races and orphan file acquisitions retain cleanup.
+   Observation support is per query kind, not the coarse feature flag alone;
+   Changes is rejected before Observe allocates a handle, keeping pull/ACK ownership
+   unique. Admission observation may be supported independently.
+8. Persist complete mutation/import intent before first send. Cancellation,
+   Not_admitted on a retry, reply loss and confirmation read failure are not proof
+   an earlier accepted operation did not commit. Exact receipts and explicit
+   presentation-bound Confirm distinguish local durability from current rendering
+   and cloud acceptance. Confirmation exposes its actual canonical readback to
+   the existing projection without another redundant query; child continuations
+   remain bounded. Partial children carry More/Partial, never a false exact count;
+   large intent/target/readback collections use the existing Rrbvec dependency.
+   A -> B -> A creates separate stable choice intents.
+9. Host keeps authentication/token/catalog/startup/unlock, resident configuration,
+   focus/select, deletion policy/confirmation and shared client lifetime. Before
+   close/removal/account replacement/stop it calls `prepare_host_change`, obtaining
+   its exact handoff ID. Overlap is refused without replacing the active cleanup
+   ledger. The host joins other legacy owners, then validates/consumes the sealed
+   safe receipt with `authorize_host_change` immediately before its actual action.
+   Retried/reopened/rebound targets cannot reuse an old safe receipt. This is a
+   coordination handoff, **not** an execution API for deleting local/remote graphs.
+   Bootstrap failure/no Open DB cannot itself forbid preparing cleanup from a
+   verified logical host binding and independent Worker resource ledger; missing
+   identity evidence or an unreachable owner stays pending/failed, never fake Safe.
+10. Shutdown is nonblocking: `Draining` requires continued pump/ACK delivery;
+    `Stopped` proves this owner's resources are quiescent or explicitly transferred.
+    It never stops the shared client. Ordinary Delete policy remains intact;
+    Force deletion belongs to its existing host owner and truthfully reports any
+    isolated pending cleanup. Durable unknown intents are not silently discarded.
 
-`Worker_api` owns sealed sessions, separate generation types, immutable intents,
-read-only page/block accessors and validating `ISSUER` mapping. Requests/responses
-use the actual in-process Service/Protocol OCaml types, not an invented bytes
-transport. Only durable intent persistence retains a bytes encoding. Runtime
-identity, authorization, receipt evidence, revocation and resource quiescence
-remain checks; types alone cannot prove them. Existing structured Error.t values
-are preserved when available; a code/message-only protocol failure cannot recover
-an already lost trace.
+## Current App capability coverage
 
-This directory owns only the Worker interaction/coordination library. Its parent
-`app/spec/` is a container; sibling parts must define their own wrapped virtual
-libraries rather than join this module set through recursive include_subdirs.
+The result types below deliberately reuse storage-independent DTOs rather than
+copying the full Service command set or introducing App UI models into Worker.
 
-## Review findings and runtime gaps
+| Current consumers / source | Target contract |
+| --- | --- |
+| journal_graph_feed_plan: list journals, root tree, child preview, cursor/revision scan | Journals (including initial revision), Tree, Children/Child_members, typed continuations and bounded budgets |
+| journal_graph_reference_plan, journal_copy, detail/confirmation | Graph_info, Page/Outline_block UUID lookup, atomic Block_summary, full page/block DTO and per-target revision |
+| journal_graph_favorites_plan and status load in journal_graph_runtime | Favorites, Task_statuses, Task_status_definitions, membership/order/revision/missing result slots |
+| journal_graph_runtime admission/Capture/create child/source/status/delete | Admission; complete Append child/status payload; typed durable Save/Insert/Delete/Create_journal/Set/Clear/Set_asset_reference intents; receipt and Confirm |
+| journal_media_runtime and Application imports/uploads | asset descriptors/list, scoped consumer demand/release, Import identity/outcome, Retry_asset/Retry_upload, imported/available file Acquire and tracked lease Release ACK |
+| journal_graph_runtime Pull_changes/Ack_changes and structure interests | Changes/Acknowledge_changes preserve generation/chain/window identity; no ACK before consumer application; resync and stale-read errors distinct |
+| current runtime interest reconciliation and empty-day refresh | Observe/Refresh/Release retain query/epoch/session, registration baseline and release ACK obligations; typed observation identity witness |
+| Application account/resident/focus/retired runtimes and graph removal | host ownership table, versioned projection and fresh binding, correlated prepare/handoff/consume, exact target fencing and nonblocking shutdown |
 
-| Finding | Contract | Existing implementation still to migrate |
-| --- | --- | --- |
-| Capture reads up to 200 full children before insertion, which can exceed encoded-byte limits | Atomic `Append`, durable intent and bounded reads | Current Service has separate create-page/insert operations. Until backend transaction/outbox/idempotent receipt semantics exist, return Unsupported_request before enqueue; wrapping those calls is not atomic. Preserve the final encoded-byte check from `a9df8c5`. |
-| Scoped and implicit-current APIs coexist; generations can be mixed | Sealed session, distinct generations, concrete mailbox lifetime | Existing dispatch still fills current scopes. Future runner maps only to scoped requests and fences old mailbox generations; preserve `1d61aeb` recovery behavior. |
-| Request/results and receipts can be mismatched, and opaque results were unusable | GADT requests/tickets, real Service reply validation, page/block UUID/title accessors | No runtime implementation exists yet. Positive clients now consume Journal page identity, request Children, render block identity/content and consume observations, including empty/error/refusal branches. |
-| Cancellation/presentation failure obscure commits | Not_admitted, Unsupported_request, Interrupted, mutation_progress and durable intents | Existing Worker outcomes remain unchanged. Use Accepted mailbox IDs for cooperative cancel, never infer rollback. Preserve stable status intent IDs (`69146ff`) and target confirmation (`6eceac6`, `c8a8cae`). |
-| Independent membership/state pushes and equality can hide progress | Versioned projection, selection/deletion consistency, Worker_coordinator.equal_view | Service.state and separate/coalesced Graph_states lack an atomic versioned baseline. A Worker-owned sample/registration or version replay handshake is required; otherwise return Unsupported_operation and no fabricated ready state. Preserve focus repair `089b2b2`; last-graph/local_deletion transitions remain requirements. |
-| Query and observation ownership/epochs are coupled | Query/Observe/Refresh/Release, typed results/unit ACK and Drain | Current Service does not offer the target observation registration/epoch/ACK protocol. Ordinary reads plus unsequenced pushes are insufficient. Reject unsupported operations explicitly; preserve empty-page `d135571` and invalidation-owned epoch `ad2b7ce`. |
+`Journal` and `Children` are bounded convenience queries for simple clients.
+`Page`, `Outline_block`, `Child_members`, `Block_summary` and `Tree` expose the
+richer existing protocol shapes needed by the actual planners. A summary's page,
+canonical root and child slice share one DB snapshot; sequential calls cannot be
+labelled a summary. Descriptor lookup has no continuation; list queries alone may
+return one. Page/tree/children continuation ownership includes the query's exact
+parameters and snapshot, beyond the static result-item index.
 
-The target covers these six issues, not every current Worker command. Append and
-lossless observation/projection are explicit backend migration gaps, not claims
-about today's Service. Ordinary Delete keeps its product rules. Force Delete
-requires confirmation, trustworthy resource ownership and truthful partial cleanup;
-no spec authorizes deleting real user data. Revocation allows only tracked cleanup
-and terminal ACKs, never new data operations or resurrection of a removed session.
+## Backend obligations and migration gate
 
-## Checks
+The spec can express these current interaction paths; it does **not** make the
+current backend capable of them. In particular, a compile-only client that reaches
+Ready is a usability check, not evidence that today's Service can issue Ready.
 
-`dune build @app/spec/worker_coordination/all` compiles the interfaces without linking an implementation.
-`dune build @test/worker-coordination-contracts` runs sealed-client compilation checks,
-including complete one-shot/observed Journal-to-Children rendering clients and
-rejection/error branches. The same rule belongs to workspace `dune runtest`.
-These checks prove interface usability/type constraints, not runtime behavior,
-backend atomicity, lossless registration or Simulator/device acceptance.
+| Required guarantee | Current boundary / work still required |
+| --- | --- |
+| Authoritative registered baseline and ongoing version stream | Service.state/Graph_states/Graph_info are separate/coalesced and lack an atomic registration/sample or version replay. Extend the actual Service owner with correlated registration, versioned baseline (membership/phases/selection/deletion/limits), replay boundary, binding revocation and unregister ACK. Current types cannot encode this proof. |
+| Existing typed read families and DTO validation | The Protocol V2 read commands already exist. Implement bounded mapping/decoding, ownership and cursor validation, and preserve existing projection conversion; these are not all Unsupported operations. Actual admission still needs the session/bootstrap above. |
+| Atomic durable Append including children/statuses and Web's existing journal page | Separate create/insert/status commands are insufficient. Worker must resolve/create and append transactionally with outbox/evidence; stable IDs bind the complete payload. Do not read an entire page merely to append. |
+| General mutation/import retry and confirmation | Existing command families and stable IDs remain the basis. Verify/implement durable outcome reconciliation per operation across restart and exact receipt/read-back matching before advertising the corresponding capability. A process-local duplicate cache or same visible text is insufficient. |
+| Observation register/sample/replay and release/fence ACK | Existing changes-available pushes and ordinary reads alone do not establish the target registration/epoch/ACK contract. Extend Worker ownership, including empty results, cancellation during registration and retained reconciliation. |
+| Lifecycle handoff and final resource ownership | Mailbox.cancel is cooperative. Require target writer/callback fencing, registration/lease ACKs and exact local-copy generation evidence or the existing independently proven lifecycle owner. A generic Client_command_completed is not a fence. Host must join legacy owners too. |
+
+Until supported, the specific target operation fails explicitly before enqueue;
+bootstrap failure is visible, no fake session/receipt/ACK is issued. Capabilities
+are advertised by a verified baseline rather than guessed in App. Returning
+Unsupported for every entry is not an implemented migration.
+
+A first production slice should be the existing Copy one-shot request/reply path,
+retaining its current business reducer and revision fences: Graph_info, UUID page/
+block lookup and Children. It needs the real bootstrap, exclusive routing and typed
+DTO mapping, but does not need atomic Append or new observation. Do not replace
+Copy's before/after graph/revision checks just because the result is now typed.
+Whole-layer replacement additionally needs the remaining capability and lifecycle
+obligations above, plus explicit transfer of all legacy resource ownership.
+
+## Validation and independent review
+
+`dune build @app/spec/worker_coordination/all` compiles the interfaces without an
+implementation. `dune build @test/worker-coordination-contracts` compiles sealed
+clients and rejects illegal clients. The rule also belongs to `dune runtest`.
+Clients start with a concrete client/binding/bootstrap, carry typed tickets through
+query results into **the current Journal_graph_projection**, observe an empty or
+nonempty page, persist/send a mutation, confirm with its presentation, and release
+resources. Additional cases cover every query/mutation/asset family, handoff and
+representative rejection/error/cancellation branches. Tests use the actual public DTO CMIs and
+only a test dependency on the existing App projection; the spec library does not
+depend on App.
+
+Independent review also found and corrected three new contract holes: Confirm
+needed an explicit presentation generation for focus-away/back; host handoff needed
+a returned ID, per-ID outcomes and a binding/target-scoped single-use safe receipt;
+asset notices needed exact opaque consumer association and a separate session/
+upload outlet. Worker-side cleanup must also settle resources whose successful
+outcome is replaced by Mailbox Cancelled/Shutdown before App sees the handle.
+
+These are **compile/type and source-boundary checks**, not executable behavior or
+backend conformance tests. The current set has 22 sealed positive clients, three
+additional compile-only integration modules using the real App projection, and
+22 negative clients. Before enabling a runtime capability, its owner needs
+at least the following deterministic integration acceptance:
+
+- Bootstrap: graph changes between sample/registration/replay, empty membership,
+  retry/rebind on the same client, delayed old not-ready/failure, exact byte limits.
+- Router: interleaved legacy/new IDs, reverse/duplicate/late replies, owned failure
+  and cancellation without legacy UI errors, malformed/foreign receipts, no second
+  pump handler and cleanup after revocation.
+- Reads: current projection conversion including refs/status/time/properties,
+  present/missing/recycled targets, every continuation family, stale cursor and
+  oversized singleton rather than silent truncation.
+- Mutations: Web-first day page, concurrent creation, lost accepted reply/restart
+  and same durable replay, A -> B -> A choice IDs, status/child suboperation order,
+  confirmation read failure and focus-away/back rejecting stale confirmation.
+- Assets: duplicate/late import and file acquisition, orphan preview/lease release,
+  demand release ACK, upload retry identity, other graph/account isolation, and
+  backend orphan retain settlement when cancellation suppresses the success reply.
+- Observation/changefeed: empty interest, register/Release races, sample/replay gap,
+  epoch ordering, read error retaining suffix reconciliation, ACK only after every
+  affected owner applies, no old/new duplicate invalidation owner.
+- Handoff/shutdown: overlap preserves first ledger, failed id1/retry id2 and late
+  id1 ACK, reopened same UUID/rebound client rejecting old safe receipt, last graph
+  empty projection, partial Force cleanup remains explicit, shared client/other
+  owners survive and pump keeps delivering cleanup until terminal fence.

@@ -9,10 +9,10 @@ import tempfile
 POSITIVE = {
     "scoped_query": """
 let read session budget day =
-  C.Request (session, W.Query (budget, W.Journal day))
+  request (session, W.Query (budget, W.Journal day))
 """,
     "atomic_capture_and_durable_retry": """
-let submit session intent = C.Request (session, W.Append intent)
+let submit session intent = request (session, W.Append intent)
 let restore_and_retry session bytes =
   Result.map (fun intent -> submit session intent) (W.restore_append_intent session bytes)
 """,
@@ -42,7 +42,7 @@ let checked (module Issuer : W.ISSUER) session request_id intent wire =
   Issuer.receipt session ~request_id ~intent wire
 """,
     "observe_empty_page_and_release": """
-let observe session budget day = C.Request (session, W.Observe (budget, W.Journal day))
+let observe session budget day = request (session, W.Observe (budget, W.Journal day))
 let receive (value : W.page option W.observed) = C.Observation_received value
 let release (observation : W.page option W.observation) = C.Release observation
 """,
@@ -62,13 +62,13 @@ let incoming runner event = Journal_worker_coordination.Worker_effect_runner.on_
     "binding_consumes_concrete_worker_values": """
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Validate (Issuer : W.ISSUER) = struct
-  let projection previous (state : Service.state) = Issuer.projection ~previous state
+  let projection previous (push : Service.push) = Issuer.projection ~previous push
   let answer session request_id request (response : Service.response) =
     Issuer.reply session ~request_id request response
   let update session observation (response : Logseq_db_worker.Protocol.response) =
     Issuer.observation session observation response
-  let confirm session receipt (response : Logseq_db_worker.Protocol.response) =
-    Issuer.confirmation session receipt response
+  let confirm session presentation receipt (response : Logseq_db_worker.Protocol.response) =
+    Issuer.confirmation session ~presentation receipt response
 end
 """,
     "release_has_a_typed_acknowledgement": """
@@ -95,7 +95,7 @@ let drain state = C.step state C.Drain
     "journal_to_children_to_rendering": """
 let children_request session budget page =
   W.page_title page,
-  C.Request (session, W.Query (budget, W.Children {parent=W.page_uuid page; after=None}))
+  request (session, W.Query (budget, W.Children {parent=W.page_uuid page; after=None}))
 let journal view (ticket : W.page option C.ticket) session budget =
   match C.reply view ticket with
   | None -> `Pending
@@ -123,7 +123,7 @@ let page view (handle : W.page option W.observation) session budget =
   | Some {value=None;_} -> `Empty
   | Some {value=Some page;_} ->
     `Children (W.page_title page,
-      C.Request (session,W.Observe(budget,W.Children {parent=W.page_uuid page;after=None})))
+      request (session,W.Observe(budget,W.Children {parent=W.page_uuid page;after=None})))
 let children view (handle : W.block W.slice W.observation) =
   match C.observed view handle with
   | None -> `Pending
@@ -177,6 +177,156 @@ NEGATIVE = {
 }
 
 
+
+POSITIVE.update({
+    "exclusive_routing_never_falls_through_on_error": """
+module R = Journal_worker_coordination.Worker_effect_runner
+let route runner event registered_owner broadcast drop =
+  let result = R.on_event runner event in
+  (match result.R.disposition with
+   | R.Consumed -> ()
+   | R.Unowned_response -> (match registered_owner event with Some handle -> handle event | None -> drop event)
+   | R.Broadcast -> broadcast event
+   | R.Dropped_envelope -> drop event);
+  result.R.error
+""",
+    "durable_all_mutations_and_confirmation": """
+module P = Logseq_db_worker.Protocol
+let operations session id uuid preconditions title status =
+  let commands = [
+    W.Save_block {block=uuid;title;preconditions};
+    W.Insert_blocks {parent=uuid;roots=[{P.uuid;title;children=[]}];preconditions};
+    W.Delete_blocks {root=uuid;preconditions};
+    W.Create_journal {page=uuid;day=(Result.get_ok(W.journal_day 20261101));title;preconditions};
+    W.Set_task_status {block=uuid;status;preconditions};
+    W.Clear_task_status {block=uuid;preconditions};
+    W.Set_asset_reference {block=uuid;previous=None;asset=uuid;preconditions}]
+  in List.map (fun command ->
+    Result.map (fun intent -> request(session,W.Mutate intent))
+      (W.mutation_intent session ~mutation_id:id command)) commands
+let recover session bytes = Result.map (fun intent -> request(session,W.Mutate intent))
+    (W.restore_mutation_intent session bytes)
+let confirm session presentation receipt = request(session,W.Confirm(presentation,receipt))
+let receipt value = W.receipt_mutation_id value,W.receipt_revisions value
+let capture session id uuid day =
+  W.append_intent session ~mutation_id:id ~block_id:uuid ~day ~title:"root"
+    ~task_status:None ~children:(Rrbvec.singleton {W.block_id=uuid;title="child";task_status=None;children=Rrbvec.empty})
+""",
+    "asset_import_notices_leases_and_ack": """
+let import session source = Result.map (fun intent -> request(session,W.Import intent))
+    (W.asset_import_intent session source)
+let retry session bytes = Result.map(fun intent -> request(session,W.Import intent))
+    (W.restore_asset_import_intent session bytes)
+let consumer session name = W.asset_consumer session ~name
+let demand session consumer descriptors =
+  request(session,W.Replace_asset_demand(consumer,W.Foreground,descriptors))
+let acquire session notice = Option.map(fun file ->
+  request(session,W.Acquire_asset_file file)) (W.ready_asset_file notice)
+let imported session receipt =
+  W.import_data receipt,
+  request(session,W.Acquire_imported_file receipt),
+  Option.map(fun lease -> request(session,W.Release_file lease)) (W.import_preview receipt)
+let lease session lease = W.file_path lease,W.file_type lease,request(session,W.Release_file lease)
+let retry_upload session notice = Option.map(fun operation ->
+  request(session,W.Retry_upload operation)) (W.upload_operation notice)
+let notice view consumer = C.asset_notices view consumer
+let facts view session first second =
+  let for_consumer consumer = List.filter(fun notice ->
+    match W.asset_notice_consumer notice with
+    | Some owner -> W.equal_asset_consumer owner consumer
+    | None -> false) (C.asset_notices view consumer) in
+  let session_facts = List.filter(fun notice -> W.asset_notice_consumer notice=None)
+      (C.session_asset_notices view session) in
+  for_consumer first,for_consumer second,
+  List.map W.asset_notice_data session_facts
+let release session consumer = request(session,W.Release_asset_demand consumer)
+""",
+    "host_ownership_handoff_and_nonblocking_shutdown": """
+module R = Journal_worker_coordination.Worker_effect_runner
+let retire state uuid = C.prepare_host_change state (W.Graph_will_remove(uuid,W.Force))
+let host_can_proceed view id =
+  match C.handoff view id with
+  | Some(W.Safe_to_proceed receipt) -> Some(W.handoff_change receipt,W.handoff_pending receipt)
+  | Some(W.Quiescing _ | W.Handoff_failed _) | None -> None
+let authorize runner receipt =
+  W.handoff_receipt_id receipt,W.handoff_binding receipt,W.handoff_sessions receipt,
+  R.authorize_host_change runner receipt
+let stop runner =
+  match R.shutdown runner with
+  | R.Draining -> `Pump_again
+  | R.Stopped -> `Done
+  | R.Shutdown_failed error -> `Error error
+""",
+    "changefeed_observation_and_snapshot_registration": """
+let bootstrap (module Issuer : W.ISSUER) response = Issuer.bootstrap response
+let sample (module Issuer : W.ISSUER) = Issuer.bootstrap_request ()
+let observed (value : W.block_summary W.observed) =
+  W.compare_observation_epoch value.epoch value.epoch,value.value.W.lookup
+let changes (batch : W.change_batch) = batch.generation,batch.through,batch.windows,batch.next
+let capability session = W.capabilities session
+let can_observe session query = W.supports_observation session query
+let release_baseline (module Issuer : W.ISSUER) response =
+  Issuer.revoke (); Issuer.release_binding_request (),Issuer.binding_released response
+let handoff (module Issuer : W.ISSUER) handoff_id change response =
+  Issuer.handoff_request ~handoff_id change,Issuer.handoff_receipt ~handoff_id change response
+""",
+})
+
+NEGATIVE.update({
+    "tree_continuation_cannot_resume_journals": (
+        """let wrong day (after : Logseq_db_worker.Protocol.v2_tree_member W.continuation option) =
+ W.Journals {from_day=day;through_day=day;revision=None;after}""", ("v2_tree_member", "v2_journal_item")),
+    "import_cannot_complete_as_graph_mutation": (
+        """let wrong (ticket : W.import_progress C.ticket) (reply : W.mutation_progress W.reply) =
+ C.Completed(ticket,reply)""", ("W.import_progress", "W.mutation_progress")),
+    "file_handle_is_not_a_lease": (
+        "let wrong (file : W.asset_file) = W.Release_file file", ("W.asset_file", "W.file_lease")),
+    "release_receipt_is_not_constructible": (
+        "let wrong : W.handoff_receipt = ()", ("W.handoff_receipt",)),
+    "bootstrap_ready_cannot_be_forged": (
+        "let wrong = W.Ready ()", ("W.projection",)),
+    "summary_is_not_a_child_slice": (
+        "let wrong (value : W.block_summary) : W.block W.slice = value", ("W.block_summary", "W.slice")),
+})
+
+
+POSITIVE.update({
+    "presentation_and_registration_identity_are_explicit": """
+let confirm (module Issuer:W.ISSUER) session presentation receipt response =
+  Issuer.confirmation session ~presentation receipt response
+let bound (module Issuer:W.ISSUER) state =
+  C.Worker_bound Issuer.binding,C.Bootstrap_received(Issuer.binding,state)
+let cleanup handle =
+  W.observation_session handle,W.observation_id handle
+let same (type a b) (left:a W.observation) (right:b W.observation) (value:b) : a option =
+  match W.same_observation left right with Some W.Refl -> Some value | None -> None
+""",
+})
+NEGATIVE.update({
+    "confirmation_requires_a_presentation": (
+      "let wrong (session:W.session) receipt = W.Confirm(session,receipt)",
+      ("W.session", "W.presentation")),
+    "binding_is_not_worker_incarnation": (
+      "let wrong (worker:W.worker_incarnation) = C.Worker_bound worker",
+      ("W.worker_incarnation", "Worker_api.binding")),
+    "observation_value_cannot_cross_without_equality": (
+      "let wrong (type a b) (left:a W.observation) (right:b W.observation) (value:b) : a = value",
+      ("b", "a")),
+})
+
+
+NEGATIVE.update({
+    "planned_ticket_keeps_its_result_type": (
+      """let wrong state session budget day =
+  match C.request state session (W.Query(budget,W.Journal day)) with
+  | Error _ -> None
+  | Ok(ticket,_) -> Some (ticket : W.block W.slice C.ticket)""",
+      ("W.page", "W.block")),
+    "handoff_id_is_not_request_id": (
+      "let wrong view (id:W.request_id) = C.handoff view id",
+      ("W.request_id", "Worker_api.handoff_id")),
+})
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ocamlc", required=True)
@@ -186,7 +336,7 @@ def main():
     if not required or any(not path.is_file() for path in required):
         raise AssertionError("The compiled Worker coordination interfaces are required before client checking")
     includes = sorted({str(path.parent) for path in required})
-    prelude = "module W = Journal_worker_coordination.Worker_api\nmodule C = Journal_worker_coordination.Worker_coordinator\n"
+    prelude = "module W = Journal_worker_coordination.Worker_api\nmodule C = Journal_worker_coordination.Worker_coordinator\nlet request (session,operation) state = Result.map snd (C.request state session operation)\n"
     with tempfile.TemporaryDirectory(prefix="journal-worker-coordination-") as temporary:
         directory = Path(temporary)
         for name, source in POSITIVE.items():

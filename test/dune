@@ -166,17 +166,21 @@
 
 (rule
  (alias worker-coordination-contracts)
- (deps worker_coordination_contract_test.py)
+ (deps worker_coordination_contract_test.py
+  worker_coordination_consumers/worker_coordination_consumers.cma)
  (action
   (run
    python3 -B %{dep:worker_coordination_contract_test.py}
    --ocamlc %{ocamlc}
+   --cmi %{lib:rrbvec:rrbvec.cmi}
    --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination.cmi}
    --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination__Worker_api.cmi}
    --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination__Worker_coordinator.cmi}
    --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination__Worker_effect_runner.cmi}
    --cmi %{lib:logseq_db_types:logseq_db_types.cmi}
    --cmi %{lib:logseq_db_types:logseq_db_types__Graph_types.cmi}
+   --cmi %{lib:logseq_db_types:logseq_db_types__Asset_import.cmi}
+   --cmi %{lib:logseq_db_types:logseq_db_types__Asset_descriptor.cmi}
    --cmi %{lib:logseq_db_worker:logseq_db_worker.cmi}
    --cmi %{lib:logseq_db_worker.contract:logseq_db_worker_contract.cmi}
    --cmi %{lib:logseq_db_worker.contract:logseq_db_worker_contract__Error.cmi}
