@@ -1,80 +1,77 @@
-(** Interpreter/adapter obligations for the target App spec. No default or stub
-    implementation is supplied; today's Service is not silently coerced into it. *)
+(** Target interpreter directly connected to the existing dbworker Service/client.
+    No default implementation or runtime migration is provided by this spec. *)
 
 module Worker = Worker_api
+module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
+module Mailbox = Logseq_db_worker_lui.Journal_worker
 
-module type WORKER = sig
-  type t
-
-  (** Bind once before sampling/subscribing. The runner supplies a verified,
-      connection/account-bound issuer; the adapter uses its validating functions
-      to turn raw Worker messages into sealed values. A failed bind is explicit.
-      Revocation invalidates this issuer as well as callbacks from the old binding. *)
-  val bind : t -> issuer:(module Worker.ISSUER) -> (unit, Worker.error) result
-
-  (** Only this trusted adapter issues sessions/projections after validating the
-      real Worker connection, account, graph and local incarnation. *)
-  val projection : t -> Worker.projection
-
-  (** Use the bound issuer's request encoder before dispatching to the real Worker.
-      Report Not_admitted only before reservation. After acceptance, issue one
-      terminal callback, preserving uncertainty if cancellation races a commit.
-      Check response kind, all envelope IDs and receipt ownership before callback.
-      Append and outbox/receipt persistence have one durable outcome; retries of
-      the same intent/payload are idempotent across process restarts. Final encoded
-      read bytes are bounded after enrichment, not only before it. *)
-  val send
-    :  t
-    -> request_id:Worker.request_id
-    -> Worker.session
-    -> 'a Worker.request
-    -> ('a Worker.reply -> unit)
-    -> unit
-
-  (** Encode only a tracked cancellation through the bound issuer. *)
-  val cancel : t -> request_id:Worker.request_id -> unit
-
-  (** Registration must not lose changes between the sampled version and the
-      first callback. A projection contains membership and phase together;
-      observations include empty results and maintain their own epochs. *)
-  val subscribe
-    :  t
-    -> projection:(Worker.projection -> unit)
-    -> observation:(Worker.observation_update -> unit)
-    -> (unit -> unit)
-end
-
-type dependencies
-
-val dependencies
-  :  managed_origin:string
-  -> user_id:string
-  -> worker_incarnation:Worker.worker_incarnation
-  -> worker:(module WORKER with type t = 'worker)
-  -> handle:'worker
-  -> dependencies
-
+type client = (Service.request, Service.response, Service.push) Mailbox.client
 type t
 
-(** Construct [Worker.issuer] from the verified binding, bind the adapter, then
-    post [Core.Worker_bound] before its baseline/projection callbacks. Failures
-    are returned; no fabricated baseline or silently unbound Worker is usable. *)
-val create : dependencies -> post:(Core.event -> unit) -> (t, Worker.error) result
+(** Borrow the connected client owned by Application/Journal_worker_runtime.
+    Derive the binding identity from [Mailbox.runtime_epoch]/[worker_generation],
+    construct the validating [Worker.issuer], and post [Core.Worker_bound] before
+    publishing its baseline. The verified local/online binding supplies origin/user.
+    No WORKER functor, separate adapter, or second transport client is required.
 
-(** Dispatch only the exact ticket/session/request, posting all completions back
-    to the serialized Core owner. Never call [Core.step] from a callback. Stop
-    admission immediately on revocation. Release joins affected observation
-    callbacks before its unit ACK; graph removal joins/fences target writers
-    before reporting cleanup complete. A failed join is an explicit failure.
-    The type system alone does not prove thread, network or filesystem atomicity.
-    [Core.Schedule_drain] posts [Core.Drain] on a later coordinator turn without
-    calling [Core.step] inline. *)
+    Application keeps its existing pump, event delivery, authentication/catalog
+    handling and client lifetime. It forwards relevant real envelopes to [on_event].
+    Creating this runner neither starts/stops that shared client nor silently
+    registers another permanent Mailbox.on_event handler (there is no unsubscribe
+    operation in that API). [post] queues a later Core turn; [publish] delivers the
+    coordination view to its host without owning UI/navigation state. Creation
+    does not claim a readable baseline is ready. *)
+val create
+  :  client:client
+  -> managed_origin:string
+  -> user_id:string
+  -> post:(Core.event -> unit)
+  -> publish:(Core.view -> unit)
+  -> (t, Worker.error) result
+
+(** Called on the App coordinator from the existing Mailbox.on_event/pump path.
+    Validate envelope runtime epoch/worker generation and the tracked mailbox ID
+    before interpreting Service responses/pushes with Worker.issuer. Retired/foreign
+    envelopes are ignored. Publish typed Core completions/projections/observations
+    through [post], never by calling [Core.step] inside a Worker callback.
+
+    Today's independently coalesced session/graph pushes do not provide an atomic,
+    versioned sample/subscription handshake. Establish registration plus a baseline
+    or replay from its version at the Worker owner before claiming this contract;
+    otherwise return Unsupported_operation to the host and publish no fabricated
+    ready projection. The host must surface this error through its existing UI
+    error/recovery path. These guarantees still require backend work and tests. *)
+val on_event
+  :  t
+  -> (Service.response, Service.push) Mailbox.event
+  -> (unit, Worker.error) result
+
+(** Map exact typed instructions to scoped Service requests, using [Mailbox.send]
+    and recording its Accepted mailbox ID against the Core ticket/protocol ID.
+    Full/Not_ready/Stopping are Not_admitted; Unsupported target commands are
+    Not_admitted(Unsupported_request ...) before any enqueue. Query/Append never
+    fall back to the implicit-current Service.Graph_request entry point.
+
+    Cancellation uses [Mailbox.cancel] with the owned Accepted mailbox ID; the
+    cooperative terminal outcome cannot prove rollback. Mailbox.Failed remains
+    Service_failed. Preserve available Error.t values; V2_failed only carries
+    code/message, so decode those without inventing a lost causal trace. A write
+    accepted before interruption stays unknown or committed pending reconciliation.
+
+    Current create-page and insert commands do not implement atomic Append. The
+    implementation must reject it until a durable idempotent backend operation
+    exists; wrapping old calls is not sufficient. Observe/Refresh/Release similarly
+    require a real registration/epoch/ack protocol, not invented completion facts.
+    Release uses a unit ticket and retains cleanup after revocation. Schedule_drain
+    posts Core.Drain on a later coordinator turn. Publish is delivered to the host
+    without applying Core.step recursively. Final enriched reads retain byte limits. *)
 val submit : t -> Core.instruction -> unit
 
-(** Revoke data issuance/callbacks/admission, retaining only the old binding's
-    tracked cancellation/Release/terminal-ACK cleanup path. Release owned
-    observations without admitting a new query/write or resurrecting the session.
-    Return success only
-    after their resources are quiescent; failures remain visible/retryable and do
-    not erase durable intents or imply that accepted writes were rolled back. *)
+(** Revoke this runner's data issuance and ignore subsequent ordinary callbacks.
+    Only its tracked cancellation/Release/terminal-ACK path may finish cleanup;
+    never stop the shared client or release another App consumer's resources.
+    Return success only after owned callbacks/interests are quiescent. Existing
+    Mailbox.cancel alone cannot prove a target writer stopped or release completed;
+    backend acknowledgement/fencing is still required. Failures remain explicit
+    and retryable; durable intents are preserved. *)
 val shutdown : t -> (unit, Worker.error) result

@@ -1,5 +1,7 @@
 (** Pure App request/observation and presentation owner. This is a target virtual
     contract, not a signature claimed by today's [Application] implementation.
+    Its view covers Worker coordination only: navigation, Timeline/feed planning,
+    Favorites, media, Capture editing and other UI/business state remain outside.
     No DB/network/filesystem/clock calls or mutable callbacks occur in [step]. *)
 
 module Worker = Worker_api

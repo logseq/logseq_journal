@@ -1,7 +1,7 @@
-(** Target App/Worker boundary. No production adapter implements this contract yet.
+(** Target App/Worker boundary. No production implementation satisfies it yet.
     Sessions, projections and observation handles are issued by the trusted Worker
-    adapter, not assembled from UI fields. Type abstraction is not authentication:
-    that adapter must validate the origin and ownership of incoming messages. *)
+    runner, not assembled from UI fields. Type abstraction is not authentication:
+    the runner must validate the origin and ownership of incoming messages. *)
 
 module Uuid = Logseq_db_types.Graph_types.Uuid
 
@@ -19,8 +19,11 @@ val presentation_session : presentation -> session
 val graph_id : session -> Uuid.t
 val equal_session : session -> session -> bool
 
-(** The host supplies a fresh UUID for each trusted Worker binding. *)
-val worker_incarnation : Uuid.t -> worker_incarnation
+(** Use the existing mailbox lifetime identities, not a second invented nonce. *)
+val worker_incarnation
+  :  runtime_epoch:Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch
+  -> worker_generation:Logseq_db_worker_lui.Journal_worker_ids.Worker.generation
+  -> worker_incarnation
 
 (** An execution session survives focus changes while resident. Closing, reopening,
     account replacement and removal revoke its authority. Every admission and
@@ -33,7 +36,9 @@ type error =
   | Invalid_input of string
   | Response_budget_exceeded
   | Protocol_mismatch of string
-  | Storage_unavailable of string
+  | Db_error of Logseq_db_worker.Error.t
+  | Service_failed of string
+  | Unsupported_operation of string
 
 type request_id
 val request_id : Uuid.t -> request_id
@@ -54,6 +59,15 @@ val journal_day : int -> (journal_day, error) result
 
 type page
 type block
+
+(** Read-only fields from the existing [Graph_types.page]/[Graph_types.block]
+    results. UUIDs remain normalized and titles retain their stored text. These
+    accessors grant no execution authority and expose no DB/storage handle. *)
+val page_uuid : page -> Uuid.t
+val page_title : page -> string
+val block_uuid : block -> Uuid.t
+val block_title : block -> string
+
 type 'a continuation
 type 'a slice = private
   { items : 'a list
@@ -96,17 +110,6 @@ val restore_append_intent : session -> bytes -> (append_intent, error) result
 type receipt
 type confirmation
 
-(** Untrusted envelope plus local commit receipt, before validation. *)
-type wire_receipt =
-  { request_id : Uuid.t
-  ; mutation_id : Uuid.t
-  ; graph_id : Uuid.t
-  ; account_generation : int
-  ; graph_generation : int
-  ; before_revision : string
-  ; after_revision : string
-  }
-
 type mutation_progress =
   | Rejected of error
   | Outcome_unknown
@@ -118,7 +121,7 @@ type mutation_progress =
     target, session and revision; rendered Timeline membership is not evidence.
     A remote sync rejection of an already committed local intent is a separate
     sync fact and must not turn that local commit into [Rejected]. *)
-type admission_error = Full | Not_ready | Stopping
+type admission_error = Full | Not_ready | Stopping | Unsupported_request of string
 type interruption = Cancelled | Transport_lost | Worker_stopped
 type 'a reply =
   | Not_admitted of admission_error
@@ -127,7 +130,8 @@ type 'a reply =
 
 (** A refusal before reservation is [Not_admitted]. After acceptance, interruption
     or an unvalidated error cannot assert that a mutation did not commit. Preserve
-    an existing receipt; otherwise reconcile using the same durable intent. *)
+    an existing receipt; otherwise reconcile using the same durable intent.
+    Not_admitted describes this attempt, not whether an earlier attempt committed. *)
 type observation_epoch
 val compare_observation_epoch : observation_epoch -> observation_epoch -> int
 type 'a observation
@@ -155,7 +159,10 @@ type _ request =
     transaction and outbox coordination. It does not require the App to fetch a
     children slice or whole page first. A retry returns the existing operation's
     outcome; graph changes, conflicts and byte limits remain runtime checks.
-    Neither response loss nor a later read failure rolls back a durable commit. *)
+    Neither response loss nor a later read failure rolls back a durable commit.
+    This is a target runtime obligation: today's separate create-page/insert
+    commands do not implement it. Until a durable atomic/idempotent backend path
+    exists, reject before enqueue with [Not_admitted (Unsupported_request ...)]. *)
 type observation_update = Update : 'a observed -> observation_update
 
 type projection_version
@@ -199,8 +206,8 @@ val equal_projection : projection -> projection -> bool
     interrupted or OS-refused cleanup is never represented as complete. *)
 val removal_target : local_deletion -> Uuid.t
 
-(** Signature of a connection-bound validating issuer. The integration factory
-    below is the explicit trust boundary; App rendering cannot assemble sealed
+(** Signature of a connection-bound validating issuer used inside Effect_runner.
+    The integration factory below is the trust boundary; App rendering cannot assemble sealed
     values from UI records. Neither a module signature nor its factory proves the
     honesty of an arbitrary backend or authenticates caller-supplied identity. *)
 module type ISSUER = sig
@@ -210,23 +217,29 @@ module type ISSUER = sig
       cleanup; they cannot admit new data operations or reactivate a session. *)
   val revoke : unit -> unit
 
-  (** Validate and encode the exact request envelope, including scoped IDs, query
+  (** Validate and map to the actual in-process Service request, including scoped IDs, query
       parameters/budget, observation handle and durable intent identity. This
-      supplies the adapter's outbound path without exposing opaque fields. After
+      preserves the current OCaml transport without a fictional bytes/adapter hop. After
       revocation reject Query, Append, Refresh and new Observe; only idempotent
-      Release of a handle tracked by this binding remains encodable. Encoding
-      does not reserve Worker capacity or prove that a mutation was persisted. *)
+      Release of a handle tracked by this binding remains encodable. Mapping
+      does not reserve Worker capacity or prove that a mutation was persisted.
+      Unsupported target operations fail explicitly; never translate atomic Append
+      into today's separate mutations or claim ordinary reads register observations. *)
   val request
-    :  session -> request_id:request_id -> 'a request -> (bytes, error) result
-
-  (** Encode cancellation only for a request tracked by this binding. Allowed
-      during revocation cleanup; it is not a no-commit or release-complete proof. *)
-  val cancellation : request_id -> (bytes, error) result
+    :  session -> request_id:request_id -> 'a request
+    -> (Logseq_db_worker_lui.Logseq_db_worker_lui_service.request, error) result
 
   (** Validate one complete version and issue its sessions/presentation. Reject
       mismatched connection/account, old incarnation/version, duplicate residents,
-      incoherent selection and invalid deletion transitions before construction. *)
-  val projection : previous:projection option -> bytes -> (projection, error) result
+      incoherent selection and invalid deletion transitions before construction.
+      Today's Service.state and separate graph-state pushes do not carry an atomic
+      versioned baseline. Return Unsupported_operation until a Worker-owned sample/
+      registration or version-replay handshake can establish all required facts;
+      combining independently sampled records is not that proof. *)
+  val projection
+    :  previous:projection option
+    -> Logseq_db_worker_lui.Logseq_db_worker_lui_service.state
+    -> (projection, error) result
 
   (** Match the live session, request ID, request/result kind and mutation receipt
       identity. Known rejected or committed outcomes require corresponding evidence;
@@ -237,12 +250,13 @@ module type ISSUER = sig
     :  session
     -> request_id:request_id
     -> 'a request
-    -> bytes
+    -> Logseq_db_worker_lui.Logseq_db_worker_lui_service.response
     -> ('a reply, error) result
 
   (** Validate this handle's owner, query/revision binding and current epoch. *)
   val observation
-    :  session -> 'a observation -> bytes -> ('a observed, error) result
+    :  session -> 'a observation -> Logseq_db_worker.Protocol.response
+    -> ('a observed, error) result
 
   (** Validate the live session, request ID, durable mutation identity, logical
       owner and committed revisions. A differently identified receipt is rejected.
@@ -251,16 +265,18 @@ module type ISSUER = sig
     :  session
     -> request_id:request_id
     -> intent:append_intent
-    -> wire_receipt
+    -> Logseq_db_worker.Protocol.response
     -> (receipt, error) result
 
   (** Issue confirmation only after exact target read-back/presentation evidence
       for this receipt, session and revision; empty Timeline text is not absence. *)
-  val confirmation : session -> receipt -> bytes -> (confirmation, error) result
+  val confirmation
+    :  session -> receipt -> Logseq_db_worker.Protocol.response
+    -> (confirmation, error) result
 end
 
-(** Trusted integration entry point, implemented by [Worker_api], so an adapter
-    can actually issue the sealed values. The host must obtain origin/account from
+(** Trusted integration entry point, implemented by [Worker_api], so the runner
+    can issue sealed values from validated dbworker facts. The host obtains origin/account from
     its verified local/online account binding and attach this issuer only to the
     corresponding real Worker channel. Normalization, connection lifetime and
     every message/receipt are validated; merely passing strings is not permission
@@ -269,5 +285,6 @@ end
 val issuer
   :  managed_origin:string
   -> user_id:string
-  -> worker_incarnation:worker_incarnation
+  -> runtime_epoch:Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch
+  -> worker_generation:Logseq_db_worker_lui.Journal_worker_ids.Worker.generation
   -> ((module ISSUER), error) result

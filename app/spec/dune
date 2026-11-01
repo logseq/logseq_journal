@@ -3,4 +3,4 @@
  (public_name logseq_journal.app_spec)
  (modules worker_api core effect_runner)
  (virtual_modules worker_api core effect_runner)
- (libraries logseq_db_types))
+ (libraries logseq_db_types logseq_db_worker logseq_db_worker.lui))

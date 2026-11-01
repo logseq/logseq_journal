@@ -55,26 +55,35 @@ let equality left right = C.equal_view (C.view left) (C.view right)
 let create client_id = C.initial ~client_id
 let step state event = C.step state event
 let execute runner instruction = Journal_app_spec.Effect_runner.submit runner instruction
+let connect client managed_origin user_id post publish =
+  Journal_app_spec.Effect_runner.create ~client ~managed_origin ~user_id ~post ~publish
+let incoming runner event = Journal_app_spec.Effect_runner.on_event runner event
 """,
-    "trusted_adapter_can_issue_from_wire": """
-module Decode_worker (Issuer : W.ISSUER) = struct
-  let projection previous wire = Issuer.projection ~previous wire
-  let answer session request_id request wire = Issuer.reply session ~request_id request wire
-  let update session observation wire = Issuer.observation session observation wire
-  let confirm session receipt wire = Issuer.confirmation session receipt wire
+    "binding_consumes_concrete_worker_values": """
+module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
+module Validate (Issuer : W.ISSUER) = struct
+  let projection previous (state : Service.state) = Issuer.projection ~previous state
+  let answer session request_id request (response : Service.response) =
+    Issuer.reply session ~request_id request response
+  let update session observation (response : Logseq_db_worker.Protocol.response) =
+    Issuer.observation session observation response
+  let confirm session receipt (response : Logseq_db_worker.Protocol.response) =
+    Issuer.confirmation session receipt response
 end
 """,
     "release_has_a_typed_acknowledgement": """
 let acknowledged (ticket : unit C.ticket) = C.Completed (ticket, W.Answered (Ok ()))
 """,
     "trusted_issuer_has_a_construction_boundary": """
-let issue managed_origin user_id worker_incarnation =
-  W.issuer ~managed_origin ~user_id ~worker_incarnation
+let issue managed_origin user_id runtime_epoch worker_generation =
+  W.issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation
 """,
-    "trusted_adapter_can_encode_outbound_requests": """
-let send (module Issuer : W.ISSUER) session request_id request =
+    "binding_encodes_scoped_service_requests": """
+let send (module Issuer : W.ISSUER) session request_id request
+    : (Logseq_db_worker_lui.Logseq_db_worker_lui_service.request, W.error) result =
   Issuer.request session ~request_id request
-let cancel (module Issuer : W.ISSUER) request_id = Issuer.cancellation request_id
+let cancel client mailbox_id =
+  Logseq_db_worker_lui.Journal_worker.cancel client ~request_id:mailbox_id
 """,
     "typed_query_and_observation_results_reach_the_view": """
 let answer view (ticket : W.page option C.ticket) : W.page option W.reply option =
@@ -82,6 +91,54 @@ let answer view (ticket : W.page option C.ticket) : W.page option W.reply option
 let observed view (handle : W.page option W.observation) : W.page option W.observed option =
   C.observed view handle
 let drain state = C.step state C.Drain
+""",
+    "journal_to_children_to_rendering": """
+let children_request session budget page =
+  W.page_title page,
+  C.Request (session, W.Query (budget, W.Children {parent=W.page_uuid page; after=None}))
+let journal view (ticket : W.page option C.ticket) session budget =
+  match C.reply view ticket with
+  | None -> `Pending
+  | Some (W.Answered (Ok (Some page))) -> `Children (children_request session budget page)
+  | Some (W.Answered (Ok None)) -> `Empty
+  | Some (W.Not_admitted (W.Full | W.Not_ready | W.Stopping)) -> `Retry
+  | Some (W.Not_admitted (W.Unsupported_request operation)) -> `Unsupported operation
+  | Some (W.Interrupted (W.Cancelled | W.Transport_lost | W.Worker_stopped)) -> `Interrupted
+  | Some (W.Answered (Error error)) -> `Error error
+let rows (slice : W.block W.slice) =
+  List.map (fun block -> W.block_uuid block, W.block_title block) slice.items
+let children view (ticket : W.block W.slice C.ticket) =
+  match C.reply view ticket with
+  | Some (W.Answered (Ok slice)) -> `Rows (rows slice), slice.next
+  | Some (W.Answered (Error error)) -> `Error error, None
+  | Some (W.Not_admitted (W.Unsupported_request operation)) -> `Unsupported operation, None
+  | Some (W.Not_admitted (W.Full | W.Not_ready | W.Stopping))
+  | Some (W.Interrupted _) -> `Retry, None
+  | None -> `Pending, None
+""",
+    "observation_consumes_empty_and_nonempty_results": """
+let page view (handle : W.page option W.observation) session budget =
+  match C.observed view handle with
+  | None -> `Pending
+  | Some {value=None;_} -> `Empty
+  | Some {value=Some page;_} ->
+    `Children (W.page_title page,
+      C.Request (session,W.Observe(budget,W.Children {parent=W.page_uuid page;after=None})))
+let children view (handle : W.block W.slice W.observation) =
+  match C.observed view handle with
+  | None -> `Pending
+  | Some {value=slice;_} ->
+    `Rows (List.map (fun block -> W.block_uuid block,W.block_title block) slice.items)
+let registration view (ticket : W.block W.slice W.observed C.ticket) =
+  match C.reply view ticket with
+  | Some (W.Answered (Ok observed)) -> `Observed (observed.observation, observed.value.items)
+  | Some (W.Answered (Error (W.Unsupported_operation operation))) -> `Unsupported operation
+  | Some (W.Answered (Error (W.Db_error error))) -> `Db_error (Logseq_db_worker.Error.code error)
+  | Some (W.Answered (Error error)) -> `Error error
+  | Some (W.Not_admitted (W.Unsupported_request operation)) -> `Unsupported operation
+  | Some (W.Not_admitted (W.Full | W.Not_ready | W.Stopping))
+  | Some (W.Interrupted _) -> `Retry
+  | None -> `Pending
 """,
 }
 
@@ -111,6 +168,12 @@ NEGATIVE = {
         ("W.page", "W.block")),
     "committed_receipts_are_not_client_constructible": (
         "let wrong : W.receipt = ()", ("W.receipt",)),
+    "mailbox_generations_are_not_runtime_epochs": (
+        """let wrong (runtime_epoch : Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch)
+    (worker_generation : Logseq_db_worker_lui.Journal_worker_ids.Worker.generation) =
+  W.issuer ~managed_origin:"https://example.invalid" ~user_id:"fixture"
+    ~runtime_epoch:worker_generation ~worker_generation:runtime_epoch""",
+        ("Worker.generation", "Runtime.epoch")),
 }
 
 
