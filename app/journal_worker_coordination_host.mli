@@ -24,14 +24,28 @@ val request
 val post : t -> Core.event -> unit
 
 val plan_query
-  : t -> owner:Runner.Service.timeline_scope
-  -> maximum_items:int -> maximum_bytes:int -> 'a Worker.query
+  :  t
+  -> owner:Runner.Service.timeline_scope
+  -> maximum_items:int
+  -> maximum_bytes:int
+  -> 'a Worker.query
   -> ('a Core.ticket, Worker.error) result
 
 (** A host-owned callback outlet only. The coordinator owns admission, cancellation
     and terminal consumption; completed tickets are forgotten on a later queued
     turn before the business callback is delivered. *)
 val watch : t -> 'a Core.ticket -> f:('a Worker.reply -> unit) -> unit
+
+(** Capture pure query provenance before the scheduled Forget, then deliver it on
+    the same later business callback turn. No session is inferred from the latest
+    projection; non-query or unsent tickets carry None. *)
+val watch_read
+  :  t
+  -> 'a Core.ticket
+  -> f:((Worker.session * Worker.read_budget) option -> 'a Worker.reply -> unit)
+  -> unit
+
+val validate_session : t -> Worker.session -> (unit, Worker.error) result
 
 val on_event
   :  t

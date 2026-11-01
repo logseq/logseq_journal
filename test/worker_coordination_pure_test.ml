@@ -17,6 +17,45 @@ let ready binding projection =
   (C.step state (C.Bootstrap_received (binding, W.Ready projection))).next
 ;;
 
+let test_query_origin_boundary () =
+  let issuer, raw, projection, session = fixture 310L in
+  let module I = (val issuer : W.ISSUER) in
+  let state = (C.step (C.initial ~client_id:client) (C.Worker_bound I.binding)).next in
+  let owner = Option.get raw.baseline.state.sync.selected in
+  let ticket, waiting =
+    C.plan_query state ~owner ~maximum_items:1 ~maximum_bytes:65536 W.Graph_info
+    |> Result.get_ok
+  in
+  check
+    (C.query_origin (C.view waiting.next) ticket = None)
+    "queued read fabricated execution origin";
+  let sent = C.step waiting.next (C.Bootstrap_received (I.binding, W.Ready projection)) in
+  (match C.query_origin (C.view sent.next) ticket with
+   | Some (actual, budget) ->
+     check (W.equal_session actual session) "queued read origin changed session";
+     check
+       (W.validate_request actual (W.Query (budget, W.Graph_info)) = Ok ())
+       "origin budget differs from actual Send"
+   | None -> failwith "actual Send lost execution origin");
+  check
+    (C.validate_session sent.next session = Ok ())
+    "Open origin cannot resume cached data";
+  let _, closing =
+    C.prepare_host_change sent.next (W.Graph_will_close (W.graph_id session))
+    |> Result.get_ok
+  in
+  check
+    (C.validate_session closing.next session = Error W.Host_change_in_progress)
+    "handoff fence allowed cached read";
+  let forgotten = C.step sent.next (C.Forget ticket) in
+  check
+    (C.query_origin (C.view forgotten.next) ticket = None)
+    "forgotten ticket retained public origin";
+  check
+    (C.query_origin (C.view sent.next) ticket <> None)
+    "origin lookup mutated preceding state"
+;;
+
 let test_bootstrap_validation () =
   let issuer, raw, projection, _ = fixture 101L in
   let module I = (val issuer : W.ISSUER) in
@@ -566,7 +605,15 @@ let test_queued_query_properties () =
     let apply (transition : C.transition) =
       List.iter
         (function
-          | C.Send (ticket, session, _) ->
+          | C.Send (ticket, session, operation) ->
+            (match operation with
+             | W.Query (budget,_) ->
+               (match C.query_origin (C.view transition.next) ticket with
+                | Some (actual,actual_budget) -> check (W.equal_session actual session && actual_budget=budget)
+                    "queued property: origin differs from actual Send"
+                | None->failwith "queued property: dispatched read lacks origin")
+             | _ -> ());
+            check (C.validate_session transition.next session=Ok ()) "dispatched query session is fenced";
             let id = C.ticket_id ticket in
             check (not (Hashtbl.mem forbidden id)) "cancelled unsent read was dispatched";
             check (not (Hashtbl.mem sends id)) "queued read sent more than once";
@@ -926,6 +973,7 @@ let test_durable_readback_reservation () =
 ;;
 
 let () =
+  test_query_origin_boundary ();
   test_durable_readback_reservation ();
   test_durable_mutation_properties ();
   test_bootstrap_validation ();

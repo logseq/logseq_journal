@@ -2,7 +2,11 @@ module Worker = Journal_worker_coordination.Worker_api
 module Core = Journal_worker_coordination.Worker_pure_coordinator
 module Runner = Journal_worker_coordination.Worker_effect_runner
 
-type watch = Watch : 'a Core.ticket * ('a Worker.reply -> unit) -> watch
+type watch =
+  | Watch :
+      'a Core.ticket
+      * ((Worker.session * Worker.read_budget) option -> 'a Worker.reply -> unit)
+      -> watch
 
 type t =
   { state : Core.t ref
@@ -25,9 +29,10 @@ let flush host =
           match Core.reply view ticket with
           | None -> Rrbvec.push_back retained watch
           | Some result ->
+            let origin = Core.query_origin view ticket in
             host.enqueue (fun () ->
               apply host.state host.runner (Core.step !(host.state) (Core.Forget ticket)));
-            callbacks := (fun () -> callback result) :: !callbacks;
+            callbacks := (fun () -> callback origin result) :: !callbacks;
             retained)
        Rrbvec.empty
        !(host.watches);
@@ -76,7 +81,11 @@ let plan_query host ~owner ~maximum_items ~maximum_bytes query =
     ticket)
 ;;
 
-let watch host ticket ~f =
+let validate_session host session = Core.validate_session !(host.state) session
+
+let watch_read host ticket ~f =
   host.watches := Rrbvec.push_back !(host.watches) (Watch (ticket, f));
   host.enqueue (fun () -> flush host)
 ;;
+
+let watch host ticket ~f = watch_read host ticket ~f:(fun _ result -> f result)

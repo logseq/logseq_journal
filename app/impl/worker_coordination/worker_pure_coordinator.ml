@@ -86,6 +86,7 @@ type 'a slot =
   { ticket : 'a ticket
   ; dispatched : bool
   ; admitted : Id.request_id option
+  ; origin : (Worker.session * Worker.read_budget) option
   ; result : 'a Worker.reply option
   ; early : 'a Worker.reply option
   ; cancelled : bool
@@ -195,6 +196,18 @@ let reply : type a. view -> a ticket -> a Worker.reply option =
   | _ -> None
 ;;
 
+let query_origin
+  : type a. view -> a ticket -> (Worker.session * Worker.read_budget) option
+  =
+  fun view ticket ->
+  match Slots.find_opt ticket.serial view.entries with
+  | Some (Entry slot) when not slot.forgotten ->
+    (match same_ticket ticket slot.ticket with
+     | Some Worker.Refl -> slot.origin
+     | None -> None)
+  | _ -> None
+;;
+
 let observed _ _ = None
 
 let equal_entry (Entry a) (Entry b) =
@@ -202,6 +215,7 @@ let equal_entry (Entry a) (Entry b) =
   | Some Worker.Refl ->
     a.dispatched = b.dispatched
     && a.admitted = b.admitted
+    && a.origin = b.origin
     && a.result = b.result
     && a.early = b.early
     && a.cancelled = b.cancelled
@@ -290,6 +304,14 @@ let affected session = function
   | Worker.Account_will_change | Connection_will_stop -> true
   | Graph_will_close id | Graph_will_remove (id, _) ->
     Worker.Uuid.equal (Worker.graph_id session) id
+;;
+
+let validate_session state session =
+  if state.lifecycle <> Running || not (current_session state.facts session)
+  then Error Worker.Revoked_session
+  else if List.exists (affected session) state.fenced
+  then Error Worker.Host_change_in_progress
+  else Ok ()
 ;;
 
 let current_target facts = function
@@ -442,7 +464,8 @@ let dispatch_waiting ?(publish = false) state instructions =
                  | Error error -> reject error
                  | Ok operation ->
                    sends := Send (slot.ticket, session, operation) :: !sends;
-                   Entry { slot with dispatched = true })
+                   let origin=match operation with Worker.Query (budget,_) -> Some (session,budget) | _ -> None in
+                   Entry { slot with dispatched = true; origin })
               | Some { phase = Worker.Opening; _ } -> entry
               | Some { phase = Worker.Failed error; _ } -> reject error
               | Some { phase = Worker.Closing; _ } -> reject Worker.Revoked_session)
@@ -917,6 +940,7 @@ let plan_mutation
       { ticket
       ; dispatched = true
       ; admitted = None
+      ; origin = None
       ; result = None
       ; early = None
       ; cancelled = false
@@ -955,61 +979,59 @@ let request
     -> (a ticket * transition, Worker.error) result
   =
   fun state session operation ->
-  if state.lifecycle <> Running || not (current_session state.facts session)
-  then Error Worker.Revoked_session
-  else if List.exists (affected session) state.fenced
-  then Error Worker.Host_change_in_progress
-  else if Slots.cardinal state.facts.entries >= 256
-  then Error (Worker.Invalid_input "Release completed query tickets before admission")
-  else
-    Result.bind (Worker.validate_request session operation) (fun () ->
-      match operation with
-      | Worker.Query (budget, query) ->
-        if state.next = Int64.max_int
-        then Error (Worker.Invalid_input "Request counter exhausted")
-        else (
-          let serial = Int64.succ state.next in
-          let ticket =
-            { id = Worker.request_id (identity state.client serial)
-            ; serial
-            ; kind = kind query
-            ; query = Read query
-            ; target = Sealed (session, budget)
-            }
-          in
-          let slot =
-            { ticket
-            ; dispatched = true
-            ; admitted = None
-            ; result = None
-            ; early = None
-            ; cancelled = false
-            ; forgotten = false
-            }
-          in
-          let facts =
-            { state.facts with
-              entries = Slots.add serial (Entry slot) state.facts.entries
-            }
-          in
-          Ok
-            ( ticket
-            , changed
-                { state with next = serial; facts }
-                [ Send (ticket, session, operation) ] ))
-      | Worker.Mutate intent ->
-        plan_mutation state session operation intent (Direct session)
-      | Worker.Confirm (presentation, receipt) ->
-        plan_mutation
-          state
-          session
-          operation
-          (Worker.receipt_intent receipt)
-          (Presentation presentation)
-      | _ ->
-        Error
-          (Worker.Unsupported_operation
-             "Operation needs backend durability/resource conformance"))
+  Result.bind (validate_session state session) (fun () ->
+    if Slots.cardinal state.facts.entries >= 256
+    then Error (Worker.Invalid_input "Release completed query tickets before admission")
+    else
+      Result.bind (Worker.validate_request session operation) (fun () ->
+        match operation with
+        | Worker.Query (budget, query) ->
+          if state.next = Int64.max_int
+          then Error (Worker.Invalid_input "Request counter exhausted")
+          else (
+            let serial = Int64.succ state.next in
+            let ticket =
+              { id = Worker.request_id (identity state.client serial)
+              ; serial
+              ; kind = kind query
+              ; query = Read query
+              ; target = Sealed (session, budget)
+              }
+            in
+            let slot =
+              { ticket
+              ; dispatched = true
+              ; admitted = None
+              ; origin = Some (session, budget)
+              ; result = None
+              ; early = None
+              ; cancelled = false
+              ; forgotten = false
+              }
+            in
+            let facts =
+              { state.facts with
+                entries = Slots.add serial (Entry slot) state.facts.entries
+              }
+            in
+            Ok
+              ( ticket
+              , changed
+                  { state with next = serial; facts }
+                  [ Send (ticket, session, operation) ] ))
+        | Worker.Mutate intent ->
+          plan_mutation state session operation intent (Direct session)
+        | Worker.Confirm (presentation, receipt) ->
+          plan_mutation
+            state
+            session
+            operation
+            (Worker.receipt_intent receipt)
+            (Presentation presentation)
+        | _ ->
+          Error
+            (Worker.Unsupported_operation
+               "Operation needs backend durability/resource conformance")))
 ;;
 
 let plan_query state ~owner ~maximum_items ~maximum_bytes query =
@@ -1041,6 +1063,7 @@ let plan_query state ~owner ~maximum_items ~maximum_bytes query =
       { ticket
       ; dispatched = false
       ; admitted = None
+      ; origin = None
       ; result = None
       ; early = None
       ; cancelled = false

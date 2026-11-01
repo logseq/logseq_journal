@@ -1479,7 +1479,86 @@ let test_read_completion_rechecks_graph_owner ?(durable = false) () =
            | _ -> failwith "durable unknown did not reconcile across close/reopen")))
 ;;
 
+let test_host_preserves_query_origin_before_forget () =
+  let module Host = Journal_worker_coordination_host in
+  with_client (fun client ->
+    let queue = Queue.create () in
+    let host =
+      Host.create
+        ~client
+        ~client_id
+        ~managed_origin:"https://api.logseq.io"
+        ~user_id:"user-1"
+        ~enqueue:(fun f -> Queue.add f queue)
+        ~changed:(fun _ -> ())
+      |> Result.get_ok
+    in
+    Mailbox.on_event client (fun event -> ignore (Host.on_event host event));
+    let pump () =
+      Mailbox.Private.deliver client ~max_events:64;
+      let count = Queue.length queue in
+      for _ = 1 to count do
+        (Queue.take queue) ()
+      done
+    in
+    let wait predicate =
+      let deadline = Unix.gettimeofday () +. 4. in
+      while (not (predicate ())) && Unix.gettimeofday () < deadline do
+        pump ();
+        Thread.delay 0.001
+      done;
+      require (predicate ()) "host provenance integration did not settle"
+    in
+    wait (fun () ->
+      match C.bootstrap (Host.view host) with
+      | W.Bootstrap_not_ready _ -> true
+      | _ -> false);
+    let owner : Service.timeline_scope =
+      { startup = { account_generation = 1; presentation_generation = 1 }
+      ; graph_id = Test_support.graph_uuid
+      ; graph_generation = 1
+      }
+    in
+    let ticket =
+      Host.plan_query host ~owner ~maximum_items:1 ~maximum_bytes:65536 W.Graph_info
+      |> Result.get_ok
+    in
+    let callback = ref None
+    and calls = ref 0 in
+    Host.watch_read host ticket ~f:(fun origin reply ->
+      incr calls;
+      require
+        (C.query_origin (Host.view host) ticket = None)
+        "business callback ran before ticket Forget";
+      callback := Some (origin, reply));
+    ignore
+      (Mailbox.send
+         client
+         (Service.Client_command (Restore_local_account { user_id = "user-1" })));
+    wait (fun () -> Option.is_some !callback);
+    let session, budget =
+      match Option.get !callback with
+      | Some origin, W.Answered (Ok info) ->
+        require
+          (W.Uuid.equal info.graph_uuid Test_support.graph_uuid)
+          "real host query lost graph";
+        origin
+      | _ -> failwith "real host callback lost exact execution origin"
+    in
+    require
+      (W.validate_request session (W.Query (budget, W.Graph_info)) = Ok ())
+      "forwarded origin budget is unrelated to Send";
+    require (Host.validate_session host session = Ok ()) "live read origin was rejected";
+    ignore (Host.shutdown host);
+    wait (fun () -> C.shutdown_state (Host.view host) = C.Stopped);
+    require
+      (Host.validate_session host session = Error W.Revoked_session)
+      "stopped host allowed cached read";
+    require (!calls = 1) "query origin callback was delivered more than once")
+;;
+
 let () =
+  test_host_preserves_query_origin_before_forget ();
   test_client_to_typed_read ();
   test_read_completion_rechecks_graph_owner ();
   test_read_completion_rechecks_graph_owner ~durable:true ();

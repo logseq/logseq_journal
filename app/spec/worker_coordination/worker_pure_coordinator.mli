@@ -22,6 +22,17 @@ val session_asset_notices : view -> Worker.session -> Worker.asset_notice list
     not acknowledge/release the other; latest-fact retention is bounded. *)
 val ticket_id : 'a ticket -> Worker.request_id
 val reply : view -> 'a ticket -> 'a Worker.reply option
+
+(** Exact immutable execution provenance is recorded only when Send is emitted,
+    including reads queued before baseline. Collect it before Forget; no queued
+    owner or later projection may stand in for the session/budget actually sent. *)
+val query_origin : view -> 'a ticket -> (Worker.session * Worker.read_budget) option
+
+(** Reuse the coordinator's current Open-session and host-handoff fences before
+    presenting buffered read data. This is a pure local eligibility check; it
+    does not grant backend resource release, writer or deletion permission. *)
+val validate_session : t -> Worker.session -> (unit, Worker.error) result
+
 val observed : view -> 'a Worker.observation -> 'a Worker.observed option
 val equal_view : view -> view -> bool
 
