@@ -79,10 +79,21 @@ type feed_cursor =
   ; skipped_day : int option
   }
 
+type child_cursor =
+  { after :
+      Logseq_db_worker.Protocol.v2_child_member
+        Journal_worker_coordination.Worker_api.continuation
+  ; maximum_items : int
+  }
+
+type block_continuation =
+  | Legacy_tree_cursor of Logseq_db_types.Graph_types.Cursor.t
+  | Child_cursor of child_cursor
+
 type block_cursor =
   { after_sibling_order : string
   ; after_block_id : string
-  ; protocol_cursor : Graph.Cursor.t option
+  ; protocol_cursor : block_continuation option
   }
 
 type child_summary =
@@ -128,6 +139,11 @@ type detail =
 type block_member =
   { block : Graph.block
   ; revision : string
+  }
+
+type children_page =
+  { items : block_member list
+  ; continuation : child_cursor option
   }
 
 type tree_member =
@@ -301,7 +317,7 @@ let timeline_entry_page
       (fun protocol_cursor ->
          { after_sibling_order = block.order
          ; after_block_id = Graph.Uuid.to_string block.uuid
-         ; protocol_cursor = Some protocol_cursor
+         ; protocol_cursor = Some (Legacy_tree_cursor protocol_cursor)
          })
       result.continuation
   in
@@ -386,7 +402,7 @@ let project_detail
       ~project_block
       ~time_context
       ~(root : block_member)
-      (children : block_member Graph.page_result)
+      (children : children_page)
   =
   let child_count =
     List.length children.items + if Option.is_some children.continuation then 1 else 0
@@ -401,14 +417,20 @@ let project_detail
           ; children =
               { blocks = List.rev reversed
               ; continuation =
-                  (match reversed, children.continuation with
-                   | block :: _, Some protocol_cursor ->
+                  (match children.continuation with
+                   | Some cursor ->
+                     let order, id =
+                       match reversed with
+                       | block :: _ ->
+                         Journal_model.sibling_order block, Journal_model.id block
+                       | [] -> Journal_model.sibling_order root, Journal_model.id root
+                     in
                      Some
-                       { after_sibling_order = Journal_model.sibling_order block
-                       ; after_block_id = Journal_model.id block
-                       ; protocol_cursor = Some protocol_cursor
+                       { after_sibling_order = order
+                       ; after_block_id = id
+                       ; protocol_cursor = Some (Child_cursor cursor)
                        }
-                   | [], _ | _, None -> None)
+                   | None -> None)
               }
           }
       | (child : block_member) :: rest ->

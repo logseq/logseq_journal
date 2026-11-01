@@ -739,6 +739,11 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
     | None ->
       feed_failure request_generation "The root and date packet limits must be positive."
     | Some day -> day_failure ~day request_generation "The root limit must be positive.")
+  else if Option.exists (fun (_,cursor) -> Option.exists (fun cursor ->
+      match cursor.Projection.protocol_cursor with Some (Projection.Child_cursor _)->true | _->false) cursor) after
+  then (match start_day with
+    | Some day -> day_failure ~day request_generation "A Detail child cursor cannot continue Timeline roots."
+    | None -> feed_failure request_generation "A Detail child cursor cannot continue Timeline roots.")
   else if Option.exists (fun day -> Result.is_error (Worker.journal_day day)) before_day
   then (
     match start_day with
@@ -789,7 +794,9 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
         [ read_root_batch t ~ports
             (Feed_roots scan)
             page
-            (Option.bind cursor (fun c -> c.Projection.protocol_cursor))
+            (Option.bind cursor (fun c -> match c.Projection.protocol_cursor with
+              | Some (Projection.Legacy_tree_cursor cursor) -> Some cursor
+              | Some (Projection.Child_cursor _) | None -> None))
             scan.root_page_size
         ])
 ;;

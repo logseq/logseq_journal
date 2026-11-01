@@ -19,7 +19,7 @@ let limits : P.v2_capability_limits =
   }
 ;;
 
-let fixture ?(graph_generation = 7) epoch =
+let fixture ?(graph_generation = 7) ?(limits = limits) epoch =
   let issuer =
     W.issuer
       ~managed_origin:"https://example.invalid"

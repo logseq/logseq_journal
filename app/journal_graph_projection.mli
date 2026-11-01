@@ -80,10 +80,21 @@ type feed_cursor =
   ; skipped_day : int option
   }
 
+type child_cursor =
+  { after :
+      Logseq_db_worker.Protocol.v2_child_member
+        Journal_worker_coordination.Worker_api.continuation
+  ; maximum_items : int
+  }
+
+type block_continuation =
+  | Legacy_tree_cursor of Logseq_db_types.Graph_types.Cursor.t
+  | Child_cursor of child_cursor
+
 type block_cursor =
   { after_sibling_order : string
   ; after_block_id : string
-  ; protocol_cursor : Logseq_db_types.Graph_types.Cursor.t option
+  ; protocol_cursor : block_continuation option
   }
 
 type child_summary =
@@ -132,6 +143,11 @@ type block_member =
   ; revision : string
   }
 
+type children_page =
+  { items : block_member list
+  ; continuation : child_cursor option
+  }
+
 type tree_member =
   { block : Logseq_db_types.Graph_types.block
   ; revision : string
@@ -167,14 +183,14 @@ val detail
   :  page:page
   -> time_context:time_context
   -> root:block_member
-  -> block_member Logseq_db_types.Graph_types.page_result
+  -> children_page
   -> (detail, string) result
 
 val detail_on_page
   :  page:Logseq_db_types.Graph_types.page
   -> time_context:time_context
   -> root:block_member
-  -> block_member Logseq_db_types.Graph_types.page_result
+  -> children_page
   -> (detail, string) result
 
 val favorite : Logseq_db_worker.Protocol.v2_favorite_item -> favorite

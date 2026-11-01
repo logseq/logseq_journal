@@ -3052,7 +3052,7 @@ let test_status_property_identity_preserved () =
            ~page
            ~time_context:context
            ~root
-           { G.items = children; continuation = None }
+           { Journal_graph_projection.items = children; continuation = None }
        in
        let detail =
          match detail with

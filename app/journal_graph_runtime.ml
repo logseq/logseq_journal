@@ -208,13 +208,13 @@ type operation =
       { generation : int64
       ; block_id : string
       ; limit : int
-      ; after : Graph.Cursor.t option
+      ; after : Projection.child_cursor option
       }
   | Detail_page of
       { generation : int64
       ; root : Projection.block_member
       ; limit : int
-      ; after : Graph.Cursor.t option
+      ; after : Projection.child_cursor option
       }
   | Child_insert of Projection.create_child * Graph.page
   | Child_read of Projection.create_child * Graph.page
@@ -234,6 +234,8 @@ type operation =
       { generation : int64
       ; page : Graph.page
       ; root : Projection.block_member
+      ; after : Projection.child_cursor option
+      ; limit : int
       }
   | Changed_children of children_interest
   | Capture_page of Projection.capture
@@ -331,7 +333,7 @@ type t =
   ; page_tree_interests : (string, page_tree_interest) Hashtbl.t
   ; children_interests : (string, children_interest) Hashtbl.t
   ; detail_pages : (string, Graph.page) Hashtbl.t
-  ; detail_children : (string, Projection.block_member Graph.page_result) Hashtbl.t
+  ; detail_children : (string, Projection.children_page) Hashtbl.t
   ; favorites : Favorites.t
   ; changed_point_epochs : (string, int64) Hashtbl.t
   ; confirmations : Confirmation.t
@@ -811,7 +813,13 @@ let submit_unowned t (request : Journal_graph_request.t) =
      | Some page ->
        Feed.load_day t.feed ~ports:(feed_ports t) ~page ~after ~limit ~request_generation |> feed_output)
   | Load_detail { block_id; request_generation; limit; after } ->
-    (match parse_uuid "block UUID" block_id with
+    let cursor = Option.bind after (fun cursor -> cursor.Projection.protocol_cursor) in
+    let parsed = match cursor with
+      | Some (Projection.Legacy_tree_cursor _) -> Error "A Timeline cursor cannot continue Detail children."
+      | Some (Projection.Child_cursor {maximum_items;_}) when maximum_items<=0 || maximum_items>Protocol.maximum_page_size ->
+        Error "The Detail continuation budget is invalid."
+      | Some (Projection.Child_cursor _) | None -> parse_uuid "block UUID" block_id in
+    (match parsed with
      | Error message ->
        responses
          [ response
@@ -830,9 +838,9 @@ let submit_unowned t (request : Journal_graph_request.t) =
              (Detail_block
                 { generation = request_generation
                 ; block_id
-                ; limit = max 1 (min Protocol.maximum_page_size limit)
-                ; after =
-                    Option.bind after (fun cursor -> cursor.Projection.protocol_cursor)
+                ; limit = (match cursor with Some (Projection.Child_cursor value)->value.maximum_items
+                    | _->max 1 (min Protocol.maximum_page_size limit))
+                ; after = (match cursor with Some (Projection.Child_cursor value)->Some value | _->None)
                 })
              (if Hashtbl.mem t.graph_pages block_id
                 ||
@@ -1382,7 +1390,7 @@ let remember_detail_members t ~page ~(root : Projection.block_member) children =
   List.iter
     (fun (member : Projection.block_member) ->
        Hashtbl.replace t.detail_pages (Graph.Uuid.to_string member.block.uuid) page)
-    children.Graph.items;
+    children.Projection.items;
   Hashtbl.replace t.detail_children key children
 ;;
 
@@ -1399,13 +1407,13 @@ let remember_detail_block t (block : Graph.block) revision =
     (fun _ children ->
        Some
          { children with
-           Graph.items =
+           Projection.items =
              List.map
                (fun (member : Projection.block_member) ->
                   if Graph.Uuid.equal member.block.uuid block.uuid
                   then { Projection.block; revision }
                   else member)
-               children.Graph.items
+               children.Projection.items
          })
     t.detail_children
 ;;
@@ -1690,9 +1698,9 @@ let detail_children t ~generation ~page ~root ~limit ~after =
   requests
     [ read
         t
-        (Detail_children { generation; page; root })
+        (Detail_children { generation; page; root; after; limit })
         (Protocol.V2_get_children
-           { parent = root.block.uuid; limit; cursor = after; revision = None })
+           { parent = root.block.uuid; limit; cursor = None; revision = None })
     ]
 ;;
 
@@ -2009,7 +2017,7 @@ let tree_result items continuation : Projection.tree_member Graph.page_result =
   }
 ;;
 
-let children_result items continuation : Projection.block_member Graph.page_result =
+let children_result items continuation : Projection.children_page =
   { items =
       List.map
         (fun (item : Protocol.v2_child_member) ->
@@ -2616,8 +2624,12 @@ let receive_response t ~read_result (protocol_response : Protocol.response) =
               item.value.tag_titles)
          items;
        (match operation with
-        | Detail_children { generation; page; root } ->
-          let children = children_result items next_cursor in
+        | (Detail_children _ | Changed_children _ | Capture_children _)
+          when children=None && next_cursor<>None ->
+          failure_output t operation request_id "Unsealed child continuation"
+        | Detail_children { generation; page; root; limit; _ } ->
+          let children = children_result items (Option.bind children (fun (value:Worker.children)->
+              Option.map (fun after -> Projection.{after;maximum_items=limit}) value.next)) in
           remember_detail_members t ~page ~root children;
           Option.iter
             (fun journal_page ->
@@ -2664,8 +2676,9 @@ let receive_response t ~read_result (protocol_response : Protocol.response) =
                 value items (Option.bind children (fun (value:Worker.children) -> value.next)) in
             let output = favorites_output planned in
             if planned.background then background_demands t output else output)
-        | Changed_children { page; root; _ } ->
-          let children = children_result items next_cursor in
+        | Changed_children { page; root; limit } ->
+          let children = children_result items (Option.bind children (fun (value:Worker.children)->
+              Option.map (fun after -> Projection.{after;maximum_items=limit}) value.next)) in
           let interest =
             Hashtbl.find_opt t.children_interests (Graph.Uuid.to_string root.block.uuid)
           in
@@ -2687,7 +2700,7 @@ let receive_response t ~read_result (protocol_response : Protocol.response) =
               | Ok detail -> responses [ response (Children_reconciled detail) ]
               | Error message -> reject message))
         | Capture_children { command; page; conflict_retries } ->
-          let children = children_result items next_cursor in
+          let children = children_result items None in
           remember_blocks t page children.items;
           capture_insert t command page conflict_retries
         | _ -> failure_output t operation request_id "Unexpected children response.")
@@ -3145,17 +3158,62 @@ let worker_read t (request : Protocol.request) =
      | Some { operation = Feed_read read; delivery = Dispatched; _ } ->
        (match Feed.child_request read with
         | Some business ->
-          Some (Read
-            { query = Worker.Child_members { parent = business.parent; revision = None; after = business.after }
-            ; maximum_items = business.limit
-            ; outcome = (fun value -> Child_members_read value)
-            })
+          Some
+            (Read
+               { query =
+                   Worker.Child_members
+                     { parent = business.parent; revision = None; after = business.after }
+               ; maximum_items = business.limit
+               ; outcome = (fun value -> Child_members_read value)
+               })
         | None -> Some (Unowned_read "Child business operation mismatch"))
      | Some { operation = Favorite_read read; delivery = Dispatched; _ } ->
        (match Favorites.membership_query read with
-        | Some query -> Some (Read { query; maximum_items = 200; outcome = (fun value -> Child_members_read value) })
+        | Some query ->
+          Some
+            (Read
+               { query
+               ; maximum_items = 200
+               ; outcome = (fun value -> Child_members_read value)
+               })
         | None -> Some (Unowned_read "Favorite child business operation mismatch"))
-     | Some { delivery = Dispatched; _ } -> None
+     | Some
+         { operation = Detail_children { root; after; limit; _ }
+         ; delivery = Dispatched
+         ; _
+         } ->
+       Some
+         (Read
+            { query =
+                Worker.Child_members
+                  { parent = root.block.uuid
+                  ; revision = None
+                  ; after = Option.map (fun value -> value.Projection.after) after
+                  }
+            ; maximum_items = limit
+            ; outcome = (fun value -> Child_members_read value)
+            })
+     | Some { operation = Changed_children interest; delivery = Dispatched; _ } ->
+       Some
+         (Read
+            { query =
+                Worker.Child_members
+                  { parent = interest.root.block.uuid; revision = None; after = None }
+            ; maximum_items = interest.limit
+            ; outcome = (fun value -> Child_members_read value)
+            })
+     | Some { operation = Capture_children { page; _ }; delivery = Dispatched; _ } ->
+       Some
+         (Read
+            { query =
+                Worker.Child_members
+                  { parent = Graph.Uuid.of_string page.id |> Result.get_ok
+                  ; revision = None
+                  ; after = None
+                  }
+            ; maximum_items = Protocol.maximum_page_size
+            ; outcome = (fun value -> Child_members_read value)
+            })
      | Some _ | None -> Some (Unowned_read "Child business request is no longer owned"))
   | V2_get_outline_block_summary _ ->
     (match Hashtbl.find_opt t.pending (Graph.Uuid.to_string request.request_id) with
@@ -3174,12 +3232,13 @@ let worker_read t (request : Protocol.request) =
         | Some business ->
           Some
             (Read
-               { query = Worker.Journals
-                   { from_day = business.from_day
-                   ; through_day = business.through_day
-                   ; revision = None
-                   ; after = business.after
-                   }
+               { query =
+                   Worker.Journals
+                     { from_day = business.from_day
+                     ; through_day = business.through_day
+                     ; revision = None
+                     ; after = business.after
+                     }
                ; maximum_items = business.limit
                ; outcome = (fun value -> Journals_read value)
                })

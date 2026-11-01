@@ -12,12 +12,13 @@ module Worker_producer = struct
   module W = Journal_worker_coordination.Worker_api
   module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 
-  let issuer, _, _, session = Coordination_test_fixture.fixture 2800L
+  let issuer, _, _, session = Coordination_test_fixture.fixture
+      ~limits:{Coordination_test_fixture.limits with response_budget_bytes=Protocol.maximum_response_bytes} 2800L
 
   module I = (val issuer : W.ISSUER)
 
   let budget maximum_items =
-    W.read_budget session ~maximum_items ~maximum_bytes:65536 |> Result.get_ok
+    W.read_budget session ~maximum_items ~maximum_bytes:Protocol.maximum_response_bytes |> Result.get_ok
   ;;
 
   let wire_request runtime request =
@@ -1095,40 +1096,141 @@ let test_detail_resolves_unretained_page ?(tagged = false) () =
   | _ -> Alcotest.fail "ordinary page detail did not load"
 ;;
 
+let initial_detail_children runtime =
+  let first =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_detail
+         { block_id = Graph.Uuid.to_string block_uuid
+         ; after = None
+         ; limit = 32
+         ; request_generation = 91L
+         })
+    |> fun output -> only "detail root" output.requests
+  in
+  Runtime.receive
+    runtime
+    (response
+       first
+       (V2_block_outcome (V2_present_block { value = record; revision = "block-1" })))
+  |> fun output -> only "detail children" output.requests
+;;
+
+let test_detail_children_use_owned_worker_query () =
+  let runtime = Runtime.create () in
+  seed_feed runtime;
+  let original = initial_detail_children runtime in
+  (match Production_runtime.worker_read runtime original with
+   | Some
+       (Production_runtime.Read
+          { query = Journal_worker_coordination.Worker_api.Child_members _
+          ; maximum_items = 32
+          ; _
+          }) -> ()
+   | _ -> Alcotest.fail "Detail children bypassed typed coordinator");
+  ignore (Runtime.abandon runtime original);
+  match Production_runtime.worker_read runtime original with
+  | Some (Production_runtime.Unowned_read _) -> ()
+  | _ -> Alcotest.fail "retired Detail children became legacy read"
+;;
+
+let test_detail_empty_more_preserves_cursor () =
+  let runtime = Runtime.create () in
+  seed_feed runtime;
+  let original = initial_detail_children runtime in
+  let cursor = Graph.Cursor.of_string "empty-detail-more" |> Result.get_ok in
+  let output =
+    Runtime.receive
+      runtime
+      (response
+         original
+         (V2_children_outcome
+            { parent = block_uuid
+            ; revision_scope = V2_children_revision block_uuid
+            ; scope_revision = "children-1"
+            ; items = []
+            ; next_cursor = Some cursor
+            }))
+  in
+  match (only "empty More Detail still publishes" output.responses).payload with
+  | Detail_loaded { detail; _ } ->
+    Alcotest.(check bool)
+      "empty page retains More"
+      true
+      (Option.is_some detail.children.continuation)
+  | _ -> Alcotest.fail "empty More lost Detail owner"
+;;
+
 let test_detail_forwards_child_cursor () =
   let runtime = Runtime.create () in
   seed_feed runtime;
+  let first = initial_detail_children runtime in
   let cursor = Graph.Cursor.of_string "detail-next-page" |> Result.get_ok in
-  let after : Journal_graph_projection.block_cursor =
-    { after_sibling_order = "m"
-    ; after_block_id = Graph.Uuid.to_string unrelated_uuid
-
-    ; protocol_cursor = Some cursor
-    }
+  let output =
+    Runtime.receive
+      runtime
+      (response
+         first
+         (V2_children_outcome
+            { parent = block_uuid
+            ; revision_scope = V2_children_revision block_uuid
+            ; scope_revision = "children-1"
+            ; items =
+                [ { Protocol.value =
+                      { record with
+                        block =
+                          { block with
+                            uuid = unrelated_uuid
+                          ; parent = block_uuid
+                          ; order = "m"
+                          }
+                      }
+                  ; revision = "child-1"
+                  }
+                ]
+            ; next_cursor = Some cursor
+            }))
   in
-  let read =
+  let after =
+    match (only "Detail initial page" output.responses).payload with
+    | Detail_loaded { detail; _ } -> Option.get detail.children.continuation
+    | _ -> Alcotest.fail "Detail initial page unavailable"
+  in
+  let wrong =
+    Runtime.submit
+      runtime
+      (Journal_graph_request.Load_day_blocks
+         { day = 20260901; after = Some after; limit = 1; request_generation = 93L })
+  in
+  Alcotest.(check int)
+    "child cursor cannot dispatch Timeline read"
+    0
+    (List.length wrong.requests);
+  (match (only "foreign family failure" wrong.responses).payload with
+   | Day_blocks_failed { request_generation = 93L; _ } -> ()
+   | _ -> Alcotest.fail "foreign child cursor lost Timeline owner");
+  let first =
     Runtime.submit
       runtime
       (Journal_graph_request.Load_detail
          { block_id = Graph.Uuid.to_string block_uuid
          ; after = Some after
-         ; limit = 32
+         ; limit = 9
          ; request_generation = 92L
          })
     |> fun output -> only "continuation root read" output.requests
   in
-  let output =
+  let child =
     Runtime.receive
       runtime
       (response
-         read
-         (Protocol.V2_block_outcome
-            (V2_present_block { value = record; revision = "block-1" })))
+         first
+         (V2_block_outcome (V2_present_block { value = record; revision = "block-1" })))
+    |> fun output -> only "continuation child read" output.requests
   in
-  let read = only "continuation child read" output.requests in
-  match read.command with
-  | Protocol.V2_get_children { cursor = Some actual; _ } when actual = cursor -> ()
-  | _ -> Alcotest.fail "detail discarded the child continuation cursor"
+  match child.command with
+  | V2_get_children { limit = 32; cursor = Some actual; _ } when actual = cursor -> ()
+  | _ -> Alcotest.fail "Detail lost sealed continuation or its original budget"
 ;;
 
 let test_status_failure_conversion () =
@@ -8999,7 +9101,9 @@ let () =
             test_projection_changes_are_owned
         ] )
     ; ( "detail"
-      , [ Alcotest.test_case
+      , [ Alcotest.test_case "children use owned Worker query" `Quick test_detail_children_use_owned_worker_query;
+          Alcotest.test_case "empty More retains continuation" `Quick test_detail_empty_more_preserves_cursor;
+ Alcotest.test_case
             "resolve unretained page"
             `Quick
             (fun () -> test_detail_resolves_unretained_page ())

@@ -941,6 +941,83 @@ let test_client_to_typed_read () =
       | _ -> failwith "Favorite membership bypassed production typed dispatch"
     in
     membership_page 0 [] (Option.get !membership);
+    let drive_detail demand =
+      let rec drive remaining output =
+        require (remaining > 0) "actual Detail read did not converge";
+        match
+          List.find_map
+            (fun response ->
+               match response.Journal_graph_runtime.payload with
+               | Detail_loaded { request_generation; detail } ->
+                 Some (request_generation, detail)
+               | Detail_failed _ -> failwith "actual Detail read failed"
+               | _ -> None)
+            output.Journal_graph_runtime.responses
+        with
+        | Some result -> result
+        | None ->
+          let original =
+            List.find
+              (fun (r : P.request) ->
+                 match r.command with
+                 | V2_get_outline_block _ | V2_get_page _ | V2_get_children _ -> true
+                 | _ -> false)
+              output.requests
+          in
+          (match Journal_graph_runtime.worker_read business original with
+           | Some (Journal_graph_runtime.Read read) ->
+             let budget =
+               W.read_budget session ~maximum_items:read.maximum_items ~maximum_bytes:65536
+               |> Result.get_ok
+             in
+             let _, reply = request_query (W.Query (budget, read.query)) in
+             (match reply with
+              | W.Answered (Ok value) ->
+                drive
+                  (remaining - 1)
+                  (Journal_graph_runtime.receive_worker_read
+                     business
+                     ~request_id:original.request_id
+                     (read.outcome value))
+              | _ -> failwith "actual Detail typed query failed")
+           | _ -> failwith "actual Detail query bypassed coordinator")
+      in
+      drive 10 (Journal_graph_runtime.submit business demand)
+    in
+    let block_id = W.Uuid.to_string Test_support.authoritative_block_uuid in
+    let _, first =
+      drive_detail
+        (Load_detail { block_id; after = None; limit = 1; request_generation = 350L })
+    in
+    require
+      (List.length first.children.blocks = 1 && first.children.continuation <> None)
+      "actual Detail first page lost Partial cursor";
+    let ui = Journal_detail.create ~session_number:350L first in
+    let ui, demands = Journal_detail.step ui (Load_more block_id) in
+    let demand =
+      match demands with
+      | [ demand ] -> demand
+      | _ -> failwith "Detail UI did not retain its continuation"
+    in
+    let generation, second = drive_detail demand in
+    let ui, _ = Journal_detail.step ui (Loaded (generation, second)) in
+    require
+      (List.length (Journal_detail.children ui) = 2)
+      "Detail UI did not merge both real Service pages";
+    require
+      (Journal_detail.continuation ui ~parent_id:block_id = None)
+      "actual exhausted Detail did not clear cursor";
+    require
+      (Journal_model.child_count (Journal_detail.root ui) = 2)
+      "Detail UI advertised partial page size as final count";
+    List.iter
+      (fun n ->
+         require
+           (List.exists
+              (fun block -> Journal_model.id block = W.Uuid.to_string (summary_child n))
+              (Journal_detail.children ui))
+           "actual Detail UI lost child identity")
+      [ 1; 2 ];
     let revision =
       match summary with
       | W.Answered (Ok { lookup = P.V2_present_block { revision; _ }; _ }) -> revision

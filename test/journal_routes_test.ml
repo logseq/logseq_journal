@@ -576,7 +576,7 @@ let test_child_refresh_replaces_cursor_and_fences_pending_read () =
     { after_sibling_order = Journal_model.sibling_order child
     ; after_block_id = Journal_model.id child
     ; protocol_cursor =
-        Some (Logseq_db_types.Graph_types.Cursor.of_string token |> Result.get_ok)
+        Some (Journal_graph_projection.Legacy_tree_cursor (Logseq_db_types.Graph_types.Cursor.of_string token |> Result.get_ok))
     }
   in
   let projection token : Journal_graph_projection.detail =
@@ -629,8 +629,8 @@ let test_append_restarts_partial_children_without_reusing_cursor () =
          ; after_block_id = Journal_model.id child
          ; protocol_cursor =
              Some
-               (Logseq_db_types.Graph_types.Cursor.of_string "before-append"
-                |> Result.get_ok)
+               (Journal_graph_projection.Legacy_tree_cursor (Logseq_db_types.Graph_types.Cursor.of_string "before-append"
+                |> Result.get_ok))
          }
        in
        let initial =
@@ -727,8 +727,8 @@ let test_append_restarts_partial_children_without_reusing_cursor () =
            { cursor with
              protocol_cursor =
                Some
-                 (Logseq_db_types.Graph_types.Cursor.of_string "after-append"
-                  |> Result.get_ok)
+                 (Journal_graph_projection.Legacy_tree_cursor (Logseq_db_types.Graph_types.Cursor.of_string "after-append"
+                  |> Result.get_ok))
            }
          in
          let first, _ =
@@ -2867,7 +2867,7 @@ let test_projected_unknown_children_are_read_once () =
   let grandchild = member 3 (uuid 2) in
   let project root children =
     P.detail_on_page ~page ~time_context:{ localtime = Unix.gmtime } ~root
-      { G.items = children; continuation = None }
+      { Journal_graph_projection.items = children; continuation = None }
     |> Result.get_ok in
   let projection = project root [ child ] in
   require (Journal_model.child_count (List.hd projection.children.blocks) = 0)
@@ -3018,8 +3018,8 @@ let test_detail_128_item_pages_preserve_order_and_completion () =
   let cursor ordinal : Journal_graph_projection.block_cursor =
     { after_sibling_order = Printf.sprintf "%06d" ordinal
     ; after_block_id = Journal_model.id (List.nth children (ordinal - 1))
-    ; protocol_cursor = Some (Logseq_db_types.Graph_types.Cursor.of_string
-        (Printf.sprintf "detail-page-%d" ordinal) |> Result.get_ok) } in
+    ; protocol_cursor = Some (Journal_graph_projection.Legacy_tree_cursor (Logseq_db_types.Graph_types.Cursor.of_string
+        (Printf.sprintf "detail-page-%d" ordinal) |> Result.get_ok)) } in
   let request after = function
     | [ Journal_graph_request.Load_detail
           { block_id; limit; after = actual; request_generation } ] ->
