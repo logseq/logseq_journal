@@ -8,7 +8,7 @@ type rejection =
   | Worker_rejection of
       { operation : string; request_id : Graph.Uuid.t; error : Error.t }
 type event =
-  | Favorites_loaded of Journal_graph_request.favorites_request * Protocol.v2_favorites_result
+  | Favorites_loaded of Journal_graph_request.favorites_request * Journal_graph_request.favorites_result
   | Favorites_failed of Journal_graph_request.favorites_request * bool * string
   | Favorites_invalidated
   | Rejected of rejection
@@ -34,8 +34,11 @@ val accepts_list : read -> bool
 val accepts_page : t -> read -> bool
 val accepts_block : t -> read -> bool
 val accepts_memberships : read -> bool
-val receive_list : t -> ports:ports -> read -> Protocol.v2_favorites_result -> output
+val receive_list : t -> ports:ports -> read -> Journal_graph_request.favorites_result -> output
 val receive_page : t -> ports:ports -> read -> Protocol.v2_page_lookup -> output
 val receive_block : t -> ports:ports -> read -> Protocol.v2_block_lookup -> output
 val receive_memberships : t -> ports:ports -> read -> Protocol.v2_child_member list -> Graph.Cursor.t option -> output
 val fail : t -> read -> request_id:Graph.Uuid.t -> code:Error.code -> message:string -> error:Error.t -> output
+
+(** The business owner retains the sealed continuation; the transport DTO is not its cursor store. *)
+val list_request : read -> Journal_graph_request.favorites_request option

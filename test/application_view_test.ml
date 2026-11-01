@@ -495,7 +495,7 @@ let test_root_navigation_capture_lifecycle () =
     true
     (R.destination replaced = Journals
      && R.capture replaced = None
-     && Journal_routes.Favorites.items (R.favorites replaced) = [])
+     && Rrbvec.is_empty (Journal_routes.Favorites.items (R.favorites replaced)))
 ;;
 
 (* Fixture teardown is outside pure reducer ownership: dispose requests an

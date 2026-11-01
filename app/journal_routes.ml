@@ -755,6 +755,7 @@ let commit_delete t ~block_id =
 ;;
 
 module Favorites = struct
+  module Hidden = Set.Make (String)
   module P = Logseq_db_worker.Protocol
   module G = Logseq_db_types.Graph_types
 
@@ -767,7 +768,8 @@ module Favorites = struct
         { first_index : int
         ; last_exclusive : int
         }
-    | Loaded of Journal_graph_request.favorites_request * P.v2_favorites_result
+    | Loaded of
+        Journal_graph_request.favorites_request * Journal_graph_request.favorites_result
     | Failed of Journal_graph_request.favorites_request * bool * string
 
   type t =
@@ -777,12 +779,12 @@ module Favorites = struct
     ; active : bool
     ; dirty : bool
     ; initialized : bool
-    ; items : P.v2_favorite_item list
-    ; hidden_targets : string list
-    ; cursor : G.Cursor.t option
+    ; items : P.v2_favorite_item Rrbvec.t
+    ; hidden_targets : Hidden.t
+    ; cursor : Journal_graph_request.favorites_cursor option
     ; pending : Journal_graph_request.favorites_request option
     ; error : string option
-    ; staging : P.v2_favorite_item list option
+    ; staging : P.v2_favorite_item Rrbvec.t option
     ; refresh_count : int
     }
 
@@ -793,8 +795,8 @@ module Favorites = struct
     ; active = false
     ; dirty = true
     ; initialized = false
-    ; items = []
-    ; hidden_targets = []
+    ; items = Rrbvec.empty
+    ; hidden_targets = Hidden.empty
     ; cursor = None
     ; pending = None
     ; error = None
@@ -806,12 +808,12 @@ module Favorites = struct
   let revision t = t.revision
 
   let visible_items t =
-    List.filter
+    Rrbvec.filter
       (fun (item : P.v2_favorite_item) ->
          match item.target with
          | V2_favorite_page _ -> true
          | V2_favorite_block { uuid; _ } ->
-           not (List.mem (G.Uuid.to_string uuid) t.hidden_targets))
+           not (Hidden.mem (G.Uuid.to_string uuid) t.hidden_targets))
       t.items
   ;;
 
@@ -839,7 +841,11 @@ module Favorites = struct
 
   let refresh t =
     request
-      { t with dirty = false; staging = Some []; refresh_count = List.length t.items }
+      { t with
+        dirty = false
+      ; staging = Some Rrbvec.empty
+      ; refresh_count = Rrbvec.length t.items
+      }
       None
   ;;
 
@@ -852,7 +858,7 @@ module Favorites = struct
     then t, []
     else if t.dirty || not t.initialized
     then refresh t
-    else if t.cursor <> None && visible_items t = []
+    else if t.cursor <> None && Rrbvec.is_empty (visible_items t)
     then request t t.cursor
     else t, []
   ;;
@@ -861,11 +867,14 @@ module Favorites = struct
     | Select active -> start_if_needed { t with active }
     | Invalidate -> start_if_needed { t with dirty = true }
     | Hide_target id ->
-      if List.mem id t.hidden_targets
+      if Hidden.mem id t.hidden_targets
       then t, []
       else (
         let next =
-          { t with hidden_targets = id :: t.hidden_targets; revision = t.revision + 1 }
+          { t with
+            hidden_targets = Hidden.add id t.hidden_targets
+          ; revision = t.revision + 1
+          }
         in
         start_if_needed next)
     | Retry -> if t.pending = None then refresh t else t, []
@@ -875,7 +884,7 @@ module Favorites = struct
         t.active
         && t.pending = None
         && t.error = None
-        && last_exclusive + 12 >= List.length visible
+        && last_exclusive + 12 >= Rrbvec.length visible
       then (
         match t.cursor with
         | None -> t, []
@@ -883,11 +892,11 @@ module Favorites = struct
       else t, []
     | Loaded (completed, result) when current t completed ->
       let pending = None in
-      let staged = Option.value t.staging ~default:t.items @ result.items in
+      let staged = Rrbvec.append (Option.value t.staging ~default:t.items) result.items in
       let needs_continuation =
         match t.staging with
-        | Some _ -> List.length staged < max 1 t.refresh_count
-        | None -> result.items = []
+        | Some _ -> Rrbvec.length staged < max 1 t.refresh_count
+        | None -> Rrbvec.is_empty result.items
       in
       let t = { t with pending; cursor = result.next_cursor } in
       if needs_continuation && result.next_cursor <> None

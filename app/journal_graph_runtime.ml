@@ -6,6 +6,11 @@ module Reference = Journal_graph_reference_plan
 module Favorites = Journal_graph_favorites_plan
 module Feed = Journal_graph_feed_plan
 module Confirmation = Journal_graph_mutation_confirmation
+module Worker = Journal_worker_coordination.Worker_api
+
+type worker_read_result =
+  | Ordinary_read of Protocol.v2_outcome
+  | Favorites_read of { first_page:bool; value:Journal_graph_request.favorites_result }
 
 let timeline_version value =
   let digits s = s <> "" && String.length s <= 19
@@ -80,7 +85,7 @@ type payload =
   | Reference_sources_changed of (string * string option) list
   | Favorites_loaded of
       Journal_graph_request.favorites_request
-      * Logseq_db_worker.Protocol.v2_favorites_result
+      * Journal_graph_request.favorites_result
   | Favorites_failed of Journal_graph_request.favorites_request * bool * string
   | Favorites_invalidated
   | Graph_ready
@@ -2009,7 +2014,7 @@ let children_result items continuation : Projection.block_member Graph.page_resu
   }
 ;;
 
-let receive_response t (protocol_response : Protocol.response) =
+let receive_response t ~favorites (protocol_response : Protocol.response) =
   let (Protocol.V2_response { request_id; outcome; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
   match Hashtbl.find_opt t.pending key with
@@ -2037,9 +2042,17 @@ let receive_response t (protocol_response : Protocol.response) =
        failure_output t operation request_id "Unexpected asset query response."
      | Protocol.V2_favorites_outcome result ->
        (match operation with
-        | Favorite_read value when Favorites.accepts_list value ->
-          Favorites.receive_list t.favorites ~ports:(favorites_ports t) value result
-          |> favorites_output |> background_demands t
+        | Favorite_read read when Favorites.accepts_list read ->
+          let result=match favorites with
+            | Some result->Ok result
+            | None when result.next_cursor=None->Ok Journal_graph_request.
+                {favorites_page=result.favorites_page;generation=result.generation;
+                 projection_revision=result.projection_revision;items=Rrbvec.of_list result.items;next_cursor=None}
+            | None->Error "An unsealed Favorites continuation cannot enter the business state." in
+          (match result with
+           | Ok result->Favorites.receive_list t.favorites ~ports:(favorites_ports t) read result
+             |> favorites_output |> background_demands t
+           | Error message->failure_output t operation request_id message)
         | _ -> failure_output t operation request_id "Unexpected favorites response.")
      | Protocol.V2_failed { code; message } ->
        (match Error.code_of_string code with
@@ -2813,7 +2826,7 @@ let receive_response t (protocol_response : Protocol.response) =
           failure_output t operation request_id "Unexpected acknowledgement response.")))
 ;;
 
-let receive t (protocol_response : Protocol.response) =
+let receive_delivery t ~favorites (protocol_response : Protocol.response) =
   let (Protocol.V2_response { request_id; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
   let pending = Hashtbl.find_opt t.pending key in
@@ -2834,7 +2847,7 @@ let receive t (protocol_response : Protocol.response) =
     scope_output
       t
       (Option.bind pending (fun pending -> pending.failure_owner))
-      (receive_response t protocol_response)
+      (receive_response t ~favorites protocol_response)
   in
   let references =
     match pending, protocol_response with
@@ -2883,7 +2896,7 @@ let receive t (protocol_response : Protocol.response) =
             | Block_removed { block_id } | Subtree_deleted { block_id; _ } ->
               Rrbvec.push_back changes Reference.{ id = block_id; text = None; page_kind = false }
             | Favorites_loaded (_, result) ->
-              List.fold_left
+              Rrbvec.fold_left
                 (fun changes item ->
                   let favorite = Projection.favorite item in
                   let id, page_kind = match favorite.target with
@@ -2924,6 +2937,28 @@ let receive t (protocol_response : Protocol.response) =
 (* Route accepted Worker terminal failures through the same owner as protocol
    failures. This removes pending/active markers and drains queued hydration;
    a later completion for the request is then unowned and ignored. *)
+let receive t response = receive_delivery t ~favorites:None response
+
+let receive_worker_read t ~request_id result =
+  let favorites, outcome =
+    match result with
+    | Ordinary_read outcome -> None, outcome
+    | Favorites_read { value; _ } ->
+      ( Some value
+      , Protocol.V2_favorites_outcome
+          { favorites_page = value.favorites_page
+          ; generation = value.generation
+          ; projection_revision = value.projection_revision
+          ; items = Rrbvec.to_list value.items
+          ; next_cursor = None
+          } )
+  in
+  receive_delivery
+    t
+    ~favorites
+    (Protocol.V2_response { api_version = Protocol.api_version; request_id; outcome })
+;;
+
 let fail_request t (request : Protocol.request) ~message =
   receive
     t
@@ -2991,26 +3026,89 @@ let reconcile_push t ~request_generation push =
 
 module Copy = Journal_copy
 
-module Worker = Journal_worker_coordination.Worker_api
-
 type worker_read =
-  | Read : { query : 'a Worker.query; maximum_items : int;
-             outcome : 'a -> Protocol.v2_outcome } -> worker_read
+  | Read :
+      { query : 'a Worker.query
+      ; maximum_items : int
+      ; outcome : 'a -> worker_read_result
+      }
+      -> worker_read
+  | Unowned_read of string
 
-let worker_read (request:Protocol.request) =
+let worker_read t (request : Protocol.request) =
   match request.command with
-  | V2_graph_info -> Some(Read{query=Worker.Graph_info;maximum_items=1;
-      outcome=(fun (i:Worker.graph_info)->Protocol.V2_graph_info_outcome
-        {graph_uuid=i.graph_uuid;graph_name=i.graph_name;schema=i.schema;
-         admission_facts=i.admission_facts;journal_title_format=i.journal_title_format;
-         limits=i.limits;generation=i.generation;projection_revision=i.projection_revision})})
-  | V2_inspect_admission -> Some(Read{query=Worker.Admission;maximum_items=1;
-      outcome=(fun value->Protocol.V2_admission_outcome value)})
-  | V2_get_page{page;revision} -> Some(Read{query=Worker.Page{uuid=page;revision};maximum_items=1;
-      outcome=(fun value->Protocol.V2_page_outcome value)})
-  | V2_get_outline_block{block;revision} -> Some(Read{query=Worker.Outline_block{uuid=block;revision};maximum_items=1;
-      outcome=(fun value->Protocol.V2_block_outcome value)})
-  | V2_get_task_status_definitions{statuses} -> Some(Read{query=Worker.Task_status_definitions statuses;
-      maximum_items=max 1 (List.length statuses);outcome=(fun value->Protocol.V2_task_status_definitions_outcome value)})
+  | V2_graph_info ->
+    Some
+      (Read
+         { query = Worker.Graph_info
+         ; maximum_items = 1
+         ; outcome =
+             (fun (i : Worker.graph_info) ->
+               Ordinary_read
+                 (Protocol.V2_graph_info_outcome
+                    { graph_uuid = i.graph_uuid
+                    ; graph_name = i.graph_name
+                    ; schema = i.schema
+                    ; admission_facts = i.admission_facts
+                    ; journal_title_format = i.journal_title_format
+                    ; limits = i.limits
+                    ; generation = i.generation
+                    ; projection_revision = i.projection_revision
+                    }))
+         })
+  | V2_inspect_admission ->
+    Some
+      (Read
+         { query = Worker.Admission
+         ; maximum_items = 1
+         ; outcome = (fun value -> Ordinary_read (Protocol.V2_admission_outcome value))
+         })
+  | V2_get_page { page; revision } ->
+    Some
+      (Read
+         { query = Worker.Page { uuid = page; revision }
+         ; maximum_items = 1
+         ; outcome = (fun value -> Ordinary_read (Protocol.V2_page_outcome value))
+         })
+  | V2_get_outline_block { block; revision } ->
+    Some
+      (Read
+         { query = Worker.Outline_block { uuid = block; revision }
+         ; maximum_items = 1
+         ; outcome = (fun value -> Ordinary_read (Protocol.V2_block_outcome value))
+         })
+  | V2_get_task_status_definitions { statuses } ->
+    Some
+      (Read
+         { query = Worker.Task_status_definitions statuses
+         ; maximum_items = max 1 (List.length statuses)
+         ; outcome =
+             (fun value ->
+               Ordinary_read (Protocol.V2_task_status_definitions_outcome value))
+         })
+  | V2_list_favorites _ ->
+    (match Hashtbl.find_opt t.pending (Graph.Uuid.to_string request.request_id) with
+     | Some { operation = Favorite_read read; delivery = Dispatched; _ } ->
+       (match Favorites.list_request read with
+        | None -> None
+        | Some business ->
+          Some
+            (Read
+               { query = Worker.Favorites business.cursor
+               ; maximum_items = business.limit
+               ; outcome =
+                   (fun (value : Worker.favorites) ->
+                     Favorites_read
+                       { first_page = business.cursor = None
+                       ; value =
+                           { favorites_page = value.favorites_page
+                           ; generation = value.generation
+                           ; projection_revision = value.projection_revision
+                           ; items = Rrbvec.of_list value.items
+                           ; next_cursor = value.next
+                           }
+                       })
+               }))
+     | _ -> Some (Unowned_read "Favorites business request is no longer owned"))
   | _ -> None
 ;;

@@ -23,7 +23,7 @@ type rejection =
   | Worker_rejection of
       { operation : string; request_id : Graph.Uuid.t; error : Error.t }
 type event =
-  | Favorites_loaded of Journal_graph_request.favorites_request * Protocol.v2_favorites_result
+  | Favorites_loaded of Journal_graph_request.favorites_request * Journal_graph_request.favorites_result
   | Favorites_failed of Journal_graph_request.favorites_request * bool * string
   | Favorites_invalidated
   | Rejected of rejection
@@ -102,7 +102,7 @@ let operation_name = function
 ;;
 let load ~ports (request : Journal_graph_request.favorites_request) =
   ports.plan_read (List_favorites request)
-    (Protocol.V2_list_favorites { limit = request.limit; cursor = request.cursor })
+    (Protocol.V2_list_favorites { limit = request.limit; cursor = None })
 ;;
 let maximum_reference_targets = 4096
 let register_favorite_dependency t uuid =
@@ -250,7 +250,7 @@ let changes t ~ports ~blocks ~pages ~structures =
 ;;
 
 
-let receive_list t ~ports (request : Journal_graph_request.favorites_request) (result : Protocol.v2_favorites_result) =
+let receive_list t ~ports (request : Journal_graph_request.favorites_request) (result : Journal_graph_request.favorites_result) =
           (try
              if request.cursor = None
              then (
@@ -272,7 +272,7 @@ let receive_list t ~ports (request : Journal_graph_request.favorites_request) (r
                result.favorites_page;
              (* Register the complete page before creating any pending reads. A
                 limit failure must not leave unscheduled request constructors. *)
-             let items = Rrbvec.of_list result.items in
+             let items = result.items in
              Rrbvec.iter
                (fun (item : Protocol.v2_favorite_item) ->
                   register_favorite_dependency t item.membership_uuid;
@@ -523,3 +523,5 @@ let fail t operation ~request_id ~code ~message ~error =
       complete_favorite_dependency_key t (favorite_membership_key page) (rejected ())
   | Favorite_page_candidate _ -> rejected ()
 ;;
+
+let list_request = function List_favorites request -> Some request | _ -> None

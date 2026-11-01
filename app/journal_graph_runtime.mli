@@ -26,7 +26,7 @@ type payload =
   | Reference_sources_changed of (string * string option) list
   | Favorites_loaded of
       Journal_graph_request.favorites_request
-      * Logseq_db_worker.Protocol.v2_favorites_result
+      * Journal_graph_request.favorites_result
   | Favorites_failed of Journal_graph_request.favorites_request * bool * string
   | Favorites_invalidated
   | Graph_ready
@@ -132,11 +132,25 @@ module Copy = Journal_copy
 
 module Worker = Journal_worker_coordination.Worker_api
 
-type worker_read =
-  | Read : { query : 'a Worker.query; maximum_items : int;
-             outcome : 'a -> Logseq_db_worker.Protocol.v2_outcome } -> worker_read
+type worker_read_result =
+  | Ordinary_read of Logseq_db_worker.Protocol.v2_outcome
+  | Favorites_read of
+      { first_page : bool
+      ; value : Journal_graph_request.favorites_result
+      }
 
-(** Business DTO interoperability for migrated non-paginated reads. Request IDs
-    here correlate existing projection work; Worker transport IDs stay exclusively
-    with the pure coordinator. No sealed continuation is unwrapped or recreated. *)
-val worker_read : Logseq_db_worker.Protocol.request -> worker_read option
+type worker_read =
+  | Read :
+      { query : 'a Worker.query
+      ; maximum_items : int
+      ; outcome : 'a -> worker_read_result
+      }
+      -> worker_read
+  | Unowned_read of string
+
+(** Business DTO interoperability. Favorites keeps its sealed continuation in
+    the business operation/result; ordinary Worker transport IDs remain solely
+    with the coordinator. No raw continuation extraction or cursor registry. *)
+val worker_read : t -> Logseq_db_worker.Protocol.request -> worker_read option
+
+val receive_worker_read : t -> request_id:Worker.Uuid.t -> worker_read_result -> output

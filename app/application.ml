@@ -333,11 +333,11 @@ let favorites_event state event =
     then state.favorites_media_roots
     else
       Journal_routes.Favorites.items favorites
-      |> List.map (fun (item : Logseq_db_worker.Protocol.v2_favorite_item) ->
+      |> Rrbvec.map (fun (item : Logseq_db_worker.Protocol.v2_favorite_item) ->
         match item.target with
         | V2_favorite_page { uuid; _ } | V2_favorite_block { uuid; _ } ->
           Logseq_db_types.Graph_types.Uuid.to_string uuid)
-      |> Rrbvec.of_list
+
   in
   if favorites == state.favorites && requests = []
   then state
@@ -2272,7 +2272,8 @@ let favorites_view
       ~on_copy
   =
   let module F = Journal_routes.Favorites in
-  let rows = F.items state in
+  (* The native list widget consumes wire lists; paginated business state is Rrbvec. *)
+  let rows = F.items state |> Rrbvec.to_list in
   let retry =
     V.buttons
       ~actions:
@@ -3778,8 +3779,10 @@ let start
   let graph_worker_requests_cell = graph_ref (fun () ->
     Hashtbl.create 16) in
   let coordinated_read_finished = ref (fun (_:Graph_service.timeline_scope)
-      (_:Logseq_db_worker.Protocol.request) (_:(Logseq_db_worker.Protocol.response,string) result) -> ()) in
-  let send_coordinated_read request (Journal_graph_runtime.Read read) =
+      (_:Logseq_db_worker.Protocol.request) (_:(Journal_graph_runtime.worker_read_result,string) result) -> ()) in
+  let send_coordinated_read request = function
+    | Journal_graph_runtime.Unowned_read _ -> Journal_graph_transport.Not_ready
+    | Read read ->
     match current_owner(),ensure_coordination() with
     | Some owner,Ok host ->
       (match Coordination_host.plan_query host ~owner ~maximum_items:read.maximum_items
@@ -3788,11 +3791,9 @@ let start
        | Ok ticket ->
          observe_projection_request request;
          Coordination_host.watch host ticket ~f:(fun reply ->
-           let response outcome=Logseq_db_worker.Protocol.V2_response
-             {api_version=Logseq_db_worker.Protocol.api_version;request_id=request.request_id;outcome} in
            let result=match reply with
-             | Wc.Answered(Ok value) -> Ok(response(read.outcome value))
-             | Answered(Error(Wc.Stale_read message)) -> Ok(response(V2_failed{code="staleReadCursor";message}))
+             | Wc.Answered(Ok value) -> Ok(read.outcome value)
+             | Answered(Error(Wc.Stale_read message)) -> Ok(Journal_graph_runtime.Ordinary_read(V2_failed{code="staleReadCursor";message}))
              | Answered(Error(Wc.Db_error error)) -> Error(Logseq_db_worker.Error.message error)
              | Answered(Error(Wc.Service_failed message | Resync_required message)) -> Error message
              | Answered(Error Revoked_session) -> Error "The graph execution changed before the read completed."
@@ -3820,7 +3821,7 @@ let start
     Journal_graph_transport.deliver
       ~runtime:(!graph_runtime_cell)
       ~send:(fun request ->
-        match Journal_graph_runtime.worker_read request with
+        match Journal_graph_runtime.worker_read (!graph_runtime_cell) request with
         | Some read -> send_coordinated_read request read
         | None ->
         match dispatch_worker ~observe_projection:true (Graph_service.Graph_request request) with
@@ -3904,8 +3905,16 @@ let start
   coordinated_read_finished := (fun owner request result ->
     if runtime_owner_is_live !state_ref owner then run_owned (Some owner) (fun () ->
       let output=match result with
-        | Ok response -> observe_projection_response response;
-          Journal_graph_runtime.receive (!graph_runtime_cell) response
+        | Ok result ->
+          (match result with
+           | Journal_graph_runtime.Ordinary_read outcome -> observe_projection_response
+             (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
+               request_id=request.request_id;outcome})
+           | Favorites_read{first_page;value}->
+             Journal_media_runtime.forget_request (!media_runtime_cell) request.request_id;
+             Journal_asset_runtime.observe_favorites_result (!asset_runtime_cell)
+               ~request_id:request.request_id ~first_page value);
+          Journal_graph_runtime.receive_worker_read (!graph_runtime_cell) ~request_id:request.request_id result
         | Error message -> forget_projection_request request.request_id;
           Journal_graph_runtime.fail_request (!graph_runtime_cell) request ~message in
       Effect.bind (Effect.of_thunk(fun()->deliver_output output)) ~f:(fun delivery ->
@@ -5157,7 +5166,7 @@ let start
     in
     let open_favorite membership_id =
       match
-        List.find_opt
+        Rrbvec.find_opt
           (fun (item : Logseq_db_worker.Protocol.v2_favorite_item) ->
              Logseq_db_types.Graph_types.Uuid.to_string item.membership_uuid
              = membership_id)
@@ -6125,7 +6134,7 @@ let start
       if exists && snapshot.graph_ready then begin_copy block_id else Effect.ignore
     | Favorite_copy membership_id ->
       (match
-         List.find_opt
+         Rrbvec.find_opt
            (fun (item : Logseq_db_worker.Protocol.v2_favorite_item) ->
               Logseq_db_types.Graph_types.Uuid.to_string item.membership_uuid
               = membership_id)
@@ -7527,7 +7536,7 @@ module For_testing = struct
            , { favorites_page = None
              ; generation = "fixture"
              ; projection_revision = "fixture"
-             ; items
+             ; items = Rrbvec.of_list items
              ; next_cursor = None
              } ))
     in

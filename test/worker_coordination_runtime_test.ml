@@ -40,10 +40,99 @@ let secrets =
   |> Result.get_ok
 ;;
 
-let with_client ?(epoch_ms = fun () -> 1_700_000_000_000L) f =
+let favorite_page_id = uuid "9c000000-0000-4000-8000-000000000100"
+let favorite_member n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (100 + n))
+
+let seed_favorite_memberships path =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let module Session = Logseq_db_storage.Storage_session in
+  let connection = Storage.open_database path |> Result.get_ok in
+  let storage = Storage.datascript_storage connection in
+  let database = Storage.restore_database connection |> Result.get_ok in
+  let session =
+    Session.create
+      ~tail:(Datascript.Storage.restore_tail_groups storage)
+      ~callbacks:(Storage.connection_callbacks connection)
+  in
+  Fun.protect
+    ~finally:(fun () -> ignore (Session.close session))
+    (fun () ->
+       let page = Datascript.Temp_id "synthetic-favorites-page" in
+       let lookup id =
+         Datascript.Lookup_ref ("block/uuid", Datascript.Uuid (W.Uuid.to_string id))
+       in
+       let member n target =
+         let node = Datascript.Temp_id ("synthetic-favorite-" ^ string_of_int n) in
+         Datascript.
+           [ Add (node, "block/uuid", Uuid (W.Uuid.to_string (favorite_member n)))
+           ; Add (node, "block/title", String "")
+           ; Add (node, "block/parent", Ref_to page)
+           ; Add (node, "block/page", Ref_to page)
+           ; Add (node, "block/order", String ("a" ^ string_of_int n))
+           ; Add (node, "block/link", Ref_to (lookup target))
+           ]
+       in
+       (* The imported synthetic storage fixture already has a Favorites index.
+       Retire only that index name in this isolated copy, preserving its data. *)
+       let previous =
+         match
+           Datascript.find_datom
+             database
+             Datascript.Avet
+             ~a:"block/name"
+             ~v:(Datascript.String "$$$favorites")
+             ()
+         with
+         | None -> []
+         | Some existing ->
+           Datascript.
+             [ Retract (Entity_id existing.e, "block/name", Some (String "$$$favorites"))
+             ]
+       in
+       let ops =
+         previous
+         @ Datascript.
+             [ Add (page, "block/uuid", Uuid (W.Uuid.to_string favorite_page_id))
+             ; Add (page, "block/title", String "Favorites")
+             ; Add (page, "block/name", String "$$$favorites")
+             ]
+         @ member 1 Test_support.authoritative_block_uuid
+         @ member 2 Test_support.page_uuid
+       in
+       let staged =
+         Session.stage_transact session ~authoritative_before:database ops
+         |> Result.get_ok
+       in
+       let seeded = Session.staged_db_after staged in
+       let page =
+         Datascript.find_datom
+           seeded
+           Datascript.Avet
+           ~a:"block/name"
+           ~v:(Datascript.String "$$$favorites")
+           ()
+         |> Option.get
+       in
+       let count =
+         Datascript.datoms
+           seeded
+           Datascript.Avet
+           ~a:"block/parent"
+           ~v:(Datascript.Ref page.e)
+           ()
+         |> Seq.length
+       in
+       require
+         (count = 2)
+         "synthetic Favorites index must contain exactly two memberships";
+       Session.commit_staged session staged |> Result.get_ok)
+;;
+
+let with_client ?(epoch_ms = fun () -> 1_700_000_000_000L) ?(favorites = false) f =
   T.with_managed (fun fixture ->
     let root = fixture.config.application_support_directory in
-    ignore (Test_support.seed_mirror root);
+    let first_path = Test_support.seed_mirror root in
+    if favorites then seed_favorite_memberships first_path;
     ignore (Test_support.seed_mirror ~graph_id:second_graph root);
     let graph : Sync.graph =
       { graph_id = Test_support.graph_uuid
@@ -97,7 +186,7 @@ let with_client ?(epoch_ms = fun () -> 1_700_000_000_000L) f =
 ;;
 
 let test_client_to_typed_read () =
-  with_client (fun client ->
+  with_client ~favorites:true (fun client ->
     let events = Queue.create ()
     and state = ref (C.initial ~client_id) in
     let published = ref 0
@@ -205,19 +294,23 @@ let test_client_to_typed_read () =
       "missing status definition lost ordered slot";
     let business = Journal_graph_runtime.create () in
     let original = Journal_graph_runtime.start business in
-    (match Journal_graph_runtime.worker_read original with
+    require
+      (Option.is_some
+         (Journal_graph_runtime.worker_read
+            business
+            { original with command = P.V2_list_favorites { limit = 50; cursor = None } }))
+      "a migrated Favorites request without business ownership fell back to legacy send";
+    (match Journal_graph_runtime.worker_read business original with
      | Some (Journal_graph_runtime.Read read) ->
        let _, reply = request (W.Query (budget, read.query)) in
        (match reply with
         | W.Answered (Ok value) ->
-          let response =
-            P.V2_response
-              { api_version = P.api_version
-              ; request_id = original.request_id
-              ; outcome = read.outcome value
-              }
+          let output =
+            Journal_graph_runtime.receive_worker_read
+              business
+              ~request_id:original.request_id
+              (read.outcome value)
           in
-          let output = Journal_graph_runtime.receive business response in
           require
             (List.exists
                (fun response ->
@@ -226,6 +319,7 @@ let test_client_to_typed_read () =
                output.responses)
             "typed graph info did not reach actual business projection"
         | _ -> failwith "typed business graph-info read failed")
+     | Some (Journal_graph_runtime.Unowned_read message) -> failwith message
      | None -> failwith "business graph-info path was not migrated");
     let _, page =
       request
@@ -323,6 +417,68 @@ let test_client_to_typed_read () =
         !deliveries
       |> Option.get
     in
+    let owner = Option.get baseline.baseline.state.sync.selected in
+    let favorites_request : Journal_graph_request.favorites_request =
+      { graph_generation = owner.graph_generation
+      ; request_generation = 310L
+      ; limit = 1
+      ; cursor = None
+      }
+    in
+    let request_query = request in
+    let read_favorites request =
+      let planned = Journal_graph_runtime.submit business (Load_favorites request) in
+      let original =
+        List.find
+          (fun (r : P.request) ->
+             match r.command with
+             | V2_list_favorites _ -> true
+             | _ -> false)
+          planned.requests
+      in
+      let read = Journal_graph_runtime.worker_read business original in
+      match read with
+      | Some (Journal_graph_runtime.Read read) ->
+        let _, reply = request_query (W.Query (budget, read.query)) in
+        (match reply with
+         | W.Answered (Ok value) ->
+           let output =
+             Journal_graph_runtime.receive_worker_read
+               business
+               ~request_id:original.request_id
+               (read.outcome value)
+           in
+           List.find_map
+             (fun response ->
+                match response.Journal_graph_runtime.payload with
+                | Favorites_loaded (_, value) -> Some value
+                | _ -> None)
+             output.responses
+           |> Option.get
+         | _ -> failwith "actual typed Favorites page failed")
+      | _ -> failwith "Favorites business read did not reach coordinator"
+    in
+    let first = read_favorites favorites_request in
+    require
+      (Rrbvec.length first.items = 1 && Option.is_some first.next_cursor)
+      (Printf.sprintf
+         "first Favorites page lost Partial continuation: items=%d more=%b page=%s"
+         (Rrbvec.length first.items)
+         (Option.is_some first.next_cursor)
+         (Option.fold ~none:"none" ~some:W.Uuid.to_string first.favorites_page));
+    require
+      ((Rrbvec.nth first.items 0).membership_uuid = favorite_member 1)
+      "first real Favorites membership changed";
+    let second =
+      read_favorites
+        { favorites_request with request_generation = 311L; cursor = first.next_cursor }
+    in
+    require
+      (Rrbvec.length second.items = 1 && second.next_cursor = None)
+      "second Favorites page inferred completeness incorrectly";
+    require
+      ((Rrbvec.nth second.items 0).membership_uuid = favorite_member 2)
+      "actual second wire request did not retain the sealed backend continuation";
     let revision =
       match summary with
       | W.Answered (Ok { lookup = P.V2_present_block { revision; _ }; _ }) -> revision

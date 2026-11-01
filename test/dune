@@ -1,3 +1,8 @@
+(library
+ (name coordination_test_fixture)
+ (modules coordination_test_fixture)
+ (libraries datascript_ocaml journal_worker_coordination_impl logseq_journal.worker_coordination uri))
+
 (test
  (name startup_test)
  (modules startup_test)
@@ -106,7 +111,7 @@
 (test
  (name journal_routes_test)
  (modules journal_routes_test)
- (libraries app))
+ (libraries app coordination_test_fixture))
 
 (rule
  (alias runtest)
@@ -197,12 +202,12 @@
 (test
  (name worker_coordination_runtime_test)
  (modules worker_coordination_runtime_test)
- (libraries app journal_worker_coordination_impl logseq_journal.worker_coordination
+ (libraries logseq_db_storage datascript-ocaml-native app journal_worker_coordination_impl logseq_journal.worker_coordination
   logseq_overlay_db_test_support logseq_db_worker_test_support
   logseq_sync.effect_runner logseq_sync.pure_reducer digestif))
 
 (test
  (name worker_coordination_pure_test)
  (modules worker_coordination_pure_test)
- (libraries datascript_ocaml journal_worker_coordination_impl logseq_journal.worker_coordination
+ (libraries coordination_test_fixture datascript_ocaml journal_worker_coordination_impl logseq_journal.worker_coordination
   logseq_db_worker logseq_sync.pure_reducer uri))

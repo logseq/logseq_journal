@@ -130,13 +130,13 @@ module Favorites : sig
         }
     | Loaded of
         Journal_graph_request.favorites_request
-        * Logseq_db_worker.Protocol.v2_favorites_result
+        * Journal_graph_request.favorites_result
     | Failed of Journal_graph_request.favorites_request * bool * string
 
   val create : graph_generation:int -> t
   val step : t -> event -> t * Journal_graph_request.favorites_request list
   val revision : t -> int
-  val items : t -> Logseq_db_worker.Protocol.v2_favorite_item list
+  val items : t -> Logseq_db_worker.Protocol.v2_favorite_item Rrbvec.t
   val loading : t -> bool
   val error : t -> string option
   val initialized : t -> bool

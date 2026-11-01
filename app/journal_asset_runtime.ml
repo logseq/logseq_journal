@@ -492,7 +492,7 @@ let settle_dirty t =
   pump t
 ;;
 
-let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
+let observe_response_internal ?favorites_first_page t (Protocol.V2_response { request_id; outcome; _ }) =
   match Hashtbl.find_opt t.requests (Graph.Uuid.to_string request_id) with
   | None -> ()
   | Some (issuance, command) ->
@@ -611,7 +611,7 @@ let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
        | V2_favorites_outcome { favorites_page; items; _ } ->
          t.favorites_page <- favorites_page;
          (match command with
-          | V2_list_favorites { cursor = None; _ } -> t.favorite_members <- Uuids.empty
+          | V2_list_favorites {cursor;_} when Option.value favorites_first_page ~default:(cursor=None) -> t.favorite_members <- Uuids.empty
           | _ -> ());
          List.iter
            (fun (item : Protocol.v2_favorite_item) ->
@@ -634,6 +634,32 @@ let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
        | _ -> ());
       settle_dirty t)
 ;;
+
+let observe_response t response = observe_response_internal t response
+
+let observe_favorites_result
+      t
+      ~request_id
+      ~first_page
+      (value : Journal_graph_request.favorites_result)
+  =
+  observe_response_internal
+    ~favorites_first_page:first_page
+    t
+    (Protocol.V2_response
+       { api_version = Protocol.api_version
+       ; request_id
+       ; outcome =
+           V2_favorites_outcome
+             { favorites_page = value.favorites_page
+             ; generation = value.generation
+             ; projection_revision = value.projection_revision
+             ; items = Rrbvec.to_list value.items
+             ; next_cursor = None
+             }
+       })
+;;
+
 
 let changes t windows =
   if Option.is_some t.configuration && not t.degraded

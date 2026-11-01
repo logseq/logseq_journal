@@ -1030,6 +1030,51 @@ let test_route_generation_background_and_runtime_replacement () =
     "Back did not return Timeline"
 ;;
 
+let favorites_cursor_factory ?(graph_generation = 7) () =
+  let module W = Journal_worker_coordination.Worker_api in
+  let module P = Logseq_db_worker.Protocol in
+  let module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service in
+  let issuer, _, _, session = Coordination_test_fixture.fixture ~graph_generation 2700L in
+  let module I = (val issuer : W.ISSUER) in
+  let budget =
+    W.read_budget session ~maximum_items:50 ~maximum_bytes:65536 |> Result.get_ok
+  in
+  fun after n ->
+    let request_id =
+      W.Uuid.of_string (Printf.sprintf "75000000-0000-4000-8000-%012d" (9000 + n))
+      |> Result.get_ok
+    in
+    let query = W.Query (budget, W.Favorites after) in
+    ignore (I.request session ~request_id:(W.request_id request_id) query |> Result.get_ok);
+    let next_cursor =
+      Logseq_db_types.Graph_types.Cursor.of_string ("favorites-fixture:" ^ string_of_int n)
+      |> Result.get_ok
+    in
+    let response =
+      P.V2_response
+        { api_version = P.api_version
+        ; request_id
+        ; outcome =
+            V2_favorites_outcome
+              { favorites_page = None
+              ; generation = "generation:v1:1:1"
+              ; projection_revision = "projection:v1:0"
+              ; items = []
+              ; next_cursor = Some next_cursor
+              }
+        }
+    in
+    match
+      I.reply
+        session
+        ~request_id:(W.request_id request_id)
+        query
+        (S.Graph_response response)
+    with
+    | Ok (W.Answered (Ok { next = Some cursor; _ })) -> cursor
+    | _ -> failwith "producer fixture did not issue a sealed Favorites continuation"
+;;
+
 let test_favorites_state_isolates_requests_and_refreshes () =
   let module F = Journal_routes.Favorites in
   let module P = Logseq_db_worker.Protocol in
@@ -1046,11 +1091,11 @@ let test_favorites_state_isolates_requests_and_refreshes () =
           { uuid = uuid (n + 100); title = string_of_int n; revision = "page" }
     }
   in
-  let result ?(cursor = None) items : P.v2_favorites_result =
+  let result ?(cursor = None) items : Journal_graph_request.favorites_result =
     { favorites_page = Some (uuid 99)
     ; generation = "generation:v1:1"
     ; projection_revision = "projection:v1:1"
-    ; items
+    ; items = Rrbvec.of_list items
     ; next_cursor = cursor
     }
   in
@@ -1068,7 +1113,7 @@ let test_favorites_state_isolates_requests_and_refreshes () =
     "first request lost graph identity";
   let selected, commands = F.step selected (Select true) in
   require (commands = []) "reselection duplicated a request";
-  let cursor = G.Cursor.of_string "favorites-test:next" |> Result.get_ok in
+  let cursor = favorites_cursor_factory () None 0 in
   let selected, commands =
     F.step selected (Loaded (first, result ~cursor:(Some cursor) []))
   in
@@ -1078,7 +1123,7 @@ let test_favorites_state_isolates_requests_and_refreshes () =
     F.step selected (Loaded (second, result [ item 1; item 2; item 3 ]))
   in
   require
-    (F.initialized loaded && List.length (F.items loaded) = 3 && commands = [])
+    (F.initialized loaded && Rrbvec.length (F.items loaded) = 3 && commands = [])
     "loaded favorites missing";
   let loaded, _ = F.step loaded (Visible { first_index = 1; last_exclusive = 3 }) in
   let hidden, _ = F.step loaded (Select false) in
@@ -1098,7 +1143,7 @@ let test_favorites_state_isolates_requests_and_refreshes () =
   let followup = request commands in
   let failed, _ = F.step coalesced (Failed (followup, false, "Read failed")) in
   require
-    (F.error failed = Some "Read failed" && F.items failed <> [])
+    (F.error failed = Some "Read failed" && not (Rrbvec.is_empty (F.items failed)))
     "refresh failure erased cache";
   let retrying, commands = F.step failed Retry in
   let retry = request commands in
@@ -1110,13 +1155,72 @@ let test_favorites_state_isolates_requests_and_refreshes () =
   let replaced = F.create ~graph_generation:8 in
   let replaced, commands = F.step replaced (Loaded (restart, result [ item 1 ])) in
   require
-    (commands = [] && F.items replaced = [])
+    (commands = [] && Rrbvec.is_empty (F.items replaced))
     "old graph completion contaminated replacement";
   let hidden, _ = F.step restarted (Select false) in
   let hidden, commands = F.step hidden (Loaded (restart, result [ item 1 ])) in
   require
-    (commands = [] && List.length (F.items hidden) = 1)
+    (commands = [] && Rrbvec.length (F.items hidden) = 1)
     "inactive current completion was discarded"
+;;
+
+let test_favorites_retains_large_typed_pages () =
+  let module F = Journal_routes.Favorites in
+  let module P = Logseq_db_worker.Protocol in
+  let module U = Logseq_db_types.Graph_types.Uuid in
+  let uuid n =
+    U.of_string (Printf.sprintf "76000000-0000-4000-8000-%012d" n) |> Result.get_ok
+  in
+  let state, requests = F.step (F.create ~graph_generation:7) (Select true) in
+  let state = ref state
+  and request = ref (List.hd requests) in
+  let next_cursor = favorites_cursor_factory () in
+  for page = 0 to 199 do
+    let after = if page = 199 then None else Some (next_cursor !request.cursor page) in
+    let items =
+      Rrbvec.init 50 (fun index ->
+        let n = (page * 50) + index + 1 in
+        P.
+          { membership_uuid = uuid n
+          ; membership_order = string_of_int n
+          ; membership_revision = "m"
+          ; target =
+              V2_favorite_page
+                { uuid = uuid (20000 + n); title = string_of_int n; revision = "p" }
+          })
+    in
+    let result : Journal_graph_request.favorites_result =
+      { favorites_page = Some (uuid 99999)
+      ; generation = "generation:v1:1:1"
+      ; projection_revision = "projection:v1:0"
+      ; items
+      ; next_cursor = after
+      }
+    in
+    let loaded, commands = F.step !state (Loaded (!request, result)) in
+    require (commands = []) "nonempty page unexpectedly restarted the scan";
+    state := loaded;
+    require
+      (Rrbvec.length (F.items !state) = (page + 1) * 50)
+      "typed pages lost accumulated rows";
+    if page < 199
+    then (
+      let pending, commands =
+        F.step
+          !state
+          (Visible { first_index = page * 50; last_exclusive = (page + 1) * 50 })
+      in
+      state := pending;
+      request := List.hd commands;
+      require (!request.cursor = after) "visible paging changed its sealed continuation")
+  done;
+  require
+    (Rrbvec.length (F.items !state) = 10000 && not (F.has_more !state))
+    "large paginated state inferred completeness before the final page";
+  let last = Rrbvec.nth (F.items !state) 9999 in
+  require
+    (U.equal last.membership_uuid (uuid 10000))
+    "Rrbvec append changed Favorites order"
 ;;
 
 let test_favorite_target_origin_and_delete () =
@@ -1179,13 +1283,13 @@ let test_favorite_target_origin_and_delete () =
          , { favorites_page = Some membership
            ; generation = "generation-1"
            ; projection_revision = "projection-1"
-           ; items = [ item; { page_item with membership_uuid = uuid "000000000003" } ]
+           ; items = Rrbvec.of_list [ item; { page_item with membership_uuid = uuid "000000000003" } ]
            ; next_cursor = None
            } ))
   in
   let hidden, _ = F.step loaded (Hide_target (G.Uuid.to_string target)) in
   require
-    (List.length (F.items hidden) = 1)
+    (Rrbvec.length (F.items hidden) = 1)
     "delete did not hide only the matching block favorite"
 ;;
 
@@ -1904,14 +2008,13 @@ let test_favorites_hidden_rows_do_not_block_pagination () =
           }
     }
   in
-  let cursor n =
-    G.Cursor.of_string ("favorites-test:" ^ string_of_int n) |> Result.get_ok
-  in
-  let result items next : P.v2_favorites_result =
+  let make_cursor=favorites_cursor_factory ~graph_generation:1 () in
+  let cursor n = make_cursor None n in
+  let result items next : Journal_graph_request.favorites_result =
     { favorites_page = Some (uuid 99)
     ; generation = "generation:v1:1"
     ; projection_revision = "projection:v1:1"
-    ; items
+    ; items = Rrbvec.of_list items
     ; next_cursor = next
     }
   in
@@ -1937,7 +2040,7 @@ let test_favorites_hidden_rows_do_not_block_pagination () =
       (loaded 16)
       (List.init 14 (( + ) 1))
   in
-  require (List.length (F.items hidden) = 2) "fixture did not hide target rows";
+  require (Rrbvec.length (F.items hidden) = 2) "fixture did not hide target rows";
   let paging, requests =
     F.step hidden (Visible { first_index = 0; last_exclusive = 2 })
   in
@@ -1958,7 +2061,7 @@ let test_favorites_hidden_rows_do_not_block_pagination () =
   let hidden, _ = hide (loaded 2) 1 in
   let empty, requests = hide hidden 2 in
   require
-    (F.items empty = [] && requests <> [])
+    (Rrbvec.is_empty(F.items empty) && requests <> [])
     "hiding the final row stranded the continuation";
   let request = one requests in
   let _, requests =
@@ -4183,6 +4286,7 @@ let tests =
           "loading Back lost Favorites origin" )
   ; ( "favorites isolated cache and refresh reducer"
     , test_favorites_state_isolates_requests_and_refreshes )
+  ; ( "Favorites retains large typed pages", test_favorites_retains_large_typed_pages )
   ; ( "direct Capture source and mutation identity"
     , test_direct_capture_preserves_source_and_mutation_identity )
   ; "direct Capture pending attachments", test_direct_capture_pending_attachments

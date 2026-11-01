@@ -1,8 +1,20 @@
+module Worker = Journal_worker_coordination.Worker_api
+
+type favorites_cursor = Worker.Protocol.v2_favorite_item Worker.continuation
+
 type favorites_request =
   { graph_generation : int
   ; request_generation : int64
   ; limit : int
-  ; cursor : Logseq_db_types.Graph_types.Cursor.t option
+  ; cursor : favorites_cursor option
+  }
+
+type favorites_result =
+  { favorites_page : Worker.Uuid.t option
+  ; generation : string
+  ; projection_revision : string
+  ; items : Worker.Protocol.v2_favorite_item Rrbvec.t
+  ; next_cursor : favorites_cursor option
   }
 
 type admission_request =

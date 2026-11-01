@@ -45,3 +45,8 @@ val pump : t -> unit
 val reject : t -> request_id:Logseq_db_types.Graph_types.Uuid.t -> unit
 
 val idle : t -> bool
+
+(** Owned business Favorites results preserve the explicit first-page boundary;
+    they never expose or reconstruct the sealed pagination cursor. *)
+val observe_favorites_result : t -> request_id:Logseq_db_types.Graph_types.Uuid.t
+  -> first_page:bool -> Journal_graph_request.favorites_result -> unit
