@@ -1,0 +1,6 @@
+(library
+ (name journal_app_spec)
+ (public_name logseq_journal.app_spec)
+ (modules worker_api core effect_runner)
+ (virtual_modules worker_api core effect_runner)
+ (libraries logseq_db_types))
