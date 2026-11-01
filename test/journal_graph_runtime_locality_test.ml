@@ -8,12 +8,55 @@ module Production_runtime = Journal_graph_runtime
 let fixture_requests = Hashtbl.create 32
 let fixture_days = Hashtbl.create 32
 
+module Catalog_producer = struct
+  module W = Journal_worker_coordination.Worker_api
+  module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
+
+  let issuer, _, _, session = Coordination_test_fixture.fixture 2800L
+
+  module I = (val issuer : W.ISSUER)
+
+  let budget =
+    W.read_budget session ~maximum_items:Protocol.maximum_page_size ~maximum_bytes:65536
+    |> Result.get_ok
+  ;;
+
+  let receive runtime request raw =
+    match Production_runtime.worker_read runtime request with
+    | Some (Production_runtime.Read read) ->
+      let operation = W.Query (budget, read.query) in
+      ignore
+        (I.request
+           session
+           ~request_id:(W.request_id request.Protocol.request_id)
+           operation
+         |> Result.get_ok);
+      (match
+         I.reply
+           session
+           ~request_id:(W.request_id request.request_id)
+           operation
+           (S.Graph_response raw)
+       with
+       | Ok (W.Answered (Ok value)) ->
+         Production_runtime.receive_worker_read
+           runtime
+           ~request_id:request.request_id
+           (read.outcome value)
+       | _ -> Alcotest.fail "typed catalog producer fixture failed")
+    | _ -> Production_runtime.receive runtime raw
+  ;;
+end
+
 module Runtime = struct
   include Production_runtime
 
   let receive runtime (Protocol.V2_response envelope as raw) =
     let key = Graph.Uuid.to_string envelope.request_id in
     match Hashtbl.find_opt fixture_requests key, envelope.outcome with
+    | Some (Protocol.V2_list_task_statuses _ as command), Protocol.V2_task_statuses_outcome _ ->
+      Catalog_producer.receive runtime
+        {Protocol.api_version=Protocol.api_version;request_id=envelope.request_id;command} raw
     | Some (Protocol.V2_get_page_tree {maximum_depth=0;_}),
       Protocol.V2_page_tree_outcome ({maximum_depth=1;items;page;_} as source) ->
       Hashtbl.remove fixture_requests key;

@@ -3910,6 +3910,7 @@ let start
            | Journal_graph_runtime.Ordinary_read outcome -> observe_projection_response
              (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
                request_id=request.request_id;outcome})
+           | Task_catalog_read _ -> forget_projection_request request.request_id
            | Favorites_read{first_page;value}->
              Journal_media_runtime.forget_request (!media_runtime_cell) request.request_id;
              Journal_asset_runtime.observe_favorites_result (!asset_runtime_cell)

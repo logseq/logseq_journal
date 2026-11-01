@@ -9,6 +9,7 @@ module Confirmation = Journal_graph_mutation_confirmation
 module Worker = Journal_worker_coordination.Worker_api
 
 type worker_read_result =
+  | Task_catalog_read of Worker.task_status_catalog
   | Ordinary_read of Protocol.v2_outcome
   | Favorites_read of { first_page:bool; value:Journal_graph_request.favorites_result }
 
@@ -190,6 +191,7 @@ type operation =
   | Task_catalog of
       { epoch : int64
       ; seen : string Rrbvec.t
+      ; after : Graph.task_status_definition Worker.continuation option
       }
   | Task_definitions of Graph.Uuid.t list
   | Graph_info
@@ -543,7 +545,7 @@ let request_task_catalog t =
   t.task_catalog_epoch <- epoch;
   read
     t
-    (Task_catalog { epoch; seen = Rrbvec.empty })
+    (Task_catalog { epoch; seen = Rrbvec.empty; after = None })
     (Protocol.V2_list_task_statuses { limit = Protocol.maximum_page_size; cursor = None })
 ;;
 
@@ -2014,7 +2016,7 @@ let children_result items continuation : Projection.block_member Graph.page_resu
   }
 ;;
 
-let receive_response t ~favorites (protocol_response : Protocol.response) =
+let receive_response t ~favorites ~catalog (protocol_response : Protocol.response) =
   let (Protocol.V2_response { request_id; outcome; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
   match Hashtbl.find_opt t.pending key with
@@ -2116,60 +2118,72 @@ let receive_response t ~favorites (protocol_response : Protocol.response) =
      | V2_task_statuses_outcome { property_uuid; default_status; items; next_cursor } ->
        (match operation with
         | Task_catalog { epoch; _ } when epoch <> t.task_catalog_epoch -> empty
-        | Task_catalog { epoch; seen } ->
-          t.task_property <- property_uuid;
-          t.default_task_status <- default_status;
-          let seen =
-            List.fold_left
-              (fun seen (definition : Graph.task_status_definition) ->
-                 let id = Graph.Uuid.to_string definition.uuid in
-                 (match
-                    ( Hashtbl.find_opt t.task_catalog_deletions id
-                    , Hashtbl.find_opt t.task_definitions id )
-                  with
-                  | Some deleted, _ when deleted > epoch -> ()
-                  | _, Some (previous, _) when previous > epoch -> ()
-                  | _ -> Hashtbl.replace t.task_definitions id (epoch, Some definition));
-                 Rrbvec.push_back seen id)
-              seen
-              items
-          in
-          let requests =
-            match next_cursor with
-            | Some cursor ->
-              [ read
-                  t
-                  (Task_catalog { epoch; seen })
-                  (Protocol.V2_list_task_statuses
-                     { limit = Protocol.maximum_page_size; cursor = Some cursor })
-              ]
+        | Task_catalog { epoch; seen; _ } ->
+          let values =
+            match catalog with
+            | Some value ->
+              Ok (value.Worker.property_uuid, value.default_status, value.items, value.next)
+            | None when next_cursor = None -> Ok (property_uuid, default_status, items, None)
             | None ->
-              let seen =
-                Rrbvec.to_seq seen |> Seq.map (fun id -> id, ()) |> Hashtbl.of_seq
-              in
-              Hashtbl.filter_map_inplace
-                (fun id (previous, value) ->
-                   if previous <= epoch && not (Hashtbl.mem seen id)
-                   then None
-                   else Some (previous, value))
-                t.task_definitions;
-              t.task_catalog_complete <- true;
-              t.task_catalog_loading <- false;
-              Hashtbl.clear t.task_catalog_deletions;
-              Hashtbl.filter_map_inplace
-                (fun _ lookup_epoch ->
-                   if lookup_epoch < epoch then None else Some lookup_epoch)
-                t.task_lookup_epochs;
-              (match t.default_task_status with
-               | Some uuid
-                 when not (Hashtbl.mem t.task_definitions (Graph.Uuid.to_string uuid)) ->
-                 t.default_task_status <- None
-               | _ -> ());
-              []
+              Error "An unsealed task catalog continuation cannot enter business state."
           in
-          { requests
-          ; responses = (if next_cursor = None then [ task_catalog_response t ] else [])
-          }
+          Result.fold
+            ~error:(fun message -> failure_output t operation request_id message)
+            ~ok:(fun (property_uuid, default_status, items, next_cursor) ->
+              t.task_property <- property_uuid;
+              t.default_task_status <- default_status;
+              let seen =
+                List.fold_left
+                  (fun seen (definition : Graph.task_status_definition) ->
+                     let id = Graph.Uuid.to_string definition.uuid in
+                     (match
+                        ( Hashtbl.find_opt t.task_catalog_deletions id
+                        , Hashtbl.find_opt t.task_definitions id )
+                      with
+                      | Some deleted, _ when deleted > epoch -> ()
+                      | _, Some (previous, _) when previous > epoch -> ()
+                      | _ -> Hashtbl.replace t.task_definitions id (epoch, Some definition));
+                     Rrbvec.push_back seen id)
+                  seen
+                  items
+              in
+              let requests =
+                match next_cursor with
+                | Some cursor ->
+                  [ read
+                      t
+                      (Task_catalog { epoch; seen; after = Some cursor })
+                      (Protocol.V2_list_task_statuses
+                         { limit = Protocol.maximum_page_size; cursor = None })
+                  ]
+                | None ->
+                  let seen =
+                    Rrbvec.to_seq seen |> Seq.map (fun id -> id, ()) |> Hashtbl.of_seq
+                  in
+                  Hashtbl.filter_map_inplace
+                    (fun id (previous, value) ->
+                       if previous <= epoch && not (Hashtbl.mem seen id)
+                       then None
+                       else Some (previous, value))
+                    t.task_definitions;
+                  t.task_catalog_complete <- true;
+                  t.task_catalog_loading <- false;
+                  Hashtbl.clear t.task_catalog_deletions;
+                  Hashtbl.filter_map_inplace
+                    (fun _ lookup_epoch ->
+                       if lookup_epoch < epoch then None else Some lookup_epoch)
+                    t.task_lookup_epochs;
+                  (match t.default_task_status with
+                   | Some uuid
+                     when not (Hashtbl.mem t.task_definitions (Graph.Uuid.to_string uuid)) ->
+                     t.default_task_status <- None
+                   | _ -> ());
+                  []
+              in
+              { requests
+              ; responses = (if next_cursor = None then [ task_catalog_response t ] else [])
+              })
+            values
         | _ -> failure_output t operation request_id "Unexpected status catalog response.")
      | V2_task_status_definitions_outcome definitions ->
        (match operation with
@@ -2826,7 +2840,7 @@ let receive_response t ~favorites (protocol_response : Protocol.response) =
           failure_output t operation request_id "Unexpected acknowledgement response.")))
 ;;
 
-let receive_delivery t ~favorites (protocol_response : Protocol.response) =
+let receive_delivery t ~favorites ~catalog (protocol_response : Protocol.response) =
   let (Protocol.V2_response { request_id; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
   let pending = Hashtbl.find_opt t.pending key in
@@ -2847,7 +2861,7 @@ let receive_delivery t ~favorites (protocol_response : Protocol.response) =
     scope_output
       t
       (Option.bind pending (fun pending -> pending.failure_owner))
-      (receive_response t ~favorites protocol_response)
+      (receive_response t ~favorites ~catalog protocol_response)
   in
   let references =
     match pending, protocol_response with
@@ -2937,14 +2951,24 @@ let receive_delivery t ~favorites (protocol_response : Protocol.response) =
 (* Route accepted Worker terminal failures through the same owner as protocol
    failures. This removes pending/active markers and drains queued hydration;
    a later completion for the request is then unowned and ignored. *)
-let receive t response = receive_delivery t ~favorites:None response
+let receive t response = receive_delivery t ~favorites:None ~catalog:None response
 
 let receive_worker_read t ~request_id result =
-  let favorites, outcome =
+  let favorites, catalog, outcome =
     match result with
-    | Ordinary_read outcome -> None, outcome
+    | Ordinary_read outcome -> None, None, outcome
+    | Task_catalog_read value ->
+      ( None
+      , Some value
+      , Protocol.V2_task_statuses_outcome
+          { property_uuid = value.property_uuid
+          ; default_status = value.default_status
+          ; items = value.items
+          ; next_cursor = None
+          } )
     | Favorites_read { value; _ } ->
       ( Some value
+      , None
       , Protocol.V2_favorites_outcome
           { favorites_page = value.favorites_page
           ; generation = value.generation
@@ -2956,6 +2980,7 @@ let receive_worker_read t ~request_id result =
   receive_delivery
     t
     ~favorites
+    ~catalog
     (Protocol.V2_response { api_version = Protocol.api_version; request_id; outcome })
 ;;
 
@@ -3086,6 +3111,16 @@ let worker_read t (request : Protocol.request) =
              (fun value ->
                Ordinary_read (Protocol.V2_task_status_definitions_outcome value))
          })
+  | V2_list_task_statuses _ ->
+    (match Hashtbl.find_opt t.pending (Graph.Uuid.to_string request.request_id) with
+     | Some { operation = Task_catalog { after; _ }; delivery = Dispatched; _ } ->
+       Some
+         (Read
+            { query = Worker.Task_statuses after
+            ; maximum_items = Protocol.maximum_page_size
+            ; outcome = (fun value -> Task_catalog_read value)
+            })
+     | _ -> Some (Unowned_read "Task catalog business request is no longer owned"))
   | V2_list_favorites _ ->
     (match Hashtbl.find_opt t.pending (Graph.Uuid.to_string request.request_id) with
      | Some { operation = Favorite_read read; delivery = Dispatched; _ } ->

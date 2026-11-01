@@ -128,12 +128,41 @@ let seed_favorite_memberships path =
        Session.commit_staged session staged |> Result.get_ok)
 ;;
 
-let with_client ?(epoch_ms = fun () -> 1_700_000_000_000L) ?(favorites = false) f =
+let seed_status_catalog support =
+  let module D = Logseq_overlay_db.Database in
+  Eio_main.run (fun _ ->
+    Eio.Switch.run (fun sw ->
+      let inspection =
+        D.inspect_mirror
+          ~application_support_directory:support
+          ~graph_id:Test_support.graph_uuid
+        |> Result.get_ok
+      in
+      let database =
+        D.open_
+          ~sw
+          (Test_support.dependencies ~behavior:"synthetic status catalog")
+          inspection
+          ~graph_name:"synthetic status catalog"
+        |> Result.get_ok
+      in
+      Fun.protect
+        ~finally:(fun () -> ignore (D.close database))
+        (fun () -> Test_support.seed_task_statuses database)))
+;;
+
+let with_client
+      ?(epoch_ms = fun () -> 1_700_000_000_000L)
+      ?(favorites = false)
+      ?(statuses = false)
+      f
+  =
   T.with_managed (fun fixture ->
     let root = fixture.config.application_support_directory in
     let first_path = Test_support.seed_mirror root in
     if favorites then seed_favorite_memberships first_path;
     ignore (Test_support.seed_mirror ~graph_id:second_graph root);
+    if statuses then seed_status_catalog root;
     let graph : Sync.graph =
       { graph_id = Test_support.graph_uuid
       ; name = "Coordination synthetic"
@@ -186,7 +215,7 @@ let with_client ?(epoch_ms = fun () -> 1_700_000_000_000L) ?(favorites = false) 
 ;;
 
 let test_client_to_typed_read () =
-  with_client ~favorites:true (fun client ->
+  with_client ~favorites:true ~statuses:true (fun client ->
     let events = Queue.create ()
     and state = ref (C.initial ~client_id) in
     let published = ref 0
@@ -418,6 +447,83 @@ let test_client_to_typed_read () =
       |> Option.get
     in
     let owner = Option.get baseline.baseline.state.sync.selected in
+    let catalog =
+      Journal_graph_runtime.submit business Journal_graph_request.Load_task_statuses
+      |> fun output ->
+      List.find
+        (fun (request : P.request) ->
+           match request.command with
+           | V2_list_task_statuses _ -> true
+           | _ -> false)
+        output.requests
+    in
+    require
+      (Option.is_some (Journal_graph_runtime.worker_read business catalog))
+      "task catalog pagination still bypassed the typed coordinator";
+    let rec read_catalog page original =
+      require (page < 100) "real status cursor did not terminate";
+      match Journal_graph_runtime.worker_read business original with
+      | Some (Journal_graph_runtime.Read read) ->
+        let _, reply = request (W.Query (budget, read.query)) in
+        (match reply with
+         | W.Answered (Ok value) ->
+           let result = read.outcome value in
+           let more =
+             match result with
+             | Journal_graph_runtime.Task_catalog_read value -> Option.is_some value.next
+             | _ -> failwith "catalog result lost typed correspondence"
+           in
+           let output =
+             Journal_graph_runtime.receive_worker_read
+               business
+               ~request_id:original.request_id
+               result
+           in
+           if more
+           then (
+             require
+               (not
+                  (List.exists
+                     (fun response ->
+                        match response.Journal_graph_runtime.payload with
+                        | Task_statuses_changed { complete = true; _ } -> true
+                        | _ -> false)
+                     output.responses))
+               "partial catalog was published as Complete";
+             let next =
+               List.find
+                 (fun (request : P.request) ->
+                    match request.command with
+                    | V2_list_task_statuses _ -> true
+                    | _ -> false)
+                 output.requests
+             in
+             read_catalog (page + 1) next)
+           else (
+             let items =
+               List.find_map
+                 (fun response ->
+                    match response.Journal_graph_runtime.payload with
+                    | Task_statuses_changed { complete = true; items; _ } -> Some items
+                    | _ -> None)
+                 output.responses
+               |> Option.get
+             in
+             require
+               (page >= 11)
+               "actual Service did not paginate all seeded status identities";
+             for n = 0 to 11 do
+               require
+                 (Rrbvec.exists
+                    (fun (definition : W.Graph.task_status_definition) ->
+                       W.Uuid.equal definition.uuid (Test_support.status_uuid n))
+                    items)
+                 "completed catalog lost a stable status UUID"
+             done)
+         | _ -> failwith "real typed catalog page failed")
+      | _ -> failwith "catalog business page bypassed coordinator"
+    in
+    read_catalog 0 catalog;
     let favorites_request : Journal_graph_request.favorites_request =
       { graph_generation = owner.graph_generation
       ; request_generation = 310L
