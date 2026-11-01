@@ -113,7 +113,10 @@ type output =
   ; responses : response list
   }
 
-val create : ?localtime:(float -> Unix.tm) -> unit -> t
+(** The host supplies the pure coordinator's current session/owner eligibility
+    check for buffered Tree DTOs. Its default rejects execution provenance; tests
+    can supply an explicit pure coordinator snapshot. *)
+val create : ?localtime:(float -> Unix.tm) -> ?validate_session:(Journal_worker_coordination.Worker_api.session -> (unit, Journal_worker_coordination.Worker_api.error) result) -> unit -> t
 val reset : t -> unit
 val set_calendar : t -> Journal_calendar.t -> unit
 val start : t -> Logseq_db_worker.Protocol.request
@@ -133,6 +136,7 @@ module Copy = Journal_copy
 module Worker = Journal_worker_coordination.Worker_api
 
 type worker_read_result =
+  | Root_tree_read of {page:Logseq_db_types.Graph_types.Uuid.t;value:Logseq_db_worker.Protocol.v2_tree_member Worker.slice}
   | Child_members_read of Worker.children
   | Target_summary_read of Worker.block_summary
   | Journals_read of Logseq_db_worker.Protocol.v2_journal_item Worker.slice
@@ -157,4 +161,4 @@ type worker_read =
     with the coordinator. No raw continuation extraction or cursor registry. *)
 val worker_read : t -> Logseq_db_worker.Protocol.request -> worker_read option
 
-val receive_worker_read : t -> request_id:Worker.Uuid.t -> worker_read_result -> output
+val receive_worker_read : ?origin:(Worker.session * Worker.read_budget) -> t -> request_id:Worker.Uuid.t -> worker_read_result -> output

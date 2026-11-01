@@ -1,6 +1,85 @@
 module Graph = Logseq_db_types.Graph_types
 module Protocol = Logseq_db_worker.Protocol
-module Runtime = Journal_graph_runtime
+module Production_runtime = Journal_graph_runtime
+
+(* Domain fixtures use the public typed read boundary. The database Service is
+   exercised separately by worker_coordination_runtime_test. *)
+module Read_fixture = struct
+  module W = Journal_worker_coordination.Worker_api
+  module C = Journal_worker_coordination.Worker_pure_coordinator
+  module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
+
+  let issuer, raw, projection, session =
+    Coordination_test_fixture.fixture
+      ~limits:
+        { Coordination_test_fixture.limits with
+          response_budget_bytes = Protocol.maximum_response_bytes
+        }
+      2900L
+  ;;
+
+  module I = (val issuer : W.ISSUER)
+
+  let state =
+    let bound =
+      C.step
+        (C.initial
+           ~client_id:
+             (W.Uuid.of_string "98000000-0000-4000-8000-000000002900" |> Result.get_ok))
+        (C.Worker_bound I.binding)
+    in
+    (C.step bound.next (C.Bootstrap_received (I.binding, W.Ready projection))).next
+  ;;
+
+  let validate_session session =
+    C.validate_session ~owner:(Option.get raw.baseline.state.sync.selected) state session
+  ;;
+
+  let receive runtime request raw =
+    match Production_runtime.worker_read runtime request with
+    | Some (Production_runtime.Read read) ->
+      let budget =
+        W.read_budget
+          session
+          ~maximum_items:read.maximum_items
+          ~maximum_bytes:Protocol.maximum_response_bytes
+        |> Result.get_ok
+      in
+      let operation = W.Query (budget, read.query) in
+      ignore
+        (I.request
+           session
+           ~request_id:(W.request_id request.Protocol.request_id)
+           operation
+         |> Result.get_ok);
+      (match
+         I.reply
+           session
+           ~request_id:(W.request_id request.request_id)
+           operation
+           (S.Graph_response raw)
+       with
+       | Ok (W.Answered (Ok value)) ->
+         Production_runtime.receive_worker_read
+           ~origin:(session, budget)
+           runtime
+           ~request_id:request.request_id
+           (read.outcome value)
+       | _ -> Alcotest.fail "typed domain fixture response rejected")
+    | _ -> Alcotest.fail "expected a typed domain read"
+  ;;
+end
+
+module Runtime = struct
+  include Production_runtime
+
+  let create ?localtime () =
+    Production_runtime.create
+      ?localtime
+      ~validate_session:Read_fixture.validate_session
+      ()
+  ;;
+end
 
 let uuid value = Graph.Uuid.of_string value |> Result.get_ok
 
@@ -110,8 +189,9 @@ let seed_visible_block ?(record = record) runtime =
             }))
     |> fun output -> only "page-tree request" output.requests
   in
-  let output = Runtime.receive
+  let output = Read_fixture.receive
     runtime
+    tree
     (respond
        tree
        (Protocol.V2_page_tree_outcome
@@ -838,7 +918,7 @@ let test_named_tags_reach_timeline_row () =
     | Ok value -> value
     | Error message -> Alcotest.failf "tag read rejected: %s" message
   in
-  let output = Runtime.receive runtime response in
+  let output = Read_fixture.receive runtime tree response in
   let child=only "tagged root preview" output.requests in
   let output=Runtime.receive runtime (respond child (Protocol.V2_children_outcome
       {parent=block_uuid;revision_scope=V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None})) in

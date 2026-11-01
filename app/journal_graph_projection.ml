@@ -86,8 +86,22 @@ type child_cursor =
   ; maximum_items : int
   }
 
+type root_cursor =
+  { session : Journal_worker_coordination.Worker_api.session
+  ; budget : Journal_worker_coordination.Worker_api.read_budget
+  ; maximum_items : int
+  ; page : Logseq_db_types.Graph_types.Uuid.t
+  ; epoch : int64
+  ; after :
+      Logseq_db_worker.Protocol.v2_tree_member
+        Journal_worker_coordination.Worker_api.continuation
+        option
+  ; remaining : Logseq_db_worker.Protocol.v2_tree_member Rrbvec.t
+  }
+
 type block_continuation =
   | Legacy_tree_cursor of Logseq_db_types.Graph_types.Cursor.t
+  | Root_tree_cursor of root_cursor
   | Child_cursor of child_cursor
 
 type block_cursor =
@@ -307,6 +321,7 @@ let preview_children children =
 ;;
 
 let timeline_entry_page
+      ?root_continuation
       ?(tag_titles = fun _ -> [])
       ~page
       ~time_context
@@ -317,9 +332,10 @@ let timeline_entry_page
       (fun protocol_cursor ->
          { after_sibling_order = block.order
          ; after_block_id = Graph.Uuid.to_string block.uuid
-         ; protocol_cursor = Some (Legacy_tree_cursor protocol_cursor)
+         ; protocol_cursor = Some protocol_cursor
          })
-      result.continuation
+      (match root_continuation with Some cursor -> Some (Root_tree_cursor cursor)
+       | None -> Option.map (fun cursor -> Legacy_tree_cursor cursor) result.continuation)
   in
   let roots =
     let children = Hashtbl.create 16 in

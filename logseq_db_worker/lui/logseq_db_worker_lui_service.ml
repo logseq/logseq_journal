@@ -304,21 +304,13 @@ let coordination_network (baseline:coordination_baseline) (scope:asset_scope) =
     baseline.baseline.state.sync.residents
 ;;
 
-let coordination_read = function
-  | Protocol.V2_graph_info | V2_inspect_admission | V2_get_asset_descriptors _
-  | V2_list_assets _ | V2_list_task_statuses _ | V2_get_task_status_definitions _
-  | V2_list_favorites _ | V2_list_journals _ | V2_get_page _ | V2_get_outline_block _
-  | V2_get_outline_block_summary _ | V2_get_children _ | V2_get_page_tree _ -> true
-  | V2_pull_changes _ | V2_ack_changes _ | V2_set_asset_reference _ | V2_save_block _
-  | V2_insert_blocks _ | V2_delete_blocks _ | V2_create_journal_page _
-  | V2_set_task_status _ | V2_clear_task_status _ -> false
-;;
+let coordination_read = Protocol.is_snapshot_read
 
 type request =
   | Register_coordination of int64
   | Release_coordination of int64
   | Coordination_query of
-      { registration : int64; owner : timeline_scope; request : Logseq_db_worker.Protocol.request }
+      { registration : int64; owner : timeline_scope; request : Logseq_db_worker.Protocol.request; response_budget_bytes : int }
   | Coordination_mutation of
       { registration : int64; owner : timeline_scope;
         request_id : Logseq_db_types.Graph_types.Uuid.t; intent : string }
@@ -1051,10 +1043,12 @@ let create ~(dependencies : dependencies) =
         (match session.coordination_registration with
          | Some id when id<=registration -> session.coordination_registration<-None | _ -> ());
         Ok(Coordination_released registration)
-      | Coordination_query {registration;owner;request} ->
+      | Coordination_query {registration;owner;request;response_budget_bytes} ->
         let current ()=Db.coordination_current session.worker ~registration in
         if not(coordination_read request.command) then
           Error "This registration supports ordinary reads only; mutation/changefeed ownership was not admitted."
+        else if response_budget_bytes<=0 || response_budget_bytes>Protocol.maximum_response_bytes
+        then Error "Invalid coordination read byte budget"
         else if not(current ()) then Error "Coordination binding retired"
         else (match resolve owner with
           | None -> Error "The graph session is no longer open."
@@ -1066,7 +1060,7 @@ let create ~(dependencies : dependencies) =
                  id=scope.graph_id && generation=scope.graph_generation
                | _ -> false) in
             if not(authorized ()) then Error "Coordination account authority changed" else
-            let response=Db.request_for_scope session.worker ~scope request in
+            let response=Db.request_for_scope ~response_budget_bytes session.worker ~scope request in
             if authorized () then Ok(Graph_response response) else Error "Coordination binding retired")
       | Coordination_mutation {registration;owner;request_id;intent} ->
         let current ()=Db.coordination_current session.worker ~registration in

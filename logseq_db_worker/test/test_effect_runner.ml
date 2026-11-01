@@ -2293,6 +2293,7 @@ let test_authoritative_rejection_diagnostics kind () =
                   drive
                     (Core.Graph_request
                        { id = Core.request_id_of_int64 3L
+                       ; response_budget_bytes = None
                        ; request =
                            { P.api_version = P.api_version
                            ; request_id =

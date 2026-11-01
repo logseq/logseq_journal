@@ -1,3 +1,5 @@
+module Protocol = Logseq_db_worker_contract.Protocol
+
 type graph_phase =
   | Graph_closed
   | Graph_opening
@@ -54,6 +56,7 @@ type _ runner_request =
   | Execute_request :
       { database : database_handle
       ; request : Logseq_db_worker_contract.Protocol.request
+      ; response_budget_bytes : int option
       }
       -> Logseq_db_worker_contract.Protocol.response runner_request
   | Close_database : database_handle -> unit runner_request
@@ -282,6 +285,7 @@ type event =
       { scope : Logseq_sync_pure_reducer.Core.graph_scope
       ; id : request_id
       ; request : Logseq_db_worker_contract.Protocol.request
+      ; response_budget_bytes : int option
       }
   | Projection_push_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_worker_contract.Protocol.push
   | Asset_requested_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_sync_pure_reducer.Asset_transfer.event
@@ -290,6 +294,7 @@ type event =
   | Graph_request of
       { id : request_id
       ; request : Logseq_db_worker_contract.Protocol.request
+      ; response_budget_bytes : int option
       }
   | Sync_event of Sync.event
   | Projection_push of Logseq_db_worker_contract.Protocol.push
@@ -543,8 +548,12 @@ let step state event =
         && Sync.admitted_graph_scope state.sync_core <> None
       then { next = state; effects = [ Publish (Graph_push push) ] }
       else no_effects state
-    | Graph_request { id; request } ->
-      (match state.graph.phase, state.database with
+    | Graph_request { id; request; response_budget_bytes } ->
+      if Option.exists (fun value->value<=0 || value>Protocol.maximum_response_bytes || not (Protocol.is_snapshot_read request.command)) response_budget_bytes
+      then {next=state;effects=[Publish (Reply (id,Protocol.V2_response
+        {api_version=Protocol.api_version;request_id=request.request_id;
+         outcome=V2_failed {code="invalidRequest";message="Invalid read response byte budget"}}))]}
+      else (match state.graph.phase, state.database with
        | Graph_open, Some database ->
          let ticket, state = fresh_ticket state in
          { next =
@@ -552,7 +561,7 @@ let step state event =
                pending = Pending_execute (id, request, ticket) :: state.pending
              }
          ; effects =
-             [ Run_worker (Request (ticket, Execute_request { database; request })) ]
+             [ Run_worker (Request (ticket, Execute_request { database; request; response_budget_bytes })) ]
          }
        | (Graph_closed | Graph_opening | Graph_closing | Graph_failed), _
        | Graph_open, None ->
@@ -1178,10 +1187,10 @@ let step state event =
     || List.exists(fun session->session.owner=scope) state.graph_sessions then Some scope else None) in
   let state=match owner with Some scope when known->load_graph state scope | _->state in
   let event=match event with
-    | Graph_request_for_scope {scope;id;request} ->
+    | Graph_request_for_scope {scope;id;request;response_budget_bytes} ->
       if Sync.scope_for_graph state.sync_core ~graph_id:scope.graph_id = Some scope
-      then Graph_request {id;request}
-      else Graph_request_for_scope {scope;id;request}
+      then Graph_request {id;request;response_budget_bytes}
+      else Graph_request_for_scope {scope;id;request;response_budget_bytes}
     | Asset_requested_for_scope (scope,event) when admitted scope -> Asset_requested {graph_generation=scope.graph_generation;event}
     | Upload_requested_for_scope (scope,operation,event) when admitted scope -> Upload_requested {graph_generation=scope.graph_generation;operation;event}
     | Projection_push_for_scope (scope,push) when Sync.scope_for_graph state.sync_core ~graph_id:scope.graph_id=Some scope -> Projection_push push

@@ -12,18 +12,43 @@ module Worker_producer = struct
   module W = Journal_worker_coordination.Worker_api
   module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 
-  let issuer, _, _, session = Coordination_test_fixture.fixture
-      ~limits:{Coordination_test_fixture.limits with response_budget_bytes=Protocol.maximum_response_bytes} 2800L
+  let issuer, raw, projection, session =
+    Coordination_test_fixture.fixture
+      ~limits:
+        { Coordination_test_fixture.limits with
+          response_budget_bytes = Protocol.maximum_response_bytes
+        }
+      2800L
+  ;;
 
   module I = (val issuer : W.ISSUER)
+  module C = Journal_worker_coordination.Worker_pure_coordinator
+
+  let state =
+    C.step
+      (C.initial
+         ~client_id:
+           (W.Uuid.of_string "98000000-0000-4000-8000-000000002800" |> Result.get_ok))
+      (C.Worker_bound I.binding)
+    |> fun step ->
+    (C.step step.next (C.Bootstrap_received (I.binding, W.Ready projection))).next
+  ;;
+
+  let validate_session session =
+    C.validate_session ~owner:(Option.get raw.baseline.state.sync.selected) state session
+  ;;
 
   let budget maximum_items =
-    W.read_budget session ~maximum_items ~maximum_bytes:Protocol.maximum_response_bytes |> Result.get_ok
+    W.read_budget session ~maximum_items ~maximum_bytes:Protocol.maximum_response_bytes
+    |> Result.get_ok
   ;;
 
   let wire_request runtime request =
     match request.Protocol.command, Production_runtime.worker_read runtime request with
-    | ( (Protocol.V2_list_journals _ | V2_get_outline_block_summary _ | V2_get_children _)
+    | ( ( Protocol.V2_list_journals _
+        | V2_get_outline_block_summary _
+        | V2_get_children _
+        | V2_get_page_tree _ )
       , Some (Production_runtime.Read read) ) ->
       (match
          I.request
@@ -59,6 +84,7 @@ module Worker_producer = struct
        with
        | Ok (W.Answered (Ok value)) ->
          Production_runtime.receive_worker_read
+           ~origin:(session, budget read.maximum_items)
            runtime
            ~request_id:request.request_id
            (read.outcome value)
@@ -90,6 +116,8 @@ end
 
 module Runtime = struct
   include Production_runtime
+  let create ?localtime ?(validate_session=Worker_producer.validate_session) () =
+    Production_runtime.create ?localtime ~validate_session ()
 
   let receive runtime (Protocol.V2_response envelope as raw) =
     let key = Graph.Uuid.to_string envelope.request_id in
@@ -100,11 +128,13 @@ module Runtime = struct
     | Some (Protocol.V2_list_task_statuses _ as command), Protocol.V2_task_statuses_outcome _ ->
       Worker_producer.receive runtime
         {Protocol.api_version=Protocol.api_version;request_id=envelope.request_id;command} raw
-    | Some (Protocol.V2_get_page_tree {maximum_depth=0;_}),
+    | Some ((Protocol.V2_get_page_tree {maximum_depth=0;_}) as command),
       Protocol.V2_page_tree_outcome ({maximum_depth=1;items;page;_} as source) ->
       Hashtbl.remove fixture_requests key;
       let roots=List.filter (fun (m:Protocol.v2_tree_member)->m.depth=0) items in
-      let result=Production_runtime.receive runtime
+      let result=Worker_producer.receive runtime
+          {Protocol.api_version=Protocol.api_version;request_id=envelope.request_id;
+           command}
           (Protocol.V2_response {envelope with outcome=V2_page_tree_outcome {source with maximum_depth=0;items=roots}}) in
       let rec serve (output:Production_runtime.output) =
         List.fold_left (fun (kept:Production_runtime.output) (request:Protocol.request) ->
@@ -131,6 +161,8 @@ module Runtime = struct
             {requests=kept.requests@next.requests;responses=kept.responses@next.responses})
           {requests=[];responses=output.responses} output.requests
       in serve result
+    | Some (Protocol.V2_get_page_tree _ as command), Protocol.V2_page_tree_outcome _ ->
+      Worker_producer.receive runtime {Protocol.api_version=Protocol.api_version;request_id=envelope.request_id;command} raw
     | _ -> Production_runtime.receive runtime raw)
     |> Worker_producer.wire_output runtime
 
@@ -636,7 +668,7 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
         counts
         kind
         (1 + Option.value ~default:0 (Hashtbl.find_opt counts kind));
-      let result = Production_runtime.receive runtime (response request outcome) in
+      let result = Runtime.receive runtime (response request outcome) in
       List.iter (fun (r : Runtime.response) -> match r.payload with
         | Feed_loaded { complete = true; _ } -> incr complete_feeds
         | Page_tree_reconciled { value; _ } ->
@@ -6332,7 +6364,7 @@ let capture_identity_owner_a = "a1000000-0000-4000-a000-0000000000c1"
 let capture_identity_owner_b = "a1000000-0000-4000-a000-0000000000c2"
 
 let capture_identity_runtime ?default () =
-  let runtime = Production_runtime.create ~localtime:Unix.gmtime () in
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
   set_calendar runtime;
   Option.iter
     (fun default_status ->
@@ -6929,7 +6961,7 @@ let initial_roots runtime generation =
        { cursor = None; root_limit = 30; day_limit = 7; request_generation = generation })
 ;;
 
-let drive_root_output ?(split_bytes = false) runtime fixtures (start : Runtime.output) =
+let drive_root_output ?(split_bytes = false) ?(filter_omitted = false) runtime fixtures (start : Runtime.output) =
   let queue = Queue.create () in
   let seen = ref []
   and outputs = ref start.responses in
@@ -6960,6 +6992,9 @@ let drive_root_output ?(split_bytes = false) runtime fixtures (start : Runtime.o
           ; next_cursor
           }
       | V2_get_page_tree { page; maximum_depth; limit; cursor; _ } ->
+        (match Production_runtime.worker_read runtime request with
+         | Some (Production_runtime.Read {query=Journal_worker_coordination.Worker_api.Tree _;_})->()
+         | _->Alcotest.fail "feed roots bypassed typed coordinator");
         Alcotest.(check int) "roots do not consume child budget" 0 maximum_depth;
         if split_bytes && limit > 2
         then
@@ -6976,7 +7011,7 @@ let drive_root_output ?(split_bytes = false) runtime fixtures (start : Runtime.o
                 List.map
                   (fun value ->
                      Protocol.{ value; revision = "root-1"; depth = 0; parent = page })
-                  selected
+                  (if filter_omitted then List.filter (fun (value:Protocol.v2_block_record)->value.block.title<>"__pbt-omitted-root__") selected else selected)
             ; next_cursor
             })
       | V2_get_children { parent; limit; cursor; _ } ->
@@ -7013,8 +7048,8 @@ let drive_root_output ?(split_bytes = false) runtime fixtures (start : Runtime.o
   !outputs, List.rev !seen
 ;;
 
-let drive_roots ?(split_bytes = false) runtime fixtures start =
-  let outputs, seen = drive_root_output ~split_bytes runtime fixtures start in
+let drive_roots ?(split_bytes = false) ?(filter_omitted = false) runtime fixtures start =
+  let outputs, seen = drive_root_output ~split_bytes ~filter_omitted runtime fixtures start in
   let complete =
     List.filter_map
       (fun (r : Runtime.response) ->
@@ -8093,7 +8128,7 @@ let test_initial_thirty_roots () =
   in
   match (only "later roots read" output.requests).command with
   | V2_get_page_tree { maximum_depth; limit; cursor; _ } ->
-    Alcotest.(check int) "later quota is thirty" 30 limit;
+    Alcotest.(check int) "continuation retains original ten-item budget" 10 limit;
     Alcotest.(check int) "root cursor keeps root shape" 0 maximum_depth;
     Alcotest.(check int) "same-day cursor follows tenth root" 10 (root_offset cursor)
   | _ -> Alcotest.fail "later root cursor changed protocol shape"
@@ -8128,7 +8163,7 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
   (* Worker failures exercise recovery, not storage cursor invalidation. *)
   List.iter
     (fun ending ->
-       let runtime = Production_runtime.create ~localtime:Unix.gmtime () in
+       let runtime = Runtime.create ~localtime:Unix.gmtime () in
        set_calendar ~clock:1_788_307_200. runtime;
        let first = normal_journal_fixture 29 1 0 in
        let older = normal_journal_fixture 30 1 0 in
@@ -8251,7 +8286,7 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
 ;;
 
 let test_later_date_cursor_no_progress_settles () =
-  let runtime=Production_runtime.create ~localtime:Unix.gmtime () in
+  let runtime=Runtime.create ~localtime:Unix.gmtime () in
   set_calendar runtime;
   let fixture=root_fixture 0 31 0 in
   let feed,_=drive_roots runtime [fixture;root_fixture 1 1 0] (initial_roots runtime 77L) in
@@ -8742,6 +8777,270 @@ let test_initial_superseded_and_singleton () =
        results)
 ;;
 
+let test_root_sealed_budget_preserves_visible_quota_and_tail () =
+  let runtime = Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let fixture = root_fixture 0 80 0 in
+  let fixture =
+    { fixture with
+      roots =
+        List.mapi
+          (fun index (value : Protocol.v2_block_record) ->
+             if index < 20
+             then { value with block = { value.block with title = "" } }
+             else value)
+          fixture.roots
+    }
+  in
+  let first, seen1 = drive_roots runtime [ fixture ] (initial_roots runtime 901L) in
+  let day = only "one root page" first.days in
+  Alcotest.(check int) "first visible quota exact" 30 (List.length day.entries);
+  let second, seen2 =
+    drive_roots
+      runtime
+      [ fixture ]
+      (Runtime.submit
+         runtime
+         (Journal_graph_request.Load_day_blocks
+            { day = day.page.day
+            ; after = day.continuation
+            ; limit = 30
+            ; request_generation = 902L
+            }))
+  in
+  Alcotest.(check int)
+    "next visible quota includes retained tail"
+    30
+    (List.fold_left
+       (fun n (day : Journal_graph_projection.day_feed) -> n + List.length day.entries)
+       0
+       second.days);
+  let reads =
+    List.filter_map
+      (fun (r : Protocol.request) ->
+         match r.command with
+         | V2_get_page_tree { limit; _ } -> Some limit
+         | _ -> None)
+      (seen1 @ seen2)
+  in
+  Alcotest.(check (list int)) "sealed root budget remains stable" [ 30; 30; 30 ] reads;
+  let ids =
+    List.concat_map
+      (fun (feed : Journal_graph_projection.feed) ->
+         List.concat_map
+           (fun (day : Journal_graph_projection.day_feed) ->
+              List.map
+                (fun (entry : Journal_graph_projection.timeline_entry) ->
+                   Journal_model.id entry.block)
+                day.entries)
+           feed.days)
+      [ first; second ]
+  in
+  Alcotest.(check int)
+    "over-read tail neither lost nor repeated"
+    60
+    (List.length (List.sort_uniq String.compare ids))
+;;
+
+let test_root_quota_generated_traces () =
+  (* Every fixture has <=180 roots. Omitted source slots can produce an empty packet with More;
+     cursor production still passes through the real Worker issuer decoder. *)
+  let run (flags, initial, quotas, mode, split) =
+    let module C = Journal_worker_coordination.Worker_pure_coordinator in
+    let core = ref Worker_producer.state in
+    let owner = ref (Option.get Worker_producer.raw.baseline.state.sync.selected) in
+    let runtime =
+      Runtime.create
+        ~localtime:Unix.gmtime
+        ~validate_session:(fun session -> C.validate_session ~owner:!owner !core session)
+        ()
+    in
+    set_calendar runtime;
+    let fixture = root_fixture 0 (List.length flags) 0 in
+    let roots =
+      List.map2
+        (fun kind (value : Protocol.v2_block_record) ->
+           { value with
+             block =
+               { value.block with
+                 title =
+                   (if kind = 1
+                    then ""
+                    else if kind = 2
+                    then "__pbt-omitted-root__"
+                    else value.block.title)
+               }
+           })
+        flags
+        fixture.roots
+    in
+    let fixture = { fixture with roots } in
+    let expected =
+      List.filter_map
+        (fun (value : Protocol.v2_block_record) ->
+           if value.block.title = "__pbt-omitted-root__" || value.block.title = ""
+           then None
+           else Some (Graph.Uuid.to_string value.block.uuid))
+        roots
+    in
+    let first =
+      Runtime.submit
+        runtime
+        (Journal_graph_request.Load_feed
+           { cursor = None
+           ; root_limit = initial
+           ; day_limit = 1
+           ; request_generation = 950L
+           })
+    in
+    let first, _ =
+      drive_roots ~filter_omitted:true ~split_bytes:split runtime [ fixture ] first
+    in
+    let feed_ids (feed : Journal_graph_projection.feed) =
+      List.concat_map
+        (fun (day : Journal_graph_projection.day_feed) ->
+           List.map
+             (fun (entry : Journal_graph_projection.timeline_entry) ->
+                Journal_model.id entry.block)
+             day.entries)
+        feed.days
+    in
+    let rec consume round quota quotas previous (feed : Journal_graph_projection.feed) =
+      if round > List.length flags + 2
+      then failwith "generated root trace did not terminate";
+      let batch = feed_ids feed in
+      let remaining = List.length expected - List.length previous in
+      if List.length batch <> min quota remaining
+      then failwith "generated root trace violated exact visible quota";
+      let seen = previous @ batch in
+      if List.take (List.length seen) expected <> seen
+      then failwith "generated root trace lost, reordered or duplicated an item";
+      match
+        List.find_map
+          (fun (day : Journal_graph_projection.day_feed) ->
+             Option.map (fun cursor -> day.page.day, cursor) day.continuation)
+          feed.days
+      with
+      | None ->
+        if seen <> expected
+        then failwith "generated root trace completed a Partial prefix"
+      | Some (day, cursor) ->
+        let quota, quotas =
+          match quotas with
+          | [] -> initial, []
+          | q :: rest -> q, rest
+        in
+        if round = 0 && mode <> 0
+        then (
+          (match mode with
+           | 1 ->
+             owner
+             := { !owner with graph_id = uuid "98000000-0000-4000-8000-000000000099" }
+           | 2 ->
+             let _, transition =
+               C.prepare_host_change
+                 !core
+                 (Journal_worker_coordination.Worker_api.Graph_will_close !owner.graph_id)
+               |> Result.get_ok
+             in
+             core := transition.next
+           | _ ->
+             ignore
+               (changed
+                  runtime
+                  (window
+                     ~scopes:[ Protocol.V2_page_tree_interest fixture.owner.uuid ]
+                     ())));
+          let output =
+            Runtime.submit
+              runtime
+              (Journal_graph_request.Load_day_blocks
+                 { day; after = Some cursor; limit = quota; request_generation = 951L })
+          in
+          if output.requests <> [] then failwith "revoked root cursor issued new reads";
+          match
+            (only "revoked generated root cursor settles" output.responses).payload
+          with
+          | Day_blocks_failed { stale_cursor = true; _ } -> ()
+          | _ -> failwith "revoked root cursor exposed retained data")
+        else (
+          let next, _ =
+            drive_roots
+              ~filter_omitted:true
+              ~split_bytes:split
+              runtime
+              [ fixture ]
+              (Runtime.submit
+                 runtime
+                 (Journal_graph_request.Load_day_blocks
+                    { day
+                    ; after = Some cursor
+                    ; limit = quota
+                    ; request_generation = Int64.of_int (952 + round)
+                    }))
+          in
+          consume (round + 1) quota quotas seen next)
+    in
+    consume 0 initial quotas [] first
+  in
+  let fails case =
+    try
+      run case;
+      false
+    with
+    | _ -> true
+  in
+  let rec shrink ((flags, initial, quotas, mode, split) as case) =
+    let half = List.length flags / 2 in
+    let candidates =
+      (if flags = []
+       then []
+       else
+         [ List.take half flags, initial, quotas, mode, split
+         ; List.drop (max 1 half) flags, initial, quotas, mode, split
+         ])
+      @ (if initial = 1 then [] else [ flags, 1, quotas, mode, split ])
+      @
+      match quotas with
+      | [] -> []
+      | _ :: rest -> [ flags, initial, rest, mode, split ]
+    in
+    match List.find_opt fails candidates with
+    | None -> case
+    | Some smaller -> shrink smaller
+  in
+  for seed = 0 to 99 do
+    let random = Random.State.make [| 33991; seed |] in
+    let count = 1 + Random.State.int random 180 in
+    let flags = List.init count (fun _ -> Random.State.int random 3) in
+    let initial = 1 + Random.State.int random 30 in
+    let quotas = List.init 8 (fun _ -> 1 + Random.State.int random 30) in
+    let case =
+      ( flags
+      , initial
+      , quotas
+      , (if seed mod 5 = 0 then 1 + (seed mod 3) else 0)
+      , seed mod 8 = 0 )
+    in
+    if fails case
+    then (
+      let flags, initial, quotas, mode, split = shrink case in
+      Alcotest.failf
+        "root quota seed=%d reduced flags=%s initial=%d quotas=%s mode=%d split=%b"
+        seed
+        (String.concat "" (List.map string_of_int flags))
+        initial
+        (String.concat "," (List.map string_of_int quotas))
+        mode
+        split)
+  done;
+  (* Force the final-page buffered-tail case for every authority revocation. *)
+  List.iter
+    (fun mode ->
+       run (List.init 60 (fun n -> if n < 20 then 1 else 0), 30, [ 30 ], mode, false))
+    [ 1; 2; 3 ]
+;;
+
 let () =
   Alcotest.run
     "journal graph runtime locality"
@@ -8928,6 +9227,8 @@ let () =
     ; ( "cross-page ownership", [Alcotest.test_case "point context and retirement" `Quick test_changed_point_ownership;
         Alcotest.test_case "resync retires point observations" `Quick test_resync_retires_changed_points] )
     ; ( "initial thirty roots", [
+        Alcotest.test_case "sealed root budget retains tail and exact visible quotas" `Quick test_root_sealed_budget_preserves_visible_quota_and_tail;
+        Alcotest.test_case "generated root quotas, empty More and revoked tails" `Quick test_root_quota_generated_traces;
         Alcotest.test_case "dates use owned Worker query" `Quick test_feed_dates_use_owned_worker_query;
         Alcotest.test_case "unowned children refuse legacy dispatch" `Quick test_private_children_without_owner_are_not_legacy;
         Alcotest.test_case "dates reject invalid local boundary" `Quick test_feed_dates_reject_invalid_local_boundary;

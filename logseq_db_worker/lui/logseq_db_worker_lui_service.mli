@@ -233,7 +233,7 @@ type request =
   | Register_coordination of int64
   | Release_coordination of int64
   | Coordination_query of
-      { registration : int64; owner : timeline_scope; request : Logseq_db_worker.Protocol.request }
+      { registration : int64; owner : timeline_scope; request : Logseq_db_worker.Protocol.request; response_budget_bytes : int }
   | Coordination_mutation of
       { registration : int64; owner : timeline_scope;
         request_id : Logseq_db_types.Graph_types.Uuid.t; intent : string }

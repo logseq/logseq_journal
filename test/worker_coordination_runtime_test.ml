@@ -43,6 +43,8 @@ let secrets =
 let favorite_page_id = uuid "9c000000-0000-4000-8000-000000000100"
 let favorite_member n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (100 + n))
 
+let byte_root n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (700+n))
+let quota_root n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (500+n))
 let preview_root = uuid "9c000000-0000-4000-8000-000000000400"
 let preview_child n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (400+n))
 let summary_child n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (300+n))
@@ -109,8 +111,8 @@ let seed_coordination_read_data path =
              Add (node,"block/uuid",Uuid (W.Uuid.to_string (journal_page n)));
              Add (node,"block/name",String ("synthetic-journal-" ^ string_of_int n));
              Add (node,"block/title",String "Synthetic journal");
-             Add (node,"block/journal-day",Int64 20260830L);
-             Add (node,"logseq.property/public?",Bool true)]) [1;2]
+             Add (node,"block/journal-day",Int64 (if n=4 then 20260831L else if n=3 then 20260829L else 20260830L));
+             Add (node,"logseq.property/public?",Bool true)]) [1;2;3;4]
        in
        let ops = ops @ List.concat_map (fun n ->
          let node=Datascript.Temp_id ("synthetic-summary-child-" ^ string_of_int n) in
@@ -135,6 +137,24 @@ let seed_coordination_read_data path =
            Add (child,"block/order",String ("a" ^ string_of_int n));
            Add (child,"block/parent",Ref_to node);
            Add (child,"block/page",Ref_to (lookup (journal_page 2)))]) [1;2] in
+       let ops=ops @ List.concat_map (fun index ->
+         let n=index+1 in
+         let node=Datascript.Temp_id ("synthetic-quota-root-" ^ string_of_int n) in
+         Datascript.[
+           Add (node,"block/uuid",Uuid (W.Uuid.to_string (quota_root n)));
+           Add (node,"block/title",String (if n<=20 then "" else "Quota root " ^ string_of_int n));
+           Add (node,"block/order",String (Printf.sprintf "a%04d" n));
+           Add (node,"block/parent",Ref_to (lookup (journal_page 3)));
+           Add (node,"block/page",Ref_to (lookup (journal_page 3)))]) (List.init 60 Fun.id) in
+       let ops=ops @ List.concat_map (fun index ->
+         let n=index+1 in
+         let node=Datascript.Temp_id ("synthetic-byte-root-" ^ string_of_int n) in
+         Datascript.[
+           Add (node,"block/uuid",Uuid (W.Uuid.to_string (byte_root n)));
+           Add (node,"block/title",String ((if n<=30 then "Before byte boundary " else String.make 3000 'x') ^ string_of_int n));
+           Add (node,"block/order",String (Printf.sprintf "a%04d" n));
+           Add (node,"block/parent",Ref_to (lookup (journal_page 4)));
+           Add (node,"block/page",Ref_to (lookup (journal_page 4)))]) (List.init 60 Fun.id) in
        let staged =
          Session.stage_transact session ~authoritative_before:database ops
          |> Result.get_ok
@@ -357,7 +377,7 @@ let test_client_to_typed_read () =
     require
       (definitions = W.Answered (Ok [ None ]))
       "missing status definition lost ordered slot";
-    let business = Journal_graph_runtime.create () in
+    let business = Journal_graph_runtime.create ~validate_session:(fun session -> C.validate_session ~owner !state session) () in
     let original = Journal_graph_runtime.start business in
     require
       (Option.is_some
@@ -632,9 +652,8 @@ let test_client_to_typed_read () =
       | _ -> failwith "catalog business page bypassed coordinator"
     in
     read_catalog 0 catalog;
-    (* Only the date planner is migrated in this checkpoint. Resolve its empty
-       root reads through the existing typed Tree API as an explicit test driver;
-       this does not claim production Tree dispatch has been migrated. *)
+    (* Exercise production date/root/preview planning with actual Service reads.
+       Root replies carry the exact pure coordinator origin through the adapter. *)
     let calendar =
       Journal_calendar.Sampler.create
         ~clock:(fun () -> 1_788_307_200.)
@@ -662,7 +681,30 @@ let test_client_to_typed_read () =
            | _ -> false)
         o.requests
     in
-    let seen = ref [] and last_root = ref None in
+    let deliver_root (original : P.request) =
+      match Journal_graph_runtime.worker_read business original with
+      | Some (Journal_graph_runtime.Read read) ->
+        let ticket, reply = request (W.Query (budget, read.query)) in
+        (match reply with
+         | W.Answered (Ok value) ->
+           let result = read.outcome value in
+           let items, next =
+             match result with
+             | Journal_graph_runtime.Root_tree_read { value; _ } -> value.items, value.next
+             | _ -> failwith "root lost typed result"
+           in
+           ( items
+           , next
+           , Journal_graph_runtime.receive_worker_read
+               ?origin:(C.query_origin (C.view !state) ticket)
+               business
+               ~request_id:original.request_id
+               result )
+         | _ -> failwith "actual root query failed")
+      | _ -> failwith "production root dispatch bypassed coordinator"
+    in
+    let seen = ref []
+    and last_root = ref None in
     let rec date_page remaining original =
       match Journal_graph_runtime.worker_read business original with
       | Some (Journal_graph_runtime.Read read) ->
@@ -707,38 +749,14 @@ let test_client_to_typed_read () =
                   | _ -> false)
                output.requests
            in
-           last_root:=Some root;
+           last_root := Some root;
            if remaining > 1
            then (
              require more "real first date page omitted continuation";
-             let query =
-               match root.command with
-               | V2_get_page_tree { page; maximum_depth; revision; cursor = None; _ } ->
-                 W.Tree { page; maximum_depth; revision; after = None }
-               | _ -> failwith "empty root fixture unexpectedly continued"
-             in
-             let _, tree = request (W.Query (budget, query)) in
-             let items =
-               match tree with
-               | W.Answered (Ok value) when value.next = None -> value.items
-               | _ -> failwith "actual empty root read failed"
-             in
-             require (items = []) "synthetic journal unexpectedly has roots";
-             let output =
-               Journal_graph_runtime.receive
-                 business
-                 (P.V2_response
-                    { api_version = P.api_version
-                    ; request_id = root.request_id
-                    ; outcome =
-                        V2_page_tree_outcome
-                          { page = item.page.uuid
-                          ; maximum_depth = 0
-                          ; items
-                          ; next_cursor = None
-                          }
-                    })
-             in
+             let items, next_cursor, output = deliver_root root in
+             require
+               (items = [] && next_cursor = None)
+               "synthetic first journal unexpectedly has roots";
              let next =
                List.find
                  (fun (r : P.request) ->
@@ -759,30 +777,10 @@ let test_client_to_typed_read () =
            "real date continuation lost seeded same-day identity")
       [ 1; 2 ];
     let root = Option.get !last_root in
-    let query =
-      match root.command with
-      | V2_get_page_tree { page; maximum_depth; revision; cursor = None; _ } ->
-        W.Tree { page; maximum_depth; revision; after = None }
-      | _ -> failwith "preview root driver lost first-page shape"
-    in
-    let _, reply = request (W.Query (budget, query)) in
-    let items =
-      match reply with
-      | W.Answered (Ok value) when value.next = None -> value.items
-      | _ -> failwith "actual preview root unavailable"
-    in
-    require (List.length items = 1) "synthetic preview root cardinality changed";
-    let output =
-      Journal_graph_runtime.receive
-        business
-        (P.V2_response
-           { api_version = P.api_version
-           ; request_id = root.request_id
-           ; outcome =
-               V2_page_tree_outcome
-                 { page = journal_page 2; maximum_depth = 0; items; next_cursor = None }
-           })
-    in
+    let items, next, output = deliver_root root in
+    require
+      (List.length items = 1 && next = None)
+      "synthetic preview root cardinality changed";
     let child_request output =
       List.find
         (fun (r : P.request) ->
@@ -837,6 +835,136 @@ let test_client_to_typed_read () =
       | _ -> failwith "production preview dispatch bypassed coordinator"
     in
     preview_page 0 (child_request output);
+    let drive_feed ?(maximum_bytes = 65536) demand =
+      let queue = Queue.create ()
+      and responses = ref []
+      and root_reads = ref [] in
+      let add output =
+        responses := List.rev_append output.Journal_graph_runtime.responses !responses;
+        List.iter (fun request -> Queue.add request queue) output.requests
+      in
+      add (Journal_graph_runtime.submit business demand);
+      let turns = ref 0 in
+      while not (Queue.is_empty queue) do
+        incr turns;
+        require (!turns < 1000) "actual root quota read did not converge";
+        let original : P.request = Queue.take queue in
+        (match original.command with
+         | V2_get_page_tree { limit; _ } -> root_reads := limit :: !root_reads
+         | _ -> ());
+        match Journal_graph_runtime.worker_read business original with
+        | Some (Journal_graph_runtime.Read read) ->
+          let budget =
+            W.read_budget session ~maximum_items:read.maximum_items ~maximum_bytes
+            |> Result.get_ok
+          in
+          let ticket, reply = request (W.Query (budget, read.query)) in
+          (match reply with
+           | W.Answered (Ok value) ->
+             add
+               (Journal_graph_runtime.receive_worker_read
+                  ?origin:(C.query_origin (C.view !state) ticket)
+                  business
+                  ~request_id:original.request_id
+                  (read.outcome value))
+           | _ -> failwith "actual root quota typed query failed")
+        | _ -> failwith "actual root quota path bypassed coordinator"
+      done;
+      let feed =
+        List.find_map
+          (fun response ->
+             match response.Journal_graph_runtime.payload with
+             | Feed_loaded { complete = true; feed; _ } -> Some feed
+             | _ -> None)
+          !responses
+        |> Option.get
+      in
+      feed, List.rev !root_reads
+    in
+    let first, reads =
+      drive_feed
+        (Load_feed
+           { cursor = Some { before_day = Some 20260830; skipped_day = None }
+           ; root_limit = 30
+           ; day_limit = 1
+           ; request_generation = 330L
+           })
+    in
+    require (reads = [ 30; 30 ]) "actual Tree continuation changed the sealed item budget";
+    let day = List.hd first.days in
+    require (List.length day.entries = 30) "actual first Tree page exceeded visible quota";
+    (match (Option.get day.continuation).protocol_cursor with
+     | Some (Journal_graph_projection.Root_tree_cursor cursor) ->
+       require
+         (cursor.after = None && Rrbvec.length cursor.remaining = 10)
+         "actual final DB page did not retain its bounded over-read tail"
+     | _ -> failwith "actual root cursor lost execution provenance");
+    let second, reads =
+      drive_feed
+        (Load_day_blocks
+           { day = day.page.day
+           ; after = day.continuation
+           ; limit = 30
+           ; request_generation = 331L
+           })
+    in
+    require (reads = []) "retained final-page roots unnecessarily reread the DB";
+    let entries =
+      List.concat_map
+        (fun (day : Journal_graph_projection.day_feed) -> day.entries)
+        second.days
+    in
+    require
+      (List.length entries = 10 && second.continuation = None)
+      "actual retained final-page tail did not exhaust exactly";
+    let all =
+      day.entries @ entries
+      |> List.map (fun (entry : Journal_graph_projection.timeline_entry) ->
+        Journal_model.id entry.block)
+    in
+    require
+      (List.length (List.sort_uniq String.compare all) = 40)
+      "actual final-page Tree tail lost or repeated visible roots";
+    let first, reads =
+      drive_feed
+        ~maximum_bytes:16384
+        (Load_feed
+           { cursor = Some { before_day = Some 20260901; skipped_day = None }
+           ; root_limit = 30
+           ; day_limit = 1
+           ; request_generation = 332L
+           })
+    in
+    require
+      (reads <> [] && List.for_all (( = ) 30) reads)
+      "byte-budget fixture changed the sealed item budget";
+    let day = List.hd first.days in
+    require
+      (List.length day.entries = 30 && day.continuation <> None)
+      "byte-budget first page lost continuation";
+    let second, reads =
+      drive_feed
+        ~maximum_bytes:16384
+        (Load_day_blocks
+           { day = day.page.day
+           ; after = day.continuation
+           ; limit = 30
+           ; request_generation = 333L
+           })
+    in
+    require
+      (List.length reads > 1 && List.for_all (( = ) 30) reads)
+      "server changed the client's sealed item budget while fitting encoded bytes";
+    let day = List.hd second.days in
+    require
+      (List.length day.entries = 30 && day.continuation = None)
+      "byte-bounded continuation did not drain all thirty large DTOs";
+    require
+      (List.for_all
+         (fun (entry : Journal_graph_projection.timeline_entry) ->
+            String.length (Journal_model.source entry.block) >= 3001)
+         day.entries)
+      "byte fitting truncated canonical DTO source text";
     let favorites_request : Journal_graph_request.favorites_request =
       { graph_generation = owner.graph_generation
       ; request_generation = 310L
@@ -1044,7 +1172,7 @@ let test_client_to_typed_read () =
         Mailbox.send
           client
           (Service.Coordination_query
-             { registration = baseline.registration
+             { response_budget_bytes=P.maximum_response_bytes; registration = baseline.registration
              ; owner = Option.get baseline.baseline.state.sync.selected
              ; request = mutation_request
              })
@@ -1337,7 +1465,7 @@ let test_read_completion_rechecks_graph_owner ?(durable = false) () =
          let read =
            send
              (Service.Coordination_query
-                { registration
+                { response_budget_bytes=P.maximum_response_bytes; registration
                 ; owner
                 ; request =
                     req
@@ -1398,7 +1526,7 @@ let test_read_completion_rechecks_graph_owner ?(durable = false) () =
          let read =
            send
              (Service.Coordination_query
-                { registration; owner; request = req "000000000004" P.V2_graph_info })
+                { response_budget_bytes=P.maximum_response_bytes; registration; owner; request = req "000000000004" P.V2_graph_info })
          in
          (* Cancelling the outer writer releases its Service lane, not its
             accepted durable DB operation. Keep that operation held while the

@@ -9,7 +9,8 @@ type publication =
   | Loaded of { request_generation : int64; feed : Projection.feed; complete : bool }
   | Reconciled of { page : Projection.page; value : Projection.timeline_entry_page }
   | Failed of { scope : failure_scope; stale_cursor : bool; message : string }
-type output = { requests : Protocol.request Rrbvec.t; publications : publication Rrbvec.t }
+type cached
+type output = { requests : Protocol.request Rrbvec.t; publications : publication Rrbvec.t; cached : cached option }
 type packet = Dates of Protocol.v2_journal_item Seq.t | Roots of Protocol.v2_tree_member Seq.t
   | Preview of Protocol.v2_child_member Seq.t
 type fragment = { page : Projection.page; members : Projection.tree_member Rrbvec.t
@@ -17,6 +18,7 @@ type fragment = { page : Projection.page; members : Projection.tree_member Rrbve
 type context = { today : int option; time_context : (Projection.time_context, string) result }
 type ports =
   { now : unit -> int64
+  ; validate_session : Worker.session -> (unit, Worker.error) result
   ; plan_read : operation -> Protocol.command -> Protocol.request
   ; context : unit -> context
   ; tag_titles : Graph.Uuid.t -> string list
@@ -48,6 +50,8 @@ val receive
   -> ports:ports
   -> ?journals:Protocol.v2_journal_item Worker.slice
   -> ?children:Worker.children
+  -> ?roots:Protocol.v2_tree_member Worker.slice
+  -> ?origin:(Worker.session * Worker.read_budget)
   -> operation
   -> Protocol.v2_outcome
   -> output option
@@ -64,3 +68,11 @@ type child_request =
   ; after : Protocol.v2_child_member Worker.continuation option
   }
 val child_request : operation -> child_request option
+
+type tree_request =
+  { page : Graph.Uuid.t; maximum_items : int
+  ; after : Protocol.v2_tree_member Worker.continuation option }
+val tree_request : operation -> tree_request option
+(** Business replay of a bounded already-read packet. Eligibility and epoch are
+    checked before projection; this does not synthesize a Worker completion. *)
+val resume_cached : t -> ports:ports -> cached -> output

@@ -45,7 +45,7 @@ val watch_read
   -> f:((Worker.session * Worker.read_budget) option -> 'a Worker.reply -> unit)
   -> unit
 
-val validate_session : t -> Worker.session -> (unit, Worker.error) result
+val validate_session : ?owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope -> t -> Worker.session -> (unit, Worker.error) result
 
 val on_event
   :  t

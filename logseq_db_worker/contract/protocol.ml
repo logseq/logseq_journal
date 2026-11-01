@@ -520,3 +520,46 @@ let push_of_yojson json =
 let encoded_response_bytes response =
   String.length (Yojson.Safe.to_string (response_to_yojson response))
 ;;
+
+let is_snapshot_read = function
+  | V2_graph_info
+  | V2_inspect_admission
+  | V2_get_asset_descriptors _
+  | V2_list_assets _
+  | V2_list_task_statuses _
+  | V2_get_task_status_definitions _
+  | V2_list_favorites _
+  | V2_list_journals _
+  | V2_get_page _
+  | V2_get_outline_block _
+  | V2_get_outline_block_summary _
+  | V2_get_children _
+  | V2_get_page_tree _ -> true
+  | V2_pull_changes _
+  | V2_ack_changes _
+  | V2_set_asset_reference _
+  | V2_save_block _
+  | V2_insert_blocks _
+  | V2_delete_blocks _
+  | V2_create_journal_page _
+  | V2_set_task_status _
+  | V2_clear_task_status _ -> false
+;;
+
+let smaller_read_page = function
+  | V2_list_journals value when value.limit > 1 ->
+    Some (V2_list_journals { value with limit = max 1 (value.limit / 2) })
+  | V2_get_outline_block_summary value when value.limit > 1 ->
+    Some (V2_get_outline_block_summary { value with limit = max 1 (value.limit / 2) })
+  | V2_get_children value when value.limit > 1 ->
+    Some (V2_get_children { value with limit = max 1 (value.limit / 2) })
+  | V2_get_page_tree value when value.limit > 1 ->
+    Some (V2_get_page_tree { value with limit = max 1 (value.limit / 2) })
+  | V2_list_favorites value when value.limit > 1 ->
+    Some (V2_list_favorites { value with limit = max 1 (value.limit / 2) })
+  | V2_list_task_statuses value when value.limit > 1 ->
+    Some (V2_list_task_statuses { value with limit = max 1 (value.limit / 2) })
+  | V2_list_assets value when value.limit > 1 ->
+    Some (V2_list_assets { value with limit = max 1 (value.limit / 2) })
+  | _ -> None
+;;

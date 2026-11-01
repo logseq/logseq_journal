@@ -88,7 +88,10 @@ val retain_imported_file
   -> operation:Logseq_db_types.Graph_types.Uuid.t
   -> (string * string) option
 
-val request_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> Protocol.request -> Protocol.response
+(** Optional byte overrides apply only to ordinary snapshot reads and are capped
+    by the configured limit. Invalid budgets or effect commands with an override
+    fail before dispatch; legacy callers without an override retain their path. *)
+val request_for_scope : ?response_budget_bytes:int -> t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> Protocol.request -> Protocol.response
 val durable_mutation_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
   -> request_id:Logseq_db_types.Graph_types.Uuid.t -> intent:string
   -> current:(unit -> bool) -> Logseq_db_worker_contract.Mutation_pure_wire.outcome

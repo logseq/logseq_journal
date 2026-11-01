@@ -52,6 +52,7 @@ type _ runner_request =
   | Execute_request :
       { database : database_handle
       ; request : Logseq_db_worker_contract.Protocol.request
+      ; response_budget_bytes : int option
       }
       -> Logseq_db_worker_contract.Protocol.response runner_request
   | Close_database : database_handle -> unit runner_request
@@ -162,6 +163,7 @@ type event =
       { scope : Logseq_sync_pure_reducer.Core.graph_scope
       ; id : request_id
       ; request : Logseq_db_worker_contract.Protocol.request
+      ; response_budget_bytes : int option
       }
   | Projection_push_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_worker_contract.Protocol.push
   | Asset_requested_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_sync_pure_reducer.Asset_transfer.event
@@ -170,6 +172,7 @@ type event =
   | Graph_request of
       { id : request_id
       ; request : Logseq_db_worker_contract.Protocol.request
+      ; response_budget_bytes : int option
       }
   | Sync_event of Logseq_sync_pure_reducer.Core.event
   | Projection_push of Logseq_db_worker_contract.Protocol.push

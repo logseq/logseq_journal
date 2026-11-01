@@ -29,9 +29,11 @@ val reply : view -> 'a ticket -> 'a Worker.reply option
 val query_origin : view -> 'a ticket -> (Worker.session * Worker.read_budget) option
 
 (** Reuse the coordinator's current Open-session and host-handoff fences before
-    presenting buffered read data. This is a pure local eligibility check; it
+    presenting buffered read data. A supplied business owner must exactly match
+    the session's account/graph generations and graph UUID. This is a pure local
+    eligibility check; it
     does not grant backend resource release, writer or deletion permission. *)
-val validate_session : t -> Worker.session -> (unit, Worker.error) result
+val validate_session : ?owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope -> t -> Worker.session -> (unit, Worker.error) result
 
 val observed : view -> 'a Worker.observation -> 'a Worker.observed option
 val equal_view : view -> view -> bool

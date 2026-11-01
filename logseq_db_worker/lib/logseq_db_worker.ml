@@ -266,7 +266,7 @@ let request t request =
   let id = Pure_reducer.request_id_of_int64 t.next_request_id in
   t.next_request_id <- Int64.succ t.next_request_id;
   Effect_runner.await_reply t.runner ~id ~request ~post:(fun () ->
-    post t (Pure_reducer.Graph_request { id; request }))
+    post t (Pure_reducer.Graph_request { id; request; response_budget_bytes=None }))
 ;;
 
 let shutdown t =
@@ -364,11 +364,11 @@ let retain_imported_file t ~scope ~operation =
   else Effect_runner.retain_imported_file t.runner ~scope ~operation
 ;;
 
-let request_for_scope t ~scope request =
+let request_for_scope ?response_budget_bytes t ~scope request =
   let id=Pure_reducer.request_id_of_int64 t.next_request_id in
   t.next_request_id <- Int64.succ t.next_request_id;
   Effect_runner.await_reply t.runner ~id ~request ~post:(fun () ->
-    post t (Pure_reducer.Graph_request_for_scope {scope;id;request}))
+    post t (Pure_reducer.Graph_request_for_scope {scope;id;request;response_budget_bytes}))
 let durable_mutation_for_scope t ~scope ~request_id ~intent ~current =
   let current () = not t.stopped && current () &&
     (match Pure_reducer.graph_state_for_scope !(t.state) scope with

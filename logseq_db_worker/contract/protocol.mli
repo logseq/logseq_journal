@@ -367,3 +367,12 @@ val response_of_yojson : Yojson.Safe.t -> (response, string) result
 val push_to_yojson : push -> Yojson.Safe.t
 val push_of_yojson : Yojson.Safe.t -> (push, string) result
 val encoded_response_bytes : response -> int
+
+(** Ordinary snapshot reads only; changefeed pulls/ACKs and mutations are effects
+    requiring their existing ownership path. *)
+val is_snapshot_read : command -> bool
+
+(** Pure bounded-page planning for one pinned snapshot. Only ordinary paged reads
+    can shrink; query family, cursor, revision and filters remain exact. Returning
+    None requires an explicit oversized-singleton/error result, never truncation. *)
+val smaller_read_page : command -> command option

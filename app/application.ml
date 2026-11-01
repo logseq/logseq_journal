@@ -3509,6 +3509,9 @@ let start
   in
   let graph_runtime_cell = graph_ref (fun () ->
     Journal_graph_runtime.create
+      ~validate_session:(fun session -> match current_owner(),!coordination_host with
+        | Some owner,Some (_,host) -> Coordination_host.validate_session ~owner host session
+        | _ -> Error Wc.Revoked_session)
       ~localtime:(Journal_calendar.Sampler.localtime calendar_sampler)
       ()) in
   let media_worker_requests_cell = graph_ref (fun () ->
@@ -3779,7 +3782,7 @@ let start
   let graph_worker_requests_cell = graph_ref (fun () ->
     Hashtbl.create 16) in
   let coordinated_read_finished = ref (fun (_:Graph_service.timeline_scope)
-      (_:Logseq_db_worker.Protocol.request) (_:(Journal_graph_runtime.worker_read_result,string) result) -> ()) in
+      (_:Logseq_db_worker.Protocol.request) (_: (Wc.session * Wc.read_budget) option) (_:(Journal_graph_runtime.worker_read_result,string) result) -> ()) in
   let send_coordinated_read request = function
     | Journal_graph_runtime.Unowned_read _ -> Journal_graph_transport.Not_ready
     | Read read ->
@@ -3790,9 +3793,13 @@ let start
        | Error _ -> Journal_graph_transport.Not_ready
        | Ok ticket ->
          observe_projection_request request;
-         Coordination_host.watch host ticket ~f:(fun reply ->
+         Coordination_host.watch_read host ticket ~f:(fun origin reply ->
            let result=match reply with
-             | Wc.Answered(Ok value) -> Ok(read.outcome value)
+             | Wc.Answered(Ok value) ->
+               (match origin with Some (session,_) when (match !coordination_host with
+                 | Some (_,current) -> Coordination_host.validate_session ~owner current session=Ok ()
+                 | None -> false) -> Ok(read.outcome value)
+                | _ -> Error "The graph execution changed before the read was delivered.")
              | Answered(Error(Wc.Stale_read message)) -> Ok(Journal_graph_runtime.Ordinary_read(V2_failed{code="staleReadCursor";message}))
              | Answered(Error Wc.Response_budget_exceeded) -> Ok(Journal_graph_runtime.Ordinary_read(V2_failed{code="responseTooLarge";message="The read exceeded its response budget."}))
              | Answered(Error(Wc.Db_error error)) -> Error(Logseq_db_worker.Error.message error)
@@ -3804,7 +3811,7 @@ let start
              | Not_admitted Stopping -> Error "Worker is stopping"
              | Not_admitted(Unsupported_request message) -> Error message
              | Interrupted _ -> Error "Worker read was interrupted" in
-           !coordinated_read_finished owner request result);
+           !coordinated_read_finished owner request origin result);
          Journal_graph_transport.Accepted)
     | _ -> Journal_graph_transport.Not_ready in
   let deliver_output (output : Journal_graph_runtime.output) =
@@ -3903,7 +3910,7 @@ let start
         | Some set_state ->
           set_state (fun state -> apply_delivery_responses state delivery))
   in
-  coordinated_read_finished := (fun owner request result ->
+  coordinated_read_finished := (fun owner request origin result ->
     if runtime_owner_is_live !state_ref owner then run_owned (Some owner) (fun () ->
       let output=match result with
         | Ok result ->
@@ -3914,6 +3921,10 @@ let start
            | Journals_read value -> observe_projection_response
              (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
                request_id=request.request_id;outcome=V2_journals_outcome {items=value.items;next_cursor=None}})
+           | Root_tree_read {page;value} -> observe_projection_response
+             (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
+               request_id=request.request_id;outcome=V2_page_tree_outcome
+                 {page;maximum_depth=0;items=value.items;next_cursor=None}})
            | Child_members_read value -> observe_projection_response
              (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
                request_id=request.request_id;outcome=V2_children_outcome
@@ -3930,7 +3941,7 @@ let start
              Journal_media_runtime.forget_request (!media_runtime_cell) request.request_id;
              Journal_asset_runtime.observe_favorites_result (!asset_runtime_cell)
                ~request_id:request.request_id ~first_page value);
-          Journal_graph_runtime.receive_worker_read (!graph_runtime_cell) ~request_id:request.request_id result
+          Journal_graph_runtime.receive_worker_read ?origin (!graph_runtime_cell) ~request_id:request.request_id result
         | Error message -> forget_projection_request request.request_id;
           Journal_graph_runtime.fail_request (!graph_runtime_cell) request ~message in
       Effect.bind (Effect.of_thunk(fun()->deliver_output output)) ~f:(fun delivery ->

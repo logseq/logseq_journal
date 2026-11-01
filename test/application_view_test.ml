@@ -1097,18 +1097,21 @@ let run_favorites_native_visibility
                 { items = [ { page; journal_day = 20260901; revision = "p" } ]
                 ; next_cursor = None
                 }
-            | V2_get_page_tree _ ->
+            | V2_get_page_tree { maximum_depth; limit; cursor; _ } ->
+              let count = Option.value media_rows ~default:timeline_rows in
+              let offset = match cursor with None -> 0 | Some value -> int_of_string (G.Cursor.to_string value) in
+              let length = max 0 (min limit (count - offset)) in
               V2_page_tree_outcome
                 { page = page.uuid
-                ; maximum_depth = 1
-                ; items =
-                    List.init (Option.value media_rows ~default:timeline_rows) (fun n ->
-                      { P.value = timeline_block n
-                      ; revision = status_revision ()
-                      ; depth = 0
-                      ; parent = page.uuid
-                      })
-                ; next_cursor = None
+                ; maximum_depth
+                ; items = List.init length (fun index ->
+                    { P.value = timeline_block (offset + index)
+                    ; revision = status_revision ()
+                    ; depth = 0
+                    ; parent = page.uuid })
+                ; next_cursor =
+                    (if offset + length < count
+                     then Some (G.Cursor.of_string (string_of_int (offset + length)) |> Result.get_ok) else None)
                 }
             | V2_pull_changes _ ->
               V2_changes
@@ -1658,6 +1661,16 @@ let run_favorites_native_visibility
        wait "Journals mounted" (fun () ->
          Option.is_some (find "accessibility-label" "Favorites")
          && Option.is_some (find "text" "Timeline fixture 2"));
+       let fixture_root_count = Option.value media_rows ~default:timeline_rows in
+       if fixture_root_count > 30 then (
+         let list_node = Option.get (find "_extension" "journal-list") in
+         consume (hooks.extension_event list_node "event"
+           (Yojson.Safe.to_string (`Assoc ["id", `Int 1; "payload", `String
+             (Yojson.Safe.to_string (`Assoc ["type", `String "visible_range";
+               "first", `Int 2; "last", `Int 32]))])));
+         wait "remaining bounded Tree page mounts" (fun () ->
+           Option.is_some (find "text"
+             (Printf.sprintf "Timeline fixture %d" (fixture_root_count - 1)))));
        if check_reselect then (
          let list () = Option.get (find "_extension" "journal-list") in
          let request () =
@@ -4505,12 +4518,12 @@ let test_reference_outer_terminals cancel =
                   { items = [ { page; journal_day = 20260901; revision = "p" } ]
                   ; next_cursor = None
                   })
-           | V2_get_page_tree _ ->
+           | V2_get_page_tree { maximum_depth; _ } ->
              completed
                request
                (V2_page_tree_outcome
                   { page = page.uuid
-                  ; maximum_depth = 1
+                  ; maximum_depth
                   ; items =
                       [ { value = record block
                         ; revision = "root"

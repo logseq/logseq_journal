@@ -9,6 +9,7 @@ module Confirmation = Journal_graph_mutation_confirmation
 module Worker = Journal_worker_coordination.Worker_api
 
 type worker_read_result =
+  | Root_tree_read of {page:Graph.Uuid.t;value:Protocol.v2_tree_member Worker.slice}
   | Child_members_read of Worker.children
   | Target_summary_read of Worker.block_summary
   | Journals_read of Protocol.v2_journal_item Worker.slice
@@ -304,7 +305,8 @@ type pending_operation =
   }
 
 type t =
-  { pending : (string, pending_operation) Hashtbl.t
+  { validate_session : Worker.session -> (unit, Worker.error) result
+  ; pending : (string, pending_operation) Hashtbl.t
   ; hydration_queue : Protocol.request Queue.t
   ; hydration_active : (string, unit) Hashtbl.t
   ; mutable next_request : int64
@@ -362,8 +364,9 @@ let day_failure ~day request_generation message =
     ]
 ;;
 
-let create ?(localtime = Unix.localtime) () =
-  { pending = Hashtbl.create 32
+let create ?(localtime = Unix.localtime) ?(validate_session = fun _ -> Error Worker.Revoked_session) () =
+  { validate_session
+  ; pending = Hashtbl.create 32
   ; hydration_queue = Queue.create ()
   ; hydration_active = Hashtbl.create 4
   ; next_request = 1L
@@ -733,20 +736,6 @@ let task_status_uuid t = function
   | Invalid_status _ -> Error "Choose a valid task status before saving."
 ;;
 
-let feed_output (value : Feed.output) =
-  { requests = Rrbvec.to_list value.requests
-  ; responses = Rrbvec.to_list (Rrbvec.map (function
-      | Feed.Loaded {request_generation;feed;complete} -> response (Feed_loaded {request_generation;feed;complete})
-      | Reconciled {page;value} -> response (Page_tree_reconciled {page;value})
-      | Failed {scope;stale_cursor;message} ->
-        let failure = Projection_failure message in
-        response (match scope with
-          | Feed request_generation -> Feed_failed {request_generation;failure}
-          | Day {day;request_generation} -> Day_blocks_failed {day;request_generation;stale_cursor;failure}
-          | Reconciliation -> Rejected failure)) value.publications)
-  }
-;;
-
 let page_of_graph_page (page : Graph.page) =
   let summary : Graph.page_summary =
     { uuid = page.uuid
@@ -762,6 +751,7 @@ let page_of_graph_page (page : Graph.page) =
 let feed_ports t =
   Feed.
     { now = (fun () -> t.next_request)
+    ; validate_session = t.validate_session
     ; plan_read = (fun operation command -> read t (Feed_read operation) command)
     ; context = (fun () -> {today=Option.map Journal_calendar.local_day t.calendar;time_context=projection_time_context t})
     ; tag_titles = (fun uuid -> Option.value (Hashtbl.find_opt t.tag_titles (Graph.Uuid.to_string uuid)) ~default:[])
@@ -798,6 +788,40 @@ let feed_ports t =
     }
 ;;
 
+let feed_output t (value : Feed.output) =
+  let rec settle (value : Feed.output) =
+    match value.cached with
+    | None -> value
+    | Some cached ->
+      let next = Feed.resume_cached t.feed ~ports:(feed_ports t) cached in
+      settle
+        { Feed.requests = Rrbvec.append value.requests next.requests
+        ; publications = Rrbvec.append value.publications next.publications
+        ; cached = next.cached
+        }
+  in
+  let value = settle value in
+  { requests = Rrbvec.to_list value.requests
+  ; responses =
+      Rrbvec.to_list
+        (Rrbvec.map
+           (function
+             | Feed.Loaded { request_generation; feed; complete } ->
+               response (Feed_loaded { request_generation; feed; complete })
+             | Reconciled { page; value } ->
+               response (Page_tree_reconciled { page; value })
+             | Failed { scope; stale_cursor; message } ->
+               let failure = Projection_failure message in
+               response
+                 (match scope with
+                  | Feed request_generation -> Feed_failed { request_generation; failure }
+                  | Day { day; request_generation } ->
+                    Day_blocks_failed { day; request_generation; stale_cursor; failure }
+                  | Reconciliation -> Rejected failure))
+           value.publications)
+  }
+;;
+
 let submit_unowned t (request : Journal_graph_request.t) =
   match request with
   | Load_task_statuses -> requests [ request_task_catalog t ]
@@ -806,16 +830,16 @@ let submit_unowned t (request : Journal_graph_request.t) =
   | Inspect_admission request ->
     requests [ read t (Admission_info request) Protocol.V2_inspect_admission ]
   | Load_feed { cursor; root_limit; day_limit; request_generation } ->
-    Feed.load_feed t.feed ~ports:(feed_ports t) ~cursor ~root_limit ~day_limit ~request_generation |> feed_output
+    Feed.load_feed t.feed ~ports:(feed_ports t) ~cursor ~root_limit ~day_limit ~request_generation |> feed_output t
   | Load_day_blocks { day; after; limit; request_generation } ->
     (match page_by_day t day with
      | None -> day_failure ~day request_generation "The requested journal page is not retained."
      | Some page ->
-       Feed.load_day t.feed ~ports:(feed_ports t) ~page ~after ~limit ~request_generation |> feed_output)
+       Feed.load_day t.feed ~ports:(feed_ports t) ~page ~after ~limit ~request_generation |> feed_output t)
   | Load_detail { block_id; request_generation; limit; after } ->
     let cursor = Option.bind after (fun cursor -> cursor.Projection.protocol_cursor) in
     let parsed = match cursor with
-      | Some (Projection.Legacy_tree_cursor _) -> Error "A Timeline cursor cannot continue Detail children."
+      | Some (Projection.Legacy_tree_cursor _ | Projection.Root_tree_cursor _) -> Error "A Timeline cursor cannot continue Detail children."
       | Some (Projection.Child_cursor {maximum_items;_}) when maximum_items<=0 || maximum_items>Protocol.maximum_page_size ->
         Error "The Detail continuation budget is invalid."
       | Some (Projection.Child_cursor _) | None -> parse_uuid "block UUID" block_id in
@@ -1559,7 +1583,7 @@ let hydration_for_changes t ~request_generation windows =
       match Feed.refresh_initial t.feed ~ports:(feed_ports t) ~request_generation with
       | None -> empty
       | Some planned ->
-        let output = feed_output planned in
+        let output = feed_output t planned in
         {output with responses=response (Feed_refresh_started {request_generation})::output.responses}
   in
   background_demands
@@ -1591,7 +1615,7 @@ let rehydrate_current_interests t ~request_generation ~generation =
     match Feed.refresh_initial t.feed ~ports:(feed_ports t) ~request_generation with
     | None -> empty
     | Some planned ->
-      let output = feed_output planned in
+      let output = feed_output t planned in
       {output with responses=response (Feed_refresh_started {request_generation})::output.responses}
   in
   let tree_requests =
@@ -2027,18 +2051,19 @@ let children_result items continuation : Projection.children_page =
   }
 ;;
 
-let receive_response t ~read_result (protocol_response : Protocol.response) =
+let receive_response t ~read_result ~origin (protocol_response : Protocol.response) =
   let favorites = match read_result with Some (Favorites_read {value;_})->Some value | _->None in
   let catalog = match read_result with Some (Task_catalog_read value)->Some value | _->None in
   let journals = match read_result with Some (Journals_read value)->Some value | _->None in
   let target_summary = match read_result with Some (Target_summary_read value)->Some value | _->None in
+  let roots = match read_result with Some (Root_tree_read {value;_})->Some value | _->None in
   let children = match read_result with Some (Child_members_read value)->Some value | _->None in
   let (Protocol.V2_response { request_id; outcome; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
   match Hashtbl.find_opt t.pending key with
   | None -> empty
   | Some {operation=Feed_read operation;_} when not (Feed.is_current t.feed operation) ->
-    Hashtbl.remove t.pending key; Feed.superseded t.feed operation |> feed_output
+    Hashtbl.remove t.pending key; Feed.superseded t.feed operation |> feed_output t
   | Some {operation;source_epoch;_} when not(changed_point_current t operation source_epoch)->
     Hashtbl.remove t.pending key;empty
   | Some { operation = Target_summary summary; source_epoch; _ }
@@ -2053,8 +2078,8 @@ let receive_response t ~read_result (protocol_response : Protocol.response) =
   | Some { operation; source_epoch; _ } ->
     let failure_output = failure_output ~source_epoch in
     Hashtbl.remove t.pending key;
-    (match (match operation with Feed_read value -> Feed.receive t.feed ~ports:(feed_ports t) ?journals ?children value outcome | _ -> None) with
-     | Some planned -> feed_output planned
+    (match (match operation with Feed_read value -> Feed.receive t.feed ~ports:(feed_ports t) ?journals ?children ?roots ?origin value outcome | _ -> None) with
+     | Some planned -> feed_output t planned
      | _ -> (match outcome with
      | Protocol.V2_assets_outcome _ ->
        failure_output t operation request_id "Unexpected asset query response."
@@ -2629,7 +2654,7 @@ let receive_response t ~read_result (protocol_response : Protocol.response) =
           failure_output t operation request_id "Unsealed child continuation"
         | Detail_children { generation; page; root; limit; _ } ->
           let children = children_result items (Option.bind children (fun (value:Worker.children)->
-              Option.map (fun after -> Projection.{after;maximum_items=limit}) value.next)) in
+              Option.map (fun after -> ({Projection.after;maximum_items=limit}:Projection.child_cursor)) value.next)) in
           remember_detail_members t ~page ~root children;
           Option.iter
             (fun journal_page ->
@@ -2678,7 +2703,7 @@ let receive_response t ~read_result (protocol_response : Protocol.response) =
             if planned.background then background_demands t output else output)
         | Changed_children { page; root; limit } ->
           let children = children_result items (Option.bind children (fun (value:Worker.children)->
-              Option.map (fun after -> Projection.{after;maximum_items=limit}) value.next)) in
+              Option.map (fun after -> ({Projection.after;maximum_items=limit}:Projection.child_cursor)) value.next)) in
           let interest =
             Hashtbl.find_opt t.children_interests (Graph.Uuid.to_string root.block.uuid)
           in
@@ -2867,7 +2892,7 @@ let receive_response t ~read_result (protocol_response : Protocol.response) =
           failure_output t operation request_id "Unexpected acknowledgement response.")))
 ;;
 
-let receive_delivery t ~read_result (protocol_response : Protocol.response) =
+let receive_delivery t ~read_result ~origin (protocol_response : Protocol.response) =
   let (Protocol.V2_response { request_id; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
   let pending = Hashtbl.find_opt t.pending key in
@@ -2888,7 +2913,7 @@ let receive_delivery t ~read_result (protocol_response : Protocol.response) =
     scope_output
       t
       (Option.bind pending (fun pending -> pending.failure_owner))
-      (receive_response t ~read_result protocol_response)
+      (receive_response t ~read_result ~origin protocol_response)
   in
   let references =
     match pending, protocol_response with
@@ -2978,12 +3003,14 @@ let receive_delivery t ~read_result (protocol_response : Protocol.response) =
 (* Route accepted Worker terminal failures through the same owner as protocol
    failures. This removes pending/active markers and drains queued hydration;
    a later completion for the request is then unowned and ignored. *)
-let receive t response = receive_delivery t ~read_result:None response
+let receive t response = receive_delivery t ~read_result:None ~origin:None response
 
-let receive_worker_read t ~request_id result =
+let receive_worker_read ?origin t ~request_id result =
   let outcome =
     match result with
     | Ordinary_read outcome -> outcome
+    | Root_tree_read {page;value} -> Protocol.V2_page_tree_outcome
+        {page;maximum_depth=0;items=value.items;next_cursor=None}
     | Child_members_read value ->
       Protocol.V2_children_outcome
         { parent = value.parent
@@ -3023,6 +3050,7 @@ let receive_worker_read t ~request_id result =
   receive_delivery
     t
     ~read_result:(Some result)
+    ~origin
     (Protocol.V2_response { api_version = Protocol.api_version; request_id; outcome })
 ;;
 
@@ -3153,6 +3181,26 @@ let worker_read t (request : Protocol.request) =
              (fun value ->
                Ordinary_read (Protocol.V2_task_status_definitions_outcome value))
          })
+  | V2_get_page_tree _ ->
+    (match Hashtbl.find_opt t.pending (Graph.Uuid.to_string request.request_id) with
+     | Some { operation = Feed_read read; delivery = Dispatched; _ } ->
+       (match Feed.tree_request read with
+        | Some business ->
+          Some
+            (Read
+               { query =
+                   Worker.Tree
+                     { page = business.page
+                     ; maximum_depth = 0
+                     ; revision = None
+                     ; after = business.after
+                     }
+               ; maximum_items = business.maximum_items
+               ; outcome = (fun value -> Root_tree_read { page = business.page; value })
+               })
+        | None -> Some (Unowned_read "Root tree business operation mismatch"))
+     | Some { delivery = Dispatched; _ } -> None
+     | _ -> Some (Unowned_read "Root tree business request is no longer owned"))
   | V2_get_children _ ->
     (match Hashtbl.find_opt t.pending (Graph.Uuid.to_string request.request_id) with
      | Some { operation = Feed_read read; delivery = Dispatched; _ } ->
@@ -3188,7 +3236,10 @@ let worker_read t (request : Protocol.request) =
                 Worker.Child_members
                   { parent = root.block.uuid
                   ; revision = None
-                  ; after = Option.map (fun value -> value.Projection.after) after
+                  ; after =
+                      Option.map
+                        (fun (value : Projection.child_cursor) -> value.after)
+                        after
                   }
             ; maximum_items = limit
             ; outcome = (fun value -> Child_members_read value)

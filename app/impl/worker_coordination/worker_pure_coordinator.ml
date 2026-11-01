@@ -306,8 +306,10 @@ let affected session = function
     Worker.Uuid.equal (Worker.graph_id session) id
 ;;
 
-let validate_session state session =
-  if state.lifecycle <> Running || not (current_session state.facts session)
+let validate_session ?owner state session =
+  if Option.exists (fun owner -> not (Worker.matches_scope session owner)) owner
+  then Error Worker.Revoked_session
+  else if state.lifecycle <> Running || not (current_session state.facts session)
   then Error Worker.Revoked_session
   else if List.exists (affected session) state.fenced
   then Error Worker.Host_change_in_progress

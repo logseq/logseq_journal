@@ -38,6 +38,13 @@ let test_query_origin_boundary () =
        "origin budget differs from actual Send"
    | None -> failwith "actual Send lost execution origin");
   check
+    (C.validate_session
+       ~owner:{ owner with graph_id = uuid "98000000-0000-4000-8000-000000000099" }
+       sent.next
+       session
+     = Error W.Revoked_session)
+    "foreign business graph accepted cached execution origin";
+  check
     (C.validate_session sent.next session = Ok ())
     "Open origin cannot resume cached data";
   let _, closing =

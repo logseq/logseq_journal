@@ -1519,7 +1519,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                 |> Result.map_error (fun e -> Db_error e)
                 |> Result.map (fun request ->
                   Service.Coordination_query
-                    { registration = binding.serial; owner = session.scope; request })))
+                    { registration = binding.serial; owner = session.scope; request;response_budget_bytes=budget.maximum_bytes })))
           | Confirm (presentation, receipt) ->
             if not (presentation_live presentation)
             then Error Revoked_session

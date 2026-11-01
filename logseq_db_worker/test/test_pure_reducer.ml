@@ -65,7 +65,7 @@ let test_managed_worker_starts_without_local_open () =
 let test_closed_graph_request_replies_once () =
   let id = Core.request_id_of_int64 1L in
   let transition =
-    Core.step (initial ()) (Core.Graph_request { id; request = graph_info_request () })
+    Core.step (initial ()) (Core.Graph_request { id; request = graph_info_request (); response_budget_bytes=None })
   in
   let replies =
     List.filter
@@ -217,7 +217,7 @@ let test_current_deletion_preserves_work_until_retirement () =
   let ready, scope = worker_open_graph () in
   let request = graph_info_request () in
   let executing =
-    Core.step ready (Core.Graph_request { id = Core.request_id_of_int64 11L; request })
+    Core.step ready (Core.Graph_request { id = Core.request_id_of_int64 11L; request; response_budget_bytes=None })
   in
   let completion =
     List.find_map
@@ -301,7 +301,7 @@ let test_current_deletion_preserves_work_until_retirement () =
   let rejected =
     Core.step
       retiring.next
-      (Core.Graph_request { id = Core.request_id_of_int64 12L; request = edit })
+      (Core.Graph_request { id = Core.request_id_of_int64 12L; request = edit; response_budget_bytes=None })
   in
   Alcotest.(check bool)
     "new editing receives a terminal reply and no execution"
@@ -1230,14 +1230,14 @@ let test_resident_worker_routes_by_scope () =
   Alcotest.(check int) "two independent DB scopes remain open" 2 (List.length (Core.graph_scopes opened));
   let second_scope=List.find (fun (scope:Sync.graph_scope)->scope.graph_id=second_id) (Core.graph_scopes opened) in
   let request=graph_info_request () in
-  let started=Core.step opened (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 101L;request}) in
+  let started=Core.step opened (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 101L;request;response_budget_bytes=None}) in
   let execution=List.find_map (function Core.Run_worker ((Core.Request (_,Execute_request _)) as instruction)->Some instruction | _->None) started.effects |> Option.get in
   let focused=Core.step started.next (Sync_event (Sync.Visible_graph_changed second_id)) in
-  let hidden=Core.step focused.next (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 102L;request}) in
+  let hidden=Core.step focused.next (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 102L;request;response_budget_bytes=None}) in
   Alcotest.(check bool) "hidden request still targets first database" true
     (List.exists (function Core.Run_worker (Core.Request (_,Execute_request {database;_}))->
       Core.database_handle_id database="db-delete" | _->false) hidden.effects);
-  let second=Core.step hidden.next (Graph_request_for_scope {scope=second_scope;id=Core.request_id_of_int64 103L;request}) in
+  let second=Core.step hidden.next (Graph_request_for_scope {scope=second_scope;id=Core.request_id_of_int64 103L;request;response_budget_bytes=None}) in
   Alcotest.(check bool) "visible request targets its own database" true
     (List.exists (function Core.Run_worker (Core.Request (_,Execute_request {database;_}))->
       Core.database_handle_id database="resident-" ^ Logseq_db_types.Graph_types.Uuid.to_string second_id | _->false) second.effects);
@@ -1305,7 +1305,7 @@ let test_resident_worker_cold_restore_keeps_open_tickets () =
   List.iter(fun scope->
     Alcotest.(check bool) "each restored graph really opens" true
       (Option.fold ~none:false ~some:(fun(g:Core.graph_state)->g.phase=Core.Graph_open) (Core.graph_state_for_scope opened scope));
-    let read=Core.step opened (Graph_request_for_scope{scope;id=Core.request_id_of_int64 901L;request=graph_info_request()}) in
+    let read=Core.step opened (Graph_request_for_scope{scope;id=Core.request_id_of_int64 901L;request=graph_info_request();response_budget_bytes=None}) in
     Alcotest.(check bool) "restored scope executes against its own DB" true
       (List.exists(function Core.Run_worker(Core.Request(_,Execute_request{database;_}))->
         Core.database_handle_id database="cached-" ^ Logseq_db_types.Graph_types.Uuid.to_string scope.graph_id|_->false) read.effects)) (Core.graph_scopes opened)) [1;2;3]
@@ -1338,6 +1338,179 @@ let test_coordination_owner_snapshot () =
   let empty=Core.coordination_state (raw_initial ()) in
   Alcotest.(check bool) "empty bootstrap has no invented account" true
     (empty.sync.account=None && empty.residents=[] && empty.sync.selected=None)
+;;
+
+let test_scoped_read_byte_budget () =
+  let opened, scope = worker_open_graph () in
+  let request = graph_info_request () in
+  let id = Core.request_id_of_int64 730L in
+  let run response_budget_bytes =
+    Core.step
+      opened
+      (Core.Graph_request_for_scope
+         { scope; id; request; response_budget_bytes = Some response_budget_bytes })
+  in
+  let valid = run 16384 in
+  Alcotest.(check bool)
+    "scoped read preserves its byte bound"
+    true
+    (List.exists
+       (function
+         | Core.Run_worker
+             (Core.Request
+                (_, Core.Execute_request { response_budget_bytes = Some 16384; _ })) ->
+           true
+         | _ -> false)
+       valid.effects);
+  List.iter
+    (fun budget ->
+       let invalid = run budget in
+       Alcotest.(check bool)
+         "invalid byte bound sends no DB IO"
+         false
+         (List.exists
+            (function
+              | Core.Run_worker _ -> true
+              | _ -> false)
+            invalid.effects);
+       Alcotest.(check bool)
+         "invalid byte bound keeps request identity"
+         true
+         (List.exists
+            (function
+              | Core.Publish
+                  (Core.Reply
+                     ( actual
+                     , Protocol.V2_response
+                         { request_id
+                         ; outcome = V2_failed { code = "invalidRequest"; _ }
+                         ; _
+                         } )) -> actual = id && request_id = request.request_id
+              | _ -> false)
+            invalid.effects))
+    [ 0; -1; Protocol.maximum_response_bytes + 1 ]
+;;
+
+let test_read_byte_budget_is_not_an_effect_capability () =
+  let opened, scope = worker_open_graph () in
+  let request =
+    { (graph_info_request ()) with
+      Protocol.command = V2_ack_changes { generation = "source"; through = "point" }
+    }
+  in
+  let transition =
+    Core.step
+      opened
+      (Core.Graph_request_for_scope
+         { scope
+         ; id = Core.request_id_of_int64 731L
+         ; request
+         ; response_budget_bytes = Some 16384
+         })
+  in
+  Alcotest.(check bool)
+    "read byte override cannot dispatch changefeed ACK"
+    false
+    (List.exists
+       (function
+         | Core.Run_worker _ -> true
+         | _ -> false)
+       transition.effects)
+;;
+
+let test_pure_read_page_bounds () =
+  let cursor =
+    Some
+      (Logseq_db_types.Graph_types.Cursor.of_string "synthetic-continuation"
+       |> Result.get_ok)
+  in
+  let target = uuid "60000000-0000-4000-8000-000000000001" in
+  let requests limit : Protocol.command list =
+    Protocol.
+      [ V2_list_journals
+          { from_day = 20260801
+          ; through_day = 20260901
+          ; limit
+          ; cursor
+          ; revision = Some "source-revision"
+          }
+      ; V2_get_outline_block_summary { block = target; limit; cursor }
+      ; V2_get_children
+          { parent = target; limit; cursor; revision = Some "source-revision" }
+      ; V2_get_page_tree
+          { page = target
+          ; maximum_depth = 2
+          ; limit
+          ; cursor
+          ; revision = Some "source-revision"
+          }
+      ; V2_list_favorites { limit; cursor }
+      ; V2_list_task_statuses { limit; cursor }
+      ; V2_list_assets { roots = [ target ]; recursive = true; limit; cursor }
+      ]
+  in
+  let limit = function
+    | Protocol.V2_list_journals { limit; _ }
+    | V2_get_outline_block_summary { limit; _ }
+    | V2_get_children { limit; _ }
+    | V2_get_page_tree { limit; _ }
+    | V2_list_favorites { limit; _ }
+    | V2_list_task_statuses { limit; _ }
+    | V2_list_assets { limit; _ } -> limit
+    | _ -> Alcotest.fail "read page planner changed query family"
+  in
+  let rec erase_limit = function
+    | `Assoc fields ->
+      `Assoc
+        (List.filter_map
+           (fun (key, value) ->
+              if key = "limit" then None else Some (key, erase_limit value))
+           fields)
+    | `List values -> `List (List.map erase_limit values)
+    | value -> value
+  in
+  let metadata command =
+    Protocol.request_to_yojson { (graph_info_request ()) with command } |> erase_limit
+  in
+  for count = 1 to Protocol.maximum_page_size do
+    List.iter
+      (fun command ->
+         let rec drain steps current =
+           if steps > 10 then Alcotest.fail "pure page planner did not terminate";
+           match Protocol.smaller_read_page current with
+           | None ->
+             Alcotest.(check int) "only a singleton is irreducible" 1 (limit current)
+           | Some next ->
+             Alcotest.(check bool)
+               "ordinary read bound strictly decreases"
+               true
+               (limit next > 0 && limit next < limit current);
+             Alcotest.(check bool)
+               "scope, revision, cursor and family stay exact"
+               true
+               (metadata next = metadata command);
+             drain (steps + 1) next
+         in
+         drain 0 command)
+      (requests count)
+  done;
+  List.iter
+    (fun command ->
+       Alcotest.(check bool)
+         "unpaged/effect command cannot be shortened"
+         true
+         (Protocol.smaller_read_page command = None))
+    Protocol.
+      [ V2_graph_info
+      ; V2_get_page { page = target; revision = None }
+      ; V2_ack_changes { generation = "source"; through = "point" }
+      ; V2_save_block
+          { mutation_id = target
+          ; block = target
+          ; title = "kept"
+          ; preconditions = { blocks = []; pages = []; scopes = [] }
+          }
+      ]
 ;;
 
 let () =
@@ -1387,6 +1560,9 @@ let () =
             `Quick
             test_asset_manual_retry_is_unlimited
         ] )
+    ; ( "read budget", [Alcotest.test_case "scoped byte budget" `Quick test_scoped_read_byte_budget;
+          Alcotest.test_case "read budget excludes effects" `Quick test_read_byte_budget_is_not_an_effect_capability;
+          Alcotest.test_case "pure bounded page planning" `Quick test_pure_read_page_bounds])
     ; ( "managed lifecycle"
       , [ Alcotest.test_case "local restore IO failures terminate loading" `Quick test_local_restore_worker_failures_are_terminal
         ; Alcotest.test_case

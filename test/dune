@@ -92,7 +92,7 @@
 (test
  (name logseq_db_worker_application_integration_test)
  (modules logseq_db_worker_application_integration_test)
- (libraries alcotest app))
+ (libraries coordination_test_fixture alcotest app))
 
 (test
  (name journal_timeline_state_test)

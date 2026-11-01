@@ -1261,7 +1261,7 @@ let read_failure ?code request error =
   | Fatal_read_state source -> fail Corrupt_storage (safe_message "fatalState" source)
 ;;
 
-let read_snapshot ~on_enrichment_error database request command =
+let read_snapshot ~on_enrichment_error ~response_budget_bytes database request command =
   match Database.current_snapshot database with
   | Error _ -> failure request Closed_session "The graph snapshot is unavailable."
   | Ok snapshot ->
@@ -1331,7 +1331,7 @@ let read_snapshot ~on_enrichment_error database request command =
            in
            block_record ~tag_titles value
          in
-         match command with
+         let read command = match command with
          | Protocol.V2_graph_info ->
            (match Database.graph_info snapshot with
             | Error error -> read_failure ~code:Corrupt_storage request error
@@ -1667,7 +1667,19 @@ let read_snapshot ~on_enrichment_error database request command =
          | V2_clear_task_status _
          | V2_pull_changes _
          | V2_ack_changes _ ->
-           failure request Invalid_request "The command is not a snapshot read.")
+           failure request Invalid_request "The command is not a snapshot read."
+         in
+         let budget=min response_budget_bytes Protocol.maximum_response_bytes in
+         (* Reuse this pinned snapshot and enrichment cache across bounded
+            attempts. The client budget and query identity stay unchanged;
+            storage returns a shorter complete page with its true next cursor. *)
+         let rec fit command =
+           let result=read command in
+           if Protocol.encoded_response_bytes result<=budget then result
+           else match Protocol.smaller_read_page command with
+             | Some smaller -> fit smaller
+             | None -> failure request Response_too_large "The encoded read singleton exceeded its byte limit."
+         in fit command)
 ;;
 
 let index_after session cursor =
@@ -1757,7 +1769,10 @@ let execute_database ~on_enrichment_error session ~response_budget_bytes request
     pull_changes session request generation after limit
   | V2_ack_changes { generation; through } ->
     acknowledge_changes session request generation through
-  | V2_inspect_admission -> inspect_admission session.database request
+  | V2_inspect_admission ->
+    let result=inspect_admission session.database request in
+    if Protocol.encoded_response_bytes result<=min response_budget_bytes Protocol.maximum_response_bytes
+    then result else failure request Response_too_large "The encoded admission result exceeded its byte limit."
   | ( V2_set_asset_reference _
     | V2_save_block _
     | V2_insert_blocks _
@@ -1767,15 +1782,7 @@ let execute_database ~on_enrichment_error session ~response_budget_bytes request
     | V2_clear_task_status _ ) as command ->
     execute_mutation session.database request command
   | command ->
-    let result = read_snapshot ~on_enrichment_error session.database request command in
-    let budget = min response_budget_bytes Protocol.maximum_response_bytes in
-    if Protocol.encoded_response_bytes result <= budget
-    then result
-    else
-      failure
-        request
-        Response_too_large
-        "The encoded read response exceeded its byte limit."
+    read_snapshot ~on_enrichment_error ~response_budget_bytes session.database request command
 ;;
 
 let sync_result ?event ?(lifecycle = Core.Lifecycle_unchanged) () =
@@ -2651,7 +2658,7 @@ let run_request t (type a) (request : a Core.runner_request)
   : (a, Core.effect_error) result
   =
   match request with
-  | Core.Execute_request { database; request } ->
+  | Core.Execute_request { database; request; response_budget_bytes } ->
     (match Hashtbl.find_opt t.databases (Core.database_handle_id database) with
      | None -> Error (effect_error "The overlay database is unavailable.")
      | Some session ->
@@ -2660,7 +2667,8 @@ let run_request t (type a) (request : a Core.runner_request)
             ~on_enrichment_error:(fun () ->
               report_current_graph t session.graph_scope "worker.readTagTitles")
             session
-            ~response_budget_bytes:t.dependencies.config.response_budget_bytes
+            ~response_budget_bytes:(Option.fold ~none:t.dependencies.config.response_budget_bytes
+              ~some:(min t.dependencies.config.response_budget_bytes) response_budget_bytes)
             request))
   | Close_database database -> close_database_by_id t (Core.database_handle_id database)
   | Handle_sync_worker_effect worker_effect -> handle_sync_worker_effect t worker_effect

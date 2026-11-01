@@ -167,7 +167,7 @@ let with_worker
              let request request =
                next := Int64.succ !next;
                let id = Core.request_id_of_int64 !next in
-               post (Core.Graph_request { id; request });
+               post (Core.Graph_request { id; request; response_budget_bytes=None });
                drain ();
                let reply = Hashtbl.find_opt replies !next |> Option.get in
                Hashtbl.remove replies !next;

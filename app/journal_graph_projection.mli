@@ -87,8 +87,25 @@ type child_cursor =
   ; maximum_items : int
   }
 
+(** A bounded remainder of one read packet plus its sealed server continuation.
+    The final server page can still retain items. Session/owner and page epoch
+    must be revalidated before replay; this value owns no Worker resource. *)
+type root_cursor =
+  { session : Journal_worker_coordination.Worker_api.session
+  ; budget : Journal_worker_coordination.Worker_api.read_budget
+  ; maximum_items : int
+  ; page : Logseq_db_types.Graph_types.Uuid.t
+  ; epoch : int64
+  ; after :
+      Logseq_db_worker.Protocol.v2_tree_member
+        Journal_worker_coordination.Worker_api.continuation
+        option
+  ; remaining : Logseq_db_worker.Protocol.v2_tree_member Rrbvec.t
+  }
+
 type block_continuation =
   | Legacy_tree_cursor of Logseq_db_types.Graph_types.Cursor.t
+  | Root_tree_cursor of root_cursor
   | Child_cursor of child_cursor
 
 type block_cursor =
@@ -173,7 +190,8 @@ val block_on_page
   -> (block, string) result
 
 val timeline_entry_page
-  :  ?tag_titles:(Logseq_db_types.Graph_types.Uuid.t -> string list)
+  :  ?root_continuation:root_cursor
+  -> ?tag_titles:(Logseq_db_types.Graph_types.Uuid.t -> string list)
   -> page:page
   -> time_context:time_context
   -> tree_member Logseq_db_types.Graph_types.page_result
