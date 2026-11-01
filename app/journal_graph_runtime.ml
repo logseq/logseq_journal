@@ -9,6 +9,7 @@ module Confirmation = Journal_graph_mutation_confirmation
 module Worker = Journal_worker_coordination.Worker_api
 
 type worker_read_result =
+  | Journals_read of Protocol.v2_journal_item Worker.slice
   | Task_catalog_read of Worker.task_status_catalog
   | Ordinary_read of Protocol.v2_outcome
   | Favorites_read of { first_page:bool; value:Journal_graph_request.favorites_result }
@@ -2016,7 +2017,7 @@ let children_result items continuation : Projection.block_member Graph.page_resu
   }
 ;;
 
-let receive_response t ~favorites ~catalog (protocol_response : Protocol.response) =
+let receive_response t ~favorites ~catalog ~journals (protocol_response : Protocol.response) =
   let (Protocol.V2_response { request_id; outcome; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
   match Hashtbl.find_opt t.pending key with
@@ -2037,7 +2038,7 @@ let receive_response t ~favorites ~catalog (protocol_response : Protocol.respons
   | Some { operation; source_epoch; _ } ->
     let failure_output = failure_output ~source_epoch in
     Hashtbl.remove t.pending key;
-    (match (match operation with Feed_read value -> Feed.receive t.feed ~ports:(feed_ports t) value outcome | _ -> None) with
+    (match (match operation with Feed_read value -> Feed.receive t.feed ~ports:(feed_ports t) ?journals value outcome | _ -> None) with
      | Some planned -> feed_output planned
      | _ -> (match outcome with
      | Protocol.V2_assets_outcome _ ->
@@ -2840,7 +2841,7 @@ let receive_response t ~favorites ~catalog (protocol_response : Protocol.respons
           failure_output t operation request_id "Unexpected acknowledgement response.")))
 ;;
 
-let receive_delivery t ~favorites ~catalog (protocol_response : Protocol.response) =
+let receive_delivery t ~favorites ~catalog ~journals (protocol_response : Protocol.response) =
   let (Protocol.V2_response { request_id; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
   let pending = Hashtbl.find_opt t.pending key in
@@ -2861,7 +2862,7 @@ let receive_delivery t ~favorites ~catalog (protocol_response : Protocol.respons
     scope_output
       t
       (Option.bind pending (fun pending -> pending.failure_owner))
-      (receive_response t ~favorites ~catalog protocol_response)
+      (receive_response t ~favorites ~catalog ~journals protocol_response)
   in
   let references =
     match pending, protocol_response with
@@ -2951,15 +2952,21 @@ let receive_delivery t ~favorites ~catalog (protocol_response : Protocol.respons
 (* Route accepted Worker terminal failures through the same owner as protocol
    failures. This removes pending/active markers and drains queued hydration;
    a later completion for the request is then unowned and ignored. *)
-let receive t response = receive_delivery t ~favorites:None ~catalog:None response
+let receive t response = receive_delivery t ~favorites:None ~catalog:None ~journals:None response
 
 let receive_worker_read t ~request_id result =
-  let favorites, catalog, outcome =
+  let favorites, catalog, journals, outcome =
     match result with
-    | Ordinary_read outcome -> None, None, outcome
+    | Ordinary_read outcome -> None, None, None, outcome
+    | Journals_read value ->
+      ( None
+      , None
+      , Some value
+      , Protocol.V2_journals_outcome { items = value.items; next_cursor = None } )
     | Task_catalog_read value ->
       ( None
       , Some value
+      , None
       , Protocol.V2_task_statuses_outcome
           { property_uuid = value.property_uuid
           ; default_status = value.default_status
@@ -2968,6 +2975,7 @@ let receive_worker_read t ~request_id result =
           } )
     | Favorites_read { value; _ } ->
       ( Some value
+      , None
       , None
       , Protocol.V2_favorites_outcome
           { favorites_page = value.favorites_page
@@ -2981,6 +2989,7 @@ let receive_worker_read t ~request_id result =
     t
     ~favorites
     ~catalog
+    ~journals
     (Protocol.V2_response { api_version = Protocol.api_version; request_id; outcome })
 ;;
 
@@ -3111,6 +3120,24 @@ let worker_read t (request : Protocol.request) =
              (fun value ->
                Ordinary_read (Protocol.V2_task_status_definitions_outcome value))
          })
+  | V2_list_journals _ ->
+    (match Hashtbl.find_opt t.pending (Graph.Uuid.to_string request.request_id) with
+     | Some { operation = Feed_read read; delivery = Dispatched; _ } ->
+       (match Feed.journal_request read with
+        | Some business ->
+          Some
+            (Read
+               { query = Worker.Journals
+                   { from_day = business.from_day
+                   ; through_day = business.through_day
+                   ; revision = None
+                   ; after = business.after
+                   }
+               ; maximum_items = business.limit
+               ; outcome = (fun value -> Journals_read value)
+               })
+        | None -> Some (Unowned_read "Journal business operation mismatch"))
+     | _ -> Some (Unowned_read "Journal business request is no longer owned"))
   | V2_list_task_statuses _ ->
     (match Hashtbl.find_opt t.pending (Graph.Uuid.to_string request.request_id) with
      | Some { operation = Task_catalog { after; _ }; delivery = Dispatched; _ } ->

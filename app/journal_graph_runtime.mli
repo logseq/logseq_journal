@@ -133,6 +133,7 @@ module Copy = Journal_copy
 module Worker = Journal_worker_coordination.Worker_api
 
 type worker_read_result =
+  | Journals_read of Logseq_db_worker.Protocol.v2_journal_item Worker.slice
   | Task_catalog_read of Worker.task_status_catalog
   | Ordinary_read of Logseq_db_worker.Protocol.v2_outcome
   | Favorites_read of

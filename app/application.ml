@@ -3794,6 +3794,7 @@ let start
            let result=match reply with
              | Wc.Answered(Ok value) -> Ok(read.outcome value)
              | Answered(Error(Wc.Stale_read message)) -> Ok(Journal_graph_runtime.Ordinary_read(V2_failed{code="staleReadCursor";message}))
+             | Answered(Error Wc.Response_budget_exceeded) -> Ok(Journal_graph_runtime.Ordinary_read(V2_failed{code="responseTooLarge";message="The read exceeded its response budget."}))
              | Answered(Error(Wc.Db_error error)) -> Error(Logseq_db_worker.Error.message error)
              | Answered(Error(Wc.Service_failed message | Resync_required message)) -> Error message
              | Answered(Error Revoked_session) -> Error "The graph execution changed before the read completed."
@@ -3910,6 +3911,9 @@ let start
            | Journal_graph_runtime.Ordinary_read outcome -> observe_projection_response
              (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
                request_id=request.request_id;outcome})
+           | Journals_read value -> observe_projection_response
+             (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
+               request_id=request.request_id;outcome=V2_journals_outcome {items=value.items;next_cursor=None}})
            | Task_catalog_read _ -> forget_projection_request request.request_id
            | Favorites_read{first_page;value}->
              Journal_media_runtime.forget_request (!media_runtime_cell) request.request_id;

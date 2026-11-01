@@ -16,15 +16,32 @@ module Catalog_producer = struct
 
   module I = (val issuer : W.ISSUER)
 
-  let budget =
-    W.read_budget session ~maximum_items:Protocol.maximum_page_size ~maximum_bytes:65536
-    |> Result.get_ok
+  let budget maximum_items =
+    W.read_budget session ~maximum_items ~maximum_bytes:65536 |> Result.get_ok
+  ;;
+
+  let wire_request runtime request =
+    match request.Protocol.command, Production_runtime.worker_read runtime request with
+    | Protocol.V2_list_journals _, Some (Production_runtime.Read read) ->
+      (match
+         I.request
+           session
+           ~request_id:(W.request_id request.request_id)
+           (W.Query (budget read.maximum_items, read.query))
+       with
+       | Ok (S.Coordination_query { request = wire; _ }) -> wire
+       | _ -> Alcotest.fail "journal fixture wire planning failed")
+    | _ -> request
+  ;;
+
+  let wire_output runtime (output : Production_runtime.output) =
+    { output with requests = List.map (wire_request runtime) output.requests }
   ;;
 
   let receive runtime request raw =
     match Production_runtime.worker_read runtime request with
     | Some (Production_runtime.Read read) ->
-      let operation = W.Query (budget, read.query) in
+      let operation = W.Query (budget read.maximum_items, read.query) in
       ignore
         (I.request
            session
@@ -53,7 +70,8 @@ module Runtime = struct
 
   let receive runtime (Protocol.V2_response envelope as raw) =
     let key = Graph.Uuid.to_string envelope.request_id in
-    match Hashtbl.find_opt fixture_requests key, envelope.outcome with
+    (match Hashtbl.find_opt fixture_requests key, envelope.outcome with
+    | Some (Protocol.V2_list_journals _ as command), Protocol.V2_journals_outcome _
     | Some (Protocol.V2_list_task_statuses _ as command), Protocol.V2_task_statuses_outcome _ ->
       Catalog_producer.receive runtime
         {Protocol.api_version=Protocol.api_version;request_id=envelope.request_id;command} raw
@@ -87,7 +105,11 @@ module Runtime = struct
             {requests=kept.requests@next.requests;responses=kept.responses@next.responses})
           {requests=[];responses=output.responses} output.requests
       in serve result
-    | _ -> Production_runtime.receive runtime raw
+    | _ -> Production_runtime.receive runtime raw)
+    |> Catalog_producer.wire_output runtime
+
+  let submit runtime request =
+    Production_runtime.submit runtime request |> Catalog_producer.wire_output runtime
 end
 
 let uuid value = Graph.Uuid.of_string value |> Result.get_ok
@@ -957,10 +979,15 @@ let test_older_feed_uses_calendar_upper_bound () =
               ; request_generation = 7L
               })
        in
-       let request = only "older journal request" output.requests in
+       if expected = 0 then (
+         Alcotest.(check int) "earliest date exhausts without invalid query" 0 (List.length output.requests);
+         match (only "earliest date completion" output.responses).payload with
+         | Feed_loaded {complete=true;feed;_} -> Alcotest.(check bool) "earliest date has no continuation" true (feed.continuation=None)
+         | _ -> Alcotest.fail "earliest date did not complete")
+       else let request = only "older journal request" output.requests in
        match request.command with
        | Protocol.V2_list_journals { from_day; through_day; _ } ->
-         Alcotest.(check int) "unbounded lower date" 0 from_day;
+         Alcotest.(check int) "first valid lower date" 10101 from_day;
          Alcotest.(check int) "exclusive calendar upper date" expected through_day
        | _ -> Alcotest.fail "older feed did not request journals")
     [ 20260907, 20260906
@@ -3939,6 +3966,108 @@ let journal_request_limit request =
   match request.Protocol.command with
   | V2_list_journals { limit; _ } -> limit
   | _ -> Alcotest.fail "expected journal listing"
+;;
+
+let test_feed_dates_use_owned_worker_query () =
+  let runtime = Runtime.create () in
+  let request = feed_window_request runtime ~days:3 ~slots:16 in
+  (match Production_runtime.worker_read runtime request with
+   | Some
+       (Production_runtime.Read
+          { query = Journal_worker_coordination.Worker_api.Journals _
+          ; maximum_items = 3
+          ; _
+          }) -> ()
+   | _ -> Alcotest.fail "feed dates bypass typed coordinator");
+  ignore (Production_runtime.abandon runtime request);
+  match Production_runtime.worker_read runtime request with
+  | Some (Production_runtime.Unowned_read _) -> ()
+  | _ -> Alcotest.fail "retired feed dates fell back to legacy transport"
+;;
+
+let test_feed_dates_reject_invalid_local_boundary () =
+  List.iter
+    (fun before_day ->
+       let runtime = Runtime.create () in
+       let output =
+         Runtime.submit
+           runtime
+           (Journal_graph_request.Load_feed
+              { cursor = Some { before_day = Some before_day; skipped_day = None }
+              ; root_limit = 1
+              ; day_limit = 3
+              ; request_generation = 321L
+              })
+       in
+       Alcotest.(check int)
+         "invalid range cannot dispatch"
+         0
+         (List.length output.requests);
+       match (only "invalid range settles" output.responses).payload with
+       | Feed_failed { request_generation = 321L; _ } -> ()
+       | _ -> Alcotest.fail "invalid local date lost owner")
+    [ 20260230; 20261301; 0; 100000101 ]
+;;
+
+let test_feed_date_budget_failure_restarts_bound_cursor () =
+  let runtime = Runtime.create () in
+  set_calendar ~clock:1_788_307_200. runtime;
+  let first = feed_window_request runtime ~days:3 ~slots:16 in
+  let item : Protocol.v2_journal_item =
+    { page; journal_day = 20260901; revision = "page-1" }
+  in
+  let more = Graph.Cursor.of_string "date-budget-after-one" |> Result.get_ok in
+  let root =
+    Runtime.receive
+      runtime
+      (response first (V2_journals_outcome { items = [ item ]; next_cursor = Some more }))
+    |> fun o -> only "date roots" o.requests
+  in
+  let next =
+    Runtime.receive
+      runtime
+      (response
+         root
+         (V2_page_tree_outcome
+            { page = page_uuid; maximum_depth = 0; items = []; next_cursor = None }))
+    |> fun o -> only "date continuation" o.requests
+  in
+  let retry =
+    Runtime.receive
+      runtime
+      (response next (V2_failed { code = "responseTooLarge"; message = "oversize" }))
+    |> fun o -> only "smaller date restart" o.requests
+  in
+  match retry.command with
+  | V2_list_journals { limit = 1; cursor = None; through_day = 20260901; _ } -> ()
+  | _ ->
+    Alcotest.fail
+      "changed budget reused a sealed cursor or lost inclusive recovery boundary"
+;;
+
+let test_typed_date_budget_failure_preserves_classification () =
+  let runtime = Runtime.create () in
+  let original = feed_window_request runtime ~days:3 ~slots:16 in
+  let module F = Catalog_producer in
+  match Production_runtime.worker_read runtime original with
+  | Some (Production_runtime.Read read) ->
+    let operation = F.W.Query (F.budget read.maximum_items, read.query) in
+    ignore
+      (F.I.request F.session ~request_id:(F.W.request_id original.request_id) operation
+       |> Result.get_ok);
+    let failure =
+      response original (V2_failed { code = "responseTooLarge"; message = "oversize" })
+    in
+    (match
+       F.I.reply
+         F.session
+         ~request_id:(F.W.request_id original.request_id)
+         operation
+         (F.S.Graph_response failure)
+     with
+     | Ok (F.W.Answered (Error F.W.Response_budget_exceeded)) -> ()
+     | _ -> Alcotest.fail "typed response discarded recoverable budget failure")
+  | _ -> Alcotest.fail "missing typed date request"
 ;;
 
 let test_feed_window_fits_encoded_response_budget () =
@@ -7832,7 +7961,7 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
          | _ -> assert false
        in
        let dates request fixtures next_cursor =
-         Production_runtime.receive runtime (response request (V2_journals_outcome
+         Runtime.receive runtime (response request (V2_journals_outcome
              { items = List.map (fun f -> ({ page = f.owner; journal_day = day f
                                             ; revision = "page-1" } : Protocol.v2_journal_item))
                    fixtures
@@ -7860,21 +7989,21 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
           | _ -> Alcotest.fail "expected root query");
          let root = only "fixture root" fixture.roots in
          let preview =
-           Production_runtime.receive runtime (response tree (V2_page_tree_outcome
+           Runtime.receive runtime (response tree (V2_page_tree_outcome
                { page = fixture.owner.uuid; maximum_depth = 0
                ; items = [ { value = root; revision = "root-1"; depth = 0
                            ; parent = fixture.owner.uuid } ]
                ; next_cursor = None }))
            |> fun output -> only "root preview" output.requests
          in
-         let output = Production_runtime.receive runtime (response preview (V2_children_outcome
+         let output = Runtime.receive runtime (response preview (V2_children_outcome
              { parent = root.block.uuid
              ; revision_scope = V2_children_revision root.block.uuid
              ; scope_revision = "children-1"; items = []; next_cursor = None })) in
          listing ~quiet:false output next_cursor through
        in
        let stale request =
-         Production_runtime.receive runtime (response request (V2_failed
+         Runtime.receive runtime (response request (V2_failed
              { code = "staleReadCursor"; message = "The read continuation is no longer current." }))
        in
        (* Recovery rereads the oldest observed date inclusively. *)
@@ -7889,11 +8018,11 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
          listing (dates request fixtures (Some cursor)) (Some cursor) 20260901
        in
        let initial =
-         Production_runtime.submit runtime (Journal_graph_request.Load_feed
+         Runtime.submit runtime (Journal_graph_request.Load_feed
              { cursor = None; root_limit = 4; day_limit = 1; request_generation = 77L })
-         |> fun output -> listing ~quiet:false output None 99_999_999
+         |> fun output -> listing ~quiet:false output None 99991231
        in
-       let next = complete_date initial first (Some (root_cursor 1)) 4 99_999_999 in
+       let next = complete_date initial first (Some (root_cursor 1)) 4 99991231 in
        let next = replay (recover next) [ first ] (root_cursor 2) in
        let next = complete_date next same_day (Some (root_cursor 3)) 3 20260901 in
        let next = replay (recover next) [ first ] (root_cursor 4) in
@@ -7920,7 +8049,7 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
               failure.operation
           | _ -> Alcotest.fail "retry exhaustion lost failure ownership")
        | `Supersede ->
-         ignore (Production_runtime.submit runtime (Journal_graph_request.Load_feed
+         ignore (Runtime.submit runtime (Journal_graph_request.Load_feed
              { cursor = None; root_limit = 4; day_limit = 1; request_generation = 78L }));
          let output = dates next [] None in
          Alcotest.(check int) "superseded recovery cannot publish or continue" 0
@@ -7937,13 +8066,13 @@ let test_later_date_cursor_no_progress_settles () =
   let root=Runtime.submit runtime (Journal_graph_request.Load_day_blocks
       {day=day.page.day;after=day.continuation;limit=30;request_generation=78L})
     |> fun o->only "later tail query" o.requests in
-  let output=Production_runtime.receive runtime (response root (V2_page_tree_outcome
+  let output=Runtime.receive runtime (response root (V2_page_tree_outcome
       {page=fixture.owner.uuid;maximum_depth=0;items=[];next_cursor=None})) in
   let listing=only "older date query" output.requests in
   let cursor=root_cursor 1 in
-  let output=Production_runtime.receive runtime (response listing (V2_journals_outcome {items=[];next_cursor=Some cursor})) in
+  let output=Runtime.receive runtime (response listing (V2_journals_outcome {items=[];next_cursor=Some cursor})) in
   let repeated=only "next date packet" output.requests in
-  let output=Production_runtime.receive runtime (response repeated (V2_journals_outcome {items=[];next_cursor=Some cursor})) in
+  let output=Runtime.receive runtime (response repeated (V2_journals_outcome {items=[];next_cursor=Some cursor})) in
   match (only "visible terminal failure" output.responses).payload with
   | Day_blocks_failed {request_generation=78L;day=20260930;_}->()
   | _ -> Alcotest.fail "date cursor failure lost its continuation owner"
@@ -8606,6 +8735,10 @@ let () =
     ; ( "cross-page ownership", [Alcotest.test_case "point context and retirement" `Quick test_changed_point_ownership;
         Alcotest.test_case "resync retires point observations" `Quick test_resync_retires_changed_points] )
     ; ( "initial thirty roots", [
+        Alcotest.test_case "dates use owned Worker query" `Quick test_feed_dates_use_owned_worker_query;
+        Alcotest.test_case "dates reject invalid local boundary" `Quick test_feed_dates_reject_invalid_local_boundary;
+        Alcotest.test_case "date budget recovery restarts sealed cursor" `Quick test_feed_date_budget_failure_restarts_bound_cursor;
+        Alcotest.test_case "date budget error remains typed" `Quick test_typed_date_budget_failure_preserves_classification;
         Alcotest.test_case "Today first within root budget" `Quick test_today_priority_batch;
         Alcotest.test_case "Today date traversal survives recovery" `Quick test_today_date_traversal_survives_recovery;
         Alcotest.test_case "Today priority continuations and midnight" `Quick test_today_priority_continuations;

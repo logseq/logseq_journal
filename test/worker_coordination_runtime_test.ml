@@ -43,7 +43,9 @@ let secrets =
 let favorite_page_id = uuid "9c000000-0000-4000-8000-000000000100"
 let favorite_member n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (100 + n))
 
-let seed_favorite_memberships path =
+let journal_page n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (200+n))
+
+let seed_favorite_memberships_and_journals path =
   let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
   let module Session = Logseq_db_storage.Storage_session in
   let connection = Storage.open_database path |> Result.get_ok in
@@ -98,6 +100,14 @@ let seed_favorite_memberships path =
              ]
          @ member 1 Test_support.authoritative_block_uuid
          @ member 2 Test_support.page_uuid
+         @ List.concat_map (fun n ->
+           let node = Datascript.Temp_id ("synthetic-journal-" ^ string_of_int n) in
+           Datascript.[
+             Add (node,"block/uuid",Uuid (W.Uuid.to_string (journal_page n)));
+             Add (node,"block/name",String ("synthetic-journal-" ^ string_of_int n));
+             Add (node,"block/title",String "Synthetic journal");
+             Add (node,"block/journal-day",Int64 20260830L);
+             Add (node,"logseq.property/public?",Bool true)]) [1;2]
        in
        let staged =
          Session.stage_transact session ~authoritative_before:database ops
@@ -160,7 +170,7 @@ let with_client
   T.with_managed (fun fixture ->
     let root = fixture.config.application_support_directory in
     let first_path = Test_support.seed_mirror root in
-    if favorites then seed_favorite_memberships first_path;
+    if favorites then seed_favorite_memberships_and_journals first_path;
     ignore (Test_support.seed_mirror ~graph_id:second_graph root);
     if statuses then seed_status_catalog root;
     let graph : Sync.graph =
@@ -524,6 +534,131 @@ let test_client_to_typed_read () =
       | _ -> failwith "catalog business page bypassed coordinator"
     in
     read_catalog 0 catalog;
+    (* Only the date planner is migrated in this checkpoint. Resolve its empty
+       root reads through the existing typed Tree API as an explicit test driver;
+       this does not claim production Tree dispatch has been migrated. *)
+    let calendar =
+      Journal_calendar.Sampler.create
+        ~clock:(fun () -> 1_788_307_200.)
+        ~localtime:Unix.gmtime
+        ()
+    in
+    ignore (Journal_calendar.Sampler.sample calendar |> Result.get_ok);
+    Journal_graph_runtime.set_calendar
+      business
+      (Journal_calendar.Sampler.sample calendar |> Result.get_ok);
+    let dates =
+      Journal_graph_runtime.submit
+        business
+        (Load_feed
+           { cursor = Some { before_day = Some 20260831; skipped_day = None }
+           ; root_limit = 1
+           ; day_limit = 1
+           ; request_generation = 320L
+           })
+      |> fun o ->
+      List.find
+        (fun (r : P.request) ->
+           match r.command with
+           | V2_list_journals _ -> true
+           | _ -> false)
+        o.requests
+    in
+    let seen = ref [] in
+    let rec date_page remaining original =
+      match Journal_graph_runtime.worker_read business original with
+      | Some (Journal_graph_runtime.Read read) ->
+        require (read.maximum_items = 1) "date planner lost requested budget";
+        let _, reply = request (W.Query (budget, read.query)) in
+        (match reply with
+         | W.Answered (Ok value) ->
+           let result = read.outcome value in
+           let items, more =
+             match result with
+             | Journal_graph_runtime.Journals_read value ->
+               value.items, Option.is_some value.next
+             | _ -> failwith "date result lost typed family"
+           in
+           require (List.length items = 1) "real date page lost item bound";
+           let item = List.hd items in
+           require (item.journal_day = 20260830) "date request lost inclusive bound";
+           require
+             (not (List.exists (W.Uuid.equal item.page.uuid) !seen))
+             "date cursor repeated identity";
+           seen := item.page.uuid :: !seen;
+           let output =
+             Journal_graph_runtime.receive_worker_read
+               business
+               ~request_id:original.request_id
+               result
+           in
+           require
+             (not
+                (List.exists
+                   (fun response ->
+                      match response.Journal_graph_runtime.payload with
+                      | Feed_loaded { complete = true; _ } -> true
+                      | _ -> false)
+                   output.responses))
+             "date Partial masqueraded as complete feed";
+           let root =
+             List.find
+               (fun (r : P.request) ->
+                  match r.command with
+                  | V2_get_page_tree _ -> true
+                  | _ -> false)
+               output.requests
+           in
+           if remaining > 1
+           then (
+             require more "real first date page omitted continuation";
+             let query =
+               match root.command with
+               | V2_get_page_tree { page; maximum_depth; revision; cursor = None; _ } ->
+                 W.Tree { page; maximum_depth; revision; after = None }
+               | _ -> failwith "empty root fixture unexpectedly continued"
+             in
+             let _, tree = request (W.Query (budget, query)) in
+             let items =
+               match tree with
+               | W.Answered (Ok value) when value.next = None -> value.items
+               | _ -> failwith "actual empty root read failed"
+             in
+             require (items = []) "synthetic journal unexpectedly has roots";
+             let output =
+               Journal_graph_runtime.receive
+                 business
+                 (P.V2_response
+                    { api_version = P.api_version
+                    ; request_id = root.request_id
+                    ; outcome =
+                        V2_page_tree_outcome
+                          { page = item.page.uuid
+                          ; maximum_depth = 0
+                          ; items
+                          ; next_cursor = None
+                          }
+                    })
+             in
+             let next =
+               List.find
+                 (fun (r : P.request) ->
+                    match r.command with
+                    | V2_list_journals _ -> true
+                    | _ -> false)
+                 output.requests
+             in
+             date_page (remaining - 1) next)
+         | _ -> failwith "real typed date page failed")
+      | _ -> failwith "date planner bypassed coordinator"
+    in
+    date_page 2 dates;
+    List.iter
+      (fun n ->
+         require
+           (List.exists (W.Uuid.equal (journal_page n)) !seen)
+           "real date continuation lost seeded same-day identity")
+      [ 1; 2 ];
     let favorites_request : Journal_graph_request.favorites_request =
       { graph_generation = owner.graph_generation
       ; request_generation = 310L

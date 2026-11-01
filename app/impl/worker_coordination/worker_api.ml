@@ -979,6 +979,7 @@ let decode
     Error
       (if code = "staleReadCursor"
        then Stale_read (code ^ ": " ^ message)
+       else if code = "responseTooLarge" then Response_budget_exceeded
        else Service_failed (code ^ ": " ^ message))
   | V2_resync_required { reason; _ } -> Error (Resync_required reason)
   | _ ->

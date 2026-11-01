@@ -1,6 +1,7 @@
 module Graph = Logseq_db_types.Graph_types
 module Protocol = Logseq_db_worker.Protocol
 module Projection = Journal_graph_projection
+module Worker = Journal_worker_coordination.Worker_api
 
 type operation
 type failure_scope = Feed of int64 | Day of { day : int; request_generation : int64 } | Reconciliation
@@ -33,7 +34,23 @@ val failure_scope : operation -> failure_scope
 val operation_name : operation -> string
 val is_current : t -> operation -> bool
 val superseded : t -> operation -> output
-val receive : t -> ports:ports -> operation -> Protocol.v2_outcome -> output option
+type journal_request =
+  { from_day : Worker.journal_day
+  ; through_day : Worker.journal_day
+  ; limit : int
+  ; after : Protocol.v2_journal_item Worker.continuation option
+  }
+
+val journal_request : operation -> journal_request option
+
+val receive
+  :  t
+  -> ports:ports
+  -> ?journals:Protocol.v2_journal_item Worker.slice
+  -> operation
+  -> Protocol.v2_outcome
+  -> output option
+
 val load_feed : t -> ports:ports -> cursor:Projection.feed_cursor option -> root_limit:int -> day_limit:int -> request_generation:int64 -> output
 val load_day : t -> ports:ports -> page:Projection.page -> after:Projection.block_cursor option -> limit:int -> request_generation:int64 -> output
 val refresh_initial : t -> ports:ports -> request_generation:int64 -> output option
