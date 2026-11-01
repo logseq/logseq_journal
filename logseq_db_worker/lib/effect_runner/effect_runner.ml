@@ -387,6 +387,7 @@ type t =
   ; recovery_current : Core.upload_recovery_ticket -> bool
   ; upload_current : Upload.ticket -> bool
   ; asset_current : Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool
+  ; durable_slots : Eio.Semaphore.t
   ; databases : (string, database_session) Hashtbl.t
   ; inspections : (string, Database.mirror_inspection) Hashtbl.t
   ; waiters : (int64, waiter) Hashtbl.t
@@ -425,6 +426,7 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; upload_staging_lock = Eio.Mutex.create ()
     ; staging_reconciled = []
     ; local_imports = Hashtbl.create 32
+    ; durable_slots = Eio.Semaphore.make 8
     ; databases = Hashtbl.create 4
     ; inspections = Hashtbl.create 4
     ; waiters = Hashtbl.create 32
@@ -1782,6 +1784,175 @@ let sync_result ?event ?(lifecycle = Core.Lifecycle_unchanged) () =
 
 let attached_session t scope =
   Option.bind (Hashtbl.find_opt t.attachments scope) (Hashtbl.find_opt t.databases)
+;;
+
+let run_durable_mutation t ~(scope : Sync.graph_scope) ~request_id ~intent ~current =
+  let module Wire = Logseq_db_worker_contract.Mutation_pure_wire in
+  let fail error = Protocol.failed ~request_id error in
+  match
+    Wire.restore
+      ~origin:scope.account.managed_sync_origin
+      ~user:scope.account.user_id
+      ~graph:scope.graph_id
+      intent
+  with
+  | Error message ->
+    Wire.Rejected
+      (failure
+         { Protocol.api_version = Protocol.api_version
+         ; request_id
+         ; command = Protocol.V2_graph_info
+         }
+         Invalid_request
+         message)
+  | Ok wire ->
+    let request =
+      { Protocol.api_version = Protocol.api_version
+      ; request_id
+      ; command = Wire.command wire
+      }
+    in
+    if t.stopped || not (current ())
+    then Wire.Unknown
+    else (
+      match attached_session t scope with
+      | None -> Wire.Unknown
+      | Some session ->
+        (match local_mutation request.command with
+         | Error message -> Wire.Rejected (failure request Unsupported_semantics message)
+         | Ok (raw, mutation) ->
+           (match parse_preconditions raw with
+            | Error message -> Wire.Rejected (failure request Conflict message)
+            | Ok expected ->
+              (match
+                 Database.persist_local_intent
+                   session.database
+                   ~namespace:(Wire.namespace wire)
+                   ~payload:intent
+                   ~expected
+                   mutation
+               with
+               | Error (Overlay.Invalid_local_mutation _ as error)
+               | Error (Overlay.Mutation_identity_conflict as error) ->
+                 Wire.Rejected (fail (local_commit_error error))
+               | Error _ -> Wire.Unknown
+               | Ok prepared ->
+                 if t.stopped || not (current ())
+                 then Wire.Unknown
+                 else (
+                   match Database.commit_local_intent session.database prepared with
+                   | Error _ ->
+                     (match Database.inspect_local_intent session.database prepared with
+                      | Ok (Database.Intent_rejected error) ->
+                        Wire.Rejected (fail (local_commit_error error))
+                      | _ -> Wire.Unknown)
+                   | Ok proof ->
+                     Wire.Committed
+                       (response
+                          request
+                          (committed_outcome (Database.intent_commit_outcome proof))))))))
+;;
+
+let durable_mutation t ~scope ~request_id ~intent ~current =
+  (* Own the accepted DB operation on the existing Worker switch. Cancelling a
+     Service waiter must release its mailbox lane without cancelling a protected
+     SQLite commit, just as ordinary Db.request does. Bound detached I/O owners. *)
+  Eio.Semaphore.acquire t.durable_slots;
+  let submitted = ref false in
+  let promise, resolve = Eio.Promise.create () in
+  Fun.protect
+    ~finally:(fun () -> if not !submitted then Eio.Semaphore.release t.durable_slots)
+    (fun () ->
+       Eio.Cancel.protect (fun () ->
+         t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+           Fun.protect
+             ~finally:(fun () -> Eio.Semaphore.release t.durable_slots)
+             (fun () ->
+                let outcome =
+                  try run_durable_mutation t ~scope ~request_id ~intent ~current with
+                  | _ -> Logseq_db_worker_contract.Mutation_pure_wire.Unknown
+                in
+                ignore (Eio.Promise.try_resolve resolve outcome : bool)));
+         submitted := true);
+       Eio.Promise.await promise)
+;;
+
+let confirm_mutation t ~(scope : Sync.graph_scope) ~request_id ~intent ~original ~current =
+  let module Wire = Logseq_db_worker_contract.Mutation_pure_wire in
+  let request command =
+    { Protocol.api_version = Protocol.api_version; request_id; command }
+  in
+  let fail message = failure (request Protocol.V2_graph_info) Conflict message in
+  match
+    Wire.restore
+      ~origin:scope.account.managed_sync_origin
+      ~user:scope.account.user_id
+      ~graph:scope.graph_id
+      intent
+  with
+  | Error message -> fail message
+  | Ok wire ->
+    if t.stopped || not (current ())
+    then fail "The confirmation presentation retired."
+    else (
+      match attached_session t scope with
+      | None -> fail "The scoped database is no longer attached."
+      | Some session ->
+        let checked =
+          Result.bind
+            (Database.find_local_intent
+               session.database
+               ~namespace:(Wire.namespace wire)
+               ~mutation_id:(Wire.mutation_id wire))
+            (function
+              | None -> Error Overlay.Mutation_identity_conflict
+              | Some prepared when Database.local_intent_payload prepared <> intent ->
+                Error Overlay.Mutation_identity_conflict
+              | Some prepared -> Database.inspect_local_intent session.database prepared)
+        in
+        (match checked with
+         | Ok (Database.Intent_committed proof) ->
+           let commit = Database.intent_commit_outcome proof in
+           let actual =
+             ( Overlay.Generation.to_string commit.generation
+             , Overlay.Projection_revision.to_string commit.before_projection_revision
+             , Overlay.Projection_revision.to_string commit.after_projection_revision )
+           in
+           if actual <> original || not (current ())
+           then fail "The original commit evidence does not match."
+           else (
+             let command =
+               match Wire.command wire with
+               | Protocol.V2_create_journal_page { page; _ } ->
+                 Protocol.V2_get_page { page; revision = None }
+               | V2_insert_blocks { roots = root :: _; _ } ->
+                 V2_get_outline_block_summary
+                   { block = root.uuid
+                   ; limit = Protocol.default_page_size
+                   ; cursor = None
+                   }
+               | V2_save_block { block; _ }
+               | V2_set_task_status { block; _ }
+               | V2_clear_task_status { block; _ }
+               | V2_set_asset_reference { block; _ } ->
+                 V2_get_outline_block_summary
+                   { block; limit = Protocol.default_page_size; cursor = None }
+               | V2_delete_blocks { root; _ } ->
+                 V2_get_outline_block_summary
+                   { block = root; limit = Protocol.default_page_size; cursor = None }
+               | _ -> assert false
+             in
+             let result =
+               execute_database
+                 ~on_enrichment_error:(fun _ -> ())
+                 session
+                 ~response_budget_bytes:t.dependencies.config.response_budget_bytes
+                 (request command)
+             in
+             if current ()
+             then result
+             else fail "The confirmation presentation retired during readback.")
+         | _ -> fail "No immutable original commit evidence is available."))
 ;;
 
 let protected_envelope (iv, ciphertext) =

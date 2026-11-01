@@ -13,6 +13,8 @@
   datascript-ocaml-native
   logseq_db_worker
   logseq_db_worker_test_support
+  rrbvec
+  uri
   yojson))
 
 (test

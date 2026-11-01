@@ -3324,6 +3324,8 @@ let start
         | Register_coordination _ -> "registerCoordination"
         | Release_coordination _ -> "releaseCoordination"
         | Coordination_query _ -> "coordinationQuery"
+        | Coordination_mutation _ -> "coordinationMutation"
+        | Coordination_confirm _ -> "coordinationConfirm"
       in
       Effect.run (set_state (fun state -> report_ui_error state ~operation ~phase:"admission"))
   in
@@ -4206,7 +4208,7 @@ let start
     Journal_media_runtime.pump (!media_runtime_cell);
     match event with
     | Worker.Push {payload=Graph_service.Coordination_updates _;_}
-    | Worker.Response {outcome=Completed(Graph_service.Coordination_registered _ | Coordination_released _);_}->Effect.ignore
+    | Worker.Response {outcome=Completed(Graph_service.Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _);_}->Effect.ignore
     | Worker.Push {payload=Graph_service.Graph_pushes _ | Graph_states _ | Session_states _;_} -> Effect.ignore
     | Worker.Response { request_id; outcome; _ }
       when Hashtbl.mem local_copy_requests request_id ->

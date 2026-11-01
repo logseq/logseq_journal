@@ -107,3 +107,15 @@ val retain_imported_file
   -> scope:Logseq_sync_pure_reducer.Core.graph_scope
   -> operation:Logseq_db_types.Graph_types.Uuid.t
   -> (string * string) option
+
+(** Durable complete mutation bytes use the existing scoped database attachment.
+    Rechecks authority before committing; accepted interruption remains unknown. *)
+val durable_mutation : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> request_id:Logseq_db_types.Graph_types.Uuid.t -> intent:string
+  -> current:(unit -> bool) -> Logseq_db_worker_contract.Mutation_pure_wire.outcome
+
+(** Read-only original-proof lookup and one bounded canonical snapshot read. *)
+val confirm_mutation : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> request_id:Logseq_db_types.Graph_types.Uuid.t -> intent:string
+  -> original:(string * string * string) -> current:(unit -> bool)
+  -> Logseq_db_worker_contract.Protocol.response

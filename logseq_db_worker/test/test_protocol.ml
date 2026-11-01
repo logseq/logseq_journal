@@ -997,10 +997,70 @@ let request_tree_boundaries () =
     "tree over root bound accepted"
 ;;
 
+let durable_wire_preserves_logical_identity () =
+  let module W = Logseq_db_worker_contract.Mutation_pure_wire in
+  let uuid text = Logseq_db_types.Graph_types.Uuid.of_string text |> Result.get_ok in
+  let graph = uuid "40000000-0000-4000-8000-000000000001" in
+  let id = uuid "30000000-0000-4000-8000-000000000003" in
+  let block = uuid "10000000-0000-4000-8000-000000000002" in
+  let origin = Uri.of_string "https://example.invalid" in
+  let command =
+    P.V2_save_block
+      { mutation_id = id
+      ; block
+      ; title = "complete durable payload"
+      ; preconditions =
+          { blocks = [ block, "block-state:v1:synthetic" ]; pages = []; scopes = [] }
+      }
+  in
+  let first = W.create ~origin ~user:"synthetic-user" ~graph command |> Result.get_ok in
+  let encoded = W.encode first in
+  let restored =
+    W.restore ~origin ~user:"synthetic-user" ~graph encoded |> Result.get_ok
+  in
+  T.require
+    (W.encode restored = encoded && W.command restored = command)
+    "durable payload changed on restore";
+  T.require (W.mutation_id restored = id) "durable mutation ID changed";
+  T.require
+    (Result.is_error (W.restore ~origin ~user:"different-user" ~graph encoded))
+    "cross-user intent restored";
+  T.require
+    (Result.is_error
+       (W.restore
+          ~origin:(Uri.of_string "https://other.invalid")
+          ~user:"synthetic-user"
+          ~graph
+          encoded))
+    "cross-origin intent restored";
+  T.require
+    (Result.is_error (W.create ~origin ~user:"synthetic-user" ~graph P.V2_graph_info))
+    "ordinary query became a durable write";
+  T.require
+    (Result.is_error (W.restore ~origin ~user:"synthetic-user" ~graph (encoded ^ " ")))
+    "noncanonical intent accepted";
+  T.require (Rrbvec.to_list (W.targets restored) = [ block ]) "canonical target missing";
+  let response status generation before_projection_revision after_projection_revision =
+    P.V2_response{api_version=P.api_version;request_id=id;
+      outcome=P.V2_mutation_committed{mutation_id=id;status;generation;
+        before_projection_revision;after_projection_revision}} in
+  T.require (Result.is_ok(W.committed_point restored ~request_id:id
+    (response P.V2_applied "generation:v1:1:1" "projection:v1:0" "projection:v1:1")))
+    "valid original commit point rejected";
+  List.iter(fun invalid ->
+    T.require(Result.is_error(W.committed_point restored ~request_id:id invalid))
+      "invalid original commit evidence accepted")
+    [response P.V2_already_applied "generation:v1:1:1" "projection:v1:0" "projection:v1:0";
+     response P.V2_applied "generation:v1:1:1" "projection:v1:1" "projection:v1:1";
+     response P.V2_no_change "generation:v1:1:1" "projection:v1:0" "projection:v1:1";
+     response P.V2_applied "futureGeneration:v2:1" "projection:v1:0" "projection:v1:1"]
+;;
+
 let () =
   T.run
     "protocol"
-    [ T.case "arbitrary task status UUID wire" arbitrary_status_uuid_wire
+    [ T.case "durable wire logical identity" durable_wire_preserves_logical_identity
+    ; T.case "arbitrary task status UUID wire" arbitrary_status_uuid_wire
     ; T.case "closed internal Config root and nested fields" closed_internal_config_fields
     ; T.case "tree depth node and root boundaries" request_tree_boundaries
     ; T.case "config golden and validation" config_generated_golden_and_validation

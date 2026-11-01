@@ -423,6 +423,49 @@ val commit_local
   -> Types.local_mutation
   -> (Types.local_commit_outcome, Types.local_commit_error) result
 
+(** Complete intent bytes are durable before the logical write. The namespace
+    identifies the logical origin/account/graph, independent of execution and
+    presentation generations. Reusing an identity requires identical payload,
+    mutation and preconditions. No original commit point is inferred from a
+    legacy idempotency receipt that did not store one. *)
+type local_intent
+type intent_commit
+type intent_resolution = Intent_pending | Intent_committed of intent_commit
+  | Intent_rejected of Types.local_commit_error
+
+val persist_local_intent
+  : t -> namespace:string -> payload:string -> expected:write_precondition
+  -> Types.local_mutation -> (local_intent, Types.local_commit_error) result
+val find_local_intent : t -> namespace:string -> mutation_id:Graph.Uuid.t
+  -> (local_intent option, Types.local_commit_error) result
+val local_intent_id : local_intent -> Graph.Uuid.t
+val local_intent_payload : local_intent -> string
+
+(** Outbox publication and immutable original commit evidence share one SQLite
+    transaction. Retrying returns that same evidence, including after reopening;
+    it never replaces the commit revision with a current read revision. *)
+val commit_local_intent
+  : t -> local_intent -> (intent_commit, Types.local_commit_error) result
+val inspect_local_intent
+  : t -> local_intent -> (intent_resolution, Types.local_commit_error) result
+val intent_commit_outcome : intent_commit -> Types.local_commit
+val intent_commit_targets : intent_commit -> Graph.Uuid.t Rrbvec.t
+
+type local_intent_page = private { items : local_intent list; next : int64 option }
+
+val pending_local_intents
+  : t -> namespace:string -> after:int64 option -> limit:int
+  -> (local_intent_page, Types.local_commit_error) result
+
+(** Acknowledges only an existing immutable known-not-applied rejection. Pending
+    or committed intents cannot be discarded through this operation. *)
+val acknowledge_rejected_local_intent
+  : t -> local_intent -> (unit, Types.local_commit_error) result
+
+(** Retains the commit proof while removing this exact intent from recovery. *)
+val acknowledge_local_intent
+  : t -> intent_commit -> (unit, Types.local_commit_error) result
+
 (** Requeues an eligible blocked mutation after validating a fresh read set. *)
 val retry_blocked
   :  t

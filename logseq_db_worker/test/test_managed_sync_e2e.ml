@@ -317,7 +317,7 @@ let handle_event context = function
   | Response { outcome = Completed (Service.Local_copy_inspected _); _ }
   | Response { outcome = Completed (Service.Local_copy_deleted _); _ } ->
     fail_worker context "local-copy" "unexpected local-copy response"
-  | Response { outcome = Completed (Service.Coordination_registered _ | Coordination_released _); _ } ->
+  | Response { outcome = Completed (Service.Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _); _ } ->
     fail_worker context "coordination" "unexpected unowned coordination response"
   | Response { outcome = Completed Service.Client_command_completed; _ } -> None
   | Response { outcome = Completed (Service.Graph_state state); _ } ->

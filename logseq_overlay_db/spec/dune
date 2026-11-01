@@ -4,4 +4,4 @@
  (modules server_cursor types database)
  (virtual_modules server_cursor types database)
  (default_implementation logseq_overlay_db_impl)
- (libraries eio logseq_db_types))
+ (libraries eio logseq_db_types rrbvec))

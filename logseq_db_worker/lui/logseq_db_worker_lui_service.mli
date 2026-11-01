@@ -234,6 +234,13 @@ type request =
   | Release_coordination of int64
   | Coordination_query of
       { registration : int64; owner : timeline_scope; request : Logseq_db_worker.Protocol.request }
+  | Coordination_mutation of
+      { registration : int64; owner : timeline_scope;
+        request_id : Logseq_db_types.Graph_types.Uuid.t; intent : string }
+  | Coordination_confirm of
+      { registration : int64; owner : timeline_scope; presentation : int64;
+        request_id : Logseq_db_types.Graph_types.Uuid.t; intent : string;
+        original : string * string * string }
   | Graph_request_at of timeline_scope * Logseq_db_worker.Protocol.request
   | Get_graph_state_at of timeline_scope
   | Asset_command_at of timeline_scope * asset_command
@@ -265,6 +272,9 @@ type request =
       }
 
 type response =
+  | Coordination_mutation_result of
+      { request_id : Logseq_db_types.Graph_types.Uuid.t;
+        outcome : Logseq_db_worker_contract.Mutation_pure_wire.outcome }
   | Coordination_registered of coordination_baseline
   | Coordination_released of int64
   | Local_copy_inspected of local_copy_request * (local_copy_presence, string) result

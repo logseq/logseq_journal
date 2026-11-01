@@ -89,6 +89,9 @@ val retain_imported_file
   -> (string * string) option
 
 val request_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> Protocol.request -> Protocol.response
+val durable_mutation_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> request_id:Logseq_db_types.Graph_types.Uuid.t -> intent:string
+  -> current:(unit -> bool) -> Logseq_db_worker_contract.Mutation_pure_wire.outcome
 val graph_scopes : t -> Logseq_sync_pure_reducer.Core.graph_scope list
 val graph_state_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> graph_state option
 
@@ -108,3 +111,9 @@ val register_coordination
 val release_coordination : t -> registration:int64 -> unit
 val coordination_current : t -> registration:int64 -> bool
 val revoke_coordination : t -> unit
+
+val coordination_presentation_current : t -> registration:int64 -> presentation:int64
+  -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> bool
+val confirm_mutation_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> request_id:Logseq_db_types.Graph_types.Uuid.t -> intent:string
+  -> original:(string * string * string) -> current:(unit -> bool) -> Protocol.response

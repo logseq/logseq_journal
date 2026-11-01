@@ -369,5 +369,29 @@ let request_for_scope t ~scope request =
   t.next_request_id <- Int64.succ t.next_request_id;
   Effect_runner.await_reply t.runner ~id ~request ~post:(fun () ->
     post t (Pure_reducer.Graph_request_for_scope {scope;id;request}))
+let durable_mutation_for_scope t ~scope ~request_id ~intent ~current =
+  let current () = not t.stopped && current () &&
+    (match Pure_reducer.graph_state_for_scope !(t.state) scope with
+     | Some {phase=Graph_open;graph_id=Some id;generation;_} ->
+       id=scope.Sync.graph_id && generation=scope.graph_generation
+     | _ -> false) in
+  Effect_runner.durable_mutation t.runner ~scope ~request_id ~intent ~current
+;;
 let graph_scopes t = Pure_reducer.graph_scopes !(t.state)
 let graph_state_for_scope t ~scope = Pure_reducer.graph_state_for_scope !(t.state) scope
+
+let coordination_presentation_current t ~registration ~presentation ~(owner:Sync.timeline_scope) =
+  coordination_current t ~registration && t.coordination.presentation=presentation &&
+  Option.fold ~none:false ~some:(fun (selected:Sync.timeline_scope) ->
+    selected.graph_id=owner.graph_id && selected.graph_generation=owner.graph_generation &&
+    selected.startup.account_generation=owner.startup.account_generation)
+    t.coordination.state.sync.selected
+;;
+let confirm_mutation_for_scope t ~scope ~request_id ~intent ~original ~current =
+  let current ()=not t.stopped && current () &&
+    (match Pure_reducer.graph_state_for_scope !(t.state) scope with
+     | Some{phase=Graph_open;graph_id=Some id;generation;_}->
+       id=scope.Sync.graph_id && generation=scope.graph_generation
+     | _->false) in
+  Effect_runner.confirm_mutation t.runner ~scope ~request_id ~intent ~original ~current
+;;

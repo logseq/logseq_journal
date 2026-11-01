@@ -1,9 +1,11 @@
 module Worker = Worker_api
 module Id = Logseq_db_worker_lui.Journal_worker_ids.Worker
+module Intents = Map.Make (String)
 module Slots = Map.Make (Int64)
 module Graphs = Map.Make (Worker.Uuid)
 
 type _ kind =
+  | Mutation : Worker.mutation_progress kind
   | Info : Worker.graph_info kind
   | Admission : Worker.Protocol.v2_admission_inspection kind
   | Journal : Worker.page option kind
@@ -42,6 +44,7 @@ let kind : type a. a Worker.query -> a kind = function
 let same_kind : type a b. a kind -> b kind -> (a, b) Worker.equality option =
   fun a b ->
   match a, b with
+  | Mutation, Mutation -> Some Refl
   | Info, Info -> Some Refl
   | Admission, Admission -> Some Refl
   | Journal, Journal -> Some Refl
@@ -60,7 +63,13 @@ let same_kind : type a b. a kind -> b kind -> (a, b) Worker.equality option =
   | _ -> None
 ;;
 
+type _ planned =
+  | Read : 'a Worker.query -> 'a planned
+  | Operation : 'a Worker.request -> 'a planned
+
 type query_target =
+  | Presentation of Worker.presentation
+  | Direct of Worker.session
   | Sealed of Worker.session * Worker.read_budget
   | Expected of
       Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope * int * int
@@ -69,7 +78,7 @@ type 'a ticket =
   { id : Worker.request_id
   ; serial : int64
   ; kind : 'a kind
-  ; query : 'a Worker.query
+  ; query : 'a planned
   ; target : query_target
   }
 
@@ -97,6 +106,7 @@ type view =
   ; entries : entry Slots.t
   ; handoffs : (Worker.handoff_id * Worker.handoff_state) list
   ; shutdown : shutdown_state
+  ; intents : Worker.mutation_progress Intents.t
   }
 
 type lifecycle =
@@ -141,6 +151,7 @@ let initial ~client_id =
       ; entries = Slots.empty
       ; handoffs = []
       ; shutdown = Active
+      ; intents = Intents.empty
       }
   }
 ;;
@@ -150,7 +161,8 @@ let bootstrap v = v.bootstrap_state
 let projection v = v.current
 let shutdown_state v = v.shutdown
 let mutation_progress _ _ = None
-let intent_progress _ _ = None
+let intent_key intent = Bytes.to_string (Worker.encode_mutation_intent intent)
+let intent_progress view intent = Intents.find_opt (intent_key intent) view.intents
 let import_progress _ _ = None
 
 let handoff v id =
@@ -203,6 +215,7 @@ let equal_view a b =
       && a.current = b.current
       && a.handoffs = b.handoffs
       && a.shutdown = b.shutdown
+      && a.intents = b.intents
       && Slots.equal equal_entry a.entries b.entries)
 ;;
 
@@ -247,6 +260,20 @@ type transition =
 let unchanged next = { next; instructions = [] }
 
 let changed next instructions =
+  let intents =
+    Intents.map
+      (function
+        | Worker.Confirmed confirmation as progress ->
+          let presentation = Worker.confirmation_presentation confirmation in
+          if Option.bind next.facts.current Worker.selected = Some presentation
+          then progress
+          else
+            Worker.Committed_pending_presentation
+              (Worker.confirmation_receipt confirmation)
+        | progress -> progress)
+      next.facts.intents
+  in
+  let next = { next with facts = { next.facts with intents } } in
   { next; instructions = instructions @ [ Publish next.facts ] }
 ;;
 
@@ -266,7 +293,10 @@ let affected session = function
 ;;
 
 let current_target facts = function
-  | Sealed (session, _) -> current_session facts session
+  | Presentation presentation ->
+    current_session facts (Worker.presentation_session presentation)
+    && Option.bind facts.current Worker.selected = Some presentation
+  | Direct session | Sealed (session, _) -> current_session facts session
   | Expected (owner, _, _) ->
     Option.fold
       ~none:false
@@ -279,7 +309,9 @@ let current_target facts = function
 
 let affected_target target change =
   match target with
-  | Sealed (session, _) -> affected session change
+  | Presentation presentation ->
+    affected (Worker.presentation_session presentation) change
+  | Direct session | Sealed (session, _) -> affected session change
   | Expected (owner, _, _) ->
     (match change with
      | Worker.Account_will_change | Connection_will_stop -> true
@@ -396,11 +428,15 @@ let dispatch_waiting ?(publish = false) state instructions =
                             maximum_bytes
                             (Worker.capabilities session).limits.response_budget_bytes))
                     (fun budget ->
-                       Result.map
-                         (fun () -> Worker.Query (budget, slot.ticket.query))
-                         (Worker.validate_request
-                            session
-                            (Worker.Query (budget, slot.ticket.query))))
+                       match slot.ticket.query with
+                       | Read query ->
+                         Result.map
+                           (fun () -> Worker.Query (budget, query))
+                           (Worker.validate_request
+                              session
+                              (Worker.Query (budget, query)))
+                       | Operation _ ->
+                         Error (Worker.Invalid_input "An effect cannot wait as a read"))
                 in
                 (match planned with
                  | Error error -> reject error
@@ -496,6 +532,52 @@ let apply_baseline state binding incoming =
       dispatch_waiting ~publish:true { state with facts; retired } instructions))
 ;;
 
+let known_receipt facts key =
+  match Intents.find_opt key facts.intents with
+  | Some (Worker.Committed_pending_presentation receipt) -> Some receipt
+  | Some (Worker.Confirmed confirmation) ->
+    Some (Worker.confirmation_receipt confirmation)
+  | _ -> None
+;;
+
+let receipt_agrees facts intent receipt =
+  let key = intent_key intent in
+  key = intent_key (Worker.receipt_intent receipt)
+  && Option.fold
+       ~none:true
+       ~some:(fun original ->
+         Worker.receipt_revisions original = Worker.receipt_revisions receipt)
+       (known_receipt facts key)
+;;
+
+let checked_result : type a. view -> a ticket -> a Worker.reply -> a Worker.reply =
+  fun facts ticket result ->
+  let mismatch () =
+    Worker.Answered
+      (Error
+         (Worker.Protocol_mismatch
+            "Mutation receipt identity or original point does not match its ticket"))
+  in
+  match ticket.query, result with
+  | ( Operation (Worker.Mutate intent)
+    , Worker.Answered (Ok (Worker.Committed_pending_presentation receipt)) ) ->
+    if receipt_agrees facts intent receipt then result else mismatch ()
+  | Operation (Worker.Mutate _), Worker.Answered (Ok (Worker.Confirmed _)) -> mismatch ()
+  | ( Operation (Worker.Confirm (presentation, receipt))
+    , Worker.Answered (Ok (Worker.Confirmed confirmation)) ) ->
+    if
+      Worker.confirmation_presentation confirmation = presentation
+      && Worker.receipt_revisions receipt
+         = Worker.receipt_revisions (Worker.confirmation_receipt confirmation)
+      && receipt_agrees
+           facts
+           (Worker.receipt_intent receipt)
+           (Worker.confirmation_receipt confirmation)
+    then result
+    else mismatch ()
+  | _ -> result
+;;
+
 let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
   fun state ticket result require_admission ->
   match Slots.find_opt ticket.serial state.facts.entries with
@@ -506,6 +588,7 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
             && (slot.early = None || not require_admission)
             && (require_admission || slot.admitted = None)
             && slot.dispatched ->
+       let result = checked_result state.facts ticket result in
        if require_admission && slot.admitted = None
        then
          changed
@@ -521,6 +604,46 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
            }
            []
        else (
+         let intents : Worker.mutation_progress Intents.t =
+           match ticket.query with
+           | Operation (Worker.Mutate intent) ->
+             let key = intent_key intent in
+             let previous = Intents.find_opt key state.facts.intents in
+             let progress : Worker.mutation_progress option =
+               match result with
+               | Worker.Answered (Ok progress) -> Some progress
+               | Worker.Not_admitted _ when slot.admitted = None -> previous
+               | _ ->
+                 (match previous with
+                  | Some
+                      (Worker.Committed_pending_presentation _ | Confirmed _ | Rejected _)
+                    -> previous
+                  | _ -> Some Worker.Outcome_unknown)
+             in
+             (match previous, progress with
+              | ( Some (Worker.Committed_pending_presentation _ | Confirmed _)
+                , Some (Worker.Outcome_unknown | Rejected _) ) -> state.facts.intents
+              | Some (Worker.Confirmed _), Some (Worker.Committed_pending_presentation _)
+                -> state.facts.intents
+              | Some (Worker.Rejected _), _ -> state.facts.intents
+              | _, None -> state.facts.intents
+              | _, Some progress -> Intents.add key progress state.facts.intents)
+           | Operation (Worker.Confirm (presentation, receipt)) ->
+             let key = intent_key (Worker.receipt_intent receipt) in
+             (match result with
+              | Worker.Answered (Ok (Worker.Confirmed confirmation))
+                when current_target state.facts (Presentation presentation) ->
+                Intents.add key (Worker.Confirmed confirmation) state.facts.intents
+              | _ ->
+                if Intents.mem key state.facts.intents
+                then state.facts.intents
+                else
+                  Intents.add
+                    key
+                    (Worker.Committed_pending_presentation receipt)
+                    state.facts.intents)
+           | _ -> state.facts.intents
+         in
          let result =
            if state.lifecycle = Running && current_target state.facts ticket.target
            then result
@@ -535,7 +658,7 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
                (Entry { slot with result = Some result; early = None })
                state.facts.entries
          in
-         settle { state with facts = { state.facts with entries } } [])
+         settle { state with facts = { state.facts with entries; intents } } [])
      | _ -> unchanged state)
   | None -> unchanged state
 ;;
@@ -749,6 +872,81 @@ let step state event =
     unchanged state
 ;;
 
+let plan_mutation
+      state
+      session
+      (operation : Worker.mutation_progress Worker.request)
+      intent
+      target
+  =
+  let key = intent_key intent in
+  let bytes = Intents.fold (fun key _ n -> n + String.length key) state.facts.intents 0 in
+  let valid =
+    match operation with
+    | Worker.Confirm (_, receipt) -> receipt_agrees state.facts intent receipt
+    | _ -> true
+  in
+  if not (current_target state.facts target)
+  then Error Worker.Revoked_session
+  else if not valid
+  then Error (Worker.Protocol_mismatch "Confirmation replaced original commit point")
+  else if
+    state.next = Int64.max_int
+    || ((not (Intents.mem key state.facts.intents))
+        && (Intents.cardinal state.facts.intents >= 256
+            || bytes + String.length key > 4194304
+            (* Reserve a full bounded readback before accepting each distinct
+               intent. Known commits must never be dropped for a later budget. *)
+            || bytes
+               + String.length key
+               + ((Intents.cardinal state.facts.intents + 1)
+                  * Worker.Protocol.maximum_response_bytes)
+               > 16777216))
+  then Error (Worker.Invalid_input "Durable intent coordination capacity exhausted")
+  else (
+    let serial = Int64.succ state.next in
+    let ticket =
+      { id = Worker.request_id (identity state.client serial)
+      ; serial
+      ; kind = Mutation
+      ; query = Operation operation
+      ; target
+      }
+    in
+    let slot =
+      { ticket
+      ; dispatched = true
+      ; admitted = None
+      ; result = None
+      ; early = None
+      ; cancelled = false
+      ; forgotten = false
+      }
+    in
+    let intents =
+      if Intents.mem key state.facts.intents
+      then state.facts.intents
+      else
+        Intents.add
+          key
+          (match operation with
+           | Worker.Mutate _ -> Worker.Outcome_unknown
+           | Worker.Confirm (_, receipt) -> Worker.Committed_pending_presentation receipt
+           | _ -> assert false)
+          state.facts.intents
+    in
+    let facts =
+      { state.facts with
+        entries = Slots.add serial (Entry slot) state.facts.entries
+      ; intents
+      }
+    in
+    Ok
+      ( ticket
+      , changed { state with next = serial; facts } [ Send (ticket, session, operation) ]
+      ))
+;;
+
 let request
   : type a.
     t
@@ -775,7 +973,7 @@ let request
             { id = Worker.request_id (identity state.client serial)
             ; serial
             ; kind = kind query
-            ; query
+            ; query = Read query
             ; target = Sealed (session, budget)
             }
           in
@@ -799,6 +997,15 @@ let request
             , changed
                 { state with next = serial; facts }
                 [ Send (ticket, session, operation) ] ))
+      | Worker.Mutate intent ->
+        plan_mutation state session operation intent (Direct session)
+      | Worker.Confirm (presentation, receipt) ->
+        plan_mutation
+          state
+          session
+          operation
+          (Worker.receipt_intent receipt)
+          (Presentation presentation)
       | _ ->
         Error
           (Worker.Unsupported_operation
@@ -826,7 +1033,7 @@ let plan_query state ~owner ~maximum_items ~maximum_bytes query =
       { id = Worker.request_id (identity state.client serial)
       ; serial
       ; kind = kind query
-      ; query
+      ; query = Read query
       ; target
       }
     in

@@ -1223,4 +1223,425 @@ let cases =
   ]
 ;;
 
+let durable_intent_keeps_original_commit database =
+  let behavior = "durable intent preserves original commit point" in
+  let expected = block_precondition database T.authoritative_block_uuid behavior in
+  let mutation =
+    Types.Save_block
+      { mutation_id = T.mutation_uuid 7601
+      ; block = T.authoritative_block_uuid
+      ; title = "Durable original edit"
+      }
+  in
+  let namespace = String.make 64 'a' in
+  let intent =
+    Database.persist_local_intent
+      database
+      ~namespace
+      ~payload:"complete stable wire payload"
+      ~expected
+      mutation
+    |> T.require_ok ~behavior
+  in
+  Alcotest.(check bool)
+    "prepared intent has no invented receipt"
+    true
+    (Database.inspect_local_intent database intent
+     |> T.require_ok ~behavior
+     = Database.Intent_pending);
+  let committed =
+    Database.commit_local_intent database intent |> T.require_ok ~behavior
+  in
+  let original = Database.intent_commit_outcome committed in
+  let fresh = block_precondition database T.authoritative_block_uuid behavior in
+  ignore
+    (Database.commit_local
+       database
+       ~expected:fresh
+       (Types.Save_block
+          { mutation_id = T.mutation_uuid 7602
+          ; block = T.authoritative_block_uuid
+          ; title = "Later independent edit"
+          })
+     |> T.require_ok ~behavior);
+  let repeated = Database.commit_local_intent database intent |> T.require_ok ~behavior in
+  Alcotest.(check bool)
+    "retry retains exact original outcome"
+    true
+    (Database.intent_commit_outcome repeated = original);
+  Alcotest.(check bool)
+    "preconditions are part of durable identity"
+    true
+    (Result.is_error
+       (Database.persist_local_intent
+          database
+          ~namespace
+          ~payload:"complete stable wire payload"
+          ~expected:fresh
+          mutation));
+  Alcotest.(check bool)
+    "wire payload is part of durable identity"
+    true
+    (Result.is_error
+       (Database.persist_local_intent
+          database
+          ~namespace
+          ~payload:"changed wire payload"
+          ~expected
+          mutation));
+  let targets = Database.intent_commit_targets committed |> Rrbvec.to_list in
+  Alcotest.(check bool)
+    "receipt names its actual canonical target"
+    true
+    (targets = [ T.authoritative_block_uuid ]);
+  let pending =
+    Database.pending_local_intents database ~namespace ~after:None ~limit:1
+    |> T.require_ok ~behavior
+  in
+  Alcotest.(check int)
+    "prepared or committed unacknowledged intent remains recoverable"
+    1
+    (List.length pending.items);
+  Database.acknowledge_local_intent database committed |> T.require_ok ~behavior;
+  let pending =
+    Database.pending_local_intents database ~namespace ~after:None ~limit:1
+    |> T.require_ok ~behavior
+  in
+  Alcotest.(check int)
+    "ack settles recovery without erasing proof"
+    0
+    (List.length pending.items);
+  let stored =
+    match Database.inspect_local_intent database intent |> T.require_ok ~behavior with
+    | Database.Intent_committed proof -> proof
+    | _ -> Alcotest.fail "committed evidence missing"
+  in
+  Alcotest.(check bool)
+    "ack cannot erase original proof"
+    true
+    (Database.intent_commit_outcome stored = original)
+;;
+
+let durable_intent_survives_restart_and_rollback () =
+  let behavior = "durable intent atomicity and restart" in
+  T.with_temp_directory "durable-intent-reopen-" (fun support ->
+    let path = T.seed_mirror support in
+    Eio_main.run (fun _ ->
+      Eio.Switch.run (fun sw ->
+        let use f =
+          let inspection =
+            Database.inspect_mirror
+              ~application_support_directory:support
+              ~graph_id:T.graph_uuid
+            |> T.require_ok ~behavior
+          in
+          let database =
+            Database.open_
+              ~sw
+              (T.dependencies ~behavior)
+              inspection
+              ~graph_name:"durable-intent"
+            |> T.require_ok ~behavior
+          in
+          Fun.protect
+            ~finally:(fun () ->
+              ignore (Database.close database |> T.require_ok ~behavior))
+            (fun () -> f database)
+        in
+        let sql command =
+          let sqlite = Sqlite3.db_open ~mode:`NO_CREATE path in
+          Fun.protect
+            ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+            (fun () -> Sqlite3.Rc.check (Sqlite3.exec sqlite command))
+        in
+        let namespace = String.make 64 'b' in
+        let original =
+          use (fun database ->
+            let expected =
+              block_precondition database T.authoritative_block_uuid behavior
+            in
+            let intent =
+              Database.persist_local_intent
+                database
+                ~namespace
+                ~payload:"stable restart payload"
+                ~expected
+                (Save_block
+                   { mutation_id = T.mutation_uuid 7610
+                   ; block = T.authoritative_block_uuid
+                   ; title = "Atomic restart edit"
+                   })
+              |> T.require_ok ~behavior
+            in
+            let before =
+              current_snapshot database behavior (fun snapshot ->
+                Database.graph_info snapshot |> T.require_ok ~behavior)
+            in
+            sql
+              "CREATE TRIGGER reject_intent_commit BEFORE UPDATE OF evidence ON \
+               overlay_intents_v1 BEGIN SELECT RAISE(ABORT, 'synthetic evidence write \
+               failure'); END";
+            (match Database.commit_local_intent database intent with
+             | Error (Local_commit_persistence_failed _) -> ()
+             | _ -> Alcotest.fail "evidence failure did not fail the logical write");
+            Alcotest.(check bool)
+              "failed transaction has no commit evidence"
+              true
+              (Database.inspect_local_intent database intent
+               |> T.require_ok ~behavior
+               = Database.Intent_pending);
+            let after =
+              current_snapshot database behavior (fun snapshot ->
+                Database.graph_info snapshot |> T.require_ok ~behavior)
+            in
+            Alcotest.(check bool)
+              "failed transaction restores projection"
+              true
+              (before = after);
+            sql "DROP TRIGGER reject_intent_commit";
+            Database.commit_local_intent database intent
+            |> T.require_ok ~behavior
+            |> Database.intent_commit_outcome)
+        in
+        use (fun database ->
+          let pending =
+            Database.pending_local_intents database ~namespace ~after:None ~limit:1
+            |> T.require_ok ~behavior
+          in
+          Alcotest.(check int)
+            "restart recovers exactly one intent"
+            1
+            (List.length pending.items);
+          let intent = List.hd pending.items in
+          Alcotest.(check string)
+            "restart restores complete wire payload"
+            "stable restart payload"
+            (Database.local_intent_payload intent);
+          let proof =
+            Database.commit_local_intent database intent |> T.require_ok ~behavior
+          in
+          Alcotest.(check bool)
+            "restart preserves original commit point"
+            true
+            (Database.intent_commit_outcome proof = original);
+          let fresh = block_precondition database T.authoritative_block_uuid behavior in
+          ignore
+            (Database.commit_local
+               database
+               ~expected:fresh
+               (Save_block
+                  { mutation_id = T.mutation_uuid 7611
+                  ; block = T.authoritative_block_uuid
+                  ; title = "Later post-restart edit"
+                  })
+             |> T.require_ok ~behavior);
+          let again =
+            Database.commit_local_intent database intent |> T.require_ok ~behavior
+          in
+          Alcotest.(check bool)
+            "later write cannot replace recovered evidence"
+            true
+            (Database.intent_commit_outcome again = original)))))
+;;
+
+let durable_rejection_is_final database =
+  let behavior = "durable rejection cannot later apply" in
+  let namespace = String.make 64 'c' in
+  let stale = block_precondition database T.authoritative_block_uuid behavior in
+  let intent =
+    Database.persist_local_intent
+      database
+      ~namespace
+      ~payload:"rejected complete intent"
+      ~expected:stale
+      (Save_block
+         { mutation_id = T.mutation_uuid 7620
+         ; block = T.authoritative_block_uuid
+         ; title = "Must not apply later"
+         })
+    |> T.require_ok ~behavior
+  in
+  ignore
+    (Database.commit_local
+       database
+       ~expected:stale
+       (Save_block
+          { mutation_id = T.mutation_uuid 7621
+          ; block = T.authoritative_block_uuid
+          ; title = "Changes target revision"
+          })
+     |> T.require_ok ~behavior);
+  Alcotest.(check bool)
+    "stale intent is deterministically rejected"
+    true
+    (Database.commit_local_intent database intent = Error Target_precondition_conflict);
+  (match Database.inspect_local_intent database intent |> T.require_ok ~behavior with
+   | Database.Intent_rejected Target_precondition_conflict -> ()
+   | _ -> Alcotest.fail "known rejection was not durable");
+  Database.acknowledge_rejected_local_intent database intent |> T.require_ok ~behavior;
+  let pending =
+    Database.pending_local_intents database ~namespace ~after:None ~limit:1
+    |> T.require_ok ~behavior
+  in
+  Alcotest.(check int) "rejected ACK settles recovery" 0 (List.length pending.items);
+  Alcotest.(check bool)
+    "ACK retains exact rejection for retry"
+    true
+    (Database.commit_local_intent database intent = Error Target_precondition_conflict)
+;;
+
+let legacy_receipt_cannot_prove_rejection database =
+  let behavior = "legacy proof stays uncertain" in
+  let expected = block_precondition database T.authoritative_block_uuid behavior in
+  let mutation =
+    Save_block
+      { mutation_id = T.mutation_uuid 7631
+      ; block = T.authoritative_block_uuid
+      ; title = "Legacy accepted write"
+      }
+  in
+  ignore (Database.commit_local database ~expected mutation |> T.require_ok ~behavior);
+  let intent =
+    Database.persist_local_intent
+      database
+      ~namespace:(String.make 64 'd')
+      ~payload:"complete newer durable encoding"
+      ~expected
+      mutation
+    |> T.require_ok ~behavior
+  in
+  ignore (Database.commit_local_intent database intent);
+  Alcotest.(check bool)
+    "legacy applied write is neither a new original point nor known rejection"
+    true
+    (Database.inspect_local_intent database intent
+     |> T.require_ok ~behavior
+     = Database.Intent_pending);
+  Alcotest.(check bool)
+    "uncertain legacy evidence cannot be acknowledged as rejected"
+    true
+    (Result.is_error (Database.acknowledge_rejected_local_intent database intent))
+;;
+
+let durable_rejection_survives_restart () =
+  let behavior = "durable rejection survives restart" in
+  T.with_temp_directory "durable-rejection-reopen-" (fun support ->
+    ignore (T.seed_mirror support);
+    Eio_main.run (fun _ ->
+      Eio.Switch.run (fun sw ->
+        let namespace = String.make 64 'e'
+        and mutation_id = T.mutation_uuid 7640 in
+        let use f =
+          let inspection =
+            Database.inspect_mirror
+              ~application_support_directory:support
+              ~graph_id:T.graph_uuid
+            |> T.require_ok ~behavior
+          in
+          let database =
+            Database.open_
+              ~sw
+              (T.dependencies ~behavior)
+              inspection
+              ~graph_name:"rejection-reopen"
+            |> T.require_ok ~behavior
+          in
+          Fun.protect
+            ~finally:(fun () ->
+              ignore (Database.close database |> T.require_ok ~behavior))
+            (fun () -> f database)
+        in
+        use (fun database ->
+          let expected =
+            block_precondition database T.authoritative_block_uuid behavior
+          in
+          let intent =
+            Database.persist_local_intent
+              database
+              ~namespace
+              ~payload:"rejected restart payload"
+              ~expected
+              (Save_block
+                 { mutation_id
+                 ; block = T.authoritative_block_uuid
+                 ; title = "Never apply"
+                 })
+            |> T.require_ok ~behavior
+          in
+          ignore
+            (Database.commit_local
+               database
+               ~expected
+               (Save_block
+                  { mutation_id = T.mutation_uuid 7641
+                  ; block = T.authoritative_block_uuid
+                  ; title = "New target revision"
+                  })
+             |> T.require_ok ~behavior);
+          Alcotest.(check bool)
+            "initial stale intent rejected"
+            true
+            (Database.commit_local_intent database intent
+             = Error Target_precondition_conflict));
+        use (fun database ->
+          let intent =
+            Database.find_local_intent database ~namespace ~mutation_id
+            |> T.require_ok ~behavior
+            |> Option.get
+          in
+          Alcotest.(check bool)
+            "restart retains exact rejection"
+            true
+            (Database.inspect_local_intent database intent
+             |> T.require_ok ~behavior
+             = Database.Intent_rejected Target_precondition_conflict);
+          Alcotest.(check bool)
+            "restart cannot replay rejection as write"
+            true
+            (Database.commit_local_intent database intent
+             = Error Target_precondition_conflict);
+          Database.acknowledge_rejected_local_intent database intent
+          |> T.require_ok ~behavior);
+        use (fun database ->
+          let pending =
+            Database.pending_local_intents database ~namespace ~after:None ~limit:1
+            |> T.require_ok ~behavior
+          in
+          Alcotest.(check int)
+            "acknowledged rejection stays out of recovery after restart"
+            0
+            (List.length pending.items);
+          let intent =
+            Database.find_local_intent database ~namespace ~mutation_id
+            |> T.require_ok ~behavior
+            |> Option.get
+          in
+          Alcotest.(check bool)
+            "settlement retains proof after restart"
+            true
+            (Database.inspect_local_intent database intent
+             |> T.require_ok ~behavior
+             = Database.Intent_rejected Target_precondition_conflict)))))
+;;
+
+let cases =
+  cases
+  @ [ Alcotest.test_case
+        "rejection survives restart"
+        `Quick
+        durable_rejection_survives_restart
+    ; T.database_case
+        "legacy receipt cannot prove rejection"
+        legacy_receipt_cannot_prove_rejection
+    ; T.database_case "durable rejection is final" durable_rejection_is_final
+    ; T.database_case
+        "durable intent keeps original commit point"
+        durable_intent_keeps_original_commit
+    ; Alcotest.test_case
+        "durable intent survives restart and rollback"
+        `Quick
+        durable_intent_survives_restart_and_rollback
+    ]
+;;
+
 let () = Alcotest.run "logseq_overlay_db mutations" [ "local planning and commit", cases ]

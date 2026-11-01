@@ -384,6 +384,87 @@ let test_client_to_typed_read () =
          (value.block.title = "Authoritative block")
          "rejected read capability altered storage"
      | _ -> failwith "guard verification read failed");
+    let intent =
+      W.mutation_intent
+        session
+        ~mutation_id:(uuid "9c000000-0000-4000-8000-000000000017")
+        (W.Save_block
+           { block = Test_support.authoritative_block_uuid
+           ; title = "Durable coordinated edit"
+           ; preconditions =
+               { blocks = [ Test_support.authoritative_block_uuid, revision ]
+               ; pages = []
+               ; scopes = []
+               }
+           })
+      |> function
+      | Ok intent -> intent
+      | Error (W.Invalid_input message) -> failwith message
+      | Error _ -> failwith "durable intent rejected"
+    in
+    let wire = W.encode_mutation_intent intent in
+    let restored = W.restore_mutation_intent session wire |> Result.get_ok in
+    require
+      (W.encode_mutation_intent restored = wire)
+      "complete mutation changed on restore";
+    let mutation_ticket, mutation_reply = request (W.Mutate intent) in
+    let receipt =
+      match mutation_reply with
+      | W.Answered (Ok (W.Committed_pending_presentation receipt)) -> receipt
+      | _ -> failwith "real durable mutation did not return commit evidence"
+    in
+    let original = W.receipt_revisions receipt in
+    require
+      (Rrbvec.to_list (W.receipt_targets receipt)
+       = [ Test_support.authoritative_block_uuid ])
+      "durable receipt lost canonical target";
+    apply (C.step !state (C.Forget mutation_ticket));
+    require
+      (Option.is_some (C.intent_progress (C.view !state) intent))
+      "forgetting ticket erased durable outcome";
+    let _, again = request (W.Mutate restored) in
+    (match again with
+     | W.Answered (Ok (W.Committed_pending_presentation repeated)) ->
+       require
+         (W.receipt_revisions repeated = original)
+         "retry replaced original commit revision"
+     | _ -> failwith "same durable intent could not be reconciled");
+    let _, readback =
+      request
+        (W.Query
+           ( budget
+           , W.Outline_block
+               { uuid = Test_support.authoritative_block_uuid; revision = None } ))
+    in
+    (match readback with
+     | W.Answered (Ok (P.V2_present_block { value; _ })) ->
+       require
+         (value.block.title = "Durable coordinated edit")
+         "durable mutation did not reach real projection"
+     | _ -> failwith "durable mutation readback failed");
+    let presentation =
+      C.projection (C.view !state) |> Option.get |> W.selected |> Option.get
+    in
+    let confirm_ticket, confirmation_reply =
+      request (W.Confirm (presentation, receipt))
+    in
+    (match confirmation_reply with
+     | W.Answered (Ok (W.Confirmed confirmation)) ->
+       require
+         (W.receipt_revisions (W.confirmation_receipt confirmation) = original)
+         "confirmation replaced original commit point";
+       (match W.confirmation_primary confirmation with
+        | W.Confirmed_block summary ->
+          require (Option.is_some summary.page) "confirmation lost atomic owning page";
+          (match summary.lookup with
+           | P.V2_present_block { value; _ } ->
+             require
+               (value.block.title = "Durable coordinated edit")
+               "confirmation did not expose canonical readback"
+           | _ -> failwith "confirmation lost canonical block")
+        | _ -> failwith "save confirmation did not return canonical block summary")
+     | _ -> failwith "real Confirm failed");
+    apply (C.step !state (C.Forget confirm_ticket));
     let tiny = W.read_budget session ~maximum_items:1 ~maximum_bytes:1 |> Result.get_ok in
     let _, oversized = request (W.Query (tiny, W.Graph_info)) in
     (match oversized with
@@ -447,6 +528,20 @@ let test_client_to_typed_read () =
          ~some:(fun p -> W.equal_session (W.presentation_session p) session)
          (selected ()))
       "focus roundtrip revoked resident execution instead of presentation";
+    (match C.intent_progress (C.view !state) intent with
+     | Some (W.Committed_pending_presentation preserved) ->
+       require
+         (W.receipt_revisions preserved = original)
+         "focus roundtrip changed durable receipt"
+     | _ -> failwith "focus roundtrip did not retire old presentation confirmation");
+    require
+      (Result.is_error (C.request !state session (W.Confirm (presentation, receipt))))
+      "old presentation confirmed a new focus round";
+    let current_presentation = selected () |> Option.get in
+    let _, reconfirmed = request (W.Confirm (current_presentation, receipt)) in
+    (match reconfirmed with
+     | W.Answered (Ok (W.Confirmed _)) -> ()
+     | _ -> failwith "new explicit Confirm could not use preserved receipt");
     apply (C.step !state C.Retry_bootstrap);
     require
       (Result.is_error (C.request !state session (W.Query (budget, W.Graph_info))))
@@ -478,7 +573,7 @@ let test_client_to_typed_read () =
       "late cancelled read revived a forgotten consumer")
 ;;
 
-let test_read_completion_rechecks_graph_owner () =
+let test_read_completion_rechecks_graph_owner ?(durable = false) () =
   let armed = Atomic.make false
   and entered = Atomic.make false
   and release = Atomic.make false in
@@ -569,24 +664,40 @@ let test_read_completion_rechecks_graph_owner () =
            | _ -> failwith "race fixture block missing"
          in
          Atomic.set armed true;
+         let mutation_request =
+           req
+             "000000000002"
+             (P.V2_save_block
+                { mutation_id = uuid "99000000-0000-4000-8000-000000000003"
+                ; block = Test_support.authoritative_block_uuid
+                ; title = "Synthetic held writer"
+                ; preconditions =
+                    { blocks = [ Test_support.authoritative_block_uuid, revision ]
+                    ; pages = []
+                    ; scopes = []
+                    }
+                })
+         in
+         let module Wire = Logseq_db_worker_contract.Mutation_pure_wire in
+         let wire =
+           Wire.create
+             ~origin:(Uri.of_string "https://api.logseq.io")
+             ~user:"user-1"
+             ~graph:Test_support.graph_uuid
+             mutation_request.command
+           |> Result.get_ok
+         in
          let writer =
            send
-             (Service.Graph_request_at
-                ( owner
-                , req
-                    "000000000002"
-                    (P.V2_save_block
-                       { mutation_id =
-                           W.Uuid.of_string "99000000-0000-4000-8000-000000000003"
-                           |> Result.get_ok
-                       ; block = Test_support.authoritative_block_uuid
-                       ; title = "Synthetic held writer"
-                       ; preconditions =
-                           { blocks = [ Test_support.authoritative_block_uuid, revision ]
-                           ; pages = []
-                           ; scopes = []
-                           }
-                       }) ))
+             (if durable
+              then
+                Service.Coordination_mutation
+                  { registration
+                  ; owner
+                  ; request_id = mutation_request.request_id
+                  ; intent = Wire.encode wire
+                  }
+              else Service.Graph_request_at (owner, mutation_request))
          in
          wait (fun () -> Atomic.get entered);
          let read =
@@ -598,10 +709,12 @@ let test_read_completion_rechecks_graph_owner () =
             accepted durable DB operation. Keep that operation held while the
             second lane is waiting on the real snapshot mutex. *)
          Mailbox.cancel client ~request_id:writer;
-         wait (fun () -> Hashtbl.mem responses writer);
-         require
-           (Hashtbl.find responses writer = Mailbox.Cancelled)
-           "held writer cancellation did not release its outer lane";
+         if not durable
+         then (
+           wait (fun () -> Hashtbl.mem responses writer);
+           require
+             (Hashtbl.find responses writer = Mailbox.Cancelled)
+             "held legacy writer cancellation did not release its outer lane");
          wait (fun () ->
            (Mailbox.Private.metrics (Mailbox.Private.pack_client client))
              .active_request_fibers
@@ -620,11 +733,60 @@ let test_read_completion_rechecks_graph_owner () =
            (match Hashtbl.find responses read with
             | Failed _ -> true
             | _ -> false)
-           "retired graph read completion still crossed Service's authority gate"))
+           "retired graph read completion still crossed Service's authority gate";
+         if durable
+         then (
+           wait (fun () -> Hashtbl.mem responses writer);
+           require
+             (Hashtbl.find responses writer = Mailbox.Cancelled)
+             "cancelled durable attempt was reported as known rollback";
+           Atomic.set armed false;
+           ignore (send (Service.Client_command (Select_graph Test_support.graph_uuid)));
+           wait (fun () ->
+             match !baseline with
+             | Some value ->
+               Option.is_some value.baseline.state.sync.selected
+               && List.exists
+                    (fun (_, state) -> state.Logseq_db_worker.phase = Graph_open)
+                    value.baseline.state.residents
+             | _ -> false);
+           let next_owner =
+             Option.get (Option.get !baseline).baseline.state.sync.selected
+           in
+           require
+             (next_owner.graph_generation <> owner.graph_generation)
+             "reopen did not replace execution generation";
+           let retry =
+             send
+               (Service.Coordination_mutation
+                  { registration
+                  ; owner = next_owner
+                  ; request_id = (req "000000000004" P.V2_graph_info).request_id
+                  ; intent = Wire.encode wire
+                  })
+           in
+           wait (fun () -> Hashtbl.mem responses retry);
+           match Hashtbl.find responses retry with
+           | Completed
+               (Service.Coordination_mutation_result
+                  { outcome =
+                      Wire.Committed
+                        (P.V2_response { outcome = P.V2_mutation_committed committed; _ })
+                  ; _
+                  }) ->
+             require
+               (committed.status = P.V2_applied)
+               "unknown write replay invented Already_applied/current revision";
+             require
+               (committed.before_projection_revision
+                <> committed.after_projection_revision)
+               "unknown accepted write lost original commit evidence"
+           | _ -> failwith "durable unknown did not reconcile across close/reopen")))
 ;;
 
 let () =
   test_client_to_typed_read ();
   test_read_completion_rechecks_graph_owner ();
+  test_read_completion_rechecks_graph_owner ~durable:true ();
   print_endline "Worker coordination real client/read/cleanup passed"
 ;;

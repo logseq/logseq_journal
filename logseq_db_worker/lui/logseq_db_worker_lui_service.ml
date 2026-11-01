@@ -319,6 +319,13 @@ type request =
   | Release_coordination of int64
   | Coordination_query of
       { registration : int64; owner : timeline_scope; request : Logseq_db_worker.Protocol.request }
+  | Coordination_mutation of
+      { registration : int64; owner : timeline_scope;
+        request_id : Logseq_db_types.Graph_types.Uuid.t; intent : string }
+  | Coordination_confirm of
+      { registration : int64; owner : timeline_scope; presentation : int64;
+        request_id : Logseq_db_types.Graph_types.Uuid.t; intent : string;
+        original : string * string * string }
   | Graph_request_at of timeline_scope * Logseq_db_worker.Protocol.request
   | Get_graph_state_at of timeline_scope
   | Asset_command_at of timeline_scope * asset_command
@@ -350,6 +357,9 @@ type request =
       }
 
 type response =
+  | Coordination_mutation_result of
+      { request_id : Logseq_db_types.Graph_types.Uuid.t;
+        outcome : Logseq_db_worker_contract.Mutation_pure_wire.outcome }
   | Coordination_registered of coordination_baseline
   | Coordination_released of int64
   | Local_copy_inspected of local_copy_request * (local_copy_presence, string) result
@@ -1058,6 +1068,35 @@ let create ~(dependencies : dependencies) =
             if not(authorized ()) then Error "Coordination account authority changed" else
             let response=Db.request_for_scope session.worker ~scope request in
             if authorized () then Ok(Graph_response response) else Error "Coordination binding retired")
+      | Coordination_mutation {registration;owner;request_id;intent} ->
+        let current ()=Db.coordination_current session.worker ~registration in
+        if not(current ()) then Error "Coordination binding retired"
+        else (match resolve owner with
+          | None -> Error "The graph session is no longer open."
+          | Some scope ->
+            let authorized ()=current () && resolve owner=Some scope &&
+              (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) &&
+              (match Db.graph_state_for_scope session.worker ~scope with
+               | Some {phase=Db.Graph_open;graph_id=Some id;generation;_} ->
+                 id=scope.graph_id && generation=scope.graph_generation
+               | _ -> false) in
+            if not(authorized ()) then Error "Coordination account authority changed" else
+            let response=Db.durable_mutation_for_scope session.worker ~scope ~request_id ~intent
+              ~current:authorized in
+            if authorized () then Ok(Coordination_mutation_result{request_id;outcome=response}) else Error "Coordination binding retired")
+      | Coordination_confirm {registration;owner;presentation;request_id;intent;original} ->
+        (match resolve owner with
+         | None -> Error "The graph session is no longer open."
+         | Some scope ->
+           let current ()=Db.coordination_presentation_current session.worker ~registration ~presentation ~owner &&
+             resolve owner=Some scope &&
+             (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+           if not(current ()) then Error "The confirmation presentation retired."
+           else
+             let response=Db.confirm_mutation_for_scope session.worker ~scope ~request_id
+               ~intent ~original ~current in
+             if current () then Ok(Graph_response response)
+             else Error "The confirmation presentation retired.")
       | Graph_request_at (owner,request) ->
         (match resolve owner with
          | Some scope -> Ok (Graph_response (Db.request_for_scope session.worker ~scope request))

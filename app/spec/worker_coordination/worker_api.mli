@@ -245,6 +245,7 @@ val restore_mutation_intent : session -> bytes -> (mutation_intent, error) resul
 
 type receipt
 type confirmation
+val receipt_intent : receipt -> mutation_intent
 val receipt_mutation_id : receipt -> Uuid.t
 val receipt_revisions : receipt -> string * string * string
 type confirmed_target = private

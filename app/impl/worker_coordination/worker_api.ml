@@ -1,6 +1,7 @@
 module Graph = Logseq_db_types.Graph_types
 module Uuid = Graph.Uuid
 module Protocol = Logseq_db_worker.Protocol
+module Wire = Logseq_db_worker_contract.Mutation_pure_wire
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 
 type account_generation = int
@@ -259,9 +260,14 @@ type mutation_command =
       ; preconditions : Protocol.v2_preconditions
       }
 
-type mutation_intent = |
-type receipt = |
-type confirmation = |
+type mutation_intent = Wire.t
+
+type receipt =
+  { intent : mutation_intent
+  ; generation : string
+  ; before : string
+  ; after : string
+  }
 
 type confirmed_target =
   | Confirmed_block of block_summary
@@ -273,6 +279,13 @@ type confirmed_target =
       ; projection_revision : string
       }
 [@@warning "-37"]
+
+type confirmation =
+  { receipt : receipt
+  ; presentation : presentation
+  ; primary : confirmed_target
+  ; additional : confirmed_target Rrbvec.t
+  }
 
 type mutation_progress =
   | Rejected of error
@@ -534,7 +547,7 @@ let equal_request_id = Uuid.equal
 let capabilities (s : session) =
   { limits = s.limits
   ; atomic_append = false
-  ; durable_mutations = false
+  ; durable_mutations = true
   ; durable_import = false
   ; observations = false
   }
@@ -597,53 +610,80 @@ let encode_append_intent (x : append_intent) =
 ;;
 
 let restore_append_intent _ _ = unavailable "Atomic Append recovery"
-let mutation_intent _ ~mutation_id:_ _ = unavailable "Durable mutation recovery"
 
-let mutation_intent_id (x : mutation_intent) =
-  match x with
-  | _ -> .
+let wire_command ~mutation_id = function
+  | Save_block { block; title; preconditions } ->
+    Protocol.V2_save_block { mutation_id; block; title; preconditions }
+  | Insert_blocks { parent; roots; preconditions } ->
+    Protocol.V2_insert_blocks { mutation_id; parent; roots; preconditions }
+  | Delete_blocks { root; preconditions } ->
+    Protocol.V2_delete_blocks { mutation_id; root; preconditions }
+  | Create_journal { page; day; title; preconditions } ->
+    Protocol.V2_create_journal_page
+      { mutation_id; page; journal_day = day; title; preconditions }
+  | Set_task_status { block; status; preconditions } ->
+    Protocol.V2_set_task_status { mutation_id; block; status; preconditions }
+  | Clear_task_status { block; preconditions } ->
+    Protocol.V2_clear_task_status { mutation_id; block; preconditions }
+  | Set_asset_reference { block; previous; asset; preconditions } ->
+    Protocol.V2_set_asset_reference { mutation_id; block; previous; asset; preconditions }
 ;;
 
-let encode_mutation_intent (x : mutation_intent) =
-  match x with
-  | _ -> .
+let mutation_intent (session : session) ~mutation_id command =
+  Wire.create
+    ~origin:(Uri.of_string session.binding.origin)
+    ~user:session.binding.user
+    ~graph:session.graph
+    (wire_command ~mutation_id command)
+  |> Result.map_error (fun message -> Invalid_input message)
 ;;
 
-let restore_mutation_intent _ _ = unavailable "Durable mutation recovery"
+let mutation_intent_id = Wire.mutation_id
+let encode_mutation_intent intent = Bytes.of_string (Wire.encode intent)
 
-let receipt_mutation_id (x : receipt) =
-  match x with
-  | _ -> .
+let restore_mutation_intent (session : session) bytes =
+  Wire.restore
+    ~origin:(Uri.of_string session.binding.origin)
+    ~user:session.binding.user
+    ~graph:session.graph
+    (Bytes.to_string bytes)
+  |> Result.map_error (fun message -> Invalid_input message)
 ;;
 
-let receipt_revisions (x : receipt) =
-  match x with
-  | _ -> .
+let validate_intent session intent =
+  restore_mutation_intent session (encode_mutation_intent intent)
+  |> Result.map (fun _ -> ())
 ;;
 
-let receipt_targets (x : receipt) =
-  match x with
-  | _ -> .
+let receipt_intent receipt = receipt.intent
+let receipt_mutation_id receipt = Wire.mutation_id receipt.intent
+let receipt_revisions receipt = receipt.generation, receipt.before, receipt.after
+let receipt_targets receipt = Wire.targets receipt.intent
+
+let decode_mutation_receipt session ~request_id ~intent response =
+  Result.bind (validate_intent session intent) (fun () ->
+    if Protocol.encoded_response_bytes response > session.limits.response_budget_bytes
+    then Error Response_budget_exceeded
+    else
+      Wire.committed_point intent ~request_id response
+      |> Result.map (fun point ->
+        { intent
+        ; generation = point.Wire.generation
+        ; before = point.before
+        ; after = point.after
+        })
+      |> Result.map_error (fun message -> Protocol_mismatch message))
 ;;
 
-let confirmation_primary (x : confirmation) =
-  match x with
-  | _ -> .
-;;
+let confirmation_primary confirmation = confirmation.primary
+let confirmation_additional confirmation = confirmation.additional
+let confirmation_receipt confirmation = confirmation.receipt
+let confirmation_presentation confirmation = confirmation.presentation
 
-let confirmation_additional (x : confirmation) =
-  match x with
-  | _ -> .
-;;
-
-let confirmation_receipt (x : confirmation) =
-  match x with
-  | _ -> .
-;;
-
-let confirmation_presentation (x : confirmation) =
-  match x with
-  | _ -> .
+let validate_confirmation session (presentation : presentation) receipt =
+  if not (equal_session session presentation.session)
+  then Error Revoked_session
+  else validate_intent session receipt.intent
 ;;
 
 let compare_observation_epoch = Int64.compare
@@ -898,6 +938,8 @@ let checked_command
 
 let validate_request : type a. session -> a request -> (unit, error) result =
   fun session -> function
+  | Mutate intent -> validate_intent session intent
+  | Confirm (presentation, receipt) -> validate_confirmation session presentation receipt
   | Query (_, Changes _) -> unavailable "Changefeed ownership transfer"
   | Query (budget, query) ->
     Result.bind (checked_command session budget query) (fun command ->
@@ -1057,6 +1099,59 @@ let decode
             })
          (bounded b.windows)
      | _ -> mismatch ())
+;;
+
+let decode_confirmation session ~presentation receipt response =
+  Result.bind (validate_confirmation session presentation receipt) (fun () ->
+    let budget =
+      { owner = session
+      ; maximum_items = Protocol.default_page_size
+      ; maximum_bytes = session.limits.response_budget_bytes
+      }
+    in
+    let response_size = Protocol.encoded_response_bytes response in
+    if response_size > budget.maximum_bytes
+    then Error Response_budget_exceeded
+    else (
+      match response with
+      | Protocol.V2_response { api_version; outcome; _ }
+        when api_version = Protocol.api_version ->
+        let target =
+          match Wire.command receipt.intent with
+          | Protocol.V2_create_journal_page { page; _ } ->
+            decode session budget (Page { uuid = page; revision = None }) outcome
+            |> Result.map (fun page -> Confirmed_page page)
+          | command ->
+            let primary =
+              match command with
+              | Protocol.V2_insert_blocks { roots = root :: _; _ } -> root.uuid
+              | V2_save_block { block; _ }
+              | V2_set_task_status { block; _ }
+              | V2_clear_task_status { block; _ }
+              | V2_set_asset_reference { block; _ } -> block
+              | V2_delete_blocks { root; _ } -> root
+              | _ -> assert false
+            in
+            decode
+              session
+              budget
+              (Block_summary { block = primary; after = None })
+              outcome
+            |> Result.map (fun summary ->
+              match summary.lookup with
+              | Protocol.V2_missing_block { uuid; revision } ->
+                Confirmed_absence
+                  { uuid
+                  ; revision
+                  ; generation = summary.generation
+                  ; projection_revision = summary.projection_revision
+                  }
+              | _ -> Confirmed_block summary)
+        in
+        Result.map
+          (fun primary -> { receipt; presentation; primary; additional = Rrbvec.empty })
+          target
+      | _ -> Error (Protocol_mismatch "Invalid canonical confirmation response")))
 ;;
 
 let validate_baseline (b : Service.coordination_baseline) =
@@ -1396,6 +1491,14 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
              !latest
       ;;
 
+      let presentation_live (presentation : presentation) =
+        live presentation.session
+        && Option.fold
+             ~none:false
+             ~some:(fun projection -> projection.selected = Some presentation)
+             !latest
+      ;;
+
       let request
         : type a.
           session -> request_id:request_id -> a request -> (Service.request, error) result
@@ -1416,6 +1519,31 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                 |> Result.map (fun request ->
                   Service.Coordination_query
                     { registration = binding.serial; owner = session.scope; request })))
+          | Confirm (presentation, receipt) ->
+            if not (presentation_live presentation)
+            then Error Revoked_session
+            else
+              Result.map
+                (fun () ->
+                   Service.Coordination_confirm
+                     { registration = binding.serial
+                     ; owner = session.scope
+                     ; presentation = presentation.generation
+                     ; request_id
+                     ; intent = Wire.encode receipt.intent
+                     ; original = receipt_revisions receipt
+                     })
+                (validate_confirmation session presentation receipt)
+          | Mutate intent ->
+            Result.map
+              (fun () ->
+                 Service.Coordination_mutation
+                   { registration = binding.serial
+                   ; owner = session.scope
+                   ; request_id
+                   ; intent = Wire.encode intent
+                   })
+              (validate_intent session intent)
           | _ -> unavailable "This operation's resource/durability")
       ;;
 
@@ -1441,17 +1569,46 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
               > budget.maximum_bytes
             then Ok (Answered (Error Response_budget_exceeded))
             else Ok (Answered (decode session budget query r.outcome))
+          | ( Confirm (presentation, receipt)
+            , Service.Graph_response (Protocol.V2_response response as raw) )
+            when response.api_version = Protocol.api_version
+                 && Uuid.equal response.request_id request_id ->
+            if not (presentation_live presentation)
+            then Error Revoked_session
+            else
+              decode_confirmation session ~presentation receipt raw
+              |> Result.map (fun confirmation -> Answered (Ok (Confirmed confirmation)))
+          | ( Mutate intent
+            , Service.Coordination_mutation_result { request_id = actual; outcome } )
+            when Uuid.equal request_id actual ->
+            (match outcome with
+             | Wire.Unknown -> Ok (Answered (Ok Outcome_unknown))
+             | Wire.Committed response ->
+               decode_mutation_receipt session ~request_id ~intent response
+               |> Result.map (fun receipt ->
+                 Answered (Ok (Committed_pending_presentation receipt)))
+             | Wire.Rejected
+                 (Protocol.V2_response
+                    { api_version
+                    ; request_id = actual
+                    ; outcome = V2_failed { code; message }
+                    })
+               when api_version = Protocol.api_version && Uuid.equal actual request_id ->
+               Ok (Answered (Ok (Rejected (Service_failed (code ^ ": " ^ message)))))
+             | _ -> Error (Protocol_mismatch "Invalid known mutation rejection"))
           | _ -> Error (Protocol_mismatch "Unexpected owned query receipt"))
       ;;
 
       let observation _ _ _ = unavailable "Observation registration/replay"
       let receipt _ ~request_id:_ ~intent:_ _ = unavailable "Atomic Append receipt"
+      let mutation_receipt = decode_mutation_receipt
 
-      let mutation_receipt _ ~request_id:_ ~intent:_ _ =
-        unavailable "Durable mutation receipt"
+      let confirmation session ~presentation receipt response =
+        if not (presentation_live presentation)
+        then Error Revoked_session
+        else decode_confirmation session ~presentation receipt response
       ;;
 
-      let confirmation _ ~presentation:_ _ _ = unavailable "Canonical confirmation"
       let asset_notice _ _ = unavailable "Asset resource/notification ownership"
     end
     in

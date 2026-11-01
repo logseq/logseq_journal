@@ -816,7 +816,213 @@ let test_compressed_response_ownership () =
   done
 ;;
 
+let test_durable_mutation_properties () =
+  let issuer, _, projection, session = fixture 1901L in
+  let module I = (val issuer : W.ISSUER) in
+  let intent =
+    W.mutation_intent
+      session
+      ~mutation_id:(uuid "98000000-0000-4000-8000-000000000091")
+      (W.Save_block
+         { block = graph
+         ; title = "stable durable choice"
+         ; preconditions =
+             { blocks = [ graph, "block-state:v1:synthetic" ]; pages = []; scopes = [] }
+         })
+    |> Result.get_ok
+  in
+  let wire = W.encode_mutation_intent intent in
+  let run trace =
+    let state = ref (ready I.binding projection)
+    and tickets = ref []
+    and committed = ref false
+    and original_point = ref None in
+    let apply event =
+      let before = C.view !state in
+      let first = C.step !state event
+      and second = C.step !state event in
+      check
+        (C.equal_view (C.view first.next) (C.view second.next))
+        "durable step is nondeterministic";
+      check (C.equal_view before (C.view !state)) "durable step modified shared input";
+      state := first.next;
+      check
+        (W.encode_mutation_intent intent = wire)
+        "unknown write changed durable payload";
+      (match C.intent_progress (C.view !state) intent with
+       | Some (W.Committed_pending_presentation receipt) ->
+         check
+           (W.encode_mutation_intent (W.receipt_intent receipt) = wire)
+           "foreign receipt poisoned durable identity";
+         let point = W.receipt_revisions receipt in
+         (match !original_point with
+          | None -> original_point := Some point
+          | Some original ->
+            check (point = original) "later completion replaced original commit point")
+       | _ -> ());
+      if !committed
+      then (
+        match C.intent_progress (C.view !state) intent with
+        | Some (W.Committed_pending_presentation _ | W.Confirmed _) -> ()
+        | _ -> failwith "committed evidence regressed or vanished")
+    in
+    let with_ticket n f = Option.iter f (List.nth_opt !tickets (n mod 8)) in
+    List.iter
+      (fun (action, n) ->
+         match action with
+         | 0 ->
+           (match C.request !state session (W.Mutate intent) with
+            | Ok (ticket, transition) ->
+              state := transition.next;
+              tickets := ticket :: List.take 7 !tickets
+            | Error _ -> ())
+         | 1 ->
+           with_ticket n (fun ticket ->
+             apply
+               (C.Admitted (ticket, Id.Worker.Request_id.of_int64 (Int64.of_int (n + 100)))))
+         | 2 ->
+           with_ticket n (fun ticket ->
+             apply (C.Completed (ticket, W.Interrupted W.Cancelled)))
+         | 3 -> with_ticket n (fun ticket -> apply (C.Cancel ticket))
+         | 4 -> with_ticket n (fun ticket -> apply (C.Forget ticket))
+         | 5 -> with_ticket n (fun ticket -> apply (C.Admission_refused (ticket, W.Full)))
+         | 6 ->
+           with_ticket n (fun ticket ->
+             apply (C.Completed (ticket, W.Answered (Ok W.Outcome_unknown))))
+         | 7 | 9 | 10 ->
+           with_ticket n (fun ticket ->
+             let receipt_intent =
+               if action <> 9
+               then intent
+               else
+                 W.mutation_intent
+                   session
+                   ~mutation_id:(uuid "98000000-0000-4000-8000-000000000092")
+                   (W.Save_block
+                      { block = graph
+                      ; title = "unrelated durable choice"
+                      ; preconditions =
+                          { blocks = [ graph, "block-state:v1:synthetic" ]
+                          ; pages = []
+                          ; scopes = []
+                          }
+                      })
+                 |> Result.get_ok
+             in
+             let request_id =
+               match
+                 I.request session ~request_id:(C.ticket_id ticket) (W.Mutate intent)
+               with
+               | Ok (S.Coordination_mutation { request_id; _ }) -> request_id
+               | _ -> assert false
+             in
+             let response =
+               P.V2_response
+                 { api_version = P.api_version
+                 ; request_id
+                 ; outcome =
+                     P.V2_mutation_committed
+                       { mutation_id = W.mutation_intent_id receipt_intent
+                       ; status = P.V2_applied
+                       ; generation = "generation:v1:1:1"
+                       ; before_projection_revision = "projection:v1:0"
+                       ; after_projection_revision =
+                           (if action = 10 then "projection:v1:2" else "projection:v1:1")
+                       }
+                 }
+             in
+             let receipt =
+               I.mutation_receipt
+                 session
+                 ~request_id:(C.ticket_id ticket)
+                 ~intent:receipt_intent
+                 response
+               |> Result.get_ok
+             in
+             apply
+               (C.Completed
+                  (ticket, W.Answered (Ok (W.Committed_pending_presentation receipt))));
+             match C.intent_progress (C.view !state) intent with
+             | Some (W.Committed_pending_presentation _ | W.Confirmed _) ->
+               committed := true
+             | _ -> ())
+         | _ ->
+           with_ticket n (fun ticket ->
+             apply
+               (C.Completed
+                  ( ticket
+                  , W.Answered (Ok (W.Rejected (W.Invalid_input "known rejection"))) ))))
+      trace
+  in
+  let prefixes =
+    [ [ 0, 0; 1, 0; 9, 0 ]
+    ; [ 0, 0; 1, 0; 7, 0; 0, 0; 1, 0; 10, 0 ]
+    ; [ 0, 0; 1, 0; 3, 0; 7, 0; 4, 0 ]
+    ; [ 0, 0; 7, 0; 1, 0; 6, 0 ]
+    ; [ 0, 0; 1, 0; 7, 0; 0, 0; 1, 0; 8, 0; 7, 1 ]
+    ; [ 0, 0; 4, 0; 1, 0; 7, 0 ]
+    ]
+  in
+  let fails trace =
+    try
+      run trace;
+      false
+    with
+    | _ -> true
+  in
+  List.iter run prefixes;
+  for seed = 0 to 249 do
+    let random = Random.State.make [| 0xd0a; seed |] in
+    let trace =
+      List.nth prefixes (seed mod List.length prefixes)
+      @ List.init 80 (fun _ -> Random.State.int random 11, Random.State.int random 8)
+    in
+    if fails trace
+    then (
+      let reduced = shrink fails trace in
+      failwith
+        (Printf.sprintf
+           "durable seed=%d shrunk=%s"
+           seed
+           (String.concat
+              ";"
+              (List.map (fun (a, n) -> Printf.sprintf "%d/%d" a n) reduced))))
+  done
+;;
+
+let test_durable_readback_reservation () =
+  let issuer, _, projection, session = fixture 1902L in
+  let module I = (val issuer : W.ISSUER) in
+  let state = ref (ready I.binding projection)
+  and admitted = ref 0 in
+  for n = 1 to 128 do
+    let intent =
+      W.mutation_intent
+        session
+        ~mutation_id:(uuid (Printf.sprintf "98000000-0000-4000-8000-%012d" (1000 + n)))
+        (W.Save_block
+           { block = graph
+           ; title = "bounded readback reservation"
+           ; preconditions =
+               { blocks = [ graph, "block-state:v1:synthetic" ]; pages = []; scopes = [] }
+           })
+      |> Result.get_ok
+    in
+    match C.request !state session (W.Mutate intent) with
+    | Error _ -> ()
+    | Ok (_, transition) ->
+      incr admitted;
+      state := transition.next
+  done;
+  check (!admitted > 0) "durable capacity admitted no legitimate operation";
+  check
+    (!admitted * P.maximum_response_bytes <= 16777216)
+    "bounded intent keys admitted unreserved confirmation snapshots"
+;;
+
 let () =
+  test_durable_readback_reservation ();
+  test_durable_mutation_properties ();
   test_bootstrap_validation ();
   test_cleanup_admission_edges ();
   test_pure_properties ();
@@ -825,6 +1031,6 @@ let () =
   test_queued_query_properties ();
   test_opening_query_retires_on_removal ();
   print_endline
-    "Pure coordinator: invariants, 500 lifecycle + 250 queued-read traces, 100 ownership \
-     traces and shrinking passed"
+    "Pure coordinator: invariants, 500 lifecycle + 250 queued-read + 250 durable traces, \
+     100 ownership traces and shrinking passed"
 ;;

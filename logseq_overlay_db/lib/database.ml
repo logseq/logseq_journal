@@ -60,11 +60,17 @@ type prepared_snapshot_activation =
   ; mutable snapshot_canceled : bool
   }
 
-type write_precondition =
+type write_precondition = Mutation_pure_intent.precondition =
   { blocks : (Graph.block_uuid * Types.block_state_revision) list
   ; pages : (Graph.page_uuid * Types.page_state_revision) list
   ; scopes : (Types.structure_revision_scope * Types.scope_revision) list
   }
+
+type local_intent = Mutation_pure_intent.t
+type intent_commit = Mutation_pure_intent.commit
+type intent_resolution = Intent_pending | Intent_committed of intent_commit
+  | Intent_rejected of Types.local_commit_error
+type local_intent_page = { items : local_intent list; next : int64 option }
 
 type outbox_record = Persistence_outbox_v16.t =
   { mutation_id : Graph.Uuid.t
@@ -5907,7 +5913,57 @@ let open_ ~sw dependencies inspection ~graph_name =
             Error (Types.Open_resource_failed (Printexc.to_string exn)))))
 ;;
 
-let persist_outbox ?(terminal_batches = []) database =
+module Intent_store = Logseq_db_storage.Mutation_effect_store
+
+let intent_store_error = function
+  | Intent_store.Identity_conflict -> Types.Mutation_identity_conflict
+  | Invalid_input message -> Types.Invalid_local_mutation message
+  | Storage_failure message -> Types.Local_commit_persistence_failed message
+;;
+
+let with_intent_store ?(initialize = true) database operation =
+  try
+    let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database.database_path in
+    Fun.protect
+      ~finally:(fun () -> ignore (Sqlite3.db_close sqlite))
+      (fun () ->
+         match if initialize then Intent_store.initialize_database sqlite else Ok () with
+         | Error error -> Error (intent_store_error error)
+         | Ok () -> operation sqlite)
+  with
+  | exn -> Error (Types.Local_commit_persistence_failed (Printexc.to_string exn))
+;;
+
+let inspect_intent_locked database (intent : local_intent) =
+  if not (Graph.Uuid.equal database.graph_uuid intent.graph_uuid)
+  then Error Types.Mutation_identity_conflict
+  else
+    with_intent_store database (fun sqlite ->
+      match
+        Intent_store.read
+          sqlite
+          ~namespace:intent.namespace
+          ~mutation_id:intent.mutation_id
+      with
+      | Error error -> Error (intent_store_error error)
+      | Ok None -> Error (Types.Invalid_local_mutation "Intent was not prepared")
+      | Ok (Some row) when row.payload <> intent.encoded ->
+        Error Types.Mutation_identity_conflict
+      | Ok (Some { evidence = None; _ }) -> Ok Intent_pending
+      | Ok (Some { evidence = Some evidence; _ }) ->
+        let decoded =
+          Result.bind (Mutation_pure_intent.decode_rejection intent evidence) (function
+            | Some error -> Ok (Intent_rejected error)
+            | None ->
+              Result.map
+                (fun proof -> Intent_committed proof)
+                (Mutation_pure_intent.decode_commit intent evidence))
+        in
+        decoded
+        |> Result.map_error (fun message -> Types.Local_commit_persistence_failed message))
+;;
+
+let persist_outbox ?(terminal_batches = []) ?intent_commit database =
   let delta, durable_outbox =
     outbox_write_set database ~revision:database.sync_revision database.outbox
   in
@@ -5919,7 +5975,12 @@ let persist_outbox ?(terminal_batches = []) database =
   in
   let sqlite = Sqlite3.db_open ~mode:`NO_CREATE database.database_path in
   Fun.protect
-    ~finally:(fun () -> (if not (Sqlite3.db_close sqlite) then report_warning "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle code=closePending recovery=reopen\n" ))
+    ~finally:(fun () ->
+      if not (Sqlite3.db_close sqlite)
+      then
+        report_warning
+          "journal: phase=cleanup operation=closeSqlite scope=temporaryStorageHandle \
+           code=closePending recovery=reopen\n")
     (fun () ->
        let rc_result rc =
          if Sqlite3.Rc.is_success rc then Ok () else Error (Sqlite3.errmsg sqlite)
@@ -5946,12 +6007,31 @@ let persist_outbox ?(terminal_batches = []) database =
                   with
                   | Error message -> rollback message
                   | Ok () ->
-                    (match rc_result (Sqlite3.exec sqlite "COMMIT") with
+                    let intent_result =
+                      match intent_commit with
+                      | None -> Ok ()
+                      | Some (proof : intent_commit) ->
+                        Intent_store.commit
+                          sqlite
+                          ~namespace:proof.intent.namespace
+                          ~mutation_id:proof.intent.mutation_id
+                          ~payload:proof.intent.encoded
+                          ~evidence:proof.encoded
+                        |> Result.map (fun _ -> ())
+                        |> Result.map_error (function
+                          | Intent_store.Identity_conflict ->
+                            "Durable intent identity conflict"
+                          | Invalid_input message | Storage_failure message -> message)
+                    in
+                    (match intent_result with
+                     | Error message -> rollback message
                      | Ok () ->
-                       database.durable_outbox <- durable_outbox;
-                       database.durable_sync_revision <- database.sync_revision;
-                       Ok ()
-                     | Error message -> rollback message)))))
+                       (match rc_result (Sqlite3.exec sqlite "COMMIT") with
+                        | Ok () ->
+                          database.durable_outbox <- durable_outbox;
+                          database.durable_sync_revision <- database.sync_revision;
+                          Ok ()
+                        | Error message -> rollback message))))))
 ;;
 
 let serialize_commit database operation =
@@ -5977,119 +6057,319 @@ let serialize_commit database operation =
          outcome))
 ;;
 
-let commit_local database ~expected mutation =
+let commit_local_with_intent ?intent database ~expected mutation =
   serialize_commit database (fun () ->
     let change, outcome =
       Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
-        if database.closed
-        then None, Error Types.Local_database_closed
-        else (
-          match Overlay_planner.validate mutation with
-          | Error message -> None, Error (Types.Invalid_local_mutation message)
-          | Ok () ->
-            let id = mutation_id mutation in
-            let fingerprint = fingerprint mutation in
-            (match existing_mutation database id fingerprint with
-             | Ok (Some existing) -> None, Ok (Types.Local_existing existing)
-             | Error () -> None, Error Types.Mutation_identity_conflict
-             | Ok None ->
-               let context = read_context (snapshot_of_database database) in
-               (match required_preconditions expected mutation with
-                | Error error -> None, Error error
-                | Ok () when not (preconditions_match context expected) ->
-                  None, Error Types.Target_precondition_conflict
-                | Ok () ->
-                  let intent_time_ms = database.dependencies.epoch_ms () in
-                  (match planned_effect database context ~now:intent_time_ms mutation with
-                   | Error error -> None, Error error
-                   | Ok (effect_footprint, delete_artifacts) ->
-                     let candidate_record =
-                       local_candidate_record
-                         database
-                         context
-                         ~fingerprint
-                         ~effect_footprint
-                         ~delete_artifacts
-                         ~intent_time_ms
-                         mutation
-                     in
-                     if not (local_candidate_fits database candidate_record)
-                     then None, Error Types.Planner_limit_exceeded
-                     else (
-                       let previous_projection = database.projection in
-                       let previous_receipts = database.receipts in
-                       let previous_outbox = database.outbox in
-                       let previous_sync_revision = database.sync_revision in
-                       let before = database.projection in
-                       let candidate_after = before + 1 in
-                       let applied = mutation_has_logical_effect context mutation in
-                       let after = if applied then candidate_after else before in
-                       database.projection <- after;
-                       let block_uuids, page_uuids, structure_interests =
-                         change_for_effect effect_footprint
-                       in
-                       let summary =
-                         if applied
-                         then
-                           bounded_logical_summary
-                             database
-                             ~block_uuids
-                             ~page_uuids
-                             ~structure_interests
-                         else Types.No_logical_change
-                       in
-                       let commit =
-                         { Types.mutation_id = id
-                         ; status = (if applied then Applied else No_change)
-                         ; generation = database.generation
-                         ; before_projection_revision = projection_revision before
-                         ; after_projection_revision = projection_revision after
-                         ; logical_change_summary = summary
-                         }
-                       in
-                       if not applied
-                       then
-                         database.receipts
-                         <- (id, fingerprint, Commit_receipt commit) :: database.receipts;
-                       if applied
-                       then (
-                         database.outbox <- database.outbox @ [ candidate_record ];
-                         database.sync_revision <- database.sync_revision + 1);
-                       match persist_outbox database with
-                       | Error message ->
-                         database.projection <- previous_projection;
-                         database.receipts <- previous_receipts;
-                         database.outbox <- previous_outbox;
-                         database.sync_revision <- previous_sync_revision;
-                         None, Error (Types.Local_commit_persistence_failed message)
-                       | Ok () ->
-                         if applied then refresh_queryable_outbox database;
-                         database.receipts <- [];
-                         if not applied
-                         then None, Ok (Types.Local_committed commit)
-                         else (
-                           let change =
-                             match summary with
-                             | Types.Exact_logical_change _ ->
-                               Types.Exact
-                                 { generation = database.generation
-                                 ; before_revision = projection_revision before
-                                 ; after_revision = projection_revision after
-                                 ; block_uuids
-                                 ; page_uuids
-                                 ; structure_interests
-                                 }
-                             | Logical_resync_required reason ->
-                               Projection_resync_required
-                                 { generation = database.generation
-                                 ; after_revision = projection_revision after
-                                 ; reason
-                                 }
-                             | No_logical_change -> assert false
-                           in
-                           Some change, Ok (Types.Local_committed commit))))))))
+        let calculate () =
+          if database.closed
+          then None, Error Types.Local_database_closed
+          else (
+            let prior =
+              match intent with
+              | None -> Ok Intent_pending
+              | Some intent -> inspect_intent_locked database intent
+            in
+            match prior with
+            | Error error -> None, Error error
+            | Ok (Intent_committed proof) ->
+              None, Ok (Types.Local_committed proof.outcome)
+            | Ok (Intent_rejected error) -> None, Error error
+            | Ok Intent_pending ->
+              (match Overlay_planner.validate mutation with
+               | Error message -> None, Error (Types.Invalid_local_mutation message)
+               | Ok () ->
+                 let id = mutation_id mutation in
+                 let fingerprint = fingerprint mutation in
+                 (match existing_mutation database id fingerprint with
+                  | Ok (Some _) when Option.is_some intent ->
+                    None, Error Types.Mutation_identity_conflict
+                  | Ok (Some existing) -> None, Ok (Types.Local_existing existing)
+                  | Error () -> None, Error Types.Mutation_identity_conflict
+                  | Ok None ->
+                    let context = read_context (snapshot_of_database database) in
+                    (match required_preconditions expected mutation with
+                     | Error error -> None, Error error
+                     | Ok () when not (preconditions_match context expected) ->
+                       None, Error Types.Target_precondition_conflict
+                     | Ok () ->
+                       let intent_time_ms = database.dependencies.epoch_ms () in
+                       (match
+                          planned_effect database context ~now:intent_time_ms mutation
+                        with
+                        | Error error -> None, Error error
+                        | Ok (effect_footprint, delete_artifacts) ->
+                          let candidate_record =
+                            local_candidate_record
+                              database
+                              context
+                              ~fingerprint
+                              ~effect_footprint
+                              ~delete_artifacts
+                              ~intent_time_ms
+                              mutation
+                          in
+                          if not (local_candidate_fits database candidate_record)
+                          then None, Error Types.Planner_limit_exceeded
+                          else (
+                            let previous_projection = database.projection in
+                            let previous_receipts = database.receipts in
+                            let previous_outbox = database.outbox in
+                            let previous_sync_revision = database.sync_revision in
+                            let before = database.projection in
+                            let candidate_after = before + 1 in
+                            let applied = mutation_has_logical_effect context mutation in
+                            let after = if applied then candidate_after else before in
+                            database.projection <- after;
+                            let block_uuids, page_uuids, structure_interests =
+                              change_for_effect effect_footprint
+                            in
+                            let summary =
+                              if applied
+                              then
+                                bounded_logical_summary
+                                  database
+                                  ~block_uuids
+                                  ~page_uuids
+                                  ~structure_interests
+                              else Types.No_logical_change
+                            in
+                            let commit =
+                              { Types.mutation_id = id
+                              ; status = (if applied then Applied else No_change)
+                              ; generation = database.generation
+                              ; before_projection_revision = projection_revision before
+                              ; after_projection_revision = projection_revision after
+                              ; logical_change_summary = summary
+                              }
+                            in
+                            if not applied
+                            then
+                              database.receipts
+                              <- (id, fingerprint, Commit_receipt commit)
+                                 :: database.receipts;
+                            if applied
+                            then (
+                              database.outbox <- database.outbox @ [ candidate_record ];
+                              database.sync_revision <- database.sync_revision + 1);
+                            let persisted =
+                              match intent with
+                              | None -> persist_outbox database
+                              | Some intent ->
+                                (match Mutation_pure_intent.committed intent commit with
+                                 | Error message -> Error message
+                                 | Ok intent_commit ->
+                                   persist_outbox ~intent_commit database)
+                            in
+                            match persisted with
+                            | Error message ->
+                              database.projection <- previous_projection;
+                              database.receipts <- previous_receipts;
+                              database.outbox <- previous_outbox;
+                              database.sync_revision <- previous_sync_revision;
+                              None, Error (Types.Local_commit_persistence_failed message)
+                            | Ok () ->
+                              if applied then refresh_queryable_outbox database;
+                              database.receipts <- [];
+                              if not applied
+                              then None, Ok (Types.Local_committed commit)
+                              else (
+                                let change =
+                                  match summary with
+                                  | Types.Exact_logical_change _ ->
+                                    Types.Exact
+                                      { generation = database.generation
+                                      ; before_revision = projection_revision before
+                                      ; after_revision = projection_revision after
+                                      ; block_uuids
+                                      ; page_uuids
+                                      ; structure_interests
+                                      }
+                                  | Logical_resync_required reason ->
+                                    Projection_resync_required
+                                      { generation = database.generation
+                                      ; after_revision = projection_revision after
+                                      ; reason
+                                      }
+                                  | No_logical_change -> assert false
+                                in
+                                Some change, Ok (Types.Local_committed commit))))))))
+        in
+        let change, outcome = calculate () in
+        match intent, outcome with
+        | Some intent, Error Types.Mutation_identity_conflict
+          when match
+                 existing_mutation
+                   database
+                   intent.mutation_id
+                   (fingerprint intent.mutation)
+               with
+               | Ok (Some _) -> true
+               | _ -> false ->
+          (* A legacy same-payload receipt can prove that a write happened, but
+             did not persist its original point. It proves neither a new commit
+             point nor non-application of this stable intent. Keep recovery pending. *)
+          change, outcome
+        | Some intent, Error error when not database.closed ->
+          (match Mutation_pure_intent.rejection intent error with
+           | None -> change, outcome
+           | Some evidence ->
+             (match
+                with_intent_store database (fun sqlite ->
+                  Intent_store.commit
+                    sqlite
+                    ~namespace:intent.namespace
+                    ~mutation_id:intent.mutation_id
+                    ~payload:intent.encoded
+                    ~evidence
+                  |> Result.map (fun _ -> ())
+                  |> Result.map_error intent_store_error)
+              with
+              | Ok () -> change, outcome
+              | Error error -> None, Error error))
+        | _ -> change, outcome)
     in
     change, outcome)
+;;
+
+let commit_local database ~expected mutation =
+  commit_local_with_intent database ~expected mutation
+;;
+
+let local_intent_id (intent : local_intent) = intent.mutation_id
+let local_intent_payload (intent : local_intent) = intent.payload
+let intent_commit_outcome (proof : intent_commit) = proof.outcome
+let intent_commit_targets (proof : intent_commit) = proof.intent.targets
+
+let persist_local_intent database ~namespace ~payload ~expected mutation =
+  match
+    Mutation_pure_intent.create
+      ~namespace
+      ~graph_uuid:database.graph_uuid
+      ~payload
+      ~expected
+      mutation
+  with
+  | Error message -> Error (Types.Invalid_local_mutation message)
+  | Ok intent ->
+    Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
+      if database.closed
+      then Error Types.Local_database_closed
+      else
+        with_intent_store database (fun sqlite ->
+          Intent_store.prepare
+            sqlite
+            ~namespace
+            ~mutation_id:intent.mutation_id
+            ~payload:intent.encoded
+          |> Result.map (fun _ -> intent)
+          |> Result.map_error intent_store_error))
+;;
+
+let find_local_intent database ~namespace ~mutation_id =
+  Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
+    if database.closed
+    then Error Types.Local_database_closed
+    else
+      with_intent_store ~initialize:false database (fun sqlite ->
+        match Intent_store.read sqlite ~namespace ~mutation_id with
+        | Error error -> Error (intent_store_error error)
+        | Ok None -> Ok None
+        | Ok (Some row) ->
+          Mutation_pure_intent.decode
+            ~namespace
+            ~graph_uuid:database.graph_uuid
+            row.payload
+          |> Result.map Option.some
+          |> Result.map_error (fun message ->
+            Types.Local_commit_persistence_failed message)))
+;;
+
+let inspect_local_intent database intent =
+  Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
+    if database.closed
+    then Error Types.Local_database_closed
+    else inspect_intent_locked database intent)
+;;
+
+let commit_local_intent database (intent : local_intent) =
+  match
+    commit_local_with_intent ~intent database ~expected:intent.expected intent.mutation
+  with
+  | Error error -> Error error
+  | Ok _ ->
+    (match inspect_local_intent database intent with
+     | Ok (Intent_committed proof) -> Ok proof
+     | Ok (Intent_rejected error) -> Error error
+     | Ok Intent_pending ->
+       Error (Types.Local_commit_persistence_failed "Missing atomic commit evidence")
+     | Error error -> Error error)
+;;
+
+let pending_local_intents database ~namespace ~after ~limit =
+  Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
+    if database.closed
+    then Error Types.Local_database_closed
+    else
+      with_intent_store database (fun sqlite ->
+        match Intent_store.pending sqlite ~namespace ~after ~limit with
+        | Error error -> Error (intent_store_error error)
+        | Ok page ->
+          let decode (row : Intent_store.record) =
+            Mutation_pure_intent.decode
+              ~namespace
+              ~graph_uuid:database.graph_uuid
+              row.payload
+            |> Result.map_error (fun message ->
+              Types.Local_commit_persistence_failed message)
+            |> fun result ->
+            Result.bind result (fun intent ->
+              if Graph.Uuid.equal row.mutation_id intent.mutation_id
+              then Ok intent
+              else Error Types.Mutation_identity_conflict)
+          in
+          let rec decode_all = function
+            | [] -> Ok []
+            | row :: rest ->
+              Result.bind (decode row) (fun intent ->
+                Result.map (fun rest -> intent :: rest) (decode_all rest))
+          in
+          Result.map (fun items -> { items; next = page.next }) (decode_all page.items)))
+;;
+
+let acknowledge_rejected_local_intent database (intent : local_intent) =
+  Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
+    if database.closed
+    then Error Types.Local_database_closed
+    else (
+      match inspect_intent_locked database intent with
+      | Ok (Intent_rejected error) ->
+        let evidence = Mutation_pure_intent.rejection intent error |> Option.get in
+        with_intent_store database (fun sqlite ->
+          Intent_store.acknowledge
+            sqlite
+            ~namespace:intent.namespace
+            ~mutation_id:intent.mutation_id
+            ~evidence
+          |> Result.map_error intent_store_error)
+      | Ok _ -> Error (Types.Invalid_local_mutation "Intent has no settled rejection")
+      | Error error -> Error error))
+;;
+
+let acknowledge_local_intent database (proof : intent_commit) =
+  Eio.Mutex.use_rw ~protect:true database.lock (fun () ->
+    if database.closed
+    then Error Types.Local_database_closed
+    else if not (Graph.Uuid.equal database.graph_uuid proof.intent.graph_uuid)
+    then Error Types.Mutation_identity_conflict
+    else
+      with_intent_store database (fun sqlite ->
+        Intent_store.acknowledge
+          sqlite
+          ~namespace:proof.intent.namespace
+          ~mutation_id:proof.intent.mutation_id
+          ~evidence:proof.encoded
+        |> Result.map_error intent_store_error))
 ;;
 
 let retry_blocked database ~expected ~mutation_id =
