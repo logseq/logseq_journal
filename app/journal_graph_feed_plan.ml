@@ -851,7 +851,7 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
     | Some day -> day_failure ~day request_generation "The root limit must be positive.")
   else if Option.exists (fun (_,cursor) -> Option.exists (fun cursor ->
       match cursor.Projection.protocol_cursor with
-        | Some (Projection.Child_cursor _ | Projection.Legacy_tree_cursor _) -> true
+        | Some (Projection.Child_cursor _) -> true
         | Some (Projection.Root_tree_cursor _) | None -> false) cursor) after
   then (match start_day with
     | Some day -> day_failure ~day request_generation "A Detail child cursor cannot continue Timeline roots."
@@ -905,7 +905,7 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
       continue_root_batch t ~ports (Feed_roots scan) page
         (Option.bind cursor (fun c -> match c.Projection.protocol_cursor with
           | Some (Projection.Root_tree_cursor cursor)->Some cursor
-          | Some (Projection.Legacy_tree_cursor _ | Projection.Child_cursor _) | None->None))
+          | Some (Projection.Child_cursor _) | None->None))
         scan.root_page_size)
 ;;
 let failure_scope = function
@@ -1102,5 +1102,7 @@ let has_initial_feed t = Option.is_some t.initial_feed_spec
 let refresh_initial t ~ports ~request_generation =
   Option.map (fun (root_limit,day_limit) -> load_feed t ~ports ~cursor:None ~root_limit ~day_limit ~request_generation)
     t.initial_feed_spec
-let reconcile_retained t ~ports ~page ~limit =
-  if Hashtbl.mem t.root_pages page.Projection.id then Some (read_changed_roots t ~ports page limit) else None
+let reconcile_page t ~ports ~page ~limit =
+  match Graph.Uuid.of_string page.Projection.id with
+  | Error _ -> None
+  | Ok _ -> Some (read_changed_roots t ~ports page limit)

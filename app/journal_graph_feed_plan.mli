@@ -60,7 +60,7 @@ val load_feed : t -> ports:ports -> cursor:Projection.feed_cursor option -> root
 val load_day : t -> ports:ports -> page:Projection.page -> after:Projection.block_cursor option -> limit:int -> request_generation:int64 -> output
 val refresh_initial : t -> ports:ports -> request_generation:int64 -> output option
 val has_initial_feed : t -> bool
-val reconcile_retained : t -> ports:ports -> page:Projection.page -> limit:int -> Protocol.request option
+val reconcile_page : t -> ports:ports -> page:Projection.page -> limit:int -> Protocol.request option
 
 type child_request =
   { parent : Graph.Uuid.t

@@ -26,6 +26,7 @@ type planning = (Protocol.request, string) result
 type step =
   | Continue of planning
   | Confirmed of confirmation
+  | Absent of {purpose:purpose; block_id:string}
   | Failed of string
 
 type ports =

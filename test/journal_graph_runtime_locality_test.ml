@@ -1298,12 +1298,10 @@ let test_status_failure_conversion () =
            0
            (List.length output.responses);
          match (only "conflict refresh" output.requests).command with
-         | Protocol.V2_get_page_tree { page; _ } ->
-           Alcotest.(check string)
-             "conflicted page"
-             (Graph.Uuid.to_string page_uuid)
-             (Graph.Uuid.to_string page)
-         | _ -> Alcotest.fail "Conflict did not refresh its page tree")
+         | Protocol.V2_get_outline_block_summary { block; _ } ->
+           Alcotest.(check string) "conflicted target"
+             (Graph.Uuid.to_string block_uuid) (Graph.Uuid.to_string block)
+         | _ -> Alcotest.fail "Conflict did not read its canonical target")
        else (
          Alcotest.(check int)
            "non-conflict does not refresh as a conflict"
@@ -1530,8 +1528,7 @@ let check_target_summary (request : Protocol.request) cursor =
 
 let test_paged_mutation_refresh kind result =
   let runtime, page, refresh = prepare_paged_refresh kind in
-  if kind = Capture || kind = Update
-  then (
+  (
     check_target_summary refresh None;
     let target =
       { record with
@@ -1597,109 +1594,42 @@ let test_paged_mutation_refresh kind result =
         "cursor failure category is preserved"
         true
         (Logseq_db_worker.Error.code failure.error = Stale_read_cursor)
+    | Found, Update_conflict, Update_conflict {block=actual;_}
+    | Found, Delete_conflict, Delete_conflict {block=actual;_} ->
+      Alcotest.(check string) "canonical conflicted target"
+        "Committed target" (Journal_model.source actual)
+    | Missing, Delete_conflict, Subtree_deleted {deleted_count=0;_} -> ()
     | Missing, _, Mutation_failed _ -> ()
     | _ -> Alcotest.fail "unexpected canonical mutation completion")
+;;
+
+
+let test_conflict_missing_after_empty_more changed_version () =
+  let runtime, page, first = prepare_paged_refresh Delete_conflict in
+  let cursor = Graph.Cursor.of_string "empty-present-prefix" |> Result.get_ok in
+  let prefix = Runtime.receive runtime
+    (summary_response first page (V2_present_block {value=record;revision="target-2"})
+      [] (Some cursor) "projection-2") in
+  let next = only "empty More target continuation" prefix.requests in
+  let missing request revision = summary_response request page
+    (V2_missing_block {uuid=block_uuid;revision="missing-2"}) [] None revision in
+  let output = Runtime.receive runtime
+    (missing next (if changed_version then "projection-3" else "projection-2")) in
+  if changed_version then (
+    Alcotest.(check int) "version change cannot confirm continuation absence" 0
+      (List.length output.responses);
+    let fresh = only "fresh target read after version change" output.requests in
+    check_target_summary fresh None;
+    let final = Runtime.receive runtime (missing fresh "projection-3") in
+    match (only "fresh complete absence" final.responses).payload with
+    | Subtree_deleted {deleted_count=0;_} -> ()
+    | _ -> Alcotest.fail "fresh authoritative absence was not accepted")
   else (
-    let cursor = Graph.Cursor.of_string "next-root-page" |> Result.get_ok in
-    (* A valid full page of earlier roots does not contain the requested target. *)
-    let members = earlier_members page in
-    let prefix =
-      List.filteri (fun index _ -> index < Protocol.maximum_page_size) members
-    in
-    let tail = List.nth members Protocol.maximum_page_size in
-    let first =
-      Runtime.receive
-        runtime
-        (response
-           refresh
-           (V2_page_tree_outcome
-              { page = page.uuid
-              ; maximum_depth = 1
-              ; items = prefix
-              ; next_cursor = Some cursor
-              }))
-    in
-    Alcotest.(check int)
-      "a partial prefix cannot complete or reject the mutation"
-      0
-      (List.length first.responses);
-    let continuation = only "next authoritative page" first.requests in
-    (match continuation.command with
-     | V2_get_page_tree { page = actual; cursor = Some actual_cursor; _ } ->
-       Alcotest.(check bool) "same journal" true (Graph.Uuid.equal actual page.uuid);
-       Alcotest.(check string)
-         "opaque cursor forwarded"
-         (Graph.Cursor.to_string cursor)
-         (Graph.Cursor.to_string actual_cursor)
-     | _ ->
-       Alcotest.fail "refresh did not continue its read without replaying the mutation");
-    let target =
-      { block with
-        page = page.uuid
-      ; parent = page.uuid
-      ; order = "a1"
-      ; title = "Committed target"
-      }
-    in
-    let completed =
-      Runtime.receive
-        runtime
-        (response
-           continuation
-           (match result with
-            | Cursor_failed ->
-              V2_failed
-                { code = Logseq_db_worker.Error.code_string Stale_read_cursor
-                ; message = "The graph changed during refresh"
-                }
-            | Found | Missing ->
-              V2_page_tree_outcome
-                { page = page.uuid
-                ; maximum_depth = 1
-                ; items =
-                    (if result = Missing
-                     then [ tail ]
-                     else
-                       [ tail
-                       ; { value = { record with block = target }
-                         ; revision = "target-2"
-                         ; depth = 0
-                         ; parent = page.uuid
-                         }
-                       ])
-                ; next_cursor = None
-                }))
-    in
-    Alcotest.(check int) "terminal page stops reading" 0 (List.length completed.requests);
-    let first_response = List.hd completed.responses in
-    match result, kind, first_response.payload with
-    | Cursor_failed, _, Mutation_failed { failure = Worker_failure failure; _ } ->
-      Alcotest.(check bool)
-        "cursor failure category is preserved"
-        true
-        (Logseq_db_worker.Error.code failure.error = Stale_read_cursor)
-    | Missing, Delete_conflict, Subtree_deleted { deleted_count = 0; _ } -> ()
-    | ( Missing
-      , (Capture | Update | Update_conflict)
-      , Mutation_failed { failure = Projection_failure _; _ } ) -> ()
-    | Found, Capture, Block_captured { block = actual; _ }
-    | Found, Update, Block_updated { block = actual; _ }
-    | Found, Update_conflict, Update_conflict actual
-    | Found, Delete_conflict, Delete_conflict actual ->
-      Alcotest.(check string)
-        "authoritative target"
-        "Committed target"
-        (Journal_model.source actual);
-      if kind = Delete_conflict
-      then (
-        match List.tl completed.responses with
-        | [ { payload = Page_tree_reconciled { value; _ } } ] ->
-          Alcotest.(check int)
-            "reconciliation retains the entire prefix"
-            (Protocol.maximum_page_size + 2)
-            (List.length value.entries)
-        | _ -> Alcotest.fail "delete conflict omitted prefix reconciliation")
-    | _ -> Alcotest.fail "unexpected paged mutation completion")
+    Alcotest.(check int) "contradictory chain does not continue" 0
+      (List.length output.requests);
+    match (only "contradictory target response" output.responses).payload with
+    | Mutation_failed _ -> ()
+    | _ -> Alcotest.fail "same-version present prefix became successful absence")
 ;;
 
 (* F3 is owned by the public Runtime request/completion boundary. The original
@@ -1709,6 +1639,8 @@ let target_refresh kind =
   match kind with
   | `Capture -> prepare_paged_refresh Capture
   | `Update -> prepare_paged_refresh Update
+  | `Update_conflict -> prepare_paged_refresh Update_conflict
+  | `Delete_conflict -> prepare_paged_refresh Delete_conflict
   | `Status ->
     let runtime = Runtime.create ~localtime:Unix.gmtime () in
     seed_feed runtime;
@@ -2232,8 +2164,11 @@ let test_target_confirmation_retains_page_interest completed =
   in
   require_ack output;
   match hydration_requests output with
-  | [ { Protocol.command = V2_get_page_tree { page = actual; maximum_depth = 1; _ }; _ } ]
+  | [ ({ Protocol.command = V2_get_page_tree { page = actual; maximum_depth = 0; _ }; _ } as request) ]
     ->
+    (match Production_runtime.worker_read runtime request with
+     | Some (Production_runtime.Read {query = Worker_producer.W.Tree {maximum_depth=0;_};_}) -> ()
+     | _ -> Alcotest.fail "new Capture page refresh escaped typed Tree ownership");
     Alcotest.(check bool)
       "new Capture page remains subscribed to structural changes"
       true
@@ -4523,20 +4458,6 @@ let test_bounded_preview_tree_paths () =
    | Page_tree_reconciled { value; _ } ->
      check_preview 3 (only "remote entry" value.entries)
    | _ -> Alcotest.fail "preview remote result lost owner");
-  (* Delete conflict exercises the legacy page-tree refresh projection rather
-     than canonical target-summary confirmation. *)
-  let runtime, _, refresh = prepare_paged_refresh Delete_conflict in
-  let legacy = Runtime.receive runtime (tree_page refresh items None) in
-  let value =
-    List.find_map
-      (fun r ->
-         match r.Runtime.payload with
-         | Page_tree_reconciled { value; _ } -> Some value
-         | _ -> None)
-      legacy.responses
-    |> Option.get
-  in
-  check_preview count (only "legacy refresh entry" value.entries)
 ;;
 
 let test_bounded_preview_target_pages kind count () =
@@ -4589,7 +4510,9 @@ let test_bounded_preview_target_pages kind count () =
       (fun r ->
          match r.Runtime.payload with
          | Block_captured { timeline_entry_update = Some entry; _ }
-         | Block_updated { timeline_entry_update = Some entry; _ } -> Some entry
+         | Block_updated { timeline_entry_update = Some entry; _ }
+         | Update_conflict {timeline_entry_update=Some entry;_}
+         | Delete_conflict {timeline_entry_update=Some entry;_} -> Some entry
          | _ -> None)
       output.responses
     |> Option.get
@@ -4944,18 +4867,6 @@ let test_parent_visibility_tree_paths () =
    with
    | Page_tree_reconciled { value; _ } -> check_parent_visibility roots value.entries
    | _ -> Alcotest.fail "visibility remote owner lost");
-  let runtime, _, refresh = prepare_paged_refresh Delete_conflict in
-  let output = Runtime.receive runtime (tree_page refresh items None) in
-  let entries =
-    List.find_map
-      (fun r ->
-         match r.Runtime.payload with
-         | Page_tree_reconciled { value; _ } -> Some value.entries
-         | _ -> None)
-      output.responses
-    |> Option.get
-  in
-  check_parent_visibility roots entries
 ;;
 
 let test_parent_visibility_confirmations () =
@@ -4985,7 +4896,9 @@ let test_parent_visibility_confirmations () =
                 (fun r ->
                    match r.Runtime.payload with
                    | Block_captured { block; timeline_entry_update }
-                   | Block_updated { block; timeline_entry_update } ->
+                   | Block_updated { block; timeline_entry_update }
+                   | Update_conflict {block;timeline_entry_update}
+                   | Delete_conflict {block;timeline_entry_update} ->
                      Some (block, timeline_entry_update)
                    | _ -> None)
                 output.responses
@@ -5007,7 +4920,7 @@ let test_parent_visibility_confirmations () =
             (fun index (v, _) -> v, index)
             (let roots, _, _ = parent_visibility_fixture page in
              roots)))
-    [ `Capture; `Update; `Status ]
+    [ `Capture; `Update; `Status; `Update_conflict; `Delete_conflict ]
 ;;
 
 
@@ -9134,6 +9047,8 @@ let () =
         ; Alcotest.test_case "Capture 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Capture 10050)
         ; Alcotest.test_case "Update 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Update 10050)
         ; Alcotest.test_case "Status 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Status 10050)
+        ; Alcotest.test_case "Update conflict 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Update_conflict 10050)
+        ; Alcotest.test_case "Delete conflict 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Delete_conflict 10050)
         ; Alcotest.test_case "Detail and Copy remain complete" `Quick test_preview_preserves_full_detail_and_copy
         ])
     ; ( "journal window budget"
@@ -9278,6 +9193,10 @@ let () =
         ] )
     ; ( "target mutation confirmation"
       , [ Alcotest.test_case "summary uses owned Worker query" `Quick test_target_summary_uses_owned_worker_query
+        ; Alcotest.test_case "conflict missing after empty More rejected" `Quick
+            (test_conflict_missing_after_empty_more false)
+        ; Alcotest.test_case "conflict changed version retries before absence" `Quick
+            (test_conflict_missing_after_empty_more true)
         ; Alcotest.test_case
             "Capture targeted canonical block and children"
             `Quick

@@ -413,21 +413,15 @@ let test_status_conflict_refreshes_authoritative_block () =
     |> fun output -> only "status conflict refresh" output.requests
   in
   let output =
-    Runtime.receive
-      runtime
-      (respond
-         refresh
-         (Protocol.V2_page_tree_outcome
-            { page = page_uuid
-            ; maximum_depth = 1
-            ; items =
-                [ { value = record; revision = "block-2"; depth = 0; parent = page_uuid }
-                ]
-            ; next_cursor = None
-            }))
+    Read_fixture.receive runtime refresh
+      (respond refresh (Protocol.V2_block_summary_outcome
+        {lookup=V2_present_block {value=record;revision="block-2"};
+         page=Some (V2_present_page {page;revision="page-1"});
+         items=[];next_cursor=None;scope_revision="children-1";
+         generation="graph-1";projection_revision="projection-2"}))
   in
   match output.responses with
-  | [ { Runtime.payload = Update_conflict latest } ] ->
+  | [ { Runtime.payload = Update_conflict {block=latest;_} } ] ->
     Alcotest.(check string)
       "authoritative conflict revision"
       "block-2"

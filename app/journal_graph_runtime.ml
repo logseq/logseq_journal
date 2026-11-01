@@ -124,14 +124,14 @@ type payload =
       }
   | Projection_unavailable of [ `Detail_calendar | `Detail_time | `Detail ]
   | Children_reconciled of Projection.detail
-  | Update_conflict of Projection.block
+  | Update_conflict of {block:Projection.block;timeline_entry_update:Projection.timeline_entry option}
   | Subtree_deleted of
       { block_id : string
       ; deleted_count : int
       ; parent : Projection.block option
       ; timeline_entry_update : Projection.timeline_entry option
       }
-  | Delete_conflict of Projection.block
+  | Delete_conflict of {block:Projection.block;timeline_entry_update:Projection.timeline_entry option}
   | Block_found of Projection.block option
   | Feed_refresh_started of { request_generation : int64 }
   | Feed_loaded of
@@ -268,12 +268,6 @@ type operation =
       ; page : Projection.page
       }
   | Target_summary of Confirmation.read
-  | Refresh_page_tree of
-      { page : Projection.page
-      ; refresh : refresh
-      ; retained_rev : Projection.tree_member list
-      }
-  | Changed_page_tree of Projection.page
   | Mutation_refresh of
       { page : Projection.page
       ; refresh : refresh
@@ -575,22 +569,6 @@ let remember_block_page t page block_id =
           t.block_pages
 ;;
 
-let remember_entries t page entries =
-  List.iter
-    (fun (entry : Projection.timeline_entry) ->
-       let block_id = Journal_model.id entry.block in
-       remember_block_page t page block_id;
-       Hashtbl.replace t.projected_blocks block_id entry.block)
-    entries
-;;
-
-let remember_tree_items t page items =
-  List.iter
-    (fun (item : Projection.tree_member) ->
-       remember_block_page t page (Graph.Uuid.to_string item.block.uuid))
-    items
-;;
-
 let remember_blocks t page blocks =
   List.iter
     (fun (member : Projection.block_member) ->
@@ -668,19 +646,6 @@ let journal_title ~format day =
 ;;
 
 let reject message = responses [ response (Rejected (Projection_failure message)) ]
-
-let page_tree t operation page ?cursor limit =
-  match parse_uuid "page UUID" page.Projection.id with
-  | Error message -> Error message
-  | Ok page_uuid ->
-    Hashtbl.replace t.page_tree_interests page.id { page; limit };
-    Ok
-      (read
-         t
-         operation
-         (Protocol.V2_get_page_tree
-            { page = page_uuid; maximum_depth = 1; limit; cursor; revision = None }))
-;;
 
 (* Admission identity follows only direct continuations of this operation.
    Reference reconciliation and queued background hydration are merged later. *)
@@ -839,7 +804,7 @@ let submit_unowned t (request : Journal_graph_request.t) =
   | Load_detail { block_id; request_generation; limit; after } ->
     let cursor = Option.bind after (fun cursor -> cursor.Projection.protocol_cursor) in
     let parsed = match cursor with
-      | Some (Projection.Legacy_tree_cursor _ | Projection.Root_tree_cursor _) -> Error "A Timeline cursor cannot continue Detail children."
+      | Some (Projection.Root_tree_cursor _) -> Error "A Timeline cursor cannot continue Detail children."
       | Some (Projection.Child_cursor {maximum_items;_}) when maximum_items<=0 || maximum_items>Protocol.maximum_page_size ->
         Error "The Detail continuation budget is invalid."
       | Some (Projection.Child_cursor _) | None -> parse_uuid "block UUID" block_id in
@@ -1059,18 +1024,6 @@ let plan_request t (request : Journal_graph_request.t) =
   scope_output t owner (submit_unowned t request)
 ;;
 
-let request_refresh t page refresh =
-  match
-    page_tree
-      t
-      (Refresh_page_tree { page; refresh; retained_rev = [] })
-      page
-      Protocol.maximum_page_size
-  with
-  | Ok request -> requests [ request ]
-  | Error message -> reject message
-;;
-
 let confirmation_ports t =
   Confirmation.
     { now = (fun () -> t.next_request)
@@ -1217,110 +1170,6 @@ let continue_capture t (command : Projection.capture) page =
              (Capture_block { command; page })
              (Protocol.V2_get_outline_block { block; revision = None })
          ])
-;;
-
-let refresh_response t page refresh result =
-  match projection_time_context t with
-  | Error message -> reject message
-  | Ok time_context ->
-    (match
-       Projection.timeline_entry_page
-         ~tag_titles:(fun uuid ->
-           Option.value
-             (Hashtbl.find_opt t.tag_titles (Graph.Uuid.to_string uuid))
-             ~default:[])
-         ~page
-         ~time_context
-         result
-     with
-     | Error message -> reject message
-     | Ok projected ->
-       remember_entries t page projected.entries;
-       let find id =
-         List.find_opt
-           (fun (entry : Projection.timeline_entry) ->
-              String.equal (Journal_model.id entry.block) id)
-           projected.entries
-       in
-       (* Timeline filters parents without their own text, tags or attachments.
-          Confirm an invisible committed block from complete raw members. *)
-       let project_invisible ~block_id ~missing ~complete =
-         match
-           List.find_opt
-             (fun (item : Projection.tree_member) ->
-                String.equal (Graph.Uuid.to_string item.block.uuid) block_id)
-             result.items
-         with
-         | None -> reject missing
-         | Some item ->
-           let child_count =
-             List.length
-               (List.filter
-                  (fun (child : Projection.tree_member) ->
-                     child.depth = 1
-                     && String.equal (Graph.Uuid.to_string child.block.parent) block_id)
-                  result.items)
-           in
-           (match
-              Projection.block
-                ~page
-                ~revision:item.revision
-                ~child_count
-                ~time_context
-                item.block
-            with
-            | Error message -> reject message
-            | Ok block -> responses [ response (complete block) ])
-       in
-       (match refresh with
-        | Captured { block_id } ->
-          (match find block_id with
-           | Some entry ->
-             responses
-               [ response
-                   (Block_captured
-                      { block = entry.block; timeline_entry_update = Some entry })
-               ]
-           | None ->
-             project_invisible
-               ~block_id
-               ~missing:"The captured block was not visible after commit."
-               ~complete:(fun block ->
-                 Block_captured { block; timeline_entry_update = None }))
-        | Updated { block_id } ->
-          (match find block_id with
-           | Some entry ->
-             responses
-               [ response
-                   (Block_updated
-                      { block = entry.block; timeline_entry_update = Some entry })
-               ]
-           | None ->
-             project_invisible
-               ~block_id
-               ~missing:"The updated block was not visible after commit."
-               ~complete:(fun block ->
-                 Block_updated { block; timeline_entry_update = None }))
-        | Delete_conflict_refresh { block_id } ->
-          let completion =
-            match find block_id with
-            | Some entry -> Delete_conflict entry.block
-            | None ->
-              Subtree_deleted
-                { block_id
-                ; deleted_count = 0
-                ; parent = None
-                ; timeline_entry_update = None
-                }
-          in
-          responses
-            [ response completion
-            ; response (Page_tree_reconciled { page; value = projected })
-            ]
-        | Update_conflict_refresh { block_id } ->
-          (match find block_id with
-           | Some entry -> responses [ response (Update_conflict entry.block) ]
-           | None -> reject "The conflicted block was not visible during reconciliation.")))
 ;;
 
 let append_unique equal value values =
@@ -1519,9 +1368,8 @@ let hydration_for_changes t ~request_generation windows =
       (function
         | Protocol.V2_page_tree_interest page ->
           Option.bind (registered_tree t page) (fun interest ->
-            match Feed.reconcile_retained t.feed ~ports:(feed_ports t) ~page:interest.page ~limit:interest.limit with
-            | Some request -> Some request
-            | None -> page_tree t (Changed_page_tree interest.page) interest.page interest.limit |> Result.to_option)
+            Feed.reconcile_page t.feed ~ports:(feed_ports t)
+              ~page:interest.page ~limit:interest.limit)
         | V2_children_interest _ | V2_journal_index_interest -> None)
       structures
   in
@@ -1622,23 +1470,8 @@ let rehydrate_current_interests t ~request_generation ~generation =
     Hashtbl.to_seq_values t.page_tree_interests
     |> List.of_seq
     |> List.filter_map (fun (interest : page_tree_interest) ->
-      match parse_uuid "page UUID" interest.page.Projection.id with
-      | Error _ -> None
-      | Ok page ->
-        (match Feed.reconcile_retained t.feed ~ports:(feed_ports t) ~page:interest.page ~limit:interest.limit with
-        | Some request -> Some request
-        | None ->
-        Some
-          (read
-             t
-             (Changed_page_tree interest.page)
-             (Protocol.V2_get_page_tree
-                { page
-                ; maximum_depth = 1
-                ; limit = interest.limit
-                ; cursor = None
-                ; revision = None
-                }))))
+      Feed.reconcile_page t.feed ~ports:(feed_ports t)
+        ~page:interest.page ~limit:interest.limit)
   in
   let children_requests =
     Hashtbl.to_seq t.children_interests
@@ -1790,13 +1623,12 @@ let complete_child t (command : Projection.create_child) (page : Graph.page)
       let completion = response (Child_created {child;parent;timeline_entry_update=None}) in
       let refresh = match page_by_uuid t page.uuid with
         | None -> empty
-           | Some page ->
-             (match
-                page_tree t (Changed_page_tree page) page Protocol.maximum_page_size
-              with
-              | Ok request -> requests [ request ]
-              | Error _ -> empty)
-         in
+        | Some page ->
+          (match Feed.reconcile_page t.feed ~ports:(feed_ports t) ~page
+            ~limit:Protocol.maximum_page_size with
+           | Some request -> requests [request]
+           | None -> empty)
+      in
       {refresh with responses=completion::refresh.responses}
        | Error message, _ | _, Error message -> reject message))
 ;;
@@ -1910,8 +1742,6 @@ let operation_name = function
   | Capture_block _ -> "readCapturedBlock"
   | Capture_status _ -> "setCaptureStatus"
   | Target_summary _ -> "readMutationTargetSummary"
-  | Refresh_page_tree _ -> "refreshPageTree"
-  | Changed_page_tree _ -> "reconcileChangedPageTree"
   | Mutation_refresh _ -> "refreshMutation"
   | Delete_mutation _ -> "deleteSubtree"
 ;;
@@ -1962,7 +1792,7 @@ let failure_output
       | Day {day;request_generation} -> Day_blocks_failed {day;request_generation;stale_cursor=code=Error.Stale_read_cursor;failure=Worker_failure worker_failure}
       | Reconciliation -> Rejected (Worker_failure worker_failure))]
   | Mutation_refresh { page; refresh = Updated { block_id } } when code = Error.Conflict
-    -> request_refresh t page (Update_conflict_refresh { block_id })
+    -> request_target_summary t page (Update_conflict_refresh { block_id })
   | Graph_info -> responses [ response (Open_failed worker_failure) ]
   | Admission_info request -> responses [ response (Admission_unavailable request) ]
   | Pull_changes _ | Acknowledge_changes ->
@@ -2024,21 +1854,8 @@ let failure_output
   | Capture_block _
   | Capture_status _
   | Target_summary _
-  | Refresh_page_tree _
-  | Changed_page_tree _
   | Mutation_refresh _
   | Delete_mutation _ -> responses [ response (Rejected (Worker_failure worker_failure)) ]
-;;
-
-let tree_result items continuation : Projection.tree_member Graph.page_result =
-  { items =
-      List.map
-        (fun (item : Protocol.v2_tree_member) ->
-           Projection.
-             { block = item.value.block; revision = item.revision; depth = item.depth })
-        items
-  ; continuation
-  }
 ;;
 
 let children_result items continuation : Projection.children_page =
@@ -2083,6 +1900,8 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
      | _ -> (match outcome with
      | Protocol.V2_assets_outcome _ ->
        failure_output t operation request_id "Unexpected asset query response."
+     | V2_page_tree_outcome _ ->
+       failure_output t operation request_id "Unowned page-tree response."
      | Protocol.V2_favorites_outcome result ->
        (match operation with
         | Favorite_read read when Favorites.accepts_list read ->
@@ -2120,7 +1939,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
              when String.equal code (Error.code_string Error.Conflict) ->
              (match page_by_block t command.block_id with
               | Some page ->
-                request_refresh
+                request_target_summary
                   t
                   page
                   (Delete_conflict_refresh { block_id = command.block_id })
@@ -2440,6 +2259,10 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                ~scope_revision ~generation ~projection_revision) with
            | Continue planned -> confirmation_planning planned
            | Failed message -> failure_output t operation request_id message
+           | Absent {purpose=Delete_conflict_refresh _;block_id} ->
+             responses [response (Subtree_deleted {block_id;deleted_count=0;
+               parent=None;timeline_entry_update=None})]
+           | Absent _ -> failure_output t operation request_id "Unexpected absent target owner."
            | Confirmed {purpose;block_id;value;revision;page;page_revision;scope_revision;children} ->
                  (match projection_time_context t with
                   | Error message -> failure_output t operation request_id message
@@ -2461,19 +2284,11 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                          match page_of_graph_page page with
                          | Some journal when Graph.Uuid.equal value.block.parent page.uuid
                            ->
-                           let items =
-                             Seq.cons Projection.{block=value.block;revision;depth=0}
-                               (Rrbvec.to_seq children |> Seq.map (fun (item:Protocol.v2_child_member)->
-                                  Projection.{block=item.value.block;revision=item.revision;depth=1}))
-                             |> List.of_seq
-                           in
-                           Result.map
-                             (fun result -> List.nth_opt result.Projection.entries 0)
-                             (Projection.timeline_entry_page
-                                ~tag_titles:(fun _ -> value.tag_titles)
-                                ~page:journal
-                                ~time_context
-                                { items; continuation = None })
+                           Projection.timeline_target_entry
+                             ~tag_titles:(fun _ -> value.tag_titles)
+                             ~page:journal ~time_context
+                             ~root:Projection.{block=value.block;revision;depth=0}
+                             children
                          | _ -> Ok None
                        in
                        (match timeline with
@@ -2532,12 +2347,8 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                                [ response
                                    (Block_updated { block; timeline_entry_update = entry })
                                ]
-                           | _ ->
-                             failure_output
-                               t
-                               operation
-                               request_id
-                               "Unexpected target confirmation owner."))))
+                           | Update_conflict_refresh _ -> responses [response (Update_conflict {block;timeline_entry_update=entry})]
+                           | Delete_conflict_refresh _ -> responses [response (Delete_conflict {block;timeline_entry_update=entry})]))))
           )
         | _ -> failure_output t operation request_id "Unexpected target summary response.")
      | V2_block_outcome lookup ->
@@ -2729,83 +2540,6 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
           remember_blocks t page children.items;
           capture_insert t command page conflict_retries
         | _ -> failure_output t operation request_id "Unexpected children response.")
-     | V2_page_tree_outcome { items; next_cursor; _ } ->
-       List.iter
-         (fun (item : Protocol.v2_tree_member) ->
-            remember_block_revision t item.value.block.uuid item.revision;
-            Hashtbl.replace
-              t.tag_titles
-              (Graph.Uuid.to_string item.value.block.uuid)
-              item.value.tag_titles)
-         items;
-       let result = tree_result items next_cursor in
-       (match operation with
-        | Refresh_page_tree { page; refresh; retained_rev } ->
-          remember_tree_items t page result.items;
-          let block_id =
-            match refresh with
-            | Captured { block_id }
-            | Updated { block_id }
-            | Update_conflict_refresh { block_id }
-            | Delete_conflict_refresh { block_id } -> block_id
-          in
-          let found =
-            List.exists
-              (fun (member : Projection.tree_member) ->
-                 member.depth = 0
-                 && String.equal (Graph.Uuid.to_string member.block.uuid) block_id)
-              result.items
-          in
-          (match result.continuation with
-           | Some cursor when not found ->
-             let retained_rev = List.rev_append result.items retained_rev in
-             (match
-                page_tree
-                  t
-                  (Refresh_page_tree { page; refresh; retained_rev })
-                  page
-                  ~cursor
-                  Protocol.maximum_page_size
-              with
-              | Ok request -> requests [ request ]
-              | Error message -> reject message)
-           | None | Some _ ->
-             refresh_response
-               t
-               page
-               refresh
-               { result with items = List.rev_append retained_rev result.items })
-        | Changed_page_tree page ->
-          remember_tree_items t page result.items;
-          (match projection_time_context t with
-           | Error message -> reject message
-           | Ok time_context ->
-             (match
-                Projection.timeline_entry_page
-                  ~tag_titles:(fun uuid ->
-                    Option.value
-                      (Hashtbl.find_opt t.tag_titles (Graph.Uuid.to_string uuid))
-                      ~default:[])
-                  ~page
-                  ~time_context
-                  result
-              with
-              | Error message -> reject message
-              | Ok value ->
-                (match value.entries, result.continuation with
-                 | [], Some cursor ->
-                   (match
-                      registered_tree t (Graph.Uuid.of_string page.id |> Result.get_ok)
-                    with
-                    | Some interest ->
-                      (match page_tree t operation page ~cursor interest.limit with
-                       | Ok request -> requests [ request ]
-                       | Error message -> reject message)
-                    | None -> reject "The changed page query is no longer retained.")
-                 | _ ->
-                   remember_entries t page value.entries;
-                   responses [ response (Page_tree_reconciled { page; value }) ])))
-        | _ -> failure_output t operation request_id "Unexpected page-tree response.")
      | V2_mutation_committed _ ->
        (match operation with
         | Child_insert (command, page) | Child_status (command, page) ->
@@ -3199,7 +2933,6 @@ let worker_read t (request : Protocol.request) =
                ; outcome = (fun value -> Root_tree_read { page = business.page; value })
                })
         | None -> Some (Unowned_read "Root tree business operation mismatch"))
-     | Some { delivery = Dispatched; _ } -> None
      | _ -> Some (Unowned_read "Root tree business request is no longer owned"))
   | V2_get_children _ ->
     (match Hashtbl.find_opt t.pending (Graph.Uuid.to_string request.request_id) with

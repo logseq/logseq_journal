@@ -637,7 +637,7 @@ let test_delete_conflict_recovery () =
       List.find_map
         (fun response ->
            match response.Runtime.payload with
-           | Delete_conflict block -> Some block
+           | Delete_conflict {block;_} -> Some block
            | _ -> None)
         responses
     in

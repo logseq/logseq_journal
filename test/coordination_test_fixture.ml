@@ -108,3 +108,42 @@ let fixture ?(graph_generation = 7) ?(limits = limits) epoch =
   let session = (List.hd (W.residents projection)).session in
   issuer, raw, projection, session
 ;;
+
+(* Stable typed cursors for pure route tests; constructed only through the public
+   issuer/decode boundary, without exposing or inventing a continuation seal. *)
+let child_cursor_fixture = lazy (fixture 6100L)
+
+let child_continuation token =
+  let issuer, _, _, session = Lazy.force child_cursor_fixture in
+  let module I = (val issuer : W.ISSUER) in
+  let budget =
+    W.read_budget session ~maximum_items:P.default_page_size ~maximum_bytes:65536
+    |> Result.get_ok
+  in
+  let operation =
+    W.Query (budget, W.Child_members { parent = graph; revision = None; after = None })
+  in
+  let request_id = uuid "98000000-0000-4000-8000-000000006100" in
+  ignore
+    (I.request session ~request_id:(W.request_id request_id) operation |> Result.get_ok);
+  let response =
+    S.Graph_response
+      (P.V2_response
+         { api_version = P.api_version
+         ; request_id
+         ; outcome =
+             V2_children_outcome
+               { parent = graph
+               ; revision_scope = V2_children_revision graph
+               ; scope_revision = "fixture"
+               ; items = []
+               ; next_cursor =
+                   Some
+                     (Logseq_db_types.Graph_types.Cursor.of_string token |> Result.get_ok)
+               }
+         })
+  in
+  match I.reply session ~request_id:(W.request_id request_id) operation response with
+  | Ok (W.Answered (Ok children)) -> Option.get children.next
+  | _ -> failwith "valid route continuation rejected"
+;;

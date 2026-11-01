@@ -34,6 +34,7 @@ type planning = (Protocol.request, string) result
 type step =
   | Continue of planning
   | Confirmed of confirmation
+  | Absent of {purpose:purpose; block_id:string}
   | Failed of string
 
 type ports =
@@ -147,6 +148,14 @@ let receive_summary
            ; scope_revision
            ; children
            })
+    | V2_missing_block {uuid;_}, _
+      when Graph.Uuid.to_string uuid = summary.block_id
+           && summary.after = None
+           && items = [] && next_cursor = None && Rrbvec.is_empty summary.children ->
+      (match summary.purpose with
+       | Delete_conflict_refresh _ -> Absent {purpose=summary.purpose;block_id=summary.block_id}
+       | Captured _ | Updated _ | Update_conflict_refresh _ ->
+         Failed "The canonical mutation target is unavailable.")
     | _ -> Failed "The canonical mutation target is unavailable or mismatched.")
 ;;
 

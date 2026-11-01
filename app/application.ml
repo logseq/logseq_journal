@@ -1452,12 +1452,15 @@ let apply_worker_response ~discard state (response : Journal_graph_runtime.respo
         Journal_detail.reconcile_children current detail)
     in
     { state with routes }
-  | Update_conflict latest ->
+  | Update_conflict {block=latest;timeline_entry_update} ->
     let routes =
       Journal_routes.map_details state.routes ~f:(fun detail ->
         Journal_detail.apply_block detail latest)
     in
-    let state = { state with routes } in
+    let state = { state with routes;
+      timeline=Option.fold ~none:state.timeline
+        ~some:(Journal_timeline_state.replace_timeline_entry state.timeline)
+        timeline_entry_update } in
     (match state.pending_status with
      | Some pending when String.equal pending.block_id (Journal_model.id latest) ->
        { state with
@@ -1532,7 +1535,7 @@ let apply_worker_response ~discard state (response : Journal_graph_runtime.respo
        ; timeline_notice = None
        }
      | None | Some _ -> state)
-  | Delete_conflict latest ->
+  | Delete_conflict {block=latest;timeline_entry_update} ->
     (match state.pending_delete with
      | None -> state
      | Some _ ->
@@ -1547,7 +1550,10 @@ let apply_worker_response ~discard state (response : Journal_graph_runtime.respo
          timeline =
            (if Journal_model.journal_day_opt latest = None
             then state.timeline
-            else Journal_timeline_state.replace_block state.timeline latest)
+            else Option.fold
+              ~none:(Journal_timeline_state.replace_block state.timeline latest)
+              ~some:(Journal_timeline_state.replace_timeline_entry state.timeline)
+              timeline_entry_update)
        ; pending_delete = None
        ; timeline_notice =
            Some (Delete_failed "The block changed elsewhere. Delete was not applied.")

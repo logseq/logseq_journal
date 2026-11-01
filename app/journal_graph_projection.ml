@@ -100,7 +100,6 @@ type root_cursor =
   }
 
 type block_continuation =
-  | Legacy_tree_cursor of Logseq_db_types.Graph_types.Cursor.t
   | Root_tree_cursor of root_cursor
   | Child_cursor of child_cursor
 
@@ -327,15 +326,15 @@ let timeline_entry_page
       ~time_context
       (result : tree_member Graph.page_result)
   =
-  let cursor (block : Graph.block) =
+  if Option.is_some result.continuation then Error "Raw Tree continuations are not supported."
+  else let cursor (block : Graph.block) =
     Option.map
       (fun protocol_cursor ->
          { after_sibling_order = block.order
          ; after_block_id = Graph.Uuid.to_string block.uuid
          ; protocol_cursor = Some protocol_cursor
          })
-      (match root_continuation with Some cursor -> Some (Root_tree_cursor cursor)
-       | None -> Option.map (fun cursor -> Legacy_tree_cursor cursor) result.continuation)
+      (Option.map (fun cursor -> Root_tree_cursor cursor) root_continuation)
   in
   let roots =
     let children = Hashtbl.create 16 in
@@ -412,6 +411,30 @@ let timeline_entry_page
          project ({ block; child_summaries } :: reversed) rest)
   in
   project [] roots
+;;
+
+let timeline_target_entry ~page ~time_context ~(root : tree_member) ~tag_titles children =
+  let preview =
+    Rrbvec.to_seq children
+    |> Seq.filter (fun (item : Logseq_db_worker.Protocol.v2_child_member) ->
+      not (property_value_block item.value.block))
+    |> Seq.take 3
+    |> Seq.map (fun (item : Logseq_db_worker.Protocol.v2_child_member) ->
+      { block = item.value.block; revision = item.revision; depth = 1 })
+    |> List.of_seq
+  in
+  timeline_entry_page
+    ~page
+    ~time_context
+    ~tag_titles
+    { Graph.items = root :: preview; continuation = None }
+  |> fun projected ->
+  Result.bind projected (fun result ->
+    match result.entries with
+    | [] -> Ok None
+    | entry :: _ ->
+      Journal_model.with_child_count entry.block ~child_count:(Rrbvec.length children)
+      |> Result.map (fun block -> Some { entry with block }))
 ;;
 
 let project_detail

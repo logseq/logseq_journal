@@ -576,7 +576,7 @@ let test_child_refresh_replaces_cursor_and_fences_pending_read () =
     { after_sibling_order = Journal_model.sibling_order child
     ; after_block_id = Journal_model.id child
     ; protocol_cursor =
-        Some (Journal_graph_projection.Legacy_tree_cursor (Logseq_db_types.Graph_types.Cursor.of_string token |> Result.get_ok))
+        Some (Journal_graph_projection.Child_cursor {after=Coordination_test_fixture.child_continuation token;maximum_items=128})
     }
   in
   let projection token : Journal_graph_projection.detail =
@@ -629,8 +629,7 @@ let test_append_restarts_partial_children_without_reusing_cursor () =
          ; after_block_id = Journal_model.id child
          ; protocol_cursor =
              Some
-               (Journal_graph_projection.Legacy_tree_cursor (Logseq_db_types.Graph_types.Cursor.of_string "before-append"
-                |> Result.get_ok))
+               (Journal_graph_projection.Child_cursor {after=Coordination_test_fixture.child_continuation "before-append";maximum_items=128})
          }
        in
        let initial =
@@ -727,8 +726,7 @@ let test_append_restarts_partial_children_without_reusing_cursor () =
            { cursor with
              protocol_cursor =
                Some
-                 (Journal_graph_projection.Legacy_tree_cursor (Logseq_db_types.Graph_types.Cursor.of_string "after-append"
-                  |> Result.get_ok))
+                 (Journal_graph_projection.Child_cursor {after=Coordination_test_fixture.child_continuation "after-append";maximum_items=128})
            }
          in
          let first, _ =
@@ -3018,8 +3016,7 @@ let test_detail_128_item_pages_preserve_order_and_completion () =
   let cursor ordinal : Journal_graph_projection.block_cursor =
     { after_sibling_order = Printf.sprintf "%06d" ordinal
     ; after_block_id = Journal_model.id (List.nth children (ordinal - 1))
-    ; protocol_cursor = Some (Journal_graph_projection.Legacy_tree_cursor (Logseq_db_types.Graph_types.Cursor.of_string
-        (Printf.sprintf "detail-page-%d" ordinal) |> Result.get_ok)) } in
+    ; protocol_cursor = Some (Journal_graph_projection.Child_cursor {after=Coordination_test_fixture.child_continuation (Printf.sprintf "detail-page-%d" ordinal);maximum_items=128}) } in
   let request after = function
     | [ Journal_graph_request.Load_detail
           { block_id; limit; after = actual; request_generation } ] ->

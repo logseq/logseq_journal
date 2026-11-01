@@ -104,7 +104,6 @@ type root_cursor =
   }
 
 type block_continuation =
-  | Legacy_tree_cursor of Logseq_db_types.Graph_types.Cursor.t
   | Root_tree_cursor of root_cursor
   | Child_cursor of child_cursor
 
@@ -212,3 +211,11 @@ val detail_on_page
   -> (detail, string) result
 
 val favorite : Logseq_db_worker.Protocol.v2_favorite_item -> favorite
+
+(** Canonical target projection retains the full raw child count while only
+    materializing the existing bounded preview. *)
+val timeline_target_entry
+  : page:page -> time_context:time_context -> root:tree_member
+  -> tag_titles:(Logseq_db_types.Graph_types.Uuid.t -> string list)
+  -> Logseq_db_worker.Protocol.v2_child_member Rrbvec.t
+  -> (timeline_entry option,string) result
