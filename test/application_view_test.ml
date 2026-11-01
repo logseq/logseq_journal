@@ -742,9 +742,12 @@ let run_favorites_native_visibility
     ; diagnostics = { groups = [] }
     }
   in
-  let manager=if check_copy then {manager with snapshot={manager.snapshot with
-    resident_graphs=[scope.graph_id];resident_scopes=[scope]}} else manager in
+  (* Ordinary single-graph mode has no resident-scopes broadcast. Native account
+     authority still permits binding; the atomic baseline supplies the session. *)
   let coordination_registration=Atomic.make None in
+  let coordination_release_entered = Atomic.make false in
+  let coordination_release_allowed = Atomic.make true in
+  let picker_returned = Atomic.make false in
   let coordination_baseline registration =
     let module C=Logseq_sync_pure_reducer.Core in
     let generation=Atomic.get graph_generation in
@@ -789,6 +792,10 @@ let run_favorites_native_visibility
           Atomic.set coordination_registration(Some registration);
           Ok(Service.Coordination_registered(coordination_baseline registration))
         | Release_coordination registration when check_copy->
+          Atomic.set coordination_release_entered true;
+          while not (Atomic.get coordination_release_allowed) do
+            Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
+          done;
           (match Atomic.get coordination_registration with Some id when id<=registration->
             Atomic.set coordination_registration None|_->());
           Ok(Service.Coordination_released registration)
@@ -838,8 +845,7 @@ let run_favorites_native_visibility
                        sync_phase = Option.value sync_phase ~default:Service.Current
                      ; last_error_attention = Option.value attention ~default:None
                      ; last_error = Option.value error ~default:None
-                     ; resident_scopes=(if check_copy then [{scope with graph_generation=Atomic.get graph_generation}]
-                         else manager.snapshot.resident_scopes)
+                     ; resident_scopes=manager.snapshot.resident_scopes
                      ; startup = { manager.snapshot.startup with
                          graph_generation = Atomic.get graph_generation }
                      }
@@ -888,6 +894,15 @@ let run_favorites_native_visibility
                (Some (Printf.sprintf "fixture-lease-%d" lease, "/tmp/targeted-media.png")))
         | Release_asset_file _ ->
           Atomic.incr released_files;
+          Ok Service.Client_command_completed
+        | Client_command Return_to_graph_picker when check_copy ->
+          Atomic.set picker_returned true;
+          W.Request_context.emit context ~topic:Service.manager_topic
+            (Service.Client_state_changed
+               { manager with snapshot =
+                   { manager.snapshot with selected_graph = None;
+                     resident_graphs = []; resident_scopes = [];
+                     startup = { manager.snapshot.startup with awaiting_selection = true } } });
           Ok Service.Client_command_completed
         | Client_command _ | Asset_command _ -> Ok Service.Client_command_completed
         | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
@@ -1392,12 +1407,14 @@ let run_favorites_native_visibility
       ()
   in
   let clipboard_requests = ref [] in
+  let termination_ready = ref 0 in
   let regions = Hashtbl.create 8 in
   let hooks =
     Application.For_testing.app_with_service
       ?calendar_sampler
       ~on_client:(fun value -> client := Some value)
       ~on_platform_request:(fun request ->
+        if Bytes.length request >= 32 && Bytes.get_uint16_le request 6 = 13 then incr termination_ready;
         if Bytes.length request >= 32 && Bytes.get_uint16_le request 6 = 25 then incr delete_notices;
         if Bytes.length request >= 32 && Bytes.get_uint16_le request 6 = 28
         then clipboard_requests := request :: !clipboard_requests)
@@ -1538,6 +1555,7 @@ let run_favorites_native_visibility
   in
   Fun.protect
     ~finally:(fun () ->
+      Atomic.set coordination_release_allowed true;
       Atomic.set delete_release true;
       Atomic.set status_release true;
       Atomic.set child_release true;
@@ -1551,6 +1569,17 @@ let run_favorites_native_visibility
       check_fixture_worker_idle ())
     (fun () ->
        hooks.init 2 2 startup |> consume;
+       if check_copy then (
+         let json = Yojson.Safe.to_string (`Assoc
+           [ "userId", `String "fixture";
+             "managedSyncOrigin", `String "https://example.invalid" ]) in
+         let packet = Bytes.make (32 + String.length json) '\000' in
+         Bytes.blit_string "LJP2" 0 packet 0 4;
+         Bytes.set_uint16_le packet 4 2;
+         Bytes.set_uint16_le packet 6 21;
+         Bytes.set_int32_le packet 24 (Int32.of_int (String.length json));
+         Bytes.blit_string json 0 packet 32 (String.length json);
+         hooks.platform_response (Bytes.to_string packet));
        on_initialized ();
        if check_ios_capture || check_capture_imports || Option.is_some detail_capture
        then (
@@ -2816,7 +2845,24 @@ let run_favorites_native_visibility
          respond_copy true;
          wait "retry succeeds without the previous failure" (fun () ->
            Option.is_some (find_current "text" "Copied block and descendants")
-           && Option.is_none (find_current "text" "Copy failed: Clipboard write was not acknowledged.")))
+           && Option.is_none (find_current "text" "Copy failed: Clipboard write was not acknowledged."));
+         (* App termination joins the real coordinator host; a manager transition
+            alone cannot acknowledge a still-registered baseline subscription. *)
+         Atomic.set coordination_release_entered false;
+         Atomic.set coordination_release_allowed false;
+         let packet = Bytes.make 32 '\000' in
+         Bytes.blit_string "LJP2" 0 packet 0 4;
+         Bytes.set_uint16_le packet 4 2;
+         Bytes.set_uint16_le packet 6 12;
+         hooks.platform_event (Bytes.to_string packet);
+         wait "termination unregister reaches Worker" (fun () -> Atomic.get coordination_release_entered);
+         wait "termination also closes legacy selection" (fun () -> Atomic.get picker_returned);
+         for _ = 1 to 5 do hooks.pump () |> consume done;
+         Alcotest.(check int) "no termination-ready before unregister ACK" 0 !termination_ready;
+         Atomic.set coordination_release_allowed true;
+         wait "termination-ready follows exact unregister ACK" (fun () -> !termination_ready = 1);
+         for _ = 1 to 5 do hooks.pump () |> consume done;
+         Alcotest.(check int) "termination-ready is emitted once" 1 !termination_ready)
        else if Option.is_some media_rows
        then (
          let count = Option.get media_rows in
@@ -5403,6 +5449,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
     ?(attachment_stage = Atomic.make 0) ?(finish_attachment = Atomic.make true)
     ?(on_timeline_presented = fun _ -> ())
     ?on_platform_request ?(on_auth_classified = fun _ -> ())
+    ?(on_local_account_command = fun _ -> ())
     ?(on_auth_handled = fun _ _ -> ()) () =
   let module W = Logseq_db_worker_lui.Journal_worker in
   let graph_id =
@@ -5621,6 +5668,9 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
           Ok Service.Client_command_completed
         | Client_command (Reconcile_authenticated_user { user_id }) ->
           on_auth_handled user_id (W.Request_context.request_id context);
+          Ok Service.Client_command_completed
+        | Client_command ((Restore_local_account _ | Local_account_unavailable _) as command) ->
+          on_local_account_command command;
           Ok Service.Client_command_completed
         | Client_command _ | Asset_command _ | Release_asset_file _ ->
           Ok Service.Client_command_completed
@@ -5872,6 +5922,53 @@ let test_pending_auth_never_replays_older_identity ~newer_accepted () =
     let rec after_newer = function [] -> [] | Some "B" :: rest -> rest | _ :: rest -> after_newer rest in
     Alcotest.(check bool) "older identity never re-enters Latest after newer verification" false
       (List.mem (Some "A") (after_newer !observed)))
+;;
+
+(* Native auth and delayed local-cache replies are owned by the mounted App,
+   before the asynchronous manager can advance its account generation. *)
+let test_native_authority_precedes_delayed_local_binding () =
+  List.iter (fun user ->
+    let requests = ref [] and local_commands = Atomic.make 0 in
+    let classified = ref false in
+    let hooks, _, release, client = unlock_fixture
+        ~on_platform_request:(fun bytes -> requests := Bytes.copy bytes :: !requests)
+        ~on_auth_classified:(fun _ -> classified := true)
+        ~on_local_account_command:(fun _ -> Atomic.incr local_commands) () in
+    let packet tag json =
+      let json = Yojson.Safe.to_string json in
+      let bytes = Bytes.make (32 + String.length json) '\000' in
+      Bytes.blit_string "LJP2" 0 bytes 0 4;
+      Bytes.set_uint16_le bytes 4 2; Bytes.set_uint16_le bytes 6 tag;
+      Bytes.set_int32_le bytes 24 (Int32.of_int (String.length json));
+      Bytes.blit_string json 0 bytes 32 (String.length json);
+      Bytes.to_string bytes in
+    let startup = Logseq_db_worker.Config.create
+        ~application_support_directory:"/tmp/journal-auth-local-order-synthetic"
+        ~target:(Managed_sync {base_url="https://example.invalid"})
+        ~compatibility_profile:Logseq_65_33_or_newer
+        ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
+        ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+        |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
+    Fun.protect ~finally:(fun () -> Atomic.set release true; ignore(hooks.dispose());
+      Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client) (fun () ->
+      ignore(hooks.init 2 2 startup);
+      let deadline = Unix.gettimeofday () +. 2. in
+      while not(List.exists(fun bytes->Bytes.length bytes>=8 && Bytes.get_uint16_le bytes 6=20) !requests)
+          && Unix.gettimeofday()<deadline do ignore(hooks.pump());Unix.sleepf 0.001 done;
+      Alcotest.(check bool) "local discovery is outstanding before SDK authority" true
+        (List.exists(fun bytes->Bytes.length bytes>=8 && Bytes.get_uint16_le bytes 6=20) !requests);
+      let deadline = Unix.gettimeofday () +. 2. in
+      while not(List.exists(fun bytes->Bytes.length bytes>=8 && Bytes.get_uint16_le bytes 6=30) !requests)
+          && Unix.gettimeofday()<deadline do ignore(hooks.pump());Unix.sleepf 0.001 done;
+      hooks.platform_event (packet 7 (`Assoc ["userId", (match user with None->`Null|Some user->`String user);
+        "startupScope",`Assoc["accountGeneration",`Int 1;"presentationGeneration",`Int 2]]));
+      ignore(hooks.pump());
+      Alcotest.(check bool) "current SDK authority reached host admission" true !classified;
+      hooks.platform_response (packet 21 (`Assoc ["userId",`String "stale-local-A";
+        "managedSyncOrigin",`String "https://example.invalid"]));
+      for _=1 to 20 do ignore(hooks.pump());Unix.sleepf 0.001 done;
+      Alcotest.(check int) "delayed local cache cannot restore after newer SDK authority" 0
+        (Atomic.get local_commands))) [Some "current-B";None]
 ;;
 
 let capture_unlock_logs run =
@@ -7288,7 +7385,8 @@ let () =
       , [ Alcotest.test_case "Full older auth is superseded by accepted newer auth" `Quick
             (fun () -> test_pending_auth_never_replays_older_identity ~newer_accepted:true ())
         ; Alcotest.test_case "Full auth retains only latest identity" `Quick
-            (fun () -> test_pending_auth_never_replays_older_identity ~newer_accepted:false ()) ] )
+            (fun () -> test_pending_auth_never_replays_older_identity ~newer_accepted:false ())
+        ; Alcotest.test_case "SDK authority supersedes delayed local cache" `Quick test_native_authority_precedes_delayed_local_binding ] )
     ; ( "native online permission"
       , [ Alcotest.test_case "same-phase sign-in acknowledges every current intent" `Quick
             test_repeated_native_sign_in_intent_receives_permission ] )

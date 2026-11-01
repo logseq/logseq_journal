@@ -199,7 +199,13 @@ at least the following deterministic integration acceptance:
 - The existing mounted `application_view_test` Copy case drives Timeline,
   Favorites and Detail menus, replacement and clipboard acknowledgement through
   the new host/coordinator/runner. Its synthetic Service implements the declared
-  baseline protocol; it is separate from actual Service conformance evidence.
+  baseline protocol and ordinary single-graph mode without a resident-scopes
+  broadcast. A validated native account permits binding; the atomic baseline
+  still supplies all execution authority. The case also holds unregister ACK
+  while the legacy manager closes, proving that graceful termination waits and
+  emits termination-ready once. Direct forced disposal requests Worker stop and
+  tears down UI without this graceful join. Mounted fixtures remain separate
+  from actual Service conformance evidence.
 - Existing Copy reducer tests use the compatibility entry to the same generic
   pure engine. Production Copy passes sealed continuations directly; its old
   mailbox-ID request table and cancellation path have been removed. Buffered

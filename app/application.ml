@@ -3233,6 +3233,10 @@ let start
   let copy_cancel : (unit -> unit) option ref = ref None in
   let coordination_host = ref None in
   let coordination_host_id = ref None in
+  (* Auth/catalog remain host-owned. This records verified native authority only;
+     the registered Worker baseline still supplies every execution session. *)
+  let coordination_account : string option option ref = ref None in
+  let coordination_sdk_seen = ref false in
   let retired_coordination_hosts = ref Rrbvec.empty in
   let coordination_lifecycle_changed = ref(fun()->()) in
   let all_coordination_hosts () = match !coordination_host with
@@ -3248,12 +3252,18 @@ let start
       List.find_opt(fun (scope:Graph_service.asset_scope)->
         Some scope.graph_id= !state_ref.graph_state.graph_id
         && scope.graph_generation= !state_ref.graph_state.generation)manager.resident_scopes) in
-    match scope with
+    let identity = match !coordination_account, !state_ref.manager, scope with
+      | Some (Some user), Some manager, _ ->
+        Some (!managed_sync_origin, user, manager.Graph_service.startup.account_generation)
+      | Some None, _, _ -> None
+      | None, _, Some scope ->
+        Some (Uri.to_string scope.account.managed_sync_origin,
+          scope.account.user_id, scope.account.account_generation)
+      | _ -> None in
+    match identity with
     | _ when !termination_in_flight->Error "Journal is closing."
     | None->Error "The graph reader is still preparing. Try Copy again."
-    | Some scope->
-      let origin=Uri.to_string scope.account.managed_sync_origin in
-      let identity=origin,scope.account.user_id,scope.account.account_generation in
+    | Some ((origin,user,_) as identity)->
       (match !coordination_host with
        | Some(previous,host) when previous=identity
            && Coordination.shutdown_state(Coordination_host.view host)=Coordination.Active->Ok host
@@ -3263,7 +3273,7 @@ let start
            retired_coordination_hosts:=Rrbvec.push_back !retired_coordination_hosts host)previous;
          let id=fresh_identity () in
          match Coordination_host.create ~client
-           ~client_id:(Wc.Uuid.of_string id |> Result.get_ok) ~managed_origin:origin ~user_id:scope.account.user_id
+           ~client_id:(Wc.Uuid.of_string id |> Result.get_ok) ~managed_origin:origin ~user_id:user
            ~enqueue:(Journal_pump.enqueue pump)
            ~changed:(fun view->
              if !coordination_host_id=Some id then Option.iter(fun poll->poll view)!copy_poll;
@@ -4623,6 +4633,8 @@ let start
     | Error _ -> set_state (fun state -> {state with startup_presentation=
         Journal_startup.Presentation.step state.startup_presentation (Account_error key)})
     | Ok user_id ->
+        coordination_sdk_seen := true;
+        coordination_account := Some user_id;
         (match !coordination_host with
          | Some((_,previous,_),_) when user_id<>Some previous->cancel_copy();shutdown_coordination()
          | _->());
@@ -4636,7 +4648,9 @@ let start
             send_manager (Graph_service.Reconcile_authenticated_user { user_id })))
   in
   let apply_local_account_binding ticket result =
+    if !coordination_sdk_seen then Effect.ignore else
     let unavailable () =
+      coordination_account := Some None;
       Effect.bind (set_state (fun state -> {state with startup_presentation=
         Journal_startup.Presentation.step state.startup_presentation (Account(ticket,No_local))}))
         ~f:(fun () -> send_manager (Graph_service.Local_account_unavailable (startup_scope !state_ref,No_local_account))) in
@@ -4651,6 +4665,7 @@ let start
       then Effect.bind (set_state (fun state -> {state with startup_presentation=
         Journal_startup.Presentation.step state.startup_presentation (Account(ticket,Local))}))
         ~f:(fun () -> cancel_copy();shutdown_coordination();
+          coordination_account := Some (Some binding.user_id);
           send_manager (Graph_service.Restore_local_account {user_id=binding.user_id}))
       else unavailable ()
   in
@@ -5787,6 +5802,9 @@ let start
           , local_copy_request ~deleting:false request )
         | _ -> state, Effect.ignore)
     | Sign_out ->
+      coordination_sdk_seen := true;
+      coordination_account := Some None;
+      shutdown_coordination ();
       pending_startup_commands:=[];
       Hashtbl.clear pending_scope_refreshes;
       cancel_copy ();
