@@ -1,5 +1,6 @@
 (library
  (name journal_worker_coordination)
+ (wrapped true)
  (public_name logseq_journal.worker_coordination)
  (modules worker_api worker_coordinator worker_effect_runner)
  (virtual_modules worker_api worker_coordinator worker_effect_runner)
