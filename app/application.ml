@@ -4648,13 +4648,20 @@ let start
             send_manager (Graph_service.Reconcile_authenticated_user { user_id })))
   in
   let apply_local_account_binding ticket result =
-    if !coordination_sdk_seen then Effect.ignore else
+    let decoded = Result.bind result Journal_platform.decode_local_account_binding in
+    let current_sdk_allows =
+      not !coordination_sdk_seen || match !coordination_account, decoded with
+      | Some (Some current), Ok (Some binding) ->
+        binding.user_id = current
+        && String.equal binding.managed_sync_origin !managed_sync_origin
+      | _ -> false in
+    if not current_sdk_allows then Effect.ignore else
     let unavailable () =
       coordination_account := Some None;
       Effect.bind (set_state (fun state -> {state with startup_presentation=
         Journal_startup.Presentation.step state.startup_presentation (Account(ticket,No_local))}))
         ~f:(fun () -> send_manager (Graph_service.Local_account_unavailable (startup_scope !state_ref,No_local_account))) in
-    match Result.bind result Journal_platform.decode_local_account_binding with
+    match decoded with
     | Error _ ->
       set_state (fun state -> {state with startup_presentation=
         Journal_startup.Presentation.step state.startup_presentation (Account_error ticket)})

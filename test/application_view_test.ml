@@ -5927,10 +5927,11 @@ let test_pending_auth_never_replays_older_identity ~newer_accepted () =
 (* Native auth and delayed local-cache replies are owned by the mounted App,
    before the asynchronous manager can advance its account generation. *)
 let test_native_authority_precedes_delayed_local_binding () =
-  List.iter (fun user ->
+  List.iter (fun (user, expected_restores) ->
     let requests = ref [] and local_commands = Atomic.make 0 in
     let classified = ref false in
     let hooks, _, release, client = unlock_fixture
+        ~cold_start:(expected_restores = 1)
         ~on_platform_request:(fun bytes -> requests := Bytes.copy bytes :: !requests)
         ~on_auth_classified:(fun _ -> classified := true)
         ~on_local_account_command:(fun _ -> Atomic.incr local_commands) () in
@@ -5959,7 +5960,8 @@ let test_native_authority_precedes_delayed_local_binding () =
         (List.exists(fun bytes->Bytes.length bytes>=8 && Bytes.get_uint16_le bytes 6=20) !requests);
       let deadline = Unix.gettimeofday () +. 2. in
       while not(List.exists(fun bytes->Bytes.length bytes>=8 && Bytes.get_uint16_le bytes 6=30) !requests)
-          && Unix.gettimeofday()<deadline do ignore(hooks.pump());Unix.sleepf 0.001 done;
+          && Unix.gettimeofday()<deadline && expected_restores=0 do ignore(hooks.pump());Unix.sleepf 0.001 done;
+      if expected_restores=1 then for _=1 to 20 do ignore(hooks.pump());Unix.sleepf 0.001 done;
       hooks.platform_event (packet 7 (`Assoc ["userId", (match user with None->`Null|Some user->`String user);
         "startupScope",`Assoc["accountGeneration",`Int 1;"presentationGeneration",`Int 2]]));
       ignore(hooks.pump());
@@ -5967,8 +5969,8 @@ let test_native_authority_precedes_delayed_local_binding () =
       hooks.platform_response (packet 21 (`Assoc ["userId",`String "stale-local-A";
         "managedSyncOrigin",`String "https://example.invalid"]));
       for _=1 to 20 do ignore(hooks.pump());Unix.sleepf 0.001 done;
-      Alcotest.(check int) "delayed local cache cannot restore after newer SDK authority" 0
-        (Atomic.get local_commands))) [Some "current-B";None]
+      Alcotest.(check int) "local restoration respects current SDK identity" expected_restores
+        (Atomic.get local_commands))) [Some "current-B",0;None,0;Some "stale-local-A",1]
 ;;
 
 let capture_unlock_logs run =
