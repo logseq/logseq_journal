@@ -10,7 +10,7 @@ type t
 type view
 type 'a ticket
 
-(** The host supplies a fresh client identity for each Core lifetime. Request IDs
+(** The host supplies a fresh client identity for each Worker_coordinator lifetime. Request IDs
     derive from it and a pure counter; durable mutation IDs do not. *)
 val initial : client_id:Worker.Uuid.t -> t
 val view : t -> view

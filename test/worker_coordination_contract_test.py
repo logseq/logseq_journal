@@ -1,4 +1,4 @@
-"""Compile client examples against the sealed App spec, without linking an implementation."""
+"""Compile client examples against the sealed App/Worker coordination spec, without linking an implementation."""
 
 import argparse
 from pathlib import Path
@@ -54,10 +54,10 @@ let equality left right = C.equal_view (C.view left) (C.view right)
     "pure_owner_and_runner": """
 let create client_id = C.initial ~client_id
 let step state event = C.step state event
-let execute runner instruction = Journal_app_spec.Effect_runner.submit runner instruction
+let execute runner instruction = Journal_worker_coordination.Worker_effect_runner.submit runner instruction
 let connect client managed_origin user_id post publish =
-  Journal_app_spec.Effect_runner.create ~client ~managed_origin ~user_id ~post ~publish
-let incoming runner event = Journal_app_spec.Effect_runner.on_event runner event
+  Journal_worker_coordination.Worker_effect_runner.create ~client ~managed_origin ~user_id ~post ~publish
+let incoming runner event = Journal_worker_coordination.Worker_effect_runner.on_event runner event
 """,
     "binding_consumes_concrete_worker_values": """
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
@@ -184,16 +184,16 @@ def main():
     args = parser.parse_args()
     required = [Path(path).resolve() for path in args.cmi]
     if not required or any(not path.is_file() for path in required):
-        raise AssertionError("The compiled App spec interfaces are required before client checking")
+        raise AssertionError("The compiled Worker coordination interfaces are required before client checking")
     includes = sorted({str(path.parent) for path in required})
-    prelude = "module W = Journal_app_spec.Worker_api\nmodule C = Journal_app_spec.Core\n"
-    with tempfile.TemporaryDirectory(prefix="journal-app-spec-") as temporary:
+    prelude = "module W = Journal_worker_coordination.Worker_api\nmodule C = Journal_worker_coordination.Worker_coordinator\n"
+    with tempfile.TemporaryDirectory(prefix="journal-worker-coordination-") as temporary:
         directory = Path(temporary)
         for name, source in POSITIVE.items():
             compile_case(args.ocamlc, directory, includes, name, prelude + source, None)
         for name, (source, diagnostic) in NEGATIVE.items():
             compile_case(args.ocamlc, directory, includes, name, prelude + source, diagnostic)
-    print("APP_SPEC_CONTRACTS_PASSED: %d positive, %d negative" % (len(POSITIVE), len(NEGATIVE)))
+    print("WORKER_COORDINATION_CONTRACTS_PASSED: %d positive, %d negative" % (len(POSITIVE), len(NEGATIVE)))
 
 
 def compile_case(compiler, directory, includes, name, source, diagnostic):

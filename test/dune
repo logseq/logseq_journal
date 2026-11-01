@@ -165,16 +165,16 @@
  (libraries app))
 
 (rule
- (alias app-spec-contracts)
- (deps app_spec_contract_test.py)
+ (alias worker-coordination-contracts)
+ (deps worker_coordination_contract_test.py)
  (action
   (run
-   python3 -B %{dep:app_spec_contract_test.py}
+   python3 -B %{dep:worker_coordination_contract_test.py}
    --ocamlc %{ocamlc}
-   --cmi %{lib:logseq_journal.app_spec:journal_app_spec.cmi}
-   --cmi %{lib:logseq_journal.app_spec:journal_app_spec__Worker_api.cmi}
-   --cmi %{lib:logseq_journal.app_spec:journal_app_spec__Core.cmi}
-   --cmi %{lib:logseq_journal.app_spec:journal_app_spec__Effect_runner.cmi}
+   --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination.cmi}
+   --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination__Worker_api.cmi}
+   --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination__Worker_coordinator.cmi}
+   --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination__Worker_effect_runner.cmi}
    --cmi %{lib:logseq_db_types:logseq_db_types.cmi}
    --cmi %{lib:logseq_db_types:logseq_db_types__Graph_types.cmi}
    --cmi %{lib:logseq_db_worker:logseq_db_worker.cmi}
@@ -188,4 +188,4 @@
 
 (alias
  (name runtest)
- (deps (alias app-spec-contracts)))
+ (deps (alias worker-coordination-contracts)))

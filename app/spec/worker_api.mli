@@ -206,7 +206,7 @@ val equal_projection : projection -> projection -> bool
     interrupted or OS-refused cleanup is never represented as complete. *)
 val removal_target : local_deletion -> Uuid.t
 
-(** Signature of a connection-bound validating issuer used inside Effect_runner.
+(** Signature of a connection-bound validating issuer used inside Worker_effect_runner.
     The integration factory below is the trust boundary; App rendering cannot assemble sealed
     values from UI records. Neither a module signature nor its factory proves the
     honesty of an arbitrary backend or authenticates caller-supplied identity. *)
