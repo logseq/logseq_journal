@@ -119,3 +119,44 @@ val confirm_mutation : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
   -> request_id:Logseq_db_types.Graph_types.Uuid.t -> intent:string
   -> original:(string * string * string) -> current:(unit -> bool)
   -> Logseq_db_worker_contract.Protocol.response
+
+(** Actual paused-listener/predecessor-snapshot registration on the existing DB.
+    A sampled V2_failed remains registered and can recover on the next
+    invalidation/Refresh; only allocation or activation failure aborts registration.
+    A repeated logical ID retains its original sample/epoch and rebinds only the
+    response envelope to this RPC request_id. Refresh does not replace the
+    listener. Release fences publication, removes the listener and joins admitted
+    reads before returning its cleanup ACK. *)
+val register_observation
+  :  t
+  -> registration:int64
+  -> id:Logseq_db_types.Graph_types.Uuid.t
+  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> request:Logseq_db_worker_contract.Protocol.request
+  -> maximum_bytes:int
+  -> current:(unit -> bool)
+  -> notify:(epoch:int64 -> unit)
+  -> (int64 * Logseq_db_worker_contract.Protocol.response, string) result
+
+val refresh_observation
+  :  t
+  -> registration:int64
+  -> id:Logseq_db_types.Graph_types.Uuid.t
+  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> request_id:Logseq_db_types.Graph_types.Uuid.t
+  -> (int64 * Logseq_db_worker_contract.Protocol.response, string) result
+
+val release_observation
+  :  t
+  -> registration:int64
+  -> id:Logseq_db_types.Graph_types.Uuid.t
+  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> (unit, string) result
+
+val release_observations : t -> registration:int64 -> unit
+
+val observation_scope
+  :  t
+  -> registration:int64
+  -> id:Logseq_db_types.Graph_types.Uuid.t
+  -> Logseq_sync_pure_reducer.Core.graph_scope option

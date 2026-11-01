@@ -15,7 +15,10 @@ let only = function
 ;;
 
 type worker =
-  { request : P.request -> P.response
+  { runner : Runner.t
+  ; scope : Sync.graph_scope
+  ; sw : Eio.Switch.t
+  ; request : P.request -> P.response
   ; drain : unit -> unit
   ; pushes : P.push Queue.t
   }
@@ -173,7 +176,7 @@ let with_worker
                Hashtbl.remove replies !next;
                reply
              in
-             run { request; drain; pushes }))))
+             run { runner;scope=List.hd (Core.graph_scopes !state);sw;request;drain;pushes }))))
 ;;
 
 let rec deliver worker runtime (output : Runtime.output) =
@@ -803,25 +806,76 @@ let require_response_limit label budget response =
 ;;
 
 let test_enriched_response_budget () =
-  with_worker
-    ~prepare:(prepare_tagged_fixture ~count:195 ~title:(String.make 4096 't'))
-    (fun worker ->
-       List.iteri
-         (fun n query ->
-            worker.request (command (1100 + n) query)
-            |> require_response_limit "enriched structural read" P.maximum_response_bytes)
-         [ P.V2_get_children
-             { parent = Fixture.page_uuid; limit = 200; cursor = None; revision = None }
-         ; P.V2_get_page_tree
-             { page = Fixture.page_uuid
-             ; maximum_depth = 1
-             ; limit = 200
-             ; cursor = None
-             ; revision = None
-             }
-         ])
+  let title = String.make 4096 't' in
+  with_worker ~prepare:(prepare_tagged_fixture ~count:195 ~title) (fun worker ->
+    let module Ids = Set.Make (Graph.Uuid) in
+    let expected =
+      List.init 195 (fun n -> Fixture.mutation_uuid (10000 + n))
+      |> List.fold_left (fun ids id -> Ids.add id ids) Ids.empty
+    in
+    List.iteri
+      (fun family query ->
+         let rec collect ordinal cursor pages seen =
+           require (pages < 16) "adaptive structural pages must terminate";
+           let query_command =
+             match query with
+             | P.V2_get_children value -> P.V2_get_children { value with cursor }
+             | V2_get_page_tree value -> V2_get_page_tree { value with cursor }
+             | _ -> failwith "unexpected budget fixture query"
+           in
+           let response =
+             worker.request (command (1100 + (family * 20) + ordinal) query_command)
+           in
+           require
+             (P.encoded_response_bytes response <= P.maximum_response_bytes)
+             "adaptive full DTO page exceeds final byte budget";
+           let values, next =
+             match response with
+             | P.V2_response
+                 { outcome = V2_children_outcome { items; next_cursor; _ }; _ } ->
+               List.map (fun (item : P.v2_child_member) -> item.value) items, next_cursor
+             | P.V2_response
+                 { outcome = V2_page_tree_outcome { items; next_cursor; _ }; _ } ->
+               List.map (fun (item : P.v2_tree_member) -> item.value) items, next_cursor
+             | _ -> failwith "adaptive structural read did not return a real page"
+           in
+           let seen =
+             List.fold_left
+               (fun seen (value : P.v2_block_record) ->
+                  if Ids.mem value.block.uuid expected
+                  then (
+                    require
+                      (value.tag_titles = [ title ])
+                      "adaptive page truncated enriched tag DTO";
+                    require
+                      (not (Ids.mem value.block.uuid seen))
+                      "adaptive structural pages repeated a member";
+                    Ids.add value.block.uuid seen)
+                  else seen)
+               seen
+               values
+           in
+           match next with
+           | None ->
+             require
+               (pages > 0 && Ids.equal seen expected)
+               "adaptive structural pagination lost known tagged members"
+           | Some _ when next = cursor ->
+             failwith "adaptive structural cursor did not advance"
+           | Some _ -> collect (ordinal + 1) next (pages + 1) seen
+         in
+         collect 0 None 0 Ids.empty)
+      [ P.V2_get_children
+          { parent = Fixture.page_uuid; limit = 200; cursor = None; revision = None }
+      ; V2_get_page_tree
+          { page = Fixture.page_uuid
+          ; maximum_depth = 1
+          ; limit = 200
+          ; cursor = None
+          ; revision = None
+          }
+      ])
 ;;
-
 let test_encoded_utf8_budget_boundary () =
   let title = String.concat "" (List.init 300 (fun _ -> "日\"\n")) in
   let prepare = prepare_tagged_fixture ~count:1 ~title in
@@ -916,11 +970,18 @@ let test_canonical_target_summary_query () =
            ~error:(fun message ->
              failwith ("target summary response rejected: " ^ message))
     in
-    let too_large = worker.request (query ~limit:P.maximum_page_size 17999 None) in
-    require_response_limit
-      "full target metadata obeys final bytes"
-      P.maximum_response_bytes
-      too_large;
+    let adapted = worker.request (query ~limit:P.maximum_page_size 17999 None) in
+    require (P.encoded_response_bytes adapted<=P.maximum_response_bytes)
+      "full canonical target metadata obeys final bytes";
+    (match adapted with
+     | P.V2_response {outcome=V2_block_summary_outcome {items;next_cursor=Some _;_};_}->
+       require (items<>[] && List.length items<P.maximum_page_size)
+         "oversized target page must shrink and retain its real continuation";
+       List.iteri(fun index (item:P.v2_child_member)->
+         require (item.value.block.uuid=Fixture.mutation_uuid (17000+index)
+           && item.value.block.title=Printf.sprintf "Canonical child %d" index)
+           "adaptive target page truncated or skipped canonical DTO") items
+     | _->failwith "oversized target page did not return an adapted complete page");
     let first_outcome = inspect 18000 None in
     match first_outcome with
     | P.V2_block_summary_outcome first ->
@@ -972,6 +1033,93 @@ let test_canonical_target_summary_query () =
     | _ -> failwith "canonical query did not return a block summary")
 ;;
 
+(* Physical release ACK cannot be proved by the pure registry: this test holds
+   the real predecessor snapshot after listen, through the injected authority
+   check, and proves cleanup waits for that admitted read to release its lease. *)
+let test_observation_release_waits_for_initial_snapshot () =
+  with_worker (fun worker ->
+    let entered, enter = Eio.Promise.create ()
+    and gate, release_gate = Eio.Promise.create () in
+    let result, resolve_result = Eio.Promise.create ()
+    and released, resolve_released = Eio.Promise.create () in
+    let calls = ref 0
+    and notifications = ref 0 in
+    let current () =
+      incr calls;
+      if !calls = 2
+      then (
+        Eio.Promise.resolve enter ();
+        Eio.Promise.await gate);
+      true
+    in
+    let id = uuid "9d000000-0000-4000-8000-000000009000" in
+    let await promise =
+      let deadline = Unix.gettimeofday () +. 3. in
+      while Eio.Promise.peek promise = None && Unix.gettimeofday () < deadline do
+        Eio.Fiber.yield ()
+      done;
+      match Eio.Promise.peek promise with
+      | Some value -> value
+      | None -> failwith "physical observation race timed out"
+    in
+    Fun.protect
+      ~finally:(fun () -> ignore (Eio.Promise.try_resolve release_gate () : bool))
+      (fun () ->
+         Eio.Fiber.fork ~sw:worker.sw (fun () ->
+           let value =
+             Runner.register_observation
+               worker.runner
+               ~registration:801L
+               ~id
+               ~scope:worker.scope
+               ~request:(command 29001 P.V2_graph_info)
+               ~maximum_bytes:16384
+               ~current
+               ~notify:(fun ~epoch:_ -> incr notifications)
+           in
+           Eio.Promise.resolve resolve_result value);
+         await entered;
+         Eio.Fiber.fork ~sw:worker.sw (fun () ->
+           let value =
+             Runner.release_observation
+               worker.runner
+               ~registration:801L
+               ~id
+               ~scope:worker.scope
+           in
+           Eio.Promise.resolve resolve_released value);
+         for _ = 1 to 8 do
+           Eio.Fiber.yield ()
+         done;
+         require
+           (Eio.Promise.peek released = None)
+           "release ACK preceded initial snapshot settlement";
+         Eio.Promise.resolve release_gate ();
+         require
+           (match await result with
+            | Error _ -> true
+            | _ -> false)
+           "cancelled registration returned a readable observation";
+         require (await released = Ok ()) "physical release did not acknowledge cleanup";
+         require
+           (!notifications = 0)
+           "initial registration resurrected a retired callback";
+         require
+           (match
+              Runner.register_observation
+                worker.runner
+                ~registration:801L
+                ~id
+                ~scope:worker.scope
+                ~request:(command 29002 P.V2_graph_info)
+                ~maximum_bytes:16384
+                ~current:(fun () -> true)
+                ~notify:(fun ~epoch:_ -> incr notifications)
+            with
+            | Error _ -> true
+            | _ -> false)
+           "retired registration ID was physically allocated again"))
+;;
 let () =
   let failures = ref [] in
   List.iter
@@ -983,7 +1131,8 @@ let () =
        | exn ->
          failures := name :: !failures;
          Printf.printf "FAIL %s: %s\n%!" name (Printexc.to_string exn))
-    [ "Canonical target summary snapshot query", test_canonical_target_summary_query
+    [ "Observation release joins predecessor snapshot", test_observation_release_waits_for_initial_snapshot
+    ; "Canonical target summary snapshot query", test_canonical_target_summary_query
     ; "Enriched structural read final bytes", test_enriched_response_budget
     ; "UTF-8 and escaping exact final budget", test_encoded_utf8_budget_boundary
     ; "Asset reference command without upload", test_asset_reference_command

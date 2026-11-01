@@ -546,6 +546,22 @@ let is_snapshot_read = function
   | V2_clear_task_status _ -> false
 ;;
 
+let is_observable_read command =
+  validate_command command
+  &&
+  match command with
+  | V2_graph_info | V2_get_asset_descriptors _ | V2_get_task_status_definitions _ -> true
+  | V2_list_assets { cursor = None; _ }
+  | V2_list_task_statuses { cursor = None; _ }
+  | V2_list_favorites { cursor = None; _ }
+  | V2_list_journals { cursor = None; revision = None; _ }
+  | V2_get_page { revision = None; _ }
+  | V2_get_outline_block { revision = None; _ }
+  | V2_get_outline_block_summary { cursor = None; _ }
+  | V2_get_children { cursor = None; revision = None; _ }
+  | V2_get_page_tree { cursor = None; revision = None; _ } -> true
+  | _ -> false
+;;
 let smaller_read_page = function
   | V2_list_journals value when value.limit > 1 ->
     Some (V2_list_journals { value with limit = max 1 (value.limit / 2) })

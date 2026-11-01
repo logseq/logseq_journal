@@ -212,3 +212,84 @@ type coordination_state =
   }
 val coordination_state : state -> coordination_state
 val import_context_for_scope : state -> Logseq_sync_pure_reducer.Core.graph_scope -> Logseq_sync_pure_reducer.Core.asset_context option
+
+(** Pure admission/epoch/tombstone ownership for real query subscriptions.
+    Physical listeners and snapshot leases remain with the effect owner. A
+    released logical ID cannot allocate later if Cancel overtook registration.
+    This registry never infers a physical release ACK. *)
+module Observation_registry : sig
+  type t
+
+  type decision =
+    | Start
+    | Existing
+    | Retired
+    | Full
+    | Mismatch
+    | Invalid
+
+  type release =
+    | Release
+    | Already_released
+    | Unknown
+    | Release_full
+    | Wrong_owner
+
+  val empty : t
+
+  val reserve
+    :  t
+    -> registration:int64
+    -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+    -> command:Logseq_db_worker_contract.Protocol.command
+    -> maximum_bytes:int
+    -> t * decision
+
+  val release
+    :  t
+    -> registration:int64
+    -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+    -> t * release
+
+  (** External completion after physical listener/read cleanup; only then is
+      its active-resource capacity reusable. *)
+  val released
+    :  t
+    -> registration:int64
+    -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+    -> t
+
+  val advance
+    :  t
+    -> registration:int64
+    -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> t * int64 option
+
+  val current
+    :  t
+    -> registration:int64
+    -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> epoch:int64
+    -> bool
+
+  val scope
+    :  t
+    -> registration:int64
+    -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> Logseq_sync_pure_reducer.Core.graph_scope option
+
+  val epoch
+    :  t
+    -> registration:int64
+    -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> int64 option
+
+  val active : t -> int
+  val retained : t -> int
+
+  (** Only after all physical listeners/read leases of this binding settled. *)
+  val retire_registration : t -> registration:int64 -> t
+end

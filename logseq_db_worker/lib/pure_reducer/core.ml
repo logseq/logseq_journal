@@ -1252,3 +1252,173 @@ let import_context_for_scope state (scope:Sync.graph_scope) =
   if Sync.scope_for_graph state.sync_core ~graph_id:scope.graph_id<>Some scope then None
   else import_context_single (load_graph state scope) ~graph_generation:scope.graph_generation
 ;;
+
+module Observation_registry = struct
+  module G = Logseq_db_types.Graph_types
+  module S = Logseq_sync_pure_reducer.Core
+
+  module Entries = Map.Make (struct
+      type t = int64 * G.Uuid.t
+
+      let compare (registration, id) (other_registration, other_id) =
+        let order = Int64.compare registration other_registration in
+        if order = 0 then G.Uuid.compare id other_id else order
+      ;;
+    end)
+
+  type live =
+    { scope : S.graph_scope
+    ; command : Protocol.command
+    ; maximum_bytes : int
+    ; epoch : int64
+    }
+
+  type entry =
+    | Live of live
+    | Closing of S.graph_scope
+    | Gone of S.graph_scope
+
+  type t =
+    { entries : entry Entries.t
+    ; active : int
+    ; retained : int
+    }
+
+  type decision =
+    | Start
+    | Existing
+    | Retired
+    | Full
+    | Mismatch
+    | Invalid
+
+  type release =
+    | Release
+    | Already_released
+    | Unknown
+    | Release_full
+    | Wrong_owner
+
+  let empty = { entries = Entries.empty; active = 0; retained = 0 }
+
+  let same_scope (a : S.graph_scope) (b : S.graph_scope) =
+    G.Uuid.equal a.graph_id b.graph_id
+    && a.graph_generation = b.graph_generation
+    && a.account.user_id = b.account.user_id
+    && Uri.equal a.account.managed_sync_origin b.account.managed_sync_origin
+    && a.account.account_generation = b.account.account_generation
+    && a.account.lifecycle_generation = b.account.lifecycle_generation
+  ;;
+
+  let reserve state ~registration ~id ~scope ~command ~maximum_bytes =
+    let key = registration, id in
+    if
+      registration <= 0L
+      || maximum_bytes <= 0
+      || maximum_bytes > Protocol.maximum_response_bytes
+      || not (Protocol.is_observable_read command)
+    then state, Invalid
+    else (
+      match Entries.find_opt key state.entries with
+      | Some (Gone old | Closing old) ->
+        state, if same_scope scope old then Retired else Mismatch
+      | Some (Live old) ->
+        ( state
+        , if
+            same_scope scope old.scope
+            && old.command = command
+            && old.maximum_bytes = maximum_bytes
+          then Existing
+          else Mismatch )
+      | None when state.active >= 256 || state.retained >= 8192 -> state, Full
+      | None ->
+        ( { entries =
+              Entries.add
+                key
+                (Live { scope; command; maximum_bytes; epoch = 0L })
+                state.entries
+          ; active = state.active + 1
+          ; retained = state.retained + 1
+          }
+        , Start ))
+  ;;
+
+  let release state ~registration ~id ~scope =
+    let key = registration, id in
+    match Entries.find_opt key state.entries with
+    | Some (Live old) when same_scope scope old.scope ->
+      { state with entries = Entries.add key (Closing old.scope) state.entries }, Release
+    | Some (Closing old) when same_scope scope old -> state, Release
+    | Some (Gone old) when same_scope scope old -> state, Already_released
+    | Some _ -> state, Wrong_owner
+    | None when registration <= 0L || state.retained >= 8192 -> state, Release_full
+    | None ->
+      ( { state with
+          entries = Entries.add key (Gone scope) state.entries
+        ; retained = state.retained + 1
+        }
+      , Unknown )
+  ;;
+
+  let released state ~registration ~id ~scope =
+    let key = registration, id in
+    match Entries.find_opt key state.entries with
+    | Some (Closing old) when same_scope old scope ->
+      { state with
+        entries = Entries.add key (Gone old) state.entries
+      ; active = state.active - 1
+      }
+    | _ -> state
+  ;;
+
+  let advance state ~registration ~id =
+    let key = registration, id in
+    match Entries.find_opt key state.entries with
+    | Some (Live old) when old.epoch < Int64.max_int ->
+      let epoch = Int64.succ old.epoch in
+      ( { state with entries = Entries.add key (Live { old with epoch }) state.entries }
+      , Some epoch )
+    | _ -> state, None
+  ;;
+
+  let current state ~registration ~id ~epoch =
+    match Entries.find_opt (registration, id) state.entries with
+    | Some (Live value) -> value.epoch = epoch
+    | _ -> false
+  ;;
+
+  let scope state ~registration ~id =
+    match Entries.find_opt (registration, id) state.entries with
+    | Some (Live value) -> Some value.scope
+    | Some (Gone scope | Closing scope) -> Some scope
+    | None -> None
+  ;;
+
+  let epoch state ~registration ~id =
+    match Entries.find_opt (registration, id) state.entries with
+    | Some (Live value) -> Some value.epoch
+    | _ -> None
+  ;;
+
+  let active state = state.active
+  let retained state = state.retained
+
+  let retire_registration state ~registration =
+    let entries =
+      Entries.filter (fun (binding, _) _ -> binding <> registration) state.entries
+    in
+    let active, retained =
+      Entries.fold
+        (fun _ entry (active, retained) ->
+           ( (active
+              +
+              match entry with
+              | Live _ | Closing _ -> 1
+              | Gone _ -> 0)
+           , retained + 1 ))
+        entries
+        (0, 0)
+    in
+    { entries; active; retained }
+  ;;
+end

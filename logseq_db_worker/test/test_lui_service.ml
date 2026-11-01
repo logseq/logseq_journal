@@ -1579,11 +1579,63 @@ let test_resident_invalidations_survive_coalescing () =
   let latest=Service.coalesce_push ~topic:Service.invalidation_topic merged (Service.Graph_pushes [scope,push 3]) in
   T.require (latest=Service.Graph_pushes [other,push 2;scope,push 3]) "latest update must replace only its exact graph scope"
 ;;
+let test_observation_invalidations_are_bounded_latest_facts () =
+  let scope = asset_scope 1 in
+  let owner : Service.timeline_scope =
+    { startup = { account_generation = 1; presentation_generation = 1 }
+    ; graph_id = scope.graph_id
+    ; graph_generation = 1
+    }
+  in
+  let topic = ID.Worker.Push_topic.of_int 8 in
+  let fact registration n epoch =
+    Service.Observation_invalidated
+      { registration_id = registration
+      ; owner
+      ; epoch
+      ; observation_id =
+          Logseq_db_types.Graph_types.Uuid.of_string
+            (Printf.sprintf "9d000000-0000-4000-8000-%012d" n)
+          |> Result.get_ok
+      }
+  in
+  let push value = Service.Coordination_observations (Rrbvec.singleton value) in
+  let merge = Service.coalesce_push ~topic in
+  let latest = merge (push (fact 1L 1 4L)) (push (fact 1L 1 2L)) in
+  T.require (latest = push (fact 1L 1 4L)) "stale observation epoch replaced newer fact";
+  let separate = merge latest (push (fact 2L 1 1L)) in
+  T.require
+    (match separate with
+     | Service.Coordination_observations values -> Rrbvec.length values = 2
+     | _ -> false)
+    "binding identity was erased during observation coalescing";
+  let all = ref (Service.Coordination_observations Rrbvec.empty) in
+  for n = 1 to 512 do
+    all := merge !all (push (fact 1L n 1L))
+  done;
+  T.require
+    (match !all with
+     | Service.Coordination_observations values -> Rrbvec.length values = 512
+     | _ -> false)
+    "distinct live observations were overwritten";
+  let overflow = merge !all (push (fact 1L 513 1L)) in
+  let marker = push Service.Observations_resync in
+  T.require (overflow = marker) "overflow silently lost observation invalidations";
+  T.require
+    (merge overflow (push (fact 1L 1 9L)) = marker)
+    "later fact erased required observation resync";
+  T.require
+    (match !all with
+     | Service.Coordination_observations values -> Rrbvec.length values = 512
+     | _ -> false)
+    "coalescing modified an earlier immutable batch"
+;;
 let () =
   T.run
     "lui worker service"
     [ T.case "registered baseline and release fences" test_coordination_registration
     ; T.case "resident invalidations preserve all graphs" test_resident_invalidations_survive_coalescing
+    ; T.case "observation invalidations bounded latest epochs" test_observation_invalidations_are_bounded_latest_facts
     ; T.case "typed asset failures reach ledger" test_asset_failure_rows
     ; T.case "safe worker failure rows" test_safe_worker_failure_rows
     ; T.case "authoritative integrity rows" test_authoritative_integrity_rows

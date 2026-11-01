@@ -1685,10 +1685,557 @@ let test_host_preserves_query_origin_before_forget () =
     require (!calls = 1) "query origin callback was delivered more than once")
 ;;
 
+let with_observation_service ?epoch_ms f =
+  with_client ?epoch_ms (fun client ->
+    let replies = Hashtbl.create 16
+    and baseline = ref None
+    and notices = ref Rrbvec.empty in
+    Mailbox.on_event client (function
+      | Response { request_id; outcome; _ } -> Hashtbl.replace replies request_id outcome
+      | Push { payload = Service.Coordination_updates updates; _ } ->
+        List.iter
+          (function
+            | Service.Coordination_snapshot value -> baseline := Some value
+            | _ -> ())
+          updates
+      | Push { payload = Service.Coordination_observations updates; _ } ->
+        notices := Rrbvec.append !notices updates
+      | _ -> ());
+    let wait predicate =
+      let deadline = Unix.gettimeofday () +. 5. in
+      while (not (predicate ())) && Unix.gettimeofday () < deadline do
+        Mailbox.Private.deliver client ~max_events:64;
+        Thread.delay 0.001
+      done;
+      require (predicate ()) "real observation Service did not settle"
+    in
+    let send value =
+      match Mailbox.send client value with
+      | Accepted id -> id
+      | _ -> failwith "observation Service request not admitted"
+    in
+    let call value =
+      let id = send value in
+      wait (fun () -> Hashtbl.mem replies id);
+      Hashtbl.find replies id
+    in
+    ignore (call (Service.Client_command (Restore_local_account { user_id = "user-1" })));
+    let registration = 910000L in
+    (match call (Service.Register_coordination registration) with
+     | Completed (Service.Coordination_registered value) -> baseline := Some value
+     | _ -> failwith "observation baseline registration failed");
+    wait (fun () ->
+      match !baseline with
+      | Some value ->
+        List.exists
+          (fun (_, graph) -> graph.Logseq_db_worker.phase = Logseq_db_worker.Graph_open)
+          value.baseline.state.residents
+      | None -> false);
+    let owner = Option.get (Option.get !baseline).baseline.state.sync.selected in
+    f client ~call ~send ~wait ~replies ~notices ~baseline ~owner ~registration)
+;;
+
+let test_service_observation_lifecycle () =
+  with_observation_service
+    (fun client ~call ~send:_ ~wait ~replies:_ ~notices ~baseline ~owner ~registration ->
+       let logical = uuid "9d000000-0000-4000-8000-000000000001" in
+       let req n command =
+         P.
+           { api_version
+           ; request_id = uuid (Printf.sprintf "9d000000-0000-4000-8000-%012d" n)
+           ; command
+           }
+       in
+       let source =
+         req
+           2
+           (P.V2_get_outline_block
+              { block = Test_support.authoritative_block_uuid; revision = None })
+       in
+       let observe =
+         Service.Coordination_observe
+           { registration
+           ; owner
+           ; observation_id = logical
+           ; request = source
+           ; maximum_bytes = 16384
+           }
+       in
+       let revision =
+         match call observe with
+         | Completed
+             (Service.Coordination_observed
+                { epoch = 0L
+                ; response =
+                    V2_response
+                      { outcome = V2_block_outcome (V2_present_block { revision; _ }); _ }
+                ; _
+                }) -> revision
+         | _ -> failwith "real initial observation did not sample its predecessor"
+       in
+       require
+         (match call observe with
+          | Completed (Service.Coordination_observed { epoch = 0L; _ }) -> true
+          | _ -> false)
+         "duplicate Observe did not retain original registration";
+       let retry_source={source with P.request_id=(req 10 P.V2_graph_info).request_id} in
+       require
+         (match call(Service.Coordination_observe {registration;owner;observation_id=logical;
+           request=retry_source;maximum_bytes=16384}) with
+          | Completed(Service.Coordination_observed {epoch=0L;response=V2_response
+              {request_id;_};_})->request_id=retry_source.request_id
+          | _->false)
+         "retried Observe lost current RPC correlation";
+       require
+         (call
+            (Service.Client_command
+               (Configure_resident_graphs [ Test_support.graph_uuid; second_graph ]))
+          = Mailbox.Completed Service.Client_command_completed)
+         "synthetic resident configuration failed";
+       wait (fun () ->
+         match !baseline with
+         | Some value ->
+           List.length value.baseline.state.residents = 2
+           && List.for_all
+                (fun (_, graph) ->
+                   graph.Logseq_db_worker.phase = Logseq_db_worker.Graph_open)
+                value.baseline.state.residents
+         | None -> false);
+       require
+         (call (Service.Client_command (Focus_resident_graph second_graph))
+          = Mailbox.Completed Service.Client_command_completed)
+         "synthetic focus change failed";
+       wait (fun () ->
+         match !baseline with
+         | Some value ->
+           Option.exists
+             (fun (selected : Service.timeline_scope) -> selected.graph_id = second_graph)
+             value.baseline.state.sync.selected
+         | None -> false);
+       require
+         (match
+            call
+              (Service.Coordination_refresh_observation
+                 { registration
+                 ; owner
+                 ; observation_id = logical
+                 ; request_id = (req 9 P.V2_graph_info).request_id
+                 })
+          with
+          | Completed
+              (Service.Coordination_observed
+                 { response =
+                     V2_response
+                       { outcome =
+                           V2_block_outcome (V2_present_block { revision = actual; _ })
+                       ; _
+                       }
+                 ; _
+                 }) -> actual = revision
+          | _ -> false)
+         "focus retired a surviving resident observation";
+       let write n revision title =
+         call
+           (Service.Graph_request_at
+              ( owner
+              , req
+                  n
+                  (P.V2_save_block
+                     { mutation_id = (req (n + 100) P.V2_graph_info).request_id
+                     ; block = Test_support.authoritative_block_uuid
+                     ; title
+                     ; preconditions =
+                         { blocks = [ Test_support.authoritative_block_uuid, revision ]
+                         ; pages = []
+                         ; scopes = []
+                         }
+                     }) ))
+       in
+       require
+         (match write 3 revision "Observed write" with
+          | Completed
+              (Service.Graph_response
+                 (V2_response { outcome = V2_mutation_committed _; _ })) -> true
+          | _ -> false)
+         "observation synthetic mutation failed";
+       wait (fun () ->
+         Rrbvec.exists
+           (function
+             | Service.Observation_invalidated value ->
+               value.registration_id = registration
+               && value.observation_id = logical
+               && value.epoch > 0L
+             | _ -> false)
+           !notices);
+       let refreshed =
+         call
+           (Service.Coordination_refresh_observation
+              { registration
+              ; owner
+              ; observation_id = logical
+              ; request_id = (req 4 P.V2_graph_info).request_id
+              })
+       in
+       let current_revision =
+         match refreshed with
+         | Completed
+             (Service.Coordination_observed
+                { epoch
+                ; response =
+                    V2_response
+                      { outcome = V2_block_outcome (V2_present_block { value; revision })
+                      ; _
+                      }
+                ; _
+                }) ->
+           require
+             (epoch > 0L && value.block.title = "Observed write")
+             "Refresh lost epoch/data";
+           revision
+         | _ -> failwith "real observation refresh failed"
+       in
+       let release =
+         Service.Coordination_release_observation
+           { registration; owner; observation_id = logical }
+       in
+       require
+         (match call release with
+          | Completed (Service.Coordination_observation_released _) -> true
+          | _ -> false)
+         "release did not acknowledge listener/read retirement";
+       require
+         (match call release with
+          | Completed (Service.Coordination_observation_released _) -> true
+          | _ -> false)
+         "release ACK was not idempotent";
+       require
+         (match call observe with
+          | Failed _ -> true
+          | _ -> false)
+         "retired logical observation was allocated again";
+       notices := Rrbvec.empty;
+       require
+         (match write 5 current_revision "After observation release" with
+          | Completed
+              (Service.Graph_response
+                 (V2_response { outcome = V2_mutation_committed _; _ })) -> true
+          | _ -> false)
+         "post-release synthetic write did not commit";
+       for _ = 1 to 12 do
+         Mailbox.Private.deliver client ~max_events:64;
+         Thread.delay 0.001
+       done;
+       require
+         (Rrbvec.is_empty !notices)
+         "released observation published a later invalidation";
+       let cancelled = uuid "9d000000-0000-4000-8000-000000000006" in
+       require
+         (match
+            call
+              (Service.Coordination_release_observation
+                 { registration; owner; observation_id = cancelled })
+          with
+          | Completed (Service.Coordination_observation_released _) -> true
+          | _ -> false)
+         "release before registration did not create a fence";
+       require
+         (match
+            call
+              (Service.Coordination_observe
+                 { registration
+                 ; owner
+                 ; observation_id = cancelled
+                 ; request = source
+                 ; maximum_bytes = 16384
+                 })
+          with
+          | Failed _ -> true
+          | _ -> false)
+         "late observation escaped its pre-registration release";
+       ignore (call (Service.Release_coordination registration)))
+;;
+
+let test_service_empty_observation_is_retained () =
+  with_observation_service
+    (fun
+        _client
+         ~call
+         ~send:_
+         ~wait
+         ~replies:_
+         ~notices
+         ~baseline:_
+         ~owner
+         ~registration
+       ->
+       let target = uuid "9d000000-0000-4000-8000-000000005000" in
+       let logical = uuid "9d000000-0000-4000-8000-000000005001" in
+       let req n command =
+         P.
+           { api_version
+           ; request_id = uuid (Printf.sprintf "9d000000-0000-4000-8000-%012d" n)
+           ; command
+           }
+       in
+       let point =
+         req 5002 (P.V2_get_outline_block { block = target; revision = None })
+       in
+       require
+         (match
+            call
+              (Service.Coordination_observe
+                 { registration
+                 ; owner
+                 ; observation_id = logical
+                 ; request = point
+                 ; maximum_bytes = 16384
+                 })
+          with
+          | Completed
+              (Service.Coordination_observed
+                 { response =
+                     V2_response
+                       { outcome = V2_block_outcome (V2_missing_block { uuid; _ }); _ }
+                 ; _
+                 }) -> uuid = target
+          | _ -> false)
+         "empty initial sample was not observable";
+       let read n command = call (Service.Graph_request_at (owner, req n command)) in
+       let page_revision =
+         match
+           read 5003 (P.V2_get_page { page = Test_support.page_uuid; revision = None })
+         with
+         | Completed
+             (Service.Graph_response
+                (V2_response
+                   { outcome = V2_page_outcome (V2_present_page { revision; _ }); _ })) ->
+           revision
+         | _ -> failwith "observation insert page revision unavailable"
+       in
+       let scope_revision =
+         match
+           read
+             5004
+             (P.V2_get_children
+                { parent = Test_support.page_uuid
+                ; limit = 1
+                ; cursor = None
+                ; revision = None
+                })
+         with
+         | Completed
+             (Service.Graph_response
+                (V2_response { outcome = V2_children_outcome { scope_revision; _ }; _ }))
+           -> scope_revision
+         | _ -> failwith "observation insert children revision unavailable"
+       in
+       require
+         (match
+            read
+              5005
+              (P.V2_insert_blocks
+                 { mutation_id = (req 5006 P.V2_graph_info).request_id
+                 ; parent = Test_support.page_uuid
+                 ; roots =
+                     [ { uuid = target; title = "First observed block"; children = [] } ]
+                 ; preconditions =
+                     { blocks = []
+                     ; pages = [ Test_support.page_uuid, page_revision ]
+                     ; scopes =
+                         [ V2_children_scope Test_support.page_uuid, scope_revision ]
+                     }
+                 })
+          with
+          | Completed
+              (Service.Graph_response
+                 (V2_response { outcome = V2_mutation_committed _; _ })) -> true
+          | _ -> false)
+         "synthetic first insertion did not commit";
+       wait (fun () ->
+         Rrbvec.exists
+           (function
+             | Service.Observation_invalidated value -> value.observation_id = logical
+             | _ -> false)
+           !notices);
+       require
+         (match
+            call
+              (Service.Coordination_refresh_observation
+                 { registration
+                 ; owner
+                 ; observation_id = logical
+                 ; request_id = (req 5007 P.V2_graph_info).request_id
+                 })
+          with
+          | Completed
+              (Service.Coordination_observed
+                 { response =
+                     V2_response
+                       { outcome = V2_block_outcome (V2_present_block { value; _ }); _ }
+                 ; _
+                 }) ->
+            value.block.uuid = target && value.block.title = "First observed block"
+          | _ -> false)
+         "missing sample discarded the interest before first value";
+       ignore (call (Service.Release_coordination registration)))
+;;
+
+let test_service_observation_read_failure_retains_interest () =
+  with_observation_service
+    (fun
+        _client
+         ~call
+         ~send:_
+         ~wait
+         ~replies:_
+         ~notices
+         ~baseline:_
+         ~owner
+         ~registration
+       ->
+       let logical = uuid "9e000000-0000-4000-8000-000000000001" in
+       let req n command =
+         P.
+           { api_version
+           ; request_id = uuid (Printf.sprintf "9e000000-0000-4000-8000-%012d" n)
+           ; command
+           }
+       in
+       let point n =
+         req
+           n
+           (P.V2_get_outline_block
+              { block = Test_support.authoritative_block_uuid; revision = None })
+       in
+       let read n =
+         match
+           call
+             (Service.Coordination_query
+                { registration
+                ; owner
+                ; request = point n
+                ; response_budget_bytes = P.maximum_response_bytes
+                })
+         with
+         | Completed
+             (Service.Graph_response
+                (P.V2_response
+                   { outcome = V2_block_outcome (V2_present_block { revision; _ }); _ } as
+                 raw)) -> revision, raw
+         | _ -> failwith "observation recovery source read failed"
+       in
+       let _, raw = read 2 in
+       let budget = P.encoded_response_bytes raw + 128 in
+       require (budget < 60000) "recovery fixture envelope unexpectedly large";
+       let write n title =
+         let revision, _ = read (n + 100) in
+         require
+           (match
+              call
+                (Service.Graph_request_at
+                   ( owner
+                   , req
+                       n
+                       (P.V2_save_block
+                          { mutation_id = (req (n + 200) P.V2_graph_info).request_id
+                          ; block = Test_support.authoritative_block_uuid
+                          ; title
+                          ; preconditions =
+                              { blocks =
+                                  [ Test_support.authoritative_block_uuid, revision ]
+                              ; pages = []
+                              ; scopes = []
+                              }
+                          }) ))
+            with
+            | Completed
+                (Service.Graph_response
+                   (V2_response { outcome = V2_mutation_committed _; _ })) -> true
+            | _ -> false)
+           "synthetic observation recovery write failed"
+       in
+       let too_large = String.make (budget + 1024) 'L' in
+       write 3 too_large;
+       let initial =
+         call
+           (Service.Coordination_observe
+              { registration
+              ; owner
+              ; observation_id = logical
+              ; request = point 4
+              ; maximum_bytes = budget
+              })
+       in
+       require
+         (match initial with
+          | Completed
+              (Service.Coordination_observed
+                 { response =
+                     V2_response
+                       { outcome = V2_failed { code = "responseTooLarge"; _ }; _ }
+                 ; _
+                 }) -> true
+          | _ -> false)
+         "oversized initial sample did not report a read failure";
+       let refresh n =
+         call
+           (Service.Coordination_refresh_observation
+              { registration
+              ; owner
+              ; observation_id = logical
+              ; request_id = (point n).request_id
+              })
+       in
+       let recover n text =
+         notices := Rrbvec.empty;
+         write n text;
+         wait (fun () ->
+           Rrbvec.exists
+             (function
+               | Service.Observation_invalidated value -> value.observation_id = logical
+               | _ -> false)
+             !notices);
+         require
+           (match refresh (n + 10) with
+            | Completed
+                (Service.Coordination_observed
+                   { response =
+                       V2_response
+                         { outcome = V2_block_outcome (V2_present_block { value; _ }); _ }
+                   ; _
+                   }) -> value.block.title = text
+            | _ -> false)
+           "read failure silently discarded its observation interest"
+       in
+       recover 5 "Recovered initial observation";
+       write 6 too_large;
+       require
+         (match refresh 17 with
+          | Completed
+              (Service.Coordination_observed
+                 { response =
+                     V2_response
+                       { outcome = V2_failed { code = "responseTooLarge"; _ }; _ }
+                 ; _
+                 }) -> true
+          | _ -> false)
+         "Refresh did not preserve its read error";
+       recover 8 "Recovered refreshed observation";
+       ignore (call (Service.Release_coordination registration)))
+;;
 let () =
-  test_host_preserves_query_origin_before_forget ();
-  test_client_to_typed_read ();
-  test_read_completion_rechecks_graph_owner ();
-  test_read_completion_rechecks_graph_owner ~durable:true ();
-  print_endline "Worker coordination real client/read/cleanup passed"
+  test_service_observation_read_failure_retains_interest ();
+  test_service_observation_lifecycle ();
+  test_service_empty_observation_is_retained ();
+  let observations_only = Array.exists (( = ) "--observations-only") Sys.argv in
+  if not observations_only
+  then (
+    test_host_preserves_query_origin_before_forget ();
+    test_client_to_typed_read ();
+    test_read_completion_rechecks_graph_owner ();
+    test_read_completion_rechecks_graph_owner ~durable:true ());
+  print_endline
+    (if observations_only
+     then "Worker coordination real observation Service passed"
+     else "Worker coordination real client/read/cleanup passed")
 ;;

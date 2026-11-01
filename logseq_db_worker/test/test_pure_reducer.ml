@@ -1513,6 +1513,266 @@ let test_pure_read_page_bounds () =
       ]
 ;;
 
+let test_observation_registry () =
+  let module O = Core.Observation_registry in
+  let _, scope = worker_open_graph () in
+  let id = uuid "10000000-0000-4000-8000-000000007001" in
+  let reserve state scope command maximum_bytes =
+    O.reserve state ~registration:71L ~id ~scope ~command ~maximum_bytes
+  in
+  let live, decision = reserve O.empty scope Protocol.V2_graph_info 16384 in
+  Alcotest.(check bool) "first query registration is admitted" true (decision = O.Start);
+  Alcotest.(check bool)
+    "initial observation epoch is live"
+    true
+    (O.current live ~registration:71L ~id ~epoch:0L);
+  let again, decision = reserve live scope Protocol.V2_graph_info 16384 in
+  Alcotest.(check bool)
+    "duplicate registration does not allocate"
+    true
+    (decision = O.Existing);
+  Alcotest.(check int) "only one active listener" 1 (O.active again);
+  let _, decision = reserve live scope Protocol.V2_inspect_admission 16384 in
+  Alcotest.(check bool)
+    "same ID cannot change query"
+    true
+    (decision = O.Mismatch || decision = O.Invalid);
+  let other = { scope with graph_generation = scope.graph_generation + 1 } in
+  let _, release = O.release live ~registration:71L ~id ~scope:other in
+  Alcotest.(check bool)
+    "foreign generation cannot retire listener"
+    true
+    (release = O.Wrong_owner);
+  let focused =
+    { scope with account = { scope.account with presentation_generation = 99 } }
+  in
+  let _, decision = reserve live focused Protocol.V2_graph_info 16384 in
+  Alcotest.(check bool)
+    "presentation focus does not replace execution"
+    true
+    (decision = O.Existing);
+  let changed, epoch = O.advance live ~registration:71L ~id in
+  Alcotest.(check (option int64)) "invalidation advances epoch" (Some 1L) epoch;
+  Alcotest.(check bool)
+    "old read cannot publish"
+    false
+    (O.current changed ~registration:71L ~id ~epoch:0L);
+  let retired, release = O.release changed ~registration:71L ~id ~scope in
+  Alcotest.(check bool) "release fences before IO ACK" true (release = O.Release);
+  Alcotest.(check int)
+    "capacity remains reserved before physical ACK"
+    1
+    (O.active retired);
+  let settled = O.released retired ~registration:71L ~id ~scope in
+  Alcotest.(check int) "only physical ACK makes capacity reusable" 0 (O.active settled);
+  let _, decision = reserve retired scope Protocol.V2_graph_info 16384 in
+  Alcotest.(check bool) "retired request cannot resurrect" true (decision = O.Retired);
+  let early, release = O.release O.empty ~registration:71L ~id ~scope in
+  Alcotest.(check bool)
+    "cancel before registration creates a fence"
+    true
+    (release = O.Unknown);
+  let _, decision = reserve early scope Protocol.V2_graph_info 16384 in
+  Alcotest.(check bool)
+    "registration after cancel cannot allocate"
+    true
+    (decision = O.Retired);
+  let scoped = O.retire_registration settled ~registration:71L in
+  Alcotest.(check int) "binding cleanup retires bounded tombstones" 0 (O.retained scoped)
+;;
+
+type observation_model =
+  | Fresh
+  | Opened of bool * int64
+  | Closing of bool
+  | Gone of bool
+
+let test_observation_registry_traces () =
+  let module O = Core.Observation_registry in
+  let _, scope = worker_open_graph () in
+  let other = { scope with graph_generation = scope.graph_generation + 1 } in
+  let focused =
+    { scope with account = { scope.account with presentation_generation = 99 } }
+  in
+  let id = uuid "10000000-0000-4000-8000-000000007002" in
+  let check trace condition message =
+    if not condition
+    then
+      Alcotest.failf
+        "minimal observation trace [%s]: %s"
+        (List.rev trace |> List.map string_of_int |> String.concat ",")
+        message
+  in
+  let verify trace state model =
+    let active =
+      match model with
+      | Opened _ | Closing _ -> 1
+      | Fresh | Gone _ -> 0
+    in
+    let retained = if model = Fresh then 0 else 1 in
+    check
+      trace
+      (O.active state = active && O.retained state = retained)
+      "bounded ownership/ACK accounting";
+    let epoch =
+      match model with
+      | Opened (_, epoch) -> epoch
+      | _ -> 0L
+    in
+    check
+      trace
+      (O.current state ~registration:71L ~id ~epoch
+       =
+       match model with
+       | Opened _ -> true
+       | _ -> false)
+      "retirement or exact epoch publication fence"
+  in
+  let step trace state model op =
+    let chosen = op = 1 || op = 3 || op = 6 in
+    let owner = if chosen then other else if op = 8 then focused else scope in
+    let model_owner =
+      match model with
+      | Opened (owner, _) | Closing owner | Gone owner -> Some owner
+      | Fresh -> None
+    in
+    let matches = model_owner = Some chosen in
+    let next, next_model =
+      match op with
+      | 0 | 1 | 8 ->
+        let next, actual =
+          O.reserve
+            state
+            ~registration:71L
+            ~id
+            ~scope:owner
+            ~command:Protocol.V2_graph_info
+            ~maximum_bytes:16384
+        in
+        let expected =
+          match model with
+          | Fresh -> O.Start
+          | Opened _ when matches -> Existing
+          | (Closing _ | Gone _) when matches -> Retired
+          | _ -> Mismatch
+        in
+        check trace (actual = expected) "registration ownership or duplicate identity";
+        next, if model = Fresh then Opened (chosen, 0L) else model
+      | 2 | 3 ->
+        let next, actual = O.release state ~registration:71L ~id ~scope:owner in
+        let expected =
+          match model with
+          | Fresh -> O.Unknown
+          | (Opened _ | Closing _) when matches -> Release
+          | Gone _ when matches -> Already_released
+          | _ -> Wrong_owner
+        in
+        check trace (actual = expected) "release ordering or wrong-owner cleanup";
+        ( next
+        , (match model with
+           | Fresh -> Gone chosen
+           | Opened (owner, _) when matches -> Closing owner
+           | _ -> model) )
+      | 4 ->
+        let next, epoch = O.advance state ~registration:71L ~id in
+        let expected =
+          match model with
+          | Opened (_, epoch) -> Some (Int64.succ epoch)
+          | _ -> None
+        in
+        check trace (epoch = expected) "epoch advance after cancel or stale scope";
+        ( next
+        , (match model with
+           | Opened (owner, epoch) -> Opened (owner, Int64.succ epoch)
+           | _ -> model) )
+      | 5 | 6 ->
+        ( O.released state ~registration:71L ~id ~scope:owner
+        , (match model with
+           | Closing owner when matches -> Gone owner
+           | _ -> model) )
+      | 7 ->
+        let next, decision =
+          O.reserve
+            state
+            ~registration:71L
+            ~id
+            ~scope:owner
+            ~command:Protocol.V2_inspect_admission
+            ~maximum_bytes:0
+        in
+        check trace (decision = O.Invalid) "invalid request allocated a listener";
+        next, model
+      | _ -> O.retire_registration state ~registration:72L, model
+    in
+    verify trace state model;
+    verify trace next next_model;
+    next, next_model
+  in
+  (* Exhaustive breadth-first generation covers legal histories and malicious
+     owner/ACK/replay orderings. First failure is already a shortest trace. *)
+  for length = 0 to 5 do
+    let rec walk trace state model remaining =
+      verify trace state model;
+      if remaining > 0
+      then
+        for op = 0 to 9 do
+          let trace = op :: trace in
+          let next, model = step trace state model op in
+          walk trace next model (remaining - 1)
+        done
+    in
+    walk [] O.empty Fresh length
+  done
+;;
+
+let test_observation_registry_capacity () =
+  let module O = Core.Observation_registry in
+  let _, scope = worker_open_graph () in
+  let id n = uuid (Printf.sprintf "10000000-0000-4000-8000-%012d" (10000 + n)) in
+  let reserve state n =
+    O.reserve
+      state
+      ~registration:71L
+      ~id:(id n)
+      ~scope
+      ~command:Protocol.V2_graph_info
+      ~maximum_bytes:16384
+  in
+  let state = ref O.empty in
+  for n = 1 to 256 do
+    let next, result = reserve !state n in
+    if result <> O.Start then Alcotest.fail "active observation capacity shrank";
+    state := next
+  done;
+  let _, result = reserve !state 257 in
+  Alcotest.(check bool) "active capacity is bounded" true (result = O.Full);
+  let closing, _ = O.release !state ~registration:71L ~id:(id 1) ~scope in
+  let _, result = reserve closing 257 in
+  Alcotest.(check bool)
+    "unacknowledged physical cleanup retains capacity"
+    true
+    (result = O.Full);
+  let settled = O.released closing ~registration:71L ~id:(id 1) ~scope in
+  let _, result = reserve settled 257 in
+  Alcotest.(check bool) "physical ACK permits a fresh ID" true (result = O.Start);
+  state := O.empty;
+  for n = 1 to 8192 do
+    let next, result = O.release !state ~registration:71L ~id:(id n) ~scope in
+    if result <> O.Unknown then Alcotest.fail "cancel tombstone capacity shrank";
+    state := next
+  done;
+  Alcotest.(check int) "retired metadata has a fixed bound" 8192 (O.retained !state);
+  let _, result = reserve !state 8193 in
+  Alcotest.(check bool)
+    "overflow cannot silently drop cancellation fences"
+    true
+    (result = O.Full);
+  let _, result = O.release !state ~registration:71L ~id:(id 8193) ~scope in
+  Alcotest.(check bool)
+    "unknown cleanup cannot invent ACK on overflow"
+    true
+    (result = O.Release_full)
+;;
 let () =
   Alcotest.run
     "logseq db worker pure reducer"
@@ -1560,6 +1820,9 @@ let () =
             `Quick
             test_asset_manual_retry_is_unlimited
         ] )
+    ; ( "observation registry", [Alcotest.test_case "registration cancellation epoch and owner" `Quick test_observation_registry;
+          Alcotest.test_case "exhaustive shortest lifecycle traces" `Quick test_observation_registry_traces;
+          Alcotest.test_case "active ACK and tombstone capacities" `Quick test_observation_registry_capacity] )
     ; ( "read budget", [Alcotest.test_case "scoped byte budget" `Quick test_scoped_read_byte_budget;
           Alcotest.test_case "read budget excludes effects" `Quick test_read_byte_budget_is_not_an_effect_capability;
           Alcotest.test_case "pure bounded page planning" `Quick test_pure_read_page_bounds])

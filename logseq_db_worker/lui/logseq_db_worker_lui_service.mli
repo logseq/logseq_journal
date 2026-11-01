@@ -229,7 +229,35 @@ type coordination_update =
 
 val coordination_network : coordination_baseline -> asset_scope -> sync_phase option
 
+type observation_invalidation =
+  { registration_id : int64
+  ; owner : timeline_scope
+  ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+  ; epoch : int64
+  }
+
+type observation_signal =
+  | Observation_invalidated of observation_invalidation
+  | Observations_resync
 type request =
+  | Coordination_observe of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      ; request : Logseq_db_worker.Protocol.request
+      ; maximum_bytes : int
+      }
+  | Coordination_refresh_observation of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      ; request_id : Logseq_db_types.Graph_types.Uuid.t
+      }
+  | Coordination_release_observation of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      }
   | Register_coordination of int64
   | Release_coordination of int64
   | Coordination_query of
@@ -272,6 +300,18 @@ type request =
       }
 
 type response =
+  | Coordination_observed of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      ; epoch : int64
+      ; response : Logseq_db_worker.Protocol.response
+      }
+  | Coordination_observation_released of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      }
   | Coordination_mutation_result of
       { request_id : Logseq_db_types.Graph_types.Uuid.t;
         outcome : Logseq_db_worker_contract.Mutation_pure_wire.outcome }
@@ -288,6 +328,7 @@ type response =
 type asset_notice_batch
 
 type push =
+  | Coordination_observations of observation_signal Rrbvec.t
   | Coordination_updates of coordination_update list
   | Graph_pushes of (asset_scope * Logseq_db_worker.Protocol.push) list
   | Graph_states of (asset_scope * Logseq_db_worker.graph_state) list
@@ -313,7 +354,9 @@ val asset_topic : Journal_worker_ids.Worker.Push_topic.t
 val asset_notices : push -> (asset_scope * asset_notice) list
 
 (** Worker topic merge policy. Snapshot topics replace; independent asset facts
-    survive together, up to 4096 distinct pending facts. *)
+    survive together, up to 4096 distinct pending facts. Observation invalidations
+    retain each binding/ID's greatest epoch up to 512 entries; overflow emits an
+    explicit resync wake-up instead of silently dropping an interest. *)
 val coalesce_push : topic:Journal_worker_ids.Worker.push_topic -> push -> push -> push
 
 type dependencies

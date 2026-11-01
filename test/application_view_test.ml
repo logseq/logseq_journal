@@ -854,6 +854,8 @@ let run_favorites_native_visibility
             Atomic.set coordination_registration None|_->());
           Ok(Service.Coordination_released registration)
         | Coordination_query _ -> Error "Fixture normalization failed"
+        | Coordination_observe _ | Coordination_refresh_observation _ | Coordination_release_observation _ ->
+          Error "Observation is not used by this fixture"
         | Coordination_mutation _ | Coordination_confirm _ -> Error "Unused durable coordination fixture"
         | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
@@ -4423,6 +4425,8 @@ let test_reference_outer_terminals cancel =
         | Register_coordination registration -> Ok(Service.Coordination_registered(fixture_coordination manager registration))
         | Release_coordination registration -> Ok(Service.Coordination_released registration)
         | Coordination_query _ -> Error "Fixture normalization failed"
+        | Coordination_observe _ | Coordination_refresh_observation _ | Coordination_release_observation _ ->
+          Error "Observation is not used by this fixture"
         | Coordination_mutation _ | Coordination_confirm _ -> Error "Unused durable coordination fixture"
         | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
@@ -5612,6 +5616,8 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
             fixture_coordination ~phase:(Atomic.get graph_phase) (Atomic.get current) registration))
         | Release_coordination registration -> Ok(Service.Coordination_released registration)
         | Coordination_query _ -> Error "Fixture normalization failed"
+        | Coordination_observe _ | Coordination_refresh_observation _ | Coordination_release_observation _ ->
+          Error "Observation is not used by this fixture"
         | Coordination_mutation _ | Coordination_confirm _ -> Error "Unused durable coordination fixture"
         | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
@@ -6629,6 +6635,8 @@ let test_graph_picker_controls scenario () =
           if Atomic.get coordination_registration=Some registration then Atomic.set coordination_registration None;
           Ok(Service.Coordination_released registration)
         | Coordination_query _ -> Error "Fixture normalization failed"
+        | Coordination_observe _ | Coordination_refresh_observation _ | Coordination_release_observation _ ->
+          Error "Observation is not used by this fixture"
         | Coordination_mutation _ | Coordination_confirm _ -> Error "Unused durable coordination fixture"
         | Service.Inspect_local_copy request ->
           let index = Atomic.fetch_and_add inspections 1 in

@@ -237,7 +237,8 @@ let register_coordination t ~registration ~notify =
 let release_coordination t ~registration =
   if registration>=t.coordination_registration then (
     t.coordination_registration<-registration;
-    t.coordination_notify<-None)
+    t.coordination_notify<-None);
+  Effect_runner.release_observations t.runner ~registration
 ;;
 
 let revoke_coordination t = t.coordination_notify<-None
@@ -369,6 +370,50 @@ let request_for_scope ?response_budget_bytes t ~scope request =
   t.next_request_id <- Int64.succ t.next_request_id;
   Effect_runner.await_reply t.runner ~id ~request ~post:(fun () ->
     post t (Pure_reducer.Graph_request_for_scope {scope;id;request;response_budget_bytes}))
+let register_observation
+      t
+      ~registration
+      ~id
+      ~scope
+      ~request
+      ~maximum_bytes
+      ~current
+      ~notify
+  =
+  let current () =
+    (not t.stopped)
+    && coordination_current t ~registration
+    && current ()
+    &&
+    match Pure_reducer.graph_state_for_scope !(t.state) scope with
+    | Some { phase = Graph_open; graph_id = Some actual; generation; _ } ->
+      actual = scope.Sync.graph_id && generation = scope.graph_generation
+    | _ -> false
+  in
+  Effect_runner.register_observation
+    t.runner
+    ~registration
+    ~id
+    ~scope
+    ~request
+    ~maximum_bytes
+    ~current
+    ~notify
+;;
+
+let refresh_observation t ~registration ~id ~scope ~request_id =
+  if not (coordination_current t ~registration)
+  then Error "Observation binding retired"
+  else Effect_runner.refresh_observation t.runner ~registration ~id ~scope ~request_id
+;;
+
+let observation_scope t ~registration ~id =
+  Effect_runner.observation_scope t.runner ~registration ~id
+;;
+
+let release_observation t ~registration ~id ~scope =
+  Effect_runner.release_observation t.runner ~registration ~id ~scope
+;;
 let durable_mutation_for_scope t ~scope ~request_id ~intent ~current =
   let current () = not t.stopped && current () &&
     (match Pure_reducer.graph_state_for_scope !(t.state) scope with

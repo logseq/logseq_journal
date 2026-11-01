@@ -372,6 +372,11 @@ val encoded_response_bytes : response -> int
     requiring their existing ownership path. *)
 val is_snapshot_read : command -> bool
 
+(** Fresh DB queries supported by atomic registered sampling. A continuation or
+    revision-pinned query cannot stand in for a fresh observation; changefeed ACK
+    and admission inspection have separate state owners. *)
+val is_observable_read : command -> bool
+
 (** Pure bounded-page planning for one pinned snapshot. Only ordinary paged reads
     can shrink; query family, cursor, revision and filters remain exact. Returning
     None requires an explicit oversized-singleton/error result, never truncation. *)

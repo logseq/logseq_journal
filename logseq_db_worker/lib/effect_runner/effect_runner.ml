@@ -371,6 +371,25 @@ type database_session =
   ; mutable windows : change_window Rrbvec.t
   }
 
+type observation_result = (int64 * Protocol.response, string) result
+
+type observation_slot =
+  { registration : int64
+  ; logical_id : Graph.Uuid.t
+  ; observation_scope : Sync.graph_scope
+  ; database_id : string
+  ; request : Protocol.request
+  ; maximum_bytes : int
+  ; current : unit -> bool
+  ; notify : epoch:int64 -> unit
+  ; initial : observation_result Eio.Promise.t
+  ; initial_resolve : observation_result Eio.Promise.u
+  ; mutable subscription : Database.subscription option
+  ; mutable closing : bool
+  ; mutable work : int
+  ; mutable idle : unit Eio.Promise.t * unit Eio.Promise.u
+  }
+
 type t =
   { sw : Eio.Switch.t
   ; dependencies : dependencies
@@ -387,6 +406,8 @@ type t =
   ; recovery_current : Core.upload_recovery_ticket -> bool
   ; upload_current : Upload.ticket -> bool
   ; asset_current : Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool
+  ; observation_slots : (int64 * Graph.Uuid.t, observation_slot) Hashtbl.t
+  ; mutable observation_registry : Core.Observation_registry.t
   ; durable_slots : Eio.Semaphore.t
   ; databases : (string, database_session) Hashtbl.t
   ; inspections : (string, Database.mirror_inspection) Hashtbl.t
@@ -426,6 +447,8 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; upload_staging_lock = Eio.Mutex.create ()
     ; staging_reconciled = []
     ; local_imports = Hashtbl.create 32
+    ; observation_slots = Hashtbl.create 32
+    ; observation_registry = Core.Observation_registry.empty
     ; durable_slots = Eio.Semaphore.make 8
     ; databases = Hashtbl.create 4
     ; inspections = Hashtbl.create 4
@@ -1065,6 +1088,63 @@ let publish_asset_notice t scope notice output =
   if failed then Option.iter (publish_scoped_asset_detail t scope) detail
 ;;
 
+let observation_work_start slot =
+  if slot.work = 0 then slot.idle <- Eio.Promise.create ();
+  slot.work <- slot.work + 1
+;;
+
+let observation_work_finish slot =
+  slot.work <- slot.work - 1;
+  if slot.work = 0 then ignore (Eio.Promise.try_resolve (snd slot.idle) () : bool)
+;;
+
+let close_observation t slot =
+  slot.closing <- true;
+  Option.iter Database.unlisten slot.subscription;
+  slot.subscription <- None;
+  if slot.work > 0 then Eio.Promise.await (fst slot.idle);
+  Hashtbl.remove t.observation_slots (slot.registration, slot.logical_id)
+;;
+
+let observation_scope t ~registration ~id =
+  Core.Observation_registry.scope t.observation_registry ~registration ~id
+;;
+
+let release_observation t ~registration ~id ~scope =
+  let next, decision =
+    Core.Observation_registry.release t.observation_registry ~registration ~id ~scope
+  in
+  t.observation_registry <- next;
+  match decision with
+  | Wrong_owner -> Error "Observation cleanup owner mismatch"
+  | Release_full -> Error "Observation cleanup storage is full"
+  | Release | Already_released | Unknown ->
+    Option.iter
+      (close_observation t)
+      (Hashtbl.find_opt t.observation_slots (registration, id));
+    t.observation_registry
+    <- Core.Observation_registry.released t.observation_registry ~registration ~id ~scope;
+    Ok ()
+;;
+
+let release_observations t ~registration =
+  let slots =
+    Hashtbl.to_seq_values t.observation_slots
+    |> Seq.filter (fun slot -> slot.registration = registration)
+    |> List.of_seq
+  in
+  List.iter
+    (fun slot ->
+       ignore
+         (release_observation
+            t
+            ~registration
+            ~id:slot.logical_id
+            ~scope:slot.observation_scope))
+    slots;
+  t.observation_registry
+  <- Core.Observation_registry.retire_registration t.observation_registry ~registration
+;;
 let close_database_by_id ?scope t database_id =
   let scope = match scope with
     | Some _ -> scope
@@ -1073,6 +1153,10 @@ let close_database_by_id ?scope t database_id =
   match Hashtbl.find_opt t.databases database_id with
   | None -> Ok ()
   | Some session ->
+    let slots=Hashtbl.to_seq_values t.observation_slots
+      |> Seq.filter (fun slot->slot.database_id=database_id) |> List.of_seq in
+    List.iter (fun slot->ignore (release_observation t ~registration:slot.registration
+      ~id:slot.logical_id ~scope:slot.observation_scope)) slots;
     Database.unlisten session.subscription;
     let result = Database.close session.database in
     (match result with
@@ -1261,12 +1345,12 @@ let read_failure ?code request error =
   | Fatal_read_state source -> fail Corrupt_storage (safe_message "fatalState" source)
 ;;
 
-let read_snapshot ~on_enrichment_error ~response_budget_bytes database request command =
-  match Database.current_snapshot database with
+let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~response_budget_bytes database request command =
+  match (match snapshot with Some snapshot->Ok snapshot | None->Database.current_snapshot database) with
   | Error _ -> failure request Closed_session "The graph snapshot is unavailable."
   | Ok snapshot ->
     Fun.protect
-      ~finally:(fun () -> Database.release_snapshot snapshot)
+      ~finally:(fun () -> if release_snapshot then Database.release_snapshot snapshot)
       (fun () ->
          let query_evidence query ?target items has_continuation =
            try
@@ -1785,6 +1869,191 @@ let execute_database ~on_enrichment_error session ~response_budget_bytes request
     read_snapshot ~on_enrichment_error ~response_budget_bytes session.database request command
 ;;
 
+let observation_alive t slot = (not t.stopped) && (not slot.closing) && slot.current ()
+
+let sample_observation ?snapshot t slot request =
+  Fun.protect
+    ~finally:(fun () -> Option.iter Database.release_snapshot snapshot)
+    (fun () ->
+       match Hashtbl.find_opt t.databases slot.database_id with
+       | None -> Error "Observation graph is no longer attached"
+       | Some session ->
+         if not (observation_alive t slot)
+         then Error "Observation execution was retired"
+         else (
+           let response =
+             read_snapshot
+               ?snapshot
+               ~release_snapshot:(Option.is_none snapshot)
+               ~on_enrichment_error:(fun _ -> ())
+               ~response_budget_bytes:
+                 (min slot.maximum_bytes t.dependencies.config.response_budget_bytes)
+               session.database
+               request
+               request.Protocol.command
+           in
+           if observation_alive t slot
+           then Ok response
+           else Error "Observation execution was retired"))
+;;
+
+let invalidate_observation t slot _change =
+  if observation_alive t slot
+  then (
+    let next, epoch =
+      Core.Observation_registry.advance
+        t.observation_registry
+        ~registration:slot.registration
+        ~id:slot.logical_id
+    in
+    t.observation_registry <- next;
+    Option.iter (fun epoch -> slot.notify ~epoch) epoch)
+;;
+
+let register_observation
+      t
+      ~registration
+      ~id
+      ~scope
+      ~request
+      ~maximum_bytes
+      ~current
+      ~notify
+  =
+  if
+    t.stopped
+    || (not (current ()))
+    || request.Protocol.api_version <> Protocol.api_version
+  then Error "Observation execution is not current"
+  else (
+    let next, decision =
+      Core.Observation_registry.reserve
+        t.observation_registry
+        ~registration
+        ~id
+        ~scope
+        ~command:request.command
+        ~maximum_bytes
+    in
+    t.observation_registry <- next;
+    match decision with
+    | Existing ->
+      (match Hashtbl.find_opt t.observation_slots (registration, id) with
+       | Some slot ->
+         Eio.Promise.await slot.initial
+         |> Result.map (fun (epoch, Protocol.V2_response response) ->
+           epoch, Protocol.V2_response { response with request_id = request.request_id })
+       | None -> Error "Observation allocation is unavailable")
+    | Retired | Mismatch | Full | Invalid -> Error "Observation registration was refused"
+    | Start ->
+      (match Hashtbl.find_opt t.attachments scope with
+       | None ->
+         ignore (release_observation t ~registration ~id ~scope);
+         Error "Observation graph is no longer attached"
+       | Some database_id ->
+         let initial, initial_resolve = Eio.Promise.create () in
+         let slot =
+           { registration
+           ; logical_id = id
+           ; observation_scope = scope
+           ; database_id
+           ; request
+           ; maximum_bytes
+           ; current
+           ; notify
+           ; initial
+           ; initial_resolve
+           ; subscription = None
+           ; closing = false
+           ; work = 0
+           ; idle = Eio.Promise.create ()
+           }
+         in
+         Hashtbl.add t.observation_slots (registration, id) slot;
+         observation_work_start slot;
+         let result = ref (Error "Observation registration interrupted") in
+         Eio.Cancel.protect (fun () ->
+           Fun.protect
+             ~finally:(fun () ->
+               if slot.closing
+               then (
+                 Option.iter Database.unlisten slot.subscription;
+                 slot.subscription <- None);
+               observation_work_finish slot;
+               (match !result with
+                | Error _ -> ignore (release_observation t ~registration ~id ~scope)
+                | Ok _ -> ());
+               ignore (Eio.Promise.try_resolve slot.initial_resolve !result : bool))
+             (fun () ->
+                (result
+                 := try
+                      match Hashtbl.find_opt t.databases database_id with
+                      | None -> Error "Observation graph is no longer attached"
+                      | Some session ->
+                        (match Database.listen session.database with
+                         | Error _ -> Error "Observation listener could not register"
+                         | Ok (subscription, snapshot) ->
+                           slot.subscription <- Some subscription;
+                           (match sample_observation ~snapshot t slot request with
+                            | Error _ as error -> error
+                            | Ok response ->
+                              (match
+                                 Database.activate_subscription
+                                   subscription
+                                   ~notify:(invalidate_observation t slot)
+                               with
+                               | Error _ -> Error "Observation replay could not activate"
+                               | Ok () -> Ok (0L, response))))
+                    with
+                    | _ -> Error "Observation registration failed");
+                !result))))
+;;
+let refresh_observation t ~registration ~id ~scope ~request_id =
+  match Hashtbl.find_opt t.observation_slots (registration, id) with
+  | None -> Error "Observation registration is not active"
+  | Some slot ->
+    let _, decision =
+      Core.Observation_registry.reserve
+        t.observation_registry
+        ~registration
+        ~id
+        ~scope
+        ~command:slot.request.command
+        ~maximum_bytes:slot.maximum_bytes
+    in
+    if decision <> Core.Observation_registry.Existing
+    then Error "Observation owner mismatch"
+    else (
+      let initial = Eio.Promise.await slot.initial in
+      match initial with
+      | Error _ as error -> error
+      | Ok _ when not (observation_alive t slot) ->
+        Error "Observation execution was retired"
+      | Ok _ ->
+        let next, epoch =
+          Core.Observation_registry.advance t.observation_registry ~registration ~id
+        in
+        t.observation_registry <- next;
+        (match epoch with
+         | None -> Error "Observation epoch is unavailable"
+         | Some epoch ->
+           observation_work_start slot;
+           Fun.protect
+             ~finally:(fun () -> observation_work_finish slot)
+             (fun () ->
+                let outcome =
+                  sample_observation t slot { slot.request with request_id }
+                in
+                match outcome with
+                | Ok response
+                  when Core.Observation_registry.current
+                         t.observation_registry
+                         ~registration
+                         ~id
+                         ~epoch -> Ok (epoch, response)
+                | Ok _ -> Error "Observation read was superseded"
+                | Error _ as error -> error)))
+;;
 let sync_result ?event ?(lifecycle = Core.Lifecycle_unchanged) () =
   Core.{ event; lifecycle }
 ;;

@@ -306,7 +306,35 @@ let coordination_network (baseline:coordination_baseline) (scope:asset_scope) =
 
 let coordination_read = Protocol.is_snapshot_read
 
+type observation_invalidation =
+  { registration_id : int64
+  ; owner : timeline_scope
+  ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+  ; epoch : int64
+  }
+
+type observation_signal =
+  | Observation_invalidated of observation_invalidation
+  | Observations_resync
 type request =
+  | Coordination_observe of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      ; request : Logseq_db_worker.Protocol.request
+      ; maximum_bytes : int
+      }
+  | Coordination_refresh_observation of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      ; request_id : Logseq_db_types.Graph_types.Uuid.t
+      }
+  | Coordination_release_observation of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      }
   | Register_coordination of int64
   | Release_coordination of int64
   | Coordination_query of
@@ -349,6 +377,18 @@ type request =
       }
 
 type response =
+  | Coordination_observed of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      ; epoch : int64
+      ; response : Logseq_db_worker.Protocol.response
+      }
+  | Coordination_observation_released of
+      { registration : int64
+      ; owner : timeline_scope
+      ; observation_id : Logseq_db_types.Graph_types.Uuid.t
+      }
   | Coordination_mutation_result of
       { request_id : Logseq_db_types.Graph_types.Uuid.t;
         outcome : Logseq_db_worker_contract.Mutation_pure_wire.outcome }
@@ -381,6 +421,7 @@ type asset_notice_batch =
   }
 
 type push =
+  | Coordination_observations of observation_signal Rrbvec.t
   | Coordination_updates of coordination_update list
   | Graph_pushes of (asset_scope * Logseq_db_worker.Protocol.push) list
   | Graph_states of (asset_scope * Logseq_db_worker.graph_state) list
@@ -403,6 +444,7 @@ let graph_state_topic = ID.Worker.Push_topic.of_int 4
 let asset_topic = ID.Worker.Push_topic.of_int 5
 let session_topic = ID.Worker.Push_topic.of_int 6
 let coordination_topic = ID.Worker.Push_topic.of_int 7
+let observation_topic = ID.Worker.Push_topic.of_int 8
 
 let asset_notices = function
   | Asset_notice (scope, notice) -> [ scope, notice ]
@@ -439,8 +481,47 @@ let merge_scoped previous next =
     List.filter (fun (owner,_) -> owner<>scope) entries @ [scope,value]) previous next in
   if List.length merged>128 then failwith "Worker pending graph scope limit exceeded";
   merged
+module Observation_facts = Map.Make (struct
+    type t = int64 * Logseq_db_types.Graph_types.Uuid.t
+
+    let compare (registration, id) (other_registration, other_id) =
+      let order = Int64.compare registration other_registration in
+      if order = 0 then Logseq_db_types.Graph_types.Uuid.compare id other_id else order
+    ;;
+  end)
+
+let merge_observations previous next =
+  let add (facts, count, overflow) = function
+    | Observations_resync -> Observation_facts.empty, 0, true
+    | Observation_invalidated _ when overflow -> facts, count, true
+    | Observation_invalidated value ->
+      let key = value.registration_id, value.observation_id in
+      let old = Observation_facts.find_opt key facts in
+      if Option.exists (fun old -> old.epoch >= value.epoch) old
+      then facts, count, false
+      else (
+        let count = count + if old = None then 1 else 0 in
+        if count > 512
+        then Observation_facts.empty, 0, true
+        else Observation_facts.add key value facts, count, false)
+  in
+  let facts, _, overflow =
+    Rrbvec.fold_left
+      add
+      (Rrbvec.fold_left add (Observation_facts.empty, 0, false) previous)
+      next
+  in
+  if overflow
+  then Rrbvec.singleton Observations_resync
+  else
+    Observation_facts.to_seq facts
+    |> Seq.map (fun (_, value) -> Observation_invalidated value)
+    |> Rrbvec.of_seq
+;;
 let coalesce_push ~topic previous next =
   match previous,next with
+  | Coordination_observations previous,Coordination_observations next ->
+    Coordination_observations (merge_observations previous next)
   | Coordination_updates previous,Coordination_updates next ->
     let id = function Coordination_snapshot b->b.registration | Coordination_revoked(id,_)->id in
     let merged=List.fold_left(fun entries update ->
@@ -837,12 +918,13 @@ let create ~(dependencies : dependencies) =
       ; auth_wake : Eio.Condition.t
       ; mutable coordination_registration : int64 option
       ; coordination_limits : Protocol.v2_capability_limits
+      ; emit_observation : observation_signal -> unit
       ; emit_coordination : coordination_update -> unit
       }
   end
   in
   Journal_worker.Service.create
-    ~push_topic_count:8
+    ~push_topic_count:9
     ~merge_push:coalesce_push
     ~concurrency:(Journal_worker.Service.Concurrent { max_in_flight = 2 })
     ~data_directory:(fun config -> Ok config.Db.Config.application_support_directory)
@@ -1017,6 +1099,8 @@ let create ~(dependencies : dependencies) =
                           outbox_max_records=limits.outbox_max_records;outbox_max_bytes=limits.outbox_max_bytes;
                           change_max_items=limits.change_max_items;change_max_bytes=limits.change_max_bytes;
                           dispatcher_capacity=limits.dispatcher_capacity;wire_batch_max_bytes=limits.wire_batch_max_bytes})
+                     ; emit_observation=(fun signal -> Journal_worker.Session_context.emit context
+                         ~topic:observation_topic (Coordination_observations (Rrbvec.singleton signal)))
                      ; emit_coordination=(fun update -> Journal_worker.Session_context.emit context
                          ~topic:coordination_topic (Coordination_updates [update]))
                      }))))
@@ -1025,6 +1109,64 @@ let create ~(dependencies : dependencies) =
         scope.account.account_generation=owner.startup.account_generation && scope.graph_id=owner.graph_id
           && scope.graph_generation=owner.graph_generation) (Db.graph_scopes session.worker) in
       match request with
+      | Coordination_observe { registration; owner; observation_id; request; maximum_bytes }
+        ->
+        (match resolve owner with
+         | None -> Error "Observation graph session is not open"
+         | Some scope ->
+           let current () =
+             Db.coordination_current session.worker ~registration
+             && resolve owner = Some scope
+             && ((not !(session.auth_seen))
+                 || !(session.authenticated_user) = Some scope.account.user_id)
+             &&
+             match Db.graph_state_for_scope session.worker ~scope with
+             | Some { phase = Db.Graph_open; _ } -> true
+             | _ -> false
+           in
+           Db.register_observation
+             session.worker
+             ~registration
+             ~id:observation_id
+             ~scope
+             ~request
+             ~maximum_bytes
+             ~current
+             ~notify:(fun ~epoch ->
+               session.emit_observation
+                 (Observation_invalidated
+                    { registration_id = registration; owner; observation_id; epoch }))
+           |> Result.map (fun (epoch, response) ->
+             Coordination_observed { registration; owner; observation_id; epoch; response }))
+      | Coordination_refresh_observation { registration; owner; observation_id; request_id }
+        ->
+        (match resolve owner with
+         | None -> Error "Observation graph session is not open"
+         | Some scope ->
+           Db.refresh_observation
+             session.worker
+             ~registration
+             ~id:observation_id
+             ~scope
+             ~request_id
+           |> Result.map (fun (epoch, response) ->
+             Coordination_observed { registration; owner; observation_id; epoch; response }))
+      | Coordination_release_observation { registration; owner; observation_id } ->
+        let stored = Db.observation_scope session.worker ~registration ~id:observation_id in
+        let scope =
+          match stored with
+          | Some _ as scope -> scope
+          | None -> resolve owner
+        in
+        (match scope with
+         | Some scope
+           when scope.graph_id = owner.graph_id
+                && scope.graph_generation = owner.graph_generation
+                && scope.account.account_generation = owner.startup.account_generation ->
+           Db.release_observation session.worker ~registration ~id:observation_id ~scope
+           |> Result.map (fun () ->
+             Coordination_observation_released { registration; owner; observation_id })
+         | _ -> Error "Observation cleanup owner is unavailable")
       | Register_coordination registration ->
         let baseline snapshot={registration;baseline=snapshot;limits=session.Session.coordination_limits;
           authority_user=(if !(session.auth_seen) then Some !(session.authenticated_user) else None)} in

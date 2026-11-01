@@ -120,3 +120,39 @@ val coordination_presentation_current : t -> registration:int64 -> presentation:
 val confirm_mutation_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
   -> request_id:Logseq_db_types.Graph_types.Uuid.t -> intent:string
   -> original:(string * string * string) -> current:(unit -> bool) -> Protocol.response
+
+(** Query registrations share the real scoped DB owner. Initial sampling uses
+    the listener's predecessor snapshot; callbacks only report epoch invalidation.
+    Cleanup remains allowed for the original retired binding/scope and waits for
+    admitted snapshots before returning. *)
+val register_observation
+  :  t
+  -> registration:int64
+  -> id:Logseq_db_types.Graph_types.Uuid.t
+  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> request:Protocol.request
+  -> maximum_bytes:int
+  -> current:(unit -> bool)
+  -> notify:(epoch:int64 -> unit)
+  -> (int64 * Protocol.response, string) result
+
+val refresh_observation
+  :  t
+  -> registration:int64
+  -> id:Logseq_db_types.Graph_types.Uuid.t
+  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> request_id:Logseq_db_types.Graph_types.Uuid.t
+  -> (int64 * Protocol.response, string) result
+
+val release_observation
+  :  t
+  -> registration:int64
+  -> id:Logseq_db_types.Graph_types.Uuid.t
+  -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> (unit, string) result
+
+val observation_scope
+  :  t
+  -> registration:int64
+  -> id:Logseq_db_types.Graph_types.Uuid.t
+  -> Logseq_sync_pure_reducer.Core.graph_scope option
