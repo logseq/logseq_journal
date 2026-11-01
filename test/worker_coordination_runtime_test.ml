@@ -40,7 +40,7 @@ let secrets =
   |> Result.get_ok
 ;;
 
-let with_client f =
+let with_client ?(epoch_ms = fun () -> 1_700_000_000_000L) f =
   T.with_managed (fun fixture ->
     let root = fixture.config.application_support_directory in
     ignore (Test_support.seed_mirror root);
@@ -76,7 +76,12 @@ let with_client f =
             |> Sync.encode_catalog_cache));
     let deps =
       Service.dependencies
-        ~overlay:fixture.overlay
+        ~overlay:
+          (Logseq_overlay_db.Database.dependencies
+             ~epoch_ms
+             ~monotonic_ns:(fun () -> 1L)
+             ~limits:(Logseq_overlay_db.Database.dependency_limits fixture.overlay)
+           |> Result.get_ok)
         ~crypto
         ~secrets
         ~tls_authenticator:(SR.system_tls_authenticator () |> Result.get_ok)
@@ -132,6 +137,22 @@ let test_client_to_typed_read () =
       match C.bootstrap (C.view !state) with
       | W.Bootstrap_not_ready _ -> true
       | _ -> false);
+    let owner : Service.timeline_scope =
+      { startup = { account_generation = 1; presentation_generation = 1 }
+      ; graph_id = Test_support.graph_uuid
+      ; graph_generation = 1
+      }
+    in
+    let queued, transition =
+      C.plan_query
+        !state
+        ~owner
+        ~maximum_items:1
+        ~maximum_bytes:P.maximum_response_bytes
+        W.Graph_info
+      |> Result.get_ok
+    in
+    apply transition;
     ignore
       (Mailbox.send
          client
@@ -147,6 +168,14 @@ let test_client_to_typed_read () =
     in
     wait (fun () -> Option.is_some (current_session ()));
     let session = Option.get (current_session ()) in
+    wait (fun () -> Option.is_some (C.reply (C.view !state) queued));
+    (match C.reply (C.view !state) queued with
+     | Some (W.Answered (Ok info)) ->
+       require
+         (W.Uuid.equal info.graph_uuid Test_support.graph_uuid)
+         "queued real read lost graph identity"
+     | _ -> failwith "queued real read did not execute after restoration");
+    apply (C.step !state (C.Forget queued));
     let budget =
       W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
     in
@@ -163,6 +192,41 @@ let test_client_to_typed_read () =
          (W.Uuid.equal info.graph_uuid Test_support.graph_uuid)
          "typed graph identity mismatch"
      | _ -> failwith "graph info failed");
+    let _, admission = request (W.Query (budget, W.Admission)) in
+    (match admission with
+     | W.Answered (Ok value) ->
+       require (value.maximum_records > 0) "typed admission inspection lost limits"
+     | _ -> failwith "admission inspection failed");
+    let _, definitions =
+      request (W.Query (budget, W.Task_status_definitions [ second_graph ]))
+    in
+    require
+      (definitions = W.Answered (Ok [ None ]))
+      "missing status definition lost ordered slot";
+    let business = Journal_graph_runtime.create () in
+    let original = Journal_graph_runtime.start business in
+    (match Journal_graph_runtime.worker_read original with
+     | Some (Journal_graph_runtime.Read read) ->
+       let _, reply = request (W.Query (budget, read.query)) in
+       (match reply with
+        | W.Answered (Ok value) ->
+          let response =
+            P.V2_response
+              { api_version = P.api_version
+              ; request_id = original.request_id
+              ; outcome = read.outcome value
+              }
+          in
+          let output = Journal_graph_runtime.receive business response in
+          require
+            (List.exists
+               (fun response ->
+                  response.Journal_graph_runtime.payload
+                  = Journal_graph_runtime.Graph_ready)
+               output.responses)
+            "typed graph info did not reach actual business projection"
+        | _ -> failwith "typed business graph-info read failed")
+     | None -> failwith "business graph-info path was not migrated");
     let _, page =
       request
         (W.Query (budget, W.Page { uuid = Test_support.page_uuid; revision = None }))
@@ -414,7 +478,153 @@ let test_client_to_typed_read () =
       "late cancelled read revived a forgotten consumer")
 ;;
 
+let test_read_completion_rechecks_graph_owner () =
+  let armed = Atomic.make false
+  and entered = Atomic.make false
+  and release = Atomic.make false in
+  let epoch_ms () =
+    if Atomic.get armed
+    then (
+      Atomic.set entered true;
+      while not (Atomic.get release) do
+        Eio.Fiber.yield ()
+      done);
+    1_700_000_000_000L
+  in
+  with_client ~epoch_ms (fun client ->
+    Fun.protect
+      ~finally:(fun () -> Atomic.set release true)
+      (fun () ->
+         let responses = Hashtbl.create 16
+         and baseline = ref None in
+         Mailbox.on_event client (function
+           | Mailbox.Response { request_id; outcome; _ } ->
+             Hashtbl.replace responses request_id outcome
+           | Push { payload = Service.Coordination_updates updates; _ } ->
+             List.iter
+               (function
+                 | Service.Coordination_snapshot value -> baseline := Some value
+                 | _ -> ())
+               updates
+           | _ -> ());
+         let wait predicate =
+           let deadline = Unix.gettimeofday () +. 4. in
+           while (not (predicate ())) && Unix.gettimeofday () < deadline do
+             Mailbox.Private.deliver client ~max_events:64;
+             Thread.delay 0.001
+           done;
+           require (predicate ()) "Service completion ownership race did not settle"
+         in
+         let send request =
+           match Mailbox.send client request with
+           | Accepted id -> id
+           | _ -> failwith "race request not admitted"
+         in
+         ignore
+           (send (Service.Client_command (Restore_local_account { user_id = "user-1" })));
+         let registration = 900000L in
+         let id = send (Service.Register_coordination registration) in
+         wait (fun () -> Hashtbl.mem responses id);
+         (match Hashtbl.find responses id with
+          | Completed (Service.Coordination_registered value) -> baseline := Some value
+          | _ -> assert false);
+         wait (fun () ->
+           match !baseline with
+           | Some value ->
+             List.exists
+               (fun (_, state) ->
+                  state.Logseq_db_worker.phase = Logseq_db_worker.Graph_open)
+               value.baseline.state.residents
+           | _ -> false);
+         let owner = Option.get (Option.get !baseline).baseline.state.sync.selected in
+         let req suffix command =
+           { P.api_version = P.api_version
+           ; request_id =
+               W.Uuid.of_string ("99000000-0000-4000-8000-" ^ suffix) |> Result.get_ok
+           ; command
+           }
+         in
+         let read =
+           send
+             (Service.Coordination_query
+                { registration
+                ; owner
+                ; request =
+                    req
+                      "000000000001"
+                      (P.V2_get_outline_block
+                         { block = Test_support.authoritative_block_uuid
+                         ; revision = None
+                         })
+                })
+         in
+         wait (fun () -> Hashtbl.mem responses read);
+         let revision =
+           match Hashtbl.find responses read with
+           | Completed
+               (Service.Graph_response
+                  (P.V2_response
+                     { outcome = V2_block_outcome (V2_present_block { revision; _ }); _ }))
+             -> revision
+           | _ -> failwith "race fixture block missing"
+         in
+         Atomic.set armed true;
+         let writer =
+           send
+             (Service.Graph_request_at
+                ( owner
+                , req
+                    "000000000002"
+                    (P.V2_save_block
+                       { mutation_id =
+                           W.Uuid.of_string "99000000-0000-4000-8000-000000000003"
+                           |> Result.get_ok
+                       ; block = Test_support.authoritative_block_uuid
+                       ; title = "Synthetic held writer"
+                       ; preconditions =
+                           { blocks = [ Test_support.authoritative_block_uuid, revision ]
+                           ; pages = []
+                           ; scopes = []
+                           }
+                       }) ))
+         in
+         wait (fun () -> Atomic.get entered);
+         let read =
+           send
+             (Service.Coordination_query
+                { registration; owner; request = req "000000000004" P.V2_graph_info })
+         in
+         (* Cancelling the outer writer releases its Service lane, not its
+            accepted durable DB operation. Keep that operation held while the
+            second lane is waiting on the real snapshot mutex. *)
+         Mailbox.cancel client ~request_id:writer;
+         wait (fun () -> Hashtbl.mem responses writer);
+         require
+           (Hashtbl.find responses writer = Mailbox.Cancelled)
+           "held writer cancellation did not release its outer lane";
+         wait (fun () ->
+           (Mailbox.Private.metrics (Mailbox.Private.pack_client client))
+             .active_request_fibers
+           > 0);
+         require
+           (not (Hashtbl.mem responses read))
+           "read did not wait behind actual writer";
+         ignore (send (Service.Client_command Return_to_graph_picker));
+         wait (fun () ->
+           match !baseline with
+           | Some value -> value.baseline.state.sync.selected = None
+           | _ -> false);
+         Atomic.set release true;
+         wait (fun () -> Hashtbl.mem responses read);
+         require
+           (match Hashtbl.find responses read with
+            | Failed _ -> true
+            | _ -> false)
+           "retired graph read completion still crossed Service's authority gate"))
+;;
+
 let () =
   test_client_to_typed_read ();
+  test_read_completion_rechecks_graph_owner ();
   print_endline "Worker coordination real client/read/cleanup passed"
 ;;

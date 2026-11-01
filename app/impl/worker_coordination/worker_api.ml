@@ -384,6 +384,7 @@ type local_deletion =
 
 type projection =
   { binding : binding
+  ; account : account_generation
   ; version : projection_version
   ; residents : resident list
   ; selected : presentation option
@@ -751,6 +752,35 @@ let residents (p : projection) = p.residents
 let selected (p : projection) = p.selected
 let local_deletion (p : projection) = p.deletion
 let equal_projection (a : projection) (b : projection) = a = b
+
+let scope_is_superseded ?previous (p : projection) (owner : Service.timeline_scope) =
+  let at_or_after (session : session) =
+    session.account = owner.startup.account_generation
+    && Uuid.equal session.graph owner.graph_id
+    && session.generation >= owner.graph_generation
+  in
+  p.account > owner.startup.account_generation
+  || (p.account = owner.startup.account_generation
+      && List.exists
+           (fun resident ->
+              at_or_after resident.session
+              && resident.session.generation > owner.graph_generation)
+           p.residents)
+  || Option.fold
+       ~none:false
+       ~some:(fun (old : projection) ->
+         equal_binding old.binding p.binding
+         && old.version < p.version
+         && List.exists
+              (fun resident ->
+                 at_or_after resident.session
+                 && not
+                      (List.exists
+                         (fun current -> equal_session current.session resident.session)
+                         p.residents))
+              old.residents)
+       previous
+;;
 
 let removal_target = function
   | Removing (id, _, _) | Removal_failed (id, _, _, _) -> id
@@ -1307,6 +1337,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                        in
                        let projection =
                          { binding
+                         ; account = account.account_generation
                          ; version = b.baseline.version
                          ; residents
                          ; selected

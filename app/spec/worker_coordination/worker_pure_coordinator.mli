@@ -106,6 +106,20 @@ val request
   : t -> Worker.session -> 'a Worker.request
   -> ('a ticket * transition, Worker.error) result
 
+(** Queue a business read against its exact host execution identity while the
+    first registered baseline is pending. This does not construct a session:
+    only a matching Open resident from that baseline may issue Send. Account or
+    graph-generation replacement fails the ticket; cancellation before Send
+    settles locally. The supplied byte/item ceilings are reduced to verified
+    capability limits before making the sealed budget. *)
+val plan_query
+  : t
+  -> owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
+  -> maximum_items:int
+  -> maximum_bytes:int
+  -> 'a Worker.query
+  -> ('a ticket * transition, Worker.error) result
+
 (** Return the exact correlation ID to the host. Overlap returns
     Host_change_in_progress without replacing the active handoff/cleanup ledger.
     Retry allocates a new ID; late prior ACKs cannot complete it. Applying the

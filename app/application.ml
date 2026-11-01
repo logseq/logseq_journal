@@ -3250,8 +3250,10 @@ let start
   let ensure_coordination () =
     let scope=Option.bind !state_ref.manager (fun manager ->
       List.find_opt(fun (scope:Graph_service.asset_scope)->
-        Some scope.graph_id= !state_ref.graph_state.graph_id
-        && scope.graph_generation= !state_ref.graph_state.generation)manager.resident_scopes) in
+        match current_owner() with
+        | Some owner -> scope.graph_id=owner.graph_id && scope.graph_generation=owner.graph_generation
+        | None -> Some scope.graph_id= !state_ref.graph_state.graph_id
+          && scope.graph_generation= !state_ref.graph_state.generation)manager.resident_scopes) in
     let identity = match !coordination_account, !state_ref.manager, scope with
       | Some (Some user), Some manager, _ ->
         Some (!managed_sync_origin, user, manager.Graph_service.startup.account_generation)
@@ -3773,6 +3775,34 @@ let start
   in
   let graph_worker_requests_cell = graph_ref (fun () ->
     Hashtbl.create 16) in
+  let coordinated_read_finished = ref (fun (_:Graph_service.timeline_scope)
+      (_:Logseq_db_worker.Protocol.request) (_:(Logseq_db_worker.Protocol.response,string) result) -> ()) in
+  let send_coordinated_read request (Journal_graph_runtime.Read read) =
+    match current_owner(),ensure_coordination() with
+    | Some owner,Ok host ->
+      (match Coordination_host.plan_query host ~owner ~maximum_items:read.maximum_items
+          ~maximum_bytes:Logseq_db_worker.Protocol.maximum_response_bytes read.query with
+       | Error _ -> Journal_graph_transport.Not_ready
+       | Ok ticket ->
+         observe_projection_request request;
+         Coordination_host.watch host ticket ~f:(fun reply ->
+           let response outcome=Logseq_db_worker.Protocol.V2_response
+             {api_version=Logseq_db_worker.Protocol.api_version;request_id=request.request_id;outcome} in
+           let result=match reply with
+             | Wc.Answered(Ok value) -> Ok(response(read.outcome value))
+             | Answered(Error(Wc.Stale_read message)) -> Ok(response(V2_failed{code="staleReadCursor";message}))
+             | Answered(Error(Wc.Db_error error)) -> Error(Logseq_db_worker.Error.message error)
+             | Answered(Error(Wc.Service_failed message | Resync_required message)) -> Error message
+             | Answered(Error Revoked_session) -> Error "The graph execution changed before the read completed."
+             | Answered(Error _) -> Error "The typed graph read could not be validated."
+             | Not_admitted Full -> Error "Worker request queue is full"
+             | Not_admitted Not_ready -> Error "Worker is not ready"
+             | Not_admitted Stopping -> Error "Worker is stopping"
+             | Not_admitted(Unsupported_request message) -> Error message
+             | Interrupted _ -> Error "Worker read was interrupted" in
+           !coordinated_read_finished owner request result);
+         Journal_graph_transport.Accepted)
+    | _ -> Journal_graph_transport.Not_ready in
   let deliver_output (output : Journal_graph_runtime.output) =
     List.iter
       (fun response ->
@@ -3788,6 +3818,9 @@ let start
     Journal_graph_transport.deliver
       ~runtime:(!graph_runtime_cell)
       ~send:(fun request ->
+        match Journal_graph_runtime.worker_read request with
+        | Some read -> send_coordinated_read request read
+        | None ->
         match dispatch_worker ~observe_projection:true (Graph_service.Graph_request request) with
         | Accepted worker_id ->
           Hashtbl.replace (!graph_worker_requests_cell) worker_id request;
@@ -3840,8 +3873,11 @@ let start
       , run_admission_directive set_state_and_effect directive ))
   in
   let trigger_admission set_state_and_effect ~graph_generation ~graph_open =
-    update_admission set_state_and_effect (fun state ->
-      Admission_refresh.trigger state.admission_refresh ~graph_generation ~graph_open)
+    match current_owner() with
+    | Some owner when owner.graph_generation=graph_generation ->
+      update_admission set_state_and_effect (fun state ->
+        Admission_refresh.trigger state.admission_refresh ~graph_generation ~graph_open)
+    | _ -> Effect.ignore
   in
   let apply_delivery_responses state delivery =
     let state =
@@ -3863,6 +3899,19 @@ let start
         | Some set_state ->
           set_state (fun state -> apply_delivery_responses state delivery))
   in
+  coordinated_read_finished := (fun owner request result ->
+    if runtime_owner_is_live !state_ref owner then run_owned (Some owner) (fun () ->
+      let output=match result with
+        | Ok response -> observe_projection_response response;
+          Journal_graph_runtime.receive (!graph_runtime_cell) response
+        | Error message -> forget_projection_request request.request_id;
+          Journal_graph_runtime.fail_request (!graph_runtime_cell) request ~message in
+      Effect.bind (Effect.of_thunk(fun()->deliver_output output)) ~f:(fun delivery ->
+        Effect.bind (apply_graph_responses set_state_and_effect delivery.responses) ~f:(fun()->
+          set_state(fun state->match delivery.error with
+            | None->state
+            | Some message when Option.is_some state.feed_refresh->fail_feed_transport state message
+            | Some message->fail_graph_transport state message)))));
   let observe_graph_state
         set_state
         set_state_and_effect
@@ -3927,6 +3976,10 @@ let start
     then cancel_copy ();
     let start_graph =
       match graph_state.phase with
+      | Graph_open when not (Option.fold ~none:false
+          ~some:(fun (owner:Graph_service.timeline_scope)->
+            Some owner.graph_id=graph_state.graph_id && owner.graph_generation=graph_state.generation)
+          (current_owner())) -> Effect.ignore
       (* Prepare each resident's first feed once, without mounting its UI.
          A first swipe can then display its own data even while another graph
          has a pending save. Later hidden invalidations remain deferred. *)

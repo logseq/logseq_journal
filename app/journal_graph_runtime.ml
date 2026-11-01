@@ -2990,3 +2990,27 @@ let reconcile_push t ~request_generation push =
 ;;
 
 module Copy = Journal_copy
+
+module Worker = Journal_worker_coordination.Worker_api
+
+type worker_read =
+  | Read : { query : 'a Worker.query; maximum_items : int;
+             outcome : 'a -> Protocol.v2_outcome } -> worker_read
+
+let worker_read (request:Protocol.request) =
+  match request.command with
+  | V2_graph_info -> Some(Read{query=Worker.Graph_info;maximum_items=1;
+      outcome=(fun (i:Worker.graph_info)->Protocol.V2_graph_info_outcome
+        {graph_uuid=i.graph_uuid;graph_name=i.graph_name;schema=i.schema;
+         admission_facts=i.admission_facts;journal_title_format=i.journal_title_format;
+         limits=i.limits;generation=i.generation;projection_revision=i.projection_revision})})
+  | V2_inspect_admission -> Some(Read{query=Worker.Admission;maximum_items=1;
+      outcome=(fun value->Protocol.V2_admission_outcome value)})
+  | V2_get_page{page;revision} -> Some(Read{query=Worker.Page{uuid=page;revision};maximum_items=1;
+      outcome=(fun value->Protocol.V2_page_outcome value)})
+  | V2_get_outline_block{block;revision} -> Some(Read{query=Worker.Outline_block{uuid=block;revision};maximum_items=1;
+      outcome=(fun value->Protocol.V2_block_outcome value)})
+  | V2_get_task_status_definitions{statuses} -> Some(Read{query=Worker.Task_status_definitions statuses;
+      maximum_items=max 1 (List.length statuses);outcome=(fun value->Protocol.V2_task_status_definitions_outcome value)})
+  | _ -> None
+;;

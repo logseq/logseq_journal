@@ -3,7 +3,8 @@
 This independent wrapped Dune virtual library is the target boundary for migrating
 App/Worker interaction. Its explicit implementation lives in
 `app/impl/worker_coordination/`: `worker_api`, `worker_pure_coordinator` and
-`worker_effect_runner`. The App currently uses it for **Copy's one-shot reads**.
+`worker_effect_runner`. The App uses it for **Copy** and the graph runtime's one-shot **Graph_info,
+Admission, Page, Outline_block and Task_status_definitions** reads.
 The runner borrows the existing Service/client and the host's single event pump;
 there is no adapter, second client or extra `Mailbox.on_event` subscription.
 Navigation, feed/Favorites planning, Capture editing and media UI remain with their
@@ -189,13 +190,17 @@ at least the following deterministic integration acceptance:
 - `test/worker_coordination_pure_test.ml` checks deterministic state transitions,
   input immutability, cancellation/admission reordering, terminal duplication,
   retired bindings, cleanup ACKs and stopping failures. It runs 500 fixed-seed
-  state traces with a counterexample shrinker, plus 100 generated ownership-range
+  state traces and 250 queued-read traces with a counterexample shrinker, plus
+  100 generated ownership-range
   traces and a 16,384-ID compression check. Generators and seeds are outside the
   pure state machine; no clock/random/IO or host callback is read by `step`.
 - `test/worker_coordination_runtime_test.ml` uses the actual Service and isolated
   synthetic mirrors/catalogs. It exercises baseline to Open session, bounded typed
   reads and continuations, DTO conversion through the actual App projection,
   focus A -> B -> A, rebinding, old reply ownership and cancellation/shutdown ACKs.
+  A held real writer also exercises read -> graph close while the read awaits its
+  snapshot; outer writer cancellation does not roll back the accepted DB write,
+  and the Service must recheck exact scope/Open phase before returning the read.
 - The existing mounted `application_view_test` Copy case drives Timeline,
   Favorites and Detail menus, replacement and clipboard acknowledgement through
   the new host/coordinator/runner. Its synthetic Service implements the declared
@@ -206,6 +211,12 @@ at least the following deterministic integration acceptance:
   emits termination-ready once. Direct forced disposal requests Worker stop and
   tears down UI without this graceful join. Mounted fixtures remain separate
   from actual Service conformance evidence.
+- `plan_query` queues exact host identities in the pure coordinator until a
+  verified Open baseline matches. Future identities are not falsely retired by
+  an older queued snapshot; a known removed execution has retained retirement
+  evidence, including Opening -> removed. The host watch stores callback outlets
+  and queues Forget before delivering a business callback. The legacy mailbox-ID
+  table no longer owns these five one-shot read families.
 - Existing Copy reducer tests use the compatibility entry to the same generic
   pure engine. Production Copy passes sealed continuations directly; its old
   mailbox-ID request table and cancellation path have been removed. Buffered

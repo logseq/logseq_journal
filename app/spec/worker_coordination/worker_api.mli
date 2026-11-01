@@ -424,6 +424,15 @@ val residents : projection -> resident list
 val selected : projection -> presentation option
 val local_deletion : projection -> local_deletion option
 val equal_projection : projection -> projection -> bool
+
+(** Positive evidence from a newer account or same-graph execution generation.
+    An unknown/future owner is not retired merely because its baseline push has
+    not reached the serial coordinator yet. A previous snapshot can additionally
+    prove retirement when this newer same-binding snapshot removed its execution
+    identity. This grants no read authority. *)
+val scope_is_superseded
+  : ?previous:projection -> projection -> Service.timeline_scope -> bool
+
 val removal_target : local_deletion -> Uuid.t
 
 (** One immutable version covers membership, phases, selection and deletion.

@@ -129,3 +129,14 @@ val reconcile_push
   -> output
 
 module Copy = Journal_copy
+
+module Worker = Journal_worker_coordination.Worker_api
+
+type worker_read =
+  | Read : { query : 'a Worker.query; maximum_items : int;
+             outcome : 'a -> Logseq_db_worker.Protocol.v2_outcome } -> worker_read
+
+(** Business DTO interoperability for migrated non-paginated reads. Request IDs
+    here correlate existing projection work; Worker transport IDs stay exclusively
+    with the pure coordinator. No sealed continuation is unwrapped or recreated. *)
+val worker_read : Logseq_db_worker.Protocol.request -> worker_read option

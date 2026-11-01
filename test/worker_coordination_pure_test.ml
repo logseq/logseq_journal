@@ -422,6 +422,371 @@ let test_cleanup_admission_edges () =
     "refused request retained an unowned early result"
 ;;
 
+let test_reads_wait_for_verified_baseline () =
+  let issuer, raw, projection, _ = fixture 301L in
+  let module I = (val issuer : W.ISSUER) in
+  let owner = Option.get raw.baseline.state.sync.selected in
+  let bound = (C.step (C.initial ~client_id:client) (C.Worker_bound I.binding)).next in
+  let ticket, waiting =
+    C.plan_query
+      bound
+      ~owner
+      ~maximum_items:64
+      ~maximum_bytes:P.maximum_response_bytes
+      W.Graph_info
+    |> Result.get_ok
+  in
+  let sends instructions =
+    List.fold_left
+      (fun n -> function
+         | C.Send _ -> n + 1
+         | _ -> n)
+      0
+      instructions
+  in
+  check (sends waiting.instructions = 0) "query sent before verified baseline";
+  let opened =
+    C.step waiting.next (C.Bootstrap_received (I.binding, W.Ready projection))
+  in
+  check (sends opened.instructions = 1) "verified Open did not dispatch queued query";
+  let duplicate = C.step opened.next (C.Projection_received projection) in
+  check (sends duplicate.instructions = 0) "duplicate baseline dispatched query twice";
+  (* Host messages may run while a newer baseline is only queued. Absence
+     from the old snapshot is not evidence that the new generation retired. *)
+  let future_owner = { owner with graph_generation = owner.graph_generation + 1 } in
+  let future, future_waiting =
+    C.plan_query
+      (ready I.binding projection)
+      ~owner:future_owner
+      ~maximum_items:1
+      ~maximum_bytes:65536
+      W.Graph_info
+    |> Result.get_ok
+  in
+  check
+    (C.reply (C.view future_waiting.next) future = None)
+    "future owner was rejected by stale baseline";
+  let drained = C.step future_waiting.next C.Drain in
+  check
+    (sends drained.instructions = 0 && C.reply (C.view drained.next) future = None)
+    "a queued future owner either sent early or was falsely retired";
+  let update_scope (scope : S.asset_scope) =
+    { scope with graph_generation = future_owner.graph_generation }
+  in
+  let raw_future =
+    { raw with
+      baseline =
+        { raw.baseline with
+          version = 2L
+        ; state =
+            { sync =
+                { raw.baseline.state.sync with
+                  selected = Some future_owner
+                ; residents =
+                    List.map
+                      (fun (scope, state) -> update_scope scope, state)
+                      raw.baseline.state.sync.residents
+                }
+            ; residents =
+                List.map
+                  (fun (scope, state) ->
+                     ( update_scope scope
+                     , { state with
+                         Logseq_db_worker.generation = future_owner.graph_generation
+                       } ))
+                  raw.baseline.state.residents
+            }
+        }
+    }
+  in
+  let future_projection =
+    match I.bootstrap (S.Coordination_registered raw_future) with
+    | Ok (W.Ready projection) -> projection
+    | _ -> failwith "future fixture baseline rejected"
+  in
+  let arrived = C.step drained.next (C.Projection_received future_projection) in
+  check
+    (sends arrived.instructions = 1)
+    "future owner did not send after matching baseline";
+  let cancelled = C.step waiting.next (C.Cancel ticket) in
+  check
+    (C.reply (C.view cancelled.next) ticket = Some (W.Interrupted W.Cancelled))
+    "unsent cancellation did not settle locally";
+  let late =
+    C.step cancelled.next (C.Bootstrap_received (I.binding, W.Ready projection))
+  in
+  check (sends late.instructions = 0) "cancelled waiting query was resurrected";
+  let wrong = { owner with graph_generation = owner.graph_generation - 1 } in
+  let stale, waiting =
+    C.plan_query bound ~owner:wrong ~maximum_items:1 ~maximum_bytes:65536 W.Graph_info
+    |> Result.get_ok
+  in
+  let opened =
+    C.step waiting.next (C.Bootstrap_received (I.binding, W.Ready projection))
+  in
+  check (sends opened.instructions = 0) "stale host identity minted a session";
+  check
+    (C.reply (C.view opened.next) stale = Some (W.Answered (Error W.Revoked_session)))
+    "replaced scope left queued read waiting forever";
+  let waiting =
+    snd
+      (C.plan_query bound ~owner ~maximum_items:1 ~maximum_bytes:65536 W.Graph_info
+       |> Result.get_ok)
+  in
+  let shutdown = C.step waiting.next C.Shutdown_requested in
+  let stopped = C.step shutdown.next (C.Binding_release_completed (I.binding, Ok ())) in
+  let stopped =
+    C.step stopped.next (C.Bootstrap_received (I.binding, W.Ready projection))
+  in
+  check
+    (C.shutdown_state (C.view stopped.next) = C.Stopped)
+    "unsent query prevented registration cleanup";
+  check (sends stopped.instructions = 0) "shutdown sent a queued query"
+;;
+
+let test_opening_query_retires_on_removal () =
+  let issuer, raw, _, _ = fixture 303L in
+  let module I = (val issuer : W.ISSUER) in
+  let owner = Option.get raw.baseline.state.sync.selected in
+  let opening =
+    { raw with
+      baseline =
+        { raw.baseline with
+          version = 2L
+        ; state =
+            { raw.baseline.state with
+              residents =
+                List.map
+                  (fun (scope, state) ->
+                     scope, { state with Logseq_db_worker.phase = Graph_opening })
+                  raw.baseline.state.residents
+            }
+        }
+    }
+  in
+  let project value =
+    match I.bootstrap (S.Coordination_registered value) with
+    | Ok (W.Ready projection) -> projection
+    | _ -> failwith "opening/removal baseline fixture failed"
+  in
+  let opening = project opening in
+  let ticket, waiting =
+    C.plan_query
+      (ready I.binding opening)
+      ~owner
+      ~maximum_items:1
+      ~maximum_bytes:65536
+      W.Graph_info
+    |> Result.get_ok
+  in
+  check (C.reply (C.view waiting.next) ticket = None) "Opening query did not wait";
+  let empty =
+    project
+      { raw with
+        baseline =
+          { raw.baseline with
+            version = 3L
+          ; state =
+              { sync =
+                  { raw.baseline.state.sync with
+                    desired_residents = []
+                  ; residents = []
+                  ; selected = None
+                  }
+              ; residents = []
+              }
+          }
+      }
+  in
+  let removed = C.step waiting.next (C.Projection_received empty) in
+  check
+    (C.reply (C.view removed.next) ticket = Some (W.Answered (Error W.Revoked_session)))
+    "removed Opening owner retained its waiting query";
+  let late, planned =
+    C.plan_query removed.next ~owner ~maximum_items:1 ~maximum_bytes:65536 W.Graph_info
+    |> Result.get_ok
+  in
+  check
+    (C.reply (C.view planned.next) late = Some (W.Answered (Error W.Revoked_session)))
+    "late request for a known removed owner waited forever"
+;;
+
+let test_queued_query_properties () =
+  let issuer, raw, first, _ = fixture 302L in
+  let module I = (val issuer : W.ISSUER) in
+  let owner = Option.get raw.baseline.state.sync.selected in
+  let later_owner = { owner with graph_generation = owner.graph_generation + 1 } in
+  let later_scope (scope : S.asset_scope) =
+    { scope with graph_generation = later_owner.graph_generation }
+  in
+  let later_raw =
+    { raw with
+      baseline =
+        { raw.baseline with
+          version = 2L
+        ; state =
+            { sync =
+                { raw.baseline.state.sync with
+                  selected = Some later_owner
+                ; residents =
+                    List.map
+                      (fun (scope, state) -> later_scope scope, state)
+                      raw.baseline.state.sync.residents
+                }
+            ; residents =
+                List.map
+                  (fun (scope, state) ->
+                     ( later_scope scope
+                     , { state with
+                         Logseq_db_worker.generation = later_owner.graph_generation
+                       } ))
+                  raw.baseline.state.residents
+            }
+        }
+    }
+  in
+  let later =
+    match I.bootstrap (S.Coordination_registered later_raw) with
+    | Ok (W.Ready value) -> value
+    | _ -> failwith "later queued-query fixture rejected"
+  in
+  let run trace =
+    let state =
+      ref (C.step (C.initial ~client_id:client) (C.Worker_bound I.binding)).next
+    in
+    let tickets = ref []
+    and expected = Hashtbl.create 128
+    and sends = Hashtbl.create 128
+    and forbidden = Hashtbl.create 128 in
+    let apply (transition : C.transition) =
+      List.iter
+        (function
+          | C.Send (ticket, session, _) ->
+            let id = C.ticket_id ticket in
+            check (not (Hashtbl.mem forbidden id)) "cancelled unsent read was dispatched";
+            check (not (Hashtbl.mem sends id)) "queued read sent more than once";
+            check
+              (W.matches_scope session (Hashtbl.find expected id))
+              "queued read used foreign scope";
+            check
+              (Option.fold
+                 ~none:false
+                 ~some:(fun projection ->
+                   List.exists
+                     (fun resident ->
+                        resident.W.phase = W.Open
+                        && W.equal_session session resident.session)
+                     (W.residents projection))
+                 (C.projection (C.view transition.next)))
+              "queued read bypassed verified Open session";
+            Hashtbl.replace sends id ()
+          | _ -> ())
+        transition.C.instructions;
+      check
+        (List.length transition.instructions < 1000)
+        "queued read emitted unbounded batch";
+      state := transition.next
+    in
+    let step event =
+      let before = C.view !state in
+      let a = C.step !state event
+      and b = C.step !state event in
+      check
+        (C.equal_view (C.view a.next) (C.view b.next))
+        "queued steps were nondeterministic";
+      check (C.equal_view before (C.view !state)) "queued step mutated prior state";
+      apply a
+    in
+    let ticket n f =
+      match List.nth_opt !tickets (n mod 8) with
+      | None -> ()
+      | Some value -> f value
+    in
+    List.iter
+      (fun (op, n) ->
+         match op with
+         | 0 ->
+           let target =
+             match n mod 3 with
+             | 0 -> owner
+             | 1 -> later_owner
+             | _ -> { owner with graph_generation = owner.graph_generation - 1 }
+           in
+           (match
+              C.plan_query
+                !state
+                ~owner:target
+                ~maximum_items:1
+                ~maximum_bytes:65536
+                W.Graph_info
+            with
+            | Error _ -> ()
+            | Ok (ticket, transition) ->
+              Hashtbl.replace expected (C.ticket_id ticket) target;
+              tickets := ticket :: List.filteri (fun i _ -> i < 7) !tickets;
+              apply transition)
+         | 1 -> step (C.Projection_received (if n mod 2 = 0 then first else later))
+         | 2 ->
+           ticket n (fun value ->
+             step
+               (C.Admitted (value, Id.Worker.Request_id.of_int64 (Int64.of_int (n + 1)))))
+         | 3 ->
+           ticket n (fun value ->
+             step (C.Completed (value, W.Interrupted W.Cancelled));
+             let once = C.view !state in
+             step (C.Completed (value, W.Answered (Error (W.Service_failed "duplicate"))));
+             check (C.equal_view once (C.view !state)) "queued terminal consumed twice")
+         | 4 | 5 ->
+           ticket n (fun value ->
+             if not (Hashtbl.mem sends (C.ticket_id value))
+             then Hashtbl.replace forbidden (C.ticket_id value) ();
+             step (if op = 4 then C.Cancel value else C.Forget value))
+         | 6 -> step C.Drain
+         | 7 -> step C.Shutdown_requested
+         | 8 -> step C.Retry_bootstrap
+         | 9 -> step (C.Binding_release_completed (I.binding, Ok ()))
+         | 10 -> ticket n (fun value -> step (C.Admission_refused (value, W.Full)))
+         | _ ->
+           step
+             (C.Bootstrap_received
+                (I.binding, W.Ready (if n mod 2 = 0 then first else later))))
+      trace
+  in
+  let prefixes =
+    [ [ 0, 1; 1, 0; 6, 0; 2, 0; 3, 0; 1, 1; 2, 0; 3, 0 ]
+    ; [ 0, 0; 4, 0; 1, 0 ]
+    ; [ 0, 1; 5, 0; 1, 1 ]
+    ; [ 0, 1; 7, 0; 9, 0; 11, 1 ]
+    ]
+  in
+  List.iter run prefixes;
+  for seed = 0 to 249 do
+    let random = Random.State.make [| 0x0c001; seed |] in
+    let prefix = List.nth prefixes (seed mod List.length prefixes) in
+    let trace =
+      prefix
+      @ List.init 96 (fun _ -> Random.State.int random 16, Random.State.int random 8)
+    in
+    let fails trace =
+      try
+        run trace;
+        false
+      with
+      | _ -> true
+    in
+    if fails trace
+    then (
+      let minimal = shrink fails trace in
+      failwith
+        (Printf.sprintf
+           "queued-query seed=%d shrunk=%s"
+           seed
+           (String.concat
+              ","
+              (List.map (fun (op, n) -> Printf.sprintf "%d:%d" op n) minimal))))
+  done
+;;
+
 let test_compressed_response_ownership () =
   let module O = C.Response_ownership in
   let id n = Id.Worker.Request_id.of_int64 (Int64.of_int n) in
@@ -456,7 +821,10 @@ let () =
   test_cleanup_admission_edges ();
   test_pure_properties ();
   test_compressed_response_ownership ();
+  test_reads_wait_for_verified_baseline ();
+  test_queued_query_properties ();
+  test_opening_query_retires_on_removal ();
   print_endline
-    "Pure coordinator: invariants, 500 seeded traces, 100 ownership traces and shrinking \
-     passed"
+    "Pure coordinator: invariants, 500 lifecycle + 250 queued-read traces, 100 ownership \
+     traces and shrinking passed"
 ;;

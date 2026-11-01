@@ -23,6 +23,16 @@ val request
 
 val post : t -> Core.event -> unit
 
+val plan_query
+  : t -> owner:Runner.Service.timeline_scope
+  -> maximum_items:int -> maximum_bytes:int -> 'a Worker.query
+  -> ('a Core.ticket, Worker.error) result
+
+(** A host-owned callback outlet only. The coordinator owns admission, cancellation
+    and terminal consumption; completed tickets are forgotten on a later queued
+    turn before the business callback is delivered. *)
+val watch : t -> 'a Core.ticket -> f:('a Worker.reply -> unit) -> unit
+
 val on_event
   :  t
   -> (Runner.Service.response, Runner.Service.push) Runner.Mailbox.event

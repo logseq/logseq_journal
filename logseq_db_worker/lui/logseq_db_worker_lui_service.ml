@@ -1049,8 +1049,12 @@ let create ~(dependencies : dependencies) =
         else (match resolve owner with
           | None -> Error "The graph session is no longer open."
           | Some scope ->
-            let authorized ()=current () &&
-              (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+            let authorized ()=current () && resolve owner=Some scope &&
+              (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) &&
+              (match Db.graph_state_for_scope session.worker ~scope with
+               | Some {phase=Db.Graph_open;graph_id=Some id;generation;_} ->
+                 id=scope.graph_id && generation=scope.graph_generation
+               | _ -> false) in
             if not(authorized ()) then Error "Coordination account authority changed" else
             let response=Db.request_for_scope session.worker ~scope request in
             if authorized () then Ok(Graph_response response) else Error "Coordination binding retired")
