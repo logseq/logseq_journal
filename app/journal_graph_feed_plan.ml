@@ -60,7 +60,7 @@ type root_preview =
   { preview_batch : root_batch
   ; preview_root : Projection.tree_member
   ; preview_members : Projection.tree_member Rrbvec.t
-  ; preview_cursor : Graph.Cursor.t option
+  ; preview_cursor : Protocol.v2_child_member Worker.continuation option
   ; preview_limit : int
   ; preview_revision : string option
   ; preview_retries : int
@@ -561,7 +561,7 @@ let read_root_preview ~ports preview =
       (Protocol.V2_get_children
          { parent = preview.preview_root.block.uuid
          ; limit = preview.preview_limit
-         ; cursor = preview.preview_cursor
+         ; cursor = None
          ; revision = None
          })
   in
@@ -724,7 +724,6 @@ let receive_root_preview t ~ports preview parent revision items next_cursor =
                      preview_members = selected
                    ; preview_cursor = next_cursor
                    ; preview_revision = Some revision
-                   ; preview_limit = min preview.preview_limit (3 - count)
                    }
                ]
          else
@@ -826,7 +825,23 @@ let journal_request = function
   | Root_tree _ | Root_preview _ -> None
 ;;
 
-let receive t ~ports ?journals operation outcome =
+type child_request =
+  { parent : Graph.Uuid.t
+  ; limit : int
+  ; after : Protocol.v2_child_member Worker.continuation option
+  }
+
+let child_request = function
+  | Root_preview preview ->
+    Some
+      { parent = preview.preview_root.block.uuid
+      ; limit = preview.preview_limit
+      ; after = preview.preview_cursor
+      }
+  | Root_dates _ | Root_today _ | Root_tree _ -> None
+;;
+
+let receive t ~ports ?journals ?children operation outcome =
   let unsealed = match operation, journals, outcome with
     | (Root_dates _ | Root_today _), None, Protocol.V2_journals_outcome {next_cursor=Some _;_} -> true
     | _ -> false in
@@ -915,8 +930,11 @@ let receive t ~ports ?journals operation outcome =
        ports.observe_packet (Roots (List.to_seq items));
        receive_root_tree t ~ports batch items next_cursor
      | Root_preview preview, V2_children_outcome {parent;scope_revision;items;next_cursor;_} ->
-       ports.observe_packet (Preview (List.to_seq items));
-       receive_root_preview t ~ports preview parent scope_revision items next_cursor
+       if children=None && next_cursor<>None then root_failure preview.preview_batch "Unsealed preview continuation"
+       else (
+         ports.observe_packet (Preview (List.to_seq items));
+         receive_root_preview t ~ports preview parent scope_revision items
+           (Option.bind children (fun (value:Worker.children)->value.next)))
      | Root_dates (scan, _), V2_failed {code="staleReadCursor";_} ->
        if not (root_owner_current t (Feed_roots scan)) then empty else (
          scan.root_date_retries <- scan.root_date_retries + 1;
@@ -935,7 +953,8 @@ let receive t ~ports ?journals operation outcome =
        (match batch.root_owner with Feed_roots scan->scan.root_page_size<-limit | _->());
        requests [read_root_batch t ~ports batch.root_owner batch.root_page batch.root_cursor limit]
      | Root_preview preview, V2_failed {code="responseTooLarge";_} when preview.preview_limit>1 ->
-       requests [read_root_preview ~ports {preview with preview_limit=max 1 (preview.preview_limit/2)}]
+       requests [read_root_preview ~ports {preview with preview_limit=max 1 (preview.preview_limit/2);
+         preview_members=Rrbvec.empty;preview_cursor=None;preview_revision=None}]
   | _ -> empty)
 ;;
 let load_feed t ~ports ~cursor ~root_limit ~day_limit ~request_generation =

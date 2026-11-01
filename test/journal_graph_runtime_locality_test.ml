@@ -22,7 +22,7 @@ module Worker_producer = struct
 
   let wire_request runtime request =
     match request.Protocol.command, Production_runtime.worker_read runtime request with
-    | ( (Protocol.V2_list_journals _ | V2_get_outline_block_summary _)
+    | ( (Protocol.V2_list_journals _ | V2_get_outline_block_summary _ | V2_get_children _)
       , Some (Production_runtime.Read read) ) ->
       (match
          I.request
@@ -93,6 +93,7 @@ module Runtime = struct
   let receive runtime (Protocol.V2_response envelope as raw) =
     let key = Graph.Uuid.to_string envelope.request_id in
     (match Hashtbl.find_opt fixture_requests key, envelope.outcome with
+    | Some (Protocol.V2_get_children _ as command), Protocol.V2_children_outcome _
     | Some (Protocol.V2_get_outline_block_summary _ as command), Protocol.V2_block_summary_outcome _
     | Some (Protocol.V2_list_journals _ as command), Protocol.V2_journals_outcome _
     | Some (Protocol.V2_list_task_statuses _ as command), Protocol.V2_task_statuses_outcome _ ->
@@ -124,7 +125,8 @@ module Runtime = struct
           match outcome with
           | None -> {kept with requests=kept.requests@[request]}
           | Some outcome ->
-            let next=serve (Production_runtime.receive runtime (Protocol.V2_response {api_version=Protocol.api_version;request_id=request.request_id;outcome})) in
+            let raw=Protocol.V2_response {api_version=Protocol.api_version;request_id=request.request_id;outcome} in
+            let next=serve (Worker_producer.receive runtime request raw |> Worker_producer.wire_output runtime) in
             {requests=kept.requests@next.requests;responses=kept.responses@next.responses})
           {requests=[];responses=output.responses} output.requests
       in serve result
@@ -3637,6 +3639,9 @@ let seed_favorite_dependencies
         match request.command with
         | V2_get_children { parent; _ } when Graph.Uuid.equal parent favorites_page_uuid
           ->
+          (match Production_runtime.worker_read runtime request with
+           | Some (Production_runtime.Read {query=Journal_worker_coordination.Worker_api.Child_members _;_}) -> ()
+           | _ -> Alcotest.fail "favorite memberships bypassed typed coordinator");
           Protocol.V2_children_outcome
             { parent
             ; revision_scope = V2_children_revision parent
@@ -4052,6 +4057,20 @@ let test_feed_dates_use_owned_worker_query () =
   match Production_runtime.worker_read runtime request with
   | Some (Production_runtime.Unowned_read _) -> ()
   | _ -> Alcotest.fail "retired feed dates fell back to legacy transport"
+;;
+
+let test_private_children_without_owner_are_not_legacy () =
+  let runtime = Runtime.create () in
+  let request : Protocol.request =
+    { api_version = Protocol.api_version
+    ; request_id = uuid "f0000000-0000-4000-8000-000000000100"
+    ; command =
+        V2_get_children { parent = block_uuid; limit = 3; cursor = None; revision = None }
+    }
+  in
+  match Production_runtime.worker_read runtime request with
+  | Some (Production_runtime.Unowned_read _) -> ()
+  | _ -> Alcotest.fail "unowned child query fell back to legacy transport"
 ;;
 
 let test_feed_dates_reject_invalid_local_boundary () =
@@ -6859,6 +6878,9 @@ let drive_root_output ?(split_bytes = false) runtime fixtures (start : Runtime.o
             ; next_cursor
             })
       | V2_get_children { parent; limit; cursor; _ } ->
+        (match Production_runtime.worker_read runtime request with
+         | Some (Production_runtime.Read {query=Journal_worker_coordination.Worker_api.Child_members _;_}) -> ()
+         | _ -> Alcotest.fail "feed preview bypassed typed coordinator");
         Alcotest.(check bool) "preview requests stay bounded" true (limit <= 3);
         if split_bytes && limit > 1
         then
@@ -8805,6 +8827,7 @@ let () =
         Alcotest.test_case "resync retires point observations" `Quick test_resync_retires_changed_points] )
     ; ( "initial thirty roots", [
         Alcotest.test_case "dates use owned Worker query" `Quick test_feed_dates_use_owned_worker_query;
+        Alcotest.test_case "unowned children refuse legacy dispatch" `Quick test_private_children_without_owner_are_not_legacy;
         Alcotest.test_case "dates reject invalid local boundary" `Quick test_feed_dates_reject_invalid_local_boundary;
         Alcotest.test_case "date budget recovery restarts sealed cursor" `Quick test_feed_date_budget_failure_restarts_bound_cursor;
         Alcotest.test_case "date budget error remains typed" `Quick test_typed_date_budget_failure_preserves_classification;

@@ -9,6 +9,7 @@ module Confirmation = Journal_graph_mutation_confirmation
 module Worker = Journal_worker_coordination.Worker_api
 
 type worker_read_result =
+  | Child_members_read of Worker.children
   | Target_summary_read of Worker.block_summary
   | Journals_read of Protocol.v2_journal_item Worker.slice
   | Task_catalog_read of Worker.task_status_catalog
@@ -2018,7 +2019,12 @@ let children_result items continuation : Projection.block_member Graph.page_resu
   }
 ;;
 
-let receive_response t ~favorites ~catalog ~journals ~target_summary (protocol_response : Protocol.response) =
+let receive_response t ~read_result (protocol_response : Protocol.response) =
+  let favorites = match read_result with Some (Favorites_read {value;_})->Some value | _->None in
+  let catalog = match read_result with Some (Task_catalog_read value)->Some value | _->None in
+  let journals = match read_result with Some (Journals_read value)->Some value | _->None in
+  let target_summary = match read_result with Some (Target_summary_read value)->Some value | _->None in
+  let children = match read_result with Some (Child_members_read value)->Some value | _->None in
   let (Protocol.V2_response { request_id; outcome; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
   match Hashtbl.find_opt t.pending key with
@@ -2039,7 +2045,7 @@ let receive_response t ~favorites ~catalog ~journals ~target_summary (protocol_r
   | Some { operation; source_epoch; _ } ->
     let failure_output = failure_output ~source_epoch in
     Hashtbl.remove t.pending key;
-    (match (match operation with Feed_read value -> Feed.receive t.feed ~ports:(feed_ports t) ?journals value outcome | _ -> None) with
+    (match (match operation with Feed_read value -> Feed.receive t.feed ~ports:(feed_ports t) ?journals ?children value outcome | _ -> None) with
      | Some planned -> feed_output planned
      | _ -> (match outcome with
      | Protocol.V2_assets_outcome _ ->
@@ -2651,10 +2657,13 @@ let receive_response t ~favorites ~catalog ~journals ~target_summary (protocol_r
                          })
                   ]))
         | Favorite_read value when Favorites.accepts_memberships value ->
-          let planned = Favorites.receive_memberships t.favorites ~ports:(favorites_ports t)
-            value items next_cursor in
-          let output = favorites_output planned in
-          if planned.background then background_demands t output else output
+          if children = None && next_cursor <> None
+          then failure_output t operation request_id "Unsealed Favorite membership continuation"
+          else (
+            let planned = Favorites.receive_memberships t.favorites ~ports:(favorites_ports t)
+                value items (Option.bind children (fun (value:Worker.children) -> value.next)) in
+            let output = favorites_output planned in
+            if planned.background then background_demands t output else output)
         | Changed_children { page; root; _ } ->
           let children = children_result items next_cursor in
           let interest =
@@ -2845,7 +2854,7 @@ let receive_response t ~favorites ~catalog ~journals ~target_summary (protocol_r
           failure_output t operation request_id "Unexpected acknowledgement response.")))
 ;;
 
-let receive_delivery t ~favorites ~catalog ~journals ~target_summary (protocol_response : Protocol.response) =
+let receive_delivery t ~read_result (protocol_response : Protocol.response) =
   let (Protocol.V2_response { request_id; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
   let pending = Hashtbl.find_opt t.pending key in
@@ -2866,7 +2875,7 @@ let receive_delivery t ~favorites ~catalog ~journals ~target_summary (protocol_r
     scope_output
       t
       (Option.bind pending (fun pending -> pending.failure_owner))
-      (receive_response t ~favorites ~catalog ~journals ~target_summary protocol_response)
+      (receive_response t ~read_result protocol_response)
   in
   let references =
     match pending, protocol_response with
@@ -2956,62 +2965,51 @@ let receive_delivery t ~favorites ~catalog ~journals ~target_summary (protocol_r
 (* Route accepted Worker terminal failures through the same owner as protocol
    failures. This removes pending/active markers and drains queued hydration;
    a later completion for the request is then unowned and ignored. *)
-let receive t response = receive_delivery t ~favorites:None ~catalog:None ~journals:None ~target_summary:None response
+let receive t response = receive_delivery t ~read_result:None response
 
 let receive_worker_read t ~request_id result =
-  let favorites, catalog, journals, target_summary, outcome =
+  let outcome =
     match result with
-    | Ordinary_read outcome -> None, None, None, None, outcome
+    | Ordinary_read outcome -> outcome
+    | Child_members_read value ->
+      Protocol.V2_children_outcome
+        { parent = value.parent
+        ; revision_scope = value.revision_scope
+        ; scope_revision = value.scope_revision
+        ; items = value.items
+        ; next_cursor = None
+        }
     | Journals_read value ->
-      ( None
-      , None
-      , Some value
-      , None
-      , Protocol.V2_journals_outcome { items = value.items; next_cursor = None } )
+      Protocol.V2_journals_outcome { items = value.items; next_cursor = None }
     | Target_summary_read value ->
-      ( None
-      , None
-      , None
-      , Some value
-      , Protocol.V2_block_summary_outcome
-          { lookup = value.lookup
-          ; page = value.page
-          ; items = value.items
-          ; next_cursor = None
-          ; scope_revision = value.scope_revision
-          ; generation = value.generation
-          ; projection_revision = value.projection_revision
-          } )
+      Protocol.V2_block_summary_outcome
+        { lookup = value.lookup
+        ; page = value.page
+        ; items = value.items
+        ; next_cursor = None
+        ; scope_revision = value.scope_revision
+        ; generation = value.generation
+        ; projection_revision = value.projection_revision
+        }
     | Task_catalog_read value ->
-      ( None
-      , Some value
-      , None
-      , None
-      , Protocol.V2_task_statuses_outcome
-          { property_uuid = value.property_uuid
-          ; default_status = value.default_status
-          ; items = value.items
-          ; next_cursor = None
-          } )
+      Protocol.V2_task_statuses_outcome
+        { property_uuid = value.property_uuid
+        ; default_status = value.default_status
+        ; items = value.items
+        ; next_cursor = None
+        }
     | Favorites_read { value; _ } ->
-      ( Some value
-      , None
-      , None
-      , None
-      , Protocol.V2_favorites_outcome
-          { favorites_page = value.favorites_page
-          ; generation = value.generation
-          ; projection_revision = value.projection_revision
-          ; items = Rrbvec.to_list value.items
-          ; next_cursor = None
-          } )
+      Protocol.V2_favorites_outcome
+        { favorites_page = value.favorites_page
+        ; generation = value.generation
+        ; projection_revision = value.projection_revision
+        ; items = Rrbvec.to_list value.items
+        ; next_cursor = None
+        }
   in
   receive_delivery
     t
-    ~favorites
-    ~catalog
-    ~journals
-    ~target_summary
+    ~read_result:(Some result)
     (Protocol.V2_response { api_version = Protocol.api_version; request_id; outcome })
 ;;
 
@@ -3142,6 +3140,23 @@ let worker_read t (request : Protocol.request) =
              (fun value ->
                Ordinary_read (Protocol.V2_task_status_definitions_outcome value))
          })
+  | V2_get_children _ ->
+    (match Hashtbl.find_opt t.pending (Graph.Uuid.to_string request.request_id) with
+     | Some { operation = Feed_read read; delivery = Dispatched; _ } ->
+       (match Feed.child_request read with
+        | Some business ->
+          Some (Read
+            { query = Worker.Child_members { parent = business.parent; revision = None; after = business.after }
+            ; maximum_items = business.limit
+            ; outcome = (fun value -> Child_members_read value)
+            })
+        | None -> Some (Unowned_read "Child business operation mismatch"))
+     | Some { operation = Favorite_read read; delivery = Dispatched; _ } ->
+       (match Favorites.membership_query read with
+        | Some query -> Some (Read { query; maximum_items = 200; outcome = (fun value -> Child_members_read value) })
+        | None -> Some (Unowned_read "Favorite child business operation mismatch"))
+     | Some { delivery = Dispatched; _ } -> None
+     | Some _ | None -> Some (Unowned_read "Child business request is no longer owned"))
   | V2_get_outline_block_summary _ ->
     (match Hashtbl.find_opt t.pending (Graph.Uuid.to_string request.request_id) with
      | Some { operation = Target_summary read; delivery = Dispatched; _ } ->

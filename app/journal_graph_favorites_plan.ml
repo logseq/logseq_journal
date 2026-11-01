@@ -1,6 +1,7 @@
 module Graph = Logseq_db_types.Graph_types
 module Protocol = Logseq_db_worker.Protocol
 module Error = Logseq_db_worker.Error
+module Worker = Journal_worker_coordination.Worker_api
 
 type read =
   | List_favorites of Journal_graph_request.favorites_request
@@ -15,7 +16,8 @@ type read =
       { epoch : int64
       ; page : Graph.Uuid.t
       ; consumed : int
-      ; seen : string list
+      ; seen : Protocol.v2_child_member Worker.continuation list
+      ; after : Protocol.v2_child_member Worker.continuation option
       }
 
 type rejection =
@@ -311,7 +313,7 @@ let receive_list t ~ports (request : Journal_graph_request.favorites_request) (r
                  Hashtbl.replace t.favorite_pending (favorite_membership_key page) ();
                  Rrbvec.singleton (ports.plan_read
                     (Favorite_memberships
-                        { epoch = t.favorite_epoch; page; consumed = 0; seen = [] })
+                        { epoch = t.favorite_epoch; page; consumed = 0; seen = []; after=None })
                      (Protocol.V2_get_children
                         { parent = page; limit = 200; cursor = None; revision = None })
                  )
@@ -440,7 +442,7 @@ let receive_memberships t ~ports operation items next_cursor =
   let items = Rrbvec.of_list items in
   match operation with
         | Favorite_memberships { epoch; _ } when epoch <> t.favorite_epoch -> empty
-        | Favorite_memberships { epoch; page; consumed; seen } ->
+        | Favorite_memberships { epoch; page; consumed; seen; _ } ->
           if Rrbvec.length items > 200 || consumed + Rrbvec.length items > 10_000
           then
             complete_favorite_dependency_key
@@ -470,7 +472,7 @@ let receive_memberships t ~ports operation items next_cursor =
               | None ->
                 complete_favorite_dependency_key t (favorite_membership_key page) output
               | Some cursor ->
-                let key = Graph.Cursor.to_string cursor in
+                let key = cursor in
                 if
                   List.mem key seen
                   || List.length seen >= 128
@@ -490,11 +492,12 @@ let receive_memberships t ~ports operation items next_cursor =
                                ; page
                                ; consumed = consumed + Rrbvec.length items
                                ; seen = key :: seen
+                               ; after = Some cursor
                                })
                             (Protocol.V2_get_children
                                { parent = page
                                ; limit = 200
-                               ; cursor = Some cursor
+                               ; cursor = None
                                ; revision = None
                                })
                         )
@@ -525,3 +528,9 @@ let fail t operation ~request_id ~code ~message ~error =
 ;;
 
 let list_request = function List_favorites request -> Some request | _ -> None
+
+let membership_query = function
+  | Favorite_memberships { page; after; _ } ->
+    Some (Worker.Child_members { parent = page; revision = None; after })
+  | _ -> None
+;;

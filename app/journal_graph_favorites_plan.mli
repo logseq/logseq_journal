@@ -1,6 +1,7 @@
 module Graph = Logseq_db_types.Graph_types
 module Protocol = Logseq_db_worker.Protocol
 module Error = Logseq_db_worker.Error
+module Worker = Journal_worker_coordination.Worker_api
 
 type read
 type rejection =
@@ -37,8 +38,10 @@ val accepts_memberships : read -> bool
 val receive_list : t -> ports:ports -> read -> Journal_graph_request.favorites_result -> output
 val receive_page : t -> ports:ports -> read -> Protocol.v2_page_lookup -> output
 val receive_block : t -> ports:ports -> read -> Protocol.v2_block_lookup -> output
-val receive_memberships : t -> ports:ports -> read -> Protocol.v2_child_member list -> Graph.Cursor.t option -> output
+val receive_memberships : t -> ports:ports -> read -> Protocol.v2_child_member list -> Protocol.v2_child_member Worker.continuation option -> output
 val fail : t -> read -> request_id:Graph.Uuid.t -> code:Error.code -> message:string -> error:Error.t -> output
 
 (** The business owner retains the sealed continuation; the transport DTO is not its cursor store. *)
 val list_request : read -> Journal_graph_request.favorites_request option
+
+val membership_query : read -> Worker.children Worker.query option

@@ -43,6 +43,8 @@ let secrets =
 let favorite_page_id = uuid "9c000000-0000-4000-8000-000000000100"
 let favorite_member n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (100 + n))
 
+let preview_root = uuid "9c000000-0000-4000-8000-000000000400"
+let preview_child n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (400+n))
 let summary_child n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (300+n))
 let journal_page n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (200+n))
 
@@ -118,6 +120,21 @@ let seed_coordination_read_data path =
            Add (node,"block/order",String ("a" ^ string_of_int n));
            Add (node,"block/parent",Ref_to (lookup Test_support.authoritative_block_uuid));
            Add (node,"block/page",Ref_to (lookup Test_support.page_uuid))]) [1;2] in
+       let node=Datascript.Temp_id "synthetic-preview-root" in
+       let preview = Datascript.[
+         Add (node,"block/uuid",Uuid (W.Uuid.to_string preview_root));
+         Add (node,"block/title",String "Synthetic preview root");
+         Add (node,"block/order",String "a");
+         Add (node,"block/parent",Ref_to (lookup (journal_page 2)));
+         Add (node,"block/page",Ref_to (lookup (journal_page 2)))] in
+       let ops=ops @ preview @ List.concat_map (fun n ->
+         let child=Datascript.Temp_id ("synthetic-preview-child-" ^ string_of_int n) in
+         Datascript.[
+           Add (child,"block/uuid",Uuid (W.Uuid.to_string (preview_child n)));
+           Add (child,"block/title",String ("Preview child " ^ string_of_int n));
+           Add (child,"block/order",String ("a" ^ string_of_int n));
+           Add (child,"block/parent",Ref_to node);
+           Add (child,"block/page",Ref_to (lookup (journal_page 2)))]) [1;2] in
        let staged =
          Session.stage_transact session ~authoritative_before:database ops
          |> Result.get_ok
@@ -645,7 +662,7 @@ let test_client_to_typed_read () =
            | _ -> false)
         o.requests
     in
-    let seen = ref [] in
+    let seen = ref [] and last_root = ref None in
     let rec date_page remaining original =
       match Journal_graph_runtime.worker_read business original with
       | Some (Journal_graph_runtime.Read read) ->
@@ -690,6 +707,7 @@ let test_client_to_typed_read () =
                   | _ -> false)
                output.requests
            in
+           last_root:=Some root;
            if remaining > 1
            then (
              require more "real first date page omitted continuation";
@@ -740,6 +758,85 @@ let test_client_to_typed_read () =
            (List.exists (W.Uuid.equal (journal_page n)) !seen)
            "real date continuation lost seeded same-day identity")
       [ 1; 2 ];
+    let root = Option.get !last_root in
+    let query =
+      match root.command with
+      | V2_get_page_tree { page; maximum_depth; revision; cursor = None; _ } ->
+        W.Tree { page; maximum_depth; revision; after = None }
+      | _ -> failwith "preview root driver lost first-page shape"
+    in
+    let _, reply = request (W.Query (budget, query)) in
+    let items =
+      match reply with
+      | W.Answered (Ok value) when value.next = None -> value.items
+      | _ -> failwith "actual preview root unavailable"
+    in
+    require (List.length items = 1) "synthetic preview root cardinality changed";
+    let output =
+      Journal_graph_runtime.receive
+        business
+        (P.V2_response
+           { api_version = P.api_version
+           ; request_id = root.request_id
+           ; outcome =
+               V2_page_tree_outcome
+                 { page = journal_page 2; maximum_depth = 0; items; next_cursor = None }
+           })
+    in
+    let child_request output =
+      List.find
+        (fun (r : P.request) ->
+           match r.command with
+           | V2_get_children _ -> true
+           | _ -> false)
+        output.Journal_graph_runtime.requests
+    in
+    let rec preview_page page original =
+      require (page < 10) "actual preview did not terminate";
+      match Journal_graph_runtime.worker_read business original with
+      | Some (Journal_graph_runtime.Read read) ->
+        let _, reply = request (W.Query (budget, read.query)) in
+        (match reply with
+         | W.Answered (Ok value) ->
+           let result = read.outcome value in
+           let more =
+             match result with
+             | Journal_graph_runtime.Child_members_read value -> Option.is_some value.next
+             | _ -> failwith "preview lost typed child result"
+           in
+           let output =
+             Journal_graph_runtime.receive_worker_read
+               business
+               ~request_id:original.request_id
+               result
+           in
+           if more
+           then preview_page (page + 1) (child_request output)
+           else (
+             require (page = 1) "real preview did not exercise sealed continuation";
+             let entry =
+               List.find_map
+                 (fun response ->
+                    match response.Journal_graph_runtime.payload with
+                    | Feed_loaded { complete = true; feed; _ } ->
+                      List.find_map
+                        (fun (day : Journal_graph_projection.day_feed) ->
+                           List.find_opt
+                             (fun (entry : Journal_graph_projection.timeline_entry) ->
+                                Journal_model.id entry.block = W.Uuid.to_string preview_root)
+                             day.entries)
+                        feed.days
+                    | _ -> None)
+                 output.responses
+               |> Option.get
+             in
+             require
+               (List.length entry.child_summaries = 2)
+               "actual preview lost visible children")
+         | _ -> failwith "actual preview query failed")
+      | _ -> failwith "production preview dispatch bypassed coordinator"
+    in
+    preview_page 0 (child_request output);
     let favorites_request : Journal_graph_request.favorites_request =
       { graph_generation = owner.graph_generation
       ; request_generation = 310L
@@ -748,6 +845,7 @@ let test_client_to_typed_read () =
       }
     in
     let request_query = request in
+    let membership = ref None in
     let read_favorites request =
       let planned = Journal_graph_runtime.submit business (Load_favorites request) in
       let original =
@@ -770,6 +868,9 @@ let test_client_to_typed_read () =
                ~request_id:original.request_id
                (read.outcome value)
            in
+           List.iter (fun (r:P.request) -> match r.command with
+             | V2_get_children {parent;_} when W.Uuid.equal parent favorite_page_id -> membership:=Some r
+             | _ -> ()) output.requests;
            List.find_map
              (fun response ->
                 match response.Journal_graph_runtime.payload with
@@ -801,6 +902,45 @@ let test_client_to_typed_read () =
     require
       ((Rrbvec.nth second.items 0).membership_uuid = favorite_member 2)
       "actual second wire request did not retain the sealed backend continuation";
+    let rec membership_page page seen original =
+      require (page < 10) "actual Favorite memberships did not terminate";
+      match Journal_graph_runtime.worker_read business original with
+      | Some (Journal_graph_runtime.Read read) ->
+        let _, reply = request_query (W.Query (budget, read.query)) in
+        (match reply with
+         | W.Answered (Ok value) ->
+           let result = read.outcome value in
+           let items, more =
+             match result with
+             | Journal_graph_runtime.Child_members_read value ->
+               value.items, Option.is_some value.next
+             | _ -> failwith "Favorite membership lost typed result"
+           in
+           let seen =
+             seen @ List.map (fun (item : P.v2_child_member) -> item.value.block.uuid) items
+           in
+           let output =
+             Journal_graph_runtime.receive_worker_read
+               business
+               ~request_id:original.request_id
+               result
+           in
+           if more
+           then membership_page (page + 1) seen (child_request output)
+           else (
+             require
+               (page = 1 && List.length seen = 2)
+               "actual membership lost two-page read";
+             List.iter
+               (fun n ->
+                  require
+                    (List.exists (W.Uuid.equal (favorite_member n)) seen)
+                    "actual Favorite membership UUID lost")
+               [ 1; 2 ])
+         | _ -> failwith "actual Favorite membership query failed")
+      | _ -> failwith "Favorite membership bypassed production typed dispatch"
+    in
+    membership_page 0 [] (Option.get !membership);
     let revision =
       match summary with
       | W.Answered (Ok { lookup = P.V2_present_block { revision; _ }; _ }) -> revision

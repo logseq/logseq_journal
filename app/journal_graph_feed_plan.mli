@@ -47,6 +47,7 @@ val receive
   :  t
   -> ports:ports
   -> ?journals:Protocol.v2_journal_item Worker.slice
+  -> ?children:Worker.children
   -> operation
   -> Protocol.v2_outcome
   -> output option
@@ -56,3 +57,10 @@ val load_day : t -> ports:ports -> page:Projection.page -> after:Projection.bloc
 val refresh_initial : t -> ports:ports -> request_generation:int64 -> output option
 val has_initial_feed : t -> bool
 val reconcile_retained : t -> ports:ports -> page:Projection.page -> limit:int -> Protocol.request option
+
+type child_request =
+  { parent : Graph.Uuid.t
+  ; limit : int
+  ; after : Protocol.v2_child_member Worker.continuation option
+  }
+val child_request : operation -> child_request option

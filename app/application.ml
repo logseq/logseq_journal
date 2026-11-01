@@ -3914,6 +3914,11 @@ let start
            | Journals_read value -> observe_projection_response
              (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
                request_id=request.request_id;outcome=V2_journals_outcome {items=value.items;next_cursor=None}})
+           | Child_members_read value -> observe_projection_response
+             (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
+               request_id=request.request_id;outcome=V2_children_outcome
+                 {parent=value.parent;revision_scope=value.revision_scope;scope_revision=value.scope_revision;
+                  items=value.items;next_cursor=None}})
            | Target_summary_read value -> observe_projection_response
              (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
                request_id=request.request_id;outcome=V2_block_summary_outcome
