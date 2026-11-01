@@ -4,7 +4,15 @@ module Intents = Map.Make (String)
 module Slots = Map.Make (Int64)
 module Graphs = Map.Make (Worker.Uuid)
 
+module Observation_ids = Map.Make (struct
+    type t = Worker.request_id
+
+    let compare = Worker.compare_request_id
+  end)
+
 type _ kind =
+  | Unit : unit kind
+  | Observed : 'a kind -> 'a Worker.observed kind
   | Mutation : Worker.mutation_progress kind
   | Info : Worker.graph_info kind
   | Admission : Worker.Protocol.v2_admission_inspection kind
@@ -41,9 +49,14 @@ let kind : type a. a Worker.query -> a kind = function
   | Changes _ -> Changes
 ;;
 
-let same_kind : type a b. a kind -> b kind -> (a, b) Worker.equality option =
+let rec same_kind : type a b. a kind -> b kind -> (a, b) Worker.equality option =
   fun a b ->
   match a, b with
+  | Observed a, Observed b ->
+    (match same_kind a b with
+     | Some Refl -> Some Refl
+     | None -> None)
+  | Unit, Unit -> Some Refl
   | Mutation, Mutation -> Some Refl
   | Info, Info -> Some Refl
   | Admission, Admission -> Some Refl
@@ -68,6 +81,7 @@ type _ planned =
   | Operation : 'a Worker.request -> 'a planned
 
 type query_target =
+  | Cleanup of Worker.session
   | Presentation of Worker.presentation
   | Direct of Worker.session
   | Sealed of Worker.session * Worker.read_budget
@@ -86,6 +100,7 @@ type 'a slot =
   { ticket : 'a ticket
   ; dispatched : bool
   ; admitted : Id.request_id option
+  ; sample_epoch : Worker.observation_epoch option
   ; origin : (Worker.session * Worker.read_budget) option
   ; result : 'a Worker.reply option
   ; early : 'a Worker.reply option
@@ -94,6 +109,28 @@ type 'a slot =
   }
 
 type entry = Entry : 'a slot -> entry
+
+type 'a observation_state =
+  { obs_initial : 'a Worker.observed ticket
+  ; obs_session : Worker.session
+  ; obs_budget : Worker.read_budget
+  ; obs_query : 'a Worker.query
+  ; obs_handle : 'a Worker.observation option
+  ; obs_latest : 'a Worker.observed option
+  ; obs_registered : bool
+  ; obs_admitted : bool
+  ; obs_releasing : bool
+  ; obs_release_inflight : bool
+  ; obs_cleanup_waiting : bool
+  ; obs_attempt : Worker.request_id option
+  ; obs_cleanup_error : Worker.error option
+  ; obs_error : Worker.error option
+  ; obs_epoch : Worker.observation_epoch option
+  ; obs_dirty : bool
+  ; obs_retry : bool
+  }
+
+type observation_entry = Observing : 'a observation_state -> observation_entry
 
 type shutdown_state =
   | Active
@@ -108,6 +145,9 @@ type view =
   ; handoffs : (Worker.handoff_id * Worker.handoff_state) list
   ; shutdown : shutdown_state
   ; intents : Worker.mutation_progress Intents.t
+  ; observations : observation_entry Observation_ids.t
+  ; retired_observations : Worker.session Observation_ids.t
+  ; retired_observation_count : int
   }
 
 type lifecycle =
@@ -153,8 +193,20 @@ let initial ~client_id =
       ; handoffs = []
       ; shutdown = Active
       ; intents = Intents.empty
+      ; observations = Observation_ids.empty
+      ; retired_observations = Observation_ids.empty
+      ; retired_observation_count = 0
       }
   }
+;;
+
+let current_session facts session =
+  match facts.bootstrap_state, facts.current with
+  | Worker.Ready _, Some p ->
+    List.exists
+      (fun r -> r.Worker.phase = Worker.Open && Worker.equal_session r.session session)
+      (Worker.residents p)
+  | _ -> false
 ;;
 
 let view t = t.facts
@@ -208,13 +260,96 @@ let query_origin
   | _ -> None
 ;;
 
-let observed _ _ = None
+let find_observation
+  : type a. view -> Worker.request_id -> a Worker.query -> a observation_state option
+  =
+  fun facts id query ->
+  match Observation_ids.find_opt id facts.observations with
+  | Some (Observing value) ->
+    (match same_kind (kind query) (kind value.obs_query) with
+     | Some Worker.Refl when query = value.obs_query -> Some value
+     | _ -> None)
+  | None -> None
+;;
+
+let observed facts observation =
+  match
+    find_observation
+      facts
+      (Worker.observation_id observation)
+      (Worker.observation_query observation)
+  with
+  | Some
+      { obs_handle = Some owned
+      ; obs_releasing = false
+      ; obs_registered = true
+      ; obs_admitted = true
+      ; _
+      } as found ->
+    (match Worker.same_observation observation owned, found with
+     | Some Worker.Refl, Some value
+       when current_session facts value.obs_session
+            && Worker.equal_request_id
+                 value.obs_initial.id
+                 (Worker.observation_id observation)
+            && value.obs_budget = Worker.observation_budget observation ->
+       value.obs_latest
+     | _ -> None)
+  | _ -> None
+;;
+
+let observation_handle
+  : type a. view -> a Worker.observed ticket -> a Worker.observation option
+  =
+  fun facts ticket ->
+  match ticket.query with
+  | Operation (Worker.Observe (_, query)) ->
+    (match find_observation facts ticket.id query with
+     | Some value
+       when (not value.obs_releasing)
+            && value.obs_admitted
+            && current_session facts value.obs_session -> value.obs_handle
+     | _ -> None)
+  | _ -> None
+;;
+
+let observation_error facts observation =
+  match
+    find_observation
+      facts
+      (Worker.observation_id observation)
+      (Worker.observation_query observation)
+  with
+  | Some value
+    when Option.exists
+           (fun owned -> Worker.same_observation observation owned <> None)
+           value.obs_handle ->
+    (match value.obs_cleanup_error with
+     | Some _ as error -> error
+     | None -> value.obs_error)
+  | _ -> None
+;;
+
+let observation_matches : type a. a observation_state -> a Worker.observation -> bool =
+  fun value observation ->
+  Worker.equal_session value.obs_session (Worker.observation_session observation)
+  && Worker.equal_request_id value.obs_initial.id (Worker.observation_id observation)
+  && value.obs_budget = Worker.observation_budget observation
+  && value.obs_query = Worker.observation_query observation
+;;
+
+let equal_observation_entry (Observing a) (Observing b) =
+  match same_kind (kind a.obs_query) (kind b.obs_query) with
+  | Some Worker.Refl -> a = b
+  | None -> false
+;;
 
 let equal_entry (Entry a) (Entry b) =
   match same_ticket a.ticket b.ticket with
   | Some Worker.Refl ->
     a.dispatched = b.dispatched
     && a.admitted = b.admitted
+    && a.sample_epoch = b.sample_epoch
     && a.origin = b.origin
     && a.result = b.result
     && a.early = b.early
@@ -230,6 +365,12 @@ let equal_view a b =
       && a.handoffs = b.handoffs
       && a.shutdown = b.shutdown
       && a.intents = b.intents
+      && a.retired_observation_count = b.retired_observation_count
+      && Observation_ids.equal
+           Worker.equal_session
+           a.retired_observations
+           b.retired_observations
+      && Observation_ids.equal equal_observation_entry a.observations b.observations
       && Slots.equal equal_entry a.entries b.entries)
 ;;
 
@@ -248,6 +389,15 @@ type event =
   | Bootstrap_received of Worker.binding * Worker.bootstrap_state
   | Completed : 'a ticket * 'a Worker.reply -> event
   | Projection_received of Worker.projection
+  | Observation_registered :
+      'a Worker.observed ticket * 'a Worker.observation * Worker.observation_epoch
+      -> event
+  | Observation_release_completed of
+      Worker.session * Worker.request_id * (unit, Worker.error) result
+  | Observation_release_not_admitted of
+      Worker.session * Worker.request_id * Worker.admission_error
+  | Observation_notice of Worker.observation_notice
+  | Observation_notices_failed of Worker.binding * Worker.error
   | Observation_received : 'a Worker.observed -> event
   | Asset_received of Worker.asset_notice
   | Cancel : 'a ticket -> event
@@ -259,6 +409,7 @@ type event =
 type instruction =
   | Bootstrap
   | Release_binding of Worker.binding
+  | Release_observation_registration of Worker.session * Worker.request_id
   | Bind_replacement
   | Send : 'a ticket * Worker.session * 'a Worker.request -> instruction
   | Cancel_request : 'a ticket -> instruction
@@ -291,15 +442,6 @@ let changed next instructions =
   { next; instructions = instructions @ [ Publish next.facts ] }
 ;;
 
-let current_session facts session =
-  match facts.bootstrap_state, facts.current with
-  | Worker.Ready _, Some p ->
-    List.exists
-      (fun r -> r.Worker.phase = Worker.Open && Worker.equal_session r.session session)
-      (Worker.residents p)
-  | _ -> false
-;;
-
 let affected session = function
   | Worker.Account_will_change | Connection_will_stop -> true
   | Graph_will_close id | Graph_will_remove (id, _) ->
@@ -317,6 +459,7 @@ let validate_session ?owner state session =
 ;;
 
 let current_target facts = function
+  | Cleanup _ -> true
   | Presentation presentation ->
     current_session facts (Worker.presentation_session presentation)
     && Option.bind facts.current Worker.selected = Some presentation
@@ -333,6 +476,7 @@ let current_target facts = function
 
 let affected_target target change =
   match target with
+  | Cleanup _ -> false
   | Presentation presentation ->
     affected (Worker.presentation_session presentation) change
   | Direct session | Sealed (session, _) -> affected session change
@@ -391,6 +535,9 @@ let cancel_entries ?(waiting = true) predicate facts =
       (fun _ (Entry slot as entry) ->
          if
            slot.result <> None
+           || (match slot.ticket.target with
+               | Cleanup _ -> true
+               | _ -> false)
            || ((not slot.dispatched) && not waiting)
            || not (predicate slot.ticket.target)
          then Some entry
@@ -466,7 +613,11 @@ let dispatch_waiting ?(publish = false) state instructions =
                  | Error error -> reject error
                  | Ok operation ->
                    sends := Send (slot.ticket, session, operation) :: !sends;
-                   let origin=match operation with Worker.Query (budget,_) -> Some (session,budget) | _ -> None in
+                   let origin =
+                     match operation with
+                     | Worker.Query (budget, _) -> Some (session, budget)
+                     | _ -> None
+                   in
                    Entry { slot with dispatched = true; origin })
               | Some { phase = Worker.Opening; _ } -> entry
               | Some { phase = Worker.Failed error; _ } -> reject error
@@ -584,6 +735,27 @@ let checked_result : type a. view -> a ticket -> a Worker.reply -> a Worker.repl
             "Mutation receipt identity or original point does not match its ticket"))
   in
   match ticket.query, result with
+  | Operation (Worker.Observe (_, query)), Worker.Answered (Ok value) ->
+    (match find_observation facts ticket.id query with
+     | Some owned when observation_matches owned value.observation -> result
+     | _ ->
+       Worker.Answered
+         (Error
+            (Worker.Protocol_mismatch
+               "Observed value does not match its planned registration")))
+  | Operation (Worker.Refresh handle), Worker.Answered (Ok value) ->
+    (match
+       ( Worker.same_observation handle value.observation
+       , find_observation
+           facts
+           (Worker.observation_id handle)
+           (Worker.observation_query handle) )
+     with
+     | Some Worker.Refl, Some owned when observation_matches owned handle -> result
+     | _ ->
+       Worker.Answered
+         (Error
+            (Worker.Protocol_mismatch "Refreshed value does not match its owned interest")))
   | ( Operation (Worker.Mutate intent)
     , Worker.Answered (Ok (Worker.Committed_pending_presentation receipt)) ) ->
     if receipt_agrees facts intent receipt then result else mismatch ()
@@ -603,6 +775,147 @@ let checked_result : type a. view -> a ticket -> a Worker.reply -> a Worker.repl
   | _ -> result
 ;;
 
+let retain_observed_value state value ~admitted ~cancelled =
+  let id = Worker.observation_id value.Worker.observation in
+  match find_observation state.facts id (Worker.observation_query value.observation) with
+  | Some owned when observation_matches owned value.observation ->
+    let active =
+      state.lifecycle = Running
+      && current_session state.facts owned.obs_session
+      && (not cancelled)
+      && not owned.obs_releasing
+    in
+    let epoch_allowed =
+      Option.fold
+        ~none:true
+        ~some:(fun epoch -> Worker.compare_observation_epoch value.epoch epoch >= 0)
+        owned.obs_epoch
+    in
+    let accepted_update =
+      active
+      && admitted
+      && epoch_allowed
+      && Option.fold
+           ~none:true
+           ~some:(fun previous ->
+             Worker.compare_observation_epoch value.epoch previous.Worker.epoch > 0)
+           owned.obs_latest
+    in
+    let latest = if accepted_update then Some value else owned.obs_latest in
+    let obs_epoch = if epoch_allowed then Some value.epoch else owned.obs_epoch in
+    let owned =
+      { owned with
+        obs_handle = Some value.observation
+      ; obs_registered = true
+      ; obs_epoch
+      ; obs_admitted = owned.obs_admitted || admitted
+      ; obs_latest = latest
+      ; obs_error = (if accepted_update then None else owned.obs_error)
+      ; obs_releasing = owned.obs_releasing || not active
+      }
+    in
+    { state with
+      facts =
+        { state.facts with
+          observations = Observation_ids.add id (Observing owned) state.facts.observations
+        }
+    }
+  | _ -> state
+;;
+
+let retain_observation_error state ticket handle error =
+  let id = Worker.observation_id handle in
+  let sample_epoch =
+    match Slots.find_opt ticket.serial state.facts.entries with
+    | Some (Entry slot) -> slot.sample_epoch
+    | None -> None
+  in
+  match find_observation state.facts id (Worker.observation_query handle) with
+  | Some owned
+    when observation_matches owned handle
+         && (not owned.obs_releasing)
+         && Option.exists (Worker.equal_request_id ticket.id) owned.obs_attempt
+         &&
+         match sample_epoch, owned.obs_epoch with
+         | Some epoch, Some latest -> Worker.compare_observation_epoch epoch latest >= 0
+         | _ -> true ->
+    { state with
+      facts =
+        { state.facts with
+          observations =
+            Observation_ids.add
+              id
+              (Observing { owned with obs_error = Some error })
+              state.facts.observations
+        }
+    }
+  | _ -> state
+;;
+
+let retain_observation_result
+  : type a. t -> a ticket -> a Worker.reply -> admitted:bool -> cancelled:bool -> t
+  =
+  fun state ticket result ~admitted ~cancelled ->
+  match ticket.query, result with
+  | Operation (Worker.Observe _), Worker.Answered (Ok value) ->
+    retain_observed_value state value ~admitted ~cancelled
+  | Operation (Worker.Refresh _), Worker.Answered (Ok value) ->
+    (* A canceled sampled read does not unregister its long-lived interest. *)
+    if cancelled
+    then state
+    else retain_observed_value state value ~admitted ~cancelled:false
+  | Operation (Worker.Refresh handle), Worker.Answered (Error error) ->
+    if cancelled then state else retain_observation_error state ticket handle error
+  | Operation (Worker.Observe (_, query)), Worker.Answered (Error error) ->
+    (match find_observation state.facts ticket.id query with
+     | Some owned when owned.obs_attempt = None && not owned.obs_releasing ->
+       { state with
+         facts =
+           { state.facts with
+             observations =
+               Observation_ids.add
+                 ticket.id
+                 (Observing { owned with obs_error = Some error })
+                 state.facts.observations
+           }
+       }
+     | _ -> state)
+  | Operation (Worker.Observe (_, query)), Worker.Not_admitted _ ->
+    (match find_observation state.facts ticket.id query with
+     | Some owned ->
+       { state with
+         facts =
+           { state.facts with
+             observations =
+               Observation_ids.add
+                 ticket.id
+                 (Observing { owned with obs_releasing = true })
+                 state.facts.observations
+           }
+       }
+     | _ -> state)
+  | Operation (Worker.Refresh handle), Worker.Not_admitted Worker.Full ->
+    (match
+       find_observation
+         state.facts
+         (Worker.observation_id handle)
+         (Worker.observation_query handle)
+     with
+     | Some owned when observation_matches owned handle ->
+       { state with
+         facts =
+           { state.facts with
+             observations =
+               Observation_ids.add
+                 (Worker.observation_id handle)
+                 (Observing { owned with obs_retry = true })
+                 state.facts.observations
+           }
+       }
+     | _ -> state)
+  | _ -> state
+;;
+
 let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
   fun state ticket result require_admission ->
   match Slots.find_opt ticket.serial state.facts.entries with
@@ -615,7 +928,15 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
             && slot.dispatched ->
        let result = checked_result state.facts ticket result in
        if require_admission && slot.admitted = None
-       then
+       then (
+         let state =
+           retain_observation_result
+             state
+             ticket
+             result
+             ~admitted:false
+             ~cancelled:slot.cancelled
+         in
          changed
            { state with
              facts =
@@ -627,8 +948,16 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
                      state.facts.entries
                }
            }
-           []
+           [])
        else (
+         let state =
+           retain_observation_result
+             state
+             ticket
+             result
+             ~admitted:(slot.admitted <> None)
+             ~cancelled:slot.cancelled
+         in
          let intents : Worker.mutation_progress Intents.t =
            match ticket.query with
            | Operation (Worker.Mutate intent) ->
@@ -670,7 +999,14 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
            | _ -> state.facts.intents
          in
          let result =
-           if state.lifecycle = Running && current_target state.facts ticket.target
+           let cancelled_observe =
+             match ticket.query with
+             | Operation (Worker.Observe _) -> slot.cancelled
+             | _ -> false
+           in
+           if cancelled_observe
+           then Worker.Interrupted Worker.Cancelled
+           else if state.lifecycle = Running && current_target state.facts ticket.target
            then result
            else Worker.Answered (Error Worker.Revoked_session)
          in
@@ -686,6 +1022,167 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
          settle { state with facts = { state.facts with entries; intents } } [])
      | _ -> unchanged state)
   | None -> unchanged state
+;;
+
+let retire_observation facts session id =
+  match Observation_ids.find_opt id facts.observations with
+  | Some (Observing value) when Worker.equal_session session value.obs_session ->
+    { facts with
+      observations =
+        Observation_ids.add
+          id
+          (Observing
+             { value with
+               obs_releasing = true
+             ; obs_cleanup_waiting = false
+             ; obs_cleanup_error = None
+             })
+          facts.observations
+    }
+  | _ -> facts
+;;
+
+let cancel_observation : type a. view -> a ticket -> view =
+  fun facts ticket ->
+  match ticket.query with
+  | Operation (Worker.Observe _) ->
+    (match Observation_ids.find_opt ticket.id facts.observations with
+     | Some (Observing value) when Worker.equal_request_id ticket.id value.obs_initial.id
+       -> retire_observation facts value.obs_session ticket.id
+     | _ -> facts)
+  | _ -> facts
+;;
+
+let forget_observation : type a. t -> a ticket -> transition =
+  fun state ticket ->
+  match Slots.find_opt ticket.serial state.facts.entries with
+  | Some (Entry slot) ->
+    (match same_ticket ticket slot.ticket with
+     | Some Worker.Refl ->
+       let entries =
+         if slot.result <> None
+         then Slots.remove ticket.serial state.facts.entries
+         else
+           Slots.add
+             ticket.serial
+             (Entry { slot with forgotten = true })
+             state.facts.entries
+       in
+       changed { state with facts = { state.facts with entries } } []
+     | _ -> unchanged state)
+  | _ -> unchanged state
+;;
+
+let retain_registration
+  : type a.
+    t
+    -> a Worker.observed ticket
+    -> a Worker.observation
+    -> Worker.observation_epoch
+    -> transition
+  =
+  fun state ticket handle epoch ->
+  let id = Worker.observation_id handle in
+  match find_observation state.facts id (Worker.observation_query handle) with
+  | Some value when observation_matches value handle ->
+    let matches =
+      match ticket.query with
+      | Operation (Worker.Observe _) ->
+        Worker.equal_request_id ticket.id value.obs_initial.id
+      | Operation (Worker.Refresh original) ->
+        Worker.same_observation original handle <> None
+      | _ -> false
+    in
+    if not matches
+    then unchanged state
+    else (
+      let obs_epoch =
+        match value.obs_epoch with
+        | Some previous when Worker.compare_observation_epoch previous epoch >= 0 ->
+          Some previous
+        | _ -> Some epoch
+      in
+      let value =
+        { value with obs_handle = Some handle; obs_registered = true; obs_epoch }
+      in
+      let entries =
+        match Slots.find_opt ticket.serial state.facts.entries with
+        | Some (Entry slot) ->
+          (match same_ticket ticket slot.ticket with
+           | Some Worker.Refl ->
+             Slots.add
+               ticket.serial
+               (Entry { slot with sample_epoch = Some epoch })
+               state.facts.entries
+           | _ -> state.facts.entries)
+        | _ -> state.facts.entries
+      in
+      changed
+        { state with
+          facts =
+            { state.facts with
+              entries
+            ; observations =
+                Observation_ids.add id (Observing value) state.facts.observations
+            }
+        }
+        [])
+  | _ -> unchanged state
+;;
+
+let complete_release_waiters facts session id =
+  let entries =
+    Slots.filter_map
+      (fun _ (Entry slot as entry) ->
+         match slot.ticket.query with
+         | Operation (Worker.Release handle)
+           when slot.result = None
+                && Worker.equal_session session (Worker.observation_session handle)
+                && Worker.equal_request_id id (Worker.observation_id handle) ->
+           if slot.forgotten
+           then None
+           else Some (Entry { slot with result = Some (Worker.Answered (Ok ())) })
+         | _ -> Some entry)
+      facts.entries
+  in
+  { facts with entries }
+;;
+
+let release_observation_result state session id result =
+  match Observation_ids.find_opt id state.facts.observations with
+  | Some (Observing value)
+    when value.obs_releasing
+         && value.obs_release_inflight
+         && Worker.equal_session session value.obs_session ->
+    (match result with
+     | Ok () ->
+       let facts =
+         { state.facts with
+           observations = Observation_ids.remove id state.facts.observations
+         ; retired_observations =
+             Observation_ids.add id session state.facts.retired_observations
+         ; retired_observation_count = state.facts.retired_observation_count + 1
+         }
+       in
+       changed { state with facts = complete_release_waiters facts session id } []
+     | Error error ->
+       changed
+         { state with
+           facts =
+             { state.facts with
+               observations =
+                 Observation_ids.add
+                   id
+                   (Observing
+                      { value with
+                        obs_release_inflight = false
+                      ; obs_cleanup_error = Some error
+                      })
+                   state.facts.observations
+             }
+         }
+         [])
+  | _ -> unchanged state
 ;;
 
 let cancel : type a. t -> a ticket -> bool -> transition =
@@ -719,7 +1216,7 @@ let cancel : type a. t -> a ticket -> bool -> transition =
   | None -> unchanged state
 ;;
 
-let step state event =
+let step_base state event =
   match event with
   | Worker_bound binding when state.binding = None || state.lifecycle = Rebinding ->
     changed
@@ -739,6 +1236,14 @@ let step state event =
             current = None
           ; bootstrap_state = Worker.Awaiting_baseline
           ; shutdown = Active
+          ; retired_observations =
+              (if state.lifecycle = Rebinding
+               then Observation_ids.empty
+               else state.facts.retired_observations)
+          ; retired_observation_count =
+              (if state.lifecycle = Rebinding
+               then 0
+               else state.facts.retired_observation_count)
           }
       }
       [ Bootstrap ]
@@ -795,7 +1300,31 @@ let step state event =
   | Binding_release_completed (binding, result)
     when is_binding state binding && state.lifecycle <> Running ->
     (match result with
-     | Ok () -> settle { state with released = true; release_pending = false } []
+     | Ok () ->
+       let retired_observations =
+         Observation_ids.fold
+           (fun id (Observing value) retired ->
+              Observation_ids.add id value.obs_session retired)
+           state.facts.observations
+           state.facts.retired_observations
+       in
+       let facts =
+         { state.facts with
+           observations = Observation_ids.empty
+         ; retired_observations
+         ; retired_observation_count =
+             state.facts.retired_observation_count
+             + Observation_ids.cardinal state.facts.observations
+         }
+       in
+       let facts =
+         Observation_ids.fold
+           (fun id (Observing value) facts ->
+              complete_release_waiters facts value.obs_session id)
+           state.facts.observations
+           facts
+       in
+       settle { state with facts; released = true; release_pending = false } []
      | Error error ->
        changed
          { state with
@@ -853,6 +1382,17 @@ let step state event =
           when slot.dispatched && slot.admitted = None && slot.result = None ->
           let early = slot.early in
           let slot = { slot with admitted = Some id; early = None } in
+          let observations =
+            match Observation_ids.find_opt ticket.id state.facts.observations with
+            | Some (Observing value)
+              when Worker.equal_request_id value.obs_initial.id ticket.id ->
+              Observation_ids.add
+                ticket.id
+                (Observing { value with obs_admitted = true })
+                state.facts.observations
+            | _ -> state.facts.observations
+          in
+          let state = { state with facts = { state.facts with observations } } in
           let next =
             { state with
               facts =
@@ -872,8 +1412,12 @@ let step state event =
   | Admission_failed (ticket, error) ->
     finish state ticket (Worker.Answered (Error error)) false
   | Completed (ticket, result) -> finish state ticket result true
-  | Cancel ticket -> cancel state ticket false
-  | Forget ticket -> cancel state ticket true
+  | Cancel ticket ->
+    cancel { state with facts = cancel_observation state.facts ticket } ticket false
+  | Forget ticket ->
+    (match ticket.query with
+     | Operation (Worker.Observe _) -> forget_observation state ticket
+     | _ -> cancel state ticket true)
   | Handoff_completed (id, outcome)
     when Option.fold ~none:false ~some:(Worker.equal_handoff_id id) state.active_handoff
     ->
@@ -893,8 +1437,255 @@ let step state event =
           }
       }
       []
-  | Handoff_completed _ | Observation_received _ | Asset_received _ | Release _ ->
-    unchanged state
+  | Observation_registered (ticket, handle, epoch) ->
+    retain_registration state ticket handle epoch
+  | Observation_release_completed (session, id, result) ->
+    release_observation_result state session id result
+  | Observation_release_not_admitted (session, id, admission) ->
+    (match Observation_ids.find_opt id state.facts.observations with
+     | Some (Observing value)
+       when Worker.equal_session session value.obs_session && value.obs_release_inflight
+       ->
+       let error =
+         match admission with
+         | Worker.Full -> None
+         | _ -> Some (Worker.Service_failed "Observation cleanup not admitted")
+       in
+       changed
+         { state with
+           facts =
+             { state.facts with
+               observations =
+                 Observation_ids.add
+                   id
+                   (Observing
+                      { value with
+                        obs_release_inflight = false
+                      ; obs_cleanup_error = error
+                      ; obs_cleanup_waiting = admission = Worker.Full
+                      })
+                   state.facts.observations
+             }
+         }
+         []
+     | _ -> unchanged state)
+  | Release handle ->
+    (match
+       find_observation
+         state.facts
+         (Worker.observation_id handle)
+         (Worker.observation_query handle)
+     with
+     | Some owned when observation_matches owned handle ->
+       changed
+         { state with
+           facts = retire_observation state.facts owned.obs_session owned.obs_initial.id
+         }
+         []
+     | _ -> unchanged state)
+  | Observation_notice (Worker.Observation_invalidated notice)
+    when is_binding state notice.binding ->
+    (match Observation_ids.find_opt notice.id state.facts.observations with
+     | Some (Observing value)
+       when (not value.obs_releasing)
+            && Worker.matches_scope value.obs_session notice.owner
+            && Option.fold
+                 ~none:true
+                 ~some:(fun epoch ->
+                   Worker.compare_observation_epoch notice.epoch epoch > 0)
+                 value.obs_epoch ->
+       let value = { value with obs_epoch = Some notice.epoch; obs_dirty = true } in
+       changed
+         { state with
+           facts =
+             { state.facts with
+               observations =
+                 Observation_ids.add notice.id (Observing value) state.facts.observations
+             }
+         }
+         []
+     | _ -> unchanged state)
+  | Observation_notice (Worker.Observations_resync binding) when is_binding state binding
+    ->
+    let observations =
+      Observation_ids.map
+        (fun (Observing value) ->
+           Observing { value with obs_dirty = not value.obs_releasing })
+        state.facts.observations
+    in
+    changed { state with facts = { state.facts with observations } } []
+  | Observation_notices_failed (binding, error) when is_binding state binding ->
+    let observations =
+      Observation_ids.map
+        (fun (Observing value) -> Observing { value with obs_error = Some error })
+        state.facts.observations
+    in
+    changed { state with facts = { state.facts with observations } } []
+  | Observation_notice _ | Observation_notices_failed _ -> unchanged state
+  | Observation_received value ->
+    (match
+       find_observation
+         state.facts
+         (Worker.observation_id value.observation)
+         (Worker.observation_query value.observation)
+     with
+     | Some owned
+       when owned.obs_admitted && owned.obs_registered && not owned.obs_releasing ->
+       changed (retain_observed_value state value ~admitted:true ~cancelled:false) []
+     | _ -> unchanged state)
+  | Handoff_completed _ | Asset_received _ -> unchanged state
+;;
+
+let plan_refresh ?(internal = false) (state : t) session handle =
+  let id = Worker.observation_id handle in
+  match find_observation state.facts id (Worker.observation_query handle) with
+  | Some owned
+    when observation_matches owned handle
+         && owned.obs_registered
+         && (not owned.obs_releasing)
+         && owned.obs_handle <> None ->
+    if state.next = Int64.max_int
+    then Error (Worker.Invalid_input "Request counter exhausted")
+    else (
+      let serial = Int64.succ state.next in
+      let ticket =
+        { id = Worker.request_id (identity state.client serial)
+        ; serial
+        ; kind = Observed (kind owned.obs_query)
+        ; query = Operation (Worker.Refresh handle)
+        ; target = Sealed (session, owned.obs_budget)
+        }
+      in
+      let slot =
+        { ticket
+        ; dispatched = true
+        ; admitted = None
+        ; sample_epoch = None
+        ; origin = Some (session, owned.obs_budget)
+        ; result = None
+        ; early = None
+        ; cancelled = false
+        ; forgotten = internal
+        }
+      in
+      let facts =
+        { state.facts with
+          entries = Slots.add serial (Entry slot) state.facts.entries
+        ; observations =
+            Observation_ids.add
+              id
+              (Observing
+                 { owned with
+                   obs_dirty = false
+                 ; obs_retry = false
+                 ; obs_attempt = Some ticket.id
+                 })
+              state.facts.observations
+        }
+      in
+      Ok
+        ( ticket
+        , changed
+            { state with next = serial; facts }
+            [ Send (ticket, session, Worker.Refresh handle) ] ))
+  | _ -> Error Worker.Revoked_session
+;;
+
+let progress_observations ~retry transition =
+  let state = transition.next in
+  let instructions = ref [] in
+  let count = ref 0 in
+  let observations =
+    Observation_ids.mapi
+      (fun id (Observing value) ->
+         let releasing =
+           value.obs_releasing || validate_session state value.obs_session <> Ok ()
+         in
+         let value = { value with obs_releasing = releasing } in
+         if
+           releasing
+           && state.lifecycle = Running
+           && (not value.obs_release_inflight)
+           && value.obs_cleanup_error = None
+           && ((not value.obs_cleanup_waiting) || retry)
+           && !count < 128
+         then (
+           incr count;
+           instructions
+           := Release_observation_registration (value.obs_session, id) :: !instructions;
+           Observing
+             { value with
+               obs_release_inflight = true
+             ; obs_cleanup_waiting = false
+             ; obs_cleanup_error = None
+             })
+         else Observing value)
+      state.facts.observations
+  in
+  let next = ref { state with facts = { state.facts with observations } } in
+  let pending =
+    Slots.fold
+      (fun _ (Entry slot) pending ->
+         match slot.ticket.query with
+         | Operation (Worker.Refresh handle) when slot.result = None ->
+           Observation_ids.add (Worker.observation_id handle) () pending
+         | _ -> pending)
+      state.facts.entries
+      Observation_ids.empty
+  in
+  let slots = ref (Slots.cardinal state.facts.entries) in
+  Observation_ids.iter
+    (fun _ (Observing value) ->
+       match value.obs_handle with
+       | Some handle
+         when (value.obs_dirty || (retry && value.obs_retry))
+              && (not value.obs_releasing)
+              && value.obs_admitted
+              && (not (Observation_ids.mem value.obs_initial.id pending))
+              && !count < 128
+              && !slots < 256 ->
+         (match plan_refresh ~internal:true !next value.obs_session handle with
+          | Ok (_, planned) ->
+            incr count;
+            incr slots;
+            next := planned.next;
+            instructions
+            := List.rev_append
+                 (List.filter
+                    (function
+                      | Publish _ -> false
+                      | _ -> true)
+                    planned.instructions)
+                 !instructions
+          | Error _ -> ())
+       | _ -> ())
+    observations;
+  if
+    !instructions = []
+    && Observation_ids.equal
+         equal_observation_entry
+         !next.facts.observations
+         state.facts.observations
+  then transition
+  else
+    changed
+      !next
+      (List.filter
+         (function
+           | Publish _ -> false
+           | _ -> true)
+         transition.instructions
+       @ List.rev !instructions
+       @ if !count = 128 then [ Schedule_drain ] else [])
+;;
+
+let step state event =
+  progress_observations
+    ~retry:
+      (match event with
+       | Capacity_available -> true
+       | _ -> false)
+    (step_base state event)
 ;;
 
 let plan_mutation
@@ -942,6 +1733,7 @@ let plan_mutation
       { ticket
       ; dispatched = true
       ; admitted = None
+      ; sample_epoch = None
       ; origin = None
       ; result = None
       ; early = None
@@ -973,6 +1765,122 @@ let plan_mutation
       ))
 ;;
 
+let plan_observation (state : t) session budget query =
+  if
+    state.next = Int64.max_int
+    || Observation_ids.cardinal state.facts.observations >= 256
+    || state.facts.retired_observation_count
+       + Observation_ids.cardinal state.facts.observations
+       >= 8192
+  then Error (Worker.Invalid_input "Observation ownership capacity exhausted")
+  else (
+    let serial = Int64.succ state.next in
+    let ticket =
+      { id = Worker.request_id (identity state.client serial)
+      ; serial
+      ; kind = Observed (kind query)
+      ; query = Operation (Worker.Observe (budget, query))
+      ; target = Sealed (session, budget)
+      }
+    in
+    let slot =
+      { ticket
+      ; dispatched = true
+      ; admitted = None
+      ; sample_epoch = None
+      ; origin = Some (session, budget)
+      ; result = None
+      ; early = None
+      ; cancelled = false
+      ; forgotten = false
+      }
+    in
+    let observation =
+      { obs_initial = ticket
+      ; obs_session = session
+      ; obs_budget = budget
+      ; obs_query = query
+      ; obs_handle = None
+      ; obs_latest = None
+      ; obs_registered = false
+      ; obs_admitted = false
+      ; obs_releasing = false
+      ; obs_release_inflight = false
+      ; obs_cleanup_waiting = false
+      ; obs_attempt = None
+      ; obs_cleanup_error = None
+      ; obs_error = None
+      ; obs_epoch = None
+      ; obs_dirty = false
+      ; obs_retry = false
+      }
+    in
+    let facts =
+      { state.facts with
+        entries = Slots.add serial (Entry slot) state.facts.entries
+      ; observations =
+          Observation_ids.add ticket.id (Observing observation) state.facts.observations
+      }
+    in
+    Ok
+      ( ticket
+      , changed
+          { state with next = serial; facts }
+          [ Send (ticket, session, Worker.Observe (budget, query)) ] ))
+;;
+
+let plan_release state session handle =
+  let id = Worker.observation_id handle in
+  let acknowledged =
+    Option.exists
+      (Worker.equal_session session)
+      (Observation_ids.find_opt id state.facts.retired_observations)
+  in
+  let owned =
+    match find_observation state.facts id (Worker.observation_query handle) with
+    | Some value ->
+      observation_matches value handle
+      && Option.exists
+           (fun actual -> Worker.same_observation actual handle <> None)
+           value.obs_handle
+    | _ -> false
+  in
+  if
+    (not (Worker.equal_session session (Worker.observation_session handle)))
+    || not (acknowledged || owned)
+  then Error Worker.Revoked_session
+  else if state.next = Int64.max_int || Slots.cardinal state.facts.entries >= 512
+  then Error (Worker.Invalid_input "Observation cleanup waiter capacity exhausted")
+  else (
+    let serial = Int64.succ state.next in
+    let ticket =
+      { id = Worker.request_id (identity state.client serial)
+      ; serial
+      ; kind = Unit
+      ; query = Operation (Worker.Release handle)
+      ; target = Cleanup session
+      }
+    in
+    let slot =
+      { ticket
+      ; dispatched = false
+      ; admitted = None
+      ; sample_epoch = None
+      ; origin = None
+      ; result = (if acknowledged then Some (Worker.Answered (Ok ())) else None)
+      ; early = None
+      ; cancelled = false
+      ; forgotten = false
+      }
+    in
+    let facts = retire_observation state.facts session id in
+    let facts = { facts with entries = Slots.add serial (Entry slot) facts.entries } in
+    Ok
+      ( ticket
+      , progress_observations ~retry:true (changed { state with next = serial; facts } [])
+      ))
+;;
+
 let request
   : type a.
     t
@@ -981,59 +1889,69 @@ let request
     -> (a ticket * transition, Worker.error) result
   =
   fun state session operation ->
-  Result.bind (validate_session state session) (fun () ->
-    if Slots.cardinal state.facts.entries >= 256
-    then Error (Worker.Invalid_input "Release completed query tickets before admission")
-    else
-      Result.bind (Worker.validate_request session operation) (fun () ->
-        match operation with
-        | Worker.Query (budget, query) ->
-          if state.next = Int64.max_int
-          then Error (Worker.Invalid_input "Request counter exhausted")
-          else (
-            let serial = Int64.succ state.next in
-            let ticket =
-              { id = Worker.request_id (identity state.client serial)
-              ; serial
-              ; kind = kind query
-              ; query = Read query
-              ; target = Sealed (session, budget)
-              }
-            in
-            let slot =
-              { ticket
-              ; dispatched = true
-              ; admitted = None
-              ; origin = Some (session, budget)
-              ; result = None
-              ; early = None
-              ; cancelled = false
-              ; forgotten = false
-              }
-            in
-            let facts =
-              { state.facts with
-                entries = Slots.add serial (Entry slot) state.facts.entries
-              }
-            in
-            Ok
-              ( ticket
-              , changed
-                  { state with next = serial; facts }
-                  [ Send (ticket, session, operation) ] ))
-        | Worker.Mutate intent ->
-          plan_mutation state session operation intent (Direct session)
-        | Worker.Confirm (presentation, receipt) ->
-          plan_mutation
-            state
-            session
-            operation
-            (Worker.receipt_intent receipt)
-            (Presentation presentation)
-        | _ ->
-          Error
-            (Worker.Unsupported_operation
-               "Operation needs backend durability/resource conformance")))
+  match operation with
+  | Worker.Release handle -> plan_release state session handle
+  | _ ->
+    Result.bind (validate_session state session) (fun () ->
+      if Slots.cardinal state.facts.entries >= 256
+      then Error (Worker.Invalid_input "Release completed query tickets before admission")
+      else
+        Result.bind (Worker.validate_request session operation) (fun () ->
+          let planned : (a ticket * transition, Worker.error) result =
+            match operation with
+            | Worker.Observe (budget, query) ->
+              plan_observation state session budget query
+            | Worker.Refresh handle -> plan_refresh state session handle
+            | Worker.Query (budget, query) ->
+              if state.next = Int64.max_int
+              then Error (Worker.Invalid_input "Request counter exhausted")
+              else (
+                let serial = Int64.succ state.next in
+                let ticket =
+                  { id = Worker.request_id (identity state.client serial)
+                  ; serial
+                  ; kind = kind query
+                  ; query = Read query
+                  ; target = Sealed (session, budget)
+                  }
+                in
+                let slot =
+                  { ticket
+                  ; dispatched = true
+                  ; admitted = None
+                  ; sample_epoch = None
+                  ; origin = Some (session, budget)
+                  ; result = None
+                  ; early = None
+                  ; cancelled = false
+                  ; forgotten = false
+                  }
+                in
+                let facts =
+                  { state.facts with
+                    entries = Slots.add serial (Entry slot) state.facts.entries
+                  }
+                in
+                Ok
+                  ( ticket
+                  , changed
+                      { state with next = serial; facts }
+                      [ Send (ticket, session, operation) ] ))
+            | Worker.Mutate intent ->
+              plan_mutation state session operation intent (Direct session)
+            | Worker.Confirm (presentation, receipt) ->
+              plan_mutation
+                state
+                session
+                operation
+                (Worker.receipt_intent receipt)
+                (Presentation presentation)
+            | _ ->
+              Error
+                (Worker.Unsupported_operation
+                   "Operation needs backend durability/resource conformance")
+          in
+          planned))
 ;;
 
 let plan_query state ~owner ~maximum_items ~maximum_bytes query =
@@ -1065,6 +1983,7 @@ let plan_query state ~owner ~maximum_items ~maximum_bytes query =
       { ticket
       ; dispatched = false
       ; admitted = None
+      ; sample_epoch = None
       ; origin = None
       ; result = None
       ; early = None
@@ -1098,14 +2017,16 @@ let prepare_host_change state change =
     in
     Ok
       ( id
-      , changed
-          { state with
-            next = serial
-          ; facts
-          ; active_handoff = Some id
-          ; fenced = change :: state.fenced
-          }
-          (cancels @ [ Quiesce (id, change) ]) ))
+      , progress_observations
+          ~retry:false
+          (changed
+             { state with
+               next = serial
+             ; facts
+             ; active_handoff = Some id
+             ; fenced = change :: state.fenced
+             }
+             (cancels @ [ Quiesce (id, change) ])) ))
 ;;
 
 module Response_ownership = struct

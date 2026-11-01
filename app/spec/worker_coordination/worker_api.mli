@@ -3,6 +3,7 @@
     Worker runner. Abstraction is not authentication: every message, continuation,
     receipt and resource is validated against its actual channel and owner. *)
 module Graph = Logseq_db_types.Graph_types
+
 module Uuid = Graph.Uuid
 module Protocol = Logseq_db_worker.Protocol
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
@@ -12,10 +13,13 @@ type graph_generation
 type presentation_generation
 type worker_incarnation
 type binding
+
 val binding_incarnation : binding -> worker_incarnation
 val equal_binding : binding -> binding -> bool
+
 type session
 type presentation
+
 val account_generation : session -> account_generation
 val graph_generation : session -> graph_generation
 val presentation_generation : presentation -> presentation_generation
@@ -24,8 +28,9 @@ val graph_id : session -> Uuid.t
 val equal_session : session -> session -> bool
 val same_logical_graph : session -> session -> bool
 val matches_scope : session -> Service.timeline_scope -> bool
+
 val worker_incarnation
-  : runtime_epoch:Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch
+  :  runtime_epoch:Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch
   -> worker_generation:Logseq_db_worker_lui.Journal_worker_ids.Worker.generation
   -> worker_incarnation
 
@@ -45,8 +50,10 @@ type error =
   | Unsupported_operation of string
 
 type request_id
+
 val request_id : Uuid.t -> request_id
 val equal_request_id : request_id -> request_id -> bool
+val compare_request_id : request_id -> request_id -> int
 
 type capabilities = private
   { limits : Protocol.v2_capability_limits
@@ -55,6 +62,7 @@ type capabilities = private
   ; durable_import : bool
   ; observations : bool
   }
+
 val capabilities : session -> capabilities
 
 type read_budget
@@ -63,13 +71,19 @@ type read_budget
     limits. Every final enriched result, including summary/refs/properties, fits
     both bounds. An oversized singleton fails explicitly; no silent truncation.
     Requests also validate Protocol limits on IDs, roots, depth, payload and lists. *)
-val read_budget : session -> maximum_items:int -> maximum_bytes:int -> (read_budget, error) result
+val read_budget
+  :  session
+  -> maximum_items:int
+  -> maximum_bytes:int
+  -> (read_budget, error) result
 
 type journal_day
+
 val journal_day : int -> (journal_day, error) result
 
 type page
 type block
+
 val page_uuid : page -> Uuid.t
 val page_title : page -> string
 val block_uuid : block -> Uuid.t
@@ -81,12 +95,17 @@ val block_title : block -> string
     Values grant no execution authority. Revisions are scoped opaque protocol text,
     never parsed or compared lexically as counters. *)
 val page_data : page -> Graph.page
+
 val page_revision : page -> string
 val block_data : block -> Protocol.v2_block_record
 val block_revision : block -> string
 
 type 'a continuation
-type 'a slice = private { items : 'a list; next : 'a continuation option }
+
+type 'a slice = private
+  { items : 'a list
+  ; next : 'a continuation option
+  }
 
 (** At most Protocol.maximum_page_size items (<1000). A continuation is bound to
     session, query kind, parameters, budget and revision. Only its item type is a
@@ -124,18 +143,21 @@ type favorites = private
   ; items : Protocol.v2_favorite_item list
   ; next : Protocol.v2_favorite_item continuation option
   }
+
 type task_status_catalog = private
   { property_uuid : Uuid.t option
   ; default_status : Uuid.t option
   ; items : Graph.task_status_definition list
   ; next : Graph.task_status_definition continuation option
   }
+
 type asset_listing = private
   { generation : string
   ; projection_revision : string
   ; items : Logseq_db_types.Asset_descriptor.t list
   ; next : Logseq_db_types.Asset_descriptor.t continuation option
   }
+
 type children = private
   { parent : Uuid.t
   ; revision_scope : Protocol.v2_revision_scope
@@ -143,6 +165,7 @@ type children = private
   ; items : Protocol.v2_child_member list
   ; next : Protocol.v2_child_member continuation option
   }
+
 type change_batch = private
   { generation : string
   ; from_exclusive : string option
@@ -150,6 +173,7 @@ type change_batch = private
   ; windows : Protocol.v2_change_window list
   ; next : string option
   }
+
 type change_ack
 
 (** Typed forms of the existing App query families, not an untyped command escape
@@ -163,30 +187,64 @@ type _ query =
   | Admission : Protocol.v2_admission_inspection query
   | Journal : journal_day -> page option query
   | Journals :
-      { from_day : journal_day; through_day : journal_day; revision : string option
-      ; after : Protocol.v2_journal_item continuation option }
+      { from_day : journal_day
+      ; through_day : journal_day
+      ; revision : string option
+      ; after : Protocol.v2_journal_item continuation option
+      }
       -> Protocol.v2_journal_item slice query
-  | Page : { uuid : Uuid.t; revision : string option } -> Protocol.v2_page_lookup query
-  | Outline_block : { uuid : Uuid.t; revision : string option } -> Protocol.v2_block_lookup query
+  | Page :
+      { uuid : Uuid.t
+      ; revision : string option
+      }
+      -> Protocol.v2_page_lookup query
+  | Outline_block :
+      { uuid : Uuid.t
+      ; revision : string option
+      }
+      -> Protocol.v2_block_lookup query
   | Block_summary :
-      { block : Uuid.t; after : Protocol.v2_child_member continuation option }
+      { block : Uuid.t
+      ; after : Protocol.v2_child_member continuation option
+      }
       -> block_summary query
-  | Children : { parent : Uuid.t; after : block continuation option } -> block slice query
+  | Children :
+      { parent : Uuid.t
+      ; after : block continuation option
+      }
+      -> block slice query
   | Child_members :
-      { parent : Uuid.t; revision : string option
-      ; after : Protocol.v2_child_member continuation option } -> children query
+      { parent : Uuid.t
+      ; revision : string option
+      ; after : Protocol.v2_child_member continuation option
+      }
+      -> children query
   | Tree :
-      { page : Uuid.t; maximum_depth : int; revision : string option
-      ; after : Protocol.v2_tree_member continuation option }
+      { page : Uuid.t
+      ; maximum_depth : int
+      ; revision : string option
+      ; after : Protocol.v2_tree_member continuation option
+      }
       -> Protocol.v2_tree_member slice query
   | Favorites : Protocol.v2_favorite_item continuation option -> favorites query
-  | Task_statuses : Graph.task_status_definition continuation option -> task_status_catalog query
-  | Task_status_definitions : Uuid.t list -> Graph.task_status_definition option list query
+  | Task_statuses :
+      Graph.task_status_definition continuation option
+      -> task_status_catalog query
+  | Task_status_definitions :
+      Uuid.t list
+      -> Graph.task_status_definition option list query
   | Asset_descriptors : Uuid.t list -> asset_listing query
   | Assets :
-      { recursive : bool; roots : Uuid.t list
-      ; after : Logseq_db_types.Asset_descriptor.t continuation option } -> asset_listing query
-  | Changes : { generation : string; after : string option } -> change_batch query
+      { recursive : bool
+      ; roots : Uuid.t list
+      ; after : Logseq_db_types.Asset_descriptor.t continuation option
+      }
+      -> asset_listing query
+  | Changes :
+      { generation : string
+      ; after : string option
+      }
+      -> change_batch query
 
 val supports_observation : session -> 'a query -> bool
 
@@ -202,11 +260,16 @@ val supports_observation : session -> 'a query -> bool
     failure cannot discard a window. Gaps/resync require a fresh baseline, not an
     invented acknowledgement. next retains the exact pull chain. *)
 val change_ack_generation : change_ack -> string
+
 val change_ack_through : change_ack -> string
 
 type capture_node =
-  { block_id : Uuid.t; title : string; task_status : Uuid.t option
-  ; children : capture_node Rrbvec.t }
+  { block_id : Uuid.t
+  ; title : string
+  ; task_status : Uuid.t option
+  ; children : capture_node Rrbvec.t
+  }
+
 type append_intent
 
 (** Persist the complete bounded root/child/status payload and normalized stable
@@ -214,23 +277,64 @@ type append_intent
     intent even for A -> B -> A. Worker resolves an existing Web-created journal
     page by day; it must not assume the App's candidate UUID became the page. *)
 val append_intent
-  : session -> mutation_id:Uuid.t -> block_id:Uuid.t -> day:journal_day
-  -> title:string -> task_status:Uuid.t option -> children:capture_node Rrbvec.t
+  :  session
+  -> mutation_id:Uuid.t
+  -> block_id:Uuid.t
+  -> day:journal_day
+  -> title:string
+  -> task_status:Uuid.t option
+  -> children:capture_node Rrbvec.t
   -> (append_intent, error) result
+
 val append_intent_id : append_intent -> Uuid.t
 val encode_append_intent : append_intent -> bytes
 val restore_append_intent : session -> bytes -> (append_intent, error) result
 
 type mutation_command =
-  | Save_block of { block : Uuid.t; title : string; preconditions : Protocol.v2_preconditions }
-  | Insert_blocks of { parent : Uuid.t; roots : Protocol.v2_block_tree list; preconditions : Protocol.v2_preconditions }
-  | Delete_blocks of { root : Uuid.t; preconditions : Protocol.v2_preconditions }
-  | Create_journal of { page : Uuid.t; day : journal_day; title : string; preconditions : Protocol.v2_preconditions }
-  | Set_task_status of { block : Uuid.t; status : Uuid.t; preconditions : Protocol.v2_preconditions }
-  | Clear_task_status of { block : Uuid.t; preconditions : Protocol.v2_preconditions }
-  | Set_asset_reference of { block : Uuid.t; previous : Uuid.t option; asset : Uuid.t; preconditions : Protocol.v2_preconditions }
+  | Save_block of
+      { block : Uuid.t
+      ; title : string
+      ; preconditions : Protocol.v2_preconditions
+      }
+  | Insert_blocks of
+      { parent : Uuid.t
+      ; roots : Protocol.v2_block_tree list
+      ; preconditions : Protocol.v2_preconditions
+      }
+  | Delete_blocks of
+      { root : Uuid.t
+      ; preconditions : Protocol.v2_preconditions
+      }
+  | Create_journal of
+      { page : Uuid.t
+      ; day : journal_day
+      ; title : string
+      ; preconditions : Protocol.v2_preconditions
+      }
+  | Set_task_status of
+      { block : Uuid.t
+      ; status : Uuid.t
+      ; preconditions : Protocol.v2_preconditions
+      }
+  | Clear_task_status of
+      { block : Uuid.t
+      ; preconditions : Protocol.v2_preconditions
+      }
+  | Set_asset_reference of
+      { block : Uuid.t
+      ; previous : Uuid.t option
+      ; asset : Uuid.t
+      ; preconditions : Protocol.v2_preconditions
+      }
+
 type mutation_intent
-val mutation_intent : session -> mutation_id:Uuid.t -> mutation_command -> (mutation_intent, error) result
+
+val mutation_intent
+  :  session
+  -> mutation_id:Uuid.t
+  -> mutation_command
+  -> (mutation_intent, error) result
+
 val mutation_intent_id : mutation_intent -> Uuid.t
 val encode_mutation_intent : mutation_intent -> bytes
 val restore_mutation_intent : session -> bytes -> (mutation_intent, error) result
@@ -245,14 +349,21 @@ val restore_mutation_intent : session -> bytes -> (mutation_intent, error) resul
 
 type receipt
 type confirmation
+
 val receipt_intent : receipt -> mutation_intent
 val receipt_mutation_id : receipt -> Uuid.t
 val receipt_revisions : receipt -> string * string * string
+
 type confirmed_target = private
   | Confirmed_block of block_summary
   | Confirmed_page of Protocol.v2_page_lookup
   | Confirmed_absence of
-      { uuid : Uuid.t; revision : string; generation : string; projection_revision : string }
+      { uuid : Uuid.t
+      ; revision : string
+      ; generation : string
+      ; projection_revision : string
+      }
+
 val receipt_targets : receipt -> Uuid.t Rrbvec.t
 val confirmation_primary : confirmation -> confirmed_target
 val confirmation_additional : confirmation -> confirmed_target Rrbvec.t
@@ -268,6 +379,7 @@ val confirmation_additional : confirmation -> confirmed_target Rrbvec.t
     performed by Confirm for current App projection consumers; a second query is
     not required just to render that same evidence. *)
 val confirmation_receipt : confirmation -> receipt
+
 val confirmation_presentation : confirmation -> presentation
 
 type mutation_progress =
@@ -287,8 +399,17 @@ type mutation_progress =
     admission and completion. Focus away/back creates a different presentation
     even if the execution session survives; its old in-flight confirmation cannot
     confirm the new view. An explicit new Confirm may use the new presentation. *)
-type admission_error = Full | Not_ready | Stopping | Unsupported_request of string
-type interruption = Cancelled | Transport_lost | Worker_stopped
+type admission_error =
+  | Full
+  | Not_ready
+  | Stopping
+  | Unsupported_request of string
+
+type interruption =
+  | Cancelled
+  | Transport_lost
+  | Worker_stopped
+
 type 'a reply =
   | Not_admitted of admission_error
   | Answered of ('a, error) result
@@ -301,18 +422,26 @@ type 'a reply =
     across restart, not merely a process-local duplicate cache. *)
 
 type observation_epoch
+
 val compare_observation_epoch : observation_epoch -> observation_epoch -> int
+
 type 'a observation
 type (_, _) equality = Refl : ('a, 'a) equality
+
 val observation_session : 'a observation -> session
 val observation_id : 'a observation -> request_id
+val observation_query : 'a observation -> 'a query
+val observation_budget : 'a observation -> read_budget
 val same_observation : 'a observation -> 'b observation -> ('a, 'b) equality option
 
 (** Equality requires the exact owner/registration identity, not only compatible
     query result types. Refl permits typed existential storage without casts;
     runtime still checks registration, scope, query and epoch. *)
 type 'a observed = private
-  { observation : 'a observation; epoch : observation_epoch; value : 'a }
+  { observation : 'a observation
+  ; epoch : observation_epoch
+  ; value : 'a
+  }
 
 (** Observe registers and samples atomically, or registers replay from the sample's
     version with a proven gap-free boundary. Missing/empty data is observable.
@@ -323,11 +452,24 @@ type 'a observed = private
     a tracked handle which is released before the ticket retires. Late updates
     match exact owner/epoch and cannot resurrect interest. *)
 
+(** Authenticated invalidation facts carry the exact binding and logical owner.
+    They do not grant ownership or create a session; Core matches an existing
+    planned registration before deciding whether to refresh. *)
+type observation_notice = private
+  | Observation_invalidated of
+      { binding : binding
+      ; owner : Service.timeline_scope
+      ; id : request_id
+      ; epoch : observation_epoch
+      }
+  | Observations_resync of binding
+
 type asset_consumer
 type asset_file
 type file_lease
 type upload_operation
 type imported
+
 val asset_consumer : session -> name:string -> (asset_consumer, error) result
 val asset_consumer_session : asset_consumer -> session
 val equal_asset_consumer : asset_consumer -> asset_consumer -> bool
@@ -339,7 +481,12 @@ val import_data : imported -> Logseq_db_worker.import_receipt
 val import_preview : imported -> file_lease option
 
 type asset_import_intent
-val asset_import_intent : session -> Logseq_db_types.Asset_import.t -> (asset_import_intent, error) result
+
+val asset_import_intent
+  :  session
+  -> Logseq_db_types.Asset_import.t
+  -> (asset_import_intent, error) result
+
 val asset_import_intent_id : asset_import_intent -> Uuid.t
 val encode_asset_import_intent : asset_import_intent -> bytes
 val restore_asset_import_intent : session -> bytes -> (asset_import_intent, error) result
@@ -349,10 +496,17 @@ val restore_asset_import_intent : session -> bytes -> (asset_import_intent, erro
     backend must reconcile the same operation and source ownership; a missing
     source fails explicitly. It must not import a duplicate asset or patch a new
     target. Imported preview handles are adopted as owned leases, never leaked. *)
-type import_progress = Import_rejected of error | Import_unknown | Imported of imported
+type import_progress =
+  | Import_rejected of error
+  | Import_unknown
+  | Imported of imported
 
-type asset_priority = Foreground | Background
+type asset_priority =
+  | Foreground
+  | Background
+
 type asset_notice
+
 val asset_notice_session : asset_notice -> session
 val asset_notice_data : asset_notice -> Service.asset_notice
 val asset_notice_consumer : asset_notice -> asset_consumer option
@@ -363,6 +517,7 @@ val asset_notice_consumer : asset_notice -> asset_consumer option
     Core. Unknown consumer/operation names are rejected, never broadcast to every
     consumer as a guessed association. *)
 val ready_asset_file : asset_notice -> asset_file option
+
 val upload_operation : asset_notice -> upload_operation option
 
 (** File capabilities/consumer names are namespaced to this binding/session and
@@ -386,13 +541,17 @@ type _ request =
   | Confirm : presentation * receipt -> mutation_progress request
   | Acknowledge_changes : change_batch -> change_ack request
   | Import : asset_import_intent -> import_progress request
-  | Replace_asset_demand : asset_consumer * asset_priority * Logseq_db_types.Asset_descriptor.t list -> unit request
+  | Replace_asset_demand :
+      asset_consumer * asset_priority * Logseq_db_types.Asset_descriptor.t list
+      -> unit request
   | Release_asset_demand : asset_consumer -> unit request
   | Retry_asset : Uuid.t -> unit request
   | Retry_upload : upload_operation -> unit request
   | Acquire_asset_file : asset_file -> file_lease option request
   | Acquire_imported_file : imported -> file_lease option request
   | Release_file : file_lease -> unit request
+
+(* Pure request shape, ownership and budget validation. *)
 
 (** No implicit-current fallback. Every request checks live session plus all
     nested resource/intent/continuation owners. Cleanup of a previously tracked
@@ -401,23 +560,46 @@ type _ request =
     the complete payload/statuses under Worker transaction/outbox coordination.
     Today's separate operations do not implement it. Unsupported capabilities
     fail before enqueue, without a fabricated receipt/registration/lease ACK. *)
-(* Pure request shape, ownership and budget validation. *)
 val validate_request : session -> 'a request -> (unit, error) result
 
 type observation_update = Update : 'a observed -> observation_update
-
 type projection_version
+
 val compare_projection_version : projection_version -> projection_version -> int
-type resident_phase = Opening | Open | Closing | Failed of error
-type network_phase = Offline | Connecting | Current | Network_failed of error
-type resident = private { session : session; phase : resident_phase; network : network_phase }
-type removal_mode = Ordinary | Force
-type removal_stage = Closing_graph | Deleting_local | Clearing_selection
+
+type resident_phase =
+  | Opening
+  | Open
+  | Closing
+  | Failed of error
+
+type network_phase =
+  | Offline
+  | Connecting
+  | Current
+  | Network_failed of error
+
+type resident = private
+  { session : session
+  ; phase : resident_phase
+  ; network : network_phase
+  }
+
+type removal_mode =
+  | Ordinary
+  | Force
+
+type removal_stage =
+  | Closing_graph
+  | Deleting_local
+  | Clearing_selection
+
 type local_deletion = private
   | Removing of Uuid.t * removal_mode * removal_stage
   | Removal_failed of Uuid.t * removal_mode * removal_stage * error
 
 type projection
+
 val projection_incarnation : projection -> worker_incarnation
 val projection_binding : projection -> binding
 val projection_version : projection -> projection_version
@@ -432,7 +614,10 @@ val equal_projection : projection -> projection -> bool
     prove retirement when this newer same-binding snapshot removed its execution
     identity. This grants no read authority. *)
 val scope_is_superseded
-  : ?previous:projection -> projection -> Service.timeline_scope -> bool
+  :  ?previous:projection
+  -> projection
+  -> Service.timeline_scope
+  -> bool
 
 val removal_target : local_deletion -> Uuid.t
 
@@ -473,12 +658,20 @@ type host_change =
   | Graph_will_remove of Uuid.t * removal_mode
   | Connection_will_stop
 
-type cleanup_resource = Observation | Asset_demand | File_lease | Pending_request | Durable_intent
+type cleanup_resource =
+  | Observation
+  | Asset_demand
+  | File_lease
+  | Pending_request
+  | Durable_intent
 
 type handoff_id
+
 val handoff_id : Uuid.t -> handoff_id
 val equal_handoff_id : handoff_id -> handoff_id -> bool
+
 type handoff_receipt
+
 val handoff_receipt_id : handoff_receipt -> handoff_id
 val handoff_binding : handoff_receipt -> binding
 val handoff_sessions : handoff_receipt -> session list
@@ -526,9 +719,16 @@ module type ISSUER = sig
       remains tracked until its exact unregister/fence ACK. Repeated cleanup is
       idempotent. Do not abandon an old registration on retry/rebind/shutdown. *)
 
-  val handoff_request : handoff_id:handoff_id -> host_change -> (Service.request, error) result
+  val handoff_request
+    :  handoff_id:handoff_id
+    -> host_change
+    -> (Service.request, error) result
+
   val handoff_receipt
-    : handoff_id:handoff_id -> host_change -> Service.response -> (handoff_receipt, error) result
+    :  handoff_id:handoff_id
+    -> host_change
+    -> Service.response
+    -> (handoff_receipt, error) result
 
   (** Match the tracked host transition and actual writer/resource fence. This
       is not Client_command_completed interpreted as proof of quiescence. Until
@@ -541,24 +741,91 @@ module type ISSUER = sig
       resident/account identities. Ordinary query families map to Protocol V2;
       unsupported durability/resource capabilities fail before enqueue. *)
   val bootstrap_request : unit -> (Service.request, error) result
+
   val bootstrap : Service.response -> (bootstrap_state, error) result
 
   (** Includes correlated ongoing baseline updates; rejects account/incarnation/
       version regressions, duplicate residents, invalid limits and selection.
       previous must be the latest accepted projection for this binding. Current
       unversioned Service.state/Graph_states alone cannot establish this obligation. *)
-  val projection : previous:projection option -> Service.push -> (projection, error) result
-  val request : session -> request_id:request_id -> 'a request -> (Service.request, error) result
-  val reply : session -> request_id:request_id -> 'a request -> Service.response -> ('a reply, error) result
-  val observation : session -> 'a observation -> Protocol.response -> ('a observed, error) result
-  val receipt : session -> request_id:request_id -> intent:append_intent -> Protocol.response -> (receipt, error) result
-  val mutation_receipt : session -> request_id:request_id -> intent:mutation_intent -> Protocol.response -> (receipt, error) result
-  val confirmation : session -> presentation:presentation -> receipt -> Protocol.response -> (confirmation, error) result
+  val projection
+    :  previous:projection option
+    -> Service.push
+    -> (projection, error) result
+
+  val request
+    :  session
+    -> request_id:request_id
+    -> 'a request
+    -> (Service.request, error) result
+
+  val reply
+    :  session
+    -> request_id:request_id
+    -> 'a request
+    -> Service.response
+    -> ('a reply, error) result
+
+  val observation
+    :  session
+    -> request_id:request_id
+    -> 'a observation
+    -> Service.response
+    -> ('a observed, error) result
+
+  (** Checked registration metadata is separate from sampled data: a V2_failed
+      still owns an observation. Metadata accepts the exact retired binding for
+      cleanup tracking; it grants no current read authority. *)
+  val observation_registration
+    :  session
+    -> request_id:request_id
+    -> 'a observed request
+    -> Service.response
+    -> ('a observation * observation_epoch, error) result
+
+  val observation_notices : Service.push -> (observation_notice Rrbvec.t, error) result
+
+  (** Settle a caller-known pending logical registration even when cancellation
+      hid its successful handle. Only the exact backend cleanup ACK is success;
+      this is not a fabricated active observation. *)
+  val release_observation_registration
+    :  session
+    -> observation_id:request_id
+    -> (Service.request, error) result
+
+  val observation_registration_released
+    :  session
+    -> observation_id:request_id
+    -> Service.response
+    -> (unit, error) result
+
+  val receipt
+    :  session
+    -> request_id:request_id
+    -> intent:append_intent
+    -> Protocol.response
+    -> (receipt, error) result
+
+  val mutation_receipt
+    :  session
+    -> request_id:request_id
+    -> intent:mutation_intent
+    -> Protocol.response
+    -> (receipt, error) result
+
+  val confirmation
+    :  session
+    -> presentation:presentation
+    -> receipt
+    -> Protocol.response
+    -> (confirmation, error) result
+
   val asset_notice : session -> Service.asset_notice -> (asset_notice, error) result
 end
 
 val issuer
-  : managed_origin:string -> user_id:string
+  :  managed_origin:string
+  -> user_id:string
   -> runtime_epoch:Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch
   -> worker_generation:Logseq_db_worker_lui.Journal_worker_ids.Worker.generation
   -> ((module ISSUER), error) result

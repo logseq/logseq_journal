@@ -310,7 +310,14 @@ type 'a reply =
   | Interrupted of interruption
 
 type observation_epoch = int64
-type 'a observation = |
+
+type 'a observation =
+  { observation_owner : session
+  ; observation_key : request_id
+  ; observation_budget : read_budget
+  ; observation_query : 'a query
+  }
+
 type (_, _) equality = Refl : ('a, 'a) equality
 
 type 'a observed =
@@ -318,6 +325,15 @@ type 'a observed =
   ; epoch : observation_epoch
   ; value : 'a
   }
+
+type observation_notice =
+  | Observation_invalidated of
+      { binding : binding
+      ; owner : Service.timeline_scope
+      ; id : request_id
+      ; epoch : observation_epoch
+      }
+  | Observations_resync of binding
 
 type asset_consumer =
   { session : session
@@ -472,9 +488,30 @@ module type ISSUER = sig
 
   val observation
     :  session
+    -> request_id:request_id
     -> 'a observation
-    -> Protocol.response
+    -> Service.response
     -> ('a observed, error) result
+
+  val observation_registration
+    :  session
+    -> request_id:request_id
+    -> 'a observed request
+    -> Service.response
+    -> ('a observation * observation_epoch, error) result
+
+  val observation_notices : Service.push -> (observation_notice Rrbvec.t, error) result
+
+  val release_observation_registration
+    :  session
+    -> observation_id:request_id
+    -> (Service.request, error) result
+
+  val observation_registration_released
+    :  session
+    -> observation_id:request_id
+    -> Service.response
+    -> (unit, error) result
 
   val receipt
     :  session
@@ -543,13 +580,14 @@ let worker_incarnation ~runtime_epoch ~worker_generation =
 
 let request_id id = id
 let equal_request_id = Uuid.equal
+let compare_request_id = Uuid.compare
 
 let capabilities (s : session) =
   { limits = s.limits
   ; atomic_append = false
   ; durable_mutations = true
   ; durable_import = false
-  ; observations = false
+  ; observations = true
   }
 ;;
 
@@ -587,7 +625,6 @@ let block_uuid (b : block) = b.data.block.uuid
 let block_title (b : block) = b.data.block.title
 let block_data (b : block) = b.data
 let block_revision (b : block) = b.revision
-let supports_observation _ _ = false
 let change_ack_generation (a : change_ack) = a.generation
 let change_ack_through (a : change_ack) = a.through
 
@@ -687,20 +724,42 @@ let validate_confirmation session (presentation : presentation) receipt =
 ;;
 
 let compare_observation_epoch = Int64.compare
+let observation_session value = value.observation_owner
+let observation_id value = value.observation_key
+let observation_budget value = value.observation_budget
+let observation_query value = value.observation_query
 
-let observation_session (x : 'a observation) =
-  match x with
-  | _ -> .
+let query_result_equality : type a b. a query -> b query -> (a, b) equality option =
+  fun a b ->
+  match a, b with
+  | Graph_info, Graph_info -> Some Refl
+  | Admission, Admission -> Some Refl
+  | Journal _, Journal _ -> Some Refl
+  | Journals _, Journals _ -> Some Refl
+  | Page _, Page _ -> Some Refl
+  | Outline_block _, Outline_block _ -> Some Refl
+  | Block_summary _, Block_summary _ -> Some Refl
+  | Children _, Children _ -> Some Refl
+  | Child_members _, Child_members _ -> Some Refl
+  | Tree _, Tree _ -> Some Refl
+  | Favorites _, Favorites _ -> Some Refl
+  | Task_statuses _, Task_statuses _ -> Some Refl
+  | Task_status_definitions _, Task_status_definitions _ -> Some Refl
+  | Asset_descriptors _, Asset_descriptors _ -> Some Refl
+  | Assets _, Assets _ -> Some Refl
+  | Changes _, Changes _ -> Some Refl
+  | _ -> None
 ;;
 
-let observation_id (x : 'a observation) =
-  match x with
-  | _ -> .
-;;
-
-let same_observation (x : 'a observation) _ =
-  match x with
-  | _ -> .
+let same_observation : type a b. a observation -> b observation -> (a, b) equality option =
+  fun a b ->
+  match query_result_equality a.observation_query b.observation_query with
+  | Some Refl
+    when equal_session a.observation_owner b.observation_owner
+         && equal_request_id a.observation_key b.observation_key
+         && a.observation_budget = b.observation_budget
+         && a.observation_query = b.observation_query -> Some Refl
+  | _ -> None
 ;;
 
 let asset_consumer session ~name =
@@ -936,10 +995,37 @@ let checked_command
   else Result.map (query_command budget query) cursor
 ;;
 
-let validate_request : type a. session -> a request -> (unit, error) result =
+let supports_observation session query =
+  let budget =
+    { owner = session
+    ; maximum_items = Protocol.maximum_page_size
+    ; maximum_bytes = session.limits.response_budget_bytes
+    }
+  in
+  match checked_command session budget query with
+  | Ok command -> Protocol.is_observable_read command
+  | Error _ -> false
+;;
+
+let rec validate_request : type a. session -> a request -> (unit, error) result =
   fun session -> function
   | Mutate intent -> validate_intent session intent
   | Confirm (presentation, receipt) -> validate_confirmation session presentation receipt
+  | Observe (budget, query) ->
+    if supports_observation session query
+    then validate_request session (Query (budget, query))
+    else unavailable "This observation query"
+  | Refresh observation ->
+    if not (equal_session session observation.observation_owner)
+    then Error Revoked_session
+    else
+      validate_request
+        session
+        (Observe (observation.observation_budget, observation.observation_query))
+  | Release observation ->
+    if equal_session session observation.observation_owner
+    then Ok ()
+    else Error Revoked_session
   | Query (_, Changes _) -> unavailable "Changefeed ownership transfer"
   | Query (budget, query) ->
     Result.bind (checked_command session budget query) (fun command ->
@@ -979,7 +1065,8 @@ let decode
     Error
       (if code = "staleReadCursor"
        then Stale_read (code ^ ": " ^ message)
-       else if code = "responseTooLarge" then Response_budget_exceeded
+       else if code = "responseTooLarge"
+       then Response_budget_exceeded
        else Service_failed (code ^ ": " ^ message))
   | V2_resync_required { reason; _ } -> Error (Resync_required reason)
   | _ ->
@@ -1500,52 +1587,212 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
              !latest
       ;;
 
+      let release_observation_registration (session : session) ~observation_id =
+        if not (equal_binding session.binding binding)
+        then Error Revoked_session
+        else
+          Ok
+            (Service.Coordination_release_observation
+               { registration = binding.serial; owner = session.scope; observation_id })
+      ;;
+
+      let observation_registration_released (session : session) ~observation_id = function
+        | Service.Coordination_observation_released
+            { registration; owner; observation_id = actual }
+          when equal_binding session.binding binding
+               && registration = binding.serial
+               && matches_scope session owner
+               && equal_request_id actual observation_id -> Ok ()
+        | _ -> Error (Protocol_mismatch "Observation cleanup acknowledgement mismatch")
+      ;;
+
+      let observation_registration
+        : type a.
+          session
+          -> request_id:request_id
+          -> a observed request
+          -> Service.response
+          -> (a observation * observation_epoch, error) result
+        =
+        fun session ~request_id operation response ->
+        let handle =
+          match operation with
+          | Observe (budget, query) ->
+            Result.map
+              (fun () ->
+                 { observation_owner = session
+                 ; observation_key = request_id
+                 ; observation_budget = budget
+                 ; observation_query = query
+                 })
+              (validate_request session operation)
+          | Refresh observation ->
+            Result.map (fun () -> observation) (validate_request session operation)
+          | _ -> .
+        in
+        Result.bind handle (fun observation ->
+          match response with
+          | Service.Coordination_observed
+              { registration
+              ; owner
+              ; observation_id
+              ; epoch
+              ; response = Protocol.V2_response raw
+              }
+            when equal_binding session.binding binding
+                 && registration = binding.serial
+                 && matches_scope session owner
+                 && equal_request_id observation_id observation.observation_key
+                 && raw.api_version = Protocol.api_version
+                 && equal_request_id raw.request_id request_id
+                 && epoch >= 0L -> Ok (observation, epoch)
+          | _ ->
+            Error
+              (Protocol_mismatch "Observation registration/epoch/correlation mismatch"))
+      ;;
+
+      let observation session ~request_id observation response =
+        if not (live session)
+        then Error Revoked_session
+        else
+          Result.bind
+            (observation_registration session ~request_id (Refresh observation) response)
+            (fun (actual, epoch) ->
+               match same_observation observation actual, response with
+               | ( Some Refl
+                 , Service.Coordination_observed
+                     { response = Protocol.V2_response raw as packet; _ } ) ->
+                 if
+                   Protocol.encoded_response_bytes packet
+                   > observation.observation_budget.maximum_bytes
+                 then Error Response_budget_exceeded
+                 else
+                   Result.map
+                     (fun value -> { observation; epoch; value })
+                     (decode
+                        session
+                        observation.observation_budget
+                        observation.observation_query
+                        raw.outcome)
+               | _ -> Error (Protocol_mismatch "Observation value owner mismatch"))
+      ;;
+
+      let observation_notices = function
+        | Service.Coordination_observations values ->
+          if Rrbvec.length values > 512
+          then Error (Protocol_mismatch "Observation notice bound exceeded")
+          else
+            Rrbvec.fold_left
+              (fun result signal ->
+                 Result.bind result (fun notices ->
+                   match signal with
+                   | Service.Observations_resync ->
+                     Ok (Rrbvec.push_back notices (Observations_resync binding))
+                   | Observation_invalidated value
+                     when value.registration_id <> binding.serial -> Ok notices
+                   | Observation_invalidated value
+                     when value.epoch < 0L
+                          || value.owner.startup.account_generation < 0
+                          || value.owner.graph_generation < 0 ->
+                     Error (Protocol_mismatch "Invalid observation notice identity/epoch")
+                   | Observation_invalidated value ->
+                     Ok
+                       (Rrbvec.push_back
+                          notices
+                          (Observation_invalidated
+                             { binding
+                             ; owner = value.owner
+                             ; id = request_id value.observation_id
+                             ; epoch = value.epoch
+                             }))))
+              (Ok Rrbvec.empty)
+              values
+        | _ -> Error (Protocol_mismatch "Not an observation notice batch")
+      ;;
+
       let request
         : type a.
           session -> request_id:request_id -> a request -> (Service.request, error) result
         =
         fun session ~request_id operation ->
-        if not (live session)
-        then Error Revoked_session
-        else (
-          match operation with
-          | Query (budget, query) ->
-            Result.bind (validate_request session operation) (fun () ->
-              Result.bind (checked_command session budget query) (fun command ->
-                let request =
-                  { Protocol.api_version = Protocol.api_version; request_id; command }
-                in
-                Protocol.request_of_yojson (Protocol.request_to_yojson request)
-                |> Result.map_error (fun e -> Db_error e)
-                |> Result.map (fun request ->
-                  Service.Coordination_query
-                    { registration = binding.serial; owner = session.scope; request;response_budget_bytes=budget.maximum_bytes })))
-          | Confirm (presentation, receipt) ->
-            if not (presentation_live presentation)
-            then Error Revoked_session
-            else
+        match operation with
+        | Release observation ->
+          Result.bind (validate_request session operation) (fun () ->
+            release_observation_registration
+              session
+              ~observation_id:observation.observation_key)
+        | _ ->
+          if not (live session)
+          then Error Revoked_session
+          else (
+            match operation with
+            | Observe (budget, query) ->
+              Result.bind (validate_request session operation) (fun () ->
+                Result.map
+                  (fun command ->
+                     Service.Coordination_observe
+                       { registration = binding.serial
+                       ; owner = session.scope
+                       ; observation_id = request_id
+                       ; request =
+                           { Protocol.api_version = Protocol.api_version
+                           ; request_id
+                           ; command
+                           }
+                       ; maximum_bytes = budget.maximum_bytes
+                       })
+                  (checked_command session budget query))
+            | Refresh observation ->
               Result.map
                 (fun () ->
-                   Service.Coordination_confirm
+                   Service.Coordination_refresh_observation
                      { registration = binding.serial
                      ; owner = session.scope
-                     ; presentation = presentation.generation
+                     ; observation_id = observation.observation_key
                      ; request_id
-                     ; intent = Wire.encode receipt.intent
-                     ; original = receipt_revisions receipt
                      })
-                (validate_confirmation session presentation receipt)
-          | Mutate intent ->
-            Result.map
-              (fun () ->
-                 Service.Coordination_mutation
-                   { registration = binding.serial
-                   ; owner = session.scope
-                   ; request_id
-                   ; intent = Wire.encode intent
-                   })
-              (validate_intent session intent)
-          | _ -> unavailable "This operation's resource/durability")
+                (validate_request session operation)
+            | Query (budget, query) ->
+              Result.bind (validate_request session operation) (fun () ->
+                Result.bind (checked_command session budget query) (fun command ->
+                  let request =
+                    { Protocol.api_version = Protocol.api_version; request_id; command }
+                  in
+                  Protocol.request_of_yojson (Protocol.request_to_yojson request)
+                  |> Result.map_error (fun e -> Db_error e)
+                  |> Result.map (fun request ->
+                    Service.Coordination_query
+                      { registration = binding.serial
+                      ; owner = session.scope
+                      ; request
+                      ; response_budget_bytes = budget.maximum_bytes
+                      })))
+            | Confirm (presentation, receipt) ->
+              if not (presentation_live presentation)
+              then Error Revoked_session
+              else
+                Result.map
+                  (fun () ->
+                     Service.Coordination_confirm
+                       { registration = binding.serial
+                       ; owner = session.scope
+                       ; presentation = presentation.generation
+                       ; request_id
+                       ; intent = Wire.encode receipt.intent
+                       ; original = receipt_revisions receipt
+                       })
+                  (validate_confirmation session presentation receipt)
+            | Mutate intent ->
+              Result.map
+                (fun () ->
+                   Service.Coordination_mutation
+                     { registration = binding.serial
+                     ; owner = session.scope
+                     ; request_id
+                     ; intent = Wire.encode intent
+                     })
+                (validate_intent session intent)
+            | _ -> unavailable "This operation's resource/durability")
       ;;
 
       let reply
@@ -1557,50 +1804,68 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
           -> (a reply, error) result
         =
         fun session ~request_id operation response ->
-        if not (live session)
-        then Error Revoked_session
-        else (
-          match operation, response with
-          | ( Query (budget, query)
-            , Service.Graph_response (Protocol.V2_response r as response) )
-            when r.api_version = Protocol.api_version
-                 && Uuid.equal request_id r.request_id ->
-            if
-              String.length (Yojson.Safe.to_string (Protocol.response_to_yojson response))
-              > budget.maximum_bytes
-            then Ok (Answered (Error Response_budget_exceeded))
-            else Ok (Answered (decode session budget query r.outcome))
-          | ( Confirm (presentation, receipt)
-            , Service.Graph_response (Protocol.V2_response response as raw) )
-            when response.api_version = Protocol.api_version
-                 && Uuid.equal response.request_id request_id ->
-            if not (presentation_live presentation)
-            then Error Revoked_session
-            else
-              decode_confirmation session ~presentation receipt raw
-              |> Result.map (fun confirmation -> Answered (Ok (Confirmed confirmation)))
-          | ( Mutate intent
-            , Service.Coordination_mutation_result { request_id = actual; outcome } )
-            when Uuid.equal request_id actual ->
-            (match outcome with
-             | Wire.Unknown -> Ok (Answered (Ok Outcome_unknown))
-             | Wire.Committed response ->
-               decode_mutation_receipt session ~request_id ~intent response
-               |> Result.map (fun receipt ->
-                 Answered (Ok (Committed_pending_presentation receipt)))
-             | Wire.Rejected
-                 (Protocol.V2_response
-                    { api_version
-                    ; request_id = actual
-                    ; outcome = V2_failed { code; message }
-                    })
-               when api_version = Protocol.api_version && Uuid.equal actual request_id ->
-               Ok (Answered (Ok (Rejected (Service_failed (code ^ ": " ^ message)))))
-             | _ -> Error (Protocol_mismatch "Invalid known mutation rejection"))
-          | _ -> Error (Protocol_mismatch "Unexpected owned query receipt"))
+        match operation with
+        | Release observation ->
+          observation_registration_released
+            session
+            ~observation_id:observation.observation_key
+            response
+          |> Result.map (fun () -> Answered (Ok ()))
+        | _ ->
+          if not (live session)
+          then Error Revoked_session
+          else (
+            match operation, response with
+            | Observe _, _ ->
+              Result.map
+                (fun (handle, _) ->
+                   Answered (observation session ~request_id handle response))
+                (observation_registration session ~request_id operation response)
+            | Refresh _, _ ->
+              Result.map
+                (fun (handle, _) ->
+                   Answered (observation session ~request_id handle response))
+                (observation_registration session ~request_id operation response)
+            | ( Query (budget, query)
+              , Service.Graph_response (Protocol.V2_response r as response) )
+              when r.api_version = Protocol.api_version
+                   && Uuid.equal request_id r.request_id ->
+              if
+                String.length
+                  (Yojson.Safe.to_string (Protocol.response_to_yojson response))
+                > budget.maximum_bytes
+              then Ok (Answered (Error Response_budget_exceeded))
+              else Ok (Answered (decode session budget query r.outcome))
+            | ( Confirm (presentation, receipt)
+              , Service.Graph_response (Protocol.V2_response response as raw) )
+              when response.api_version = Protocol.api_version
+                   && Uuid.equal response.request_id request_id ->
+              if not (presentation_live presentation)
+              then Error Revoked_session
+              else
+                decode_confirmation session ~presentation receipt raw
+                |> Result.map (fun confirmation -> Answered (Ok (Confirmed confirmation)))
+            | ( Mutate intent
+              , Service.Coordination_mutation_result { request_id = actual; outcome } )
+              when Uuid.equal request_id actual ->
+              (match outcome with
+               | Wire.Unknown -> Ok (Answered (Ok Outcome_unknown))
+               | Wire.Committed response ->
+                 decode_mutation_receipt session ~request_id ~intent response
+                 |> Result.map (fun receipt ->
+                   Answered (Ok (Committed_pending_presentation receipt)))
+               | Wire.Rejected
+                   (Protocol.V2_response
+                      { api_version
+                      ; request_id = actual
+                      ; outcome = V2_failed { code; message }
+                      })
+                 when api_version = Protocol.api_version && Uuid.equal actual request_id
+                 -> Ok (Answered (Ok (Rejected (Service_failed (code ^ ": " ^ message)))))
+               | _ -> Error (Protocol_mismatch "Invalid known mutation rejection"))
+            | _ -> Error (Protocol_mismatch "Unexpected owned query receipt"))
       ;;
 
-      let observation _ _ _ = unavailable "Observation registration/replay"
       let receipt _ ~request_id:_ ~intent:_ _ = unavailable "Atomic Append receipt"
       let mutation_receipt = decode_mutation_receipt
 

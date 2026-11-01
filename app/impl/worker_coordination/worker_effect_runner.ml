@@ -11,6 +11,7 @@ type flight =
   | Query :
       (module Worker.ISSUER) * 'a Core.ticket * Worker.session * 'a Worker.request
       -> flight
+  | Unobserve of (module Worker.ISSUER) * Worker.session * Worker.request_id
   | Unregister of (module Worker.ISSUER)
 
 type t =
@@ -67,7 +68,7 @@ type delivery =
 let admit t request flight =
   let limit =
     match flight with
-    | Unregister _ -> 8192
+    | Unregister _ | Unobserve _ -> 8192
     | _ -> 4096
   in
   if Core.Response_ownership.spans t.owned >= limit
@@ -100,6 +101,16 @@ let submit t = function
        (match admit t request (Baseline t.issuer) with
         | Accepted id -> t.post (Core.Bootstrap_admitted (I.binding, id))
         | result -> t.post (Core.Bootstrap_not_admitted (I.binding, refused result))))
+  | Release_observation_registration (session, id) ->
+    let module I = (val t.issuer : Worker.ISSUER) in
+    (match I.release_observation_registration session ~observation_id:id with
+     | Error error ->
+       t.post (Core.Observation_release_completed (session, id, Error error))
+     | Ok request ->
+       (match admit t request (Unobserve (t.issuer, session, id)) with
+        | Mailbox.Accepted _ -> ()
+        | result ->
+          t.post (Core.Observation_release_not_admitted (session, id, refused result))))
   | Release_binding binding ->
     let module I = (val t.issuer : Worker.ISSUER) in
     if not (Worker.equal_binding binding I.binding)
@@ -208,6 +219,30 @@ let on_event t event =
               let result =
                 match outcome with
                 | Completed response ->
+                  (match request with
+                   | Worker.Observe _ ->
+                     (match
+                        I.observation_registration
+                          session
+                          ~request_id:(Core.ticket_id ticket)
+                          request
+                          response
+                      with
+                      | Ok (handle, epoch) ->
+                        t.post (Core.Observation_registered (ticket, handle, epoch))
+                      | Error _ -> ())
+                   | Worker.Refresh _ ->
+                     (match
+                        I.observation_registration
+                          session
+                          ~request_id:(Core.ticket_id ticket)
+                          request
+                          response
+                      with
+                      | Ok (handle, epoch) ->
+                        t.post (Core.Observation_registered (ticket, handle, epoch))
+                      | Error _ -> ())
+                   | _ -> ());
                   (match
                      I.reply session ~request_id:(Core.ticket_id ticket) request response
                    with
@@ -221,6 +256,18 @@ let on_event t event =
                 | Shutdown -> Worker.Interrupted Worker.Worker_stopped
               in
               t.post (Core.Completed (ticket, result))
+            | Unobserve (issuer, session, id) ->
+              let module I = (val issuer : Worker.ISSUER) in
+              let result =
+                match outcome with
+                | Completed response ->
+                  I.observation_registration_released session ~observation_id:id response
+                | _ ->
+                  Error
+                    (Worker.Service_failed
+                       "Observation release did not acknowledge physical retirement")
+              in
+              t.post (Core.Observation_release_completed (session, id, result))
             | Unregister issuer ->
               let module I = (val issuer : Worker.ISSUER) in
               let result =
@@ -250,6 +297,15 @@ let on_event t event =
                    (I.binding, Worker.Binding_revoked Worker.Revoked_session))
             | _ -> ())
           updates;
+        Broadcast
+      | Push { payload = Service.Coordination_observations _ as payload; _ } ->
+        let module I = (val t.issuer : Worker.ISSUER) in
+        (match I.observation_notices payload with
+         | Ok notices ->
+           Rrbvec.iter (fun notice -> t.post (Core.Observation_notice notice)) notices
+         | Error e ->
+           error := Some e;
+           t.post (Core.Observation_notices_failed (I.binding, e)));
         Broadcast
       | Push _ -> Broadcast
       | Terminal { error = message; _ } ->

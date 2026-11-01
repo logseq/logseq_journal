@@ -414,6 +414,10 @@ let observation_scope t ~registration ~id =
 let release_observation t ~registration ~id ~scope =
   Effect_runner.release_observation t.runner ~registration ~id ~scope
 ;;
+let release_unallocated_observation t ~registration ~id ~owner =
+  Effect_runner.release_unallocated_observation t.runner ~registration ~id ~owner
+;;
+
 let durable_mutation_for_scope t ~scope ~request_id ~intent ~current =
   let current () = not t.stopped && current () &&
     (match Pure_reducer.graph_state_for_scope !(t.state) scope with

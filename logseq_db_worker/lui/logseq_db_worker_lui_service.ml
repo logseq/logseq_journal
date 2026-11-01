@@ -1152,21 +1152,13 @@ let create ~(dependencies : dependencies) =
            |> Result.map (fun (epoch, response) ->
              Coordination_observed { registration; owner; observation_id; epoch; response }))
       | Coordination_release_observation { registration; owner; observation_id } ->
-        let stored = Db.observation_scope session.worker ~registration ~id:observation_id in
-        let scope =
-          match stored with
-          | Some _ as scope -> scope
-          | None -> resolve owner
-        in
-        (match scope with
-         | Some scope
-           when scope.graph_id = owner.graph_id
-                && scope.graph_generation = owner.graph_generation
-                && scope.account.account_generation = owner.startup.account_generation ->
-           Db.release_observation session.worker ~registration ~id:observation_id ~scope
-           |> Result.map (fun () ->
-             Coordination_observation_released { registration; owner; observation_id })
-         | _ -> Error "Observation cleanup owner is unavailable")
+        let result=match Db.observation_scope session.worker ~registration ~id:observation_id with
+        | Some scope when scope.graph_id=owner.graph_id && scope.graph_generation=owner.graph_generation
+            && scope.account.account_generation=owner.startup.account_generation ->
+          Db.release_observation session.worker ~registration ~id:observation_id ~scope
+        | Some _ -> Error "Observation cleanup owner mismatch"
+        | None -> Db.release_unallocated_observation session.worker ~registration ~id:observation_id ~owner in
+        Result.map (fun () -> Coordination_observation_released {registration;owner;observation_id}) result
       | Register_coordination registration ->
         let baseline snapshot={registration;baseline=snapshot;limits=session.Session.coordination_limits;
           authority_user=(if !(session.auth_seen) then Some !(session.authenticated_user) else None)} in

@@ -1127,6 +1127,23 @@ let release_observation t ~registration ~id ~scope =
     Ok ()
 ;;
 
+let release_unallocated_observation t ~registration ~id ~owner =
+  if Hashtbl.mem t.observation_slots (registration, id)
+  then Error "Known observation requires physical cleanup with its stored owner"
+  else (
+    let next, result =
+      Core.Observation_registry.release_unallocated
+        t.observation_registry
+        ~registration
+        ~id
+        ~owner
+    in
+    t.observation_registry <- next;
+    match result with
+    | Unknown | Already_released -> Ok ()
+    | _ -> Error "Unallocated observation cleanup was refused")
+;;
+
 let release_observations t ~registration =
   let slots =
     Hashtbl.to_seq_values t.observation_slots

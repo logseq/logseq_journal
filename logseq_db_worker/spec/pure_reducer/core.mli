@@ -253,6 +253,12 @@ module Observation_registry : sig
     -> scope:Logseq_sync_pure_reducer.Core.graph_scope
     -> t * release
 
+  (** Fence an unallocated logical ID even after its graph owner has disappeared.
+      This cannot release a known live/closing resource or grant a graph fence. *)
+  val release_unallocated
+    : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> t * release
+
   (** External completion after physical listener/read cleanup; only then is
       its active-resource capacity reusable. *)
   val released

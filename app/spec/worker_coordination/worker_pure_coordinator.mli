@@ -6,6 +6,7 @@ module Worker = Worker_api
 type t
 type view
 type 'a ticket
+
 val initial : client_id:Worker.Uuid.t -> t
 val view : t -> view
 val bootstrap : view -> Worker.bootstrap_state
@@ -21,6 +22,7 @@ val session_asset_notices : view -> Worker.session -> Worker.asset_notice list
     upload state is keyed by its checked operation ID. Polling either outlet does
     not acknowledge/release the other; latest-fact retention is bounded. *)
 val ticket_id : 'a ticket -> Worker.request_id
+
 val reply : view -> 'a ticket -> 'a Worker.reply option
 
 (** Exact immutable execution provenance is recorded only when Send is emitted,
@@ -33,12 +35,26 @@ val query_origin : view -> 'a ticket -> (Worker.session * Worker.read_budget) op
     the session's account/graph generations and graph UUID. This is a pure local
     eligibility check; it
     does not grant backend resource release, writer or deletion permission. *)
-val validate_session : ?owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope -> t -> Worker.session -> (unit, Worker.error) result
+val validate_session
+  :  ?owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
+  -> t
+  -> Worker.session
+  -> (unit, Worker.error) result
 
+(** A sampled read error retains the acknowledged interest. This outlet returns
+    only the exact registered handle planned by this ticket, never a fabricated one. *)
+val observation_handle : view -> 'a Worker.observed ticket -> 'a Worker.observation option
+
+val observation_error : view -> 'a Worker.observation -> Worker.error option
 val observed : view -> 'a Worker.observation -> 'a Worker.observed option
 val equal_view : view -> view -> bool
 
-type shutdown_state = Active | Draining | Stopped | Shutdown_failed of Worker.error
+type shutdown_state =
+  | Active
+  | Draining
+  | Stopped
+  | Shutdown_failed of Worker.error
+
 val shutdown_state : view -> shutdown_state
 
 (** Equality includes not-ready/retry/revocation, all request/observation/asset/
@@ -48,13 +64,22 @@ val shutdown_state : view -> shutdown_state
     Reply storage and notice queues are bounded; retired callers must release or
     consume their entries. Durable intent outcome survives request ticket disposal. *)
 
+(** Registration metadata is independent of sampled data success. It retains
+    cleanup ownership through error/cancellation; it grants no live data authority.
+    Forget disposes an Observe reply only; Cancel retires its logical interest.
+    Full cleanup waits for external Capacity_available. Internal Drain advances
+    bounded new work without busy-retrying refused resources. Terminal cleanup
+    failures remain observable until explicit Cancel/Release retries them. *)
 type event =
   | Worker_bound of Worker.binding
   | Retry_bootstrap
-  | Admitted : 'a ticket * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id -> event
+  | Admitted :
+      'a ticket * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id
+      -> event
   | Admission_refused : 'a ticket * Worker.admission_error -> event
   | Admission_failed : 'a ticket * Worker.error -> event
-  | Bootstrap_admitted of Worker.binding * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id
+  | Bootstrap_admitted of
+      Worker.binding * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id
   | Bootstrap_not_admitted of Worker.binding * Worker.admission_error
   | Binding_release_completed of Worker.binding * (unit, Worker.error) result
   | Binding_release_not_admitted of Worker.binding * Worker.admission_error
@@ -63,6 +88,15 @@ type event =
   | Bootstrap_received of Worker.binding * Worker.bootstrap_state
   | Completed : 'a ticket * 'a Worker.reply -> event
   | Projection_received of Worker.projection
+  | Observation_registered :
+      'a Worker.observed ticket * 'a Worker.observation * Worker.observation_epoch
+      -> event
+  | Observation_release_completed of
+      Worker.session * Worker.request_id * (unit, Worker.error) result
+  | Observation_release_not_admitted of
+      Worker.session * Worker.request_id * Worker.admission_error
+  | Observation_notice of Worker.observation_notice
+  | Observation_notices_failed of Worker.binding * Worker.error
   | Observation_received : 'a Worker.observed -> event
   | Asset_received of Worker.asset_notice
   | Cancel : 'a ticket -> event
@@ -74,6 +108,7 @@ type event =
 type instruction =
   | Bootstrap
   | Release_binding of Worker.binding
+  | Release_observation_registration of Worker.session * Worker.request_id
   | Bind_replacement
   | Send : 'a ticket * Worker.session * 'a Worker.request -> instruction
   | Cancel_request : 'a ticket -> instruction
@@ -81,7 +116,10 @@ type instruction =
   | Publish of view
   | Schedule_drain
 
-type transition = { next : t; instructions : instruction list }
+type transition =
+  { next : t
+  ; instructions : instruction list
+  }
 
 (** Host supplies a fresh client identity for pure counters; durable mutation IDs
     are independent. Worker_bound enters Awaiting_baseline and schedules Bootstrap.
@@ -116,7 +154,9 @@ val step : t -> event -> transition
     inference from instruction order or unchecked cast is required. A planning
     refusal sends nothing; Worker queue refusal is a typed Not_admitted reply. *)
 val request
-  : t -> Worker.session -> 'a Worker.request
+  :  t
+  -> Worker.session
+  -> 'a Worker.request
   -> ('a ticket * transition, Worker.error) result
 
 (** Queue a business read against its exact host execution identity while the
@@ -126,7 +166,7 @@ val request
     settles locally. The supplied byte/item ceilings are reduced to verified
     capability limits before making the sealed budget. *)
 val plan_query
-  : t
+  :  t
   -> owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
   -> maximum_items:int
   -> maximum_bytes:int
@@ -144,12 +184,14 @@ val plan_query
     owner or unprovable identity stays pending or fails explicitly, never fake Safe.
     Host ordinary deletion/auth/catalog/confirmation policies still apply. *)
 val prepare_host_change
-  : t -> Worker.host_change
+  :  t
+  -> Worker.host_change
   -> (Worker.handoff_id * transition, Worker.error) result
 
 (** Pure compressed ownership history for real mailbox-ID association. *)
 module Response_ownership : sig
   type t
+
   val empty : t
   val add : t -> Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id -> t
   val mem : t -> Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id -> bool

@@ -1277,6 +1277,7 @@ module Observation_registry = struct
     | Live of live
     | Closing of S.graph_scope
     | Gone of S.graph_scope
+    | Gone_unallocated of S.timeline_scope
 
   type t =
     { entries : entry Entries.t
@@ -1310,6 +1311,18 @@ module Observation_registry = struct
     && a.account.lifecycle_generation = b.account.lifecycle_generation
   ;;
 
+  let same_owner (scope : S.graph_scope) (owner : S.timeline_scope) =
+    G.Uuid.equal scope.graph_id owner.graph_id
+    && scope.graph_generation = owner.graph_generation
+    && scope.account.account_generation = owner.startup.account_generation
+  ;;
+
+  let equal_owner (a : S.timeline_scope) (b : S.timeline_scope) =
+    G.Uuid.equal a.graph_id b.graph_id
+    && a.graph_generation = b.graph_generation
+    && a.startup.account_generation = b.startup.account_generation
+  ;;
+
   let reserve state ~registration ~id ~scope ~command ~maximum_bytes =
     let key = registration, id in
     if
@@ -1322,6 +1335,8 @@ module Observation_registry = struct
       match Entries.find_opt key state.entries with
       | Some (Gone old | Closing old) ->
         state, if same_scope scope old then Retired else Mismatch
+      | Some (Gone_unallocated old) ->
+        state, if same_owner scope old then Retired else Mismatch
       | Some (Live old) ->
         ( state
         , if
@@ -1350,11 +1365,30 @@ module Observation_registry = struct
       { state with entries = Entries.add key (Closing old.scope) state.entries }, Release
     | Some (Closing old) when same_scope scope old -> state, Release
     | Some (Gone old) when same_scope scope old -> state, Already_released
+    | Some (Gone_unallocated old) when same_owner scope old -> state, Already_released
     | Some _ -> state, Wrong_owner
     | None when registration <= 0L || state.retained >= 8192 -> state, Release_full
     | None ->
       ( { state with
           entries = Entries.add key (Gone scope) state.entries
+        ; retained = state.retained + 1
+        }
+      , Unknown )
+  ;;
+
+  let release_unallocated state ~registration ~id ~(owner : S.timeline_scope) =
+    let key = registration, id in
+    match Entries.find_opt key state.entries with
+    | Some (Gone_unallocated old) when equal_owner owner old -> state, Already_released
+    | Some _ -> state, Wrong_owner
+    | None
+      when registration <= 0L
+           || owner.startup.account_generation < 0
+           || owner.graph_generation < 0
+           || state.retained >= 8192 -> state, Release_full
+    | None ->
+      ( { state with
+          entries = Entries.add key (Gone_unallocated owner) state.entries
         ; retained = state.retained + 1
         }
       , Unknown )
@@ -1391,7 +1425,7 @@ module Observation_registry = struct
     match Entries.find_opt (registration, id) state.entries with
     | Some (Live value) -> Some value.scope
     | Some (Gone scope | Closing scope) -> Some scope
-    | None -> None
+    | Some (Gone_unallocated _) | None -> None
   ;;
 
   let epoch state ~registration ~id =
@@ -1414,7 +1448,7 @@ module Observation_registry = struct
               +
               match entry with
               | Live _ | Closing _ -> 1
-              | Gone _ -> 0)
+              | Gone _ | Gone_unallocated _ -> 0)
            , retained + 1 ))
         entries
         (0, 0)

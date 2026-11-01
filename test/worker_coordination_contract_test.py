@@ -65,8 +65,8 @@ module Validate (Issuer : W.ISSUER) = struct
   let projection previous (push : Service.push) = Issuer.projection ~previous push
   let answer session request_id request (response : Service.response) =
     Issuer.reply session ~request_id request response
-  let update session observation (response : Logseq_db_worker.Protocol.response) =
-    Issuer.observation session observation response
+  let update session request_id observation (response : Service.response) =
+    Issuer.observation session ~request_id observation response
   let confirm session presentation receipt (response : Logseq_db_worker.Protocol.response) =
     Issuer.confirmation session ~presentation receipt response
 end
@@ -143,6 +143,11 @@ let registration view (ticket : W.block W.slice W.observed C.ticket) =
 }
 
 NEGATIVE = {
+    "observation_requires_registered_service_envelope": (
+        """let wrong (module Issuer : W.ISSUER) session request_id observation
+          (response:Logseq_db_worker.Protocol.response) =
+          Issuer.observation session ~request_id observation response""",
+        ("Protocol.response", "Service.response")),
     "account_generation_is_not_graph_generation": (
         "let wrong (x : W.account_generation) : W.graph_generation = x",
         ("W.account_generation", "W.graph_generation")),

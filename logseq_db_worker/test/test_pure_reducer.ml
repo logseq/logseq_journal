@@ -1725,6 +1725,67 @@ let test_observation_registry_traces () =
   done
 ;;
 
+let test_unallocated_observation_fence () =
+  let module O = Core.Observation_registry in
+  let _, scope = worker_open_graph () in
+  let owner : Logseq_sync_pure_reducer.Core.timeline_scope =
+    { startup =
+        { account_generation = scope.account.account_generation
+        ; presentation_generation = 0
+        }
+    ; graph_id = scope.graph_id
+    ; graph_generation = scope.graph_generation
+    }
+  in
+  let id = uuid "10000000-0000-4000-8000-000000007003" in
+  let closed, result = O.release_unallocated O.empty ~registration:71L ~id ~owner in
+  Alcotest.(check bool)
+    "unallocated ID receives an actual local fence"
+    true
+    (result = O.Unknown);
+  Alcotest.(check bool)
+    "no invented full graph owner"
+    true
+    (O.scope closed ~registration:71L ~id = None);
+  let focused =
+    { owner with startup = { owner.startup with presentation_generation = 99 } }
+  in
+  let _, result = O.release_unallocated closed ~registration:71L ~id ~owner:focused in
+  Alcotest.(check bool)
+    "focus does not change ID cleanup ownership"
+    true
+    (result = O.Already_released);
+  List.iter
+    (fun scope ->
+       let _, result =
+         O.reserve
+           closed
+           ~registration:71L
+           ~id
+           ~scope
+           ~command:Protocol.V2_graph_info
+           ~maximum_bytes:16384
+       in
+       Alcotest.(check bool)
+         "canceled ID never allocates in old or new generation"
+         true
+         (result = O.Retired || result = O.Mismatch))
+    [ scope; { scope with graph_generation = scope.graph_generation + 1 } ];
+  let live, _ =
+    O.reserve
+      O.empty
+      ~registration:71L
+      ~id
+      ~scope
+      ~command:Protocol.V2_graph_info
+      ~maximum_bytes:16384
+  in
+  let unchanged, result = O.release_unallocated live ~registration:71L ~id ~owner in
+  Alcotest.(check bool)
+    "unallocated cleanup cannot erase a physical registration"
+    true
+    (result = O.Wrong_owner && O.current unchanged ~registration:71L ~id ~epoch:0L)
+;;
 let test_observation_registry_capacity () =
   let module O = Core.Observation_registry in
   let _, scope = worker_open_graph () in
@@ -1777,6 +1838,7 @@ let () =
   Alcotest.run
     "logseq db worker pure reducer"
     [ ( "resident graphs", [
+        Alcotest.test_case "unallocated observation fence" `Quick test_unallocated_observation_fence;
         Alcotest.test_case "coordination owner snapshot" `Quick test_coordination_owner_snapshot;
         Alcotest.test_case "cold cached membership opens every DB" `Quick test_resident_worker_cold_restore_keeps_open_tickets;
         Alcotest.test_case "scope routes and delayed replies survive focus" `Quick test_resident_worker_routes_by_scope;

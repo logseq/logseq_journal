@@ -366,6 +366,53 @@ let test_client_to_typed_read () =
          (W.Uuid.equal info.graph_uuid Test_support.graph_uuid)
          "typed graph identity mismatch"
      | _ -> failwith "graph info failed");
+    (* Actual client -> interpreter -> pure registration -> sampled read and ACK.
+       The source values below come from Service, never a synthetic projection. *)
+    let observed_ticket,observed_reply=request(W.Observe(budget,W.Graph_info)) in
+    let observed=match observed_reply with
+      | W.Answered(Ok value)->value
+      | _->failwith "real App observation registration failed" in
+    require(C.observation_handle(C.view !state) observed_ticket=Some observed.observation)
+      "interpreter did not forward actual registration metadata";
+    require(C.observed(C.view !state) observed.observation=Some observed)
+      "real observed DTO did not reach pure retained state";
+    apply(C.step !state(C.Forget observed_ticket));
+    require(C.observed(C.view !state) observed.observation=Some observed)
+      "host result disposal unregistered the live interest";
+    let refresh,refreshed_reply=request(W.Refresh observed.observation) in
+    let refreshed=match refreshed_reply with
+      | W.Answered(Ok value)->value|_->failwith "real App Refresh failed" in
+    require(W.compare_observation_epoch refreshed.epoch observed.epoch>0)
+      "real Refresh did not advance the backend epoch";
+    apply(C.step !state(C.Forget refresh));
+    let released,released_reply=request(W.Release observed.observation) in
+    require(released_reply=W.Answered(Ok())) "real Release did not receive a physical ACK";
+    require(C.observed(C.view !state) observed.observation=None) "released interest remained visible";
+    apply(C.step !state(C.Forget released));
+    let tiny=W.read_budget session ~maximum_items:1 ~maximum_bytes:1 |> Result.get_ok in
+    let failed_ticket,failed_reply=request(W.Observe(tiny,W.Graph_info)) in
+    require(match failed_reply with W.Answered(Error _)->true|_->false)
+      "tiny actual observation unexpectedly fit its byte budget";
+    let failed_handle=match C.observation_handle(C.view !state) failed_ticket with
+      | Some handle->handle|_->failwith "actual read error erased registration metadata" in
+    let _,_=request(W.Release failed_handle) in
+    apply(C.step !state(C.Forget failed_ticket));
+    let cancel_ticket,cancel_plan=C.request !state session(W.Observe(budget,W.Graph_info)) |> Result.get_ok in
+    apply cancel_plan;
+    (* Admission is queued by the real interpreter, but has not yet been reduced. *)
+    apply(C.step !state(C.Cancel cancel_ticket));
+    wait(fun ()->C.reply(C.view !state) cancel_ticket<>None);
+    wait(fun ()->List.exists(function
+      | Mailbox.Response{outcome=Completed(Service.Coordination_observation_released value);_},R.Consumed ->
+        W.equal_request_id(W.request_id value.observation_id)(C.ticket_id cancel_ticket)
+      | _->false) !deliveries);
+    require(C.observation_handle(C.view !state) cancel_ticket=None)
+      "canceled registration adopted a late active handle";
+    require(match C.reply(C.view !state) cancel_ticket with
+      | Some(W.Interrupted W.Cancelled)->true|_->false)
+      "canceled observation returned a successful sampled result";
+    apply(C.step !state(C.Forget cancel_ticket));
+
     let _, admission = request (W.Query (budget, W.Admission)) in
     (match admission with
      | W.Answered (Ok value) ->
@@ -1230,12 +1277,25 @@ let test_client_to_typed_read () =
     require
       (W.encode_mutation_intent restored = wire)
       "complete mutation changed on restore";
+    let observed_block_ticket,observed_block_reply=request(W.Observe(budget,
+      W.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None})) in
+    let observed_block=match observed_block_reply with
+      | W.Answered(Ok value)->value|_->failwith "actual block observation failed" in
+    apply(C.step !state(C.Forget observed_block_ticket));
     let mutation_ticket, mutation_reply = request (W.Mutate intent) in
     let receipt =
       match mutation_reply with
       | W.Answered (Ok (W.Committed_pending_presentation receipt)) -> receipt
       | _ -> failwith "real durable mutation did not return commit evidence"
     in
+    wait(fun ()->match C.observed(C.view !state) observed_block.observation with
+      | Some {value=P.V2_present_block {value;_};_}->value.block.title="Durable coordinated edit"
+      | _->false);
+    let observed_after=Option.get(C.observed(C.view !state) observed_block.observation) in
+    require(W.compare_observation_epoch observed_after.epoch observed_block.epoch>0)
+      "actual write invalidation did not advance retained observation";
+    let _,released=request(W.Release observed_block.observation) in
+    require(released=W.Answered(Ok())) "updated observation did not physically release";
     let original = W.receipt_revisions receipt in
     require
       (Rrbvec.to_list (W.receipt_targets receipt)
@@ -2223,7 +2283,36 @@ let test_service_observation_read_failure_retains_interest () =
        recover 8 "Recovered refreshed observation";
        ignore (call (Service.Release_coordination registration)))
 ;;
+let test_service_unallocated_observation_cleanup_after_close () =
+  with_observation_service(fun _ ~call ~send:_ ~wait ~replies:_ ~notices:_ ~baseline ~owner ~registration ->
+    let logical=uuid "9d000000-0000-4000-8000-000000000990" in
+    ignore(call(Service.Client_command Return_to_graph_picker));
+    wait(fun ()->match !baseline with
+      | Some value->value.baseline.state.sync.residents=[] && value.baseline.state.residents=[]
+      | _ -> false);
+    require(match call(Service.Coordination_release_observation {registration;owner;observation_id=logical}) with
+      | Completed(Service.Coordination_observation_released value)->value.observation_id=logical
+      | _ -> false) "unallocated observation could not settle after graph close";
+    ignore(call(Service.Client_command(Select_graph Test_support.graph_uuid)));
+    wait(fun ()->match !baseline with
+      | Some value -> List.exists(fun (_,state)->state.Logseq_db_worker.phase=Graph_open) value.baseline.state.residents
+          && Option.is_some value.baseline.state.sync.selected
+      | _ -> false);
+    let reopened=Option.get(Option.get !baseline).baseline.state.sync.selected in
+    let observe observation_id request_id=Service.Coordination_observe
+      {registration;owner=reopened;observation_id;maximum_bytes=16384;
+       request={P.api_version=P.api_version;request_id;command=P.V2_graph_info}} in
+    require(match call(observe logical (uuid "9d000000-0000-4000-8000-000000000991")) with
+      | Failed _->true|_->false) "canceled logical ID allocated in a reopened generation";
+    require(match call(observe (uuid "9d000000-0000-4000-8000-000000000992")
+      (uuid "9d000000-0000-4000-8000-000000000993")) with
+      | Completed(Service.Coordination_observed _)->true|_->false)
+      "cleanup of one unknown ID incorrectly fenced the reopened graph";
+    ignore(call(Service.Release_coordination registration)))
+;;
+
 let () =
+  test_service_unallocated_observation_cleanup_after_close ();
   test_service_observation_read_failure_retains_interest ();
   test_service_observation_lifecycle ();
   test_service_empty_observation_is_retained ();
