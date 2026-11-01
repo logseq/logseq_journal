@@ -2,6 +2,7 @@ module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Worker = Logseq_db_worker_lui.Journal_worker
 module Id = Logseq_db_worker_lui.Journal_worker_ids.Worker
 module Protocol = Logseq_db_worker.Protocol
+module Runtime = Logseq_db_worker_lui.Journal_worker_ids.Runtime
 
 type graph_owner = int * Logseq_db_types.Graph_types.Uuid.t * int
 
@@ -15,7 +16,10 @@ type lease =
   }
 
 type t =
-  { send : Service.request -> Worker.send_result
+  { runtime_epoch : Runtime.epoch
+  ; worker_generation : Id.generation
+  ; responses : (Id.request_id, unit) Hashtbl.t
+  ; send : Service.request -> Worker.send_result
   ; cancel : Id.request_id -> unit
   ; projection_accepted : Protocol.request -> unit
   ; projection_finished : Logseq_db_types.Graph_types.Uuid.t -> unit
@@ -24,11 +28,31 @@ type t =
   ; protocol_ids : (graph_owner option * Logseq_db_types.Graph_types.Uuid.t, Id.request_id) Hashtbl.t
   }
 
-let create ~send ~cancel ~projection_accepted ~projection_finished ~refused =
-  { send; cancel; projection_accepted; projection_finished; refused
+let create ~runtime_epoch ~worker_generation ~send ~cancel ~projection_accepted ~projection_finished ~refused =
+  { runtime_epoch; worker_generation; responses = Hashtbl.create 64
+  ; send; cancel; projection_accepted; projection_finished; refused
   ; graph_requests = Hashtbl.create 32
   ; protocol_ids = Hashtbl.create 32
   }
+;;
+
+type delivery = Registered_response | Unowned_response | Broadcast | Dropped_envelope
+
+let receive owner event =
+  let runtime_epoch, worker_generation = match event with
+    | Worker.Response {runtime_epoch;worker_generation;_}
+    | Push {runtime_epoch;worker_generation;_}
+    | Terminal {runtime_epoch;worker_generation;_} -> runtime_epoch,worker_generation in
+  if not (Runtime.Epoch.equal owner.runtime_epoch runtime_epoch)
+     || not (Id.Generation.equal owner.worker_generation worker_generation)
+  then Dropped_envelope
+  else match event with
+    | Worker.Response {request_id;_} ->
+      if Hashtbl.mem owner.responses request_id then (
+        Hashtbl.remove owner.responses request_id;
+        Registered_response)
+      else Unowned_response
+    | Push _ | Terminal _ -> Broadcast
 ;;
 
 let dispatch owner ?(observe_projection = false) (request : Service.request) =
@@ -42,6 +66,7 @@ let dispatch owner ?(observe_projection = false) (request : Service.request) =
   if duplicate then Worker.Full
   else match owner.send request with
     | Accepted worker_id as accepted ->
+      Hashtbl.add owner.responses worker_id ();
       Option.iter (fun protocol ->
         Hashtbl.add owner.graph_requests worker_id {scope=(match request with Service.Graph_request_at (scope,_) -> Some scope | _ -> None);protocol_request=protocol;retired=false};
         Hashtbl.add owner.protocol_ids (protocol_key protocol.Protocol.request_id) worker_id;

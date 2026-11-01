@@ -4219,6 +4219,32 @@ let state_for_scope core (scope : graph_scope) =
   else if core.current_graph_scope=Some scope then Some core.public_state
   else Option.map (fun session -> (restore_session core session).public_state)
     (List.find_opt (fun s -> s.saved_identity=scope) core.resident_sessions)
+type coordination_state =
+  { account : account_scope option
+  ; desired_residents : graph_id list
+  ; residents : (graph_scope * state) list
+  ; selected : timeline_scope option
+  ; deletion : (graph_scope * local_deletion) option
+  }
+let coordination_state core =
+  let desired_residents=resident_graphs core in
+  let saved=(remember_current core).resident_sessions in
+  let residents=List.filter_map (fun id ->
+    Option.map (fun session -> session.saved_identity,
+      (restore_session core session).public_state)
+      (List.find_opt (fun session -> session.saved_identity.graph_id=id
+        && session.saved_identity.account.account_generation=
+           core.public_state.snapshot.startup.account_generation) saved)) desired_residents in
+  let snapshot=core.public_state.snapshot in
+  let selected=Option.bind snapshot.selected_graph (fun id ->
+    List.find_map (fun ((scope:graph_scope),_) ->
+      if scope.graph_id<>id then None else Some
+        {startup={account_generation=scope.account.account_generation;
+          presentation_generation=snapshot.startup.presentation_generation};
+         graph_id=id;graph_generation=scope.graph_generation}) residents) in
+  {account=Option.map (account_scope core) core.user_id;desired_residents;residents;selected;
+   deletion=(match core.deletion_scope,snapshot.local_deletion with
+     | Some scope,Some phase -> Some(scope,phase) | _ -> None)}
 let asset_context_for_scope core (scope : graph_scope) =
   if scope_for_graph core ~graph_id:scope.graph_id <> Some scope then None
   else if core.current_graph_scope=Some scope then asset_context core

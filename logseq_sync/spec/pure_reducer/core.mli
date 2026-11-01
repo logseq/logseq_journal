@@ -663,3 +663,16 @@ val catalog_cache_resident_graphs : catalog_cache -> graph_id list
 val state_for_scope : t -> graph_scope -> state option
 val asset_context_for_scope : t -> graph_scope -> asset_context option
 val event_graph_scope : t -> event -> graph_scope option
+
+type coordination_state =
+  { account : account_scope option
+  ; desired_residents : graph_id list
+  ; residents : (graph_scope * state) list
+  ; selected : timeline_scope option
+  ; deletion : (graph_scope * local_deletion) option
+  }
+
+(** One immutable owner read, including non-admitted resident lifetimes and the
+    exact local deletion flight. Execution identity excludes focus generations;
+    selected carries the current presentation separately. No IO or registration. *)
+val coordination_state : t -> coordination_state

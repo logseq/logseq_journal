@@ -42,6 +42,7 @@
   journal_platform
   journal_platform_requests
   journal_worker_admission
+  journal_worker_coordination_host
   journal_routes
   journal_row
   journal_startup
@@ -62,6 +63,8 @@
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.lui
+  logseq_journal.worker_coordination
+  journal_worker_coordination_impl
   threads
   unix
   ppx_deriving_yojson.runtime

@@ -86,6 +86,65 @@ let v2_graph_info_request () =
       (Logseq_db_worker.Error.message error)
 ;;
 
+let test_coordination_registration () =
+  T.with_managed (fun fixture ->
+    let config={fixture.config with response_budget_bytes=4096} in
+    with_client config (fun client ->
+    let updates=ref [] in
+    let drain () =
+      let events=Worker.For_testing.drain_events client ~max_events:64 in
+      List.iter (function Worker.Push {payload=Service.Coordination_updates batch;_}->
+        updates:=List.rev_append batch !updates | _ -> ()) events;
+      events in
+    let send request=
+      let id=Worker.send client request |> accepted in
+      let rec receive () =
+        match drain () |> List.find_map (function
+          | Worker.Response {request_id;outcome;_} when ID.Worker.Request_id.equal id request_id -> Some outcome
+          | _ -> None) with
+        | Some (Completed response) -> response
+        | Some _ -> T.fail "coordination command did not complete"
+        | None -> Worker.For_testing.await_output client;receive () in
+      receive () in
+    let baseline id = match send (Service.Register_coordination id) with
+      | Service.Coordination_registered baseline -> baseline
+      | _ -> T.fail "registration did not return a baseline" in
+    let first=baseline 10L in
+    T.require (first.registration=10L && first.baseline.state.residents=[])
+      "empty baseline must be authoritative without an invented Open DB";
+    T.require (first.limits.response_budget_bytes=config.response_budget_bytes)
+      "baseline must retain effective configured response budget";
+    let same=baseline 10L in
+    T.require (same.baseline.version=first.baseline.version) "duplicate registration changed version";
+    ignore(send (Service.Client_command (Restore_local_account {user_id="baseline-synthetic"})));
+    let changed ()=List.exists (function Service.Coordination_snapshot next ->
+      next.registration=10L && next.baseline.version>first.baseline.version
+        && Option.is_some next.baseline.state.sync.account | _ -> false) !updates in
+    let deadline=Unix.gettimeofday () +. 2. in
+    while not(changed ()) && Unix.gettimeofday ()<deadline do
+      ignore(drain ());Thread.delay 0.001
+    done;
+    T.require (changed ()) "registered state change was lost between sample and notification";
+    (match send (Service.Release_coordination 10L) with
+     | Coordination_released 10L -> () | _ -> T.fail "missing exact unregister ACK");
+    (* A release of a known future registration fences its delayed first send. *)
+    (match send (Service.Release_coordination 20L) with
+     | Coordination_released 20L -> () | _ -> T.fail "missing pre-registration release ACK");
+    let id=Worker.send client (Service.Register_coordination 20L) |> accepted in
+    let rec refusal () =
+      match Worker.For_testing.drain_events client ~max_events:64 |> List.find_map (function
+        | Worker.Response {request_id;outcome;_} when ID.Worker.Request_id.equal id request_id -> Some outcome
+        | _ -> None) with
+      | Some (Failed _) -> ()
+      | Some _ -> T.fail "released registration was resurrected"
+      | None -> Worker.For_testing.await_output client;refusal () in
+    refusal ();
+    let next=baseline 21L in
+    T.require (next.registration=21L) "new binding was not admitted";
+    ignore(send (Service.Release_coordination 10L));
+    T.require ((baseline 21L).registration=21L) "old unregister retired a newer binding"))
+;;
+
 let test_managed_worker_starts_closed_and_replies_with_v2_envelope () =
   T.with_managed (fun fixture ->
     with_client fixture.config (fun client ->
@@ -1523,7 +1582,8 @@ let test_resident_invalidations_survive_coalescing () =
 let () =
   T.run
     "lui worker service"
-    [ T.case "resident invalidations preserve all graphs" test_resident_invalidations_survive_coalescing
+    [ T.case "registered baseline and release fences" test_coordination_registration
+    ; T.case "resident invalidations preserve all graphs" test_resident_invalidations_survive_coalescing
     ; T.case "typed asset failures reach ledger" test_asset_failure_rows
     ; T.case "safe worker failure rows" test_safe_worker_failure_rows
     ; T.case "authoritative integrity rows" test_authoritative_integrity_rows

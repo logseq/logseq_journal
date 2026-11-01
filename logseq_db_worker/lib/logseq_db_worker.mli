@@ -91,3 +91,20 @@ val retain_imported_file
 val request_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> Protocol.request -> Protocol.response
 val graph_scopes : t -> Logseq_sync_pure_reducer.Core.graph_scope list
 val graph_state_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> graph_state option
+
+type coordination_snapshot =
+  { version : int64
+  ; presentation : int64
+  ; state : Pure_reducer.coordination_state
+  }
+
+(** Register and sample on the serial Worker domain without yielding. A single
+    binding borrows this coordination outlet. Increasing caller-known identities
+    replace predecessors; release fences older delayed registration attempts.
+    Notification runs after state assignment, before effects, and must not yield. *)
+val register_coordination
+  : t -> registration:int64 -> notify:(coordination_snapshot -> unit)
+  -> (coordination_snapshot, string) result
+val release_coordination : t -> registration:int64 -> unit
+val coordination_current : t -> registration:int64 -> bool
+val revoke_coordination : t -> unit

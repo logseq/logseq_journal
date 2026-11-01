@@ -1,15 +1,31 @@
 # App/Worker coordination contracts
 
 This independent wrapped Dune virtual library is the target boundary for migrating
-App/Worker interaction. It has **no implementation or default implementation**;
-the current App does not link it. `Worker_effect_runner` will interpret the pure
-coordinator directly against the existing Service/client, without an adapter or a
-second transport. UI layout, navigation, feed planning, Capture choice/order and
-media rendering remain with their business reducers.
+App/Worker interaction. Its explicit implementation lives in
+`app/impl/worker_coordination/`: `worker_api`, `worker_pure_coordinator` and
+`worker_effect_runner`. The App currently uses it for **Copy's one-shot reads**.
+The runner borrows the existing Service/client and the host's single event pump;
+there is no adapter, second client or extra `Mailbox.on_event` subscription.
+Navigation, feed/Favorites planning, Capture editing and media UI remain with their
+business reducers.
+
+The implementation currently advertises read capabilities only. Atomic Append,
+durable mutation/import reconciliation, observation/resource ACKs and writer/local
+copy fences are not implemented by this slice and are rejected before enqueue.
+Their existing App paths remain owned by the legacy runtime; the whole layer has
+**not** been migrated.
+
+The pure coordinator receives actual admission IDs, refusals, terminal replies and
+registration-release ACKs as explicit events. It decides cancellation races,
+bootstrap retry, revocation and nonblocking stop. The effect runner encodes/sends,
+associates actual mailbox IDs, decodes and queues later events. Ownership history
+uses a pure interval map, so sequential completed requests do not grow one entry
+per request. A bounded number of disjoint ownership ranges limits adversarial
+interleaving; it is distinct from the number of completed reads.
 
 ## Construction, consumption and ownership
 
-1. The host creates `Worker_coordinator.initial` and borrows its verified existing
+1. The host creates `Worker_pure_coordinator.initial` and borrows its verified existing
    client through `Worker_effect_runner.create`. The existing pump remains the only
    `Mailbox.on_event` owner. Runner callbacks enqueue later serialized Core turns.
 2. `Worker_bound` identifies a fresh **binding** within the real mailbox
@@ -20,7 +36,7 @@ media rendering remain with their business reducers.
 3. The baseline issues usable Open sessions, per-session capability/byte limits,
    all resident phases, selection and deletion progress at one version. The
    client obtains its first session here, never from a test-supplied sealed value.
-4. `Worker_coordinator.request` returns the exact typed ticket **and** transition.
+4. `Worker_pure_coordinator.request` returns the exact typed ticket **and** transition.
    Apply that transition before planning another request, then interpret its
    instructions. This also works for identical concurrent requests; there is no
    existential ticket recovery or inference from emitted instruction order.
@@ -99,7 +115,7 @@ Ready is a usability check, not evidence that today's Service can issue Ready.
 
 | Required guarantee | Current boundary / work still required |
 | --- | --- |
-| Authoritative registered baseline and ongoing version stream | Service.state/Graph_states/Graph_info are separate/coalesced and lack an atomic registration/sample or version replay. Extend the actual Service owner with correlated registration, versioned baseline (membership/phases/selection/deletion/limits), replay boundary, binding revocation and unregister ACK. Current types cannot encode this proof. |
+| Authoritative registered baseline and ongoing version stream | Implemented for the read slice: Sync/Worker expose one immutable lifecycle snapshot; Db registers/samples without yielding, publishes versions before effects, and owns an independent presentation epoch. Service carries stable caller-known registration IDs, complete updates and exact unregister ACKs, fences release-before-register and revokes registrations at short authentication controls. Limits come from the actual immutable Database dependencies and effective Worker response budget. |
 | Existing typed read families and DTO validation | The Protocol V2 read commands already exist. Implement bounded mapping/decoding, ownership and cursor validation, and preserve existing projection conversion; these are not all Unsupported operations. Actual admission still needs the session/bootstrap above. |
 | Atomic durable Append including children/statuses and Web's existing journal page | Separate create/insert/status commands are insufficient. Worker must resolve/create and append transactionally with outbox/evidence; stable IDs bind the complete payload. Do not read an entire page merely to append. |
 | General mutation/import retry and confirmation | Existing command families and stable IDs remain the basis. Verify/implement durable outcome reconciliation per operation across restart and exact receipt/read-back matching before advertising the corresponding capability. A process-local duplicate cache or same visible text is insufficient. |
@@ -111,10 +127,11 @@ bootstrap failure is visible, no fake session/receipt/ACK is issued. Capabilitie
 are advertised by a verified baseline rather than guessed in App. Returning
 Unsupported for every entry is not an implemented migration.
 
-A first production slice should be the existing Copy one-shot request/reply path,
+The first production slice is the existing Copy one-shot request/reply path,
 retaining its current business reducer and revision fences: Graph_info, UUID page/
-block lookup and Children. It needs the real bootstrap, exclusive routing and typed
-DTO mapping, but does not need atomic Append or new observation. Do not replace
+block lookup and Children. It uses the real bootstrap, exclusive routing and typed DTO mapping, while keeping
+the existing business reducer's before/after version checks. It does not advertise
+atomic Append or new observation. Do not replace
 Copy's before/after graph/revision checks just because the result is now typed.
 Whole-layer replacement additionally needs the remaining capability and lifecycle
 obligations above, plus explicit transfer of all legacy resource ownership.
@@ -166,3 +183,27 @@ at least the following deterministic integration acceptance:
   id1 ACK, reopened same UUID/rebound client rejecting old safe receipt, last graph
   empty projection, partial Force cleanup remains explicit, shared client/other
   owners survive and pump keeps delivering cleanup until terminal fence.
+
+## Executable read-slice checks
+
+- `test/worker_coordination_pure_test.ml` checks deterministic state transitions,
+  input immutability, cancellation/admission reordering, terminal duplication,
+  retired bindings, cleanup ACKs and stopping failures. It runs 500 fixed-seed
+  state traces with a counterexample shrinker, plus 100 generated ownership-range
+  traces and a 16,384-ID compression check. Generators and seeds are outside the
+  pure state machine; no clock/random/IO or host callback is read by `step`.
+- `test/worker_coordination_runtime_test.ml` uses the actual Service and isolated
+  synthetic mirrors/catalogs. It exercises baseline to Open session, bounded typed
+  reads and continuations, DTO conversion through the actual App projection,
+  focus A -> B -> A, rebinding, old reply ownership and cancellation/shutdown ACKs.
+- The existing mounted `application_view_test` Copy case drives Timeline,
+  Favorites and Detail menus, replacement and clipboard acknowledgement through
+  the new host/coordinator/runner. Its synthetic Service implements the declared
+  baseline protocol; it is separate from actual Service conformance evidence.
+- Existing Copy reducer tests use the compatibility entry to the same generic
+  pure engine. Production Copy passes sealed continuations directly; its old
+  mailbox-ID request table and cancellation path have been removed. Buffered
+  subtree children, cursor history and text fragments use Rrbvec.
+
+These checks do not establish mutation/import recovery, observation/resource
+ownership, writer fences, full-layer migration or real-device acceptance.

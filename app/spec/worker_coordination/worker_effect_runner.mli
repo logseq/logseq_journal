@@ -1,5 +1,5 @@
 (** Direct interpreter against the existing dbworker Service/client. No adapter,
-    second Worker client or default runtime implementation is supplied. *)
+    second Worker client is introduced; the host selects its implementation explicitly. *)
 module Worker = Worker_api
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Mailbox = Logseq_db_worker_lui.Journal_worker
@@ -8,21 +8,22 @@ type client = (Service.request, Service.response, Service.push) Mailbox.client
 type t
 val create
   : client:client -> managed_origin:string -> user_id:string
-  -> post:(Worker_coordinator.event -> unit)
-  -> publish:(Worker_coordinator.view -> unit)
+  -> post:(Worker_pure_coordinator.event -> unit)
+  -> publish:(Worker_pure_coordinator.view -> unit)
   -> (t, Worker.error) result
 
 (** Borrow the host's verified client/account. Derive real mailbox epoch/generation,
     revoke any predecessor, queue Worker_bound before any baseline. The pure
     coordinator emits Bootstrap, executed by submit. Creation succeeds without
     claiming Ready. Registration not-ready/failure/revocation posts typed bootstrap
-    states; retry tears down the old registration before starting a new one.
+    states; the pure coordinator waits for old registration release and in-flight
+    completion before requesting a fresh binding.
 
     Host keeps its existing pump, single Mailbox.on_event registration, auth/token/
     catalog/startup and client lifetime. This function does not install a second
     permanent handler (Mailbox has no unsubscribe). post queues serialized later
-    turns; publish does not own UI/business state. Actual Service lacks the atomic
-    baseline protocol: report Unsupported_operation, never construct a fake Ready. *)
+    turns; publish does not own UI/business state. Ready comes only from the
+    correlated registered Service baseline, never from independent legacy pushes. *)
 
 type disposition = Consumed | Unowned_response | Broadcast | Dropped_envelope
 type delivery = private { disposition : disposition; error : Worker.error option }
@@ -48,7 +49,7 @@ val on_event : t -> (Service.response, Service.push) Mailbox.event -> delivery
     pump drain. All callbacks queue typed events; no recursive step. Host continues
     forwarding terminal cleanup responses after revocation and while draining. *)
 
-val submit : t -> Worker_coordinator.instruction -> unit
+val submit : t -> Worker_pure_coordinator.instruction -> unit
 
 (** Directly encode scoped Service/Protocol requests; never implicit-current
     Graph_request/Asset_command fallbacks. Track Accepted mailbox ID against typed

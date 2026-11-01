@@ -175,7 +175,7 @@
    --cmi %{lib:rrbvec:rrbvec.cmi}
    --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination.cmi}
    --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination__Worker_api.cmi}
-   --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination__Worker_coordinator.cmi}
+   --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination__Worker_pure_coordinator.cmi}
    --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination__Worker_effect_runner.cmi}
    --cmi %{lib:logseq_db_types:logseq_db_types.cmi}
    --cmi %{lib:logseq_db_types:logseq_db_types__Graph_types.cmi}
@@ -193,3 +193,16 @@
 (alias
  (name runtest)
  (deps (alias worker-coordination-contracts)))
+
+(test
+ (name worker_coordination_runtime_test)
+ (modules worker_coordination_runtime_test)
+ (libraries app journal_worker_coordination_impl logseq_journal.worker_coordination
+  logseq_overlay_db_test_support logseq_db_worker_test_support
+  logseq_sync.effect_runner logseq_sync.pure_reducer digestif))
+
+(test
+ (name worker_coordination_pure_test)
+ (modules worker_coordination_pure_test)
+ (libraries datascript_ocaml journal_worker_coordination_impl logseq_journal.worker_coordination
+  logseq_db_worker logseq_sync.pure_reducer uri))

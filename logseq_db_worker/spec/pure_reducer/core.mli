@@ -202,4 +202,10 @@ val import_context
 val graph_scopes : state -> Logseq_sync_pure_reducer.Core.graph_scope list
 
 val graph_state_for_scope : state -> Logseq_sync_pure_reducer.Core.graph_scope -> graph_state option
+
+type coordination_state =
+  { sync : Logseq_sync_pure_reducer.Core.coordination_state
+  ; residents : (Logseq_sync_pure_reducer.Core.graph_scope * graph_state) list
+  }
+val coordination_state : state -> coordination_state
 val import_context_for_scope : state -> Logseq_sync_pure_reducer.Core.graph_scope -> Logseq_sync_pure_reducer.Core.asset_context option

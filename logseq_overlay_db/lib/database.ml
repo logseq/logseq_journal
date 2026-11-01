@@ -325,6 +325,8 @@ let dependencies ~epoch_ms ~monotonic_ns ~limits =
   | None -> Ok { epoch_ms; monotonic_ns; limits }
 ;;
 
+let dependency_limits dependencies = dependencies.limits
+
 let durable_mirror_location ~application_support_directory ~graph_id =
   if String.trim application_support_directory = ""
   then Error Types.Invalid_application_support_directory

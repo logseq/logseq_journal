@@ -3221,11 +3221,70 @@ let start
     fun () -> Journal_platform_requests.emit platform_requests
       ~on_result:(fun result -> run_owned owner (fun () -> f result)) request
   in
-  let copy_state = graph_ref (fun () -> Journal_copy.initial) in
-  let copy_owner = graph_ref (fun () -> None) in
-  let copy_sequence = graph_ref (fun () -> 0L) in
-  let copy_worker_requests_cell = graph_ref (fun () ->
-    Hashtbl.create 2) in
+  let module Wc = Journal_worker_coordination.Worker_api in
+  let module Coordination = Journal_worker_coordination.Worker_pure_coordinator in
+  let module Coordination_host = Journal_worker_coordination_host in
+  let module Copy = Journal_copy.Pure in
+  let copy_state : Wc.Protocol.v2_child_member Wc.continuation Copy.t ref = ref Copy.initial in
+  let copy_owner = ref None in
+  let copy_sequence = ref 0L in
+  let termination_in_flight = ref false in
+  let copy_poll : (Coordination.view -> unit) option ref = ref None in
+  let copy_cancel : (unit -> unit) option ref = ref None in
+  let coordination_host = ref None in
+  let coordination_host_id = ref None in
+  let retired_coordination_hosts = ref Rrbvec.empty in
+  let coordination_lifecycle_changed = ref(fun()->()) in
+  let all_coordination_hosts () = match !coordination_host with
+    | None-> !retired_coordination_hosts
+    | Some(_,host)->Rrbvec.push_back !retired_coordination_hosts host in
+  let shutdown_coordination () =
+    Rrbvec.iter(fun host->ignore(Coordination_host.shutdown host))(all_coordination_hosts()) in
+  let coordination_stopped () = Rrbvec.fold_left(fun stopped host->
+    stopped && Coordination.shutdown_state(Coordination_host.view host)=Coordination.Stopped)
+    true(all_coordination_hosts()) in
+  let ensure_coordination () =
+    let scope=Option.bind !state_ref.manager (fun manager ->
+      List.find_opt(fun (scope:Graph_service.asset_scope)->
+        Some scope.graph_id= !state_ref.graph_state.graph_id
+        && scope.graph_generation= !state_ref.graph_state.generation)manager.resident_scopes) in
+    match scope with
+    | _ when !termination_in_flight->Error "Journal is closing."
+    | None->Error "The graph reader is still preparing. Try Copy again."
+    | Some scope->
+      let origin=Uri.to_string scope.account.managed_sync_origin in
+      let identity=origin,scope.account.user_id,scope.account.account_generation in
+      (match !coordination_host with
+       | Some(previous,host) when previous=identity
+           && Coordination.shutdown_state(Coordination_host.view host)=Coordination.Active->Ok host
+       | previous->
+         Option.iter(fun(_,host)->
+           ignore(Coordination_host.shutdown host);
+           retired_coordination_hosts:=Rrbvec.push_back !retired_coordination_hosts host)previous;
+         let id=fresh_identity () in
+         match Coordination_host.create ~client
+           ~client_id:(Wc.Uuid.of_string id |> Result.get_ok) ~managed_origin:origin ~user_id:scope.account.user_id
+           ~enqueue:(Journal_pump.enqueue pump)
+           ~changed:(fun view->
+             if !coordination_host_id=Some id then Option.iter(fun poll->poll view)!copy_poll;
+             !coordination_lifecycle_changed()) with
+         | Error _->Error "Unable to bind the graph reader. Try Copy again."
+         | Ok host->coordination_host_id:=Some id;coordination_host:=Some(identity,host);Ok host)
+  in
+  let route_coordination_event event =
+    let module Runner=Journal_worker_coordination.Worker_effect_runner in
+    let active=Option.map snd !coordination_host in
+    let consumed=ref false in
+    let deliver host=let delivery=Coordination_host.on_event host event in
+      if delivery.Runner.disposition=Runner.Consumed then consumed:=true in
+    Option.iter deliver active;
+    Rrbvec.iter deliver !retired_coordination_hosts;
+    retired_coordination_hosts:=Rrbvec.fold_left(fun retained host->
+      match Coordination_host.shutdown host with
+      | Runner.Stopped->retained|Draining|Shutdown_failed _->Rrbvec.push_back retained host)
+      Rrbvec.empty !retired_coordination_hosts;
+    !consumed
+  in
   let projection_request_accepted = ref (fun _ -> ()) in
   let projection_request_finished = ref (fun _ -> ()) in
   let report_worker_refusal (request : Graph_service.request) (refused : Worker.send_result) =
@@ -3250,6 +3309,9 @@ let start
         | Acquire_imported_file _ | Acquire_asset_file _ -> "acquireAssetFile"
         | Release_asset_file _ -> "releaseAssetFile"
         | Get_graph_state | Get_graph_state_at _ -> "getGraphState"
+        | Register_coordination _ -> "registerCoordination"
+        | Release_coordination _ -> "releaseCoordination"
+        | Coordination_query _ -> "coordinationQuery"
       in
       Effect.run (set_state (fun state -> report_ui_error state ~operation ~phase:"admission"))
   in
@@ -3257,6 +3319,8 @@ let start
      registries stay with Copy/media/assets; this owns delivery and lease life. *)
   let worker_admission =
     Journal_worker_admission.create
+      ~runtime_epoch:(Worker.runtime_epoch client)
+      ~worker_generation:(Worker.worker_generation client)
       ~send:(Worker.send client)
       ~cancel:(fun request_id -> Worker.cancel client ~request_id)
       ~projection_accepted:(fun request -> !projection_request_accepted request)
@@ -3301,15 +3365,10 @@ let start
         else Hashtbl.remove pending_scope_refreshes (owner_key owner)))
   in
   let cancel_copy () =
-    let state, _ = Journal_copy.step !copy_state Cancel in
-    copy_state := state;
-    copy_owner := None;
-    set_state (fun state -> { state with detail_copy_feedback = None }) ();
-    Hashtbl.iter
-      (fun request_id (_, _, protocol_id) ->
-         !projection_request_finished protocol_id;
-         Worker.cancel client ~request_id)
-      (!copy_worker_requests_cell)
+    let state,_=Copy.step !copy_state Copy.Cancel in
+    copy_state:=state;copy_owner:=None;copy_poll:=None;
+    Option.iter(fun cancel->cancel())!copy_cancel;copy_cancel:=None;
+    set_state(fun state->{state with detail_copy_feedback=None})()
   in
   let copy_current owner =
     !copy_owner = Some owner
@@ -3327,6 +3386,51 @@ let start
         | _ -> { state with timeline_notice = Some (Copy_failed message) })
       else state)
   in
+  let schedule_copy_read (type a) owner (query:a Wc.query)
+      (convert:a -> Wc.Protocol.v2_child_member Wc.continuation Copy.result) completed =
+    Effect.of_thunk(fun()->match ensure_coordination() with
+      | Error message->completed(Error message)
+      | Ok host->
+        let fail message=copy_poll:=None;copy_cancel:=None;completed(Error message) in
+        let await view=
+          if not(copy_current owner) then cancel_copy() else
+          match Coordination.bootstrap view with
+          | Wc.Ready projection->
+            let session=List.find_map(fun resident->
+              if resident.Wc.phase=Wc.Open && Option.fold ~none:false
+                ~some:(Wc.matches_scope resident.session)(current_owner())
+              then Some resident.session else None)(Wc.residents projection) in
+            (match session with
+             | None->fail "The graph is no longer available for copying."
+             | Some session->
+               let budget=Wc.read_budget session ~maximum_items:64
+                 ~maximum_bytes:(Wc.capabilities session).limits.response_budget_bytes in
+               let requested=Result.bind budget(fun budget->Coordination_host.request host session(Wc.Query(budget,query))) in
+               match requested with
+               | Error _->fail "The copy read could not be admitted. Try again."
+               | Ok ticket->
+                 copy_cancel:=Some(fun()->Coordination_host.post host(Coordination.Cancel ticket);
+                   Coordination_host.post host(Coordination.Forget ticket));
+                 copy_poll:=Some(fun view->match Coordination.reply view ticket with
+                   | None->()
+                   | Some reply->
+                     copy_poll:=None;copy_cancel:=None;
+                     Coordination_host.post host(Coordination.Forget ticket);
+                     let result=match reply with
+                       | Wc.Answered(Ok value)->Ok(convert value)
+                       | Answered(Error(Response_budget_exceeded))->Error "The selected block is too large to copy."
+                       | Answered(Error(Stale_read _ | Resync_required _ | Revoked_session))->Error "The graph changed while copying. Try again."
+                       | Answered(Error _)|Not_admitted _|Interrupted _->Error "The copy read failed or was interrupted. Try again." in
+                     completed result))
+          | Awaiting_baseline|Bootstrap_not_ready _->()
+          | Bootstrap_failed _|Binding_revoked _->fail "The graph reader could not prepare. Try Copy again."
+        in
+        copy_poll:=Some await;
+        let view=Coordination_host.view host in
+        match Coordination.bootstrap view with
+        | Wc.Bootstrap_failed _|Binding_revoked _->Coordination_host.post host Coordination.Retry_bootstrap
+        | _->await view)
+  in
   let rec copy_transition owner event =
     if !copy_owner <> Some owner
     then Effect.ignore
@@ -3335,11 +3439,11 @@ let start
       cancel_copy ();
       Effect.ignore)
     else (
-      let state, actions = Journal_copy.step !copy_state event in
+      let state, actions = Copy.step !copy_state event in
       copy_state := state;
       Effect.many (List.map (copy_action owner) actions))
   and copy_action owner = function
-    | Journal_copy.Failed message -> copy_error owner message
+    | Copy.Failed message -> copy_error owner message
     | Copied text ->
       (match Journal_platform.copy_text_request ~text with
        | Error message -> copy_error owner message
@@ -3359,33 +3463,17 @@ let start
                          { feedback with copy_phase = Copied } }
                    | _ -> state)
                | Error message -> copy_error owner message)))
-    | Read (ticket, command) ->
-      Effect.bind
-        (Effect.of_thunk (fun () ->
-           if not (copy_current owner)
-           then None
-           else (
-             let request =
-               Logseq_db_worker.Protocol.
-                 { api_version
-                 ; request_id =
-                     Logseq_db_types.Graph_types.Uuid.of_string (fresh_identity ())
-                     |> Result.get_ok
-                 ; command
-                 }
-             in
-             match dispatch_worker ~observe_projection:true (Graph_service.Graph_request request) with
-             | Accepted request_id ->
-               Hashtbl.replace
-                 (!copy_worker_requests_cell)
-                 request_id
-                 (owner, ticket, request.request_id);
-               None
-             | Full | Not_ready | Stopping ->
-               Some "The graph reader is temporarily unavailable.")))
-        ~f:(function
-          | None -> Effect.ignore
-          | Some message -> copy_transition owner (Read_failed (ticket, message)))
+    | Read(ticket,query)->
+      let completed result=if copy_current owner then Effect.run(copy_transition owner
+        (match result with Ok result->Copy.Completed(ticket,result)|Error message->Copy.Read_failed(ticket,message))) in
+      match query with
+      | Copy.Info_query->schedule_copy_read owner Wc.Graph_info
+          (fun info->Copy.Info_result{graph_uuid=info.Wc.graph_uuid;generation=info.generation;projection_revision=info.projection_revision})completed
+      | Block_query uuid->schedule_copy_read owner(Wc.Outline_block{uuid;revision=None})(fun result->Copy.Block_result result)completed
+      | Page_query uuid->schedule_copy_read owner(Wc.Page{uuid;revision=None})(fun result->Copy.Page_result result)completed
+      | Children_query{parent;cursor}->schedule_copy_read owner(Wc.Child_members{parent;revision=None;after=cursor})
+          (fun result->Copy.Children_result{parent=result.Wc.parent;revision_scope=result.revision_scope;
+            scope_revision=result.scope_revision;items=result.items;next_cursor=result.next})completed
   in
   let begin_copy block_id =
     match Logseq_db_types.Graph_types.Uuid.of_string block_id with
@@ -3954,7 +4042,15 @@ let start
     List.iter(fun restore->restore ()) current;active_runtime:=active;processing_owner:=previous
   in
   let sign_out_in_flight = ref false in
-  let termination_in_flight = ref false in
+  let finish_termination () =
+    let legacy_ready=local_deletion_active !state_ref || Option.fold ~none:false
+      ~some:(fun manager->manager.Graph_service.startup.awaiting_selection || not manager.startup.authenticated)
+      !state_ref.manager in
+    if !termination_in_flight && legacy_ready && coordination_stopped() then (
+      termination_in_flight:=false;
+      platform_request Journal_platform.termination_ready_request ~f:(fun _->Effect.ignore))
+    else Effect.ignore in
+  coordination_lifecycle_changed:=(fun()->Effect.run(finish_termination()));
   let apply_manager_transition set_state set_state_and_effect manager_state =
     let manager = manager_state.Graph_service.snapshot in
     let previous_scopes = match !state_ref.manager with
@@ -4011,17 +4107,7 @@ let start
                 (Non_worker_sync_failure "Unable to sign out of the authenticated session"))))
       else Effect.ignore
     in
-    let termination_ready =
-      if
-        !termination_in_flight
-        && (manager.Graph_service.startup.awaiting_selection
-            || not manager.startup.authenticated)
-      then (
-        termination_in_flight := false;
-        platform_request Journal_platform.termination_ready_request ~f:(fun _ ->
-          Effect.ignore))
-      else Effect.ignore
-    in
+    let termination_ready = finish_termination ()    in
     Effect.bind update ~f:(fun () ->
       let snapshot = !state_ref in
       Effect.many
@@ -4056,6 +4142,8 @@ let start
     sync_media !state_ref;
     Journal_media_runtime.pump (!media_runtime_cell);
     match event with
+    | Worker.Push {payload=Graph_service.Coordination_updates _;_}
+    | Worker.Response {outcome=Completed(Graph_service.Coordination_registered _ | Coordination_released _);_}->Effect.ignore
     | Worker.Push {payload=Graph_service.Graph_pushes _ | Graph_states _ | Session_states _;_} -> Effect.ignore
     | Worker.Response { request_id; outcome; _ }
       when Hashtbl.mem local_copy_requests request_id ->
@@ -4103,25 +4191,6 @@ let start
             | Ok Not_downloaded -> { state with local_copy_message = Some "No local copy on this device." }
                | Error message -> { state with local_copy_message = Some message }))))
         ~f:(fun () -> !drain_visible_copies ())
-    | Worker.Response { request_id; outcome; _ }
-      when Hashtbl.mem (!copy_worker_requests_cell) request_id ->
-      let owner, ticket, protocol_id = Hashtbl.find (!copy_worker_requests_cell) request_id in
-      Hashtbl.remove (!copy_worker_requests_cell) request_id;
-      let event =
-        match outcome with
-        | Completed
-            (Graph_service.Graph_response (Logseq_db_worker.Protocol.V2_response response))
-          when Logseq_db_types.Graph_types.Uuid.equal response.request_id protocol_id ->
-          if copy_current owner
-          then
-            observe_projection_response (Logseq_db_worker.Protocol.V2_response response)
-          else forget_projection_request protocol_id;
-          Journal_copy.Completed (ticket, response.outcome)
-        | _ ->
-          forget_projection_request protocol_id;
-          Read_failed (ticket, "The copy request was cancelled or failed.")
-      in
-      copy_transition owner event
     | Worker.Response { request_id; outcome = Completed response; _ }
       when Hashtbl.mem (!media_worker_requests_cell) request_id ->
       let ticket = Hashtbl.find (!media_worker_requests_cell) request_id in
@@ -4554,6 +4623,9 @@ let start
     | Error _ -> set_state (fun state -> {state with startup_presentation=
         Journal_startup.Presentation.step state.startup_presentation (Account_error key)})
     | Ok user_id ->
+        (match !coordination_host with
+         | Some((_,previous,_),_) when user_id<>Some previous->cancel_copy();shutdown_coordination()
+         | _->());
         (match user_id with
          | None -> sign_out_in_flight := true
          | Some _ -> ());
@@ -4578,7 +4650,8 @@ let start
          && ticket = Journal_startup.Presentation.account_ticket !state_ref.startup_presentation
       then Effect.bind (set_state (fun state -> {state with startup_presentation=
         Journal_startup.Presentation.step state.startup_presentation (Account(ticket,Local))}))
-        ~f:(fun () -> send_manager (Graph_service.Restore_local_account {user_id=binding.user_id}))
+        ~f:(fun () -> cancel_copy();shutdown_coordination();
+          send_manager (Graph_service.Restore_local_account {user_id=binding.user_id}))
       else unavailable ()
   in
   let revoked_online_scope = ref None in
@@ -4605,14 +4678,11 @@ let start
            if scope = startup_scope !state_ref then revoked_online_scope := Some scope))
         ~f:(fun () -> send_manager (Graph_service.Cancel_online scope))
     | Error _ -> if Journal_platform.is_prepare_to_terminate_event payload
-    then
-      if local_deletion_active !state_ref
-      then
-        platform_request Journal_platform.termination_ready_request ~f:(fun _ ->
-          Effect.ignore)
-      else (
-        termination_in_flight := true;
-        send_manager Graph_service.Return_to_graph_picker)
+    then (
+      termination_in_flight:=true;
+      cancel_copy();shutdown_coordination();
+      if local_deletion_active !state_ref then finish_termination()
+      else send_manager Graph_service.Return_to_graph_picker)
     else (
       match Journal_platform.decode_network_lifecycle payload with
       | Ok _ -> apply_network_lifecycle payload
@@ -7056,10 +7126,22 @@ let start
      graph_id=scope.graph_id;graph_generation=scope.graph_generation} in
   Worker.on_event client (fun event ->
     Journal_pump.enqueue pump (fun () ->
+      let coordination_consumed=route_coordination_event event in
+      match (if coordination_consumed then Journal_worker_admission.Unowned_response
+        else Journal_worker_admission.receive worker_admission event) with
+      | Dropped_envelope -> ()
+      | Unowned_response ->
+        (* A response owned elsewhere can still free shared queue capacity. *)
+        drain_retired_runtimes ();
+        Journal_asset_runtime.pump (!asset_runtime_cell);
+        sync_media !state_ref;
+        Journal_media_runtime.pump (!media_runtime_cell);
+        Effect.run (Effect.bind (Effect.bind (drain_startup_commands ()) ~f:drain_focus_refresh) ~f:finish_termination)
+      | Registered_response | Broadcast ->
       drain_retired_runtimes ();
       let deliver event=Effect.bind
         (Effect.bind (handle_worker_event event) ~f:drain_startup_commands)
-        ~f:drain_focus_refresh in
+        ~f:(fun()->Effect.bind(drain_focus_refresh()) ~f:finish_termination) in
       match event with
       | Worker.Response {request_id;_} ->
         let owner=Hashtbl.find_opt worker_owners request_id in

@@ -336,7 +336,7 @@ def main():
     if not required or any(not path.is_file() for path in required):
         raise AssertionError("The compiled Worker coordination interfaces are required before client checking")
     includes = sorted({str(path.parent) for path in required})
-    prelude = "module W = Journal_worker_coordination.Worker_api\nmodule C = Journal_worker_coordination.Worker_coordinator\nlet request (session,operation) state = Result.map snd (C.request state session operation)\n"
+    prelude = "module W = Journal_worker_coordination.Worker_api\nmodule C = Journal_worker_coordination.Worker_pure_coordinator\nlet request (session,operation) state = Result.map snd (C.request state session operation)\n"
     with tempfile.TemporaryDirectory(prefix="journal-worker-coordination-") as temporary:
         directory = Path(temporary)
         for name, source in POSITIVE.items():

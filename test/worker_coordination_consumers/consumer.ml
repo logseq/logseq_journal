@@ -1,6 +1,6 @@
 (* Compile-only clients using the actual App projection. No runtime implementation is linked. *)
 module W = Journal_worker_coordination.Worker_api
-module C = Journal_worker_coordination.Worker_coordinator
+module C = Journal_worker_coordination.Worker_pure_coordinator
 let request (session,operation) state = Result.map snd (C.request state session operation)
 
 module Client_bootstrap_query_projection_and_release = struct

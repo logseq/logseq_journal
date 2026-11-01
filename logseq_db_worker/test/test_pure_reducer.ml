@@ -1311,10 +1311,41 @@ let test_resident_worker_cold_restore_keeps_open_tickets () =
         Core.database_handle_id database="cached-" ^ Logseq_db_types.Graph_types.Uuid.to_string scope.graph_id|_->false) read.effects)) (Core.graph_scopes opened)) [1;2;3]
 ;;
 
+let test_coordination_owner_snapshot () =
+  let opened,first,second=resident_worker_fixture () in
+  let before=Core.coordination_state opened in
+  Alcotest.(check int) "all resident identities" 2 (List.length before.residents);
+  Alcotest.(check bool) "account belongs to owner" true (Option.is_some before.sync.account);
+  List.iter (fun ((scope:Sync.graph_scope),state) ->
+    Alcotest.(check bool) "exact open lifetime" true
+      (state.Core.phase=Graph_open && state.generation=scope.Sync.graph_generation)) before.residents;
+  let switched=(Core.step opened (Sync_event (Sync.Visible_graph_changed second))).next in
+  let back=(Core.step switched (Sync_event (Sync.Visible_graph_changed first.graph_id))).next in
+  let after=Core.coordination_state back in
+  Alcotest.(check bool) "focus preserves execution scopes" true
+    (List.map fst before.residents=List.map fst after.residents);
+  Alcotest.(check bool) "selection follows current owner" true
+    (Option.map (fun (owner:Sync.timeline_scope)->owner.graph_id)
+       (Core.coordination_state switched).sync.selected=Some second
+     && Option.map (fun (owner:Sync.timeline_scope)->owner.graph_id)
+       after.sync.selected=Some first.graph_id);
+  let removed=(Core.step back (Sync_event (Sync.Resident_graphs_changed [first.graph_id]))).next in
+  let deleting=Core.step removed (Sync_event (Sync.Local_cache_deletion_requested second)) in
+  let current=Core.coordination_state deleting.next in
+  Alcotest.(check bool) "exact deletion target is visible" true
+    (Option.fold ~none:false ~some:(fun ((scope:Sync.graph_scope),_) ->
+      scope.graph_id=second) current.sync.deletion);
+  let empty=Core.coordination_state (raw_initial ()) in
+  Alcotest.(check bool) "empty bootstrap has no invented account" true
+    (empty.sync.account=None && empty.residents=[] && empty.sync.selected=None)
+;;
+
 let () =
   Alcotest.run
     "logseq db worker pure reducer"
-    [ ( "resident graphs", [Alcotest.test_case "cold cached membership opens every DB" `Quick test_resident_worker_cold_restore_keeps_open_tickets;
+    [ ( "resident graphs", [
+        Alcotest.test_case "coordination owner snapshot" `Quick test_coordination_owner_snapshot;
+        Alcotest.test_case "cold cached membership opens every DB" `Quick test_resident_worker_cold_restore_keeps_open_tickets;
         Alcotest.test_case "scope routes and delayed replies survive focus" `Quick test_resident_worker_routes_by_scope;
         Alcotest.test_case "all removals and logout detach each graph" `Quick test_resident_worker_closes_every_scope;
         Alcotest.test_case "shutdown closes every resident database" `Quick test_resident_worker_shutdown_closes_all_databases])

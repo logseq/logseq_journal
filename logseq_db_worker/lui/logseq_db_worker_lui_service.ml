@@ -287,7 +287,38 @@ type local_copy_request =
   ; account_generation : int
   }
 
+type coordination_baseline =
+  { registration : int64
+  ; baseline : Logseq_db_worker.coordination_snapshot
+  ; authority_user : string option option
+  ; limits : Logseq_db_worker.Protocol.v2_capability_limits
+  }
+
+type coordination_update =
+  | Coordination_snapshot of coordination_baseline
+  | Coordination_revoked of int64 * string
+
+let coordination_network (baseline:coordination_baseline) (scope:asset_scope) =
+  List.find_map(fun(owner,(state:Sync.state))->
+    if owner=scope then Some(sync_phase state.snapshot.sync_phase) else None)
+    baseline.baseline.state.sync.residents
+;;
+
+let coordination_read = function
+  | Protocol.V2_graph_info | V2_inspect_admission | V2_get_asset_descriptors _
+  | V2_list_assets _ | V2_list_task_statuses _ | V2_get_task_status_definitions _
+  | V2_list_favorites _ | V2_list_journals _ | V2_get_page _ | V2_get_outline_block _
+  | V2_get_outline_block_summary _ | V2_get_children _ | V2_get_page_tree _ -> true
+  | V2_pull_changes _ | V2_ack_changes _ | V2_set_asset_reference _ | V2_save_block _
+  | V2_insert_blocks _ | V2_delete_blocks _ | V2_create_journal_page _
+  | V2_set_task_status _ | V2_clear_task_status _ -> false
+;;
+
 type request =
+  | Register_coordination of int64
+  | Release_coordination of int64
+  | Coordination_query of
+      { registration : int64; owner : timeline_scope; request : Logseq_db_worker.Protocol.request }
   | Graph_request_at of timeline_scope * Logseq_db_worker.Protocol.request
   | Get_graph_state_at of timeline_scope
   | Asset_command_at of timeline_scope * asset_command
@@ -319,6 +350,8 @@ type request =
       }
 
 type response =
+  | Coordination_registered of coordination_baseline
+  | Coordination_released of int64
   | Local_copy_inspected of local_copy_request * (local_copy_presence, string) result
   | Local_copy_deleted of local_copy_request * (unit, string) result
   | Asset_imported of (Logseq_db_worker.import_receipt, string) result
@@ -346,6 +379,7 @@ type asset_notice_batch =
   }
 
 type push =
+  | Coordination_updates of coordination_update list
   | Graph_pushes of (asset_scope * Logseq_db_worker.Protocol.push) list
   | Graph_states of (asset_scope * Logseq_db_worker.graph_state) list
   | Session_states of (asset_scope * state) list
@@ -366,6 +400,7 @@ let bootstrap_topic = ID.Worker.Push_topic.of_int 3
 let graph_state_topic = ID.Worker.Push_topic.of_int 4
 let asset_topic = ID.Worker.Push_topic.of_int 5
 let session_topic = ID.Worker.Push_topic.of_int 6
+let coordination_topic = ID.Worker.Push_topic.of_int 7
 
 let asset_notices = function
   | Asset_notice (scope, notice) -> [ scope, notice ]
@@ -404,6 +439,12 @@ let merge_scoped previous next =
   merged
 let coalesce_push ~topic previous next =
   match previous,next with
+  | Coordination_updates previous,Coordination_updates next ->
+    let id = function Coordination_snapshot b->b.registration | Coordination_revoked(id,_)->id in
+    let merged=List.fold_left(fun entries update ->
+      update :: List.filter(fun old -> id old<>id update) entries) previous next in
+    if List.length merged>8 then failwith "Pending coordination binding limit exceeded";
+    Coordination_updates merged
   | Graph_pushes previous,Graph_pushes next -> Graph_pushes (merge_scoped previous next)
   | Graph_states previous,Graph_states next -> Graph_states (merge_scoped previous next)
   | Session_states previous,Session_states next -> Session_states (merge_scoped previous next)
@@ -792,11 +833,14 @@ let create ~(dependencies : dependencies) =
       ; auth_sequence : int ref
       ; auth_enqueued_sequence : int ref
       ; auth_wake : Eio.Condition.t
+      ; mutable coordination_registration : int64 option
+      ; coordination_limits : Protocol.v2_capability_limits
+      ; emit_coordination : coordination_update -> unit
       }
   end
   in
   Journal_worker.Service.create
-    ~push_topic_count:7
+    ~push_topic_count:8
     ~merge_push:coalesce_push
     ~concurrency:(Journal_worker.Service.Concurrent { max_in_flight = 2 })
     ~data_directory:(fun config -> Ok config.Db.Config.application_support_directory)
@@ -821,6 +865,10 @@ let create ~(dependencies : dependencies) =
            request.request
            "host rejected request"
        | Client_command (Reconcile_authenticated_user { user_id }) ->
+         Option.iter (fun id -> session.Session.emit_coordination
+           (Coordination_revoked(id,"Authentication authority changed"))) session.coordination_registration;
+         session.coordination_registration<-None;
+         Db.revoke_coordination session.worker;
          session.Session.authenticated_user := user_id;
          (* Every admitted changed key revoked the old reply ticket, including
            A -> B -> A coalescing. Preserve that invalidation even when only
@@ -960,12 +1008,52 @@ let create ~(dependencies : dependencies) =
                      ; auth_sequence
                      ; auth_enqueued_sequence
                      ; auth_wake
+                     ; coordination_registration=None
+                     ; coordination_limits=(let limits=Overlay.dependency_limits dependencies.overlay in
+                         {response_budget_bytes=min limits.response_budget_bytes
+                           (min config.response_budget_bytes Protocol.maximum_response_bytes);
+                          outbox_max_records=limits.outbox_max_records;outbox_max_bytes=limits.outbox_max_bytes;
+                          change_max_items=limits.change_max_items;change_max_bytes=limits.change_max_bytes;
+                          dispatcher_capacity=limits.dispatcher_capacity;wire_batch_max_bytes=limits.wire_batch_max_bytes})
+                     ; emit_coordination=(fun update -> Journal_worker.Session_context.emit context
+                         ~topic:coordination_topic (Coordination_updates [update]))
                      }))))
     ~handle:(fun context session request ->
       let resolve (owner:timeline_scope) = List.find_opt (fun (scope:Sync.graph_scope) ->
         scope.account.account_generation=owner.startup.account_generation && scope.graph_id=owner.graph_id
           && scope.graph_generation=owner.graph_generation) (Db.graph_scopes session.worker) in
       match request with
+      | Register_coordination registration ->
+        let baseline snapshot={registration;baseline=snapshot;limits=session.Session.coordination_limits;
+          authority_user=(if !(session.auth_seen) then Some !(session.authenticated_user) else None)} in
+        (match Db.register_coordination session.worker ~registration
+          ~notify:(fun snapshot -> session.emit_coordination (Coordination_snapshot(baseline snapshot))) with
+         | Error message -> Error message
+         | Ok snapshot ->
+           (match session.coordination_registration with
+            | Some id when id<>registration -> session.emit_coordination
+              (Coordination_revoked(id,"Coordination binding replaced"))
+            | _ -> ());
+           session.coordination_registration<-Some registration;
+           Ok(Coordination_registered(baseline snapshot)))
+      | Release_coordination registration ->
+        Db.release_coordination session.worker ~registration;
+        (match session.coordination_registration with
+         | Some id when id<=registration -> session.coordination_registration<-None | _ -> ());
+        Ok(Coordination_released registration)
+      | Coordination_query {registration;owner;request} ->
+        let current ()=Db.coordination_current session.worker ~registration in
+        if not(coordination_read request.command) then
+          Error "This registration supports ordinary reads only; mutation/changefeed ownership was not admitted."
+        else if not(current ()) then Error "Coordination binding retired"
+        else (match resolve owner with
+          | None -> Error "The graph session is no longer open."
+          | Some scope ->
+            let authorized ()=current () &&
+              (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+            if not(authorized ()) then Error "Coordination account authority changed" else
+            let response=Db.request_for_scope session.worker ~scope request in
+            if authorized () then Ok(Graph_response response) else Error "Coordination binding retired")
       | Graph_request_at (owner,request) ->
         (match resolve owner with
          | Some scope -> Ok (Graph_response (Db.request_for_scope session.worker ~scope request))

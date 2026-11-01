@@ -216,7 +216,24 @@ type local_copy_request =
   ; account_generation : int
   }
 
+type coordination_baseline =
+  { registration : int64
+  ; baseline : Logseq_db_worker.coordination_snapshot
+  ; authority_user : string option option
+  ; limits : Logseq_db_worker.Protocol.v2_capability_limits
+  }
+
+type coordination_update =
+  | Coordination_snapshot of coordination_baseline
+  | Coordination_revoked of int64 * string
+
+val coordination_network : coordination_baseline -> asset_scope -> sync_phase option
+
 type request =
+  | Register_coordination of int64
+  | Release_coordination of int64
+  | Coordination_query of
+      { registration : int64; owner : timeline_scope; request : Logseq_db_worker.Protocol.request }
   | Graph_request_at of timeline_scope * Logseq_db_worker.Protocol.request
   | Get_graph_state_at of timeline_scope
   | Asset_command_at of timeline_scope * asset_command
@@ -248,6 +265,8 @@ type request =
       }
 
 type response =
+  | Coordination_registered of coordination_baseline
+  | Coordination_released of int64
   | Local_copy_inspected of local_copy_request * (local_copy_presence, string) result
   | Local_copy_deleted of local_copy_request * (unit, string) result
   | Asset_imported of (Logseq_db_worker.import_receipt, string) result
@@ -259,6 +278,7 @@ type response =
 type asset_notice_batch
 
 type push =
+  | Coordination_updates of coordination_update list
   | Graph_pushes of (asset_scope * Logseq_db_worker.Protocol.push) list
   | Graph_states of (asset_scope * Logseq_db_worker.graph_state) list
   | Session_states of (asset_scope * state) list

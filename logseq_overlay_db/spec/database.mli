@@ -42,6 +42,9 @@ val dependencies
   -> limits:Types.capability_limits
   -> (dependencies, Types.limits_error) result
 
+(** Immutable limits fixed by [dependencies], before any graph is opened. *)
+val dependency_limits : dependencies -> Types.capability_limits
+
 (** {1 Discovering a durable mirror}
 
     Opening begins with observation rather than mutation. An inspection records

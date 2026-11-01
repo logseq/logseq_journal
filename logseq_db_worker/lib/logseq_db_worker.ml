@@ -78,6 +78,12 @@ type queued_event =
   | Event of Pure_reducer.event
   | Delete_copy of local_deletion_waiter
 
+type coordination_snapshot =
+  { version : int64
+  ; presentation : int64
+  ; state : Pure_reducer.coordination_state
+  }
+
 type t =
   { state : Pure_reducer.state ref
   ; runner : Effect_runner.t
@@ -85,6 +91,9 @@ type t =
   ; mutable next_request_id : int64
   ; mutable stopped : bool
   ; mutable local_deletion_waiter : local_deletion_waiter option
+  ; mutable coordination : coordination_snapshot
+  ; mutable coordination_registration : int64
+  ; mutable coordination_notify : (int64 * (coordination_snapshot -> unit)) option
   }
 
 type create_error = Invalid_create of string
@@ -94,6 +103,15 @@ let dispatch t event =
   let transition = Pure_reducer.step before event in
   observe_unlock before transition event;
   t.state := transition.next;
+  let state=Pure_reducer.coordination_state transition.next in
+  if state<>t.coordination.state then (
+    let previous=t.coordination in
+    if previous.version=Int64.max_int then failwith "Coordination version exhausted";
+    let presentation=if previous.state.sync.selected=state.sync.selected then previous.presentation
+      else (if previous.presentation=Int64.max_int then failwith "Presentation version exhausted";
+        Int64.succ previous.presentation) in
+    t.coordination <- {state;version=Int64.succ previous.version;presentation};
+    Option.iter (fun (_,notify)->notify t.coordination) t.coordination_notify);
   (match t.local_deletion_waiter with
    | None -> ()
    | Some waiter ->
@@ -179,7 +197,9 @@ let create ~sw ~config ~runner_dependencies =
      | Ok runner ->
        let t =
          { state = state_ref; runner; events; next_request_id = 0L; stopped = false
-         ; local_deletion_waiter = None }
+         ; local_deletion_waiter = None
+         ; coordination={version=0L;presentation=0L;state=Pure_reducer.coordination_state state}
+         ; coordination_registration=0L;coordination_notify=None }
        in
        event_sink := route_event t;
        dispatch t Pure_reducer.Start;
@@ -198,6 +218,29 @@ let report_asset_diagnostic t ~scope ~operation ~request_operation diagnostic =
 
 let view t = Pure_reducer.view !(t.state)
 let graph_state t = (view t).graph
+
+let coordination_current t ~registration =
+  not t.stopped && Option.fold ~none:false
+    ~some:(fun (id,_)->id=registration) t.coordination_notify
+;;
+
+let register_coordination t ~registration ~notify =
+  if t.stopped then Error "Worker stopped"
+  else if coordination_current t ~registration then Ok t.coordination
+  else if registration<=t.coordination_registration then Error "Coordination binding retired"
+  else (
+    t.coordination_registration<-registration;
+    t.coordination_notify<-Some(registration,notify);
+    Ok t.coordination)
+;;
+
+let release_coordination t ~registration =
+  if registration>=t.coordination_registration then (
+    t.coordination_registration<-registration;
+    t.coordination_notify<-None)
+;;
+
+let revoke_coordination t = t.coordination_notify<-None
 
 let delete_local_copy t ~account_generation ~graph_id =
   let snapshot = (view t).sync.snapshot in
@@ -230,6 +273,7 @@ let shutdown t =
   if not t.stopped
   then (
     t.stopped <- true;
+    revoke_coordination t;
     Option.iter (fun waiter ->
       ignore (Eio.Promise.try_resolve waiter.resolve (Error "The Worker stopped.") : bool))
       t.local_deletion_waiter;

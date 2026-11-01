@@ -23,6 +23,7 @@ val presentation_session : presentation -> session
 val graph_id : session -> Uuid.t
 val equal_session : session -> session -> bool
 val same_logical_graph : session -> session -> bool
+val matches_scope : session -> Service.timeline_scope -> bool
 val worker_incarnation
   : runtime_epoch:Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch
   -> worker_generation:Logseq_db_worker_lui.Journal_worker_ids.Worker.generation
@@ -399,6 +400,9 @@ type _ request =
     the complete payload/statuses under Worker transaction/outbox coordination.
     Today's separate operations do not implement it. Unsupported capabilities
     fail before enqueue, without a fabricated receipt/registration/lease ACK. *)
+(* Pure request shape, ownership and budget validation. *)
+val validate_request : session -> 'a request -> (unit, error) result
+
 type observation_update = Update : 'a observed -> observation_update
 
 type projection_version
@@ -522,11 +526,10 @@ module type ISSUER = sig
       failed/pending handoff; host may use its existing independently proven
       lifecycle/deletion owner, but must never fabricate this receipt. *)
 
-  (** Required Worker registration/baseline protocol, currently absent. This must
-      be implemented at the actual Service owner; current Service request/response
-      variants cannot encode it and must report Unsupported_operation. Ordinary
-      query families already map to Protocol V2 once bootstrap is available; do
-      not label every request unsupported to pretend the migration is complete. *)
+  (** The actual Service owner registers and samples one lifecycle version.
+      Baselines carry caller-known registration IDs, effective limits and exact
+      resident/account identities. Ordinary query families map to Protocol V2;
+      unsupported durability/resource capabilities fail before enqueue. *)
   val bootstrap_request : unit -> (Service.request, error) result
   val bootstrap : Service.response -> (bootstrap_state, error) result
 

@@ -25,6 +25,9 @@ val reply : view -> 'a ticket -> 'a Worker.reply option
 val observed : view -> 'a Worker.observation -> 'a Worker.observed option
 val equal_view : view -> view -> bool
 
+type shutdown_state = Active | Draining | Stopped | Shutdown_failed of Worker.error
+val shutdown_state : view -> shutdown_state
+
 (** Equality includes not-ready/retry/revocation, all request/observation/asset/
     handoff facts and empty residents/no selection/local_deletion transitions.
     Confirmed applies only to its exact still-current presentation; focus change
@@ -35,6 +38,15 @@ val equal_view : view -> view -> bool
 type event =
   | Worker_bound of Worker.binding
   | Retry_bootstrap
+  | Admitted : 'a ticket * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id -> event
+  | Admission_refused : 'a ticket * Worker.admission_error -> event
+  | Admission_failed : 'a ticket * Worker.error -> event
+  | Bootstrap_admitted of Worker.binding * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id
+  | Bootstrap_not_admitted of Worker.binding * Worker.admission_error
+  | Binding_release_completed of Worker.binding * (unit, Worker.error) result
+  | Binding_release_not_admitted of Worker.binding * Worker.admission_error
+  | Capacity_available
+  | Shutdown_requested
   | Bootstrap_received of Worker.binding * Worker.bootstrap_state
   | Completed : 'a ticket * 'a Worker.reply -> event
   | Projection_received of Worker.projection
@@ -48,6 +60,8 @@ type event =
 
 type instruction =
   | Bootstrap
+  | Release_binding of Worker.binding
+  | Bind_replacement
   | Send : 'a ticket * Worker.session * 'a Worker.request -> instruction
   | Cancel_request : 'a ticket -> instruction
   | Quiesce of Worker.handoff_id * Worker.host_change
@@ -105,3 +119,12 @@ val request
 val prepare_host_change
   : t -> Worker.host_change
   -> (Worker.handoff_id * transition, Worker.error) result
+
+(** Pure compressed ownership history for real mailbox-ID association. *)
+module Response_ownership : sig
+  type t
+  val empty : t
+  val add : t -> Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id -> t
+  val mem : t -> Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id -> bool
+  val spans : t -> int
+end

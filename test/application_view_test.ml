@@ -6,6 +6,7 @@ let fixture_request = function
   | Get_graph_state_at _ -> Get_graph_state
   | Asset_command_at (owner,command) -> Asset_command {graph_generation=owner.graph_generation;command}
   | Import_asset_at (owner,source) -> Import_asset {graph_generation=owner.graph_generation;source}
+  | Coordination_query {request;_}->Graph_request request
   | Client_command (Focus_resident_graph id) -> Client_command (Select_graph id)
   | request -> request
 ;;
@@ -516,6 +517,7 @@ let run_favorites_native_visibility
   let publish_error = Atomic.make None in
   let publish_attention = Atomic.make None in
   let publish_graph_first = Atomic.make false in
+  let publish_delayed_graph = Atomic.make false in
   let reported_graph_generation = Atomic.make None in
   let queried = Atomic.make [] in
   let feed_queried = Atomic.make false in
@@ -740,10 +742,34 @@ let run_favorites_native_visibility
     ; diagnostics = { groups = [] }
     }
   in
+  let manager=if check_copy then {manager with snapshot={manager.snapshot with
+    resident_graphs=[scope.graph_id];resident_scopes=[scope]}} else manager in
+  let coordination_registration=Atomic.make None in
+  let coordination_baseline registration =
+    let module C=Logseq_sync_pure_reducer.Core in
+    let generation=Atomic.get graph_generation in
+    let scope={scope with graph_generation=generation} in
+    let limits=C.limits ~maximum_response_bytes:P.maximum_response_bytes
+      ~maximum_artifact_bytes:1048576 ~submission_batch_size:1 |> Result.get_ok in
+    let config=C.config ~managed_sync_origin:scope.account.managed_sync_origin ~limits |> Result.get_ok in
+    let state=C.initial config |> Result.get_ok |> C.state in
+    let state={state with snapshot={state.snapshot with selected_graph=Some scope.graph_id;
+      resident_graphs=[scope.graph_id];startup={state.snapshot.startup with
+        account_generation=1;graph_generation=generation;presentation_generation=generation}}} in
+    let owner:Service.timeline_scope={startup={account_generation=1;presentation_generation=generation};
+      graph_id=scope.graph_id;graph_generation=generation} in
+    let sync:C.coordination_state={account=Some scope.account;desired_residents=[scope.graph_id];
+      residents=[scope,state];selected=Some owner;deletion=None} in
+    let physical:Logseq_db_worker.graph_state={graph_id=Some scope.graph_id;generation;phase=Graph_open;error=None} in
+    Service.{registration;authority_user=None;
+      limits={response_budget_bytes=P.maximum_response_bytes;outbox_max_records=4096;outbox_max_bytes=8388608;
+        change_max_items=4096;change_max_bytes=1048576;dispatcher_capacity=256;wire_batch_max_bytes=262144};
+      baseline={version=Int64.of_int generation;presentation=Int64.of_int generation;state={sync;residents=[scope,physical]}}}
+  in
   let latest_error_manager = Atomic.make manager in
   let service =
     W.Service.create
-      ~push_topic_count:6
+      ~push_topic_count:8
       ~merge_push:Service.coalesce_push
       ~concurrency:
         (if check_capture_imports || Option.is_some detail_capture
@@ -759,8 +785,20 @@ let run_favorites_native_visibility
       ~handle:(fun context () request ->
         match fixture_request request with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
+        | Register_coordination registration when check_copy->
+          Atomic.set coordination_registration(Some registration);
+          Ok(Service.Coordination_registered(coordination_baseline registration))
+        | Release_coordination registration when check_copy->
+          (match Atomic.get coordination_registration with Some id when id<=registration->
+            Atomic.set coordination_registration None|_->());
+          Ok(Service.Coordination_released registration)
+        | Register_coordination _ | Release_coordination _ | Coordination_query _ -> Error "This fixture does not provide coordination authority"
         | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
+          if check_copy then Option.iter(fun registration->W.Request_context.emit context
+            ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+            (Service.Coordination_updates[Service.Coordination_snapshot(coordination_baseline registration)]))
+            (Atomic.get coordination_registration);
           if Atomic.get import_probe then Atomic.set import_probed true;
           if Atomic.exchange publish_block false
           then (
@@ -800,6 +838,8 @@ let run_favorites_native_visibility
                        sync_phase = Option.value sync_phase ~default:Service.Current
                      ; last_error_attention = Option.value attention ~default:None
                      ; last_error = Option.value error ~default:None
+                     ; resident_scopes=(if check_copy then [{scope with graph_generation=Atomic.get graph_generation}]
+                         else manager.snapshot.resident_scopes)
                      ; startup = { manager.snapshot.startup with
                          graph_generation = Atomic.get graph_generation }
                      }
@@ -809,6 +849,11 @@ let run_favorites_native_visibility
               context
               ~topic:Service.manager_topic
               (Service.Client_state_changed next));
+          if Atomic.exchange publish_delayed_graph false then
+            W.Request_context.emit context ~topic:Service.graph_state_topic
+              (Service.Graph_state_changed
+                {generation=Atomic.get graph_generation;graph_id=Some(uuid 900);
+                 phase=Graph_open;error=None});
           Ok
             (Service.Graph_state
                { generation = Option.value (Atomic.get reported_graph_generation)
@@ -3971,6 +4016,9 @@ let run_favorites_native_visibility
            Atomic.set reported_graph_generation (Some 2);
            issue (Some Service.Requires_attention) (Some "Synthetic new-scope integrity failure");
            Atomic.set reported_graph_generation (Some 3);
+           (* This fixture publishes the delayed graph transition as the actual
+              Worker does. An unregistered read reply is not an App update. *)
+           Atomic.set publish_delayed_graph true;
            ignore (W.send (Option.get !client) Service.Get_graph_state);
            settle_worker ();
            for _ = 1 to 10 do hooks.pump () |> consume; Unix.sleepf 0.001 done;
@@ -4257,6 +4305,7 @@ let test_reference_outer_terminals cancel =
         in
         match fixture_request request with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
+        | Register_coordination _ | Release_coordination _ | Coordination_query _ -> Error "This fixture does not provide coordination authority"
         | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
           if Atomic.exchange refresh false
@@ -5436,6 +5485,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
         in
         match fixture_request request with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
+        | Register_coordination _ | Release_coordination _ | Coordination_query _ -> Error "This fixture does not provide coordination authority"
         | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
           if queue_full && Atomic.fetch_and_add graph_reads 1 > 0
@@ -6380,6 +6430,7 @@ let test_graph_picker_controls scenario () =
           W.Request_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed value) in
         match (match request with Service.Client_command _ when scenario=`Retry_local || scenario=`Retry_graph_phase -> request | _ -> fixture_request request) with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
+        | Register_coordination _ | Release_coordination _ | Coordination_query _ -> Error "This fixture does not provide coordination authority"
         | Service.Inspect_local_copy request ->
           let index = Atomic.fetch_and_add inspections 1 in
           if scenario = `Late_presence && index = 0
@@ -6951,6 +7002,8 @@ module Admission_fixture = struct
     let refused = ref [] and results = ref [] and events = ref [] and next = ref 0L in
     let observe_hook = ref (fun _ -> ()) in
     let owner = Journal_worker_admission.create
+      ~runtime_epoch:(Logseq_db_worker_lui.Journal_worker_ids.Runtime.Epoch.of_int64 1L)
+      ~worker_generation:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Generation.of_int64 2L)
       ~send:(fun request ->
         sent := !sent @ [request];next := Int64.succ !next;
         match !results with
@@ -6970,6 +7023,69 @@ module Admission_fixture = struct
     ;command=V2_graph_info}
   ;;
 end
+
+let test_worker_response_routing () =
+  let module F = Admission_fixture in
+  let module A = Journal_worker_admission in
+  let module W = F.Worker in
+  let module Ids = Logseq_db_worker_lui.Journal_worker_ids in
+  let epoch n = Ids.Runtime.Epoch.of_int64 n in
+  let generation n = Ids.Worker.Generation.of_int64 n in
+  let response ?(runtime = 1L) ?(worker = 2L) n outcome =
+    W.Response {runtime_epoch=epoch runtime;worker_generation=generation worker;
+      request_id=F.Id.of_int64 n;outcome} in
+  let check expected actual = Alcotest.(check bool) "delivery" true (actual=expected) in
+  let outcomes = [W.Completed Service.Client_command_completed;
+    Failed "owned failure"; Cancelled; Shutdown] in
+  List.iter (fun outcome ->
+    let f=F.create () in
+    check A.Unowned_response (A.receive f.owner (response 99L outcome));
+    ignore(A.dispatch f.owner Service.Get_graph_state);
+    check A.Registered_response (A.receive f.owner (response 1L outcome));
+    check A.Unowned_response (A.receive f.owner (response 1L outcome))) outcomes;
+  let f=F.create () in
+  ignore(A.dispatch f.owner Service.Get_graph_state);
+  ignore(A.dispatch f.owner Service.Get_graph_state);
+  check A.Dropped_envelope (A.receive f.owner (response ~runtime:9L 1L (W.Failed "foreign runtime")));
+  check A.Dropped_envelope (A.receive f.owner (response ~worker:9L 1L (W.Failed "foreign worker")));
+  check A.Registered_response (A.receive f.owner (response 2L W.Cancelled));
+  check A.Registered_response (A.receive f.owner (response 1L (W.Completed Service.Client_command_completed)));
+  let f=F.create () in
+  let request=F.request 1 in
+  ignore(A.dispatch f.owner (Service.Graph_request request));
+  A.cancel_graph_leases f.owner;
+  ignore(A.dispatch f.owner (Service.Graph_request request));
+  check A.Registered_response (A.receive f.owner (response 1L W.Cancelled));
+  Alcotest.(check bool) "retired graph request" true (A.retire f.owner (F.Id.of_int64 1L));
+  check A.Unowned_response (A.receive f.owner (response 1L (W.Failed "late duplicate")));
+  Alcotest.(check bool) "old completion preserves new protocol owner" true
+    (A.dispatch f.owner (Service.Graph_request request)=W.Full);
+  check A.Registered_response (A.receive f.owner (response 2L W.Shutdown));
+  let f=F.create () in
+  List.iter (fun refusal -> f.results:=[refusal];
+    ignore(A.dispatch f.owner Service.Get_graph_state);
+    check A.Unowned_response
+      (A.receive f.owner (response (Int64.of_int (List.length !(f.sent))) W.Cancelled)))
+    [W.Full;Not_ready;Stopping];
+  let f=F.create () in
+  ignore(A.dispatch f.owner Service.Get_graph_state);
+  let terminal runtime = W.Terminal {runtime_epoch=epoch runtime;
+    worker_generation=generation 2L;error="terminal"} in
+  check A.Broadcast (A.receive f.owner (terminal 1L));
+  check A.Dropped_envelope (A.receive f.owner (terminal 9L));
+  let push worker = W.Push {runtime_epoch=epoch 1L;worker_generation=generation worker;
+    push_sequence=Ids.Worker.Push_sequence.one;topic=Service.invalidation_topic;
+    payload=Service.Graph_push (F.Protocol.V2_changes_available
+      {api_version=F.Protocol.api_version;generation="db";through="r1"})} in
+  check A.Broadcast (A.receive f.owner (push 2L));
+  check A.Dropped_envelope (A.receive f.owner (push 9L));
+  check A.Registered_response (A.receive f.owner (response 1L W.Shutdown));
+  let f=F.create () in
+  f.observe_hook := (fun _ -> check A.Registered_response
+    (A.receive f.owner (response 1L (W.Failed "observer completion"))));
+  ignore(A.dispatch f.owner ~observe_projection:true (Service.Graph_request (F.request 1)));
+  check A.Unowned_response (A.receive f.owner (response 1L W.Cancelled))
+;;
 
 let test_worker_admission_owner () =
   let module F = Admission_fixture in
@@ -7068,7 +7184,9 @@ let () =
     Journal_bridge.register hooks)
   else Alcotest.run
     "application view"
-    [ ( "Worker admission owner", [Alcotest.test_case "single owner lifecycle" `Quick test_worker_admission_owner])
+    [ ( "Worker admission owner", [
+      Alcotest.test_case "single owner lifecycle" `Quick test_worker_admission_owner;
+      Alcotest.test_case "exclusive channel response routing" `Quick test_worker_response_routing])
     ; ( "diagnostic identity", [ Alcotest.test_case "actual worker identity" `Quick test_diagnostic_identity_comes_from_worker ])
     ; ( "diagnostic failure", [
       Alcotest.test_case "integrity attention survives read success and bounded history" `Quick test_integrity_attention_survives_unrelated_read_success;

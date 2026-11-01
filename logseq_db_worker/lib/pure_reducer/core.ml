@@ -1145,6 +1145,13 @@ let graph_scopes state =
 let graph_state_for_scope state (scope:Sync.graph_scope) =
   if Sync.scope_for_graph state.sync_core ~graph_id:scope.graph_id <> Some scope then None
   else Some (load_graph state scope).graph
+type coordination_state =
+  { sync : Sync.coordination_state
+  ; residents : (Sync.graph_scope * graph_state) list
+  }
+let coordination_state state =
+  let sync=Sync.coordination_state state.sync_core in
+  {sync;residents=List.map (fun (scope,_) -> scope,(load_graph state scope).graph) sync.residents}
 let session_for_ticket state ticket =
   List.find_opt (fun s -> has_pending ticket.id s.saved_pending) (remember_graph state).graph_sessions
 let scope_of_event state = function
