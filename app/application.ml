@@ -3914,6 +3914,12 @@ let start
            | Journals_read value -> observe_projection_response
              (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
                request_id=request.request_id;outcome=V2_journals_outcome {items=value.items;next_cursor=None}})
+           | Target_summary_read value -> observe_projection_response
+             (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
+               request_id=request.request_id;outcome=V2_block_summary_outcome
+                 {lookup=value.lookup;page=value.page;items=value.items;next_cursor=None;
+                  scope_revision=value.scope_revision;generation=value.generation;
+                  projection_revision=value.projection_revision}})
            | Task_catalog_read _ -> forget_projection_request request.request_id
            | Favorites_read{first_page;value}->
              Journal_media_runtime.forget_request (!media_runtime_cell) request.request_id;

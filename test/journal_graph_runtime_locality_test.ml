@@ -8,7 +8,7 @@ module Production_runtime = Journal_graph_runtime
 let fixture_requests = Hashtbl.create 32
 let fixture_days = Hashtbl.create 32
 
-module Catalog_producer = struct
+module Worker_producer = struct
   module W = Journal_worker_coordination.Worker_api
   module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 
@@ -22,7 +22,8 @@ module Catalog_producer = struct
 
   let wire_request runtime request =
     match request.Protocol.command, Production_runtime.worker_read runtime request with
-    | Protocol.V2_list_journals _, Some (Production_runtime.Read read) ->
+    | ( (Protocol.V2_list_journals _ | V2_get_outline_block_summary _)
+      , Some (Production_runtime.Read read) ) ->
       (match
          I.request
            session
@@ -30,7 +31,7 @@ module Catalog_producer = struct
            (W.Query (budget read.maximum_items, read.query))
        with
        | Ok (S.Coordination_query { request = wire; _ }) -> wire
-       | _ -> Alcotest.fail "journal fixture wire planning failed")
+       | _ -> Alcotest.fail "typed fixture wire planning failed")
     | _ -> request
   ;;
 
@@ -60,7 +61,28 @@ module Catalog_producer = struct
            runtime
            ~request_id:request.request_id
            (read.outcome value)
-       | _ -> Alcotest.fail "typed catalog producer fixture failed")
+       | Ok (W.Answered (Error (W.Stale_read message))) ->
+         Production_runtime.receive
+           runtime
+           (Protocol.V2_response
+              { api_version = Protocol.api_version
+              ; request_id = request.request_id
+              ; outcome = V2_failed { code = "staleReadCursor"; message }
+              })
+       | Ok (W.Answered (Error W.Response_budget_exceeded)) ->
+         Production_runtime.receive
+           runtime
+           (Protocol.V2_response
+              { api_version = Protocol.api_version
+              ; request_id = request.request_id
+              ; outcome =
+                  V2_failed { code = "responseTooLarge"; message = "oversized fixture" }
+              })
+       | _ ->
+         Production_runtime.fail_request
+           runtime
+           request
+           ~message:"Typed fixture response rejected")
     | _ -> Production_runtime.receive runtime raw
   ;;
 end
@@ -71,9 +93,10 @@ module Runtime = struct
   let receive runtime (Protocol.V2_response envelope as raw) =
     let key = Graph.Uuid.to_string envelope.request_id in
     (match Hashtbl.find_opt fixture_requests key, envelope.outcome with
+    | Some (Protocol.V2_get_outline_block_summary _ as command), Protocol.V2_block_summary_outcome _
     | Some (Protocol.V2_list_journals _ as command), Protocol.V2_journals_outcome _
     | Some (Protocol.V2_list_task_statuses _ as command), Protocol.V2_task_statuses_outcome _ ->
-      Catalog_producer.receive runtime
+      Worker_producer.receive runtime
         {Protocol.api_version=Protocol.api_version;request_id=envelope.request_id;command} raw
     | Some (Protocol.V2_get_page_tree {maximum_depth=0;_}),
       Protocol.V2_page_tree_outcome ({maximum_depth=1;items;page;_} as source) ->
@@ -106,10 +129,10 @@ module Runtime = struct
           {requests=[];responses=output.responses} output.requests
       in serve result
     | _ -> Production_runtime.receive runtime raw)
-    |> Catalog_producer.wire_output runtime
+    |> Worker_producer.wire_output runtime
 
   let submit runtime request =
-    Production_runtime.submit runtime request |> Catalog_producer.wire_output runtime
+    Production_runtime.submit runtime request |> Worker_producer.wire_output runtime
 end
 
 let uuid value = Graph.Uuid.of_string value |> Result.get_ok
@@ -1581,6 +1604,26 @@ let target_refresh kind =
     runtime, page, refresh
 ;;
 
+let test_target_summary_uses_owned_worker_query () =
+  let runtime, _, request = target_refresh `Capture in
+  (match Production_runtime.worker_read runtime request with
+   | Some
+       (Production_runtime.Read
+          { query = Journal_worker_coordination.Worker_api.Block_summary _
+          ; maximum_items
+          ; _
+          }) ->
+     Alcotest.(check int)
+       "retained summary budget"
+       Protocol.default_page_size
+       maximum_items
+   | _ -> Alcotest.fail "canonical summary bypasses typed coordinator");
+  ignore (Production_runtime.abandon runtime request);
+  match Production_runtime.worker_read runtime request with
+  | Some (Production_runtime.Unowned_read _) -> ()
+  | _ -> Alcotest.fail "retired summary falls back to legacy transport"
+;;
+
 let summary_children ?(page = page_uuid) count =
   List.init count (fun index ->
     let child =
@@ -1712,6 +1755,32 @@ let test_target_children_continue () =
       3
       (List.length entry.child_summaries)
   | _ -> Alcotest.fail "Capture lost its canonical children"
+;;
+
+let test_target_repeated_cursor_settles () =
+  let runtime, page, first = target_refresh `Capture in
+  let lookup =
+    Protocol.V2_present_block
+      { value =
+          { record with block = { block with page = page.uuid; parent = page.uuid } }
+      ; revision = "canonical-2"
+      }
+  in
+  let cursor = Some (Graph.Cursor.of_string "nonadvancing-summary" |> Result.get_ok) in
+  let page request =
+    Runtime.receive
+      runtime
+      (summary_response request page lookup [] cursor "projection-2")
+  in
+  let next = page first |> fun o -> only "summary continuation" o.requests in
+  let output = page next in
+  Alcotest.(check int)
+    "nonadvancing summary cannot continue"
+    0
+    (List.length output.requests);
+  match (only "summary failure remains owned" output.responses).payload with
+  | Runtime.Mutation_failed { kind = Capture_mutation; _ } -> ()
+  | _ -> Alcotest.fail "nonadvancing summary lost mutation owner"
 ;;
 
 let test_target_terminal kind terminal =
@@ -4048,7 +4117,7 @@ let test_feed_date_budget_failure_restarts_bound_cursor () =
 let test_typed_date_budget_failure_preserves_classification () =
   let runtime = Runtime.create () in
   let original = feed_window_request runtime ~days:3 ~slots:16 in
-  let module F = Catalog_producer in
+  let module F = Worker_producer in
   match Production_runtime.worker_read runtime original with
   | Some (Production_runtime.Read read) ->
     let operation = F.W.Query (F.budget read.maximum_items, read.query) in
@@ -8782,7 +8851,8 @@ let () =
             test_feed_with_blank_root_continues
         ] )
     ; ( "target mutation confirmation"
-      , [ Alcotest.test_case
+      , [ Alcotest.test_case "summary uses owned Worker query" `Quick test_target_summary_uses_owned_worker_query
+        ; Alcotest.test_case
             "Capture targeted canonical block and children"
             `Quick
             (fun () -> test_target_confirmation `Capture "Stored capture" 3)
@@ -8794,6 +8864,7 @@ let () =
             "Blank canonical target completes without fabricated entry"
             `Quick
             (fun () -> test_target_confirmation `Update "" 0)
+        ; Alcotest.test_case "Repeated target cursor settles" `Quick test_target_repeated_cursor_settles
         ; Alcotest.test_case
             "Target children paginate independently of siblings"
             `Quick

@@ -43,9 +43,10 @@ let secrets =
 let favorite_page_id = uuid "9c000000-0000-4000-8000-000000000100"
 let favorite_member n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (100 + n))
 
+let summary_child n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (300+n))
 let journal_page n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (200+n))
 
-let seed_favorite_memberships_and_journals path =
+let seed_coordination_read_data path =
   let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
   let module Session = Logseq_db_storage.Storage_session in
   let connection = Storage.open_database path |> Result.get_ok in
@@ -109,6 +110,14 @@ let seed_favorite_memberships_and_journals path =
              Add (node,"block/journal-day",Int64 20260830L);
              Add (node,"logseq.property/public?",Bool true)]) [1;2]
        in
+       let ops = ops @ List.concat_map (fun n ->
+         let node=Datascript.Temp_id ("synthetic-summary-child-" ^ string_of_int n) in
+         Datascript.[
+           Add (node,"block/uuid",Uuid (W.Uuid.to_string (summary_child n)));
+           Add (node,"block/title",String "Synthetic summary child");
+           Add (node,"block/order",String ("a" ^ string_of_int n));
+           Add (node,"block/parent",Ref_to (lookup Test_support.authoritative_block_uuid));
+           Add (node,"block/page",Ref_to (lookup Test_support.page_uuid))]) [1;2] in
        let staged =
          Session.stage_transact session ~authoritative_before:database ops
          |> Result.get_ok
@@ -170,7 +179,7 @@ let with_client
   T.with_managed (fun fixture ->
     let root = fixture.config.application_support_directory in
     let first_path = Test_support.seed_mirror root in
-    if favorites then seed_favorite_memberships_and_journals first_path;
+    if favorites then seed_coordination_read_data first_path;
     ignore (Test_support.seed_mirror ~graph_id:second_graph root);
     if statuses then seed_status_catalog root;
     let graph : Sync.graph =
@@ -409,15 +418,17 @@ let test_client_to_typed_read () =
      with
      | Error (W.Invalid_input _) -> ()
      | _ -> failwith "foreign parent accepted continuation");
+    let summary_budget = W.read_budget session ~maximum_items:P.maximum_page_size ~maximum_bytes:65536 |> Result.get_ok in
     let _, summary =
       request
         (W.Query
-           ( budget
+           ( summary_budget
            , W.Block_summary
                { block = Test_support.authoritative_block_uuid; after = None } ))
     in
     (match summary with
      | W.Answered (Ok summary) ->
+       require (summary.next=None) "test projection cannot infer exact child count from Partial";
        require (Option.is_some summary.page) "atomic summary lost owning page";
        (match summary.lookup, summary.page with
         | P.V2_present_block { value; revision }, Some (P.V2_present_page { page; _ }) ->
@@ -438,6 +449,76 @@ let test_client_to_typed_read () =
             "actual App projection lost typed DTO source"
         | _ -> failwith "atomic summary missing canonical block")
      | _ -> failwith "atomic summary failed");
+    (* Drive the production summary planner through real Service pages. The
+       smaller test budget exercises continuation; production uses the protocol
+       default budget. No write UI is switched by this read-path test. *)
+    let module Confirmation = Journal_graph_mutation_confirmation in
+    let owner = Confirmation.create () in
+    let planned = ref None
+    and clock = ref 800L in
+    let ports : Confirmation.ports =
+      { now =
+          (fun () ->
+            clock := Int64.succ !clock;
+            !clock)
+      ; plan_read =
+          (fun ~source_epoch:_ read command ->
+            let original : P.request =
+              { api_version = P.api_version
+              ; request_id = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012Ld" !clock)
+              ; command
+              }
+            in
+            planned := Some (read, original);
+            original)
+      }
+    in
+    ignore
+      (Confirmation.start
+         owner
+         ~ports
+         (Update_conflict_refresh
+            { block_id = W.Uuid.to_string Test_support.authoritative_block_uuid })
+       |> Result.get_ok);
+    let rec summary_page count =
+      require (count < 10) "real summary cursor did not terminate";
+      let read, _ = Option.get !planned in
+      let _, reply = request (W.Query (budget, Confirmation.worker_query read)) in
+      match reply with
+      | W.Answered (Ok value) ->
+        let more = Option.is_some value.next in
+        (match
+           Confirmation.receive_summary
+             owner
+             ~ports
+             read
+             ~lookup:value.lookup
+             ~page:value.page
+             ~items:value.items
+             ~next_cursor:value.next
+             ~scope_revision:value.scope_revision
+             ~generation:value.generation
+             ~projection_revision:value.projection_revision
+         with
+         | Continue (Ok _) ->
+           require more "planner continued exhausted real summary";
+           summary_page (count + 1)
+         | Confirmed value ->
+           require ((not more) && count >= 1) "summary completed before all real pages";
+           require (Rrbvec.length value.children = 2) "summary lost exact child cardinality";
+           List.iter
+             (fun n ->
+                require
+                  (Rrbvec.exists
+                     (fun (item : P.v2_child_member) ->
+                        W.Uuid.equal item.value.block.uuid (summary_child n))
+                     value.children)
+                  "summary lost actual child identity")
+             [ 1; 2 ]
+         | _ -> failwith "production summary planner rejected actual Service DTO")
+      | _ -> failwith "real summary planner query failed"
+    in
+    summary_page 0;
     let baseline =
       List.find_map
         (fun (event, _) ->
