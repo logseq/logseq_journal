@@ -15,6 +15,15 @@ type mutation_kind =
   | Delete_subtree_mutation
 
 type payload =
+  | Child_projection_ready of
+      { root : Logseq_db_types.Graph_types.Uuid.t; round : int64;
+        command : Journal_graph_projection.create_child;
+        presentation : Journal_worker_coordination.Worker_api.presentation;
+        result : payload; failure : Journal_worker_coordination.Worker_api.error option }
+  | Child_waiting of {command:Journal_graph_projection.create_child;message:string}
+  | Child_projection_settled of
+      { command : Journal_graph_projection.create_child; presentation : Journal_worker_coordination.Worker_api.presentation option; result : payload;
+        failure : Journal_worker_coordination.Worker_api.error option; insert_rejected : bool }
   | Mutation_settled of Journal_worker_coordination.Worker_api.mutation_intent * Journal_worker_coordination.Worker_api.presentation * payload
   | Mutation_waiting of { mutation_id:string; block_id:string; message:string }
   | Projection_changes of Logseq_db_worker.Protocol.v2_change_window list
@@ -139,6 +148,7 @@ module Copy = Journal_copy
 module Worker = Journal_worker_coordination.Worker_api
 
 type worker_read_result =
+  | Child_chain_summary of Journal_worker_coordination.Worker_api.block_summary
   | Changes_resync of string
   | Changes_retired
   | Changes_read of Worker.change_batch
@@ -218,3 +228,11 @@ val mutation_presentation : t -> Logseq_db_worker.Protocol.request ->
   Journal_worker_coordination.Worker_api.presentation option
 
 val acknowledge_mutation : t -> Journal_worker_coordination.Worker_api.mutation_intent -> unit
+
+val worker_child_ack : t -> Logseq_db_worker.Protocol.request ->
+  (Journal_worker_coordination.Worker_api.mutation_intent * Journal_worker_coordination.Worker_api.presentation) option
+val rebind_child_ack : t -> Logseq_db_worker.Protocol.request ->
+  presentation:Journal_worker_coordination.Worker_api.presentation -> bool
+val receive_child_ack : t -> Logseq_db_worker.Protocol.request -> (unit,string) result -> output
+val child_projection_applied : t -> root:Logseq_db_types.Graph_types.Uuid.t -> round:int64
+  -> presentation:Journal_worker_coordination.Worker_api.presentation -> output

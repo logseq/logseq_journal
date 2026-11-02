@@ -470,6 +470,46 @@ let map_details t ~f =
     t
 ;;
 
+let child_consumed t command ~detail ~draft =
+  let found,accepted=Owners.fold(fun _ view (found,accepted)->
+    let owner=match view with Detail_view{detail;_}->Some detail
+      | Detail_loading_view{staged_detail;_}->staged_detail|_->None in
+    match owner with Some owner when Journal_detail.has_child_request owner command ->true,accepted && detail owner
+      | _->found,accepted) t.owners (false,true) in
+  let found,accepted=Drafts.fold(fun _ owner(found,accepted)->
+    if Journal_detail.retained_has_child_request owner.composer command then true,accepted && draft owner.composer
+    else found,accepted) t.drafts (found,accepted) in
+  found && accepted
+;;
+let has_child_request t command = child_consumed t command ~detail:(fun _->true) ~draft:(fun _->true)
+let preview_child_created t ~command ~child ~parent ~error =
+  let drafts=Drafts.map(fun draft->
+    let composer=Journal_detail.preview_retained_child draft.composer ~command ~child ~parent ~error in
+    if composer==draft.composer then draft else {draft with composer})t.drafts in
+  map_details {t with drafts} ~f:(fun detail->Journal_detail.preview_child_created detail ~command ~child ~parent ~error)
+;;
+let preview_child_failure t ~command ~message =
+  let drafts=Drafts.map(fun draft->
+    let composer=Journal_detail.preview_retained_failure draft.composer ~command ~message in
+    if composer==draft.composer then draft else {draft with composer})t.drafts in
+  map_details {t with drafts} ~f:(fun detail->Journal_detail.preview_child_failure detail ~command ~message)
+;;
+let child_projection_applied t ~command ~child ~parent ~error =
+  child_consumed t command
+    ~detail:(fun detail->Journal_detail.child_projection_applied detail ~command ~child ~parent ~error)
+    ~draft:(fun draft->Journal_detail.retained_projection_applied draft ~command ~child ~parent ~error)
+;;
+let child_failure_applied t ~command ~message = child_consumed t command
+  ~detail:(fun detail->Journal_detail.child_failure_applied detail ~command ~message)
+  ~draft:(fun draft->Journal_detail.retained_failure_applied draft ~command ~message)
+;;
+let release_rejected_child t ~command ~message =
+  let drafts=Drafts.map(fun draft->
+    let composer=Journal_detail.release_rejected_retained draft.composer ~command ~message in
+    if composer==draft.composer then draft else {draft with composer})t.drafts in
+  map_details {t with drafts} ~f:(fun detail->Journal_detail.release_rejected_child detail ~command ~message)
+;;
+
 let apply_detail_response t ~request_generation projection =
   Owners.fold
     (fun entry_id view t ->

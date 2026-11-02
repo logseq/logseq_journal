@@ -76,3 +76,5 @@ val retry : t -> t * Journal_graph_request.t option
 val completed_by : t -> Journal_model.t -> bool
 val retry_identity_locked : t -> bool
 val lock_for_retry : t -> t
+(** Only after a known-not-applied outcome was consumed and acknowledged. *)
+val release_rejected_attempt : t -> t

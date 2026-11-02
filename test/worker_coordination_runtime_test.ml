@@ -1751,6 +1751,77 @@ let test_host_durable_recovery_confirmation_ack () =
       | _->false) "real canonical DTO lost committed status UUID";
     ignore(value(call(W.Acknowledge_intent status_intent)));
     require(Rrbvec.is_empty(recover()).items) "real status ACK retained pending recovery entry";
+    (* Child business ordering against the actual Service and persisted intents.
+       UI application here uses the production pure block projection; mounted
+       application tests separately verify the rendered composer barrier. *)
+    let module Child=Journal_graph_mutation_confirmation.Pure_child in
+    let parent_summary=value(call(W.Query(budget,W.Block_summary
+      {block=Test_support.authoritative_block_uuid;after=None}))) in
+    let parent_revision,page=match parent_summary.lookup,parent_summary.page with
+      | P.V2_present_block{revision;_},Some(P.V2_present_page{page;_})->revision,page
+      | _->failwith "real Child parent unavailable" in
+    let child=uuid "9f000000-0000-4000-8000-000000001003" in
+    let mutation_id=uuid "9f000000-0000-4000-8000-000000001004" in
+    let command:Journal_graph_projection.create_child=
+      {mutation_id=W.Uuid.to_string mutation_id;calendar_generation=1L;
+       block_id=W.Uuid.to_string child;parent_block_id=W.Uuid.to_string Test_support.authoritative_block_uuid;
+       expected_parent_revision=parent_revision;sibling_order="a";source="Typed real child";
+       task_state=Journal_model.Status(W.Uuid.to_string status);status_confirmation=true;status_intent_revision=0L;
+       creation_time=Journal_time.create ~instant_unix_ms:1_788_192_000_000L ~local_day:20260901
+         ~local_minute_of_day:0 |> Result.get_ok} in
+    let insert=P.V2_insert_blocks{mutation_id;parent=Test_support.authoritative_block_uuid;
+      roots=[{uuid=child;title=command.source;children=[]}];
+      preconditions={blocks=[Test_support.authoritative_block_uuid,parent_revision];pages=[];
+        scopes=[P.V2_children_scope Test_support.authoritative_block_uuid,parent_summary.scope_revision]}} in
+    let initial,action=Child.start ~command ~page ~resolved_status:(Some status) ~insert |> Result.get_ok in
+    let writes=ref 0 and acks=ref 0 and applied=ref None and proofs=ref [] in
+    let rec drive fuel state action =
+      require(fuel>0) "actual Child lifecycle failed to settle";
+      let next,action=match action with
+        | Child.Write(index,round,_) ->
+          incr writes;
+          let stage=Child.stage state index in
+          let intent=W.mutation_intent session ~mutation_id:(Child.stage_id stage)(Child.stage_mutation stage) |> Result.get_ok in
+          let state=Child.bind state ~index ~round ~intent ~presentation |> Option.get in
+          let receipt=match value(call(W.Mutate intent)) with
+            | W.Committed_pending_presentation receipt->receipt|_->failwith "real Child lost durable commit" in
+          proofs:=(intent,receipt):: !proofs;
+          Child.receive state ~index ~round(value(call(W.Confirm(presentation,receipt))))
+        | Read_child round ->
+          Child.read_child state ~round(value(call(W.Query(budget,W.Block_summary{block=child;after=None}))))
+        | Read_parent(round,summary) ->
+          ignore(value(call(W.Query(budget,W.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None}))));
+          let block,revision,page=match summary.lookup,summary.page with
+            | P.V2_present_block{value;revision},Some(P.V2_present_page{page;_})->value.block,revision,page
+            | _->failwith "real Child canonical DTO absent" in
+          applied:=Some(Journal_graph_projection.block_on_page ~page ~revision
+            ~child_count:(List.length summary.items) ~time_context:{localtime=Unix.gmtime} block |> Result.get_ok);
+          Child.projection_ready state ~round
+        | Present round ->
+          require(Option.exists(fun block->Journal_model.source block=command.source) !applied)
+            "Child ACK preceded production projection application";
+          Child.applied state ~round presentation
+        | Acknowledge(index,round,intent,_) ->
+          require(!applied<>None) "actual Child intent acknowledged without a consumer";
+          ignore(value(call(W.Acknowledge_intent intent)));incr acks;
+          require(Rrbvec.is_empty(recover()).items) "settled Child prefix retained recovery obligation";
+          Child.acknowledged state ~index ~round(Ok())
+        | Complete->state,Complete
+        | Wait message->failwith("actual Child stalled: "^message)
+        | Ignore->failwith "actual Child dropped its current continuation" in
+      match action with Child.Complete->next|_->drive(fuel-1)next action in
+    ignore(drive 24 initial action);
+    require(!writes=2 && !acks=2) "real Child bypassed Insert/Status or per-stage ACK";
+    let final=value(call(W.Query(budget,W.Outline_block{uuid=child;revision=None}))) in
+    require(match final with P.V2_present_block{value;_}->value.block.title=command.source && value.task_status=Some status|_->false)
+      "real Child chain did not preserve source/status";
+    List.iter(fun(intent,receipt)->
+      require(match value(call(W.Mutate intent)) with
+        | W.Committed_pending_presentation original->W.receipt_revisions original=W.receipt_revisions receipt
+        | _->false) "Child ACK removed original commit proof") !proofs;
+    require(value(call(W.Query(budget,W.Outline_block{uuid=child;revision=None})))=final)
+      "Child original-intent reconciliation wrote a duplicate";
+
     let revision=match read() with P.V2_present_block{revision;_}->revision|_->assert false in
     let deletion=W.mutation_intent session ~mutation_id:(uuid "9f000000-0000-4000-8000-000000001002")
       (W.Delete_blocks{root=Test_support.authoritative_block_uuid;

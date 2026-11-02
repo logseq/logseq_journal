@@ -1176,8 +1176,40 @@ let back_state state =
   { state with routes; timeline }
 ;;
 
+let coordinated_error_message = function
+  | Journal_worker_coordination.Worker_api.Db_error error -> Logseq_db_worker.Error.message error
+  | Invalid_input message | Service_failed message | Unsupported_operation message
+  | Protocol_mismatch message | Stale_read message | Resync_required message -> message
+  | Revoked_session -> "The graph session changed. Retry in the current graph."
+  | Host_change_in_progress -> "The graph is closing. The outcome is retained."
+  | Response_budget_exceeded -> "The result exceeded its response budget."
+;;
 let rec apply_worker_response ?(settling=false) ~discard state (response : Journal_graph_runtime.response) =
   match response.payload with
+  | Child_projection_ready {command;result;failure;_} ->
+    if not(Journal_routes.has_child_request state.routes command) then state
+    else (match result with
+      | Child_created{child;parent;_}->
+        {state with routes=Journal_routes.preview_child_created state.routes ~command ~child ~parent
+          ~error:(Option.map coordinated_error_message failure)}
+      | Child_failed{failure;_}->
+        {state with routes=Journal_routes.preview_child_failure state.routes ~command
+          ~message:(failure_source_message failure)}
+      | _->state)
+  | Child_waiting{command;message}->
+    if Journal_routes.has_child_request state.routes command then
+      {state with routes=Journal_routes.apply_child_failure state.routes ~block_id:command.block_id ~message}
+    else state
+  | Child_projection_settled{command;result;failure;insert_rejected;_}->
+    if not(Journal_routes.has_child_request state.routes command) then state
+    else (match failure with
+      | Some failure when insert_rejected ->
+        {state with routes=Journal_routes.release_rejected_child state.routes ~command
+          ~message:(coordinated_error_message failure)}
+      | Some failure ->
+        {state with routes=Journal_routes.apply_child_failure state.routes ~block_id:command.block_id
+          ~message:(coordinated_error_message failure)}
+      | None->apply_worker_response ~settling:true ~discard state {payload=result})
   | Mutation_settled(intent,presentation,payload)->
     let next=apply_worker_response ~settling:true ~discard state {payload} in
     (match state.pending_status with
@@ -4071,6 +4103,8 @@ let start
     | _->Journal_graph_transport.Not_ready in
   let coordinated_mutation_finished=ref(fun (_:Graph_service.timeline_scope)
     (_:Logseq_db_worker.Protocol.request) (_:(Wc.mutation_progress,string)result)->()) in
+  let coordinated_child_ack_finished=ref(fun (_:Graph_service.timeline_scope)
+    (_:Logseq_db_worker.Protocol.request) (_:Wc.presentation) (_:(unit,string)result)->()) in
   let send_coordinated_mutation request (mutation_id,command) =
     match current_owner(),ensure_coordination() with
     | Some owner,Ok host ->
@@ -4094,6 +4128,32 @@ let start
           | _->Journal_graph_transport.Not_ready)
        | _->Journal_graph_transport.Not_ready)
     | _->Journal_graph_transport.Not_ready in
+  let send_coordinated_child_ack request (intent,applied_presentation) =
+    match current_owner(),!coordination_host with
+    | Some owner,Some(_,host)->
+      (match Option.bind(Coordination.projection(Coordination_host.view host))Wc.selected with
+       | Some presentation when Wc.matches_scope(Wc.presentation_session presentation)owner ->
+         (match Coordination_host.settle_applied_mutation host ~presentation ~applied_presentation intent with
+          | Error _->Journal_graph_transport.Not_ready
+          | Ok(Coordination.Acknowledgement ticket)->
+            Coordination_host.watch host ticket ~f:(fun reply->
+              let result=match reply with Wc.Answered(Ok())->Ok()
+                | _->Error "The child result is applied. Retry finishes its durable acknowledgement." in
+              !coordinated_child_ack_finished owner request presentation result);
+            Journal_graph_transport.Accepted
+          | Ok(Coordination.Reconciliation ticket)->
+            let bound=Journal_graph_runtime.rebind_child_ack (!graph_runtime_cell)request ~presentation in
+            let rec watch ticket=Coordination_host.watch host ticket ~f:(fun reply->
+              match reply with
+              | Wc.Answered(Ok(Wc.Committed_pending_presentation _)) when bound ->
+                (match Coordination_host.reconcile_mutation host ~presentation intent with
+                 | Ok ticket->watch ticket
+                 | Error _-> !coordinated_mutation_finished owner request(Error "The child awaits a current presentation."))
+              | Answered(Ok progress) when bound -> !coordinated_mutation_finished owner request(Ok progress)
+              | _-> !coordinated_mutation_finished owner request(Error "The child could not be reconciled. Retry checks the same child.")) in
+            watch ticket;Journal_graph_transport.Accepted)
+       | _->Journal_graph_transport.Not_ready)
+    | _->Journal_graph_transport.Not_ready in
   let deliver_output (output : Journal_graph_runtime.output) =
     List.iter
       (fun response ->
@@ -4109,6 +4169,9 @@ let start
       ~send:(fun request ->
         match Journal_graph_runtime.worker_read (!graph_runtime_cell) request with
         | Some read -> send_coordinated_read request read
+        | None ->
+        match Journal_graph_runtime.worker_child_ack (!graph_runtime_cell) request with
+        | Some ack->send_coordinated_child_ack request ack
         | None ->
         match Journal_graph_runtime.worker_mutation (!graph_runtime_cell) request with
         | Some mutation->send_coordinated_mutation request mutation
@@ -4191,6 +4254,18 @@ let start
     set_state_and_effect (fun state ->
       let state, effects = List.fold_left (fun (state, effects) response ->
         let response=match response.Journal_graph_runtime.payload with
+          | Child_projection_ready{command;presentation;_} when not(
+              match timeline_scope state,!coordination_host with
+              | Some owner,Some(_,host)->Coordination.current_presentation ~owner(Coordination_host.view host)presentation
+              | _->false)->
+            Journal_graph_runtime.{payload=Child_failed{mutation_id=command.mutation_id;block_id=command.block_id;
+              failure=Projection_failure "The child confirmation belongs to an earlier presentation. Retry checks the same child."}}
+          | Child_projection_settled{command;presentation;_} when not(
+              match timeline_scope state,!coordination_host,presentation with
+              | Some owner,Some(_,host),Some presentation->Coordination.current_presentation ~owner(Coordination_host.view host)presentation
+              | _->false)->
+            Journal_graph_runtime.{payload=Child_failed{mutation_id=command.mutation_id;block_id=command.block_id;
+              failure=Projection_failure "The child cleanup belongs to an earlier presentation. Retry checks the same child."}}
           | Mutation_settled(intent,presentation,_) when not(
               match timeline_scope state,!coordination_host with
               | Some owner,Some(_,host)->Coordination.current_presentation ~owner (Coordination_host.view host)presentation
@@ -4216,6 +4291,19 @@ let start
           let next = step_root state (Completed response) in
           report_app_response state next response;
           let effects=match response.payload,!coordination_host with
+            | Journal_graph_runtime.Child_projection_ready{root;round;command;presentation;result;failure},Some _ ->
+              let applied=match result with
+                | Child_created{child;parent;_}->Journal_routes.child_projection_applied next.routes ~command ~child ~parent
+                    ~error:(Option.map coordinated_error_message failure)
+                | Child_failed{failure;_}->Journal_routes.child_failure_applied next.routes ~command
+                    ~message:(failure_source_message failure)
+                | _->false in
+              if not applied then effects else
+                let owner=timeline_scope next in
+                Effect.of_thunk(fun()->run_owned owner(fun()->
+                  Effect.bind(Effect.of_thunk(fun()->deliver_output
+                    (Journal_graph_runtime.child_projection_applied (!graph_runtime_cell) ~root ~round ~presentation)))
+                    ~f:(fun delivery->apply_graph_responses set_state_and_effect delivery.responses)))::effects
             | Journal_graph_runtime.Mutation_settled(intent,presentation,_),Some _->
               let acknowledgement=Effect.of_thunk(fun()->acknowledge_mutation ~applied_presentation:presentation intent) in
               acknowledgement::effects
@@ -4336,8 +4424,6 @@ let start
     in
     match delivery.error with
     | None -> state
-    | Some _ when List.exists(fun response->match response.Journal_graph_runtime.payload with
-        | Mutation_waiting _->true|_->false)delivery.responses ->state
     | Some message -> fail_graph_transport state message
   in
   let send request =
@@ -4391,7 +4477,7 @@ let start
                request_id=request.request_id;outcome=V2_children_outcome
                  {parent=value.parent;revision_scope=value.revision_scope;scope_revision=value.scope_revision;
                   items=value.items;next_cursor=None}})
-           | Target_summary_read value -> observe_projection_response
+           | Child_chain_summary value | Target_summary_read value -> observe_projection_response
              (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
                request_id=request.request_id;outcome=V2_block_summary_outcome
                  {lookup=value.lookup;page=value.page;items=value.items;next_cursor=None;
@@ -4425,10 +4511,17 @@ let start
               | _->Ok())))!coordination_host) application;
           set_state(fun state->match delivery.error with
             | None->state
-            | Some _ when List.exists(fun response->match response.Journal_graph_runtime.payload with
-                | Mutation_waiting _->true|_->false)delivery.responses->state
             | Some message when Option.is_some state.feed_refresh->fail_feed_transport state message
             | Some message->fail_graph_transport state message)))))));
+  coordinated_child_ack_finished := (fun owner request presentation result ->
+    if runtime_owner_is_live !state_ref owner then run_owned(Some owner)(fun()->
+      let current=match !coordination_host with
+        | Some(_,host)->Coordination.current_presentation ~owner(Coordination_host.view host)presentation
+        | None->false in
+      let result=if current then result else Error "The child result needs the current presentation before cleanup." in
+      let output=Journal_graph_runtime.receive_child_ack (!graph_runtime_cell)request result in
+      Effect.bind(Effect.of_thunk(fun()->deliver_output output))~f:(fun delivery->
+        apply_graph_responses set_state_and_effect delivery.responses)));
   coordinated_mutation_finished := (fun owner request result ->
     if runtime_owner_is_live !state_ref owner then run_owned(Some owner)(fun()->
       let result=match result,!coordination_host with
@@ -6527,7 +6620,13 @@ let start
                     match Journal_detail.mode detail with
                     | Failed _ -> true
                     | _ -> false
-                  then Journal_detail.retry detail
+                  then (match Journal_detail.retry detail with
+                    | _,Some _ as retry->retry
+                    | _,None->Journal_detail.admit_child detail
+                        ~mutation_id:(fresh_identity ())
+                        ~calendar_generation:(Journal_calendar.generation calendar)
+                        ~block_id:(Logseq_db_types.Graph_types.Uuid.to_string block_id)
+                        ~sibling_order:(sibling_order number) ~creation_time)
                   else
                     Journal_detail.admit_child
                       detail
@@ -6889,6 +6988,8 @@ let start
           composer_capture left owner == composer_capture right owner
           && composer_saving left owner = composer_saving right owner)
     && left.modal = right.modal
+    && Option.bind(Journal_routes.detail left.routes)Journal_detail.child_error
+       = Option.bind(Journal_routes.detail right.routes)Journal_detail.child_error
     && left.graph_state.generation = right.graph_state.generation
     && left.write_enabled = right.write_enabled
     && left.capture_error == right.capture_error
@@ -7096,11 +7197,12 @@ let start
                     (Detail_action
                        ( Detail_outline.scope state.routes
                        , match Journal_detail.mode detail with
-                         | Failed _ -> Detail_retry
+                         | Failed _ when snd(Journal_detail.retry detail)<>None -> Detail_retry
                          | _ -> Detail_submit (Journal_capture.source capture) )))
                ~error:
                  (match Journal_detail.mode detail with
                   | Failed message -> Some message
+                  | _ when Journal_detail.child_error detail<>None -> Journal_detail.child_error detail
                   | _ ->
                     Option.map
                       capture_failure_message

@@ -575,6 +575,7 @@ let run_favorites_native_visibility
   let status_writes = Atomic.make [] in
   let typed_status_mutations=Atomic.make 0 and typed_status_confirms=Atomic.make 0 and typed_status_acks=Atomic.make 0 in
   let pending_change_reads = Atomic.make 0 in
+  let legacy_child_writes = Atomic.make 0 in
   let typed_status_intents=Atomic.make [] in
   let status_summary_queries=Atomic.make 0 in
   let status_more_entered=Atomic.make false and status_more_release=Atomic.make(durable_status<>Some `Paged) in
@@ -1322,6 +1323,15 @@ let run_favorites_native_visibility
                     | Some n ->
                       V2_present_block { value = timeline_block n; revision = status_revision () }
                     | None -> V2_missing_block { uuid = block; revision = "p" }))
+            | V2_get_outline_block_summary{block;_} when
+                List.exists(fun(_, (root:P.v2_block_tree))->root.uuid=block)(Atomic.get detail_captures) ->
+              let parent,root=List.find(fun(_, (root:P.v2_block_tree))->root.uuid=block)(Atomic.get detail_captures) in
+              let value=timeline_block 0 in
+              let value={value with block={value.block with uuid=root.uuid;title=root.title;parent;order="999"}} in
+              V2_block_summary_outcome{lookup=V2_present_block{value;revision="appended"};
+                page=Some(V2_present_page{page;revision="p"});items=[];next_cursor=None;
+                scope_revision="child-children";generation="generation:v1:1:1";
+                projection_revision="projection:v1:1"}
             | V2_get_outline_block_summary{block;_} when Option.is_some delete_scenario ->
               let present=durable_delete=Some `Conflict || durable_delete=Some `Reappeared in
               let value=timeline_block 0 in
@@ -1615,6 +1625,7 @@ let run_favorites_native_visibility
                 })
             | V2_insert_blocks { mutation_id; parent; roots = [ root ]; _ }
               when Option.is_some detail_capture ->
+              (match original_request with Service.Coordination_mutation _->()|_->Atomic.incr legacy_child_writes);
               Atomic.incr child_attempts;
               while not (Atomic.get child_release) do
                 Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
@@ -2798,6 +2809,9 @@ let run_favorites_native_visibility
             then (
               wait "write failure is visible in Composer" (fun () ->
                 Option.is_some (find "text" "Fixture child write failed"));
+              wait "known rejected insertion finishes its acknowledgement" (fun()->Atomic.get typed_status_acks=1);
+              wait "known rejected outcome reaches the rendered cleanup terminal" (fun()->
+                Option.is_none(find "text" "Saving…"));
               collapse ();
               open_capture ();
               dispatch (Lui_protocol.Press (send ())));
@@ -2964,8 +2978,14 @@ let run_favorites_native_visibility
                   (Option.is_some (find "text" "Keep new root draft")));
             if scenario <> "offscreen-attachments"
             then (
-              wait "completion closes Detail Composer" (fun () ->
-                Option.is_none (find "style-class" "composer-input"));
+              wait "completion closes the entire Detail Composer after durable ACK" (fun () ->
+                Option.is_none (find "accessibility-identifier" "journal-append-composer"));
+              Alcotest.(check int) "child UI consumed each durable outcome" (if scenario="failure" then 2 else 1)
+                (Atomic.get typed_status_acks);
+              Alcotest.(check int) "child writes use the typed channel" (if scenario="failure" then 2 else 1)
+                (Atomic.get typed_status_mutations);
+              Alcotest.(check bool) "child completion used canonical confirmation" true (Atomic.get typed_status_confirms>=1);
+              Alcotest.(check int) "child writes have no legacy second consumer" 0 (Atomic.get legacy_child_writes);
               if scenario = "selection-error" then (
                 open_capture ();
                 Alcotest.(check bool) "completed Detail retires picker failure" true

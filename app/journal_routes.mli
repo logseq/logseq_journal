@@ -149,3 +149,12 @@ type retained_drafts
 val retained_attachments : retained_drafts -> Journal_asset_import.staged list
 val retain_drafts : interrupted:bool -> t -> retained_drafts
 val restore_drafts : t -> retained_drafts -> t
+
+val has_child_request : t -> Journal_graph_projection.create_child -> bool
+val preview_child_created : t -> command:Journal_graph_projection.create_child
+  -> child:Journal_model.t -> parent:Journal_model.t -> error:string option -> t
+val preview_child_failure : t -> command:Journal_graph_projection.create_child -> message:string -> t
+val child_projection_applied : t -> command:Journal_graph_projection.create_child
+  -> child:Journal_model.t -> parent:Journal_model.t -> error:string option -> bool
+val child_failure_applied : t -> command:Journal_graph_projection.create_child -> message:string -> bool
+val release_rejected_child : t -> command:Journal_graph_projection.create_child -> message:string -> t

@@ -4339,6 +4339,327 @@ let test_child_choice_traces () =
   done
 ;;
 
+module Child_chain_fixture = struct
+  module C = Journal_graph_mutation_confirmation.Pure_child
+  module W = Journal_worker_coordination.Worker_api
+  module P = Logseq_db_worker.Protocol
+  module G = Logseq_db_types.Graph_types
+  type t =
+    { initial : C.t
+    ; action : C.action
+    ; command : Journal_graph_projection.create_child
+    ; session : W.session
+    ; presentation : W.presentation
+    ; projection : W.projection
+    ; binding : W.binding
+    ; confirm : int -> W.mutation_intent -> W.presentation -> W.mutation_progress
+    }
+  let make ?(task_state=Journal_model.No_status) () =
+    let issuer,_,projection,session=Coordination_test_fixture.fixture
+      ~limits:{Coordination_test_fixture.limits with response_budget_bytes=P.maximum_response_bytes} 5514L in
+    let module I=(val issuer:W.ISSUER) in
+    let presentation=Option.get(W.selected projection) in
+    let uuid s=G.Uuid.of_string s |> Result.get_ok in
+    let _,request=child_identity_detail() |> fun t->Journal_detail.update_child_source t "Frozen child source"
+      |> fun t->Journal_detail.set_child_task t task_state |> child_identity_append in
+    let command=Option.get request |> child_command in
+    let page:G.page={uuid=uuid "70000000-0000-4000-b000-000020260809";name="Child fixture";title="Child fixture";
+      kind=Ordinary_page;created_at_ms=1L;updated_at_ms=1L;tags=[];properties=[];recycled=false} in
+    let parent=uuid command.parent_block_id and child=uuid command.block_id in
+    let insert=P.V2_insert_blocks {mutation_id=uuid command.mutation_id;parent;
+      roots=[{uuid=child;title=command.source;children=[]}];
+      preconditions={blocks=[parent,command.expected_parent_revision];pages=[];
+        scopes=[P.V2_children_scope parent,"children-state:v1:frozen"]}} in
+    let resolved_status=match task_state with Journal_model.Status id->Some(uuid id)|_->None in
+    let initial,action=C.start ~command ~page ~resolved_status ~insert |> Result.get_ok in
+    let confirm index intent presentation =
+      let id=W.mutation_intent_id intent in
+      let request_id=W.request_id id in
+      let after=Printf.sprintf "projection:v1:%d" (index+1) in
+      let receipt=I.mutation_receipt session ~request_id ~intent(P.V2_response
+        {api_version=P.api_version;request_id=id;outcome=V2_mutation_committed
+          {mutation_id=id;status=V2_applied;generation="generation:v1:1:1";
+           before_projection_revision=Printf.sprintf "projection:v1:%d" index;after_projection_revision=after}})
+        |> Result.get_ok in
+      let block:G.block={uuid=child;title=command.source;parent;page=page.uuid;order="a";
+        created_at_ms=1L;updated_at_ms=1L;refs=[];tags=[];properties=[]} in
+      (* Equal visible status is deliberately insufficient to prove a status sub-operation. *)
+      let value:P.v2_block_record={block;task_status=resolved_status;rendered_page_title=page.title;tag_titles=[]} in
+      let confirmation=I.confirmation session ~presentation receipt(P.V2_response
+        {api_version=P.api_version;request_id=id;outcome=V2_block_summary_outcome
+          {lookup=V2_present_block{value;revision=Printf.sprintf "child-state:v1:%d" index};
+           page=Some(V2_present_page{page;revision="page-state:v1:1"});items=[];next_cursor=None;
+           scope_revision="children-state:v1:1";generation="generation:v1:1:1";projection_revision=after}})
+        |> Result.get_ok in
+      W.Confirmed confirmation in
+    {initial;action;command;session;presentation;projection;binding=I.binding;confirm}
+  let write = function C.Write(index,round,wire)->index,round,wire|_->fail "expected a child write"
+  let bind fixture state action =
+    let index,round,_=write action in
+    let stage=C.stage state index in
+    let intent=W.mutation_intent fixture.session ~mutation_id:(C.stage_id stage)(C.stage_mutation stage)
+      |> Result.get_ok in
+    let state=C.bind state ~index ~round ~intent ~presentation:fixture.presentation |> Option.get in
+    state,index,round,intent
+  let confirm fixture state action =
+    let state,index,round,intent=bind fixture state action in
+    C.receive state ~index ~round (fixture.confirm index intent fixture.presentation)
+  let applied fixture state action =
+    let round=match action with C.Read_parent(round,_)->round|_->fail "expected canonical parent read" in
+    let ready,action=C.projection_ready state ~round in
+    require (action=C.Present round) "parent projection cannot be presented";
+    let ignored,action=C.applied ready ~round:Int64.(succ round) fixture.presentation in
+    require(ignored==ready && action=C.Ignore) "foreign UI application advanced cleanup";
+    C.applied ready ~round fixture.presentation
+  let rec flush_prefix fixture state action = match action with
+    | C.Write _ | Complete -> state,action
+    | Read_parent _ -> let state,action=applied fixture state action in flush_prefix fixture state action
+    | Present round -> let state,action=C.applied state ~round fixture.presentation in flush_prefix fixture state action
+    | Acknowledge(index,round,_,_) ->
+      let state,action=C.acknowledged state ~index ~round(Ok()) in flush_prefix fixture state action
+    | Read_child round ->
+      let state,action=C.read_child state ~round(Option.get(C.canonical state)) in flush_prefix fixture state action
+    | Wait message ->fail "prefix settlement failed: %s" message
+    | Ignore ->fail "prefix settlement ignored its current operation"
+end
+
+let test_child_chain_frozen_unknown_choice () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make ~task_state:child_status_a () in
+  let insertion,insert_index,insert_round,_=F.bind fixture fixture.initial fixture.action in
+  let unknown,action=C.receive insertion ~index:insert_index ~round:insert_round F.W.Outcome_unknown in
+  require(match action with C.Wait _->true|_->false) "unknown insertion advanced to status";
+  let retried,retry=C.retry unknown in
+  child_equal (let _,_,wire=F.write fixture.action in wire) (let _,_,wire=F.write retry in wire)
+    "unknown retry rebuilt frozen parent/scope preconditions";
+  let old,action=C.receive retried ~index:insert_index ~round:insert_round F.W.Outcome_unknown in
+  require(old==retried && action=C.Ignore) "old insertion callback changed the retried phase";
+  let inserted,parent=F.confirm fixture retried retry in
+  let inserted,status_a=F.flush_prefix fixture inserted parent in
+  require(match status_a with C.Write(1,_,_)->true|_->false)
+    "equal status skipped its own mutation proof";
+  let active,index,round,_=F.bind fixture inserted status_a in
+  let active,_=C.receive active ~index ~round F.W.Outcome_unknown in
+  let command_b={fixture.command with task_state=child_status_b;status_intent_revision=1L} in
+  let status_b=match child_status_b with Journal_model.Status id->Some(F.G.Uuid.of_string id |> Result.get_ok)|_->None in
+  let selected=C.retarget active ~command:command_b ~resolved_status:status_b |> Result.get_ok in
+  let selected,retry_a=C.retry selected in
+  child_equal (let _,_,wire=F.write status_a in wire) (let _,_,wire=F.write retry_a in wire)
+    "new choice replaced an unresolved status payload";
+  let after_a,parent=F.confirm fixture selected retry_a in
+  let after_a,write_b=F.flush_prefix fixture after_a parent in
+  require(match write_b with C.Write(1,_,_)->true|_->false) "old status did not settle before the new choice";
+  let active,index,round,_=F.bind fixture after_a write_b in
+  let active,_=C.receive active ~index ~round F.W.Outcome_unknown in
+  let command_a2={fixture.command with status_intent_revision=2L} in
+  let status_a_uuid=match child_status_a with Journal_model.Status id->Some(F.G.Uuid.of_string id |> Result.get_ok)|_->None in
+  let selected=C.retarget active ~command:command_a2 ~resolved_status:status_a_uuid |> Result.get_ok in
+  let selected,retry_b=C.retry selected in
+  let after_b,parent=F.confirm fixture selected retry_b in
+  let after_b,write_a2=F.flush_prefix fixture after_b parent in
+  let _,_,first_wire=F.write status_a and _,_,second_wire=F.write write_a2 in
+  require(first_wire<>second_wire) "A to B to A reused the original status intent";
+  require(Result.is_error(C.retarget after_b ~command:{command_a2 with source="Replace accepted body"}
+    ~resolved_status:status_a_uuid)) "child retarget replaced the frozen insertion body"
+;;
+
+let test_child_chain_ack_failure_keeps_proofs () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make ~task_state:child_status_a () in
+  let inserted,parent=F.confirm fixture fixture.initial fixture.action in
+  let inserted,status=F.flush_prefix fixture inserted parent in
+  let confirmed,parent=F.confirm fixture inserted status in
+  let applied,ack=F.applied fixture confirmed parent in
+  let index,round=match ack with C.Acknowledge(index,round,_,_)->index,round|_->fail "UI applied chain did not ACK" in
+  child_equal 1 index "a successful insertion ACK was sent again";
+  let failed,_=C.acknowledged applied ~index ~round (Error "Synthetic release/ACK failure") in
+  let retried,write=C.retry failed in
+  child_equal (let _,_,wire=F.write status in wire) (let _,_,wire=F.write write in wire)
+    "ACK failure replay changed the original status preconditions";
+  let stale,action=C.acknowledged retried ~index ~round (Ok()) in
+  require(stale==retried && action=C.Ignore) "old ACK completed a new retry round";
+  let confirmed,parent=F.confirm fixture retried write in
+  let applied,ack=F.applied fixture confirmed parent in
+  let index,round=match ack with C.Acknowledge(index,round,_,_)->index,round|_->fail "remaining cleanup missing" in
+  child_equal 1 index "a successful insertion ACK was sent again";
+  let completed,action=C.acknowledged applied ~index ~round (Ok()) in
+  require(action=C.Complete) "all child stages did not settle";
+  let same,action=C.retry completed in
+  require(same==completed && action=C.Ignore) "completed child was replayed"
+;;
+
+(* Capacity belongs to the public SDK coordinator, so this regression composes
+   the two pure owners rather than injecting a synthetic refusal into business. *)
+let test_child_chain_sdk_capacity_progress () =
+  let module F=Child_chain_fixture in let module B=F.C in
+  let module K=Journal_worker_coordination.Worker_pure_coordinator in
+  let module Id=Logseq_db_worker_lui.Journal_worker_ids in
+  let fixture=F.make() in
+  let client=F.G.Uuid.of_string "98000000-0000-4000-8000-000000005515" |> Result.get_ok in
+  let boot=K.step(K.initial ~client_id:client)(Worker_bound fixture.binding) in
+  let core=ref(K.step boot.next(Bootstrap_received(fixture.binding,F.W.Ready fixture.projection))).next in
+  let serial=ref 0L and acknowledgements=ref 0 in
+  let run : type a. a F.W.request -> a -> unit = fun operation value ->
+    match K.request !core fixture.session operation with
+    | Error error->fail "Child stalled at actual SDK capacity after %Ld attempts: %s" !serial
+        (match error with F.W.Invalid_input message->message|_->"other refusal")
+    | Ok(ticket,transition)->
+      serial:=Int64.succ !serial;
+      core:=transition.next;
+      core:=(K.step !core(Admitted(ticket,Id.Worker.Request_id.of_int64 !serial))).next;
+      core:=(K.step !core(Completed(ticket,F.W.Answered(Ok value)))).next;
+      core:=(K.step !core(Forget ticket)).next in
+  let state=ref fixture.initial and action=ref fixture.action in
+  for n=1 to 70 do
+    let bound,index,round,intent=F.bind fixture !state !action in
+    run(F.W.Mutate intent)F.W.Outcome_unknown;
+    let unknown,_=B.receive bound ~index ~round F.W.Outcome_unknown in
+    let selected=if n mod 2=0 then child_status_a else child_status_b in
+    let resolved=match selected with Journal_model.Status id->Some(F.G.Uuid.of_string id |> Result.get_ok)|_->None in
+    let command={(B.command unknown) with task_state=selected;status_confirmation=true;
+      status_intent_revision=Int64.of_int n} in
+    let selected=B.retarget unknown ~command ~resolved_status:resolved |> Result.get_ok in
+    let selected,retry=B.retry selected in
+    let bound,index,round,intent=F.bind fixture selected retry in
+    let progress=fixture.confirm index intent fixture.presentation in
+    let confirmation=match progress with F.W.Confirmed value->value|_->assert false in
+    let receipt=F.W.confirmation_receipt confirmation in
+    run(F.W.Mutate intent)(F.W.Committed_pending_presentation receipt);
+    run(F.W.Confirm(fixture.presentation,receipt))progress;
+    let next,out=B.receive bound ~index ~round progress in
+    let rec drain fuel state action =
+      require(fuel>0) "child prefix settlement did not terminate";
+      match action with
+      | B.Write _->state,action
+      | Read_parent(round,_)->
+        let next,action=B.projection_ready state ~round in drain(fuel-1)next action
+      | Present round->
+        let next,action=B.applied state ~round fixture.presentation in drain(fuel-1)next action
+      | Acknowledge(index,round,intent,_)->
+        run(F.W.Acknowledge_intent intent)();incr acknowledgements;
+        let next,action=B.acknowledged state ~index ~round(Ok()) in drain(fuel-1)next action
+      | Read_child round->
+        let summary=match F.W.confirmation_primary confirmation with
+          | Confirmed_block value->value|_->assert false in
+        let next,action=B.read_child state ~round summary in drain(fuel-1)next action
+      | Wait message->fail "child prefix stopped instead of settling: %s" message
+      | Ignore|Complete->fail "pending newer child choice was discarded" in
+    let next,out=drain 16 next out in
+    state:=next;action:=out
+  done;
+  require(!acknowledgements>=70) "child kept unconsumed prefixes until exhausting the SDK ledger"
+;;
+
+let test_child_rejected_status_rebound_canonical () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make ~task_state:child_status_a () in
+  let inserted,parent=F.confirm fixture fixture.initial fixture.action in
+  let inserted,status=F.flush_prefix fixture inserted parent in
+  let bound,index,round,_=F.bind fixture inserted status in
+  let rejected,read=C.receive bound ~index ~round (F.W.Rejected(Service_failed "Known status rejection")) in
+  let read_round=match read with C.Read_child round->round|_->fail "status rejection lost canonical read" in
+  let parent,action=C.read_child rejected ~round:read_round(Option.get(C.canonical rejected)) in
+  let applied,ack=F.applied fixture parent action in
+  let index,round,intent=match ack with C.Acknowledge(i,r,intent,_)->i,r,intent|_->fail "status rejection lost ACK" in
+  let rebound=C.rebind_ack applied ~index ~round ~intent ~presentation:fixture.presentation |> Option.get in
+  let rejected,action=C.receive rebound ~index ~round(F.W.Rejected(Service_failed "Known status rejection")) in
+  let round=match action with C.Read_child round->round|_->fail "rebound rejection lost canonical read" in
+  let parent,action=C.read_child rejected ~round(Option.get(C.canonical rejected)) in
+  let applied,action=F.applied fixture parent action in
+  let index,round=match action with C.Acknowledge(i,r,_,_)->i,r|_->fail "rebound canonical never reached ACK" in
+  require(snd(C.acknowledged applied ~index ~round(Ok()))=C.Complete)
+    "rebound status rejection remained stuck"
+;;
+
+let test_child_chain_generated_traces () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let run actions =
+    let fixture=F.make ~task_state:child_status_a () in
+    let foreign=Coordination_test_fixture.fixture ~graph:(F.G.Uuid.of_string "98000000-0000-4000-8000-000000008891" |> Result.get_ok) 8891L |> fun (_,_,p,_)->Option.get(F.W.selected p) in
+    let state=ref fixture.initial and action=ref fixture.action in
+    let revision=ref 0 and frozen=Hashtbl.create 8 in
+    let take transition =
+      let before= !state in
+      let snapshot=Marshal.to_string before [] in
+      let next,out=transition before and again,out2=transition before in
+      require(next=again && out=out2) "child transition is nondeterministic";
+      require(snapshot=Marshal.to_string before []) "child transition mutated its input";
+      state:=next;action:=out in
+    List.iter(fun n ->
+      match n mod 8 with
+      | 0 ->
+        incr revision;
+        let task_state=if !revision mod 2=0 then child_status_a else child_status_b in
+        let resolved_status=match task_state with Journal_model.Status id->Some(F.G.Uuid.of_string id |> Result.get_ok)|_->None in
+        let command={(C.command !state) with task_state;status_confirmation=true;status_intent_revision=Int64.of_int !revision} in
+        (match C.retarget !state ~command ~resolved_status with Ok next->state:=next|Error _->())
+      | 1 -> take C.retry
+      | 2 ->
+        let before= !state in
+        let same,out=C.applied before ~round:0L fixture.presentation in
+        require(same==before && out=C.Ignore) "obsolete UI application changed lifecycle"
+      | _ -> match !action with
+        | C.Write(index,round,wire) ->
+          let id=C.stage_id(C.stage !state index) |> F.G.Uuid.to_string in
+          (match Hashtbl.find_opt frozen id with None->Hashtbl.add frozen id wire
+           |Some previous->require(previous=wire) "one child intent acquired a different payload");
+          let intent=F.W.mutation_intent fixture.session ~mutation_id:(C.stage_id(C.stage !state index))
+            (C.stage_mutation(C.stage !state index)) |> Result.get_ok in
+          state:=C.bind !state ~index ~round ~intent ~presentation:fixture.presentation |> Option.get;
+          require(C.bind !state ~index ~round ~intent ~presentation:foreign=None)
+            "foreign logical graph bound a child stage";
+          state:=C.bind !state ~index ~round ~intent ~presentation:fixture.presentation |> Option.get;
+          let progress=if n mod 5=0 then F.W.Outcome_unknown
+            else if n mod 7=0 then F.W.Rejected(Service_failed "Generated noncommit")
+            else fixture.confirm index intent fixture.presentation in
+          take(fun state->C.receive state ~index ~round progress)
+        | Read_parent(round,_) ->take(fun state->C.projection_ready state ~round)
+        | Read_child round ->take(fun state->C.read_child state ~round(Option.get(C.canonical state)))
+        | Present round ->take(fun state->C.applied state ~round fixture.presentation)
+        | Acknowledge(index,round,_,_) ->
+          take(fun state->C.acknowledged state ~index ~round
+            (if n mod 5=0 then Error "Generated ACK interruption" else Ok()))
+        | Wait _ | Ignore ->take C.retry
+        | Complete ->
+          if C.failure !state=None || C.insert_rejected !state then (
+            let same,out=C.retry !state in
+            require(same== !state && out=C.Ignore) "terminal child resurrected")
+          else take C.retry) actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions =
+    let rec remove prefix=function
+      | []->actions
+      | _::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      | x::rest->remove(x::prefix)rest in remove [] actions in
+  for seed=0 to 199 do
+    let random=Random.State.make[|0xC111;seed|] in
+    let actions=List.init 80(fun _->Random.State.int random 80) in
+    if fails actions then (
+      let minimal=shrink actions in
+      let cause=try run minimal;"unknown" with error->Printexc.to_string error in
+      fail "Child lifecycle seed=%d minimized=[%s]: %s" seed
+        (minimal |> List.map string_of_int |> String.concat ";") cause)
+  done
+;;
+
+let test_child_known_rejection_is_terminal () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make() in
+  let bound,index,round,_=F.bind fixture fixture.initial fixture.action in
+  let rejected,action=C.receive bound ~index ~round (F.W.Rejected(Service_failed "Known not applied")) in
+  require(action=C.Present round) "known rejection must reach its UI consumer";
+  let applied,ack=C.applied rejected ~round fixture.presentation in
+  let index,round=match ack with C.Acknowledge(index,round,_,_)->index,round|_->fail "known rejection did not ACK" in
+  let completed,action=C.acknowledged applied ~index ~round (Ok()) in
+  require(action=C.Complete) "known rejection did not settle";
+  let same,action=C.retry completed in
+  require(same==completed && action=C.Ignore) "settled non-insertion was replayed as the same logical action";
+  require(Result.is_error(C.retarget completed ~command:{fixture.command with
+    task_state=child_status_a;status_confirmation=true;status_intent_revision=1L}
+    ~resolved_status:(match child_status_a with Journal_model.Status id->Some(F.G.Uuid.of_string id |> Result.get_ok)|_->None)))
+    "settled non-insertion adopted a new child choice"
+;;
+
 let test_readonly_recovery_owner () =
   let module R = Journal_diagnostics_view.Pure_recovery in
   let _, _, _, session = Coordination_test_fixture.fixture 5510L in
@@ -4436,7 +4757,13 @@ let test_readonly_recovery_traces () =
 ;;
 
 let tests =
-  [ "Read-only recovery pure generated traces",test_readonly_recovery_traces
+  [ "Child generated lifecycle traces",test_child_chain_generated_traces
+  ; "Rejected child status rebind reaches canonical ACK",test_child_rejected_status_rebound_canonical
+  ; "Child prefixes progress through actual SDK capacity",test_child_chain_sdk_capacity_progress
+  ; "Known child non-insertion is terminal",test_child_known_rejection_is_terminal
+  ; "Child chain freezes unknown writes and status choices",test_child_chain_frozen_unknown_choice
+  ; "Child chain ACK failure retains original proofs",test_child_chain_ack_failure_keeps_proofs
+  ; "Read-only recovery pure generated traces",test_readonly_recovery_traces
   ; "Read-only recovery pure request owner",test_readonly_recovery_owner
   ; "Uncertain plain child preserves insertion identity",test_uncertain_plain_child_keeps_identity
   ; "Child reselected status is a distinct sub-operation",test_child_reselected_status_intent

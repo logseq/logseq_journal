@@ -137,6 +137,7 @@ let rebind t ~session_number =
 let phase t = t.phase
 let retry_identity_locked t = t.retry_identity_locked
 let lock_for_retry t = { t with retry_identity_locked = true }
+let release_rejected_attempt t = {t with retry_identity_locked=false;pending=None;phase=Editing}
 
 (* Unicode White_Space, shared by button admission and attachment-only naming.
    Do not trim meaningful drafts or treat format characters as whitespace. *)

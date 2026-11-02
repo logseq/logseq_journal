@@ -6342,7 +6342,7 @@ let test_catalog_and_lookup_cross_fences () =
 ;;
 
 (* Core cannot reproduce the business Runtime's old sub-operation allocator. *)
-let child_identity_status_command runtime =
+let child_identity_insert runtime =
   let child=uuid "a1000000-0000-4000-9000-000000000081" in
   let mutation_id=uuid "a1000000-0000-4000-a000-000000000081" in
   let command : Journal_graph_projection.create_child =
@@ -6352,8 +6352,14 @@ let child_identity_status_command runtime =
      task_state=Status "00000002-1615-5853-7700-000000000000";status_confirmation=true;
      creation_time=Journal_time.create ~instant_unix_ms:1_788_192_000_000L
        ~local_day:20260901 ~local_minute_of_day:0 |> Result.get_ok} in
+  Runtime.submit runtime(Create_child command)
+  |> fun output -> only "child insertion" output.Runtime.requests
+;;
+let child_identity_status_command runtime =
   let next output=only "child identity continuation" output.Runtime.requests in
-  let insert=Runtime.submit runtime(Create_child command) |> next in
+  let insert=child_identity_insert runtime in
+  let mutation_id=match insert.command with Protocol.V2_insert_blocks{mutation_id;_}->mutation_id|_->assert false in
+  let child=uuid "a1000000-0000-4000-9000-000000000081" in
   let child_read=Runtime.receive runtime(response insert(V2_mutation_committed
     {mutation_id;status=V2_already_applied;generation="g";before_projection_revision="p";after_projection_revision="p"})) |> next in
   Runtime.receive runtime(response child_read(V2_block_outcome(V2_present_block
@@ -6366,6 +6372,44 @@ let child_identity request=match request.Protocol.command with
 let child_identity_runtime () =
   let runtime=Runtime.create () in seed_children_interest runtime;set_calendar runtime;runtime
 ;;
+let test_child_typed_insert_admission () =
+  let runtime=child_identity_runtime() in
+  let insert=child_identity_insert runtime in
+  Alcotest.(check bool) "child insertion enters the existing typed durable channel" true
+    (match Runtime.worker_mutation runtime insert with
+     | Some(id,Journal_worker_coordination.Worker_api.Insert_blocks {parent;roots=[root];_}) ->
+       (match insert.command with Protocol.V2_insert_blocks{mutation_id;_}->id=mutation_id|_->false)
+       && parent=block_uuid && root.title="Stable child"
+     | _->false)
+;;
+(* The public business reducer has no graph transport lifecycle. Exercise the
+   narrow pure dispatcher boundary that owns synchronous admission refusal. *)
+let test_typed_child_planning_refusal_retains_transport () =
+  let module W=Journal_worker_coordination.Worker_api in
+  List.iter(fun refusal->
+    let runtime=child_identity_runtime() in
+    let insert=child_identity_insert runtime in
+    let _,_,projection,session=Coordination_test_fixture.fixture 5521L in
+    let presentation=Option.get(W.selected projection) in
+    let id,command=Runtime.worker_mutation runtime insert |> Option.get in
+    let intent=W.mutation_intent session ~mutation_id:id command |> Result.get_ok in
+    Alcotest.(check bool) "typed child bound before admission" true
+      (Runtime.bind_mutation runtime insert ~presentation ~intent);
+    let delivery=Journal_graph_transport.deliver ~runtime ~send:(fun _->refusal)
+      {Runtime.requests=[insert];responses=[]} in
+    Alcotest.(check (option string)) "retryable Child admission does not retire the graph" None delivery.error;
+    Alcotest.(check bool) "pending Child keeps a visible retry owner" true
+      (delivery.responses<>[]);
+    let ordinary=Runtime.submit runtime(Find_block(Graph.Uuid.to_string unrelated_uuid)) in
+    let mixed=Journal_graph_transport.deliver ~runtime ~send:(fun _->refusal)
+      {Runtime.requests=insert::ordinary.requests;responses=[]} in
+    Alcotest.(check bool) "ordinary failures in a mixed batch remain transport failures" true
+      (mixed.error<>None);
+    Alcotest.(check bool) "original child remains owned after refused transport" true
+      ((Runtime.receive_mutation runtime insert W.Outcome_unknown).responses<>[]))
+    Journal_graph_transport.[Full;Not_ready;Stopping]
+;;
+
 let test_child_status_identity_independent_reads () =
   let first=child_identity_status_command(child_identity_runtime()) |> child_identity in
   let runtime=child_identity_runtime() in
@@ -9181,6 +9225,8 @@ let () =
             test_feed_window_bounds_and_singleton_failure
         ] )
     ; ("child status identity",[
+        Alcotest.test_case "typed insertion admission" `Quick test_child_typed_insert_admission;
+        Alcotest.test_case "typed admission refusal retains graph" `Quick test_typed_child_planning_refusal_retains_transport;
         Alcotest.test_case "unrelated reads cannot change child status intent" `Quick test_child_status_identity_independent_reads;
         Alcotest.test_case "lost response keeps the same child status intent" `Quick test_child_status_identity_after_lost_reply])
     ; ( "Capture persistent status identity"

@@ -51,6 +51,7 @@ type t =
   ; mode : mode
   ; pending : Journal_graph_request.t option
   ; child_capture : Journal_capture.t option
+  ; child_error : string option
   ; composer_revision : int64
   ; reveal_id : string option
   ; reveal_outcome : Ui.View.Native_list.outcome option
@@ -70,6 +71,8 @@ type retained_composer =
   ; draft_capture : Journal_capture.t
   ; draft_mode : mode
   ; draft_pending : Journal_graph_request.t option
+  ; draft_projection : (Journal_model.t * Journal_model.t) option
+  ; draft_error : string option
   }
 
 let invalidate_rows (t : t) = { t with row_snapshot = ref None }
@@ -81,6 +84,7 @@ let equal_presentation (left : t) (right : t) =
       && left.branches == right.branches
       && left.session_number = right.session_number
       && left.mode = right.mode
+      && left.child_error = right.child_error
       && left.composer_revision = right.composer_revision
       && left.reveal_id = right.reveal_id)
 ;;
@@ -112,26 +116,12 @@ let retain_composer (t : t) =
        ; draft_capture = capture
        ; draft_mode = t.mode
        ; draft_pending = t.pending
+       ; draft_projection = None
+       ; draft_error = t.child_error
        })
     t.child_capture
 ;;
 
-let restore_composer (t : t) draft =
-  if draft.draft_parent <> t.root_id
-  then t
-  else (
-    let capture =
-      Journal_capture.rebind draft.draft_capture ~session_number:t.session_number
-    in
-    invalidate_rows
-      { t with
-        child_capture = Some capture
-      ; session_number =
-          ID.Text_input.Session_id.to_int64 (Journal_capture.session_id capture)
-      ; mode = draft.draft_mode
-      ; pending = draft.draft_pending
-      })
-;;
 
 let complete_retained_composer draft ~child ~parent =
   if matching_child draft.draft_pending ~root_id:draft.draft_parent ~child ~parent
@@ -201,6 +191,7 @@ let create ~session_number (detail : Journal_graph_projection.detail) =
   ; mode = Reading
   ; pending = None
   ; child_capture = None
+  ; child_error = None
   ; composer_revision = 0L
   ; reveal_id = None
   ; reveal_outcome = None
@@ -220,6 +211,9 @@ let session_id (t : t) = ID.Text_input.Session_id.of_int64 t.session_number
 let composer_revision (t : t) = t.composer_revision
 let reveal_id (t : t) = t.reveal_id
 let child_capture (t : t) = t.child_capture
+let child_error (t : t) = t.child_error
+let has_child_request (t:t) command = t.pending=Some(Journal_graph_request.Create_child command)
+let retained_has_child_request draft command = draft.draft_pending=Some(Journal_graph_request.Create_child command)
 
 let pending_with_child_status pending task_state =
   Option.map
@@ -248,7 +242,7 @@ let map_child_capture (t : t) ~f =
         child_capture = Some next
       ; pending = pending_with_child_status t.pending (Journal_capture.task_state next)
       }
-    else { t with child_capture = Some next; mode = Reading; pending = None }
+    else { t with child_capture = Some next; mode = Reading; pending = None;child_error=None }
 ;;
 
 let matching_attachment_imports pending capture ~root_id ~child ~parent =
@@ -293,7 +287,8 @@ let map_retained_capture draft ~f =
           pending_with_child_status draft.draft_pending (Journal_capture.task_state capture)
       }
     else
-      { draft with draft_capture = capture; draft_mode = Reading; draft_pending = None })
+      { draft with draft_capture = capture; draft_mode = Reading; draft_pending = None;
+        draft_error=None;draft_projection=None })
 ;;
 
 let continuation (t : t) ~parent_id = (branch t parent_id).continuation
@@ -593,7 +588,7 @@ let update_child_source (t : t) source =
       | None -> Journal_capture.create ~session_number:t.session_number ~source
       | Some capture -> Journal_capture.update_source capture ~source
     in
-    { t with child_capture = Some capture; mode = Reading; pending = None })
+    { t with child_capture = Some capture; mode = Reading; pending = None;child_error=None })
 ;;
 
 let apply_child_edit t edit =
@@ -608,7 +603,7 @@ let apply_child_edit t edit =
     let capture = Journal_capture.apply_text_edit initial edit in
     if capture = initial
     then t
-    else { t with child_capture = Some capture; mode = Reading; pending = None })
+    else { t with child_capture = Some capture; mode = Reading; pending = None;child_error=None })
 ;;
 
 let set_child_task (t : t) task_state =
@@ -625,7 +620,7 @@ let set_child_task (t : t) task_state =
     then (
       let pending = pending_with_child_status t.pending task_state in
       { t with child_capture; pending })
-    else { t with child_capture; mode = Reading; pending = None })
+    else { t with child_capture; mode = Reading; pending = None;child_error=None })
 ;;
 
 let toggle_child_task (t : t) =
@@ -666,7 +661,7 @@ let admit_child
         ; task_state = Journal_capture.task_state capture
         }
     in
-    { t with mode = Saving_child; pending = Some request }, Some request
+    { t with mode = Saving_child; pending = Some request;child_error=None }, Some request
   | _ -> t, None
 ;;
 
@@ -674,7 +669,7 @@ let fail (t : t) ~message = if t.pending = None then t else fail_child_attempt t
 
 let retry (t : t) =
   match t.mode, t.pending with
-  | Failed _, Some request -> { t with mode = Saving_child }, Some request
+  | Failed _, Some request -> { t with mode = Saving_child;child_error=None }, Some request
   | _ -> t, None
 ;;
 
@@ -780,7 +775,7 @@ let apply_child_created (t : t) ~child ~parent =
       ; branches =
           Blocks.add
             t.root_id
-            { appended = id :: current.appended
+            { appended = id :: List.filter ((<>)id) current.appended
             ; children = List.filter (( <> ) id) current.children @ [ id ]
             ; loaded =
                 current.loaded && current.continuation = None && current.pending = None
@@ -801,11 +796,77 @@ let apply_child_created (t : t) ~child ~parent =
                  ID.Text_input.Session_id.to_int64 (Journal_capture.session_id capture))
                t.child_capture)
       ; child_capture = None
+      ; child_error = None
       ; composer_revision = Int64.succ t.composer_revision
       ; reveal_id = Some id
       ; reveal_outcome = None
       })
   else t
+;;
+
+let preview_child_created (t:t) ~command ~child ~parent ~error =
+  if not(has_child_request t command) || not(matching_child t.pending ~root_id:t.root_id ~child ~parent)
+  then t
+  else
+    let next=apply_child_created t ~child ~parent in
+    {next with mode=Saving_child;pending=t.pending;child_capture=t.child_capture;
+      child_error=error;session_number=t.session_number;composer_revision=t.composer_revision;
+      automatic_reads=t.automatic_reads;materialized_blocks=t.materialized_blocks;
+      reveal_id=t.reveal_id;reveal_outcome=t.reveal_outcome}
+;;
+let preview_child_failure (t:t) ~command ~message =
+  if has_child_request t command then {t with mode=Saving_child;child_error=Some message} else t
+;;
+let preview_retained_child draft ~command ~child ~parent ~error =
+  if retained_has_child_request draft command
+     && matching_child draft.draft_pending ~root_id:draft.draft_parent ~child ~parent
+  then {draft with draft_projection=Some(child,parent);draft_error=error;draft_mode=Saving_child}
+  else draft
+;;
+let preview_retained_failure draft ~command ~message =
+  if retained_has_child_request draft command then
+    {draft with draft_error=Some message;draft_mode=Saving_child} else draft
+;;
+let child_projection_applied (t:t) ~command ~child ~parent ~error =
+  has_child_request t command && t.child_error=error
+  && Blocks.find_opt (Journal_model.id child) t.blocks=Some child
+  && Blocks.find_opt (Journal_model.id parent) t.blocks=Some parent
+;;
+let retained_projection_applied draft ~command ~child ~parent ~error =
+  retained_has_child_request draft command && draft.draft_projection=Some(child,parent) && draft.draft_error=error
+;;
+let child_failure_applied (t:t) ~command ~message = has_child_request t command && t.child_error=Some message
+let retained_failure_applied draft ~command ~message = retained_has_child_request draft command && draft.draft_error=Some message
+let release_rejected_child (t:t) ~command ~message =
+  if has_child_request t command then {t with pending=None;mode=Failed message;child_error=Some message;
+    child_capture=Option.map Journal_capture.release_rejected_attempt t.child_capture} else t
+;;
+let release_rejected_retained draft ~command ~message =
+  if retained_has_child_request draft command then {draft with draft_pending=None;draft_mode=Failed message;
+    draft_error=Some message;draft_capture=Journal_capture.release_rejected_attempt draft.draft_capture} else draft
+;;
+
+let restore_composer (t : t) draft =
+  if draft.draft_parent <> t.root_id
+  then t
+  else (
+    let capture =
+      Journal_capture.rebind draft.draft_capture ~session_number:t.session_number
+    in
+    let restored=invalidate_rows
+      { t with
+        child_capture = Some capture
+      ; session_number =
+          ID.Text_input.Session_id.to_int64 (Journal_capture.session_id capture)
+      ; mode = draft.draft_mode
+      ; pending = draft.draft_pending
+      ; child_error = draft.draft_error
+      } in
+    match draft.draft_projection,draft.draft_pending with
+    | Some(child,parent),Some(Journal_graph_request.Create_child command)->
+      let next=preview_child_created restored ~command ~child ~parent ~error:draft.draft_error in
+      {next with mode=draft.draft_mode}
+    | _->restored)
 ;;
 
 let remove_block (t : t) ~block_id =

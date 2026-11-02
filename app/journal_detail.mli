@@ -148,3 +148,23 @@ val complete_reveal
   -> token:int64
   -> outcome:Journal_view.View.Native_list.outcome
   -> t
+
+val child_error : t -> string option
+val has_child_request : t -> Journal_graph_projection.create_child -> bool
+val retained_has_child_request : retained_composer -> Journal_graph_projection.create_child -> bool
+val preview_child_created : t -> command:Journal_graph_projection.create_child
+  -> child:Journal_model.t -> parent:Journal_model.t -> error:string option -> t
+val preview_child_failure : t -> command:Journal_graph_projection.create_child -> message:string -> t
+val preview_retained_child : retained_composer -> command:Journal_graph_projection.create_child
+  -> child:Journal_model.t -> parent:Journal_model.t -> error:string option -> retained_composer
+val preview_retained_failure : retained_composer -> command:Journal_graph_projection.create_child
+  -> message:string -> retained_composer
+val child_projection_applied : t -> command:Journal_graph_projection.create_child
+  -> child:Journal_model.t -> parent:Journal_model.t -> error:string option -> bool
+val retained_projection_applied : retained_composer -> command:Journal_graph_projection.create_child
+  -> child:Journal_model.t -> parent:Journal_model.t -> error:string option -> bool
+val child_failure_applied : t -> command:Journal_graph_projection.create_child -> message:string -> bool
+val retained_failure_applied : retained_composer -> command:Journal_graph_projection.create_child -> message:string -> bool
+val release_rejected_child : t -> command:Journal_graph_projection.create_child -> message:string -> t
+val release_rejected_retained : retained_composer -> command:Journal_graph_projection.create_child
+  -> message:string -> retained_composer
