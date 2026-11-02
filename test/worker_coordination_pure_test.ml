@@ -1082,9 +1082,15 @@ let test_durable_recovery_and_ack_purity () =
 ;;
 
 let test_committed_ack_requires_current_confirmation () =
-  let issuer,_,projection,session=fixture 1905L in
+  let issuer,raw,projection,session=fixture 1905L in
   let module I=(val issuer:W.ISSUER) in
   let presentation=Option.get(W.selected projection) in
+  let owner=Option.get raw.baseline.state.sync.selected in
+  check(C.current_presentation ~owner (C.view(ready I.binding projection))presentation)
+    "current UI presentation was rejected";
+  let future={owner with startup={owner.startup with presentation_generation=owner.startup.presentation_generation+2}} in
+  check(not(C.current_presentation ~owner:future(C.view(ready I.binding projection))presentation))
+    "lagging Worker baseline authorized a newer UI presentation";
   let intent=W.mutation_intent session ~mutation_id:(uuid "98000000-0000-4000-8000-000000001905")
     (W.Save_block{block=graph;title="confirmed choice";
       preconditions={blocks=[graph,"block-state:v1:synthetic"];pages=[];scopes=[]}}) |> Result.get_ok in
@@ -1098,6 +1104,12 @@ let test_committed_ack_requires_current_confirmation () =
   let state=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.of_int64 20L))).next in
   let state=(C.step state(C.Completed(ticket,W.Answered(Ok(W.Committed_pending_presentation receipt))))).next in
   check(Result.is_error(C.request state session(W.Acknowledge_intent intent))) "unconfirmed commit admitted ACK";
+  let _,resumed=C.reconcile_mutation state ~presentation intent |> Result.get_ok in
+  check(List.exists(function C.Send(_,_,W.Confirm(actual,proof))->
+    actual=presentation && W.receipt_revisions proof=W.receipt_revisions receipt|_->false)resumed.instructions)
+    "reconciliation rewrote a known committed intent";
+  check(C.intent_progress(C.view state)intent=Some(W.Committed_pending_presentation receipt))
+    "reconciliation mutated its previous state";
   let confirmation=I.confirmation session ~presentation receipt(P.V2_response
     {api_version=P.api_version;request_id;outcome=V2_block_summary_outcome
       {lookup=V2_missing_block{uuid=graph;revision="block-state:v1:missing"};page=None;items=[];next_cursor=None;
@@ -1106,11 +1118,106 @@ let test_committed_ack_requires_current_confirmation () =
   let confirm,planned=C.request state session(W.Confirm(presentation,receipt)) |> Result.get_ok in
   let state=(C.step planned.next(C.Admitted(confirm,Id.Worker.Request_id.of_int64 21L))).next in
   let state=(C.step state(C.Completed(confirm,W.Answered(Ok(W.Confirmed confirmation))))).next in
+  let captured=W.Answered(Ok(W.Confirmed confirmation)) in
+  let forgotten=(C.step state(C.Forget confirm)).next in
+  check(C.revalidate_reply(C.view forgotten)confirm captured=captured)
+    "Forget alone revoked a valid queued confirmation";
+  let focused=match I.bootstrap(S.Coordination_registered{raw with baseline={raw.baseline with
+      version=3L;presentation=3L}}) with
+    | Ok(W.Ready projection)->projection|_->failwith "focus roundtrip fixture" in
+  let focused=(C.step forgotten(C.Projection_received focused)).next in
+  check(C.revalidate_reply(C.view focused)confirm captured=W.Answered(Error W.Revoked_session))
+    "queued confirmation settled a later focus after Forget";
+  check(C.revalidate_reply(C.view forgotten)confirm captured=captured)
+    "delivery validation mutated preceding state";
+  check(Result.is_error(C.reconcile_mutation focused ~presentation intent))
+    "explicit retry reused stale presentation";
+  let latest=Option.get(W.selected(Option.get(C.projection(C.view focused)))) in
+  check(match C.settle_applied_mutation state ~presentation ~applied_presentation:presentation intent with
+    | Ok(C.Acknowledgement _,_)->true|_->false) "current applied intent rewrote instead of ACK";
+  check(match C.settle_applied_mutation focused ~presentation:latest ~applied_presentation:presentation intent with
+    | Ok(C.Reconciliation _,transition)->List.exists(function
+        C.Send(_,_,W.Confirm(actual,proof))->actual=latest && W.receipt_revisions proof=W.receipt_revisions receipt
+        | _->false)transition.instructions|_->false)
+    "cleanup retry across focus did not re-confirm original proof";
+  let next_confirmation=I.confirmation session ~presentation:latest receipt(P.V2_response
+    {api_version=P.api_version;request_id;outcome=V2_block_summary_outcome
+      {lookup=V2_missing_block{uuid=graph;revision="block-state:v1:missing"};page=None;items=[];next_cursor=None;
+       scope_revision="scope-revision:v1:missing";generation="generation:v1:1:1";projection_revision="projection:v1:1"}})
+    |> Result.get_ok in
+  let next_ticket,next_plan=C.request focused session(W.Confirm(latest,receipt)) |> Result.get_ok in
+  let next_admitted=(C.step next_plan.next(C.Admitted(next_ticket,Id.Worker.Request_id.of_int64 24L))).next in
+  let next_state=(C.step next_admitted(C.Completed(next_ticket,W.Answered(Ok(W.Confirmed next_confirmation))))).next in
+  check(match C.settle_applied_mutation next_state ~presentation:latest ~applied_presentation:presentation intent with
+    | Ok(C.Reconciliation _,_)->true|_->false)
+    "new first DTO ACKed using old presentation's applied proof";
+  check(match C.settle_applied_mutation next_state ~presentation:latest ~applied_presentation:latest intent with
+    | Ok(C.Acknowledgement _,_)->true|_->false)
+    "new applied canonical projection could not ACK";
+  let run_delivery_trace trace =
+    let current=ref forgotten and round=ref 1L and version=ref 1L in
+    let advance n =
+      round:=Int64.add !round(Int64.of_int(n+1));version:=Int64.succ !version;
+      let projected=match I.bootstrap(S.Coordination_registered{raw with baseline={raw.baseline with
+          version= !version;presentation= !round}}) with
+        | Ok(W.Ready value)->value|_->failwith "generated presentation baseline" in
+      current:=(C.step !current(C.Projection_received projected)).next in
+    List.iter(fun(op,n)->
+      (match op with
+       | 0->advance n
+       | 1->current:=(C.step !current(C.Projection_received projection)).next
+       | 2->current:=(C.step !current(C.Forget confirm)).next
+       | 3->current:=(C.step !current C.Drain).next
+       | 4->current:=(C.step !current(C.Cancel confirm)).next
+       | 5->current:=(C.step !current C.Capacity_available).next
+       | 6->current:=(C.step !current(C.Completed(confirm,captured))).next
+       | _->());
+      let view=C.view !current in
+      let latest=Option.get(W.selected(Option.get(C.projection view))) in
+      let same=latest=presentation in
+      check((C.revalidate_reply view confirm captured=captured)=same)
+        "queued callback crossed a focus generation";
+      let before=C.intent_progress view intent in
+      let plan=C.settle_applied_mutation !current ~presentation:latest ~applied_presentation:presentation intent |> Result.get_ok in
+      check(match fst plan with
+        | C.Acknowledgement _->same
+        | C.Reconciliation _->not same && List.exists(function
+          C.Send(_,_,W.Confirm(actual,proof))->actual=latest && W.receipt_revisions proof=W.receipt_revisions receipt
+          | _->false)(snd plan).instructions)
+        "applied cleanup invented a new write or reused old presentation";
+      check(C.intent_progress(C.view !current)intent=before) "planning mutated its input";
+      check(C.revalidate_reply(C.view forgotten)confirm captured=captured) "trace mutated retained old state")trace in
+  for seed=0 to 199 do
+    let random=Random.State.make[|0xdda1905;seed|] in
+    let trace=(if seed mod 2=0 then [2,0;0,1;6,0] else [6,0;2,0]) @
+      List.init 64(fun _->Random.State.int random 9,Random.State.int random 4) in
+    let fails trace=try run_delivery_trace trace;false with _->true in
+    if fails trace then (
+      let minimal=shrink fails trace in
+      try run_delivery_trace minimal with error->failwith(Printf.sprintf
+        "delivery property seed=%d minimal=[%s] %s" seed
+        (String.concat ";"(List.map(fun(op,n)->Printf.sprintf "%d:%d" op n)minimal))(Printexc.to_string error)))
+  done;
   let ack,planned=match C.request state session(W.Acknowledge_intent intent) with
     | Ok value->value|Error _->failwith "current Confirmed intent could not plan ACK" in
   check(match C.ticket_acknowledgement ack with Some(actual,Some proof)->
     actual=presentation && W.receipt_revisions proof=W.receipt_revisions receipt|_->false)
     "ACK did not capture exact presentation and original proof";
+  let full=C.step planned.next(C.Admission_refused(ack,W.Full)) in
+  check(C.reply(C.view full.next)ack=None) "durable ACK lost its obligation on pre-admission Full";
+  let passive=C.step full.next C.Drain in
+  check(not(List.exists(function C.Send _->true|_->false)passive.instructions))
+    "durable ACK busy retried without capacity";
+  let available=C.step full.next C.Capacity_available in
+  check(List.exists(function C.Send(_,_,W.Acknowledge_intent actual)->
+    W.encode_mutation_intent actual=W.encode_mutation_intent intent|_->false)available.instructions)
+    "real capacity did not retry the original durable ACK";
+  let other_ack,other_plan=C.request full.next session(W.Acknowledge_intent intent) |> Result.get_ok in
+  let other_admitted=(C.step other_plan.next(C.Admitted(other_ack,Id.Worker.Request_id.of_int64 23L))).next in
+  let other_done=(C.step other_admitted(C.Completed(other_ack,W.Answered(Ok())))).next in
+  let old_retry=C.step other_done C.Capacity_available in
+  check(not(List.exists(function C.Send(_,_,W.Acknowledge_intent _)->true|_->false)old_retry.instructions))
+    "capacity resent an ACK retired by a later settled lifecycle";
   let admitted=(C.step planned.next(C.Admitted(ack,Id.Worker.Request_id.of_int64 22L))).next in
   let retired=(C.step admitted C.Shutdown_requested).next in
   let late=(C.step retired(C.Completed(ack,W.Answered(Ok())))).next in
@@ -3323,5 +3430,5 @@ let () =
   test_opening_query_retires_on_removal ();
   print_endline
     "Pure coordinator: invariants, 500 lifecycle + 250 queued-read + 250 durable traces, \
-     100 ownership + 300 observation + 250 application + 200 live-binding + 200 recovery/ACK + 200 retired-intent traces and shrinking passed"
+     100 ownership + 300 observation + 250 application + 200 live-binding + 200 recovery/ACK + 200 retired-intent + 200 queued-presentation traces and shrinking passed"
 ;;

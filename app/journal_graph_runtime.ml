@@ -84,6 +84,8 @@ type mutation_kind =
   | Delete_subtree_mutation
 
 type payload =
+  | Mutation_settled of Journal_worker_coordination.Worker_api.mutation_intent * Journal_worker_coordination.Worker_api.presentation * payload
+  | Mutation_waiting of { mutation_id:string; block_id:string; message:string }
   | Projection_changes of Protocol.v2_change_window list
   | Projection_resync
   | Task_statuses_changed of
@@ -295,8 +297,17 @@ type request_delivery =
   | Queued
   | Dispatched
 
+type durable_operation =
+  { intent : Worker.mutation_intent
+  ; presentation : Worker.presentation
+  ; confirm_readback : bool
+  ; root_request : Protocol.request
+  }
+
 type pending_operation =
   { operation : operation
+  ; original : Protocol.request
+  ; durable : durable_operation option
   ; source_epoch : int64
   ; failure_owner : failure_owner option
   ; mutable change_application : Coordination.change_application option
@@ -498,7 +509,7 @@ let make_request ?source_epoch ?(background = false) t operation command =
   Hashtbl.replace
     t.pending
     (Graph.Uuid.to_string request_id)
-    { operation; source_epoch; failure_owner = None; background; delivery = Planned;
+    { operation; original = Protocol.{api_version;request_id;command}; durable=None; source_epoch; failure_owner = None; background; delivery = Planned;
       external_children=Rrbvec.empty;change_application=(if participates then Option.map(fun(token,_,_)->token)t.application_context else None) };
   if participates then Option.iter(fun(_,_,children)->children:=Rrbvec.push_back !children request_id)t.application_context;
   Protocol.{ api_version; request_id; command }
@@ -2758,6 +2769,26 @@ let receive_delivery_body t ~read_result ~origin (protocol_response : Protocol.r
         ~source_epoch ~sources ~changes ~property_blocks |> reference_output
   in
   let output = { output with responses = output.responses @ references.responses } in
+  let output = match Option.bind pending (fun pending -> pending.durable) with
+    | None -> output
+    | Some durable ->
+      List.iter (fun (request:Protocol.request) ->
+        let key=Graph.Uuid.to_string request.request_id in
+        Option.iter (fun pending -> Hashtbl.replace t.pending key {pending with durable=Some durable})
+          (Hashtbl.find_opt t.pending key)) output.requests;
+      let settled=List.exists(fun response->match response.payload with
+        | Block_updated _ | Block_removed _ | Update_conflict _ -> true
+        | Mutation_failed _ when not durable.confirm_readback ->true | _ -> false)output.responses in
+      let responses=List.map(fun response->match response.payload with
+        | Mutation_failed{mutation_id;block_id;failure;_} when durable.confirm_readback ->
+          {payload=Mutation_waiting{mutation_id;block_id;message=(match failure with
+            | Projection_failure message->message|Worker_failure value->Error.message value.error)}}
+        | (Block_updated _ | Block_removed _ | Update_conflict _ | Mutation_failed _) as payload when settled ->
+          {payload=Mutation_settled(durable.intent,durable.presentation,payload)}
+        | _->response)output.responses in
+      if Graph.Uuid.equal request_id durable.root_request.request_id then
+        Option.iter(fun pending->Hashtbl.replace t.pending key pending)pending;
+      {output with responses} in
   if background then ignore (background_demands t output);
   dispatch_output t { output with requests = output.requests @ references.requests })
 ;;
@@ -2773,10 +2804,12 @@ let set_change_application t ~request_id token =
     pending.change_application<-Some token;t.latest_application<-Some token;true
   | _ -> false
 ;;
-let response_application_error response =
+let rec response_application_error response =
   let failure=function Worker_failure failure->Worker.Db_error failure.error
     | Projection_failure message->Worker.Service_failed message in
   match response.payload with
+  | Mutation_settled(_,_,payload)->response_application_error {payload}
+  | Mutation_waiting{message;_}->Some(Worker.Service_failed message)
   | Rejected source | Feed_failed {failure=source;_} | Day_blocks_failed {failure=source;_}
   | Child_failed {failure=source;_} | Mutation_failed {failure=source;_} -> Some(failure source)
   | Detail_failed {missing=false;failure=source;_}->Some(failure source)
@@ -2990,6 +3023,92 @@ let receive_worker_read ?resync_generation ?origin t ~request_id result =
     (Protocol.V2_response { api_version = Protocol.api_version; request_id; outcome })
 ;;
 
+let worker_mutation t (request:Protocol.request) =
+  match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id),request.command with
+  | Some {operation=Mutation_refresh _;delivery=Dispatched;_},
+    Protocol.V2_set_task_status{mutation_id;block;status;preconditions}->
+      Some(mutation_id,Worker.Set_task_status{block;status;preconditions})
+  | Some {operation=Mutation_refresh _;delivery=Dispatched;_},
+    Protocol.V2_clear_task_status{mutation_id;block;preconditions}->
+      Some(mutation_id,Worker.Clear_task_status{block;preconditions})
+  | _->None
+;;
+
+let bind_mutation t request ~presentation ~intent =
+  let key=Graph.Uuid.to_string request.Protocol.request_id in
+  match Hashtbl.find_opt t.pending key with
+  | Some pending when pending.delivery=Dispatched ->
+    Hashtbl.replace t.pending key {pending with durable=Some{intent;presentation;confirm_readback=true;root_request=request}};true
+  | _->false
+;;
+
+let mutation_presentation t (request:Protocol.request) =
+  Option.bind(Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id))
+    (fun pending->Option.map(fun durable->durable.presentation)pending.durable)
+;;
+
+let pending_mutation t ~mutation_id =
+  Hashtbl.to_seq_values t.pending |> Seq.find_map(fun pending->
+    match pending.durable with
+    | Some durable when Graph.Uuid.to_string(Worker.mutation_intent_id durable.intent)=mutation_id
+        && Graph.Uuid.equal pending.original.request_id durable.root_request.request_id -> Some durable.root_request
+    | _->None)
+;;
+
+let acknowledge_mutation t intent =
+  match pending_mutation t ~mutation_id:(Graph.Uuid.to_string(Worker.mutation_intent_id intent)) with
+  | Some request->Hashtbl.remove t.pending(Graph.Uuid.to_string request.request_id)
+  | None->()
+;;
+
+let mutation_waiting t (request:Protocol.request) message =
+  match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
+  | Some {failure_owner=Some(Mutation_owner{mutation_id;block_id;_});_}->
+    responses[response(Mutation_waiting{mutation_id;block_id;message})]
+  | _->empty
+;;
+
+let receive_mutation t (request:Protocol.request) progress =
+  let key=Graph.Uuid.to_string request.request_id in
+  match Hashtbl.find_opt t.pending key with
+  | Some ({durable=Some durable;operation=Mutation_refresh{page;refresh};_} as pending) ->
+    (match progress with
+     | Worker.Confirmed confirmation when Worker.confirmation_presentation confirmation=durable.presentation ->
+       (match Worker.confirmation_primary confirmation with
+        | Worker.Confirmed_block summary ->
+          let planned=scope_output t pending.failure_owner(request_target_summary t page refresh) in
+          (match planned.requests with
+           | [first]->
+             let child=Graph.Uuid.to_string first.request_id in
+             Option.iter(fun pending->Hashtbl.replace t.pending child {pending with durable=Some durable})
+               (Hashtbl.find_opt t.pending child);
+             let planned=dispatch_output t planned in
+             let output=receive_worker_read t ~request_id:first.request_id(Target_summary_read summary) in
+             {output with requests=List.filter(fun (value:Protocol.request)->value.request_id<>first.request_id)planned.requests @ output.requests}
+           | _->mutation_waiting t request "The canonical status read could not be planned.")
+        | Confirmed_absence{uuid;_}->
+          responses[response(Mutation_settled(durable.intent,durable.presentation,Block_removed{block_id=Graph.Uuid.to_string uuid}))]
+        | Confirmed_page _->mutation_waiting t request "The canonical status target is not a block.")
+     | Rejected error ->
+       let durable={durable with confirm_readback=false} in
+       (* The known rejection is terminal evidence; only this branch may report
+          that the choice did not apply. *)
+       Hashtbl.replace t.pending key {pending with durable=None};
+       let code,message=match error with Worker.Db_error error->Error.code error,Error.message error
+         | Service_failed message->Error.Invalid_request,message
+         | _->Error.Invalid_request,"The status change was rejected." in
+       let output=receive t (Protocol.V2_response{api_version=Protocol.api_version;request_id=request.request_id;
+         outcome=V2_failed{code=Error.code_string code;message}}) in
+       Hashtbl.replace t.pending key {pending with durable=Some durable};
+       List.iter(fun (request:Protocol.request)->let key=Graph.Uuid.to_string request.request_id in
+         Option.iter(fun pending->Hashtbl.replace t.pending key {pending with durable=Some durable})
+           (Hashtbl.find_opt t.pending key))output.requests;
+       {output with responses=List.map(fun value->{payload=Mutation_settled(durable.intent,durable.presentation,value.payload)})output.responses}
+     | Confirmed _ | Outcome_unknown | Committed_pending_presentation _ ->
+       mutation_waiting t request "The status change is awaiting confirmation. Retry checks the same change.")
+  | _->empty
+;;
+
 let fail_request t (request : Protocol.request) ~message =
   receive
     t
@@ -3058,6 +3177,7 @@ let reconcile_push t ~request_generation push =
 module Copy = Journal_copy
 
 type worker_read =
+  | Confirm_readback of {intent:Worker.mutation_intent;presentation:Worker.presentation}
   | Read :
       { query : 'a Worker.query
       ; maximum_items : int
@@ -3068,6 +3188,12 @@ type worker_read =
   | Unowned_read of string
 
 let worker_read t (request : Protocol.request) =
+  let confirmation=match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
+    | Some {operation=Target_summary summary;durable=Some durable;_}
+      when durable.confirm_readback && (match Confirmation.worker_query summary with Worker.Block_summary{after=None;_}->true|_->false) ->
+      Some(Confirm_readback{intent=durable.intent;presentation=durable.presentation})
+    | _->None in
+  match confirmation with Some _->confirmation|None->
   match request.command with
   | V2_pull_changes {generation;after;limit} ->
     (match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with

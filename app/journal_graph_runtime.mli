@@ -15,6 +15,8 @@ type mutation_kind =
   | Delete_subtree_mutation
 
 type payload =
+  | Mutation_settled of Journal_worker_coordination.Worker_api.mutation_intent * Journal_worker_coordination.Worker_api.presentation * payload
+  | Mutation_waiting of { mutation_id:string; block_id:string; message:string }
   | Projection_changes of Logseq_db_worker.Protocol.v2_change_window list
   | Projection_resync
   | Task_statuses_changed of
@@ -152,6 +154,7 @@ type worker_read_result =
       }
 
 type worker_read =
+  | Confirm_readback of {intent:Journal_worker_coordination.Worker_api.mutation_intent;presentation:Journal_worker_coordination.Worker_api.presentation}
   | Read :
       { query : 'a Worker.query
       ; maximum_items : int
@@ -199,3 +202,18 @@ val report_projection_failure : t -> Worker.error -> unit
 val retry_failed_change_application : t
   -> view:Journal_worker_coordination.Worker_pure_coordinator.view
   -> request_generation:int64 -> output
+
+val worker_mutation : t -> Logseq_db_worker.Protocol.request ->
+  (Logseq_db_types.Graph_types.Uuid.t * Journal_worker_coordination.Worker_api.mutation_command) option
+val bind_mutation : t -> Logseq_db_worker.Protocol.request ->
+  presentation:Journal_worker_coordination.Worker_api.presentation ->
+  intent:Journal_worker_coordination.Worker_api.mutation_intent -> bool
+val pending_mutation : t -> mutation_id:string -> Logseq_db_worker.Protocol.request option
+val mutation_waiting : t -> Logseq_db_worker.Protocol.request -> string -> output
+val receive_mutation : t -> Logseq_db_worker.Protocol.request ->
+  Journal_worker_coordination.Worker_api.mutation_progress -> output
+
+val mutation_presentation : t -> Logseq_db_worker.Protocol.request ->
+  Journal_worker_coordination.Worker_api.presentation option
+
+val acknowledge_mutation : t -> Journal_worker_coordination.Worker_api.mutation_intent -> unit

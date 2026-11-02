@@ -15,6 +15,12 @@ val projection : view -> Worker.projection option
 val mutation_progress : view -> Worker.append_intent -> Worker.mutation_progress option
 val intent_progress : view -> Worker.mutation_intent -> Worker.mutation_progress option
 
+(** A queued business callback rechecks presentation after ticket Forget. It
+    cannot use a captured success to settle a later focus generation. *)
+val current_presentation : ?owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
+  -> view -> Worker.presentation -> bool
+val revalidate_reply : view -> 'a ticket -> 'a Worker.reply -> 'a Worker.reply
+
 (** Immutable acknowledgement decision captured while planning this ticket.
     The effect interpreter forwards it without consulting a later UI/view. *)
 val ticket_acknowledgement : unit ticket -> (Worker.presentation * Worker.receipt option) option
@@ -185,6 +191,24 @@ val request
   -> Worker.session
   -> 'a Worker.request
   -> ('a ticket * transition, Worker.error) result
+
+(** Explicit business retry keeps the immutable intent. A known commit only
+    reads its original proof; Unknown reconciles using the same intent. The
+    supplied current presentation is checked before either request is planned. *)
+val reconcile_mutation
+  : t -> presentation:Worker.presentation -> Worker.mutation_intent
+  -> (Worker.mutation_progress ticket * transition, Worker.error) result
+
+type mutation_settlement =
+  | Acknowledgement of unit ticket
+  | Reconciliation of Worker.mutation_progress ticket
+
+(** Retry an applied consumer's cleanup. A current confirmation/known rejection
+    needs ACK only after that exact presentation consumed its canonical DTOs;
+    an older applied presentation first requires canonical readback. *)
+val settle_applied_mutation
+  : t -> presentation:Worker.presentation -> applied_presentation:Worker.presentation -> Worker.mutation_intent
+  -> (mutation_settlement * transition, Worker.error) result
 
 (** Start application of an actually delivered batch. An active successful
     attempt cannot be replaced by a duplicate pull; an explicit retry after a

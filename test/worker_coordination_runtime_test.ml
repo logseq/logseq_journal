@@ -466,7 +466,7 @@ let test_client_to_typed_read () =
             "typed graph info did not reach actual business projection"
         | _ -> failwith "typed business graph-info read failed")
      | Some (Journal_graph_runtime.Unowned_read message) -> failwith message
-     | Some (Journal_graph_runtime.Acknowledge _) -> failwith "graph-info dispatch became an ACK"
+     | Some (Journal_graph_runtime.Acknowledge _ | Confirm_readback _) -> failwith "graph-info dispatch became a non-query"
      | None -> failwith "business graph-info path was not migrated");
     let _, page =
       request
@@ -1684,7 +1684,7 @@ let test_read_completion_rechecks_graph_owner ?(durable = false) () =
 
 let test_host_durable_recovery_confirmation_ack () =
   let module Host=Journal_worker_coordination_host in
-  with_client(fun client->
+  with_client ~statuses:true(fun client->
     let jobs=Queue.create() in
     let host=Host.create ~client ~client_id ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
       ~enqueue:(fun job->Queue.add job jobs) ~changed:(fun _->()) |> Result.get_ok in
@@ -1737,6 +1737,21 @@ let test_host_durable_recovery_confirmation_ack () =
     require(match value(call(W.Mutate intent)) with W.Committed_pending_presentation original->
       W.receipt_revisions original=W.receipt_revisions receipt|_->false) "typed ACK removed original idempotency proof";
     require(read()=before) "typed same-intent reconciliation executed a second write";
+    let revision=match read() with P.V2_present_block{revision;_}->revision|_->assert false in
+    let status=Test_support.status_uuid 2 in
+    let status_intent=W.mutation_intent session ~mutation_id:(uuid "9f000000-0000-4000-8000-000000001001")
+      (W.Set_task_status{block=Test_support.authoritative_block_uuid;status;
+        preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}) |> Result.get_ok in
+    let status_receipt=match value(call(W.Mutate status_intent)) with
+      | W.Committed_pending_presentation receipt->receipt|_->failwith "real typed status commit failed" in
+    let status_confirmation=match value(call(W.Confirm(presentation,status_receipt))) with
+      | W.Confirmed value->value|_->failwith "real typed status canonical readback failed" in
+    require(match W.confirmation_primary status_confirmation with
+      | W.Confirmed_block{lookup=P.V2_present_block{value;_};_}->value.task_status=Some status
+      | _->false) "real canonical DTO lost committed status UUID";
+    ignore(value(call(W.Acknowledge_intent status_intent)));
+    require(Rrbvec.is_empty(recover()).items) "real status ACK retained pending recovery entry";
+
     ignore(Host.shutdown host);
     wait(fun()->C.shutdown_state(Host.view host)=C.Stopped))
 ;;
@@ -2294,6 +2309,7 @@ let test_changefeed_business_waits_for_ui_application () =
           match reply with
           | W.Answered (Ok value) -> finished request None origin (read.outcome value)
           | _ -> failwith "real typed Changes business ACK failed")
+      | Some (Business.Confirm_readback _) -> failwith "Changes dispatch became mutation confirmation"
       | Some (Business.Unowned_read message) -> failwith message
       | None -> failwith "Changes business flow fell back to legacy transport"
     and finished request application origin result =

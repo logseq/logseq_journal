@@ -32,7 +32,7 @@ let flush host =
             let origin = Core.query_origin view ticket in
             host.enqueue (fun () ->
               apply host.state host.runner (Core.step !(host.state) (Core.Forget ticket)));
-            callbacks := (fun () -> callback origin result) :: !callbacks;
+            callbacks := (fun () -> callback origin (Core.revalidate_reply (Core.view !(host.state)) ticket result)) :: !callbacks;
             retained)
        Rrbvec.empty
        !(host.watches);
@@ -65,6 +65,18 @@ let request host session operation =
   |> Result.map (fun (ticket, transition) ->
     apply host.state host.runner transition;
     ticket)
+;;
+
+let reconcile_mutation host ~presentation intent =
+  Core.reconcile_mutation !(host.state) ~presentation intent
+  |> Result.map (fun (ticket, transition) ->
+    apply host.state host.runner transition;
+    ticket)
+;;
+
+let settle_applied_mutation host ~presentation ~applied_presentation intent =
+  Core.settle_applied_mutation !(host.state) ~presentation ~applied_presentation intent
+  |> Result.map(fun(ticket,transition)->apply host.state host.runner transition;ticket)
 ;;
 
 let begin_change_application host batch ~root =

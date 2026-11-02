@@ -580,6 +580,17 @@ let current_target facts = function
       facts.current
 ;;
 
+let current_presentation ?owner facts presentation =
+  current_target facts (Presentation presentation)
+  && Option.fold ~none:true ~some:(Worker.presentation_matches_scope presentation) owner
+
+let revalidate_reply : type a. view -> a ticket -> a Worker.reply -> a Worker.reply =
+  fun facts ticket reply -> match ticket.target,reply with
+  | Presentation presentation,Worker.Answered(Ok _)
+    when not(current_presentation facts presentation)->Worker.Answered(Error Worker.Revoked_session)
+  | _->reply
+;;
+
 let affected_target target change =
   match target with
   | Cleanup _ -> false
@@ -779,7 +790,9 @@ let dispatch_waiting ?(publish = false) ?(retry_full = false) state instructions
            let reject error =
              Entry { slot with result = Some (Worker.Answered (Error error)) }
            in
-           if
+           if slot.retired_by_ack then
+             reject(Worker.Stale_read "This intent attempt predates its durable acknowledgement")
+           else if
              slot.wait_for_capacity
              && slot.early = Some (Worker.Not_admitted Worker.Full)
              && Option.exists
@@ -788,6 +801,16 @@ let dispatch_waiting ?(publish = false) ?(retry_full = false) state instructions
            then reject Worker.Revoked_session
            else (
              match slot.ticket.query with
+             | Operation (Worker.Acknowledge_intent _ as operation) ->
+               (match slot.ticket.target with
+                | Presentation presentation when current_target state.facts (Presentation presentation) ->
+                  let session=Worker.presentation_session presentation in
+                  (match validate_session state session with
+                   | Error error->reject error
+                   | Ok ()->
+                     sends:=Send(slot.ticket,session,operation)::!sends;
+                     Entry{slot with dispatched=true;early=None})
+                | _->reject Worker.Revoked_session)
              | Operation (Worker.Acknowledge_changes batch) ->
                let session = Worker.change_batch_session batch in
                (match validate_session state session with
@@ -2069,7 +2092,7 @@ let step_base state event =
           when (slot.wait_for_capacity
                 ||
                 match slot.ticket.query with
-                | Operation (Worker.Acknowledge_changes _) -> true
+                | Operation (Worker.Acknowledge_changes _ | Worker.Acknowledge_intent _) -> true
                 | _ -> false)
                && slot.dispatched
                && slot.admitted = None
@@ -2873,6 +2896,36 @@ let request
                    "Operation needs backend durability/resource conformance")
           in
           planned))
+;;
+
+let reconcile_mutation state ~presentation intent =
+  let session = Worker.presentation_session presentation in
+  match Option.bind state.facts.current Worker.selected with
+  | Some current when current = presentation ->
+    let operation = match intent_progress (view state) intent with
+      | Some (Worker.Committed_pending_presentation receipt) -> Worker.Confirm (presentation, receipt)
+      | Some (Worker.Confirmed confirmation) ->
+        Worker.Confirm (presentation, Worker.confirmation_receipt confirmation)
+      | None | Some (Worker.Outcome_unknown | Worker.Rejected _) -> Worker.Mutate intent in
+    request state session operation
+  | _ -> Error Worker.Revoked_session
+;;
+
+type mutation_settlement =
+  | Acknowledgement of unit ticket
+  | Reconciliation of Worker.mutation_progress ticket
+
+let settle_applied_mutation state ~presentation ~applied_presentation intent =
+  let current=applied_presentation=presentation && current_presentation (view state) presentation in
+  let acknowledged=match intent_progress (view state) intent with
+    | Some(Worker.Rejected _)->current
+    | Some(Worker.Confirmed value)->current && Worker.confirmation_presentation value=presentation
+    | _->false in
+  if acknowledged then
+    request state (Worker.presentation_session presentation)(Worker.Acknowledge_intent intent)
+    |> Result.map(fun(ticket,transition)->Acknowledgement ticket,transition)
+  else reconcile_mutation state ~presentation intent
+    |> Result.map(fun(ticket,transition)->Reconciliation ticket,transition)
 ;;
 
 let begin_change_application state batch ~root =

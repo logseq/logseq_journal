@@ -21,6 +21,14 @@ val request
   -> 'a Worker.request
   -> ('a Core.ticket, Worker.error) result
 
+val reconcile_mutation
+  : t -> presentation:Worker.presentation -> Worker.mutation_intent
+  -> (Worker.mutation_progress Core.ticket, Worker.error) result
+
+val settle_applied_mutation
+  : t -> presentation:Worker.presentation -> applied_presentation:Worker.presentation -> Worker.mutation_intent
+  -> (Core.mutation_settlement, Worker.error) result
+
 val begin_change_application
   :  t
   -> Worker.change_batch

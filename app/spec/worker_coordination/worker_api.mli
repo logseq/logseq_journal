@@ -28,6 +28,7 @@ val graph_id : session -> Uuid.t
 val equal_session : session -> session -> bool
 val same_logical_graph : session -> session -> bool
 val matches_scope : session -> Service.timeline_scope -> bool
+val presentation_matches_scope : presentation -> Service.timeline_scope -> bool
 
 val worker_incarnation
   :  runtime_epoch:Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch

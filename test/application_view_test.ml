@@ -537,6 +537,7 @@ let run_favorites_native_visibility
       ?(check_capture_imports = false)
       ?detail_capture
       ?status_scenario
+      ?durable_status
       ?delete_scenario
       ?(on_initialized = fun () -> ())
       ?media_rows
@@ -568,9 +569,16 @@ let run_favorites_native_visibility
   let delete_release = Atomic.make false in
   let delete_notices = ref 0 in
   let status_writes = Atomic.make [] in
+  let typed_status_mutations=Atomic.make 0 and typed_status_confirms=Atomic.make 0 and typed_status_acks=Atomic.make 0 in
+  let typed_status_intents=Atomic.make [] in
+  let status_summary_queries=Atomic.make 0 in
+  let status_more_entered=Atomic.make false and status_more_release=Atomic.make(durable_status<>Some `Paged) in
+  let status_confirm_entered=Atomic.make false in
+  let status_confirm_release=Atomic.make(durable_status<>Some `Held) in
   let status_revision () = if Atomic.get status_writes = [] then "root" else "status-updated" in
   let status_release = Atomic.make (status_scenario <> Some "duplicate") in
   let graph_generation = Atomic.make 1 in
+  let status_presentation=Atomic.make 1 in
   let client = ref None in
   let worker_context = ref None in
   let shutdown_called = Atomic.make false in
@@ -829,6 +837,7 @@ let run_favorites_native_visibility
   let coordination_baseline registration =
     let module C=Logseq_sync_pure_reducer.Core in
     let generation=Atomic.get graph_generation in
+    let presentation=max generation(Atomic.get status_presentation) in
     let scope={scope with graph_generation=generation} in
     let limits=C.limits ~maximum_response_bytes:P.maximum_response_bytes
       ~maximum_artifact_bytes:1048576 ~submission_batch_size:1 |> Result.get_ok in
@@ -836,8 +845,8 @@ let run_favorites_native_visibility
     let state=C.initial config |> Result.get_ok |> C.state in
     let state={state with snapshot={state.snapshot with selected_graph=Some scope.graph_id;
       resident_graphs=[scope.graph_id];startup={state.snapshot.startup with
-        account_generation=1;graph_generation=generation;presentation_generation=generation}}} in
-    let owner:Service.timeline_scope={startup={account_generation=1;presentation_generation=generation};
+        account_generation=1;graph_generation=generation;presentation_generation=presentation}}} in
+    let owner:Service.timeline_scope={startup={account_generation=1;presentation_generation=presentation};
       graph_id=scope.graph_id;graph_generation=generation} in
     let sync:C.coordination_state={account=Some scope.account;desired_residents=[scope.graph_id];
       residents=[scope,state];selected=Some owner;deletion=None} in
@@ -845,15 +854,18 @@ let run_favorites_native_visibility
     Service.{registration;authority_user=None;
       limits={response_budget_bytes=P.maximum_response_bytes;outbox_max_records=4096;outbox_max_bytes=8388608;
         change_max_items=4096;change_max_bytes=1048576;dispatcher_capacity=256;wire_batch_max_bytes=262144};
-      baseline={version=Int64.of_int generation;presentation=Int64.of_int generation;state={sync;residents=[scope,physical]}}}
+      baseline={version=Int64.of_int presentation;presentation=Int64.of_int presentation;state={sync;residents=[scope,physical]}}}
   in
+  let durable_outcomes = Hashtbl.create 8 in
+  let durable_intent intent = Logseq_db_worker_contract.Mutation_pure_wire.restore
+    ~origin:(Uri.of_string "https://example.invalid") ~user:"fixture" ~graph:(uuid 900) intent |> Result.get_ok in
   let latest_error_manager = Atomic.make manager in
   let service =
     W.Service.create
       ~push_topic_count:8
       ~merge_push:Service.coalesce_push
       ~concurrency:
-        (if check_capture_imports || Option.is_some detail_capture || check_media_change_ack || Option.is_some asset_change
+        (if check_capture_imports || Option.is_some detail_capture || check_media_change_ack || Option.is_some asset_change || Option.is_some durable_status
          then Concurrent { max_in_flight = 2 }
          else Serial)
       ~init:(fun context _ ->
@@ -864,7 +876,49 @@ let run_favorites_native_visibility
           (Service.Client_state_changed manager);
         Ok ())
       ~handle:(fun context () request ->
-        let normalized=fixture_request request in
+        (match request with
+         | Service.Coordination_mutation{intent;_}->
+           Atomic.incr typed_status_mutations;
+           Atomic.set typed_status_intents(intent::Atomic.get typed_status_intents)
+         | Coordination_confirm _->
+           Atomic.incr typed_status_confirms;
+           Atomic.set status_confirm_entered true;
+           while not(Atomic.get status_confirm_release) do
+             Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done
+         | Coordination_acknowledge_mutation _->Atomic.incr typed_status_acks
+         | Coordination_query{request={command=P.V2_get_outline_block_summary _;_};_}->Atomic.incr status_summary_queries
+         | _->());
+        if (match request with Service.Coordination_acknowledge_mutation _->
+          (durable_status=Some `Ack_failed || durable_status=Some `Reconfirm_failed) && Atomic.get typed_status_acks=1|_->false)
+        then Error "Fixture acknowledgement failed after UI application" else
+        let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+        let cached=match request with
+          | Service.Coordination_mutation{request_id;intent;_} ->
+            Option.map(fun outcome->
+              let rebind=function P.V2_response value->P.V2_response{value with request_id} in
+              Service.Coordination_mutation_result{request_id;outcome=(match outcome with
+                | Wire.Committed response->Wire.Committed(rebind response)
+                | Rejected response->Rejected(rebind response)|Unknown->Unknown)})
+              (Hashtbl.find_opt durable_outcomes intent)
+          | Coordination_acknowledge_mutation{request_id;intent;original;_}->
+            (match Hashtbl.find_opt durable_outcomes intent,original with
+             | Some(Wire.Rejected _),None->()
+             | Some(Committed(P.V2_response{outcome=V2_mutation_committed point;_})),Some(g,b,a)->
+               Alcotest.(check bool) "ACK uses original proof" true
+                 ((g,b,a)=(point.generation,point.before_projection_revision,point.after_projection_revision))
+             | _->failwith "ACK without known settled proof");
+            Some(Service.Coordination_mutation_acknowledged{request_id})
+          | _->None in
+        let original_request=request in
+        match cached with Some response->Ok response|None->
+        let normalized=match request with
+          | Service.Coordination_mutation{request_id;intent;_}->
+            Service.Graph_request P.{api_version;request_id;command=Wire.command(durable_intent intent)}
+          | Coordination_confirm{request_id;intent;_}->
+            let block=Rrbvec.nth (Wire.targets(durable_intent intent)) 0 in
+            Service.Graph_request P.{api_version;request_id;command=V2_get_outline_block_summary
+              {block;limit=P.default_page_size;cursor=None}}
+          | _->fixture_request request in
         let fail_this_media_read=ref false and fail_this_media_listing=ref false in
         (match normalized with
          | Service.Graph_request{command=(P.V2_get_outline_block _|V2_get_page _);_}->
@@ -1096,7 +1150,7 @@ let run_favorites_native_visibility
               Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
             done;
             if status_scenario = Some "failure"
-            then P.V2_failed { code = "invalid-request"; message = "Fixture status write failed" }
+            then P.V2_failed { code = (if durable_status=Some `Conflict then "conflict" else "invalid-request"); message = "Fixture status write failed" }
             else (
               Atomic.set status_value value;
               P.V2_mutation_committed { mutation_id; status = V2_applied; generation = "g"
@@ -1245,13 +1299,25 @@ let run_favorites_native_visibility
                     | Some n ->
                       V2_present_block { value = timeline_block n; revision = status_revision () }
                     | None -> V2_missing_block { uuid = block; revision = "p" }))
-            | V2_get_outline_block_summary { block; _ } when Option.is_some status_scenario ->
+            | V2_get_outline_block_summary { block; cursor; _ } when Option.is_some status_scenario ->
+              let paged=durable_status=Some `Paged in
+              if paged && Option.is_some cursor then (
+                Atomic.set status_more_entered true;
+                while not(Atomic.get status_more_release) do
+                  Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done);
+              let child n : P.v2_child_member =
+                let value=timeline_block n in
+                {value={value with block={value.block with uuid=uuid(9100+n);parent=block;title="Canonical child "^string_of_int n}};
+                 revision="child"} in
               let n = List.find_index (G.Uuid.equal block) roots |> Option.get in
               V2_block_summary_outcome
                 { lookup = V2_present_block { value = timeline_block n; revision = status_revision () }
                 ; page = Some (V2_present_page { page; revision = "p" })
-                ; items = []; next_cursor = None; scope_revision = "children"
-                ; generation = "g"; projection_revision = "p2" }
+                ; items = (if paged then [child(if cursor=None then 0 else 1)] else [])
+                ; next_cursor = (if paged && cursor=None then Some(G.Cursor.of_string "status-confirmation-more" |> Result.get_ok) else None)
+                ; scope_revision = "children"
+                ; generation = (if paged then "generation:v1:1:1" else "g")
+                ; projection_revision = (if paged then "projection:v1:1" else "p2") }
             | V2_get_outline_block_summary { block; _ } when check_capture_imports ->
               let root = Atomic.get capture_root |> Option.get in
               let page = Atomic.get capture_page |> Option.get in
@@ -1551,10 +1617,31 @@ let run_favorites_native_visibility
                 }
             | _ -> V2_failed { code = "unsupported"; message = "Unused fixture command" }
           in
-          Ok
-            (Service.Graph_response
-               (P.V2_response
-                  { api_version = 2; request_id = request.request_id; outcome })))
+          let response=P.V2_response{api_version=2;request_id=request.request_id;outcome} in
+          Ok (match original_request with
+            | Service.Coordination_mutation{request_id;intent;_}->
+              let outcome=match outcome with
+                | P.V2_mutation_committed point->Wire.Committed(P.V2_response{api_version=2;request_id;
+                    outcome=V2_mutation_committed{point with generation="generation:v1:1:1";
+                      before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"}})
+                | _->Wire.Rejected response in
+              Hashtbl.replace durable_outcomes intent outcome;
+              Service.Coordination_mutation_result{request_id;outcome=(if durable_status=Some `Unknown
+                && Atomic.get typed_status_mutations=1 then Wire.Unknown else outcome)}
+            | Coordination_confirm _ when (durable_status=Some `Confirm_failed && Atomic.get typed_status_confirms=1)
+              || (durable_status=Some `Reconfirm_failed && Atomic.get typed_status_confirms=2) ->
+              Service.Graph_response(P.V2_response{api_version=2;request_id=request.request_id;
+                outcome=V2_failed{code="invalidRequest";message="Fixture canonical read failed"}})
+            | Coordination_confirm _ when durable_status=Some `Absence ->
+              Service.Graph_response(P.V2_response{api_version=2;request_id=request.request_id;
+                outcome=V2_block_summary_outcome{lookup=V2_missing_block{uuid=uuid 1;revision="missing"};
+                  page=None;items=[];next_cursor=None;scope_revision="children";
+                  generation="generation:v1:1:1";projection_revision="projection:v1:1"}})
+            | Coordination_confirm _ ->
+              Service.Graph_response(match response with P.V2_response({outcome=V2_block_summary_outcome value;_}as response)->
+                P.V2_response{response with outcome=V2_block_summary_outcome{value with
+                  generation="generation:v1:1:1";projection_revision="projection:v1:1"}}|_->response)
+            | _->Service.Graph_response response))
       ~shutdown:(fun () -> Atomic.set shutdown_called true)
       ()
   in
@@ -1714,6 +1801,8 @@ let run_favorites_native_visibility
       Atomic.set asset_more_release true;
       Atomic.set delete_release true;
       Atomic.set status_release true;
+      Atomic.set status_confirm_release true;
+      Atomic.set status_more_release true;
       Atomic.set child_release true;
       Atomic.set calendar_feed_release true;
       Atomic.set detail_wait_release true;
@@ -1988,10 +2077,10 @@ let run_favorites_native_visibility
                  ^ if tag = "clear" then tag else G.Uuid.to_string (status_uuid tag))
             in
          let close () = Option.get (find "accessibility-identifier" "journal-status-close") in
-         let send_status () =
+         let send_status ?(block=uuid 1) () =
            let list = Option.get (find "_extension" "journal-list") in
            let row_payload = Yojson.Safe.to_string (`Assoc
-             [ "key", `String "status"; "row", `String ("block:" ^ G.Uuid.to_string (uuid 1)) ]) in
+             [ "key", `String "status"; "row", `String ("block:" ^ G.Uuid.to_string block) ]) in
            let event = Yojson.Safe.to_string (`Assoc
              [ "type", `String "row_event"; "payload", `String row_payload ]) in
            hooks.extension_event list "event" (Yojson.Safe.to_string
@@ -2054,11 +2143,53 @@ let run_favorites_native_visibility
               send_status ();
               Alcotest.(check bool) "pending status cannot reopen another operation" true (Option.is_none (option "doing"));
               Atomic.set status_release true);
+            (match durable_status with
+             | Some `Reconfirm_failed->
+               wait "initial ACK failure offers cleanup Retry" (fun()->Option.is_some(find "accessibility-label" "Retry status"));
+               Atomic.set status_presentation 3;
+               let manager={manager with snapshot={manager.snapshot with startup={manager.snapshot.startup with presentation_generation=3}}} in
+               W.Session_context.emit(Option.get !worker_context) ~topic:Service.manager_topic(Service.Client_state_changed manager);
+               W.Session_context.emit(Option.get !worker_context)
+                 ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+                 (Service.Coordination_updates[Service.Coordination_snapshot
+                   (coordination_baseline(Option.get(Atomic.get coordination_registration)))]);
+               for _=1 to 80 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+               dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Retry status")));
+               wait "re-confirmation failure restores same-intent Retry" (fun()->
+                 Atomic.get typed_status_confirms=2 && Option.is_some(find "accessibility-label" "Retry status"));
+               Alcotest.(check int) "failed new presentation cannot ACK old UI proof" 1(Atomic.get typed_status_acks);
+               dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Retry status")))
+             | Some `Paged->
+               wait "canonical More request is held" (fun()->Atomic.get status_more_entered);
+               for _=1 to 50 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+               Alcotest.(check int) "Partial canonical children cannot ACK" 0(Atomic.get typed_status_acks);
+               send_status();
+               Alcotest.(check bool) "Partial canonical readback keeps status pending" true(Option.is_none(option "doing"));
+               Atomic.set status_more_release true
+             | Some `Held->
+               wait "actual typed status Confirm is held" (fun()->Atomic.get status_confirm_entered);
+               for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+               Alcotest.(check int) "held canonical DTO cannot be ACKed" 0(Atomic.get typed_status_acks);
+               send_status();
+               Alcotest.(check bool) "unconfirmed status cannot start another choice" true(Option.is_none(option "doing"));
+               Atomic.set status_confirm_release true
+             | Some(`Unknown|`Confirm_failed|`Ack_failed)->
+               wait "unsettled status offers same-intent Retry" (fun()->Option.is_some(find "accessibility-label" "Retry status"));
+               Alcotest.(check bool) "unsettled accepted write is not reported as unchanged" true
+                 (Option.is_none(find "text" "Status not changed"));
+               Alcotest.(check int) "unsettled status has no completed durable ACK"
+                 (if durable_status=Some `Ack_failed then 1 else 0)(Atomic.get typed_status_acks);
+               dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Retry status")))
+             | _->());
             wait "status operation completes" (fun () ->
               if scenario = "failure" then Option.is_some (find "text" "Status not changed")
                  else
                    Atomic.get status_value
                    = if scenario = "clear" then None else Some target);
+            if durable_status=Some `Absence then (
+              wait "absent confirmed status releases next operation" (fun()->
+                send_status ~block:(uuid 2)();Option.is_some(option "doing"));
+              dispatch(Lui_protocol.Press(close()))) else (
             wait "status owner accepts another menu after completion" (fun () ->
               if Option.is_none (option "doing") then send_status ();
               Option.is_some (option "doing"));
@@ -2071,11 +2202,25 @@ let run_favorites_native_visibility
                       (Option.get (find "accessibility-identifier" "journal-status-next")));
             Alcotest.(check bool) "reopened menu shows the committed status or retains it on failure" true
               (List.assoc_opt "selected" (Hashtbl.find props (Option.get (option expected))) = Some (`Bool true));
-            dispatch (Lui_protocol.Press (close ()))
+            dispatch (Lui_protocol.Press (close ())))
           | _ -> Alcotest.fail "unknown status scenario");
          if List.mem scenario ["expanded"; "dismiss"; "none"; "now"; "waiting"; "later"] then (
            Alcotest.(check bool) "closing removes status UI" true (Option.is_none (option "doing"));
-           Alcotest.(check int) "closing never submits" 0 (List.length (Atomic.get status_writes)))) status_scenario;
+           Alcotest.(check int) "closing never submits" 0 (List.length (Atomic.get status_writes)));
+         if Option.is_some durable_status then (
+           wait "applied status outcome is durably ACKed" (fun()->Atomic.get typed_status_acks>0);
+           Alcotest.(check int) "status UI uses typed durable intent" (if durable_status=Some `Unknown then 2 else 1)
+             (Atomic.get typed_status_mutations);
+           Alcotest.(check int) "known rejection needs no canonical readback"
+             (match durable_status with Some(`Rejected|`Conflict)->0|Some `Confirm_failed->2|Some `Reconfirm_failed->3|_->1)
+             (Atomic.get typed_status_confirms);
+           Alcotest.(check int) "only failed ACK is retried" (if durable_status=Some `Ack_failed || durable_status=Some `Reconfirm_failed then 2 else 1)
+             (Atomic.get typed_status_acks);
+           if durable_status=Some `Conflict then Alcotest.(check int)
+             "known conflict uses ordinary canonical read without another write" 1(Atomic.get status_summary_queries);
+           let intents=Atomic.get typed_status_intents in
+           Alcotest.(check bool) "status retry preserves complete immutable intent" true
+             (intents<>[] && List.for_all((=)(List.hd intents))intents))) status_scenario;
        if Option.is_none status_scenario && Option.is_none delete_scenario then (
        if Option.is_some calendar_change then (
          let label () = Hashtbl.fold (fun _ values found ->
@@ -7650,6 +7795,27 @@ let () =
             ; "custom"
             ; "pagination"
             ] )
+    ; ( "durable status UI"
+      , [Alcotest.test_case "canonical status projection before durable ACK" `Quick(fun()->
+           run_favorites_native_visibility ~status_scenario:"select" ~durable_status:`Happy ());
+         Alcotest.test_case "held Confirm retains pending status" `Quick(fun()->
+           run_favorites_native_visibility ~status_scenario:"select" ~durable_status:`Held ());
+         Alcotest.test_case "Unknown retry keeps original intent" `Quick(fun()->
+           run_favorites_native_visibility ~status_scenario:"select" ~durable_status:`Unknown ());
+         Alcotest.test_case "canonical read failure retries confirmation" `Quick(fun()->
+           run_favorites_native_visibility ~status_scenario:"select" ~durable_status:`Confirm_failed ());
+         Alcotest.test_case "known rejection is presented then ACKed" `Quick(fun()->
+           run_favorites_native_visibility ~status_scenario:"failure" ~durable_status:`Rejected ());
+        Alcotest.test_case "ACK failure retains explicit cleanup Retry" `Quick (fun()->
+           run_favorites_native_visibility ~status_scenario:"select" ~durable_status:`Ack_failed ());
+        Alcotest.test_case "canonical absence unlocks status" `Quick (fun()->
+           run_favorites_native_visibility ~status_scenario:"select" ~durable_status:`Absence ());
+        Alcotest.test_case "known conflict refreshes without rewriting" `Quick (fun()->
+           run_favorites_native_visibility ~status_scenario:"failure" ~durable_status:`Conflict ());
+        Alcotest.test_case "canonical More applies before ACK" `Quick (fun()->
+           run_favorites_native_visibility ~status_scenario:"select" ~durable_status:`Paged ());
+        Alcotest.test_case "focus re-confirmation failure restores Retry" `Quick(fun()->
+           run_favorites_native_visibility ~status_scenario:"select" ~durable_status:`Reconfirm_failed ())])
     ; ("Favorites compact title",[Alcotest.test_case "Favorite Page uses shared reference lookup" `Quick test_favorite_page_uses_shared_reference_lookup; Alcotest.test_case "page property values keep name without duplication" `Quick test_detail_page_property_value_presentation; Alcotest.test_case "root Capture only in Journals" `Quick test_root_capture_placement; Alcotest.test_case "LUI titles icons and no arrow" `Quick test_favorites_compact_shared_titles; Alcotest.test_case "page outline click and native Back" `Quick (fun () -> run_favorites_native_visibility ~check_favorite_targets:true ())])
     ; ( "local account retry", [
         Alcotest.test_case "transient failure retries local discovery" `Quick (fun () -> test_local_account_failure_retries_local_discovery ());

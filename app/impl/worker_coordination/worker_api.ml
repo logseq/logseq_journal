@@ -599,6 +599,11 @@ let matches_scope (session : session) (scope : Service.timeline_scope) =
   && Uuid.equal session.graph scope.graph_id
 ;;
 
+let presentation_matches_scope (presentation:presentation) (scope:Service.timeline_scope) =
+  matches_scope presentation.session scope
+  && presentation.generation=Int64.of_int scope.startup.presentation_generation
+;;
+
 let worker_incarnation ~runtime_epoch ~worker_generation =
   { runtime_epoch; worker_generation }
 ;;
@@ -771,7 +776,12 @@ let decode_mutation_progress session ~request_id ~intent outcome =
       when api_version=Protocol.api_version && Uuid.equal actual request_id->
       if Protocol.encoded_response_bytes response>session.limits.response_budget_bytes
       then Error Response_budget_exceeded
-      else Ok(Rejected(Service_failed(code^": "^message)))
+      else (match Logseq_db_worker.Error.code_of_string code with
+        | Some code ->
+          (match Logseq_db_worker.Error.create ~code ~message ~details:[] with
+           | Ok error->Ok(Rejected(Db_error error))
+           | Error _->Error(Protocol_mismatch "Invalid known mutation error"))
+        | None->Ok(Rejected(Service_failed(code^": "^message))))
     | _->Error(Protocol_mismatch "Invalid known mutation rejection"))
 ;;
 
