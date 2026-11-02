@@ -13,6 +13,7 @@ type branch =
   ; continuation : Journal_graph_projection.block_cursor option
   ; loaded : bool
   ; pending : (int64 * Journal_graph_projection.block_cursor option) option
+  ; pending_blocks : Journal_model.t Blocks.t option
   ; error : string option
   }
 
@@ -157,6 +158,7 @@ let empty_branch =
   ; continuation = None
   ; loaded = false
   ; pending = None
+  ; pending_blocks = None
   ; error = None
   }
 ;;
@@ -448,6 +450,7 @@ let load ?(automatic = false) (t : t) id =
               id
               { current with
                 pending = Some (generation, current.continuation)
+              ; pending_blocks = Some t.blocks
               ; error = None
               }
               t.branches
@@ -498,7 +501,17 @@ let step (t : t) = function
     let current = branch t id in
     (match current.pending with
      | Some (expected, after) when generation = expected ->
-       let blocks = add_blocks t.blocks (detail.root :: detail.children.blocks) in
+       (* The page owns membership/continuation, while point updates received
+          since dispatch own their newer content. Revisions are opaque; compare
+          with the immutable dispatch snapshot, never order revision strings. *)
+       let preserve value =
+         let id=Journal_model.id value in
+         let before=Option.bind current.pending_blocks(Blocks.find_opt id) in
+         match Blocks.find_opt id t.blocks with
+         | Some now when before<>Some now->now
+         | _->value in
+       let page_root=preserve detail.root in
+       let blocks=add_blocks t.blocks (page_root::List.map preserve detail.children.blocks) in
        let previous = if after = None then current.appended else current.children in
        let children =
          List.fold_left
@@ -524,14 +537,15 @@ let step (t : t) = function
          ; continuation = detail.children.continuation
          ; loaded = true
          ; pending = None
+         ; pending_blocks = None
          ; error = None
          }
        in
        let root =
          Journal_model.with_child_count
-           detail.root
+           page_root
            ~child_count:
-             (max (List.length children) (Journal_model.child_count detail.root))
+             (max (List.length children) (Journal_model.child_count page_root))
          |> Result.get_ok
        in
        ( invalidate_rows
@@ -562,6 +576,7 @@ let step (t : t) = function
              | Some (expected, _) when generation = expected ->
                { current with
                  pending = None
+               ; pending_blocks = None
                ; error = Some message
                ; continuation = (if stale_cursor then None else current.continuation)
                ; loaded = current.loaded && not stale_cursor
@@ -723,6 +738,7 @@ let reconcile_children (t : t) (detail : Journal_graph_projection.detail) =
             ; loaded = true
             ; continuation = detail.children.continuation
             ; pending = None
+            ; pending_blocks = None
             ; error = None
             }
             t.branches
@@ -736,7 +752,7 @@ let cancel_initial_reads (t : t) =
     invalidate_rows
       { t with
         branches =
-          Blocks.map (fun (branch : branch) -> { branch with pending = None }) t.branches
+          Blocks.map (fun (branch : branch) -> { branch with pending = None;pending_blocks=None }) t.branches
       }
 ;;
 
@@ -783,6 +799,7 @@ let apply_child_created (t : t) ~child ~parent =
                 current.loaded && current.continuation = None && current.pending = None
             ; continuation = None
             ; pending = None
+            ; pending_blocks = None
             ; error = None
             }
             t.branches
@@ -944,3 +961,155 @@ let retain_retained_child_chain draft ~command chain =
   let next=Journal_capture.retain_child_chain draft.draft_capture ~command chain in
   if next==draft.draft_capture then draft else {draft with draft_capture=next}
 ;;
+
+module Pure_observation = struct
+  module Worker = Journal_worker_coordination.Worker_api
+  module Core = Journal_worker_coordination.Worker_pure_coordinator
+  module Protocol = Logseq_db_worker.Protocol
+  module Entries = Map.Make (String)
+
+  type context =
+    { entry_id : string
+    ; request_generation : int64
+    ; root : Worker.Uuid.t
+    ; owner : Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
+    ; original : Protocol.request
+    ; maximum_children : int
+    }
+
+  type ticket = Protocol.v2_block_lookup Worker.observed Core.ticket
+
+  type instruction =
+    | Cancel_initial of ticket
+    | Forget_initial of ticket
+    | Release of Protocol.v2_block_lookup Worker.observation
+    | Initial of context * Protocol.v2_block_lookup Worker.observed
+    | Updated of context * Protocol.v2_block_lookup Worker.observed
+    | Failed of context * Worker.error
+    | Rejected of context * Worker.error
+
+  type entry =
+    { context : context
+    ; ticket : ticket
+    ; handle : Protocol.v2_block_lookup Worker.observation option
+    ; forwarded_epoch : Worker.observation_epoch option
+    ; reported : bool
+    ; forgotten : bool
+    ; error : Worker.error option
+    }
+
+  type t = entry Entries.t
+
+  let empty = Entries.empty
+  let context_count = Entries.cardinal
+
+  let retire entry =
+    let cleanup = match entry.handle with
+      | Some handle -> Rrbvec.singleton (Release handle)
+      | None -> Rrbvec.singleton (Cancel_initial entry.ticket)
+    in
+    if entry.forgotten then cleanup
+    else Rrbvec.push_back cleanup (Forget_initial entry.ticket)
+  ;;
+
+  let planned t context ticket =
+    let claimed=Entries.exists(fun _ old->old.ticket=ticket && old.context<>context)t in
+    if claimed then t,Rrbvec.singleton(Rejected(context,Worker.Invalid_input
+      "This observation ticket already belongs to another Detail context.")) else
+    match context.original.command with
+    | Protocol.V2_get_outline_block { block; _ }
+      when block=context.root && context.original.api_version=Protocol.api_version
+        && context.request_generation>=0L && context.maximum_children>0
+        && context.maximum_children<=Protocol.maximum_page_size ->
+      (match Entries.find_opt context.entry_id t with
+       | Some old when old.context = context && Core.ticket_id old.ticket = Core.ticket_id ticket ->
+         t, Rrbvec.empty
+       | previous ->
+         let effects = Option.fold ~none:Rrbvec.empty ~some:retire previous in
+         let entry = { context; ticket; handle=None; forwarded_epoch=None;
+           reported=false; forgotten=false; error=None } in
+         Entries.add context.entry_id entry t, effects)
+    | _ ->
+      t, Rrbvec.of_list [Cancel_initial ticket; Forget_initial ticket;
+        Rejected (context, Worker.Invalid_input "Detail observation does not match its root request.")]
+  ;;
+
+  let retain t wanted =
+    let wanted=Rrbvec.fold_left(fun wanted(id,generation,root)->Entries.add id(generation,root)wanted)
+      Entries.empty wanted in
+    let retained, effects = Entries.fold (fun id entry (retained,effects) ->
+      let current=Entries.find_opt id wanted=Some(entry.context.request_generation,entry.context.root) in
+      if current then retained,effects
+      else Entries.remove id retained,Rrbvec.append effects (retire entry)) t (t,Rrbvec.empty) in
+    retained,effects
+  ;;
+
+  let admission_error = function
+    | Worker.Not_admitted Worker.Full -> Some (Worker.Service_failed "Worker request queue is full.")
+    | Not_admitted Not_ready -> Some (Worker.Service_failed "Worker is not ready.")
+    | Not_admitted Stopping -> Some (Worker.Service_failed "Worker is stopping.")
+    | Not_admitted (Unsupported_request message) -> Some (Worker.Unsupported_operation message)
+    | Answered (Error error) -> Some error
+    | Interrupted _ -> Some Worker.Revoked_session
+    | Answered (Ok _) -> None
+  ;;
+
+  let inspect_entry view entry =
+    let handle = match entry.handle with
+      | Some _ as handle -> handle
+      | None -> Core.observation_handle view entry.ticket
+    in
+    let reply = Core.reply view entry.ticket in
+    let forgotten,effects =
+      if entry.forgotten || (handle=None && reply=None) then entry.forgotten,Rrbvec.empty
+      else true,Rrbvec.singleton (Forget_initial entry.ticket)
+    in
+    let entry = {entry with handle;forgotten} in
+    let result = Option.map (fun handle ->
+      let session = Worker.observation_session handle in
+      let Worker.Outline_block {uuid;revision}=Worker.observation_query handle in
+      let query_matches=uuid=entry.context.root && entry.context.original.command=
+        Protocol.V2_get_outline_block{block=uuid;revision} in
+      if not query_matches then Error (Worker.Protocol_mismatch "Detail observation root changed.")
+      else if Core.observation_handle view entry.ticket=None
+           || not(Worker.matches_scope session entry.context.owner) then Error Worker.Revoked_session
+      else Ok handle) handle in
+    match result with
+    | Some (Error error) ->
+      None,Rrbvec.append effects
+        (Rrbvec.push_back (retire entry) (Failed(entry.context,error)))
+    | None | Some (Ok _) ->
+      let sample = Option.bind handle (Core.observed view) in
+      let error = match handle with
+        | Some handle -> Core.observation_error view handle
+        | None -> Option.bind reply admission_error
+      in
+      (match sample,error with
+       | Some sample,None ->
+         let newer = Option.fold ~none:true ~some:(fun previous ->
+           Worker.compare_observation_epoch sample.epoch previous > 0) entry.forwarded_epoch in
+         if not newer then Some entry,effects
+         else
+           let delivery = if entry.reported then Updated(entry.context,sample) else Initial(entry.context,sample) in
+           Some {entry with forwarded_epoch=Some sample.epoch;reported=true;error=None},
+             Rrbvec.push_back effects delivery
+       | _,Some error when entry.error<>Some error ->
+         Some {entry with reported=true;error=Some error},Rrbvec.push_back effects (Failed(entry.context,error))
+       | _ -> Some entry,effects)
+  ;;
+
+  let inspect t view =
+    Entries.fold (fun id entry (next,effects) ->
+      let updated,produced = inspect_entry view entry in
+      let next = match updated with
+        | None -> Entries.remove id next
+        | Some updated when updated=entry -> next
+        | Some updated -> Entries.add id updated next
+      in
+      next,Rrbvec.append effects produced) t (t,Rrbvec.empty)
+  ;;
+  let handle t ~entry_id ~request_generation ~root =
+    Option.bind(Entries.find_opt entry_id t)(fun entry->
+      if entry.context.request_generation=request_generation && entry.context.root=root then entry.handle else None)
+
+end

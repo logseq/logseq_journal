@@ -60,6 +60,9 @@ val next_automatic_load : t -> string option
     must preserve these counters rather than starting another automatic round. *)
 val initial_staging : t -> [ `Waiting | `Ready | `Load of string ]
 
+(** A page completion owns membership and continuation. Content changed by a
+    point update since dispatch survives that completion; opaque revisions are
+    never ordered as clocks. *)
 val step : t -> event -> t * Journal_graph_request.t list
 val mode : t -> mode
 val session_id : t -> ID.Text_input.session_id
@@ -177,3 +180,50 @@ val retain_child_chain : t -> command:Journal_graph_projection.create_child ->
   Journal_graph_mutation_confirmation.Pure_insertion.t -> t
 val retain_retained_child_chain : retained_composer -> command:Journal_graph_projection.create_child ->
   Journal_graph_mutation_confirmation.Pure_insertion.t -> retained_composer
+
+module Pure_observation : sig
+  module Worker = Journal_worker_coordination.Worker_api
+  module Core = Journal_worker_coordination.Worker_pure_coordinator
+  module Protocol = Logseq_db_worker.Protocol
+
+  type context =
+    { entry_id : string
+    ; request_generation : int64
+    ; root : Worker.Uuid.t
+    ; owner : Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
+    ; original : Protocol.request
+    ; maximum_children : int
+    }
+
+  type ticket = Protocol.v2_block_lookup Worker.observed Core.ticket
+
+  type instruction =
+    | Cancel_initial of ticket
+    | Forget_initial of ticket
+    | Release of Protocol.v2_block_lookup Worker.observation
+    | Initial of context * Protocol.v2_block_lookup Worker.observed
+    | Updated of context * Protocol.v2_block_lookup Worker.observed
+    | Failed of context * Worker.error
+    | Rejected of context * Worker.error
+
+  type t
+
+  val empty : t
+
+  (** Retain presentation context, never a second admission or resource authority.
+      Replacement delegates cancellation/release to the Worker coordinator. *)
+  val planned : t -> context -> ticket -> t * instruction Rrbvec.t
+
+  (** Forward only coordinator-owned current samples. Missing values and failed
+      reads retain their observation; errors do not imply physical release. *)
+  val inspect : t -> Core.view -> t * instruction Rrbvec.t
+
+  (** Native path identity includes the entry generation, even for the same UUID.
+      Cleanup ownership remains in Core until its actual physical ACK. *)
+  val retain : t -> (string * int64 * Worker.Uuid.t) Rrbvec.t -> t * instruction Rrbvec.t
+
+  val context_count : t -> int
+  val handle : t -> entry_id:string -> request_generation:int64 -> root:Worker.Uuid.t ->
+    Protocol.v2_block_lookup Worker.observation option
+
+end

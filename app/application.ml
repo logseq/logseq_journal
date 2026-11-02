@@ -1,3 +1,4 @@
+module Detail_observation = Journal_detail.Pure_observation
 module ID = Journal_ids
 module Ui = Journal_view
 module V = Ui.View
@@ -905,7 +906,18 @@ let open_detail_state state detail request_generation =
   let routes =
     Journal_routes.apply_detail_response state.routes ~request_generation detail
   in
-  if routes == state.routes then state else { state with routes }
+  if routes == state.routes then state else
+    let accepted=Lui_navigation.Path.entries(Journal_routes.path routes) |> List.to_seq
+      |> Seq.find_map(fun (entry:Journal_routes.detail_route Lui_navigation.entry)->
+        let before=Option.bind(Journal_routes.at_entry state.routes ~entry_id:entry.id)Journal_routes.detail in
+        let after=Option.bind(Journal_routes.at_entry routes ~entry_id:entry.id)Journal_routes.detail in
+        if Option.equal(==)before after then None
+        else Option.map Journal_detail.root after) in
+    let timeline=match accepted with
+      | Some root when Journal_model.id root<>Journal_model.page_id root
+          && Journal_model.journal_day_opt root<>None->Journal_timeline_state.replace_block state.timeline root
+      | _->state.timeline in
+    {state with routes;timeline}
 ;;
 
 let capture_failure_message = function
@@ -1529,6 +1541,10 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
           timeline_entry_update
     }
   | Block_removed { block_id } -> commit_deleted ~discard state block_id
+  | Block_observed_missing { block_id } ->
+    favorites_event
+      {state with timeline=Journal_timeline_state.remove_block state.timeline ~block_id}
+      Invalidate
   | Page_tree_reconciled { page; value } ->
     { state with
       timeline =
@@ -2097,6 +2113,7 @@ type command =
   | Submit_e2ee_password
   | Request_local_cache_reset
   | Detail_retry
+  | Detail_observation_retry
   | Asset_settings of string
   | Import_asset of string
   | Select_graph of string
@@ -2861,7 +2878,7 @@ let detail_page ~media_store ?(on_region = fun _ -> ()) ~state ~on_scroll_comple
     }
   in
   let local command = dispatch.send (Detail_action (scope, command)) in
-  Journal_detail_view.view props
+  let body=Journal_detail_view.view props
     ~render_media:(fun ~known_images ~title ~root child ->
       Journal_media_view.view ~store:media_store ~on_region ~scope:media_scope
         ~known_images ~title ~root
@@ -2877,7 +2894,17 @@ let detail_page ~media_store ?(on_region = fun _ -> ()) ~state ~on_scroll_comple
       | Visible_range (first, last) ->
         local (Detail_visible_range (first, last));
         dispatch.send (Media_range (media_scope, first, last))
-      | Import_asset payload -> local (Import_asset payload))
+      | Import_asset payload -> local (Import_asset payload)) in
+  match Journal_routes.observation_error state.routes with
+  | None->body
+  | Some(message,refreshing)->
+    let feedback=V.padding ~insets:(Ui.Layout.Edge_insets.all 16.)
+      (V.column ~spacing:8. [live_region_text message;
+        V.button ~enabled:(not refreshing)
+          ~child:(V.text(if refreshing then "Refreshing observation…" else "Retry observation"))
+          ~on_press:(Ui.Event.Handler.create ~name:"journal-action" (fun _->local Detail_observation_retry)) ()]) in
+    Journal_header.feedback ~key:(Ui.Key.string(scope^"-observation-feedback")) ~top:false
+      ~visible:true ~compact:feedback ~expanded:feedback body
 ;;
 
 let manager_picker_live state : Journal_manager_view.picker_live =
@@ -3364,6 +3391,16 @@ let start
   let coordination_sdk_seen = ref false in
   let retired_coordination_hosts = ref Rrbvec.empty in
   let coordination_lifecycle_changed = ref(fun()->()) in
+  let detail_observations_changed = ref(fun()->()) in
+  let detail_observations_cell=graph_ref(fun()->Detail_observation.empty) in
+  let observation_wanted routes =
+    Lui_navigation.Path.entries(Journal_routes.path routes) |> List.to_seq
+    |> Seq.filter_map(fun (entry:Journal_routes.detail_route Lui_navigation.entry)->
+      Option.bind(Journal_routes.at_entry routes ~entry_id:entry.id)(fun local->
+        Option.bind(Journal_routes.detail_block_id local)(fun root->
+          match Wc.Uuid.of_string root with Error _->None|Ok root->
+            Some(entry.id,Journal_routes.detail_request_generation local,root))))
+    |> Seq.fold_left Rrbvec.push_back Rrbvec.empty in
   let all_coordination_hosts () = match !coordination_host with
     | None-> !retired_coordination_hosts
     | Some(_,host)->Rrbvec.push_back !retired_coordination_hosts host in
@@ -3403,7 +3440,9 @@ let start
            ~client_id:(Wc.Uuid.of_string id |> Result.get_ok) ~managed_origin:origin ~user_id:user
            ~enqueue:(Journal_pump.enqueue pump)
            ~changed:(fun view->
-             if !coordination_host_id=Some id then Option.iter(fun poll->poll view)!copy_poll;
+             if !coordination_host_id=Some id then (
+               Option.iter(fun poll->poll view)!copy_poll;
+               !detail_observations_changed());
              !coordination_lifecycle_changed()) with
          | Error _->Error "Unable to bind the graph reader. Try Copy again."
          | Ok host->coordination_host_id:=Some id;coordination_host:=Some(identity,host);Ok host)
@@ -4150,7 +4189,36 @@ let start
       in
       (match read with
        | Journal_graph_runtime.Read read ->
-         (match Coordination_host.plan_query host ~owner ~maximum_items:read.maximum_items
+         let observed=match read.query,Journal_graph_runtime.detail_observation_input (!graph_runtime_cell) request with
+           | Wc.Outline_block{uuid;_},Some(generation,maximum_children)->
+             (match Rrbvec.find_opt(fun(_,actual,root)->actual=generation && root=uuid)
+                (observation_wanted (!state_ref).routes),Coordination.projection(Coordination_host.view host) with
+              | Some(entry_id,_,_),Some projection->
+                let session=List.find_map(fun resident->if resident.Wc.phase=Wc.Open
+                  && Wc.matches_scope resident.session owner then Some resident.session else None)(Wc.residents projection) in
+                (match session with None->Some Journal_graph_transport.Not_ready|Some session->
+                  match Wc.read_budget session ~maximum_items:read.maximum_items ~maximum_bytes:Logseq_db_worker.Protocol.maximum_response_bytes with
+                  | Error _->Some Journal_graph_transport.Not_ready
+                  | Ok budget->
+                    observe_projection_request request;
+                    match Coordination_host.request host session(Wc.Observe(budget,read.query)) with
+                    | Error _->Some Journal_graph_transport.Not_ready
+                    | Ok ticket->
+                      let context:Detail_observation.context={entry_id;request_generation=generation;root=uuid;
+                        owner;original=request;maximum_children} in
+                      let next,cleanup=Detail_observation.planned (!detail_observations_cell) context ticket in
+                      detail_observations_cell:=next;
+                      Rrbvec.iter(function
+                        | Detail_observation.Cancel_initial ticket->Coordination_host.post host(Coordination.Cancel ticket)
+                        | Forget_initial ticket->Coordination_host.post host(Coordination.Forget ticket)
+                        | Release handle->Coordination_host.post host(Coordination.Release handle)
+                        | _->())cleanup;
+                      !detail_observations_changed();
+                      Some Journal_graph_transport.Accepted)
+              | _->None)
+           | _->None in
+         (match observed with Some result->result|None->
+         match Coordination_host.plan_query host ~owner ~maximum_items:read.maximum_items
            ~maximum_bytes:Logseq_db_worker.Protocol.maximum_response_bytes read.query with
           | Ok ticket->watch None ticket read.outcome;Journal_graph_transport.Accepted
           | Error _->Journal_graph_transport.Not_ready)
@@ -4556,6 +4624,15 @@ let start
   in
   coordinated_read_finished := (fun owner request application origin result ->
     if runtime_owner_is_live !state_ref owner then run_owned (Some owner) (fun () ->
+      if not(Journal_graph_runtime.owns_read (!graph_runtime_cell) request) then Effect.ignore else
+      (* Check again at the serialized application point, before any shared DTO
+         observer sees the response. An earlier callback check is not a lease. *)
+      let result=match result,origin,!coordination_host with
+        | Ok _,Some(session,_),Some(_,host)
+          when Coordination_host.validate_session ~owner host session<>Ok ()->
+          Error "The graph execution changed before the read was applied."
+        | Ok _,Some _,None->Error "The read lost its Worker binding."
+        | _->result in
       let result=match Journal_graph_runtime.mutation_presentation (!graph_runtime_cell) request,!coordination_host with
         | Some presentation,Some(_,host) when not(Coordination.current_presentation(Coordination_host.view host)presentation)->
           Error "The confirmation belongs to an earlier presentation. Retry checks the same change."
@@ -4655,6 +4732,73 @@ let start
         | Error message->Journal_graph_runtime.mutation_waiting (!graph_runtime_cell)request message in
       Effect.bind(Effect.of_thunk(fun()->deliver_output output))~f:(fun delivery->
         apply_graph_responses set_state_and_effect delivery.responses)));
+  detail_observations_changed := (fun()->
+    let owner=current_owner() in
+    run_owned owner(fun()->Effect.of_thunk(fun()->match !coordination_host with
+      | None->()
+      | Some(_,host)->
+        let current,cleanup=Detail_observation.retain (!detail_observations_cell)
+          (observation_wanted (!state_ref).routes) in
+        let next,updates=Detail_observation.inspect current(Coordination_host.view host) in
+        detail_observations_cell:=next;
+        let live context=match Journal_routes.at_entry (!state_ref).routes ~entry_id:context.Detail_observation.entry_id with
+          | Some route->Journal_routes.detail_request_generation route=context.request_generation
+            && Journal_routes.detail_block_id route=Some(Wc.Uuid.to_string context.root)
+            && runtime_owner_is_live !state_ref context.owner
+          | None->false in
+        let forward context sample request=
+          observe_projection_request request;
+          !coordinated_read_finished context.Detail_observation.owner request None
+            (Some(Wc.observation_session sample.Wc.observation,Wc.observation_budget sample.observation))
+            (Ok(Journal_graph_runtime.Ordinary_read(V2_block_outcome sample.value))) in
+        Rrbvec.iter(function
+          | Detail_observation.Cancel_initial ticket->Coordination_host.post host(Coordination.Cancel ticket)
+          | Forget_initial ticket->Coordination_host.post host(Coordination.Forget ticket)
+          | Release handle->Coordination_host.post host(Coordination.Release handle)
+          | Initial(context,sample) when live context ->
+            let session=Wc.observation_session sample.observation in
+            (match Coordination_host.validate_session ~owner:context.owner host session with
+             | Error _->()
+             | Ok()->
+               Effect.run(set_state(fun state->{state with routes=Journal_routes.observation_clear state.routes
+                 ~entry_id:context.entry_id ~request_generation:context.request_generation}));
+               !coordinated_read_finished context.owner context.original None
+               (Some(session,Wc.observation_budget sample.observation))
+               (Ok(Journal_graph_runtime.Ordinary_read(V2_block_outcome sample.value))))
+          | Updated(context,sample) when live context ->
+            let session=Wc.observation_session sample.observation in
+            (match Coordination_host.validate_session ~owner:context.owner host session with
+             | Error _->()
+             | Ok()->
+               Effect.run(set_state(fun state->{state with routes=Journal_routes.observation_clear state.routes
+                 ~entry_id:context.entry_id ~request_generation:context.request_generation}));
+               let block_id=Wc.Uuid.to_string context.root in
+               (match sample.value with
+                | Logseq_db_worker.Protocol.V2_missing_block _->
+                  Effect.run(set_state_and_effect(fun state->
+                    {state with routes=Journal_routes.observation_missing state.routes
+                      ~entry_id:context.entry_id ~request_generation:context.request_generation ~block_id},
+                    Effect.of_thunk(fun()->forward context sample
+                      (Journal_graph_runtime.plan_observed_block (!graph_runtime_cell) ~root:context.root))))
+                | V2_present_block _->
+                  let route=Journal_routes.at_entry (!state_ref).routes ~entry_id:context.entry_id |> Option.get in
+                  (match Journal_routes.route route with
+                   | Journal_routes.Detail->forward context sample
+                     (Journal_graph_runtime.plan_observed_block (!graph_runtime_cell) ~root:context.root)
+                   | _->Effect.run(set_state_and_effect(fun state->
+                     let routes=Journal_routes.observation_recover state.routes ~entry_id:context.entry_id
+                       ~request_generation:context.request_generation ~block_id in
+                     favorites_event {state with routes} Invalidate,Effect.of_thunk(fun()->forward context sample
+                       (Journal_graph_runtime.plan_observed_detail (!graph_runtime_cell)
+                         ~generation:context.request_generation ~limit:context.maximum_children ~root:context.root)))))))
+          | Rejected(context,error) when live context ->
+            Effect.run(set_state(fun state->{state with routes=Journal_routes.observation_failed state.routes
+              ~entry_id:context.entry_id ~request_generation:context.request_generation ~message:(coordinated_error_message error)}))
+          | Failed(context,error) when live context ->
+            !coordinated_read_finished context.owner context.original None None (Error(coordinated_error_message error));
+            Effect.run(set_state(fun state->{state with routes=Journal_routes.observation_failed state.routes
+              ~entry_id:context.entry_id ~request_generation:context.request_generation ~message:(coordinated_error_message error)}))
+          | _->())(Rrbvec.append cleanup updates))));
   let observe_graph_state
         set_state
         set_state_and_effect
@@ -5855,7 +5999,7 @@ let start
       Effect.many [ update (fun _ -> next); send request ]
     in
     let with_direct_request next request =
-      Effect.bind (update (fun _ -> next)) ~f:(fun () -> send request)
+      set_state_and_effect(fun _ -> next,send request)
     in
     let open_block block_id =
       let generation = snapshot.next_request_generation in
@@ -6690,6 +6834,31 @@ let start
       detail_event (Observe_visible_range (first, last))
     | Detail_more value -> detail_event (Load_more value)
     | Detail_task_intent value -> update_draft ~toggle:true value
+    | Detail_observation_retry ->
+      (match Journal_routes.active_entry_id snapshot.routes,Journal_routes.detail_block_id snapshot.routes,!coordination_host with
+       | Some entry_id,Some block_id,Some(_,host)->
+         (match Wc.Uuid.of_string block_id with
+          | Error _->Effect.ignore
+          | Ok root->let request_generation=Journal_routes.detail_request_generation snapshot.routes in
+            match Detail_observation.handle (!detail_observations_cell) ~entry_id ~request_generation ~root with
+            | None->
+              let generation=snapshot.next_request_generation in
+              let routes,request=Journal_routes.retry_detail_at snapshot.routes ~entry_id ~request_generation:generation in
+              (match request with None->Effect.ignore|Some request->with_direct_request
+                {snapshot with routes;next_request_generation=Int64.succ generation}request)
+            | Some handle->
+              let owner=current_owner() in
+              let fail error=run_owned owner(fun()->set_state(fun state->{state with routes=Journal_routes.observation_failed state.routes
+                ~entry_id ~request_generation ~message:(coordinated_error_message error)})) in
+              set_state_and_effect(fun state->
+                {state with routes=Journal_routes.observation_refreshing state.routes ~entry_id ~request_generation},
+                Effect.of_thunk(fun()->match Coordination_host.request host(Wc.observation_session handle)(Wc.Refresh handle) with
+                  | Error error->fail error
+                  | Ok ticket->Coordination_host.watch host ticket ~f:(function
+                    | Wc.Answered(Ok _)->()
+                    | Answered(Error error)->fail error
+                    | _->fail(Wc.Service_failed "The observation refresh could not be admitted.")))))
+       | _->Effect.ignore)
     | Detail_retry ->
       (match Journal_routes.detail snapshot.routes with
        | None ->
@@ -6936,7 +7105,11 @@ let start
   (* Every [Edge.on_change] of the bonsai version becomes a post-update key
      comparison: the key is recomputed from the new model and the callback
      fires when it differs from the previous post-update value. *)
+  let prev_detail_observation_routes=graph_ref(fun()->None) in
   let run_edge_callbacks model =
+    (if not(Option.fold ~none:false ~some:(fun previous->previous==model.routes)!prev_detail_observation_routes) then (
+      prev_detail_observation_routes:=Some model.routes;
+      !detail_observations_changed()));
     (let key = feed_key model in
      if not (Option.equal equal_feed_projection_context !prev_feed_key key)
      then (
@@ -7194,6 +7367,7 @@ let start
     && left.import_completion = right.import_completion
     && left.graph_ready = right.graph_ready
     && left.detail_copy_feedback = right.detail_copy_feedback
+    && Journal_routes.observation_error left.routes = Journal_routes.observation_error right.routes
     && operation_failure left.timeline_notice = operation_failure right.timeline_notice
   in
   let equal_modal_presentation left right =

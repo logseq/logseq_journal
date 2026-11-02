@@ -13,6 +13,38 @@ let fixture_request = function
   | request -> request
 ;;
 
+(* Synthetic observation registration uses the same query handler, while
+   preserving the real Service envelopes, identity, epochs and release ACK. *)
+let fixture_observations ?(observed=(fun _->())) ?(released=(fun _->())) handle =
+  let registrations=Hashtbl.create 16 in
+  fun context state request ->
+    let read registration owner observation_id epoch query maximum_bytes =
+      match handle context state (Service.Coordination_query{registration;owner;request=query;
+        response_budget_bytes=maximum_bytes}) with
+      | Ok(Service.Graph_response response)->
+        Hashtbl.replace registrations (registration,observation_id)(owner,query,maximum_bytes,epoch);
+        Ok(Service.Coordination_observed{registration;owner;observation_id;epoch;response})
+      | Error error->Error error
+      | Ok _->Error "Observation fixture expected a query response" in
+    match request with
+    | Service.Coordination_observe value->
+      observed request;
+      read value.registration value.owner value.observation_id 0L value.request value.maximum_bytes
+    | Coordination_refresh_observation value->
+      (match Hashtbl.find_opt registrations(value.registration,value.observation_id) with
+       | Some(owner,query,maximum_bytes,epoch) when owner=value.owner ->
+         read value.registration owner value.observation_id (Int64.succ epoch)
+           {query with request_id=value.request_id} maximum_bytes
+       | _->Error "Observation fixture rejected an unknown owner")
+    | Coordination_release_observation value->
+      (match Hashtbl.find_opt registrations(value.registration,value.observation_id) with
+       | Some(owner,_,_,_) when owner<>value.owner->Error "Observation fixture rejected a foreign release"
+       | _->Hashtbl.remove registrations(value.registration,value.observation_id);
+         released request;Ok(Service.Coordination_observation_released{
+           registration=value.registration;owner=value.owner;observation_id=value.observation_id}))
+    | _->handle context state request
+;;
+
 (* Synthetic owners declare the same baseline protocol as the production
    Service. These fixtures control UI events; the separate runtime test uses the
    actual database Service for protocol conformance. *)
@@ -538,6 +570,8 @@ let run_favorites_native_visibility
       ?(check_capture_imports = false)
       ?capture_case
       ?detail_capture
+      ?(check_detail_observation=false)
+      ?detail_observation_case
       ?status_scenario
       ?durable_status
       ?delete_scenario
@@ -576,6 +610,10 @@ let run_favorites_native_visibility
   let status_writes = Atomic.make [] in
   let typed_status_mutations=Atomic.make 0 and typed_status_confirms=Atomic.make 0 and typed_status_acks=Atomic.make 0 in
   let pending_change_reads = Atomic.make 0 in
+  let detail_observes=Atomic.make 0 and detail_releases=Atomic.make 0 in
+  let detail_observation_notice : Service.observation_invalidation option Atomic.t=Atomic.make None in
+  let detail_observed_title=Atomic.make false and detail_observed_missing=Atomic.make false
+  and detail_observed_failure=Atomic.make false in
   let legacy_child_writes = Atomic.make 0 in
   let capture_append_writes=Atomic.make 0 and legacy_capture_writes=Atomic.make 0 in
   let typed_status_intents=Atomic.make [] in
@@ -712,7 +750,8 @@ let run_favorites_native_visibility
     { block =
         { uuid = List.nth roots n
         ; title =
-            (if n = 1 && Atomic.get updated_block
+            (if n=0 && Atomic.get detail_observed_title then "Observed root updated"
+             else if n = 1 && Atomic.get updated_block
              then "Updated covered row"
              else Printf.sprintf "Timeline fixture %d" n)
         ; parent = page.uuid
@@ -744,7 +783,8 @@ let run_favorites_native_visibility
     }
   in
   let favorite_target_uuid n =
-    if n mod 2 = 0 then uuid (30000 + n) else List.nth roots n
+    if check_detail_observation && n=1 then uuid 1
+    else if n mod 2 = 0 then uuid (30000 + n) else List.nth roots n
   in
   let favorite_page n =
     { page with
@@ -870,7 +910,7 @@ let run_favorites_native_visibility
   let latest_error_manager = Atomic.make manager in
   let service =
     W.Service.create
-      ~push_topic_count:8
+      ~push_topic_count:9
       ~merge_push:Service.coalesce_push
       ~concurrency:
         (if check_capture_imports || Option.is_some detail_capture || check_media_change_ack || Option.is_some asset_change || Option.is_some durable_case
@@ -883,7 +923,10 @@ let run_favorites_native_visibility
           ~topic:Service.manager_topic
           (Service.Client_state_changed manager);
         Ok ())
-      ~handle:(fun context () request ->
+      ~handle:(fixture_observations ~observed:(fun request->Atomic.incr detail_observes;
+        match request with Service.Coordination_observe value->
+          Atomic.set detail_observation_notice(Some{registration_id=value.registration;owner=value.owner;
+            observation_id=value.observation_id;epoch=0L})|_->()) ~released:(fun _->Atomic.incr detail_releases) (fun context () request ->
         (match request with
          | Service.Coordination_mutation{intent;_}->
            Atomic.incr typed_status_mutations;
@@ -1296,7 +1339,11 @@ let run_favorites_native_visibility
               Atomic.set changes_acknowledged true;
               V2_changes_acknowledged {generation;through}
             | V2_get_outline_block { block; _ } ->
-              if !fail_this_media_read then V2_failed {code="FixtureReadFailure";message="Synthetic Media dependency read failed"}
+              if Atomic.get detail_observed_failure && block=uuid 1 then V2_failed{
+                code=Logseq_db_worker.Error.code_string Invalid_request;message="Observation sample failed"}
+              else if Atomic.get detail_observed_missing && block=uuid 1 then
+                V2_block_outcome(V2_missing_block{uuid=block;revision="observed-missing"})
+              else if !fail_this_media_read then V2_failed {code="FixtureReadFailure";message="Synthetic Media dependency read failed"}
               else V2_block_outcome
                 (match
                    List.find_opt
@@ -1323,7 +1370,8 @@ let run_favorites_native_visibility
                  | None ->
                    (match List.find_index (G.Uuid.equal block) roots with
                     | Some n ->
-                      V2_present_block { value = timeline_block n; revision = status_revision () }
+                      V2_present_block { value = timeline_block n; revision =
+                        (if n=0 && Atomic.get detail_observed_title then "observed-root-1" else status_revision ()) }
                     | None -> V2_missing_block { uuid = block; revision = "p" }))
             | V2_get_outline_block_summary{block;_} when
                 List.exists(fun(_, (root:P.v2_block_tree))->root.uuid=block)(Atomic.get detail_captures) ->
@@ -1702,7 +1750,7 @@ let run_favorites_native_visibility
               Service.Graph_response(match response with P.V2_response({outcome=V2_block_summary_outcome value;_}as response)->
                 P.V2_response{response with outcome=V2_block_summary_outcome{value with
                   generation="generation:v1:1:1";projection_revision="projection:v1:1"}}|_->response)
-            | _->Service.Graph_response response))
+            | _->Service.Graph_response response)))
       ~shutdown:(fun () -> Atomic.set shutdown_called true)
       ()
   in
@@ -2610,6 +2658,59 @@ let run_favorites_native_visibility
             in
             let original_root_content = timeline_title 1 in
             enter 0;
+            if check_detail_observation then (
+              Alcotest.(check bool) "Detail registers an actual typed observation" true
+                (Atomic.get detail_observes>0);
+              back ();
+              wait "native Back releases the Detail observation" (fun()->Atomic.get detail_releases>0);
+              enter 0;
+              let notice=Atomic.get detail_observation_notice |> Option.get in
+              let invalidate epoch = W.Session_context.emit (Option.get !worker_context)
+                ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 8)
+                (Service.Coordination_observations(Rrbvec.singleton(Service.Observation_invalidated{notice with epoch}))) in
+              (match detail_observation_case with
+               | Some `Refresh->
+                 Atomic.set detail_observed_title true;invalidate 1L;
+                 wait "registered invalidation refresh updates actual Detail" (fun()->Option.is_some(find "text" "Observed root updated"))
+               | Some `Missing->
+                 open_capture();edit "observation retained source";
+                 let released=Atomic.get detail_releases in
+                 Atomic.set detail_observed_missing true;invalidate 1L;
+                 wait "missing observation remains on the native Detail path" (fun()->
+                   Option.is_none(find "accessibility-identifier" ("detail-block:"^G.Uuid.to_string(uuid 1))));
+                 Alcotest.(check int) "missing data keeps its registered interest" released(Atomic.get detail_releases);
+                 Atomic.set detail_observed_missing false;invalidate 2L;
+                 wait "later data recovers the same missing observation" (fun()->
+                   Option.is_some(find "accessibility-identifier" ("detail-block:"^G.Uuid.to_string(uuid 1))));
+                 wait "recovered observation retains the Composer source" (fun()->
+                   Option.is_some(find "text" "observation retained source"));
+                 edit "";collapse();back();
+                 (* No public pure App reducer exposes this producer's event
+                    choice. Favorites.Hide_target itself is intentionally
+                    permanent, so exercise the mounted observation outlet. *)
+                 dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Favorites")));
+                 load_all_favorites "observation recovery refreshes Favorites";
+                 wait "temporary observed absence does not permanently hide a favorite" (fun()->
+                   Option.is_some(find "accessibility-identifier" ("favorite-open:"^G.Uuid.to_string(uuid 1001))));
+                 dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Journals")));
+                 enter 0
+               | Some `Failure->
+                 let registrations=Atomic.get detail_observes and releases=Atomic.get detail_releases in
+                 Atomic.set detail_observed_failure true;invalidate 1L;
+                 (try wait "observation read failure keeps its source in Detail" (fun()->Option.is_some(find "text" "invalidRequest: Observation sample failed"))
+                  with error->Printf.eprintf "OBSERVATION visible texts=%s\n%!"
+                    (Hashtbl.fold(fun _ values texts->match List.assoc_opt "text" values with
+                      | Some(`String text)->text::texts|_->texts)props[] |> String.concat " | ");raise error);
+                 Alcotest.(check bool) "failed refresh preserves existing Detail content" true
+                   (Option.is_some(find "accessibility-identifier" ("detail-block:"^G.Uuid.to_string(uuid 1))));
+                 Alcotest.(check int) "failed read does not unregister" releases(Atomic.get detail_releases);
+                 Atomic.set detail_observed_failure false;Atomic.set detail_observed_title true;
+                 dispatch(Lui_protocol.Press(ancestor_property(Option.get(find "text" "Retry observation"))"press-enabled"));
+                 wait "failed observation recovers without a new registration" (fun()->Option.is_some(find "text" "Observed root updated"));
+                 Alcotest.(check int) "read recovery retains exact registration" registrations(Atomic.get detail_observes);
+                 Alcotest.(check bool) "successful refresh clears only its owned read error" true
+                   (Option.is_none(find "text" "invalidRequest: Observation sample failed"))
+               | None->()));
             if scenario = "legacy-interrupted" then (
               (* No pure reducer owns native completion copy or the Worker queue.
                  The existing non-staged adapter is tested via its public callback;
@@ -4922,7 +5023,7 @@ let test_reference_outer_terminals cancel =
   in
   let service =
     W.Service.create
-      ~push_topic_count:8
+      ~push_topic_count:9
       ~concurrency:(Concurrent { max_in_flight = 16 })
       ~init:(fun context _ ->
         W.Session_context.emit
@@ -4930,7 +5031,7 @@ let test_reference_outer_terminals cancel =
           ~topic:Service.manager_topic
           (Service.Client_state_changed manager);
         Ok ())
-      ~handle:(fun context () request ->
+      ~handle:(fixture_observations (fun context () request ->
         let completed request outcome =
           Ok
             (Service.Graph_response
@@ -5092,7 +5193,7 @@ let test_reference_outer_terminals cancel =
            | _ ->
              completed
                request
-               (V2_failed { code = "InvalidRequest"; message = "unused fixture query" })))
+               (V2_failed { code = "InvalidRequest"; message = "unused fixture query" }))))
       ~shutdown:(fun () -> ())
       ()
   in
@@ -5522,11 +5623,11 @@ let test_favorite_page_uses_shared_reference_lookup () =
     ; diagnostics = { groups = [] } } in
   let manager=fixture_with_scope manager in
   let target_reads = Atomic.make 0 in
-  let service = W.Service.create ~push_topic_count:8 ~concurrency:(Concurrent { max_in_flight = 2 })
+  let service = W.Service.create ~push_topic_count:9 ~concurrency:(Concurrent { max_in_flight = 2 })
     ~init:(fun context _ ->
       W.Session_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed manager);
       Ok ())
-    ~handle:(fun _ () request -> match fixture_request request with
+    ~handle:(fixture_observations (fun _ () request -> match fixture_request request with
       | Service.Get_graph_state -> Ok (Service.Graph_state
           { generation = 1; graph_id = Some (uuid 9); phase = Graph_open; error = None })
       | Register_coordination registration -> Ok(Service.Coordination_registered(fixture_coordination manager registration))
@@ -5573,7 +5674,7 @@ let test_favorite_page_uses_shared_reference_lookup () =
         in
         Ok (Service.Graph_response (V2_response
           { api_version; request_id = request.request_id; outcome }))
-      | _ -> Error "Unused fixture service operation")
+      | _ -> Error "Unused fixture service operation"))
     ~shutdown:(fun () -> ()) () in
   let client = ref None in
   let hooks = Application.For_testing.app_with_service
@@ -6106,7 +6207,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
   let client = ref None in
   let worker =
     W.Service.create
-      ~push_topic_count:8
+      ~push_topic_count:9
       ~merge_push:Service.coalesce_push
       ~concurrency:Serial
       ~control_topic_count:2
@@ -6122,7 +6223,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
           ~topic:Service.manager_topic
           (Service.Client_state_changed manager);
         Ok ())
-      ~handle:(fun context () request ->
+      ~handle:(fixture_observations (fun context () request ->
         let publish value =
           Atomic.set current value;
           W.Request_context.emit
@@ -6299,7 +6400,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
           Ok (Service.Graph_response (P.V2_response
             { api_version = P.api_version; request_id = request.request_id; outcome }))
         | Import_asset _ | Graph_request _ ->
-          Error "Unused isolated password fixture command")
+          Error "Unused isolated password fixture command"))
       ~shutdown:(fun () -> ())
       ()
   in
@@ -7127,13 +7228,13 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
   let refresh_full=Atomic.make false and release_refresh=Atomic.make false in
   let root_renders = ref 0 in
   let client = ref None in
-  let service = W.Service.create ~push_topic_count:8
+  let service = W.Service.create ~push_topic_count:9
       ~concurrency:(if check_recovery_focus || scenario = `Late_presence || scenario = `Late_graph_cancel
                     then Concurrent { max_in_flight = 2 } else Serial)
       ~init:(fun context _ ->
         W.Session_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed manager);
         Ok ())
-      ~handle:(fun context () request ->
+      ~handle:(fixture_observations (fun context () request ->
         (match request with Service.Coordination_mutation _ | Coordination_acknowledge_mutation _ ->
           Atomic.incr recovery_writes | _ -> ());
         let publish value =
@@ -7272,7 +7373,7 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
             | _ -> P.V2_failed { code = "UnusedFixtureRead"; message = "Unused graph-picker fixture read" } in
           Ok (Service.Graph_response (P.V2_response
             { api_version = P.api_version; request_id = request.request_id; outcome }))
-        | Import_asset _ -> Error "Unused graph-picker fixture import")
+        | Import_asset _ -> Error "Unused graph-picker fixture import"))
       ~shutdown:(fun () -> ()) () in
   let hooks = Application.For_testing.app_with_service
     ~on_view_region:(fun region -> if region = "root" then incr root_renders)
@@ -8197,6 +8298,15 @@ let () =
     ; ( "Pending changes recovery"
       , [Alcotest.test_case "bounded readonly pages" `Quick (fun () ->
           run_favorites_native_visibility ~check_pending_changes:true ())] )
+    ; ( "Detail observation",[
+        Alcotest.test_case "actual registration and native Back release" `Quick
+          (fun ()->run_favorites_native_visibility ~detail_capture:"text" ~check_detail_observation:true ());
+        Alcotest.test_case "invalidation refresh applies actual Detail DTO" `Quick
+          (fun ()->run_favorites_native_visibility ~detail_capture:"text" ~check_detail_observation:true ~detail_observation_case:`Refresh ());
+        Alcotest.test_case "missing data retains and recovers the observation" `Quick
+          (fun ()->run_favorites_native_visibility ~detail_capture:"text" ~check_detail_observation:true ~detail_observation_case:`Missing ());
+        Alcotest.test_case "read failure retains and recovers the observation" `Quick
+          (fun ()->run_favorites_native_visibility ~detail_capture:"text" ~check_detail_observation:true ~detail_observation_case:`Failure ())])
     ; ( "Detail shared Composer"
       , List.map
           (fun scenario ->

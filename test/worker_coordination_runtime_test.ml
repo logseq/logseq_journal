@@ -1314,6 +1314,16 @@ let test_client_to_typed_read () =
       W.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None})) in
     let observed_block=match observed_block_reply with
       | W.Answered(Ok value)->value|_->failwith "actual block observation failed" in
+    let module Detail_observation=Journal_detail.Pure_observation in
+    let context:Detail_observation.context={entry_id="actual-service-detail";
+      request_generation=350L;root=Test_support.authoritative_block_uuid;owner;maximum_children=128;
+      original={P.api_version=P.api_version;request_id=uuid "9c000000-0000-4000-8000-0000000000d0";
+        command=V2_get_outline_block{block=Test_support.authoritative_block_uuid;revision=None}}} in
+    let presentation_model,_=Detail_observation.planned Detail_observation.empty context observed_block_ticket in
+    let presentation_model,initial_effects=Detail_observation.inspect presentation_model(C.view !state) in
+    require(Rrbvec.exists(function Detail_observation.Initial(_,sample)->
+      (match sample.value with P.V2_present_block{value;_}->value.block.title="Authoritative block"|_->false)
+      | _->false)initial_effects) "actual Service sample did not reach the pure Detail outlet";
     apply(C.step !state(C.Forget observed_block_ticket));
     let mutation_ticket, mutation_reply = request (W.Mutate intent) in
     let receipt =
@@ -1327,8 +1337,25 @@ let test_client_to_typed_read () =
     let observed_after=Option.get(C.observed(C.view !state) observed_block.observation) in
     require(W.compare_observation_epoch observed_after.epoch observed_block.epoch>0)
       "actual write invalidation did not advance retained observation";
-    let _,released=request(W.Release observed_block.observation) in
+    let presentation_model,update_effects=Detail_observation.inspect presentation_model(C.view !state) in
+    let actual=Rrbvec.find_opt(function Detail_observation.Updated _->true|_->false)update_effects |> Option.get in
+    let sample=match actual with Detail_observation.Updated(_,sample)->sample|_->assert false in
+    let business_request=Journal_graph_runtime.plan_observed_block business ~root:context.root in
+    let applied=Journal_graph_runtime.receive_worker_read business ~request_id:business_request.request_id
+      ~origin:(W.observation_session sample.observation,W.observation_budget sample.observation)
+      (Journal_graph_runtime.Ordinary_read(P.V2_block_outcome sample.value)) in
+    require(List.exists(fun response->match response.Journal_graph_runtime.payload with
+      | Block_updated{block;_}->Journal_model.id block=W.Uuid.to_string context.root
+        && Journal_model.source block="Durable coordinated edit"
+      | _->false)applied.responses) "actual observed DTO did not enter the existing Detail projection";
+    let presentation_model,cleanup=Detail_observation.retain presentation_model Rrbvec.empty in
+    require(Detail_observation.context_count presentation_model=0) "retired actual Detail kept presentation ownership";
+    let handle=Rrbvec.find_opt(function Detail_observation.Release _->true|_->false)cleanup |> Option.get
+      |> function Detail_observation.Release handle->handle|_->assert false in
+    require(W.same_observation handle observed_block.observation<>None) "actual Detail cleanup changed registration";
+    let release_ticket,released=request(W.Release handle) in
     require(released=W.Answered(Ok())) "updated observation did not physically release";
+    apply(C.step !state(C.Forget release_ticket));
     let original = W.receipt_revisions receipt in
     require
       (Rrbvec.to_list (W.receipt_targets receipt)

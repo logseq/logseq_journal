@@ -74,6 +74,7 @@ type payload =
       ; timeline_entry_update : Journal_graph_projection.timeline_entry option
       }
   | Block_removed of { block_id : string }
+  | Block_observed_missing of { block_id : string }
   | Page_tree_reconciled of
       { page : Journal_graph_projection.page
       ; value : Journal_graph_projection.timeline_entry_page
@@ -262,3 +263,10 @@ val retained_child_chains : t ->
 
 val changed_child_chains : t -> output ->
   (Journal_graph_projection.create_child * Journal_graph_mutation_confirmation.Pure_insertion.t) Rrbvec.t
+
+val detail_observation_input : t -> Logseq_db_worker.Protocol.request -> (int64 * int) option
+val plan_observed_block : t -> root:Logseq_db_types.Graph_types.Uuid.t -> Logseq_db_worker.Protocol.request
+val plan_observed_detail : t -> generation:int64 -> limit:int -> root:Logseq_db_types.Graph_types.Uuid.t ->
+  Logseq_db_worker.Protocol.request
+
+val owns_read : t -> Logseq_db_worker.Protocol.request -> bool

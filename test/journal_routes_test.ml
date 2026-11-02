@@ -582,6 +582,59 @@ let test_direct_capture_task_intent_survives_edit_failure_and_retry () =
   | _ -> fail "status recovery did not retain original Capture identity"
 ;;
 
+let test_detail_page_keeps_newer_point_content () =
+  let module D=Journal_detail in
+  let root=block ~source:"root A" ~revision:"opaque-A" ~child_count:3 () in
+  let root_id=Journal_model.id root in
+  let child=block ~id:(generated_block_id 550) ~parent_id:(Some root_id)
+    ~source:"child A" ~revision:"child-A" () in
+  let cursor:Journal_graph_projection.block_cursor={after_sibling_order="one";
+    after_block_id=Journal_model.id child;protocol_cursor=Some(Journal_graph_projection.Child_cursor
+      {after=Coordination_test_fixture.child_continuation "point-race";maximum_items=128})} in
+  let initial:Journal_graph_projection.detail={root;children={blocks=[child];continuation=Some cursor}} in
+  let state,requests=D.step(D.create ~session_number:69L initial)(Load_more root_id) in
+  let generation=match requests with [Journal_graph_request.Load_detail{request_generation;_}]->request_generation|_->assert false in
+  let root_b=block ~source:"root B" ~revision:"opaque-B" ~child_count:3 () in
+  let child_b=block ~id:(Journal_model.id child) ~parent_id:(Some root_id)
+    ~source:"child B" ~revision:"child-B" () in
+  let state=D.apply_block(D.apply_block state root_b)child_b in
+  let new_child=block ~id:(generated_block_id 552) ~parent_id:(Some root_id) ~source:"new page" () in
+  let loaded={initial with children={blocks=[child;new_child];continuation=None}} in
+  let next,_=D.step state(Loaded(generation,loaded)) in
+  require_string "root B" (Journal_model.source(D.root next)) "late page root";
+  require_string "child B" (Journal_model.source(Option.get(D.find_block next ~block_id:(Journal_model.id child)))) "late page child";
+  require(List.exists(fun value->Journal_model.id value=Journal_model.id new_child)(D.children next))
+    "preserving point content discarded a valid paginated child";
+  require(D.continuation next ~parent_id:root_id=None) "preserving point content discarded the page continuation";
+  let run actions=
+    let state,requests=D.step(D.create ~session_number:69L initial)(Load_more root_id) in
+    let generation=match requests with [Journal_graph_request.Load_detail{request_generation;_}]->request_generation|_->assert false in
+    let state=ref state and expected_root=ref "root A" and expected_child=ref "child A" in
+    List.iteri(fun index action->
+      (match action mod 5 with
+       | 0->let source=Printf.sprintf "root update %d" index in expected_root:=source;
+         state:=D.apply_block !state(block ~source ~revision:source ~child_count:3 ())
+       | 1->let source=Printf.sprintf "child update %d" index in expected_child:=source;
+         state:=D.apply_block !state(block ~id:(Journal_model.id child) ~parent_id:(Some root_id) ~source ~revision:source ())
+       | 2|3->state:=fst(D.step !state(Loaded(generation,loaded)))
+       | _->state:=fst(D.step !state(Load_failed(Int64.pred generation,false,"stale failure"))));
+      require_string !expected_root(Journal_model.source(D.root !state)) "generated page/point root";
+      require_string !expected_child(Journal_model.source(Option.get(D.find_block !state ~block_id:(Journal_model.id child))))
+        "generated page/point child") actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec remove prefix=function
+      | []->actions
+      | _::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      | item::rest->remove(item::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x0A6E;seed|] in
+    let actions=List.init 40(fun _->Random.State.int random 50) in
+    if fails actions then fail "page/point seed=%d minimized=[%s]" seed
+      (String.concat ";" (List.map string_of_int(shrink actions)))
+  done
+;;
+
 let test_child_refresh_replaces_cursor_and_fences_pending_read () =
   let module D = Journal_detail in
   let root = block ~child_count:3 () in
@@ -4366,6 +4419,206 @@ let test_child_choice_traces () =
   done
 ;;
 
+module Detail_observation_fixture = struct
+  module M=Journal_detail.Pure_observation
+  module W=Journal_worker_coordination.Worker_api
+  module C=Journal_worker_coordination.Worker_pure_coordinator
+  module P=Logseq_db_worker.Protocol
+  module S=Logseq_db_worker_lui.Logseq_db_worker_lui_service
+  module Id=Logseq_db_worker_lui.Journal_worker_ids
+  let root=W.Uuid.of_string "70000000-0000-4000-a000-000000005540" |> Result.get_ok
+  let make ?(failed=false) () =
+    let issuer,raw,projection,session=Coordination_test_fixture.fixture 5540L in
+    let module I=(val issuer:W.ISSUER) in
+    let ready=(C.step(C.initial ~client_id:root)(C.Worker_bound I.binding)).next
+      |> fun state->(C.step state(C.Bootstrap_received(I.binding,W.Ready projection))).next in
+    let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
+    let operation=W.Observe(budget,W.Outline_block{uuid=root;revision=None}) in
+    let ticket,planned=C.request ready session operation |> Result.get_ok in
+    let wire=I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok in
+    let registration,owner,observation_id,request=match wire with S.Coordination_observe value->
+      value.registration,value.owner,value.observation_id,value.request|_->assert false in
+    let response=S.Coordination_observed{registration;owner;observation_id;epoch=0L;
+      response=P.V2_response{api_version=P.api_version;request_id=request.request_id;
+        outcome=V2_block_outcome(V2_missing_block{uuid=root;revision="missing-0"})}} in
+    let handle,epoch=I.observation_registration session ~request_id:(C.ticket_id ticket) operation response |> Result.get_ok in
+    let admitted=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
+    let registered=(C.step admitted(C.Observation_registered(ticket,handle,epoch))).next in
+    let reply=if failed then W.Answered(Error W.Response_budget_exceeded) else I.reply session
+      ~request_id:(C.ticket_id ticket) operation response |> Result.get_ok in
+    let completed=(C.step registered(C.Completed(ticket,reply))).next in
+    let context:M.context={entry_id="detail-observation-fixture";request_generation=1L;root;owner;original=request;maximum_children=128} in
+    context,ticket,handle,planned.next,completed,issuer,session,raw
+  let refresh issuer session handle state =
+    let module I=(val issuer:W.ISSUER) in
+    let operation=W.Refresh handle in
+    let ticket,planned=C.request state session operation |> Result.get_ok in
+    let registration,owner,observation_id,request_id=match I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok with
+      | S.Coordination_refresh_observation value->value.registration,value.owner,value.observation_id,value.request_id
+      | _->assert false in
+    let response=S.Coordination_observed{registration;owner;observation_id;epoch=1L;
+      response=P.V2_response{api_version=P.api_version;request_id;
+        outcome=V2_block_outcome(V2_missing_block{uuid=root;revision="missing-1"})}} in
+    let value=match I.reply session ~request_id:(C.ticket_id ticket) operation response |> Result.get_ok with
+      | W.Answered(Ok value)->value|_->assert false in
+    let admitted=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.of_int64 2L))).next in
+    let registered=(C.step admitted(C.Observation_registered(ticket,handle,value.epoch))).next in
+    (C.step registered(C.Completed(ticket,W.Answered(Ok value)))).next
+
+end
+
+let test_detail_observation_context_retains_empty_and_releases () =
+  let module F=Detail_observation_fixture in let module M=F.M in let module C=F.C in
+  let context,ticket,handle,pending,ready,_,_,_=F.make() in
+  let model,effects=M.planned M.empty context ticket in
+  require(Rrbvec.is_empty effects) "new Detail observation cancelled an unrelated owner";
+  let waiting,effects=M.inspect model(C.view pending) in
+  require(Rrbvec.is_empty effects && M.context_count waiting=1) "pending Observe fabricated a sample";
+  let current,effects=M.inspect waiting(C.view ready) in
+  require(Rrbvec.exists(function M.Initial(_,sample)->(match sample.value with V2_missing_block _->true|_->false)|_->false)effects)
+    "missing/empty Detail observation was discarded";
+  require(not(Rrbvec.exists(function M.Release _->true|_->false)effects)) "empty Detail observation was released";
+  let current,again=M.inspect current(C.view ready) in
+  require(Rrbvec.is_empty again) "one observation epoch was forwarded twice";
+  let previous=current in
+  let retired,effects=M.retain current Rrbvec.empty in
+  require(M.context_count previous=1 && M.context_count retired=0) "retirement mutated an earlier pure state";
+  require(Rrbvec.exists(function M.Release actual->F.W.same_observation actual handle<>None|_->false)effects)
+    "native Back did not release the exact registered observation";
+  let retired,effects=M.inspect retired(C.view ready) in
+  require(M.context_count retired=0 && Rrbvec.is_empty effects) "late observed DTO revived a retired Detail"
+;;
+
+let test_detail_observation_failure_recovers_same_handle () =
+  let module F=Detail_observation_fixture in let module M=F.M in let module C=F.C in
+  let context,ticket,handle,_,failed,issuer,session,_=F.make ~failed:true () in
+  let model,_=M.planned M.empty context ticket in
+  let model,_=M.inspect model(C.view failed) in
+  let refreshed=F.refresh issuer session handle (C.step failed(C.Forget ticket)).next in
+  let model,effects=M.inspect model(C.view refreshed) in
+  require(M.context_count model=1) "failed observation lost its presentation context";
+  require(Rrbvec.exists(function M.Updated(_,sample)->F.W.same_observation sample.observation handle<>None|_->false)effects)
+    "recovery replaced the original observation or initial read owner";
+  require(not(Rrbvec.exists(function M.Release _|Cancel_initial _->true|_->false)effects))
+    "read recovery retired its live registration"
+;;
+
+(* This business projection owner exposes a synchronous Runtime facade rather
+   than a pure reducer. Exercise that facade; do not duplicate database IO. *)
+let test_observed_absence_does_not_commit_user_deletion () =
+  let module F=Detail_observation_fixture in
+  let runtime=Journal_graph_runtime.create() in
+  let request=Journal_graph_runtime.plan_observed_block runtime ~root:F.root in
+  let output=Journal_graph_runtime.receive_worker_read runtime ~request_id:request.request_id
+    (Journal_graph_runtime.Ordinary_read(F.P.V2_block_outcome
+      (F.P.V2_missing_block{uuid=F.root;revision="missing-observed"}))) in
+  require(not(List.exists(fun response->match response.Journal_graph_runtime.payload with
+    | Block_removed _|Subtree_deleted _->true|_->false)output.responses))
+    "an observed absence committed deletion of retained Detail drafts";
+  require(not(Journal_graph_runtime.owns_read runtime request)) "observed absence kept a consumed DTO owner"
+;;
+
+let test_detail_observation_binding_revocation_is_visible () =
+  let module F=Detail_observation_fixture in let module M=F.M in let module C=F.C in
+  let context,ticket,_,_,ready,issuer,_,_=F.make() in
+  let module I=(val issuer:F.W.ISSUER) in
+  let model,_=M.planned M.empty context ticket in
+  let model,_=M.inspect model(C.view ready) in
+  let forgotten=(C.step ready(C.Forget ticket)).next in
+  let revoked=(C.step forgotten(C.Binding_invalidated I.binding)).next in
+  let retired,effects=M.inspect model(C.view revoked) in
+  require(M.context_count retired=0) "binding revocation silently retained a dead Detail observation";
+  require(Rrbvec.exists(function M.Failed(actual,F.W.Revoked_session)->actual=context|_->false)effects)
+    "binding revocation left Detail without an explicit resubscription path";
+  let _,again=M.inspect retired(C.view revoked) in
+  require(Rrbvec.is_empty again) "retired binding emitted repeated presentation failures"
+;;
+
+let test_detail_observation_generated_lifetimes () =
+  let module F=Detail_observation_fixture in let module M=F.M in let module C=F.C in
+  let run actions =
+    let context,ticket,handle,pending,ready,issuer,session,_=F.make() in
+    let refreshed=F.refresh issuer session handle (C.step ready(C.Forget ticket)).next in
+    let current=ref(fst(M.planned M.empty context ticket)) and retired=ref false
+      and cleanup_count=ref 0 and last_epoch=ref None and latest_view=ref 0 in
+    List.iter(fun action->
+      let before= !current in let snapshot=Marshal.to_string before [] in
+      (* Core views are authoritative snapshots. Packet reordering is reduced by
+         Core before this boundary; a caller never republishes an older view. *)
+      if action mod 7<=2 then latest_view:=max !latest_view (action mod 7);
+      let current_view=C.view(match !latest_view with 0->pending|1->ready|_->refreshed) in
+      let transition model=match action mod 7 with
+        | 0|1|2->M.inspect model current_view
+        | 3->M.retain model(Rrbvec.singleton(context.entry_id,context.request_generation,context.root))
+        | 4->M.retain model Rrbvec.empty
+        | 5 when not !retired->M.planned model context ticket
+        | 6 when not !retired->M.planned model {context with entry_id="foreign-context"} ticket
+        | _->M.inspect model current_view in
+      let next,effects=transition before and again,repeated=transition before in
+      require(next=again && effects=repeated && snapshot=Marshal.to_string before [])
+        "Detail observation transition mutated its input or was nondeterministic";
+      require(M.context_count next<=1) "one observation acquired two native owners";
+      Rrbvec.iter(function
+        | M.Initial(actual,sample)|Updated(actual,sample)->
+          require(not !retired && actual=context) "late DTO crossed native context ownership";
+          require(Option.fold ~none:true ~some:(fun previous->F.W.compare_observation_epoch sample.epoch previous>0)!last_epoch)
+            "observation epoch was duplicated or moved backwards";
+          last_epoch:=Some sample.epoch
+        | Cancel_initial _|Release _->incr cleanup_count
+        | _->())effects;
+      current:=next;
+      if M.context_count next=0 then retired:=true;
+      require(!cleanup_count<=1) "retired UI context issued cleanup twice";
+      if !retired then require(M.context_count next=0) "stale input revived a retired Detail")actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec remove prefix=function
+      | []->actions
+      | _::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      | item::rest->remove(item::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x0B5E;seed|] in
+    let actions=List.init 60(fun _->Random.State.int random 70) in
+    if fails actions then fail "Detail observation seed=%d minimized=[%s]" seed
+      (String.concat ";" (List.map string_of_int(shrink actions)))
+  done
+;;
+
+let test_detail_observation_ticket_has_one_context_owner () =
+  let module F=Detail_observation_fixture in let module M=F.M in
+  let context,ticket,_,_,_,_,_,_=F.make() in
+  let model,_=M.planned M.empty context ticket in
+  let other={context with entry_id="foreign-native-entry"} in
+  let attempted,effects=M.planned model other ticket in
+  require(M.context_count attempted=1) "one Observe ticket acquired two context owners";
+  require(not(Rrbvec.exists(function M.Cancel_initial _|Forget_initial _|Release _->true|_->false)effects))
+    "a foreign context retired the legitimate Observe ticket";
+  let wrong_root=F.W.Uuid.of_string "70000000-0000-4000-a000-000000005541" |> Result.get_ok in
+  let attempted,effects=M.planned model {other with root=wrong_root} ticket in
+  require(M.context_count attempted=1 && not(Rrbvec.exists(function M.Cancel_initial _|Release _->true|_->false)effects))
+    "malformed reattachment cancelled another context's observation"
+;;
+
+let test_detail_observation_failure_and_pending_cancel () =
+  let module F=Detail_observation_fixture in let module M=F.M in let module C=F.C in
+  let context,ticket,handle,_,failed,_,_,_=F.make ~failed:true () in
+  let model,_=M.planned M.empty context ticket in
+  let model,effects=M.inspect model(C.view failed) in
+  require(M.context_count model=1) "read failure erased a registered Detail observation";
+  require(Rrbvec.exists(function M.Failed(_,F.W.Response_budget_exceeded)->true|_->false)effects)
+    "failed initial sample lost its owned error";
+  require(not(Rrbvec.exists(function M.Release _->true|_->false)effects)) "read failure pretended to release a resource";
+  let _,effects=M.retain model(Rrbvec.singleton(context.entry_id,2L,context.root)) in
+  require(Rrbvec.exists(function M.Release actual->F.W.same_observation actual handle<>None|_->false)effects)
+    "new route generation retained an old observation";
+  let pending,_=M.planned M.empty context ticket in
+  let _,effects=M.retain pending Rrbvec.empty in
+  require(Rrbvec.exists(function M.Cancel_initial actual->C.ticket_id actual=C.ticket_id ticket|_->false)effects)
+    "pop racing registration did not cancel the exact initial ticket";
+  require(Rrbvec.exists(function M.Forget_initial _->true|_->false)effects)
+    "cancelled initial ticket leaked its presentation slot"
+;;
+
 module Child_chain_fixture = struct
   module C = Journal_graph_mutation_confirmation.Pure_child
   module W = Journal_worker_coordination.Worker_api
@@ -5152,6 +5405,14 @@ let test_resident_focus_preserves_graph_drafts_and_saving () =
   require (R.capture (focus cleared 1)=None) "logout retained resident draft"
 let tests=tests @ ["resident focus keeps per-graph drafts and pending Capture",test_resident_focus_preserves_graph_drafts_and_saving]
 ;;
+let () = test_detail_page_keeps_newer_point_content ()
+let () = test_observed_absence_does_not_commit_user_deletion ()
+let () = test_detail_observation_binding_revocation_is_visible ()
+let () = test_detail_observation_generated_lifetimes ()
+let () = test_detail_observation_failure_recovers_same_handle ()
+let () = test_detail_observation_ticket_has_one_context_owner ()
+let () = test_detail_observation_context_retains_empty_and_releases ()
+let () = test_detail_observation_failure_and_pending_cancel ()
 let () = test_child_retained_chain_generated_roundtrips ()
 let () = test_child_retained_chain_survives_projection_reopen ()
 let () = test_child_oversize_is_editable_before_admission ()

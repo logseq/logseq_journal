@@ -57,6 +57,7 @@ type t =
   ; next_session : int64
   ; next_retained : int64
   ; drafts : detached Drafts.t
+  ; observation_errors : (int64 * string * bool) Owners.t
   }
 
 let create () =
@@ -67,6 +68,7 @@ let create () =
   ; next_session = 1L
   ; next_retained = 1L
   ; drafts = Drafts.empty
+  ; observation_errors = Owners.empty
   }
 ;;
 
@@ -660,7 +662,8 @@ let accept_path t path =
            then t
            else (
              let t = retain_owner t entry.id in
-             { t with owners = Owners.remove entry.id t.owners }))
+             { t with owners = Owners.remove entry.id t.owners;
+               observation_errors=Owners.remove entry.id t.observation_errors }))
         t
         original
     in
@@ -974,4 +977,45 @@ let retain_child_chain t ~command chain =
     t.drafts t.drafts in
   let t=if drafts==t.drafts then t else {t with drafts} in
   map_details t ~f:(fun detail->Journal_detail.retain_child_chain detail ~command chain)
+;;
+
+let observation_missing t ~entry_id ~request_generation ~block_id =
+  match Owners.find_opt entry_id t.owners with
+  | Some view when view_generation view=request_generation && view_block_id view=Some block_id ->
+    let t=retain_owner t entry_id in
+    {t with owners=Owners.add entry_id (Missing_detail_view{block_id;request_generation;draft_owner=Some entry_id})t.owners}
+  | _->t
+;;
+let observation_recover t ~entry_id ~request_generation ~block_id =
+  match Owners.find_opt entry_id t.owners with
+  | Some (Missing_detail_view _|Failed_detail_view _) as found
+    when Option.fold ~none:false ~some:(fun view->view_generation view=request_generation && view_block_id view=Some block_id) found ->
+    {t with next_session=Int64.succ t.next_session;
+      owners=Owners.add entry_id(Detail_loading_view{block_id;request_generation;session_number=t.next_session;
+        draft_owner=Some entry_id;loading_indicator=false;staged_detail=None})t.owners}
+  | _->t
+;;
+
+let observation_error t =
+  Option.bind(active_entry_id t)(fun id->
+    Option.bind(Owners.find_opt id t.observation_errors)(fun(generation,message,refreshing)->
+      if generation=detail_request_generation t then Some(message,refreshing) else None))
+;;
+let observation_failed t ~entry_id ~request_generation ~message =
+  match Owners.find_opt entry_id t.owners with
+  | Some view when view_generation view=request_generation ->
+    {t with observation_errors=Owners.add entry_id(request_generation,message,false)t.observation_errors}
+  | _->t
+;;
+let observation_refreshing t ~entry_id ~request_generation =
+  match Owners.find_opt entry_id t.observation_errors with
+  | Some(generation,message,_) when generation=request_generation ->
+    {t with observation_errors=Owners.add entry_id(generation,message,true)t.observation_errors}
+  | _->t
+;;
+let observation_clear t ~entry_id ~request_generation =
+  match Owners.find_opt entry_id t.observation_errors with
+  | Some(generation,_,_) when generation=request_generation ->
+    {t with observation_errors=Owners.remove entry_id t.observation_errors}
+  | _->t
 ;;

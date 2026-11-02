@@ -143,6 +143,7 @@ type payload =
       ; timeline_entry_update : Projection.timeline_entry option
       }
   | Block_removed of { block_id : string }
+  | Block_observed_missing of { block_id : string }
   | Page_tree_reconciled of
       { page : Projection.page
       ; value : Projection.timeline_entry_page
@@ -255,7 +256,7 @@ type operation =
   | Child_status of Projection.create_child * Graph.page
   | Child_parent of Projection.create_child * Graph.page * Projection.block_member
   | Changed_block of { block_id : string }
-  | Changed_detail_block of { block_id : string }
+  | Changed_detail_block of { block_id : string; observed : bool }
   | Changed_point_context of
       { block_id : string
       ; value : Protocol.v2_block_record
@@ -1673,7 +1674,7 @@ let hydration_for_changes t ~request_generation windows =
              (fun _ ->
                 read
                   t
-                  (Changed_detail_block { block_id })
+                  (Changed_detail_block { block_id; observed=false })
                   (Protocol.V2_get_outline_block { block; revision = None }))
                (Hashtbl.find_opt t.detail_pages block_id)))
       blocks
@@ -1827,7 +1828,7 @@ let rehydrate_current_interests t ~request_generation ~generation =
       let block_id = Graph.Uuid.to_string interest.root.block.uuid in
       read
         t
-        (Changed_detail_block { block_id })
+        (Changed_detail_block { block_id; observed=false })
         (Protocol.V2_get_outline_block { block = interest.root.block.uuid; revision = None }))
     |> List.of_seq
   in
@@ -2810,8 +2811,8 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
           responses [ response (Block_found None) ]
         |V2_present_block{value;revision},(Changed_block{block_id;_}|Changed_detail_block{block_id;_})->
           resolve_changed_point t ~source_epoch ~block_id ~value ~revision
-        | V2_missing_block { uuid; revision }, Changed_block { block_id; _ }
-        | V2_missing_block { uuid; revision }, Changed_detail_block { block_id; _ } ->
+        | V2_missing_block { uuid; revision }, ((Changed_block { block_id; _ }
+          | Changed_detail_block { block_id; _ }) as operation) ->
           remember_block_revision t uuid revision;
           t.block_pages
           <- List.filter
@@ -2821,7 +2822,10 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
           Hashtbl.remove t.detail_pages block_id;
           Hashtbl.remove t.children_interests block_id;
           Hashtbl.remove t.detail_children block_id;
-          responses [ response (Block_removed { block_id }) ]
+          let payload=match operation with
+            | Changed_detail_block {observed=true;_}->Block_observed_missing{block_id}
+            | _->Block_removed{block_id} in
+          responses [response payload]
         | V2_present_block { value; revision }, Capture_block { command; page } ->
           remember_block_revision t value.block.uuid revision;
           capture_status t command page
@@ -3077,7 +3081,7 @@ let receive_delivery_body t ~read_result ~origin (protocol_response : Protocol.r
       let changes =
         List.fold_left
           (fun changes response -> match response.payload with
-            | Block_removed { block_id } | Subtree_deleted { block_id; _ } ->
+            | Block_removed { block_id } | Block_observed_missing { block_id } | Subtree_deleted { block_id; _ } ->
               Rrbvec.push_back changes Reference.{ id = block_id; text = None; page_kind = false }
             | Favorites_loaded (_, result) ->
               Rrbvec.fold_left
@@ -3851,4 +3855,29 @@ let worker_read t (request : Protocol.request) =
                }))
      | _ -> Some (Unowned_read "Favorites business request is no longer owned"))
   | _ -> None
+;;
+
+let detail_observation_input t (request:Protocol.request) =
+  match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id),request.command with
+  | Some{operation=Detail_block{generation;block_id;limit;after=None};delivery=Dispatched;_},
+    Protocol.V2_get_outline_block{block;_} when Graph.Uuid.to_string block=block_id ->Some(generation,limit)
+  | _->None
+;;
+let plan_observed_block t ~root =
+  read t (Changed_detail_block{block_id=Graph.Uuid.to_string root;observed=true})
+    (Protocol.V2_get_outline_block{block=root;revision=None}) |> issue_request t
+;;
+let plan_observed_detail t ~generation ~limit ~root =
+  (* Ordinary initial reads are superseded; Changes consumers retain their own
+     causal obligation until an actual dependent projection settles. *)
+  Hashtbl.filter_map_inplace(fun _ pending->match pending.operation,pending.change_application with
+    | Detail_children{root=old;_},None when old.block.uuid=root->None
+    | _->Some pending)t.pending;
+  read t (Detail_block{generation;block_id=Graph.Uuid.to_string root;limit;after=None})
+    (Protocol.V2_get_outline_block{block=root;revision=None}) |> issue_request t
+;;
+let owns_read t (request:Protocol.request) =
+  match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
+  | Some pending->pending.delivery=Dispatched
+  | None->false
 ;;
