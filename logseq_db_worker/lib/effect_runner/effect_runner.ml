@@ -2309,6 +2309,90 @@ let confirm_mutation t ~(scope : Sync.graph_scope) ~request_id ~intent ~original
          | _ -> fail "No immutable original commit evidence is available."))
 ;;
 
+let recover_mutations t ~(scope:Sync.graph_scope) ~request_id ~after ~maximum_items ~maximum_bytes ~current =
+  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  let fail error=Error(Logseq_db_worker_contract.Error.message(local_commit_error error)) in
+  if maximum_items<=0 || maximum_items>256 || maximum_bytes<=0
+     || maximum_bytes>Wire.maximum_recovery_bytes || Option.exists(fun after->after<=0L)after
+  then Error "Invalid durable recovery budget or cursor"
+  else if t.stopped || not(current()) then Error "Durable recovery authority retired"
+  else match attached_session t scope with
+  | None->Error "The scoped database is no longer attached."
+  | Some session->
+    let namespace=Wire.namespace_for_owner ~origin:scope.account.managed_sync_origin
+      ~user:scope.account.user_id ~graph:scope.graph_id in
+    (* Fetch one indexed row at a time: the existing cursor belongs to a full
+       database page. This bounds resident payload bytes without guessing a row
+       cursor or skipping a row that does not fit the caller's remaining budget. *)
+    let rec loop cursor items =
+      if t.stopped || not(current()) then Error "Durable recovery authority retired" else
+      match Database.pending_local_intents session.database ~namespace ~after:cursor ~limit:1 with
+      | Error error->fail error
+      | Ok page->
+        (match page.items with
+         | []->Ok Wire.{items;next=None}
+         | [prepared]->
+           let intent=Database.local_intent_payload prepared in
+           (match Wire.restore ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id intent with
+            | Error _->Error "Stored durable intent owner or payload is invalid"
+            | Ok wire->
+              (match Database.inspect_local_intent session.database prepared with
+               | Error error->fail error
+               | Ok resolution->
+                 let outcome=match resolution with
+                   | Database.Intent_pending->Wire.Unknown
+                   | Intent_rejected error->Wire.Rejected(Protocol.failed ~request_id (local_commit_error error))
+                   | Intent_committed proof->Wire.Committed(response
+                       {Protocol.api_version=Protocol.api_version;request_id;command=Wire.command wire}
+                       (committed_outcome(Database.intent_commit_outcome proof))) in
+                 let candidate=Wire.{items=Rrbvec.push_back items {intent;outcome};next=page.next} in
+                 if Wire.recovery_page_bytes candidate>maximum_bytes then
+                   if Rrbvec.is_empty items then Error "A complete durable recovery item exceeds the byte budget"
+                   else Ok Wire.{items;next=cursor}
+                 else if candidate.next=None || Rrbvec.length candidate.items=maximum_items then Ok candidate
+                 else loop candidate.next candidate.items))
+         | _->Error "Durable recovery returned an invalid bounded page") in
+    Result.bind(loop after Rrbvec.empty)(fun page->
+      if not(current()) || t.stopped then Error "Durable recovery authority retired"
+      else if Wire.recovery_page_bytes page>maximum_bytes then Error "Durable recovery envelope exceeds the byte budget"
+      else Ok page)
+;;
+
+let acknowledge_mutation t ~(scope:Sync.graph_scope) ~intent ~original ~current =
+  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  let fail error=Error(Logseq_db_worker_contract.Error.message(local_commit_error error)) in
+  match Wire.restore ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id intent with
+  | Error _->Error "Durable intent owner or payload is invalid"
+  | Ok wire->
+    if t.stopped || not(current()) then Error "Durable acknowledgement authority retired" else
+    match attached_session t scope with
+    | None->Error "The scoped database is no longer attached."
+    | Some session->
+      (match Database.find_local_intent session.database ~namespace:(Wire.namespace wire) ~mutation_id:(Wire.mutation_id wire) with
+       | Error error->fail error
+       | Ok None->Error "No durable intent evidence is available"
+       | Ok(Some prepared) when Database.local_intent_payload prepared<>intent->Error "Durable intent identity does not match"
+       | Ok(Some prepared)->
+         match Database.inspect_local_intent session.database prepared with
+         | Error error->fail error
+         | Ok resolution->
+           if not(current()) then Error "Durable acknowledgement authority retired" else
+           let acknowledged=match original,resolution with
+             | None,Database.Intent_rejected _->Database.acknowledge_rejected_local_intent session.database prepared
+             | Some expected,Intent_committed proof->
+               let commit=Database.intent_commit_outcome proof in
+               let actual=Overlay.Generation.to_string commit.generation,
+                 Overlay.Projection_revision.to_string commit.before_projection_revision,
+                 Overlay.Projection_revision.to_string commit.after_projection_revision in
+               if expected=actual then Database.acknowledge_local_intent session.database proof
+               else Error Overlay.Mutation_identity_conflict
+             | _->Error(Overlay.Invalid_local_mutation "Intent has no matching settled acknowledgement proof") in
+           match acknowledged with
+           | Error error->fail error
+           | Ok() when current() && not t.stopped->Ok()
+           | Ok()->Error "Durable acknowledgement completed after authority retired")
+;;
+
 let protected_envelope (iv, ciphertext) =
   Transit_codec.to_string (Transit.Array [ Transit.Binary iv; Transit.Binary ciphertext ])
 ;;

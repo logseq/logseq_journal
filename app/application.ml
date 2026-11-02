@@ -3354,6 +3354,8 @@ let start
         | Coordination_query _ -> "coordinationQuery"
         | Coordination_mutation _ -> "coordinationMutation"
         | Coordination_confirm _ -> "coordinationConfirm"
+        | Coordination_recover_mutations _ -> "coordinationRecovery"
+        | Coordination_acknowledge_mutation _ -> "coordinationIntentAck"
         | Coordination_observe _ -> "coordinationObserve"
         | Coordination_refresh_observation _ -> "coordinationRefreshObservation"
         | Coordination_release_observation _ -> "coordinationReleaseObservation"
@@ -4473,7 +4475,7 @@ let start
     Journal_media_runtime.pump (!media_runtime_cell);
     match event with
     | Worker.Push {payload=Graph_service.Coordination_updates _ | Coordination_observations _;_}
-    | Worker.Response {outcome=Completed(Graph_service.Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _);_}->Effect.ignore
+    | Worker.Response {outcome=Completed(Graph_service.Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _);_}->Effect.ignore
     | Worker.Push {payload=Graph_service.Graph_pushes _ | Graph_states _ | Session_states _;_} -> Effect.ignore
     | Worker.Response { request_id; outcome; _ }
       when Hashtbl.mem local_copy_requests request_id ->

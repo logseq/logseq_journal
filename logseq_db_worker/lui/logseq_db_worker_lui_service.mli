@@ -270,6 +270,13 @@ type request =
         request_id : Logseq_db_types.Graph_types.Uuid.t; intent : string;
         original : string * string * string }
   | Graph_request_at of timeline_scope * Logseq_db_worker.Protocol.request
+  | Coordination_recover_mutations of
+      { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
+        after:int64 option; maximum_items:int; maximum_bytes:int }
+  | Coordination_acknowledge_mutation of
+      { registration:int64; owner:timeline_scope; presentation:int64;
+        request_id:Logseq_db_types.Graph_types.Uuid.t; intent:string;
+        original:(string * string * string) option }
   | Get_graph_state_at of timeline_scope
   | Asset_command_at of timeline_scope * asset_command
   | Import_asset_at of timeline_scope * Logseq_db_types.Asset_import.t
@@ -300,6 +307,10 @@ type request =
       }
 
 type response =
+  | Coordination_mutations_recovered of
+      { request_id:Logseq_db_types.Graph_types.Uuid.t;
+        page:Logseq_db_worker_contract.Mutation_pure_wire.recovery_page }
+  | Coordination_mutation_acknowledged of {request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_observed of
       { registration : int64
       ; owner : timeline_scope

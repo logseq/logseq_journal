@@ -223,6 +223,7 @@ let with_client
       ?(favorites = false)
       ?(assets = false)
       ?(statuses = false)
+      ?(prepare = fun _ -> ())
       f
   =
   T.with_managed (fun fixture ->
@@ -231,6 +232,7 @@ let with_client
     if favorites then seed_coordination_read_data ~assets first_path;
     ignore (Test_support.seed_mirror ~graph_id:second_graph root);
     if statuses then seed_status_catalog root;
+    prepare root;
     let graph : Sync.graph =
       { graph_id = Test_support.graph_uuid
       ; name = "Coordination synthetic"
@@ -2390,8 +2392,8 @@ let test_changefeed_business_waits_for_ui_application () =
     wait (fun () -> C.shutdown_state (Host.view host) = C.Stopped))
 ;;
 
-let with_observation_service ?epoch_ms ?(observe_push=fun _->()) f =
-  with_client ?epoch_ms (fun client ->
+let with_observation_service ?epoch_ms ?prepare ?(observe_push=fun _->()) f =
+  with_client ?epoch_ms ?prepare (fun client ->
     let replies = Hashtbl.create 16
     and baseline = ref None
     and notices = ref Rrbvec.empty in
@@ -2958,6 +2960,162 @@ let test_service_unallocated_observation_cleanup_after_close () =
     ignore(call(Service.Release_coordination registration)))
 ;;
 
+let test_service_unknown_recovery_is_read_only ?(large=false) () =
+  let module D=Logseq_overlay_db.Database in
+  let module Types=Logseq_overlay_db.Types in
+  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  let mutation_id=uuid "9f000000-0000-4000-8000-000000000900" in
+  let encoded=ref "" in
+  let prepare support=Eio_main.run(fun _->Eio.Switch.run(fun sw->
+    let inspection=D.inspect_mirror ~application_support_directory:support ~graph_id:Test_support.graph_uuid |> Result.get_ok in
+    let database=D.open_ ~sw (Test_support.dependencies ~behavior:"pending recovery fixture") inspection ~graph_name:"pending recovery" |> Result.get_ok in
+    Fun.protect ~finally:(fun()->ignore(D.close database)) (fun()->
+      let snapshot=D.current_snapshot database |> Result.get_ok in
+      let revision=Fun.protect ~finally:(fun()->D.release_snapshot snapshot)(fun()->
+        match D.get_outline_blocks snapshot [Test_support.authoritative_block_uuid] |> Result.get_ok with
+        | [Types.Present_block{revision;_}]->revision|_->failwith "pending fixture block missing") in
+      let preconditions=P.{blocks=[Test_support.authoritative_block_uuid,Types.Block_state_revision.to_string revision];pages=[];scopes=[]} in
+      let command,mutation=if large then (
+        let children=List.init 5(fun n->P.{uuid=uuid(Printf.sprintf "9f000000-0000-4000-8000-%012d" (910+n));
+          title=String.make 60000 '"';children=[]}) in
+        let root=P.{uuid=uuid "9f000000-0000-4000-8000-000000000909";title="Never automatically replay";children} in
+        let tree=Types.{uuid=root.uuid;title=root.title;children=List.map(fun (child:P.v2_block_tree)->
+          {uuid=child.uuid;title=child.title;children=[]})children} in
+        P.V2_insert_blocks{mutation_id;parent=Test_support.authoritative_block_uuid;roots=[root];preconditions},
+        Types.Insert_blocks{mutation_id;parent=Test_support.authoritative_block_uuid;tree;asset=None})
+      else P.V2_save_block{mutation_id;block=Test_support.authoritative_block_uuid;title="Never automatically replay";preconditions},
+        Types.Save_block{mutation_id;block=Test_support.authoritative_block_uuid;title="Never automatically replay"} in
+      let wire=Wire.create ~origin:(Uri.of_string "https://api.logseq.io") ~user:"user-1" ~graph:Test_support.graph_uuid command
+        |> Result.get_ok in
+      encoded:=Wire.encode wire;
+      if large then require(String.length !encoded>P.maximum_response_bytes && String.length !encoded<=P.maximum_request_bytes)
+        "large recovery fixture must be a valid intent exceeding the ordinary read cap";
+      let expected=D.write_precondition ~blocks:[Test_support.authoritative_block_uuid,revision] ~pages:[] ~scopes:[] |> Result.get_ok in
+      ignore(D.persist_local_intent database ~namespace:(Wire.namespace wire) ~payload: !encoded ~expected mutation |> Result.get_ok)))) in
+  with_observation_service ~prepare (fun _ ~call ~send:_ ~wait:_ ~replies:_ ~notices:_ ~baseline ~owner ~registration->
+    let request_id=uuid "9f000000-0000-4000-8000-000000000901" in
+    let recover()=match call(Service.Coordination_recover_mutations{registration;owner;request_id;
+      after=None;maximum_items=8;maximum_bytes=(if large then Wire.maximum_recovery_bytes else 16384)}) with
+      | Mailbox.Completed(Service.Coordination_mutations_recovered{page;_})->page
+      | _->failwith "pending recovery failed" in
+    let page=recover() in
+    require(Rrbvec.length page.items=1 && (Rrbvec.nth page.items 0).intent= !encoded
+      && (Rrbvec.nth page.items 0).outcome=Wire.Unknown) "recovery inferred a pending write outcome";
+    require(match call(Service.Coordination_acknowledge_mutation{registration;owner;request_id;
+      presentation=(Option.get !baseline).baseline.presentation;intent= !encoded;original=None}) with
+      | Mailbox.Failed _->true|_->false) "Unknown intent could be acknowledged away";
+    require(Rrbvec.length(recover()).items=1) "Unknown ACK or recovery dropped pending identity";
+    require(match call(Service.Coordination_query{registration;owner;
+      request={P.api_version=P.api_version;request_id;command=V2_get_outline_block{block=Test_support.authoritative_block_uuid;revision=None}};
+      response_budget_bytes=16384}) with
+      | Mailbox.Completed(Service.Graph_response(V2_response{outcome=V2_block_outcome(V2_present_block{value;_});_}))->
+        value.block.title<>"Never automatically replay"
+      | _->false) "recovery automatically executed Unknown intent")
+;;
+
+let test_service_durable_recovery_and_ack () =
+  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  with_observation_service(fun _ ~call ~send:_ ~wait ~replies:_ ~notices:_ ~baseline ~owner ~registration->
+    let id n=uuid(Printf.sprintf "9f000000-0000-4000-8000-%012d" n) in
+    let owner=ref owner in
+    let presentation ()=(Option.get !baseline).Service.baseline.presentation in
+    let read n=match call(Service.Coordination_query{registration;owner= !owner;
+      request={P.api_version=P.api_version;request_id=id n;command=V2_get_outline_block
+        {block=Test_support.authoritative_block_uuid;revision=None}};response_budget_bytes=16384}) with
+      | Mailbox.Completed(Service.Graph_response(V2_response{outcome=V2_block_outcome(V2_present_block{revision;value});_}))->revision,value.block.title
+      | _->failwith "durable lifecycle source read failed" in
+    let recover ?(maximum_bytes=16384) ?(maximum_items=1) n after=call(Service.Coordination_recover_mutations
+      {registration;owner= !owner;request_id=id n;after;maximum_items;maximum_bytes}) in
+    let page n after=match recover n after with
+      | Mailbox.Completed(Service.Coordination_mutations_recovered{request_id;page}) when request_id=id n->
+        require(Wire.recovery_page_bytes page<=16384) "recovery exceeded complete byte budget";page
+      | _->failwith "real durable recovery did not return its bounded page" in
+    require(Rrbvec.is_empty(page 1 None).items) "new fixture has unexpected pending intents";
+    let rev,_=read 2 in
+    let intent n revision title=Wire.create ~origin:(Uri.of_string "https://api.logseq.io") ~user:"user-1"
+      ~graph:(!owner).graph_id (P.V2_save_block{mutation_id=id n;block=Test_support.authoritative_block_uuid;
+        title;preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}})
+      |> Result.get_ok in
+    let first=intent 10 rev "Durable first" in
+    let mutate n intent=match call(Service.Coordination_mutation
+      {registration;owner= !owner;request_id=id n;intent=Wire.encode intent}) with
+      | Mailbox.Completed(Service.Coordination_mutation_result{outcome;_})->outcome
+      | _->failwith "durable lifecycle mutation did not settle" in
+    let original=match mutate 11 first with
+      | Wire.Committed response->Wire.committed_point first ~request_id:(id 11) response |> Result.get_ok
+      | _->failwith "first durable fixture write failed" in
+    let rejected=intent 20 rev "Stale rejected" in
+    require(match mutate 21 rejected with Wire.Rejected _->true|_->false) "stale durable write was not rejected";
+    let current,_=read 3 in
+    let second=intent 30 current "Durable second" in
+    require(match mutate 31 second with Wire.Committed _->true|_->false) "second durable write failed";
+    let collect n =
+      let rec loop n after count items=
+        require(count<8) "recovery continuation did not terminate";
+        let current=page n after in
+        require(Rrbvec.length current.items<=1) "recovery exceeded item budget";
+        let items=Rrbvec.append items current.items in
+        match current.next with None->items|Some next->loop(n+1)(Some next)(count+1)items in
+      loop n None 0 Rrbvec.empty in
+    let before=read 4 in
+    let recovered=collect 40 in
+    require(Rrbvec.length recovered=3) "bounded recovery skipped committed or rejected intent";
+    let first_page=page 44 None in
+    let byte_budget=Wire.recovery_page_bytes first_page in
+    (match recover ~maximum_bytes:byte_budget ~maximum_items:3 45 None with
+     | Mailbox.Completed(Service.Coordination_mutations_recovered{page;_})->
+       require(Rrbvec.length page.items=1 && page.next=first_page.next)
+         "byte-bounded prefix skipped the next complete row or forged completeness"
+     | _->failwith "byte-bounded recovery prefix failed");
+    require(read 5=before) "read-only recovery replayed a mutation";
+    require(match recover ~maximum_bytes:1 6 None with Mailbox.Failed _->true|_->false)
+      "oversized first recovery item was silently skipped";
+    let old_presentation=presentation() in
+    let old_generation=(!owner).graph_generation in
+    ignore(call(Service.Client_command Return_to_graph_picker));
+    ignore(call(Service.Client_command(Select_graph(!owner).graph_id)));
+    wait(fun()->match !baseline with Some b->List.exists(fun((scope:Service.asset_scope),graph)->
+      scope.graph_id=(!owner).graph_id && scope.graph_generation<>old_generation
+      && graph.Logseq_db_worker.phase=Logseq_db_worker.Graph_open)b.baseline.state.residents|None->false);
+    owner:=Option.get(Option.get !baseline).baseline.state.sync.selected;
+    let restored=collect 50 in
+    require(Rrbvec.length restored=3) "reopening lost unsettled durable intents";
+    let item=Rrbvec.fold_left(fun found (item:Wire.recovery_item)->
+      if item.intent=Wire.encode first then Some item else found)None restored |> Option.get in
+    let restored_point=match item.outcome with
+      | Wire.Committed response->(match response with P.V2_response{request_id;_}->
+        Wire.committed_point first ~request_id response |> Result.get_ok)
+      | _->failwith "recovered commit lost original proof" in
+    require(restored_point=original) "recovery rewrote original commit generation or revisions";
+    let ack n presentation intent original=call(Service.Coordination_acknowledge_mutation
+      {registration;owner= !owner;presentation;request_id=id n;intent=Wire.encode intent;original}) in
+    let proof=original.generation,original.before,original.after in
+    require(match ack 60 old_presentation first(Some proof) with Mailbox.Failed _->true|_->false)
+      "old presentation acknowledged a committed intent";
+    require(match ack 61 (presentation()) first None with Mailbox.Failed _->true|_->false)
+      "committed intent was acknowledged as a rejection";
+    require(match ack 62 (presentation()) first(Some("wrong","wrong","wrong")) with Mailbox.Failed _->true|_->false)
+      "wrong immutable proof acknowledged intent";
+    require(Rrbvec.length(collect 70)=3) "invalid ACK removed recovery ownership";
+    require(match call(Service.Coordination_confirm{registration;owner= !owner;presentation=presentation();
+      request_id=id 80;intent=Wire.encode first;original=proof}) with
+      | Mailbox.Completed(Service.Graph_response(V2_response{outcome=V2_block_summary_outcome _;_}))->true|_->false)
+      "reopened intent could not confirm its original proof";
+    let acknowledged n result=require(match result with
+      | Mailbox.Completed(Service.Coordination_mutation_acknowledged{request_id})->request_id=id n|_->false)
+      "durable ACK did not return its exact completion" in
+    acknowledged 81 (ack 81 (presentation()) first(Some proof));
+    acknowledged 82 (ack 82 (presentation()) rejected None);
+    acknowledged 84 (ack 84 (presentation()) rejected None);
+    acknowledged 83 (ack 83 (presentation()) first(Some proof));
+    require(Rrbvec.length(collect 90)=1) "ACK removed the wrong intent or retained settled rows";
+    let revision_before=read 7 in
+    require(match mutate 100 first with Wire.Committed response->
+      Wire.committed_point first ~request_id:(id 100) response=Ok original|_->false)
+      "ACK deleted immutable original commit proof";
+    require(read 8=revision_before) "same-intent reconciliation after ACK replayed the write")
+;;
+
 let test_service_changefeed_has_one_owner () =
   let pushes = ref Rrbvec.empty
   and pulses = ref 0
@@ -3213,6 +3371,9 @@ let test_service_changefeed_has_one_owner () =
 ;;
 
 let () =
+  test_service_unknown_recovery_is_read_only ~large:true ();
+  test_service_unknown_recovery_is_read_only ();
+  test_service_durable_recovery_and_ack ();
   test_visible_media_listing_uses_typed_reads ();
   test_offline_asset_scans_use_typed_reads ();
   test_dependency_point_reads_use_typed_owner ();

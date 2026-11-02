@@ -43,6 +43,10 @@ let context ~origin ~user ~graph =
     ]
 ;;
 
+let namespace_for_owner ~origin ~user ~graph =
+  Digestif.SHA256.digest_string(canonical(context ~origin ~user ~graph)) |> Digestif.SHA256.to_hex
+;;
+
 let create ~origin ~user ~graph command =
   if user = "" || String.length user > 4096 || String.length (Uri.to_string origin) > 8192
   then Error "Invalid logical mutation owner"
@@ -114,6 +118,26 @@ type outcome =
   | Committed of Protocol.response
   | Rejected of Protocol.response
   | Unknown
+
+type recovery_item = { intent : string; outcome : outcome }
+type recovery_page = { items : recovery_item Rrbvec.t; next : int64 option }
+
+(* A complete maximum-size immutable intent may double when escaped as a JSON
+   string, alongside one bounded outcome and the fixed recovery envelope. This
+   is a distinct artifact budget, not the smaller ordinary query response cap. *)
+let maximum_recovery_bytes =
+  (2 * Protocol.maximum_request_bytes) + Protocol.maximum_response_bytes + 4096
+
+let recovery_page_bytes page =
+  let outcome = function
+    | Unknown -> `List[`String "Unknown"]
+    | Committed response -> `List[`String "Committed";Protocol.response_to_yojson response]
+    | Rejected response -> `List[`String "Rejected";Protocol.response_to_yojson response] in
+  let item (item:recovery_item)=`Assoc["intent",`String item.intent;"outcome",outcome item.outcome] in
+  String.length(Yojson.Safe.to_string(`Assoc[
+    "items",`List(Rrbvec.to_list(Rrbvec.map item page.items));
+    "next",(match page.next with None->`Null|Some value->`String(Int64.to_string value))]))
+;;
 
 type original_point =
   { generation : string

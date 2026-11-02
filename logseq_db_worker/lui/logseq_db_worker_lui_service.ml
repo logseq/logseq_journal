@@ -347,6 +347,13 @@ type request =
         request_id : Logseq_db_types.Graph_types.Uuid.t; intent : string;
         original : string * string * string }
   | Graph_request_at of timeline_scope * Logseq_db_worker.Protocol.request
+  | Coordination_recover_mutations of
+      { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
+        after:int64 option; maximum_items:int; maximum_bytes:int }
+  | Coordination_acknowledge_mutation of
+      { registration:int64; owner:timeline_scope; presentation:int64;
+        request_id:Logseq_db_types.Graph_types.Uuid.t; intent:string;
+        original:(string * string * string) option }
   | Get_graph_state_at of timeline_scope
   | Asset_command_at of timeline_scope * asset_command
   | Import_asset_at of timeline_scope * Logseq_db_types.Asset_import.t
@@ -377,6 +384,10 @@ type request =
       }
 
 type response =
+  | Coordination_mutations_recovered of
+      { request_id:Logseq_db_types.Graph_types.Uuid.t;
+        page:Logseq_db_worker_contract.Mutation_pure_wire.recovery_page }
+  | Coordination_mutation_acknowledged of {request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_observed of
       { registration : int64
       ; owner : timeline_scope
@@ -1240,6 +1251,30 @@ let create ~(dependencies : dependencies) =
         (match resolve owner with
          | Some scope -> Ok (Graph_response (Db.request_for_scope session.worker ~scope request))
          | None -> Error "The graph session is no longer open.")
+      | Coordination_recover_mutations {registration;owner;request_id;after;maximum_items;maximum_bytes} ->
+        (match resolve owner with
+         | None -> Error "The graph session is no longer open."
+         | Some scope ->
+           let current ()=Db.coordination_current session.worker ~registration && resolve owner=Some scope &&
+             (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+           if not(current()) then Error "Durable recovery authority retired"
+           else if maximum_bytes>Logseq_db_worker_contract.Mutation_pure_wire.maximum_recovery_bytes
+           then Error "Invalid durable recovery byte budget"
+           else Result.bind(Db.recover_mutations_for_scope session.worker ~scope ~request_id ~after
+             ~maximum_items ~maximum_bytes ~current)(fun page->
+             if current() then Ok(Coordination_mutations_recovered{request_id;page})
+             else Error "Durable recovery authority retired"))
+      | Coordination_acknowledge_mutation {registration;owner;presentation;request_id;intent;original} ->
+        (match resolve owner with
+         | None -> Error "The graph session is no longer open."
+         | Some scope ->
+           let current ()=Db.coordination_presentation_current session.worker ~registration ~presentation ~owner &&
+             resolve owner=Some scope &&
+             (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+           if not(current()) then Error "Durable acknowledgement presentation retired"
+           else Result.bind(Db.acknowledge_mutation_for_scope session.worker ~scope ~intent ~original ~current)(fun()->
+             if current() then Ok(Coordination_mutation_acknowledged{request_id})
+             else Error "Durable acknowledgement presentation retired"))
       | Get_graph_state_at owner ->
         (match Option.bind (resolve owner) (fun scope->Db.graph_state_for_scope session.worker ~scope) with
          | Some state -> Ok (Graph_state state) | None -> Error "The graph session is no longer open.")

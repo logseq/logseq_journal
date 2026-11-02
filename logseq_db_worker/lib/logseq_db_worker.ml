@@ -450,6 +450,22 @@ let confirm_mutation_for_scope t ~scope ~request_id ~intent ~original ~current =
   Effect_runner.confirm_mutation t.runner ~scope ~request_id ~intent ~original ~current
 ;;
 
+let recover_mutations_for_scope t ~scope ~request_id ~after ~maximum_items ~maximum_bytes ~current =
+  let current ()=not t.stopped && current() &&
+    (match Pure_reducer.graph_state_for_scope !(t.state) scope with
+     | Some{phase=Graph_open;graph_id=Some id;generation;_}->id=scope.Sync.graph_id && generation=scope.graph_generation
+     | _->false) in
+  Effect_runner.recover_mutations t.runner ~scope ~request_id ~after ~maximum_items ~maximum_bytes ~current
+;;
+
+let acknowledge_mutation_for_scope t ~scope ~intent ~original ~current =
+  let current ()=not t.stopped && current() &&
+    (match Pure_reducer.graph_state_for_scope !(t.state) scope with
+     | Some{phase=Graph_open;graph_id=Some id;generation;_}->id=scope.Sync.graph_id && generation=scope.graph_generation
+     | _->false) in
+  Effect_runner.acknowledge_mutation t.runner ~scope ~intent ~original ~current
+;;
+
 let coordinated_changefeed t ~registration ~scope ~request ~maximum_bytes ~current =
   let current ()=coordination_current t ~registration && current () &&
     match Pure_reducer.graph_state_for_scope !(t.state) scope with

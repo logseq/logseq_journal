@@ -127,6 +127,20 @@ val confirm_mutation : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
   -> original:(string * string * string) -> current:(unit -> bool)
   -> Logseq_db_worker_contract.Protocol.response
 
+(** Read-only item/byte bounded recovery. Complete immutable intent bytes and
+    original proofs are returned; pending work remains Unknown and is not run. *)
+val recover_mutations : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> request_id:Logseq_db_types.Graph_types.Uuid.t -> after:int64 option
+  -> maximum_items:int -> maximum_bytes:int -> current:(unit -> bool)
+  -> (Logseq_db_worker_contract.Mutation_pure_wire.recovery_page,string) result
+
+(** Acknowledges only a stored rejection or the exact immutable commit proof.
+    The caller admits committed ACK only after applying a confirmation in the
+    current presentation. Proof and outbox contents are retained. *)
+val acknowledge_mutation : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> intent:string -> original:(string * string * string) option
+  -> current:(unit -> bool) -> (unit,string) result
+
 (** Actual paused-listener/predecessor-snapshot registration on the existing DB.
     A sampled V2_failed remains registered and can recover on the next
     invalidation/Refresh; only allocation or activation failure aborts registration.

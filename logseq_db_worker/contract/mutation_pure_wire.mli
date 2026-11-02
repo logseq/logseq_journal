@@ -27,6 +27,13 @@ type outcome =
   | Rejected of Protocol.response
   | Unknown
 
+type recovery_item = { intent : string; outcome : outcome }
+type recovery_page = { items : recovery_item Rrbvec.t; next : int64 option }
+
+val recovery_page_bytes : recovery_page -> int
+val maximum_recovery_bytes : int
+val namespace_for_owner : origin:Uri.t -> user:string -> graph:Graph_types.Uuid.t -> string
+
 type original_point = private
   { generation : string
   ; before : string

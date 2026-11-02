@@ -125,6 +125,14 @@ val confirm_mutation_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_
   -> request_id:Logseq_db_types.Graph_types.Uuid.t -> intent:string
   -> original:(string * string * string) -> current:(unit -> bool) -> Protocol.response
 
+val recover_mutations_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> request_id:Logseq_db_types.Graph_types.Uuid.t -> after:int64 option
+  -> maximum_items:int -> maximum_bytes:int -> current:(unit -> bool)
+  -> (Logseq_db_worker_contract.Mutation_pure_wire.recovery_page,string) result
+val acknowledge_mutation_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> intent:string -> original:(string * string * string) option
+  -> current:(unit -> bool) -> (unit,string) result
+
 (** Query registrations share the real scoped DB owner. Initial sampling uses
     the listener's predecessor snapshot; callbacks only report epoch invalidation.
     Cleanup remains allowed for the original retired binding/scope and waits for
