@@ -6538,7 +6538,7 @@ let pending_local_intents database ~namespace ~after ~limit =
     if database.closed
     then Error Types.Local_database_closed
     else
-      with_intent_store database (fun sqlite ->
+      with_intent_store ~initialize:false database (fun sqlite ->
         match Intent_store.pending sqlite ~namespace ~after ~limit with
         | Error error -> Error (intent_store_error error)
         | Ok page ->

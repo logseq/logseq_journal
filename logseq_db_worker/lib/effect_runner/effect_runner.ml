@@ -1258,7 +1258,22 @@ let rec block_tree (value : Protocol.v2_block_tree) : Overlay.block_tree =
   }
 ;;
 
-let local_mutation = function
+let rec append_node (node:Protocol.v2_append_node) : Overlay.append_node =
+  {uuid=node.block_id;title=node.title;task_status=node.task_status;children=Rrbvec.map append_node node.children}
+;;
+
+let journal_append_title format day =
+  let module Title=Logseq_db_types.Journal_title in
+  let render pattern=Title.format ~pattern ~year:(day/10000) ~month:(day/100 mod 100) ~day:(day mod 100) in
+  match render(Option.value format ~default:Title.default_format) with
+  |Some title->title|None->Option.get(render Title.default_format)
+;;
+
+let local_mutation ?append_title = function
+  | Protocol.V2_append_journal{mutation_id;page;journal_day;root}->
+    let title=Option.value append_title ~default:(journal_append_title None journal_day) in
+    Ok(Protocol.{blocks=[];pages=[];scopes=[]},Overlay.Append_journal
+      {mutation_id;page;journal_day;title;root=append_node root})
   | Protocol.V2_set_asset_reference { mutation_id; block; previous; asset; preconditions }
     ->
     Ok (preconditions, Overlay.Set_asset_reference { mutation_id; block; previous; asset })
@@ -1770,6 +1785,7 @@ let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~respo
          | V2_set_asset_reference _
          | V2_save_block _
          | V2_insert_blocks _
+         | V2_append_journal _
          | V2_delete_blocks _
          | V2_create_journal_page _
          | V2_set_task_status _
@@ -1883,6 +1899,8 @@ let execute_database ~on_enrichment_error session ~response_budget_bytes request
   | V2_ack_changes { generation; through } ->
     if Core.Changefeed_owner.legacy session.changefeed then acknowledge_changes session request generation through
     else failure request Invalid_request "The changefeed is owned by the registered coordinator."
+  | V2_append_journal _ ->
+    failure request Unsupported_semantics "Atomic Append requires a registered durable intent."
   | V2_inspect_admission ->
     let result=inspect_admission session.database request in
     if Protocol.encoded_response_bytes result<=min response_budget_bytes Protocol.maximum_response_bytes
@@ -2140,71 +2158,63 @@ let coordinated_changefeed t ~registration ~scope ~request ~maximum_bytes ~curre
     | _ -> Error "This operation is not Changes or its ACK"
 ;;
 
-let run_durable_mutation t ~(scope : Sync.graph_scope) ~request_id ~intent ~current =
-  let module Wire = Logseq_db_worker_contract.Mutation_pure_wire in
-  let fail error = Protocol.failed ~request_id error in
-  match
-    Wire.restore
-      ~origin:scope.account.managed_sync_origin
-      ~user:scope.account.user_id
-      ~graph:scope.graph_id
-      intent
-  with
-  | Error message ->
-    Wire.Rejected
-      (failure
-         { Protocol.api_version = Protocol.api_version
-         ; request_id
-         ; command = Protocol.V2_graph_info
-         }
-         Invalid_request
-         message)
-  | Ok wire ->
-    let request =
-      { Protocol.api_version = Protocol.api_version
-      ; request_id
-      ; command = Wire.command wire
-      }
-    in
-    if t.stopped || not (current ())
-    then Wire.Unknown
-    else (
-      match attached_session t scope with
-      | None -> Wire.Unknown
-      | Some session ->
-        (match local_mutation request.command with
-         | Error message -> Wire.Rejected (failure request Unsupported_semantics message)
-         | Ok (raw, mutation) ->
-           (match parse_preconditions raw with
-            | Error message -> Wire.Rejected (failure request Conflict message)
-            | Ok expected ->
-              (match
-                 Database.persist_local_intent
-                   session.database
-                   ~namespace:(Wire.namespace wire)
-                   ~payload:intent
-                   ~expected
-                   mutation
-               with
-               | Error (Overlay.Invalid_local_mutation _ as error)
-               | Error (Overlay.Mutation_identity_conflict as error) ->
-                 Wire.Rejected (fail (local_commit_error error))
-               | Error _ -> Wire.Unknown
-               | Ok prepared ->
-                 if t.stopped || not (current ())
-                 then Wire.Unknown
-                 else (
-                   match Database.commit_local_intent session.database prepared with
-                   | Error _ ->
-                     (match Database.inspect_local_intent session.database prepared with
-                      | Ok (Database.Intent_rejected error) ->
-                        Wire.Rejected (fail (local_commit_error error))
-                      | _ -> Wire.Unknown)
-                   | Ok proof ->
-                     Wire.Committed
-                       (response
-                          request
-                          (committed_outcome (Database.intent_commit_outcome proof))))))))
+let run_durable_mutation t ~(scope:Sync.graph_scope) ~request_id ~intent ~current =
+  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  let fail error=Protocol.failed ~request_id error in
+  match Wire.restore ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id intent with
+  | Error message->Wire.Rejected(failure {Protocol.api_version=Protocol.api_version;request_id;command=Protocol.V2_graph_info}
+      Invalid_request message)
+  | Ok wire->
+    let request=Protocol.{api_version;request_id;command=Wire.command wire} in
+    if t.stopped || not(current()) then Wire.Unknown else
+    match attached_session t scope with
+    | None->Wire.Unknown
+    | Some session->
+      let existing ()=Database.find_local_intent session.database ~namespace:(Wire.namespace wire)
+        ~mutation_id:(Wire.mutation_id wire) in
+      let matching prepared=Database.local_intent_payload prepared=intent in
+      let reject error=Wire.Rejected(fail(local_commit_error error)) in
+      let prepare ()=match existing() with
+        | Error _->Error Wire.Unknown
+        | Ok(Some prepared) when matching prepared->Ok prepared
+        | Ok(Some _)->Error(reject Overlay.Mutation_identity_conflict)
+        | Ok None->
+          let append_title=match request.command with
+            | Protocol.V2_append_journal{journal_day;_}->
+              (match Database.current_snapshot session.database with
+               | Error _->Error Wire.Unknown
+               | Ok snapshot->Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
+                 match Database.graph_info snapshot with
+                 | Error _->Error Wire.Unknown
+                 | Ok info->Ok(Some(journal_append_title info.journal_title_format journal_day))))
+            | _->Ok None in
+          Result.bind append_title(fun append_title->
+            match local_mutation ?append_title request.command with
+            | Error message->Error(Wire.Rejected(failure request Unsupported_semantics message))
+            | Ok(raw,mutation)->
+              match parse_preconditions raw with
+              | Error message->Error(Wire.Rejected(failure request Conflict message))
+              | Ok expected->
+                match Database.persist_local_intent session.database ~namespace:(Wire.namespace wire)
+                  ~payload:intent ~expected mutation with
+                | Ok prepared->Ok prepared
+                | Error(Overlay.Invalid_local_mutation _ as error)
+                | Error(Overlay.Mutation_identity_conflict as error)->
+                  (* Concurrent first preparations may sample different formats;
+                     only the one exact stored wire wins, never a new intent. *)
+                  (match existing() with
+                   | Ok(Some prepared) when matching prepared->Ok prepared
+                   | _->Error(reject error))
+                | Error _->Error Wire.Unknown) in
+      match prepare() with
+      | Error outcome->outcome
+      | Ok prepared->
+        if t.stopped || not(current()) then Wire.Unknown else
+        match Database.commit_local_intent session.database prepared with
+        | Error _->
+          (match Database.inspect_local_intent session.database prepared with
+           | Ok(Database.Intent_rejected error)->reject error|_->Wire.Unknown)
+        | Ok proof->Wire.Committed(response request(committed_outcome(Database.intent_commit_outcome proof)))
 ;;
 
 let durable_mutation t ~scope ~request_id ~intent ~current =
@@ -2277,6 +2287,8 @@ let confirm_mutation t ~(scope : Sync.graph_scope) ~request_id ~intent ~original
            else (
              let command =
                match Wire.command wire with
+               | Protocol.V2_append_journal{root;_}->
+                 Protocol.V2_get_outline_block_summary{block=root.block_id;limit=Protocol.default_page_size;cursor=None}
                | Protocol.V2_create_journal_page { page; _ } ->
                  Protocol.V2_get_page { page; revision = None }
                | V2_insert_blocks { roots = root :: _; _ } ->

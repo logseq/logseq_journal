@@ -218,14 +218,14 @@ type _ query =
       }
       -> change_batch query
 
-type capture_node =
+type capture_node = Protocol.v2_append_node =
   { block_id : Uuid.t
   ; title : string
   ; task_status : Uuid.t option
   ; children : capture_node Rrbvec.t
   }
 
-type append_intent = |
+type append_intent = Wire.t
 
 type mutation_command =
   | Save_block of
@@ -615,7 +615,7 @@ let compare_request_id = Uuid.compare
 
 let capabilities (s : session) =
   { limits = s.limits
-  ; atomic_append = false
+  ; atomic_append = true
   ; durable_mutations = true
   ; durable_import = false
   ; observations = true
@@ -665,21 +665,27 @@ let unavailable feature =
   Error (Unsupported_operation (feature ^ " backend guarantee is not available"))
 ;;
 
-let append_intent _ ~mutation_id:_ ~block_id:_ ~day:_ ~title:_ ~task_status:_ ~children:_ =
-  unavailable "Atomic Append"
+let append_intent (session:session) ~mutation_id ~block_id ~day ~title ~task_status ~children =
+  let root:Protocol.v2_append_node={block_id;title;task_status;children} in
+  if not(Protocol.valid_append_node root) then Error(Invalid_input "Invalid bounded Append tree")
+  else Result.bind(journal_day day)(fun day->
+    let digits=Printf.sprintf "%08d" day in
+    let page=Uuid.of_string(Printf.sprintf "00000001-%s-%s-0000-000000000000"
+      (String.sub digits 0 4)(String.sub digits 4 4)) |> Result.get_ok in
+    Wire.create ~origin:(Uri.of_string session.binding.origin) ~user:session.binding.user ~graph:session.graph
+      (Protocol.V2_append_journal{mutation_id;page;journal_day=day;root})
+    |> Result.map_error(fun message->Invalid_input message))
 ;;
 
-let append_intent_id (x : append_intent) =
-  match x with
-  | _ -> .
+let append_intent_id = Wire.mutation_id
+let encode_append_intent intent = Bytes.of_string(Wire.encode intent)
+let restore_append_intent (session:session) bytes =
+  Result.bind(Wire.restore ~origin:(Uri.of_string session.binding.origin) ~user:session.binding.user
+    ~graph:session.graph(Bytes.to_string bytes) |> Result.map_error(fun message->Invalid_input message))
+    (fun intent->match Wire.command intent with
+      | Protocol.V2_append_journal _->Ok intent
+      | _->Error(Invalid_input "Stored intent is not an atomic Append"))
 ;;
-
-let encode_append_intent (x : append_intent) =
-  match x with
-  | _ -> .
-;;
-
-let restore_append_intent _ _ = unavailable "Atomic Append recovery"
 
 let wire_command ~mutation_id = function
   | Save_block { block; title; preconditions } ->
@@ -1094,6 +1100,9 @@ let supports_observation session query =
 
 let rec validate_request : type a. session -> a request -> (unit, error) result =
   fun session -> function
+  | Append intent ->
+    if not(capabilities session).atomic_append then unavailable "Atomic Append"
+    else Result.map(fun _->())(restore_append_intent session(encode_append_intent intent))
   | Mutate intent -> validate_intent session intent
   | Confirm (presentation, receipt) -> validate_confirmation session presentation receipt
   | Recover_mutations {after;maximum_items;maximum_bytes}->validate_recovery session ~after ~maximum_items ~maximum_bytes
@@ -1326,6 +1335,7 @@ let decode_confirmation session ~presentation receipt response =
           | command ->
             let primary =
               match command with
+              | Protocol.V2_append_journal{root;_}->root.block_id
               | Protocol.V2_insert_blocks { roots = root :: _; _ } -> root.uuid
               | V2_save_block { block; _ }
               | V2_set_task_status { block; _ }
@@ -1977,7 +1987,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                        ; original = receipt_revisions receipt
                        })
                   (validate_confirmation session presentation receipt)
-            | Mutate intent ->
+            | Mutate intent | Append intent ->
               Result.map
                 (fun () ->
                    Service.Coordination_mutation
@@ -2084,10 +2094,15 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
               when Uuid.equal request_id actual ->
               decode_mutation_progress session ~request_id ~intent outcome
               |> Result.map(fun progress->Answered(Ok progress))
+            | ( Append intent
+              , Service.Coordination_mutation_result { request_id = actual; outcome } )
+              when Uuid.equal request_id actual ->
+              decode_mutation_progress session ~request_id ~intent outcome
+              |> Result.map(fun progress->Answered(Ok progress))
             | _ -> Error (Protocol_mismatch "Unexpected owned query receipt"))
       ;;
 
-      let receipt _ ~request_id:_ ~intent:_ _ = unavailable "Atomic Append receipt"
+      let receipt session ~request_id ~intent response = decode_mutation_receipt session ~request_id ~intent response
       let mutation_receipt = decode_mutation_receipt
 
       let confirmation session ~presentation receipt response =

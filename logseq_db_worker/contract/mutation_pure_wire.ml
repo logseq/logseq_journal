@@ -19,6 +19,12 @@ let identity command =
   | V2_set_asset_reference { mutation_id; block; _ } -> single mutation_id block
   | V2_delete_blocks { mutation_id; root; _ } -> single mutation_id root
   | V2_create_journal_page { mutation_id; page; _ } -> single mutation_id page
+  | V2_append_journal{mutation_id;root;_}->
+    let rec collect nodes index found =
+      if index=Rrbvec.length nodes then Ok(mutation_id,Rrbvec.sort_uniq U.compare found)
+      else let node=Rrbvec.nth nodes index in
+        collect(Rrbvec.append nodes node.Protocol.children)(index+1)(Rrbvec.push_back found node.block_id) in
+    collect(Rrbvec.singleton root)0 Rrbvec.empty
   | V2_insert_blocks { mutation_id; roots = [ root ]; _ } ->
     let nodes = ref (Rrbvec.singleton root)
     and found = ref Rrbvec.empty

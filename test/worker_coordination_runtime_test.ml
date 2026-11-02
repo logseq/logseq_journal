@@ -218,6 +218,24 @@ let seed_status_catalog support =
         (fun () -> Test_support.seed_task_statuses database)))
 ;;
 
+let prepare_atomic_append_fixture support =
+  let module D=Logseq_overlay_db.Database in
+  let module J=Transit_core.Json in
+  Eio_main.run(fun _->Eio.Switch.run(fun sw->
+    let inspection=D.inspect_mirror ~application_support_directory:support ~graph_id:Test_support.graph_uuid |> Result.get_ok in
+    let database=D.open_ ~sw (Test_support.dependencies ~behavior:"atomic append fixture") inspection
+      ~graph_name:"atomic append fixture" |> Result.get_ok in
+    Fun.protect ~finally:(fun()->ignore(D.close database))(fun()->
+      let web=J.String "existing-web-append-day" in
+      let add attribute value=Test_support.status_add web attribute value in
+      Test_support.apply_test_transaction database ~cursor:2
+        [Test_support.status_add (J.Keyword "logseq.class/Journal")
+           "logseq.property.journal/title-format" (J.String "yyyy-MM-dd");
+         add "block/uuid" (J.Uuid "9f000000-0000-4000-8000-000000002100");
+         add "block/title" (J.String "Existing Web day title");add "block/name" (J.String "existing-web-append-day");
+         add "block/journal-day" (J.Int 20261103);add "block/tags" (J.Keyword "logseq.class/Journal")])))
+;;
+
 let with_client
       ?(epoch_ms = fun () -> 1_700_000_000_000L)
       ?(favorites = false)
@@ -1684,7 +1702,7 @@ let test_read_completion_rechecks_graph_owner ?(durable = false) () =
 
 let test_host_durable_recovery_confirmation_ack () =
   let module Host=Journal_worker_coordination_host in
-  with_client ~statuses:true(fun client->
+  with_client ~statuses:true ~prepare:prepare_atomic_append_fixture(fun client->
     let jobs=Queue.create() in
     let host=Host.create ~client ~client_id ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
       ~enqueue:(fun job->Queue.add job jobs) ~changed:(fun _->()) |> Result.get_ok in
@@ -1702,7 +1720,7 @@ let test_host_durable_recovery_confirmation_ack () =
       (C.projection(Host.view host)));
     let presentation=Option.get(Option.bind(C.projection(Host.view host))W.selected) in
     let session=W.presentation_session presentation in
-    let call : type a. a W.request -> a W.reply = fun operation->
+    let call_in : type a. W.session -> a W.request -> a W.reply = fun session operation->
       let before= !consumed in
       let ticket=Host.request host session operation |> Result.get_ok in
       let result=ref None in
@@ -1711,6 +1729,7 @@ let test_host_durable_recovery_confirmation_ack () =
       wait(fun()-> !result<>None);
       require(!consumed=before+1) "typed lifecycle response has duplicate or missing owner";
       Option.get !result in
+    let call : type a. a W.request -> a W.reply = fun operation->call_in session operation in
     let value : type a. a W.reply -> a = function W.Answered(Ok value)->value|_->failwith "typed lifecycle operation failed" in
     let budget=W.read_budget session ~maximum_items:8 ~maximum_bytes:16384 |> Result.get_ok in
     let read()=value(call(W.Query(budget,W.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None}))) in
@@ -1751,6 +1770,39 @@ let test_host_durable_recovery_confirmation_ack () =
       | _->false) "real canonical DTO lost committed status UUID";
     ignore(value(call(W.Acknowledge_intent status_intent)));
     require(Rrbvec.is_empty(recover()).items) "real status ACK retained pending recovery entry";
+    let completed_appends=ref Rrbvec.empty in
+    List.iteri(fun index day->
+      let root_id=uuid(Printf.sprintf "9f000000-0000-4000-8000-%012d" (2000+index*10)) in
+      let child_id=uuid(Printf.sprintf "9f000000-0000-4000-8000-%012d" (2001+index*10)) in
+      let append=W.append_intent session ~mutation_id:(uuid(Printf.sprintf "9f000000-0000-4000-8000-%012d" (2002+index*10)))
+        ~block_id:root_id ~day:(W.journal_day day |> Result.get_ok) ~title:"Atomic Service root 中文"
+        ~task_status:(Some status) ~children:(Rrbvec.singleton W.{block_id=child_id;title="Atomic Service child";
+          task_status=Some(Test_support.status_uuid 3);children=Rrbvec.empty}) |> Result.get_ok in
+      let receipt=match value(call(W.Append append)) with
+        | W.Committed_pending_presentation receipt->receipt|_->failwith "actual Append did not commit atomically" in
+      require(Rrbvec.length(W.receipt_targets receipt)=2) "Append receipt lost complete immutable targets";
+      let confirmation=match value(call(W.Confirm(presentation,receipt))) with
+        | W.Confirmed value->value|_->failwith "actual Append did not confirm" in
+      let summary=match W.confirmation_primary confirmation with W.Confirmed_block summary->summary
+        |_->failwith "Append canonical primary was not the admitted root" in
+      require(match summary.lookup,summary.page with
+        | P.V2_present_block{value;_},Some(P.V2_present_page{page;_})->
+          value.block.uuid=root_id && value.block.title="Atomic Service root 中文" && value.task_status=Some status
+          && value.block.parent=page.uuid && value.block.page=page.uuid
+          && (if index=0 then page.title="2026-11-02" else
+            page.uuid=uuid "9f000000-0000-4000-8000-000000002100" && page.title="Existing Web day title")
+        |_->false) "Append lost settings format or adopted the candidate instead of the existing Web page";
+      require(List.exists(fun(item:P.v2_child_member)->item.value.block.uuid=child_id
+        && item.value.task_status=Some(Test_support.status_uuid 3))summary.items)
+        "Append separated or lost its child status write";
+      ignore(value(call(W.Acknowledge_intent(W.receipt_intent receipt))));
+      require(Rrbvec.is_empty(recover()).items) "actual Append ACK did not settle its durable recovery item";
+      require(match value(call(W.Append(W.restore_append_intent session(W.encode_append_intent append) |> Result.get_ok))) with
+        | W.Committed_pending_presentation again->W.receipt_revisions again=W.receipt_revisions receipt
+        |_->false) "Append retry lost the original commit proof";
+      require(value(call(W.Query(budget,W.Block_summary{block=root_id;after=None})))=summary)
+        "Append retry duplicated or changed the complete canonical tree";
+      completed_appends:=Rrbvec.push_back !completed_appends(W.encode_append_intent append,receipt,root_id,summary)) [20261102;20261103];
     (* Child business ordering against the actual Service and persisted intents.
        UI application here uses the production pure block projection; mounted
        application tests separately verify the rendered composer barrier. *)
@@ -1842,6 +1894,31 @@ let test_host_durable_recovery_confirmation_ack () =
       "same-intent deletion reconciliation changed canonical absence";
 
 
+    ignore(Mailbox.send client(Service.Client_command Return_to_graph_picker));
+    wait(fun()->Option.exists(fun projection->W.selected projection=None)(C.projection(Host.view host)));
+    ignore(Mailbox.send client(Service.Client_command(Select_graph Test_support.graph_uuid)));
+    wait(fun()->Option.exists(fun projection->
+      match W.selected projection with
+      | Some current->let fresh=W.presentation_session current in
+        not(W.equal_session fresh session)
+        && List.exists(fun resident->resident.W.phase=W.Open && W.equal_session resident.session fresh)(W.residents projection)
+      | None->false)(C.projection(Host.view host)));
+    let current=Option.get(Option.bind(C.projection(Host.view host))W.selected) in
+    let fresh=W.presentation_session current in
+    Rrbvec.iter(fun(bytes,original,root_id,summary)->
+      let append=W.restore_append_intent fresh bytes |> Result.get_ok in
+      let receipt=match value(call_in fresh(W.Append append)) with
+        | W.Committed_pending_presentation receipt->receipt|_->failwith "reopened Append did not reconcile" in
+      require(W.receipt_revisions receipt=W.receipt_revisions original)
+        "reopened Append replaced original evidence with the new read generation";
+      let confirmation=match value(call_in fresh(W.Confirm(current,receipt))) with
+        | W.Confirmed value->value|_->failwith "reopened Append failed current presentation readback" in
+      require(match W.confirmation_primary confirmation with
+        | W.Confirmed_block value->value.lookup=summary.W.lookup && value.page=summary.page && value.items=summary.items
+        | _->false) "reopened Append changed the original complete source/status tree";
+      require(W.receipt_targets receipt=W.receipt_targets original
+        && Rrbvec.exists(W.Uuid.equal root_id)(W.receipt_targets receipt)) "reopened Append changed stable targets";
+      ignore(value(call_in fresh(W.Acknowledge_intent(W.receipt_intent receipt))))) !completed_appends;
     ignore(Host.shutdown host);
     wait(fun()->C.shutdown_state(Host.view host)=C.Stopped))
 ;;

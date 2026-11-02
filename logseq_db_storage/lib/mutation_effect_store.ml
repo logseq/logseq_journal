@@ -120,9 +120,18 @@ let decode stmt =
       }
 ;;
 
+let store_exists db =
+  statement db "SELECT 1 FROM sqlite_master WHERE name='overlay_intents_v1'" (fun stmt->
+    match Sqlite3.step stmt with
+    | Sqlite3.Rc.ROW->Ok true
+    | DONE->Ok false
+    | code->let* ()=rc db code in Error(Storage_failure "Intent schema lookup did not complete"))
+;;
+
 let read db ~namespace ~mutation_id =
   let* () = validate_namespace namespace in
-  statement
+  let* exists=store_exists db in
+  if not exists then Ok None else statement
     db
     "SELECT sequence,namespace,mutation_id,payload,evidence,acknowledged FROM \
      overlay_intents_v1 WHERE namespace=? AND mutation_id=?"
@@ -204,7 +213,8 @@ let pending db ~namespace ~after ~limit =
   if after < 0L || limit <= 0 || limit > 256
   then Error (Invalid_input "Invalid recovery page bounds")
   else
-    statement
+    let* exists=store_exists db in
+    if not exists then Ok{items=[];next=None} else statement
       db
       "SELECT sequence,namespace,mutation_id,payload,evidence,acknowledged, \
        length(payload),coalesce(length(evidence),0) FROM overlay_intents_v1 WHERE \

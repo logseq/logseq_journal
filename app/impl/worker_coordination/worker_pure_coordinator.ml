@@ -2805,7 +2805,7 @@ let plan_change_ack state session batch =
     Ok (ticket, dispatch_waiting ~publish:true { state with next = serial; facts } []))
 ;;
 
-let request
+let rec request
   : type a.
     t
     -> Worker.session
@@ -2814,6 +2814,12 @@ let request
   =
   fun state session operation ->
   match operation with
+  | Worker.Append intent ->
+    (* One durable ledger owns Append and ordinary mutation receipts. This is a
+       pure normalization of the exact immutable wire, never a new intent. *)
+    Result.bind(Worker.validate_request session operation)(fun()->
+      Result.bind(Worker.restore_mutation_intent session(Worker.encode_append_intent intent))
+        (fun mutation->request state session(Worker.Mutate mutation)))
   | Worker.Release handle -> plan_release state session handle
   | _ ->
     Result.bind (validate_session state session) (fun () ->

@@ -775,11 +775,18 @@ let test_compressed_response_ownership () =
   done
 ;;
 
-let test_durable_mutation_properties () =
+let test_durable_mutation_properties ?(append=false) () =
   let issuer, _, projection, session = fixture 1901L in
   let module I = (val issuer : W.ISSUER) in
-  let intent =
-    W.mutation_intent
+  let append_intent=if not append then None else Some(
+    W.append_intent session ~mutation_id:(uuid "98000000-0000-4000-8000-000000000091")
+      ~block_id:graph ~day:(W.journal_day 20261102 |> Result.get_ok) ~title:"stable durable Append"
+      ~task_status:(Some(uuid "98000000-0000-4000-8000-000000000096"))
+      ~children:(Rrbvec.singleton W.{block_id=uuid "98000000-0000-4000-8000-000000000095";
+        title="complete child";task_status=None;children=Rrbvec.empty}) |> Result.get_ok) in
+  let intent = match append_intent with
+  | Some intent->W.restore_mutation_intent session(W.encode_append_intent intent) |> Result.get_ok
+  | None->W.mutation_intent
       session
       ~mutation_id:(uuid "98000000-0000-4000-8000-000000000091")
       (W.Save_block
@@ -790,6 +797,7 @@ let test_durable_mutation_properties () =
          })
     |> Result.get_ok
   in
+  let operation=match append_intent with Some intent->W.Append intent|None->W.Mutate intent in
   let wire = W.encode_mutation_intent intent in
   let run trace =
     let state = ref (ready I.binding projection)
@@ -830,7 +838,7 @@ let test_durable_mutation_properties () =
       (fun (action, n) ->
          match action with
          | 0 ->
-           (match C.request !state session (W.Mutate intent) with
+           (match C.request !state session operation with
             | Ok (ticket, transition) ->
               state := transition.next;
               tickets := ticket :: List.take 7 !tickets
@@ -870,7 +878,7 @@ let test_durable_mutation_properties () =
              in
              let request_id =
                match
-                 I.request session ~request_id:(C.ticket_id ticket) (W.Mutate intent)
+                 I.request session ~request_id:(C.ticket_id ticket) operation
                with
                | Ok (S.Coordination_mutation { request_id; _ }) -> request_id
                | _ -> assert false
@@ -931,7 +939,7 @@ let test_durable_mutation_properties () =
   in
   List.iter run prefixes;
   for seed = 0 to 249 do
-    let random = Random.State.make [| 0xd0a; seed |] in
+    let random = Random.State.make [| 0xd0a; (if append then 1 else 0); seed |] in
     let trace =
       List.nth prefixes (seed mod List.length prefixes)
       @ List.init 80 (fun _ -> Random.State.int random 11, Random.State.int random 8)
@@ -941,8 +949,8 @@ let test_durable_mutation_properties () =
       let reduced = shrink fails trace in
       failwith
         (Printf.sprintf
-           "durable seed=%d shrunk=%s"
-           seed
+           "durable append=%b seed=%d shrunk=%s"
+           append seed
            (String.concat
               ";"
               (List.map (fun (a, n) -> Printf.sprintf "%d/%d" a n) reduced))))
@@ -3403,7 +3411,37 @@ let test_change_application_properties () =
   done
 ;;
 
+let test_atomic_append_intent_and_admission () =
+  let issuer,_,projection,session=fixture 6050L in
+  let module I=(val issuer:W.ISSUER) in
+  let intent=match W.append_intent session ~mutation_id:(uuid "98000000-0000-4000-8000-000000006051")
+    ~block_id:(uuid "98000000-0000-4000-8000-000000006052")
+    ~day:(W.journal_day 20261102 |> Result.get_ok) ~title:"Atomic typed source"
+    ~task_status:(Some(uuid "98000000-0000-4000-8000-000000006053"))
+    ~children:(Rrbvec.singleton W.{block_id=uuid "98000000-0000-4000-8000-000000006054";
+      title="Nested status";task_status=Some(uuid "98000000-0000-4000-8000-000000006055");children=Rrbvec.empty}) with
+    | Ok intent->intent|Error _->failwith "atomic Append constructor is unavailable after the real backend contract" in
+  let bytes=W.encode_append_intent intent in
+  check(W.encode_append_intent(W.restore_append_intent session bytes |> Result.get_ok)=bytes)
+    "restored Append changed its complete payload";
+  let _,_,_,reopened=fixture 6051L in
+  check(W.encode_append_intent(W.restore_append_intent reopened bytes |> Result.get_ok)=bytes)
+    "fresh execution lost stable logical Append identity";
+  let _,_,_,foreign=fixture ~graph:(uuid "98000000-0000-4000-8000-000000006056") 6052L in
+  check(Result.is_error(W.restore_append_intent foreign bytes)) "foreign graph restored an Append";
+  let initial=ready I.binding projection in
+  let ticket,planned=C.request initial session(W.Append intent) |> Result.get_ok in
+  check(C.validate_session initial session=Ok()) "Append mutated the previous pure state";
+  check(List.exists(function C.Send(sent,owner,operation)->
+    W.equal_request_id(C.ticket_id sent)(C.ticket_id ticket) && W.equal_session owner session
+    && (match I.request owner ~request_id:(C.ticket_id sent)operation with
+      |Ok(S.Coordination_mutation{intent=encoded;_})->encoded=Bytes.to_string bytes
+      |_->false)|_->false)planned.instructions)
+    "Append bypassed the existing durable Service channel"
+;;
+
 let () =
+  test_atomic_append_intent_and_admission ();
   test_recovery_cursor_and_capacity_bounds ();
   test_durable_recovery_and_ack_purity ();
   test_committed_ack_requires_current_confirmation ();
@@ -3429,6 +3467,7 @@ let () =
   test_query_origin_boundary ();
   test_durable_readback_reservation ();
   test_durable_mutation_properties ();
+  test_durable_mutation_properties ~append:true ();
   test_bootstrap_validation ();
   test_cleanup_admission_edges ();
   test_pure_properties ();
@@ -3437,6 +3476,6 @@ let () =
   test_queued_query_properties ();
   test_opening_query_retires_on_removal ();
   print_endline
-    "Pure coordinator: invariants, 500 lifecycle + 250 queued-read + 250 durable traces, \
+    "Pure coordinator: invariants, 500 lifecycle + 250 queued-read + 250 ordinary/250 Append durable traces, \
      100 ownership + 300 observation + 250 application + 200 live-binding + 200 recovery/ACK + 200 retired-intent + 200 queued-presentation traces and shrinking passed"
 ;;

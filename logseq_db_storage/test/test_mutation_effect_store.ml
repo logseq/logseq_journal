@@ -27,6 +27,27 @@ let with_db path f =
        f db)
 ;;
 
+(* SQL store existence has no reducer model. Exercise the public read boundary
+   on a genuinely fresh database; absence is distinct from corrupt schema. *)
+let fresh_store_reads_are_empty_and_readonly () =
+  fixture(fun path->
+    let db=Sqlite3.db_open path in
+    Fun.protect ~finally:(fun()->ignore(Sqlite3.db_close db))(fun()->
+      Alcotest.(check bool) "fresh durable lookup is known absence" true
+        (S.read db ~namespace ~mutation_id:(uuid 1)=Ok None);
+      let page=ok(S.pending db ~namespace ~after:None ~limit:8) in
+      Alcotest.(check bool) "fresh recovery is an empty complete page" true (page.items=[] && page.next=None);
+      let stmt=Sqlite3.prepare db "SELECT count(*) FROM sqlite_master WHERE name='overlay_intents_v1'" in
+      Fun.protect ~finally:(fun()->ignore(Sqlite3.finalize stmt))(fun()->
+        Alcotest.(check bool) "schema query returns one row" true (Sqlite3.step stmt=Sqlite3.Rc.ROW);
+        Alcotest.(check int) "read/recovery did not create a store" 0(Sqlite3.column_int stmt 0));
+      Sqlite3.Rc.check(Sqlite3.exec db "CREATE TABLE overlay_intents_v1(unrelated INTEGER)");
+      Alcotest.(check bool) "a malformed existing schema is not absence" true
+        (Result.is_error(S.read db ~namespace ~mutation_id:(uuid 1)));
+      Alcotest.(check bool) "a malformed recovery schema is not empty" true
+        (Result.is_error(S.pending db ~namespace ~after:None ~limit:8))))
+;;
+
 let restart_and_identity () =
   fixture (fun path ->
     with_db path (fun db ->
@@ -209,7 +230,8 @@ let () =
   Alcotest.run
     "durable mutation intent bytes"
     [ ( "storage"
-      , [ Alcotest.test_case "restart and exact identity" `Quick restart_and_identity
+      , [ Alcotest.test_case "fresh reads are empty without schema writes" `Quick fresh_store_reads_are_empty_and_readonly
+        ; Alcotest.test_case "restart and exact identity" `Quick restart_and_identity
         ; Alcotest.test_case "atomic outbox transaction" `Quick atomic_outbox_transaction
         ; Alcotest.test_case "bounded scoped recovery" `Quick paging_and_bounds
         ; Alcotest.test_case

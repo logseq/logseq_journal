@@ -95,6 +95,14 @@ and command =
       ; roots : v2_block_tree list
       ; preconditions : v2_preconditions
       }
+  (* Atomic Append executes only through the registered durable intent bridge;
+     unregistered raw graph requests cannot bypass persistence/receipt ownership. *)
+  | V2_append_journal of
+      { mutation_id : Uuid.t
+      ; page : page_uuid
+      ; journal_day : int
+      ; root : v2_append_node
+      }
   | V2_delete_blocks of
       { mutation_id : Uuid.t
       ; root : block_uuid
@@ -142,6 +150,13 @@ and v2_block_tree =
   { uuid : block_uuid
   ; title : string
   ; children : v2_block_tree list
+  }
+
+and v2_append_node =
+  { block_id : block_uuid
+  ; title : string
+  ; task_status : Uuid.t option
+  ; children : v2_append_node Rrbvec.t
   }
 
 type response =
@@ -381,3 +396,5 @@ val is_observable_read : command -> bool
     can shrink; query family, cursor, revision and filters remain exact. Returning
     None requires an explicit oversized-singleton/error result, never truncation. *)
 val smaller_read_page : command -> command option
+
+val valid_append_node : v2_append_node -> bool

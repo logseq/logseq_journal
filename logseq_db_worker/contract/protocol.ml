@@ -1,5 +1,17 @@
 open Graph_types
 
+(* The wire codec uses Yojson's list envelope; the owned append tree stays a
+   persistent vector while planning, validating and decoding. *)
+module Rrbvec = struct
+  include Rrbvec
+  let to_yojson encode values = `List(Rrbvec.to_seq values |> Seq.map encode |> List.of_seq)
+  let of_yojson decode = function
+    | `List values ->
+      List.fold_left(fun result value->Result.bind result(fun values->
+        Result.map(fun value->Rrbvec.push_back values value)(decode value)))(Ok Rrbvec.empty)values
+    | _->Error "Append children must be an array"
+end
+
 let api_version = 2
 let maximum_request_bytes = Limits.maximum_request_bytes
 let maximum_response_bytes = Limits.maximum_response_bytes
@@ -92,6 +104,12 @@ and command =
       ; roots : v2_block_tree list
       ; preconditions : v2_preconditions
       }
+  | V2_append_journal of
+      { mutation_id : Uuid.t
+      ; page : page_uuid
+      ; journal_day : int
+      ; root : v2_append_node
+      }
   | V2_delete_blocks of
       { mutation_id : Uuid.t
       ; root : block_uuid
@@ -139,6 +157,13 @@ and v2_block_tree =
   { uuid : block_uuid
   ; title : string
   ; children : v2_block_tree list
+  }
+
+and v2_append_node =
+  { block_id : block_uuid
+  ; title : string
+  ; task_status : Uuid.t option
+  ; children : v2_append_node Rrbvec.t
   }
 [@@deriving yojson]
 
@@ -393,7 +418,29 @@ let valid_tree roots =
   List.length roots <= maximum_roots && visit 0 (List.map (fun tree -> 0, tree) roots)
 ;;
 
+module Append_ids=Set.Make(String)
+let valid_append_node root =
+  let rec visit pending index seen =
+    if index=Rrbvec.length pending then true
+    else if index>=maximum_tree_nodes then false
+    else let node,depth=Rrbvec.nth pending index in
+      let id=Uuid.to_string node.block_id in
+      depth<=maximum_tree_depth && valid_title node.title
+      && Rrbvec.length node.children<maximum_tree_nodes && not(Append_ids.mem id seen)
+      && visit(Rrbvec.append pending(Rrbvec.map(fun child->child,depth+1)node.children))
+        (index+1)(Append_ids.add id seen) in
+  visit(Rrbvec.singleton(root,0))0 Append_ids.empty
+;;
+
+let valid_append_day day =
+  let year=day/10000 and month=day/100 mod 100 and date=day mod 100 in
+  let leap=year mod 400=0 || (year mod 4=0 && year mod 100<>0) in
+  let maximum=match month with 2->if leap then 29 else 28|4|6|9|11->30|_->31 in
+  year>=1 && year<=9999 && month>=1 && month<=12 && date>=1 && date<=maximum
+;;
+
 let validate_command = function
+  | V2_append_journal{root;journal_day;_}->valid_append_node root && valid_append_day journal_day
   | V2_get_task_status_definitions { statuses = assets }
   | V2_get_asset_descriptors { assets } -> List.length assets <= maximum_page_size
   | V2_list_assets { roots; limit; _ } ->
@@ -540,6 +587,7 @@ let is_snapshot_read = function
   | V2_set_asset_reference _
   | V2_save_block _
   | V2_insert_blocks _
+  | V2_append_journal _
   | V2_delete_blocks _
   | V2_create_journal_page _
   | V2_set_task_status _
