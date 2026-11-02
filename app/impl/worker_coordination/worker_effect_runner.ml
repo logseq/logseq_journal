@@ -301,9 +301,7 @@ let on_event t event =
                  t.post (Core.Bootstrap_received (I.binding, Worker.Bootstrap_failed e)))
             | Coordination_revoked (id, _) when t.registration = Some id ->
               I.revoke ();
-              t.post
-                (Core.Bootstrap_received
-                   (I.binding, Worker.Binding_revoked Worker.Revoked_session))
+              t.post (Core.Binding_invalidated I.binding)
             | _ -> ())
           updates;
         Broadcast

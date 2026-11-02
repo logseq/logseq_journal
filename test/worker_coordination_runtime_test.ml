@@ -1746,6 +1746,90 @@ let test_host_preserves_query_origin_before_forget () =
     require (!calls = 1) "query origin callback was delivered more than once")
 ;;
 
+(* A real Service authority control can retire an offline binding without
+   changing its user or physical graph. The old pure event only represented
+   terminal bootstrap revocation, so it could not express this live handover. *)
+let test_live_authority_invalidation_rebinds () =
+  let module Host = Journal_worker_coordination_host in
+  with_client (fun client ->
+    let jobs = Queue.create () in
+    let host =
+      Host.create
+        ~client
+        ~client_id
+        ~managed_origin:"https://api.logseq.io"
+        ~user_id:"user-1"
+        ~enqueue:(fun f -> Queue.add f jobs)
+        ~changed:(fun _ -> ())
+      |> Result.get_ok
+    in
+    Mailbox.on_event client (fun event -> ignore (Host.on_event host event));
+    let pump () =
+      Mailbox.Private.deliver client ~max_events:64;
+      let count = Queue.length jobs in
+      for _ = 1 to count do
+        (Queue.take jobs) ()
+      done
+    in
+    let wait predicate =
+      let deadline = Unix.gettimeofday () +. 6. in
+      while (not (predicate ())) && Unix.gettimeofday () < deadline do
+        pump ();
+        Thread.delay 0.001
+      done;
+      require (predicate ()) "authority handover did not settle"
+    in
+    let current () =
+      Option.bind
+        (C.projection (Host.view host))
+        (fun p ->
+           List.find_map
+             (fun r -> if r.W.phase = W.Open then Some r.session else None)
+             (W.residents p))
+    in
+    ignore
+      (Mailbox.send
+         client
+         (Service.Client_command (Restore_local_account { user_id = "user-1" })));
+    wait (fun () -> current () <> None);
+    let old = Option.get (current ()) in
+    ignore
+      (Mailbox.send
+         client
+         (Service.Client_command
+            (Reconcile_authenticated_user { user_id = Some "user-1" })));
+    wait (fun () ->
+      match C.bootstrap (Host.view host), current () with
+      | W.Binding_revoked _, _ -> true
+      | _, Some session -> not (W.equal_session old session)
+      | _ -> false);
+    let session =
+      match current () with
+      | Some value -> value
+      | None ->
+        failwith "same-user live authority left the offline binding permanently revoked"
+    in
+    require
+      (not (W.equal_session old session))
+      "authority handover reused its revoked registration";
+    let budget =
+      W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
+    in
+    let ticket =
+      Host.request host session (W.Query (budget, W.Graph_info)) |> Result.get_ok
+    in
+    let completed = ref false in
+    Host.watch host ticket ~f:(function
+      | W.Answered (Ok _) -> completed := true
+      | _ -> failwith "replacement binding cannot execute a real read");
+    wait (fun () -> !completed);
+    require
+      (Host.validate_session host old = Error W.Revoked_session)
+      "old authority session recovered data admission";
+    ignore (Host.shutdown host);
+    wait (fun () -> C.shutdown_state (Host.view host) = C.Stopped))
+;;
+
 let test_changefeed_business_waits_for_ui_application () =
   let module Host = Journal_worker_coordination_host in
   let module Business = Journal_graph_runtime in
@@ -2897,6 +2981,7 @@ let test_service_changefeed_has_one_owner () =
 ;;
 
 let () =
+  test_live_authority_invalidation_rebinds ();
   test_service_changefeed_has_one_owner ();
   test_service_unallocated_observation_cleanup_after_close ();
   test_service_observation_read_failure_retains_interest ();

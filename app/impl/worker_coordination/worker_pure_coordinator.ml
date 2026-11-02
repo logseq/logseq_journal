@@ -460,6 +460,7 @@ let equal_view a b =
 type event =
   | Worker_bound of Worker.binding
   | Retry_bootstrap
+  | Binding_invalidated of Worker.binding
   | Admitted : 'a ticket * Id.request_id -> event
   | Admission_refused : 'a ticket * Worker.admission_error -> event
   | Admission_failed : 'a ticket * Worker.error -> event
@@ -1795,6 +1796,9 @@ let step_base state event =
       }
       [ Bootstrap ]
   | Worker_bound _ -> unchanged state
+  | Binding_invalidated binding when is_binding state binding && state.lifecycle = Running
+    -> retire state Retrying
+  | Binding_invalidated _ -> unchanged state
   | Retry_bootstrap when state.lifecycle = Running -> retire state Retrying
   | Retry_bootstrap
     when state.lifecycle = Retrying && (not state.release_pending) && not state.released
@@ -2855,4 +2859,3 @@ module Response_ownership = struct
 
   let spans = Ranges.cardinal
 end
-

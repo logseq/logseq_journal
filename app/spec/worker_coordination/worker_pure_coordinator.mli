@@ -83,6 +83,7 @@ val shutdown_state : view -> shutdown_state
 type event =
   | Worker_bound of Worker.binding
   | Retry_bootstrap
+  | Binding_invalidated of Worker.binding
   | Admitted :
       'a ticket * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id
       -> event
@@ -142,7 +143,10 @@ type transition =
 
 (** Host supplies a fresh client identity for pure counters; durable mutation IDs
     are independent. Worker_bound enters Awaiting_baseline and schedules Bootstrap.
-    Retry never reuses a revoked registration. Ready/Projection is applied as one
+    Retry never reuses a revoked registration. A checked live Binding_invalidated
+    fact retires old authority and awaits real unregister ACK before replacement;
+    a replacement bootstrap rejecting this user remains visible, without an
+    automatic retry loop. Ready/Projection is applied as one
     version before admitting Open sessions; all older binding callbacks (including
     not-ready/failure states without a projection) are ignored, even on the same
     unchanged mailbox incarnation.

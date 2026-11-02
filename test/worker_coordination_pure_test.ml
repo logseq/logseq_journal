@@ -1890,6 +1890,114 @@ let test_observation_properties () =
   done
 ;;
 
+let test_live_binding_invalidation_is_pure () =
+  let old_issuer, _, old_projection, old_session = fixture 741L in
+  let new_issuer, _, new_projection, new_session = fixture 742L in
+  let module Old = (val old_issuer : W.ISSUER) in
+  let module New = (val new_issuer : W.ISSUER) in
+  let initial = ready Old.binding old_projection in
+  let invalidated = C.step initial (C.Binding_invalidated Old.binding) in
+  check
+    (C.validate_session invalidated.next old_session = Error W.Revoked_session)
+    "live invalidation left old session data admission open";
+  check
+    (List.exists
+       (function
+         | C.Release_binding binding -> W.equal_binding binding Old.binding
+         | _ -> false)
+       invalidated.instructions)
+    "live invalidation did not require actual old registration release";
+  let released =
+    C.step invalidated.next (C.Binding_release_completed (Old.binding, Ok ()))
+  in
+  let bound = C.step released.next (C.Worker_bound New.binding) in
+  let denied =
+    C.step
+      bound.next
+      (C.Bootstrap_received (New.binding, W.Binding_revoked W.Revoked_session))
+  in
+  let capacity = C.step denied.next C.Capacity_available in
+  check
+    (not
+       (List.exists
+          (function
+            | C.Bind_replacement | C.Bootstrap -> true
+            | _ -> false)
+          capacity.instructions))
+    "replacement authority denial created an automatic registration loop";
+  let run trace =
+    let state = ref invalidated.next
+    and released = ref false
+    and replaced = ref false in
+    List.iter
+      (fun op ->
+         let event =
+           match op with
+           | 0 -> C.Binding_invalidated Old.binding
+           | 1 -> C.Projection_received old_projection
+           | 2 -> C.Bootstrap_received (Old.binding, W.Ready old_projection)
+           | 3 -> C.Capacity_available
+           | 4 -> C.Drain
+           | 5 -> C.Binding_release_completed (Old.binding, Ok ())
+           | 6 -> C.Binding_release_not_admitted (Old.binding, W.Full)
+           | 7 -> C.Worker_bound New.binding
+           | _ -> C.Bootstrap_received (New.binding, W.Ready new_projection)
+         in
+         let before = C.view !state in
+         let tr = C.step !state event in
+         check
+           (C.equal_view (C.view !state) before)
+           "live invalidation mutated a prior view";
+         check
+           (C.equal_view (C.view tr.next) (C.view (C.step !state event).next))
+           "invalidation ceased to be deterministic";
+         List.iter
+           (function
+             | C.Bind_replacement ->
+               check
+                 (!released && not !replaced)
+                 "replacement escaped one real release ACK";
+               replaced := true
+             | _ -> ())
+           (if op = 5
+            then (
+              released := true;
+              tr.instructions)
+            else tr.instructions);
+         state := tr.next;
+         check
+           (C.validate_session !state old_session = Error W.Revoked_session)
+           "late old binding revived its session";
+         if C.validate_session !state new_session = Ok ()
+         then check (!released && !replaced) "fresh session preceded actual replacement")
+      trace
+  in
+  for seed = 0 to 199 do
+    let random = Random.State.make [| 0xb1d; seed |] in
+    let trace =
+      [ 0; 1; 2; 6; 3; 5; 7; 8 ] @ List.init 64 (fun _ -> Random.State.int random 9)
+    in
+    let fails trace =
+      try
+        run trace;
+        false
+      with
+      | _ -> true
+    in
+    if fails trace
+    then (
+      let minimal = shrink fails trace in
+      try run minimal with
+      | error ->
+        failwith
+          (Printf.sprintf
+             "binding invalidation seed=%d minimal=[%s]: %s"
+             seed
+             (String.concat "," (List.map string_of_int minimal))
+             (Printexc.to_string error)))
+  done
+;;
+
 let test_changefeed_planning_owns_its_typed_ticket () =
   let issuer, _, projection, session = fixture 731L in
   let module I = (val issuer : W.ISSUER) in
@@ -2769,6 +2877,7 @@ let test_change_application_properties () =
 ;;
 
 let () =
+  test_live_binding_invalidation_is_pure ();
   test_changes_serial_and_ack_capacity ();
   test_changefeed_planning_owns_its_typed_ticket ();
   test_changefeed_ack_requires_owned_delivered_batch ();
@@ -2797,5 +2906,5 @@ let () =
   test_opening_query_retires_on_removal ();
   print_endline
     "Pure coordinator: invariants, 500 lifecycle + 250 queued-read + 250 durable traces, \
-     100 ownership + 300 observation + 250 application traces and shrinking passed"
+     100 ownership + 300 observation + 250 application + 200 live-binding traces and shrinking passed"
 ;;
