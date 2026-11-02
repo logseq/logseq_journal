@@ -1798,7 +1798,7 @@ let test_visible_media_listing_uses_typed_reads () =
       ~send:(fun _->function Service.Graph_request _->incr legacy_reads;false|_->true)
       ~changed:(fun _ (view:Media.view)->
         require(view.error=None) "typed media projection failed";
-        seen:=List.rev_append(List.map(fun(item:Media.item)->item.asset.uuid)view.items)!seen) in
+        seen:=List.rev_append(List.map(fun(item:Media.item)->item.asset.uuid)view.items)!seen) () in
     runtime:=Some media;
     Media.reset media ~graph_generation:(Some 1);
     Media.root_visible media ~root true;

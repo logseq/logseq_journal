@@ -116,7 +116,7 @@ type output =
 (** The host supplies the pure coordinator's current session/owner eligibility
     check for buffered Tree DTOs. Its default rejects execution provenance; tests
     can supply an explicit pure coordinator snapshot. *)
-val create : ?on_change:(Journal_worker_coordination.Worker_pure_coordinator.event -> unit) -> ?localtime:(float -> Unix.tm) -> ?validate_session:(Journal_worker_coordination.Worker_api.session -> (unit, Journal_worker_coordination.Worker_api.error) result) -> unit -> t
+val create : ?on_change:(Journal_worker_coordination.Worker_pure_coordinator.event -> unit) -> ?on_projection_changes:(Logseq_db_worker.Protocol.v2_change_window list -> unit) -> ?localtime:(float -> Unix.tm) -> ?validate_session:(Journal_worker_coordination.Worker_api.session -> (unit, Journal_worker_coordination.Worker_api.error) result) -> unit -> t
 val reset : t -> unit
 val set_calendar : t -> Journal_calendar.t -> unit
 val start : t -> Logseq_db_worker.Protocol.request
@@ -172,3 +172,30 @@ val application_for_request : t -> request_id:Worker.Uuid.t -> Journal_worker_co
 val set_change_application : t -> request_id:Worker.Uuid.t -> Journal_worker_coordination.Worker_pure_coordinator.change_application -> bool
 
 val receive_worker_read : ?resync_generation:int64 -> ?origin:(Worker.session * Worker.read_budget) -> t -> request_id:Worker.Uuid.t -> worker_read_result -> output
+
+(** Called at business planning time, including queued reads. The active Changes
+    delivery supplies the exact causal token; no latest-application inference. *)
+val register_external_read : t -> request_id:Worker.Uuid.t -> unit
+
+(** Retire an explicitly discarded business read, also removing an expansion
+    which has not yet been emitted. This grants no transport/resource release. *)
+val retire_external_read : t -> request_id:Worker.Uuid.t -> unit
+
+(** Collect actual descendant reads while applying this request's DTO. The host
+    publishes applied/failed only after its resulting UI projection commits. *)
+val with_external_read : t -> request_id:Worker.Uuid.t -> f:(unit -> 'a)
+  -> 'a * Journal_worker_coordination.Worker_pure_coordinator.change_application option
+
+(** Shared DTO observers may plan external reads before the business reducer
+    consumes this same request. Preserve those descendants for its one expansion. *)
+val with_read_projection : t -> request_id:Worker.Uuid.t -> f:(unit -> 'a) -> 'a
+
+(** Record an actual failed business interest in the currently delivering batch.
+    A later successful parent completion cannot erase this failure. *)
+val report_projection_failure : t -> Worker.error -> unit
+
+(** Explicit business Retry only. Re-read the same owned failed batch through the
+    existing Changes path; no synthetic notice, cursor advancement or ACK. *)
+val retry_failed_change_application : t
+  -> view:Journal_worker_coordination.Worker_pure_coordinator.view
+  -> request_generation:int64 -> output

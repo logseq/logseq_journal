@@ -300,14 +300,18 @@ type pending_operation =
   ; source_epoch : int64
   ; failure_owner : failure_owner option
   ; mutable change_application : Coordination.change_application option
+  ; mutable external_children : Graph.Uuid.t Rrbvec.t
   ; mutable background : bool
   ; mutable delivery : request_delivery
   }
 
 type t =
   { on_change : Coordination.event -> unit
+  ; on_projection_changes : Protocol.v2_change_window list -> unit
+  ; external_reads : (Graph.Uuid.t,Coordination.change_application) Hashtbl.t
   ; mutable application_context : (Coordination.change_application * Graph.Uuid.t * Graph.Uuid.t Rrbvec.t ref) option
   ; mutable latest_application : Coordination.change_application option
+  ; mutable latest_change_batch : Worker.change_batch option
   ; validate_session : Worker.session -> (unit, Worker.error) result
   ; pending : (string, pending_operation) Hashtbl.t
   ; hydration_queue : Protocol.request Queue.t
@@ -367,8 +371,8 @@ let day_failure ~day request_generation message =
     ]
 ;;
 
-let create ?(on_change=fun _->()) ?(localtime = Unix.localtime) ?(validate_session = fun _ -> Error Worker.Revoked_session) () =
-  { validate_session;on_change;application_context=None;latest_application=None
+let create ?(on_change=fun _->()) ?(on_projection_changes=fun _->()) ?(localtime = Unix.localtime) ?(validate_session = fun _ -> Error Worker.Revoked_session) () =
+  { validate_session;on_change;on_projection_changes;external_reads=Hashtbl.create 16;application_context=None;latest_application=None;latest_change_batch=None
   ; pending = Hashtbl.create 32
   ; hydration_queue = Queue.create ()
   ; hydration_active = Hashtbl.create 4
@@ -408,7 +412,8 @@ let create ?(on_change=fun _->()) ?(localtime = Unix.localtime) ?(validate_sessi
 
 let reset t =
   Option.iter(fun token->t.on_change(Coordination.Change_application_retired token)) t.latest_application;
-  t.latest_application<-None;t.application_context<-None;
+  t.latest_application<-None;t.latest_change_batch<-None;t.application_context<-None;
+  Hashtbl.clear t.external_reads;
   Hashtbl.clear t.pending;
   Queue.clear t.hydration_queue;
   Hashtbl.clear t.hydration_active;
@@ -494,7 +499,7 @@ let make_request ?source_epoch ?(background = false) t operation command =
     t.pending
     (Graph.Uuid.to_string request_id)
     { operation; source_epoch; failure_owner = None; background; delivery = Planned;
-      change_application=(if participates then Option.map(fun(token,_,_)->token)t.application_context else None) };
+      external_children=Rrbvec.empty;change_application=(if participates then Option.map(fun(token,_,_)->token)t.application_context else None) };
   if participates then Option.iter(fun(_,_,children)->children:=Rrbvec.push_back !children request_id)t.application_context;
   Protocol.{ api_version; request_id; command }
 ;;
@@ -2600,6 +2605,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
             ];
           t.change_generation <- Some generation;
           let batch=match read_result with Some(Changes_read batch)->Some batch|_->None in
+          t.latest_change_batch<-batch;
           let acknowledgement =
             read t (Acknowledge_changes {batch;continuation=Option.map(fun _->request_generation)next}) (Protocol.V2_ack_changes { generation; through })
           in
@@ -2779,15 +2785,127 @@ let response_application_error response =
   | Projection_unavailable _->Some(Worker.Service_failed "The change consumer projection is unavailable")
   | _->None
 ;;
+let retry_failed_change_application t ~view ~request_generation =
+  match t.latest_change_batch with
+  | Some batch
+    when Coordination.owns_change_batch view batch
+         && Option.is_some (Coordination.change_application_error view batch) ->
+    dispatch_output
+      t
+      (requests
+         [ read
+             t
+             (Pull_changes { request_generation; generation = batch.generation })
+             (Protocol.V2_pull_changes
+                { generation = batch.generation
+                ; after = batch.from_exclusive
+                ; limit = Protocol.maximum_page_size
+                })
+         ])
+  | _ -> empty
+;;
+
+(* This table is a business request-to-cause relation, not transport ownership.
+   The pure coordinator owns membership, failures, retirement and ACK eligibility. *)
+let register_external_read t ~request_id =
+  match t.application_context with
+  | None -> ()
+  | Some (token, _, children) ->
+    if Hashtbl.find_opt t.external_reads request_id <> Some token
+    then (
+      Hashtbl.replace t.external_reads request_id token;
+      children := Rrbvec.push_back !children request_id)
+;;
+
+let retire_external_read t ~request_id =
+  match Hashtbl.find_opt t.external_reads request_id with
+  | None -> ()
+  | Some token ->
+    Hashtbl.remove t.external_reads request_id;
+    (* A synchronously pruned queued read must not be introduced later by the
+       enclosing expansion. Already registered consumers are explicitly retired. *)
+    (match t.application_context with
+     | Some (active, _, children) when active = token ->
+       children
+       := Rrbvec.fold_left
+            (fun kept id ->
+               if Graph.Uuid.equal id request_id then kept else Rrbvec.push_back kept id)
+            Rrbvec.empty
+            !children
+     | _ -> ());
+    t.on_change (Coordination.Change_consumer_retired (token, request_id))
+;;
+
+let report_projection_failure t error =
+  match t.application_context with
+  | None -> ()
+  | Some (token, parent, _) ->
+    t.on_change (Coordination.Change_consumer_applied (token, parent, Error error))
+;;
+
+let with_read_projection t ~request_id ~f =
+  match Hashtbl.find_opt t.pending (Graph.Uuid.to_string request_id) with
+  | Some ({ change_application = Some token; delivery = Dispatched; _ } as pending) ->
+    let previous = t.application_context
+    and children = ref pending.external_children in
+    t.application_context <- Some (token, request_id, children);
+    Fun.protect
+      ~finally:(fun () ->
+        pending.external_children <- !children;
+        t.application_context <- previous)
+      f
+  | _ -> f ()
+;;
+
+let with_external_read t ~request_id ~f =
+  match Hashtbl.find_opt t.external_reads request_id with
+  | None -> f (), None
+  | Some token ->
+    Hashtbl.remove t.external_reads request_id;
+    let previous = t.application_context
+    and children = ref Rrbvec.empty in
+    t.application_context <- Some (token, request_id, children);
+    let result =
+      Fun.protect
+        ~finally:(fun () -> t.application_context <- previous)
+        (fun () ->
+           try Ok (f ()) with
+           | error -> Error error)
+    in
+    t.on_change (Coordination.Change_consumer_expanded (token, request_id, !children));
+    (match result with
+     | Ok value -> value, Some token
+     | Error error ->
+       t.on_change
+         (Coordination.Change_consumer_applied
+            ( token
+            , request_id
+            , Error (Worker.Service_failed "The external projection consumer failed") ));
+       raise error)
+;;
+
+let notify_projection_changes t (output : output) =
+  List.iter
+    (fun response ->
+       match response.payload with
+       | Projection_changes windows -> t.on_projection_changes windows
+       | _ -> ())
+    output.responses
+;;
+
 let receive_delivery t ~read_result ~origin (Protocol.V2_response raw as protocol_response) =
   let token=application_for_request t ~request_id:raw.request_id in
   match token with
-  | None->receive_delivery_body t ~read_result ~origin protocol_response
+  | None->let output=receive_delivery_body t ~read_result ~origin protocol_response in
+    notify_projection_changes t output;output
   | Some token ->
-    let previous=t.application_context and children=ref Rrbvec.empty in
+    let external_children=match Hashtbl.find_opt t.pending(Graph.Uuid.to_string raw.request_id) with
+      | Some pending->pending.external_children|None->Rrbvec.empty in
+    let previous=t.application_context and children=ref external_children in
     t.application_context<-Some(token,raw.request_id,children);
     let output=Fun.protect ~finally:(fun()->t.application_context<-previous)
-      (fun()->receive_delivery_body t ~read_result ~origin protocol_response) in
+      (fun()->let output=receive_delivery_body t ~read_result ~origin protocol_response in
+        notify_projection_changes t output;output) in
     t.on_change(Coordination.Change_consumer_expanded(token,raw.request_id,!children));
     let error=match raw.outcome with
       | Protocol.V2_failed{code;message}->Some(Worker.Service_failed(code^": "^message))
@@ -2813,7 +2931,7 @@ let receive_worker_read ?resync_generation ?origin t ~request_id result =
      | Some {delivery=Dispatched;operation=(Pull_changes _ | Acknowledge_changes _);_},Some request_generation ->
        Hashtbl.remove t.pending key;Hashtbl.remove t.hydration_active key;
        Option.iter(fun token->t.on_change(Coordination.Change_application_retired token)) t.latest_application;
-       t.latest_application<-None;
+       t.latest_application<-None;t.latest_change_batch<-None;
        let generation=Option.value t.change_generation ~default:"" in
        dispatch_output t (rehydrate_current_interests t ~request_generation ~generation)
      | _ -> responses[response(Rejected(Projection_failure reason))])

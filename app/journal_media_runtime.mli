@@ -39,10 +39,17 @@ val create
     the read result on a later turn of the existing serial App event entrance.
     Transport IDs and continuation construction stay with the coordinator SDK. *)
 val create_coordinated
-  :  read:(read_request -> bool)
+  :  ?read_planned:(Logseq_db_types.Graph_types.Uuid.t -> unit)
+  -> ?read_retired:(Logseq_db_types.Graph_types.Uuid.t -> unit)
+  -> read:(read_request -> bool)
   -> send:(ticket option -> Service.request -> bool)
   -> changed:(string -> view -> unit)
+  -> unit
   -> t
+
+(** Business read identities include queued and accepted reads; resource leases
+    are excluded. Planning is reported before a possible synchronous refusal. *)
+val owns_read : t -> Logseq_db_types.Graph_types.Uuid.t -> bool
 
 val receive_read : t -> read_result -> bool
 val reset : t -> graph_generation:int option -> unit
@@ -92,3 +99,14 @@ val observe_journals_result
   -> request_id:Logseq_db_types.Graph_types.Uuid.t
   -> Protocol.v2_journal_item Journal_worker_coordination.Worker_api.slice
   -> unit
+
+(** Exact business correlation, independent of Worker transport IDs. *)
+val read_request_id : read_request -> Logseq_db_types.Graph_types.Uuid.t
+
+(** Failed visible interests remain obligations of a repeated Changes attempt,
+    even when their error view did not change and no new read was planned. *)
+val change_application_error : t -> Protocol.v2_change_window list -> string option
+
+(** Only failed DTO/dependency reads, excluding download/lease/import status. An
+    actual queued listing retry remains an obligation rather than a final error. *)
+val projection_read_error : t -> root:string -> string option

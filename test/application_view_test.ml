@@ -542,6 +542,11 @@ let run_favorites_native_visibility
       ?media_rows
       ?(shared_media = false)
       ?(check_point_read_owner = false)
+      ?(check_media_change_ack = false)
+      ?(media_change_failure = false)
+      ?(media_change_retire = false)
+      ?(media_change_descendant = false)
+      ?(media_descendant_failure = false)
       ?(check_asset_scan_owner = false)
       ?media_navigation
       ()
@@ -585,6 +590,12 @@ let run_favorites_native_visibility
       ~clock:(fun () -> !calendar_seconds)
       ~localtime:(fun instant -> Unix.gmtime (instant +. !calendar_offset)) ()) calendar_change in
   let publish_block = Atomic.make false in
+  let fail_media_listings=Atomic.make false in
+  let media_reference_changed=Atomic.make false
+  and hold_media_descendant=Atomic.make false and media_descendant_entered=Atomic.make false
+  and media_descendant_release=Atomic.make false in
+  let hold_changed_media_fact=Atomic.make false and changed_media_fact_entered=Atomic.make false
+  and changed_media_fact_release=Atomic.make false and changed_other_fact_completed=Atomic.make 0 in
   let updated_block = Atomic.make false in
   let media_notices = Atomic.make [] in
   let media_delivered = Atomic.make 0 in
@@ -692,7 +703,7 @@ let run_favorites_native_visibility
         ; order = Printf.sprintf "%03d" n
         ; created_at_ms = 1_788_192_000_000L
         ; updated_at_ms = 1_788_192_000_000L
-        ; refs = []
+        ; refs = (if n=0 && Atomic.get media_reference_changed then [uuid 60000] else [])
         ; tags = []
         ; properties = (match Atomic.get status_value with
             | None -> []
@@ -770,6 +781,7 @@ let run_favorites_native_visibility
     }
   in
   let changes_acknowledged = Atomic.make false in
+  let change_pull_reads=Atomic.make 0 in
   let manager : Service.state =
     { snapshot =
         { sync_phase = Current
@@ -834,7 +846,7 @@ let run_favorites_native_visibility
       ~push_topic_count:8
       ~merge_push:Service.coalesce_push
       ~concurrency:
-        (if check_capture_imports || Option.is_some detail_capture
+        (if check_capture_imports || Option.is_some detail_capture || check_media_change_ack
          then Concurrent { max_in_flight = 2 }
          else Serial)
       ~init:(fun context _ ->
@@ -846,6 +858,7 @@ let run_favorites_native_visibility
         Ok ())
       ~handle:(fun context () request ->
         let normalized=fixture_request request in
+        let fail_this_media_read=ref false and fail_this_media_listing=ref false in
         (match normalized with
          | Service.Graph_request{command=(P.V2_get_outline_block _|V2_get_page _);_}->
            Atomic.incr point_reads;
@@ -858,6 +871,26 @@ let run_favorites_native_visibility
          | Service.Graph_request {command=P.V2_list_assets {recursive=true;_};_}->
            Atomic.incr offline_scans;
            (match request with Service.Coordination_query _->()|_->Atomic.incr legacy_offline_scans)
+         | _->());
+        (* Only the mounted App adapter knows these Media reads are descendants
+           of this Changes delivery. Feeding an incomplete expansion to Core is
+           not a reproduction of that missing production ownership boundary. *)
+        (match normalized with
+         | Service.Graph_request {command=P.V2_get_outline_block {block;_};_}
+           when check_media_change_ack && G.Uuid.equal block (uuid 1) ->
+           if Atomic.compare_and_set hold_changed_media_fact true false then (
+             Atomic.set changed_media_fact_entered true;
+             fail_this_media_read:=media_change_failure;
+             while not(Atomic.get changed_media_fact_release) do
+               Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done)
+           else if Atomic.get changed_media_fact_entered then Atomic.incr changed_other_fact_completed
+         | Service.Graph_request {command=P.V2_list_assets {recursive=false;roots=[root];_};_}
+           when media_change_descendant && G.Uuid.equal root(uuid 1)
+             && Atomic.compare_and_set hold_media_descendant true false ->
+           Atomic.set media_descendant_entered true;
+           fail_this_media_listing:=media_descendant_failure;
+           while not(Atomic.get media_descendant_release) do
+             Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done
          | _->());
         match normalized with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
@@ -1135,6 +1168,7 @@ let run_favorites_native_visibility
                      then Some (G.Cursor.of_string (string_of_int (offset + length)) |> Result.get_ok) else None)
                 }
             | V2_pull_changes {generation;after;_} ->
+              Atomic.incr change_pull_reads;
               V2_changes
                 { generation
                 ; from_exclusive = after
@@ -1157,7 +1191,8 @@ let run_favorites_native_visibility
               Atomic.set changes_acknowledged true;
               V2_changes_acknowledged {generation;through}
             | V2_get_outline_block { block; _ } ->
-              V2_block_outcome
+              if !fail_this_media_read then V2_failed {code="FixtureReadFailure";message="Synthetic Media dependency read failed"}
+              else V2_block_outcome
                 (match
                    List.find_opt
                      (fun (parent, (root : P.v2_block_tree)) ->
@@ -1405,6 +1440,8 @@ let run_favorites_native_visibility
                      else None)
                 }
             | V2_list_assets { roots; _ } ->
+              if !fail_this_media_listing || (Atomic.get fail_media_listings && List.exists(G.Uuid.equal(uuid 1))roots) then V2_failed {code="FixtureReadFailure";message="Synthetic Media listing failed"}
+              else (
               Atomic.set queried (List.rev_append roots (Atomic.get queried));
               V2_assets_outcome
                 { generation = "g"
@@ -1440,7 +1477,7 @@ let run_favorites_native_visibility
                        ]
                      else [])
                 ; next_cursor = None
-                }
+                })
             | V2_insert_blocks { mutation_id; parent; roots = [ root ]; _ }
               when Option.is_some detail_capture ->
               Atomic.incr child_attempts;
@@ -1635,6 +1672,8 @@ let run_favorites_native_visibility
   Fun.protect
     ~finally:(fun () ->
       Atomic.set coordination_release_allowed true;
+      Atomic.set changed_media_fact_release true;
+      Atomic.set media_descendant_release true;
       Atomic.set delete_release true;
       Atomic.set status_release true;
       Atomic.set child_release true;
@@ -3102,10 +3141,60 @@ let run_favorites_native_visibility
            Printf.printf "\n%!"
          in
          if check_point_read_owner then (
+           if check_media_change_ack then (
+             Atomic.set changes_acknowledged false;
+             Atomic.set hold_changed_media_fact true;
+             if media_change_descendant then (
+               Atomic.set media_reference_changed true;
+               Atomic.set fail_media_listings media_descendant_failure;
+               Atomic.set hold_media_descendant true));
            Atomic.set publish_block true;
            ignore(W.send(Option.get !client)Service.Get_graph_state);
            wait "resource dependency point read reaches actual Worker" (fun()->Atomic.get point_reads>0);
-           Alcotest.(check int) "resource dependency points have one typed response owner" 0(Atomic.get legacy_point_reads)
+           Alcotest.(check int) "resource dependency points have one typed response owner" 0(Atomic.get legacy_point_reads);
+           if check_media_change_ack then (
+             wait "actual Media Facts reply is held" (fun()->Atomic.get changed_media_fact_entered);
+             wait "other actual graph consumers remain live" (fun()->Atomic.get changed_other_fact_completed>0);
+             for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+             Alcotest.(check bool) "Changes ACK waits for Media DTO application" false
+               (Atomic.get changes_acknowledged);
+             Atomic.set changed_media_fact_release true;
+             if media_change_descendant then (
+               wait "Media DTO actually plans its typed listing descendant" (fun()->Atomic.get media_descendant_entered);
+               for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+               Alcotest.(check bool) "Changes ACK waits for the derived Media listing" false
+                 (Atomic.get changes_acknowledged);
+               Atomic.set media_descendant_release true);
+             if media_change_failure || media_descendant_failure then (
+               wait "failed Media dependency has explicit Retry feedback" (fun()->Option.is_some(find "text" "Retry attachments"));
+               for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+               Alcotest.(check bool) "failed Media consumer preserves unACKed window" false
+                 (Atomic.get changes_acknowledged);
+               for _round=1 to (if media_descendant_failure then 2 else 1) do
+               let pulls=Atomic.get change_pull_reads in
+               Atomic.set publish_block true;
+               ignore(W.send(Option.get !client)Service.Get_graph_state);
+               wait "failed application receives another actual Changes delivery" (fun()->Atomic.get change_pull_reads>pulls);
+               for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+               Alcotest.(check bool) "new application retains its failed Media interest" false
+                 (Atomic.get changes_acknowledged);
+               done;
+               if media_change_retire then (
+                 hooks.extension_event list_node "event"
+                   (Yojson.Safe.to_string(`Assoc["id",`Int 1;"payload",`String
+                     (Yojson.Safe.to_string(`Assoc["type",`String "visible_range";"first",`Int 2;"last",`Int(count+1)]))])) |> consume;
+                 let pulls=Atomic.get change_pull_reads in
+                 Atomic.set publish_block true;
+                 ignore(W.send(Option.get !client)Service.Get_graph_state);
+                 wait "business retirement is followed by an actual Changes delivery" (fun()->Atomic.get change_pull_reads>pulls);
+                 wait "retired Media interest does not block the new application" (fun()->Atomic.get changes_acknowledged))
+               else (
+                 Atomic.set fail_media_listings false;
+                 dispatch(Lui_protocol.Press(Option.get(find "text" "Retry attachments")));
+                 wait "explicit Media Retry rejoins and completes the retained Changes application"
+                   (fun()->Atomic.get changes_acknowledged)))
+             else wait "Changes ACK progresses after Media DTO and descendants apply"
+               (fun()->Atomic.get changes_acknowledged))
          ) else match media_navigation with
          | Some scenario ->
            let native_range first last =
@@ -7643,6 +7732,22 @@ let () =
     ; ( "offline asset coordination"
       , [ Alcotest.test_case "mounted catalog and asset scans use typed owner" `Quick
             (fun ()->run_favorites_native_visibility ~check_asset_scan_owner:true ()) ] )
+    ; ( "media changes application barrier"
+      , [Alcotest.test_case "held typed Media Facts prevents ACK" `Quick (fun()->
+          run_favorites_native_visibility ~media_rows:3 ~media_navigation:`Offscreen
+            ~check_point_read_owner:true ~check_media_change_ack:true ());
+         Alcotest.test_case "failed typed Media Facts preserves window" `Quick (fun()->
+          run_favorites_native_visibility ~media_rows:3 ~media_navigation:`Offscreen
+            ~check_point_read_owner:true ~check_media_change_ack:true ~media_change_failure:true ());
+         Alcotest.test_case "derived typed Media listing prevents ACK" `Quick (fun()->
+          run_favorites_native_visibility ~media_rows:3 ~media_navigation:`Offscreen
+            ~check_point_read_owner:true ~check_media_change_ack:true ~media_change_descendant:true ());
+         Alcotest.test_case "failed Media interest can explicitly retire" `Quick (fun()->
+          run_favorites_native_visibility ~media_rows:3 ~media_navigation:`Offscreen
+            ~check_point_read_owner:true ~check_media_change_ack:true ~media_change_failure:true ~media_change_retire:true ());
+         Alcotest.test_case "failed Listing survives repeated attempts and Retry" `Quick (fun()->
+          run_favorites_native_visibility ~media_rows:3 ~media_navigation:`Offscreen
+            ~check_point_read_owner:true ~check_media_change_ack:true ~media_change_descendant:true ~media_descendant_failure:true ())] )
     ; ( "targeted media subscriptions"
       , [ Alcotest.test_case "dependency points use typed owner" `Quick (fun () ->
           run_favorites_native_visibility ~media_rows:3 ~media_navigation:`Offscreen ~check_point_read_owner:true ());

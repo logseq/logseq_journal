@@ -58,6 +58,12 @@ type controller =
   ; mutable owners : Owners.t
   }
 
+let read_request_id (request : read_request) =
+  match request.ticket with
+  | Query { request_id; _ } | Facts { request_id; _ } -> request_id
+  | Lease _ -> assert false
+;;
+
 type scan_cursor =
   | Wire_cursor of G.Cursor.t
   | Sealed_cursor of Asset.t Worker.continuation
@@ -70,6 +76,7 @@ type group =
   ; mutable membership_changed : bool
   ; mutable invalidation : int
   ; mutable dependency_failed : bool
+  ; mutable listing_failed : bool
   ; mutable pending : G.Uuid.t option
   ; mutable cursor : scan_cursor option
   ; mutable error : string option
@@ -101,6 +108,8 @@ type page_fact =
 
 type t =
   { read_port : (read_request -> bool) option
+  ; read_planned : G.Uuid.t -> unit
+  ; read_retired : G.Uuid.t -> unit
   ; send : ticket option -> Service.request -> bool
   ; changed : string -> view -> unit
   ; groups : (string, group) Hashtbl.t
@@ -118,8 +127,10 @@ type t =
   ; mutable queued : outgoing list
   }
 
-let create_state ~read_port ~send ~changed =
+let create_state ~read_port ~read_planned ~read_retired ~send ~changed =
   { read_port
+  ; read_planned
+  ; read_retired
   ; send
   ; changed
   ; groups = Hashtbl.create 16
@@ -138,10 +149,48 @@ let create_state ~read_port ~send ~changed =
   }
 ;;
 
-let create ~send ~changed = create_state ~read_port:None ~send ~changed
+let create ~send ~changed =
+  create_state
+    ~read_port:None
+    ~read_planned:(fun _ -> ())
+    ~read_retired:(fun _ -> ())
+    ~send
+    ~changed
+;;
 
-let create_coordinated ~read ~send ~changed =
-  create_state ~read_port:(Some read) ~send ~changed
+let create_coordinated
+      ?(read_planned = fun _ -> ())
+      ?(read_retired = fun _ -> ())
+      ~read
+      ~send
+      ~changed
+      ()
+  =
+  create_state ~read_port:(Some read) ~read_planned ~read_retired ~send ~changed
+;;
+
+let owns_read t request_id =
+  Hashtbl.fold
+    (fun _ actual found -> found || G.Uuid.equal actual request_id)
+    t.fact_requests
+    false
+  || Hashtbl.fold (fun _ g found -> found || g.pending = Some request_id) t.groups false
+;;
+
+let retire_outgoing t outgoing =
+  match outgoing.ticket with
+  | Some (Facts { block; request_id; _ }) ->
+    if Hashtbl.find_opt t.fact_requests block = Some request_id
+    then Hashtbl.remove t.fact_requests block;
+    t.read_retired request_id
+  | Some (Query { root; epoch; request_id }) ->
+    (match Hashtbl.find_opt t.groups root with
+     | Some g when g.epoch = epoch && g.pending = Some request_id ->
+       g.pending <- None;
+       g.membership_changed <- true
+     | _ -> ());
+    t.read_retired request_id
+  | None | Some (Lease _) -> ()
 ;;
 
 let empty_view = { items = []; more = false; error = None }
@@ -276,11 +325,7 @@ let rec pump t =
   | next :: rest ->
     if not (next.current ())
     then (
-      (match next.ticket with
-       | Some (Facts { block; request_id; _ })
-         when Hashtbl.find_opt t.fact_requests block = Some request_id ->
-         Hashtbl.remove t.fact_requests block
-       | _ -> ());
+      retire_outgoing t next;
       t.queued <- rest;
       pump t)
     else if
@@ -298,7 +343,14 @@ let rec pump t =
 
 let enqueue t ?ticket ?(current = fun () -> true) request =
   t.queued
-  <- List.filter (fun item -> item.current ()) t.queued
+  <- List.filter
+       (fun item ->
+          if item.current ()
+          then true
+          else (
+            retire_outgoing t item;
+            false))
+       t.queued
      @ [ { ticket; request = Command request; current } ]
 ;;
 
@@ -414,6 +466,7 @@ let read t g cursor =
     g.membership_changed <- false;
     g.error <- None;
     let ticket = Query { root = g.root; epoch = g.epoch; request_id } in
+    t.read_planned request_id;
     let current () = current_group t g && g.pending = Some request_id in
     match t.read_port with
     | None ->
@@ -449,7 +502,14 @@ let read t g cursor =
         }
       in
       t.queued
-      <- List.filter (fun item -> item.current ()) t.queued
+      <- List.filter
+           (fun item ->
+              if item.current ()
+              then true
+              else (
+                retire_outgoing t item;
+                false))
+           t.queued
          @ [ { ticket = Some ticket; request = Listing request; current } ])
   else if g.pending = None
   then g.error <- Some "Attachment requests are busy. Retry shortly."
@@ -458,6 +518,8 @@ let read t g cursor =
 let ensure_fresh t g = if g.membership_changed && g.pending = None then read t g None
 
 let reset t ~graph_generation =
+  Hashtbl.iter (fun _ id -> t.read_retired id) t.fact_requests;
+  Hashtbl.iter (fun _ g -> Option.iter t.read_retired g.pending) t.groups;
   Hashtbl.iter
     (fun _ g ->
        clear t g;
@@ -531,6 +593,7 @@ let root_visible ?(owner = "default") t ~root visible =
          ; membership_changed = true
          ; invalidation = 0
          ; dependency_failed = false
+         ; listing_failed = false
          ; pending = None
          ; cursor = None
          ; error = None
@@ -692,6 +755,7 @@ let property_dependencies properties =
 ;;
 
 let request_fact t block =
+  Option.iter t.read_planned (Hashtbl.find_opt t.fact_requests block);
   if
     (not (Hashtbl.mem t.fact_requests block))
     && Hashtbl.length t.fact_requests < 64
@@ -706,6 +770,7 @@ let request_fact t block =
     | Ok uuid ->
       let request_id = next_request_id t in
       Hashtbl.add t.fact_requests block request_id;
+      t.read_planned request_id;
       let generation = t.generation in
       enqueue
         t
@@ -801,6 +866,7 @@ let invalidate t g at =
     g.invalidation <- at;
     g.membership_changed <- true;
     g.cursor <- None;
+    Option.iter t.read_planned g.pending;
     if g.visible && not g.dependency_failed then ensure_fresh t g)
 ;;
 
@@ -962,6 +1028,29 @@ let chain_complete t g =
   walk 0 Owners.empty g.root
 ;;
 
+let affected_by_changes t g windows =
+  let deps = dependencies t g in
+  (not (chain_complete t g))
+  || List.exists
+       (fun (window : Protocol.v2_change_window) ->
+          List.exists (fun id -> Owners.mem (G.Uuid.to_string id) deps) window.block_uuids
+          || Option.exists
+               (fun page ->
+                  List.exists (fun id -> G.Uuid.to_string id = page) window.page_uuids)
+               (group_page t g))
+       windows
+;;
+
+let group_read_error g =
+  if g.visible && (g.dependency_failed || (g.listing_failed && g.pending = None))
+  then Some (Option.value g.error ~default:"Attachment reads require Retry")
+  else None
+;;
+
+let projection_read_error t ~root =
+  Option.bind (Hashtbl.find_opt t.groups root) group_read_error
+;;
+
 let changes t windows =
   let at = tick t in
   let relevant =
@@ -1050,7 +1139,24 @@ let changes t windows =
        if Hashtbl.find_opt t.barriers node = Some at
        then Hashtbl.replace t.facts node { fact with edges_changed = false })
     t.facts;
+  (* A user-initiated retry may already be queued/in flight before this batch is
+     re-delivered. It remains a read obligation until the real listing succeeds. *)
+  Hashtbl.iter
+    (fun _ g ->
+       if g.visible && g.listing_failed && affected_by_changes t g windows
+       then Option.iter t.read_planned g.pending)
+    t.groups;
   pump t
+;;
+
+let change_application_error t windows =
+  Hashtbl.fold
+    (fun _ g found ->
+       match found with
+       | Some _ -> found
+       | None -> if affected_by_changes t g windows then group_read_error g else None)
+    t.groups
+    None
 ;;
 
 let resync t =
@@ -1123,6 +1229,7 @@ let receive_listing t ~root ~epoch ~request_id listing =
     else (
       match listing with
       | Some (items, next_cursor) when List.length items <= 16 ->
+        g.listing_failed <- false;
         let old = g.controllers in
         let controllers =
           List.map
@@ -1185,7 +1292,9 @@ let receive_listing t ~root ~epoch ~request_id listing =
                    c
                    (P.Show { graph_generation; consumer = c.consumer; asset = c.asset })))
           controllers
-      | _ -> g.error <- Some "Unable to load attachments. Retry.");
+      | _ ->
+        g.listing_failed <- true;
+        g.error <- Some "Unable to load attachments. Retry.");
     notify t g;
     true
   | _ -> false
@@ -1337,6 +1446,7 @@ let imported t ~current (receipt : Logseq_db_worker.import_receipt) =
           ; membership_changed = true
           ; invalidation = 0
           ; dependency_failed = false
+          ; listing_failed = false
           ; pending = None
           ; cursor = None
           ; error = None

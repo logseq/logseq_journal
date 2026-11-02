@@ -3537,8 +3537,10 @@ let start
                   (Journal_routes.detail state.routes) })
         ; copy_transition owner (Start root) ]
   in
+  let media_projection_changes=ref(fun (_:Logseq_db_worker.Protocol.v2_change_window list)->()) in
   let graph_runtime_cell = graph_ref (fun () ->
     Journal_graph_runtime.create
+      ~on_projection_changes:(fun windows-> !media_projection_changes windows)
       ~on_change:(fun event->Option.iter(fun(_,host)->Coordination_host.post host event)!coordination_host)
       ~validate_session:(fun session -> match current_owner(),!coordination_host with
         | Some owner,Some (_,host) -> Coordination_host.validate_session ~owner host session
@@ -3583,6 +3585,8 @@ let start
   let coordinated_media_read = ref(fun (_:Journal_media_runtime.read_request)->false) in
   let media_runtime_cell = graph_ref (fun () ->
     Journal_media_runtime.create_coordinated
+      ~read_planned:(fun request_id->Journal_graph_runtime.register_external_read (!graph_runtime_cell) ~request_id)
+      ~read_retired:(fun request_id->Journal_graph_runtime.retire_external_read (!graph_runtime_cell) ~request_id)
       ~read:(fun request-> !coordinated_media_read request)
       ~send:(fun ticket request ->
         match !coordinated_media_point ticket request with
@@ -3596,7 +3600,11 @@ let start
             ticket;
           true
         | Full | Not_ready | Stopping -> false)
-      ~changed:(fun root view -> Hashtbl.replace (!media_changes_cell) root view)) in
+      ~changed:(fun root view -> Hashtbl.replace (!media_changes_cell) root view) ()) in
+  media_projection_changes:=(fun windows->
+    Journal_media_runtime.changes (!media_runtime_cell) windows;
+    Option.iter(fun message->Journal_graph_runtime.report_projection_failure (!graph_runtime_cell)
+      (Wc.Service_failed message))(Journal_media_runtime.change_application_error (!media_runtime_cell) windows));
   let sync_media state =
     let key = media_key state in
     if key <> !media_context
@@ -3677,14 +3685,36 @@ let start
     Journal_media_runtime.observe_response (!media_runtime_cell) response;
     Journal_asset_runtime.observe_response (!asset_runtime_cell) response
   in
+  let apply_media_read ~request_id ~result ~f =
+    Effect.bind (Effect.of_thunk(fun()->
+      let consumed,application=Journal_graph_runtime.with_external_read (!graph_runtime_cell)
+        ~request_id ~f in
+      let result=match result with Error _->result|Ok()->
+        Hashtbl.fold(fun root (_view:Journal_media_runtime.view) result->
+          match result,Journal_media_runtime.projection_read_error (!media_runtime_cell) ~root with
+          | Ok(),Some message->Error(Wc.Service_failed message)|_->result)
+          (!media_changes_cell)(Ok()) in
+      consumed,application,result))
+      ~f:(fun(consumed,application,result)->
+        let flush=match !set_state_ref with None->Effect.ignore|Some set_state->flush_media set_state in
+        Effect.bind flush ~f:(fun()->
+          Option.iter(fun token->Option.iter(fun(_,host)->Coordination_host.post host
+            (if consumed then Coordination.Change_consumer_applied(token,request_id,result)
+             else Coordination.Change_consumer_retired(token,request_id))) !coordination_host)application;
+          Effect.ignore))
+  in
   coordinated_media_point := (fun ticket request ->
-    match ticket with
-    | None->None
-    | Some ticket->send_coordinated_point request ~finish:(fun result->
-      Effect.bind (Effect.of_thunk(fun()->match result with
-        | Ok response->Journal_media_runtime.receive (!media_runtime_cell) ticket (Graph_service.Graph_response response)
-        | Error _->Journal_media_runtime.reject (!media_runtime_cell) ticket))
-        ~f:(fun()->match !set_state_ref with None->Effect.ignore|Some set_state->flush_media set_state)));
+    match ticket,request with
+    | Some ticket,Graph_service.Graph_request original->
+      send_coordinated_point request ~finish:(fun result->
+        apply_media_read ~request_id:original.request_id ~result:(Result.map(fun _->())result)
+          ~f:(fun()->
+            let owned=Journal_media_runtime.owns_read (!media_runtime_cell) original.request_id in
+            (match result with
+             | Ok response->Journal_media_runtime.receive (!media_runtime_cell) ticket (Graph_service.Graph_response response)
+             | Error _->Journal_media_runtime.reject (!media_runtime_cell) ticket);
+            owned))
+    | _->None);
   coordinated_media_read := (fun (request:Journal_media_runtime.read_request)->
     match current_owner(),ensure_coordination() with
     | Some owner,Ok host->
@@ -3695,13 +3725,18 @@ let start
        | Ok ticket->
          Coordination_host.watch_read host ticket ~f:(fun origin reply->
            if runtime_owner_is_live !state_ref owner then run_owned (Some owner)(fun()->
-             Effect.bind (Effect.of_thunk(fun()->
-               match origin,reply with
+             let value=match origin,reply with
                | Some(session,_),Wc.Answered(Ok value)
-                 when Coordination_host.validate_session ~owner host session=Ok()->
-                 ignore(Journal_media_runtime.receive_read (!media_runtime_cell)(request.outcome value):bool)
-               | _->Journal_media_runtime.reject (!media_runtime_cell) request.ticket))
-               ~f:(fun()->match !set_state_ref with None->Effect.ignore|Some set_state->flush_media set_state)));
+                 when Coordination_host.validate_session ~owner host session=Ok()->Ok value
+               | _,Wc.Answered(Error error)->Error error
+               | _->Error(Wc.Service_failed "The media listing was interrupted or retired") in
+             (* The business ID is carried by its private request ticket. *)
+             let request_id=Journal_media_runtime.read_request_id request in
+             apply_media_read ~request_id ~result:(Result.map(fun _->())value) ~f:(fun()->
+               let owned=Journal_media_runtime.owns_read (!media_runtime_cell) request_id in
+               match value with
+               | Ok value->Journal_media_runtime.receive_read (!media_runtime_cell)(request.outcome value)
+               | Error _->Journal_media_runtime.reject (!media_runtime_cell) request.ticket;owned)));
          true)
     | _->false);
   coordinated_asset_point := (fun request ->
@@ -3934,7 +3969,6 @@ let start
       (fun response ->
          match response.Journal_graph_runtime.payload with
          | Projection_changes windows ->
-           Journal_media_runtime.changes (!media_runtime_cell) windows;
            Journal_asset_runtime.changes (!asset_runtime_cell) windows
          | Projection_resync ->
            Journal_media_runtime.resync (!media_runtime_cell);
@@ -3998,6 +4032,18 @@ let start
       ( { state with admission_refresh }
       , run_admission_directive set_state_and_effect directive ))
   in
+  let retry_media_change_application () =
+    let generation= !state_ref.next_request_generation in
+    Effect.bind(Effect.of_thunk(fun()->match !coordination_host with
+      | None->Journal_graph_runtime.{requests=[];responses=[]}
+      | Some(_,host)->Journal_graph_runtime.retry_failed_change_application (!graph_runtime_cell)
+          ~view:(Coordination_host.view host) ~request_generation:generation))
+      ~f:(fun output->if output.Journal_graph_runtime.requests=[] then Effect.ignore else
+        Effect.bind(set_state(fun state->{state with next_request_generation=
+          Int64.max state.next_request_generation(Int64.succ generation)})) ~f:(fun()->
+          Effect.bind(Effect.of_thunk(fun()->deliver_output output))
+            ~f:(fun delivery->apply_graph_responses set_state_and_effect delivery.responses)))
+  in
   let trigger_admission set_state_and_effect ~graph_generation ~graph_open =
     match current_owner() with
     | Some owner when owner.graph_generation=graph_generation ->
@@ -4043,6 +4089,7 @@ let start
         | _->Effect.ignore in
       let output=match result with
         | Ok result ->
+          Journal_graph_runtime.with_read_projection (!graph_runtime_cell) ~request_id:request.request_id ~f:(fun()->
           (match result with
            | Journal_graph_runtime.Ordinary_read outcome -> observe_projection_response
              (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
@@ -4070,23 +4117,25 @@ let start
            | Favorites_read{first_page;value}->
              Journal_media_runtime.forget_request (!media_runtime_cell) request.request_id;
              Journal_asset_runtime.observe_favorites_result (!asset_runtime_cell)
-               ~request_id:request.request_id ~first_page value);
+               ~request_id:request.request_id ~first_page value));
           Journal_graph_runtime.receive_worker_read ~resync_generation ?origin (!graph_runtime_cell) ~request_id:request.request_id result
         | Error message -> forget_projection_request request.request_id;
           Journal_graph_runtime.fail_request (!graph_runtime_cell) request ~message in
       Effect.bind prepare ~f:(fun()->
       Effect.bind (Effect.of_thunk(fun()->deliver_output output)) ~f:(fun delivery ->
         Effect.bind (apply_graph_responses set_state_and_effect delivery.responses) ~f:(fun()->
+          let media_error=Hashtbl.fold(fun root (_view:Journal_media_runtime.view) found->
+            match found,Journal_media_runtime.projection_read_error (!media_runtime_cell) ~root with None,Some message->Some message|_->found)(!media_changes_cell)None in
+          Effect.bind(flush_media set_state) ~f:(fun()->
           Option.iter(fun token->Option.iter(fun(_,host)->Coordination_host.post host
             (Coordination.Change_consumer_applied(token,request.request_id,
-              match result,delivery.error with
-              | Error message,_->Error(Wc.Service_failed message)
-              | _,Some message->Error(Wc.Service_failed message)
+              match result,delivery.error,media_error with
+              | Error message,_,_|_,Some message,_|_,_,Some message->Error(Wc.Service_failed message)
               | _->Ok())))!coordination_host) application;
           set_state(fun state->match delivery.error with
             | None->state
             | Some message when Option.is_some state.feed_refresh->fail_feed_transport state message
-            | Some message->fail_graph_transport state message))))));
+            | Some message->fail_graph_transport state message)))))));
   let observe_graph_state
         set_state
         set_state_and_effect
@@ -5653,21 +5702,21 @@ let start
              (List.assoc_opt owner (media_detail_roots snapshot))))
         ~f:(fun () -> flush_media set_state)
     | Media (owner, event) when List.mem owner (media_presentation_scopes snapshot) ->
+      let source_active =
+        owner
+        = media_presentation_scope
+            snapshot
+            ~detail:(Journal_routes.route snapshot.routes <> Timeline)
+      in
+      let allowed_root =
+        Option.fold
+          ~none:true
+          ~some:(fun rows -> List.mem (Some event.Journal_media_view.root) rows)
+          (List.assoc_opt owner (media_detail_roots snapshot))
+      in
       Effect.bind
         (Effect.of_thunk (fun () ->
            sync_media snapshot;
-           let source_active =
-             owner
-             = media_presentation_scope
-                 snapshot
-                 ~detail:(Journal_routes.route snapshot.routes <> Timeline)
-           in
-           let allowed_root =
-             Option.fold
-               ~none:true
-               ~some:(fun rows -> List.mem (Some event.Journal_media_view.root) rows)
-               (List.assoc_opt owner (media_detail_roots snapshot))
-           in
            if event.visible && not allowed_root
            then ()
            else (
@@ -5675,19 +5724,19 @@ let start
              | Root ->
                Journal_media_runtime.root_visible
                  ~owner
-                 (!media_runtime_cell)
+                 !media_runtime_cell
                  ~root:event.root
                  event.visible
              | Asset ->
                Journal_media_runtime.asset_visible
                  ~owner
-                 (!media_runtime_cell)
+                 !media_runtime_cell
                  ~root:event.root
                  ~asset:event.asset
                  event.visible
              | Preview ->
                Journal_media_runtime.preview_visible
-                 (!media_runtime_cell)
+                 !media_runtime_cell
                  ~owner
                  ~slot:event.slot
                  ~root:event.root
@@ -5697,11 +5746,17 @@ let start
              | Retry ->
                Journal_media_runtime.retry
                  ~owner
-                 (!media_runtime_cell)
+                 !media_runtime_cell
                  ~root:event.root
                  ~asset:event.asset
-             | Next -> Journal_media_runtime.next (!media_runtime_cell) ~root:event.root)))
-        ~f:(fun () -> flush_media set_state)
+             | Next -> Journal_media_runtime.next !media_runtime_cell ~root:event.root)))
+        ~f:(fun () ->
+          Effect.bind (flush_media set_state) ~f:(fun () ->
+            if
+              event.action = Journal_media_view.Retry
+              && ((not event.visible) || (source_active && allowed_root))
+            then retry_media_change_application ()
+            else Effect.ignore))
     | Import_asset value ->
       let import_payload = value in
       if Journal_asset_import.is_dismissal import_payload

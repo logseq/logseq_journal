@@ -60,6 +60,39 @@ let test_equal_media_notices_keep_effects () =
     "graph reset must clear the old root presentation even when it was empty"
 ;;
 
+let coordinated_read_retirement accepted () =
+  let planned = ref []
+  and retired = ref [] in
+  let runtime =
+    R.create_coordinated
+      ~read_planned:(fun id -> planned := id :: !planned)
+      ~read_retired:(fun id -> retired := id :: !retired)
+      ~read:(fun request ->
+        check
+          (List.mem (R.read_request_id request) !planned)
+          "read callback ran before causal planning";
+        accepted)
+      ~send:(fun _ _ -> true)
+      ~changed:(fun _ _ -> ())
+      ()
+  in
+  R.reset runtime ~graph_generation:(Some 1);
+  let root = G.Uuid.to_string (uuid 1) in
+  R.root_visible runtime ~root true;
+  let id = List.hd !planned in
+  check (R.owns_read runtime id) "queued/accepted read lost its business identity";
+  if accepted
+  then R.reset runtime ~graph_generation:(Some 2)
+  else R.root_visible runtime ~root false;
+  check (not (R.owns_read runtime id)) "retired view retained its read ownership";
+  check
+    (List.mem id !retired)
+    "explicit business retirement did not settle its causal consumer";
+  let before = !retired in
+  R.pump runtime;
+  check (!retired = before) "a pruned request was retired again on a later pump"
+;;
+
 let () = test_equal_media_notices_keep_effects ()
 
 let () =
@@ -575,7 +608,9 @@ let run_cases cases =
 
 let () =
   run_cases
-    [ ( "stale initial holder facts refill without poisoning the root"
+    [ ("queued coordinated read retires on Hide",coordinated_read_retirement false)
+    ; ("accepted coordinated read retires on reset",coordinated_read_retirement true)
+    ; ( "stale initial holder facts refill without poisoning the root"
       , fun () ->
           let r, q, v, _ = fixture () in
           let root = G.Uuid.to_string (uuid 1) in
