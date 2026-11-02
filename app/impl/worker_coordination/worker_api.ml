@@ -33,6 +33,7 @@ type session =
 type presentation =
   { session : session
   ; generation : presentation_generation
+  ; host_generation : int
   }
 
 type error =
@@ -601,7 +602,7 @@ let matches_scope (session : session) (scope : Service.timeline_scope) =
 
 let presentation_matches_scope (presentation:presentation) (scope:Service.timeline_scope) =
   matches_scope presentation.session scope
-  && presentation.generation=Int64.of_int scope.startup.presentation_generation
+  && presentation.host_generation=scope.startup.presentation_generation
 ;;
 
 let worker_incarnation ~runtime_epoch ~worker_generation =
@@ -1609,6 +1610,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                                      Some
                                        { session = r.session
                                        ; generation = b.baseline.presentation
+                                       ; host_generation = owner.startup.presentation_generation
                                        }
                                    else None)
                                 residents)

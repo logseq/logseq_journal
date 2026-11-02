@@ -1088,6 +1088,14 @@ let test_committed_ack_requires_current_confirmation () =
   let owner=Option.get raw.baseline.state.sync.selected in
   check(C.current_presentation ~owner (C.view(ready I.binding projection))presentation)
     "current UI presentation was rejected";
+  let independent,independent_raw,_,_=fixture 1915L in
+  let module J=(val independent:W.ISSUER) in
+  let divergent=match J.bootstrap(S.Coordination_registered{independent_raw with
+      baseline={independent_raw.baseline with version=2L;presentation=17L}}) with
+    | Ok(W.Ready value)->value|_->failwith "independent presentation counter fixture" in
+  let divergent_presentation=Option.get(W.selected divergent) in
+  check(C.current_presentation ~owner(C.view(ready J.binding divergent))divergent_presentation)
+    "Worker token counter was confused with UI presentation generation";
   let future={owner with startup={owner.startup with presentation_generation=owner.startup.presentation_generation+2}} in
   check(not(C.current_presentation ~owner:future(C.view(ready I.binding projection))presentation))
     "lagging Worker baseline authorized a newer UI presentation";
