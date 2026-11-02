@@ -3580,12 +3580,16 @@ let start
   let prev_detail_media_roots = graph_ref (fun () -> (media_detail_roots initial_state)) in
   let prev_detail_media_routes = graph_ref (fun () -> initial_state.routes) in
   let coordinated_media_point = ref(fun (_:Journal_media_runtime.ticket option) (_:Graph_service.request)->None) in
+  let coordinated_media_read = ref(fun (_:Journal_media_runtime.read_request)->false) in
   let media_runtime_cell = graph_ref (fun () ->
-    Journal_media_runtime.create
+    Journal_media_runtime.create_coordinated
+      ~read:(fun request-> !coordinated_media_read request)
       ~send:(fun ticket request ->
         match !coordinated_media_point ticket request with
         | Some accepted->accepted
-        | None->match dispatch_worker request with
+        | None->match request with
+        | Graph_service.Graph_request _->false
+        | _->match dispatch_worker request with
         | Accepted id ->
           Option.iter
             (fun ticket -> Hashtbl.replace (!media_worker_requests_cell) id ticket)
@@ -3681,6 +3685,25 @@ let start
         | Ok response->Journal_media_runtime.receive (!media_runtime_cell) ticket (Graph_service.Graph_response response)
         | Error _->Journal_media_runtime.reject (!media_runtime_cell) ticket))
         ~f:(fun()->match !set_state_ref with None->Effect.ignore|Some set_state->flush_media set_state)));
+  coordinated_media_read := (fun (request:Journal_media_runtime.read_request)->
+    match current_owner(),ensure_coordination() with
+    | Some owner,Ok host->
+      (match Coordination_host.plan_query_when_available host ~owner
+         ~maximum_items:request.maximum_items
+         ~maximum_bytes:Logseq_db_worker.Protocol.maximum_response_bytes request.query with
+       | Error _->false
+       | Ok ticket->
+         Coordination_host.watch_read host ticket ~f:(fun origin reply->
+           if runtime_owner_is_live !state_ref owner then run_owned (Some owner)(fun()->
+             Effect.bind (Effect.of_thunk(fun()->
+               match origin,reply with
+               | Some(session,_),Wc.Answered(Ok value)
+                 when Coordination_host.validate_session ~owner host session=Ok()->
+                 ignore(Journal_media_runtime.receive_read (!media_runtime_cell)(request.outcome value):bool)
+               | _->Journal_media_runtime.reject (!media_runtime_cell) request.ticket))
+               ~f:(fun()->match !set_state_ref with None->Effect.ignore|Some set_state->flush_media set_state)));
+         true)
+    | _->false);
   coordinated_asset_point := (fun request ->
     let result=send_coordinated_point request ~finish:(fun result->
       Effect.of_thunk(fun()->match request with

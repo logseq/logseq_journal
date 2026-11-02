@@ -4,6 +4,17 @@ module Protocol = Logseq_db_worker.Protocol
 
 type ticket
 
+module Worker = Journal_worker_coordination.Worker_api
+
+type read_result
+
+type read_request = private
+  { ticket : ticket
+  ; maximum_items : int
+  ; query : Worker.asset_listing Worker.query
+  ; outcome : Worker.asset_listing -> read_result
+  }
+
 type item =
   { token : string
   ; asset : Asset.t
@@ -24,6 +35,16 @@ val create
   -> changed:(string -> view -> unit)
   -> t
 
+(** A fixed typed listing port. It returns admission synchronously and delivers
+    the read result on a later turn of the existing serial App event entrance.
+    Transport IDs and continuation construction stay with the coordinator SDK. *)
+val create_coordinated
+  :  read:(read_request -> bool)
+  -> send:(ticket option -> Service.request -> bool)
+  -> changed:(string -> view -> unit)
+  -> t
+
+val receive_read : t -> read_result -> bool
 val reset : t -> graph_generation:int option -> unit
 
 (** Visibility belongs to a retained presentation. Shared roots and assets are
@@ -61,10 +82,13 @@ val reject : t -> ticket -> unit
 val notice : t -> Service.asset_scope -> Service.asset_notice -> unit
 val pump : t -> unit
 val imported : t -> current:bool -> Logseq_db_worker.import_receipt -> unit
-
 val idle : t -> bool
 
 (** Page-fact observation only. No enumeration or pagination state is consumed. *)
 val observe_journals_request : t -> request_id:Logseq_db_types.Graph_types.Uuid.t -> unit
-val observe_journals_result : t -> request_id:Logseq_db_types.Graph_types.Uuid.t
-  -> Protocol.v2_journal_item Journal_worker_coordination.Worker_api.slice -> unit
+
+val observe_journals_result
+  :  t
+  -> request_id:Logseq_db_types.Graph_types.Uuid.t
+  -> Protocol.v2_journal_item Journal_worker_coordination.Worker_api.slice
+  -> unit

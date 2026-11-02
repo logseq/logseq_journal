@@ -802,6 +802,7 @@ let run_favorites_native_visibility
   let manager=if check_copy then manager else fixture_with_scope manager in
   let point_reads=Atomic.make 0 and legacy_point_reads=Atomic.make 0 in
   let offline_scans=Atomic.make 0 and legacy_offline_scans=Atomic.make 0 in
+  let media_listings=Atomic.make 0 and legacy_media_listings=Atomic.make 0 in
   let coordination_registration=Atomic.make None in
   let coordination_release_entered = Atomic.make false in
   let coordination_release_allowed = Atomic.make true in
@@ -851,6 +852,9 @@ let run_favorites_native_visibility
            (match request with Service.Coordination_query _->()|_->Atomic.incr legacy_point_reads)
          | _->());
         (match normalized with
+         | Service.Graph_request {command=P.V2_list_assets {recursive=false;_};_}->
+           Atomic.incr media_listings;
+           (match request with Service.Coordination_query _->()|_->Atomic.incr legacy_media_listings)
          | Service.Graph_request {command=P.V2_list_assets {recursive=true;_};_}->
            Atomic.incr offline_scans;
            (match request with Service.Coordination_query _->()|_->Atomic.incr legacy_offline_scans)
@@ -4351,6 +4355,8 @@ let run_favorites_native_visibility
            Alcotest.(check bool) "Favorites visible range does not hydrate media roots" true
              (Atomic.get queried=before))))));
   if check_point_read_owner then (
+    Alcotest.(check bool) "media fixture actually exercised listing reads" true(Atomic.get media_listings>0);
+    Alcotest.(check int) "media listings have one typed response owner" 0(Atomic.get legacy_media_listings);
     Alcotest.(check bool) "resource fixture actually exercised dependency point reads" true (Atomic.get point_reads>0);
     Alcotest.(check int) "resource dependency points have one typed response owner" 0 (Atomic.get legacy_point_reads))
 

@@ -164,6 +164,7 @@ let seed_coordination_read_data ?(assets=false) path =
            Add(node,"block/page",Ref_to(lookup(journal_page 1)));
            Add(node,"block/order",String("a" ^ string_of_int n));
            Add(node,"block/tags",Ref_to(Ident "logseq.class/Asset"));
+           Add(lookup(journal_page 1),"block/refs",Ref_to node);
            Add(node,"logseq.property.asset/external-url",String("https://example.invalid/" ^ string_of_int n))]) [1;2;3] in
        let staged =
          Session.stage_transact session ~authoritative_before:database ops
@@ -1757,6 +1758,68 @@ let test_host_preserves_query_origin_before_forget () =
     require (!calls = 1) "query origin callback was delivered more than once")
 ;;
 
+let test_visible_media_listing_uses_typed_reads () =
+  let module Host=Journal_worker_coordination_host in
+  let module Media=Journal_media_runtime in
+  with_client ~favorites:true ~assets:true (fun client->
+    let jobs=Queue.create() in
+    let host=Host.create ~client ~client_id ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
+      ~enqueue:(fun f->Queue.add f jobs) ~changed:(fun _->()) |> Result.get_ok in
+    Mailbox.on_event client(fun event->ignore(Host.on_event host event));
+    let pump()=Mailbox.Private.deliver client ~max_events:64;
+      let count=Queue.length jobs in for _=1 to count do (Queue.take jobs)() done in
+    let wait predicate=let deadline=Unix.gettimeofday()+.6. in
+      while not(predicate()) && Unix.gettimeofday()<deadline do pump();Thread.delay 0.001 done;
+      require(predicate()) "typed visible media listing did not settle" in
+    ignore(Mailbox.send client(Service.Client_command(Restore_local_account{user_id="user-1"})));
+    wait(fun()->Option.exists(fun p->List.exists(fun r->r.W.phase=W.Open)(W.residents p))(C.projection(Host.view host)));
+    let owner:Service.timeline_scope={startup={account_generation=1;presentation_generation=1};graph_id=Test_support.graph_uuid;graph_generation=1} in
+    let runtime=ref None and legacy_reads=ref 0 and typed_reads=ref 0 and seen=ref [] and finished=ref false and last=ref None and held=ref None and retiring=ref false and late_returned=ref false in
+    let root=W.Uuid.to_string(journal_page 1) in
+    let read(request:Media.read_request)=
+      let ticket=Host.plan_query_when_available host ~owner ~maximum_items:(min 1 request.maximum_items) ~maximum_bytes:65536 request.query |> Result.get_ok in
+      incr typed_reads;
+      let number= !typed_reads in
+      Host.watch_read host ticket ~f:(fun origin reply->
+        require(Option.exists(fun(session,_)->Host.validate_session ~owner host session=Ok())origin) "media listing borrowed its response origin";
+        match reply with
+        | W.Answered(Ok value)->
+          let result=request.outcome value in last:=Some result;
+          if !retiring then (
+            require(not(Media.receive_read(Option.get !runtime)result)) "in-flight result revived reset scope";
+            late_returned:=true)
+          else if number=1 then held:=Some result else (
+          require(Media.receive_read(Option.get !runtime) result) "owned typed media page was lost";
+          require(not(Media.receive_read(Option.get !runtime) result)) "media page consumed twice";
+          if Option.is_some value.next then Queue.add(fun()->Media.next(Option.get !runtime) ~root)jobs
+          else finished:=true)
+        | _->failwith "real typed media listing failed");true in
+    let media=Media.create_coordinated ~read
+      ~send:(fun _->function Service.Graph_request _->incr legacy_reads;false|_->true)
+      ~changed:(fun _ (view:Media.view)->
+        require(view.error=None) "typed media projection failed";
+        seen:=List.rev_append(List.map(fun(item:Media.item)->item.asset.uuid)view.items)!seen) in
+    runtime:=Some media;
+    Media.reset media ~graph_generation:(Some 1);
+    Media.root_visible media ~root true;
+    require(!legacy_reads=0) "visible media listing still sent a legacy graph query";
+    wait(fun()->Option.is_some !held);
+    Media.resync media;
+    require(Media.receive_read media(Option.get !held)) "superseded media read lost its owning terminal";
+    require(!typed_reads=2) "typed completion left the replacement listing queued without pumping";
+    require(not(Media.receive_read media(Option.get !held))) "superseded media terminal consumed twice";
+    wait(fun()-> !finished);
+    require(!typed_reads>=3) "media fixture did not exercise sealed pagination";
+    require(List.sort_uniq W.Uuid.compare !seen=List.init 3(fun n->uuid(Printf.sprintf "9c000000-0000-4000-8000-%012d"(901+n))))
+      "visible media listing lost a real external descriptor";
+    retiring:=true;
+    Media.resync media;
+    Media.reset media ~graph_generation:(Some 2);
+    wait(fun()-> !late_returned);
+    require(not(Media.receive_read media (Option.get !last))) "old media result revived reset scope";
+    ignore(Host.shutdown host);wait(fun()->C.shutdown_state(Host.view host)=C.Stopped))
+;;
+
 let test_offline_asset_scans_use_typed_reads () =
   let module Host=Journal_worker_coordination_host in
   let module Assets=Journal_asset_runtime in
@@ -3150,6 +3213,7 @@ let test_service_changefeed_has_one_owner () =
 ;;
 
 let () =
+  test_visible_media_listing_uses_typed_reads ();
   test_offline_asset_scans_use_typed_reads ();
   test_dependency_point_reads_use_typed_owner ();
   test_live_authority_invalidation_rebinds ();
