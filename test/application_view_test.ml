@@ -541,6 +541,7 @@ let run_favorites_native_visibility
       ?(on_initialized = fun () -> ())
       ?media_rows
       ?(shared_media = false)
+      ?(check_point_read_owner = false)
       ?media_navigation
       ()
   =
@@ -798,6 +799,7 @@ let run_favorites_native_visibility
   (* Copy specifically exercises ordinary single-graph/native authority. Other
      UI fixtures declare their synthetic manager owner directly. *)
   let manager=if check_copy then manager else fixture_with_scope manager in
+  let point_reads=Atomic.make 0 and legacy_point_reads=Atomic.make 0 in
   let coordination_registration=Atomic.make None in
   let coordination_release_entered = Atomic.make false in
   let coordination_release_allowed = Atomic.make true in
@@ -840,7 +842,13 @@ let run_favorites_native_visibility
           (Service.Client_state_changed manager);
         Ok ())
       ~handle:(fun context () request ->
-        match fixture_request request with
+        let normalized=fixture_request request in
+        (match normalized with
+         | Service.Graph_request{command=(P.V2_get_outline_block _|V2_get_page _);_}->
+           Atomic.incr point_reads;
+           (match request with Service.Coordination_query _->()|_->Atomic.incr legacy_point_reads)
+         | _->());
+        match normalized with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
         | Register_coordination registration ->
           Atomic.set coordination_registration(Some registration);
@@ -1128,7 +1136,7 @@ let run_favorites_native_visibility
                       ; block_uuids =
                           (if Atomic.get media_metadata_changed
                            then [ uuid 20000 ]
-                           else [ uuid 2 ])
+                           else [if check_point_read_owner then uuid 1 else uuid 2])
                       ; page_uuids = []
                       ; structure_interests = []
                       }
@@ -3067,7 +3075,12 @@ let run_favorites_native_visibility
            |> List.iter (fun (name, n) -> Printf.printf " %s=%d" name n);
            Printf.printf "\n%!"
          in
-         match media_navigation with
+         if check_point_read_owner then (
+           Atomic.set publish_block true;
+           ignore(W.send(Option.get !client)Service.Get_graph_state);
+           wait "resource dependency point read reaches actual Worker" (fun()->Atomic.get point_reads>0);
+           Alcotest.(check int) "resource dependency points have one typed response owner" 0(Atomic.get legacy_point_reads)
+         ) else match media_navigation with
          | Some scenario ->
            let native_range first last =
              hooks.extension_event
@@ -4314,7 +4327,10 @@ let run_favorites_native_visibility
            Alcotest.(check int) "Favorites has no media body or lease acquisition" 0
              (if Option.is_some (find "path" "/tmp/targeted-media.png") then 1 else 0);
            Alcotest.(check bool) "Favorites visible range does not hydrate media roots" true
-             (Atomic.get queried=before))))))
+             (Atomic.get queried=before))))));
+  if check_point_read_owner then (
+    Alcotest.(check bool) "resource fixture actually exercised dependency point reads" true (Atomic.get point_reads>0);
+    Alcotest.(check int) "resource dependency points have one typed response owner" 0 (Atomic.get legacy_point_reads))
 
 ;;
 
@@ -7597,7 +7613,9 @@ let () =
             (fun () -> run_favorites_native_visibility ~check_capture_imports:true ())
         ] )
     ; ( "targeted media subscriptions"
-      , [ Alcotest.test_case "single Ready and Acquire N=3" `Quick (fun () ->
+      , [ Alcotest.test_case "dependency points use typed owner" `Quick (fun () ->
+          run_favorites_native_visibility ~media_rows:3 ~media_navigation:`Offscreen ~check_point_read_owner:true ());
+ Alcotest.test_case "single Ready and Acquire N=3" `Quick (fun () ->
             run_favorites_native_visibility ~media_rows:3 ())
         ; Alcotest.test_case "single Ready and Acquire N=50" `Quick (fun () ->
             run_favorites_native_visibility ~media_rows:50 ())

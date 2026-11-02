@@ -63,3 +63,17 @@ val on_event
   -> Runner.delivery
 
 val shutdown : t -> Runner.shutdown_state
+
+(** Route existing business Block/Page dependency point reads through the same
+    typed admission and exclusive response owner. False means another request
+    family; callbacks retain the actual Send origin and carry only checked DTOs. *)
+val query_point
+  :  t
+  -> owner:Runner.Service.timeline_scope
+  -> maximum_bytes:int
+  -> Logseq_db_worker.Protocol.command
+  -> f:
+       ((Worker.session * Worker.read_budget) option
+        -> (Logseq_db_worker.Protocol.v2_outcome, Worker.error) result
+        -> unit)
+  -> (bool, Worker.error) result

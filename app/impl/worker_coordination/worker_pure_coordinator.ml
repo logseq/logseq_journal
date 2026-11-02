@@ -101,6 +101,7 @@ type 'a ticket =
 type 'a slot =
   { ticket : 'a ticket
   ; dispatched : bool
+  ; wait_for_capacity : bool
   ; admitted : Id.request_id option
   ; change_version : int64
   ; sample_epoch : Worker.observation_epoch option
@@ -423,7 +424,8 @@ let equal_observation_entry (Observing a) (Observing b) =
 let equal_entry (Entry a) (Entry b) =
   match same_ticket a.ticket b.ticket with
   | Some Worker.Refl ->
-    a.dispatched = b.dispatched
+    a.wait_for_capacity = b.wait_for_capacity
+    && a.dispatched = b.dispatched
     && a.admitted = b.admitted
     && a.change_version = b.change_version
     && a.sample_epoch = b.sample_epoch
@@ -735,7 +737,7 @@ let change_ack_known facts batch =
   | _ -> false
 ;;
 
-let dispatch_waiting ?(publish = false) ?(retry_acks = false) state instructions =
+let dispatch_waiting ?(publish = false) ?(retry_full = false) state instructions =
   let sends = ref [] in
   let active = ref (active_change_reads state.facts) in
   let ready : type a. Worker.session -> Worker.read_budget -> a Worker.query -> bool =
@@ -756,140 +758,157 @@ let dispatch_waiting ?(publish = false) ?(retry_acks = false) state instructions
   let entries =
     Slots.map
       (fun (Entry slot as entry) ->
-         if state.lifecycle <> Running || slot.dispatched || slot.result <> None
+         if
+           state.lifecycle <> Running
+           || slot.dispatched
+           || slot.result <> None
+           || (slot.early = Some (Worker.Not_admitted Worker.Full) && not retry_full)
          then entry
          else (
            let reject error =
              Entry { slot with result = Some (Worker.Answered (Error error)) }
            in
-           match slot.ticket.query with
-           | Operation (Worker.Acknowledge_changes batch) ->
-             let session = Worker.change_batch_session batch in
-             (match validate_session state session with
-              | Error error -> reject error
-              | Ok () ->
-                if
-                  (slot.early <> Some (Worker.Not_admitted Worker.Full) || retry_acks)
-                  && (change_ack_known state.facts batch
-                      || change_application_ready state.facts batch)
-                then (
-                  sends
-                  := Send (slot.ticket, session, Worker.Acknowledge_changes batch)
-                     :: !sends;
-                  Entry
-                    { slot with
-                      dispatched = true
-                    ; early = None
-                    ; change_version = change_version state.facts session
-                    })
-                else (
-                  match
-                    Graphs.find_opt (Worker.graph_id session) state.facts.change_batches
-                  with
-                  | Some (actual, _) when actual = batch -> entry
-                  | _ ->
-                    reject
-                      (Worker.Resync_required "The unapplied change batch was retired")))
-           | Read (Worker.Changes _ as query)
-             when match slot.ticket.target with
-                  | Sealed _ -> true
-                  | _ -> false ->
-             (match slot.ticket.target with
-              | Sealed (session, budget) ->
-                (match validate_session state session with
-                 | Error error -> reject error
-                 | Ok () ->
-                   (match validate_change_query state.facts session budget query with
-                    | Error _ ->
+           if
+             slot.wait_for_capacity
+             && slot.early = Some (Worker.Not_admitted Worker.Full)
+             && Option.exists
+                  (fun (session, _) -> validate_session state session <> Ok ())
+                  slot.origin
+           then reject Worker.Revoked_session
+           else (
+             match slot.ticket.query with
+             | Operation (Worker.Acknowledge_changes batch) ->
+               let session = Worker.change_batch_session batch in
+               (match validate_session state session with
+                | Error error -> reject error
+                | Ok () ->
+                  if
+                    (slot.early <> Some (Worker.Not_admitted Worker.Full) || retry_full)
+                    && (change_ack_known state.facts batch
+                        || change_application_ready state.facts batch)
+                  then (
+                    sends
+                    := Send (slot.ticket, session, Worker.Acknowledge_changes batch)
+                       :: !sends;
+                    Entry
+                      { slot with
+                        dispatched = true
+                      ; early = None
+                      ; change_version = change_version state.facts session
+                      })
+                  else (
+                    match
+                      Graphs.find_opt (Worker.graph_id session) state.facts.change_batches
+                    with
+                    | Some (actual, _) when actual = batch -> entry
+                    | _ ->
                       reject
-                        (Worker.Stale_read
-                           "The queued change cursor was superseded by an applied page")
-                    | Ok () when ready session budget query ->
-                      mark session (Worker.Query (budget, query));
-                      sends
-                      := Send (slot.ticket, session, Worker.Query (budget, query))
-                         :: !sends;
-                      Entry
-                        { slot with
-                          dispatched = true
-                        ; origin = Some (session, budget)
-                        ; change_version = change_version state.facts session
-                        }
-                    | Ok () -> entry))
-              | _ -> entry)
-           | _ ->
-             (match
-                slot.ticket.target, state.facts.bootstrap_state, state.facts.current
-              with
-              | ( Expected (owner, maximum_items, maximum_bytes)
-                , Worker.Ready _
-                , Some projection ) ->
-                (match
-                   List.find_opt
-                     (fun r -> Worker.matches_scope r.Worker.session owner)
-                     (Worker.residents projection)
-                 with
-                 | None
-                   when Worker.scope_is_superseded
-                          ?previous:(Graphs.find_opt owner.graph_id state.retired)
-                          projection
-                          owner -> reject Worker.Revoked_session
-                 | None -> entry
-                 | Some { phase = Worker.Open; session; _ } ->
-                   let planned =
-                     Result.bind
-                       (Worker.read_budget
-                          session
-                          ~maximum_items:
-                            (min maximum_items Worker.Protocol.maximum_page_size)
-                          ~maximum_bytes:
-                            (min
-                               maximum_bytes
-                               (Worker.capabilities session).limits.response_budget_bytes))
-                       (fun budget ->
-                          match slot.ticket.query with
-                          | Read query ->
-                            Result.bind
-                              (validate_change_query state.facts session budget query)
-                              (fun () ->
-                                 Result.map
-                                   (fun () -> Worker.Query (budget, query))
-                                   (Worker.validate_request
-                                      session
-                                      (Worker.Query (budget, query))))
-                          | Operation _ ->
-                            Error (Worker.Invalid_input "An effect cannot wait as a read"))
-                   in
-                   (match planned with
-                    | Error error ->
-                      (match slot.ticket.query with
-                       | Read (Worker.Changes _) ->
-                         reject
-                           (Worker.Stale_read
-                              "The queued change cursor was superseded by an applied page")
-                       | _ -> reject error)
-                    | Ok (Worker.Query (budget, query))
-                      when not (ready session budget query) -> entry
-                    | Ok operation ->
-                      mark session operation;
-                      sends := Send (slot.ticket, session, operation) :: !sends;
-                      let origin =
-                        match operation with
-                        | Worker.Query (budget, _) -> Some (session, budget)
-                        | _ -> None
-                      in
-                      Entry
-                        { slot with
-                          dispatched = true
-                        ; origin
-                        ; change_version = change_version state.facts session
-                        })
-                 | Some { phase = Worker.Opening; _ } -> entry
-                 | Some { phase = Worker.Failed error; _ } -> reject error
-                 | Some { phase = Worker.Closing; _ } -> reject Worker.Revoked_session)
-              | _, (Worker.Bootstrap_failed error | Binding_revoked error), _ ->
-                reject error
-              | _ -> entry)))
+                        (Worker.Resync_required "The unapplied change batch was retired")))
+             | Read (Worker.Changes _ as query)
+               when match slot.ticket.target with
+                    | Sealed _ -> true
+                    | _ -> false ->
+               (match slot.ticket.target with
+                | Sealed (session, budget) ->
+                  (match validate_session state session with
+                   | Error error -> reject error
+                   | Ok () ->
+                     (match validate_change_query state.facts session budget query with
+                      | Error _ ->
+                        reject
+                          (Worker.Stale_read
+                             "The queued change cursor was superseded by an applied page")
+                      | Ok () when ready session budget query ->
+                        mark session (Worker.Query (budget, query));
+                        sends
+                        := Send (slot.ticket, session, Worker.Query (budget, query))
+                           :: !sends;
+                        Entry
+                          { slot with
+                            dispatched = true
+                          ; early = None
+                          ; origin = Some (session, budget)
+                          ; change_version = change_version state.facts session
+                          }
+                      | Ok () -> entry))
+                | _ -> entry)
+             | _ ->
+               (match
+                  slot.ticket.target, state.facts.bootstrap_state, state.facts.current
+                with
+                | ( Expected (owner, maximum_items, maximum_bytes)
+                  , Worker.Ready _
+                  , Some projection ) ->
+                  (match
+                     List.find_opt
+                       (fun r -> Worker.matches_scope r.Worker.session owner)
+                       (Worker.residents projection)
+                   with
+                   | None
+                     when Worker.scope_is_superseded
+                            ?previous:(Graphs.find_opt owner.graph_id state.retired)
+                            projection
+                            owner -> reject Worker.Revoked_session
+                   | None -> entry
+                   | Some { phase = Worker.Open; session; _ } ->
+                     let planned =
+                       Result.bind
+                         (Worker.read_budget
+                            session
+                            ~maximum_items:
+                              (min maximum_items Worker.Protocol.maximum_page_size)
+                            ~maximum_bytes:
+                              (min
+                                 maximum_bytes
+                                 (Worker.capabilities session).limits
+                                   .response_budget_bytes))
+                         (fun budget ->
+                            match slot.ticket.query with
+                            | Read query ->
+                              Result.bind
+                                (validate_change_query state.facts session budget query)
+                                (fun () ->
+                                   Result.map
+                                     (fun () -> Worker.Query (budget, query))
+                                     (Worker.validate_request
+                                        session
+                                        (Worker.Query (budget, query))))
+                            | Operation _ ->
+                              Error
+                                (Worker.Invalid_input "An effect cannot wait as a read"))
+                     in
+                     (match planned with
+                      | Error error ->
+                        (match slot.ticket.query with
+                         | Read (Worker.Changes _) ->
+                           reject
+                             (Worker.Stale_read
+                                "The queued change cursor was superseded by an applied \
+                                 page")
+                         | _ -> reject error)
+                      | Ok (Worker.Query (budget, query))
+                        when not (ready session budget query) -> entry
+                      | Ok operation ->
+                        mark session operation;
+                        sends := Send (slot.ticket, session, operation) :: !sends;
+                        let origin =
+                          match operation with
+                          | Worker.Query (budget, _) -> Some (session, budget)
+                          | _ -> None
+                        in
+                        Entry
+                          { slot with
+                            dispatched = true
+                          ; early = None
+                          ; origin
+                          ; change_version = change_version state.facts session
+                          })
+                   | Some { phase = Worker.Opening; _ } -> entry
+                   | Some { phase = Worker.Failed error; _ } -> reject error
+                   | Some { phase = Worker.Closing; _ } -> reject Worker.Revoked_session)
+                | _, (Worker.Bootstrap_failed error | Binding_revoked error), _ ->
+                  reject error
+                | _ -> entry))))
       state.facts.entries
   in
   let next = { state with facts = { state.facts with entries } } in
@@ -1923,7 +1942,7 @@ let step_base state event =
          ; bootstrap_mailbox = None
          }
          [ Bootstrap ]
-     | _, Running -> dispatch_waiting ~retry_acks:(event = Capacity_available) state []
+     | _, Running -> dispatch_waiting ~retry_full:(event = Capacity_available) state []
      | _ -> unchanged state)
   | Admitted (ticket, id) ->
     (match Slots.find_opt ticket.serial state.facts.entries with
@@ -1961,9 +1980,14 @@ let step_base state event =
   | Admission_refused (ticket, Worker.Full) ->
     (match Slots.find_opt ticket.serial state.facts.entries with
      | Some (Entry slot) ->
-       (match same_ticket ticket slot.ticket, slot.ticket.query with
-        | Some Worker.Refl, Operation (Worker.Acknowledge_changes _)
-          when slot.dispatched
+       (match same_ticket ticket slot.ticket with
+        | Some Worker.Refl
+          when (slot.wait_for_capacity
+                ||
+                match slot.ticket.query with
+                | Operation (Worker.Acknowledge_changes _) -> true
+                | _ -> false)
+               && slot.dispatched
                && slot.admitted = None
                && slot.result = None
                && not slot.cancelled ->
@@ -2239,6 +2263,7 @@ let plan_refresh ?(internal = false) (state : t) session handle =
       in
       let slot =
         { ticket
+        ; wait_for_capacity = false
         ; dispatched = true
         ; admitted = None
         ; change_version = 0L
@@ -2413,6 +2438,7 @@ let plan_mutation
     in
     let slot =
       { ticket
+      ; wait_for_capacity = false
       ; dispatched = true
       ; admitted = None
       ; change_version = 0L
@@ -2468,6 +2494,7 @@ let plan_observation (state : t) session budget query =
     in
     let slot =
       { ticket
+      ; wait_for_capacity = false
       ; dispatched = true
       ; admitted = None
       ; change_version = 0L
@@ -2547,6 +2574,7 @@ let plan_release state session handle =
     in
     let slot =
       { ticket
+      ; wait_for_capacity = false
       ; dispatched = false
       ; admitted = None
       ; change_version = 0L
@@ -2600,6 +2628,7 @@ let plan_change_ack state session batch =
     in
     let slot =
       { ticket
+      ; wait_for_capacity = false
       ; dispatched = false
       ; admitted = None
       ; change_version = 0L
@@ -2665,6 +2694,7 @@ let request
                      in
                      let slot =
                        { ticket
+                       ; wait_for_capacity = false
                        ; dispatched = ready
                        ; admitted = None
                        ; change_version = change_version state.facts session
@@ -2747,7 +2777,14 @@ let begin_change_application state batch ~root =
       Ok (token, changed { state with next = serial; facts } [])))
 ;;
 
-let plan_query state ~owner ~maximum_items ~maximum_bytes query =
+let plan_query_internal
+      ~wait_for_capacity
+      state
+      ~owner
+      ~maximum_items
+      ~maximum_bytes
+      query
+  =
   let target = Expected (owner, maximum_items, maximum_bytes) in
   if state.lifecycle <> Running
   then Error Worker.Revoked_session
@@ -2774,6 +2811,7 @@ let plan_query state ~owner ~maximum_items ~maximum_bytes query =
     in
     let slot =
       { ticket
+      ; wait_for_capacity
       ; dispatched = false
       ; admitted = None
       ; change_version = 0L
@@ -2859,3 +2897,23 @@ module Response_ownership = struct
 
   let spans = Ranges.cardinal
 end
+
+let plan_query state ~owner ~maximum_items ~maximum_bytes query =
+  plan_query_internal
+    ~wait_for_capacity:false
+    state
+    ~owner
+    ~maximum_items
+    ~maximum_bytes
+    query
+;;
+
+let plan_query_when_available state ~owner ~maximum_items ~maximum_bytes query =
+  plan_query_internal
+    ~wait_for_capacity:true
+    state
+    ~owner
+    ~maximum_items
+    ~maximum_bytes
+    query
+;;

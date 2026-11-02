@@ -1746,6 +1746,115 @@ let test_host_preserves_query_origin_before_forget () =
     require (!calls = 1) "query origin callback was delivered more than once")
 ;;
 
+let test_dependency_point_reads_use_typed_owner () =
+  let module Host = Journal_worker_coordination_host in
+  with_client (fun client ->
+    let jobs = Queue.create () in
+    let host =
+      Host.create
+        ~client
+        ~client_id
+        ~managed_origin:"https://api.logseq.io"
+        ~user_id:"user-1"
+        ~enqueue:(fun f -> Queue.add f jobs)
+        ~changed:(fun _ -> ())
+      |> Result.get_ok
+    in
+    let consumed = ref 0 in
+    Mailbox.on_event client (fun event ->
+      if (Host.on_event host event).R.disposition = R.Consumed then incr consumed);
+    let pump () =
+      Mailbox.Private.deliver client ~max_events:64;
+      let count = Queue.length jobs in
+      for _ = 1 to count do
+        (Queue.take jobs) ()
+      done
+    in
+    let wait predicate =
+      let deadline = Unix.gettimeofday () +. 6. in
+      while (not (predicate ())) && Unix.gettimeofday () < deadline do
+        pump ();
+        Thread.delay 0.001
+      done;
+      require (predicate ()) "typed dependency point query did not settle"
+    in
+    ignore
+      (Mailbox.send
+         client
+         (Service.Client_command (Restore_local_account { user_id = "user-1" })));
+    wait (fun () ->
+      Option.exists
+        (fun p -> List.exists (fun r -> r.W.phase = W.Open) (W.residents p))
+        (C.projection (Host.view host)));
+    let owner : Service.timeline_scope =
+      { startup = { account_generation = 1; presentation_generation = 1 }
+      ; graph_id = Test_support.graph_uuid
+      ; graph_generation = 1
+      }
+    in
+    let query maximum_bytes command =
+      let result = ref None in
+      let before = !consumed in
+      require
+        (Host.query_point host ~owner ~maximum_bytes command ~f:(fun origin outcome ->
+           result := Some (origin, outcome))
+         = Ok true)
+        "resource dependency point read still bypasses typed owner";
+      require
+        (!result = None)
+        "point callback ran synchronously before business admission";
+      wait (fun () -> !result <> None);
+      require
+        (!consumed = before + 1)
+        "dependency point response was not consumed exactly once";
+      let origin, outcome = Option.get !result in
+      require
+        (Option.exists
+           (fun (session, _) -> Host.validate_session ~owner host session = Ok ())
+           origin)
+        "point dependency inferred its origin after delivery";
+      outcome
+    in
+    require
+      (match
+         query
+           65536
+           (P.V2_get_outline_block
+              { block = Test_support.authoritative_block_uuid; revision = None })
+       with
+       | Ok (P.V2_block_outcome (P.V2_present_block { value; revision })) ->
+         value.block.uuid = Test_support.authoritative_block_uuid && revision <> ""
+       | _ -> false)
+      "typed dependency lost full block identity or revision";
+    require
+      (match
+         query 65536 (P.V2_get_page { page = Test_support.page_uuid; revision = None })
+       with
+       | Ok (P.V2_page_outcome (P.V2_present_page { page; revision })) ->
+         page.uuid = Test_support.page_uuid && revision <> ""
+       | _ -> false)
+      "typed dependency lost its full page DTO";
+    require
+      (match
+         query
+           64
+           (P.V2_get_outline_block
+              { block = Test_support.authoritative_block_uuid; revision = None })
+       with
+       | Error W.Response_budget_exceeded -> true
+       | _ -> false)
+      "point read bypassed encoded budget validation";
+    let called = ref false in
+    require
+      (Host.query_point host ~owner ~maximum_bytes:65536 P.V2_graph_info ~f:(fun _ _ ->
+         called := true)
+       = Ok false)
+      "point bridge claimed another read family";
+    require (not !called) "unowned family invoked a point callback";
+    ignore (Host.shutdown host);
+    wait (fun () -> C.shutdown_state (Host.view host) = C.Stopped))
+;;
+
 (* A real Service authority control can retire an offline binding without
    changing its user or physical graph. The old pure event only represented
    terminal bootstrap revocation, so it could not express this live handover. *)
@@ -2981,6 +3090,7 @@ let test_service_changefeed_has_one_owner () =
 ;;
 
 let () =
+  test_dependency_point_reads_use_typed_owner ();
   test_live_authority_invalidation_rebinds ();
   test_service_changefeed_has_one_owner ();
   test_service_unallocated_observation_cleanup_after_close ();

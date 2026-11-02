@@ -1890,6 +1890,150 @@ let test_observation_properties () =
   done
 ;;
 
+let test_dependency_read_waits_for_capacity () =
+  let issuer, raw, projection, session = fixture 745L in
+  let module I = (val issuer : W.ISSUER) in
+  let owner = Option.get raw.baseline.state.sync.selected in
+  let state = ready I.binding projection in
+  let ticket, planned =
+    C.plan_query_when_available
+      state
+      ~owner
+      ~maximum_items:1
+      ~maximum_bytes:65536
+      (W.Outline_block { uuid = graph; revision = None })
+    |> Result.get_ok
+  in
+  let full = C.step planned.next (C.Admission_refused (ticket, W.Full)) in
+  check
+    (C.reply (C.view full.next) ticket = None)
+    "Full terminated a logical dependency read";
+  let ignored =
+    C.step
+      full.next
+      (C.Completed
+         (ticket, W.Answered (Error (W.Service_failed "impossible unadmitted completion"))))
+  in
+  check
+    (C.reply (C.view ignored.next) ticket = None)
+    "unadmitted completion escaped capacity waiting";
+  let drain = C.step ignored.next C.Drain in
+  check
+    (not
+       (List.exists
+          (function
+            | C.Send _ -> true
+            | _ -> false)
+          drain.instructions))
+    "Full dependency self-retried on Drain";
+  let capacity = C.step drain.next C.Capacity_available in
+  check
+    (List.exists
+       (function
+         | C.Send (actual, actual_session, W.Query (_, W.Outline_block _)) ->
+           W.equal_request_id (C.ticket_id actual) (C.ticket_id ticket)
+           && W.equal_session actual_session session
+         | _ -> false)
+       capacity.instructions)
+    "capacity did not retry the exact dependency ticket and session";
+  let duplicate = C.step capacity.next C.Capacity_available in
+  check
+    (not
+       (List.exists
+          (function
+            | C.Send _ -> true
+            | _ -> false)
+          duplicate.instructions))
+    "capacity duplicated an active dependency read";
+  let admitted = C.step duplicate.next (C.Admitted (ticket, Id.Worker.Request_id.one)) in
+  let contradictory = C.step admitted.next (C.Admission_refused (ticket, W.Full)) in
+  check
+    (C.reply (C.view contradictory.next) ticket = None)
+    "late Full replaced an admitted read";
+  let completed =
+    C.step
+      contradictory.next
+      (C.Completed (ticket, W.Answered (Error (W.Service_failed "actual read failure"))))
+  in
+  check
+    (C.reply (C.view completed.next) ticket
+     = Some (W.Answered (Error (W.Service_failed "actual read failure"))))
+    "capacity waiting hid an actual terminal read failure";
+  let cancelled = C.step full.next (C.Cancel ticket) in
+  let capacity = C.step cancelled.next C.Capacity_available in
+  check
+    (not
+       (List.exists
+          (function
+            | C.Send _ -> true
+            | _ -> false)
+          capacity.instructions))
+    "cancelled waiting dependency was resent";
+  let unavailable = C.step planned.next (C.Admission_refused (ticket, W.Not_ready)) in
+  check
+    (C.reply (C.view unavailable.next) ticket = Some (W.Not_admitted W.Not_ready))
+    "capacity planner hid a non-Full refusal";
+  let bump (scope : S.asset_scope) =
+    { scope with
+      account =
+        { scope.account with
+          lifecycle_generation = Int64.succ scope.account.lifecycle_generation
+        }
+    }
+  in
+  let baseline =
+    { raw.baseline with
+      version = 2L
+    ; state =
+        { sync =
+            { raw.baseline.state.sync with
+              account =
+                Option.map
+                  (fun (account : Sync.account_scope) ->
+                     { account with
+                       lifecycle_generation = Int64.succ account.lifecycle_generation
+                     })
+                  raw.baseline.state.sync.account
+            ; residents =
+                List.map
+                  (fun (scope, value) -> bump scope, value)
+                  raw.baseline.state.sync.residents
+            }
+        ; residents =
+            List.map
+              (fun (scope, value) -> bump scope, value)
+              raw.baseline.state.residents
+        }
+    }
+  in
+  let changed =
+    match I.bootstrap (S.Coordination_registered { raw with baseline }) with
+    | Ok (W.Ready value) -> value
+    | _ -> failwith "capacity lifecycle fixture"
+  in
+  let retired = C.step full.next (C.Projection_received changed) in
+  let capacity = C.step retired.next C.Capacity_available in
+  check
+    (not
+       (List.exists
+          (function
+            | C.Send _ -> true
+            | _ -> false)
+          capacity.instructions))
+    "capacity retry borrowed a replacement lifecycle";
+  check
+    (C.reply (C.view capacity.next) ticket = Some (W.Answered (Error W.Revoked_session)))
+    "capacity retry retained a stale execution origin";
+  let ordinary, planned =
+    C.plan_query state ~owner ~maximum_items:1 ~maximum_bytes:65536 W.Graph_info
+    |> Result.get_ok
+  in
+  let refused = C.step planned.next (C.Admission_refused (ordinary, W.Full)) in
+  check
+    (C.reply (C.view refused.next) ordinary = Some (W.Not_admitted W.Full))
+    "ordinary planner lost its explicit refusal semantics"
+;;
+
 let test_live_binding_invalidation_is_pure () =
   let old_issuer, _, old_projection, old_session = fixture 741L in
   let new_issuer, _, new_projection, new_session = fixture 742L in
@@ -2877,6 +3021,7 @@ let test_change_application_properties () =
 ;;
 
 let () =
+  test_dependency_read_waits_for_capacity ();
   test_live_binding_invalidation_is_pure ();
   test_changes_serial_and_ack_capacity ();
   test_changefeed_planning_owns_its_typed_ticket ();

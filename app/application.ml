@@ -3290,6 +3290,27 @@ let start
          | Error _->Error "Unable to bind the graph reader. Try Copy again."
          | Ok host->coordination_host_id:=Some id;coordination_host:=Some(identity,host);Ok host)
   in
+  let send_coordinated_point request ~finish =
+    match request with
+    | Graph_service.Graph_request request when (match request.command with
+        Logseq_db_worker.Protocol.V2_get_outline_block _ | V2_get_page _->true|_->false) ->
+      (match current_owner(),ensure_coordination() with
+       | Some owner,Ok host when request.api_version=Logseq_db_worker.Protocol.api_version ->
+         let accepted=Coordination_host.query_point host ~owner
+           ~maximum_bytes:Logseq_db_worker.Protocol.maximum_response_bytes request.command
+           ~f:(fun origin result->
+             if runtime_owner_is_live !state_ref owner then run_owned (Some owner) (fun()->
+               let result=match result,origin with
+                 | Ok outcome,Some(session,_) when Coordination_host.validate_session ~owner host session=Ok()->
+                   Ok(Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
+                     request_id=request.request_id;outcome})
+                 | Ok _,_->Error Wc.Revoked_session
+                 | Error error,_->Error error in
+               finish result)) in
+         Some(match accepted with Ok true->true|Ok false|Error _->false)
+       | _->Some false)
+    | _->None
+  in
   let route_coordination_event event =
     let module Runner=Journal_worker_coordination.Worker_effect_runner in
     let active=Option.map snd !coordination_host in
@@ -3558,10 +3579,13 @@ let start
   let prev_media_owners = graph_ref (fun () -> (media_presentation_scopes initial_state)) in
   let prev_detail_media_roots = graph_ref (fun () -> (media_detail_roots initial_state)) in
   let prev_detail_media_routes = graph_ref (fun () -> initial_state.routes) in
+  let coordinated_media_point = ref(fun (_:Journal_media_runtime.ticket option) (_:Graph_service.request)->None) in
   let media_runtime_cell = graph_ref (fun () ->
     Journal_media_runtime.create
       ~send:(fun ticket request ->
-        match dispatch_worker request with
+        match !coordinated_media_point ticket request with
+        | Some accepted->accepted
+        | None->match dispatch_worker request with
         | Accepted id ->
           Option.iter
             (fun ticket -> Hashtbl.replace (!media_worker_requests_cell) id ticket)
@@ -3612,6 +3636,7 @@ let start
   let drain_capture_imports = ref (fun () -> Effect.ignore) in
   let asset_worker_requests_cell = graph_ref (fun () ->
     Hashtbl.create 2) in
+  let coordinated_asset_point = ref(fun (_:Graph_service.request)->None) in
   let asset_runtime_cell = graph_ref (fun () ->
     Journal_asset_runtime.create
       ~changed:(fun generation recent favorites ->
@@ -3626,7 +3651,9 @@ let start
                   | Some _ -> state)))
           !set_state_ref)
       ~send:(fun request ->
-        match dispatch_worker request with
+        match !coordinated_asset_point request with
+        | Some accepted->accepted
+        | None->match dispatch_worker request with
         | Worker.Accepted worker_id ->
           (match request with
            | Graph_service.Graph_request request ->
@@ -3654,6 +3681,27 @@ let start
     Journal_media_runtime.observe_response (!media_runtime_cell) response;
     Journal_asset_runtime.observe_response (!asset_runtime_cell) response
   in
+  coordinated_media_point := (fun ticket request ->
+    match ticket with
+    | None->None
+    | Some ticket->send_coordinated_point request ~finish:(fun result->
+      Effect.bind (Effect.of_thunk(fun()->match result with
+        | Ok response->Journal_media_runtime.receive (!media_runtime_cell) ticket (Graph_service.Graph_response response)
+        | Error _->Journal_media_runtime.reject (!media_runtime_cell) ticket))
+        ~f:(fun()->match !set_state_ref with None->Effect.ignore|Some set_state->flush_media set_state)));
+  coordinated_asset_point := (fun request ->
+    let result=send_coordinated_point request ~finish:(fun result->
+      Effect.of_thunk(fun()->match request with
+        | Graph_service.Graph_request original ->
+          (match result with
+           | Ok response when Journal_asset_runtime.receive (!asset_runtime_cell) response->
+             Journal_media_runtime.observe_response (!media_runtime_cell) response
+           | _->forget_projection_request original.request_id;
+             Journal_asset_runtime.reject (!asset_runtime_cell) ~request_id:original.request_id)
+        | _->())) in
+    (match result,request with Some true,Graph_service.Graph_request original->
+      Journal_media_runtime.observe_request (!media_runtime_cell) original|_->());
+    result);
   let asset_settings = ref None in
   let refresh_assets ~graph_generation calendar =
     Option.iter
