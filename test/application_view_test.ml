@@ -105,6 +105,39 @@ let fixture_coordination ?(version=1L) ?(phase=Logseq_db_worker.Graph_open) (man
         ({graph_id=Some scope.graph_id;generation=scope.graph_generation;phase;error=None}:Logseq_db_worker.graph_state)) scopes}}}
 ;;
 
+(* A UI fixture uses the public pure permission owner. It proves wiring and
+   one-use envelopes only; physical settlement has separate real Service tests. *)
+let fixture_host_handoffs ~lifetime ~registered ~baseline ~apply =
+  let module H=Logseq_db_worker_pure_reducer.Core.Host_handoff in
+  let state=ref(H.empty ~lifetime) in
+  let facts registration =
+    let value=baseline registration in
+    let sync=value.Service.baseline.state.sync in
+    let scopes=Rrbvec.of_list(List.map fst sync.residents) in
+    let facts:H.facts={authenticated=sync.account<>None;version=value.baseline.version;
+      registration=registered();account=sync.account;scopes;
+      catalog=Rrbvec.of_list sync.desired_residents} in facts in
+  fun context request->match request with
+  |Service.Coordination_prepare_host_change plan->
+    let facts=facts plan.registration in
+    let request:H.request={version=plan.version;id=plan.id;registration=plan.registration;
+      owner=plan.owner;change=plan.change;expected=plan.expected;
+      captured=H.capture ~owner:plan.owner ~change:plan.change facts.scopes} in
+    let next,decision=H.prepare !state facts request in state:=next;
+    (match decision with H.Start attempt->
+      state:=H.settled !state attempt ~copy_generation:None;
+      (match H.phase !state plan.id with Some(H.Safe receipt)->Ok(Service.Coordination_host_prepared receipt)
+       |_->Error "UI fixture permission settlement failed")
+     |_->Error "UI fixture refused host preparation")
+  |Coordination_apply_host_change receipt->
+    let request=H.receipt_request receipt in
+    let next,result=H.consume !state (facts request.registration)receipt in state:=next;
+    (match result with Error _->Error "UI fixture refused stale or reused permission"
+     |Ok change->Result.map(fun()->state:=H.completed !state receipt;
+       Service.Coordination_host_applied request.id)(apply context change))
+  |_->Error "Not a UI fixture host operation"
+;;
+
 module Root_state = struct
   include Application.Root_navigation
   let step state event =
@@ -850,7 +883,9 @@ let run_favorites_native_visibility
   let manager : Service.state =
     { snapshot =
         { sync_phase = Current
-        ; catalog = []
+        ; catalog = (if capture_case=Some `Closed_failed_import then
+            [({graph_id=uuid 900;name="Unknown Import synthetic graph";
+              schema={major=65;minor=33;exact=true};encrypted=false}:Service.graph)] else [])
     ; resident_graphs=[];resident_scopes=[]
         ; selected_graph = Some (uuid 900)
         ; applied_server_t = Some (server_cursor_of_int 0)
@@ -890,6 +925,7 @@ let run_favorites_native_visibility
   let coordination_release_entered = Atomic.make false in
   let coordination_release_allowed = Atomic.make true in
   let picker_returned = Atomic.make false in
+  let host_closed=Atomic.make false in
   let coordination_baseline registration =
     let module C=Logseq_sync_pure_reducer.Core in
     let generation=Atomic.get graph_generation in
@@ -912,6 +948,16 @@ let run_favorites_native_visibility
         change_max_items=4096;change_max_bytes=1048576;dispatcher_capacity=256;wire_batch_max_bytes=262144};
       baseline={version=Int64.of_int presentation;presentation=Int64.of_int presentation;state={sync;residents=[scope,physical]}}}
   in
+  let host_fixture=fixture_host_handoffs ~lifetime:(uuid 98000)
+    ~registered:(fun()->Atomic.get coordination_registration) ~baseline:coordination_baseline
+    ~apply:(fun context change->match change with
+      |Logseq_db_worker_pure_reducer.Core.Host_handoff.Close_graph graph when graph=scope.graph_id->
+        Atomic.set host_closed true;
+        let closed={manager with snapshot={manager.snapshot with selected_graph=None;
+          resident_graphs=[];resident_scopes=[];
+          startup={manager.snapshot.startup with awaiting_selection=true;graph_generation=2}}} in
+        W.Request_context.emit context ~topic:Service.manager_topic(Service.Client_state_changed closed);Ok()
+      |_->Error "Unsupported host change in this UI fixture") in
   let durable_outcomes = Hashtbl.create 8 in
   let durable_intent intent = Logseq_db_worker_contract.Mutation_pure_wire.restore
     ~origin:(Uri.of_string "https://example.invalid") ~user:"fixture" ~graph:(uuid 900) intent |> Result.get_ok in
@@ -1027,7 +1073,8 @@ let run_favorites_native_visibility
          | _ -> ());
         match normalized with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ ->host_fixture context normalized
+        | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration ->
           Atomic.set coordination_registration(Some registration);
           Ok(Service.Coordination_registered(coordination_baseline registration))
@@ -4544,10 +4591,20 @@ let run_favorites_native_visibility
              if completed then (Atomic.set import_release true;
                wait "Unknown import reaches visible retry feedback" (fun()->Atomic.get imports_finished=2
                  && Option.is_some(find "accessibility-label" "Error info")));
-             let closed={manager with snapshot={manager.snapshot with selected_graph=None;
-               resident_graphs=[];resident_scopes=[];
-               startup={manager.snapshot.startup with awaiting_selection=true;graph_generation=2}}} in
-             W.Session_context.emit(Option.get !worker_context) ~topic:Service.manager_topic(Service.Client_state_changed closed);
+             if completed then (
+               dispatch(Lui_protocol.Press(Option.get(find "text" "Switch graph")));
+               wait "Unknown Import graph exposes resident Close" (fun()->Option.is_some(find "accessibility-identifier"
+                 ("graph-resident-remove:" ^ G.Uuid.to_string scope.graph_id)));
+               dispatch(Lui_protocol.Press(Option.get(find "accessibility-identifier"
+                 ("graph-resident-remove:" ^ G.Uuid.to_string scope.graph_id))));
+               wait "retained Unknown source does not block actual host preparation" (fun()->Atomic.get host_closed);
+               wait "closed current resident leaves the shared picker model" (fun()->Option.is_none(find "accessibility-identifier"
+                 ("graph-resident-remove:" ^ G.Uuid.to_string scope.graph_id))))
+             else (
+               let closed={manager with snapshot={manager.snapshot with selected_graph=None;
+                 resident_graphs=[];resident_scopes=[];
+                 startup={manager.snapshot.startup with awaiting_selection=true;graph_generation=2}}} in
+               W.Session_context.emit(Option.get !worker_context) ~topic:Service.manager_topic(Service.Client_state_changed closed));
              for _=0 to 40 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
              if not completed then Alcotest.(check int) "retired graph import has not completed its source preparation" 0(Atomic.get imports_finished);
              Alcotest.(check bool) "closing graph retains a typed in-flight or Unknown import source" true
@@ -7214,6 +7271,7 @@ let test_picker_presence_native_patch_lifecycle () =
 
 let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
   let reordered=scenario=`Reordered_open || scenario=`Reordered_full in
+  let resident_scenario=scenario=`Current || scenario=`Remove || scenario=`Replace in
   let module W = Logseq_db_worker_lui.Journal_worker in
   let module P = Logseq_db_worker.Protocol in
   let uuid n = Logseq_db_types.Graph_types.Uuid.of_string
@@ -7228,10 +7286,10 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
   let manager : Service.state =
     { snapshot =
         { sync_phase = Current;
-          resident_graphs=(if reordered then [first] else if scenario=`Current then [first;second;uuid 3] else if scenario=`Retry_local || scenario=`Retry_graph_phase then [first;second] else []);
-          resident_scopes=(if reordered then [resident_scope first 1] else if scenario=`Current then [resident_scope first 1;resident_scope second 2;resident_scope (uuid 3) 3] else if scenario=`Retry_local || scenario=`Retry_graph_phase then [resident_scope first 1;resident_scope second 2] else []);
+          resident_graphs=(if reordered then [first] else if resident_scenario then [first;second;uuid 3] else if scenario=`Retry_local || scenario=`Retry_graph_phase then [first;second] else []);
+          resident_scopes=(if reordered then [resident_scope first 1] else if resident_scenario then [resident_scope first 1;resident_scope second 2;resident_scope (uuid 3) 3] else if scenario=`Retry_local || scenario=`Retry_graph_phase then [resident_scope first 1;resident_scope second 2] else []);
           catalog = [graph first "Current synthetic graph"; graph second long_name]
-            @ (if scenario=`Current then [graph (uuid 3) "Third synthetic graph";graph (uuid 4) "Fourth synthetic graph"] else [])
+            @ (if resident_scenario then [graph (uuid 3) "Third synthetic graph";graph (uuid 4) "Fourth synthetic graph"] else [])
         ; selected_graph = Some first; applied_server_t = Some (server_cursor_of_int 0)
         ; unlock = Logseq_sync_pure_reducer.Core.Unlock_inactive
         ; timeline_presentation_pending = false
@@ -7243,6 +7301,9 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
   let manager=fixture_with_scope manager in
   let coordination_registration=Atomic.make None and coordination_version=Atomic.make 1 in
   let current = Atomic.make manager and commands = Atomic.make [] in
+  let module H=Logseq_db_worker_pure_reducer.Core.Host_handoff in
+  let handoffs=ref(H.empty ~lifetime:(uuid 90000)) in
+  let host_prepared=Atomic.make 0 and host_applied=Atomic.make 0 in
   let recovery_writes=Atomic.make 0 in
   let recovery_entered=Atomic.make false and recovery_release=Atomic.make false and recovery_finished=Atomic.make false in
   let inspections = Atomic.make 0 and deletions = Atomic.make [] in
@@ -7285,7 +7346,42 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
         match (match request with Service.Client_command (Focus_resident_graph _) when check_recovery_focus -> request
           | Service.Client_command _ when scenario=`Retry_local || scenario=`Retry_graph_phase -> request | _ -> fixture_request request) with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_prepare_host_change plan ->
+          let baseline=fixture_coordination ~version:(Int64.of_int(Atomic.get coordination_version))
+            (Atomic.get current) plan.registration in
+          let scopes=Rrbvec.of_list(List.map fst baseline.baseline.state.sync.residents) in
+          let facts:H.facts={authenticated=baseline.baseline.state.sync.account<>None;
+            version=baseline.baseline.version;registration=Atomic.get coordination_registration;
+            account=baseline.baseline.state.sync.account;scopes;
+            catalog=Rrbvec.of_list(List.map(fun(g:Service.graph)->g.graph_id)(Atomic.get current).snapshot.catalog)} in
+          let request:H.request={version=plan.version;id=plan.id;registration=plan.registration;
+            owner=plan.owner;change=plan.change;expected=plan.expected;
+            captured=H.capture ~owner:plan.owner ~change:plan.change scopes} in
+          let next,admission=H.prepare !handoffs facts request in handoffs:=next;
+          (match admission with H.Start attempt->
+            handoffs:=H.settled !handoffs attempt ~copy_generation:None;
+            (match H.phase !handoffs plan.id with Some(H.Safe receipt)->
+              Atomic.incr host_prepared;Ok(Service.Coordination_host_prepared receipt)
+             |_->Error "Fixture host settlement refused")
+           |_->Error "Fixture host plan refused")
+        | Coordination_apply_host_change receipt ->
+          let request=H.receipt_request receipt in
+          let baseline=fixture_coordination ~version:(Int64.of_int(Atomic.get coordination_version))
+            (Atomic.get current) request.registration in
+          let facts:H.facts={authenticated=true;version=baseline.baseline.version;
+            registration=Atomic.get coordination_registration;account=baseline.baseline.state.sync.account;
+            scopes=Rrbvec.of_list(List.map fst baseline.baseline.state.sync.residents);
+            catalog=Rrbvec.of_list(List.map(fun(g:Service.graph)->g.graph_id)(Atomic.get current).snapshot.catalog)} in
+          let next,result=H.consume !handoffs facts receipt in handoffs:=next;
+          (match result with Ok(H.Close_graph graph_id)->
+            let previous=Atomic.get current in
+            publish{previous with snapshot={previous.snapshot with
+              resident_graphs=List.filter((<>)graph_id)previous.snapshot.resident_graphs;
+              resident_scopes=List.filter(fun(scope:Service.asset_scope)->scope.graph_id<>graph_id)previous.snapshot.resident_scopes}};
+            handoffs:=H.completed !handoffs receipt;Atomic.incr host_applied;
+            Ok(Service.Coordination_host_applied request.id)
+           |_->Error "Fixture only accepts an exact one-use Close permission")
+        | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration ->
           Atomic.set coordination_registration(Some registration);
           Ok(Service.Coordination_registered(fixture_coordination
@@ -7357,6 +7453,10 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
              while not(Atomic.get early_graph_observed) do Eio.Fiber.yield () done;
              publish {previous with snapshot={previous.snapshot with resident_graphs=ids;
                resident_scopes=[resident_scope first 1;resident_scope second 2]}}
+           | Configure_resident_graphs ids when scenario=`Replace ->
+             if Atomic.get host_applied<>1 then failwith "Replacement bypassed its old owner's permission";
+             publish{previous with snapshot={previous.snapshot with resident_graphs=ids;
+               resident_scopes=List.mapi(fun index id->resident_scope id (index+1))ids}}
            | Focus_resident_graph id when check_recovery_focus ->
              let scope=List.find(fun(scope:Service.asset_scope)->scope.graph_id=id)previous.snapshot.resident_scopes in
              publish {previous with snapshot={previous.snapshot with selected_graph=Some id;
@@ -7628,6 +7728,24 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
         Alcotest.(check int) "same viewport reuses presence observations" 2 (Atomic.get inspections);
         Alcotest.(check int) "presence does not reconstruct the graph catalog" before !root_renders
       | `Retry_local | `Retry_graph_phase -> ()
+      | `Replace ->
+        press(node("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string(uuid 4)));
+        wait "replacement slot choice is available" (fun()->Option.is_some(find "accessibility-identifier"
+          ("graph-resident-replace:" ^ Logseq_db_types.Graph_types.Uuid.to_string second)));
+        press(node("graph-resident-replace:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        wait "replacement closes original owner before selecting new graph" (fun()->
+          Atomic.get host_applied=1 && (Atomic.get current).snapshot.selected_graph=Some(uuid 4));
+        Alcotest.(check int) "replacement prepares exactly once" 1(Atomic.get host_prepared);
+        Alcotest.(check bool) "replacement preserves other slots" true
+          ((Atomic.get current).snapshot.resident_graphs=[first;uuid 4;uuid 3])
+      | `Remove ->
+        press(node("graph-resident-remove:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        wait "resident removal consumes typed permission" (fun()->Atomic.get host_applied=1);
+        Alcotest.(check int) "one actual prepare envelope" 1 (Atomic.get host_prepared);
+        Alcotest.(check bool) "other residents stay admitted" true
+          ((Atomic.get current).snapshot.resident_graphs=[first;uuid 3]);
+        Alcotest.(check bool) "typed removal has no second legacy configure" false
+          (List.exists(function Service.Configure_resident_graphs _->true|_->false)(Atomic.get commands))
       | `Current ->
         Alcotest.(check bool) "current marker stays in catalog row" true
           (Option.is_some (find "text" "Current graph"));
@@ -8204,6 +8322,8 @@ let () =
         Alcotest.test_case "offline deletion is disabled with explanation" `Quick (test_graph_picker_controls `Offline);
         Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);
         Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);
+        Alcotest.test_case "resident replacement closes old owner before new admission" `Quick (test_graph_picker_controls `Replace);
+        Alcotest.test_case "resident removal uses one-use host permission" `Quick (test_graph_picker_controls `Remove);
         Alcotest.test_case "resident picker keeps native patch references alive" `Quick (test_graph_picker_controls `Current);
         Alcotest.test_case "recovery completion returns to background resident" `Quick
           (test_graph_picker_controls ~check_recovery_focus:true `Current);

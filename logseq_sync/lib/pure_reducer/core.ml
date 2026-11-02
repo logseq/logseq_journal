@@ -4472,12 +4472,12 @@ let prune_sessions core =
        || session.saved_protected_pending<>[]
     then Some session
     else if session.saved_asset_known_scopes=[]
-      || session.saved_identity.account.account_generation<>core.public_state.snapshot.startup.account_generation
     then None
     else (
-      (* Retained native pages may release their admitted file leases after
-         the graph has closed. Keep only cleanup ownership and retirement
-         fences; the closed graph's snapshot, key and network state are gone. *)
+      (* Original native leases retain cleanup authority across graph/account
+         retirement. This tombstone cannot acquire/read: it has no live snapshot,
+         key, or execution owner. Keep it for idempotent release even after a
+         checked cache close, including a lost per-handle ACK. *)
       Some(cleanup_session core session))) core.resident_sessions}
 let step core event =
   match event with
@@ -4514,7 +4514,8 @@ let step core event =
     (* Account cleanup owns the old physical files. Already admitted requests
        must still receive their completion while their native owners retire. *)
     let cleanup=List.filter_map(fun session ->
-      if session.saved_assets_pending=[] && session.saved_protected_pending=[] then None
+      if session.saved_assets_pending=[] && session.saved_protected_pending=[]
+         && session.saved_asset_known_scopes=[] then None
       else Some(cleanup_session signed_out.next session)) closed in
     {next={signed_out.next with resident_order=[];resident_sessions=cleanup;
       public_state={signed_out.next.public_state with snapshot={signed_out.next.public_state.snapshot with resident_graphs=[]}}};

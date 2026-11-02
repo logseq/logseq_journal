@@ -2142,6 +2142,25 @@ let test_host_gate_keeps_other_graph_live () =
       (Core.graph_scopes reopened.next))
 ;;
 
+let test_revoked_account_keeps_hidden_cleanup_owner () =
+  let opened,_,second=resident_worker_fixture() in
+  let hidden=List.find(fun(scope:Sync.graph_scope)->scope.graph_id=second)(Core.graph_scopes opened) in
+  let revoked=Core.step opened(Sync_event(Sync.Account_authenticated{user_id=None})) in
+  let release scope operation=Core.step revoked.next(Sync_event(Sync.Asset_requested
+    {scope;operation;action=Release_asset_file "original-hidden-preview"})) in
+  let released=release hidden "revoked-hidden-release" in
+  Alcotest.(check bool) "old hidden owner retains cleanup-only IO authority after auth revocation" true
+    (List.exists(function Core.Run_sync(Sync.Asset_io(_,{context;action=Release_asset_file "original-hidden-preview";_}))->
+      context.scope=hidden|_->false)released.effects);
+  let forged=release {hidden with graph_generation=hidden.graph_generation+100} "foreign-hidden-release" in
+  Alcotest.(check bool) "revocation never creates implicit authority for an unknown execution" false
+    (List.exists(function Core.Run_sync(Sync.Asset_io _)->true|_->false)forged.effects);
+  let acquire=Core.step revoked.next(Sync_event(Sync.Asset_requested
+    {scope=hidden;operation="revoked-hidden-acquire";action=Retain_asset_file "original-hidden-preview"})) in
+  Alcotest.(check bool) "retaining cleanup ownership does not restore old data/acquisition authority" false
+    (List.exists(function Core.Run_sync(Sync.Asset_io _)->true|_->false)acquire.effects)
+;;
+
 let test_host_deletion_private_resource_owner () =
   let opened,first,_=resident_worker_fixture() in
   let owner=Option.get(Core.coordination_state opened).sync.account in
@@ -2342,7 +2361,7 @@ let () =
             `Quick
             test_asset_manual_retry_is_unlimited
         ] )
-    ; ( "host handoff",[Alcotest.test_case "private deletion resource owner" `Quick test_host_deletion_private_resource_owner; Alcotest.test_case "account gate blocks catalog producer" `Quick test_account_host_gate_blocks_new_catalog_producer; Alcotest.test_case "target gate preserves other execution" `Quick test_host_gate_keeps_other_graph_live; Alcotest.test_case "single-use and reopen witness" `Quick test_host_handoff_single_use_and_reopen; Alcotest.test_case "generated owner/late result traces" `Quick test_host_handoff_properties])
+    ; ( "host handoff",[Alcotest.test_case "revoked hidden resource cleanup owner" `Quick test_revoked_account_keeps_hidden_cleanup_owner; Alcotest.test_case "private deletion resource owner" `Quick test_host_deletion_private_resource_owner; Alcotest.test_case "account gate blocks catalog producer" `Quick test_account_host_gate_blocks_new_catalog_producer; Alcotest.test_case "target gate preserves other execution" `Quick test_host_gate_keeps_other_graph_live; Alcotest.test_case "single-use and reopen witness" `Quick test_host_handoff_single_use_and_reopen; Alcotest.test_case "generated owner/late result traces" `Quick test_host_handoff_properties])
     ; ( "writer fence",[Alcotest.test_case "only physical completion drains" `Quick test_writer_fence_physical_completion; Alcotest.test_case "generated scoped fence traces" `Quick test_writer_fence_properties])
     ; ( "typed demand registry",[Alcotest.test_case "generated owner retirement traces" `Quick test_demand_registry_properties; Alcotest.test_case "retirement and exact settlement" `Quick test_demand_registry_retirement_requires_physical_settlement])
     ; ( "orphan resource cleanup",[Alcotest.test_case "failed release and stale attempt ACK" `Quick test_orphan_cleanup_retains_failed_release])

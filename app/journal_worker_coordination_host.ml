@@ -13,6 +13,7 @@ type t =
   ; runner : Runner.t
   ; enqueue : (unit -> unit) -> unit
   ; watches : watch Rrbvec.t ref
+  ; host_watches : (Worker.handoff_id * (Worker.handoff_state -> unit))Rrbvec.t ref
   }
 
 let apply state runner transition =
@@ -36,6 +37,11 @@ let flush host =
             retained)
        Rrbvec.empty
        !(host.watches);
+  host.host_watches:=Rrbvec.fold_left(fun retained(id,callback as watch)->
+    match Core.handoff view id with
+    |Some(Worker.Safe_to_proceed _|Host_change_applied _|Handoff_failed _ as outcome)->
+      callbacks:=(fun()->callback outcome)::!callbacks;retained
+    |_->Rrbvec.push_back retained watch)Rrbvec.empty !(host.host_watches);
   List.iter host.enqueue (List.rev !callbacks)
 ;;
 
@@ -53,7 +59,7 @@ let create ~client ~client_id ~managed_origin ~user_id ~enqueue ~changed =
       changed view))
   |> Result.map (fun value ->
     runner := Some value;
-    let value = { state; runner = value; enqueue; watches = ref Rrbvec.empty } in
+    let value = { state; runner = value; enqueue; watches = ref Rrbvec.empty;host_watches=ref Rrbvec.empty } in
     host := Some value;
     value)
 ;;
@@ -154,3 +160,18 @@ let query_point host ~owner ~maximum_bytes command ~f =
     submit (Worker.Page { uuid = page; revision }) (fun value -> P.V2_page_outcome value)
   | _ -> Ok false
 ;;
+
+let prepare_host_change ?(legacy_pending=false) host change =
+  Core.prepare_host_change ~legacy_pending !(host.state) change
+  |> Result.map(fun(id,transition)->apply host.state host.runner transition;id)
+;;
+let authorize_host_change host receipt =
+  Core.authorize_host_change !(host.state) receipt
+  |> Result.map(fun transition->apply host.state host.runner transition)
+;;
+let watch_handoff host id ~f =
+  host.host_watches:=Rrbvec.push_back !(host.host_watches)(id,f);
+  host.enqueue(fun()->flush host)
+;;
+
+let host_change_blocks host ~owner=Core.host_change_blocks !(host.state) ~owner

@@ -95,3 +95,11 @@ val query_point
         -> (Logseq_db_worker.Protocol.v2_outcome, Worker.error) result
         -> unit)
   -> (bool, Worker.error) result
+
+(** Queued business outlets only. Exact plan/admission/cleanup/one-use decisions
+    remain in Core; the host supplies real legacy retirement facts through post. *)
+val prepare_host_change : ?legacy_pending:bool -> t -> Worker.host_change -> (Worker.handoff_id,Worker.error)result
+val authorize_host_change : t -> Worker.handoff_receipt -> (unit,Worker.error)result
+val watch_handoff : t -> Worker.handoff_id -> f:(Worker.handoff_state -> unit) -> unit
+
+val host_change_blocks : t -> owner:Runner.Service.timeline_scope -> bool

@@ -399,6 +399,51 @@ let test_new_host_source_proof_retires_only_identical_unknown () =
    event. The pure plan pins the original owner/version; no closure may retarget
    the host action at whatever happens to be latest. Physical settlement is
    proved by the real Service tests, not by this validation fixture. *)
+let test_host_prepare_waits_for_exact_legacy_owner () =
+  let issuer,raw,projection,session=fixture 9881L in
+  let module I=(val issuer:W.ISSUER) in
+  let initial=ready I.binding projection in
+  let id,waiting=C.prepare_host_change ~legacy_pending:true initial
+      (W.Graph_will_close(W.graph_id session)) |> Result.get_ok in
+  let sent transition=List.exists(function C.Quiesce _->true|_->false)transition.C.instructions in
+  check(not(sent waiting))"legacy retirement was skipped before actual Worker quiescence";
+  let owner:S.timeline_scope={startup={account_generation=(Option.get raw.baseline.state.sync.account).account_generation;
+    presentation_generation=1};graph_id=W.graph_id session;graph_generation=(List.hd raw.baseline.state.residents |> fst).graph_generation} in
+  check(C.host_change_blocks waiting.next ~owner)"legacy admission remained open during its join";
+  check(C.validate_session waiting.next session=Error W.Host_change_in_progress)
+    "waiting for legacy IO left ordinary admission open";
+  let wrong=C.step waiting.next(C.Legacy_handoff_completed
+    (W.handoff_id(uuid "98000000-0000-4000-8000-000000009999"),Ok())) in
+  check(not(sent wrong))"foreign legacy retirement ACK unlocked a new handoff";
+  let latest=match I.bootstrap(S.Coordination_registered{raw with baseline={raw.baseline with version=2L}}) |> Result.get_ok with
+    |W.Ready value->value|_->assert false in
+  let advanced=(C.step wrong.next(C.Projection_received latest)).next in
+  let released=C.step advanced(C.Legacy_handoff_completed(id,Ok())) in
+  let plan=List.find_map(function C.Quiesce plan->Some plan|_->None)released.instructions |> Option.get in
+  let request=match I.handoff_request plan |> Result.get_ok with S.Coordination_prepare_host_change value->value|_->assert false in
+  check(request.version=2L)"coordinator ignored the serialized metadata baseline while joining legacy IO";
+  check(W.matches_asset_scope session(Rrbvec.nth request.expected 0))"legacy join retargeted the execution owner";
+  let repeated=C.step released.next(C.Legacy_handoff_completed(id,Ok())) in
+  check(not(sent repeated))"duplicate legacy ACK sent another backend prepare";
+  let scope,physical=List.hd raw.baseline.state.residents in
+  let replacement={scope with graph_generation=scope.graph_generation+1} in
+  let replaced={raw with baseline={raw.baseline with version=3L;
+    state={residents=[replacement,{physical with generation=replacement.graph_generation}];
+      sync={raw.baseline.state.sync with selected=None;residents=List.map(fun(_,state)->replacement,
+        {state with Sync.snapshot={state.Sync.snapshot with startup={state.snapshot.startup with
+          graph_generation=replacement.graph_generation}}})raw.baseline.state.sync.residents}}}} in
+  let replaced=match I.bootstrap(S.Coordination_registered replaced) |> Result.get_ok with
+    |W.Ready value->value|_->assert false in
+  let changed=(C.step waiting.next(C.Projection_received replaced)).next in
+  let stale=C.step changed(C.Legacy_handoff_completed(id,Ok())) in
+  check(not(sent stale))"old legacy ACK retargeted preparation to a reopened execution";
+  check(match C.handoff(C.view stale.next)id with Some(W.Handoff_failed _)->true|_->false)
+    "execution replacement while joining did not revoke the original round";
+  let failed=C.step waiting.next(C.Legacy_handoff_completed(id,Error(W.Service_failed "cleanup failed"))) in
+  check(not(sent failed))"failed real cleanup was treated as an ACK";
+  check(C.host_change_blocks failed.next ~owner)"cleanup failure reopened legacy admission"
+;;
+
 let test_host_consumption_keeps_old_execution_retired () =
   let issuer,raw,projection,session=fixture 9873L in
   let module I=(val issuer:W.ISSUER) in
@@ -3961,9 +4006,15 @@ let test_host_handoff_properties () =
     match I.bootstrap(S.Coordination_registered raw) |> Result.get_ok with W.Ready value->value|_->assert false) in
   let run trace=
     let state=ref(ready I.binding projection) and preparations=ref [] and attempts=ref []
-      and receipts=ref [] and accepted=ref [] and rejected=ref [] and applied=ref [] and retired=ref [] in
+      and receipts=ref [] and accepted=ref [] and rejected=ref [] and applied=ref [] and retired=ref []
+      and legacy_waiting=ref [] in
     let consume instructions=List.iter(function
-      |C.Quiesce plan->let receipt=pure_host_receipt_fixture issuer plan in
+      |C.Quiesce plan->
+        check(not(List.exists(W.equal_handoff_id(W.handoff_plan_id plan))!legacy_waiting))
+          "backend prepare ran before the original legacy ACK";
+        check(not(List.exists(fun(id,_)->W.equal_handoff_id id(W.handoff_plan_id plan))!preparations))
+          "duplicate legacy event dispatched another prepare";
+        let receipt=pure_host_receipt_fixture issuer plan in
         preparations:=(W.handoff_plan_id plan,receipt)::!preparations;receipts:=receipt::!receipts
       |C.Consume_handoff(receipt,attempt)->
         let mailbox=Id.Worker.Request_id.of_int64(Int64.of_int(10000+List.length !attempts)) in
@@ -3975,30 +4026,35 @@ let test_host_handoff_properties () =
     List.iteri(fun index action->
       let before= !state and before_view=C.view !state in
       let old_facts=List.map(fun(id,_)->id,C.handoff before_view id)!preparations in
-      (match action mod 13 with
-       |0|1->(match C.prepare_host_change !state(W.Graph_will_close(W.graph_id session))with
-         |Error _->()|Ok(_,transition)->
+      (match action mod 15 with
+       |0|1->(match C.prepare_host_change ~legacy_pending:(action mod 15=1) !state(W.Graph_will_close(W.graph_id session))with
+         |Error _->()|Ok(id,transition)->
+           if action mod 15=1 then legacy_waiting:=id::!legacy_waiting;
            (match C.projection before_view with None->()|Some projection->
              retired:=List.map(fun resident->resident.W.session)(W.residents projection) @ !retired);
            state:=transition.next;consume transition.instructions)
-       |2->(match pick !preparations(action/13)with Some(id,receipt)->event(C.Handoff_completed(id,W.Safe_to_proceed receipt))|_->())
-       |3->(match pick !receipts(action/13)with Some receipt->
+       |2->(match pick !preparations(action/15)with Some(id,receipt)->event(C.Handoff_completed(id,W.Safe_to_proceed receipt))|_->())
+       |3->(match pick !receipts(action/15)with Some receipt->
          (match C.authorize_host_change !state receipt with Error _->()|Ok transition->state:=transition.next;consume transition.instructions)|_->())
-       |4->(match pick !attempts(action/13)with Some(id,attempt,_)->
+       |4->(match pick !attempts(action/15)with Some(id,attempt,_)->
          if not(List.exists(fun(_,actual,_)->equal_attempt actual attempt)!accepted)then rejected:=attempt::!rejected;
          event(C.Handoff_apply_not_admitted(id,attempt,W.Full))|_->())
        |5->event C.Capacity_available
-       |6->(match pick !attempts(action/13)with Some(id,attempt,mailbox)->
+       |6->(match pick !attempts(action/15)with Some(id,attempt,mailbox)->
          if not(List.exists(equal_attempt attempt)!rejected)then accepted:=(id,attempt,mailbox)::!accepted;
          event(C.Handoff_apply_admitted(id,attempt,mailbox))|_->())
-       |7->(match pick !attempts(action/13)with Some(id,attempt,mailbox)->event(C.Handoff_applied(id,attempt,mailbox,Ok()))|_->())
-       |8->event(C.Projection_received projections.((action/13)mod Array.length projections))
+       |7->(match pick !attempts(action/15)with Some(id,attempt,mailbox)->event(C.Handoff_applied(id,attempt,mailbox,Ok()))|_->())
+       |8->event(C.Projection_received projections.((action/15)mod Array.length projections))
        |9 when index>=List.length trace-8->event C.Shutdown_requested
-       |10->(match pick !attempts(action/13)with Some(id,attempt,_)->
+       |10->(match pick !attempts(action/15)with Some(id,attempt,_)->
          event(C.Handoff_applied(id,attempt,Id.Worker.Request_id.of_int64 999999L,Ok()))|_->())
-       |11->(match pick !receipts(action/13)with Some receipt when List.exists(W.equal_handoff_id(W.handoff_receipt_id receipt))!applied->
+       |11->(match pick !receipts(action/15)with Some receipt when List.exists(W.equal_handoff_id(W.handoff_receipt_id receipt))!applied->
          check(Result.is_error(C.authorize_host_change !state receipt))"applied permission planned another action"|_->())
        |12 when index>=List.length trace-4->event(C.Binding_invalidated I.binding)
+       |13->(match pick !legacy_waiting(action/15)with None->()|Some id->
+         legacy_waiting:=List.filter(fun actual->not(W.equal_handoff_id actual id))!legacy_waiting;
+         event(C.Legacy_handoff_completed(id,Ok())))
+       |14->event(C.Legacy_handoff_completed(W.handoff_id(uuid "98000000-0000-4000-8000-000000009999"),Ok()))
        |_->event C.Capacity_available);
       List.iter(fun(id,value)->check(C.handoff(C.view before)id=value)"handoff step mutated its prior immutable state")old_facts;
       List.iter(fun(id,_)->match C.handoff(C.view !state)id with
@@ -4012,12 +4068,12 @@ let test_host_handoff_properties () =
         |_->())!preparations;
       List.iter(fun session->check(Result.is_error(C.validate_session !state session))
         "retired original execution became eligible again")!retired)trace in
-  let prefixes=[[0;2;3;4;5;6;7];[0;2;3;7;6];[0;2;3;4;5;6;4;5;7];[0;8;2;3;6;7];[0;2;3;6;10;7]] in
+  let prefixes=[[1;13;2;3;6;7];[1;8;13;2;3;6;7];[0;2;3;4;5;6;7];[0;2;3;7;6];[0;2;3;4;5;6;4;5;7];[0;8;2;3;6;7];[0;2;3;6;10;7]] in
   let fails trace=try run trace;false with _->true in
   List.iter run prefixes;
   for seed=0 to 99 do
     let random=Random.State.make[|0x484F5354;seed|] in
-    let trace=List.nth prefixes(seed mod List.length prefixes) @ List.init 80(fun _->Random.State.int random 1300) in
+    let trace=List.nth prefixes(seed mod List.length prefixes) @ List.init 80(fun _->Random.State.int random 1500) in
     if fails trace then failwith(Printf.sprintf "host handoff seed=%d shrunk=[%s]" seed
       (String.concat ";"(List.map string_of_int(shrink fails trace))))
   done
@@ -4056,6 +4112,7 @@ let () =
   test_observation_full_batch_does_not_self_wake ();
   test_observation_focus_and_reopen_fences ();
   test_observation_retirement_capacity_resets_only_after_binding_ack ();
+  test_host_prepare_waits_for_exact_legacy_owner ();
   test_host_handoff_properties ();
   test_host_consumption_keeps_old_execution_retired ();
   test_host_plan_pins_original_authoritative_frame ();

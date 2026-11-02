@@ -235,6 +235,8 @@ type t =
   ; released : bool
   ; active_handoff : Worker.handoff_id option
   ; host_plan : Worker.handoff_plan option
+  ; host_legacy_pending : bool
+  ; host_quiesce_sent : bool
   ; host_candidate : Worker.handoff_receipt option
   ; host_consume_waiting : bool
   ; host_consume_attempt : Worker.request_id option
@@ -255,7 +257,7 @@ let initial ~client_id =
   ; release_pending = false
   ; released = false
   ; active_handoff = None
-  ; host_plan=None;host_candidate=None;host_consume_waiting=false;host_consume_attempt=None;host_consume_admitted=None;host_consume_early=None
+  ; host_plan=None;host_candidate=None;host_legacy_pending=false;host_quiesce_sent=false;host_consume_waiting=false;host_consume_attempt=None;host_consume_admitted=None;host_consume_early=None
   ; retired = Graphs.empty
   ; fenced = []
   ; facts =
@@ -602,6 +604,7 @@ type event =
   | Cancel : 'a ticket -> event
   | Forget : 'a ticket -> event
   | Release : 'a Worker.observation -> event
+  | Legacy_handoff_completed of Worker.handoff_id * (unit,Worker.error)result
   | Handoff_completed of Worker.handoff_id * Worker.handoff_state
   | Handoff_applied of Worker.handoff_id * Worker.request_id * Id.request_id * (unit,Worker.error)result
   | Handoff_apply_admitted of Worker.handoff_id * Worker.request_id * Id.request_id
@@ -650,6 +653,13 @@ let affected session = function
   | Worker.Account_will_change | Connection_will_stop -> true
   | Graph_will_close id | Graph_will_remove (id, _) ->
     Worker.Uuid.equal (Worker.graph_id session) id
+;;
+
+let host_change_blocks state ~owner =
+  Sessions.exists(fun session->Worker.matches_scope session owner)state.facts.retired_host_sessions
+  || Option.exists(fun projection->List.exists(fun(resident:Worker.resident)->
+       Worker.matches_scope resident.session owner && List.exists(affected resident.session)state.fenced)
+       (Worker.residents projection))state.facts.current
 ;;
 
 let validate_session ?owner state session =
@@ -2239,7 +2249,7 @@ let step_base state event =
       ; bootstrap_inflight = true
       ; bootstrap_mailbox = None
       ; active_handoff = None
-      ; host_plan=None;host_candidate=None;host_consume_waiting=false;host_consume_attempt=None;host_consume_admitted=None;host_consume_early=None
+      ; host_plan=None;host_candidate=None;host_legacy_pending=false;host_quiesce_sent=false;host_consume_waiting=false;host_consume_attempt=None;host_consume_admitted=None;host_consume_early=None
       ; retired = Graphs.empty
       ; fenced = []
       ; facts =
@@ -2499,8 +2509,16 @@ let step_base state event =
     (match ticket.query with
      | Operation (Worker.Observe _) -> forget_observation state ticket
      | _ -> cancel state ticket true)
+  |Legacy_handoff_completed(id,result) when Option.exists(Worker.equal_handoff_id id)state.active_handoff
+      && state.host_legacy_pending && not state.host_quiesce_sent->
+    (match result,handoff state.facts id with
+     |Ok(),Some(Worker.Quiescing _)->changed{state with host_legacy_pending=false}[]
+     |Error error,Some(Worker.Quiescing change)->changed{state with active_handoff=None;host_plan=None;host_candidate=None;host_legacy_pending=false;
+        facts={state.facts with handoffs=(id,Worker.Handoff_failed(change,error))::
+          List.filter(fun(old,_)->not(Worker.equal_handoff_id old id))state.facts.handoffs}}[]
+     |_->unchanged state)
   | Handoff_completed (id, outcome)
-    when Option.fold ~none:false ~some:(Worker.equal_handoff_id id)state.active_handoff->
+    when Option.fold ~none:false ~some:(Worker.equal_handoff_id id)state.active_handoff && state.host_quiesce_sent->
     (match state.host_plan,outcome with
      |Some plan,Worker.Safe_to_proceed receipt when Worker.valid_handoff_receipt plan receipt->
        changed{state with host_candidate=Some receipt}[]
@@ -2730,7 +2748,7 @@ let step_base state event =
        changed (retain_observed_value state value ~admitted:true ~cancelled:false) []
      | _ -> unchanged state)
   | Asset_received(notice,sequence)->retain_asset_notice state notice sequence
-  | Handoff_completed _ | Handoff_applied _ | Handoff_apply_admitted _ | Handoff_apply_rejected _ | Handoff_apply_not_admitted _ -> unchanged state
+  | Legacy_handoff_completed _ | Handoff_completed _ | Handoff_applied _ | Handoff_apply_admitted _ | Handoff_apply_rejected _ | Handoff_apply_not_admitted _ -> unchanged state
 ;;
 
 let plan_refresh ?(internal = false) (state : t) session handle =
@@ -2941,11 +2959,18 @@ let progress_host_handoff ?(capacity=false) transition =
           |Ok plan->
             let retired_host_sessions=Rrbvec.fold_left(fun values session->Sessions.add session values)
               state.facts.retired_host_sessions(host_sessions state change) in
-            changed{state with host_plan=Some plan;facts={state.facts with retired_host_sessions}}
-              (non_publications transition.instructions @ [Quiesce plan])
+            let sent=not state.host_legacy_pending in
+            changed{state with host_plan=Some plan;host_quiesce_sent=sent;facts={state.facts with retired_host_sessions}}
+              (non_publications transition.instructions @ if sent then [Quiesce plan] else [])
           |Error error->changed{state with active_handoff=None;
              facts={state.facts with handoffs=(id,Worker.Handoff_failed(change,error))::
                List.filter(fun(old,_)->not(Worker.equal_handoff_id old id))state.facts.handoffs}}(non_publications transition.instructions)))
+    |Some(Worker.Quiescing change),Some plan,_ when not state.host_quiesce_sent && not state.host_legacy_pending->
+      (match state.facts.current with None->transition|Some projection->
+        match Worker.host_change_plan projection ~handoff_id:id ~change ~sessions:(Worker.handoff_plan_sessions plan) with
+        |Error error->fail change error
+        |Ok plan->changed{state with host_plan=Some plan;host_quiesce_sent=true}
+          (non_publications transition.instructions @ [Quiesce plan]))
     |Some(Worker.Quiescing change),Some plan,Some receipt when Worker.valid_handoff_receipt plan receipt
        && Option.exists(Worker.valid_handoff_projection plan)state.facts.current->
       let pending=Observation_ids.exists(fun _ (Observing value)->affected value.obs_session change)state.facts.observations
@@ -3610,7 +3635,7 @@ let plan_query_internal
     Ok (ticket, dispatch_waiting ~publish:true { state with next = serial; facts } []))
 ;;
 
-let prepare_host_change state change =
+let prepare_host_change ?(legacy_pending=false) state change =
   if state.active_handoff <> None
   then Error Worker.Host_change_in_progress
   else if state.binding = None || state.lifecycle <> Running
@@ -3644,6 +3669,8 @@ let prepare_host_change state change =
                next = serial
              ; facts
              ; active_handoff = Some id
+             ; host_plan=None;host_candidate=None;host_legacy_pending=legacy_pending;host_quiesce_sent=false
+             ; host_consume_attempt=None;host_consume_admitted=None;host_consume_early=None;host_consume_waiting=false
              ; fenced = change :: state.fenced
              }
              cancels)))))

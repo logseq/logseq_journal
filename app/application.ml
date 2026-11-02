@@ -3316,13 +3316,16 @@ let start
   let active_runtime = ref None in
   let owner_key (owner:Graph_service.timeline_scope) =
     string_of_int owner.startup.account_generation ^ ":" ^ Logseq_db_types.Graph_types.Uuid.to_string owner.graph_id ^ ":" ^ string_of_int owner.graph_generation in
+  let coordination_owner_allowed=ref(fun (_:Graph_service.timeline_scope)->true) in
+  let runtime_owner_is_live state owner=
+    runtime_owner_is_live state owner && !coordination_owner_allowed owner in
   let model_key state = Option.map (fun owner -> owner_key owner) (timeline_scope state) in
   let snapshot_cells () = List.map (fun (save,_) -> save ()) !graph_cells in
   let save_runtime () = Option.iter (fun key ->
     match Hashtbl.find_opt retired_runtimes key with
     | Some(owner,_) -> Hashtbl.replace retired_runtimes key (owner,snapshot_cells ())
     | None -> Hashtbl.replace runtime_sessions key (snapshot_cells ())) !active_runtime in
-  let activate_runtime owner =
+  let activate_runtime owner = if !coordination_owner_allowed owner then (
     let key=owner_key owner in
     Hashtbl.replace runtime_owners key owner;
     if !active_runtime=None && !state_ref.graph_state.graph_id=Some owner.graph_id
@@ -3333,7 +3336,7 @@ let start
       (match Hashtbl.find_opt runtime_sessions key with
        | Some restore -> List.iter (fun restore -> restore ()) restore
        | None -> List.iter (fun (_,reset)->reset ()) !graph_cells);
-      active_runtime:=Some key) in
+      active_runtime:=Some key)) in
   let current_owner () = match !processing_owner with Some _ as owner->owner | None->timeline_scope !state_ref in
   let run_owned owner build = match owner with
     | None -> Effect.run (build ())
@@ -3404,6 +3407,8 @@ let start
   let all_coordination_hosts () = match !coordination_host with
     | None-> !retired_coordination_hosts
     | Some(_,host)->Rrbvec.push_back !retired_coordination_hosts host in
+  coordination_owner_allowed:=(fun owner->
+    not(Rrbvec.exists(fun host->Coordination_host.host_change_blocks host ~owner)(all_coordination_hosts())));
   let prune_retired_coordination_hosts () =
     retired_coordination_hosts:=Rrbvec.filter(fun host->
       Coordination.shutdown_state(Coordination_host.view host)<>Coordination.Stopped
@@ -3563,7 +3568,12 @@ let start
         request,Some(timeline_owner_of_scope scope)
       | _,Client_command (Acknowledge_timeline_presented scope | Begin_online_recovery scope) -> request,Some scope
       | _,request -> request,None in
-    let result=Journal_worker_admission.dispatch worker_admission ?observe_projection targeted in
+    let cleanup=match targeted with
+      |Graph_service.Release_asset_file _|Asset_command_at(_,Release_asset_demand _)
+      |Asset_command{command=Release_asset_demand _;_}->true|_->false in
+    let result=if not cleanup && Option.exists(fun owner->not(!coordination_owner_allowed owner))owner
+      then Worker.Not_ready
+      else Journal_worker_admission.dispatch worker_admission ?observe_projection targeted in
     (match result,owner with Worker.Accepted id,Some owner ->
       Hashtbl.replace worker_owners id owner;
       (match targeted with
@@ -5005,18 +5015,64 @@ let start
       Hashtbl.remove pending_graph_pushes key) retired;
     List.iter(fun restore->restore ()) restore;active_runtime:=active;processing_owner:=previous
   in
+  let retired_runtime_io=ref Rrbvec.empty in
   let drain_retired_runtimes () =
+    retired_runtime_io:=Rrbvec.empty;
     let current=snapshot_cells () and active= !active_runtime and previous= !processing_owner in
     Hashtbl.to_seq retired_runtimes |> List.of_seq |> List.iter(fun(key,(owner,restore))->
       List.iter(fun restore->restore ()) restore;active_runtime:=Some key;processing_owner:=Some owner;
       Journal_media_runtime.pump (!media_runtime_cell);Journal_asset_runtime.pump (!asset_runtime_cell);
       save_runtime ();
-      if not(Hashtbl.to_seq_values worker_owners |> Seq.exists(fun scope->owner_key scope=key))
-         && Journal_media_runtime.idle (!media_runtime_cell) && Journal_asset_runtime.idle (!asset_runtime_cell)
-         && not(import_sources_pending owner) then (
+      let io_pending=(Hashtbl.to_seq_values worker_owners |> Seq.exists(fun scope->owner_key scope=key))
+        || not(Journal_media_runtime.idle (!media_runtime_cell))
+        || not(Journal_asset_runtime.idle (!asset_runtime_cell)) in
+      if io_pending then retired_runtime_io:=Rrbvec.push_back !retired_runtime_io owner;
+      (* Unknown input keeps its cells/source pin, but a source pin alone is not
+         physical I/O. The backend still joins actual staging/writes/callbacks. *)
+      if not io_pending && not(import_sources_pending owner) then (
         release_runtime_staging ();Hashtbl.remove retired_runtimes key));
     List.iter(fun restore->restore ()) current;active_runtime:=active;processing_owner:=previous
   in
+  (* Only real legacy handle ownership is tracked here. The pure coordinator
+     decides admission, snapshot validity, one-use consumption and failure. *)
+  let legacy_host_joins=ref Rrbvec.empty in
+  let progress_legacy_host_joins () =
+    retire_absent_runtimes !state_ref;
+    drain_retired_runtimes();
+    legacy_host_joins:=Rrbvec.filter(fun(host,id)->
+      let blocked owner=Coordination_host.host_change_blocks host ~owner in
+      let pending=(Hashtbl.to_seq_values runtime_owners |> Seq.exists blocked)
+        || Rrbvec.exists blocked !retired_runtime_io
+        || (Hashtbl.to_seq_values worker_owners |> Seq.exists blocked) in
+      if pending || Coordination.projection(Coordination_host.view host)=None then true
+      else (Coordination_host.post host(Coordination.Legacy_handoff_completed(id,Ok()));false))!legacy_host_joins in
+  let set_root_state_and_effect transition : unit Effect.t = fun()->send_action(Update transition) in
+  let set_root_state transition : unit Effect.t =
+    set_root_state_and_effect(fun state->transition state,Effect.ignore) in
+  let begin_host_change change ~f = Effect.of_thunk(fun()->
+    match ensure_coordination() with
+    |Error message->Effect.run(f(Error(Wc.Service_failed message)))
+    |Ok host->
+      let account=(startup_scope !state_ref).account_generation in
+      Journal_pump.enqueue pump(fun()->
+        let current()=(startup_scope !state_ref).account_generation=account
+          && Option.exists(fun(_,active)->active==host)!coordination_host in
+        let finish result=if current()then Effect.run(f result) in
+        if not(current())then () else
+        match Coordination_host.prepare_host_change ~legacy_pending:true host change with
+        |Error error->finish(Error error)
+        |Ok id->
+          legacy_host_joins:=Rrbvec.push_back !legacy_host_joins(host,id);
+          let rec watch outcome=match outcome with
+            |Wc.Safe_to_proceed receipt->
+              (match Coordination_host.authorize_host_change host receipt with
+               |Error error->finish(Error error)
+               |Ok()->Coordination_host.watch_handoff host id ~f:watch)
+            |Wc.Host_change_applied _->finish(Ok())
+            |Wc.Handoff_failed(_,error)->finish(Error error)
+            |Wc.Quiescing _|Wc.Applying_host_change _->() in
+          Coordination_host.watch_handoff host id ~f:watch;
+          progress_legacy_host_joins())) in
   let sign_out_in_flight = ref false in
   let finish_termination () =
     let legacy_ready=local_deletion_active !state_ref || Option.fold ~none:false
@@ -5027,7 +5083,7 @@ let start
       platform_request Journal_platform.termination_ready_request ~f:(fun _->Effect.ignore))
     else Effect.ignore in
   coordination_lifecycle_changed:=(fun()->
-    drain_retired_runtimes();prune_retired_coordination_hosts();
+    progress_legacy_host_joins();prune_retired_coordination_hosts();
     Effect.run(finish_termination()));
   let apply_manager_transition set_state set_state_and_effect manager_state =
     let manager = manager_state.Graph_service.snapshot in
@@ -5440,7 +5496,12 @@ let start
     | Worker.Push { payload = Graph_state_changed graph_state; _ } ->
       observe_graph_state set_state set_state_and_effect graph_state
     | Worker.Push { payload = Client_state_changed manager_state; _ } ->
-      apply_manager_transition set_state set_state_and_effect manager_state
+      (* Global membership/auth facts must reach the shared model even when the
+         previously focused execution is already retired. Session_states still
+         enter under their explicit business owner. *)
+      (match !processing_owner with
+       |None->apply_manager_transition set_root_state set_root_state_and_effect manager_state
+       |Some _->apply_manager_transition set_state set_state_and_effect manager_state)
     | Worker.Push { payload = Need_id_token challenge; _ } ->
       platform_request (Journal_platform.id_token_request challenge) ~f:(fun response ->
         let answer =
@@ -6492,10 +6553,13 @@ let start
       landed_owner:=None;preview_owner:=None;update(fun state->{state with graph_preview=None})
     | Cancel_resident_replacement -> update (fun state->{state with resident_replacement=None})
     | Remove_resident value ->
-      let ids=Option.fold ~none:[] ~some:(fun (m:Graph_service.snapshot)->
-        if m.resident_graphs=[] then Option.to_list m.selected_graph else m.resident_graphs) snapshot.manager in
-      let kept=List.filter (fun id->Logseq_db_types.Graph_types.Uuid.to_string id<>value) ids in
-      send_manager (Graph_service.Configure_resident_graphs kept)
+      (match Wc.Uuid.of_string value with
+       |Error _->Effect.ignore
+       |Ok graph->
+         Effect.bind(set_root_state(fun state->{state with local_copy_message=Some "Closing graph…"}))
+           ~f:(fun()->begin_host_change(Wc.Graph_will_close graph) ~f:(fun result->
+             set_root_state(fun state->{state with local_copy_message=
+               match result with Ok()->None|Error error->Some(coordinated_error_message error)}))))
     | Move_resident (index,direction) ->
       let ids=Option.fold ~none:[] ~some:(fun (m:Graph_service.snapshot)->m.resident_graphs) snapshot.manager in
       let target=index+direction in
@@ -6503,17 +6567,34 @@ let start
       let moved=List.mapi (fun i id-> if i=index then List.nth ids target else if i=target then List.nth ids index else id) ids in
       send_manager (Graph_service.Configure_resident_graphs moved)
     | Replace_resident previous ->
-      (match snapshot.resident_replacement with
-       | None->Effect.ignore
-       | Some replacement ->
-         let ids=Option.fold ~none:[] ~some:(fun (m:Graph_service.snapshot)->m.resident_graphs) snapshot.manager in
-         match Logseq_db_types.Graph_types.Uuid.of_string replacement with
-         | Error _->Effect.ignore
-         | Ok graph_id ->
-           let ids=List.map (fun id->if Logseq_db_types.Graph_types.Uuid.to_string id=previous then graph_id else id) ids in
-           Effect.bind (update (fun state->{state with resident_replacement=None;graph_picker_open=false})) ~f:(fun ()->
-             Effect.bind (send_manager (Graph_service.Configure_resident_graphs ids))
-               ~f:(fun ()->send_manager (Graph_service.Focus_resident_graph graph_id))))
+      (match snapshot.resident_replacement,Wc.Uuid.of_string previous with
+       |Some replacement,Ok old_graph->
+         (match Wc.Uuid.of_string replacement with
+          |Error _->Effect.ignore
+          |Ok graph_id->
+            let original=Option.fold ~none:[] ~some:(fun(m:Graph_service.snapshot)->m.resident_graphs)snapshot.manager in
+            let index=List.find_index((=)old_graph)original |> Option.value ~default:0 in
+            Effect.bind(set_root_state(fun state->{state with local_copy_message=Some "Closing graph…"}))
+              ~f:(fun()->begin_host_change(Wc.Graph_will_close old_graph) ~f:(function
+                |Error error->set_root_state(fun state->{state with local_copy_message=Some(coordinated_error_message error)})
+                |Ok()->
+                  let current= !state_ref in
+                  if current.resident_replacement<>Some replacement then Effect.ignore else
+                  let kept=Option.fold ~none:[] ~some:(fun(m:Graph_service.snapshot)->
+                    List.filter((<>)old_graph)m.resident_graphs)current.manager in
+                  if List.length kept>=3 && not(List.mem graph_id kept) then
+                    set_root_state(fun state->{state with local_copy_message=Some "Graph slots changed. Choose a slot again."})
+                  else
+                    let rec insert index = function
+                      |rest when index=0->graph_id::rest
+                      |[]->[graph_id]
+                      |head::rest->head::insert(index-1)rest in
+                    let ids=if List.mem graph_id kept then kept else insert index kept in
+                    Effect.bind(set_root_state(fun state->{state with resident_replacement=None;
+                      graph_picker_open=false;local_copy_message=None})) ~f:(fun()->
+                      Effect.bind(send_manager(Graph_service.Configure_resident_graphs ids))
+                        ~f:(fun()->send_manager(Graph_service.Focus_resident_graph graph_id))))))
+       |_->Effect.ignore)
     | Select_graph value ->
       (match Logseq_db_types.Graph_types.Uuid.of_string value with
        | Error _->Effect.ignore
@@ -8168,13 +8249,13 @@ let start
       | Dropped_envelope -> ()
       | Unowned_response ->
         (* A response owned elsewhere can still free shared queue capacity. *)
-        drain_retired_runtimes ();
+        progress_legacy_host_joins ();
         Journal_asset_runtime.pump (!asset_runtime_cell);
         sync_media !state_ref;
         Journal_media_runtime.pump (!media_runtime_cell);
         Effect.run (Effect.bind (Effect.bind (drain_startup_commands ()) ~f:drain_focus_refresh) ~f:finish_termination)
       | Registered_response | Broadcast ->
-      drain_retired_runtimes ();
+      progress_legacy_host_joins ();
       let deliver event=Effect.bind
         (Effect.bind (handle_worker_event event) ~f:drain_startup_commands)
         ~f:(fun()->Effect.bind(flush_media set_state) ~f:(fun()->
@@ -8225,7 +8306,8 @@ let start
               | _->push in
             Hashtbl.replace pending_graph_pushes key (scope,push,
               fun push->deliver(Worker.Push{envelope with payload=Graph_service.Graph_push push})))) pushes
-      | _ -> Effect.run (deliver event)));
+      | _ -> Effect.run (deliver event));
+      progress_legacy_host_joins());
 
   (* The worker fires the wakeup on its own domain whenever output lands;
      enqueueing hops through the host wakeup onto the UI thread. An OCaml

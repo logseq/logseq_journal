@@ -48,6 +48,10 @@ val reply : view -> 'a ticket -> 'a Worker.reply option
     owner or later projection may stand in for the session/budget actually sent. *)
 val query_origin : view -> 'a ticket -> (Worker.session * Worker.read_budget) option
 
+(** Legacy UI/runtime producers consult the same pure retirement decision before
+    creating work. This grants no physical cleanup or host-action permission. *)
+val host_change_blocks : t -> owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope -> bool
+
 (** Reuse the coordinator's current Open-session and host-handoff fences before
     presenting buffered read data. A supplied business owner must exactly match
     the session's account/graph generations and graph UUID. This is a pure local
@@ -140,6 +144,7 @@ type event =
   | Cancel : 'a ticket -> event
   | Forget : 'a ticket -> event
   | Release : 'a Worker.observation -> event
+  | Legacy_handoff_completed of Worker.handoff_id * (unit,Worker.error)result
   | Handoff_completed of Worker.handoff_id * Worker.handoff_state
   | Handoff_applied of Worker.handoff_id * Worker.request_id * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id * (unit,Worker.error)result
   | Handoff_apply_admitted of Worker.handoff_id * Worker.request_id * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id
@@ -257,7 +262,13 @@ val plan_query_when_available
   -> 'a Worker.query
   -> ('a ticket * transition, Worker.error) result
 
-(** Return the exact correlation ID to the host. Overlap returns
+(** With legacy_pending the ordinary admission/presentation fence is immediate,
+    while Quiesce waits for the exact Legacy_handoff_completed ACK. The pure owner
+    pins execution identity while waiting, then chooses the serialized current
+    baseline version only if that original owner remains valid. A stale ACK cannot
+    unlock a later round. No effect-runner closure chooses the target.
+
+    Return the exact correlation ID to the host. Overlap returns
     Host_change_in_progress without replacing the active handoff/cleanup ledger.
     Retry allocates a new ID; late prior ACKs cannot complete it. Applying the
     returned transition is serialized with request and step. Outcome queries use
@@ -268,7 +279,8 @@ val plan_query_when_available
     owner or unprovable identity stays pending or fails explicitly, never fake Safe.
     Host ordinary deletion/auth/catalog/confirmation policies still apply. *)
 val prepare_host_change
-  :  t
+  :  ?legacy_pending:bool
+  -> t
   -> Worker.host_change
   -> (Worker.handoff_id * transition, Worker.error) result
 

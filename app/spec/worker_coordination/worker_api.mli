@@ -726,6 +726,7 @@ val host_change_plan : projection -> handoff_id:handoff_id -> change:host_change
 val handoff_plan_id : handoff_plan -> handoff_id
 val handoff_plan_change : handoff_plan -> host_change
 val handoff_plan_binding : handoff_plan -> binding
+val handoff_plan_sessions : handoff_plan -> session Rrbvec.t
 
 type handoff_receipt
 val valid_handoff_receipt : handoff_plan -> handoff_receipt -> bool

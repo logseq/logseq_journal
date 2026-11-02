@@ -1023,6 +1023,7 @@ let host_change_plan (projection:projection) ~handoff_id ~change ~sessions =
 let handoff_plan_id plan=plan.plan_wire.id
 let handoff_plan_change plan=plan.plan_change
 let handoff_plan_binding plan=plan.plan_binding
+let handoff_plan_sessions plan=plan.plan_sessions
 let handoff_receipt_id receipt=receipt.host_plan.plan_wire.id
 let handoff_binding receipt=receipt.host_plan.plan_binding
 let handoff_sessions receipt=receipt.host_plan.plan_sessions
