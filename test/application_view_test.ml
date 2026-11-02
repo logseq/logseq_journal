@@ -539,6 +539,8 @@ let run_favorites_native_visibility
       ?status_scenario
       ?durable_status
       ?delete_scenario
+      ?(check_durable_delete=false)
+      ?durable_delete
       ?(on_initialized = fun () -> ())
       ?media_rows
       ?(shared_media = false)
@@ -565,6 +567,7 @@ let run_favorites_native_visibility
        | Some (("now" | "waiting" | "later") as value) -> Some value
     | Some _ -> Some "doing"
     | None -> None) in
+  let durable_case=match durable_status with Some _->durable_status|None->durable_delete in
   let delete_writes = Atomic.make 0 in
   let delete_release = Atomic.make false in
   let delete_notices = ref 0 in
@@ -574,7 +577,7 @@ let run_favorites_native_visibility
   let status_summary_queries=Atomic.make 0 in
   let status_more_entered=Atomic.make false and status_more_release=Atomic.make(durable_status<>Some `Paged) in
   let status_confirm_entered=Atomic.make false in
-  let status_confirm_release=Atomic.make(durable_status<>Some `Held) in
+  let status_confirm_release=Atomic.make(durable_case<>Some `Held) in
   let status_revision () = if Atomic.get status_writes = [] then "root" else "status-updated" in
   let status_release = Atomic.make (status_scenario <> Some "duplicate") in
   let graph_generation = Atomic.make 1 in
@@ -865,7 +868,7 @@ let run_favorites_native_visibility
       ~push_topic_count:8
       ~merge_push:Service.coalesce_push
       ~concurrency:
-        (if check_capture_imports || Option.is_some detail_capture || check_media_change_ack || Option.is_some asset_change || Option.is_some durable_status
+        (if check_capture_imports || Option.is_some detail_capture || check_media_change_ack || Option.is_some asset_change || Option.is_some durable_case
          then Concurrent { max_in_flight = 2 }
          else Serial)
       ~init:(fun context _ ->
@@ -889,7 +892,7 @@ let run_favorites_native_visibility
          | Coordination_query{request={command=P.V2_get_outline_block_summary _;_};_}->Atomic.incr status_summary_queries
          | _->());
         if (match request with Service.Coordination_acknowledge_mutation _->
-          (durable_status=Some `Ack_failed || durable_status=Some `Reconfirm_failed) && Atomic.get typed_status_acks=1|_->false)
+          (durable_case=Some `Ack_failed || durable_case=Some `Reconfirm_failed) && Atomic.get typed_status_acks=1|_->false)
         then Error "Fixture acknowledgement failed after UI application" else
         let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
         let cached=match request with
@@ -1179,14 +1182,16 @@ let run_favorites_native_visibility
               Alcotest.(check string) "delete keeps target UUID"
                 (G.Uuid.to_string (uuid 1)) (G.Uuid.to_string root);
               Alcotest.(check (list (pair string string))) "delete preserves revision preconditions"
-                [ G.Uuid.to_string root, "root" ]
+                [ G.Uuid.to_string root, (if durable_delete=Some `Conflict && Atomic.get typed_status_mutations>1
+                  then "canonical-current" else "root") ]
                 (List.map (fun (id, revision) -> G.Uuid.to_string id, revision) preconditions.blocks);
               Atomic.incr delete_writes;
               while not (Atomic.get delete_release) do
                 Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
               done;
               if delete_scenario = Some "failure" then
-                P.V2_failed { code = Logseq_db_worker.Error.code_string Invalid_request; message = "Fixture delete failed" }
+                P.V2_failed { code = Logseq_db_worker.Error.code_string
+                  (if durable_delete=Some `Conflict then Conflict else Invalid_request); message = "Fixture delete failed" }
               else P.V2_mutation_committed { mutation_id; status = V2_applied; generation = "g"
                 ; before_projection_revision = "p"; after_projection_revision = "p2" }
             | V2_set_task_status { mutation_id; block; status; _ } when Option.is_some status_scenario ->
@@ -1299,6 +1304,16 @@ let run_favorites_native_visibility
                     | Some n ->
                       V2_present_block { value = timeline_block n; revision = status_revision () }
                     | None -> V2_missing_block { uuid = block; revision = "p" }))
+            | V2_get_outline_block_summary{block;_} when Option.is_some delete_scenario ->
+              let present=durable_delete=Some `Conflict || durable_delete=Some `Reappeared in
+              let value=timeline_block 0 in
+              let value=if durable_delete=Some `Reappeared then
+                {value with block={value.block with title="Reappeared after deletion"}} else value in
+              V2_block_summary_outcome{lookup=(if present then V2_present_block{value;revision="canonical-current"}
+                else V2_missing_block{uuid=block;revision="deleted"});
+                page=(if present then Some(V2_present_page{page;revision="p"}) else None);items=[];
+                next_cursor=None;scope_revision="children";generation="generation:v1:1:1";
+                projection_revision=(if durable_delete=Some `Reappeared then "projection:v1:2" else "projection:v1:1")}
             | V2_get_outline_block_summary { block; cursor; _ } when Option.is_some status_scenario ->
               let paged=durable_status=Some `Paged in
               if paged && Option.is_some cursor then (
@@ -1626,9 +1641,9 @@ let run_favorites_native_visibility
                       before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"}})
                 | _->Wire.Rejected response in
               Hashtbl.replace durable_outcomes intent outcome;
-              Service.Coordination_mutation_result{request_id;outcome=(if durable_status=Some `Unknown
+              Service.Coordination_mutation_result{request_id;outcome=(if durable_case=Some `Unknown
                 && Atomic.get typed_status_mutations=1 then Wire.Unknown else outcome)}
-            | Coordination_confirm _ when (durable_status=Some `Confirm_failed && Atomic.get typed_status_confirms=1)
+            | Coordination_confirm _ when (durable_case=Some `Confirm_failed && Atomic.get typed_status_confirms=1)
               || (durable_status=Some `Reconfirm_failed && Atomic.get typed_status_confirms=2) ->
               Service.Graph_response(P.V2_response{api_version=2;request_id=request.request_id;
                 outcome=V2_failed{code="invalidRequest";message="Fixture canonical read failed"}})
@@ -2051,21 +2066,55 @@ let run_favorites_native_visibility
          send_delete ();
          Alcotest.(check int) "repeated pending row action sends once" 1 (Atomic.get delete_writes);
          Atomic.set delete_release true;
+         (match durable_delete with
+          | Some `Held->
+            wait "delete Confirm is held" (fun()->Atomic.get status_confirm_entered);
+            for _=1 to 50 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+            Alcotest.(check bool) "unconfirmed deletion retains content" true(Option.is_some(find "text" "Timeline fixture 0"));
+            Alcotest.(check int) "unconfirmed deletion cannot ACK" 0(Atomic.get typed_status_acks);
+            Atomic.set status_confirm_release true
+          | Some(`Unknown|`Confirm_failed|`Ack_failed)->
+            wait "unsettled deletion exposes same-intent Retry" (fun()->Option.is_some(find "accessibility-label" "Retry delete"));
+            Alcotest.(check bool) "unknown accepted deletion is not called failed" true(Option.is_none(find "text" "Delete failed"));
+            Alcotest.(check int) "unsettled deletion has no completed ACK"
+              (if durable_delete=Some `Ack_failed then 1 else 0)(Atomic.get typed_status_acks);
+            dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Retry delete")))
+          | _->());
          wait "delete completion updates content or shows failure" (fun () ->
            if scenario = "failure" then Option.is_some (find "text" "Delete failed")
            else Option.is_none (find "text" "Timeline fixture 0"));
          Alcotest.(check bool) "failure preserves block; success removes it" (scenario = "failure")
            (Option.is_some (find "text" "Timeline fixture 0"));
          Alcotest.(check int) "completion cannot leave an Undo notice" 0 !delete_notices;
+         if check_durable_delete then (
+           wait "delete UI settles through typed durable ACK" (fun()->Atomic.get typed_status_acks=
+             (if durable_delete=Some `Ack_failed then 2 else 1));
+           Alcotest.(check int) "delete retry keeps immutable mutation"
+             (if durable_delete=Some `Unknown then 2 else 1)(Atomic.get typed_status_mutations);
+           Alcotest.(check int) "delete confirms actual absence before settlement"
+             (if scenario="failure" then 0 else if durable_delete=Some `Confirm_failed then 2 else 1)(Atomic.get typed_status_confirms);
+           if durable_delete=Some `Conflict then Alcotest.(check int)
+             "rejected deletion reads current canonical target without another Mutate" 1(Atomic.get status_summary_queries);
+           let intents=Atomic.get typed_status_intents in
+           Alcotest.(check bool) "delete attempts preserve complete immutable intent" true
+             (intents<>[] && List.for_all((=)(List.hd intents))intents));
          if scenario = "failure" then (
            dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Details")));
            wait "failure details explain recovery" (fun () ->
              Option.is_some (find "text" "The block is kept. Review it before trying Delete again."));
            Alcotest.(check bool) "failure includes worker reason" true
-             (Option.is_some (find "text" "Fixture delete failed"));
+             (Option.is_some(find "text" (if durable_delete=Some `Conflict
+               then "The block changed elsewhere. Delete was not applied." else "Fixture delete failed")));
            dispatch (Lui_protocol.Press (Option.get (find "accessibility-identifier" "journal-error-info-close")));
            send_delete ();
-           wait "failure releases admission for explicit retry" (fun () -> Atomic.get delete_writes = 2))
+           wait "failure releases admission after durable settlement for explicit retry" (fun () ->
+             if Atomic.get delete_writes<2 then send_delete();Atomic.get delete_writes = 2))
+         else if durable_delete=Some `Reappeared then (
+           wait "new canonical block is preserved after committed deletion" (fun()->
+             Option.is_some(find "text" "Reappeared after deletion"));
+           Alcotest.(check bool) "committed deletion is not reported as unapplied" true
+             (Option.is_some(find "text" "Block changed after deletion"));
+           Alcotest.(check int) "current block was not destructively replayed" 1(Atomic.get delete_writes))
          else (
            send_delete ();
            Alcotest.(check int) "deleted identity cannot submit again" 1 (Atomic.get delete_writes))) delete_scenario;
@@ -7780,6 +7829,22 @@ let () =
     ; ( "direct delete", List.map (fun scenario ->
         Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~delete_scenario:scenario ()))
         ["success"; "failure"])
+    ; ("durable delete UI",[Alcotest.test_case "committed deletion confirms absence and ACKs" `Quick(fun()->
+        run_favorites_native_visibility ~delete_scenario:"success" ~check_durable_delete:true());
+      Alcotest.test_case "known deletion rejection is applied before ACK" `Quick(fun()->
+        run_favorites_native_visibility ~delete_scenario:"failure" ~check_durable_delete:true());
+      Alcotest.test_case "held absence cannot settle deletion" `Quick(fun()->
+        run_favorites_native_visibility ~delete_scenario:"success" ~check_durable_delete:true ~durable_delete:`Held());
+      Alcotest.test_case "Unknown deletion reuses complete intent" `Quick(fun()->
+        run_favorites_native_visibility ~delete_scenario:"success" ~check_durable_delete:true ~durable_delete:`Unknown());
+      Alcotest.test_case "failed deletion readback retries Confirm" `Quick(fun()->
+        run_favorites_native_visibility ~delete_scenario:"success" ~check_durable_delete:true ~durable_delete:`Confirm_failed());
+      Alcotest.test_case "failed deletion ACK retries cleanup only" `Quick(fun()->
+        run_favorites_native_visibility ~delete_scenario:"success" ~check_durable_delete:true ~durable_delete:`Ack_failed());
+      Alcotest.test_case "rejected deletion refreshes canonical conflict" `Quick(fun()->
+        run_favorites_native_visibility ~delete_scenario:"failure" ~check_durable_delete:true ~durable_delete:`Conflict());
+      Alcotest.test_case "committed deletion preserves a reappeared canonical block" `Quick(fun()->
+        run_favorites_native_visibility ~delete_scenario:"success" ~check_durable_delete:true ~durable_delete:`Reappeared())])
     ; ( "status list", List.map (fun scenario ->
         Alcotest.test_case scenario `Quick (fun () -> run_favorites_native_visibility ~status_scenario:scenario ()))
             [ "expanded"

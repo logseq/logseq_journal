@@ -134,11 +134,12 @@ type payload =
   | Update_conflict of {block:Projection.block;timeline_entry_update:Projection.timeline_entry option}
   | Subtree_deleted of
       { block_id : string
-      ; deleted_count : int
+      ; deleted_count : int option
       ; parent : Projection.block option
       ; timeline_entry_update : Projection.timeline_entry option
       }
   | Delete_conflict of {block:Projection.block;timeline_entry_update:Projection.timeline_entry option}
+  | Delete_reappeared of {block:Projection.block;timeline_entry_update:Projection.timeline_entry option}
   | Block_found of Projection.block option
   | Feed_refresh_started of { request_generation : int64 }
   | Feed_loaded of
@@ -1064,10 +1065,20 @@ let confirmation_planning = function
   | Ok request -> requests [request]
   | Error message -> reject message
 ;;
-let request_target_summary t page refresh =
-  (* Retain the structural subscription before the first target confirmation. *)
-  Hashtbl.replace t.page_tree_interests page.Projection.id {page;limit=Protocol.maximum_page_size};
+let request_target_summary_without_interest t refresh =
   Confirmation.start t.confirmations ~ports:(confirmation_ports t) refresh |> confirmation_planning
+;;
+let request_target_summary t page refresh =
+  (* Journal interests are optional business subscriptions. The target summary
+     itself supplies its real owning page, including ordinary pages. *)
+  Hashtbl.replace t.page_tree_interests page.Projection.id {page;limit=Protocol.maximum_page_size};
+  request_target_summary_without_interest t refresh
+;;
+let request_delete_summary t block_id =
+  let refresh=Delete_conflict_refresh{block_id} in
+  match page_by_block t block_id with
+  | Some page->request_target_summary t page refresh
+  | None->request_target_summary_without_interest t refresh
 ;;
 
 let capture_tree (command : Projection.capture) =
@@ -1969,13 +1980,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
              capture_children t command page (conflict_retries + 1)
            | Delete_mutation command
              when String.equal code (Error.code_string Error.Conflict) ->
-             (match page_by_block t command.block_id with
-              | Some page ->
-                request_target_summary
-                  t
-                  page
-                  (Delete_conflict_refresh { block_id = command.block_id })
-              | None -> failure_output ~code:failure_code t operation request_id message)
+             request_delete_summary t command.block_id
            | _ -> failure_output ~code:failure_code t operation request_id message))
      | V2_resync_required { generation; reason } ->
        (match operation with
@@ -2294,7 +2299,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
            | Continue planned -> confirmation_planning planned
            | Failed message -> failure_output t operation request_id message
            | Absent {purpose=Delete_conflict_refresh _;block_id} ->
-             responses [response (Subtree_deleted {block_id;deleted_count=0;
+             responses [response (Subtree_deleted {block_id;deleted_count=Some 0;
                parent=None;timeline_entry_update=None})]
            | Absent _ -> failure_output t operation request_id "Unexpected absent target owner."
            | Confirmed {purpose;block_id;value;revision;page;page_revision;scope_revision;children} ->
@@ -2594,7 +2599,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
             [ response
                 (Subtree_deleted
                    { block_id = command.block_id
-                   ; deleted_count = 1
+                   ; deleted_count = None
                    ; parent = None
                    ; timeline_entry_update = None
                    })
@@ -2707,7 +2712,7 @@ let receive_delivery_body t ~read_result ~origin (protocol_response : Protocol.r
             { lookup = V2_present_block { value; _ }; items; next_cursor = None; _ }
           when List.exists
                  (fun response -> match response.payload with
-                    | Block_captured _ | Block_updated _ -> true | _ -> false)
+                    | Block_captured _ | Block_updated _ | Update_conflict _ | Delete_conflict _ -> true | _ -> false)
                  output.responses ->
           let fragment = match operation with
             | Target_summary summary -> Confirmation.reference_fragment summary ~target:value ~final_children:items
@@ -2777,13 +2782,15 @@ let receive_delivery_body t ~read_result ~origin (protocol_response : Protocol.r
         Option.iter (fun pending -> Hashtbl.replace t.pending key {pending with durable=Some durable})
           (Hashtbl.find_opt t.pending key)) output.requests;
       let settled=List.exists(fun response->match response.payload with
-        | Block_updated _ | Block_removed _ | Update_conflict _ -> true
+        | Block_updated _ | Block_removed _ | Update_conflict _ | Delete_conflict _ | Subtree_deleted _ -> true
         | Mutation_failed _ when not durable.confirm_readback ->true | _ -> false)output.responses in
       let responses=List.map(fun response->match response.payload with
         | Mutation_failed{mutation_id;block_id;failure;_} when durable.confirm_readback ->
           {payload=Mutation_waiting{mutation_id;block_id;message=(match failure with
             | Projection_failure message->message|Worker_failure value->Error.message value.error)}}
-        | (Block_updated _ | Block_removed _ | Update_conflict _ | Mutation_failed _) as payload when settled ->
+        | Delete_conflict{block;timeline_entry_update} when settled && durable.confirm_readback ->
+          {payload=Mutation_settled(durable.intent,durable.presentation,Delete_reappeared{block;timeline_entry_update})}
+        | (Block_updated _ | Block_removed _ | Update_conflict _ | Mutation_failed _ | Delete_conflict _ | Subtree_deleted _) as payload when settled ->
           {payload=Mutation_settled(durable.intent,durable.presentation,payload)}
         | _->response)output.responses in
       if Graph.Uuid.equal request_id durable.root_request.request_id then
@@ -3031,6 +3038,9 @@ let worker_mutation t (request:Protocol.request) =
   | Some {operation=Mutation_refresh _;delivery=Dispatched;_},
     Protocol.V2_clear_task_status{mutation_id;block;preconditions}->
       Some(mutation_id,Worker.Clear_task_status{block;preconditions})
+  | Some {operation=Delete_mutation _;delivery=Dispatched;_},
+    Protocol.V2_delete_blocks{mutation_id;root;preconditions}->
+      Some(mutation_id,Worker.Delete_blocks{root;preconditions})
   | _->None
 ;;
 
@@ -3071,12 +3081,19 @@ let mutation_waiting t (request:Protocol.request) message =
 let receive_mutation t (request:Protocol.request) progress =
   let key=Graph.Uuid.to_string request.request_id in
   match Hashtbl.find_opt t.pending key with
-  | Some ({durable=Some durable;operation=Mutation_refresh{page;refresh};_} as pending) ->
+  | Some ({durable=Some durable;operation=(Mutation_refresh _ | Delete_mutation _);_} as pending) ->
     (match progress with
      | Worker.Confirmed confirmation when Worker.confirmation_presentation confirmation=durable.presentation ->
        (match Worker.confirmation_primary confirmation with
         | Worker.Confirmed_block summary ->
-          let planned=scope_output t pending.failure_owner(request_target_summary t page refresh) in
+          let target=match pending.operation with
+            | Mutation_refresh{page;refresh}->Some(request_target_summary t page refresh)
+            | Delete_mutation command->Some(request_delete_summary t command.block_id)
+            | _->None in
+          (match target with
+           | None->mutation_waiting t request "The canonical mutation owner is unavailable."
+           | Some planned->
+          let planned=scope_output t pending.failure_owner planned in
           (match planned.requests with
            | [first]->
              let child=Graph.Uuid.to_string first.request_id in
@@ -3085,10 +3102,14 @@ let receive_mutation t (request:Protocol.request) progress =
              let planned=dispatch_output t planned in
              let output=receive_worker_read t ~request_id:first.request_id(Target_summary_read summary) in
              {output with requests=List.filter(fun (value:Protocol.request)->value.request_id<>first.request_id)planned.requests @ output.requests}
-           | _->mutation_waiting t request "The canonical status read could not be planned.")
+           | _->mutation_waiting t request "The canonical mutation read could not be planned."))
         | Confirmed_absence{uuid;_}->
-          responses[response(Mutation_settled(durable.intent,durable.presentation,Block_removed{block_id=Graph.Uuid.to_string uuid}))]
-        | Confirmed_page _->mutation_waiting t request "The canonical status target is not a block.")
+          let block_id=Graph.Uuid.to_string uuid in
+          let payload=match pending.operation with
+            | Delete_mutation _->Subtree_deleted{block_id;deleted_count=None;parent=None;timeline_entry_update=None}
+            | _->Block_removed{block_id} in
+          responses[response(Mutation_settled(durable.intent,durable.presentation,payload))]
+        | Confirmed_page _->mutation_waiting t request "The canonical mutation target is not a block.")
      | Rejected error ->
        let durable={durable with confirm_readback=false} in
        (* The known rejection is terminal evidence; only this branch may report
@@ -3096,7 +3117,7 @@ let receive_mutation t (request:Protocol.request) progress =
        Hashtbl.replace t.pending key {pending with durable=None};
        let code,message=match error with Worker.Db_error error->Error.code error,Error.message error
          | Service_failed message->Error.Invalid_request,message
-         | _->Error.Invalid_request,"The status change was rejected." in
+         | _->Error.Invalid_request,"The change was rejected." in
        let output=receive t (Protocol.V2_response{api_version=Protocol.api_version;request_id=request.request_id;
          outcome=V2_failed{code=Error.code_string code;message}}) in
        Hashtbl.replace t.pending key {pending with durable=Some durable};
@@ -3105,7 +3126,7 @@ let receive_mutation t (request:Protocol.request) progress =
            (Hashtbl.find_opt t.pending key))output.requests;
        {output with responses=List.map(fun value->{payload=Mutation_settled(durable.intent,durable.presentation,value.payload)})output.responses}
      | Confirmed _ | Outcome_unknown | Committed_pending_presentation _ ->
-       mutation_waiting t request "The status change is awaiting confirmation. Retry checks the same change.")
+       mutation_waiting t request "The change is awaiting confirmation. Retry checks the same change.")
   | _->empty
 ;;
 

@@ -65,11 +65,12 @@ type payload =
   | Update_conflict of {block:Journal_graph_projection.block;timeline_entry_update:Journal_graph_projection.timeline_entry option}
   | Subtree_deleted of
       { block_id : string
-      ; deleted_count : int
+      ; deleted_count : int option (* None: committed, exact subtree cardinality unavailable. *)
       ; parent : Journal_graph_projection.block option
       ; timeline_entry_update : Journal_graph_projection.timeline_entry option
       }
   | Delete_conflict of {block:Journal_graph_projection.block;timeline_entry_update:Journal_graph_projection.timeline_entry option}
+  | Delete_reappeared of {block:Journal_graph_projection.block;timeline_entry_update:Journal_graph_projection.timeline_entry option}
   | Block_found of Journal_graph_projection.block option
   | Feed_refresh_started of { request_generation : int64 }
   | Feed_loaded of

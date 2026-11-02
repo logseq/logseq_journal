@@ -1356,7 +1356,8 @@ let earlier_members (page : Graph.page) =
       })
 ;;
 
-let prepare_paged_refresh kind =
+let prepare_paged_refresh ?(ordinary=false) ?(defer=false) kind =
+  let page=if ordinary then {page with kind=Ordinary_page;name="ordinary";title="Ordinary"} else page in
   let runtime = Runtime.create ~localtime:Unix.gmtime () in
   let sampler =
     Journal_calendar.Sampler.create
@@ -1481,7 +1482,7 @@ let prepare_paged_refresh kind =
       in
       page, Runtime.submit runtime command |> next "target mutation"
   in
-  let refresh =
+  let refresh = if defer then mutation else
     receive
       mutation
       (match kind with
@@ -1598,11 +1599,56 @@ let test_paged_mutation_refresh kind result =
     | Found, Delete_conflict, Delete_conflict {block=actual;_} ->
       Alcotest.(check string) "canonical conflicted target"
         "Committed target" (Journal_model.source actual)
-    | Missing, Delete_conflict, Subtree_deleted {deleted_count=0;_} -> ()
+    | Missing, Delete_conflict, Subtree_deleted {deleted_count=Some 0;_} -> ()
     | Missing, _, Mutation_failed _ -> ()
     | _ -> Alcotest.fail "unexpected canonical mutation completion")
 ;;
 
+
+(* The pure SDK cannot reproduce business ownership's journal-only page map.
+   Exercise the public Runtime boundary with a real ordinary Detail and sealed
+   canonical DTOs issued by the same typed Worker test issuer. *)
+let test_ordinary_delete_readback committed paged () =
+  let module W=Worker_producer.W in
+  let module I=Worker_producer.I in
+  let runtime,page,request=prepare_paged_refresh ~ordinary:true ~defer:committed Delete_conflict in
+  let target={record with block={block with page=page.uuid;parent=page.uuid;title="Ordinary canonical target"}} in
+  let lookup=Protocol.V2_present_block{value=target;revision="canonical-current"} in
+  let summary request_id cursor=Protocol.V2_response{api_version=Protocol.api_version;request_id;
+    outcome=V2_block_summary_outcome{lookup;page=Some(V2_present_page{page;revision="page-2"});items=[];
+      next_cursor=cursor;scope_revision="ordinary-children";generation="generation:v1:1:1";projection_revision="projection:v1:2"}} in
+  let output=if committed then (
+    let mutation_id,root,preconditions=match request.command with
+      | Protocol.V2_delete_blocks{mutation_id;root;preconditions}->mutation_id,root,preconditions
+      | _->Alcotest.fail "ordinary delete did not plan its exact mutation" in
+    let session=Worker_producer.session in
+    let presentation=Option.get(W.selected Worker_producer.projection) in
+    let intent=W.mutation_intent session ~mutation_id(W.Delete_blocks{root;preconditions}) |> Result.get_ok in
+    Alcotest.(check bool) "ordinary mutation business owner bound" true
+      (Production_runtime.bind_mutation runtime request ~presentation ~intent);
+    let receipt=I.mutation_receipt session ~request_id:(W.request_id request.request_id) ~intent
+      (response request(V2_mutation_committed{mutation_id;status=V2_applied;generation="generation:v1:1:1";
+        before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"})) |> Result.get_ok in
+    let confirmation=I.confirmation session ~presentation receipt
+      (summary request.request_id(if paged then Some(Graph.Cursor.of_string "ordinary-more" |> Result.get_ok) else None))
+      |> Result.get_ok in
+    let output=Production_runtime.receive_mutation runtime request(W.Confirmed confirmation) in
+    if paged then (
+      Alcotest.(check bool) "ordinary More cannot settle before final DTO" false
+        (List.exists(fun r->match r.Production_runtime.payload with Mutation_settled _->true|_->false)output.responses);
+      let more=only "ordinary canonical More remains typed" output.requests in
+      Worker_producer.receive runtime more(summary more.request_id None)) else output)
+    else Runtime.receive runtime(summary request.request_id None) in
+  let current=List.find_map(fun response->match response.Runtime.payload with
+    | Mutation_settled(_,_,Delete_reappeared{block;timeline_entry_update=None}) when committed->Some block
+    | Delete_conflict{block;timeline_entry_update=None} when not committed->Some block
+    | _->None)output.responses in
+  match current with
+  | Some block->
+    Alcotest.(check string) "ordinary canonical DTO is consumed" "Ordinary canonical target" (Journal_model.source block);
+    Alcotest.(check(option int)) "ordinary page never invents journal date" None(Journal_model.journal_day_opt block)
+  | None->Alcotest.fail "ordinary canonical delete readback could not settle"
+;;
 
 let test_conflict_missing_after_empty_more changed_version () =
   let runtime, page, first = prepare_paged_refresh Delete_conflict in
@@ -1622,7 +1668,7 @@ let test_conflict_missing_after_empty_more changed_version () =
     check_target_summary fresh None;
     let final = Runtime.receive runtime (missing fresh "projection-3") in
     match (only "fresh complete absence" final.responses).payload with
-    | Subtree_deleted {deleted_count=0;_} -> ()
+    | Subtree_deleted {deleted_count=Some 0;_} -> ()
     | _ -> Alcotest.fail "fresh authoritative absence was not accepted")
   else (
     Alcotest.(check int) "contradictory chain does not continue" 0
@@ -9281,6 +9327,10 @@ let () =
                       (fun () -> test_target_terminal kind terminal))
                  [ "missing", `Missing; "failure", `Failure; "graph reset", `Reset ])
             [ "Capture", `Capture; "Update", `Update; "Status", `Status ] )
+    ; ("ordinary delete readback",[
+        Alcotest.test_case "known rejection reads ordinary current target" `Quick(test_ordinary_delete_readback false false);
+        Alcotest.test_case "committed present ordinary target consumes actual DTO" `Quick(test_ordinary_delete_readback true false);
+        Alcotest.test_case "ordinary canonical More applies before settlement" `Quick(test_ordinary_delete_readback true true)])
     ; ( "paged mutation refresh"
       , List.concat_map
           (fun (name, kind) ->

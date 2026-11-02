@@ -1751,6 +1751,25 @@ let test_host_durable_recovery_confirmation_ack () =
       | _->false) "real canonical DTO lost committed status UUID";
     ignore(value(call(W.Acknowledge_intent status_intent)));
     require(Rrbvec.is_empty(recover()).items) "real status ACK retained pending recovery entry";
+    let revision=match read() with P.V2_present_block{revision;_}->revision|_->assert false in
+    let deletion=W.mutation_intent session ~mutation_id:(uuid "9f000000-0000-4000-8000-000000001002")
+      (W.Delete_blocks{root=Test_support.authoritative_block_uuid;
+        preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}) |> Result.get_ok in
+    let deleted_receipt=match value(call(W.Mutate deletion)) with
+      | W.Committed_pending_presentation receipt->receipt|_->failwith "real typed deletion failed" in
+    let deleted_confirmation=match value(call(W.Confirm(presentation,deleted_receipt))) with
+      | W.Confirmed value->value|_->failwith "real typed deletion confirmation failed" in
+    require(match W.confirmation_primary deleted_confirmation with
+      | W.Confirmed_absence{uuid;_}->W.Uuid.equal uuid Test_support.authoritative_block_uuid
+      | _->false) "typed deletion did not deliver exact canonical absence";
+    ignore(value(call(W.Acknowledge_intent deletion)));
+    require(Rrbvec.is_empty(recover()).items) "real deletion ACK retained pending recovery entry";
+    require(match value(call(W.Mutate deletion)) with
+      | W.Committed_pending_presentation original->W.receipt_revisions original=W.receipt_revisions deleted_receipt
+      | _->false) "deletion reconciliation lost its original idempotent proof";
+    require(match read() with P.V2_missing_block{uuid;_}->W.Uuid.equal uuid Test_support.authoritative_block_uuid|_->false)
+      "same-intent deletion reconciliation changed canonical absence";
+
 
     ignore(Host.shutdown host);
     wait(fun()->C.shutdown_state(Host.view host)=C.Stopped))

@@ -106,7 +106,11 @@ let reconcile_unlock previous (snapshot : Graph_service.snapshot) =
 
 module Admission_refresh = Journal_admission_refresh
 
-type pending_delete = Journal_graph_projection.delete_subtree
+type pending_delete =
+  { mutation_id:string
+  ; block_id:string
+  ; settled_intent:(Journal_worker_coordination.Worker_api.mutation_intent * Journal_worker_coordination.Worker_api.presentation) option
+  }
 
 type pending_status =
   { mutation_id : string
@@ -117,6 +121,8 @@ type pending_status =
   }
 
 type timeline_notice =
+  | Delete_pending of string
+  | Delete_changed of string
   | Delete_failed of string
   | Status_pending of string
   | Status_failed of string
@@ -124,6 +130,10 @@ type timeline_notice =
   | Import_failed of string
 
 let operation_failure ?(can_retry_imports = false) = function
+  | Some (Delete_pending message) ->
+    Some("Delete pending",message,"The block may already be deleted. Retry checks the same deletion.")
+  | Some (Delete_changed message) ->
+    Some("Block changed after deletion",message,"Review the current block before making another choice.")
   | Some (Delete_failed message) ->
     Some
       ( "Delete failed"
@@ -1170,12 +1180,19 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
      | Some pending when pending.mutation_id=Logseq_db_types.Graph_types.Uuid.to_string
          (Journal_worker_coordination.Worker_api.mutation_intent_id intent)->
        {next with pending_status=Some{pending with settled_intent=Some(intent,presentation)}}
-     | _->next)
+     | _->(match state.pending_delete with
+       | Some pending when pending.mutation_id=Logseq_db_types.Graph_types.Uuid.to_string
+           (Journal_worker_coordination.Worker_api.mutation_intent_id intent)->
+         {next with pending_delete=Some{pending with settled_intent=Some(intent,presentation)}}
+       | _->next))
   | Mutation_waiting{mutation_id;block_id;message}->
     (match state.pending_status with
      | Some pending when pending.mutation_id=mutation_id && pending.block_id=block_id ->
        {state with timeline_notice=Some(Status_pending message)}
-     | _->state)
+     | _->(match state.pending_delete with
+       | Some pending when pending.mutation_id=mutation_id && pending.block_id=block_id ->
+         {state with timeline_notice=Some(Delete_pending message)}
+       | _->state))
   | Projection_changes _ | Projection_resync -> state
   | Task_statuses_changed { items; default_status; complete; error } ->
     if
@@ -1551,9 +1568,11 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
        ; timeline_notice = None
        }
      | None | Some _ -> state)
-  | Delete_conflict {block=latest;timeline_entry_update} ->
+  | Delete_conflict {block=latest;timeline_entry_update}
+  | Delete_reappeared {block=latest;timeline_entry_update} ->
     (match state.pending_delete with
      | None -> state
+     | Some pending when pending.block_id<>Journal_model.id latest->state
      | Some _ ->
        let state =
          { state with
@@ -1572,7 +1591,9 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
               timeline_entry_update)
        ; pending_delete = None
        ; timeline_notice =
-           Some (Delete_failed "The block changed elsewhere. Delete was not applied.")
+           Some(match response.payload with
+             | Delete_reappeared _->Delete_changed "The deletion was committed, but the block is present again."
+             | _->Delete_failed "The block changed elsewhere. Delete was not applied.")
        })
   | Open_failed worker_failure ->
     let state = record_runtime_worker_failure state worker_failure in
@@ -1997,6 +2018,7 @@ type command =
   | Dismiss_operation_error
   | Retry_capture_imports
   | Retry_status
+  | Retry_delete
   | Close_error_info
   | Switch_graph
   | Close_graph_picker
@@ -2100,11 +2122,14 @@ let operation_feedback ~scope ~state dispatch body =
             ((match state.timeline_notice,state.pending_status with
               | Some(Status_pending _),Some _->[action "Retry status" "arrow.clockwise" Retry_status]
               | _->[])
+             @ (match state.timeline_notice,state.pending_delete with
+               | Some(Delete_pending _),Some _->[action "Retry delete" "arrow.clockwise" Retry_delete]
+               | _->[])
              @ (if state.failed_capture_imports = []
               then []
               else [ action "Retry imports" "arrow.clockwise" Retry_capture_imports ])
              @ [ action "Details" "exclamationmark.circle" Open_error_info ]
-             @ (match state.timeline_notice with Some(Status_pending _)->[]
+             @ (match state.timeline_notice with Some(Status_pending _|Delete_pending _)->[]
                | _->[action "Dismiss" "xmark" Dismiss_operation_error]))
           ()
         |> V.with_test_id (Ui.Test_id.string (scope ^ "-operation-actions")) )
@@ -4023,8 +4048,8 @@ let start
               | Wc.Confirmed confirmation ->
                 (match Wc.confirmation_primary confirmation with
                  | Confirmed_block value->Journal_graph_runtime.Target_summary_read value
-                 | _->Ordinary_read(V2_failed{code="invalidRequest";message="The canonical status target is unavailable."}))
-              | _->Ordinary_read(V2_failed{code="invalidRequest";message="The status change is awaiting confirmation."}));
+                 | _->Ordinary_read(V2_failed{code="invalidRequest";message="The canonical mutation target is unavailable."}))
+              | _->Ordinary_read(V2_failed{code="invalidRequest";message="The change is awaiting confirmation."}));
             Journal_graph_transport.Accepted
           | Error _->Journal_graph_transport.Not_ready)
        | Acknowledge read ->
@@ -4049,9 +4074,9 @@ let start
                 | Wc.Answered(Ok(Wc.Committed_pending_presentation _))->
                   (match Coordination_host.reconcile_mutation host ~presentation intent with
                    | Ok ticket->watch ticket
-                   | Error _-> !coordinated_mutation_finished owner request(Error "The status change is awaiting a current presentation."))
+                   | Error _-> !coordinated_mutation_finished owner request(Error "The change is awaiting a current presentation."))
                 | Answered(Ok progress)-> !coordinated_mutation_finished owner request(Ok progress)
-                | _-> !coordinated_mutation_finished owner request(Error "The status change could not be confirmed. Retry checks the same change.")) in
+                | _-> !coordinated_mutation_finished owner request(Error "The change could not be confirmed. Retry checks the same change.")) in
             (match Coordination_host.reconcile_mutation host ~presentation intent with
              | Ok ticket->watch ticket;Journal_graph_transport.Accepted
              | Error _->Journal_graph_transport.Not_ready)
@@ -4091,7 +4116,7 @@ let start
     Hashtbl.clear (!graph_worker_requests_cell);
     Journal_graph_runtime.reset (!graph_runtime_cell)
   in
-  let acknowledge_status ~applied_presentation intent =
+  let acknowledge_mutation ~applied_presentation intent =
     let owner=current_owner() in
     let completed ?presentation success = run_owned owner(fun()->set_state_and_effect(fun state->
       match state.pending_status with
@@ -4106,7 +4131,18 @@ let start
             Journal_graph_runtime.acknowledge_mutation (!graph_runtime_cell)intent)
         else {state with timeline_notice=Some(Status_pending
           "The status result is applied. Retry finishes its durable acknowledgement.")},Effect.ignore
-      | _->state,Effect.ignore)) in
+      | _->(match state.pending_delete with
+        | Some pending when pending.mutation_id=Logseq_db_types.Graph_types.Uuid.to_string(Wc.mutation_intent_id intent)
+            && pending.settled_intent=Some(intent,applied_presentation)->
+          let current=match presentation,timeline_scope state,!coordination_host with
+            | Some presentation,Some owner,Some(_,host)->Coordination.current_presentation ~owner
+                (Coordination_host.view host)presentation
+            | _->false in
+          if success && current then {state with pending_delete=None},Effect.of_thunk(fun()->
+            Journal_graph_runtime.acknowledge_mutation (!graph_runtime_cell)intent)
+          else {state with timeline_notice=Some(Delete_pending
+            "The deletion result is applied. Retry finishes its durable acknowledgement.")},Effect.ignore
+        | _->state,Effect.ignore))) in
     match !coordination_host with
     | None->completed false
     | Some(_,host)->
@@ -4126,16 +4162,19 @@ let start
                Effect.run(set_state(fun state->match state.pending_status with
                  | Some pending when pending.settled_intent=Some(intent,applied_presentation)->
                    {state with pending_status=Some{pending with settled_intent=None}}
-                 | _->state));
+                 | _->(match state.pending_delete with
+                   | Some pending when pending.settled_intent=Some(intent,applied_presentation)->
+                     {state with pending_delete=Some{pending with settled_intent=None}}
+                   | _->state)));
                ignore(Journal_graph_runtime.bind_mutation (!graph_runtime_cell)request ~presentation ~intent);
                let finish result=Option.iter(fun owner-> !coordinated_mutation_finished owner request result)owner in
                let rec watch ticket=Coordination_host.watch host ticket ~f:(function
                  | Wc.Answered(Ok(Wc.Committed_pending_presentation _))->
                    (match Coordination_host.reconcile_mutation host ~presentation intent with
                     | Ok ticket->watch ticket
-                    | Error _->finish(Error "The status change is awaiting a current presentation."))
+                    | Error _->finish(Error "The change is awaiting a current presentation."))
                  | Wc.Answered(Ok progress)->finish(Ok progress)
-                 | _->finish(Error "The status change could not be confirmed. Retry checks the same change.")) in
+                 | _->finish(Error "The change could not be confirmed. Retry checks the same change.")) in
                watch ticket))) in
   let rec apply_graph_responses set_state_and_effect responses =
     set_state_and_effect (fun state ->
@@ -4148,8 +4187,12 @@ let start
             (match state.pending_status with
              | Some pending when pending.mutation_id=Logseq_db_types.Graph_types.Uuid.to_string(Wc.mutation_intent_id intent)->
                Journal_graph_runtime.{payload=Mutation_waiting{mutation_id=pending.mutation_id;block_id=pending.block_id;
-                 message="The status confirmation belongs to an earlier presentation. Retry checks the same change."}}
-             | _->Journal_graph_runtime.{payload=Reference_sources_changed []})
+                 message="The confirmation belongs to an earlier presentation. Retry checks the same change."}}
+             | _->(match state.pending_delete with
+               | Some pending when pending.mutation_id=Logseq_db_types.Graph_types.Uuid.to_string(Wc.mutation_intent_id intent)->
+                 Journal_graph_runtime.{payload=Mutation_waiting{mutation_id=pending.mutation_id;block_id=pending.block_id;
+                   message="The deletion confirmation belongs to an earlier presentation. Retry checks the same deletion."}}
+               | _->Journal_graph_runtime.{payload=Reference_sources_changed []}))
           | _->response in
         let completion = match response.Journal_graph_runtime.payload with
           | Admission_inspected { request; observation } ->
@@ -4163,7 +4206,7 @@ let start
           report_app_response state next response;
           let effects=match response.payload,!coordination_host with
             | Journal_graph_runtime.Mutation_settled(intent,presentation,_),Some _->
-              let acknowledgement=Effect.of_thunk(fun()->acknowledge_status ~applied_presentation:presentation intent) in
+              let acknowledgement=Effect.of_thunk(fun()->acknowledge_mutation ~applied_presentation:presentation intent) in
               acknowledgement::effects
             | _->effects in
           next, effects
@@ -4235,8 +4278,8 @@ let start
     if runtime_owner_is_live !state_ref owner then run_owned (Some owner) (fun () ->
       let result=match Journal_graph_runtime.mutation_presentation (!graph_runtime_cell) request,!coordination_host with
         | Some presentation,Some(_,host) when not(Coordination.current_presentation(Coordination_host.view host)presentation)->
-          Error "The status confirmation belongs to an earlier presentation. Retry checks the same change."
-        | Some _,None->Error "The status confirmation lost its Worker binding."
+          Error "The confirmation belongs to an earlier presentation. Retry checks the same change."
+        | Some _,None->Error "The confirmation lost its Worker binding."
         | _->result in
       let application,result=match result,!coordination_host with
         | Ok(Journal_graph_runtime.Changes_read batch),Some(_,host) ->
@@ -4317,8 +4360,8 @@ let start
         | Ok(Wc.Confirmed confirmation),Some(_,host) when not(
             Option.fold ~none:false ~some:(fun owner->Coordination.current_presentation ~owner
               (Coordination_host.view host)(Wc.confirmation_presentation confirmation))(timeline_scope !state_ref))->
-          Error "The status confirmation belongs to an earlier presentation. Retry checks the same change."
-        | Ok(Wc.Confirmed _),None->Error "The status confirmation lost its Worker binding."
+          Error "The confirmation belongs to an earlier presentation. Retry checks the same change."
+        | Ok(Wc.Confirmed _),None->Error "The confirmation lost its Worker binding."
         | _->result in
       let output=match result with
         | Ok progress->Journal_graph_runtime.receive_mutation (!graph_runtime_cell)request progress
@@ -6187,12 +6230,26 @@ let start
           && Option.is_none (operation_failure state.timeline_notice)
         then state
         else { state with modal = Error_info })
+    | Retry_delete when snapshot.write_enabled ->
+      (match snapshot.pending_delete with
+       | None->Effect.ignore
+       | Some {settled_intent=Some(intent,applied_presentation);_}->
+         Effect.bind(update(fun state->{state with timeline_notice=None}))~f:(fun()->
+           Effect.of_thunk(fun()->acknowledge_mutation ~applied_presentation intent))
+       | Some pending->
+         (match Journal_graph_runtime.pending_mutation (!graph_runtime_cell) ~mutation_id:pending.mutation_id with
+          | None->Effect.ignore
+          | Some request->
+            Effect.bind(update(fun state->{state with timeline_notice=None}))~f:(fun()->
+              Effect.of_thunk(fun()->match Journal_graph_runtime.worker_mutation (!graph_runtime_cell)request with
+                | Some mutation->ignore(send_coordinated_mutation request mutation)
+                | None->()))))
     | Retry_status when snapshot.write_enabled ->
       (match snapshot.pending_status with
        | None->Effect.ignore
        | Some {settled_intent=Some(intent,applied_presentation);_}->
          Effect.bind(update(fun state->{state with timeline_notice=None}))~f:(fun()->
-           Effect.of_thunk(fun()->acknowledge_status ~applied_presentation intent))
+           Effect.of_thunk(fun()->acknowledge_mutation ~applied_presentation intent))
        | Some pending->
          (match Journal_graph_runtime.pending_mutation (!graph_runtime_cell) ~mutation_id:pending.mutation_id with
           | None->Effect.ignore
@@ -6224,10 +6281,10 @@ let start
     | Dismiss_operation_error ->
       update (fun state -> finish_cleanup (with_cleanup (fun ~discard ->
         match state.timeline_notice with
-        | Some (Delete_failed _ | Status_failed _ | Copy_failed _ | Import_failed _) ->
+        | Some (Delete_failed _ | Delete_changed _ | Status_failed _ | Copy_failed _ | Import_failed _) ->
           discard_import_batches ~discard state.failed_capture_imports;
           { state with timeline_notice = None; failed_capture_imports = [] }
-        | None | Some(Status_pending _) -> state)))
+        | None | Some(Status_pending _|Delete_pending _) -> state)))
     | Close_error_info -> update (fun state -> { state with modal = No_modal })
     | Switch_graph ->
       cancel_copy ();
@@ -6524,7 +6581,9 @@ let start
              }
            in
            with_direct_request
-             { snapshot with pending_delete = Some request; timeline_notice = None }
+             { snapshot with pending_delete = Some
+                 {mutation_id=request.mutation_id;block_id=request.block_id;settled_intent=None};
+               timeline_notice = None }
              (Journal_graph_request.Delete_subtree request))
        | _ -> Effect.ignore)
     | Copy_block block_id ->
