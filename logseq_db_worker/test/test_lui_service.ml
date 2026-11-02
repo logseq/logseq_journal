@@ -420,6 +420,104 @@ let control_wait label predicate =
   T.require (predicate ()) label
 ;;
 
+(* A successful I/O result may be produced after cancellation was requested.
+   Only the Mailbox owner knows whether that result becomes externally visible. *)
+let test_discarded_success_is_settled ?(slow = false) ending () =
+  let started = Atomic.make false
+  and release = Atomic.make false in
+  let live = Atomic.make 0
+  and discarded = Atomic.make 0 in
+  let cleanup_started = Atomic.make false
+  and cleanup_release = Atomic.make (not slow)
+  and shutdown_called = Atomic.make false in
+  let service =
+    Worker.Service.create
+      ~push_topic_count:1
+      ~concurrency:Serial
+      ~init:(fun context () -> Ok (Worker.Session_context.clock context))
+      ~handle:(fun context _ value ->
+        if ending = `Finalizer_failure
+        then
+          Eio.Switch.on_release (Worker.Request_context.switch context) (fun () ->
+            failwith "synthetic resource finalizer failure");
+        Eio.Cancel.protect (fun () ->
+          Atomic.incr live;
+          Atomic.set started true;
+          while not (Atomic.get release) do
+            Eio.Time.Mono.sleep (Worker.Request_context.clock context) 0.001
+          done;
+          Ok value))
+      ~discard_response:(fun clock ~request_id:_ request response ->
+        Atomic.set cleanup_started true;
+        while not (Atomic.get cleanup_release) do
+          Eio.Time.Mono.sleep clock 0.001
+        done;
+        T.require (request = response) "discard cleanup changed produced result";
+        Atomic.incr discarded;
+        Atomic.decr live)
+      ~shutdown:(fun _ ->
+        Atomic.set shutdown_called true;
+        Atomic.set live 0)
+      ()
+  in
+  let client =
+    Worker_runtime.start ~runtime_epoch:(ID.Runtime.Epoch.of_int64 2190L) service ()
+    |> Result.get_ok
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      Atomic.set release true;
+      Atomic.set cleanup_release true;
+      Worker_runtime.stop client)
+    (fun () ->
+       let id = Worker.send client 7 |> accepted in
+       control_wait "protected resource operation started" (fun () -> Atomic.get started);
+       (match ending with
+        | `Cancel -> Worker.cancel client ~request_id:id
+        | `Stop -> Worker.Private.request_stop client
+        | `Complete | `Finalizer_failure -> ());
+       Atomic.set release true;
+       if slow
+       then (
+         control_wait "discard cleanup has started" (fun () -> Atomic.get cleanup_started);
+         T.require
+           (not (Atomic.get shutdown_called))
+           "Service shutdown overtook yielding discard cleanup";
+         T.require
+           (not
+              (List.exists
+                 (function
+                   | Worker.Response _ | Terminal _ -> true
+                   | _ -> false)
+                 (Worker.For_testing.drain_events client ~max_events:64)))
+           "terminal became visible before yielding discard cleanup settled";
+         Atomic.set cleanup_release true);
+       let terminal = ref None in
+       control_wait "resource operation reaches one visible terminal" (fun () ->
+         List.iter
+           (function
+             | Worker.Response { request_id; outcome; _ } when request_id = id ->
+               T.require (!terminal = None) "resource terminal published twice";
+               terminal := Some outcome;
+               T.require
+                 (Atomic.get discarded = if ending = `Complete then 0 else 1)
+                 "successful discarded result was not settled before terminal publication"
+             | _ -> ())
+           (Worker.For_testing.drain_events client ~max_events:64);
+         Option.is_some !terminal);
+       T.require
+         (match ending, !terminal with
+          | `Cancel, Some Worker.Cancelled
+          | `Stop, Some Shutdown
+          | `Complete, Some (Completed 7)
+          | `Finalizer_failure, Some (Failed _) -> true
+          | _ -> false)
+         "cleanup changed cancellation/stop/normal delivery semantics";
+       T.require
+         (ending <> `Complete || Atomic.get live = 1)
+         "delivered resource was released as an orphan")
+;;
+
 type control_request =
   | Data of int
   | Reply of Worker.control_ticket * int
@@ -1638,7 +1736,13 @@ let test_observation_invalidations_are_bounded_latest_facts () =
 let () =
   T.run
     "lui worker service"
-    [ T.case "registered baseline and release fences" test_coordination_registration
+    [ T.case "cancelled successful result is settled before terminal" (test_discarded_success_is_settled `Cancel)
+    ; T.case "shutdown successful result is settled before terminal" (test_discarded_success_is_settled `Stop)
+    ; T.case "delivered successful result keeps ownership" (test_discarded_success_is_settled `Complete)
+    ; T.case "switch-finalizer discarded success is settled" (test_discarded_success_is_settled `Finalizer_failure)
+    ; T.case "slow cancel cleanup joins before terminal" (test_discarded_success_is_settled ~slow:true `Cancel)
+    ; T.case "slow stop cleanup joins before terminal and shutdown" (test_discarded_success_is_settled ~slow:true `Stop)
+    ; T.case "registered baseline and release fences" test_coordination_registration
     ; T.case "resident invalidations preserve all graphs" test_resident_invalidations_survive_coalescing
     ; T.case "observation invalidations bounded latest epochs" test_observation_invalidations_are_bounded_latest_facts
     ; T.case "typed asset failures reach ledger" test_asset_failure_rows

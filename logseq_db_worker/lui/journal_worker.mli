@@ -96,6 +96,12 @@ module Service : sig
 
   type ('config, 'request, 'response, 'push) t
 
+  (** [discard_response] settles a successful handler result that cancellation,
+      stop or handler-switch failure prevents from being published. It runs once
+      in the Worker Domain, under cancellation protection, outside Mailbox locks,
+      before the replacement terminal is observable. It may perform cleanup I/O;
+      an exception is a fatal Service error. Published results retain ownership.
+      The Service still owns cleanup of all retained resources at shutdown. *)
   val create
     :  push_topic_count:int
     -> concurrency:concurrency
@@ -104,6 +110,7 @@ module Service : sig
     -> ?control_topic_count:int
     -> ?classify_control:('request -> control_admission option)
     -> ?handle_control:('state -> 'request -> unit)
+    -> ?discard_response:('state -> request_id:Journal_worker_ids.Worker.request_id -> 'request -> 'response -> unit)
     -> init:('push Session_context.t -> 'config -> ('state, string) result)
     -> handle:
          ('push Request_context.t -> 'state -> 'request -> ('response, string) result)
