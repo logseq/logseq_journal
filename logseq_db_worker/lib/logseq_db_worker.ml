@@ -77,6 +77,9 @@ type local_deletion_waiter =
 type queued_event =
   | Event of Pure_reducer.event
   | Delete_copy of local_deletion_waiter
+  | Asset_command_barrier of
+      { serial:int64; event:Pure_reducer.event; owner:Pure_reducer.Demand_registry.owner; data:bool
+      ; resolve:(Effect_runner.asset_cleanup_snapshot,string)result Eio.Promise.u }
 
 type coordination_snapshot =
   { version : int64
@@ -94,6 +97,9 @@ type t =
   ; mutable coordination : coordination_snapshot
   ; mutable coordination_registration : int64
   ; mutable coordination_notify : (int64 * (coordination_snapshot -> unit)) option
+  ; mutable demand_registry : Pure_reducer.Demand_registry.t
+  ; mutable next_asset_command_barrier : int64
+  ; asset_command_waiters : (int64,(Effect_runner.asset_cleanup_snapshot,string)result Eio.Promise.u)Hashtbl.t
   }
 
 type create_error = Invalid_create of string
@@ -146,6 +152,7 @@ let dispatch t event =
 ;;
 
 let accepts_after_shutdown = function
+  | Pure_reducer.Asset_cleanup_barrier _->true
   | Pure_reducer.Sync_event
       ( Logseq_sync_pure_reducer.Core.Asset_requested _ | Protected_requested _
       | Runner_completed (Asset_completion _ | Protected_completion _)
@@ -159,8 +166,19 @@ let route_event t event =
   else Eio.Stream.add t.events (Event event)
 ;;
 
+let coordination_live t registration=not t.stopped && Option.fold ~none:false
+  ~some:(fun(id,_)->id=registration)t.coordination_notify
+
 let dispatch_queued t = function
   | Event event -> dispatch t event
+  | Asset_command_barrier{serial;event;owner;data;resolve}->
+    Hashtbl.remove t.asset_command_waiters serial;
+    let result=if t.stopped then Error "The Worker stopped before resource settlement."
+      else if data && (not(coordination_live t owner.registration)
+        || not(Pure_reducer.Demand_registry.admitted t.demand_registry owner))
+      then Error "The asset demand round retired before application."
+      else (dispatch t event;Ok(Effect_runner.asset_cleanup_snapshot t.runner ~scope:owner.scope)) in
+    ignore(Eio.Promise.try_resolve resolve result:bool)
   | Delete_copy waiter ->
     let snapshot = (Pure_reducer.view !(t.state)).sync.snapshot in
     if not t.stopped && snapshot.startup.authenticated
@@ -199,7 +217,9 @@ let create ~sw ~config ~runner_dependencies =
          { state = state_ref; runner; events; next_request_id = 0L; stopped = false
          ; local_deletion_waiter = None
          ; coordination={version=0L;presentation=0L;state=Pure_reducer.coordination_state state}
-         ; coordination_registration=0L;coordination_notify=None }
+         ; coordination_registration=0L;coordination_notify=None
+         ; demand_registry=Pure_reducer.Demand_registry.empty;next_asset_command_barrier=0L
+         ; asset_command_waiters=Hashtbl.create 16 }
        in
        event_sink := route_event t;
        dispatch t Pure_reducer.Start;
@@ -219,9 +239,7 @@ let report_asset_diagnostic t ~scope ~operation ~request_operation diagnostic =
 let view t = Pure_reducer.view !(t.state)
 let graph_state t = (view t).graph
 
-let coordination_current t ~registration =
-  not t.stopped && Option.fold ~none:false
-    ~some:(fun (id,_)->id=registration) t.coordination_notify
+let coordination_current t ~registration=coordination_live t registration
 ;;
 
 let register_coordination t ~registration ~notify =
@@ -234,12 +252,70 @@ let register_coordination t ~registration ~notify =
     Ok t.coordination)
 ;;
 
+let run_asset_command_barrier t ~owner ~data event =
+  if t.stopped then Error "The Worker stopped before asset resource admission."
+  else if t.next_asset_command_barrier=Int64.max_int then Error "Resource command counter exhausted." else
+  let promise,resolve=Eio.Promise.create() in
+  t.next_asset_command_barrier<-Int64.succ t.next_asset_command_barrier;
+  let serial=t.next_asset_command_barrier in
+  Hashtbl.add t.asset_command_waiters serial resolve;
+  Fun.protect ~finally:(fun()->Hashtbl.remove t.asset_command_waiters serial)(fun()->
+    Eio.Stream.add t.events(Asset_command_barrier{serial;event;owner;data;resolve});
+    Eio.Promise.await promise)
+;;
+
+let replace_coordinated_asset_demand t ~registration ~scope ~consumer ~priority ~assets =
+  let module R=Pure_reducer.Demand_registry in
+  if not(coordination_current t ~registration) then Error "The coordination binding retired."
+  else
+    let owner:R.owner={registration;scope;consumer} in
+    let registry,decision=R.reserve t.demand_registry owner ~priority ~assets in
+    t.demand_registry<-registry;
+    match decision with
+    | R.Existing->Ok()
+    | R.Retired->Error "The asset demand round retired."
+    | R.Mismatch->Error "The asset demand round changed its immutable owner or descriptors."
+    | R.Full->Error "Asset demand ownership capacity is full. Retire previous rounds."
+    | R.Invalid->Error "Invalid bounded asset demand."
+    | R.Start->
+      Eio.Cancel.protect(fun()->
+        run_asset_command_barrier t ~owner ~data:true
+          (Pure_reducer.Asset_requested_for_scope(scope,Logseq_sync_pure_reducer.Asset_transfer.Replace{consumer;priority;assets}))
+        |> Result.map(fun _->()))
+;;
+
+let release_coordinated_asset_demand t ~registration ~scope ~consumer =
+  let module R=Pure_reducer.Demand_registry in
+  if t.stopped then Error "The Worker stopped before resource release."
+  else if registration<=0L || registration>t.coordination_registration then Error "Unknown coordination resource owner." else
+  let owner:R.owner={registration;scope;consumer} in
+  let registry,decision=R.retire t.demand_registry owner in
+  t.demand_registry<-registry;
+  match decision with
+  | R.Unknown|R.Already_settled->Ok()
+  | R.Mismatch->Error "The resource cleanup owner does not match its allocation."
+  | R.Full->Error "Asset demand retirement capacity is full."
+  | R.Release->
+    let actual=R.pending t.demand_registry ~registration |> Rrbvec.find_opt(fun owner->owner.R.consumer=consumer) |> Option.get in
+    Result.bind(run_asset_command_barrier t ~owner:actual ~data:false
+      (Pure_reducer.Asset_requested_for_scope(actual.scope,Logseq_sync_pure_reducer.Asset_transfer.Release consumer)))
+      (fun snapshot->Result.map(fun()->t.demand_registry<-R.settled t.demand_registry actual)
+        (Effect_runner.await_asset_cleanup t.runner snapshot))
+;;
+
 let release_coordination t ~registration =
   if registration>=t.coordination_registration then (
     t.coordination_registration<-registration;
     t.coordination_notify<-None);
-  Effect_runner.release_observations t.runner ~registration;
-  Effect_runner.retire_changefeed t.runner ~registration
+  let error=ref None in
+  let record=function Ok()->()|Error message->if !error=None then error:=Some message in
+  Pure_reducer.Demand_registry.pending t.demand_registry ~registration
+  |> Rrbvec.iter(fun owner->record(release_coordinated_asset_demand t ~registration ~scope:owner.Pure_reducer.Demand_registry.scope ~consumer:owner.consumer));
+  record(Effect_runner.release_observations_checked t.runner ~registration);
+  Effect_runner.retire_changefeed t.runner ~registration;
+  (match !error with
+   | Some message->Error message
+   | None->t.demand_registry<-Pure_reducer.Demand_registry.forget_settled t.demand_registry ~registration;Ok())
 ;;
 
 let revoke_coordination t = t.coordination_notify<-None
@@ -280,6 +356,8 @@ let shutdown t =
       ignore (Eio.Promise.try_resolve waiter.resolve (Error "The Worker stopped.") : bool))
       t.local_deletion_waiter;
     t.local_deletion_waiter <- None;
+    Hashtbl.iter(fun _ resolve->ignore(Eio.Promise.try_resolve resolve(Error "The Worker stopped before resource settlement."):bool))t.asset_command_waiters;
+    Hashtbl.clear t.asset_command_waiters;
     dispatch t Pure_reducer.Shutdown;
     let rec drain () =
       match Eio.Stream.take_nonblocking t.events with
@@ -287,6 +365,8 @@ let shutdown t =
       | Some (Event event) ->
         if accepts_after_shutdown event then dispatch t event;
         drain ()
+      | Some(Asset_command_barrier{resolve;_})->
+        ignore(Eio.Promise.try_resolve resolve(Error "The Worker stopped before resource settlement."):bool);drain()
       | Some (Delete_copy waiter) ->
         ignore (Eio.Promise.try_resolve waiter.resolve (Error "The Worker stopped.") : bool);
         drain ()

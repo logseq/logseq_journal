@@ -321,6 +321,18 @@ let on_event t event =
            error := Some e;
            t.post (Core.Observation_notices_failed (I.binding, e)));
         Broadcast
+      | Push {payload=(Service.Asset_notice _|Asset_notices _) as payload;push_sequence;_}->
+        let module I=(val t.issuer:Worker.ISSUER) in
+        Option.iter(fun view->Option.iter(fun projection->
+          List.iter(fun(scope,data)->
+            match List.find_opt(fun resident->resident.Worker.phase=Worker.Open
+              && Worker.matches_asset_scope resident.session scope)(Worker.residents projection) with
+            | None->()
+            | Some resident->(match I.asset_notice resident.session data with
+              | Ok notice->t.post(Core.Asset_received(notice,push_sequence))
+              | Error _->()))(Service.asset_notices payload))
+          (Core.projection view))t.latest;
+        Broadcast
       | Push _ -> Broadcast
       | Terminal { error = message; _ } ->
         let module I = (val t.issuer : Worker.ISSUER) in
@@ -354,7 +366,7 @@ let shutdown t =
     t.post Core.Shutdown_requested)
   else (
     match Option.map Core.shutdown_state t.latest with
-    | Some (Core.Shutdown_failed _) -> t.post Core.Capacity_available
+    | Some (Core.Shutdown_failed _) -> t.post Core.Shutdown_requested
     | _ -> ());
   match Option.map Core.shutdown_state t.latest with
   | Some Core.Stopped -> Stopped

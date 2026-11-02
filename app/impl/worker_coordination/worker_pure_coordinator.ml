@@ -3,6 +3,9 @@ module Id = Logseq_db_worker_lui.Journal_worker_ids.Worker
 module Intents = Map.Make (String)
 module Slots = Map.Make (Int64)
 module Graphs = Map.Make (Worker.Uuid)
+module Asset_consumers=Map.Make(struct type t=Worker.asset_consumer let compare=Worker.compare_asset_consumer end)
+type asset_registration={consumer:Worker.asset_consumer;assets:Logseq_db_types.Asset_descriptor.t list;
+  active:bool;notices:(Worker.asset_notice * Id.push_sequence) list}
 
 module Observation_ids = Map.Make (struct
     type t = Worker.request_id
@@ -141,6 +144,15 @@ type 'a observation_state =
 
 type observation_entry = Observing : 'a observation_state -> observation_entry
 
+type asset_cleanup =
+  { consumer:Worker.asset_consumer
+  ; attempt:Worker.request_id option
+  ; waiters:int64 list
+  ; wait_for_capacity:bool
+  ; error:Worker.error option
+  }
+
+
 type change_application =
   { application_id : Worker.request_id
   ; application_batch : Worker.change_batch
@@ -182,6 +194,9 @@ type view =
   ; change_batches : (Worker.change_batch * Worker.read_budget) Graphs.t
   ; change_acks : Worker.change_ack Graphs.t
   ; observations : observation_entry Observation_ids.t
+  ; asset_consumers : asset_registration Asset_consumers.t
+  ; asset_cleanup : asset_cleanup Observation_ids.t
+  ; session_assets : (Worker.asset_notice * Id.push_sequence) list Graphs.t
   ; retired_observations : Worker.session Observation_ids.t
   ; retired_observation_count : int
   }
@@ -237,6 +252,9 @@ let initial ~client_id =
       ; change_batches = Graphs.empty
       ; change_acks = Graphs.empty
       ; observations = Observation_ids.empty
+      ; asset_consumers = Asset_consumers.empty
+      ; asset_cleanup = Observation_ids.empty
+      ; session_assets = Graphs.empty
       ; retired_observations = Observation_ids.empty
       ; retired_observation_count = 0
       }
@@ -274,8 +292,16 @@ let handoff v id =
     v.handoffs
 ;;
 
-let asset_notices _ _ = []
-let session_asset_notices _ _ = []
+let asset_notices facts consumer =
+  if not(current_session facts(Worker.asset_consumer_session consumer)) then [] else
+  match Asset_consumers.find_opt consumer facts.asset_consumers with
+  | Some entry when entry.active->List.map fst entry.notices
+  | _->[]
+let session_asset_notices facts session =
+  if not(current_session facts session) then [] else
+    Option.value(Graphs.find_opt(Worker.graph_id session)facts.session_assets)~default:[]
+    |> List.map fst
+    |> List.filter(fun notice->Worker.equal_session session(Worker.asset_notice_session notice))
 let ticket_id ticket = ticket.id
 let ticket_acknowledgement ticket = ticket.acknowledgement
 
@@ -455,6 +481,9 @@ let equal_view a b =
       && a.shutdown = b.shutdown
       && a.intents = b.intents
       && a.intent_epoch = b.intent_epoch
+      && Asset_consumers.equal(=)a.asset_consumers b.asset_consumers
+      && Observation_ids.equal(=)a.asset_cleanup b.asset_cleanup
+      && Graphs.equal(=)a.session_assets b.session_assets
       && Graphs.equal ( = ) a.applications b.applications
       && Graphs.equal ( = ) a.change_notices b.change_notices
       && Graphs.equal String.equal a.change_projections b.change_projections
@@ -505,7 +534,7 @@ type event =
   | Observation_notice of Worker.observation_notice
   | Observation_notices_failed of Worker.binding * Worker.error
   | Observation_received : 'a Worker.observed -> event
-  | Asset_received of Worker.asset_notice
+  | Asset_received of Worker.asset_notice * Id.push_sequence
   | Cancel : 'a ticket -> event
   | Forget : 'a ticket -> event
   | Release : 'a Worker.observation -> event
@@ -629,7 +658,15 @@ let outstanding state =
 ;;
 
 let settle state instructions =
-  if state.released && (not state.bootstrap_inflight) && not (outstanding state)
+  if not(Observation_ids.is_empty state.facts.asset_cleanup) then
+    let error=Observation_ids.fold(fun _ cleanup found->match found with
+      | Some _->found|None->cleanup.error)state.facts.asset_cleanup None in
+    let facts=match state.lifecycle,error with
+      | Stopping,Some error->{state.facts with shutdown=Shutdown_failed error}
+      | Retrying,Some error->{state.facts with bootstrap_state=Worker.Bootstrap_failed error}
+      | _->state.facts in
+    changed {state with facts} instructions
+  else if state.released && (not state.bootstrap_inflight) && not (outstanding state)
   then (
     match state.lifecycle with
     | Retrying ->
@@ -955,11 +992,65 @@ let dispatch_waiting ?(publish = false) ?(retry_full = false) state instructions
   else unchanged next
 ;;
 
+let plan_intent_lifecycle
+  : type a. t -> Worker.session -> a Worker.request -> a kind -> query_target
+    -> (Worker.presentation * Worker.receipt option) option
+    -> (a ticket * transition,Worker.error) result
+  = fun state session operation kind target acknowledgement ->
+  if state.next=Int64.max_int then Error(Worker.Invalid_input "Request counter exhausted") else
+  let serial=Int64.succ state.next in
+  let ticket={id=Worker.request_id(identity state.client serial);serial;kind;query=Operation operation;target;
+    planned_intent_epoch=state.facts.intent_epoch;acknowledgement} in
+  let slot={ticket;wait_for_capacity=false;dispatched=true;admitted=None;change_version=0L;
+    sample_epoch=None;origin=None;result=None;early=None;cancelled=false;forgotten=false;retired_by_ack=false} in
+  let facts={state.facts with entries=Slots.add serial(Entry slot)state.facts.entries} in
+  Ok(ticket,changed{state with next=serial;facts}[Send(ticket,session,operation)])
+;;
+
+
+let non_publications instructions=List.filter(function Publish _->false|_->true)instructions
+
+let queue_asset_cleanup facts consumer ?waiter () =
+  match Worker.asset_consumer_round consumer with
+  | None->facts
+  | Some round->
+    let cleanup=match Observation_ids.find_opt round facts.asset_cleanup with
+      | Some old->
+        let retained=List.filter(fun serial->match Slots.find_opt serial facts.entries with
+          | Some(Entry slot)->slot.result=None && not slot.forgotten && not slot.cancelled
+          | None->false)old.waiters in
+        {old with error=None;wait_for_capacity=false;
+          waiters=(match waiter with None->retained|Some serial->serial::retained)}
+      | None->{consumer;attempt=None;waiters=Option.to_list waiter;wait_for_capacity=false;error=None} in
+    {facts with asset_cleanup=Observation_ids.add round cleanup facts.asset_cleanup}
+;;
+
+let progress_asset_cleanup ?(capacity=false) transition =
+  let next=ref transition.next and effects=ref [] in
+  Observation_ids.iter(fun round cleanup->
+    if cleanup.attempt=None && cleanup.error=None && (capacity || not cleanup.wait_for_capacity) then
+      let session=Worker.asset_consumer_session cleanup.consumer in
+      match plan_intent_lifecycle !next session(Worker.Release_asset_demand cleanup.consumer)Unit(Cleanup session)None with
+      | Error error->next:={!next with facts={!next.facts with asset_cleanup=Observation_ids.add round {cleanup with error=Some error} !next.facts.asset_cleanup}}
+      | Ok(ticket,planned)->
+        let entries=match Slots.find_opt ticket.serial planned.next.facts.entries with
+          | Some(Entry slot)->Slots.add ticket.serial(Entry{slot with forgotten=true})planned.next.facts.entries
+          | None->assert false in
+        next:={planned.next with facts={planned.next.facts with entries;
+          asset_cleanup=Observation_ids.add round {cleanup with attempt=Some ticket.id;wait_for_capacity=false}planned.next.facts.asset_cleanup}};
+        effects:=List.rev_append(non_publications planned.instructions)!effects)
+    transition.next.facts.asset_cleanup;
+  if !next==transition.next then transition else
+    changed !next(non_publications transition.instructions @ List.rev !effects)
+;;
+
 let retire state lifecycle =
   let facts, instructions = cancel_entries (fun _ -> true) state.facts in
+  let facts=Asset_consumers.fold(fun _ (entry:asset_registration) facts->queue_asset_cleanup facts entry.consumer ())facts.asset_consumers facts in
   let facts =
     { facts with
-      current = None
+      asset_consumers=Asset_consumers.map(fun (entry:asset_registration)->{entry with active=false;notices=[]})facts.asset_consumers
+    ; current = None
     ; bootstrap_state = Worker.Awaiting_baseline
     ; shutdown = (if lifecycle = Stopping then Draining else facts.shutdown)
     }
@@ -1056,6 +1147,8 @@ let apply_baseline state binding incoming =
               (fun _ (batch, _) ->
                  current_session facts (Worker.change_batch_session batch))
               facts.change_batches
+        ; session_assets=Graphs.filter(fun _ values->List.exists(fun(notice,_)->
+            current_session facts(Worker.asset_notice_session notice))values)facts.session_assets
         ; change_acks =
             Graphs.filter
               (fun _ ack -> current_session facts (Worker.change_ack_session ack))
@@ -1068,7 +1161,13 @@ let apply_baseline state binding incoming =
           (fun target -> not (current_target facts target))
           facts
       in
-      dispatch_waiting ~publish:true { state with facts; retired } instructions))
+      let facts=Asset_consumers.fold(fun _ (entry:asset_registration) facts->
+        if entry.active && not(current_session facts(Worker.asset_consumer_session entry.consumer))
+        then queue_asset_cleanup facts entry.consumer () else facts)facts.asset_consumers facts in
+      let asset_consumers=Asset_consumers.map(fun (entry:asset_registration)->
+        if not(current_session facts(Worker.asset_consumer_session entry.consumer))
+        then {entry with active=false;notices=[]}else entry)facts.asset_consumers in
+      dispatch_waiting ~publish:true { state with facts={facts with asset_consumers}; retired } instructions))
 ;;
 
 let known_receipt facts key =
@@ -1546,6 +1645,47 @@ let retain_change_result : type a. t -> a ticket -> a Worker.reply -> t =
   | _ -> state
 ;;
 
+let asset_cleanup_error = function
+  | Worker.Answered(Error error)->error
+  | Worker.Not_admitted _->Worker.Service_failed "Asset cleanup could not be admitted. Retry the same consumer."
+  | Worker.Interrupted _->Worker.Service_failed "Asset cleanup was interrupted. Retry the same consumer."
+  | Worker.Answered(Ok())->assert false
+
+let complete_asset_waiters facts waiters (result:unit Worker.reply) =
+  let entries=List.fold_left(fun entries serial->match Slots.find_opt serial entries with
+    | Some(Entry slot) when slot.result=None->
+      (match same_kind slot.ticket.kind Unit with
+       | Some Worker.Refl->if slot.forgotten then Slots.remove serial entries else
+         Slots.add serial(Entry{slot with result=Some result})entries
+       | None->entries)
+    | _->entries)facts.entries waiters in
+  {facts with entries}
+;;
+let retain_asset_command_result : type a. t -> a ticket -> a Worker.reply -> t =
+  fun state ticket result->match ticket.query with
+  | Operation(Worker.Release_asset_demand consumer)->
+    (match Option.bind(Worker.asset_consumer_round consumer)(fun round->
+      Option.map(fun cleanup->round,cleanup)(Observation_ids.find_opt round state.facts.asset_cleanup)) with
+     | Some(round,cleanup) when cleanup.attempt=Some ticket.id->
+       (match result with
+        | Worker.Not_admitted Worker.Full->{state with facts={state.facts with asset_cleanup=
+            Observation_ids.add round {cleanup with attempt=None;wait_for_capacity=true}state.facts.asset_cleanup}}
+        | _->
+          let success=result=Worker.Answered(Ok()) in
+          let error=if success then None else Some(asset_cleanup_error result) in
+          let facts=complete_asset_waiters state.facts cleanup.waiters
+            (match error with None->Worker.Answered(Ok())|Some error->Worker.Answered(Error error)) in
+          let asset_consumers=match Asset_consumers.find_opt consumer facts.asset_consumers with
+            | Some entry when success && not entry.active
+                && Worker.asset_consumer_round entry.consumer=Some round->Asset_consumers.remove consumer facts.asset_consumers
+            | _->facts.asset_consumers in
+          let asset_cleanup=if success then Observation_ids.remove round facts.asset_cleanup else
+            Observation_ids.add round {cleanup with attempt=None;waiters=[];wait_for_capacity=false;error}facts.asset_cleanup in
+          {state with facts={facts with asset_consumers;asset_cleanup}})
+     | _->state)
+  | _->state
+;;
+
 let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
   fun state ticket result require_admission ->
   match Slots.find_opt ticket.serial state.facts.entries with
@@ -1591,6 +1731,7 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
              ~cancelled:slot.cancelled
          in
          let state = retain_change_result state ticket result in
+         let state = retain_asset_command_result state ticket result in
          let intents : Worker.mutation_progress Intents.t =
            if slot.retired_by_ack then state.facts.intents else match ticket.query with
            | Operation (Worker.Mutate intent) ->
@@ -1655,7 +1796,8 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
            in
            if cancelled_observe
            then Worker.Interrupted Worker.Cancelled
-           else if state.lifecycle = Running && current_target state.facts ticket.target
+           else if (state.lifecycle = Running || match ticket.target with Cleanup _->true|_->false)
+                   && current_target state.facts ticket.target
            then result
            else Worker.Answered (Error Worker.Revoked_session)
          in
@@ -1885,6 +2027,39 @@ let change_consumer state token operation =
   | _ -> unchanged state
 ;;
 
+let asset_fact_key notice=match Worker.asset_notice_data notice with
+  | Logseq_db_worker_lui.Logseq_db_worker_lui_service.Asset_availability{asset;_}->"asset:"^Worker.Uuid.to_string asset
+  | Asset_demand_accepted _|Asset_backpressure _->"admission"
+  | Asset_capacity_available->"capacity"
+  | Upload_status{operation;_}->"upload:"^Worker.Uuid.to_string operation
+let retain_asset_notice state notice sequence =
+  let session=Worker.asset_notice_session notice in
+  if validate_session state session<>Ok() then unchanged state else
+  let replace values=
+    let key=asset_fact_key notice in
+    let previous=List.find_opt(fun(old,_)->asset_fact_key old=key)values in
+    if Option.exists(fun(_,seen)->Id.Push_sequence.compare sequence seen<=0)previous then None
+    else Some((notice,sequence)::List.filter(fun(old,_)->asset_fact_key old<>key)values) in
+  match Worker.asset_notice_consumer notice with
+  | Some consumer->
+    (match Asset_consumers.find_opt consumer state.facts.asset_consumers with
+     | Some entry when entry.active && Worker.asset_consumer_round consumer=Worker.asset_consumer_round entry.consumer->
+       let owned=match Worker.asset_notice_data notice with
+         | Logseq_db_worker_lui.Logseq_db_worker_lui_service.Asset_availability{asset;_}->
+           List.exists(fun descriptor->descriptor.Logseq_db_types.Asset_descriptor.uuid=asset)entry.assets
+         | _->true in
+       if not owned then unchanged state else
+       (match replace entry.notices with None->unchanged state|Some notices->
+       changed {state with facts={state.facts with asset_consumers=Asset_consumers.add consumer {entry with notices}state.facts.asset_consumers}}[])
+     | _->unchanged state)
+  | None->
+    let graph=Worker.graph_id session in
+    let previous=Option.value(Graphs.find_opt graph state.facts.session_assets)~default:[]
+      |> List.filter(fun(old,_)->Worker.equal_session session(Worker.asset_notice_session old)) in
+    (match replace previous with None->unchanged state|Some values->
+      changed {state with facts={state.facts with session_assets=Graphs.add graph(List.take 256 values)state.facts.session_assets}}[])
+;;
+
 let step_base state event =
   match event with
   | Worker_bound binding when state.binding = None || state.lifecycle = Rebinding ->
@@ -1936,6 +2111,13 @@ let step_base state event =
   | Retry_bootstrap -> unchanged state
   | Shutdown_requested when state.lifecycle <> Finished && state.lifecycle <> Stopping ->
     retire state Stopping
+  | Shutdown_requested when state.lifecycle=Stopping ->
+    let facts={state.facts with shutdown=Draining;
+      asset_cleanup=Observation_ids.map(fun cleanup->{cleanup with error=None;wait_for_capacity=false})state.facts.asset_cleanup} in
+    (match state.binding with
+     | Some binding when not state.release_pending && not state.released->
+       changed {state with facts;release_pending=true}[Release_binding binding]
+     | _->settle {state with facts}[])
   | Shutdown_requested -> unchanged state
   | Bootstrap_admitted (binding, id)
     when is_binding state binding && state.bootstrap_inflight ->
@@ -2001,6 +2183,15 @@ let step_base state event =
            state.facts.observations
            facts
        in
+       (* Unregister's checked ACK covers every demand allocated by this
+          binding. Independent release responses can still be in the mailbox;
+          they retain their ticket fence but cannot revive these obligations. *)
+       let facts=Observation_ids.fold(fun _ cleanup facts->
+         complete_asset_waiters facts cleanup.waiters(Worker.Answered(Ok())))
+         facts.asset_cleanup facts in
+       let facts={facts with asset_cleanup=Observation_ids.empty;
+         asset_consumers=Asset_consumers.empty;session_assets=Graphs.empty;
+         shutdown=(if state.lifecycle=Stopping then Draining else facts.shutdown)} in
        settle { state with facts; released = true; release_pending = false } []
      | Error error ->
        changed
@@ -2345,7 +2536,8 @@ let step_base state event =
        when owned.obs_admitted && owned.obs_registered && not owned.obs_releasing ->
        changed (retain_observed_value state value ~admitted:true ~cancelled:false) []
      | _ -> unchanged state)
-  | Handoff_completed _ | Asset_received _ -> unchanged state
+  | Asset_received(notice,sequence)->retain_asset_notice state notice sequence
+  | Handoff_completed _ -> unchanged state
 ;;
 
 let plan_refresh ?(internal = false) (state : t) session handle =
@@ -2497,12 +2689,13 @@ let progress_observations ~retry transition =
 ;;
 
 let step state event =
-  progress_observations
+  progress_asset_cleanup ~capacity:(event=Capacity_available)
+  (progress_observations
     ~retry:
       (match event with
        | Capacity_available -> true
        | _ -> false)
-    (step_base state event)
+    (step_base state event))
 ;;
 
 let plan_mutation
@@ -2587,19 +2780,60 @@ let plan_mutation
       ))
 ;;
 
-let plan_intent_lifecycle
-  : type a. t -> Worker.session -> a Worker.request -> a kind -> query_target
-    -> (Worker.presentation * Worker.receipt option) option
-    -> (a ticket * transition,Worker.error) result
-  = fun state session operation kind target acknowledgement ->
-  if state.next=Int64.max_int then Error(Worker.Invalid_input "Request counter exhausted") else
-  let serial=Int64.succ state.next in
-  let ticket={id=Worker.request_id(identity state.client serial);serial;kind;query=Operation operation;target;
-    planned_intent_epoch=state.facts.intent_epoch;acknowledgement} in
-  let slot={ticket;wait_for_capacity=false;dispatched=true;admitted=None;change_version=0L;
-    sample_epoch=None;origin=None;result=None;early=None;cancelled=false;forgotten=false;retired_by_ack=false} in
-  let facts={state.facts with entries=Slots.add serial(Entry slot)state.facts.entries} in
-  Ok(ticket,changed{state with next=serial;facts}[Send(ticket,session,operation)])
+let asset_round_count facts =
+  let rounds=Observation_ids.map(fun _->())facts.asset_cleanup in
+  let rounds=Asset_consumers.fold(fun _ (entry:asset_registration) rounds->
+    match Worker.asset_consumer_round entry.consumer with
+    | None->rounds|Some round->Observation_ids.add round ()rounds)facts.asset_consumers rounds in
+  Observation_ids.cardinal rounds
+;;
+
+let plan_asset_command state session operation consumer assets =
+  if asset_round_count state.facts>=128
+  then Error(Worker.Invalid_input "Settle asset demand rounds before admitting another replacement") else
+  let facts=match Asset_consumers.find_opt consumer state.facts.asset_consumers with
+    | None->state.facts
+    | Some previous->queue_asset_cleanup state.facts previous.consumer () in
+  Result.map(fun(ticket,transition)->
+    let bound=Worker.bind_asset_consumer consumer ~round:ticket.id in
+    let entry={consumer=bound;assets;active=true;notices=[]} in
+    let next={transition.next with facts={transition.next.facts with
+      asset_consumers=Asset_consumers.add consumer entry transition.next.facts.asset_consumers}} in
+    progress_asset_cleanup(changed next(non_publications transition.instructions)) |> fun transition->ticket,transition)
+    (plan_intent_lifecycle {state with facts} session operation Unit(Direct session)None)
+;;
+
+let plan_asset_release state session consumer =
+  if not(Worker.equal_session session(Worker.asset_consumer_session consumer))
+  then Error Worker.Revoked_session
+  else if Slots.cardinal state.facts.entries>=512
+  then Error(Worker.Invalid_input "Release completed cleanup tickets before adding another waiter") else
+  let bound=match Asset_consumers.find_opt consumer state.facts.asset_consumers with
+    | Some entry->Some entry.consumer
+    | None->Observation_ids.fold(fun _ cleanup found->match found with Some _->found|None->
+        if Worker.equal_asset_consumer consumer cleanup.consumer then Some cleanup.consumer else None)
+        state.facts.asset_cleanup None in
+  let operation=Worker.Release_asset_demand(Option.value bound ~default:consumer) in
+  Result.map(fun((ticket:unit ticket),planned)->
+    let entries=match Slots.find_opt ticket.serial planned.next.facts.entries with
+      | Some(Entry slot)->(match same_ticket ticket slot.ticket with
+        | Some Worker.Refl->Slots.add ticket.serial(Entry{slot with dispatched=false;
+            result=(if bound=None then Some(Worker.Answered(Ok())) else None)})planned.next.facts.entries
+        | None->assert false)
+      | None->assert false in
+    let facts={planned.next.facts with entries} in
+    let facts=match bound with
+      | None->facts
+      | Some bound->
+        let asset_consumers=match Asset_consumers.find_opt consumer facts.asset_consumers with
+          | None->facts.asset_consumers
+          | Some entry->Asset_consumers.add consumer {entry with active=false;notices=[]}facts.asset_consumers in
+        let asset_cleanup=Observation_ids.map(fun cleanup->
+          if Worker.equal_asset_consumer cleanup.consumer consumer then {cleanup with error=None;wait_for_capacity=false}
+          else cleanup)facts.asset_cleanup in
+        queue_asset_cleanup {facts with asset_consumers;asset_cleanup} bound ~waiter:ticket.serial () in
+    ticket,progress_asset_cleanup(changed {planned.next with facts}[]))
+    (plan_intent_lifecycle state session operation Unit(Cleanup session)None)
 ;;
 
 let plan_recovery state session operation =
@@ -2821,6 +3055,7 @@ let rec request
       Result.bind(Worker.restore_mutation_intent session(Worker.encode_append_intent intent))
         (fun mutation->request state session(Worker.Mutate mutation)))
   | Worker.Release handle -> plan_release state session handle
+  | Worker.Release_asset_demand consumer->plan_asset_release state session consumer
   | _ ->
     Result.bind (validate_session state session) (fun () ->
       if Slots.cardinal state.facts.entries >= 256
@@ -2833,6 +3068,9 @@ let rec request
               plan_observation state session budget query
             | Worker.Refresh handle -> plan_refresh state session handle
             | Worker.Acknowledge_changes batch -> plan_change_ack state session batch
+            | Worker.Replace_asset_demand(consumer,_,assets)->plan_asset_command state session operation consumer assets
+            | Worker.Retry_asset _->plan_intent_lifecycle state session operation Unit(Direct session)None
+            | Worker.Retry_upload _->plan_intent_lifecycle state session operation Unit(Direct session)None
             | Worker.Recover_mutations _ -> plan_recovery state session operation
             | Worker.Acknowledge_intent intent -> plan_intent_ack state session intent
             | Worker.Query (budget, query) ->
@@ -3050,9 +3288,14 @@ let prepare_host_change state change =
     let facts, cancels =
       cancel_entries (fun target -> affected_target target change) facts
     in
+    let facts=Asset_consumers.fold(fun _ (entry:asset_registration) facts->
+      if affected(Worker.asset_consumer_session entry.consumer)change
+      then queue_asset_cleanup facts entry.consumer () else facts)facts.asset_consumers facts in
+    let facts={facts with asset_consumers=Asset_consumers.map(fun (entry:asset_registration)->
+      if affected(Worker.asset_consumer_session entry.consumer)change then {entry with active=false;notices=[]}else entry)facts.asset_consumers} in
     Ok
       ( id
-      , progress_observations
+      , progress_asset_cleanup(progress_observations
           ~retry:false
           (changed
              { state with
@@ -3061,7 +3304,7 @@ let prepare_host_change state change =
              ; active_handoff = Some id
              ; fenced = change :: state.fenced
              }
-             (cancels @ [ Quiesce (id, change) ])) ))
+             (cancels @ [ Quiesce (id, change) ]))) ))
 ;;
 
 module Response_ownership = struct

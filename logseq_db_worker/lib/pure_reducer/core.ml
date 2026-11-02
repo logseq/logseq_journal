@@ -108,6 +108,7 @@ type upload_recovery_ticket =
   }
 
 type instruction =
+  | Asset_cleanup_barrier_reached of int64
   | Deliver_protected_result of Logseq_sync_pure_reducer.Core.protected_output
   | Deliver_asset_result of Logseq_sync_pure_reducer.Core.asset_output
   | Read_uploads of upload_recovery_ticket
@@ -123,6 +124,7 @@ type instruction =
 module Sync = Logseq_sync_pure_reducer.Core
 
 let instruction_diagnostic = function
+  | Asset_cleanup_barrier_reached _ -> "asset-cleanup-barrier"
   | Deliver_protected_result _ -> "deliver-protected-result"
   | Deliver_asset_result _ -> "deliver-asset-result"
   | Read_uploads _ -> "read-uploads"
@@ -144,6 +146,7 @@ let instruction_diagnostic = function
 
 let equal_instruction left right =
   match left, right with
+  | Asset_cleanup_barrier_reached l,Asset_cleanup_barrier_reached r->l=r
   | Deliver_protected_result l, Deliver_protected_result r -> l = r
   | Deliver_asset_result l, Deliver_asset_result r -> l = r
   | Read_uploads l, Read_uploads r -> l = r
@@ -153,7 +156,8 @@ let equal_instruction left right =
   | Run_sync left, Run_sync right -> Sync.equal_runner_effect left right
   | Run_worker left, Run_worker right -> left = right
   | Publish left, Publish right -> left = right
-  | ( ( Run_worker _
+  | ( ( Asset_cleanup_barrier_reached _
+      | Run_worker _
       | Run_sync _
       | Run_asset _
       | Run_upload _
@@ -266,6 +270,7 @@ let view state =
 let equal_view left right = left = right
 
 type event =
+  | Asset_cleanup_barrier of int64
   | Upload_requested of
       { graph_generation : int
       ; operation : Logseq_db_types.Graph_types.Uuid.t
@@ -534,6 +539,7 @@ let step state event =
     | _ -> no_effects state)
   else (
     match event with
+    | Asset_cleanup_barrier _
     | Uploads_loaded _
     | Upload_requested _
     | Upload_completed _
@@ -1233,6 +1239,11 @@ let step state event =
   let next=if next.graph.phase=Graph_closed && next.database=None && List.filter graph_pending next.pending=[]
     then {next with active_scope=None} else next in
   {next=(if known || (Sync.state next.sync_core).snapshot.resident_graphs<>[] then restore_visible_graph next else next);effects}
+let step_without_asset_barrier=step
+let step state event=match event with
+  | Asset_cleanup_barrier token->{next=state;effects=[Asset_cleanup_barrier_reached token]}
+  | _->step_without_asset_barrier state event
+
 let asset_ticket_current_single = asset_ticket_current
 let asset_ticket_current state ticket =
   let scope=match ticket with Transfer.Lookup t->t.scope | Download t->t.scope in
@@ -1667,4 +1678,59 @@ module Orphan_cleanup = struct
        | Error _->{resources=Resources.add work.resource {attempt=None;failures=min 6(entry.failures+1)}t.resources;
            ready=Queue.add t.serial work.resource t.ready;serial=Int64.succ t.serial})
     | _->t
+end
+
+module Demand_registry = struct
+  type owner={registration:int64;scope:Logseq_sync_pure_reducer.Core.graph_scope;consumer:string}
+  module Keys=Map.Make(struct type t=int64*string let compare=Stdlib.compare end)
+  type payload=Logseq_sync_pure_reducer.Asset_transfer.priority * Logseq_db_types.Asset_descriptor.t list
+  type entry={owner:owner;payload:payload option;retired:bool;settled:bool}
+  type t={entries:entry Keys.t;closed:int64}
+  type reservation=Start|Existing|Retired|Mismatch|Full|Invalid
+  type release=Release|Already_settled|Unknown|Mismatch|Full
+  let empty={entries=Keys.empty;closed=0L}
+  let key owner=owner.registration,owner.consumer
+  let same_scope (a:Logseq_sync_pure_reducer.Core.graph_scope) (b:Logseq_sync_pure_reducer.Core.graph_scope)=
+    a.graph_id=b.graph_id && a.graph_generation=b.graph_generation
+    && a.account.user_id=b.account.user_id && Uri.equal a.account.managed_sync_origin b.account.managed_sync_origin
+    && a.account.account_generation=b.account.account_generation
+    && a.account.lifecycle_generation=b.account.lifecycle_generation
+  let admitted t owner=owner.registration>t.closed && match Keys.find_opt(key owner)t.entries with
+    | Some entry->not entry.retired && same_scope entry.owner.scope owner.scope
+    | None->false
+  let reserve t owner ~priority ~assets : t * reservation =
+    if owner.registration<=t.closed then t,Retired
+    else if owner.registration<=0L || owner.consumer="" || String.length owner.consumer>512
+         || List.length assets>Protocol.maximum_page_size then t,Invalid else
+    let bytes=List.fold_left(fun bytes asset->if bytes>Protocol.maximum_response_bytes then bytes else
+      bytes+1+String.length(Yojson.Safe.to_string(Logseq_db_types.Asset_descriptor.to_yojson asset)))2 assets in
+    if bytes>Protocol.maximum_response_bytes then t,Invalid else
+    match Keys.find_opt(key owner)t.entries with
+    | Some entry when not(same_scope entry.owner.scope owner.scope)->t,Mismatch
+    | Some{retired=true;_}->t,Retired
+    | Some entry when entry.payload=Some(priority,assets)->t,Existing
+    | Some _->t,Mismatch
+    | None->
+      let pending=Keys.fold(fun _ entry count->count+(if entry.settled then 0 else 1))t.entries 0 in
+      if pending>=128 || Keys.cardinal t.entries>=8192 then t,Full else
+      {t with entries=Keys.add(key owner){owner;payload=Some(priority,assets);retired=false;settled=false}t.entries},Start
+  let retire t owner : t * release =
+    if owner.registration<=0L || owner.consumer="" || String.length owner.consumer>512 then t,Mismatch else
+    match Keys.find_opt(key owner)t.entries with
+    | Some entry when not(same_scope entry.owner.scope owner.scope)->t,Mismatch
+    | Some{settled=true;_}->t,Already_settled
+    | Some entry->{t with entries=Keys.add(key owner){entry with retired=true}t.entries},Release
+    | None when owner.registration<=t.closed->t,Unknown
+    | None when Keys.cardinal t.entries>=8192->t,Full
+    | None->{t with entries=Keys.add(key owner){owner;payload=None;retired=true;settled=true}t.entries},Unknown
+  let settled t owner=match Keys.find_opt(key owner)t.entries with
+    | Some entry when entry.retired && same_scope entry.owner.scope owner.scope->
+      {t with entries=Keys.add(key owner){entry with settled=true;payload=None}t.entries}
+    | _->t
+  let pending t ~registration=Keys.fold(fun _ entry values->
+    if entry.owner.registration=registration && not entry.settled then Rrbvec.push_back values entry.owner else values)
+    t.entries Rrbvec.empty
+  let forget_settled t ~registration=
+    {closed=max t.closed registration;entries=Keys.filter(fun _ entry->
+      entry.owner.registration>registration || not entry.settled)t.entries}
 end

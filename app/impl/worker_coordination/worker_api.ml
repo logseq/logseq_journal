@@ -27,6 +27,7 @@ type session =
   ; lifecycle : int64
   ; generation : graph_generation
   ; scope : Service.timeline_scope
+  ; asset_scope : Service.asset_scope
   ; limits : Protocol.v2_capability_limits
   }
 
@@ -354,11 +355,12 @@ type observation_notice =
 type asset_consumer =
   { session : session
   ; name : string
+  ; round : request_id option
   }
 
-type asset_file = |
+type asset_file = { asset_owner:session; asset_consumer:asset_consumer; asset:Uuid.t; source_handle:string }
 type file_lease = |
-type upload_operation = |
+type upload_operation = { upload_owner:session; operation:Uuid.t }
 type imported = |
 type asset_import_intent = |
 
@@ -371,7 +373,7 @@ type asset_priority =
   | Foreground
   | Background
 
-type asset_notice = |
+type asset_notice = { notice_owner:session; notice_consumer:asset_consumer option; notice_data:Service.asset_notice }
 
 type _ request =
   | Query : read_budget * 'a query -> 'a request
@@ -586,6 +588,15 @@ let equal_session (a : session) (b : session) =
   && a.lifecycle = b.lifecycle
   && a.generation = b.generation
   && Uuid.equal a.graph b.graph
+;;
+
+let matches_asset_scope (session:session) (scope:Service.asset_scope)=
+  let expected=session.asset_scope in
+  expected.graph_id=scope.graph_id && expected.graph_generation=scope.graph_generation
+  && expected.account.user_id=scope.account.user_id
+  && Uri.equal expected.account.managed_sync_origin scope.account.managed_sync_origin
+  && expected.account.account_generation=scope.account.account_generation
+  && expected.account.lifecycle_generation=scope.account.lifecycle_generation
 ;;
 
 let same_logical_graph (a : session) (b : session) =
@@ -856,7 +867,7 @@ let same_observation : type a b. a observation -> b observation -> (a, b) equali
 let asset_consumer session ~name =
   if name = "" || String.length name > 128
   then Error (Invalid_input "Invalid asset consumer name")
-  else Ok { session; name }
+  else Ok { session; name;round=None }
 ;;
 
 let asset_consumer_session (c : asset_consumer) = c.session
@@ -864,6 +875,32 @@ let asset_consumer_session (c : asset_consumer) = c.session
 let equal_asset_consumer (a : asset_consumer) (b : asset_consumer) =
   equal_session a.session b.session && a.name = b.name
 ;;
+
+let asset_consumer_prefix (session:session) =
+  let module Id=Logseq_db_worker_lui.Journal_worker_ids in
+  Printf.sprintf "journal-asset/v1:%Ld:%Ld:%Ld:%d:%Ld:%s:%d:"
+    (Id.Runtime.Epoch.to_int64 session.binding.incarnation.runtime_epoch)
+    (Id.Worker.Generation.to_int64 session.binding.incarnation.worker_generation)
+    session.binding.serial session.account session.lifecycle (Uuid.to_string session.graph) session.generation
+let asset_consumer_key (consumer:asset_consumer)=asset_consumer_prefix consumer.session^consumer.name
+let compare_asset_consumer a b=String.compare(asset_consumer_key a)(asset_consumer_key b)
+let bind_asset_consumer consumer ~round={consumer with round=Some round}
+let asset_consumer_round consumer=consumer.round
+let asset_consumer_wire (consumer:asset_consumer)=match consumer.round with
+  | Some round->Ok(asset_consumer_prefix consumer.session^Uuid.to_string round^":"^consumer.name)
+  | None->Error(Invalid_input "Asset demand must use its pure registered round")
+let decode_asset_consumer session wire =
+  let prefix=asset_consumer_prefix session in
+  if not(String.starts_with ~prefix wire) then Error Revoked_session else
+    let suffix=String.sub wire(String.length prefix)(String.length wire-String.length prefix) in
+    if String.length suffix<38 || suffix.[36]<>':' then Error(Protocol_mismatch "Asset demand round is absent") else
+      match Uuid.of_string(String.sub suffix 0 36) with
+      | Error _->Error(Protocol_mismatch "Asset demand round is invalid")
+      | Ok round->Result.map(fun consumer->bind_asset_consumer consumer ~round)
+          (asset_consumer session ~name:(String.sub suffix 37(String.length suffix-37)))
+
+let asset_file_consumer (file:asset_file)=file.asset_consumer
+let asset_file_asset (file:asset_file)=file.asset
 
 let file_lease_session (x : file_lease) =
   match x with
@@ -909,29 +946,21 @@ let encode_asset_import_intent (x : asset_import_intent) =
 
 let restore_asset_import_intent _ _ = unavailable "Durable import recovery"
 
-let asset_notice_session (x : asset_notice) =
-  match x with
-  | _ -> .
+let asset_notice_session (x:asset_notice)=x.notice_owner
+
+let asset_notice_data (x:asset_notice)=x.notice_data
+
+let asset_notice_consumer (x:asset_notice)=x.notice_consumer
+
+let ready_asset_file (x:asset_notice)=match x.notice_consumer,x.notice_data with
+  | Some consumer,Service.Asset_availability{asset;availability=Ready handle;_}->
+    Some{asset_owner=x.notice_owner;asset_consumer=consumer;asset;source_handle=handle}
+  | _->None
 ;;
 
-let asset_notice_data (x : asset_notice) =
-  match x with
-  | _ -> .
-;;
-
-let asset_notice_consumer (x : asset_notice) =
-  match x with
-  | _ -> .
-;;
-
-let ready_asset_file (x : asset_notice) =
-  match x with
-  | _ -> .
-;;
-
-let upload_operation (x : asset_notice) =
-  match x with
-  | _ -> .
+let upload_operation (x:asset_notice)=match x.notice_data with
+  | Service.Upload_status{operation;_}->Some{upload_owner=x.notice_owner;operation}
+  | _->None
 ;;
 
 let compare_projection_version = Int64.compare
@@ -1124,6 +1153,22 @@ let rec validate_request : type a. session -> a request -> (unit, error) result 
     else Error Revoked_session
   | Acknowledge_changes batch ->
     if equal_session session batch.change_owner then Ok () else Error Revoked_session
+  | Replace_asset_demand(consumer,_,assets)->
+    if not(equal_session session consumer.session) then Error Revoked_session
+    else if List.length assets>Protocol.maximum_page_size
+    then Error(Invalid_input "Asset demand exceeds the bounded member batch")
+    else
+      let limit=min session.limits.response_budget_bytes Protocol.maximum_response_bytes in
+      let bytes=List.fold_left(fun bytes asset->if bytes>limit then bytes else
+        bytes+1+String.length(Yojson.Safe.to_string(Logseq_db_types.Asset_descriptor.to_yojson asset)))2 assets in
+      if bytes>limit then Error(Invalid_input "Asset demand exceeds the encoded payload bound") else Ok()
+  | Release_asset_demand consumer->if equal_session session consumer.session then Ok() else Error Revoked_session
+  | Retry_asset _->Ok()
+  | Acquire_asset_file file->
+    if not(equal_session session file.asset_owner) || not(equal_session session file.asset_consumer.session)
+    then Error Revoked_session
+    else if file.source_handle="" then Error(Protocol_mismatch "Ready asset omitted its file capability") else Ok()
+  | Retry_upload operation->if equal_session session operation.upload_owner then Ok() else Error Revoked_session
   | Query (budget, query) ->
     Result.bind (checked_command session budget query) (fun command ->
       Protocol.request_of_yojson
@@ -1131,7 +1176,7 @@ let rec validate_request : type a. session -> a request -> (unit, error) result 
            { api_version = Protocol.api_version; request_id = dummy_id; command })
       |> Result.map (fun _ -> ())
       |> Result.map_error (fun error -> Db_error error))
-  | _ -> unavailable "This operation's resource/durability"
+  | _ -> .
 ;;
 
 let decode
@@ -1571,6 +1616,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                                 ; lifecycle = scope.account.lifecycle_generation
                                 ; generation = scope.graph_generation
                                 ; limits = b.limits
+                                ; asset_scope = scope
                                 ; scope =
                                     { startup =
                                         { account_generation =
@@ -1905,6 +1951,12 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
         =
         fun session ~request_id operation ->
         match operation with
+        | Release_asset_demand consumer->
+          if not(equal_binding session.binding binding) then Error Revoked_session else
+          Result.bind(validate_request session operation)(fun()->
+            Result.map(fun consumer->Service.Coordination_release_asset_demand
+              {registration=binding.serial;owner=session.asset_scope;request_id;consumer})
+              (asset_consumer_wire consumer))
         | Release observation ->
           Result.bind (validate_request session operation) (fun () ->
             release_observation_registration
@@ -1997,6 +2049,15 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                      ; intent = Wire.encode intent
                      })
                 (validate_intent session intent)
+            | Replace_asset_demand(consumer,priority,assets)->
+              Result.bind(validate_request session operation)(fun()->
+              Result.map(fun consumer->Service.Coordination_asset_demand
+                {registration=binding.serial;owner=session.scope;request_id;consumer;
+                 priority=(match priority with Foreground->Service.Asset.Foreground|Background->Background);
+                 assets})(asset_consumer_wire(bind_asset_consumer consumer ~round:request_id)))
+            | Retry_asset asset->Ok(Service.Asset_command_at(session.scope,Retry_asset asset))
+            | Retry_upload upload->Result.map(fun()->Service.Asset_command_at(session.scope,Retry_upload upload.operation))
+                (validate_request session operation)
             | Recover_mutations {after;maximum_items;maximum_bytes}->
               Result.map(fun()->Service.Coordination_recover_mutations
                 {registration=binding.serial;owner=session.scope;request_id;
@@ -2015,6 +2076,14 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
         =
         fun session ~request_id operation response ->
         match operation with
+        | Release_asset_demand consumer->
+          if not(equal_binding session.binding binding)
+             || not(equal_asset_consumer consumer {consumer with session}) then Error Revoked_session else
+          (match response,asset_consumer_wire consumer with
+           | Service.Coordination_asset_demand_released value,Ok expected
+             when value.registration=binding.serial && value.request_id=request_id
+               && value.consumer=expected && matches_asset_scope session value.owner->Ok(Answered(Ok()))
+           | _->Error(Protocol_mismatch "Asset cleanup did not acknowledge actual scoped settlement"))
         | Release observation ->
           observation_registration_released
             session
@@ -2036,6 +2105,10 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                 (fun (handle, _) ->
                    Answered (observation session ~request_id handle response))
                 (observation_registration session ~request_id operation response)
+            | Replace_asset_demand _,Service.Coordination_asset_demand_accepted value
+              when value.request_id=request_id->Ok(Answered(Ok()))
+            | Retry_asset _,Service.Client_command_completed->Ok(Answered(Ok()))
+            | Retry_upload _,Service.Client_command_completed->Ok(Answered(Ok()))
             | ( Query (budget, query)
               , Service.Graph_response (Protocol.V2_response r as response) )
               when r.api_version = Protocol.api_version
@@ -2111,7 +2184,18 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
         else decode_confirmation session ~presentation receipt response
       ;;
 
-      let asset_notice _ _ = unavailable "Asset resource/notification ownership"
+      let asset_notice session data =
+        if not(live session) then Error Revoked_session else
+        let consumer wire make=Result.map(fun consumer->
+          {notice_owner=session;notice_consumer=Some consumer;notice_data=make consumer.name})
+          (decode_asset_consumer session wire) in
+        match data with
+        | Service.Asset_availability value->consumer value.consumer(fun name->
+            Service.Asset_availability{value with consumer=name})
+        | Asset_demand_accepted wire->consumer wire(fun name->Service.Asset_demand_accepted name)
+        | Asset_backpressure wire->consumer wire(fun name->Service.Asset_backpressure name)
+        | Asset_capacity_available|Upload_status _->
+          Ok{notice_owner=session;notice_consumer=None;notice_data=data}
     end
     in
     Ok (module I : ISSUER))

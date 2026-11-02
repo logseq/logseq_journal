@@ -391,6 +391,21 @@ let test_client_to_typed_read () =
       wait (fun () -> Option.is_some (C.reply (C.view !state) ticket));
       ticket, C.reply (C.view !state) ticket |> Option.get
     in
+    let asset_consumer=W.asset_consumer session ~name:"runtime-synthetic-demand" |> Result.get_ok in
+    let asset=Logseq_db_types.Asset_descriptor.create
+      ~uuid:(uuid "9c000000-0000-4000-8000-000000000881") ~source:(Managed None)
+      ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
+    let demand_ticket,demand_reply=request(W.Replace_asset_demand(asset_consumer,W.Foreground,[asset])) in
+    require(demand_reply=W.Answered(Ok())) "actual Service rejected typed scoped asset demand";
+    wait(fun()->List.exists(fun notice->match W.asset_notice_data notice with
+      | Service.Asset_demand_accepted name->name="runtime-synthetic-demand"
+      | _->false)(C.asset_notices(C.view !state)asset_consumer));
+    require(List.for_all(fun notice->Option.exists(W.equal_asset_consumer asset_consumer)(W.asset_notice_consumer notice))
+      (C.asset_notices(C.view !state)asset_consumer)) "actual asset push crossed consumer identity";
+    let release_demand,released_demand=request(W.Release_asset_demand asset_consumer) in
+    require(released_demand=W.Answered(Ok())) "actual scoped asset demand retirement failed";
+    require(C.asset_notices(C.view !state)asset_consumer=[]) "retired actual asset demand retained data authority";
+    apply(C.step !state(C.Forget demand_ticket));apply(C.step !state(C.Forget release_demand));
     let info_ticket, info = request (W.Query (budget, W.Graph_info)) in
     (match info with
      | W.Answered (Ok info) ->

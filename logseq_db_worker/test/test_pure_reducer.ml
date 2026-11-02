@@ -79,6 +79,7 @@ let test_closed_graph_request_replies_once () =
         | Close_asset_scope _
         | Deliver_asset_result _
         | Deliver_protected_result _
+        | Asset_cleanup_barrier_reached _
         | Publish _ -> false)
       transition.effects
   in
@@ -1977,6 +1978,80 @@ let test_orphan_cleanup_retains_failed_release () =
   done
 ;;
 
+let test_demand_registry_retirement_requires_physical_settlement () =
+  let module R=Core.Demand_registry in
+  let _,scope=worker_open_graph() in
+  let owner:R.owner={registration=90L;scope;consumer="typed-synthetic-round"} in
+  let oversized=Logseq_db_types.Asset_descriptor.create ~uuid:scope.graph_id
+    ~source:(External(String.make(Protocol.maximum_response_bytes+1)'x'))
+    ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
+  let unchanged,invalid=R.reserve R.empty owner ~priority:Foreground ~assets:[oversized] in
+  Alcotest.(check bool) "unbounded descriptor rejected before registry allocation" true
+    (invalid=R.Invalid && unchanged=R.empty);
+  let reserved,result=R.reserve R.empty owner ~priority:Foreground ~assets:[] in
+  Alcotest.(check bool) "first demand allocation admitted" true(result=R.Start);
+  let retired,result=R.retire reserved owner in
+  Alcotest.(check bool) "retirement requires actual cleanup" true(result=R.Release);
+  Alcotest.(check int) "retirement is not a physical ACK" 1(Rrbvec.length(R.pending retired ~registration:90L));
+  let _,result=R.reserve retired owner ~priority:Foreground ~assets:[] in
+  Alcotest.(check bool) "retired round cannot reallocate" true(result=R.Retired);
+  let wrong={owner with scope={scope with graph_generation=scope.graph_generation+1}} in
+  let unchanged,result=R.retire retired wrong in
+  Alcotest.(check bool) "cleanup cannot borrow a reopened owner" true(result=R.Mismatch && unchanged=retired);
+  let wrong_ack=R.settled retired wrong in
+  Alcotest.(check int) "wrong owner ACK retains original cleanup" 1(Rrbvec.length(R.pending wrong_ack ~registration:90L));
+  let completed=R.settled retired owner in
+  Alcotest.(check int) "actual exact settlement clears resource obligation" 0(Rrbvec.length(R.pending completed ~registration:90L));
+  let _,result=R.reserve completed owner ~priority:Foreground ~assets:[] in
+  Alcotest.(check bool) "settlement retains tombstone" true(result=R.Retired);
+  let unknown={owner with consumer="not-allocated-round"} in
+  let cancelled,result=R.retire R.empty unknown in
+  Alcotest.(check bool) "Cancel before allocation has a distinct proof" true(result=R.Unknown);
+  let _,result=R.reserve cancelled unknown ~priority:Foreground ~assets:[] in
+  Alcotest.(check bool) "late allocation cannot follow no-allocation cleanup" true(result=R.Retired)
+;;
+
+let test_demand_registry_properties () =
+  let module R=Core.Demand_registry in
+  let _,scope=worker_open_graph() in
+  let run actions=
+    let owners=Array.init 8(fun n->R.{registration=91L;scope;consumer="round-"^string_of_int n}) in
+    let states=Array.make 8 0 in (* 0 unallocated, 1 live, 2 retired, 3 physically settled *)
+    let registry=ref R.empty and closed=ref false in
+    List.iter(fun action->
+      let n=(action/6)mod 8 in let owner=owners.(n) in
+      let before= !registry in
+      let prior_count=Rrbvec.length(R.pending before ~registration:91L) in
+      (match action mod 6 with
+       | 0->let next,result=R.reserve before owner ~priority:Foreground ~assets:[] in
+         if !closed || states.(n)>=2 then Alcotest.(check bool) "retirement never reallocates" true(result=R.Retired)
+         else (Alcotest.(check bool) "valid exact round allocates once" true(result=(if states.(n)=0 then R.Start else R.Existing));states.(n)<-1);
+         registry:=next
+       | 1->let next,_=R.retire before owner in registry:=next;states.(n)<-(if states.(n)=0 then 3 else max 2 states.(n))
+       | 2->registry:=R.settled before owner;if states.(n)=2 then states.(n)<-3
+       | 3->let wrong={owner with scope={scope with graph_generation=scope.graph_generation+1}} in
+         registry:=R.settled before wrong;Alcotest.(check bool) "foreign ACK is inert" true(!registry=before)
+       | 4->registry:=R.forget_settled before ~registration:91L;closed:=true
+       | _->if states.(n)=1 then (let next,result=R.retire before {owner with scope={scope with graph_generation=scope.graph_generation+1}} in
+         Alcotest.(check bool) "foreign release is inert" true(result=R.Mismatch && next=before)));
+      let pending=R.pending !registry ~registration:91L in
+      Alcotest.(check int) "only exact physical settlement drops an allocated round"
+        (Array.fold_left(fun n state->n+(if state=1 || state=2 then 1 else 0))0 states)(Rrbvec.length pending);
+      Alcotest.(check int) "persistent prior registry unchanged" prior_count
+        (Rrbvec.length(R.pending before ~registration:91L)))actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec remove prefix=function []->actions
+      | _::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      | action::rest->remove(action::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0xD3AD;seed|] in
+    let actions=[0;1;3;4;2;0] @ List.init 80(fun _->Random.State.int random 48) in
+    if fails actions then Alcotest.failf "demand registry seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+
 let () =
   Alcotest.run
     "logseq db worker pure reducer"
@@ -2027,6 +2102,7 @@ let () =
             `Quick
             test_asset_manual_retry_is_unlimited
         ] )
+    ; ( "typed demand registry",[Alcotest.test_case "generated owner retirement traces" `Quick test_demand_registry_properties; Alcotest.test_case "retirement and exact settlement" `Quick test_demand_registry_retirement_requires_physical_settlement])
     ; ( "orphan resource cleanup",[Alcotest.test_case "failed release and stale attempt ACK" `Quick test_orphan_cleanup_retains_failed_release])
     ; ( "observation registry", [Alcotest.test_case "registration cancellation epoch and owner" `Quick test_observation_registry;
           Alcotest.test_case "exhaustive shortest lifecycle traces" `Quick test_observation_registry_traces;

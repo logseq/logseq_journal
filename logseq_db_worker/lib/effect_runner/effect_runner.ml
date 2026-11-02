@@ -392,6 +392,12 @@ type observation_slot =
   ; mutable idle : unit Eio.Promise.t * unit Eio.Promise.u
   }
 
+type asset_cleanup_job=
+  {cleanup_id:int64;cleanup_scope:Sync.graph_scope;finished:unit Eio.Promise.t;
+   mutable children:asset_cleanup_job Rrbvec.t}
+type asset_cleanup_snapshot={snapshot_scope:Sync.graph_scope;snapshot_jobs:asset_cleanup_job Rrbvec.t}
+module Cleanup_ids=Set.Make(Int64)
+
 type t =
   { sw : Eio.Switch.t
   ; dependencies : dependencies
@@ -412,6 +418,14 @@ type t =
   ; mutable observation_registry : Core.Observation_registry.t
   ; mutable orphan_cleanup : Core.Orphan_cleanup.t
   ; mutable orphan_cleanup_running : bool
+  ; mutable next_asset_cleanup : int64
+  ; mutable next_asset_barrier : int64
+  ; asset_cleanup_jobs : (int64,asset_cleanup_job) Hashtbl.t
+  ; asset_cleanup_barriers : (int64,unit Eio.Promise.u) Hashtbl.t
+  ; cancelled_asset_jobs : (Logseq_sync_pure_reducer.Asset_transfer.ticket,asset_cleanup_job)Hashtbl.t
+  ; asset_result_sources : ((Sync.graph_scope*string),Logseq_sync_pure_reducer.Asset_transfer.ticket)Hashtbl.t
+  ; asset_cleanup_stopped : unit Eio.Promise.t * unit Eio.Promise.u
+  ; resource_cleanup_owners : ((Sync.graph_scope * string),asset_cleanup_job) Hashtbl.t
   ; durable_slots : Eio.Semaphore.t
   ; databases : (string, database_session) Hashtbl.t
   ; inspections : (string, Database.mirror_inspection) Hashtbl.t
@@ -455,6 +469,14 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; observation_registry = Core.Observation_registry.empty
     ; orphan_cleanup = Core.Orphan_cleanup.empty
     ; orphan_cleanup_running = false
+    ; next_asset_cleanup = 0L
+    ; next_asset_barrier = 0L
+    ; asset_cleanup_jobs = Hashtbl.create 16
+    ; asset_cleanup_barriers = Hashtbl.create 16
+    ; cancelled_asset_jobs = Hashtbl.create 16
+    ; asset_result_sources = Hashtbl.create 16
+    ; asset_cleanup_stopped = Eio.Promise.create ()
+    ; resource_cleanup_owners = Hashtbl.create 16
     ; durable_slots = Eio.Semaphore.make 8
     ; databases = Hashtbl.create 4
     ; inspections = Hashtbl.create 4
@@ -1156,23 +1178,14 @@ let release_unallocated_observation t ~registration ~id ~owner =
     | _ -> Error "Unallocated observation cleanup was refused")
 ;;
 
-let release_observations t ~registration =
-  let slots =
-    Hashtbl.to_seq_values t.observation_slots
-    |> Seq.filter (fun slot -> slot.registration = registration)
-    |> List.of_seq
-  in
-  List.iter
-    (fun slot ->
-       ignore
-         (release_observation
-            t
-            ~registration
-            ~id:slot.logical_id
-            ~scope:slot.observation_scope))
-    slots;
-  t.observation_registry
-  <- Core.Observation_registry.retire_registration t.observation_registry ~registration
+let release_observations_checked t ~registration =
+  let slots=Hashtbl.to_seq_values t.observation_slots
+    |> Seq.filter(fun slot->slot.registration=registration) |> Rrbvec.of_seq in
+  Rrbvec.fold_left(fun result slot->
+    let released=release_observation t ~registration ~id:slot.logical_id ~scope:slot.observation_scope in
+    match result with Error _->result|Ok()->released)(Ok())slots
+;;
+let release_observations t ~registration=ignore(release_observations_checked t ~registration)
 ;;
 let close_database_by_id ?scope t database_id =
   let scope = match scope with
@@ -3391,6 +3404,111 @@ let lookup_local_asset t ~scope ~asset ~checksum ~current ~diagnostic call =
         | Error _ as error -> error))
 ;;
 
+let release_asset_file_result t ~scope ~handle ~report_failure =
+  if t.stopped then Error "The Worker stopped before resource release." else
+  let detail=ref None in
+  match asset_call ~on_diagnostic:(fun value->detail:=Some value) t ~scope (Sync.Release_asset_file handle) with
+  | Ok Sync.Asset_unit -> Ok()
+  | Error failure ->
+    if report_failure then report_asset_failure ?detail:!detail t scope "assetRelease" failure;
+    Error(asset_failure_message failure)
+  | Ok _ ->
+    if report_failure then report_source_failure t scope "assetRelease" "invalidContent" "Unexpected asset completion";
+    Error "Unexpected asset release completion"
+;;
+let release_asset_file_checked t ~scope ~handle=release_asset_file_result t ~scope ~handle ~report_failure:true
+
+let unsettled_orphan_retains t=Core.Orphan_cleanup.count t.orphan_cleanup
+
+let release_orphan_work t work =
+  let resource=Core.Orphan_cleanup.resource work in
+  let result=try Eio.Cancel.protect(fun()->
+    release_asset_file_result t ~scope:resource.scope ~handle:resource.handle
+      ~report_failure:(Core.Orphan_cleanup.first_attempt work))
+    with _->Error "Attachment cleanup was interrupted." in
+  t.orphan_cleanup<-Core.Orphan_cleanup.completed t.orphan_cleanup work result;
+  if result=Ok() then Hashtbl.remove t.resource_cleanup_owners(resource.scope,resource.handle)
+;;
+
+let abandon_asset_file_internal ?cleanup_job t ~scope ~handle =
+  Option.iter(fun job->Hashtbl.replace t.resource_cleanup_owners(scope,handle)job)cleanup_job;
+  t.orphan_cleanup<-Core.Orphan_cleanup.track t.orphan_cleanup {scope;handle};
+  if not t.orphan_cleanup_running && not t.stopped then (
+    t.orphan_cleanup_running<-true;
+    let next,work=Core.Orphan_cleanup.next t.orphan_cleanup in
+    t.orphan_cleanup<-next;
+    Option.iter(release_orphan_work t)work;
+    if unsettled_orphan_retains t=0 then t.orphan_cleanup_running<-false else
+      t.dependencies.runtime.fork ~sw:t.sw (fun()->
+        Fun.protect ~finally:(fun()->t.orphan_cleanup_running<-false)(fun()->
+          let rec retry ()=
+            if not t.stopped then (
+              let next,work=Core.Orphan_cleanup.next t.orphan_cleanup in
+              t.orphan_cleanup<-next;
+              match work with None->()|Some work->
+                t.dependencies.runtime.sleep(Core.Orphan_cleanup.retry_delay work);
+                if not t.stopped then (release_orphan_work t work;retry())) in
+          retry())))
+;;
+
+
+let abandon_asset_file t ~scope ~handle=abandon_asset_file_internal t ~scope ~handle
+
+let asset_cleanup_snapshot t ~scope =
+  let jobs=Hashtbl.fold(fun _ job values->
+    if job.cleanup_scope=scope then Rrbvec.push_back values job else values)
+    t.asset_cleanup_jobs Rrbvec.empty in
+  let jobs=Hashtbl.fold(fun(resource_scope,_) job values->
+    if resource_scope=scope then Rrbvec.push_back values job else values)
+    t.resource_cleanup_owners jobs in
+  {snapshot_scope=scope;snapshot_jobs=jobs}
+let await_asset_cleanup t snapshot =
+  let rec join seen job=
+    if Cleanup_ids.mem job.cleanup_id seen then seen else (
+      Eio.Promise.await job.finished;
+      Rrbvec.fold_left join(Cleanup_ids.add job.cleanup_id seen)job.children) in
+  Eio.Fiber.first
+    (fun()->
+      let joined=Rrbvec.fold_left join Cleanup_ids.empty snapshot.snapshot_jobs in
+      let pending=Hashtbl.fold(fun(scope,_) owner pending->
+        pending || (scope=snapshot.snapshot_scope && Cleanup_ids.mem owner.cleanup_id joined))t.resource_cleanup_owners false in
+      if t.stopped then Error "The Worker stopped before attachment settlement."
+      else if pending then Error "Attachment cleanup has an unsettled physical release. Retry after storage recovers."
+      else Ok())
+    (fun()->Eio.Promise.await(fst t.asset_cleanup_stopped);
+      Error "The Worker stopped before attachment settlement.")
+;;
+let asset_callback_barrier t =
+  if t.next_asset_barrier=Int64.max_int then failwith "Asset callback barrier counter exhausted";
+  t.next_asset_barrier<-Int64.succ t.next_asset_barrier;
+  let token=t.next_asset_barrier in
+  let promise,resolve=Eio.Promise.create() in
+  Hashtbl.add t.asset_cleanup_barriers token resolve;
+  t.post(Core.Asset_cleanup_barrier token);
+  Fun.protect ~finally:(fun()->Hashtbl.remove t.asset_cleanup_barriers token)(fun()->
+    Eio.Fiber.first
+      (fun()->Eio.Promise.await promise)
+      (fun()->Eio.Promise.await(fst t.asset_cleanup_stopped)))
+;;
+let start_asset_cleanup_job ?parent ?(prepare=(fun _->())) t ~scope work =
+  if t.next_asset_cleanup=Int64.max_int then failwith "Asset cleanup counter exhausted";
+  t.next_asset_cleanup<-Int64.succ t.next_asset_cleanup;
+  let serial=t.next_asset_cleanup in
+  let finished,resolve=Eio.Promise.create() in
+  let job={cleanup_id=serial;cleanup_scope=scope;finished;children=Rrbvec.empty} in
+  Hashtbl.add t.asset_cleanup_jobs serial job;
+  Option.iter(fun parent->parent.children<-Rrbvec.push_back parent.children job)parent;
+  prepare job;
+  t.dependencies.runtime.fork ~sw:t.sw(fun()->
+    work job;
+    ignore(Eio.Promise.try_resolve resolve():bool);
+    Hashtbl.remove t.asset_cleanup_jobs serial)
+;;
+let asset_cleanup_parent t scope handle=
+  Option.bind(Hashtbl.find_opt t.asset_result_sources(scope,handle))(fun ticket->
+    Hashtbl.find_opt t.cancelled_asset_jobs ticket)
+;;
+
 let run_asset t (context : Sync.asset_context) instruction =
   let module Transfer = Logseq_sync_pure_reducer.Asset_transfer in
   let perform ticket action success =
@@ -3422,6 +3540,10 @@ let run_asset t (context : Sync.asset_context) instruction =
                      t ~scope:context.scope action in
                  action detail call
              in
+             (match result with
+              | Ok(Sync.Asset_cached(Some handle)|Asset_downloaded handle)->
+                Hashtbl.replace t.asset_result_sources(context.scope,handle)ticket
+              | _->());
              if valid ()
              then (
                let asset = match ticket with Transfer.Lookup ticket -> ticket.asset | Download ticket -> ticket.asset in
@@ -3439,7 +3561,10 @@ let run_asset t (context : Sync.asset_context) instruction =
              else (
                match result with
                | Ok (Sync.Asset_cached (Some handle) | Asset_downloaded handle) ->
-                 send_asset t ~scope:context.scope (Sync.Release_asset_file handle)
+                 let parent=asset_cleanup_parent t context.scope handle in
+                 Hashtbl.remove t.asset_result_sources(context.scope,handle);
+                 start_asset_cleanup_job ?parent t ~scope:context.scope(fun job->
+                   abandon_asset_file_internal ~cleanup_job:job t ~scope:context.scope ~handle)
                | Ok _ | Error _ -> ()))))
   in
   match instruction with
@@ -3490,15 +3615,23 @@ let run_asset t (context : Sync.asset_context) instruction =
                | _ -> Error (Transfer.Invalid_content "Unexpected download completion"))
            ))
   | Cancel ticket ->
-    let asset, id = match ticket with Transfer.Lookup ticket -> ticket.asset,ticket.id | Download ticket -> ticket.asset,ticket.id in
-    clear_notice_diagnostic ~ticket_id:id t context.scope (Download_notice asset);
-    Option.iter
-      (fun operation ->
-         if operation <> ""
-         then send_asset t ~scope:context.scope (Sync.Cancel_asset_operation operation))
-      (Hashtbl.find_opt t.asset_operations ticket)
+    let asset,id=match ticket with Transfer.Lookup ticket->ticket.asset,ticket.id|Download ticket->ticket.asset,ticket.id in
+    clear_notice_diagnostic ~ticket_id:id t context.scope(Download_notice asset);
+    start_asset_cleanup_job ~prepare:(fun job->Hashtbl.replace t.cancelled_asset_jobs ticket job)
+      t ~scope:context.scope(fun job->
+      Fun.protect ~finally:(fun()->match Hashtbl.find_opt t.cancelled_asset_jobs ticket with
+        | Some active when active.cleanup_id=job.cleanup_id->Hashtbl.remove t.cancelled_asset_jobs ticket
+        | _->())(fun()->
+      Option.iter(fun operation->if operation<>"" then send_asset t ~scope:context.scope(Sync.Cancel_asset_operation operation))
+        (Hashtbl.find_opt t.asset_operations ticket);
+      let rec joined()=if not t.stopped && Hashtbl.mem t.asset_operations ticket then (t.dependencies.runtime.sleep 0.001;joined()) in
+      joined();
+      asset_callback_barrier t))
   | Release_handle handle ->
-    send_asset t ~scope:context.scope (Sync.Release_asset_file handle)
+    let parent=asset_cleanup_parent t context.scope handle in
+    Hashtbl.remove t.asset_result_sources(context.scope,handle);
+    start_asset_cleanup_job ?parent t ~scope:context.scope(fun job->
+      abandon_asset_file_internal ~cleanup_job:job t ~scope:context.scope ~handle)
   | Retry_after { id; seconds } ->
     t.dependencies.runtime.fork ~sw:t.sw (fun () ->
       match asset_call t ~scope:context.scope (Sync.Asset_retry_after seconds) with
@@ -3562,6 +3695,11 @@ let submit t = function
   | Close_asset_scope scope ->
     t.notice_diagnostics <- List.filter (fun item -> item.scope<>scope) t.notice_diagnostics;
     send_asset t ~scope Sync.Close_asset_scope
+  | Core.Asset_cleanup_barrier_reached token->
+    Option.iter(fun resolve->
+      Hashtbl.remove t.asset_cleanup_barriers token;
+      ignore(Eio.Promise.try_resolve resolve():bool))
+      (Hashtbl.find_opt t.asset_cleanup_barriers token)
   | Core.Run_worker (Core.Request (_, Core.Handle_sync_worker_effect (Sync.Delete_mirror deletion)) as request) ->
     if deletion_authorized t deletion then t.deletion_owner <- Some deletion;
     if not t.stopped then t.dependencies.runtime.fork ~sw:t.sw (fun () -> complete t request)
@@ -3636,6 +3774,7 @@ let shutdown t =
   then (
     t.post (Core.Sync_event Sync.Shutdown);
     t.stopped <- true;
+    ignore(Eio.Promise.try_resolve(snd t.asset_cleanup_stopped)():bool);
     t.notice_diagnostics <- [];
     Hashtbl.iter
       (fun _ resolve -> ignore (Eio.Promise.try_resolve resolve () : bool))
@@ -3668,51 +3807,6 @@ let release_asset_file t ~scope ~handle =
   | Ok Sync.Asset_unit | Error Sync.Asset_cancelled -> ()
   | Error failure -> report_asset_failure ?detail:!detail t scope "assetRelease" failure
   | Ok _ -> report_source_failure t scope "assetRelease" "invalidContent" "Unexpected asset completion"
-;;
-
-let release_asset_file_result t ~scope ~handle ~report_failure =
-  if t.stopped then Error "The Worker stopped before resource release." else
-  let detail=ref None in
-  match asset_call ~on_diagnostic:(fun value->detail:=Some value) t ~scope (Sync.Release_asset_file handle) with
-  | Ok Sync.Asset_unit -> Ok()
-  | Error failure ->
-    if report_failure then report_asset_failure ?detail:!detail t scope "assetRelease" failure;
-    Error(asset_failure_message failure)
-  | Ok _ ->
-    if report_failure then report_source_failure t scope "assetRelease" "invalidContent" "Unexpected asset completion";
-    Error "Unexpected asset release completion"
-;;
-let release_asset_file_checked t ~scope ~handle=release_asset_file_result t ~scope ~handle ~report_failure:true
-
-let unsettled_orphan_retains t=Core.Orphan_cleanup.count t.orphan_cleanup
-
-let release_orphan_work t work =
-  let resource=Core.Orphan_cleanup.resource work in
-  let result=try Eio.Cancel.protect(fun()->
-    release_asset_file_result t ~scope:resource.scope ~handle:resource.handle
-      ~report_failure:(Core.Orphan_cleanup.first_attempt work))
-    with _->Error "Attachment cleanup was interrupted." in
-  t.orphan_cleanup<-Core.Orphan_cleanup.completed t.orphan_cleanup work result
-;;
-
-let abandon_asset_file t ~scope ~handle =
-  t.orphan_cleanup<-Core.Orphan_cleanup.track t.orphan_cleanup {scope;handle};
-  if not t.orphan_cleanup_running && not t.stopped then (
-    t.orphan_cleanup_running<-true;
-    let next,work=Core.Orphan_cleanup.next t.orphan_cleanup in
-    t.orphan_cleanup<-next;
-    Option.iter(release_orphan_work t)work;
-    if unsettled_orphan_retains t=0 then t.orphan_cleanup_running<-false else
-      t.dependencies.runtime.fork ~sw:t.sw (fun()->
-        Fun.protect ~finally:(fun()->t.orphan_cleanup_running<-false)(fun()->
-          let rec retry ()=
-            if not t.stopped then (
-              let next,work=Core.Orphan_cleanup.next t.orphan_cleanup in
-              t.orphan_cleanup<-next;
-              match work with None->()|Some work->
-                t.dependencies.runtime.sleep(Core.Orphan_cleanup.retry_delay work);
-                if not t.stopped then (release_orphan_work t work;retry())) in
-          retry())))
 ;;
 
 let prepare_import_unlocked

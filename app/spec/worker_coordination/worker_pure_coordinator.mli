@@ -128,7 +128,7 @@ type event =
   | Observation_notice of Worker.observation_notice
   | Observation_notices_failed of Worker.binding * Worker.error
   | Observation_received : 'a Worker.observed -> event
-  | Asset_received of Worker.asset_notice
+  | Asset_received of Worker.asset_notice * Logseq_db_worker_lui.Journal_worker_ids.Worker.push_sequence
   | Cancel : 'a ticket -> event
   | Forget : 'a ticket -> event
   | Release : 'a Worker.observation -> event

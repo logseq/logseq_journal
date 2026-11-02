@@ -74,6 +74,15 @@ val release_asset_file_checked
 val abandon_asset_file : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> handle:string -> unit
 val unsettled_orphan_retains : t -> int
 
+(** Typed demand registration and checked retirement on the existing serial
+    Worker entry. Release joins actual retiring IO/callbacks before success. *)
+val replace_coordinated_asset_demand : t -> registration:int64
+  -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> consumer:string
+  -> priority:Logseq_sync_pure_reducer.Asset_transfer.priority
+  -> assets:Logseq_db_types.Asset_descriptor.t list -> (unit,string) result
+val release_coordinated_asset_demand : t -> registration:int64
+  -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> consumer:string -> (unit,string) result
+
 type import_receipt =
   { operation : Logseq_db_types.Graph_types.Uuid.t
   ; graph_generation : int
@@ -119,7 +128,7 @@ type coordination_snapshot =
 val register_coordination
   : t -> registration:int64 -> notify:(coordination_snapshot -> unit)
   -> (coordination_snapshot, string) result
-val release_coordination : t -> registration:int64 -> unit
+val release_coordination : t -> registration:int64 -> (unit,string) result
 val coordination_current : t -> registration:int64 -> bool
 val revoke_coordination : t -> unit
 

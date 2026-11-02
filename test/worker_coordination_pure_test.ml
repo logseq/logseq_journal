@@ -17,6 +17,155 @@ let ready binding projection =
   (C.step state (C.Bootstrap_received (binding, W.Ready projection))).next
 ;;
 
+let test_asset_demand_notice_has_one_registered_owner () =
+  let issuer,raw,projection,session=fixture 881L in
+  let module I=(val issuer:W.ISSUER) in
+  let state=ready I.binding projection in
+  let consumer=W.asset_consumer session ~name:"media:synthetic-owner" |> Result.get_ok in
+  let asset=Logseq_db_types.Asset_descriptor.create ~uuid:(uuid "98000000-0000-4000-8000-000000000881")
+    ~source:(Managed None) ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
+  let oversized=Logseq_db_types.Asset_descriptor.create ~uuid:asset.uuid
+    ~source:(External(String.make(P.maximum_response_bytes+1)'x'))
+    ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
+  check(Result.is_error(W.validate_request session(W.Replace_asset_demand(consumer,W.Foreground,[oversized]))))
+    "asset demand admitted an unbounded descriptor payload";
+  let operation=W.Replace_asset_demand(consumer,W.Foreground,[asset]) in
+  let ticket,planned=match C.request state session operation with
+    | Ok value->value
+    | Error(W.Unsupported_operation message)->failwith("typed demand admission unsupported: "^message)
+    | Error _->failwith "typed demand admission rejected" in
+  let wire_name=match I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok with
+    | S.Coordination_asset_demand{consumer;_}->consumer
+    | _->failwith "typed asset demand did not use the existing scoped Service command" in
+  check(wire_name<>"media:synthetic-owner") "asset demand was not isolated by binding/session";
+  let notice=I.asset_notice session(S.Asset_demand_accepted wire_name) |> Result.get_ok in
+  let announced=(C.step planned.next(C.Asset_received(notice,Id.Worker.Push_sequence.of_int64 1L))).next in
+  let values=C.asset_notices(C.view announced)consumer in
+  check(not(C.equal_view(C.view announced)(C.view planned.next))) "asset fact update was hidden by view equality";
+  check(List.length values=1) "registered consumer did not own its exact acceptance notice";
+  check(Option.exists(W.equal_asset_consumer consumer)(W.asset_notice_consumer(List.hd values))) "notice guessed a different consumer association";
+  let duplicate=(C.step announced(C.Asset_received(notice,Id.Worker.Push_sequence.of_int64 1L))).next in
+  check(C.asset_notices(C.view duplicate)consumer=values) "duplicate acceptance accumulated an event log";
+  let asset_notice=I.asset_notice session(S.Asset_availability{consumer=wire_name;asset=asset.uuid;availability=Ready "real-ready-capability"}) |> Result.get_ok in
+  let latest=(C.step duplicate(C.Asset_received(asset_notice,Id.Worker.Push_sequence.of_int64 3L))).next in
+  let old=I.asset_notice session(S.Asset_availability{consumer=wire_name;asset=asset.uuid;availability=Downloading}) |> Result.get_ok in
+  let older=(C.step latest(C.Asset_received(old,Id.Worker.Push_sequence.of_int64 2L))).next in
+  check(List.exists(fun notice->Option.is_some(W.ready_asset_file notice))(C.asset_notices(C.view older)consumer))
+    "out-of-order notice rolled a Ready capability backwards";
+  let version=Logseq_db_types.Asset_descriptor.version ~checksum:(String.make 64 '1') ~file_type:"png" |> Result.get_ok in
+  let replacement=Logseq_db_types.Asset_descriptor.create ~uuid:asset.uuid ~source:(Managed(Some version))
+    ~current_checksum:(Some version.checksum) ~size:None ~dimensions:None |> Result.get_ok in
+  let _,replaced=C.request older session(W.Replace_asset_demand(consumer,W.Foreground,[replacement])) |> Result.get_ok in
+  let old_ready=(C.step replaced.next(C.Asset_received(asset_notice,Id.Worker.Push_sequence.of_int64 4L))).next in
+  check(not(List.exists(fun notice->Option.is_some(W.ready_asset_file notice))(C.asset_notices(C.view old_ready)consumer)))
+    "old demand Ready capability survived a descriptor replacement round";
+  let focused=match I.bootstrap(S.Coordination_registered{raw with limits={raw.limits with response_budget_bytes=32768};
+    baseline={raw.baseline with version=2L;presentation=2L}}) with
+    | Ok(W.Ready value)->value|_->failwith "changed metadata did not produce a Ready session" in
+  let focused_session=(List.hd(W.residents focused)).session in
+  let focused_consumer=W.asset_consumer focused_session ~name:"media:synthetic-owner" |> Result.get_ok in
+  check(W.equal_asset_consumer consumer focused_consumer && W.compare_asset_consumer consumer focused_consumer=0)
+    "consumer identity changed with presentation/read metadata";
+  let focused_state=(C.step older(C.Projection_received focused)).next in
+  check(C.asset_notices(C.view focused_state)focused_consumer<>[])
+    "pure consumer registry did not preserve execution across focus/metadata updates";
+  let _,releasing=C.request focused_state focused_session(W.Release_asset_demand focused_consumer) |> Result.get_ok in
+  let late=(C.step releasing.next(C.Asset_received(notice,Id.Worker.Push_sequence.of_int64 1L))).next in
+  check(C.asset_notices(C.view late)consumer=[]) "late demand notice revived a retired consumer";
+  let foreign,_,_,foreign_session=fixture 882L in
+  let module F=(val foreign:W.ISSUER) in
+  check(Result.is_error(F.asset_notice foreign_session(S.Asset_demand_accepted wire_name)))
+    "old binding consumer namespace crossed into a new issuer"
+;;
+
+let asset_release_tickets instructions =
+  let release : C.instruction -> unit C.ticket option = function
+    | C.Send(ticket,_,W.Release_asset_demand _)->Some ticket
+    | _->None in
+  List.filter_map release instructions
+;;
+
+let test_asset_cleanup_ack_and_shutdown_retry () =
+  let issuer,_,projection,session=fixture 883L in
+  let module I=(val issuer:W.ISSUER) in
+  let initial=ready I.binding projection in
+  let consumer=W.asset_consumer session ~name:"cleanup-owner" |> Result.get_ok in
+  let asset=Logseq_db_types.Asset_descriptor.create ~uuid:graph ~source:(Managed None)
+    ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
+  let _,planned=C.request initial session(W.Replace_asset_demand(consumer,W.Foreground,[asset])) |> Result.get_ok in
+  let waiter,releasing=C.request planned.next session(W.Release_asset_demand consumer) |> Result.get_ok in
+  let cleanup=List.hd(asset_release_tickets releasing.instructions) in
+  let forged=(C.step releasing.next(C.Completed(waiter,W.Answered(Ok())))).next in
+  check(C.reply(C.view forged)waiter=None) "public release waiter accepted a fabricated transport ACK";
+  let full=C.step forged(C.Admission_refused(cleanup,W.Full)) in
+  check(C.reply(C.view full.next)waiter=None) "Full lost the actual release waiter";
+  check(asset_release_tickets(C.step full.next C.Drain).instructions=[]) "Full cleanup spun without capacity";
+  let retry=C.step full.next C.Capacity_available in
+  let cleanup=List.hd(asset_release_tickets retry.instructions) in
+  let early=(C.step retry.next(C.Completed(cleanup,W.Answered(Ok())))).next in
+  check(C.reply(C.view early)waiter=None) "early physical reply escaped admission ordering";
+  let done_state=(C.step early(C.Admitted(cleanup,Id.Worker.Request_id.one))).next in
+  check(C.reply(C.view done_state)waiter=Some(W.Answered(Ok()))) "actual release ACK did not settle waiter";
+  check(C.validate_session initial session=Ok()) "cleanup mutated a preceding pure state";
+  let _,planned=C.request done_state session(W.Replace_asset_demand(consumer,W.Foreground,[asset])) |> Result.get_ok in
+  let stopping=C.step planned.next C.Shutdown_requested in
+  let cleanup=List.hd(asset_release_tickets stopping.instructions) in
+  let admitted=(C.step stopping.next(C.Admitted(cleanup,Id.Worker.Request_id.of_int64 2L))).next in
+  let failed=(C.step admitted(C.Completed(cleanup,W.Answered(Error(W.Service_failed "synthetic physical failure"))))).next in
+  check((match C.shutdown_state(C.view failed)with C.Shutdown_failed _->true|_->false)) "physical release failure was hidden";
+  let aggregate=(C.step failed(C.Binding_release_completed(I.binding,Ok()))).next in
+  check(C.shutdown_state(C.view aggregate)=C.Draining)
+    "actual aggregate binding ACK retained a settled demand failure";
+  let late=(C.step aggregate(C.Completed(cleanup,W.Answered(Error(W.Service_failed "duplicate old cleanup"))))).next in
+  check(C.shutdown_state(C.view late)=C.Draining) "old cleanup error revived an aggregate-settled obligation";
+  let wake=C.step failed C.Capacity_available in
+  check(asset_release_tickets wake.instructions=[]) "failed physical release retried automatically on every callback";
+  let retried=C.step wake.next C.Shutdown_requested in
+  check(List.length(asset_release_tickets retried.instructions)=1) "explicit shutdown retry stranded the failed resource obligation"
+;;
+
+let test_asset_cleanup_round_properties () =
+  let run actions =
+    let issuer,_,projection,session=fixture 884L in
+    let module I=(val issuer:W.ISSUER) in
+    let consumer=W.asset_consumer session ~name:"round-properties" |> Result.get_ok in
+    let first,one=C.request(ready I.binding projection)session(W.Replace_asset_demand(consumer,W.Foreground,[])) |> Result.get_ok in
+    let _,two=C.request one.next session(W.Replace_asset_demand(consumer,W.Foreground,[])) |> Result.get_ok in
+    let old=List.hd(asset_release_tickets two.instructions) in
+    let waiter,release=C.request two.next session(W.Release_asset_demand consumer) |> Result.get_ok in
+    let current=List.hd(asset_release_tickets release.instructions) in
+    let state=ref release.next in
+    let admitted=Array.make 2 false and answered=Array.make 2 false in
+    let apply event=state:=(C.step !state event).next in
+    (* Both rounds exist before randomized delivery. Old-round ACKs may never
+       settle the current public waiter, even when their callbacks arrive last. *)
+    List.iter(fun action->
+      let which=(action/4)mod 2 in
+      let ticket=if which=0 then old else current in
+      (match action mod 4 with
+       | 0->admitted.(which)<-true;
+         apply(C.Admitted(ticket,Id.Worker.Request_id.of_int64(Int64.of_int(which+10))))
+       | 1->answered.(which)<-true;apply(C.Completed(ticket,W.Answered(Ok())))
+       | 2->apply(C.Completed(waiter,W.Answered(Ok())))
+       | _->apply(C.Completed(first,W.Answered(Ok()))));
+      check((C.reply(C.view !state)waiter=Some(W.Answered(Ok())))=(admitted.(1)&&answered.(1)))
+        "current waiter borrowed an old round or unadmitted ACK";
+      check(C.asset_notices(C.view !state)consumer=[]) "retired consumer regained notification authority")actions
+  in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec remove prefix=function
+      | []->actions
+      | _::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      | action::rest->remove(action::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0xA55E;seed|] in
+    let actions=[1;0;2;4;5] @ List.init 60(fun _->Random.State.int random 8) in
+    if fails actions then failwith(Printf.sprintf "asset round seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions))))
+  done
+;;
+
 let test_query_origin_boundary () =
   let issuer, raw, projection, session = fixture 310L in
   let module I = (val issuer : W.ISSUER) in
@@ -3441,6 +3590,9 @@ let test_atomic_append_intent_and_admission () =
 ;;
 
 let () =
+  test_asset_demand_notice_has_one_registered_owner ();
+  test_asset_cleanup_ack_and_shutdown_retry ();
+  test_asset_cleanup_round_properties ();
   test_atomic_append_intent_and_admission ();
   test_recovery_cursor_and_capacity_bounds ();
   test_durable_recovery_and_ack_purity ();

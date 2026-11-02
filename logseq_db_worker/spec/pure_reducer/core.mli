@@ -104,6 +104,7 @@ type upload_recovery_ticket = private
   }
 
 type instruction =
+  | Asset_cleanup_barrier_reached of int64
   | Deliver_protected_result of Logseq_sync_pure_reducer.Core.protected_output
   | Deliver_asset_result of Logseq_sync_pure_reducer.Core.asset_output
   | Read_uploads of upload_recovery_ticket
@@ -144,6 +145,7 @@ val initial : config -> (state, create_error) result
 val view : state -> view
 
 type event =
+  | Asset_cleanup_barrier of int64
   | Upload_requested of
       { graph_generation : int
       ; operation : Logseq_db_types.Graph_types.Uuid.t
@@ -368,4 +370,25 @@ module Orphan_cleanup : sig
   val first_attempt : work -> bool
   val retry_delay : work -> float
   val completed : t -> work -> (unit,string) result -> t
+end
+
+(** Admission/tombstones for typed demand rounds on the existing Service. A
+    retired round cannot allocate later, even when release overtook Replace.
+    Physical settlement remains separate from command admission. *)
+module Demand_registry : sig
+  type t
+  type owner={registration:int64;scope:Logseq_sync_pure_reducer.Core.graph_scope;consumer:string}
+  type reservation=Start|Existing|Retired|Mismatch|Full|Invalid
+  type release=Release|Already_settled|Unknown|Mismatch|Full
+  val empty:t
+  val reserve:t -> owner -> priority:Logseq_sync_pure_reducer.Asset_transfer.priority
+    -> assets:Logseq_db_types.Asset_descriptor.t list -> t * reservation
+  val admitted:t -> owner -> bool
+  val retire:t -> owner -> t * release
+  val settled:t -> owner -> t
+  val pending:t -> registration:int64 -> owner Rrbvec.t
+
+  (** Permanently fences this and older registrations before pruning completed
+      tombstones. Unsettled resource owners remain pending. *)
+  val forget_settled:t -> registration:int64 -> t
 end

@@ -317,6 +317,12 @@ type observation_signal =
   | Observation_invalidated of observation_invalidation
   | Observations_resync
 type request =
+  | Coordination_asset_demand of
+      {registration:int64;owner:timeline_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       consumer:string;priority:Logseq_sync_pure_reducer.Asset_transfer.priority;
+       assets:Logseq_db_types.Asset_descriptor.t list}
+  | Coordination_release_asset_demand of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
   | Coordination_observe of
       { registration : int64
       ; owner : timeline_scope
@@ -384,6 +390,9 @@ type request =
       }
 
 type response =
+  | Coordination_asset_demand_accepted of {request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_asset_demand_released of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
   | Coordination_mutations_recovered of
       { request_id:Logseq_db_types.Graph_types.Uuid.t;
         page:Logseq_db_worker_contract.Mutation_pure_wire.recovery_page }
@@ -920,6 +929,23 @@ let worker_dependency_error_message = function
   | Worker_runner.Invalid_dependency message -> message
 ;;
 
+let typed_asset_consumer_owner registration (scope:asset_scope) wire =
+  match String.split_on_char ':' wire with
+  | "journal-asset/v1"::epoch::generation::binding::account::lifecycle::graph::execution::round::names->
+    Int64.of_string_opt epoch<>None && Int64.of_string_opt generation<>None
+    && Int64.of_string_opt binding=Some registration
+    && int_of_string_opt account=Some scope.account.account_generation
+    && Int64.of_string_opt lifecycle=Some scope.account.lifecycle_generation
+    && Logseq_db_types.Graph_types.Uuid.of_string graph=Ok scope.graph_id
+    && int_of_string_opt execution=Some scope.graph_generation
+    && Result.is_ok(Logseq_db_types.Graph_types.Uuid.of_string round)
+    && let name=String.concat ":" names in name<>"" && String.length name<=128
+  | _->false
+let reserved_asset_command = function
+  | Replace_asset_demand{consumer;_}|Release_asset_demand consumer->String.starts_with ~prefix:"journal-asset/v1:" consumer
+  | Retry_asset _|Retry_upload _->false
+;;
+
 let discarded_asset_retain request response =
   match request,response with
   | (Acquire_asset_file{scope;_}|Acquire_imported_file{scope;_}),Asset_file(Some(handle,_))->Some(scope,handle)
@@ -1138,6 +1164,17 @@ let create ~(dependencies : dependencies) =
         scope.account.account_generation=owner.startup.account_generation && scope.graph_id=owner.graph_id
           && scope.graph_generation=owner.graph_generation) (Db.graph_scopes session.worker) in
       match request with
+      | Coordination_asset_demand{registration;owner;request_id;consumer;priority;assets}->
+        (match resolve owner with
+         | None->Error "The asset demand graph session is not open."
+         | Some scope when not(typed_asset_consumer_owner registration scope consumer)->Error "The asset demand namespace does not match its owner."
+         | Some scope when !(session.auth_seen) && !(session.authenticated_user)<>Some scope.account.user_id->Error "The asset account is no longer current."
+         | Some scope->Db.replace_coordinated_asset_demand session.worker ~registration ~scope ~consumer ~priority ~assets
+           |> Result.map(fun()->Coordination_asset_demand_accepted{request_id}))
+      | Coordination_release_asset_demand{registration;owner;request_id;consumer}->
+        if not(typed_asset_consumer_owner registration owner consumer) then Error "The asset cleanup namespace does not match its owner." else
+        Db.release_coordinated_asset_demand session.worker ~registration ~scope:owner ~consumer
+        |> Result.map(fun()->Coordination_asset_demand_released{registration;owner;request_id;consumer})
       | Coordination_observe { registration; owner; observation_id; request; maximum_bytes }
         ->
         (match resolve owner with
@@ -1202,10 +1239,10 @@ let create ~(dependencies : dependencies) =
            session.coordination_registration<-Some registration;
            Ok(Coordination_registered(baseline snapshot)))
       | Release_coordination registration ->
-        Db.release_coordination session.worker ~registration;
-        (match session.coordination_registration with
-         | Some id when id<=registration -> session.coordination_registration<-None | _ -> ());
-        Ok(Coordination_released registration)
+        Result.map(fun()->
+          (match session.coordination_registration with
+           | Some id when id<=registration -> session.coordination_registration<-None | _ -> ());
+          Coordination_released registration)(Db.release_coordination session.worker ~registration)
       | Coordination_query {registration;owner;request;response_budget_bytes} ->
         let current ()=Db.coordination_current session.worker ~registration in
         let changefeed=match request.command with Protocol.V2_pull_changes _|V2_ack_changes _->true|_->false in
@@ -1292,6 +1329,7 @@ let create ~(dependencies : dependencies) =
       | Import_asset_at (owner,source) ->
         (match resolve owner with Some scope -> Ok (Asset_imported (Db.import_asset session.worker ~graph_generation:scope.graph_generation source))
          | None -> Error "The graph session is no longer open.")
+      | Asset_command_at (_,command) when reserved_asset_command command->Error "Use the typed asset coordination entry."
       | Asset_command_at (owner,command) ->
         (match resolve owner with
          | None -> Error "The graph session is no longer open."
@@ -1333,6 +1371,7 @@ let create ~(dependencies : dependencies) =
       | Import_asset { graph_generation; source } ->
         Ok (Asset_imported (Db.import_asset session.worker ~graph_generation source))
       | Get_graph_state -> Ok (Graph_state (Db.graph_state session.worker))
+      | Asset_command {command;_} when reserved_asset_command command->Error "Use the typed asset coordination entry."
       | Asset_command { graph_generation; command } ->
         let event =
           match command with

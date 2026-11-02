@@ -3516,6 +3516,8 @@ let start
         | Coordination_observe _ -> "coordinationObserve"
         | Coordination_refresh_observation _ -> "coordinationRefreshObservation"
         | Coordination_release_observation _ -> "coordinationReleaseObservation"
+        | Coordination_asset_demand _ -> "coordinationAssetDemand"
+        | Coordination_release_asset_demand _ -> "coordinationReleaseAssetDemand"
       in
       Effect.run (set_state (fun state -> report_ui_error state ~operation ~phase:"admission"))
   in
@@ -5093,7 +5095,7 @@ let start
     Journal_media_runtime.pump (!media_runtime_cell);
     match event with
     | Worker.Push {payload=Graph_service.Coordination_updates _ | Coordination_observations _;_}
-    | Worker.Response {outcome=Completed(Graph_service.Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _);_}->Effect.ignore
+    | Worker.Response {outcome=Completed(Graph_service.Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _);_}->Effect.ignore
     | Worker.Push {payload=Graph_service.Graph_pushes _ | Graph_states _ | Session_states _;_} -> Effect.ignore
     | Worker.Response { request_id; outcome; _ }
       when Hashtbl.mem local_copy_requests request_id ->

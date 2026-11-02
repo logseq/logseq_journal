@@ -112,6 +112,13 @@ val abandon_asset_file
   : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> handle:string -> unit
 val unsettled_orphan_retains : t -> int
 
+(** Capture after the serial reducer has submitted the retiring effects. Await
+    joins their IO and callback barrier, including stale-result release children;
+    pending physical failures remain errors. New unrelated work is not a fence. *)
+type asset_cleanup_snapshot
+val asset_cleanup_snapshot : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> asset_cleanup_snapshot
+val await_asset_cleanup : t -> asset_cleanup_snapshot -> (unit,string) result
+
 val prepare_import
   :  t
   -> context:Logseq_sync_pure_reducer.Core.asset_context
@@ -185,6 +192,7 @@ val release_observation
   -> (unit, string) result
 
 val release_observations : t -> registration:int64 -> unit
+val release_observations_checked : t -> registration:int64 -> (unit,string) result
 
 (** Retire only an unknown logical observation ID; no implicit-current graph or
     invented account lifecycle. A known physical allocation must use its owner. *)

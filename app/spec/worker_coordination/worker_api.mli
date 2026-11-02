@@ -28,6 +28,7 @@ val graph_id : session -> Uuid.t
 val equal_session : session -> session -> bool
 val same_logical_graph : session -> session -> bool
 val matches_scope : session -> Service.timeline_scope -> bool
+val matches_asset_scope : session -> Service.asset_scope -> bool
 val presentation_matches_scope : presentation -> Service.timeline_scope -> bool
 
 val worker_incarnation
@@ -492,6 +493,13 @@ type imported
 val asset_consumer : session -> name:string -> (asset_consumer, error) result
 val asset_consumer_session : asset_consumer -> session
 val equal_asset_consumer : asset_consumer -> asset_consumer -> bool
+val compare_asset_consumer : asset_consumer -> asset_consumer -> int
+
+(** Coordinator-owned replacement round, separate from logical consumer identity.
+    Requests and Ready facts must match this exact round; a later descriptor
+    replacement never adopts the old consumer's queued file capability. *)
+val bind_asset_consumer : asset_consumer -> round:request_id -> asset_consumer
+val asset_consumer_round : asset_consumer -> request_id option
 val file_lease_session : file_lease -> session
 val imported_session : imported -> session
 val file_path : file_lease -> string
@@ -536,6 +544,11 @@ val asset_notice_consumer : asset_notice -> asset_consumer option
     Core. Unknown consumer/operation names are rejected, never broadcast to every
     consumer as a guessed association. *)
 val ready_asset_file : asset_notice -> asset_file option
+
+(** Pure identity facts for matching a Ready capability to its still-registered
+    demand. These do not expose its physical handle or grant acquire authority. *)
+val asset_file_consumer : asset_file -> asset_consumer
+val asset_file_asset : asset_file -> Uuid.t
 
 val upload_operation : asset_notice -> upload_operation option
 
