@@ -1,4 +1,33 @@
+module Worker = Journal_worker_coordination.Worker_api
+
+type read_result
+
+type read_request = private
+  | Read :
+      { request_id : Logseq_db_types.Graph_types.Uuid.t
+      ; maximum_items : int
+      ; query : 'a Worker.query
+      ; outcome : 'a -> read_result
+      }
+      -> read_request
+
 type t
+
+val create_coordinated
+  :  read:(read_request -> bool)
+  -> send:(Logseq_db_worker_lui.Logseq_db_worker_lui_service.request -> bool)
+  -> changed:
+       (int option
+        -> Journal_asset_policy.offline
+        -> Journal_asset_policy.offline
+        -> unit)
+  -> t
+
+val receive_read
+  :  t
+  -> request_id:Logseq_db_types.Graph_types.Uuid.t
+  -> read_result
+  -> bool
 
 val create
   :  send:(Logseq_db_worker_lui.Logseq_db_worker_lui_service.request -> bool)
@@ -43,10 +72,13 @@ val notice
 
 val pump : t -> unit
 val reject : t -> request_id:Logseq_db_types.Graph_types.Uuid.t -> unit
-
 val idle : t -> bool
 
 (** Owned business Favorites results preserve the explicit first-page boundary;
     they never expose or reconstruct the sealed pagination cursor. *)
-val observe_favorites_result : t -> request_id:Logseq_db_types.Graph_types.Uuid.t
-  -> first_page:bool -> Journal_graph_request.favorites_result -> unit
+val observe_favorites_result
+  :  t
+  -> request_id:Logseq_db_types.Graph_types.Uuid.t
+  -> first_page:bool
+  -> Journal_graph_request.favorites_result
+  -> unit

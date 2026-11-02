@@ -542,6 +542,7 @@ let run_favorites_native_visibility
       ?media_rows
       ?(shared_media = false)
       ?(check_point_read_owner = false)
+      ?(check_asset_scan_owner = false)
       ?media_navigation
       ()
   =
@@ -800,6 +801,7 @@ let run_favorites_native_visibility
      UI fixtures declare their synthetic manager owner directly. *)
   let manager=if check_copy then manager else fixture_with_scope manager in
   let point_reads=Atomic.make 0 and legacy_point_reads=Atomic.make 0 in
+  let offline_scans=Atomic.make 0 and legacy_offline_scans=Atomic.make 0 in
   let coordination_registration=Atomic.make None in
   let coordination_release_entered = Atomic.make false in
   let coordination_release_allowed = Atomic.make true in
@@ -847,6 +849,11 @@ let run_favorites_native_visibility
          | Service.Graph_request{command=(P.V2_get_outline_block _|V2_get_page _);_}->
            Atomic.incr point_reads;
            (match request with Service.Coordination_query _->()|_->Atomic.incr legacy_point_reads)
+         | _->());
+        (match normalized with
+         | Service.Graph_request {command=P.V2_list_assets {recursive=true;_};_}->
+           Atomic.incr offline_scans;
+           (match request with Service.Coordination_query _->()|_->Atomic.incr legacy_offline_scans)
          | _->());
         match normalized with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
@@ -1671,6 +1678,21 @@ let run_favorites_native_visibility
        wait "Journals mounted" (fun () ->
          Option.is_some (find "accessibility-label" "Favorites")
          && Option.is_some (find "text" "Timeline fixture 2"));
+       if check_asset_scan_owner then (
+         let settings=Option.get(find "_extension" "journal-asset-settings") in
+         hooks.extension_event settings "event"
+           (Yojson.Safe.to_string (`Assoc ["id",`Int 1;"payload",`String "days:7"])) |> consume;
+         wait "offline scan runs through mounted App" (fun()->Atomic.get offline_scans>=2);
+         wait "offline scans publish complete status" (fun()->
+           match Hashtbl.find_opt props settings with
+           | Some values->(match List.assoc_opt "payload" values with
+             | Some (`String payload)->let json=Yojson.Safe.from_string payload in
+               Yojson.Safe.Util.member "recent" json=`String "No managed attachments in this scope"
+               && Yojson.Safe.Util.member "favorites" json=`String "No managed attachments in this scope"
+             | _->false)
+           | None->false);
+         Alcotest.(check int) "offline scans have one typed response owner" 0
+           (Atomic.get legacy_offline_scans));
        let fixture_root_count = Option.value media_rows ~default:timeline_rows in
        if fixture_root_count > 30 then (
          let list_node = Option.get (find "_extension" "journal-list") in
@@ -7612,6 +7634,9 @@ let () =
             `Quick
             (fun () -> run_favorites_native_visibility ~check_capture_imports:true ())
         ] )
+    ; ( "offline asset coordination"
+      , [ Alcotest.test_case "mounted catalog and asset scans use typed owner" `Quick
+            (fun ()->run_favorites_native_visibility ~check_asset_scan_owner:true ()) ] )
     ; ( "targeted media subscriptions"
       , [ Alcotest.test_case "dependency points use typed owner" `Quick (fun () ->
           run_favorites_native_visibility ~media_rows:3 ~media_navigation:`Offscreen ~check_point_read_owner:true ());

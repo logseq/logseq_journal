@@ -43,28 +43,28 @@ let recent_interval days ~today =
     Some (subtract today (days - 1), today))
 ;;
 
-type query =
+type 'cursor query =
   | Recent_roots of
       { from_day : int
       ; through_day : int
-      ; cursor : Graph.Cursor.t option
+      ; cursor : 'cursor option
       }
-  | Favorite_roots of Graph.Cursor.t option
+  | Favorite_roots of 'cursor option
   | Assets of
       { roots : Graph.Uuid.t list
-      ; cursor : Graph.Cursor.t option
+      ; cursor : 'cursor option
       }
 
-type ticket =
+type 'cursor ticket =
   { id : int
   ; graph_generation : int
   ; revision : int
   ; reason : reason
-  ; query : query
+  ; query : 'cursor query
   }
 
-type instruction =
-  | Read of ticket
+type 'cursor instruction =
+  | Read of 'cursor ticket
   | Demand of
       { consumer : string
       ; priority : Transfer.priority
@@ -72,7 +72,7 @@ type instruction =
       }
   | Release of string
 
-type event =
+type 'cursor event =
   | Refresh of
       { graph_generation : int
       ; today : int
@@ -82,9 +82,9 @@ type event =
   | Roots_changed of Graph.Uuid.t list
   | Index_changed of reason
   | Dependencies_unavailable
-  | Roots_loaded of ticket * Graph.Uuid.t list * Graph.Cursor.t option
-  | Assets_loaded of ticket * Asset.t list * Graph.Cursor.t option
-  | Read_failed of ticket
+  | Roots_loaded of 'cursor ticket * Graph.Uuid.t list * 'cursor option
+  | Assets_loaded of 'cursor ticket * Asset.t list * 'cursor option
+  | Read_failed of 'cursor ticket
   | Demand_accepted of string
   | Backpressure of string
   | Capacity_available
@@ -109,16 +109,16 @@ type progress =
 
 let page_size = 32
 
-type pending_demand =
+type 'cursor pending_demand =
   { consumer : string
   ; assets : Asset.t list
-  ; continuation : query option
+  ; continuation : 'cursor query option
   }
 
-type phase =
-  | Reading of ticket
-  | Awaiting of pending_demand
-  | Pressured of pending_demand
+type 'cursor phase =
+  | Reading of 'cursor ticket
+  | Awaiting of 'cursor pending_demand
+  | Pressured of 'cursor pending_demand
   | Finished
   | Broken
 
@@ -136,24 +136,55 @@ type batch =
   ; consumers : Names.t
   }
 
-type mode =
+type 'cursor mode =
   | Full
   | Index of Uuids.t
-  | Partial of query Rrbvec.t * int
+  | Partial of 'cursor query Rrbvec.t * int
 
-type scan =
+(* Brent's checkpoint cycle detection keeps two opaque cursor values and two
+   counters per stream. It detects arbitrary cycles without retaining every page
+   or scanning a growing cursor history. Adjacent repetition fails immediately. *)
+type 'cursor cursor_progress =
+  { last : 'cursor option
+  ; checkpoint : 'cursor option
+  ; power : int
+  ; distance : int
+  }
+
+let empty_cursor_progress = { last = None; checkpoint = None; power = 1; distance = 0 }
+
+let advance_cursor progress next =
+  match next with
+  | None -> Some progress
+  | Some _ when next = progress.last || next = progress.checkpoint -> None
+  | Some _ ->
+    let distance = progress.distance + 1 in
+    if distance = progress.power
+    then
+      Some
+        { last = next
+        ; checkpoint = next
+        ; distance = 0
+        ; power = (if progress.power > max_int / 2 then max_int else progress.power * 2)
+        }
+    else Some { progress with last = next; distance }
+;;
+
+type 'cursor scan =
   { reason : reason
   ; enabled : bool
   ; dirty : bool
-  ; root_query : query
-  ; root_next : Graph.Cursor.t option
+  ; root_query : 'cursor query
+  ; root_next : 'cursor option
+  ; root_progress : 'cursor cursor_progress
+  ; asset_progress : 'cursor cursor_progress
   ; committed : Names.t
   ; staged : Names.t
-  ; phase : phase
+  ; phase : 'cursor phase
   ; batches : batch Batches.t
   ; staged_batches : batch Batches.t
   ; replacing : Names.t
-  ; mode : mode
+  ; mode : 'cursor mode
   ; changed_roots : Uuids.t
   ; index_dirty : bool
   ; known_roots : Uuids.t
@@ -179,12 +210,12 @@ type residency =
   ; failed : bool
   }
 
-type t =
+type 'cursor t =
   { configuration : (int * int * settings) option
   ; graph_generation : int option
   ; revision : int
   ; serial : int
-  ; scans : scan list
+  ; scans : 'cursor scan list
   ; visible : visible list
   ; residency : residency Versions.t Consumers.t
   ; ready_owners : int Versions.t
@@ -203,7 +234,7 @@ let empty =
 ;;
 
 let progress state reason =
-  match List.find_opt (fun (scan : scan) -> scan.reason = reason) state.scans with
+  match List.find_opt (fun (scan : 'cursor scan) -> scan.reason = reason) state.scans with
   | None -> Inactive
   | Some scan ->
     (match scan.phase with
@@ -222,7 +253,7 @@ let managed assets =
     assets
 ;;
 
-let demand (pending : pending_demand) =
+let demand (pending : 'cursor pending_demand) =
   Demand
     { consumer = pending.consumer
     ; priority = Transfer.Background
@@ -237,11 +268,21 @@ let releases consumers =
 let with_scan state scan =
   { state with
     scans =
-      scan :: List.filter (fun (other : scan) -> other.reason <> scan.reason) state.scans
+      scan
+      :: List.filter
+           (fun (other : 'cursor scan) -> other.reason <> scan.reason)
+           state.scans
   }
 ;;
 
 let issue state scan query =
+  let scan =
+    match query with
+    | Recent_roots { cursor = None; _ } | Favorite_roots None ->
+      { scan with root_progress = empty_cursor_progress }
+    | Assets { cursor = None; _ } -> { scan with asset_progress = empty_cursor_progress }
+    | _ -> scan
+  in
   let ticket =
     { id = state.serial
     ; graph_generation = Option.get state.graph_generation
@@ -322,7 +363,7 @@ let continue_roots state scan =
 
 let current state ticket =
   List.find_opt
-    (fun (scan : scan) ->
+    (fun (scan : 'cursor scan) ->
        match scan.phase with
        | Reading expected -> expected = ticket
        | _ -> false)
@@ -521,7 +562,9 @@ let step_policy state = function
     List.fold_left
       (fun (state, instructions) reason ->
          let committed =
-           match List.find_opt (fun (scan : scan) -> scan.reason = reason) prior with
+           match
+             List.find_opt (fun (scan : 'cursor scan) -> scan.reason = reason) prior
+           with
            | None -> Names.empty
            | Some scan -> scan.committed
          in
@@ -540,6 +583,8 @@ let step_policy state = function
            ; dirty = false
            ; root_query = Option.value query ~default:(Favorite_roots None)
            ; root_next = None
+           ; root_progress = empty_cursor_progress
+           ; asset_progress = empty_cursor_progress
            ; committed
            ; staged = Names.empty
            ; phase = Finished
@@ -630,9 +675,11 @@ let step_policy state = function
      | None -> state, []
      | Some scan when scan.dirty -> restart state scan
      | Some scan ->
-       if List.length roots > page_size
+       let progress = advance_cursor scan.root_progress next_cursor in
+       if List.length roots > page_size || Option.is_none progress
        then fail state scan
        else (
+         let scan = { scan with root_progress = Option.get progress } in
          match ticket.query with
          | Assets _ -> state, []
          | Recent_roots _ | Favorite_roots _ ->
@@ -665,9 +712,11 @@ let step_policy state = function
      | None -> state, []
      | Some scan when scan.dirty -> restart state scan
      | Some scan ->
-       if List.length assets > page_size
+       let progress = advance_cursor scan.asset_progress next_cursor in
+       if List.length assets > page_size || Option.is_none progress
        then fail state scan
        else (
+         let scan = { scan with asset_progress = Option.get progress } in
          match ticket.query with
          | Recent_roots _ | Favorite_roots _ -> state, []
          | Assets { roots; _ } ->
@@ -915,7 +964,9 @@ type offline =
 
 let offline state reason =
   let consumers =
-    match List.find_opt (fun (scan : scan) -> scan.reason = reason) state.scans with
+    match
+      List.find_opt (fun (scan : 'cursor scan) -> scan.reason = reason) state.scans
+    with
     | None -> Names.empty
     | Some scan ->
       (match scan.phase with

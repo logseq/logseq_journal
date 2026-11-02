@@ -63,3 +63,8 @@ val pump : t -> unit
 val imported : t -> current:bool -> Logseq_db_worker.import_receipt -> unit
 
 val idle : t -> bool
+
+(** Page-fact observation only. No enumeration or pagination state is consumed. *)
+val observe_journals_request : t -> request_id:Logseq_db_types.Graph_types.Uuid.t -> unit
+val observe_journals_result : t -> request_id:Logseq_db_types.Graph_types.Uuid.t
+  -> Protocol.v2_journal_item Journal_worker_coordination.Worker_api.slice -> unit

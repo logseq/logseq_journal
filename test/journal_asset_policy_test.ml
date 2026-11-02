@@ -227,7 +227,7 @@ let read_count ins =
        ins)
 ;;
 
-let first_root (ticket : P.ticket) =
+let first_root (ticket : _ P.ticket) =
   match ticket.query with
   | Recent_roots { cursor = None; _ } | Favorite_roots None -> true
   | _ -> false
@@ -688,10 +688,13 @@ let runtime_unconfigured_changes after_shutdown () =
   let sent = Queue.create () in
   let r =
     Runtime.create
-      ~send:(fun request -> Queue.add request sent; true)
+      ~send:(fun request ->
+        Queue.add request sent;
+        true)
       ~changed:(fun _ _ _ -> ())
   in
-  if after_shutdown then (
+  if after_shutdown
+  then (
     Runtime.refresh
       r
       ~graph_generation:1
@@ -1239,6 +1242,186 @@ let runtime_dependency_failure rejected () =
      completeness"
 ;;
 
+let repeated_cursor_fails () =
+  let cursor n = n, "opaque" in
+  let state, instructions = refresh P.empty in
+  let first = read Favorites instructions in
+  let state, instructions = P.step state (Roots_loaded (first, [], Some (cursor 1))) in
+  check
+    (P.progress state Favorites = Enumerating)
+    "new empty More was treated as complete";
+  let second = read Favorites instructions in
+  let failed, instructions = P.step state (Roots_loaded (second, [], Some (cursor 1))) in
+  check
+    (P.progress failed Favorites = Failed && instructions = [])
+    "repeated catalog More must fail without another Read";
+  let state, instructions = P.step state (Roots_loaded (second, [], Some (cursor 2))) in
+  let third = read Favorites instructions in
+  let failed, instructions = P.step state (Roots_loaded (third, [], Some (cursor 1))) in
+  check
+    (P.progress failed Favorites = Failed && instructions = [])
+    "cyclic catalog More must fail";
+  let state, instructions = refresh P.empty in
+  let state, instructions =
+    P.step state (Roots_loaded (read Favorites instructions, [ uuid 1 ], None))
+  in
+  let state, instructions =
+    P.step
+      state
+      (Assets_loaded (read Favorites instructions, [ asset 2 ], Some (cursor 1)))
+  in
+  let consumer, _ = demand instructions in
+  let state, instructions = P.step state (Demand_accepted consumer) in
+  let failed, instructions =
+    P.step
+      state
+      (Assets_loaded (read Favorites instructions, [ asset 2 ], Some (cursor 1)))
+  in
+  check (P.progress failed Favorites = Failed) "repeated asset More must fail";
+  check
+    (not
+       (List.exists
+          (function
+            | P.Read _ | Demand _ -> true
+            | Release _ -> false)
+          instructions))
+    "repeated asset More created a new consumer or Read"
+;;
+
+(* The pure scan owns continuations and lifecycle decisions; this generator
+   supplies equality-comparable payloads without access to any cursor decoder. *)
+let opaque_cursor_properties () =
+  let snapshot state =
+    ( P.offline state Recent
+    , P.offline state Favorites
+    , List.of_seq (P.roots state Recent)
+    , List.of_seq (P.roots state Favorites) )
+  in
+  let run seed actions =
+    let state = ref P.empty
+    and tickets = ref []
+    and consumers = ref [] in
+    let record instructions =
+      List.iter
+        (function
+          | P.Read ticket -> tickets := ticket :: !tickets
+          | Demand { consumer; _ } -> consumers := consumer :: !consumers
+          | Release _ -> ())
+        instructions
+    in
+    let apply event =
+      let before = snapshot !state in
+      let next, instructions = P.step !state event in
+      let repeated, again = P.step !state event in
+      check (snapshot !state = before) "pure scan mutated a previous state";
+      check
+        (snapshot next = snapshot repeated && instructions = again)
+        "pure scan is nondeterministic";
+      state := next;
+      record instructions;
+      match event with
+      | P.Roots_loaded _ | Assets_loaded _ | Read_failed _ ->
+        let duplicate, extra = P.step !state event in
+        check
+          (extra = [] && snapshot duplicate = snapshot !state)
+          "read terminal consumed twice"
+      | _ -> ()
+    in
+    apply
+      (Refresh { graph_generation = 1; today = 20260301; settings = P.default_settings });
+    List.iteri
+      (fun index action ->
+         let picked () =
+           List.nth_opt !tickets (action mod max 1 (List.length !tickets))
+         in
+         match action mod 8 with
+         | 0 | 1 | 2 ->
+           Option.iter
+             (fun ticket ->
+                let next =
+                  if action mod 3 = 0
+                  then None
+                  else Some (seed, index, "sealed-by-data-owner")
+                in
+                match ticket.P.query with
+                | Recent_roots _ | Favorite_roots _ ->
+                  apply
+                    (Roots_loaded
+                       ( ticket
+                       , (if action mod 2 = 0 then [] else [ uuid (index + 1) ])
+                       , next ))
+                | Assets _ ->
+                  apply
+                    (Assets_loaded
+                       ( ticket
+                       , (if action mod 2 = 0 then [] else [ asset (index + 1) ])
+                       , next )))
+             (picked ())
+         | 3 -> Option.iter (fun ticket -> apply (Read_failed ticket)) (picked ())
+         | 4 -> apply Resync
+         | 5 ->
+           let retired = !tickets in
+           apply Shutdown;
+           apply
+             (Refresh
+                { graph_generation = index + 2
+                ; today = 20260301
+                ; settings = P.default_settings
+                });
+           List.iter
+             (fun ticket ->
+                let before = snapshot !state in
+                let next, instructions = P.step !state (Read_failed ticket) in
+                check
+                  (instructions = [] && snapshot next = before)
+                  "old graph response revived retired scan")
+             retired
+         | 6 ->
+           Option.iter
+             (fun consumer -> apply (Demand_accepted consumer))
+             (List.nth_opt !consumers 0)
+         | _ -> apply Capacity_available)
+      actions
+  in
+  let failed seed actions =
+    try
+      run seed actions;
+      false
+    with
+    | _ -> true
+  in
+  let rec shrink seed actions width =
+    if width = 0
+    then actions
+    else (
+      let rec seek offset =
+        if offset >= List.length actions
+        then shrink seed actions (width / 2)
+        else (
+          let candidate =
+            List.filteri
+              (fun index _ -> index < offset || index >= offset + width)
+              actions
+          in
+          if failed seed candidate then shrink seed candidate width else seek (offset + 1))
+      in
+      seek 0)
+  in
+  for seed = 1 to 200 do
+    let random = Random.State.make [| 0xA55E; seed |] in
+    let actions = List.init 64 (fun _ -> Random.State.int random 10000) in
+    try run seed actions with
+    | error ->
+      let minimal = shrink seed actions 32 in
+      failwith
+        (Printf.sprintf
+           "opaque cursor seed=%d trace=[%s]: %s"
+           seed
+           (String.concat ";" (List.map string_of_int minimal))
+           (Printexc.to_string error))
+  done
+;;
+
 let () =
   let failed = ref 0 in
   List.iter
@@ -1250,7 +1433,9 @@ let () =
        | exn ->
          incr failed;
          Printf.printf "FAIL %s: %s\n%!" name (Printexc.to_string exn))
-    [ "runtime never configured changes", runtime_unconfigured_changes false
+    [ "repeated and cyclic opaque More", repeated_cursor_fails
+    ; "opaque cursor 200 seeded traces and shrinking", opaque_cursor_properties
+    ; "runtime never configured changes", runtime_unconfigured_changes false
     ; "runtime shutdown changes", runtime_unconfigured_changes true
     ; "runtime unknown old parent", runtime_unknown_old_parent
     ; "runtime dependency reject", runtime_dependency_failure true

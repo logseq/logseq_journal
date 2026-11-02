@@ -2,6 +2,32 @@ module Policy = Journal_asset_policy
 module Protocol = Logseq_db_worker.Protocol
 module Graph = Logseq_db_types.Graph_types
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
+module Worker = Journal_worker_coordination.Worker_api
+
+type scan_cursor =
+  | Wire_cursor of Graph.Cursor.t
+  | Journals_cursor of Protocol.v2_journal_item Worker.continuation
+  | Favorites_cursor of Protocol.v2_favorite_item Worker.continuation
+  | Assets_cursor of Logseq_db_types.Asset_descriptor.t Worker.continuation
+
+type read_packet =
+  | Journals_packet of Protocol.v2_journal_item Worker.slice
+  | Favorites_packet of Worker.favorites
+  | Assets_packet of Worker.asset_listing
+
+type read_result =
+  { read_id : Graph.Uuid.t
+  ; packet : read_packet
+  }
+
+type read_request =
+  | Read :
+      { request_id : Graph.Uuid.t
+      ; maximum_items : int
+      ; query : 'a Worker.query
+      ; outcome : 'a -> read_result
+      }
+      -> read_request
 
 module Uuids = Set.Make (struct
     type t = Graph.Uuid.t
@@ -35,14 +61,15 @@ type dependency =
   | Page of Graph.Uuid.t
 
 type t =
-  { send : Service.request -> bool
+  { read_port : (read_request -> bool) option
+  ; send : Service.request -> bool
   ; changed : int option -> Policy.offline -> Policy.offline -> unit
   ; mutable published : (int option * Policy.offline * Policy.offline) option
-  ; mutable policy : Policy.t
+  ; mutable policy : scan_cursor Policy.t
   ; mutable configuration : (int * int * Policy.settings) option
   ; mutable generation : int option
-  ; mutable queued : Policy.instruction Queue.t
-  ; pending : (string, Policy.ticket) Hashtbl.t
+  ; mutable queued : scan_cursor Policy.instruction Queue.t
+  ; pending : (string, scan_cursor Policy.ticket) Hashtbl.t
   ; facts : (string, fact) Hashtbl.t
   ; pages : (string, Graph.page option * int) Hashtbl.t
   ; page_dirty : (string, Graph.page option * Uuids.t * int * bool) Hashtbl.t
@@ -59,8 +86,9 @@ type t =
   ; mutable favorite_members : Uuids.t
   }
 
-let create ~send ~changed =
-  { send
+let create_state ~read_port ~send ~changed =
+  { read_port
+  ; send
   ; changed
   ; published = None
   ; policy = Policy.empty
@@ -85,14 +113,33 @@ let create ~send ~changed =
   }
 ;;
 
-let command (ticket : Policy.ticket) =
+let create ~send ~changed = create_state ~read_port:None ~send ~changed
+
+let create_coordinated ~read ~send ~changed =
+  create_state ~read_port:(Some read) ~send ~changed
+;;
+
+let wire_cursor = function
+  | None -> None
+  | Some (Wire_cursor cursor) -> Some cursor
+  | Some _ -> invalid_arg "A sealed continuation cannot enter the legacy reader"
+;;
+
+let command (ticket : scan_cursor Policy.ticket) =
   match ticket.query with
   | Recent_roots { from_day; through_day; cursor } ->
     Protocol.V2_list_journals
-      { from_day; through_day; cursor; limit = Policy.page_size; revision = None }
-  | Favorite_roots cursor -> V2_list_favorites { cursor; limit = Policy.page_size }
+      { from_day
+      ; through_day
+      ; cursor = wire_cursor cursor
+      ; limit = Policy.page_size
+      ; revision = None
+      }
+  | Favorite_roots cursor ->
+    V2_list_favorites { cursor = wire_cursor cursor; limit = Policy.page_size }
   | Assets { roots; cursor } ->
-    V2_list_assets { recursive = true; roots; cursor; limit = Policy.page_size }
+    V2_list_assets
+      { recursive = true; roots; cursor = wire_cursor cursor; limit = Policy.page_size }
 ;;
 
 let degrade t =
@@ -139,11 +186,84 @@ let execute t = function
       Graph.Uuid.of_string (Printf.sprintf "a55e7000-0000-4000-8000-%012x" ticket.id)
       |> Result.get_ok
     in
-    if
-      t.send
-        (Service.Graph_request { api_version = 2; request_id; command = command ticket })
+    let accepted =
+      match t.read_port with
+      | None ->
+        let command = command ticket in
+        let accepted =
+          t.send (Service.Graph_request { api_version = 2; request_id; command })
+        in
+        if accepted
+        then observe_request t Protocol.{ api_version = 2; request_id; command };
+        accepted
+      | Some read ->
+        let submit query packet =
+          read
+            (Read
+               { request_id
+               ; maximum_items = Policy.page_size
+               ; query
+               ; outcome = (fun value -> { read_id = request_id; packet = packet value })
+               })
+        in
+        (match ticket.query with
+         | Recent_roots { from_day; through_day; cursor } ->
+           let after =
+             match cursor with
+             | None -> None
+             | Some (Journals_cursor c) -> Some c
+             | Some _ -> invalid_arg "Wrong journals continuation"
+           in
+           (match Worker.journal_day from_day, Worker.journal_day through_day with
+            | Ok from_day, Ok through_day ->
+              submit
+                (Worker.Journals { from_day; through_day; revision = None; after })
+                (fun value -> Journals_packet value)
+            | _ -> false)
+         | Favorite_roots cursor ->
+           let after =
+             match cursor with
+             | None -> None
+             | Some (Favorites_cursor c) -> Some c
+             | Some _ -> invalid_arg "Wrong favorites continuation"
+           in
+           submit (Worker.Favorites after) (fun value -> Favorites_packet value)
+         | Assets { roots; cursor } ->
+           let after =
+             match cursor with
+             | None -> None
+             | Some (Assets_cursor c) -> Some c
+             | Some _ -> invalid_arg "Wrong assets continuation"
+           in
+           submit
+             (Worker.Assets { recursive = true; roots; after })
+             (fun value -> Assets_packet value))
+    in
+    if accepted
     then (
-      observe_request t Protocol.{ api_version = 2; request_id; command = command ticket };
+      (* The logical scan identity is independent of the physical mailbox ID. *)
+      if Option.is_some t.read_port
+      then (
+        (* Metadata is observed locally, never sent as a transport query. *)
+        let metadata =
+          match ticket.query with
+          | Recent_roots { from_day; through_day; _ } ->
+            Protocol.V2_list_journals
+              { from_day
+              ; through_day
+              ; cursor = None
+              ; limit = Policy.page_size
+              ; revision = None
+              }
+          | Favorite_roots _ ->
+            V2_list_favorites { cursor = None; limit = Policy.page_size }
+          | Assets { roots; _ } ->
+            V2_list_assets
+              { recursive = true; roots; cursor = None; limit = Policy.page_size }
+        in
+        observe_request
+          t
+          Protocol.{ api_version = Protocol.api_version; request_id; command = metadata });
       Hashtbl.replace t.pending (Graph.Uuid.to_string request_id) ticket;
       true)
     else false
@@ -226,7 +346,7 @@ let rec pump t =
   then pump_dependencies t
   else if execute t (Queue.peek t.queued)
   then (
-    ignore (Queue.take t.queued : Policy.instruction);
+    ignore (Queue.take t.queued : scan_cursor Policy.instruction);
     pump t)
 ;;
 
@@ -492,7 +612,11 @@ let settle_dirty t =
   pump t
 ;;
 
-let observe_response_internal ?favorites_first_page t (Protocol.V2_response { request_id; outcome; _ }) =
+let observe_response_internal
+      ?favorites_first_page
+      t
+      (Protocol.V2_response { request_id; outcome; _ })
+  =
   match Hashtbl.find_opt t.requests (Graph.Uuid.to_string request_id) with
   | None -> ()
   | Some (issuance, command) ->
@@ -611,7 +735,9 @@ let observe_response_internal ?favorites_first_page t (Protocol.V2_response { re
        | V2_favorites_outcome { favorites_page; items; _ } ->
          t.favorites_page <- favorites_page;
          (match command with
-          | V2_list_favorites {cursor;_} when Option.value favorites_first_page ~default:(cursor=None) -> t.favorite_members <- Uuids.empty
+          | V2_list_favorites { cursor; _ }
+            when Option.value favorites_first_page ~default:(cursor = None) ->
+            t.favorite_members <- Uuids.empty
           | _ -> ());
          List.iter
            (fun (item : Protocol.v2_favorite_item) ->
@@ -659,7 +785,6 @@ let observe_favorites_result
              }
        })
 ;;
-
 
 let changes t windows =
   if Option.is_some t.configuration && not t.degraded
@@ -780,6 +905,71 @@ let shutdown t =
   publish t
 ;;
 
+let receive_read t ~request_id result =
+  let key = Graph.Uuid.to_string request_id in
+  if not (Graph.Uuid.equal request_id result.read_id)
+  then false
+  else (
+    match Hashtbl.find_opt t.pending key with
+    | None -> false
+    | Some ticket ->
+      let delivery =
+        match ticket.query, result.packet with
+        | Policy.Recent_roots _, Journals_packet value ->
+          Some
+            ( Policy.Roots_loaded
+                ( ticket
+                , List.map
+                    (fun (item : Protocol.v2_journal_item) -> item.page.uuid)
+                    value.items
+                , Option.map (fun c -> Journals_cursor c) value.next )
+            , Protocol.V2_journals_outcome { items = value.items; next_cursor = None }
+            , None )
+        | Favorite_roots cursor, Favorites_packet value ->
+          Some
+            ( Policy.Roots_loaded
+                ( ticket
+                , List.map
+                    (fun (item : Protocol.v2_favorite_item) ->
+                       match item.target with
+                       | V2_favorite_page { uuid; _ } | V2_favorite_block { uuid; _ } ->
+                         uuid)
+                    value.items
+                , Option.map (fun c -> Favorites_cursor c) value.next )
+            , Protocol.V2_favorites_outcome
+                { favorites_page = value.favorites_page
+                ; generation = value.generation
+                ; projection_revision = value.projection_revision
+                ; items = value.items
+                ; next_cursor = None
+                }
+            , Some (cursor = None) )
+        | Assets _, Assets_packet value ->
+          Some
+            ( Policy.Assets_loaded
+                (ticket, value.items, Option.map (fun c -> Assets_cursor c) value.next)
+            , Protocol.V2_assets_outcome
+                { generation = value.generation
+                ; projection_revision = value.projection_revision
+                ; items = value.items
+                ; next_cursor = None
+                }
+            , None )
+        | _ -> None
+      in
+      (match delivery with
+       | None -> false
+       | Some (event, outcome, favorites_first_page) ->
+         Hashtbl.remove t.pending key;
+         observe_response_internal
+           ?favorites_first_page
+           t
+           (Protocol.V2_response
+              { api_version = Protocol.api_version; request_id; outcome });
+         dispatch t event;
+         true))
+;;
+
 let receive t (Protocol.V2_response { request_id; outcome; _ } as response) =
   let key = Graph.Uuid.to_string request_id in
   match Hashtbl.find_opt t.pending key with
@@ -812,6 +1002,7 @@ let receive t (Protocol.V2_response { request_id; outcome; _ } as response) =
            | _ -> ()));
        pump t;
        true)
+  | Some _ when Option.is_some t.read_port -> false
   | Some ticket ->
     Hashtbl.remove t.pending key;
     observe_response t response;
@@ -821,7 +1012,7 @@ let receive t (Protocol.V2_response { request_id; outcome; _ } as response) =
         Policy.Roots_loaded
           ( ticket
           , List.map (fun (item : Protocol.v2_journal_item) -> item.page.uuid) items
-          , next_cursor )
+          , Option.map (fun c -> Wire_cursor c) next_cursor )
       | Favorite_roots _, V2_favorites_outcome { items; next_cursor; _ } ->
         Roots_loaded
           ( ticket
@@ -830,9 +1021,9 @@ let receive t (Protocol.V2_response { request_id; outcome; _ } as response) =
                  match item.target with
                  | V2_favorite_page { uuid; _ } | V2_favorite_block { uuid; _ } -> uuid)
               items
-          , next_cursor )
+          , Option.map (fun c -> Wire_cursor c) next_cursor )
       | Assets _, V2_assets_outcome { items; next_cursor; _ } ->
-        Assets_loaded (ticket, items, next_cursor)
+        Assets_loaded (ticket, items, Option.map (fun c -> Wire_cursor c) next_cursor)
       | _ -> Read_failed ticket
     in
     dispatch t event;

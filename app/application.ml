@@ -3634,11 +3634,11 @@ let start
   let capture_import_queue_cell = graph_ref (fun () ->
     Queue.create ()) in
   let drain_capture_imports = ref (fun () -> Effect.ignore) in
-  let asset_worker_requests_cell = graph_ref (fun () ->
-    Hashtbl.create 2) in
   let coordinated_asset_point = ref(fun (_:Graph_service.request)->None) in
+  let coordinated_asset_read = ref(fun (_:Journal_asset_runtime.read_request)->false) in
   let asset_runtime_cell = graph_ref (fun () ->
-    Journal_asset_runtime.create
+    Journal_asset_runtime.create_coordinated
+      ~read:(fun request-> !coordinated_asset_read request)
       ~changed:(fun generation recent favorites ->
         Option.iter
           (fun set_state ->
@@ -3653,19 +3653,11 @@ let start
       ~send:(fun request ->
         match !coordinated_asset_point request with
         | Some accepted->accepted
-        | None->match dispatch_worker request with
-        | Worker.Accepted worker_id ->
-          (match request with
-           | Graph_service.Graph_request request ->
-             sync_media !state_ref;
-             Journal_media_runtime.observe_request (!media_runtime_cell) request;
-             Hashtbl.replace
-               (!asset_worker_requests_cell)
-               worker_id
-               (media_key !state_ref, request.request_id)
-           | _ -> ());
-          true
-        | Full | Not_ready | Stopping -> false)) in
+        | None->match request with
+          | Graph_service.Graph_request _ -> false
+          | _->match dispatch_worker request with
+            | Worker.Accepted _->true
+            | Full | Not_ready | Stopping -> false)) in
   let observe_projection_request request =
     sync_media !state_ref;
     Journal_media_runtime.observe_request (!media_runtime_cell) request;
@@ -3702,6 +3694,35 @@ let start
     (match result,request with Some true,Graph_service.Graph_request original->
       Journal_media_runtime.observe_request (!media_runtime_cell) original|_->());
     result);
+  coordinated_asset_read := (fun (Journal_asset_runtime.Read request) ->
+    match current_owner(),ensure_coordination() with
+    | Some owner,Ok host ->
+      (match Coordination_host.plan_query_when_available host ~owner
+          ~maximum_items:request.maximum_items
+          ~maximum_bytes:Logseq_db_worker.Protocol.maximum_response_bytes request.query with
+       | Error _->false
+       | Ok ticket ->
+         (match request.query with
+          | Wc.Journals _->Journal_media_runtime.observe_journals_request (!media_runtime_cell)
+              ~request_id:request.request_id
+          | _->());
+         Coordination_host.watch_read host ticket ~f:(fun origin reply->
+           if runtime_owner_is_live !state_ref owner then run_owned (Some owner) (fun()->
+             Effect.of_thunk(fun()->
+               match origin,reply with
+               | Some(session,_),Wc.Answered(Ok value)
+                 when Coordination_host.validate_session ~owner host session=Ok()->
+                 if Journal_asset_runtime.receive_read (!asset_runtime_cell)
+                     ~request_id:request.request_id (request.outcome value) then (
+                   match request.query with
+                   | Wc.Journals _->Journal_media_runtime.observe_journals_result (!media_runtime_cell)
+                       ~request_id:request.request_id value
+                   | _->())
+                 else forget_projection_request request.request_id
+               | _->Journal_asset_runtime.reject (!asset_runtime_cell) ~request_id:request.request_id;
+                 Journal_media_runtime.forget_request (!media_runtime_cell) request.request_id)));
+         true)
+    | _->false);
   let asset_settings = ref None in
   let refresh_assets ~graph_generation calendar =
     Option.iter
@@ -4442,25 +4463,6 @@ let start
                       | Some message -> fail_feed_transport state message
                       | None -> state)))
             ]))
-    | Worker.Response
-        { request_id = worker_id
-        ; outcome = Worker.Completed (Graph_service.Graph_response response)
-        ; _
-        }
-      when Hashtbl.mem (!asset_worker_requests_cell) worker_id ->
-      let context, protocol_id = Hashtbl.find (!asset_worker_requests_cell) worker_id in
-      Hashtbl.remove (!asset_worker_requests_cell) worker_id;
-      let (Logseq_db_worker.Protocol.V2_response { request_id = actual; _ }) = response in
-      if context = media_key !state_ref && Option.is_some context
-      then
-        if
-          Logseq_db_types.Graph_types.Uuid.equal actual protocol_id
-          && Journal_asset_runtime.receive (!asset_runtime_cell) response
-        then Journal_media_runtime.observe_response (!media_runtime_cell) response
-        else (
-          forget_projection_request protocol_id;
-          Journal_asset_runtime.reject (!asset_runtime_cell) ~request_id:protocol_id);
-      Effect.ignore
     | Worker.Response { outcome = Completed (Graph_service.Graph_response _); _ }
       when retired ->
       Effect.ignore
@@ -4704,15 +4706,6 @@ let start
         | Some manager when manager.selected_graph = Some progress.graph_id ->
           { state with bootstrap_progress = Some progress }
         | None | Some _ -> state)
-    | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
-      when Hashtbl.mem (!asset_worker_requests_cell) request_id ->
-      let context, protocol_id = Hashtbl.find (!asset_worker_requests_cell) request_id in
-      Hashtbl.remove (!asset_worker_requests_cell) request_id;
-      if context = media_key !state_ref && Option.is_some context
-      then (
-        forget_projection_request protocol_id;
-        Journal_asset_runtime.reject (!asset_runtime_cell) ~request_id:protocol_id);
-      Effect.ignore
     | Worker.Response
         { request_id; outcome = (Failed _ | Cancelled | Shutdown) as outcome; _ }
       when Hashtbl.mem (!graph_worker_requests_cell) request_id ->

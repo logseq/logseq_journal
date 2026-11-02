@@ -88,6 +88,13 @@ let plan_query host ~owner ~maximum_items ~maximum_bytes query =
     ticket)
 ;;
 
+let plan_query_when_available host ~owner ~maximum_items ~maximum_bytes query =
+  Core.plan_query_when_available !(host.state) ~owner ~maximum_items ~maximum_bytes query
+  |> Result.map (fun (ticket, transition) ->
+    apply host.state host.runner transition;
+    ticket)
+;;
+
 let validate_session ?owner host session =
   Core.validate_session ?owner !(host.state) session
 ;;

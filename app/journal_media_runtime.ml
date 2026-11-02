@@ -206,9 +206,14 @@ let dependency_failure t node message =
     t.groups
 ;;
 
+let observe_journals_request t ~request_id =
+  if Hashtbl.mem t.sources request_id || Hashtbl.length t.sources < 4096
+  then Hashtbl.replace t.sources request_id (tick t)
+;;
+
 let observe_request t (request : Protocol.request) =
   if Hashtbl.mem t.sources request.request_id || Hashtbl.length t.sources < 4096
-  then Hashtbl.replace t.sources request.request_id (tick t)
+  then observe_journals_request t ~request_id:request.request_id
   else (
     let fail uuid =
       dependency_failure
@@ -856,6 +861,14 @@ let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
     then (
       reconcile_dependencies t;
       pump t)
+;;
+
+let observe_journals_result t ~request_id
+      (value : Protocol.v2_journal_item Journal_worker_coordination.Worker_api.slice) =
+  (* This outlet records page facts only; it does not publish enumeration or a
+     transport continuation. The scan owner retains the actual sealed next. *)
+  observe_response t (Protocol.V2_response {api_version=Protocol.api_version;request_id;
+    outcome=V2_journals_outcome {items=value.items;next_cursor=None}})
 ;;
 
 (* Observation registers facts only. The changes owner determines which

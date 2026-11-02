@@ -37,6 +37,16 @@ val plan_query
   -> 'a Worker.query
   -> ('a Core.ticket, Worker.error) result
 
+(** Retain the same pure ticket on pre-admission Full and retry only after real
+    capacity. Session replacement still revokes its original send authority. *)
+val plan_query_when_available
+  :  t
+  -> owner:Runner.Service.timeline_scope
+  -> maximum_items:int
+  -> maximum_bytes:int
+  -> 'a Worker.query
+  -> ('a Core.ticket, Worker.error) result
+
 (** A host-owned callback outlet only. The coordinator owns admission, cancellation
     and terminal consumption; completed tickets are forgotten on a later queued
     turn before the business callback is delivered. *)

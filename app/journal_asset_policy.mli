@@ -12,28 +12,30 @@ val settings : recent_days:int -> (settings, string) result
 val default_settings : settings
 val recent_interval : settings -> today:int -> (int * int) option
 
-type query =
+(** Opaque equality-comparable cursor payloads stay with their data owner.
+    Scanning never decodes a cursor or turns pagination into completeness. *)
+type 'cursor query =
   | Recent_roots of
       { from_day : int
       ; through_day : int
-      ; cursor : Graph.Cursor.t option
+      ; cursor : 'cursor option
       }
-  | Favorite_roots of Graph.Cursor.t option
+  | Favorite_roots of 'cursor option
   | Assets of
       { roots : Graph.Uuid.t list
-      ; cursor : Graph.Cursor.t option
+      ; cursor : 'cursor option
       }
 
-type ticket = private
+type 'cursor ticket = private
   { id : int
   ; graph_generation : int
   ; revision : int
   ; reason : reason
-  ; query : query
+  ; query : 'cursor query
   }
 
-type instruction =
-  | Read of ticket
+type 'cursor instruction =
+  | Read of 'cursor ticket
   | Demand of
       { consumer : string
       ; priority : Transfer.priority
@@ -41,7 +43,7 @@ type instruction =
       }
   | Release of string
 
-type event =
+type 'cursor event =
   | Refresh of
       { graph_generation : int
       ; today : int
@@ -51,9 +53,9 @@ type event =
   | Roots_changed of Graph.Uuid.t list
   | Index_changed of reason
   | Dependencies_unavailable
-  | Roots_loaded of ticket * Graph.Uuid.t list * Graph.Cursor.t option
-  | Assets_loaded of ticket * Asset.t list * Graph.Cursor.t option
-  | Read_failed of ticket
+  | Roots_loaded of 'cursor ticket * Graph.Uuid.t list * 'cursor option
+  | Assets_loaded of 'cursor ticket * Asset.t list * 'cursor option
+  | Read_failed of 'cursor ticket
   | Demand_accepted of string
   | Backpressure of string
   | Capacity_available
@@ -76,13 +78,13 @@ type progress =
   | Complete
   | Failed
 
-type t
+type 'cursor t
 
-val empty : t
-val progress : t -> reason -> progress
-val step : t -> event -> t * instruction list
+val empty : 'cursor t
+val progress : 'cursor t -> reason -> progress
+val step : 'cursor t -> 'cursor event -> 'cursor t * 'cursor instruction list
 val page_size : int
-val roots : t -> reason -> Graph.Uuid.t Seq.t
+val roots : 'cursor t -> reason -> Graph.Uuid.t Seq.t
 
 type offline =
   { enumeration : progress
@@ -91,4 +93,4 @@ type offline =
   ; failed : int
   }
 
-val offline : t -> reason -> offline
+val offline : 'cursor t -> reason -> offline

@@ -50,7 +50,7 @@ let preview_child n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (400+
 let summary_child n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (300+n))
 let journal_page n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (200+n))
 
-let seed_coordination_read_data path =
+let seed_coordination_read_data ?(assets=false) path =
   let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
   let module Session = Logseq_db_storage.Storage_session in
   let connection = Storage.open_database path |> Result.get_ok in
@@ -155,6 +155,16 @@ let seed_coordination_read_data path =
            Add (node,"block/order",String (Printf.sprintf "a%04d" n));
            Add (node,"block/parent",Ref_to (lookup (journal_page 4)));
            Add (node,"block/page",Ref_to (lookup (journal_page 4)))]) (List.init 60 Fun.id) in
+       let ops=if not assets then ops else ops @ List.concat_map(fun n->
+         let node=Datascript.Temp_id ("typed-scan-external-asset-" ^ string_of_int n) in
+         Datascript.[
+           Add(node,"block/uuid",Uuid(Printf.sprintf "9c000000-0000-4000-8000-%012d" (900+n)));
+           Add(node,"block/title",String "Synthetic external attachment");
+           Add(node,"block/parent",Ref_to(lookup(journal_page 1)));
+           Add(node,"block/page",Ref_to(lookup(journal_page 1)));
+           Add(node,"block/order",String("a" ^ string_of_int n));
+           Add(node,"block/tags",Ref_to(Ident "logseq.class/Asset"));
+           Add(node,"logseq.property.asset/external-url",String("https://example.invalid/" ^ string_of_int n))]) [1;2;3] in
        let staged =
          Session.stage_transact session ~authoritative_before:database ops
          |> Result.get_ok
@@ -210,13 +220,14 @@ let seed_status_catalog support =
 let with_client
       ?(epoch_ms = fun () -> 1_700_000_000_000L)
       ?(favorites = false)
+      ?(assets = false)
       ?(statuses = false)
       f
   =
   T.with_managed (fun fixture ->
     let root = fixture.config.application_support_directory in
     let first_path = Test_support.seed_mirror root in
-    if favorites then seed_coordination_read_data first_path;
+    if favorites then seed_coordination_read_data ~assets first_path;
     ignore (Test_support.seed_mirror ~graph_id:second_graph root);
     if statuses then seed_status_catalog root;
     let graph : Sync.graph =
@@ -1746,6 +1757,55 @@ let test_host_preserves_query_origin_before_forget () =
     require (!calls = 1) "query origin callback was delivered more than once")
 ;;
 
+let test_offline_asset_scans_use_typed_reads () =
+  let module Host=Journal_worker_coordination_host in
+  let module Assets=Journal_asset_runtime in
+  with_client ~favorites:true ~assets:true (fun client->
+    let jobs=Queue.create() in
+    let host=Host.create ~client ~client_id ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
+      ~enqueue:(fun f->Queue.add f jobs) ~changed:(fun _->()) |> Result.get_ok in
+    Mailbox.on_event client(fun event->ignore(Host.on_event host event));
+    let pump()=Mailbox.Private.deliver client ~max_events:64;
+      let count=Queue.length jobs in for _=1 to count do (Queue.take jobs)() done in
+    let wait predicate=let deadline=Unix.gettimeofday()+.6. in
+      while not(predicate()) && Unix.gettimeofday()<deadline do pump();Thread.delay 0.001 done;
+      require(predicate()) "typed offline asset scan did not settle" in
+    ignore(Mailbox.send client(Service.Client_command(Restore_local_account{user_id="user-1"})));
+    wait(fun()->Option.exists(fun p->List.exists(fun r->r.W.phase=W.Open)(W.residents p))(C.projection(Host.view host)));
+    let owner:Service.timeline_scope={startup={account_generation=1;presentation_generation=1};graph_id=Test_support.graph_uuid;graph_generation=1} in
+    let runtime=ref None and legacy_reads=ref 0 and typed_reads=ref 0 and status=ref None and asset_continuations=ref 0 and asset_rows=ref [] in
+    let read(Assets.Read request)=
+      (match request.query with W.Assets {after=Some _;_}->incr asset_continuations|_->());
+      let ticket=Host.plan_query_when_available host ~owner ~maximum_items:(min 1 request.maximum_items) ~maximum_bytes:65536 request.query |> Result.get_ok in
+      incr typed_reads;
+      Host.watch_read host ticket ~f:(fun origin reply->
+        require(Option.exists(fun(session,_)->Host.validate_session ~owner host session=Ok())origin) "asset scan borrowed its response origin";
+        match reply with
+        | W.Answered(Ok value)->
+          (match request.query with
+           | W.Assets _->asset_rows:=List.rev_append (List.map(fun(a:Logseq_db_types.Asset_descriptor.t)->a.uuid)value.items) !asset_rows
+           | _->());
+          let result=request.outcome value in
+          require(Assets.receive_read(Option.get !runtime)~request_id:request.request_id result)
+            "owned typed scan result was lost";
+          require(not(Assets.receive_read(Option.get !runtime)~request_id:request.request_id result))
+            "typed scan consumed the same result twice"
+        | _->failwith "real typed offline asset read failed");true in
+    let assets=Assets.create_coordinated ~read
+      ~send:(function Service.Graph_request _->incr legacy_reads;false|_->true)
+      ~changed:(fun _ recent favorites->status:=Some(recent,favorites)) in
+    runtime:=Some assets;
+    Assets.refresh assets ~graph_generation:1 ~today:20260901 ~settings:Journal_asset_policy.default_settings;
+    require(!legacy_reads=0) "offline asset scan still sent a legacy graph query";
+    wait(fun()->match !status with Some(recent,favorites)->
+      recent.Journal_asset_policy.enumeration=Complete && favorites.enumeration=Complete|_->false);
+    require(!typed_reads>=3) "offline scan did not execute real catalog and asset query families";
+    require(!asset_continuations>=2) (Printf.sprintf "real asset More did not retain its sealed continuation (after=%d)" !asset_continuations);
+    require(List.sort_uniq W.Uuid.compare !asset_rows = List.init 3(fun n->uuid(Printf.sprintf "9c000000-0000-4000-8000-%012d" (901+n))))
+      "asset pagination lost a real external descriptor";
+    Assets.shutdown assets;ignore(Host.shutdown host);wait(fun()->C.shutdown_state(Host.view host)=C.Stopped))
+;;
+
 let test_dependency_point_reads_use_typed_owner () =
   let module Host = Journal_worker_coordination_host in
   with_client (fun client ->
@@ -3090,6 +3150,7 @@ let test_service_changefeed_has_one_owner () =
 ;;
 
 let () =
+  test_offline_asset_scans_use_typed_reads ();
   test_dependency_point_reads_use_typed_owner ();
   test_live_authority_invalidation_rebinds ();
   test_service_changefeed_has_one_owner ();
