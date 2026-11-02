@@ -304,6 +304,9 @@ type asset_action =
   (** Join already admitted actual asset I/O tasks and their callback posting.
       This read-only barrier neither closes caches nor grants a host permit. *)
   | Await_asset_operations
+  (** Checked scope close preserves retained handles and failed physical cleanup
+      on error. The caller releases its original handles and retries; cancellation
+      or scope retirement does not stand in for a physical release ACK. *)
   | Close_asset_scope
   (** Cancels every target generation and waits for operations/native leases.
       New target work remains blocked until its terminal action; lease release

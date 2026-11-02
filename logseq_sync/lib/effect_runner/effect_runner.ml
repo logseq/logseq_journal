@@ -1604,7 +1604,7 @@ let fetch_asset
           ~version)))
 ;;
 
-let close_asset_scope ?except_id t scope =
+let close_asset_scope_checked ?except_id t scope =
   Hashtbl.iter
     (fun id (operation : operation) ->
        if
@@ -1618,8 +1618,12 @@ let close_asset_scope ?except_id t scope =
          operation.cancelled <- true;
          operation.cancel ()))
     t.operations;
-  Option.iter Asset_cache.close (Hashtbl.find_opt t.asset_caches scope);
-  Hashtbl.remove t.asset_caches scope
+  match Hashtbl.find_opt t.asset_caches scope with
+  |None->Ok()
+  |Some cache->Asset_cache.close_checked cache
+    |> Result.map(fun()->Hashtbl.remove t.asset_caches scope)
+;;
+let close_asset_scope ?except_id t scope=ignore(close_asset_scope_checked ?except_id t scope)
 ;;
 
 let scoped_asset_cache t scope =
@@ -1696,11 +1700,13 @@ let prepare_graph_asset_deletion ?except_id t (scope : Core.graph_scope) retirem
     else if attempts = 0 then Error (Core.Asset_invalid_content "Attachment resources are still in use.")
     else (t.dependencies.runtime.sleep 0.005; wait (attempts - 1)) in
   let result = Result.bind (wait 1000) (fun () ->
-    Hashtbl.fold (fun scope _ scopes -> if same_target scope then scope :: scopes else scopes)
-      t.asset_caches [] |> List.iter (close_asset_scope ?except_id t);
-    Asset_cache.prepare_graph_deletion ~root:(asset_root t) ~scope ~retirement
-    |> Result.map_error asset_cache_failure
-    |> Result.map (fun () -> Core.Asset_deletion_prepared (Core.asset_deletion_reference ~scope ~retirement))) in
+    let scopes=Hashtbl.fold(fun scope _ scopes->if same_target scope then Rrbvec.push_back scopes scope else scopes)
+      t.asset_caches Rrbvec.empty in
+    let closed=Rrbvec.fold_left(fun result scope->Result.bind result(fun()->
+      close_asset_scope_checked ?except_id t scope |> Result.map_error asset_cache_failure))(Ok())scopes in
+    Result.bind closed(fun()->Asset_cache.prepare_graph_deletion ~root:(asset_root t) ~scope ~retirement
+      |> Result.map_error asset_cache_failure
+      |> Result.map(fun()->Core.Asset_deletion_prepared(Core.asset_deletion_reference ~scope ~retirement)))) in
   (* A failed preparation may already own a durable rename. Its coordinating
      journal will cancel it; keep the barrier until that exact terminal action. *)
   result
@@ -2070,8 +2076,7 @@ let execute_asset ?except_id ?(asset_snapshot=Rrbvec.empty) t (request : Core.as
     Rrbvec.iter Eio.Promise.await asset_snapshot;
     if t.closed then Error Core.Asset_cancelled else Ok Core.Asset_unit
   | Close_asset_scope ->
-    close_asset_scope ?except_id t scope;
-    Ok Core.Asset_unit
+    close_asset_scope_checked ?except_id t scope |> Result.map_error asset_cache_failure |> map_unit
   | Prepare_graph_asset_deletion retirement ->
     prepare_graph_asset_deletion ?except_id t scope retirement ~current
   | Commit_graph_asset_deletion deletion -> finish_graph_asset_deletion t deletion ~commit:true

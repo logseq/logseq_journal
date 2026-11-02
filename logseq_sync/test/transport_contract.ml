@@ -2808,7 +2808,9 @@ let test_downloaded_cache_corruption () =
     (fun _ origin request reopen ->
        let core, scope = cache_selection origin in
        let handle = cache_download request core scope "file" in
-       let _, path = cache_retain request core scope handle in
+       let lease, path = cache_retain request core scope handle in
+       cache_release request core scope lease;
+       cache_release request core scope handle;
        Runner_contract.cache_unit (request core scope Core.Close_asset_scope);
        Out_channel.with_open_bin path (fun output -> output_string output "bad!");
        reopen ();
@@ -2913,8 +2915,10 @@ let test_downloaded_cache_legacy_cleanup () =
     (fun _ origin request reopen ->
        let core, scope = cache_selection origin in
        let handle = cache_download request core scope "file" in
-       let _, path = cache_retain request core scope handle in
+       let lease, path = cache_retain request core scope handle in
        let legacy = Filename.chop_extension path ^ ".bin" in
+       cache_release request core scope lease;
+       cache_release request core scope handle;
        Sys.rename path legacy;
        Runner_contract.cache_unit (request core scope Core.Close_asset_scope);
        reopen ();
@@ -2929,12 +2933,13 @@ let test_downloaded_cache_isolation () =
     (fun _ origin request _ ->
        let first, first_scope = cache_selection origin in
        let second, second_scope = cache_selection ~user:"another" origin in
-       ignore (cache_download request first first_scope "file");
+       let first_handle=cache_download request first first_scope "file" in
        Alcotest.(check bool)
          "accounts isolated"
          true
          (cache_lookup request second second_scope "file" = None);
        ignore (cache_download request second second_scope "next");
+       cache_release request first first_scope first_handle;
        Runner_contract.cache_unit (Runner_contract.retire_cache (request first first_scope));
        Alcotest.(check bool)
          "deletion leaves other account"
@@ -2997,9 +3002,9 @@ let test_downloaded_cache_graph_cleanup () =
            ~selected_graph:{ graph with graph_id = Core_contract.other_graph_id }
            origin
        in
-       List.iter
-         (fun (core, scope) -> ignore (cache_download request core scope "file"))
-         [ first, scope; another, another_scope ];
+       let first_handle=cache_download request first scope "file" in
+       ignore(cache_download request another another_scope "file");
+       cache_release request first scope first_handle;
        Runner_contract.cache_unit (Runner_contract.retire_cache (request first scope));
        Runner_contract.cache_unit (Runner_contract.retire_cache (request first scope));
        Alcotest.(check bool)

@@ -566,6 +566,16 @@ module Asset_cache = struct
     Hashtbl.clear t.staged_records
   ;;
 
+  let close_checked t =
+    if Hashtbl.length t.handles>0 || Hashtbl.length t.staged_handles>0
+    then Error(Invalid "Attachment resources are still retained.") else
+    let retired=Hashtbl.fold(fun _ record records->Rrbvec.push_back records record)
+      t.staged_records Rrbvec.empty in
+    let cleaned=Rrbvec.fold_left(fun result record->
+      Result.bind result(fun()->clean_retired_staging t record))(Ok())retired in
+    Result.map(fun()->close t)cleaned
+  ;;
+
   let remove_tree path =
     let rec remove path =
       match Unix.lstat path with

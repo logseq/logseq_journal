@@ -573,6 +573,7 @@ type asset_bridge_fixture =
   ; on_asset_completed : (Logseq_sync_pure_reducer.Asset_transfer.event -> unit) -> unit
   ; held_path : string option ref
   ; actions : Sync.asset_action list ref
+  ; fixture_result : Sync.asset_action -> Sync.asset_result
   ; fixture_asset : Sync.asset_action -> Sync.asset_value
   }
 
@@ -665,7 +666,7 @@ let with_asset_bridge ?(asynchronous=false) ?(asynchronous_io=false) run =
         in
         active_runner := Some runner;
         let serial = ref 0 in
-        let fixture_asset action =
+        let fixture_result action =
           incr serial;
           fixture_output := None;
           post
@@ -676,8 +677,9 @@ let with_asset_bridge ?(asynchronous=false) ?(asynchronous_io=false) run =
                   ; action
                   }));
           while !fixture_output=None do Eio.Fiber.yield() done;
-          Option.get !fixture_output |> Result.get_ok
+          Option.get !fixture_output
         in
+        let fixture_asset action=fixture_result action |> Result.get_ok in
         let path_of_output (output : Sync.asset_output) =
           match output.result with
           | Ok (Sync.Asset_staged { file; _ }) ->
@@ -741,6 +743,7 @@ let with_asset_bridge ?(asynchronous=false) ?(asynchronous_io=false) run =
                ; on_asset_completed=(fun callback->asset_completed:=callback)
                ; held_path
                ; actions
+               ; fixture_result
                ; fixture_asset
                }))))
 ;;
@@ -820,6 +823,26 @@ let cancelled_stage_output deliver_first () =
       "cancel before staging acceptance persists no import"
       true
       (durable = None))
+;;
+
+let test_scope_close_keeps_live_staged_lease () =
+  with_asset_bridge(fun fixture->
+    let source=picker_import fixture.support 960 in
+    let staged=match fixture.fixture_asset(Sync.Stage_asset_file
+      {operation=source.operation;file_type=source.file_type;source_file=source.source_file})with
+      |Sync.Asset_staged value->value.file|_->Alcotest.fail "scope close fixture staging" in
+    let lease,path=match fixture.fixture_asset(Sync.Retain_staged_file staged)with
+      |Sync.Asset_retained(Some value)->value|_->Alcotest.fail "scope close fixture lease" in
+    ignore(fixture.fixture_asset(Sync.Release_staged_file staged));
+    let closed=fixture.fixture_result Sync.Close_asset_scope in
+    let prematurely_unlinked=not(Sys.file_exists path) in
+    let released=fixture.fixture_result(Sync.Release_asset_file lease) in
+    let retried=fixture.fixture_result Sync.Close_asset_scope in
+    Alcotest.(check bool) "live native lease prevents successful close ACK" true(Result.is_error closed);
+    Alcotest.(check bool) "failed close preserves actual retained staged bytes" false prematurely_unlinked;
+    Alcotest.(check bool) "original handle still has actual release authority" true(released=Ok Sync.Asset_unit);
+    Alcotest.(check bool) "last checked release settles retired bytes" false(Sys.file_exists path);
+    Alcotest.(check bool) "close retries after physical lease release" true(retried=Ok Sync.Asset_unit))
 ;;
 
 let test_asset_io_barrier_does_not_block_serial_submit () =
@@ -2730,7 +2753,8 @@ let () =
         ] )
     ; ( "unlock diagnostics", [Alcotest.test_case "typed finite runner observations" `Quick test_unlock_runner_logging] )
     ; ( "contract"
-      , [ Alcotest.test_case "asset IO barrier submit stays nonblocking" `Quick test_asset_io_barrier_does_not_block_serial_submit
+      , [ Alcotest.test_case "scope close keeps live staged lease" `Quick test_scope_close_keeps_live_staged_lease
+        ; Alcotest.test_case "asset IO barrier submit stays nonblocking" `Quick test_asset_io_barrier_does_not_block_serial_submit
         ; Alcotest.test_case "writer fence joins actual canceled asset callback" `Quick test_writer_fence_joins_actual_canceled_asset_callback
         ; Alcotest.test_case "asset cleanup joins queued result child" `Quick test_asset_cleanup_joins_queued_result_child
         ; Alcotest.test_case "asset cleanup ignores later unrelated work" `Quick test_asset_cleanup_ignores_later_unrelated_work
