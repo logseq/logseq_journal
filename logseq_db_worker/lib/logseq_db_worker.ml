@@ -310,6 +310,9 @@ let release_asset_file_checked t ~scope ~handle =
   Effect_runner.release_asset_file_checked t.runner ~scope ~handle
 ;;
 
+let abandon_asset_file t ~scope ~handle=Effect_runner.abandon_asset_file t.runner ~scope ~handle
+let unsettled_orphan_retains t=Effect_runner.unsettled_orphan_retains t.runner
+
 type import_receipt =
   { operation : Logseq_db_types.Graph_types.Uuid.t
   ; graph_generation : int
@@ -332,7 +335,7 @@ let import_asset t ~graph_generation request =
       | None -> false
     in
     Result.map
-      (fun intent ->
+      (fun intent -> Eio.Cancel.protect(fun()->
          let preview =
            Effect_runner.retain_imported_file
              t.runner
@@ -360,7 +363,7 @@ let import_asset t ~graph_generation request =
          ; asset
          ; file_type = intent.version.file_type
          ; preview
-         })
+         }))
       (Effect_runner.prepare_import t.runner ~context request ~current)
 ;;
 

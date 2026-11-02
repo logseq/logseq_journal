@@ -379,6 +379,10 @@ val dependencies
   -> crypto:Logseq_sync_effect_runner.Effect_runner.crypto
   -> dependencies
 
+(** Pure cleanup routing for the Mailbox's exactly-once unpublished success.
+    Returns only the actual result's lease and owner, never the lookup handle. *)
+val discarded_asset_retain : request -> response -> (asset_scope * string) option
+
 val create
   :  dependencies:dependencies
   -> (Logseq_db_worker.Config.t, request, response, push) Journal_worker.Service.t

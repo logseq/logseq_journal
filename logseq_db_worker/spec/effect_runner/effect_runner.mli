@@ -102,6 +102,16 @@ val release_asset_file_checked
   : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> handle:string
   -> (unit, string) result
 
+(** Transfer a discarded successful acquisition to this actual resource owner.
+    The first checked release is attempted before returning. Failed obligations
+    remain in the pure retry ledger. All unsettled obligations gate acquisition;
+    a retry owns
+    its exact attempt and cannot be settled by an earlier ACK. Shutdown does not
+    turn pending cleanup into a success. These counts are required by handoff. *)
+val abandon_asset_file
+  : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> handle:string -> unit
+val unsettled_orphan_retains : t -> int
+
 val prepare_import
   :  t
   -> context:Logseq_sync_pure_reducer.Core.asset_context

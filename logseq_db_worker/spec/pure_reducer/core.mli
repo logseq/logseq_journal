@@ -350,3 +350,22 @@ module Changefeed_owner : sig
   val retire : t -> registration:int64 -> t
 end
 
+
+(** Cleanup ownership transferred by the real Mailbox's exactly-once discarded
+    success callback. Any unsettled physical release blocks new acquisition;
+    failure retains that obligation. Attempt tokens prevent an old ACK from settling a retry. No
+    clock, callback, transport or filesystem access occurs here. *)
+module Orphan_cleanup : sig
+  type resource = { scope : Logseq_sync_pure_reducer.Core.graph_scope; handle : string }
+  type t
+  type work
+  val empty : t
+  val count : t -> int
+  val acquisition_open : t -> bool
+  val track : t -> resource -> t
+  val next : t -> t * work option
+  val resource : work -> resource
+  val first_attempt : work -> bool
+  val retry_delay : work -> float
+  val completed : t -> work -> (unit,string) result -> t
+end

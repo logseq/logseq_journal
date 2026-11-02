@@ -297,6 +297,31 @@ let test_release_requires_physical_ack () =
       "retired scope cannot fabricate a successful physical release ACK"))
 ;;
 
+let test_discarded_asset_result_keeps_actual_lease_owner () =
+  let scope=asset_scope 1 in
+  let actual=Service.Asset_file(Some("retained-lease","/synthetic/preview")) in
+  T.require(Service.discarded_asset_retain
+    (Acquire_asset_file{scope;handle="lookup-handle"})actual=Some(scope,"retained-lease"))
+    "discard cleanup used the lookup capability instead of the acquired lease";
+  let operation=asset_uuid 99 in
+  T.require(Service.discarded_asset_retain(Acquire_imported_file{scope;operation})actual=Some(scope,"retained-lease"))
+    "imported acquisition lost its exact lease owner";
+  let source:Logseq_db_types.Asset_import.t={operation;asset=asset_uuid 98;replace_reference=None;
+    target=asset_uuid 97;local_mutation=asset_uuid 96;metadata_mutation=asset_uuid 95;
+    source_file="/synthetic/source";title="source";file_type="text/plain"} in
+  let asset=Logseq_db_types.Asset_descriptor.create ~uuid:source.asset ~source:(Managed None)
+    ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
+  let receipt:Logseq_db_worker.import_receipt={operation;graph_generation=scope.graph_generation;
+    scope;target=source.target;asset;file_type=source.file_type;preview=Some("import-preview-lease","/synthetic/preview")} in
+  T.require(Service.discarded_asset_retain(Import_asset{graph_generation=scope.graph_generation;source})
+    (Asset_imported(Ok receipt))=Some(scope,"import-preview-lease"))
+    "discarded import preview did not transfer the actual result lease";
+  T.require(Service.discarded_asset_retain(Acquire_asset_file{scope;handle="lookup-handle"})(Asset_file None)=None)
+    "missing resource fabricated a cleanup capability";
+  T.require(Service.discarded_asset_retain(Import_asset{graph_generation=scope.graph_generation;source})
+    (Asset_imported(Error "failed"))=None) "failed import fabricated a cleanup capability"
+;;
+
 let availability scope consumer asset state =
   Service.Asset_notice
     (scope, Asset_availability { consumer; asset; availability = state })
@@ -1751,7 +1776,8 @@ let test_observation_invalidations_are_bounded_latest_facts () =
 let () =
   T.run
     "lui worker service"
-    [ T.case "release requires scoped physical ACK" test_release_requires_physical_ack
+    [ T.case "discarded asset result keeps actual retained owner" test_discarded_asset_result_keeps_actual_lease_owner
+    ; T.case "release requires scoped physical ACK" test_release_requires_physical_ack
     ; T.case "cancelled successful result is settled before terminal" (test_discarded_success_is_settled `Cancel)
     ; T.case "shutdown successful result is settled before terminal" (test_discarded_success_is_settled `Stop)
     ; T.case "delivered successful result keeps ownership" (test_discarded_success_is_settled `Complete)

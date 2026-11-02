@@ -571,7 +571,7 @@ type asset_bridge_fixture =
   ; fixture_asset : Sync.asset_action -> Sync.asset_value
   }
 
-let with_asset_bridge run =
+let with_asset_bridge ?(asynchronous=false) run =
   T.with_managed (fun fixture ->
     Eio_main.run (fun env ->
       Eio.Switch.run (fun sw ->
@@ -632,7 +632,9 @@ let with_asset_bridge run =
         let dependencies =
           Runner.dependencies
             ~runtime:
-              (Runner.runtime ~fork:(fun ~sw:_ task -> task ()) ~sleep:(fun _ -> ())
+              (Runner.runtime
+                ~fork:(fun ~sw task -> if asynchronous then Eio.Fiber.fork ~sw task else task ())
+                ~sleep:(fun seconds->if asynchronous then Eio.Time.sleep(Eio.Stdenv.clock env)seconds)
                |> Result.get_ok)
             ~config:fixture.config
             ~overlay:fixture.overlay
@@ -880,6 +882,30 @@ let test_checked_release_storage_retry () =
     Alcotest.(check bool) "same exact handle can settle after storage recovers" true
       (Runner.release_asset_file_checked fixture.runner ~scope:fixture.context.scope ~handle:lease=Ok());
     Alcotest.(check bool) "successful retry actually removes retired staging" false(Sys.file_exists path))
+;;
+
+let test_discarded_retain_retries_real_storage_cleanup () =
+  with_asset_bridge ~asynchronous:true(fun fixture->
+    let source=picker_import fixture.support 81 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source
+      ~current:(fun()->true) |> Result.get_ok in
+    let lease,path=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope
+      ~operation:source.operation |> Option.get in
+    ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
+    let directory=Filename.dirname path in
+    Unix.chmod directory 0o500;
+    Fun.protect ~finally:(fun()->Unix.chmod directory 0o700)(fun()->
+      Runner.abandon_asset_file fixture.runner ~scope:fixture.context.scope ~handle:lease;
+      Alcotest.(check int) "discard retains failed physical cleanup" 1(Runner.unsettled_orphan_retains fixture.runner);
+      Alcotest.(check bool) "pending failed cleanup preserves its bytes" true(Sys.file_exists path);
+      Alcotest.(check bool) "failed orphan cleanup gates new retain" true
+        (Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation=None));
+    let deadline=Unix.gettimeofday()+.2. in
+    while Runner.unsettled_orphan_retains fixture.runner>0 && Unix.gettimeofday()<deadline do
+      Eio.Fiber.yield()
+    done;
+    Alcotest.(check int) "actual background ACK settles the obligation" 0(Runner.unsettled_orphan_retains fixture.runner);
+    Alcotest.(check bool) "actual retry removes the retired staging bytes" false(Sys.file_exists path))
 ;;
 
 let test_db_shutdown_accepts_late_staging_completion () =
@@ -2488,7 +2514,9 @@ let () =
         ] )
     ; ( "unlock diagnostics", [Alcotest.test_case "typed finite runner observations" `Quick test_unlock_runner_logging] )
     ; ( "contract"
-      , [ Alcotest.test_case
+      , [ Alcotest.test_case "discarded retain retries actual storage cleanup" `Quick
+            test_discarded_retain_retries_real_storage_cleanup
+        ; Alcotest.test_case
             "checked release preserves storage failure for same-handle retry" `Quick
             test_checked_release_storage_retry
         ; Alcotest.test_case

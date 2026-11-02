@@ -1636,3 +1636,35 @@ module Changefeed_owner = struct
   ;;
 end
 
+
+module Orphan_cleanup = struct
+  type resource = { scope : Logseq_sync_pure_reducer.Core.graph_scope; handle : string }
+  module Resources=Map.Make(struct type t=resource let compare=Stdlib.compare end)
+  module Queue=Map.Make(Int64)
+  type work={resource:resource;attempt:int64;failures:int}
+  type entry={attempt:int64 option;failures:int}
+  type t={resources:entry Resources.t;ready:resource Queue.t;serial:int64}
+  let empty={resources=Resources.empty;ready=Queue.empty;serial=0L}
+  let count t=Resources.cardinal t.resources
+  let acquisition_open t=Resources.is_empty t.resources
+  let resource work=work.resource
+  let first_attempt (work:work)=work.failures=0
+  let retry_delay (work:work)=if work.failures=0 then 0. else min 1. (0.05 *. (2. ** float_of_int(work.failures-1)))
+  let track t resource=
+    if Resources.mem resource t.resources then t else
+    {resources=Resources.add resource {attempt=None;failures=0} t.resources;
+      ready=Queue.add t.serial resource t.ready;serial=Int64.succ t.serial}
+  let next t=match Queue.min_binding_opt t.ready with
+    | None->t,None
+    | Some(attempt,resource)->
+      let entry=Resources.find resource t.resources in
+      {t with ready=Queue.remove attempt t.ready;
+        resources=Resources.add resource {entry with attempt=Some attempt}t.resources},Some{resource;attempt;failures=entry.failures}
+  let completed t work result=match Resources.find_opt work.resource t.resources with
+    | Some entry when entry.attempt=Some work.attempt->
+      (match result with
+       | Ok()->{t with resources=Resources.remove work.resource t.resources}
+       | Error _->{resources=Resources.add work.resource {attempt=None;failures=min 6(entry.failures+1)}t.resources;
+           ready=Queue.add t.serial work.resource t.ready;serial=Int64.succ t.serial})
+    | _->t
+end

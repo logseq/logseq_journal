@@ -1912,6 +1912,71 @@ let test_observation_registry_capacity () =
     true
     (result = O.Release_full)
 ;;
+let test_orphan_cleanup_retains_failed_release () =
+  let module O=Core.Orphan_cleanup in
+  let _,scope=worker_open_graph() in
+  let resource:O.resource={scope;handle="actual-retained-lease"} in
+  let tracked=O.track O.empty resource in
+  Alcotest.(check int) "one successful retain transfers exactly one cleanup" 1(O.count tracked);
+  Alcotest.(check bool) "unsettled first release gates further acquisition" false(O.acquisition_open tracked);
+  let running,work=O.next tracked in
+  let work=Option.get work in
+  Alcotest.(check bool) "first release reports its failure once" true(O.first_attempt work);
+  Alcotest.(check (float 0.0001)) "first release is immediate" 0.(O.retry_delay work);
+  Alcotest.(check bool) "release preserves exact physical owner" true(O.resource work=resource);
+  let duplicate=O.track running resource in
+  Alcotest.(check int) "duplicate live obligation is not a second retain" 1(O.count duplicate);
+  let failed=O.completed duplicate work(Error "physical release failed") in
+  Alcotest.(check int) "failed release retains cleanup" 1(O.count failed);
+  Alcotest.(check bool) "failed cleanup gates acquisition" false(O.acquisition_open failed);
+  let retrying,retry=O.next failed in
+  let retry=Option.get retry in
+  Alcotest.(check bool) "automatic retry does not repeat diagnostics" false(O.first_attempt retry);
+  Alcotest.(check (float 0.0001)) "pure retry policy yields bounded delay" 0.05(O.retry_delay retry);
+  let stale=O.completed retrying work(Ok()) in
+  Alcotest.(check int) "old ACK cannot settle new attempt" 1(O.count stale);
+  let done_=O.completed stale retry(Ok()) in
+  Alcotest.(check int) "actual retry ACK settles cleanup" 0(O.count done_);
+  Alcotest.(check bool) "settled cleanup permits acquisition" true(O.acquisition_open done_);
+  Alcotest.(check int) "duplicate completion is inert" 0(O.count(O.completed done_ retry(Ok())));
+  Alcotest.(check int) "pure transitions preserve prior state" 1(O.count tracked);
+  let other:O.resource={scope={scope with graph_generation=scope.graph_generation+1};handle=resource.handle} in
+  let run actions=
+    let state=ref(O.track(O.track O.empty resource)other) and settled=ref [] and stale=ref None in
+    List.iter(fun action->
+      let old= !state in let snapshot=Marshal.to_string old [] in
+      let running,work=O.next old in
+      let repeated,repeated_work=O.next old in
+      Alcotest.(check bool) "deterministic pure cleanup selection" true(running=repeated && work=repeated_work);
+      Alcotest.(check string) "selection preserves input" snapshot(Marshal.to_string old []);
+      match work with
+      | None->state:=running
+      | Some work->
+        let physical=O.resource work in
+        Alcotest.(check bool) "settled lease cannot be released twice" false(List.mem physical !settled);
+        let running=match !stale with None->running|Some previous->
+          let late=O.completed running previous(Ok()) in
+          Alcotest.(check bool) "stale ACK is inert" true(late=running);late in
+        let success=action mod 4=0 in
+        state:=O.completed running work(if success then Ok() else Error "storage unavailable");
+        stale:=Some work;
+        if success then settled:=physical::!settled;
+        Alcotest.(check int) "no obligation disappears without its exact physical ACK"
+          (2-List.length !settled)(O.count !state))actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec remove prefix=function
+      | []->actions
+      | _::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      | item::rest->remove(item::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0xC1EA;seed|] in
+    let actions=List.init 80(fun _->Random.State.int random 32) in
+    if fails actions then Alcotest.failf "cleanup seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+
 let () =
   Alcotest.run
     "logseq db worker pure reducer"
@@ -1962,6 +2027,7 @@ let () =
             `Quick
             test_asset_manual_retry_is_unlimited
         ] )
+    ; ( "orphan resource cleanup",[Alcotest.test_case "failed release and stale attempt ACK" `Quick test_orphan_cleanup_retains_failed_release])
     ; ( "observation registry", [Alcotest.test_case "registration cancellation epoch and owner" `Quick test_observation_registry;
           Alcotest.test_case "exhaustive shortest lifecycle traces" `Quick test_observation_registry_traces;
           Alcotest.test_case "active ACK and tombstone capacities" `Quick test_observation_registry_capacity] )

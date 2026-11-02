@@ -70,6 +70,10 @@ val release_asset_file_checked
   : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> handle:string
   -> (unit, string) result
 
+(** Backend ownership of an unpublished retained resource, including retries. *)
+val abandon_asset_file : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> handle:string -> unit
+val unsettled_orphan_retains : t -> int
+
 type import_receipt =
   { operation : Logseq_db_types.Graph_types.Uuid.t
   ; graph_generation : int

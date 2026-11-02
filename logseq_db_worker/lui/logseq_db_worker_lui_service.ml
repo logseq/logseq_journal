@@ -920,6 +920,14 @@ let worker_dependency_error_message = function
   | Worker_runner.Invalid_dependency message -> message
 ;;
 
+let discarded_asset_retain request response =
+  match request,response with
+  | (Acquire_asset_file{scope;_}|Acquire_imported_file{scope;_}),Asset_file(Some(handle,_))->Some(scope,handle)
+  | (Import_asset_at _|Import_asset _),Asset_imported(Ok receipt)->
+    Option.map(fun(handle,_)->receipt.Db.scope,handle)receipt.preview
+  | _->None
+;;
+
 let create ~(dependencies : dependencies) =
   let module Session = struct
     type t =
@@ -945,6 +953,9 @@ let create ~(dependencies : dependencies) =
     ~push_topic_count:9
     ~merge_push:coalesce_push
     ~concurrency:(Journal_worker.Service.Concurrent { max_in_flight = 2 })
+    ~discard_response:(fun session ~request_id:_ request response->
+      Option.iter(fun(scope,handle)->Db.abandon_asset_file session.Session.worker ~scope ~handle)
+        (discarded_asset_retain request response))
     ~data_directory:(fun config -> Ok config.Db.Config.application_support_directory)
     ~control_topic_count:2
     ~classify_control:(function
@@ -1346,9 +1357,9 @@ let create ~(dependencies : dependencies) =
         Db.post session.worker event;
         Ok Client_command_completed
       | Acquire_imported_file { scope; operation } ->
-        Ok (Asset_file (Db.retain_imported_file session.worker ~scope ~operation))
+        Eio.Cancel.protect(fun()->Ok (Asset_file (Db.retain_imported_file session.worker ~scope ~operation)))
       | Acquire_asset_file { scope; handle } ->
-        Ok (Asset_file (Db.retain_asset_file session.worker ~scope ~handle))
+        Eio.Cancel.protect(fun()->Ok (Asset_file (Db.retain_asset_file session.worker ~scope ~handle)))
       | Release_asset_file { scope; handle } ->
         Result.map(fun()->Client_command_completed)
           (Db.release_asset_file_checked session.worker ~scope ~handle)

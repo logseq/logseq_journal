@@ -410,6 +410,8 @@ type t =
   ; asset_current : Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool
   ; observation_slots : (int64 * Graph.Uuid.t, observation_slot) Hashtbl.t
   ; mutable observation_registry : Core.Observation_registry.t
+  ; mutable orphan_cleanup : Core.Orphan_cleanup.t
+  ; mutable orphan_cleanup_running : bool
   ; durable_slots : Eio.Semaphore.t
   ; databases : (string, database_session) Hashtbl.t
   ; inspections : (string, Database.mirror_inspection) Hashtbl.t
@@ -451,6 +453,8 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; local_imports = Hashtbl.create 32
     ; observation_slots = Hashtbl.create 32
     ; observation_registry = Core.Observation_registry.empty
+    ; orphan_cleanup = Core.Orphan_cleanup.empty
+    ; orphan_cleanup_running = false
     ; durable_slots = Eio.Semaphore.make 8
     ; databases = Hashtbl.create 4
     ; inspections = Hashtbl.create 4
@@ -3649,6 +3653,7 @@ let shutdown t =
 ;;
 
 let retain_asset_file t ~scope ~handle =
+  if not(Core.Orphan_cleanup.acquisition_open t.orphan_cleanup) then None else
   let detail = ref None in
   match asset_call ~on_diagnostic:(fun value -> detail := Some value) t ~scope (Sync.Retain_asset_file handle) with
   | Ok (Sync.Asset_retained file) -> file
@@ -3665,17 +3670,49 @@ let release_asset_file t ~scope ~handle =
   | Ok _ -> report_source_failure t scope "assetRelease" "invalidContent" "Unexpected asset completion"
 ;;
 
-let release_asset_file_checked t ~scope ~handle =
+let release_asset_file_result t ~scope ~handle ~report_failure =
   if t.stopped then Error "The Worker stopped before resource release." else
   let detail=ref None in
   match asset_call ~on_diagnostic:(fun value->detail:=Some value) t ~scope (Sync.Release_asset_file handle) with
   | Ok Sync.Asset_unit -> Ok()
   | Error failure ->
-    report_asset_failure ?detail:!detail t scope "assetRelease" failure;
+    if report_failure then report_asset_failure ?detail:!detail t scope "assetRelease" failure;
     Error(asset_failure_message failure)
   | Ok _ ->
-    report_source_failure t scope "assetRelease" "invalidContent" "Unexpected asset completion";
+    if report_failure then report_source_failure t scope "assetRelease" "invalidContent" "Unexpected asset completion";
     Error "Unexpected asset release completion"
+;;
+let release_asset_file_checked t ~scope ~handle=release_asset_file_result t ~scope ~handle ~report_failure:true
+
+let unsettled_orphan_retains t=Core.Orphan_cleanup.count t.orphan_cleanup
+
+let release_orphan_work t work =
+  let resource=Core.Orphan_cleanup.resource work in
+  let result=try Eio.Cancel.protect(fun()->
+    release_asset_file_result t ~scope:resource.scope ~handle:resource.handle
+      ~report_failure:(Core.Orphan_cleanup.first_attempt work))
+    with _->Error "Attachment cleanup was interrupted." in
+  t.orphan_cleanup<-Core.Orphan_cleanup.completed t.orphan_cleanup work result
+;;
+
+let abandon_asset_file t ~scope ~handle =
+  t.orphan_cleanup<-Core.Orphan_cleanup.track t.orphan_cleanup {scope;handle};
+  if not t.orphan_cleanup_running && not t.stopped then (
+    t.orphan_cleanup_running<-true;
+    let next,work=Core.Orphan_cleanup.next t.orphan_cleanup in
+    t.orphan_cleanup<-next;
+    Option.iter(release_orphan_work t)work;
+    if unsettled_orphan_retains t=0 then t.orphan_cleanup_running<-false else
+      t.dependencies.runtime.fork ~sw:t.sw (fun()->
+        Fun.protect ~finally:(fun()->t.orphan_cleanup_running<-false)(fun()->
+          let rec retry ()=
+            if not t.stopped then (
+              let next,work=Core.Orphan_cleanup.next t.orphan_cleanup in
+              t.orphan_cleanup<-next;
+              match work with None->()|Some work->
+                t.dependencies.runtime.sleep(Core.Orphan_cleanup.retry_delay work);
+                if not t.stopped then (release_orphan_work t work;retry())) in
+          retry())))
 ;;
 
 let prepare_import_unlocked
@@ -3710,6 +3747,8 @@ let prepare_import_unlocked
   let* _ = source_error "invalidRequest" (prepare version 0L "validation.bin") in
   if (not (current ())) || t.stopped
   then Error "The selected graph is no longer active"
+  else if not(Core.Orphan_cleanup.acquisition_open t.orphan_cleanup)
+  then Error "Attachment cleanup is pending. Retry after cleanup succeeds."
   else
     let* () = source_error "restoreFailed" (reconcile_staging t context.scope ~current) in
     let* existing =
@@ -3805,7 +3844,7 @@ let prepare_import t ~(context : Sync.asset_context) request ~current =
 ;;
 
 let retain_imported_file t ~(scope : Sync.graph_scope) ~operation =
-  if t.stopped
+  if t.stopped || not(Core.Orphan_cleanup.acquisition_open t.orphan_cleanup)
   then None
   else (
     match
