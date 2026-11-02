@@ -790,12 +790,7 @@ let test_stale_calendar_generation_rejects_capture_before_worker_io () =
   Alcotest.(check int) "no stale worker request" 0 (List.length output.requests);
   match output.responses with
   | [ { Runtime.payload =
-          Mutation_failed
-            { kind = Capture_mutation
-            ; mutation_id
-            ; block_id
-            ; failure = Projection_failure message
-            }
+          Capture_not_admitted{command={mutation_id;block_id;_};message}
       ; _
       }
     ] ->

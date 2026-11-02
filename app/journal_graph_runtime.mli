@@ -24,6 +24,15 @@ type payload =
   | Child_projection_settled of
       { command : Journal_graph_projection.create_child; presentation : Journal_worker_coordination.Worker_api.presentation option; result : payload;
         failure : Journal_worker_coordination.Worker_api.error option; insert_rejected : bool }
+  | Capture_projection_ready of
+      {root:Logseq_db_types.Graph_types.Uuid.t;round:int64;command:Journal_graph_projection.capture;
+       presentation:Journal_worker_coordination.Worker_api.presentation;result:payload;
+       failure:Journal_worker_coordination.Worker_api.error option}
+  | Capture_not_admitted of {command:Journal_graph_projection.capture;message:string}
+  | Capture_waiting of {command:Journal_graph_projection.capture;message:string}
+  | Capture_projection_settled of
+      {command:Journal_graph_projection.capture;presentation:Journal_worker_coordination.Worker_api.presentation option;
+       result:payload;failure:Journal_worker_coordination.Worker_api.error option;insert_rejected:bool}
   | Mutation_settled of Journal_worker_coordination.Worker_api.mutation_intent * Journal_worker_coordination.Worker_api.presentation * payload
   | Mutation_waiting of { mutation_id:string; block_id:string; message:string }
   | Projection_changes of Logseq_db_worker.Protocol.v2_change_window list
@@ -132,7 +141,7 @@ val create : ?on_change:(Journal_worker_coordination.Worker_pure_coordinator.eve
 val reset : t -> unit
 val set_calendar : t -> Journal_calendar.t -> unit
 val start : t -> Logseq_db_worker.Protocol.request
-val submit : t -> Journal_graph_request.t -> output
+val submit : ?capture_chain:Journal_graph_mutation_confirmation.Pure_insertion.t -> t -> Journal_graph_request.t -> output
 val receive : t -> Logseq_db_worker.Protocol.response -> output
 val fail_request : t -> Logseq_db_worker.Protocol.request -> message:string -> output
 val abandon : t -> Logseq_db_worker.Protocol.request -> unit
@@ -214,6 +223,8 @@ val retry_failed_change_application : t
   -> view:Journal_worker_coordination.Worker_pure_coordinator.view
   -> request_generation:int64 -> output
 
+val worker_append : t -> Logseq_db_worker.Protocol.request ->
+  (Logseq_db_worker.Protocol.command,string) result option
 val worker_mutation : t -> Logseq_db_worker.Protocol.request ->
   (Logseq_db_types.Graph_types.Uuid.t * Journal_worker_coordination.Worker_api.mutation_command) option
 val bind_mutation : t -> Logseq_db_worker.Protocol.request ->
@@ -236,3 +247,9 @@ val rebind_child_ack : t -> Logseq_db_worker.Protocol.request ->
 val receive_child_ack : t -> Logseq_db_worker.Protocol.request -> (unit,string) result -> output
 val child_projection_applied : t -> root:Logseq_db_types.Graph_types.Uuid.t -> round:int64
   -> presentation:Journal_worker_coordination.Worker_api.presentation -> output
+
+val capture_chain : t -> command:Journal_graph_projection.capture ->
+  Journal_graph_mutation_confirmation.Pure_insertion.t option
+
+val capture_snapshot : t -> Logseq_db_worker.Protocol.request ->
+  (Journal_graph_projection.capture * Journal_graph_mutation_confirmation.Pure_insertion.t) option

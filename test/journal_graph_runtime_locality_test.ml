@@ -3068,6 +3068,9 @@ let expect_admitted_failure description ~kind ~mutation_id ~block_id output =
          true
          (Logseq_db_worker.Error.code failure.error = Closed_session)
      | Projection_failure _ -> ())
+  | Runtime.Capture_not_admitted{command;_} when kind=Capture_mutation ->
+    Alcotest.(check string) "unadmitted mutation identity" mutation_id command.mutation_id;
+    Alcotest.(check string) "unadmitted block identity" block_id command.block_id
   | _ -> Alcotest.fail (description ^ ": admitted owner was lost")
 ;;
 

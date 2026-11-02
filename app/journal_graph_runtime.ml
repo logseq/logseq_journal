@@ -93,6 +93,15 @@ type payload =
   | Child_projection_settled of
       { command : Projection.create_child; presentation : Worker.presentation option; result : payload; failure : Worker.error option;
         insert_rejected : bool }
+  | Capture_projection_ready of
+      {root:Logseq_db_types.Graph_types.Uuid.t;round:int64;command:Journal_graph_projection.capture;
+       presentation:Journal_worker_coordination.Worker_api.presentation;result:payload;
+       failure:Journal_worker_coordination.Worker_api.error option}
+  | Capture_not_admitted of {command:Journal_graph_projection.capture;message:string}
+  | Capture_waiting of {command:Journal_graph_projection.capture;message:string}
+  | Capture_projection_settled of
+      {command:Journal_graph_projection.capture;presentation:Journal_worker_coordination.Worker_api.presentation option;
+       result:payload;failure:Journal_worker_coordination.Worker_api.error option;insert_rejected:bool}
   | Mutation_settled of Journal_worker_coordination.Worker_api.mutation_intent * Journal_worker_coordination.Worker_api.presentation * payload
   | Mutation_waiting of { mutation_id:string; block_id:string; message:string }
   | Projection_changes of Protocol.v2_change_window list
@@ -235,6 +244,7 @@ type operation =
       ; after : Projection.child_cursor option
       }
   | Child_chain of { chain : Child.t; projection : payload option }
+  | Capture_chain of { chain : Child.t; projection : payload option; command : Projection.capture }
   | Child_write of { root : Graph.Uuid.t; index : int; round : int64 }
   | Child_canonical of { root : Graph.Uuid.t; round : int64 }
   | Child_chain_parent of { root : Graph.Uuid.t; round : int64; summary : Worker.block_summary }
@@ -848,7 +858,17 @@ let child_failure (command : Projection.create_child) message = response (Child_
 let child_root t root =
   match Hashtbl.find_opt t.pending (Graph.Uuid.to_string root) with
   | Some ({operation=Child_chain value;_} as pending) -> Some(pending,value.chain,value.projection)
+  | Some ({operation=Capture_chain value;_} as pending) -> Some(pending,value.chain,value.projection)
   | _ -> None
+;;
+let capture_snapshot t (request:Protocol.request) =
+  let root=match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
+    | Some{operation=Capture_chain _;_}->Some request.request_id
+    | Some{operation=(Child_write{root;_}|Child_ack{root;_});_}->Some root
+    | _->None in
+  Option.bind root(fun root->match Hashtbl.find_opt t.pending(Graph.Uuid.to_string root) with
+    | Some{operation=Capture_chain value;_}->Some(value.command,value.chain)
+    | _->None)
 ;;
 let child_request_root = function
   | Child_write {root;_} | Child_canonical {root;_} | Child_chain_parent {root;_}
@@ -857,11 +877,70 @@ let child_request_root = function
 ;;
 let update_child_root t root chain projection =
   Option.iter (fun (pending,_,_) -> Hashtbl.replace t.pending (Graph.Uuid.to_string root)
-    {pending with operation=Child_chain {chain;projection}}) (child_root t root)
+    {pending with operation=(match pending.operation with
+      | Capture_chain value->Capture_chain{value with chain;projection}
+      | _->Child_chain {chain;projection})}) (child_root t root)
+;;
+let capture_root_command t root =
+  match Hashtbl.find_opt t.pending(Graph.Uuid.to_string root) with
+  | Some{operation=Capture_chain{command;_};_}->Some command | _->None
+;;
+let capture_failure (command:Projection.capture) message =
+  Mutation_failed{kind=Capture_mutation;mutation_id=command.mutation_id;block_id=command.block_id;
+    failure=Projection_failure message}
+;;
+let project_capture_summary t (summary:Worker.block_summary) =
+  match summary.lookup,summary.page,projection_time_context t with
+  | Protocol.V2_present_block{value;revision},Some(V2_present_page{page;revision=page_revision}),Ok time_context ->
+    (match Projection.block_on_page ~page ~revision
+      ~child_count:(List.length summary.items + if summary.next=None then 0 else 1)
+      ~time_context value.block,page_of_graph_page page with
+     | Ok block,Some journal ->
+       let block=Journal_model.with_tag_titles block ~tag_titles:value.tag_titles in
+       (match Projection.timeline_target_entry ~page:journal ~time_context
+          ~root:Projection.{block=value.block;revision;depth=0}
+          ~tag_titles:(fun _->value.tag_titles)(Rrbvec.of_list summary.items) with
+        | Error message->Error message
+        | Ok entry->
+          Hashtbl.replace t.graph_pages (Graph.Uuid.to_string page.uuid) page;
+          Hashtbl.replace t.page_revisions (Graph.Uuid.to_string page.uuid) page_revision;
+          Hashtbl.replace t.block_revisions (Graph.Uuid.to_string value.block.uuid) revision;
+          Hashtbl.replace t.projected_blocks (Graph.Uuid.to_string value.block.uuid) block;
+          Hashtbl.replace t.tag_titles (Graph.Uuid.to_string value.block.uuid) value.tag_titles;
+          Hashtbl.replace t.page_tree_interests journal.id {page=journal;limit=Protocol.maximum_page_size};
+          remember_block_page t journal (Graph.Uuid.to_string value.block.uuid);
+          (* The summary is a bounded slice. Keep the same lower bound on
+             both projections; Timeline owns a preview and opens a fresh Detail
+             read rather than treating this slice as a complete child set. *)
+          Ok(Block_captured{block;timeline_entry_update=Option.map(fun (entry:Projection.timeline_entry)->
+            {entry with block})entry}))
+     | Error message,_->Error message
+     | _,None->Error "The captured block has no canonical journal page.")
+  | _,_,Error message->Error message
+  | _->Error "The captured block is not available in its canonical journal page."
+;;
+let capture_append_wire t (command:Projection.capture) =
+  let bind=Result.bind in
+  bind (parse_uuid "mutation UUID" command.mutation_id)(fun mutation_id->
+  bind (parse_uuid "block UUID" command.block_id)(fun block_id->
+  bind (journal_uuid(Journal_time.local_day command.creation_time))(fun page->
+  bind (task_status_uuid t command.task_state)(fun task_status->
+    if List.length command.children>=2000 then Error "Capture exceeds the atomic tree budget." else
+    let children=List.fold_left(fun result (child:Projection.capture_child)->
+      bind result(fun nodes->bind(parse_uuid "child UUID" child.block_id)(fun block_id->
+        bind(task_status_uuid t child.task_state)(fun task_status->
+          Ok(Rrbvec.push_back nodes Protocol.{block_id;title=child.source;task_status;children=Rrbvec.empty})))))
+      (Ok Rrbvec.empty)command.children in
+    bind children(fun children->
+      let root:Protocol.v2_append_node={block_id;title=command.source;task_status;children} in
+      if not(Protocol.valid_append_node root) then Error "Capture tree has invalid or duplicate identities."
+      else Ok(Protocol.V2_append_journal{mutation_id;page;
+        journal_day=Journal_time.local_day command.creation_time;root}))))))
 ;;
 let child_action t root chain projection action =
   update_child_root t root chain projection;
   let command=Child.command chain in
+  let capture=capture_root_command t root in
   match action with
   | Child.Write(index,round,wire) -> requests [mutate t (Child_write{root;index;round}) wire]
   | Read_child round -> requests [read t (Child_canonical{root;round})
@@ -873,6 +952,18 @@ let child_action t root chain projection action =
     requests [read t (Child_chain_parent{root;round;summary})
       (if parent=page.uuid then Protocol.V2_get_page{page=parent;revision=None}
        else V2_get_outline_block{block=parent;revision=None})]
+  | Present round when capture<>None ->
+    let command=Option.get capture in
+    let result=match Child.failure chain,Child.canonical chain with
+      | Some error,None->Ok(capture_failure command (child_error_message error))
+      | _,Some summary->project_capture_summary t summary
+      | _->Error "The captured result is not available." in
+    (match result,Child.presentation chain with
+     | Ok result,Some presentation->
+       update_child_root t root chain (Some result);
+       responses[response(Capture_projection_ready{root;round;command;presentation;result;failure=Child.failure chain})]
+     | Error message,_->responses[response(Capture_waiting{command;message})]
+     | _,None->responses[response(Capture_waiting{command;message="Capture lost its confirming presentation."})])
   | Present round ->
     let result=match projection with Some result->result
       | None->(child_failure command (Option.fold ~none:"The child could not be applied."
@@ -898,10 +989,15 @@ let child_action t root chain projection action =
     let refresh=if Child.canonical chain=None then [] else
       match page_of_graph_page(Child.page chain) with None->[]|Some page->
         Option.to_list(Feed.reconcile_page t.feed ~ports:(feed_ports t) ~page ~limit:Protocol.maximum_page_size) in
-    {requests=refresh;responses=[response(Child_projection_settled
-      {command;presentation=Child.presentation chain;result;failure=Child.failure chain;insert_rejected})]}
+    {requests=refresh;responses=[response(match capture with
+      | Some command->Capture_projection_settled
+        {command;presentation=Child.presentation chain;result;failure=Child.failure chain;insert_rejected}
+      | None->Child_projection_settled
+        {command;presentation=Child.presentation chain;result;failure=Child.failure chain;insert_rejected})]}
   | Ignore -> empty
-  | Wait message -> responses[response(Child_waiting{command;message})]
+  | Wait message -> responses[response(match capture with
+      | Some command->Capture_waiting{command;message}
+      | None->Child_waiting{command;message})]
 ;;
 let child_step t root transition = match child_root t root with
   | None -> empty
@@ -966,11 +1062,31 @@ let submit_unowned t (request : Journal_graph_request.t) =
        requests
          [ read t Find_block_result (Protocol.V2_get_outline_block { block; revision = None }) ])
   | Capture { calendar_generation; command } ->
-    (match
+    let retained=Hashtbl.to_seq t.pending |> Seq.find_map(fun(key,pending)->match pending.operation with
+      | Capture_chain value when value.command.mutation_id=command.mutation_id->
+        Some(Graph.Uuid.of_string key |> Result.get_ok,value.command,value.chain,value.projection)
+      | _->None) in
+    (match retained with
+     | Some(root,_original,chain,projection)->
+       let previous=Child.command chain in
+       let resolved=if command.status_intent_revision=previous.status_intent_revision
+         && command.task_state=previous.task_state then Ok(Child.resolved_status chain)
+         else task_status_uuid t command.task_state in
+       (match resolved with Error message->responses[response(Capture_waiting{command;message})]
+        | Ok resolved_status->match Child.retarget_capture chain ~command ~resolved_status with
+          | Error message->responses[response(Capture_waiting{command;message})]
+          | Ok chain->
+            Option.iter(fun pending->Hashtbl.replace t.pending(Graph.Uuid.to_string root)
+              {pending with operation=Capture_chain{command;chain;projection}})
+              (Hashtbl.find_opt t.pending(Graph.Uuid.to_string root));
+            let next,action=Child.retry chain in child_action t root next projection action)
+     | None->(match capture_append_wire t command with
+       | Error message->responses[response(Capture_not_admitted{command;message})]
+       | Ok _->(match
        ( calendar_generation_is_current t calendar_generation
        , journal_uuid (Journal_time.local_day command.creation_time) )
      with
-     | false, _ -> reject "The local calendar changed before capture admission."
+     | false, _ -> responses[response(Capture_not_admitted{command;message="The local calendar changed before capture admission."})]
      | true, Error message -> reject message
      | true, Ok page_uuid ->
        (match task_status_uuid t command.task_state with
@@ -981,7 +1097,7 @@ let submit_unowned t (request : Journal_graph_request.t) =
              t
              (Capture_page command)
              (Protocol.V2_get_page { page = page_uuid; revision = None })
-            ]))
+            ]))))
   | Update_source command ->
     (match
        mutation_context t command.mutation_id, parse_uuid "block UUID" command.block_id
@@ -1414,7 +1530,23 @@ let dispatch_output t output =
   { output with requests = foreground @ drain_hydration t }
 ;;
 
-let submit t request = dispatch_output t (plan_request t request)
+let capture_chain t ~(command:Projection.capture) =
+  Hashtbl.to_seq_values t.pending |> Seq.find_map(fun pending->match pending.operation with
+    | Capture_chain value when value.command.mutation_id=command.mutation_id
+        && Child.matches_capture value.chain command->Some value.chain
+    | _->None)
+;;
+let submit ?capture_chain:retained t request =
+  (match request,retained with
+   | Journal_graph_request.Capture{command;_},Some chain
+     when Child.matches_capture chain command && capture_chain t ~command=None ->
+     (* A retained pure business owner survives Runtime reset. This root is a
+        routing handle only; retry emits the exact existing stage wire. *)
+     ignore(mutate t (Capture_chain{command;chain;projection=None})
+       (Child.stage_wire(Child.stage chain 0)) : Protocol.request)
+   | _->());
+  dispatch_output t (plan_request t request)
+
 
 let remember_detail_members t ~page ~(root : Projection.block_member) children =
   let key = Graph.Uuid.to_string root.Projection.block.uuid in
@@ -1911,6 +2043,7 @@ let operation_name = function
   | Detail_block _ -> "loadDetailBlock"
   | Detail_page _ -> "loadDetailPage"
   | Child_chain _ -> "coordinateChild"
+  | Capture_chain _ -> "coordinateCapture"
   | Child_write _ -> "mutateChild"
   | Child_canonical _ -> "readCanonicalChild"
   | Child_chain_parent _ -> "readCanonicalChildParent"
@@ -2011,7 +2144,7 @@ let failure_output
              ; failure = Worker_failure worker_failure
              })
       ]
-  | Child_chain _ -> child_step t request_id(fun chain->Child.interrupted chain ~index:0 ~round:1L message)
+  | Child_chain _ | Capture_chain _ -> child_step t request_id(fun chain->Child.interrupted chain ~index:0 ~round:1L message)
   | Child_write{root;index;round}|Child_ack{root;index;round;_}->
     child_step t root(fun chain->Child.interrupted chain ~index ~round message)
   | Child_canonical{root;round}|Child_chain_parent{root;round;_}->
@@ -3199,14 +3332,24 @@ let receive_worker_read ?resync_generation ?origin t ~request_id result =
     (Protocol.V2_response { api_version = Protocol.api_version; request_id; outcome })
 ;;
 
+let worker_append t (request:Protocol.request) =
+  match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
+  | Some{operation=Capture_page command;delivery=Dispatched;_}->Some(capture_append_wire t command)
+  | Some{operation=Child_write{root;index;_};delivery=Dispatched;_}->
+    Option.bind(child_root t root)(fun(_,chain,_)->match Child.stage_wire(Child.stage chain index) with
+      | Protocol.V2_append_journal _ as wire->Some(Ok wire)|_->None)
+  | _->None
+;;
 let worker_mutation t (request:Protocol.request) =
   match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id),request.command with
   | Some {operation=Child_insert _;delivery=Dispatched;_},
     Protocol.V2_insert_blocks{mutation_id;parent;roots;preconditions}->
       Some(mutation_id,Worker.Insert_blocks{parent;roots;preconditions})
   | Some {operation=Child_write{root;index;_};delivery=Dispatched;_},_ ->
-    Option.map(fun(_,chain,_)->let stage=Child.stage chain index in
-      Child.stage_id stage,Child.stage_mutation stage)(child_root t root)
+    Option.bind(child_root t root)(fun(_,chain,_)->let stage=Child.stage chain index in
+      match Child.stage_wire stage with
+      | Protocol.V2_append_journal _->None
+      | _->Some(Child.stage_id stage,Child.stage_mutation stage))
   | Some {operation=Mutation_refresh _;delivery=Dispatched;_},
     Protocol.V2_set_task_status{mutation_id;block;status;preconditions}->
       Some(mutation_id,Worker.Set_task_status{block;status;preconditions})
@@ -3222,6 +3365,16 @@ let worker_mutation t (request:Protocol.request) =
 let bind_mutation t request ~presentation ~intent =
   let key=Graph.Uuid.to_string request.Protocol.request_id in
   match Hashtbl.find_opt t.pending key with
+  | Some ({operation=Capture_page command;delivery=Dispatched;_} as pending) ->
+    (match capture_append_wire t command,task_status_uuid t command.task_state with
+     | Ok insert,Ok resolved_status->
+       (match Child.start_capture ~command ~resolved_status ~insert with
+        | Error _->false
+        | Ok(chain,_)->match Child.bind chain ~index:0 ~round:1L ~intent ~presentation with
+          | None->false
+          | Some chain->Hashtbl.replace t.pending key
+            {pending with operation=Capture_chain{chain;projection=None;command}};true)
+     | _->false)
   | Some ({operation=Child_insert(command,page);delivery=Dispatched;_} as pending) ->
     (match task_status_uuid t command.task_state with
      | Error _->false
@@ -3264,7 +3417,7 @@ let acknowledge_mutation t intent =
 
 let mutation_waiting t (request:Protocol.request) message =
   match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
-  | Some {operation=Child_chain _;_} ->
+  | Some {operation=(Child_chain _|Capture_chain _);_} ->
     child_step t request.request_id(fun chain->Child.interrupted chain ~index:0 ~round:1L message)
   | Some {operation=(Child_write{root;index;round}|Child_ack{root;index;round;_});_} ->
     child_step t root(fun chain->Child.interrupted chain ~index ~round message)
@@ -3276,7 +3429,7 @@ let mutation_waiting t (request:Protocol.request) message =
 let receive_mutation t (request:Protocol.request) progress =
   let key=Graph.Uuid.to_string request.request_id in
   match Hashtbl.find_opt t.pending key with
-  | Some {operation=Child_chain _;_} ->
+  | Some {operation=(Child_chain _|Capture_chain _);_} ->
     dispatch_output t (child_step t request.request_id (fun chain->Child.receive chain ~index:0 ~round:1L progress))
   | Some {operation=(Child_write{root;index;round}|Child_ack{root;index;round;_});_} ->
     Hashtbl.remove t.pending key;
@@ -3357,7 +3510,10 @@ let child_projection_applied t ~root ~round ~presentation =
 
 let fail_request t (request : Protocol.request) ~message =
   match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
-  | Some{operation=(Child_chain _|Child_write _|Child_ack _);_}->mutation_waiting t request message
+  | Some{operation=Capture_page command;_}->
+    Hashtbl.remove t.pending(Graph.Uuid.to_string request.request_id);
+    responses[response(Capture_waiting{command;message})]
+  | Some{operation=(Child_chain _|Capture_chain _|Child_write _|Child_ack _);_}->mutation_waiting t request message
   | _->receive
     t
     (Protocol.V2_response

@@ -78,3 +78,10 @@ val retry_identity_locked : t -> bool
 val lock_for_retry : t -> t
 (** Only after a known-not-applied outcome was consumed and acknowledged. *)
 val release_rejected_attempt : t -> t
+
+val pending_command : t -> Journal_graph_projection.capture option
+
+val admission_error : t -> string option
+
+val retained_chain : t -> Journal_graph_mutation_confirmation.Pure_insertion.t option
+val retain_chain : t -> Journal_graph_mutation_confirmation.Pure_insertion.t -> t

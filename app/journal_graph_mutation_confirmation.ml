@@ -172,7 +172,7 @@ let reference_fragment (summary : read) ~target ~final_children =
     target
 ;;
 
-module Pure_child = struct
+module Pure_insertion = struct
   type choice =
     { revision : int64
     ; task_state : Journal_model.task_state
@@ -189,7 +189,9 @@ module Pure_child = struct
   type phase = Writing of int | Canonical of int * bool | Parent | Applying | Acknowledging of int | Finished
   type t =
     { command : Journal_graph_projection.create_child
-    ; page : Graph.page
+    ; page : Graph.page option
+    ; append_day : int option
+    ; capture : Journal_graph_projection.capture option
     ; desired : choice
     ; stages : stage Rrbvec.t
     ; phase : phase
@@ -211,19 +213,36 @@ module Pure_child = struct
     | Wait of string
 
   let command t = t.command
-  let page t = t.page
+  let page t = Option.get t.page
   let failure t = t.failure
   let stage t index = Rrbvec.nth t.stages index
-  let stage_id stage = match stage.wire with
+  let wire_id = function
     | Protocol.V2_insert_blocks {mutation_id;_}
+    | V2_append_journal {mutation_id;_}
     | V2_set_task_status {mutation_id;_}
     | V2_clear_task_status {mutation_id;_} -> mutation_id
     | _ -> assert false
+  let stage_id stage = wire_id stage.wire
   let mutation = function
     | Protocol.V2_insert_blocks {parent;roots;preconditions;_} -> Worker.Insert_blocks {parent;roots;preconditions}
     | V2_set_task_status {block;status;preconditions;_} -> Set_task_status {block;status;preconditions}
     | V2_clear_task_status {block;preconditions;_} -> Clear_task_status {block;preconditions}
     | _ -> invalid_arg "Unsupported child mutation"
+  let rec capture_node (node:Protocol.v2_append_node) : Worker.capture_node =
+    {block_id=node.block_id;title=node.title;task_status=node.task_status;
+      children=Rrbvec.map capture_node node.children}
+  let wire_intent session wire = match wire with
+    | Protocol.V2_append_journal{mutation_id;journal_day;root;_}->
+      (match Worker.journal_day journal_day with
+       | Error error->Error error
+       | Ok day->match Worker.append_intent session ~mutation_id ~block_id:root.block_id
+           ~day ~title:root.title ~task_status:root.task_status ~children:(Rrbvec.map capture_node root.children) with
+         | Error error->Error error
+         | Ok intent->Worker.restore_mutation_intent session (Worker.encode_append_intent intent))
+    | (Protocol.V2_insert_blocks _|V2_set_task_status _|V2_clear_task_status _) as wire->
+      Worker.mutation_intent session ~mutation_id:(wire_id wire)(mutation wire)
+    | _->Error(Worker.Invalid_input "Unsupported durable insertion wire.")
+  let stage_intent session stage = wire_intent session stage.wire
   let replace_stage t index value =
     {t with stages=Rrbvec.mapi (fun i old -> if i=index then value else old) t.stages}
   let status_mutation_id ~domain ~mutation_id ~revision ~block status =
@@ -246,22 +265,50 @@ module Pure_child = struct
     | Status value,Some id -> String.lowercase_ascii value=Graph.Uuid.to_string id
     | _ -> false
   let fresh wire choice = {wire;choice;binding=None;outcome=None;acknowledged=false}
-  let start ~(command:Journal_graph_projection.create_child) ~page ~resolved_status ~insert =
+  let start_value ~(command:Journal_graph_projection.create_child) ~page ~resolved_status ~insert =
     let desired={revision=command.status_intent_revision;task_state=command.task_state;
       resolved=resolved_status;required=command.status_confirmation} in
-    let value=fresh insert None in
+    let append_day=match insert with Protocol.V2_append_journal{journal_day;_}->Some journal_day|_->None in
+    let value=fresh insert (Option.map (fun _->desired) append_day) in
     let valid=match insert with
       | Protocol.V2_insert_blocks {mutation_id;parent;roots=[root];_}->
         Graph.Uuid.to_string mutation_id=String.lowercase_ascii command.mutation_id
         && Graph.Uuid.to_string parent=String.lowercase_ascii command.parent_block_id
         && Graph.Uuid.to_string root.uuid=String.lowercase_ascii command.block_id
         && root.title=command.source && root.children=[]
+      | V2_append_journal{mutation_id;root;_}->
+        Graph.Uuid.to_string mutation_id=String.lowercase_ascii command.mutation_id
+        && Graph.Uuid.to_string root.block_id=String.lowercase_ascii command.block_id
+        && root.title=command.source && root.task_status=resolved_status
+        && Protocol.valid_append_node root
       | _->false in
     if not valid || command.status_intent_revision<0L || not(choice_matches command.task_state resolved_status)
     then Error "The initial child payload does not match its admitted business command."
-    else Ok({command;page;desired;stages=Rrbvec.singleton value;phase=Writing 0;round=1L;
+    else Ok({command;page;append_day;capture=None;desired;stages=Rrbvec.singleton value;phase=Writing 0;round=1L;
       canonical=None;failure=None;current=None;applied=None;origin=None}, Write(0,1L,insert))
-  let insert_rejected t = Rrbvec.exists (fun stage -> stage.choice=None &&
+  let start ~command ~page ~resolved_status ~insert =
+    start_value ~command ~page:(Some page) ~resolved_status ~insert
+  let capture_command (capture:Journal_graph_projection.capture) : Journal_graph_projection.create_child =
+    {mutation_id=capture.mutation_id;calendar_generation=0L;block_id=capture.block_id;
+      parent_block_id="";expected_parent_revision="";sibling_order=capture.sibling_order;
+      source=capture.source;task_state=capture.task_state;status_confirmation=capture.status_confirmation;
+      status_intent_revision=capture.status_intent_revision;creation_time=capture.creation_time}
+  let start_capture ~(command:Journal_graph_projection.capture) ~resolved_status ~insert = match insert with
+    | Protocol.V2_append_journal{journal_day;_}
+      when journal_day=Journal_time.local_day command.Journal_graph_projection.creation_time ->
+      (match insert with
+       | V2_append_journal{root;_} when Rrbvec.length root.children=List.length command.children
+         && Seq.for_all2 (fun (node:Protocol.v2_append_node) (child:Journal_graph_projection.capture_child)->
+           Graph.Uuid.to_string node.block_id=String.lowercase_ascii child.block_id
+           && node.title=child.source && Rrbvec.is_empty node.children
+           && choice_matches child.task_state node.task_status)
+           (Rrbvec.to_seq root.children)(List.to_seq command.children)->
+         Result.map(fun(t,action)->{t with capture=Some command},action)
+           (start_value ~command:(capture_command command) ~page:None ~resolved_status ~insert)
+       | _->Error "The atomic Capture children do not match the admitted payload.")
+    | _->Error "Capture requires its admitted day and atomic Append payload."
+  let insert_rejected t = Rrbvec.exists (fun stage ->
+    (match stage.wire with Protocol.V2_insert_blocks _|V2_append_journal _->true|_->false) &&
     match stage.outcome with Some(Worker.Rejected _)->true|_->false) t.stages
   let terminal t = t.phase=Finished && (t.failure=None || insert_rejected t)
   let retarget t ~(command:Journal_graph_projection.create_child) ~resolved_status =
@@ -277,6 +324,19 @@ module Pure_child = struct
     else if not(choice_matches command.task_state resolved_status) then Error "The child status choice is invalid."
     else Ok {t with command;desired={revision=command.status_intent_revision;
       task_state=command.task_state;resolved=resolved_status;required=true};applied=None}
+  let matches_capture t (command:Journal_graph_projection.capture) = match t.capture with
+    | Some original->{command with task_state=original.task_state;
+        status_confirmation=original.status_confirmation;
+        status_intent_revision=original.status_intent_revision}=original
+    | None->false
+  let retarget_capture t ~(command:Journal_graph_projection.capture) ~resolved_status =
+    match t.capture with
+    | Some original when {command with task_state=original.task_state;
+        status_confirmation=original.status_confirmation;
+        status_intent_revision=original.status_intent_revision}=original ->
+      Result.map(fun t->{t with capture=Some command})
+        (retarget t ~command:(capture_command command) ~resolved_status)
+    | _->Error "Capture retry does not belong to its frozen atomic payload."
   let bind t ~index ~round ~intent ~presentation =
     match t.phase with
     | Writing expected when expected=index && round=t.round ->
@@ -284,8 +344,7 @@ module Pure_child = struct
       let same_origin=Option.fold ~none:true ~some:(fun previous->Worker.same_logical_graph
         previous (Worker.presentation_session presentation)) t.origin in
       if not same_origin then None else
-      (match Worker.mutation_intent (Worker.presentation_session presentation)
-          ~mutation_id:(stage_id current) (mutation current.wire) with
+      (match stage_intent (Worker.presentation_session presentation) current with
        | Ok expected when Worker.encode_mutation_intent expected=Worker.encode_mutation_intent intent ->
          Some{(replace_stage t index {current with binding=Some(intent,presentation);acknowledged=false}) with current=Some presentation;origin=Some(Worker.presentation_session presentation)}
        | _ -> None)
@@ -294,14 +353,17 @@ module Pure_child = struct
     match summary.lookup,summary.page with
     | Protocol.V2_present_block {value;_},Some(V2_present_page {page;_}) ->
       Graph.Uuid.to_string value.block.uuid=t.command.block_id
-      && Graph.Uuid.to_string value.block.parent=t.command.parent_block_id
-      && value.block.page=page.uuid && page.uuid=t.page.uuid && not page.recycled
+      && value.block.page=page.uuid && not page.recycled
+      && (match t.append_day with
+        | Some day->value.block.parent=page.uuid && page.kind=Graph.Journal_page{journal_day=day}
+        | None->Graph.Uuid.to_string value.block.parent=t.command.parent_block_id
+          && Option.exists(fun (original:Graph.page)->page.uuid=original.uuid)t.page)
     | _ -> false
   let status_wire t (summary:Worker.block_summary) =
     match summary.lookup with
     | Protocol.V2_present_block {value;revision} ->
       let block=value.block.uuid in
-      let mutation_id=status_mutation_id ~domain:"child" ~mutation_id:t.command.mutation_id
+      let mutation_id=status_mutation_id ~domain:(if t.append_day=None then "child" else "capture") ~mutation_id:t.command.mutation_id
         ~revision:t.desired.revision ~block t.desired.resolved in
       let preconditions:Protocol.v2_preconditions={blocks=[block,revision];pages=[];scopes=[]} in
       (match t.desired.resolved with
@@ -309,10 +371,11 @@ module Pure_child = struct
        | Some status->V2_set_task_status{mutation_id;block;status;preconditions})
     | _ -> assert false
   let canonical_state t (summary:Worker.block_summary) =
-    let page=match summary.page with Some(Protocol.V2_present_page{page;_})->page|_->t.page in
+    let page=match summary.page with Some(Protocol.V2_present_page{page;_})->Some page|_->t.page in
     {t with canonical=Some summary;page}
   let after_child t summary =
     if not(exact_child t summary) then t,Wait "The canonical child is absent or belongs to another parent."
+    else if t.append_day<>None then {(canonical_state t summary) with phase=Applying},Present t.round
     else {(canonical_state t summary) with phase=Parent},Read_parent(t.round,summary)
   let next_choice t summary =
     if not(exact_child t summary) then t,Wait "The saved child is no longer available in its parent."
@@ -342,7 +405,7 @@ module Pure_child = struct
          else let next=replace_stage t index {current with outcome=Some progress} in
          (match Worker.confirmation_primary confirmation with
           | Worker.Confirmed_block summary when index<Rrbvec.length t.stages-1 ->
-            if exact_child next summary then {(canonical_state next summary) with phase=Parent},Read_parent(t.round,summary)
+            if exact_child next summary then after_child next summary
             else next,Wait "The committed child is no longer available in its parent."
           | Worker.Confirmed_block summary->after_child next summary
           | _->next,Wait "The committed child is no longer available in its parent.")
@@ -351,7 +414,8 @@ module Pure_child = struct
          t,Wait "A committed child operation cannot become a rejection."
        | Some _,Worker.Rejected error ->
          let next=replace_stage t index {current with outcome=Some progress} in
-         if current.choice=None then {next with failure=Some error;phase=Applying},Present t.round
+         if (match current.wire with Protocol.V2_insert_blocks _|V2_append_journal _->true|_->false)
+         then {next with failure=Some error;phase=Applying},Present t.round
          else {next with failure=Some error;phase=Canonical(index,false)},Read_child t.round
        | Some _,(Worker.Outcome_unknown|Committed_pending_presentation _) ->
          let outcome=match current.outcome with
@@ -435,3 +499,5 @@ module Pure_child = struct
     then t,Wait message else t,Ignore
 
 end
+
+module Pure_child = Pure_insertion

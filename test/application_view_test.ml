@@ -536,6 +536,7 @@ let run_favorites_native_visibility
       ?malformed_native_event
       ?(check_ios_capture = false)
       ?(check_capture_imports = false)
+      ?capture_case
       ?detail_capture
       ?status_scenario
       ?durable_status
@@ -576,11 +577,12 @@ let run_favorites_native_visibility
   let typed_status_mutations=Atomic.make 0 and typed_status_confirms=Atomic.make 0 and typed_status_acks=Atomic.make 0 in
   let pending_change_reads = Atomic.make 0 in
   let legacy_child_writes = Atomic.make 0 in
+  let capture_append_writes=Atomic.make 0 and legacy_capture_writes=Atomic.make 0 in
   let typed_status_intents=Atomic.make [] in
   let status_summary_queries=Atomic.make 0 in
   let status_more_entered=Atomic.make false and status_more_release=Atomic.make(durable_status<>Some `Paged) in
   let status_confirm_entered=Atomic.make false in
-  let status_confirm_release=Atomic.make(durable_case<>Some `Held) in
+  let status_confirm_release=Atomic.make(durable_case<>Some `Held && capture_case<>Some `Held) in
   let status_revision () = if Atomic.get status_writes = [] then "root" else "status-updated" in
   let status_release = Atomic.make (status_scenario <> Some "duplicate") in
   let graph_generation = Atomic.make 1 in
@@ -895,7 +897,7 @@ let run_favorites_native_visibility
          | Coordination_query{request={command=P.V2_get_outline_block_summary _;_};_}->Atomic.incr status_summary_queries
          | _->());
         if (match request with Service.Coordination_acknowledge_mutation _->
-          (durable_case=Some `Ack_failed || durable_case=Some `Reconfirm_failed) && Atomic.get typed_status_acks=1|_->false)
+          (durable_case=Some `Ack_failed || durable_case=Some `Reconfirm_failed || capture_case=Some `Ack_failed) && Atomic.get typed_status_acks=1|_->false)
         then Error "Fixture acknowledgement failed after UI application" else
         let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
         let cached=match request with
@@ -1386,8 +1388,12 @@ let run_favorites_native_visibility
                       ; revision = "captured"
                       }
                 ; page = Some (V2_present_page { page; revision = "p" })
-                ; items = []
-                ; next_cursor = None
+                ; items = (if capture_case=Some `Paged then
+                    [{P.value={value with block={value.block with uuid=uuid 94322;
+                        title="Canonical child";parent=root.uuid;page=page.uuid}};revision="child"}]
+                    else [])
+                ; next_cursor = (if capture_case=Some `Paged
+                    then Some(G.Cursor.of_string "capture-more" |> Result.get_ok) else None)
                 ; scope_revision = "children"
                 ; generation = "g"
                 ; projection_revision = "p2"
@@ -1644,6 +1650,17 @@ let run_favorites_native_visibility
                   ; before_projection_revision = "p"
                   ; after_projection_revision = "p2"
                   })
+            | V2_append_journal{mutation_id;page=candidate;journal_day;root} when check_capture_imports ->
+              (match original_request with Service.Coordination_mutation _->()|_->Atomic.incr legacy_capture_writes);
+              Atomic.incr capture_append_writes;
+              Alcotest.(check int) "the full attachment-only capture has one root" 0(Rrbvec.length root.children);
+              let captured={page with uuid=uuid 94321;name=string_of_int journal_day;
+                title="Web-created journal page";kind=Journal_page{journal_day}} in
+              Alcotest.(check bool) "canonical Web page differs from candidate" true (candidate<>captured.uuid);
+              Atomic.set capture_page(Some captured);
+              Atomic.set capture_root(Some{uuid=root.block_id;title=root.title;children=[]});
+              V2_mutation_committed{mutation_id;status=V2_applied;generation="g";
+                before_projection_revision="p";after_projection_revision="p2"}
             | V2_insert_blocks { mutation_id; parent; roots = [ root ]; _ }
               when check_capture_imports ->
               let page = Atomic.get capture_page |> Option.get in
@@ -1670,7 +1687,7 @@ let run_favorites_native_visibility
                       before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"}})
                 | _->Wire.Rejected response in
               Hashtbl.replace durable_outcomes intent outcome;
-              Service.Coordination_mutation_result{request_id;outcome=(if durable_case=Some `Unknown
+              Service.Coordination_mutation_result{request_id;outcome=(if (durable_case=Some `Unknown || capture_case=Some `Unknown)
                 && Atomic.get typed_status_mutations=1 then Wire.Unknown else outcome)}
             | Coordination_confirm _ when (durable_case=Some `Confirm_failed && Atomic.get typed_status_confirms=1)
               || (durable_status=Some `Reconfirm_failed && Atomic.get typed_status_confirms=2) ->
@@ -4377,8 +4394,41 @@ let run_favorites_native_visibility
                    "accessibility-identifier"
                    ("composer-attachment:" ^ G.Uuid.to_string (uuid 30001))));
            dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Send")));
-           wait "first attachment enters actual Worker handler" (fun () ->
-             Atomic.get imports_entered <> []);
+           (match capture_case with
+            | Some `Held->
+              wait "Capture canonical read is held" (fun()->Atomic.get status_confirm_entered);
+              Alcotest.(check int) "unapplied canonical result cannot ACK" 0(Atomic.get typed_status_acks);
+              Alcotest.(check int) "unapplied canonical result cannot import" 0(Atomic.get imports_finished);
+              Alcotest.(check bool) "held canonical result keeps staged attachments" true
+                (List.for_all Sys.file_exists !staged_paths);
+              Alcotest.(check bool) "held result retains Composer" true
+                (Option.is_some(find "accessibility-identifier" "journal-capture-composer"));
+              Atomic.set status_confirm_release true
+            | Some (`Ack_failed|`Unknown)->
+              wait "Capture exposes retry after uncertain settlement" (fun()->
+                (if capture_case=Some `Ack_failed then Atomic.get typed_status_acks=1
+                   && Option.is_some(find "text" "The child result is applied. Retry finishes its durable acknowledgement.")
+                 else Atomic.get typed_status_mutations=1
+                   && Option.is_some(find "text" "The child outcome is unknown. Retry checks the same operation."))
+                && Option.is_some(find "text" "Retry"));
+              Alcotest.(check int) "unsettled Capture cannot start imports" 0(Atomic.get imports_finished);
+              Alcotest.(check bool) "unsettled Capture retains Composer" true
+                (Option.is_some(find "accessibility-identifier" "journal-capture-composer"));
+              Alcotest.(check bool) "unsettled Capture keeps original staged bytes" true
+                (List.for_all Sys.file_exists !staged_paths);
+              dispatch(Lui_protocol.Press(ancestor_property(Option.get(find "text" "Retry"))"press-enabled"))
+            | None|Some `Paged->());
+           (try wait "first attachment enters actual Worker handler" (fun () ->
+             Atomic.get imports_entered <> []) with error->
+             Printf.eprintf "CAPTURE retry mutations=%d confirms=%d acks=%d texts=%s\n%!"
+               (Atomic.get typed_status_mutations)(Atomic.get typed_status_confirms)(Atomic.get typed_status_acks)
+               (Hashtbl.fold(fun _ values texts->match List.assoc_opt "text" values with
+                 | Some(`String text)->text::texts|_->texts)props[] |> String.concat " | ");
+             raise error);
+           Alcotest.(check int) "Capture performs exactly one physical Append" 1(Atomic.get capture_append_writes);
+           Alcotest.(check int) "Capture has no legacy write consumer" 0(Atomic.get legacy_capture_writes);
+           Alcotest.(check int) "canonical Capture was ACKed before imports" (if capture_case=Some `Ack_failed then 2 else 1)
+             (Atomic.get typed_status_acks);
            Atomic.set import_probe true;
            ignore (W.send (Option.get !client) Service.Get_graph_state);
            wait "second Worker lane reaches ordered request barrier" (fun () ->
@@ -8170,7 +8220,15 @@ let () =
       , [ Alcotest.test_case
             "ordered partial failure and staging release"
             `Quick
-            (fun () -> run_favorites_native_visibility ~check_capture_imports:true ())
+            (fun () -> run_favorites_native_visibility ~check_capture_imports:true ());
+          Alcotest.test_case "atomic Append waits for canonical UI application" `Quick
+            (fun ()->run_favorites_native_visibility ~check_capture_imports:true ~capture_case:`Held ());
+          Alcotest.test_case "atomic Append ACK retry preserves draft and attachments" `Quick
+            (fun ()->run_favorites_native_visibility ~check_capture_imports:true ~capture_case:`Ack_failed ());
+          Alcotest.test_case "atomic Append unknown retry keeps exact intent" `Quick
+            (fun ()->run_favorites_native_visibility ~check_capture_imports:true ~capture_case:`Unknown ());
+          Alcotest.test_case "partial Append summary keeps an applied lower bound" `Quick
+            (fun ()->run_favorites_native_visibility ~check_capture_imports:true ~capture_case:`Paged ())
         ] )
     ; ( "offline asset coordination"
       , [ Alcotest.test_case "mounted catalog and asset scans use typed owner" `Quick

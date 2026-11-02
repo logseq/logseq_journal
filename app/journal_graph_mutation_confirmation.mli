@@ -65,7 +65,7 @@ val worker_query : read -> Worker.block_summary Worker.query
 
 (** Pure business ordering for one child insertion and its status sub-operations.
     The Worker coordinator remains the authority for admission and receipts. *)
-module Pure_child : sig
+module Pure_insertion : sig
   type stage
   type t
   type action =
@@ -79,6 +79,11 @@ module Pure_child : sig
     | Wait of string
   val start : command:Journal_graph_projection.create_child -> page:Graph.page
     -> resolved_status:Graph.Uuid.t option -> insert:Protocol.command -> (t * action,string) result
+  val start_capture : command:Journal_graph_projection.capture -> resolved_status:Graph.Uuid.t option
+    -> insert:Protocol.command -> (t * action,string) result
+  val capture_command : Journal_graph_projection.capture -> Journal_graph_projection.create_child
+  val wire_intent : Worker.session -> Protocol.command -> (Worker.mutation_intent,Worker.error) result
+  val stage_intent : Worker.session -> stage -> (Worker.mutation_intent,Worker.error) result
   val command : t -> Journal_graph_projection.create_child
   val page : t -> Graph.page
   val failure : t -> Worker.error option
@@ -96,6 +101,8 @@ module Pure_child : sig
     -> block:Graph.Uuid.t -> Graph.Uuid.t option -> Graph.Uuid.t
   val retarget : t -> command:Journal_graph_projection.create_child
     -> resolved_status:Graph.Uuid.t option -> (t,string) result
+  val matches_capture : t -> Journal_graph_projection.capture -> bool
+  val retarget_capture : t -> command:Journal_graph_projection.capture -> resolved_status:Graph.Uuid.t option -> (t,string) result
   val bind : t -> index:int -> round:int64 -> intent:Worker.mutation_intent
     -> presentation:Worker.presentation -> t option
   val receive : t -> index:int -> round:int64 -> Worker.mutation_progress -> t * action
@@ -107,3 +114,5 @@ module Pure_child : sig
   val rebind_ack : t -> index:int -> round:int64 -> intent:Worker.mutation_intent
     -> presentation:Worker.presentation -> t option
 end
+
+module Pure_child = Pure_insertion

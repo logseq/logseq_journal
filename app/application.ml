@@ -1184,8 +1184,38 @@ let coordinated_error_message = function
   | Host_change_in_progress -> "The graph is closing. The outcome is retained."
   | Response_budget_exceeded -> "The result exceeded its response budget."
 ;;
+let owns_capture state command =
+  Option.bind state.direct_capture Journal_capture.pending_command=Some command
+;;
 let rec apply_worker_response ?(settling=false) ~discard state (response : Journal_graph_runtime.response) =
   match response.payload with
+  | Capture_projection_ready{command;result;failure;_} ->
+    if not(owns_capture state command) then state else
+    let timeline=match result with
+      | Block_captured{timeline_entry_update=Some entry;_}->
+        Journal_timeline_state.prepend_timeline_entry state.timeline entry
+      | _->state.timeline in
+    let message=Option.map coordinated_error_message failure in
+    {state with timeline;direct_capture=Option.map Journal_capture.lock_for_retry state.direct_capture;
+      capture_error=Option.map(fun message->Local_capture_failure message)message;
+      capture_error_owner=Option.map(fun _->Timeline_composer)message}
+  | Capture_not_admitted{command;message}->
+    if not(owns_capture state command) then state else
+    {state with direct_capture=Option.map Journal_capture.release_rejected_attempt state.direct_capture;
+      capture_error=Some(Local_capture_failure message);capture_error_owner=Some Timeline_composer}
+  | Capture_waiting{command;message}->
+    if not(owns_capture state command) then state else
+    {state with direct_capture=Option.map(fun capture->Journal_capture.fail capture ~message)state.direct_capture;
+      capture_error=Some(Local_capture_failure message);capture_error_owner=Some Timeline_composer}
+  | Capture_projection_settled{command;result;failure;insert_rejected;_}->
+    if not(owns_capture state command) then state else
+    (match failure with
+     | Some error->let message=coordinated_error_message error in
+       {state with direct_capture=Option.map(fun capture->
+         if insert_rejected then Journal_capture.release_rejected_attempt capture
+         else Journal_capture.fail capture ~message)state.direct_capture;
+         capture_error=Some(Local_capture_failure message);capture_error_owner=Some Timeline_composer}
+     | None->apply_worker_response ~settling:true ~discard state {payload=result})
   | Child_projection_ready {command;result;failure;_} ->
     if not(Journal_routes.has_child_request state.routes command) then state
     else (match result with
@@ -4038,7 +4068,28 @@ let start
       (Graph_drafts.find_opt key state.graph_drafts);
     { state with graph_drafts = Graph_drafts.remove key state.graph_drafts }))
   in
-  let submit request = Journal_graph_runtime.submit (!graph_runtime_cell) request in
+  let submit request =
+    let retained=match request,(!state_ref).direct_capture with
+      | Journal_graph_request.Capture{command;_},Some capture
+        when Journal_capture.pending_command capture=Some command->Journal_capture.retained_chain capture
+      | _->None in
+    Journal_graph_runtime.submit ?capture_chain:retained (!graph_runtime_cell) request in
+  let capture_chain_snapshot () =
+    Option.bind (!state_ref).direct_capture (fun capture->
+      Option.bind(Journal_capture.pending_command capture)(fun command->
+        Option.map(fun chain->command,chain)
+          (Journal_graph_runtime.capture_chain (!graph_runtime_cell) ~command))) in
+  let apply_capture_snapshot state (command,chain) =
+    if not(owns_capture state command) then state else
+    match state.direct_capture with
+    | None->state
+    | Some capture->let next=Journal_capture.retain_chain capture chain in
+      if next==capture then state else {state with direct_capture=Some next} in
+  let retain_capture_chain () =
+    (* Capture the immutable value before any queued state update or effect.
+       The update is owner-scoped and never reads a later/reset Runtime. *)
+    Option.iter(fun snapshot->Effect.run(set_state(fun state->apply_capture_snapshot state snapshot)))
+      (capture_chain_snapshot ()) in
   let fail_graph_transport state message =
     terminal_graph_state state (Transport_graph_error message)
   in
@@ -4105,13 +4156,13 @@ let start
     (_:Logseq_db_worker.Protocol.request) (_:(Wc.mutation_progress,string)result)->()) in
   let coordinated_child_ack_finished=ref(fun (_:Graph_service.timeline_scope)
     (_:Logseq_db_worker.Protocol.request) (_:Wc.presentation) (_:(unit,string)result)->()) in
-  let send_coordinated_mutation request (mutation_id,command) =
+  let send_coordinated_intent request make_intent =
     match current_owner(),ensure_coordination() with
     | Some owner,Ok host ->
       (match Option.bind(Coordination.projection(Coordination_host.view host))Wc.selected with
        | Some presentation when Wc.matches_scope(Wc.presentation_session presentation)owner ->
          let session=Wc.presentation_session presentation in
-         (match Wc.mutation_intent session ~mutation_id command with
+         (match make_intent session with
           | Ok intent when Journal_graph_runtime.bind_mutation (!graph_runtime_cell)request ~presentation ~intent ->
             let rec watch ticket =
               Coordination_host.watch host ticket ~f:(fun reply->
@@ -4122,12 +4173,30 @@ let start
                    | Error _-> !coordinated_mutation_finished owner request(Error "The change is awaiting a current presentation."))
                 | Answered(Ok progress)-> !coordinated_mutation_finished owner request(Ok progress)
                 | _-> !coordinated_mutation_finished owner request(Error "The change could not be confirmed. Retry checks the same change.")) in
-            (match Coordination_host.reconcile_mutation host ~presentation intent with
-             | Ok ticket->watch ticket;Journal_graph_transport.Accepted
-             | Error _->Journal_graph_transport.Not_ready)
+            let dispatch ()=match Coordination_host.reconcile_mutation host ~presentation intent with
+              | Ok ticket->watch ticket;Journal_graph_transport.Accepted
+              | Error _->Journal_graph_transport.Not_ready in
+            (match Journal_graph_runtime.capture_snapshot (!graph_runtime_cell) request with
+             | None->dispatch ()
+             | Some ((command,_) as snapshot)->
+               (* The owner-scoped state transition commits the full bound wire
+                  before this effect can send it, including queued updates. *)
+               Effect.run(set_state_and_effect(fun state->
+                 if not(owns_capture state command) then state,Effect.ignore else
+                 apply_capture_snapshot state snapshot,Effect.of_thunk(fun()->
+                   match dispatch () with
+                   | Journal_graph_transport.Accepted->()
+                   | _-> !coordinated_mutation_finished owner request
+                     (Error "The entry could not be admitted. Retry checks the same operation."))));
+               Journal_graph_transport.Accepted)
           | _->Journal_graph_transport.Not_ready)
        | _->Journal_graph_transport.Not_ready)
     | _->Journal_graph_transport.Not_ready in
+  let send_coordinated_mutation request (mutation_id,command) =
+    send_coordinated_intent request(fun session->Wc.mutation_intent session ~mutation_id command) in
+  let send_coordinated_append request wire =
+    send_coordinated_intent request(fun session->
+      Journal_graph_mutation_confirmation.Pure_insertion.wire_intent session wire) in
   let send_coordinated_child_ack request (intent,applied_presentation) =
     match current_owner(),!coordination_host with
     | Some owner,Some(_,host)->
@@ -4155,6 +4224,7 @@ let start
        | _->Journal_graph_transport.Not_ready)
     | _->Journal_graph_transport.Not_ready in
   let deliver_output (output : Journal_graph_runtime.output) =
+    retain_capture_chain ();
     List.iter
       (fun response ->
          match response.Journal_graph_runtime.payload with
@@ -4167,6 +4237,10 @@ let start
     Journal_graph_transport.deliver
       ~runtime:(!graph_runtime_cell)
       ~send:(fun request ->
+        match Journal_graph_runtime.worker_append (!graph_runtime_cell) request with
+        | Some(Ok wire)->send_coordinated_append request wire
+        | Some(Error _)->Journal_graph_transport.Not_ready
+        | None->
         match Journal_graph_runtime.worker_read (!graph_runtime_cell) request with
         | Some read -> send_coordinated_read request read
         | None ->
@@ -4254,6 +4328,16 @@ let start
     set_state_and_effect (fun state ->
       let state, effects = List.fold_left (fun (state, effects) response ->
         let response=match response.Journal_graph_runtime.payload with
+          | Capture_projection_ready{command;presentation;_} when not(
+              match timeline_scope state,!coordination_host with
+              | Some owner,Some(_,host)->Coordination.current_presentation ~owner(Coordination_host.view host)presentation
+              | _->false)->Journal_graph_runtime.{payload=Capture_waiting{command;
+                message="The Capture confirmation belongs to an earlier presentation. Retry checks the same operation."}}
+          | Capture_projection_settled{command;presentation;_} when not(
+              match timeline_scope state,!coordination_host,presentation with
+              | Some owner,Some(_,host),Some presentation->Coordination.current_presentation ~owner(Coordination_host.view host)presentation
+              | _->false)->Journal_graph_runtime.{payload=Capture_waiting{command;
+                message="The Capture acknowledgement belongs to an earlier presentation. Retry checks the same operation."}}
           | Child_projection_ready{command;presentation;_} when not(
               match timeline_scope state,!coordination_host with
               | Some owner,Some(_,host)->Coordination.current_presentation ~owner(Coordination_host.view host)presentation
@@ -4291,6 +4375,18 @@ let start
           let next = step_root state (Completed response) in
           report_app_response state next response;
           let effects=match response.payload,!coordination_host with
+            | Journal_graph_runtime.Capture_projection_ready{root;round;command;presentation;result;failure},Some _ ->
+              let applied=owns_capture next command && (match result,failure with
+                | Block_captured{block;_},_->Journal_timeline_state.find_block next.timeline
+                    ~block_id:command.block_id=Some block
+                | Mutation_failed _,Some error->next.capture_error=Some(Local_capture_failure(coordinated_error_message error))
+                | _->false) in
+              if not applied then effects else
+                let owner=timeline_scope next in
+                Effect.of_thunk(fun()->run_owned owner(fun()->
+                  Effect.bind(Effect.of_thunk(fun()->deliver_output
+                    (Journal_graph_runtime.child_projection_applied (!graph_runtime_cell) ~root ~round ~presentation)))
+                    ~f:(fun delivery->apply_graph_responses set_state_and_effect delivery.responses)))::effects
             | Journal_graph_runtime.Child_projection_ready{root;round;command;presentation;result;failure},Some _ ->
               let applied=match result with
                 | Child_created{child;parent;_}->Journal_routes.child_projection_applied next.routes ~command ~child ~parent
@@ -5900,7 +5996,11 @@ let start
                     ; capture_error = Some (Local_capture_failure message)
                     ; capture_error_owner = Some Timeline_composer
                     })
-                | Ok (_, None) -> Effect.ignore
+                | Ok (capture, None) ->
+                  (match Journal_capture.admission_error capture with
+                   | None->Effect.ignore
+                   | Some message->update(fun state->{state with direct_capture=Some capture;
+                     capture_error=Some(Local_capture_failure message);capture_error_owner=Some Timeline_composer}))
                 | Ok (capture, Some request) ->
                   with_direct_request
                     (step_root

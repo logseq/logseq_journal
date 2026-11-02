@@ -102,6 +102,7 @@ type t =
   ; phase : phase
   ; pending : Journal_graph_request.t option
   ; retry_identity_locked : bool
+  ; retained_chain : Journal_graph_mutation_confirmation.Pure_insertion.t option
   ; pending_attachments : Journal_asset_import.staged list
   }
 
@@ -111,6 +112,7 @@ let create ~session_number ~source =
   ; phase = Editing
   ; pending = None
   ; retry_identity_locked = false
+  ; retained_chain = None
   ; pending_attachments = []
   }
 ;;
@@ -137,7 +139,7 @@ let rebind t ~session_number =
 let phase t = t.phase
 let retry_identity_locked t = t.retry_identity_locked
 let lock_for_retry t = { t with retry_identity_locked = true }
-let release_rejected_attempt t = {t with retry_identity_locked=false;pending=None;phase=Editing}
+let release_rejected_attempt t = {t with retry_identity_locked=false;pending=None;retained_chain=None;phase=Editing}
 
 (* Unicode White_Space, shared by button admission and attachment-only naming.
    Do not trim meaningful drafts or treat format characters as whitespace. *)
@@ -272,9 +274,15 @@ let apply_text_edit t edit =
   | None -> t
 ;;
 
+let admission_error t =
+  if String.length(submission_source t)>Logseq_db_worker.Protocol.maximum_title_bytes
+  then Some "This entry is too long to save. Shorten the draft and try again."
+  else None
+;;
+
 let admit_save t ~mutation_id ~block_id ~sibling_order ~calendar_generation ~creation_time
   =
-  if not (can_save t)
+  if not (can_save t) || admission_error t<>None
   then t, None
   else (
     (* A blank capture only containing attachments names its block after the
@@ -301,8 +309,7 @@ let fail t ~message =
   | Some _ ->
     { t with
       phase = Failed message
-    ; retry_identity_locked =
-        t.retry_identity_locked || t.task_state <> Journal_model.No_status
+    ; retry_identity_locked = true
     }
   | None -> t
 ;;
@@ -333,4 +340,16 @@ let retry t =
   match t.phase, t.pending with
   | Failed _, Some request -> { t with phase = Saving }, Some request
   | Failed _, None | Editing, _ | Saving, _ -> t, None
+;;
+
+let pending_command t = match t.pending with
+  | Some(Journal_graph_request.Capture{command;_})->Some command | _->None
+
+let retained_chain t = t.retained_chain
+let retain_chain t chain =
+  if Option.fold ~none:false ~some:(fun previous->previous==chain)t.retained_chain then t else
+  match pending_command t with
+  | Some command when Journal_graph_mutation_confirmation.Pure_insertion.matches_capture chain command ->
+    {t with retained_chain=Some chain;retry_identity_locked=true}
+  | _->t
 ;;

@@ -30,7 +30,7 @@ let deliver ~runtime ~send (output : Journal_graph_runtime.output) =
          refusal of any other work still reports a transport failure. *)
       if retired.responses=[] || not(List.for_all(fun response->
         match response.Journal_graph_runtime.payload with
-        | Child_waiting _ | Mutation_waiting _ -> true
+        | Child_waiting _ | Capture_waiting _ | Mutation_waiting _ -> true
         | _ -> false) retired.responses) then fatal:=true;
       (* A failed completion can release queued work. It is still unsent and
          must be settled, not retried against the refusing Worker. *)
