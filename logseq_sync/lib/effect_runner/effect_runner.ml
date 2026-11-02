@@ -366,6 +366,8 @@ type t =
       -> request_operation:string -> Failure_diagnostic.t -> unit
   ; operations : (string, operation) Hashtbl.t
   ; asset_jobs : (string,Core.graph_scope * unit Eio.Promise.t)Hashtbl.t
+  ; mutable next_general_job : int64
+  ; general_jobs : (int64,Core.effect_scope * unit Eio.Promise.t)Hashtbl.t
   ; submitted_operations : Submitted_effects.t
   ; keys : (string, key_entry) Hashtbl.t
   ; websockets : (Core.connection_scope, Websocket_eio.t) Hashtbl.t
@@ -393,6 +395,8 @@ let create ?(on_asset_diagnostic=(fun ~scope:_ ~operation:_ ~request_operation:_
     ; on_asset_diagnostic
     ; operations = Hashtbl.create 32
     ; asset_jobs = Hashtbl.create 32
+    ; next_general_job = 0L
+    ; general_jobs = Hashtbl.create 32
     ; submitted_operations = Submitted_effects.create 32
     ; keys = Hashtbl.create 8
     ; websockets = Hashtbl.create 4
@@ -410,6 +414,17 @@ let create ?(on_asset_diagnostic=(fun ~scope:_ ~operation:_ ~request_operation:_
     ; preparing_retirements = Hashtbl.create 4
     ; closed = false
     }
+;;
+
+let fork_general t ~scope task =
+  if t.next_general_job=Int64.max_int then failwith "Sync I/O owner counter exhausted";
+  t.next_general_job<-Int64.succ t.next_general_job;
+  let id=t.next_general_job in
+  let finished,resolve=Eio.Promise.create() in
+  Hashtbl.add t.general_jobs id(scope,finished);
+  let complete()=Hashtbl.remove t.general_jobs id;ignore(Eio.Promise.try_resolve resolve():bool) in
+  try t.dependencies.runtime.fork ~sw:t.sw(fun()->Fun.protect ~finally:complete task)
+  with error->complete();raise error
 ;;
 
 let asset_root t =
@@ -951,7 +966,7 @@ let retire_websocket_owner ?(abort = false) t (scope:Core.connection_scope) =
          owner.operation.cancel ());
       (* submit runs on the event consumer. Joining here would deadlock a callback
          waiting to publish into its full sink. The waiter is never a callback. *)
-      t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+      fork_general t ~scope:({(Core.effect_scope_of_graph scope.graph) with connection_generation=Some scope.connection_generation}) (fun () ->
         (try Eio.Promise.await owner.finished with
          | Eio.Cancel.Cancelled _ ->
            Eio.Cancel.protect (fun () -> Eio.Promise.await owner.finished));
@@ -962,7 +977,7 @@ let retire_websocket_owner ?(abort = false) t (scope:Core.connection_scope) =
         if not t.closed then t.post (Core.Websocket_retired scope)))
   | _ when List.mem scope t.retired_websockets -> ()
   | _ ->
-    t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+    fork_general t ~scope:({(Core.effect_scope_of_graph scope.graph) with connection_generation=Some scope.connection_generation}) (fun () ->
       if not t.closed then t.post (Core.Websocket_retired scope))
 ;;
 
@@ -1061,7 +1076,7 @@ let submit_request : type a. t -> a Core.effect_ticket -> a Core.runner_request 
     }
   in
   Hashtbl.replace t.operations id operation;
-  t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+  fork_general t ~scope:(Core.effect_ticket_scope ticket) (fun () ->
     let result =
       try
         Some
@@ -1117,7 +1132,7 @@ let submit_nonasset t instruction =
   if not t.closed
   then (
     match instruction with
-    | Core.Asset_io _ | Core.Protected_io _ ->
+    | Core.Asset_io _ | Core.Protected_io _ | Core.Await_io _ ->
       invalid_arg "Effect requires its dedicated interpreter"
     | Core.Request (ticket, request) -> submit_request t ticket request
     | Cancel_effects scope -> cancel_scope t scope
@@ -1135,7 +1150,7 @@ let submit_nonasset t instruction =
         }
       in
       Hashtbl.replace t.operations id operation;
-      t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+      fork_general t ~scope:(Core.runner_effect_scope instruction) (fun () ->
         (try
            Eio.Fiber.first
              (fun () -> t.dependencies.runtime.sleep request.delay_seconds)
@@ -1151,7 +1166,7 @@ let submit_nonasset t instruction =
       (match Hashtbl.find_opt t.websocket_owners request.scope.graph with
        | Some owner when owner.physical_scope = request.scope -> ()
        | Some _ ->
-         t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+         fork_general t ~scope:(Core.runner_effect_scope instruction) (fun () ->
            if not t.closed
            then
              t.post
@@ -1188,7 +1203,7 @@ let submit_nonasset t instruction =
          in
          Hashtbl.replace t.websocket_owners request.scope.graph owner;
          Hashtbl.replace t.operations key operation;
-         t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+         fork_general t ~scope:(Core.runner_effect_scope instruction) (fun () ->
            let registered = ref false in
            Fun.protect
              ~finally:(fun () ->
@@ -2242,7 +2257,7 @@ let submit_protected t instruction ticket (request : Core.protected_request) =
       }
     in
     Hashtbl.add t.operations id operation;
-    t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+    fork_general t ~scope:(Core.effect_scope_of_graph request.protected_scope) (fun () ->
       let result =
         Fun.protect
           ~finally:(fun () -> Hashtbl.remove t.operations id)
@@ -2284,8 +2299,25 @@ let cleanup_asset_action = function
   | Asset_retry_after _ -> false
 ;;
 
+let submit_io_fence t id scope =
+  (* Capture before yielding/forking. Later unrelated work is not part of this
+     round; waiting must never occupy the serial callback consumer. *)
+  let jobs=Hashtbl.fold(fun _ (owner,finished) jobs->
+    if scope_matches scope owner then Rrbvec.push_back jobs finished else jobs)
+    t.general_jobs Rrbvec.empty in
+  let jobs=Hashtbl.fold(fun _ (owner,finished) jobs->
+    if scope_matches scope(Core.effect_scope_of_graph owner)
+    then Rrbvec.push_back jobs finished else jobs)t.asset_jobs jobs in
+  t.dependencies.runtime.fork ~sw:t.sw(fun()->
+    let result=if t.closed then Error "Sync stopped before I/O settlement." else (
+      Rrbvec.iter Eio.Promise.await jobs;
+      if t.closed then Error "Sync stopped before I/O settlement." else Ok()) in
+    t.post(Core.IO_fence_completed(id,scope,result)))
+;;
+
 let submit t instruction =
   match instruction with
+  |Core.Await_io(id,scope)->submit_io_fence t id scope
   | Core.Asset_io (ticket, ({ action = (Core.Prepare_graph_asset_deletion _ | Await_asset_operations); _ } as request)) ->
     (* Waiting must leave the serial event consumer free to deliver the I/O
        callbacks or native lease releases being joined. *)

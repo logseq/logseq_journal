@@ -4669,7 +4669,8 @@ let run ()=with_support(fun root->
    attached.next,starts @ List.filter_map(function C.Run(C.Start_websocket _ as runnable)->Some runnable|_->None) attached.effects)
    (configured.next,[]) graphs in
  require "two real graph connect instructions" (List.length starts=2);
- let core=ref current and events=Eio.Stream.create 128 and opened=ref [] and messages=ref [] in
+ let core=ref current and events=Eio.Stream.create 128 and opened=ref [] and messages=ref []
+ and retired=ref [] and io_fences=ref [] and expected_retirement=ref None in
  let cert=X509.Certificate.decode_pem(read(path "ephemeral-cert.pem")) |> Result.get_ok in
  let fingerprint=X509.Certificate.fingerprint `SHA256 cert in
  let authenticator=X509.Authenticator.cert_fingerprint ~time:(fun()->Some(Ptime_clock.now())) ~hash:`SHA256 ~fingerprint in
@@ -4693,12 +4694,16 @@ let run ()=with_support(fun root->
     | Websocket_closed(_,(Authentication_failure message|Protocol_failure message))->Printf.eprintf "CLOSED %s\n%!" message
     | _->());Eio.Stream.add events event) |> Result.get_ok in
  let run=function
-   | C.Start_websocket _ | Send_websocket _ | Close_websocket _ | Cancel_effects _ | Cancel_network_effects _ | Schedule_timer _ as op->R.submit runner op
+   | C.Await_io _ | Start_websocket _ | Send_websocket _ | Close_websocket _ | Cancel_effects _ | Cancel_network_effects _ | Schedule_timer _ as op->R.submit runner op
    | Request _ | Asset_io _ | Protected_io _ -> () in
  let running=ref true in
  Eio.Fiber.fork ~sw (fun()->while !running do
    let event=Eio.Stream.take events in
    (match event with C.Websocket_opened scope->opened:=scope::!opened
+    | Websocket_retired scope->retired:=scope::!retired
+    | IO_fence_completed(id,scope,result)->
+      let retired_at_ack=Option.exists(fun expected->List.mem expected !retired)!expected_retirement in
+      io_fences:=(id,(scope,result,retired_at_ack))::!io_fences
     | Websocket_message(scope,message)->messages:=(scope,message)::!messages|_->());
    let next=C.step !core event in core:=next.next;
    List.iter(function C.Run instruction->run instruction|_->()) next.effects
@@ -4714,6 +4719,15 @@ let run ()=with_support(fun root->
  Eio.Time.sleep clock 0.05;
  let removal=C.step !core (C.Resident_graphs_changed [b]) in core:=removal.next;
  List.iter(function C.Run instruction->run instruction|_->()) removal.effects;
+ let a_scope=List.find(fun(scope:C.connection_scope)->scope.graph.graph_id=a)!opened in
+ expected_retirement:=Some a_scope;
+ let io_scope={(C.effect_scope_of_graph a_scope.graph) with
+   presentation_generation=None;lifecycle_generation=None} in
+ let fence=C.step !core(C.IO_fence_requested(9001L,io_scope)) in core:=fence.next;
+ List.iter(function C.Run instruction->run instruction|_->()) fence.effects;
+ wait "A scope I/O fence finishes while B remains active" (fun()->List.mem_assoc 9001L !io_fences);
+ require "I/O fence receives exact successful payload only after actual retirement callback"
+   (List.assoc 9001L !io_fences=(io_scope,Ok(),true));
  wait "closing A retires only its real socket" (fun()->Sys.file_exists(path "retired-A"));
  let b_responses ()=List.length(List.filter(function (scope:C.connection_scope),Logseq_sync_pure_reducer.Sync_protocol.Server.Pull_ok _->scope.graph.graph_id=b|_->false) !messages) in
  let before=b_responses () in touch(path "after-A");

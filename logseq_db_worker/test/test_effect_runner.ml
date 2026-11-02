@@ -507,20 +507,12 @@ let test_sync_and_publish_instructions_are_not_reduced_recursively () =
         Runner.shutdown runner)))
 ;;
 
+let asset_sync_config () =
+  let limits=Sync.limits ~maximum_response_bytes:1024 ~maximum_artifact_bytes:1024 ~submission_batch_size:1 |> Result.get_ok in
+  Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits |> Result.get_ok
+;;
 let admitted_asset_state graph_id =
-  let limits =
-    Sync.limits
-      ~maximum_response_bytes:1024
-      ~maximum_artifact_bytes:1024
-      ~submission_batch_size:1
-    |> Result.get_ok
-  in
-  let initial =
-    Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits
-    |> Result.get_ok
-    |> Sync.initial
-    |> Result.get_ok
-  in
+  let initial=Sync.initial(asset_sync_config()) |> Result.get_ok in
   let graph : Sync.graph =
     { graph_id
     ; name = "Upload checkpoint fixture"
@@ -570,6 +562,7 @@ type asset_bridge_fixture =
   ; hold_asset_barrier : unit -> unit Eio.Promise.t
   ; deliver_asset_barriers : unit -> unit
   ; set_asset_current : (Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool) -> unit
+  ; on_sync_fence : (int64 * Sync.effect_scope -> unit) -> unit
   ; on_asset_completed : (Logseq_sync_pure_reducer.Asset_transfer.event -> unit) -> unit
   ; held_path : string option ref
   ; actions : Sync.asset_action list ref
@@ -588,6 +581,8 @@ let with_asset_bridge ?(asynchronous=false) ?(asynchronous_io=false) run =
         in
         let admitted, context = admitted_asset_state graph_id in
         let state = ref admitted in
+        let worker_state=ref(Core.initial(Core.config ~worker:fixture.config ~sync:(asset_sync_config())) |> Result.get_ok) in
+        let on_sync_fence=ref(fun (_:int64*Sync.effect_scope)->()) in
         let active_runner = ref None in
         let io_runner = ref None in
         let actions = ref [] in
@@ -599,6 +594,11 @@ let with_asset_bridge ?(asynchronous=false) ?(asynchronous_io=false) run =
         let asset_current=ref(fun (_:Logseq_sync_pure_reducer.Asset_transfer.ticket)->false) in
         let asset_completed=ref(fun (_:Logseq_sync_pure_reducer.Asset_transfer.event)->()) in
         let post = function
+          | Core.Sync_event((Sync.IO_fence_requested _|Sync.IO_fence_completed _)as event)->
+            (match event with Sync.IO_fence_requested(id,scope)-> !on_sync_fence(id,scope)|_->());
+            let transition=Core.step !worker_state(Core.Sync_event event) in
+            worker_state:=transition.next;
+            List.iter(Runner.submit(Option.get !active_runner))transition.effects
           | Core.Sync_event event ->
             (match event with
              | Sync.Asset_requested request -> actions := request.action :: !actions
@@ -740,6 +740,7 @@ let with_asset_bridge ?(asynchronous=false) ?(asynchronous_io=false) run =
                ; hold_asset_barrier
                ; deliver_asset_barriers
                ; set_asset_current=(fun callback->asset_current:=callback)
+               ; on_sync_fence=(fun callback->on_sync_fence:=callback)
                ; on_asset_completed=(fun callback->asset_completed:=callback)
                ; held_path
                ; actions
@@ -823,6 +824,66 @@ let cancelled_stage_output deliver_first () =
       "cancel before staging acceptance persists no import"
       true
       (durable = None))
+;;
+
+let test_worker_sync_io_fence_correlates_real_child () =
+  with_asset_bridge ~asynchronous:true ~asynchronous_io:true(fun fixture->
+    let source=picker_import fixture.support 950 in
+    let reached=fixture.gate ~hold_callback:true
+      (fun output->match output.Sync.request.action with Sync.Stage_asset_file _->true|_->false)
+      ~deliver_first:false in
+    Eio.Fiber.first
+      (fun()->ignore(Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true));
+        Alcotest.fail "held source unexpectedly finished")
+      (fun()->Eio.Promise.await reached);
+    let outcome=ref None and request=ref None in
+    fixture.on_sync_fence(fun value->request:=Some value);
+    let scope=Sync.effect_scope_of_graph fixture.context.scope in
+    Eio.Fiber.fork ~sw:fixture.sw(fun()->outcome:=Some(Runner.await_sync_io fixture.runner ~scope));
+    while !request=None do Eio.Fiber.yield() done;
+    let id,actual_scope=Option.get !request in
+    let wrong={actual_scope with graph_generation=Some 9999} in
+    Runner.submit fixture.runner(Core.Sync_io_fence_reached(id,wrong,Ok()));
+    Runner.submit fixture.runner(Core.Sync_io_fence_reached(Int64.succ id,actual_scope,Ok()));
+    for _=1 to 20 do Eio.Fiber.yield() done;
+    let premature= !outcome<>None in
+    fixture.deliver_held();
+    while !outcome=None do Eio.Fiber.yield() done;
+    Alcotest.(check bool) "wrong scope/ID and canceled parent cannot fake I/O ACK" false premature;
+    Alcotest.(check bool) "actual Sync and Worker callback outlets settle exact fence" true(!outcome=Some(Ok()));
+    Runner.shutdown fixture.runner;
+    Alcotest.(check bool) "stopped Worker cannot mint an I/O ACK" true
+      (Result.is_error(Runner.await_sync_io fixture.runner ~scope)))
+;;
+
+let test_sync_io_fence_joins_nonasset_callback () =
+  T.with_managed(fun fixture->Eio_main.run(fun env->Eio.Switch.run(fun sw->
+    let reached,reached_resolve=Eio.Promise.create() and release,release_resolve=Eio.Promise.create() in
+    let fenced=ref None in
+    let runner=asset_io_runner ~env ~sw ~support:fixture.config.application_support_directory
+      ~fork:(fun ~sw task->Eio.Fiber.fork ~sw task)
+      ~post:(function
+        |Sync.Runner_completed _->ignore(Eio.Promise.try_resolve reached_resolve():bool);Eio.Promise.await release
+        |Sync.IO_fence_completed(id,_,outcome) when id=1L->fenced:=Some outcome
+        |_->())() in
+    Fun.protect ~finally:(fun()->ignore(Eio.Promise.try_resolve release_resolve():bool);Sync_runner.shutdown runner)(fun()->
+      let limits=Sync.limits ~maximum_response_bytes:1024 ~maximum_artifact_bytes:1024 ~submission_batch_size:1 |> Result.get_ok in
+      let state=Sync.config ~managed_sync_origin:(Uri.of_string "https://api.logseq.io") ~limits |> Result.get_ok |> Sync.initial |> Result.get_ok in
+      let state=(Sync.step state(Sync.Sign_in_requested{account_generation=0;presentation_generation=0})).next in
+      let authenticated=Sync.step state(Sync.Account_authenticated{user_id=Some "user-1"}) in
+      let request=List.find_map(function Sync.Run(Sync.Request(_,Sync.Fetch_catalog _) as request)->Some request|_->None)authenticated.effects |> Option.get in
+      Sync_runner.submit runner request;
+      Eio.Promise.await reached;
+      let scope:Sync.effect_scope={account_generation=None;graph_generation=None;connection_generation=None;
+        presentation_generation=None;lifecycle_generation=None} in
+      let barrier=Sync.step authenticated.next(Sync.IO_fence_requested(1L,scope)) in
+      List.iter(function Sync.Run instruction->Sync_runner.submit runner instruction|_->())barrier.effects;
+      for _=1 to 20 do Eio.Fiber.yield() done;
+      let premature= !fenced<>None in
+      ignore(Eio.Promise.try_resolve release_resolve():bool);
+      while !fenced=None do Eio.Fiber.yield() done;
+      Alcotest.(check bool) "generic Sync callback belongs to its actual I/O fence" false premature;
+      Alcotest.(check bool) "generic Sync callback completion settles fence" true(!fenced=Some(Ok()))))))
 ;;
 
 let test_scope_close_keeps_live_staged_lease () =
@@ -2753,7 +2814,9 @@ let () =
         ] )
     ; ( "unlock diagnostics", [Alcotest.test_case "typed finite runner observations" `Quick test_unlock_runner_logging] )
     ; ( "contract"
-      , [ Alcotest.test_case "scope close keeps live staged lease" `Quick test_scope_close_keeps_live_staged_lease
+      , [ Alcotest.test_case "Worker Sync IO fence correlates actual child" `Quick test_worker_sync_io_fence_correlates_real_child
+        ; Alcotest.test_case "Sync IO fence joins nonasset callback" `Quick test_sync_io_fence_joins_nonasset_callback
+        ; Alcotest.test_case "scope close keeps live staged lease" `Quick test_scope_close_keeps_live_staged_lease
         ; Alcotest.test_case "asset IO barrier submit stays nonblocking" `Quick test_asset_io_barrier_does_not_block_serial_submit
         ; Alcotest.test_case "writer fence joins actual canceled asset callback" `Quick test_writer_fence_joins_actual_canceled_asset_callback
         ; Alcotest.test_case "asset cleanup joins queued result child" `Quick test_asset_cleanup_joins_queued_result_child

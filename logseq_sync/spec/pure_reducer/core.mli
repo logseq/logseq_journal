@@ -449,6 +449,10 @@ type timer_request =
   }
 
 type runner_effect = private
+  (* Snapshot actual I/O owners before fork; wait off the serial consumer and
+      report after their physical task and callback posting finish. No host,
+      filesystem or data-admission permission is granted. *)
+  | Await_io of int64 * effect_scope
   | Asset_io of asset_ticket * asset_io_request
   | Protected_io of protected_ticket * protected_request
   | Request : 'a effect_ticket * 'a runner_request -> runner_effect
@@ -593,6 +597,8 @@ type timeline_scope =
   }
 
 type event =
+  | IO_fence_requested of int64 * effect_scope
+  | IO_fence_completed of int64 * effect_scope * (unit,string) result
   | Asset_requested of asset_request
   | Protected_requested of protected_request
   | Restore_local_account of { user_id : string }

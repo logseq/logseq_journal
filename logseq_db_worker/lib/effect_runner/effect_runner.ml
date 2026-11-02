@@ -424,6 +424,7 @@ type t =
   ; mutable next_asset_barrier : int64
   ; asset_cleanup_jobs : (int64,asset_cleanup_job) Hashtbl.t
   ; asset_cleanup_barriers : (int64,unit Eio.Promise.u) Hashtbl.t
+  ; sync_io_waiters : (int64,Sync.effect_scope * (unit,string)result Eio.Promise.u)Hashtbl.t
   ; cancelled_asset_jobs : (Logseq_sync_pure_reducer.Asset_transfer.ticket,asset_cleanup_job)Hashtbl.t
   ; asset_result_sources : ((Sync.graph_scope*string),Logseq_sync_pure_reducer.Asset_transfer.ticket)Hashtbl.t
   ; asset_cleanup_stopped : unit Eio.Promise.t * unit Eio.Promise.u
@@ -477,6 +478,7 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; next_asset_barrier = 0L
     ; asset_cleanup_jobs = Hashtbl.create 16
     ; asset_cleanup_barriers = Hashtbl.create 16
+    ; sync_io_waiters = Hashtbl.create 4
     ; cancelled_asset_jobs = Hashtbl.create 16
     ; asset_result_sources = Hashtbl.create 16
     ; asset_cleanup_stopped = Eio.Promise.create ()
@@ -3565,6 +3567,22 @@ let asset_callback_barrier t =
       (fun()->Eio.Promise.await promise)
       (fun()->Eio.Promise.await(fst t.asset_cleanup_stopped)))
 ;;
+let await_sync_io t ~scope =
+  if t.stopped then Error "The Worker stopped before Sync I/O settlement."
+  else if t.next_asset_barrier=Int64.max_int then Error "I/O fence counter exhausted." else
+  let promise,resolve=Eio.Promise.create() in
+  t.next_asset_barrier<-Int64.succ t.next_asset_barrier;
+  let id=t.next_asset_barrier in
+  Hashtbl.add t.sync_io_waiters id(scope,resolve);
+  Fun.protect ~finally:(fun()->Hashtbl.remove t.sync_io_waiters id)(fun()->
+    t.post(Core.Sync_event(Sync.IO_fence_requested(id,scope)));
+    Eio.Fiber.first
+      (fun()->let result=Eio.Promise.await promise in
+        if t.stopped then Error "The Worker stopped before Sync I/O settlement." else result)
+      (fun()->Eio.Promise.await(fst t.asset_cleanup_stopped);
+        Error "The Worker stopped before Sync I/O settlement."))
+;;
+
 let quiesce_writers t ~scope =
   let next,outcome=Core.Writer_fence.freeze t.writer_fence scope in
   t.writer_fence<-next;
@@ -3752,6 +3770,10 @@ let run_asset t (context : Sync.asset_context) instruction =
 ;;
 
 let submit t = function
+  | Core.Sync_io_fence_reached(id,scope,result)->
+    (match Hashtbl.find_opt t.sync_io_waiters id with
+     |Some(expected,resolve) when expected=scope->ignore(Eio.Promise.try_resolve resolve result:bool)
+     |_->())
   | Core.Deliver_protected_result output ->
     (match
        Hashtbl.find_opt

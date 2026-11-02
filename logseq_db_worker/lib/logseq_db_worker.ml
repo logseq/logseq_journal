@@ -156,6 +156,7 @@ let accepts_after_shutdown = function
   | Pure_reducer.Sync_event
       ( Logseq_sync_pure_reducer.Core.Asset_requested _ | Protected_requested _
       | Runner_completed (Asset_completion _ | Protected_completion _)
+      | IO_fence_completed _
       | Shutdown ) -> true
   | _ -> false
 ;;

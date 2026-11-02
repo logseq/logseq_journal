@@ -480,6 +480,7 @@ let test_cached_wrapped_key_is_unlocked_before_protected_value_decryption
             Core.graph_key_handle
               ~id:("graph-key-" ^ Core.effect_id_to_string (Core.effect_ticket_id ticket))
               ~scope
+          | Await_io _
           | Asset_io _
           | Protected_io _
           | Request _
@@ -596,6 +597,7 @@ let test_cached_wrapped_key_unlock_failure_is_fail_closed () =
             Core.graph_key_handle
               ~id:("graph-key-" ^ Core.effect_id_to_string (Core.effect_ticket_id ticket))
               ~scope
+          | Await_io _
           | Asset_io _
           | Protected_io _
           | Request _

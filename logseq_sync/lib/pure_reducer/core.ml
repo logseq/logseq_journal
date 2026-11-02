@@ -593,6 +593,10 @@ type timer_request =
   }
 
 type runner_effect =
+  (* Snapshot actual I/O owners before fork; wait off the serial consumer and
+      report after their physical task and callback posting finish. No host,
+      filesystem or data-admission permission is granted. *)
+  | Await_io of int64 * effect_scope
   | Asset_io of asset_ticket * asset_io_request
   | Protected_io of protected_ticket * protected_request
   | Request : 'a effect_ticket * 'a runner_request -> runner_effect
@@ -625,6 +629,7 @@ let scope_of_request : type a. a runner_request -> effect_scope = function
 ;;
 
 let runner_effect_scope = function
+  | Await_io(_,scope)->scope
   | Protected_io (_, request) -> effect_scope_of_graph request.protected_scope
   | Asset_io (_, request) -> effect_scope_of_graph request.context.scope
   | Request (ticket, _) -> ticket.scope
@@ -636,6 +641,7 @@ let runner_effect_scope = function
 ;;
 
 let runner_effect_diagnostic = function
+  | Await_io(id,_)->Printf.sprintf "io-fence:%Ld" id
   | Protected_io (ticket, _) -> protected_ticket_id ticket
   | Asset_io (ticket, _) -> asset_ticket_id ticket
   | Request (ticket, _) -> Printf.sprintf "request:%d" ticket.id
@@ -791,6 +797,8 @@ type timeline_scope =
   }
 
 type event =
+  | IO_fence_requested of int64 * effect_scope
+  | IO_fence_completed of int64 * effect_scope * (unit,string) result
   | Asset_requested of asset_request
   | Protected_requested of protected_request
   | Restore_local_account of { user_id : string }
@@ -3103,6 +3111,7 @@ let step core event =
   then unchanged core
   else (
     match event with
+    | IO_fence_requested _ | IO_fence_completed _ -> unchanged core
     | Sign_in_requested scope when startup_scope_is_current core scope ->
       let next=network_phase core Online_by_user in {next;effects=[publish next]}
     | Online_cancelled scope when startup_scope_is_current core scope ->
@@ -4529,4 +4538,10 @@ let step core event =
   let changed=transition.next.resident_enabled && scopes core<>scopes transition.next in
   if changed then {transition with effects=transition.effects @ [Publish(Resident_scopes_changed(scopes transition.next))]}
   else transition
+;;
+
+let step core = function
+  |IO_fence_requested(id,scope)->{next=core;effects=[Run(Await_io(id,scope))]}
+  |IO_fence_completed _->unchanged core
+  |event->step core event
 ;;

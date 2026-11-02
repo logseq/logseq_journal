@@ -79,6 +79,7 @@ let test_closed_graph_request_replies_once () =
         | Close_asset_scope _
         | Deliver_asset_result _
         | Deliver_protected_result _
+        | Sync_io_fence_reached _
         | Asset_cleanup_barrier_reached _
         | Publish _ -> false)
       transition.effects

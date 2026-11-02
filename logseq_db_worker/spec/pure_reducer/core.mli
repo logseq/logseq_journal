@@ -104,6 +104,7 @@ type upload_recovery_ticket = private
   }
 
 type instruction =
+  | Sync_io_fence_reached of int64 * Logseq_sync_pure_reducer.Core.effect_scope * (unit,string) result
   | Asset_cleanup_barrier_reached of int64
   | Deliver_protected_result of Logseq_sync_pure_reducer.Core.protected_output
   | Deliver_asset_result of Logseq_sync_pure_reducer.Core.asset_output

@@ -219,3 +219,9 @@ val retire_changefeed : t -> registration:int64 -> unit
     join their actual serial reducer callback barrier. This is only writer evidence;
     resources, exclusive local-copy ownership and host permits require further ACKs. *)
 val quiesce_writers : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> (unit,string) result
+
+(** Join the Sync owner's captured ordinary/protected/timer/WebSocket/asset I/O
+    and actual callback posting via its existing serial event channel. The caller
+    first retires target producers; this function itself grants no admission or
+    host permit and does not stop the shared client. *)
+val await_sync_io : t -> scope:Logseq_sync_pure_reducer.Core.effect_scope -> (unit,string) result

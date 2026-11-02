@@ -108,6 +108,7 @@ type upload_recovery_ticket =
   }
 
 type instruction =
+  | Sync_io_fence_reached of int64 * Logseq_sync_pure_reducer.Core.effect_scope * (unit,string) result
   | Asset_cleanup_barrier_reached of int64
   | Deliver_protected_result of Logseq_sync_pure_reducer.Core.protected_output
   | Deliver_asset_result of Logseq_sync_pure_reducer.Core.asset_output
@@ -124,6 +125,7 @@ type instruction =
 module Sync = Logseq_sync_pure_reducer.Core
 
 let instruction_diagnostic = function
+  | Sync_io_fence_reached _->"sync-io-fence"
   | Asset_cleanup_barrier_reached _ -> "asset-cleanup-barrier"
   | Deliver_protected_result _ -> "deliver-protected-result"
   | Deliver_asset_result _ -> "deliver-asset-result"
@@ -146,6 +148,7 @@ let instruction_diagnostic = function
 
 let equal_instruction left right =
   match left, right with
+  | Sync_io_fence_reached(li,ls,lr),Sync_io_fence_reached(ri,rs,rr)->li=ri && ls=rs && lr=rr
   | Asset_cleanup_barrier_reached l,Asset_cleanup_barrier_reached r->l=r
   | Deliver_protected_result l, Deliver_protected_result r -> l = r
   | Deliver_asset_result l, Deliver_asset_result r -> l = r
@@ -156,7 +159,8 @@ let equal_instruction left right =
   | Run_sync left, Run_sync right -> Sync.equal_runner_effect left right
   | Run_worker left, Run_worker right -> left = right
   | Publish left, Publish right -> left = right
-  | ( ( Asset_cleanup_barrier_reached _
+  | ( ( Sync_io_fence_reached _
+      | Asset_cleanup_barrier_reached _
       | Run_worker _
       | Run_sync _
       | Run_asset _
@@ -1241,6 +1245,8 @@ let step state event =
   {next=(if known || (Sync.state next.sync_core).snapshot.resident_graphs<>[] then restore_visible_graph next else next);effects}
 let step_without_asset_barrier=step
 let step state event=match event with
+  | Sync_event(Sync.IO_fence_completed(id,scope,result))->{next=state;effects=[Sync_io_fence_reached(id,scope,result)]}
+  | Sync_event(Sync.IO_fence_requested _ as event)->translate_sync(Sync.step state.sync_core event)state
   | Asset_cleanup_barrier token->{next=state;effects=[Asset_cleanup_barrier_reached token]}
   | _->step_without_asset_barrier state event
 
