@@ -150,6 +150,7 @@ let content { kind; capture; saving; enabled; error; assets } ~on_action =
              ]
          ]
          @ List.map live_region_text (Option.to_list error))
+      |> V.with_test_id (Ui.Test_id.string (scope ^ "-composer"))
     else
     V.composer
       ~key:(Ui.Key.string (scope ^ "-composer"))

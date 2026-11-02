@@ -3190,6 +3190,7 @@ let test_child_failure_retains_admitted_child () =
     ; block_id
     ; parent_block_id = Graph.Uuid.to_string block_uuid
     ; calendar_generation = Journal_calendar.generation calendar
+    ; status_intent_revision = 0L
     ; expected_parent_revision = "block-detail-1"
     ; sibling_order = "a"
     ; source = "Child draft"
@@ -5817,6 +5818,7 @@ let test_page_detail_root_and_append () =
          ; calendar_generation = 1L
          ; block_id = Graph.Uuid.to_string unrelated_uuid
          ; parent_block_id = Graph.Uuid.to_string page_uuid
+         ; status_intent_revision = 0L
          ; expected_parent_revision = Journal_model.revision detail.root
          ; sibling_order = "z"
          ; source = "Append only here"
@@ -6339,6 +6341,50 @@ let test_catalog_and_lookup_cross_fences () =
     (List.length stale.responses)
 ;;
 
+(* Core cannot reproduce the business Runtime's old sub-operation allocator. *)
+let child_identity_status_command runtime =
+  let child=uuid "a1000000-0000-4000-9000-000000000081" in
+  let mutation_id=uuid "a1000000-0000-4000-a000-000000000081" in
+  let command : Journal_graph_projection.create_child =
+    {mutation_id=Graph.Uuid.to_string mutation_id;block_id=Graph.Uuid.to_string child;
+     parent_block_id=Graph.Uuid.to_string block_uuid;calendar_generation=1L;
+     status_intent_revision=0L;expected_parent_revision="block-detail-1";sibling_order="a";source="Stable child";
+     task_state=Status "00000002-1615-5853-7700-000000000000";status_confirmation=true;
+     creation_time=Journal_time.create ~instant_unix_ms:1_788_192_000_000L
+       ~local_day:20260901 ~local_minute_of_day:0 |> Result.get_ok} in
+  let next output=only "child identity continuation" output.Runtime.requests in
+  let insert=Runtime.submit runtime(Create_child command) |> next in
+  let child_read=Runtime.receive runtime(response insert(V2_mutation_committed
+    {mutation_id;status=V2_already_applied;generation="g";before_projection_revision="p";after_projection_revision="p"})) |> next in
+  Runtime.receive runtime(response child_read(V2_block_outcome(V2_present_block
+    {value={record with block={block with uuid=child;parent=block_uuid};task_status=None};revision="child-1"}))) |> next
+;;
+let child_identity request=match request.Protocol.command with
+  | V2_set_task_status{mutation_id;_}->mutation_id
+  | _->Alcotest.fail "child did not produce its persistent status operation"
+;;
+let child_identity_runtime () =
+  let runtime=Runtime.create () in seed_children_interest runtime;set_calendar runtime;runtime
+;;
+let test_child_status_identity_independent_reads () =
+  let first=child_identity_status_command(child_identity_runtime()) |> child_identity in
+  let runtime=child_identity_runtime() in
+  let noise=Runtime.submit runtime(Find_block(Graph.Uuid.to_string unrelated_uuid))
+    |> fun output->only "unrelated child identity read" output.requests in
+  Runtime.abandon runtime noise;
+  let second=child_identity_status_command runtime |> child_identity in
+  Alcotest.(check string) "unrelated reads cannot replace persistent child status intent"
+    (Graph.Uuid.to_string first)(Graph.Uuid.to_string second)
+;;
+let test_child_status_identity_after_lost_reply () =
+  let runtime=child_identity_runtime() in
+  let first=child_identity_status_command runtime in
+  ignore(Runtime.fail_request runtime first ~message:"The child status response was lost");
+  let second=child_identity_status_command runtime in
+  Alcotest.(check string) "retry cannot invent another status intent"
+    (Graph.Uuid.to_string(child_identity first))(Graph.Uuid.to_string(child_identity second))
+;;
+
 let capture_identity_status_a = "00000002-1615-5853-7700-000000000000"
 let capture_identity_status_b = "00000002-1827-5820-8200-000000000000"
 let capture_identity_owner_a = "a1000000-0000-4000-a000-0000000000c1"
@@ -6637,6 +6683,7 @@ let test_child_recovery_explicit_clear () =
          ; block_id = Graph.Uuid.to_string child_uuid
          ; parent_block_id = Graph.Uuid.to_string block_uuid
          ; calendar_generation = 1L
+         ; status_intent_revision = 0L
          ; expected_parent_revision = "block-detail-1"
          ; sibling_order = "a"
          ; source = "Retained child"
@@ -9133,6 +9180,9 @@ let () =
             `Quick
             test_feed_window_bounds_and_singleton_failure
         ] )
+    ; ("child status identity",[
+        Alcotest.test_case "unrelated reads cannot change child status intent" `Quick test_child_status_identity_independent_reads;
+        Alcotest.test_case "lost response keeps the same child status intent" `Quick test_child_status_identity_after_lost_reply])
     ; ( "Capture persistent status identity"
       , [ Alcotest.test_case "distinct owners across Runtime restart" `Quick test_capture_status_identity_cross_runtime
         ; Alcotest.test_case "same owner retry after lost response" `Quick test_capture_status_identity_retry_same_runtime

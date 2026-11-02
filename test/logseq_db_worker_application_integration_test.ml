@@ -512,6 +512,7 @@ let test_create_child_uses_caller_observed_parent_revision () =
          ; calendar_generation = 1L
          ; block_id = "a2000000-0000-4000-9000-000000000005"
          ; parent_block_id = Graph.Uuid.to_string block_uuid
+         ; status_intent_revision = 0L
          ; expected_parent_revision = "block-detail-1"
          ; sibling_order = "a1"
          ; source = "Child"

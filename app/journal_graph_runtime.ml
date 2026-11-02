@@ -1145,10 +1145,10 @@ let capture_children t command page conflict_retries =
       ]
 ;;
 
-let capture_status_mutation_id (command : Projection.capture) ~block status =
-  (* A persistent sub-operation belongs to the Capture intent, not the lifetime
+let status_mutation_id ~domain ~mutation_id ~revision ~block status =
+  (* A persistent sub-operation belongs to its composer intent, not the lifetime
      of the request counter. Resolve Default_status before deriving the identity
-     so retrying one choice is stable. The Capture-owned revision distinguishes
+     so retrying one choice is stable. The business-owned revision distinguishes
      choosing A again after B from replaying the first A operation. *)
   let intent =
     match status with
@@ -1157,10 +1157,11 @@ let capture_status_mutation_id (command : Projection.capture) ~block status =
   in
   let bytes =
     Printf.sprintf
-      "logseq-journal:capture-status:v1:%s:%s:%Ld:%s"
-      (String.lowercase_ascii command.mutation_id)
+      "logseq-journal:%s-status:v1:%s:%s:%Ld:%s"
+      domain
+      (String.lowercase_ascii mutation_id)
       (Graph.Uuid.to_string block)
-      command.status_intent_revision
+      revision
       intent
     |> Digest.BLAKE128.string
     |> Bytes.of_string
@@ -1174,6 +1175,11 @@ let capture_status_mutation_id (command : Projection.capture) ~block status =
     (String.sub hex 16 4) (String.sub hex 20 12)
   |> Graph.Uuid.of_string
   |> Result.get_ok
+;;
+
+let capture_status_mutation_id (command : Projection.capture) ~block status =
+  status_mutation_id ~domain:"capture" ~mutation_id:command.mutation_id
+    ~revision:command.status_intent_revision ~block status
 ;;
 
 let capture_status t (command : Projection.capture) page =
@@ -2433,8 +2439,11 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                   || (status = None && not command.status_confirmation) ->
              read_child_parent t command page child
            | Ok status ->
-             let mutation_id = request_uuid t in
              let block = value.block.uuid in
+             let mutation_id =
+               status_mutation_id ~domain:"child" ~mutation_id:command.mutation_id
+                 ~revision:command.status_intent_revision ~block status
+             in
              let preconditions = preconditions ~blocks:[ block, revision ] () in
              let mutation =
                match status with

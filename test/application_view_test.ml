@@ -2510,7 +2510,11 @@ let run_favorites_native_visibility
               wait "Detail expands the shared Composer" (fun () ->
                 Option.is_some (find "accessibility-identifier" "journal-append-composer"))
             in
-            let send () = Option.get (find "accessibility-label" "Send") in
+            let send () =
+              match find "accessibility-label" "Send" with
+              | Some id -> id
+              | None -> ancestor_property (Option.get (find "text" "Retry")) "press-enabled"
+            in
             let edit text =
               dispatch
                 (Lui_protocol.TextChanged

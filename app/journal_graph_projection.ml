@@ -51,6 +51,7 @@ type create_child =
   ; source : string
   ; task_state : Journal_model.task_state
   ; status_confirmation : bool
+  ; status_intent_revision : int64
   ; creation_time : Journal_time.t
   }
 

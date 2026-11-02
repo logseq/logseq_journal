@@ -1642,7 +1642,7 @@ let test_late_capture_completion_preserves_newer_edit () =
     "late capture completion"
 ;;
 
-let test_failed_append_edit_replaces_only_failed_attempt () =
+let test_uncertain_append_keeps_original_attempt () =
   let module D = Journal_detail in
   let root = block () in
   let owner, request =
@@ -1678,12 +1678,12 @@ let test_failed_append_edit_replaces_only_failed_attempt () =
   let failed = D.fail owner ~message:"Offline" in
   let changed = D.apply_child_edit failed edited in
   require_string
-    "Corrected"
+    "Original"
     (Journal_capture.source (Option.get (D.child_capture changed)))
     "failed Append edit";
   require
-    (D.mode changed = Reading && snd (D.retry changed) = None)
-    "editing a failed attempt retained its obsolete retry";
+    (D.mode changed = Failed "Offline" && snd (D.retry changed) = request)
+    "uncertain insertion lost its original retry";
   let child =
     block
       ~id:"70000000-0000-4000-a000-000000000012"
@@ -1691,23 +1691,20 @@ let test_failed_append_edit_replaces_only_failed_attempt () =
       ()
   in
   let late = D.apply_child_created changed ~child ~parent:root in
-  require_string
-    "Corrected"
-    (Journal_capture.source (Option.get (D.child_capture late)))
-    "late Append completion";
+  require (D.child_capture late = None) "matching late insertion did not settle the original draft";
   let toggled = D.toggle_child_task failed in
   require
-    (D.mode toggled = Reading && snd (D.retry toggled) = None)
-    "task edit retained failed request";
+    (D.mode toggled = Failed "Offline" && snd (D.retry toggled) <> None)
+    "task edit discarded uncertain insertion";
   require
     (Journal_capture.task_state (Option.get (D.child_capture toggled))
      = Journal_model.Default_status)
     "failed Append task edit ignored";
   let text_changed = D.update_child_source failed "Replacement" in
   require_string
-    "Replacement"
+    "Original"
     (Journal_capture.source (Option.get (D.child_capture text_changed)))
-    "failed Append source replacement"
+    "uncertain Append source remains frozen"
 ;;
 
 let test_failed_task_append_retains_identity () =
@@ -4186,8 +4183,168 @@ let test_staged_file_adapter_guard_and_failures () =
       require (Sys.file_exists kept && Sys.is_directory blocked) "adapter crossed guarded resource scope")
 ;;
 
+let child_equal expected actual label = if expected<>actual then failwith label
+let child_identity_detail () =
+  Journal_detail.create ~session_number:11L
+    {root=block();children={blocks=[];continuation=None}}
+;;
+let child_identity_append detail =
+  Journal_detail.admit_child detail ~mutation_id:"70000000-0000-4000-9000-000000000071"
+    ~calendar_generation:1L ~block_id:"70000000-0000-4000-a000-000000000071"
+    ~sibling_order:"a" ~creation_time:(creation_time 550)
+;;
+let child_status_a=Journal_model.Status "00000002-1615-5853-7700-000000000000"
+let child_status_b=Journal_model.Status "00000002-1827-5820-8200-000000000000"
+let failed_child_choice_from task_state =
+  let draft=child_identity_detail() |> fun t->Journal_detail.update_child_source t "Frozen child source"
+    |> fun t->Journal_detail.set_child_task t task_state in
+  let saving,request=child_identity_append draft in
+  Journal_detail.fail saving ~message:"Accepted response unknown",Option.get request
+;;
+let failed_child_choice () = failed_child_choice_from child_status_a
+let child_command = function
+  | Journal_graph_request.Create_child command->command
+  | _->failwith "Child owner lost its pending request"
+;;
+let test_child_reselected_status_intent () =
+  let failed,first=failed_child_choice() in
+  let duplicate=Journal_detail.set_child_task failed child_status_a in
+  child_equal (Some first)(snd(Journal_detail.retry duplicate)) "duplicate choice keeps its intent";
+  let second=Journal_detail.set_child_task failed child_status_b in
+  let second,request_b=Journal_detail.retry second in
+  let second=Journal_detail.fail second ~message:"Second response unknown" in
+  let third=Journal_detail.set_child_task second child_status_a in
+  let _,request_a2=Journal_detail.retry third in
+  require(Option.get request_a2<>first) "A to B to A reused the first child status intent";
+  let original=child_command first and actual=child_command(Option.get request_a2) in
+  child_equal original.mutation_id actual.mutation_id "new status choice replaced original insertion";
+  child_equal original.block_id actual.block_id "new status choice replaced child identity";
+  child_equal original.source actual.source "new status choice changed frozen source";
+  child_equal original.expected_parent_revision actual.expected_parent_revision "new choice changed parent precondition";
+  require(request_b<>Some first) "new status choice was not distinct"
+;;
+let test_retained_child_status_keeps_frozen_attempt () =
+  let failed,first=failed_child_choice() in
+  let retained=Journal_detail.retain_composer failed |> Option.get in
+  let retained=Journal_detail.map_retained_capture retained
+    ~f:(fun capture->Journal_capture.with_task_state capture child_status_b) in
+  let restored=Journal_detail.restore_composer(child_identity_detail())retained in
+  let _,request=Journal_detail.retry restored in
+  let current=Option.get request |> child_command and original=child_command first in
+  child_equal original.mutation_id current.mutation_id "retained choice lost insertion owner";
+  child_equal original.source current.source "retained choice lost frozen source";
+  child_equal child_status_b current.task_state "retained status choice was ignored"
+;;
+
+let test_uncertain_plain_child_keeps_identity () =
+  let saving, request = child_identity_detail ()
+    |> fun t -> Journal_detail.update_child_source t "Frozen plain child"
+    |> child_identity_append in
+  let original = Option.get request |> child_command in
+  let failed = Journal_detail.fail saving ~message:"Accepted insertion response unknown" in
+  List.iter (fun owner ->
+    let owner = Journal_detail.set_child_task owner child_status_a in
+    let owner = Journal_detail.update_child_source owner "Unsafe replacement" in
+    let _, request = Journal_detail.retry owner in
+    require (request <> None) "uncertain plain insertion lost its retry owner";
+    let actual = Option.get request |> child_command in
+    child_equal original.mutation_id actual.mutation_id "plain insertion ID replaced";
+    child_equal original.block_id actual.block_id "plain child ID replaced";
+    child_equal original.source actual.source "uncertain plain child source replaced";
+    require actual.status_confirmation "new status choice was not retained as a sub-operation";
+    let cleared = Journal_detail.set_child_task owner Journal_model.No_status in
+    let command = snd (Journal_detail.retry cleared) |> Option.get |> child_command in
+    require command.status_confirmation "returning to No status silently skipped Clear";
+    child_equal 2L command.status_intent_revision "plain child lost A to Clear choice history")
+    [failed; Journal_detail.restore_composer (child_identity_detail ())
+       (Journal_detail.retain_composer saving |> Option.get
+        |> Journal_detail.interrupt_retained_composer)]
+;;
+
+(* Public pure business owner: generated traces start with a legally admitted,
+   uncertain insertion, then interleave edits, retries and retained composers.
+   Choice history is independent of the implementation's revision counter. *)
+let test_child_choice_traces () =
+  let choices = [| child_status_a; child_status_b; Journal_model.No_status |] in
+  let run initial_choice actions =
+    let initial, request = failed_child_choice_from initial_choice in
+    let original = child_command request in
+    let current = ref initial and selected = ref initial_choice and revision = ref 0L in
+    List.iteri (fun index action ->
+      let before = !current in
+      let _, before_request = Journal_detail.retry before in
+      let pick = choices.(action mod Array.length choices) in
+      let choose () =
+        if pick <> !selected then revision := Int64.succ !revision;
+        selected := pick
+      in
+      current := (match action / 3 with
+        | 0 -> choose (); Journal_detail.set_child_task before pick
+        | 1 -> choose (); Journal_detail.map_child_capture before
+            ~f:(fun capture -> Journal_capture.with_task_state capture pick)
+        | 2 ->
+          choose ();
+          let draft = Journal_detail.retain_composer before |> Option.get in
+          let draft = Journal_detail.map_retained_capture draft
+            ~f:(fun capture -> Journal_capture.with_task_state capture pick) in
+          Journal_detail.restore_composer (child_identity_detail ()) draft
+        | 3 -> Journal_detail.update_child_source before "Do not replace frozen source"
+        | 4 ->
+          let saving, admitted = Journal_detail.retry before in
+          child_equal before_request admitted "retry replaced the frozen request";
+          let ignored = Journal_detail.set_child_task saving pick in
+          child_equal admitted (snd (Journal_detail.retry
+            (Journal_detail.fail ignored ~message:"Still uncertain")))
+            "in-flight status edit changed an admitted operation";
+          Journal_detail.fail ignored ~message:"Still uncertain"
+        | _ ->
+          let draft = Journal_detail.retain_composer before |> Option.get in
+          let other = Journal_detail.create ~session_number:99L
+            { root=block ~id:"70000000-0000-4000-a000-000000000099" ();
+              children={blocks=[];continuation=None} } in
+          require (Journal_detail.child_capture (Journal_detail.restore_composer other draft)=None)
+            "foreign root adopted a retained child";
+          before);
+      child_equal before_request (snd (Journal_detail.retry before))
+        "later pure transition mutated an earlier state";
+      let _, pending = Journal_detail.retry !current in
+      let actual = Option.get pending |> child_command in
+      child_equal !selected actual.task_state "selected status lost";
+      child_equal !revision actual.status_intent_revision "choice history reused a status identity";
+      require (actual.status_confirmation =
+        (original.status_confirmation || !revision > 0L)) "status sub-operation was lost";
+      child_equal original {actual with task_state=original.task_state;
+        status_confirmation=original.status_confirmation;
+        status_intent_revision=original.status_intent_revision}
+        (Printf.sprintf "frozen insertion changed at action %d" index)) actions
+  in
+  let fails initial actions = try run initial actions; false with _ -> true in
+  let rec shrink initial actions =
+    let rec remove prefix = function
+      | [] -> actions
+      | _ :: rest when fails initial (List.rev_append prefix rest) ->
+        shrink initial (List.rev_append prefix rest)
+      | item :: rest -> remove (item :: prefix) rest
+    in
+    remove [] actions
+  in
+  for seed = 0 to 199 do
+    let random = Random.State.make [|0xC11D; seed|] in
+    let initial = if seed mod 2 = 0 then child_status_a else Journal_model.No_status in
+    let actions = List.init 80 (fun _ -> Random.State.int random 18) in
+    if fails initial actions then (
+      let minimal = shrink initial actions in
+      fail "Child choice trace seed=%d minimized=[%s]" seed
+        (String.concat ";" (List.map string_of_int minimal)))
+  done
+;;
+
 let tests =
-  [ "pure Root cleanup plan contract", test_root_cleanup_plan_contract
+  [ "Uncertain plain child preserves insertion identity",test_uncertain_plain_child_keeps_identity
+  ; "Child reselected status is a distinct sub-operation",test_child_reselected_status_intent
+  ; "Retained child status preserves its admitted owner",test_retained_child_status_keeps_frozen_attempt
+  ; "Child choice retained/retry pure generated traces",test_child_choice_traces
+  ; "pure Root cleanup plan contract", test_root_cleanup_plan_contract
   ; "staging adapter guard and failures", test_staged_file_adapter_guard_and_failures
   ; "Page append exact page ownership", test_page_detail_append_matches_exact_page
   ; ( "Initial staging refresh and delete review regressions"
@@ -4243,7 +4400,7 @@ let tests =
     ; ( "task Append failure retains insertion identity"
       , test_failed_task_append_retains_identity )
     ; ( "failed Append editing and late completion"
-    , test_failed_append_edit_replaces_only_failed_attempt )
+    , test_uncertain_append_keeps_original_attempt )
   ; ( "late Capture completion preserves newer edit"
     , test_late_capture_completion_preserves_newer_edit )
   ; "retained graph Append owner", test_graph_retained_append_owner

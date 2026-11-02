@@ -141,7 +141,7 @@ let complete_retained_composer draft ~child ~parent =
 
 let lock_retained_attempt draft =
   match draft.draft_pending with
-  | Some (Journal_graph_request.Create_child command) when command.status_confirmation ->
+  | Some (Journal_graph_request.Create_child _) ->
     { draft with draft_capture = Journal_capture.lock_for_retry draft.draft_capture }
   | _ -> draft
 ;;
@@ -221,6 +221,20 @@ let composer_revision (t : t) = t.composer_revision
 let reveal_id (t : t) = t.reveal_id
 let child_capture (t : t) = t.child_capture
 
+let pending_with_child_status pending task_state =
+  Option.map
+    (function
+      | Journal_graph_request.Create_child command when command.task_state <> task_state ->
+        Journal_graph_request.Create_child
+          { command with
+            task_state
+          ; status_confirmation = true
+          ; status_intent_revision = Int64.succ command.status_intent_revision
+          }
+      | request -> request)
+    pending
+;;
+
 let map_child_capture (t : t) ~f =
   match t.mode, t.child_capture with
   | Saving_child, _ | _, None -> t
@@ -228,6 +242,12 @@ let map_child_capture (t : t) ~f =
     let next = f capture in
     if next == capture
     then t
+    else if Journal_capture.retry_identity_locked capture
+    then
+      { t with
+        child_capture = Some next
+      ; pending = pending_with_child_status t.pending (Journal_capture.task_state next)
+      }
     else { t with child_capture = Some next; mode = Reading; pending = None }
 ;;
 
@@ -265,6 +285,13 @@ let map_retained_capture draft ~f =
     let capture = f draft.draft_capture in
     if capture == draft.draft_capture
     then draft
+    else if Journal_capture.retry_identity_locked draft.draft_capture
+    then
+      { draft with
+        draft_capture = capture
+      ; draft_pending =
+          pending_with_child_status draft.draft_pending (Journal_capture.task_state capture)
+      }
     else
       { draft with draft_capture = capture; draft_mode = Reading; draft_pending = None })
 ;;
@@ -436,7 +463,7 @@ let load ?(automatic = false) (t : t) id =
 let fail_child_attempt (t : t) message =
   let lock =
     match t.pending with
-    | Some (Journal_graph_request.Create_child command) -> command.status_confirmation
+    | Some (Journal_graph_request.Create_child _) -> true
     | _ -> false
   in
   { t with
@@ -596,14 +623,7 @@ let set_child_task (t : t) task_state =
     in
     if Option.fold ~none:false ~some:Journal_capture.retry_identity_locked child_capture
     then (
-      let pending =
-        Option.map
-          (function
-            | Journal_graph_request.Create_child command ->
-              Journal_graph_request.Create_child { command with task_state }
-            | request -> request)
-          t.pending
-      in
+      let pending = pending_with_child_status t.pending task_state in
       { t with child_capture; pending })
     else { t with child_capture; mode = Reading; pending = None })
 ;;
@@ -638,6 +658,7 @@ let admit_child
         ; sibling_order
         ; creation_time
         ; parent_block_id = t.root_id
+        ; status_intent_revision = 0L
         ; expected_parent_revision = Journal_model.revision (root t)
         ; source = Journal_capture.submission_source capture
         ; status_confirmation =
