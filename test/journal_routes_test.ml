@@ -4209,6 +4209,17 @@ let child_identity_append detail =
     ~calendar_generation:1L ~block_id:"70000000-0000-4000-a000-000000000071"
     ~sibling_order:"a" ~creation_time:(creation_time 550)
 ;;
+let test_child_oversize_is_editable_before_admission () =
+  let source=String.make(Logseq_db_worker.Protocol.maximum_title_bytes+1)'x' in
+  let detail=child_identity_detail() |> fun detail->Journal_detail.update_child_source detail source in
+  let next,request=child_identity_append detail in
+  require(request=None) "oversized Child was admitted despite the protocol bound";
+  require(Journal_detail.mode next=Journal_detail.Reading && Journal_detail.child_error next<>None)
+    "unadmitted Child lost its editable error";
+  let next=Journal_detail.update_child_source next "Shortened child" in
+  require(Option.map Journal_capture.source(Journal_detail.child_capture next)=Some "Shortened child")
+    "unadmitted oversized Child could not be corrected"
+;;
 let child_status_a=Journal_model.Status "00000002-1615-5853-7700-000000000000"
 let child_status_b=Journal_model.Status "00000002-1827-5820-8200-000000000000"
 let failed_child_choice_from task_state =
@@ -4570,6 +4581,92 @@ let test_append_chain_uses_canonical_journal_owner () =
   let _,_,actual=F.write action in
   require (actual=wire) "atomic Append retry changed its frozen payload";
   ignore state
+;;
+
+let child_unknown_stages fixture =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let bound,index,round,_=F.bind fixture fixture.initial fixture.action in
+  let initial,_=C.receive bound ~index ~round F.W.Outcome_unknown in
+  let inserted,action=F.confirm fixture fixture.initial fixture.action in
+  let inserted,status=F.flush_prefix fixture inserted action in
+  let bound,index,round,_=F.bind fixture inserted status in
+  let unknown_status,_=C.receive bound ~index ~round F.W.Outcome_unknown in
+  [initial,0;unknown_status,1]
+;;
+let test_child_retained_chain_survives_projection_reopen () =
+  let module F=Child_chain_fixture in let module C=F.C in let module D=Journal_detail in
+  let fixture=F.make ~task_state:child_status_a () in
+  List.iter(fun(chain,index)->
+    let saving,_=child_identity_detail() |> fun detail->D.update_child_source detail fixture.command.source
+      |> fun detail->D.set_child_task detail child_status_a |> child_identity_append in
+    let saving=D.retain_child_chain saving ~command:fixture.command chain in
+    require(Option.exists(fun retained->retained==chain)(D.child_chain saving ~command:fixture.command))
+      "Saving Child did not retain its bound pure chain";
+    let retained=D.retain_composer saving |> Option.get |> D.interrupt_retained_composer in
+    require(Option.exists(fun retained->retained==chain)(D.retained_child_chain retained ~command:fixture.command))
+      "interruption discarded the original Child stage";
+    let reopened=D.restore_composer(child_identity_detail())retained |> fun detail->D.set_child_task detail child_status_b in
+    let _,request=D.retry reopened in
+    let command=Option.get request |> child_command in
+    let chain=D.child_chain reopened ~command |> Option.get in
+    let chain=C.retarget chain ~command
+      ~resolved_status:(match child_status_b with Status value->Some(F.G.Uuid.of_string value |> Result.get_ok)|_->assert false)
+      |> Result.get_ok in
+    let _,action=C.retry chain in
+    let _,_,wire=F.write action in
+    require(wire=C.stage_wire(C.stage chain index))
+      "Child reopening replaced an accepted wire/precondition before reconciling it")
+    (child_unknown_stages fixture)
+;;
+
+let test_child_retained_chain_generated_roundtrips () =
+  let module F=Child_chain_fixture in let module C=F.C in let module D=Journal_detail in
+  let run stage actions =
+    let fixture=F.make ~task_state:child_status_a () in
+    let chain,index=List.nth(child_unknown_stages fixture)stage in
+    let expected=C.stage_wire(C.stage chain index) in
+    let saving,_=child_identity_detail() |> fun detail->D.update_child_source detail fixture.command.source
+      |> fun detail->D.set_child_task detail child_status_a |> child_identity_append in
+    let current=ref(D.retain_child_chain saving ~command:fixture.command chain
+      |> fun detail->D.fail detail ~message:"Unknown original Child") in
+    List.iter(fun action->
+      let before= !current in
+      current:=(match action mod 6 with
+        | 0->let draft=D.retain_composer before |> Option.get |> D.interrupt_retained_composer in
+          D.restore_composer(child_identity_detail())draft
+        | 1->D.set_child_task before (if (action/6) mod 3=0 then Journal_model.No_status
+            else if (action/6) mod 3=1 then child_status_a else child_status_b)
+        | 2->D.update_child_source before "Do not replace accepted source"
+        | 3->let saving,_=D.retry before in D.fail saving ~message:"Still unknown"
+        | 4->let draft=D.retain_composer before |> Option.get in
+          let foreign=D.create ~session_number:5531L
+            {root=block ~id:"70000000-0000-4000-a000-000000005531" ();children={blocks=[];continuation=None}} in
+          require(D.child_capture(D.restore_composer foreign draft)=None) "foreign Detail adopted the original chain";
+          before
+        | _->D.fail before ~message:"Duplicate interruption");
+      let _,request=D.retry(D.fail !current ~message:"Read pending") in
+      let command=Option.get request |> child_command in
+      let retained=D.child_chain !current ~command |> Option.get in
+      require(C.stage_wire(C.stage retained index)=expected) "retained Child acquired a new payload";
+      require(Option.map Journal_capture.submission_source(D.child_capture !current)=Some fixture.command.source)
+        "retained Child source changed";
+      require(command.mutation_id=fixture.command.mutation_id && command.block_id=fixture.command.block_id)
+        "retained Child replaced an original identity";
+      let _,previous_request=D.retry(D.fail before ~message:"Old snapshot") in
+      require(previous_request<>None) "later transition mutated an old pending owner")actions in
+  let fails stage actions=try run stage actions;false with _->true in
+  let rec shrink stage actions=
+    let rec remove prefix=function
+      | []->actions
+      | _::rest when fails stage(List.rev_append prefix rest)->shrink stage(List.rev_append prefix rest)
+      | item::rest->remove(item::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0xC105E;seed|] in
+    let actions=List.init 60(fun _->Random.State.int random 60) in
+    let stage=seed mod 2 in
+    if fails stage actions then fail "Child retained wire seed=%d stage=%d minimized=[%s]" seed stage
+      (String.concat ";" (List.map string_of_int(shrink stage actions)))
+  done
 ;;
 
 let test_child_chain_frozen_unknown_choice () =
@@ -5055,6 +5152,9 @@ let test_resident_focus_preserves_graph_drafts_and_saving () =
   require (R.capture (focus cleared 1)=None) "logout retained resident draft"
 let tests=tests @ ["resident focus keeps per-graph drafts and pending Capture",test_resident_focus_preserves_graph_drafts_and_saving]
 ;;
+let () = test_child_retained_chain_generated_roundtrips ()
+let () = test_child_retained_chain_survives_projection_reopen ()
+let () = test_child_oversize_is_editable_before_admission ()
 let () = test_capture_retained_attempt_survives_runtime_reset ()
 let () = test_capture_chain_freezes_complete_payload ()
 let () = test_capture_oversize_is_editable_before_admission ()

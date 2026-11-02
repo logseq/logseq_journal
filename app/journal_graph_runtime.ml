@@ -870,10 +870,41 @@ let capture_snapshot t (request:Protocol.request) =
     | Some{operation=Capture_chain value;_}->Some(value.command,value.chain)
     | _->None)
 ;;
+let child_snapshot t (request:Protocol.request) =
+  let root=match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
+    | Some{operation=Child_chain _;_}->Some request.request_id
+    | Some{operation=(Child_write{root;_}|Child_ack{root;_});_}->Some root
+    | _->None in
+  Option.bind root(fun root->match Hashtbl.find_opt t.pending(Graph.Uuid.to_string root) with
+    | Some{operation=Child_chain value;_}->Some(Child.command value.chain,value.chain)
+    | _->None)
+;;
+let retained_child_chains t =
+  Hashtbl.to_seq_values t.pending |> Seq.fold_left(fun retained pending->match pending.operation with
+    | Child_chain value->Rrbvec.push_back retained (Child.command value.chain,value.chain)
+    | _->retained)Rrbvec.empty
+;;
 let child_request_root = function
   | Child_write {root;_} | Child_canonical {root;_} | Child_chain_parent {root;_}
   | Child_ack {root;_} -> Some root
   | _ -> None
+;;
+let changed_child_chains t (output:output) =
+  let module Roots=Set.Make(struct type t=Graph.Uuid.t let compare=Graph.Uuid.compare end) in
+  let roots=List.fold_left(fun roots (request:Protocol.request)->
+    match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
+    | Some pending->Option.fold ~none:roots ~some:(fun root->Roots.add root roots)(child_request_root pending.operation)
+    | None->roots)Roots.empty output.requests in
+  let roots=List.fold_left(fun roots response->match response.payload with
+    | Child_projection_ready{root;_}->Roots.add root roots
+    | Child_waiting{command;_}->
+      Hashtbl.to_seq t.pending |> Seq.fold_left(fun roots(key,pending)->match pending.operation with
+        | Child_chain value when Child.matches_child value.chain command->Roots.add(Graph.Uuid.of_string key |> Result.get_ok)roots
+        | _->roots)roots
+    | _->roots)roots output.responses in
+  Roots.fold(fun root snapshots->match Hashtbl.find_opt t.pending(Graph.Uuid.to_string root) with
+    | Some{operation=Child_chain value;_}->Rrbvec.push_back snapshots(Child.command value.chain,value.chain)
+    | _->snapshots)roots Rrbvec.empty
 ;;
 let update_child_root t root chain projection =
   Option.iter (fun (pending,_,_) -> Hashtbl.replace t.pending (Graph.Uuid.to_string root)
@@ -1536,13 +1567,20 @@ let capture_chain t ~(command:Projection.capture) =
         && Child.matches_capture value.chain command->Some value.chain
     | _->None)
 ;;
-let submit ?capture_chain:retained t request =
+let submit ?capture_chain:retained ?child_chain:retained_child t request =
   (match request,retained with
    | Journal_graph_request.Capture{command;_},Some chain
      when Child.matches_capture chain command && capture_chain t ~command=None ->
      (* A retained pure business owner survives Runtime reset. This root is a
         routing handle only; retry emits the exact existing stage wire. *)
      ignore(mutate t (Capture_chain{command;chain;projection=None})
+       (Child.stage_wire(Child.stage chain 0)) : Protocol.request)
+   | _->());
+  (match request,retained_child with
+   | Journal_graph_request.Create_child command,Some chain when Child.matches_child chain command ->
+     let present=Hashtbl.to_seq_values t.pending |> Seq.exists(fun pending->match pending.operation with
+       | Child_chain value->Child.matches_child value.chain command|_->false) in
+     if not present then ignore(mutate t (Child_chain{chain;projection=None})
        (Child.stage_wire(Child.stage chain 0)) : Protocol.request)
    | _->());
   dispatch_output t (plan_request t request)

@@ -158,3 +158,8 @@ val child_projection_applied : t -> command:Journal_graph_projection.create_chil
   -> child:Journal_model.t -> parent:Journal_model.t -> error:string option -> bool
 val child_failure_applied : t -> command:Journal_graph_projection.create_child -> message:string -> bool
 val release_rejected_child : t -> command:Journal_graph_projection.create_child -> message:string -> t
+
+val child_chain : t -> command:Journal_graph_projection.create_child ->
+  Journal_graph_mutation_confirmation.Pure_insertion.t option
+val retain_child_chain : t -> command:Journal_graph_projection.create_child ->
+  Journal_graph_mutation_confirmation.Pure_insertion.t -> t

@@ -353,3 +353,11 @@ let retain_chain t chain =
     {t with retained_chain=Some chain;retry_identity_locked=true}
   | _->t
 ;;
+
+let retain_child_chain t ~command chain =
+  if Option.fold ~none:false ~some:(fun previous->previous==chain)t.retained_chain then t
+  else if Journal_graph_mutation_confirmation.Pure_insertion.matches_child chain command
+    && submission_source t=command.Journal_graph_projection.source
+  then {t with retained_chain=Some chain;retry_identity_locked=true}
+  else t
+;;

@@ -324,6 +324,11 @@ module Pure_insertion = struct
     else if not(choice_matches command.task_state resolved_status) then Error "The child status choice is invalid."
     else Ok {t with command;desired={revision=command.status_intent_revision;
       task_state=command.task_state;resolved=resolved_status;required=true};applied=None}
+  let matches_child t (command:Journal_graph_projection.create_child) =
+    let original=t.command in
+    t.capture=None && t.append_day=None &&
+      {command with task_state=original.task_state;status_confirmation=original.status_confirmation;
+        status_intent_revision=original.status_intent_revision}=original
   let matches_capture t (command:Journal_graph_projection.capture) = match t.capture with
     | Some original->{command with task_state=original.task_state;
         status_confirmation=original.status_confirmation;

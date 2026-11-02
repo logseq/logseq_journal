@@ -85,3 +85,6 @@ val admission_error : t -> string option
 
 val retained_chain : t -> Journal_graph_mutation_confirmation.Pure_insertion.t option
 val retain_chain : t -> Journal_graph_mutation_confirmation.Pure_insertion.t -> t
+
+val retain_child_chain : t -> command:Journal_graph_projection.create_child ->
+  Journal_graph_mutation_confirmation.Pure_insertion.t -> t

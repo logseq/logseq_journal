@@ -141,7 +141,8 @@ val create : ?on_change:(Journal_worker_coordination.Worker_pure_coordinator.eve
 val reset : t -> unit
 val set_calendar : t -> Journal_calendar.t -> unit
 val start : t -> Logseq_db_worker.Protocol.request
-val submit : ?capture_chain:Journal_graph_mutation_confirmation.Pure_insertion.t -> t -> Journal_graph_request.t -> output
+val submit : ?capture_chain:Journal_graph_mutation_confirmation.Pure_insertion.t ->
+  ?child_chain:Journal_graph_mutation_confirmation.Pure_insertion.t -> t -> Journal_graph_request.t -> output
 val receive : t -> Logseq_db_worker.Protocol.response -> output
 val fail_request : t -> Logseq_db_worker.Protocol.request -> message:string -> output
 val abandon : t -> Logseq_db_worker.Protocol.request -> unit
@@ -253,3 +254,11 @@ val capture_chain : t -> command:Journal_graph_projection.capture ->
 
 val capture_snapshot : t -> Logseq_db_worker.Protocol.request ->
   (Journal_graph_projection.capture * Journal_graph_mutation_confirmation.Pure_insertion.t) option
+
+val child_snapshot : t -> Logseq_db_worker.Protocol.request ->
+  (Journal_graph_projection.create_child * Journal_graph_mutation_confirmation.Pure_insertion.t) option
+val retained_child_chains : t ->
+  (Journal_graph_projection.create_child * Journal_graph_mutation_confirmation.Pure_insertion.t) Rrbvec.t
+
+val changed_child_chains : t -> output ->
+  (Journal_graph_projection.create_child * Journal_graph_mutation_confirmation.Pure_insertion.t) Rrbvec.t

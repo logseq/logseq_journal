@@ -168,3 +168,12 @@ val retained_failure_applied : retained_composer -> command:Journal_graph_projec
 val release_rejected_child : t -> command:Journal_graph_projection.create_child -> message:string -> t
 val release_rejected_retained : retained_composer -> command:Journal_graph_projection.create_child
   -> message:string -> retained_composer
+
+val child_chain : t -> command:Journal_graph_projection.create_child ->
+  Journal_graph_mutation_confirmation.Pure_insertion.t option
+val retained_child_chain : retained_composer -> command:Journal_graph_projection.create_child ->
+  Journal_graph_mutation_confirmation.Pure_insertion.t option
+val retain_child_chain : t -> command:Journal_graph_projection.create_child ->
+  Journal_graph_mutation_confirmation.Pure_insertion.t -> t
+val retain_retained_child_chain : retained_composer -> command:Journal_graph_projection.create_child ->
+  Journal_graph_mutation_confirmation.Pure_insertion.t -> retained_composer

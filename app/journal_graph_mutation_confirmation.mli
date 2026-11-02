@@ -101,6 +101,7 @@ module Pure_insertion : sig
     -> block:Graph.Uuid.t -> Graph.Uuid.t option -> Graph.Uuid.t
   val retarget : t -> command:Journal_graph_projection.create_child
     -> resolved_status:Graph.Uuid.t option -> (t,string) result
+  val matches_child : t -> Journal_graph_projection.create_child -> bool
   val matches_capture : t -> Journal_graph_projection.capture -> bool
   val retarget_capture : t -> command:Journal_graph_projection.capture -> resolved_status:Graph.Uuid.t option -> (t,string) result
   val bind : t -> index:int -> round:int64 -> intent:Worker.mutation_intent

@@ -960,3 +960,18 @@ module Favorites = struct
     | Loaded _ | Failed _ -> t, []
   ;;
 end
+
+let child_chain t ~command =
+  let active=Owners.to_seq t.owners |> Seq.find_map(fun(_,view)->match view with
+    | Detail_view{detail;_}|Detail_loading_view{staged_detail=Some detail;_}->Journal_detail.child_chain detail ~command
+    | _->None) in
+  match active with Some _->active|None->Drafts.to_seq t.drafts |> Seq.find_map(fun(_,draft)->
+    Journal_detail.retained_child_chain draft.composer ~command)
+let retain_child_chain t ~command chain =
+  let drafts=Drafts.fold(fun key draft drafts->
+    let composer=Journal_detail.retain_retained_child_chain draft.composer ~command chain in
+    if composer==draft.composer then drafts else Drafts.add key {draft with composer} drafts)
+    t.drafts t.drafts in
+  let t=if drafts==t.drafts then t else {t with drafts} in
+  map_details t ~f:(fun detail->Journal_detail.retain_child_chain detail ~command chain)
+;;

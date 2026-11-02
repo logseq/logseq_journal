@@ -859,7 +859,7 @@ let test_page_tree_interest_refetches_only_matching_tree () =
       (List.length requests)
 ;;
 
-let seed_children_interest runtime =
+let seed_children_interest ?(scope_revision="scope-children-1") runtime =
   seed_feed runtime;
   let block_request =
     Runtime.submit
@@ -889,7 +889,7 @@ let seed_children_interest runtime =
           (Protocol.V2_children_outcome
              { parent = block_uuid
              ; revision_scope = V2_children_revision block_uuid
-             ; scope_revision = "scope-children-1"
+             ; scope_revision
              ; items = []
              ; next_cursor = None
              })));
@@ -6375,6 +6375,55 @@ let child_identity request=match request.Protocol.command with
 let child_identity_runtime () =
   let runtime=Runtime.create () in seed_children_interest runtime;set_calendar runtime;runtime
 ;;
+let test_child_unknown_wire_survives_reset ?(status=false) () =
+  let module W=Journal_worker_coordination.Worker_api in
+  let runtime=child_identity_runtime() in
+  let insert=child_identity_insert runtime in
+  let issuer,_,projection,session=Coordination_test_fixture.fixture 5530L in
+  let module I=(val issuer:W.ISSUER) in
+  let presentation=Option.get(W.selected projection) in
+  let mutation_id,command=Runtime.worker_mutation runtime insert |> Option.get in
+  let original=W.mutation_intent session ~mutation_id command |> Result.get_ok in
+  Alcotest.(check bool) "original Child binds" true(Runtime.bind_mutation runtime insert ~presentation ~intent:original);
+  let original=if not status then (
+    ignore(Runtime.receive_mutation runtime insert W.Outcome_unknown); original)
+    else (
+      let child=uuid "a1000000-0000-4000-9000-000000000081" in
+      let target={record with block={block with uuid=child;title="Stable child";parent=block_uuid};task_status=None} in
+      let receipt=I.mutation_receipt session ~request_id:(W.request_id insert.request_id) ~intent:original
+        (response insert(V2_mutation_committed{mutation_id;status=V2_applied;generation="generation:v1:1:1";
+          before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"})) |> Result.get_ok in
+      let summary=Protocol.V2_block_summary_outcome{lookup=V2_present_block{value=target;revision="original-child-precondition"};
+        page=Some(V2_present_page{page;revision="page-original"});items=[];next_cursor=None;
+        scope_revision="original-child-scope";generation="generation:v1:1:1";projection_revision="projection:v1:1"} in
+      let proof=I.confirmation session ~presentation receipt (response insert summary) |> Result.get_ok in
+      let parent=Production_runtime.receive_mutation runtime insert(W.Confirmed proof)
+        |> fun output->only "canonical Child parent" output.Runtime.requests in
+      let output=Production_runtime.receive runtime(response parent(V2_block_outcome(V2_present_block{value=record;revision="new-parent-state"}))) in
+      let root,round=List.find_map(fun response->match response.Runtime.payload with
+        | Child_projection_ready{root;round;_}->Some(root,round)|_->None)output.responses |> Option.get in
+      let ack=Production_runtime.child_projection_applied runtime ~root ~round ~presentation
+        |> fun output->only "insert prefix ACK" output.Runtime.requests in
+      let canonical=Production_runtime.receive_child_ack runtime ack (Ok())
+        |> fun output->only "fresh child before status" output.Runtime.requests in
+      let value=match W.confirmation_primary proof with Confirmed_block value->value|_->assert false in
+      let pending=Production_runtime.receive_worker_read runtime ~request_id:canonical.request_id (Runtime.Child_chain_summary value)
+        |> fun output->only "original status attempt" output.Runtime.requests in
+      let mutation_id,command=Runtime.worker_mutation runtime pending |> Option.get in
+      let intent=W.mutation_intent session ~mutation_id command |> Result.get_ok in
+      Alcotest.(check bool) "original status binds" true(Runtime.bind_mutation runtime pending ~presentation ~intent);
+      ignore(Runtime.receive_mutation runtime pending W.Outcome_unknown);intent) in
+  let business_command,chain=Production_runtime.retained_child_chains runtime |> fun values->Rrbvec.nth values 0 in
+  Runtime.reset runtime;set_calendar runtime;
+  seed_children_interest ~scope_revision:"scope-children-after-reopen" runtime;
+  let retry=Production_runtime.submit ~child_chain:chain runtime (Journal_graph_request.Create_child business_command)
+    |> fun output->only "restored Child insertion" output.Runtime.requests in
+  let mutation_id,command=Runtime.worker_mutation runtime retry |> Option.get in
+  let retried=W.mutation_intent session ~mutation_id command |> Result.get_ok in
+  Alcotest.(check string) "unknown Child keeps the complete original intent across reset"
+    (Bytes.to_string(W.encode_mutation_intent original))(Bytes.to_string(W.encode_mutation_intent retried))
+;;
+
 let test_child_typed_insert_admission () =
   let runtime=child_identity_runtime() in
   let insert=child_identity_insert runtime in
@@ -9229,6 +9278,8 @@ let () =
         ] )
     ; ("child status identity",[
         Alcotest.test_case "typed insertion admission" `Quick test_child_typed_insert_admission;
+        Alcotest.test_case "unknown Child preserves wire across reset" `Quick (fun ()->test_child_unknown_wire_survives_reset ());
+        Alcotest.test_case "unknown Child status preserves preconditions across reset" `Quick (fun ()->test_child_unknown_wire_survives_reset ~status:true ());
         Alcotest.test_case "typed admission refusal retains graph" `Quick test_typed_child_planning_refusal_retains_transport;
         Alcotest.test_case "unrelated reads cannot change child status intent" `Quick test_child_status_identity_independent_reads;
         Alcotest.test_case "lost response keeps the same child status intent" `Quick test_child_status_identity_after_lost_reply])

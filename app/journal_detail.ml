@@ -644,6 +644,8 @@ let admit_child
       ~creation_time
   =
   match t.mode, t.child_capture with
+  | Reading, Some capture when Journal_capture.can_save capture && Journal_capture.admission_error capture<>None ->
+    {t with child_error=Journal_capture.admission_error capture},None
   | Reading, Some capture when Journal_capture.can_save capture ->
     let request =
       Journal_graph_request.Create_child
@@ -926,4 +928,19 @@ let complete_reveal t ~token ~outcome =
   if t.reveal_id <> None && token = t.composer_revision
   then { t with reveal_id = None; reveal_outcome = Some outcome }
   else t
+;;
+
+let child_chain (t:t) ~command =
+  if has_child_request t command then Option.bind t.child_capture Journal_capture.retained_chain else None
+let retained_child_chain draft ~command =
+  if retained_has_child_request draft command then Journal_capture.retained_chain draft.draft_capture else None
+let retain_child_chain (t:t) ~command chain =
+  if not(has_child_request t command) then t else match t.child_capture with
+  | None->t
+  | Some capture->let next=Journal_capture.retain_child_chain capture ~command chain in
+    if next==capture then t else {t with child_capture=Some next}
+let retain_retained_child_chain draft ~command chain =
+  if not(retained_has_child_request draft command) then draft else
+  let next=Journal_capture.retain_child_chain draft.draft_capture ~command chain in
+  if next==draft.draft_capture then draft else {draft with draft_capture=next}
 ;;

@@ -4073,23 +4073,42 @@ let start
       | Journal_graph_request.Capture{command;_},Some capture
         when Journal_capture.pending_command capture=Some command->Journal_capture.retained_chain capture
       | _->None in
-    Journal_graph_runtime.submit ?capture_chain:retained (!graph_runtime_cell) request in
+    let child=match request with
+      | Journal_graph_request.Create_child command->Journal_routes.child_chain (!state_ref).routes ~command
+      | _->None in
+    Journal_graph_runtime.submit ?capture_chain:retained ?child_chain:child (!graph_runtime_cell) request in
   let capture_chain_snapshot () =
     Option.bind (!state_ref).direct_capture (fun capture->
       Option.bind(Journal_capture.pending_command capture)(fun command->
         Option.map(fun chain->command,chain)
           (Journal_graph_runtime.capture_chain (!graph_runtime_cell) ~command))) in
-  let apply_capture_snapshot state (command,chain) =
-    if not(owns_capture state command) then state else
-    match state.direct_capture with
-    | None->state
-    | Some capture->let next=Journal_capture.retain_chain capture chain in
-      if next==capture then state else {state with direct_capture=Some next} in
-  let retain_capture_chain () =
-    (* Capture the immutable value before any queued state update or effect.
-       The update is owner-scoped and never reads a later/reset Runtime. *)
-    Option.iter(fun snapshot->Effect.run(set_state(fun state->apply_capture_snapshot state snapshot)))
-      (capture_chain_snapshot ()) in
+  let owns_business_snapshot state = function
+    | `Capture(command,_)->owns_capture state command
+    | `Child(command,_)->Journal_routes.has_child_request state.routes command in
+  let apply_business_snapshot state = function
+    | `Capture(command,chain)->
+      if not(owns_capture state command) then state else
+      (match state.direct_capture with
+       | None->state
+       | Some capture->let next=Journal_capture.retain_chain capture chain in
+         if next==capture then state else {state with direct_capture=Some next})
+    | `Child(command,chain)->
+      if not(Journal_routes.has_child_request state.routes command) then state else
+      let routes=Journal_routes.retain_child_chain state.routes ~command chain in
+      if routes==state.routes then state else {state with routes} in
+  let retain_business_chains output =
+    (* Capture immutable values now; queued updates never reread a reset Runtime. *)
+    let snapshots=Rrbvec.map(fun(command,chain)->`Child(command,chain))
+      (Journal_graph_runtime.changed_child_chains (!graph_runtime_cell) output) in
+    let snapshots=match capture_chain_snapshot () with
+      | None->snapshots
+      | Some(command,chain)->
+        if Option.fold ~none:false ~some:(fun capture->
+            Option.fold ~none:false ~some:(fun previous->previous==chain)(Journal_capture.retained_chain capture))
+            (!state_ref).direct_capture
+        then snapshots else Rrbvec.push_back snapshots (`Capture(command,chain)) in
+    if not(Rrbvec.is_empty snapshots) then
+      Effect.run(set_state(fun state->Rrbvec.fold_left apply_business_snapshot state snapshots)) in
   let fail_graph_transport state message =
     terminal_graph_state state (Transport_graph_error message)
   in
@@ -4176,14 +4195,18 @@ let start
             let dispatch ()=match Coordination_host.reconcile_mutation host ~presentation intent with
               | Ok ticket->watch ticket;Journal_graph_transport.Accepted
               | Error _->Journal_graph_transport.Not_ready in
-            (match Journal_graph_runtime.capture_snapshot (!graph_runtime_cell) request with
+            let snapshot=match Journal_graph_runtime.capture_snapshot (!graph_runtime_cell) request with
+              | Some(command,chain)->Some(`Capture(command,chain))
+              | None->Option.map(fun(command,chain)->`Child(command,chain))
+                (Journal_graph_runtime.child_snapshot (!graph_runtime_cell) request) in
+            (match snapshot with
              | None->dispatch ()
-             | Some ((command,_) as snapshot)->
+             | Some snapshot->
                (* The owner-scoped state transition commits the full bound wire
                   before this effect can send it, including queued updates. *)
                Effect.run(set_state_and_effect(fun state->
-                 if not(owns_capture state command) then state,Effect.ignore else
-                 apply_capture_snapshot state snapshot,Effect.of_thunk(fun()->
+                 if not(owns_business_snapshot state snapshot) then state,Effect.ignore else
+                 apply_business_snapshot state snapshot,Effect.of_thunk(fun()->
                    match dispatch () with
                    | Journal_graph_transport.Accepted->()
                    | _-> !coordinated_mutation_finished owner request
@@ -4224,7 +4247,7 @@ let start
        | _->Journal_graph_transport.Not_ready)
     | _->Journal_graph_transport.Not_ready in
   let deliver_output (output : Journal_graph_runtime.output) =
-    retain_capture_chain ();
+    retain_business_chains output;
     List.iter
       (fun response ->
          match response.Journal_graph_runtime.payload with
@@ -6746,7 +6769,7 @@ let start
                       ( Option.get (Journal_routes.active_entry_id state.routes)
                       , Journal_routes.detail_request_generation state.routes ))
                    (Some (Local_capture_failure message)))
-             | Ok (_, None) -> Effect.ignore
+             | Ok (detail, None) -> update(fun state->{state with routes=Journal_routes.update_detail state.routes detail})
              | Ok (detail, Some request) ->
                with_direct_request
                  { snapshot with
