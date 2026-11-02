@@ -184,6 +184,9 @@ let test_import_intent_preserves_complete_source () =
      source_file="/tmp/synthetic-picker-885.png";title="Synthetic attachment";file_type="png"} in
   let intent=W.asset_import_intent session source |> Result.get_ok in
   let encoded=W.encode_asset_import_intent intent in
+  (* cbe942a's persisted flat Import_json encoding is the compatibility fixture. *)
+  check(Bytes.to_string encoded={golden|{"asset":"98000000-0000-4000-8000-000000000886","file_type":"png","local_mutation":"98000000-0000-4000-8000-000000000887","metadata_mutation":"98000000-0000-4000-8000-000000000888","namespace":"fb8d27f50b99fca49665bdb748e7c3518017a82099d540b8d62ead3c96ba2e48","operation":"98000000-0000-4000-8000-000000000885","replace_reference":null,"schema":1,"source_file":"/tmp/synthetic-picker-885.png","target":"98000000-0000-4000-8000-000000000001","title":"Synthetic attachment"}|golden})
+    "shared pure import codec changed a previously persisted intent identity";
   check(W.asset_import_intent_id intent=source.operation) "import minted a replacement operation identity";
   let _,_,_,restarted=fixture ~graph_generation:99 886L in
   let restored=W.restore_asset_import_intent restarted encoded |> Result.get_ok in

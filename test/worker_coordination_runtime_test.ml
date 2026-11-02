@@ -236,7 +236,7 @@ let prepare_atomic_append_fixture support =
          add "block/journal-day" (J.Int 20261103);add "block/tags" (J.Keyword "logseq.class/Journal")])))
 ;;
 
-let with_client
+let with_client_sessions
       ?(epoch_ms = fun () -> 1_700_000_000_000L)
       ?(favorites = false)
       ?(assets = false)
@@ -292,14 +292,22 @@ let with_client
         ~secrets
         ~tls_authenticator:(SR.system_tls_authenticator () |> Result.get_ok)
     in
-    let client =
-      Runtime.start
-        ~runtime_epoch:(Id.Runtime.Epoch.of_int64 9000L)
-        (Service.create ~dependencies:deps)
-        fixture.config
-      |> Result.get_ok
+    let current = ref None and epoch = ref 8999L in
+    let stop () = Option.iter Runtime.stop !current; current := None in
+    let start () =
+      stop ();
+      epoch := Int64.succ !epoch;
+      let client = Runtime.start ~runtime_epoch:(Id.Runtime.Epoch.of_int64 !epoch)
+          (Service.create ~dependencies:deps) fixture.config |> Result.get_ok in
+      current := Some client;
+      client
     in
-    Fun.protect ~finally:(fun () -> Runtime.stop client) (fun () -> f client))
+    Fun.protect ~finally:stop (fun () -> f start))
+;;
+
+let with_client ?epoch_ms ?favorites ?assets ?statuses ?prepare f =
+  with_client_sessions ?epoch_ms ?favorites ?assets ?statuses ?prepare
+    (fun start -> f (start ()))
 ;;
 
 let test_client_to_typed_read () =
@@ -2816,6 +2824,90 @@ let test_service_import_rejects_retired_registration () =
         "retired coordination registration still prepared a queued typed Import"))
 ;;
 
+(* This crosses actual Service/Db/runner lifetimes and reopens the source store.
+   A pure reducer cannot establish that source bytes or the Prepared checkpoint
+   survived closing their physical owners. No unprepared recovery is claimed. *)
+let test_prepared_import_survives_worker_lifetime () =
+  with_client_sessions (fun start ->
+    let source_file=Filename.temp_file "journal-restarted-import-synthetic-" ".png" in
+    Fun.protect ~finally:(fun()->if Sys.file_exists source_file then Sys.remove source_file)(fun()->
+      Out_channel.with_open_bin source_file(fun output->output_string output "file");
+      let source:Logseq_db_types.Asset_import.t=
+        {operation=uuid "9c000000-0000-4000-8000-000000002885";
+         asset=uuid "9c000000-0000-4000-8000-000000002886";
+         target=Test_support.authoritative_block_uuid;replace_reference=None;
+         local_mutation=uuid "9c000000-0000-4000-8000-000000002887";
+         metadata_mutation=uuid "9c000000-0000-4000-8000-000000002888";
+         source_file;title="Prepared across actual worker restart";file_type="png"} in
+      let lifetime saved =
+        let client=start() in
+        let replies=Hashtbl.create 16 and baseline=ref None in
+        Mailbox.on_event client(function
+          |Mailbox.Response{request_id;outcome;_}->Hashtbl.replace replies request_id outcome
+          |Push{payload=Service.Coordination_updates updates;_}->
+            List.iter(function Service.Coordination_snapshot value->baseline:=Some value|_->())updates
+          |_->());
+        let wait predicate=
+          let deadline=Unix.gettimeofday()+.5. in
+          while not(predicate()) && Unix.gettimeofday()<deadline do
+            Mailbox.Private.deliver client ~max_events:64;Thread.delay 0.001 done;
+          require(predicate()) "restarted Import actual Service did not settle" in
+        let call request=
+          let id=match Mailbox.send client request with Accepted id->id|_->failwith "restarted Import admission" in
+          wait(fun()->Hashtbl.mem replies id);Hashtbl.find replies id in
+        ignore(call(Service.Client_command(Restore_local_account{user_id="user-1"})));
+        let issuer=W.issuer ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
+          ~runtime_epoch:(Mailbox.runtime_epoch client) ~worker_generation:(Mailbox.worker_generation client) |> Result.get_ok in
+        let module I=(val issuer:W.ISSUER) in
+        (match call(I.bootstrap_request() |> Result.get_ok)with
+         |Completed(Service.Coordination_registered value)->baseline:=Some value
+         |_->failwith "restarted Import bootstrap failed");
+        wait(fun()->Option.exists(fun value->List.exists(fun(_,graph)->
+          graph.Logseq_db_worker.phase=Graph_open)value.Service.baseline.state.residents)!baseline);
+        let projection=match I.bootstrap(Service.Coordination_registered(Option.get !baseline))with
+          |Ok(W.Ready value)->value|_->failwith "restarted Import baseline invalid" in
+        let session=(List.find(fun resident->W.graph_id resident.W.session=Test_support.graph_uuid)(W.residents projection)).session in
+        let sequence=ref 0 in
+        let request : type a. a W.request -> a W.reply = fun operation ->
+          incr sequence;
+          let request_id=W.request_id(uuid(Printf.sprintf "9c000000-0000-4000-8000-%012d" (3000 + !sequence))) in
+          let raw=I.request session ~request_id operation |> Result.get_ok in
+          match call raw with
+          |Completed response->I.reply session ~request_id operation response |> Result.get_ok
+          |Failed message->failwith("restarted Import request failed: "^message)
+          |_->failwith "restarted Import request interrupted" in
+        let children ()=
+          let budget=W.read_budget session ~maximum_items:100 ~maximum_bytes:65536 |> Result.get_ok in
+          match request(W.Query(budget,W.Children{parent=source.target;after=None}))with
+          |W.Answered(Ok value)->require(value.next=None) "synthetic Import child count was partial";value.items
+          |_->failwith "restarted Import children unavailable" in
+        let before=children() in
+        let intent=match saved with None->W.asset_import_intent session source |> Result.get_ok
+          |Some(encoded,_,_)->W.restore_asset_import_intent session encoded |> Result.get_ok in
+        let imported=match request(W.Import intent)with
+          |W.Answered(Ok(W.Imported imported))->imported
+          |W.Answered(Error(W.Service_failed message))->failwith("restarted Import failed: "^message)
+          |_->failwith "restarted Import did not reconcile Prepared" in
+        let preview=W.import_preview imported |> Option.get in
+        require(Sys.file_exists(W.file_path preview)) "restarted Import lost physically staged source";
+        require((W.import_data imported).operation=source.operation && (W.import_data imported).target=source.target)
+          "restarted Import replaced original operation/target";
+        let after=children() in
+        require(List.exists(fun block->W.block_uuid block=source.asset)after)
+          "actual Import did not materialize its asset child";
+        (match saved with
+         |None->require(List.length after=List.length before+1) "first Import duplicated asset children"
+         |Some(_,asset,count)->
+           require((W.import_data imported).asset=asset) "restarted Import changed original descriptor";
+           require(List.length before=count && List.length after=count) "restarted Import replayed local insertion");
+        require(request(W.Release_file preview)=W.Answered(Ok())) "restarted Import physical release was not acknowledged";
+        W.encode_asset_import_intent intent,(W.import_data imported).asset,List.length after
+      in
+      let saved=lifetime None in
+      Sys.remove source_file;
+      ignore(lifetime(Some saved))))
+;;
+
 let test_service_observation_lifecycle () =
   with_observation_service
     (fun client ~call ~send:_ ~wait ~replies:_ ~notices ~baseline ~owner ~registration ->
@@ -3743,6 +3835,7 @@ let test_service_changefeed_has_one_owner () =
 ;;
 
 let () =
+  test_prepared_import_survives_worker_lifetime ();
   test_service_import_rejects_retired_registration ();
   test_host_durable_recovery_confirmation_ack ();
   test_service_unknown_recovery_is_read_only ~large:true ();
