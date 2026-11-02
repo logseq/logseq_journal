@@ -1767,6 +1767,11 @@ module Writer_fence = struct
     else let serial=Int64.succ state.next in
       let operation:operation={serial;scope} in
       {state with next=serial;operations=Operations.add serial operation state.operations},Ok operation
+  let admit_cleanup state scope=
+    if Operations.cardinal state.operations>=512 || state.next=Int64.max_int then state,Error Full
+    else let serial=Int64.succ state.next in
+      let operation:operation={serial;scope} in
+      {state with next=serial;operations=Operations.add serial operation state.operations},Ok operation
   let finish state (operation:operation)=
     match Operations.find_opt operation.serial state.operations with
     |Some actual when actual=operation->{state with operations=Operations.remove operation.serial state.operations}
@@ -1782,3 +1787,120 @@ module Writer_fence = struct
     Option.exists(fun (actual:fence)->actual.serial=fence.serial && actual.scope=fence.scope)
       (Scopes.find_opt fence.scope state.fences) && pending state fence.scope=0
 end
+
+module Host_handoff = struct
+  module S=Logseq_sync_pure_reducer.Core
+  module G=Logseq_db_types.Graph_types
+  module Ids=Set.Make(G.Uuid)
+  module Scopes=Set.Make(Writer_fence.Scope)
+  type mode=Normal|Force
+  type change=Close_graph of G.Uuid.t|Remove_graph of G.Uuid.t * mode|Replace_account|Stop_connection
+  type facts={authenticated:bool;version:int64;registration:int64 option;account:S.account_scope option;scopes:S.graph_scope Rrbvec.t;catalog:G.Uuid.t Rrbvec.t}
+  type request={version:int64;id:G.Uuid.t;registration:int64;owner:S.account_scope;change:change;
+    expected:S.graph_scope Rrbvec.t;captured:S.graph_scope Rrbvec.t}
+  type attempt={lifetime:G.Uuid.t;serial:int64;id:G.Uuid.t}
+  type receipt={attempt:attempt;request:request;copy_generation:Logseq_overlay_db.Types.mirror_generation option}
+  type error=Busy|Retired|Mismatch|Owner_changed|Scopes_changed|Baseline_changed|Full|Missing_copy_witness|Not_settled
+  type phase=Preparing|Safe of receipt|Consumed of receipt|Failed of error
+  type entry={attempt:attempt;request:request;keys:Scopes.t;phase:phase;settlement_pending:bool}
+  type t={lifetime:G.Uuid.t;next:int64;active:entry option;retired:Ids.t}
+  type admission=Start of attempt|Existing of phase|Refused of error
+  let empty ~lifetime={lifetime;next=0L;active=None;retired=Ids.empty}
+  let receipt_request (receipt:receipt)=receipt.request
+  let receipt_copy_generation (receipt:receipt)=receipt.copy_generation
+  let same_attempt (a:attempt)(b:attempt)=a.lifetime=b.lifetime && a.serial=b.serial && a.id=b.id
+  let same_logical (a:S.account_scope)(b:S.account_scope)=
+    Uri.equal a.managed_sync_origin b.managed_sync_origin && a.user_id=b.user_id
+  let same_owner a b=same_logical a b && a.S.account_generation=b.S.account_generation
+    && a.lifecycle_generation=b.lifecycle_generation
+  let affects change (scope:S.graph_scope)=match change with
+    |Close_graph id|Remove_graph(id,_)->scope.graph_id=id
+    |Replace_account|Stop_connection->true
+  let capture ~owner ~change scopes=Rrbvec.filter(fun (scope:S.graph_scope)->
+    affects change scope && (change=Stop_connection || same_logical owner scope.account))scopes
+  let all predicate values=Rrbvec.fold_left(fun ok value->ok && predicate value)true values
+  let any predicate values=Rrbvec.fold_left(fun yes value->yes || predicate value)false values
+  let keys values=Rrbvec.fold_left(fun keys scope->Scopes.add scope keys)Scopes.empty values
+  let frame_error (facts:facts)(entry:entry)=
+    if facts.registration<>Some entry.request.registration
+      || not(Option.exists(same_owner entry.request.owner)facts.account)
+    then Some Owner_changed
+    else if (match entry.request.change with Remove_graph(id,_)->not facts.authenticated || not(any((=)id)facts.catalog)|_->false)
+    then Some Owner_changed
+    else if not(all(fun scope->not(affects entry.request.change scope) || Scopes.mem scope entry.keys)facts.scopes)
+    then Some Scopes_changed else None
+  let observe state facts=match state.active with
+    |Some({phase=(Preparing|Safe _);_}as entry)->
+      (match frame_error facts entry with None->state
+       |Some error->{state with active=Some{entry with phase=Failed error}})
+    |_->state
+  let equivalent (a:request)(b:request)=a.id=b.id && a.version=b.version && a.registration=b.registration
+    && same_owner a.owner b.owner && a.change=b.change && Scopes.equal(keys a.expected)(keys b.expected)
+  let prepare state (facts:facts) (request:request)=
+    let state=observe state facts in
+    if Ids.mem request.id state.retired then state,Refused Retired else
+    match state.active with
+    |Some entry when entry.request.id=request.id->
+      state,(if equivalent entry.request request then Existing entry.phase else Refused Mismatch)
+    |Some{settlement_pending=true;_}|Some{phase=(Preparing|Safe _|Consumed _);_}->state,Refused Busy
+    |Some entry when entry.request.change<>request.change || not(same_owner entry.request.owner request.owner)->state,Refused Busy
+    |previous->
+      if state.next=Int64.max_int || Ids.cardinal state.retired + (if previous=None then 1 else 2)>8192
+        || Rrbvec.length request.captured>8192 || Rrbvec.length request.expected>8192
+      then state,Refused Full else
+      if request.version<>facts.version then state,Refused Baseline_changed else
+      let catalog_allows=match request.change with
+        |Remove_graph(id,_)->facts.authenticated && any((=)id)facts.catalog
+        |Close_graph id->any((=)id)facts.catalog || any(fun (scope:S.graph_scope)->scope.graph_id=id)request.captured
+        |Replace_account|Stop_connection->true in
+      let owned_scope(scope:S.graph_scope)=affects request.change scope
+        && (request.change=Stop_connection || same_logical scope.account request.owner) in
+      if request.registration<=0L || facts.registration<>Some request.registration
+        || not(Option.exists(same_owner request.owner)facts.account) || not catalog_allows
+        || not(all owned_scope request.expected) || not(all owned_scope request.captured)
+      then state,Refused Owner_changed else
+      let expected=keys request.expected and captured=keys request.captured in
+      if not(all(fun scope->not(affects request.change scope)
+        || (Scopes.mem scope expected && Scopes.mem scope captured))facts.scopes)
+      then state,Refused Scopes_changed else
+      let serial=Int64.succ state.next in
+      let attempt={lifetime=state.lifetime;serial;id=request.id} in
+      let retired=Option.fold ~none:state.retired ~some:(fun entry->Ids.add entry.request.id state.retired)previous in
+      let entry={attempt;request;keys=captured;phase=Preparing;settlement_pending=true} in
+      {state with next=serial;retired;active=Some entry},Start attempt
+  let released_registration state registration=match state.active with
+    |Some entry when entry.request.registration=registration && not entry.settlement_pending->
+      (match entry.phase,entry.request.change with Consumed _,(Stop_connection|Replace_account)->state,None|_->
+        {state with active=None;retired=Ids.add entry.request.id state.retired},Some entry.request.id)
+    |_->state,None
+  let phase state id=Option.bind state.active(fun entry->if entry.request.id=id then Some entry.phase else None)
+  let settled state attempt ~copy_generation=match state.active with
+    |Some({phase=Preparing;_}as entry) when same_attempt entry.attempt attempt->
+      let phase=match entry.request.change,copy_generation with
+        |Remove_graph _,None->Failed Missing_copy_witness
+        |(Close_graph _|Replace_account|Stop_connection),Some _->Failed Mismatch
+        |_->Safe{attempt;request=entry.request;copy_generation} in
+      {state with active=Some{entry with phase;settlement_pending=false}}
+    |Some entry when same_attempt entry.attempt attempt->
+      {state with active=Some{entry with settlement_pending=false}}
+    |_->state
+  let current state=Option.map(fun entry->entry.request,entry.phase)state.active
+  let completed state receipt=match state.active with
+    |Some{phase=Consumed actual;_}when actual=receipt->
+      {state with active=None;retired=Ids.add receipt.request.id state.retired}
+    |_->state
+  let failed state attempt=match state.active with
+    |Some entry when same_attempt entry.attempt attempt->{state with active=Some{entry with phase=Failed Not_settled;settlement_pending=false}}
+    |_->state
+  let consume state (facts:facts) (receipt:receipt)=
+    let state=observe state facts in
+    if receipt.attempt.lifetime<>state.lifetime then state,Error Mismatch else
+    match state.active with
+    |Some{phase=Safe actual;_}when actual=receipt->
+      {state with active=Some{(Option.get state.active)with phase=Consumed actual}},Ok receipt.request.change
+    |Some{phase=Failed error;_}->state,Error error
+    |_->state,Error(if Ids.mem receipt.request.id state.retired then Retired else Not_settled)
+end
+
+let host_fence_blocks state id=Logseq_sync_pure_reducer.Core.host_fence_blocks state.sync_core id
+let host_fence_active state=Logseq_sync_pure_reducer.Core.host_fence_active state.sync_core

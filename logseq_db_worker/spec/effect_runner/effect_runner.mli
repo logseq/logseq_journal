@@ -225,3 +225,25 @@ val quiesce_writers : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> (u
     first retires target producers; this function itself grants no admission or
     host permit and does not stop the shared client. *)
 val await_sync_io : t -> scope:Logseq_sync_pure_reducer.Core.effect_scope -> (unit,string) result
+
+(** Actual retained physical scope roster, including old failed cleanup owners.
+    This is captured by the backend, never supplied by the host as a substitute
+    for ownership. No admission or acknowledgement is implied. *)
+val physical_host_scopes : t -> Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t
+
+(** The caller has withdrawn producers and gated reopen. Joins real graph tasks,
+    Sync callbacks, database/listener close and resource children; success also
+    requires the actual scoped cache's checked close. A failed DB close remains
+    a physical failure, even if its logical session has already retired. *)
+val settle_host_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> (unit,string) result
+
+(** Hold the existing exclusive prepared_mirror_deletion owner before issuing a
+    removal receipt, including copies whose DB cannot be opened. Retry may rebind
+    an unconsumed failed round's same held owner; it cannot borrow a deletion in
+    progress. No namespace mutation or new identity-probe API is involved. *)
+val prepare_host_copy:t -> registration:int64 -> handoff_id:Logseq_db_types.Graph_types.Uuid.t
+  -> owner:Logseq_sync_pure_reducer.Core.account_scope -> graph_id:Logseq_db_types.Graph_types.Uuid.t
+  -> (Logseq_overlay_db.Types.mirror_generation,string)result
+val bind_host_copy:t -> handoff_id:Logseq_db_types.Graph_types.Uuid.t
+  -> Logseq_sync_pure_reducer.Core.mirror_deletion -> (unit,Logseq_db_worker_pure_reducer.Core.effect_error)result
+val release_host_copy:t -> registration:int64 -> (unit,string)result

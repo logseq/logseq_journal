@@ -400,6 +400,11 @@ type writer_job={writer_operation:Core.Writer_fence.operation;writer_scope:Sync.
   writer_finished:unit Eio.Promise.t;writer_resolve:unit Eio.Promise.u}
 module Cleanup_ids=Set.Make(Int64)
 
+type host_copy={mutable copy_handoff:Graph.Uuid.t;copy_registration:int64;copy_owner:Sync.account_scope;
+  copy_graph:Graph.Uuid.t;copy_retirement:Sync.retirement_id;
+  copy_preparation:Database.prepared_mirror_deletion;copy_generation:Overlay.mirror_generation;
+  mutable copy_bound:Sync.mirror_deletion option}
+
 type t =
   { sw : Eio.Switch.t
   ; dependencies : dependencies
@@ -431,6 +436,8 @@ type t =
   ; resource_cleanup_owners : ((Sync.graph_scope * string),asset_cleanup_job) Hashtbl.t
   ; mutable writer_fence : Core.Writer_fence.t
   ; writer_jobs : (int64,writer_job)Hashtbl.t
+  ; resource_scopes : (Sync.graph_scope,unit)Hashtbl.t
+  ; failed_database_closes : (string,Core.effect_error)Hashtbl.t
   ; durable_slots : Eio.Semaphore.t
   ; databases : (string, database_session) Hashtbl.t
   ; inspections : (string, Database.mirror_inspection) Hashtbl.t
@@ -443,6 +450,7 @@ type t =
   ; mutable stopped : bool
   ; mutable latest_snapshot : Sync.snapshot option
   ; mutable authorized_graphs : Authorized_graphs.t
+  ; mutable host_copy : host_copy option
   ; mutable deletion_owner : Sync.mirror_deletion option
   }
 
@@ -485,6 +493,8 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; resource_cleanup_owners = Hashtbl.create 16
     ; writer_fence = Core.Writer_fence.empty
     ; writer_jobs = Hashtbl.create 32
+    ; resource_scopes = Hashtbl.create 16
+    ; failed_database_closes = Hashtbl.create 4
     ; durable_slots = Eio.Semaphore.make 8
     ; databases = Hashtbl.create 4
     ; inspections = Hashtbl.create 4
@@ -497,6 +507,7 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; stopped = false
     ; latest_snapshot = None
     ; authorized_graphs = Authorized_graphs.empty
+    ; host_copy = None
     ; deletion_owner = None
     }
 ;;
@@ -524,6 +535,7 @@ let with_upload_store t action =
 ;;
 
 let asset_request t ~scope action =
+  Hashtbl.replace t.resource_scopes scope ();
   let operation = "worker-asset:" ^ Int64.to_string t.next_asset_operation in
   t.next_asset_operation <- Int64.succ t.next_asset_operation;
   { Sync.scope; operation; action }
@@ -672,15 +684,16 @@ let asset_unit ?(on_failure = fun _ -> ()) ?on_diagnostic t ~scope action =
     Error "Unexpected asset completion"
 ;;
 
-let reserve_writer t scope =
+let reserve_writer ?(cleanup=false) t scope =
   if t.stopped then Error "The Worker stopped before graph operation admission." else
-  let next,outcome=Core.Writer_fence.admit t.writer_fence scope in
+  let next,outcome=(if cleanup then Core.Writer_fence.admit_cleanup else Core.Writer_fence.admit) t.writer_fence scope in
   t.writer_fence<-next;
   Result.map_error(function Core.Writer_fence.Fenced->"The graph incarnation is quiescing."
     |Full->"Graph operation capacity is full.")outcome
   |> Result.map(fun writer_operation->
     let writer_finished,writer_resolve=Eio.Promise.create() in
     let job={writer_operation;writer_scope=scope;writer_finished;writer_resolve} in
+    Hashtbl.replace t.resource_scopes scope ();
     Hashtbl.add t.writer_jobs(Core.Writer_fence.operation_id writer_operation)job;job)
 ;;
 let finish_writer t job =
@@ -1226,8 +1239,14 @@ let close_database_by_id ?scope t database_id =
   | Some session ->
     let slots=Hashtbl.to_seq_values t.observation_slots
       |> Seq.filter (fun slot->slot.database_id=database_id) |> List.of_seq in
-    List.iter (fun slot->ignore (release_observation t ~registration:slot.registration
-      ~id:slot.logical_id ~scope:slot.observation_scope)) slots;
+    let released=List.fold_left(fun result slot->
+      let next=release_observation t ~registration:slot.registration
+        ~id:slot.logical_id ~scope:slot.observation_scope in
+      match result with Error _->result|Ok()->next)(Ok())slots in
+    Result.bind(Result.map_error effect_error released)(fun()->
+    match Hashtbl.find_opt t.failed_database_closes database_id with
+    |Some error->Error error
+    |None->
     Database.unlisten session.subscription;
     let result = Database.close session.database in
     (match result with
@@ -1247,12 +1266,14 @@ let close_database_by_id ?scope t database_id =
            t.dependencies.publish (Core.Diagnostic(D.signal_prefix ^ D.encode detail))
          | _ -> ()) scope;
        report_warning "journal: operation=closeDatabase code=cleanupPending\n");
-    Hashtbl.remove t.databases database_id;
-    Hashtbl.filter_map_inplace (fun _ id -> if id=database_id then None else Some id) t.attachments;
-    (match t.attached with Some (id,_) when id=database_id -> t.attached <- None | _ -> ());
+    (match result with
+     |Error error->Hashtbl.replace t.failed_database_closes database_id(close_error error)
+     |Ok()->Hashtbl.remove t.databases database_id);
+    if Result.is_ok result then Hashtbl.filter_map_inplace (fun _ id -> if id=database_id then None else Some id) t.attachments;
+    (match t.attached with Some (id,_) when id=database_id && Result.is_ok result -> t.attached <- None | _ -> ());
     Result.map_error
       close_error
-      result
+      result)
 ;;
 
 let close_attached t =
@@ -2807,6 +2828,39 @@ let recover_local_retirements ?on_diagnostic t (scope : Sync.graph_scope) =
         raise error)
 ;;
 
+let prepare_host_copy t ~registration ~handoff_id ~(owner:Sync.account_scope) ~graph_id =
+  match t.host_copy with
+  |Some copy when copy.copy_bound=None && copy.copy_registration=registration
+      && copy.copy_graph=graph_id && copy.copy_owner.user_id=owner.user_id
+      && Uri.equal copy.copy_owner.managed_sync_origin owner.managed_sync_origin
+      && copy.copy_owner.account_generation=owner.account_generation
+      && copy.copy_owner.lifecycle_generation=owner.lifecycle_generation->
+    copy.copy_handoff<-handoff_id;Ok copy.copy_generation
+  |Some _->Error "Another host change still owns the exclusive local copy."
+  |None->
+    let scope:Sync.graph_scope={account=owner;graph_id;graph_generation=0} in
+    Result.bind(with_staging_lock t(fun()->recover_local_retirements t scope))(fun()->
+      let retirement=fresh_retirement() in
+      Database.prepare_mirror_deletion
+        ~application_support_directory:t.dependencies.config.application_support_directory ~graph_id ~retirement
+      |> Result.map_error(fun _->"The local copy is still in use or changed during handoff.")
+      |> Result.map(fun(prepared,generation)->
+        t.host_copy<-Some{copy_handoff=handoff_id;copy_registration=registration;copy_owner=owner;copy_graph=graph_id;copy_retirement=retirement;copy_preparation=prepared;copy_generation=generation;copy_bound=None};generation))
+;;
+let bind_host_copy t ~handoff_id (request:Sync.mirror_deletion)=
+  match t.host_copy with
+  |Some copy when copy.copy_handoff=handoff_id && copy.copy_bound=None
+     && copy.copy_graph=request.graph_id && copy.copy_owner.user_id=request.account.user_id
+     && Uri.equal copy.copy_owner.managed_sync_origin request.account.managed_sync_origin
+     && copy.copy_owner.account_generation=request.account.account_generation->copy.copy_bound<-Some request;Ok()
+  |_->Error(effect_error "The deletion does not own this exact prepared host copy.")
+;;
+let release_host_copy t ~registration =match t.host_copy with
+  |None->Ok()
+  |Some copy when copy.copy_registration<>registration->Error "The local-copy release owner does not match its registration."
+  |Some copy->Result.map(fun()->t.host_copy<-None)(Database.cancel_mirror_deletion_checked copy.copy_preparation)
+;;
+
 let handle_sync_worker_effect t = function
   | Sync.Inspect_mirror request ->
     let recovery = with_staging_lock t (fun () -> recover_local_retirements t request.scope) in
@@ -2907,17 +2961,20 @@ let handle_sync_worker_effect t = function
           Error "Switch to another graph before deleting."
         | false -> Ok () in
       let* () = with_staging_lock t (fun () -> recover_local_retirements ~on_diagnostic:report t scope) in
-      let retirement = fresh_retirement () in
-      (* Ownership is acquired before any asset retirement or intent mutation. *)
-      let* prepared, expected = Database.prepare_mirror_deletion
-        ~application_support_directory:t.dependencies.config.application_support_directory
-        ~graph_id:request.graph_id ~retirement
-        |> Result.map_error (fun error ->
-          report (mirror_deletion_detail error);
-          match error with
-          | Overlay.Mirror_delete_busy -> "The local copy is still in use. Close attachment previews and try again."
-          | _ -> "The local copy changed. Refresh and try again.") in
-      Fun.protect ~finally:(fun () -> Database.cancel_mirror_deletion prepared) (fun () ->
+      (* A consumed host receipt supplies this original exclusive handle. Never
+         reacquire its namespace and accidentally compete with our own owner. *)
+      let* retirement,prepared,expected,host_owned=match t.host_copy with
+        |Some copy when copy.copy_bound=Some request->Ok(copy.copy_retirement,copy.copy_preparation,copy.copy_generation,true)
+        |Some _->Error "The local copy belongs to another host handoff."
+        |None->
+          let retirement=fresh_retirement() in
+          Database.prepare_mirror_deletion
+            ~application_support_directory:t.dependencies.config.application_support_directory
+            ~graph_id:request.graph_id ~retirement
+          |> Result.map_error(fun error->report(mirror_deletion_detail error);
+            "The local copy is still in use or changed. Refresh and try again.")
+          |> Result.map(fun(prepared,expected)->retirement,prepared,expected,false) in
+      Fun.protect ~finally:(fun () ->if not host_owned then Database.cancel_mirror_deletion prepared) (fun () ->
         let same_target (actual : Sync.graph_scope) = actual.graph_id=scope.graph_id
           && actual.account.user_id=scope.account.user_id
           && Uri.equal actual.account.managed_sync_origin scope.account.managed_sync_origin in
@@ -3193,17 +3250,19 @@ let complete t ?writer (Core.Request (ticket, request)) =
 ;;
 let worker_operation_scope t (Core.Request(_,request)) =
   match request with
-  |Core.Execute_request{database;_}->Option.map(fun session->session.graph_scope)
+  |Core.Execute_request{database;_}->Option.map(fun session->session.graph_scope,false)
       (Hashtbl.find_opt t.databases(Core.database_handle_id database))
-  |Close_database _->None
+  |Close_database database->Option.map(fun session->session.graph_scope,true)
+      (Hashtbl.find_opt t.databases(Core.database_handle_id database))
   |Handle_sync_worker_effect worker_effect->
     (match worker_effect with
-     |Sync.Inspect_mirror request|Attach_graph request->Some request.scope
-     |Activate_snapshot request->Some(Sync.snapshot_activation_scope request)
-     |Inspect_sync scope->Some scope
-     |Apply_outbox_transition request->Some request.scope
-     |Apply_authoritative_batch request->Some request.scope.graph
-     |Detach_graph _|Reset_managed_account _|Delete_mirror _->None)
+     |Sync.Inspect_mirror request|Attach_graph request->Some(request.scope,false)
+     |Activate_snapshot request->Some(Sync.snapshot_activation_scope request,false)
+     |Inspect_sync scope->Some(scope,false)
+     |Apply_outbox_transition request->Some(request.scope,false)
+     |Apply_authoritative_batch request->Some(request.scope.graph,false)
+     |Detach_graph scope->Some(scope,true)
+     |Reset_managed_account _|Delete_mirror _->None)
 ;;
 let submit_worker t (Core.Request(ticket,request) as packed) =
   let fork ?writer ()=
@@ -3211,7 +3270,7 @@ let submit_worker t (Core.Request(ticket,request) as packed) =
     with error->Option.iter(finish_writer t)writer;raise error in
   match worker_operation_scope t packed with
   |None->fork()
-  |Some scope->match reserve_writer t scope with
+  |Some(scope,cleanup)->match reserve_writer ~cleanup t scope with
     |Ok writer->fork ~writer ()
     |Error message->let error=effect_error message in
       let result=match request with
@@ -3589,26 +3648,52 @@ let quiesce_writers t ~scope =
   match outcome with
   |Error _->Error "Writer fence capacity is full."
   |Ok fence->
-    let jobs=Hashtbl.fold(fun _ job jobs->
-      if Core.Writer_fence.same_incarnation job.writer_scope scope
-      then Rrbvec.push_back jobs job else jobs)t.writer_jobs Rrbvec.empty in
+    let rec join ()=
+      let jobs=Hashtbl.fold(fun _ job jobs->
+        if Core.Writer_fence.same_incarnation job.writer_scope scope
+        then Rrbvec.push_back jobs job else jobs)t.writer_jobs Rrbvec.empty in
+      Rrbvec.iter(fun job->Eio.Promise.await job.writer_finished)jobs;
+      (* A completion can emit a deferred Detach. Cleanup admission remains open
+         behind the data fence; join its physical task and callback too. *)
+      asset_callback_barrier t;
+      if t.stopped then Error "The Worker stopped before writer settlement."
+      else if Core.Writer_fence.drained t.writer_fence fence then Ok()
+      else join () in
     Eio.Fiber.first
-      (fun()->
-        Rrbvec.iter(fun job->Eio.Promise.await job.writer_finished)jobs;
-        (* Join the actual reducer callback outlet after each captured task has
-           posted. Work emitted by those callbacks meets the permanent gate. *)
-        asset_callback_barrier t;
-        (* Parent cancellation only requests Sync cancellation. Its physical task
-           and final callback remain owned by Sync until this actual I/O join. *)
+      (fun()->Result.bind(join())(fun()->
         let children=asset_call t ~scope Sync.Await_asset_operations in
         asset_callback_barrier t;
-        if t.stopped then Error "The Worker stopped before writer settlement."
-        else match children with
-          |Ok Sync.Asset_unit when Core.Writer_fence.drained t.writer_fence fence->Ok()
-          |Ok _->Error "Graph writers remain unsettled."
-          |Error _->Error "Scoped asset child I/O did not settle.")
+        match children with
+        |Ok Sync.Asset_unit->join()
+        |Ok _->Error "Unexpected scoped asset settlement."
+        |Error _->Error "Scoped asset child I/O did not settle."))
       (fun()->Eio.Promise.await(fst t.asset_cleanup_stopped);
         Error "The Worker stopped before writer settlement.")
+;;
+
+let physical_host_scopes t =
+  let scopes=Hashtbl.fold(fun scope () scopes->Rrbvec.push_back scopes scope)t.resource_scopes Rrbvec.empty in
+  Hashtbl.fold(fun _ session scopes->Rrbvec.push_back scopes session.graph_scope)t.databases scopes
+;;
+
+let settle_host_scope t ~scope =
+  Result.bind(quiesce_writers t ~scope)(fun()->
+    let io_scope={ (Sync.effect_scope_of_graph scope) with
+      presentation_generation=None;lifecycle_generation=None;connection_generation=None } in
+    Result.bind(await_sync_io t ~scope:io_scope)(fun()->
+      let databases=Hashtbl.fold(fun id session ids->
+        if Core.Writer_fence.same_incarnation session.graph_scope scope then id::ids else ids)t.databases [] in
+      let closed=List.fold_left(fun result id->Result.bind result(fun()->
+        Result.map_error (fun _->"A physical graph database close remains unsettled.")
+          (close_database_by_id ~scope t id)))(Ok())databases in
+      Result.bind closed(fun()->
+        asset_callback_barrier t;
+        Result.bind(await_asset_cleanup t (asset_cleanup_snapshot t ~scope))(fun()->
+          Result.bind(asset_unit t ~scope Sync.Close_asset_scope)(fun()->
+            if t.stopped then Error "The Worker stopped before host scope settlement."
+            else (Hashtbl.filter_map_inplace(fun actual value->
+              if Core.Writer_fence.same_incarnation actual scope then None else Some value)t.resource_scopes;
+              Ok()))))))
 ;;
 
 let start_asset_cleanup_job ?parent ?(prepare=(fun _->())) t ~scope work =

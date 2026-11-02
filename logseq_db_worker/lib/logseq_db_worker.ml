@@ -70,11 +70,23 @@ type graph_state = Pure_reducer.graph_state =
 type local_deletion_waiter =
   { graph_id : Logseq_db_types.Graph_types.Uuid.t
   ; account_generation : int
+  ; prepared_handoff : Logseq_db_types.Graph_types.Uuid.t option
   ; mutable request : (Pure_reducer.ticket * Sync.mirror_deletion) option
   ; resolve : (unit, string) result Eio.Promise.u
   }
 
+module Host=Pure_reducer.Host_handoff
+
+type host_plan={version:int64;id:Logseq_db_types.Graph_types.Uuid.t;registration:int64;
+  owner:Sync.account_scope;change:Host.change;expected:Sync.graph_scope Rrbvec.t}
+
 type queued_event =
+  | Host_begin of host_plan * (Host.request * Host.admission,string)result Eio.Promise.u
+  | Host_settled of Host.attempt * (Logseq_overlay_db.Types.mirror_generation option,string)result
+      * (Host.receipt,string)result Eio.Promise.u
+  | Host_consume of Host.receipt * (Host.change,string)result Eio.Promise.u
+  | Host_complete of Host.receipt * (unit,string)result Eio.Promise.u
+  | Host_release_registration of int64 * (unit,string)result Eio.Promise.u
   | Event of Pure_reducer.event
   | Delete_copy of local_deletion_waiter
   | Asset_command_barrier of
@@ -91,12 +103,16 @@ type t =
   { state : Pure_reducer.state ref
   ; runner : Effect_runner.t
   ; events : queued_event Eio.Stream.t
+  ; followups : queued_event Queue.t
   ; mutable next_request_id : int64
   ; mutable stopped : bool
   ; mutable local_deletion_waiter : local_deletion_waiter option
   ; mutable coordination : coordination_snapshot
   ; mutable coordination_registration : int64
   ; mutable coordination_notify : (int64 * (coordination_snapshot -> unit)) option
+  ; mutable host_handoff : Host.t
+  ; host_stopped : unit Eio.Promise.t * unit Eio.Promise.u
+  ; host_tasks : (Logseq_db_types.Graph_types.Uuid.t,int64 * (unit Eio.Promise.t * unit Eio.Promise.u))Hashtbl.t
   ; mutable demand_registry : Pure_reducer.Demand_registry.t
   ; mutable next_asset_command_barrier : int64
   ; asset_command_waiters : (int64,(Effect_runner.asset_cleanup_snapshot,string)result Eio.Promise.u)Hashtbl.t
@@ -104,7 +120,28 @@ type t =
 
 type create_error = Invalid_create of string
 
+let host_facts t : Host.facts =
+  {authenticated=(Pure_reducer.view !(t.state)).sync.snapshot.startup.authenticated;
+   version=t.coordination.version;registration=Option.map fst t.coordination_notify;
+   account=t.coordination.state.sync.account;
+   scopes=Rrbvec.of_list(List.map fst t.coordination.state.residents);
+   catalog=Rrbvec.of_list(List.map(fun(graph:Sync.graph)->graph.graph_id)
+     (Pure_reducer.view !(t.state)).sync.snapshot.catalog)}
+;;
+let host_error=function
+  |Host.Busy->"Another host change still owns physical settlement."
+  |Retired->"This host change permission has already retired."
+  |Mismatch->"The host change receipt does not match its original owner."
+  |Owner_changed->"The host change account or registration retired."
+  |Scopes_changed->"A target execution reopened during host settlement."
+  |Baseline_changed->"The authoritative baseline changed before host preparation."
+  |Full->"Host change ownership capacity is full."
+  |Missing_copy_witness->"The local copy has no exclusive preparation witness."
+  |Not_settled->"The physical host change has not settled."
+;;
+
 let dispatch t event =
+  let refused_deletion=ref None in
   let before = !(t.state) in
   let transition = Pure_reducer.step before event in
   observe_unlock before transition event;
@@ -118,6 +155,16 @@ let dispatch t event =
         Int64.succ previous.presentation) in
     t.coordination <- {state;version=Int64.succ previous.version;presentation};
     Option.iter (fun (_,notify)->notify t.coordination) t.coordination_notify);
+  t.host_handoff<-Host.observe t.host_handoff(host_facts t);
+  (match Host.current t.host_handoff with
+   |Some(request,Host.Consumed receipt) when request.change=Host.Replace_account
+      && (match (host_facts t).account with
+          |None->true|Some account->account.user_id<>request.owner.user_id
+            || not(Uri.equal account.managed_sync_origin request.owner.managed_sync_origin)
+            || account.account_generation<>request.owner.account_generation
+            || account.lifecycle_generation<>request.owner.lifecycle_generation)->
+     let _,resolve=Eio.Promise.create() in Queue.add(Host_complete(receipt,resolve))t.followups
+   |_->());
   (match t.local_deletion_waiter with
    | None -> ()
    | Some waiter ->
@@ -135,7 +182,12 @@ let dispatch t event =
             | Pure_reducer.Run_worker (Pure_reducer.Request (ticket, Pure_reducer.Handle_sync_worker_effect (Sync.Delete_mirror request))) ->
               Some (ticket, request)
             | _ -> None) transition.effects;
-          if waiter.request = None then finish (Error "This local copy cannot be deleted now.")
+          if waiter.request = None then finish (Error "This local copy cannot be deleted now.");
+          (match waiter.prepared_handoff,waiter.request with
+           |Some handoff_id,Some(ticket,request)->
+             (match Effect_runner.bind_host_copy t.runner ~handoff_id request with
+              |Ok()->()|Error error->refused_deletion:=Some(ticket,error))
+           |_->())
         | _ -> ());
        match waiter.request, event with
        | Some (expected_ticket, expected),
@@ -146,9 +198,14 @@ let dispatch t event =
        | Some (expected_ticket, _),
          Pure_reducer.Runner_completed
            (Pure_reducer.Sync_worker_effect_completed (ticket, Error _))
-         when ticket = expected_ticket -> finish (Error "Mirror deletion failed.")
+         when ticket = expected_ticket ->finish (Error "Mirror deletion failed.")
        | _ -> ()));
-  List.iter (Effect_runner.submit t.runner) transition.effects
+  List.iter (function
+    |Pure_reducer.Run_worker(Pure_reducer.Request(ticket,Pure_reducer.Handle_sync_worker_effect(Sync.Delete_mirror _)))
+       when Option.exists(fun(actual,_)->actual=ticket)!refused_deletion->
+      let _,error=Option.get !refused_deletion in
+      Queue.add(Event(Pure_reducer.Runner_completed(Pure_reducer.Sync_worker_effect_completed(ticket,Error error))))t.followups
+    |instruction->Effect_runner.submit t.runner instruction)transition.effects
 ;;
 
 let accepts_after_shutdown = function
@@ -171,6 +228,51 @@ let coordination_live t registration=not t.stopped && Option.fold ~none:false
   ~some:(fun(id,_)->id=registration)t.coordination_notify
 
 let dispatch_queued t = function
+  |Host_begin(plan,resolve)->
+    let result=if t.stopped then Error "Worker stopped before host preparation." else
+      let captured=Host.capture ~owner:plan.owner ~change:plan.change
+        (Rrbvec.append (host_facts t).scopes (Effect_runner.physical_host_scopes t.runner)) in
+      let request:Host.request={version=plan.version;id=plan.id;registration=plan.registration;
+        owner=plan.owner;change=plan.change;expected=plan.expected;captured} in
+      let next,decision=Host.prepare t.host_handoff(host_facts t)request in
+      t.host_handoff<-next;
+      (match decision with
+       |Host.Start _->
+         Hashtbl.add t.host_tasks plan.id(plan.registration,Eio.Promise.create());
+         let previous=Option.map(fun(fence:Sync.host_fence)->fence.id)(Pure_reducer.host_fence_active !(t.state)) in
+         let target=match plan.change with Host.Close_graph id|Remove_graph(id,_)->Sync.One_graph id
+           |Replace_account|Stop_connection->All_graphs in
+         dispatch t(Pure_reducer.Sync_event(Sync.Host_fence_started{id=plan.id;owner=plan.owner;target;captured_scopes=captured;previous}));
+         if Option.exists(fun(fence:Sync.host_fence)->fence.id=plan.id)(Pure_reducer.host_fence_active !(t.state))
+         then Ok(request,decision) else Error "The physical execution gate was not admitted."
+       |_->Ok(request,decision)) in
+    ignore(Eio.Promise.try_resolve resolve result:bool)
+  |Host_settled(attempt,result,resolve)->
+    t.host_handoff<-Host.observe t.host_handoff(host_facts t);
+    t.host_handoff<-(match result with Ok copy_generation->Host.settled t.host_handoff attempt ~copy_generation
+      |Error _->Host.failed t.host_handoff attempt);
+    let result=match result,Host.current t.host_handoff with
+      |Error message,_->Error message
+      |Ok _,Some(_,Host.Safe receipt)->Ok receipt
+      |Ok _,Some(_,Host.Failed error)->Error(host_error error)
+      |_->Error "The physical host settlement retired before acknowledgement." in
+    ignore(Eio.Promise.try_resolve resolve result:bool)
+  |Host_consume(receipt,resolve)->
+    let next,result=Host.consume t.host_handoff(host_facts t)receipt in
+    t.host_handoff<-next;
+    (match result with Ok _->let request=Host.receipt_request receipt in
+      Hashtbl.add t.host_tasks request.id(request.registration,Eio.Promise.create())|Error _->());
+    ignore(Eio.Promise.try_resolve resolve(Result.map_error host_error result):bool)
+  |Host_complete(receipt,resolve)->
+    t.host_handoff<-Host.completed t.host_handoff receipt;
+    let id=(Host.receipt_request receipt).id in
+    dispatch t(Pure_reducer.Sync_event(Sync.Host_fence_released id));
+    ignore(Eio.Promise.try_resolve resolve(Ok()):bool)
+  |Host_release_registration(registration,resolve)->
+    let next,retired=Host.released_registration t.host_handoff registration in
+    t.host_handoff<-next;
+    Option.iter(fun id->dispatch t(Pure_reducer.Sync_event(Sync.Host_fence_released id)))retired;
+    ignore(Eio.Promise.try_resolve resolve(Ok()):bool)
   | Event event -> dispatch t event
   | Asset_command_barrier{serial;event;owner;data;resolve}->
     Hashtbl.remove t.asset_command_waiters serial;
@@ -191,6 +293,14 @@ let dispatch_queued t = function
       if Option.fold ~none:false ~some:(fun active -> active == waiter) t.local_deletion_waiter
       then t.local_deletion_waiter <- None;
       ignore (Eio.Promise.try_resolve waiter.resolve (Error "The graph account is no longer current.") : bool))
+;;
+
+let fresh_host_lifetime () =
+  let bytes=In_channel.with_open_bin "/dev/urandom"(fun input->really_input_string input 16) in
+  let hex=String.concat ""(List.init 16(fun n->Printf.sprintf "%02x"(Char.code bytes.[n]))) in
+  Logseq_db_types.Graph_types.Uuid.of_string(Printf.sprintf "%s-%s-4%s-8%s-%s"
+    (String.sub hex 0 8)(String.sub hex 8 4)(String.sub hex 13 3)(String.sub hex 17 3)(String.sub hex 20 12))
+  |> Result.get_ok
 ;;
 
 let create ~sw ~config ~runner_dependencies =
@@ -215,10 +325,11 @@ let create ~sw ~config ~runner_dependencies =
      | Error (Effect_runner.Invalid_create message) -> Error (Invalid_create message)
      | Ok runner ->
        let t =
-         { state = state_ref; runner; events; next_request_id = 0L; stopped = false
+         { state = state_ref; runner; events;followups=Queue.create(); next_request_id = 0L; stopped = false
          ; local_deletion_waiter = None
          ; coordination={version=0L;presentation=0L;state=Pure_reducer.coordination_state state}
          ; coordination_registration=0L;coordination_notify=None
+         ; host_handoff=Host.empty ~lifetime:(fresh_host_lifetime());host_stopped=Eio.Promise.create();host_tasks=Hashtbl.create 2
          ; demand_registry=Pure_reducer.Demand_registry.empty;next_asset_command_barrier=0L
          ; asset_command_waiters=Hashtbl.create 16 }
        in
@@ -226,7 +337,7 @@ let create ~sw ~config ~runner_dependencies =
        dispatch t Pure_reducer.Start;
        Eio.Fiber.fork ~sw (fun () ->
          while not t.stopped do
-           dispatch_queued t (Eio.Stream.take events)
+           dispatch_queued t (if Queue.is_empty t.followups then Eio.Stream.take events else Queue.take t.followups)
          done);
        Ok t)
 ;;
@@ -308,22 +419,40 @@ let release_coordination t ~registration =
   if registration>=t.coordination_registration then (
     t.coordination_registration<-registration;
     t.coordination_notify<-None);
+  let jobs=Hashtbl.fold(fun _ (owner,(promise,_)) jobs->
+    if owner=registration then promise::jobs else jobs)t.host_tasks [] in
+  List.iter Eio.Promise.await jobs;
   let error=ref None in
   let record=function Ok()->()|Error message->if !error=None then error:=Some message in
   Pure_reducer.Demand_registry.pending t.demand_registry ~registration
   |> Rrbvec.iter(fun owner->record(release_coordinated_asset_demand t ~registration ~scope:owner.Pure_reducer.Demand_registry.scope ~consumer:owner.consumer));
   record(Effect_runner.release_observations_checked t.runner ~registration);
+  (match Host.current t.host_handoff with
+   |Some(request,phase) when request.registration=registration->
+     (match phase,request.change with
+      |Host.Consumed _,(Host.Stop_connection|Replace_account)->()
+      |_->
+       Rrbvec.iter(fun scope->record(Effect_runner.settle_host_scope t.runner ~scope))request.captured;
+       record(Effect_runner.release_host_copy t.runner ~registration))
+   |_->());
   Effect_runner.retire_changefeed t.runner ~registration;
   (match !error with
    | Some message->Error message
-   | None->t.demand_registry<-Pure_reducer.Demand_registry.forget_settled t.demand_registry ~registration;Ok())
+   | None->
+     let promise,resolve=Eio.Promise.create() in
+     if not t.stopped then Eio.Stream.add t.events(Host_release_registration(registration,resolve))
+     else ignore(Eio.Promise.try_resolve resolve(Error "Worker stopped before host retirement."):bool);
+     Result.map(fun()->t.demand_registry<-Pure_reducer.Demand_registry.forget_settled t.demand_registry ~registration)
+       (Eio.Fiber.first(fun()->Eio.Promise.await promise)
+         (fun()->Eio.Promise.await(fst t.host_stopped);Error "Worker stopped before host retirement.")))
 ;;
 
 let revoke_coordination t = t.coordination_notify<-None
 
-let delete_local_copy t ~account_generation ~graph_id =
+let delete_local_copy_internal ?prepared_handoff t ~account_generation ~graph_id =
   let snapshot = (view t).sync.snapshot in
   if t.stopped || t.local_deletion_waiter <> None
+     || (prepared_handoff=None && Pure_reducer.host_fence_active !(t.state)<>None)
      || not snapshot.startup.authenticated
      || snapshot.startup.account_generation <> account_generation
      || List.exists (fun (scope:Sync.graph_scope)->scope.graph_id=graph_id) (Pure_reducer.graph_scopes !(t.state))
@@ -331,7 +460,7 @@ let delete_local_copy t ~account_generation ~graph_id =
   then Error "This local copy cannot be deleted now."
   else (
     let outcome, resolve = Eio.Promise.create () in
-    let waiter = { graph_id; account_generation; request = None; resolve } in
+    let waiter = { graph_id; account_generation; prepared_handoff;request = None; resolve } in
     t.local_deletion_waiter <- Some waiter;
     (try Eio.Stream.add t.events (Delete_copy waiter)
      with error ->
@@ -339,6 +468,10 @@ let delete_local_copy t ~account_generation ~graph_id =
        then t.local_deletion_waiter <- None;
        raise error);
     Eio.Promise.await outcome)
+;;
+
+let delete_local_copy t ~account_generation ~graph_id =
+  delete_local_copy_internal t ~account_generation ~graph_id
 ;;
 
 let request t request =
@@ -352,6 +485,7 @@ let shutdown t =
   if not t.stopped
   then (
     t.stopped <- true;
+    ignore(Eio.Promise.try_resolve(snd t.host_stopped)():bool);
     revoke_coordination t;
     Option.iter (fun waiter ->
       ignore (Eio.Promise.try_resolve waiter.resolve (Error "The Worker stopped.") : bool))
@@ -361,11 +495,20 @@ let shutdown t =
     Hashtbl.clear t.asset_command_waiters;
     dispatch t Pure_reducer.Shutdown;
     let rec drain () =
-      match Eio.Stream.take_nonblocking t.events with
+      match (if Queue.is_empty t.followups then Eio.Stream.take_nonblocking t.events else Some(Queue.take t.followups)) with
       | None -> ()
       | Some (Event event) ->
         if accepts_after_shutdown event then dispatch t event;
         drain ()
+      | Some(Host_begin(_,resolve))->
+        ignore(Eio.Promise.try_resolve resolve(Error "Worker stopped before host preparation."):bool);drain()
+      | Some(Host_settled(_,_,resolve))->
+        ignore(Eio.Promise.try_resolve resolve(Error "Worker stopped before host settlement."):bool);drain()
+      | Some(Host_consume(_,resolve))->
+        ignore(Eio.Promise.try_resolve resolve(Error "Worker stopped before host consumption."):bool);drain()
+      | Some(Host_release_registration(_,resolve))
+      | Some(Host_complete(_,resolve))->
+        ignore(Eio.Promise.try_resolve resolve(Error "Worker stopped before host action completion."):bool);drain()
       | Some(Asset_command_barrier{resolve;_})->
         ignore(Eio.Promise.try_resolve resolve(Error "The Worker stopped before resource settlement."):bool);drain()
       | Some (Delete_copy waiter) ->
@@ -572,4 +715,62 @@ let quiesce_writers t ~registration ~scope =
   then Error "The writer fence owner is no longer current." else
   Result.bind(Effect_runner.quiesce_writers t.runner ~scope)(fun()->
     if coordination_current t ~registration then Ok() else Error "The writer fence binding retired.")
+;;
+
+let await_host_command t make =
+  if t.stopped then Error "Worker stopped before host command admission." else
+  let promise,resolve=Eio.Promise.create() in
+  Eio.Stream.add t.events(make resolve);
+  Eio.Fiber.first (fun()->Eio.Promise.await promise)
+    (fun()->Eio.Promise.await(fst t.host_stopped);Error "Worker stopped before host acknowledgement.")
+;;
+
+let finish_host_task t id =match Hashtbl.find_opt t.host_tasks id with
+  |None->()|Some(_,(_,resolve))->Hashtbl.remove t.host_tasks id;
+    ignore(Eio.Promise.try_resolve resolve():bool)
+;;
+
+let prepare_host_change t plan = Eio.Cancel.protect(fun()->
+  let started=ref false in
+  Fun.protect ~finally:(fun()->if !started then finish_host_task t plan.id)(fun()->
+  Result.bind(await_host_command t(fun resolve->Host_begin(plan,resolve)))(fun(request,decision)->
+    match decision with
+    |Host.Refused error|Existing(Failed error)->Error(host_error error)
+    |Existing(Safe receipt)->Ok receipt
+    |Existing(Consumed _)->Error "This host permission has already been consumed."
+    |Existing Preparing->Error "This host preparation is still running."
+    |Start attempt->
+      started:=true;
+      let settled=Rrbvec.fold_left(fun result scope->Result.bind result(fun()->
+        Effect_runner.settle_host_scope t.runner ~scope))(Ok())request.captured in
+      let settled=Result.bind settled(fun()->
+        match request.change with
+        |Host.Replace_account|Stop_connection->
+          let scope={ (Sync.effect_scope_of_account request.owner) with
+            presentation_generation=None;lifecycle_generation=None } in
+          Effect_runner.await_sync_io t.runner ~scope
+        |Close_graph _|Remove_graph _->Ok()) in
+      let settled=Result.bind settled(fun()->
+        match request.change with
+        |Host.Remove_graph(graph_id,_)->Effect_runner.prepare_host_copy t.runner
+          ~registration:request.registration ~handoff_id:request.id ~owner:request.owner ~graph_id
+          |> Result.map Option.some
+        |Close_graph _|Replace_account|Stop_connection->Ok None) in
+      await_host_command t(fun resolve->Host_settled(attempt,settled,resolve)))))
+;;
+
+let apply_host_change t receipt = Eio.Cancel.protect(fun()->
+  let request=Host.receipt_request receipt in
+  let started=ref false in
+  Fun.protect ~finally:(fun()->if !started then finish_host_task t request.id)(fun()->
+    Result.bind(await_host_command t(fun resolve->Host_consume(receipt,resolve)))(fun change->
+      started:=true;
+      match change with
+      |Host.Close_graph _->await_host_command t(fun resolve->Host_complete(receipt,resolve))
+      |Replace_account|Stop_connection->Ok()
+      |Remove_graph(graph_id,_)->
+        let result=delete_local_copy_internal ~prepared_handoff:request.id t
+          ~account_generation:request.owner.account_generation ~graph_id in
+        Result.bind(Effect_runner.release_host_copy t.runner ~registration:request.registration)(fun()->
+          Result.bind(await_host_command t(fun resolve->Host_complete(receipt,resolve)))(fun()->result)))))
 ;;

@@ -46,19 +46,15 @@ let accepted = function
 
 let await_response client request_id =
   let rec loop () =
-    match
-      Worker.For_testing.drain_events client ~max_events:64
-      |> List.find_map (function
-        | Worker.Response { request_id = actual; outcome = Completed response; _ }
-          when ID.Worker.Request_id.equal request_id actual -> Some response
-        | Response _ | Push _ | Terminal _ -> None)
-    with
-    | Some response -> response
-    | None ->
-      Worker.For_testing.await_output client;
-      loop ()
-  in
-  loop ()
+    match Worker.For_testing.drain_events client ~max_events:64 |> List.find_map(function
+      |Worker.Response{request_id=actual;outcome;_}when ID.Worker.Request_id.equal request_id actual->Some outcome
+      |_->None)with
+    |Some(Worker.Completed response)->response
+    |Some(Failed message)->T.fail "expected completed response: %s" message
+    |Some Cancelled->T.fail "expected response was canceled"
+    |Some Shutdown->T.fail "Worker stopped before expected response"
+    |None->Worker.For_testing.await_output client;loop() in
+  loop()
 ;;
 
 let with_client config run =
@@ -143,6 +139,32 @@ let test_coordination_registration () =
     T.require (next.registration=21L) "new binding was not admitted";
     ignore(send (Service.Release_coordination 10L));
     T.require ((baseline 21L).registration=21L) "old unregister retired a newer binding"))
+;;
+
+(* Service owns registration and serial handoff commands. Core-only tests
+   cannot prove that this real mailbox routes a receipt to its physical owner. *)
+let test_host_handoff_real_service_single_use () =
+  let module H=Logseq_db_worker_pure_reducer.Core.Host_handoff in
+  T.with_managed(fun fixture->with_client fixture.config(fun client->
+    let send request=await_response client(Worker.send client request |> accepted) in
+    ignore(send(Service.Client_command(Restore_local_account{user_id="host-synthetic"})));
+    let baseline=match send(Service.Register_coordination 71L)with
+      |Coordination_registered value->value|_->T.fail "host baseline" in
+    let owner=Option.get baseline.baseline.state.sync.account in
+    let plan:Logseq_db_worker.host_plan={version=baseline.baseline.version;
+      id=Logseq_db_types.Graph_types.Uuid.of_string "00000000-0000-4000-8000-000000079071" |> Result.get_ok;
+      registration=71L;owner;change=H.Stop_connection;expected=Rrbvec.empty} in
+    let receipt=match send(Service.Coordination_prepare_host_change plan)with
+      |Coordination_host_prepared receipt->receipt|_->T.fail "missing actual host receipt" in
+    T.require ((H.receipt_request receipt).id=plan.id) "actual receipt changed its handoff identity";
+    (match send(Service.Coordination_apply_host_change receipt)with
+     |Coordination_host_applied id->T.require(id=plan.id)"actual consumed ACK changed identity"
+     |_->T.fail "missing actual consume ACK");
+    let id=Worker.send client(Service.Coordination_apply_host_change receipt) |> accepted in
+    let rec terminal ()=match Worker.For_testing.drain_events client ~max_events:64 |> List.find_map(function
+      |Worker.Response{request_id;outcome;_}when ID.Worker.Request_id.equal id request_id->Some outcome|_->None)with
+      |Some(Worker.Failed _)->()|Some _->T.fail "same host permit consumed twice"
+      |None->Worker.For_testing.await_output client;terminal() in terminal()))
 ;;
 
 let test_managed_worker_starts_closed_and_replies_with_v2_envelope () =
@@ -1374,7 +1396,7 @@ let test_local_copy_presence mode () =
     let cache = Core.catalog_cache ~user_id:user ~graphs:[graph] ~selected_graph:None in
     Out_channel.with_open_bin (Filename.concat catalogs (name ^ ".json"))
       (fun output -> output_string output (Core.encode_catalog_cache cache));
-    if List.mem mode ["downloaded"; "corrupt"; "delete"; "busy"] then (
+    if List.mem mode ["downloaded"; "corrupt"; "delete"; "busy"; "handoff"] then (
       let mirrors = Filename.concat directory "synced-graphs" in
       Unix.mkdir mirrors 0o700;
       let mirror = Filename.concat mirrors (G.Uuid.to_string graph_id) in
@@ -1421,10 +1443,38 @@ let test_local_copy_presence mode () =
         T.require (actual = request) "presence result retains exact identity";
         (match mode, result with
          | "absent", Ok Service.Not_downloaded
-         | ("downloaded" | "corrupt" | "delete" | "busy"), Ok Service.Downloaded -> ()
+         | ("downloaded" | "corrupt" | "delete" | "busy" | "handoff"), Ok Service.Downloaded -> ()
          | ("stale" | "unauthorized"), Error _ -> ()
          | _ -> T.fail "unexpected presence result for %s" mode);
-        if List.mem mode ["delete"; "busy"] then (
+        if mode="handoff" then (
+          let module H=Logseq_db_worker_pure_reducer.Core.Host_handoff in
+          let send request=await_response client(Worker.send client request |> accepted) in
+          let baseline=match send(Service.Register_coordination 72L)with
+            |Service.Coordination_registered value->value|_->T.fail "missing removal baseline" in
+          let plan:Logseq_db_worker.host_plan={version=baseline.baseline.version;
+            id=G.Uuid.of_string "94000000-0000-4000-8000-000000079072" |> Result.get_ok;
+            registration=72L;owner=Option.get baseline.baseline.state.sync.account;
+            change=H.Remove_graph(graph_id,H.Force);expected=Rrbvec.of_list(List.map fst baseline.baseline.state.residents)} in
+          let receipt=match send(Service.Coordination_prepare_host_change plan)with
+            |Service.Coordination_host_prepared value->value|_->T.fail "missing prepared copy receipt" in
+          T.require(Option.is_some(H.receipt_copy_generation receipt))"removal receipt lacks the actual held copy generation";
+          T.require(Sys.file_exists mirror_directory)"preparing permission removed its copy";
+          (match send(Service.Delete_local_copy request)with
+           |Service.Local_copy_deleted(_,Error _)->()|_->T.fail "legacy deletion bypassed the held host owner");
+          (match send(Service.Coordination_apply_host_change receipt)with
+           |Service.Coordination_host_applied id->T.require(id=plan.id)"removal ACK changed handoff identity"
+           |_->T.fail "actual prepared copy did not commit");
+          T.require(not(Sys.file_exists mirror_directory))"consumed removal did not retire the physical namespace";
+          Unix.mkdir mirror_directory 0o700;
+          let replacement=Filename.concat mirror_directory "replacement-fixture" in
+          Out_channel.with_open_bin replacement(fun output->output_string output "new synthetic incarnation");
+          let id=Worker.send client(Service.Coordination_apply_host_change receipt) |> accepted in
+          let rec terminal ()=match Worker.For_testing.drain_events client ~max_events:64 |> List.find_map(function
+            |Worker.Response{request_id;outcome;_}when ID.Worker.Request_id.equal id request_id->Some outcome|_->None)with
+            |Some(Worker.Failed _)->()|Some _->T.fail "old removal permission consumed twice"
+            |None->Worker.For_testing.await_output client;terminal() in terminal();
+          T.require(Sys.file_exists replacement)"old permission removed a replacement namespace")
+        else if List.mem mode ["delete"; "busy"] then (
           let lock = if mode <> "busy" then None else (
             let db = Sqlite3.db_open (Filename.concat mirror_directory ".logseq-overlay-owner.sqlite") in
             Sqlite3.Rc.check (Sqlite3.exec db "CREATE TABLE owner_primitive (protocol INTEGER NOT NULL); BEGIN IMMEDIATE");
@@ -1785,6 +1835,7 @@ let () =
     ; T.case "slow cancel cleanup joins before terminal" (test_discarded_success_is_settled ~slow:true `Cancel)
     ; T.case "slow stop cleanup joins before terminal and shutdown" (test_discarded_success_is_settled ~slow:true `Stop)
     ; T.case "registered baseline and release fences" test_coordination_registration
+    ; T.case "real host receipt is single-use" test_host_handoff_real_service_single_use
     ; T.case "resident invalidations preserve all graphs" test_resident_invalidations_survive_coalescing
     ; T.case "observation invalidations bounded latest epochs" test_observation_invalidations_are_bounded_latest_facts
     ; T.case "typed asset failures reach ledger" test_asset_failure_rows
@@ -1794,6 +1845,7 @@ let () =
     ; T.case "strict authoritative detail rows" test_authoritative_detail_rows
     ; T.case "authoritative category row allowlist" test_authoritative_diagnostic_rows
     ; T.case "ignored restore failure reaches scoped safe Diagnostics" test_restore_error_reaches_diagnostics
+    ; T.case "real one-use removal owns prepared copy" (test_local_copy_presence "handoff")
     ; T.case "local copy confirmed deletion awaits physical removal" (test_local_copy_presence "delete")
     ; T.case "local copy busy failure recovers" (test_local_copy_presence "busy")
     ; T.case "local copy absent metadata" (test_local_copy_presence "absent")

@@ -906,6 +906,68 @@ let test_scope_close_keeps_live_staged_lease () =
     Alcotest.(check bool) "close retries after physical lease release" true(retried=Ok Sync.Asset_unit))
 ;;
 
+(* Physical cache/lease ownership is outside Core.step; exercise the real Sync
+   storage owner through the Worker interpreter, not an injected successful ACK. *)
+let test_host_scope_settlement_preserves_live_lease () =
+  with_asset_bridge ~asynchronous:true ~asynchronous_io:true(fun fixture->
+    let source=picker_import fixture.support 961 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
+    let lease,path=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation |> Option.get in
+    ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
+    let first=Runner.settle_host_scope fixture.runner ~scope:fixture.context.scope in
+    Alcotest.(check bool) "actual live lease prevents host settlement" true(Result.is_error first);
+    Alcotest.(check bool) "failed settlement preserves retained bytes" true(Sys.file_exists path);
+    let released=Runner.release_asset_file_checked fixture.runner ~scope:fixture.context.scope ~handle:lease in
+    Alcotest.(check bool) "original release succeeds behind admission fence" true(released=Ok());
+    let second=Runner.settle_host_scope fixture.runner ~scope:fixture.context.scope in
+    Alcotest.(check bool) "host settlement succeeds only after actual release" true(second=Ok());
+    Alcotest.(check bool) "settled retired file is removed" false(Sys.file_exists path))
+;;
+
+(* The bounded actor queue is outside Core.step. Fill it inside the registered
+   snapshot callback before automatic host follow-up; the consumer must not wait
+   for itself to make room. All data and account identities are isolated. *)
+let test_host_followup_survives_full_actor_queue () =
+  T.with_managed(fun fixture->Eio_main.run(fun env->Eio.Switch.run(fun sw->
+    let module Db=Logseq_db_worker in
+    let worker=ref None in
+    let post event=Option.iter(fun worker->Db.post worker(Core.Sync_event event))!worker in
+    let sync_runner=Runner.sync_runner ~shutdown:(fun()->()) ~submit:(function
+      |Sync.Request(ticket,Sync.Load_catalog _)->post(Sync.Runner_completed(Sync.Completion(ticket,Ok None)))
+      |Sync.Await_io(id,scope)->post(Sync.IO_fence_completed(id,scope,Ok()))
+      |_->())() in
+    let dependencies=Runner.dependencies ~config:fixture.config ~overlay:fixture.overlay ~sync_runner
+      ~runtime:(Runner.runtime ~fork:(fun ~sw task->Eio.Fiber.fork ~sw task)
+        ~sleep:(Eio.Time.sleep(Eio.Stdenv.clock env)) |> Result.get_ok) ~publish:(fun _->()) |> Result.get_ok in
+    let db=Db.create ~sw ~config:(Core.config ~worker:fixture.config ~sync:(asset_sync_config()))
+      ~runner_dependencies:dependencies |> Result.get_ok in
+    worker:=Some db;
+    Fun.protect ~finally:(fun()->Db.shutdown db)(fun()->
+      let latest=ref None and armed=ref false and filled=ref false in
+      let notify (snapshot:Db.coordination_snapshot)=
+        latest:=Some snapshot;
+        if !armed && not !filled && snapshot.state.sync.account=None then (
+          filled:=true;
+          for _=1 to 256 do Db.post db(Core.Set_foreground false) done;
+          Eio.Fiber.fork ~sw(fun()->post(Sync.Restore_local_account{user_id="host-queue-next"}))) in
+      ignore(Db.register_coordination db ~registration:79L ~notify |> Result.get_ok);
+      post(Sync.Restore_local_account{user_id="host-queue-old"});
+      Eio.Time.with_timeout_exn(Eio.Stdenv.clock env) 2.(fun()->
+        while not(Option.exists(fun(snapshot:Db.coordination_snapshot)->snapshot.state.sync.account<>None)!latest)do Eio.Fiber.yield()done;
+        let snapshot=Option.get !latest in
+        let owner=Option.get snapshot.state.sync.account in
+        let plan:Db.host_plan={version=snapshot.version;registration=79L;owner;
+          id=Logseq_db_types.Graph_types.Uuid.of_string "10000000-0000-4000-8000-000000079079" |> Result.get_ok;
+          change=Core.Host_handoff.Replace_account;expected=Rrbvec.empty} in
+        let receipt=Db.prepare_host_change db plan |> Result.get_ok in
+        ignore(Db.apply_host_change db receipt |> Result.get_ok);
+        armed:=true;post(Sync.Account_authenticated{user_id=None});
+        while not(Option.exists(fun(snapshot:Db.coordination_snapshot)->
+          Option.exists(fun(account:Sync.account_scope)->account.user_id="host-queue-next")snapshot.state.sync.account)!latest)
+        do Eio.Fiber.yield()done;
+        Alcotest.(check bool) "consumer drains full queue across internal follow-up" true !filled)))))
+;;
+
 let test_asset_io_barrier_does_not_block_serial_submit () =
   T.with_managed(fun fixture->Eio_main.run(fun env->Eio.Switch.run(fun sw->
     let tasks=Queue.create() and events=ref [] in
@@ -2814,7 +2876,9 @@ let () =
         ] )
     ; ( "unlock diagnostics", [Alcotest.test_case "typed finite runner observations" `Quick test_unlock_runner_logging] )
     ; ( "contract"
-      , [ Alcotest.test_case "Worker Sync IO fence correlates actual child" `Quick test_worker_sync_io_fence_correlates_real_child
+      , [ Alcotest.test_case "host internal followup survives full actor queue" `Quick test_host_followup_survives_full_actor_queue
+        ; Alcotest.test_case "host scope settlement preserves real lease" `Quick test_host_scope_settlement_preserves_live_lease
+        ; Alcotest.test_case "Worker Sync IO fence correlates actual child" `Quick test_worker_sync_io_fence_correlates_real_child
         ; Alcotest.test_case "Sync IO fence joins nonasset callback" `Quick test_sync_io_fence_joins_nonasset_callback
         ; Alcotest.test_case "scope close keeps live staged lease" `Quick test_scope_close_keeps_live_staged_lease
         ; Alcotest.test_case "asset IO barrier submit stays nonblocking" `Quick test_asset_io_barrier_does_not_block_serial_submit

@@ -240,6 +240,8 @@ type observation_signal =
   | Observation_invalidated of observation_invalidation
   | Observations_resync
 type request =
+  | Coordination_prepare_host_change of Logseq_db_worker.host_plan
+  | Coordination_apply_host_change of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt
   | Coordination_quiesce_writers of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_import of
@@ -318,6 +320,8 @@ type request =
       }
 
 type response =
+  | Coordination_host_prepared of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt
+  | Coordination_host_applied of Logseq_db_types.Graph_types.Uuid.t
   | Coordination_writers_quiesced of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_imported of

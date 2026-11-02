@@ -46,9 +46,10 @@ let release owner =
   if owner.released
   then Ok ()
   else (
-    owner.released <- true;
     (match Sqlite3.exec owner.database "ROLLBACK" with
      | result when Sqlite3.Rc.is_success result -> ()
      | _ -> Printf.eprintf "journal: phase=cleanup operation=releaseOwnership code=rollbackPending recovery=reopen\n%!");
-    close owner.database)
+    match close owner.database with
+    |Ok()->owner.released<-true;Ok()
+    |Error _ as failure->failure)
 ;;

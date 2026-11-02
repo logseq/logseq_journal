@@ -162,6 +162,12 @@ type graph_scope =
   ; graph_generation : graph_generation
   }
 
+(** Execution admission gate owned by a pending host handoff. It grants no
+    deletion authority. Release is exact-ID and cannot unfreeze a later round. *)
+type host_fence_target=One_graph of graph_id|All_graphs
+type host_fence={id:Logseq_db_types.Graph_types.Uuid.t;owner:account_scope;
+  target:host_fence_target;captured_scopes:graph_scope Rrbvec.t;previous:Logseq_db_types.Graph_types.Uuid.t option}
+
 type connection_scope =
   { graph : graph_scope
   ; connection_generation : connection_generation
@@ -597,6 +603,8 @@ type timeline_scope =
   }
 
 type event =
+  | Host_fence_started of host_fence
+  | Host_fence_released of Logseq_db_types.Graph_types.Uuid.t
   | IO_fence_requested of int64 * effect_scope
   | IO_fence_completed of int64 * effect_scope * (unit,string) result
   | Asset_requested of asset_request
@@ -688,3 +696,6 @@ type coordination_state =
     exact local deletion flight. Execution identity excludes focus generations;
     selected carries the current presentation separately. No IO or registration. *)
 val coordination_state : t -> coordination_state
+
+val host_fence_blocks : t -> graph_id -> bool
+val host_fence_active : t -> host_fence option

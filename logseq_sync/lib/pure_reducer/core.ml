@@ -38,6 +38,13 @@ type graph_scope =
   ; graph_generation : graph_generation
   }
 
+(** Execution admission gate owned by a pending host handoff. It grants no
+    deletion authority. Release is exact-ID and cannot unfreeze a later round. *)
+module Host_cleanup_scopes=Set.Make(struct type t=graph_scope let compare=Stdlib.compare end)
+type host_fence_target=One_graph of graph_id|All_graphs
+type host_fence={id:Logseq_db_types.Graph_types.Uuid.t;owner:account_scope;
+  target:host_fence_target;captured_scopes:graph_scope Rrbvec.t;previous:Logseq_db_types.Graph_types.Uuid.t option}
+
 type connection_scope =
   { graph : graph_scope
   ; connection_generation : connection_generation
@@ -797,6 +804,8 @@ type timeline_scope =
   }
 
 type event =
+  | Host_fence_started of host_fence
+  | Host_fence_released of Logseq_db_types.Graph_types.Uuid.t
   | IO_fence_requested of int64 * effect_scope
   | IO_fence_completed of int64 * effect_scope * (unit,string) result
   | Asset_requested of asset_request
@@ -938,7 +947,9 @@ type graph_session =
   }
 
 type t =
-  { resident_order : graph_id list
+  { host_fence : host_fence option
+  ; host_cleanup_scopes : Host_cleanup_scopes.t
+  ; resident_order : graph_id list
   ; resident_sessions : graph_session list
   ; resident_next_generation : int
   ; resident_enabled : bool
@@ -1024,7 +1035,9 @@ let initial config =
     }
   in
   Ok
-    { resident_order = []
+    { host_fence = None
+    ; host_cleanup_scopes = Host_cleanup_scopes.empty
+    ; resident_order = []
     ; resident_sessions = []
     ; resident_next_generation = 0
     ; resident_enabled = false
@@ -1562,7 +1575,11 @@ let is_graph_key_access (Pending_effect ticket) =
   | _ -> false
 ;;
 
+let host_fence_blocks core graph_id=match core.host_fence with
+  |None->false|Some fence->match fence.target with All_graphs->true|One_graph id->id=graph_id
+;;
 let select_graph_transition core ~persist graph_id =
+  if host_fence_blocks core graph_id then unchanged core else
   match core.user_id, graph_in_catalog core.public_state.snapshot.catalog graph_id with
   | Some user_id, Some graph ->
     let graph_generation = max core.resident_next_generation core.public_state.snapshot.startup.graph_generation + 1 in
@@ -3111,6 +3128,7 @@ let step core event =
   then unchanged core
   else (
     match event with
+    | Host_fence_started _ | Host_fence_released _
     | IO_fence_requested _ | IO_fence_completed _ -> unchanged core
     | Sign_in_requested scope when startup_scope_is_current core scope ->
       let next=network_phase core Online_by_user in {next;effects=[publish next]}
@@ -3625,6 +3643,8 @@ let request_asset core (request : asset_request) =
             && scope.graph_id = request.scope.graph_id in
           Option.fold ~none:false ~some:same_target core.deletion_scope
           || Option.fold ~none:false ~some:same_target core.current_graph_scope
+        | Close_asset_scope|Await_asset_operations->List.mem request.scope core.asset_known_scopes
+          || Host_cleanup_scopes.mem request.scope core.host_cleanup_scopes
         | _ -> List.mem request.scope core.asset_known_scopes
       in
       if known
@@ -4271,7 +4291,19 @@ let session_for_effect core (scope : effect_scope) =
     (scope.graph_generation=Some s.graph_generation && scope.account_generation=Some s.account.account_generation)
     || List.exists (fun (Pending_effect ticket)->ticket.scope=scope) session.saved_pending_effects)
     (remember_current core).resident_sessions
+let private_deletion_asset_scope core (scope:graph_scope)=
+  Option.exists(fun (owner:graph_scope)->owner.graph_id=scope.graph_id && owner.account=scope.account)core.deletion_scope
+;;
 let event_graph_scope core = function
+  |Asset_requested{scope;action=(Close_asset_scope|Await_asset_operations);_}
+    when Host_cleanup_scopes.mem scope core.host_cleanup_scopes->None
+  |Runner_completed(Asset_completion(ticket,_))
+    when (match ticket.asset_request.action with Close_asset_scope|Await_asset_operations->true|_->false)
+      && Host_cleanup_scopes.mem ticket.asset_request.context.scope core.host_cleanup_scopes->None
+  |Asset_requested {scope;action=(Prepare_graph_asset_deletion _|Commit_graph_asset_deletion _|Cancel_graph_asset_deletion _);_}
+    when private_deletion_asset_scope core scope->None
+  |Runner_completed(Asset_completion(ticket,_))
+    when private_deletion_asset_scope core ticket.asset_request.context.scope->None
   | Asset_requested ({scope;action;_} as request) when asset_cleanup_action action ->
     (match List.find_opt (fun session->List.mem scope session.saved_asset_known_scopes)
       (remember_current core).resident_sessions with
@@ -4370,6 +4402,7 @@ let valid_residents core ids =
   List.length ids<=3 && List.length (List.sort_uniq compare ids)=List.length ids
   && List.for_all (fun id -> Option.is_some (graph_in_catalog core.public_state.snapshot.catalog id)) ids
 let configure_residents core ids =
+  let ids=List.filter(fun id->not(host_fence_blocks core id))ids in
   if not (valid_residents core ids) then unchanged core else
   let old_visible=visible_identity core in
   let core=remember_current {core with resident_enabled=true} in
@@ -4385,7 +4418,7 @@ let configure_residents core ids =
     let base = match core.current_graph_scope with
       | Some _ -> empty_session core
       | None -> let blank=initial core.config |> Result.get_ok in
-        let base={blank with user_id=core.user_id;next_effect_id=core.next_effect_id;
+        let base={blank with host_fence=core.host_fence;host_cleanup_scopes=core.host_cleanup_scopes;user_id=core.user_id;next_effect_id=core.next_effect_id;
           resident_order=core.resident_order;resident_enabled=true;resident_sessions=core.resident_sessions;
           resident_next_generation=core.resident_next_generation;foreground=core.foreground;
           lifecycle_generation=core.lifecycle_generation;public_state=core.public_state} in
@@ -4545,3 +4578,39 @@ let step core = function
   |IO_fence_completed _->unchanged core
   |event->step core event
 ;;
+
+let step core = function
+  |Host_fence_started fence->
+    let current=Option.map(account_scope core)core.user_id in
+    let owner_matches=Option.exists(fun (owner:account_scope)->
+      Uri.equal owner.managed_sync_origin fence.owner.managed_sync_origin
+      && owner.user_id=fence.owner.user_id && owner.account_generation=fence.owner.account_generation
+      && owner.lifecycle_generation=fence.owner.lifecycle_generation)current in
+    let replace_matches=match core.host_fence,fence.previous with
+      |None,None->true
+      |Some old,Some previous->old.id=previous && old.target=fence.target
+      |Some old,None->old.id=fence.id && old.target=fence.target
+      |_->false in
+    if not owner_matches || not replace_matches || Rrbvec.length fence.captured_scopes>8192 then unchanged core else
+    let residents=resident_graphs core in
+    let core=remember_current{core with host_fence=Some fence;
+      host_cleanup_scopes=Rrbvec.fold_left(fun scopes scope->Host_cleanup_scopes.add scope scopes)Host_cleanup_scopes.empty fence.captured_scopes;
+      resident_enabled=true;resident_order=residents} in
+    let closed=configure_residents core(List.filter(fun id->not(host_fence_blocks core id))residents) in
+    (match fence.target with
+    |One_graph _->closed
+    |All_graphs->
+      let scope={ (effect_scope_of_account fence.owner) with
+        presentation_generation=None;lifecycle_generation=None } in
+      {closed with effects=Run(Cancel_effects scope)::closed.effects})
+  |Host_fence_released id->
+    (match core.host_fence with
+     |Some fence when fence.id=id->let next={core with host_fence=None;host_cleanup_scopes=Host_cleanup_scopes.empty} in {next;effects=[publish next]}
+     |_->unchanged core)
+  |Account_authenticated{user_id=Some user} when core.user_id=Some user
+      && Option.exists(fun fence->fence.target=All_graphs)core.host_fence->unchanged core
+  |(Catalog_refresh_requested _|Sign_in_requested _|Online_recovery_requested _)
+    when Option.exists(fun fence->fence.target=All_graphs)core.host_fence->unchanged core
+  |event->step core event
+;;
+let host_fence_active core=core.host_fence

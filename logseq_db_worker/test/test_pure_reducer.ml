@@ -2064,6 +2064,8 @@ let test_writer_fence_physical_completion () =
   let second=Result.get_ok second in
   let frozen,fence=F.freeze state scope in
   let fence=Result.get_ok fence in
+  let frozen,cleanup=F.admit_cleanup frozen scope in
+  let cleanup=Result.get_ok cleanup in
   Alcotest.(check bool) "freeze cannot assert physical completion" false(F.drained frozen fence);
   let unchanged,denied=F.admit frozen focus in
   Alcotest.(check bool) "focus/lifecycle change cannot bypass closed incarnation" true
@@ -2073,7 +2075,7 @@ let test_writer_fence_physical_completion () =
   let partial=F.finish elsewhere first in
   Alcotest.(check bool) "one completion does not settle another writer" false(F.drained partial fence);
   Alcotest.(check bool) "duplicate completion is inert" true(F.finish partial first=partial);
-  let drained=F.finish partial second in
+  let drained=F.finish (F.finish partial second) cleanup in
   Alcotest.(check bool) "only actual captured writers must finish" true(F.drained drained fence);
   Alcotest.(check bool) "previous immutable state still pending" false(F.drained frozen fence);
   let _,same=F.freeze drained focus in
@@ -2112,6 +2114,180 @@ let test_writer_fence_properties () =
     let random=Random.State.make[|0xF3AC;seed|] in
     let actions=[0;0;2;3;4;3;0;5;7;8] @ List.init 80(fun _->Random.State.int random 20) in
     if fails actions then Alcotest.failf "writer fence seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+
+let test_host_gate_keeps_other_graph_live () =
+  let opened,first,second=resident_worker_fixture() in
+  let id=uuid "10000000-0000-4000-8000-000000079001" in
+  let owner=Option.get(Core.coordination_state opened).sync.account in
+  let fence:Sync.host_fence={id;owner;target=One_graph first.graph_id;captured_scopes=Rrbvec.singleton first;previous=None} in
+  let closed=Core.step opened(Sync_event(Sync.Host_fence_started fence)) in
+  Alcotest.(check bool) "host gate withdraws only target execution" true
+    (List.for_all(fun(scope:Sync.graph_scope)->scope.graph_id<>first.graph_id)(Core.graph_scopes closed.next)
+     && List.exists(fun(scope:Sync.graph_scope)->scope.graph_id=second)(Core.graph_scopes closed.next));
+  let blocked=Core.step closed.next(Sync_event(Sync.Graph_selected first.graph_id)) in
+  Alcotest.(check bool) "target cannot reopen during physical settlement" true
+    (not(List.exists(fun(scope:Sync.graph_scope)->scope.graph_id=first.graph_id)(Core.graph_scopes blocked.next)));
+  let configured=Core.step blocked.next(Sync_event(Sync.Resident_graphs_changed[first.graph_id;second])) in
+  Alcotest.(check bool) "configuration cannot bypass target gate" true
+    (not(List.exists(fun(scope:Sync.graph_scope)->scope.graph_id=first.graph_id)(Core.graph_scopes configured.next)));
+  let wrong=Core.step configured.next(Sync_event(Sync.Host_fence_released(uuid "10000000-0000-4000-8000-000000079099"))) in
+  Alcotest.(check bool) "foreign release cannot open target" true(Core.host_fence_blocks wrong.next first.graph_id);
+  let released=Core.step wrong.next(Sync_event(Sync.Host_fence_released id)) in
+  let reopened=Core.step released.next(Sync_event(Sync.Resident_graphs_changed[first.graph_id;second])) in
+  Alcotest.(check bool) "fresh execution only after exact fence release" true
+    (List.exists(fun(scope:Sync.graph_scope)->scope.graph_id=first.graph_id && scope.graph_generation>first.graph_generation)
+      (Core.graph_scopes reopened.next))
+;;
+
+let test_host_deletion_private_resource_owner () =
+  let opened,first,_=resident_worker_fixture() in
+  let owner=Option.get(Core.coordination_state opened).sync.account in
+  let id=uuid "10000000-0000-4000-8000-000000079003" in
+  let fenced=Core.step opened(Sync_event(Sync.Host_fence_started{id;owner;target=One_graph first.graph_id;captured_scopes=Rrbvec.singleton first;previous=None})) in
+  let deleting=Core.step fenced.next(Sync_event(Sync.Local_cache_deletion_requested first.graph_id)) in
+  let request=List.find_map(function
+    |Core.Run_worker(Core.Request(_,Core.Handle_sync_worker_effect(Sync.Delete_mirror request)))->Some request|_->None)deleting.effects
+    |> Option.get in
+  let scope:Sync.graph_scope={account=request.account;graph_id=request.graph_id;graph_generation=0} in
+  let retirement=Sync.retirement_id_of_string "10000000-0000-4000-8000-000000079004" |> Result.get_ok in
+  let started=Core.step deleting.next(Sync_event(Sync.Asset_requested
+    {scope;operation="host-private-delete";action=Prepare_graph_asset_deletion retirement})) in
+  let ticket=List.find_map(function
+    |Core.Run_sync(Sync.Asset_io(ticket,{context;action=Prepare_graph_asset_deletion actual;_}))
+      when context.scope=scope && actual=retirement->Some ticket|_->None)started.effects in
+  Alcotest.(check bool) "private deletion resource request reaches its actual owner" true(Option.is_some ticket);
+  let deletion=Sync.asset_deletion_reference ~scope ~retirement in
+  let completed=Core.step started.next(Sync_event(Sync.Runner_completed(Sync.Asset_completion
+    (Option.get ticket,Ok(Sync.Asset_deletion_prepared deletion))))) in
+  Alcotest.(check bool) "private deletion result reaches original Worker waiter" true
+    (List.exists(function Core.Deliver_asset_result output->output.request.operation="host-private-delete"
+      && output.result=Ok(Sync.Asset_deletion_prepared deletion)|_->false)completed.effects)
+;;
+
+let test_account_host_gate_blocks_new_catalog_producer () =
+  let opened,_,_=resident_worker_fixture() in
+  let owner=Option.get(Core.coordination_state opened).sync.account in
+  let id=uuid "10000000-0000-4000-8000-000000079002" in
+  let closed=Core.step opened(Sync_event(Sync.Host_fence_started{id;owner;target=All_graphs;captured_scopes=Rrbvec.of_list(Core.graph_scopes opened);previous=None})) in
+  let startup=(Core.view closed.next).sync.snapshot.startup in
+  let refresh=Core.step closed.next(Sync_event(Sync.Catalog_refresh_requested
+    {account_generation=startup.account_generation;presentation_generation=startup.presentation_generation})) in
+  Alcotest.(check bool) "account handoff cannot start another catalog producer" false
+    (List.exists(function Core.Run_sync(Sync.Request(_,Sync.Fetch_catalog _))->true|_->false)refresh.effects)
+;;
+
+let test_host_handoff_single_use_and_reopen () =
+  let module H=Core.Host_handoff in
+  let _,scope=worker_open_graph() in
+  let facts:H.facts={authenticated=true;version=1L;registration=Some 91L;account=Some scope.account;
+    scopes=Rrbvec.singleton scope;catalog=Rrbvec.singleton scope.graph_id} in
+  let request:H.request={version=1L;id=uuid "10000000-0000-4000-8000-000000080001";registration=91L;
+    owner=scope.account;change=H.Close_graph scope.graph_id;expected=Rrbvec.singleton scope;captured=Rrbvec.singleton scope} in
+  let initial=H.empty ~lifetime:(uuid "10000000-0000-4000-8000-000000080000") in
+  let _,stale=H.prepare initial {facts with version=2L;scopes=Rrbvec.empty} request in
+  Alcotest.(check bool) "delayed prepare cannot cross a changed authoritative baseline" true(stale=H.Refused H.Baseline_changed);
+  let pending,outcome=H.prepare initial facts request in
+  let attempt=match outcome with H.Start attempt->attempt|_->Alcotest.fail "host prepare refused valid frame" in
+  Alcotest.(check bool) "prepare cannot manufacture Ready" true(H.phase pending request.id=Some H.Preparing);
+  let ready=H.settled pending attempt ~copy_generation:None in
+  let receipt=match H.phase ready request.id with Some(H.Safe receipt)->receipt|_->Alcotest.fail "actual settlement did not create receipt" in
+  let focus={facts with account=Some{scope.account with presentation_generation=99}} in
+  let consumed,result=H.consume ready focus receipt in
+  Alcotest.(check bool) "focus alone does not invalidate execution permission" true(result=Ok request.change);
+  Alcotest.(check bool) "same receipt cannot consume twice" true(Result.is_error(snd(H.consume consumed facts receipt)));
+  let next_request={request with id=uuid "10000000-0000-4000-8000-000000080003"} in
+  Alcotest.(check bool) "consumption keeps physical action exclusive until completed" true
+    (snd(H.prepare consumed facts next_request)=H.Refused H.Busy);
+  let completed=H.completed consumed receipt in
+  Alcotest.(check bool) "physical action completion permits a new round" true
+    (match snd(H.prepare completed facts next_request)with H.Start _->true|_->false);
+  let reopened={facts with scopes=Rrbvec.singleton{scope with graph_generation=scope.graph_generation+1}} in
+  let invalid=H.observe ready reopened in
+  let closed_again=H.observe invalid {facts with scopes=Rrbvec.empty} in
+  Alcotest.(check bool) "reopen then close cannot revive safe receipt" true(Result.is_error(snd(H.consume closed_again facts receipt)));
+  Alcotest.(check bool) "late physical result cannot revive invalid frame" true
+    (H.phase(H.settled closed_again attempt ~copy_generation:None)request.id=H.phase closed_again request.id);
+  let failed_while_running=H.observe pending reopened in
+  Alcotest.(check bool) "invalidated preparation still owns its actual in-flight settlement" true
+    (snd(H.prepare failed_while_running facts next_request)=H.Refused H.Busy);
+  let failed_but_finished=H.settled failed_while_running attempt ~copy_generation:None in
+  Alcotest.(check bool) "actual end permits a retry without reviving old receipt" true
+    (match snd(H.prepare failed_but_finished facts next_request)with H.Start _->true|_->false);
+  let foreign=H.empty ~lifetime:(uuid "10000000-0000-4000-8000-000000080099") in
+  Alcotest.(check bool) "foreign Worker lifetime cannot consume receipt" true(Result.is_error(snd(H.consume foreign facts receipt)));
+  let remove={request with id=uuid "10000000-0000-4000-8000-000000080002";change=H.Remove_graph(scope.graph_id,H.Force)} in
+  let pending,outcome=H.prepare initial facts remove in
+  let attempt=match outcome with H.Start attempt->attempt|_->assert false in
+  let invalid=H.settled pending attempt ~copy_generation:None in
+  Alcotest.(check bool) "remove needs actual exclusive local-copy witness" true
+    (match H.phase invalid remove.id with Some(H.Failed _)->true|_->false);
+  (* This is only a pure external physical-ACK input; storage tests establish
+     actual release. Removing a consumed permission must never rerun its action. *)
+  let generation=Logseq_overlay_db.Types.Mirror_generation.of_string "mirror-generation:v1:pure-held-copy" |> Result.get_ok in
+  let safe=H.settled pending attempt ~copy_generation:(Some generation) in
+  let receipt=match H.phase safe remove.id with Some(H.Safe value)->value|_->assert false in
+  let consumed,_=H.consume safe facts receipt in
+  let released,retired=H.released_registration consumed request.registration in
+  Alcotest.(check bool) "checked unregister can retire consumed removal cleanup" true(retired=Some remove.id);
+  Alcotest.(check bool) "released consumed removal is never an action retry" true(Result.is_error(snd(H.consume released facts receipt)))
+;;
+
+let test_host_handoff_properties () =
+  let module H=Core.Host_handoff in
+  let _,scope=worker_open_graph() in
+  let run actions=
+    let facts=ref H.{authenticated=true;version=1L;registration=Some 92L;account=Some scope.account;
+      scopes=Rrbvec.singleton scope;catalog=Rrbvec.singleton scope.graph_id} in
+    let state=ref(H.empty ~lifetime:(uuid "10000000-0000-4000-8000-000000081000")) in
+    let attempts=ref [] and receipts=ref [] and serial=ref 0 and active=ref None and registration=ref 92L in
+    List.iter(fun action->
+      let before= !state in
+      let before_active= !active in
+      let before_phase=Option.bind before_active(H.phase before) in
+      (match action mod 8 with
+       |0|1->incr serial;
+         let request:H.request={version=(!facts).version;id=uuid(Printf.sprintf "10000000-0000-4000-8000-%012d" (81000+ !serial));registration=Option.value (!facts).registration ~default:!registration;
+           owner=Option.value (!facts).account ~default:scope.account;change=H.Close_graph scope.graph_id;expected=(!facts).scopes;
+           captured=(!facts).scopes} in
+         let next,outcome=H.prepare before !facts request in state:=next;
+         (match outcome with H.Start ticket->attempts:=ticket::!attempts;active:=Some request.id|_->())
+       |2->(match !attempts with []->()|ticket::_->state:=H.settled before ticket ~copy_generation:None)
+       |3->(match Option.bind !active(H.phase before)with Some(H.Safe receipt)->receipts:=receipt::!receipts;
+         let next,outcome=H.consume before !facts receipt in state:=next;
+         if Result.is_ok outcome then (
+           Alcotest.(check bool) "successful consume is permanently single-use" true
+             (Result.is_error(snd(H.consume next !facts receipt)));state:=H.completed next receipt;active:=None)
+         |_->())
+       |4->let next={scope with graph_generation=scope.graph_generation+1+action} in
+         facts:={!facts with scopes=Rrbvec.singleton next};state:=H.observe before !facts
+       |5->facts:={!facts with scopes=Rrbvec.empty};state:=H.observe before !facts
+       |6->
+         registration:=Int64.succ !registration;
+         facts:={!facts with registration=(if action mod 2=0 then None else Some !registration)};
+         state:=H.observe before !facts;
+         (match H.current !state with
+          |Some(request,_)->let next,retired=H.released_registration !state request.registration in
+            state:=next;if retired<>None then active:=None
+          |_->())
+       |_->(match !receipts with []->()|receipt::_->
+         let next,result=H.consume before !facts receipt in
+         Alcotest.(check bool) "retained old receipt never consumes another round" true(Result.is_error result);state:=next));
+      Alcotest.(check bool) "previous immutable host state unchanged" true
+        (Option.bind before_active(H.phase before)=before_phase);
+      (match before_phase,Option.bind !active(H.phase !state)with
+       |Some(H.Failed _),Some(H.Safe _)->Alcotest.fail "stale I/O revived failed handoff"|_->()))actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec remove prefix=function []->actions
+      |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      |action::rest->remove(action::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x4A6D;seed|] in
+    let actions=[0;2;4;5;2;3;0;2;3;7] @ List.init 80(fun _->Random.State.int random 64) in
+    if fails actions then Alcotest.failf "host handoff seed=%d minimized=[%s]" seed
       (String.concat ";"(List.map string_of_int(shrink actions)))
   done
 ;;
@@ -2166,6 +2342,7 @@ let () =
             `Quick
             test_asset_manual_retry_is_unlimited
         ] )
+    ; ( "host handoff",[Alcotest.test_case "private deletion resource owner" `Quick test_host_deletion_private_resource_owner; Alcotest.test_case "account gate blocks catalog producer" `Quick test_account_host_gate_blocks_new_catalog_producer; Alcotest.test_case "target gate preserves other execution" `Quick test_host_gate_keeps_other_graph_live; Alcotest.test_case "single-use and reopen witness" `Quick test_host_handoff_single_use_and_reopen; Alcotest.test_case "generated owner/late result traces" `Quick test_host_handoff_properties])
     ; ( "writer fence",[Alcotest.test_case "only physical completion drains" `Quick test_writer_fence_physical_completion; Alcotest.test_case "generated scoped fence traces" `Quick test_writer_fence_properties])
     ; ( "typed demand registry",[Alcotest.test_case "generated owner retirement traces" `Quick test_demand_registry_properties; Alcotest.test_case "retirement and exact settlement" `Quick test_demand_registry_retirement_requires_physical_settlement])
     ; ( "orphan resource cleanup",[Alcotest.test_case "failed release and stale attempt ACK" `Quick test_orphan_cleanup_retains_failed_release])

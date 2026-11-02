@@ -405,6 +405,7 @@ module Writer_fence : sig
   type error = Fenced | Full
   val empty : t
   val admit : t -> Logseq_sync_pure_reducer.Core.graph_scope -> t * (operation,error) result
+  val admit_cleanup : t -> Logseq_sync_pure_reducer.Core.graph_scope -> t * (operation,error) result
   val finish : t -> operation -> t
   val freeze : t -> Logseq_sync_pure_reducer.Core.graph_scope -> t * (fence,error) result
   val drained : t -> fence -> bool
@@ -413,3 +414,45 @@ module Writer_fence : sig
   val operation_id : operation -> int64
   val same_incarnation : Logseq_sync_pure_reducer.Core.graph_scope -> Logseq_sync_pure_reducer.Core.graph_scope -> bool
 end
+
+(** Pure one-use host permission policy. External settlement inputs are supplied
+    only after actual I/O/resource owners have acknowledged. This model itself
+    performs no quiescence, callbacks, randomness, file inspection or deletion. *)
+module Host_handoff : sig
+  type mode=Normal|Force
+  type change=Close_graph of Logseq_db_types.Graph_types.Uuid.t
+    |Remove_graph of Logseq_db_types.Graph_types.Uuid.t * mode
+    |Replace_account|Stop_connection
+  type facts={authenticated:bool;version:int64;registration:int64 option;account:Logseq_sync_pure_reducer.Core.account_scope option;
+    scopes:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t;catalog:Logseq_db_types.Graph_types.Uuid.t Rrbvec.t}
+  type request={version:int64;id:Logseq_db_types.Graph_types.Uuid.t;registration:int64;
+    owner:Logseq_sync_pure_reducer.Core.account_scope;change:change;
+    expected:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t;
+    captured:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t}
+  type t
+  type attempt
+  type receipt
+  type error=Busy|Retired|Mismatch|Owner_changed|Scopes_changed|Baseline_changed|Full|Missing_copy_witness|Not_settled
+  type phase=Preparing|Safe of receipt|Consumed of receipt|Failed of error
+  type admission=Start of attempt|Existing of phase|Refused of error
+  val empty:lifetime:Logseq_db_types.Graph_types.Uuid.t -> t
+  val capture:owner:Logseq_sync_pure_reducer.Core.account_scope -> change:change
+    -> Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t -> Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t
+  val prepare:t -> facts -> request -> t * admission
+  val observe:t -> facts -> t
+  val settled:t -> attempt -> copy_generation:Logseq_overlay_db.Types.mirror_generation option -> t
+  val failed:t -> attempt -> t
+  val released_registration:t -> int64 -> t * Logseq_db_types.Graph_types.Uuid.t option
+  val phase:t -> Logseq_db_types.Graph_types.Uuid.t -> phase option
+  val consume:t -> facts -> receipt -> t * (change,error)result
+
+  (** Consuming is terminal for the capability but retains exclusivity until
+      the bound physical action finishes. A later prepare cannot overlap it. *)
+  val completed:t -> receipt -> t
+  val current:t -> (request * phase)option
+  val receipt_request:receipt -> request
+  val receipt_copy_generation:receipt -> Logseq_overlay_db.Types.mirror_generation option
+end
+
+val host_fence_blocks : state -> Logseq_db_types.Graph_types.Uuid.t -> bool
+val host_fence_active : state -> Logseq_sync_pure_reducer.Core.host_fence option

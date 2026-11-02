@@ -199,6 +199,11 @@ val commit_mirror_deletion
     never restored, and its durable receipt is retained for coordinated recovery. *)
 val cancel_mirror_deletion : prepared_mirror_deletion -> unit
 
+(** Checked release for a handoff owner. A failed physical ownership close keeps
+    the exact preparation and its cleanup obligation; success is the release ACK.
+    This neither restores a committed namespace nor removes its durable proof. *)
+val cancel_mirror_deletion_checked : prepared_mirror_deletion -> (unit,string)result
+
 (** Collects eligible durable garbage without removing mutation receipts needed
     to classify late synchronization responses. *)
 val collect_garbage

@@ -317,6 +317,8 @@ type observation_signal =
   | Observation_invalidated of observation_invalidation
   | Observations_resync
 type request =
+  | Coordination_prepare_host_change of Logseq_db_worker.host_plan
+  | Coordination_apply_host_change of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt
   | Coordination_quiesce_writers of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_import of
@@ -395,6 +397,8 @@ type request =
       }
 
 type response =
+  | Coordination_host_prepared of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt
+  | Coordination_host_applied of Logseq_db_types.Graph_types.Uuid.t
   | Coordination_writers_quiesced of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_imported of
@@ -1175,6 +1179,15 @@ let create ~(dependencies : dependencies) =
         scope.account.account_generation=owner.startup.account_generation && scope.graph_id=owner.graph_id
           && scope.graph_generation=owner.graph_generation) (Db.graph_scopes session.worker) in
       match request with
+      | Coordination_prepare_host_change plan->
+        if !(session.auth_seen) && !(session.authenticated_user)<>Some plan.owner.user_id
+        then Error "The host account authority has retired."
+        else Db.prepare_host_change session.worker plan |> Result.map(fun receipt->Coordination_host_prepared receipt)
+      | Coordination_apply_host_change receipt->
+        let plan=Pure.Host_handoff.receipt_request receipt in
+        if !(session.auth_seen) && !(session.authenticated_user)<>Some plan.owner.user_id
+        then Error "The host account authority has retired."
+        else Db.apply_host_change session.worker receipt |> Result.map(fun()->Coordination_host_applied plan.id)
       | Coordination_quiesce_writers{registration;owner;request_id}->
         let timeline:timeline_scope={startup={account_generation=owner.account.account_generation;
           presentation_generation=owner.account.presentation_generation};graph_id=owner.graph_id;graph_generation=owner.graph_generation} in

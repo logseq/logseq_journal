@@ -200,3 +200,11 @@ val coordinated_changefeed
 (** Writer-only actual I/O/callback barrier. No resource settlement or host permit
     is implied; the scope remains fenced until its execution incarnation retires. *)
 val quiesce_writers : t -> registration:int64 -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> (unit,string) result
+
+(** Host plans pin the authoritative baseline and client-known execution owners.
+    Physical resource scopes are captured by the backend, not by this request. *)
+type host_plan={version:int64;id:Logseq_db_types.Graph_types.Uuid.t;registration:int64;
+  owner:Logseq_sync_pure_reducer.Core.account_scope;change:Pure_reducer.Host_handoff.change;
+  expected:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t}
+val prepare_host_change:t -> host_plan -> (Pure_reducer.Host_handoff.receipt,string)result
+val apply_host_change:t -> Pure_reducer.Host_handoff.receipt -> (unit,string)result

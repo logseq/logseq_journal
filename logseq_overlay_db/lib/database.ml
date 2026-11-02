@@ -983,10 +983,14 @@ let prepare_mirror_deletion ~application_support_directory ~graph_id ~retirement
 
 let mirror_deletion_committed preparation = preparation.deletion_durable
 
-let cancel_mirror_deletion preparation =
-  Option.iter (fun owner -> ignore (Ownership.release owner)) preparation.deletion_ownership;
-  preparation.deletion_ownership <- None;
-  if preparation.deletion_committed = None then preparation.deletion_cancelled <- true
+let cancel_mirror_deletion_checked preparation =
+  let released=match preparation.deletion_ownership with None->Ok()|Some owner->Ownership.release owner in
+  Result.map(fun()->
+    preparation.deletion_ownership<-None;
+    if preparation.deletion_committed=None then preparation.deletion_cancelled<-true)released
+;;
+
+let cancel_mirror_deletion preparation = ignore(cancel_mirror_deletion_checked preparation)
 ;;
 
 let commit_mirror_deletion preparation =

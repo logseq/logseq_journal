@@ -1027,7 +1027,7 @@ let run_favorites_native_visibility
          | _ -> ());
         match normalized with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration ->
           Atomic.set coordination_registration(Some registration);
           Ok(Service.Coordination_registered(coordination_baseline registration))
@@ -5073,7 +5073,7 @@ let test_reference_outer_terminals cancel =
         in
         match fixture_request request with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration -> Ok(Service.Coordination_registered(fixture_coordination manager registration))
         | Release_coordination registration -> Ok(Service.Coordination_released registration)
         | Coordination_query _ -> Error "Fixture normalization failed"
@@ -6264,7 +6264,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
         in
         match fixture_request request with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration -> Ok(Service.Coordination_registered(
             fixture_coordination ~phase:(Atomic.get graph_phase) (Atomic.get current) registration))
         | Release_coordination registration -> Ok(Service.Coordination_released registration)
@@ -7285,7 +7285,7 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
         match (match request with Service.Client_command (Focus_resident_graph _) when check_recovery_focus -> request
           | Service.Client_command _ when scenario=`Retry_local || scenario=`Retry_graph_phase -> request | _ -> fixture_request request) with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration ->
           Atomic.set coordination_registration(Some registration);
           Ok(Service.Coordination_registered(fixture_coordination
