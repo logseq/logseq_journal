@@ -105,6 +105,7 @@ let reconcile_unlock previous (snapshot : Graph_service.snapshot) =
 
 
 module Admission_refresh = Journal_admission_refresh
+module Mutation_recovery = Journal_diagnostics_view.Pure_recovery
 
 type pending_delete =
   { mutation_id:string
@@ -326,6 +327,7 @@ type state =
   ; graph_state : Logseq_db_worker.graph_state
   ; diagnostics : Graph_service.diagnostics option
   ; admission_refresh : Admission_refresh.t
+  ; mutation_recovery : Mutation_recovery.t
   ; bootstrap_progress : Graph_service.bootstrap_progress option
   ; next_worker_error_sequence : int64
   ; worker_errors : worker_error_occurrence list
@@ -474,6 +476,7 @@ let initial_state =
   ; graph_state = { generation = -1; graph_id = None; phase = Graph_closed; error = None }
   ; diagnostics = None
   ; admission_refresh = Admission_refresh.closed
+  ; mutation_recovery = Mutation_recovery.closed
   ; bootstrap_progress = None
   ; next_worker_error_sequence = 1L
   ; worker_errors = []
@@ -668,6 +671,7 @@ let clear_graph_surface ~discard ?(discard_capture = true) state =
   ; feed_refresh = None
   ; presented_feed_context = None
   ; admission_refresh = Admission_refresh.closed
+  ; mutation_recovery = fst (Mutation_recovery.step state.mutation_recovery Close)
   ; next_request_generation = Int64.succ state.next_request_generation
   ; next_local_sequence = Int64.succ state.next_local_sequence
   ; modal = No_modal
@@ -2014,6 +2018,9 @@ type command =
   | Close_status
   | Open_diagnostics
   | Close_diagnostics
+  | Reload_pending_changes
+  | Retry_pending_changes
+  | Next_pending_changes
   | Open_error_info
   | Dismiss_operation_error
   | Retry_capture_imports
@@ -2703,8 +2710,12 @@ let error_info_page ~sync_error ~operation_failure occurrences dispatch =
   |> V.Body.with_test_id (Ui.Test_id.string "journal-error-info-page")
 ;;
 
-let diagnostics_page ?(errors = []) ~snapshot ~graph ~admission diagnostics dispatch =
+let diagnostics_page ?(errors = []) ?recovery ~snapshot ~graph ~admission diagnostics dispatch =
   Journal_diagnostics_view.view
+    ?recovery:(Option.map (fun state -> Journal_diagnostics_view.{state;
+      on_reload=bind_action dispatch Reload_pending_changes;
+      on_retry=bind_action dispatch Retry_pending_changes;
+      on_next=bind_action dispatch Next_pending_changes}) recovery)
     { snapshot; graph; admission; diagnostics
     ; application_errors = application_error_rows errors
     }
@@ -4232,6 +4243,70 @@ let start
       let admission_refresh, directive = transition state in
       ( { state with admission_refresh }
       , run_admission_directive set_state_and_effect directive ))
+  in
+  let run_mutation_recovery = function
+    | None -> Effect.ignore
+    | Some (request : Mutation_recovery.request) ->
+      Effect.of_thunk (fun () ->
+        let originating_owner = current_owner () in
+        let finish result =
+          run_owned originating_owner (fun () ->
+            set_state (fun state ->
+              let mutation_recovery, _ =
+                Mutation_recovery.step
+                  state.mutation_recovery
+                  (Completed (request, result))
+              in
+              { state with mutation_recovery }))
+        in
+        match originating_owner, !coordination_host with
+        | Some owner, Some (_, host)
+          when Wc.matches_scope request.session owner
+               && Coordination_host.validate_session ~owner host request.session = Ok ()
+          ->
+          (match
+             Coordination_host.request
+               host
+               request.session
+               (Mutation_recovery.operation request)
+           with
+           | Error (Wc.Invalid_input message | Unsupported_operation message) ->
+             finish (Error message)
+           | Error _ -> finish (Error "Pending changes are not available. Retry loading.")
+           | Ok ticket ->
+             Coordination_host.watch host ticket ~f:(fun reply ->
+               let current =
+                 match originating_owner, !coordination_host with
+                 | Some owner, Some (_, host) ->
+                   runtime_owner_is_live !state_ref owner
+                   && Coordination_host.validate_session ~owner host request.session
+                      = Ok ()
+                 | _ -> false
+               in
+               let result =
+                 if not current
+                 then Error "The graph changed. Reopen Diagnostics."
+                 else (
+                   match reply with
+                   | Wc.Answered (Ok page) -> Ok page
+                   | Wc.Answered
+                       (Error
+                          ( Wc.Service_failed message
+                          | Invalid_input message
+                          | Unsupported_operation message
+                          | Protocol_mismatch message ))
+                   | Not_admitted (Unsupported_request message) -> Error message
+                   | _ -> Error "Pending changes could not be loaded. Retry loading.")
+               in
+               finish result))
+        | _ -> finish (Error "Open a graph and reload pending changes."))
+  in
+  let update_mutation_recovery event =
+    set_state_and_effect (fun state ->
+      let mutation_recovery, request =
+        Mutation_recovery.step state.mutation_recovery event
+      in
+      { state with mutation_recovery }, run_mutation_recovery request)
   in
   let retry_media_change_application () =
     let generation= !state_ref.next_request_generation in
@@ -5910,6 +5985,7 @@ let start
           { state with
             modal = No_modal
           ; admission_refresh = Admission_refresh.close state.admission_refresh
+          ; mutation_recovery = fst (Mutation_recovery.step state.mutation_recovery Close)
           }
         | No_modal -> state
         | Capture_sheet -> step_root state Capture_closed
@@ -6213,13 +6289,30 @@ let start
             ~graph_generation:state.graph_state.generation
             ~graph_open:(state.graph_state.phase = Graph_open)
         in
-        ( { state with modal = Diagnostics; admission_refresh }
-        , run_admission_directive set_state_and_effect directive ))
+        let session = match current_owner(),!coordination_host with
+          | Some owner,Some(_,host) ->
+            Option.bind (Coordination.projection (Coordination_host.view host)) (fun projection ->
+              Option.bind (Wc.selected projection) (fun presentation ->
+                let session=Wc.presentation_session presentation in
+                if Wc.matches_scope session owner then Some session else None))
+          | _ -> None in
+        let mutation_recovery, request = Mutation_recovery.step state.mutation_recovery (Open session) in
+        ( { state with modal = Diagnostics; admission_refresh; mutation_recovery }
+        , Effect.many [run_admission_directive set_state_and_effect directive;
+            run_mutation_recovery request] ))
+    | Reload_pending_changes when snapshot.modal = Diagnostics ->
+      update_mutation_recovery Reload
+    | Retry_pending_changes when snapshot.modal = Diagnostics ->
+      update_mutation_recovery Retry
+    | Next_pending_changes when snapshot.modal = Diagnostics ->
+      update_mutation_recovery Next
+    | Reload_pending_changes | Retry_pending_changes | Next_pending_changes -> Effect.ignore
     | Close_diagnostics ->
       update (fun state ->
         { state with
           modal = No_modal
         ; admission_refresh = Admission_refresh.close state.admission_refresh
+        ; mutation_recovery = fst (Mutation_recovery.step state.mutation_recovery Close)
         })
     | Open_error_info ->
       update (fun state ->
@@ -7350,6 +7443,7 @@ let start
         in
         Some
           (diagnostics_page
+             ~recovery:state.mutation_recovery
              ~errors:state.worker_errors
              ~snapshot:state.manager
              ~graph:state.graph_state

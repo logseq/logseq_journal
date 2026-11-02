@@ -4339,8 +4339,106 @@ let test_child_choice_traces () =
   done
 ;;
 
+let test_readonly_recovery_owner () =
+  let module R = Journal_diagnostics_view.Pure_recovery in
+  let _, _, _, session = Coordination_test_fixture.fixture 5510L in
+  let opening, request = R.step R.closed (Open (Some session)) in
+  require (request <> None && R.loading opening) "recovery Open did not reserve one read";
+  let pending = Option.get request in
+  let _, _, _, other = Coordination_test_fixture.fixture 5512L in
+  let foreign, fresh = R.step opening (Open (Some other)) in
+  require (fresh<>None) "changed execution owner did not plan a fresh read";
+  let ignored, extra = R.step foreign (Completed (pending, Error "foreign callback")) in
+  require (ignored==foreign && extra=None) "foreign recovery owner altered the new session";
+  let duplicate, extra = R.step opening Reload in
+  require (duplicate == opening && extra = None) "loading recovery admitted a duplicate read";
+  let failed, extra = R.step opening (Completed (pending, Error "Synthetic recovery read failed")) in
+  require (extra = None && not (R.loading failed) && R.error failed <> None)
+    "recovery failure has no retryable feedback";
+  let retry, request = R.step failed Retry in
+  require (request <> None && R.loading retry) "failed recovery cannot retry";
+  let retired, _ = R.step retry Close in
+  let reopened, fresh = R.step retired (Open (Some session)) in
+  let ignored, extra = R.step reopened (Completed (Option.get request, Error "stale")) in
+  require (ignored == reopened && extra = None && R.error ignored = None)
+    "old recovery callback polluted reopened diagnostics";
+  require (Option.get fresh <> pending) "reopened recovery reused request generation";
+  require (R.error opening = None && R.loading opening) "recovery transition mutated older state"
+;;
+
+let test_readonly_recovery_traces () =
+  let module R = Journal_diagnostics_view.Pure_recovery in
+  let module W = R.Worker in
+  let module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service in
+  let module Wire = Logseq_db_worker_contract.Mutation_pure_wire in
+  let issuer, _, _, session = Coordination_test_fixture.fixture 5511L in
+  let module I = (val issuer : W.ISSUER) in
+  let uuid s = W.Uuid.of_string s |> Result.get_ok in
+  let id = uuid "98000000-0000-4000-8000-000000005511" in
+  let intent = W.mutation_intent session ~mutation_id:id
+    (W.Save_block {block=id;title="Read-only recovery trace";
+      preconditions={blocks=[id,"block-state:v1:synthetic"];pages=[];scopes=[]}}) |> Result.get_ok in
+  let page (request:R.request) more =
+    let result = I.reply request.session ~request_id:(W.request_id id) (R.operation request)
+      (S.Coordination_mutations_recovered {request_id=id;
+        page=Wire.{items=Rrbvec.singleton {intent=Bytes.to_string(W.encode_mutation_intent intent);outcome=Unknown};
+          next=(if more then Some(Int64.succ request.serial) else None)}}) in
+    match result with Ok(W.Answered(Ok page))->page | _->fail "recovery trace fixture failed codec"
+  in
+  let run actions =
+    let state=ref R.closed and pending=ref None and history=ref [] in
+    List.iter (fun action ->
+      let before = !state in
+      let snapshot=R.items before,R.loading before,R.error before,R.page_number before in
+      let delivered=ref None in
+      let complete request result = delivered:=Some request; R.Completed(request,result) in
+      let event=match action with
+        | 0 -> R.Open(Some session) | 1 -> Close | 2 -> Reload | 3 -> Next | 4 -> Retry
+        | 5 | 6 | 7 -> (match !pending with
+          | None -> R.Next
+          | Some request -> complete request
+              (if action=5 then Error "Synthetic failure" else Ok(page request (action=6))))
+        | _ -> (match !history with
+          | [] -> R.Close
+          | _::request::_ -> complete request (Error "Delayed completion")
+          | [request] -> complete request (Error "Delayed completion")) in
+      let next,request = R.step before event in
+      (match !delivered with
+       | Some value when !pending<>Some value -> require (next==before && request=None)
+           "old recovery completion altered current page"
+       | Some _ -> require (request=None && not(R.loading next)) "completion created a second read";
+         pending:=None
+       | None -> (match event with R.Close->pending:=None|_->()));
+      Option.iter (fun request ->
+        require (W.validate_request request.R.session (R.operation request)=Ok ())
+          "pure recovery emitted an invalid sealed cursor/budget";
+        pending:=Some request;history:=request::!history) request;
+      require (R.loading next=(!pending<>None)) "recovery has multiple or unowned reads";
+      if not (R.available next) then require (Rrbvec.is_empty(R.items next) && not(R.can_next next))
+        "closed recovery retained foreign data";
+      child_equal snapshot (R.items before,R.loading before,R.error before,R.page_number before)
+        "recovery mutated an earlier state";
+      state:=next) actions
+  in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions =
+    let rec remove prefix=function
+      | []->actions
+      | _::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      | item::rest->remove(item::prefix)rest in
+    remove [] actions in
+  for seed=0 to 199 do
+    let random=Random.State.make[|0xDEC0;seed|] in
+    let actions=List.init 80(fun _->Random.State.int random 9) in
+    if fails actions then fail "Recovery trace seed=%d minimized=[%s]" seed
+      (String.concat ";" (List.map string_of_int(shrink actions)))
+  done
+;;
+
 let tests =
-  [ "Uncertain plain child preserves insertion identity",test_uncertain_plain_child_keeps_identity
+  [ "Read-only recovery pure generated traces",test_readonly_recovery_traces
+  ; "Read-only recovery pure request owner",test_readonly_recovery_owner
+  ; "Uncertain plain child preserves insertion identity",test_uncertain_plain_child_keeps_identity
   ; "Child reselected status is a distinct sub-operation",test_child_reselected_status_intent
   ; "Retained child status preserves its admitted owner",test_retained_child_status_keeps_frozen_attempt
   ; "Child choice retained/retry pure generated traces",test_child_choice_traces

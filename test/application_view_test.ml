@@ -532,6 +532,7 @@ let run_favorites_native_visibility
       ?(check_reselect = false)
       ?(check_chrome = false)
       ?(check_error_control = false)
+      ?(check_pending_changes = false)
       ?malformed_native_event
       ?(check_ios_capture = false)
       ?(check_capture_imports = false)
@@ -573,6 +574,7 @@ let run_favorites_native_visibility
   let delete_notices = ref 0 in
   let status_writes = Atomic.make [] in
   let typed_status_mutations=Atomic.make 0 and typed_status_confirms=Atomic.make 0 and typed_status_acks=Atomic.make 0 in
+  let pending_change_reads = Atomic.make 0 in
   let typed_status_intents=Atomic.make [] in
   let status_summary_queries=Atomic.make 0 in
   let status_more_entered=Atomic.make false and status_more_release=Atomic.make(durable_status<>Some `Paged) in
@@ -985,6 +987,22 @@ let run_favorites_native_visibility
         | Coordination_query _ -> Error "Fixture normalization failed"
         | Coordination_observe _ | Coordination_refresh_observation _ | Coordination_release_observation _ ->
           Error "Observation is not used by this fixture"
+        | Coordination_recover_mutations {request_id;after;maximum_items;maximum_bytes;_}
+          when check_pending_changes ->
+          Atomic.incr pending_change_reads;
+          let offset=match after with None->0|Some value->Int64.to_int value in
+          let count=min maximum_items (21-offset) in
+          let items=Rrbvec.init count (fun index ->
+            let mutation_id=uuid (20000+offset+index) in
+            let intent=Wire.create ~origin:(Uri.of_string "https://example.invalid")
+              ~user:"fixture" ~graph:(uuid 900)
+              (P.V2_save_block {mutation_id;block=uuid 1;title="Never replay recovery";
+                preconditions={blocks=[uuid 1,"block-detail-1"];pages=[];scopes=[]}})
+              |> Result.get_ok in
+            Wire.{intent=Wire.encode intent;outcome=Unknown}) in
+          let page=Wire.{items;next=(if offset+count<21 then Some(Int64.of_int(offset+count)) else None)} in
+          if Wire.recovery_page_bytes page>maximum_bytes then Error "Fixture recovery byte budget"
+          else Ok(Service.Coordination_mutations_recovered{request_id;page})
         | Coordination_mutation _ | Coordination_confirm _ | Coordination_recover_mutations _ | Coordination_acknowledge_mutation _ -> Error "Unused durable coordination fixture"
         | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
@@ -2040,6 +2058,27 @@ let run_favorites_native_visibility
            wait "returning to an earlier cause becomes a new latest occurrence" (fun () -> syntax_occurrences ()=2);
            dispatch (Lui_protocol.Press (Option.get
              (find "accessibility-identifier" "journal-diagnostics-close"))))) malformed_native_event;
+       if check_pending_changes then (
+         dispatch (Lui_protocol.Press (Option.get (find "text" "Diagnostics")));
+         let first=G.Uuid.to_string(uuid 20000) and last=G.Uuid.to_string(uuid 20020) in
+         wait "recovery renders its first bounded page" (fun () ->
+           Option.is_some(find "text" first) && Option.is_some(find "text" "Page 1; more available"));
+         Alcotest.(check bool) "recovery labels uncertainty" true
+           (Option.is_some(find "text" "Outcome unknown"));
+         let press_text text = dispatch (Lui_protocol.Press
+           (ancestor_property (Option.get(find "text" text)) "press-enabled")) in
+         press_text "Next pending changes";
+         wait "recovery renders the next page" (fun () ->
+           Option.is_some(find "text" last) && Option.is_some(find "text" "Page 2; end of results"));
+         Alcotest.(check bool) "recovery only retains the current bounded page" true
+           (Option.is_none(find "text" first));
+         Alcotest.(check int) "More consumes exactly one cursor" 2 (Atomic.get pending_change_reads);
+         press_text "Reload pending changes";
+         wait "explicit recovery reload returns to first page" (fun () ->
+           Option.is_some(find "text" first) && Atomic.get pending_change_reads=3);
+         Alcotest.(check int) "viewing recovery never submits a mutation" 0 (Atomic.get typed_status_mutations);
+         Alcotest.(check int) "viewing recovery never acknowledges an intent" 0 (Atomic.get typed_status_acks);
+         dispatch (Lui_protocol.Press(Option.get(find "accessibility-identifier" "journal-diagnostics-close"))));
        (* Delete admission is private to Application, absent from Root_navigation's
           public pure events. Use its existing public bridge and controlled Worker
           fixture to execute the actual UI admission/completion boundary. *)
@@ -6970,7 +7009,7 @@ let test_picker_presence_native_patch_lifecycle () =
        Some(Ok Service.Downloaded);None;Some(Ok Service.Not_downloaded);Some(Ok Service.Downloaded)])
 ;;
 
-let test_graph_picker_controls scenario () =
+let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
   let reordered=scenario=`Reordered_open || scenario=`Reordered_full in
   let module W = Logseq_db_worker_lui.Journal_worker in
   let module P = Logseq_db_worker.Protocol in
@@ -7001,6 +7040,8 @@ let test_graph_picker_controls scenario () =
   let manager=fixture_with_scope manager in
   let coordination_registration=Atomic.make None and coordination_version=Atomic.make 1 in
   let current = Atomic.make manager and commands = Atomic.make [] in
+  let recovery_writes=Atomic.make 0 in
+  let recovery_entered=Atomic.make false and recovery_release=Atomic.make false and recovery_finished=Atomic.make false in
   let inspections = Atomic.make 0 and deletions = Atomic.make [] in
   let finish_deletion = Atomic.make false in
   let deletion_terminal = ref false in
@@ -7017,12 +7058,14 @@ let test_graph_picker_controls scenario () =
   let root_renders = ref 0 in
   let client = ref None in
   let service = W.Service.create ~push_topic_count:8
-      ~concurrency:(if scenario = `Late_presence || scenario = `Late_graph_cancel
+      ~concurrency:(if check_recovery_focus || scenario = `Late_presence || scenario = `Late_graph_cancel
                     then Concurrent { max_in_flight = 2 } else Serial)
       ~init:(fun context _ ->
         W.Session_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed manager);
         Ok ())
       ~handle:(fun context () request ->
+        (match request with Service.Coordination_mutation _ | Coordination_acknowledge_mutation _ ->
+          Atomic.incr recovery_writes | _ -> ());
         let publish value =
           let value=fixture_with_scope value in
           Atomic.set current value;
@@ -7036,7 +7079,8 @@ let test_graph_picker_controls scenario () =
         let query_owner=match request with
           | Service.Coordination_query{owner;_}|Graph_request_at(owner,_)->Some owner
           | _->None in
-        match (match request with Service.Client_command _ when scenario=`Retry_local || scenario=`Retry_graph_phase -> request | _ -> fixture_request request) with
+        match (match request with Service.Client_command (Focus_resident_graph _) when check_recovery_focus -> request
+          | Service.Client_command _ when scenario=`Retry_local || scenario=`Retry_graph_phase -> request | _ -> fixture_request request) with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
         | Register_coordination registration ->
           Atomic.set coordination_registration(Some registration);
@@ -7048,6 +7092,17 @@ let test_graph_picker_controls scenario () =
         | Coordination_query _ -> Error "Fixture normalization failed"
         | Coordination_observe _ | Coordination_refresh_observation _ | Coordination_release_observation _ ->
           Error "Observation is not used by this fixture"
+        | Coordination_recover_mutations {request_id;owner;_} when check_recovery_focus ->
+          if owner.graph_id=first then (
+            Atomic.set recovery_entered true;
+            while not(Atomic.get recovery_release) do Eio.Fiber.yield () done);
+          let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+          let intent=Wire.create ~origin:(Uri.of_string "https://example.invalid") ~user:"synthetic"
+            ~graph:owner.graph_id (P.V2_save_block {mutation_id=uuid(30000+owner.graph_generation);
+              block=uuid 100;title="Never replay resident recovery";
+              preconditions={blocks=[uuid 100,"block-state:v1:synthetic"];pages=[];scopes=[]}}) |> Result.get_ok in
+          Ok(Service.Coordination_mutations_recovered {request_id;
+            page=Wire.{items=Rrbvec.singleton{intent=Wire.encode intent;outcome=Unknown};next=None}})
         | Coordination_mutation _ | Coordination_confirm _ | Coordination_recover_mutations _ | Coordination_acknowledge_mutation _ -> Error "Unused durable coordination fixture"
         | Service.Inspect_local_copy request ->
           let index = Atomic.fetch_and_add inspections 1 in
@@ -7098,6 +7153,12 @@ let test_graph_picker_controls scenario () =
              while not(Atomic.get early_graph_observed) do Eio.Fiber.yield () done;
              publish {previous with snapshot={previous.snapshot with resident_graphs=ids;
                resident_scopes=[resident_scope first 1;resident_scope second 2]}}
+           | Focus_resident_graph id when check_recovery_focus ->
+             let scope=List.find(fun(scope:Service.asset_scope)->scope.graph_id=id)previous.snapshot.resident_scopes in
+             publish {previous with snapshot={previous.snapshot with selected_graph=Some id;
+               startup={previous.snapshot.startup with awaiting_selection=false;
+                 graph_generation=scope.graph_generation;
+                 presentation_generation=previous.snapshot.startup.presentation_generation+1}}}
            | Select_graph id ->
              let generation = previous.snapshot.startup.graph_generation + 1 in
              publish { previous with snapshot = { previous.snapshot with selected_graph = Some id
@@ -7163,6 +7224,7 @@ let test_graph_picker_controls scenario () =
         | W.Push {payload=Service.Graph_states _;_} -> Atomic.set early_graph_observed true
         | W.Response { outcome = Completed (Service.Local_copy_deleted _); _ } ->
           deletion_terminal := true
+        | W.Response {outcome=Completed(Service.Coordination_mutations_recovered _);_}->Atomic.set recovery_finished true
         | W.Response { request_id; outcome = Cancelled; _ } ->
           incr inspection_terminals;
           if Atomic.get graph_read_worker = Some request_id then incr graph_read_cancellations
@@ -7225,6 +7287,7 @@ let test_graph_picker_controls scenario () =
       ~response_budget_bytes:P.maximum_response_bytes ~default_page_size:P.default_page_size
       |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
   Fun.protect ~finally:(fun () ->
+    Atomic.set recovery_release true;
     Atomic.set release_refresh true;
     Atomic.set finish_deletion true;
     Atomic.set release_automatic_inspection true;
@@ -7240,6 +7303,46 @@ let test_graph_picker_controls scenario () =
         Alcotest.(check bool) "retry retains second resident" true (List.mem second (Atomic.get current).snapshot.resident_graphs)
       ) else (
       wait "Switch graph action mounts" (fun () -> Option.is_some (find "text" "Switch graph"));
+      if check_recovery_focus then (
+        let focused key value =
+          let state=(Atomic.get current).snapshot in
+          let selected=Option.get state.selected_graph in
+          let scope=List.find(fun(scope:Service.asset_scope)->scope.graph_id=selected)state.resident_scopes in
+          let expected=Printf.sprintf "1:%s:%d" (Logseq_db_types.Graph_types.Uuid.to_string selected) scope.graph_generation in
+          let rec belongs id =
+            let fields=Option.value(Hashtbl.find_opt props id)~default:[] in
+            let host=match List.assoc_opt "payload" fields with
+              | Some(`String payload)->(try let open Yojson.Safe.Util in let json=Yojson.Safe.from_string payload in
+                  if member "mode" json=`String "timeline-host" then Some(member "ownerID" json= `String expected) else None
+                with _->None)
+              | _->None in
+            match host with Some value->value|None->Option.fold~none:false~some:belongs(Hashtbl.find_opt page_parents id) in
+          Hashtbl.to_seq props |> Seq.find_map(fun(id,fields)->
+            if List.assoc_opt key fields=Some(`String value) && belongs id then Some id else None) in
+        press(Option.get(focused "text" "Diagnostics"));
+        wait "resident A recovery is held in flight" (fun()->Atomic.get recovery_entered);
+        let select graph_id =
+          (match W.send (Option.get !client) (Service.Client_command(Focus_resident_graph graph_id)) with
+           | W.Accepted _->()|_->Alcotest.fail "resident focus was not admitted");
+          wait "resident focus publication" (fun()->(Atomic.get current).snapshot.selected_graph=Some graph_id);
+          for _=1 to 8 do consume(hooks.pump()) done in
+        select second;
+        Atomic.set recovery_release true;
+        wait "A recovery completes while B remains focused" (fun()->Atomic.get recovery_finished);
+        wait "B Diagnostics control belongs to its materialized host" (fun()->focused "text" "Diagnostics"<>None);
+        press(Option.get(focused "text" "Diagnostics"));
+        wait "B recovery applies after A later-turn callback" (fun()->
+          Option.is_some(find "text" (Logseq_db_types.Graph_types.Uuid.to_string(uuid 30002))));
+        Alcotest.(check bool) "A completion keeps B focused" true
+          ((Atomic.get current).snapshot.selected_graph=Some second);
+        select first;
+        if Option.is_none(focused "accessibility-identifier" "journal-diagnostics-dialog-page") then
+          press(Option.get(focused "text" "Diagnostics"));
+        wait "returning to A settles its original recovery owner" (fun()->
+          Option.is_some(find "text" (Logseq_db_types.Graph_types.Uuid.to_string(uuid 30001))));
+        Alcotest.(check int) "focus recovery never writes or ACKs" 0 (Atomic.get recovery_writes);
+        press(Option.get(focused "accessibility-identifier" "journal-diagnostics-close")))
+      else (
       if scenario=`Current then
         wait "native swipe admission follows graph readiness" (fun () ->
           Hashtbl.to_seq_values props |> Seq.exists(fun fields->match List.assoc_opt "payload" fields with
@@ -7474,7 +7577,7 @@ let test_graph_picker_controls scenario () =
       | `Current_menu ->
         ignore (node ("graph-picker-options:" ^ Logseq_db_types.Graph_types.Uuid.to_string first));
         Alcotest.(check bool) "current protection explains switching first" true
-          (Option.is_some (find "text" "Switch graphs first."))))
+          (Option.is_some (find "text" "Switch graphs first.")))))
 ;;
 
 (* Compose the production runtime's public completions with the Application
@@ -7898,6 +8001,8 @@ let () =
         Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);
         Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);
         Alcotest.test_case "resident picker keeps native patch references alive" `Quick (test_graph_picker_controls `Current);
+        Alcotest.test_case "recovery completion returns to background resident" `Quick
+          (test_graph_picker_controls ~check_recovery_focus:true `Current);
         Alcotest.test_case "close retains current session" `Quick (test_graph_picker_controls `Close);
         Alcotest.test_case "focus graph-state refresh survives full Worker lane" `Quick (test_graph_picker_controls `Reordered_full);
         Alcotest.test_case "graph open before membership still presents after focus" `Quick (test_graph_picker_controls `Reordered_open);
@@ -8019,6 +8124,9 @@ let () =
         ; Alcotest.test_case "fixture early exit releases Worker" `Quick (fun () ->
             test_fixture_exception_cleanup Exit)
         ] )
+    ; ( "Pending changes recovery"
+      , [Alcotest.test_case "bounded readonly pages" `Quick (fun () ->
+          run_favorites_native_visibility ~check_pending_changes:true ())] )
     ; ( "Detail shared Composer"
       , List.map
           (fun scenario ->

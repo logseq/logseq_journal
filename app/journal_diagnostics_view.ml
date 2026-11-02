@@ -4,6 +4,126 @@ module Graph_service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Admission_refresh = Journal_admission_refresh
 module Presentation = Journal_page_layout
 
+module Pure_recovery = struct
+  module Worker = Journal_worker_coordination.Worker_api
+
+  type request =
+    { session : Worker.session
+    ; serial : int64
+    ; after : Worker.mutation_recovery_cursor option
+    ; page_number : int
+    }
+
+  type t =
+    { serial : int64
+    ; session : Worker.session option
+    ; pending : request option
+    ; page : Worker.mutation_recovery option
+    ; after : Worker.mutation_recovery_cursor option
+    ; page_number : int
+    ; error : string option
+    }
+
+  type event =
+    | Open of Worker.session option
+    | Close
+    | Reload
+    | Retry
+    | Next
+    | Completed of request * (Worker.mutation_recovery, string) result
+
+  let closed =
+    { serial = 0L
+    ; session = None
+    ; pending = None
+    ; page = None
+    ; after = None
+    ; page_number = 0
+    ; error = None
+    }
+  ;;
+
+  let loading t = t.pending <> None
+  let error t = t.error
+  let available t = t.session <> None
+  let loaded t = t.page <> None
+
+  let can_next t =
+    (not (loading t))
+    && t.error = None
+    && Option.fold
+         ~none:false
+         ~some:(fun (page : Worker.mutation_recovery) -> page.next <> None)
+         t.page
+  ;;
+
+  let page_number t = t.page_number
+
+  let items t =
+    Option.fold
+      ~none:Rrbvec.empty
+      ~some:(fun (page : Worker.mutation_recovery) -> page.items)
+      t.page
+  ;;
+
+  let operation (request : request) =
+    Worker.Recover_mutations
+      { after = request.after
+      ; maximum_items = 20
+      ; maximum_bytes = Worker.maximum_mutation_recovery_bytes
+      }
+  ;;
+
+  let start t session after page_number =
+    let request = { session; serial = Int64.succ t.serial; after; page_number } in
+    ( { serial = request.serial
+      ; session = Some session
+      ; pending = Some request
+      ; page = None
+      ; after
+      ; page_number
+      ; error = None
+      }
+    , Some request )
+  ;;
+
+  let step t = function
+    | Close -> { closed with serial = Int64.succ t.serial }, None
+    | Open None -> { closed with serial = Int64.succ t.serial }, None
+    | Open (Some session) ->
+      if
+        loading t
+        && Option.fold ~none:false ~some:(Worker.equal_session session) t.session
+      then t, None
+      else start t session None 1
+    | Reload when not (loading t) ->
+      (match t.session with
+       | None -> t, None
+       | Some session -> start t session None 1)
+    | Retry when (not (loading t)) && t.error <> None ->
+      (match t.session with
+       | None -> t, None
+       | Some session -> start t session t.after t.page_number)
+    | Next when can_next t ->
+      start t (Option.get t.session) (Option.get t.page).next (t.page_number + 1)
+    | Completed (request, result) when t.pending = Some request ->
+      let next =
+        match result with
+        | Ok page -> { t with pending = None; page = Some page; error = None }
+        | Error error -> { t with pending = None; error = Some error }
+      in
+      next, None
+    | Reload | Retry | Next | Completed _ -> t, None
+  ;;
+end
+
+type recovery_controls =
+  { state : Pure_recovery.t
+  ; on_reload : Ui.Event.Handler.t
+  ; on_retry : Ui.Event.Handler.t
+  ; on_next : Ui.Event.Handler.t
+  }
+
 type props =
   { snapshot : Graph_service.snapshot option
   ; graph : Logseq_db_worker.graph_state
@@ -134,7 +254,67 @@ let diagnostic_groups diagnostics =
       if entries = [] then None else Some (group.title, entries))
 ;;
 
-let view { snapshot; graph; admission; diagnostics; application_errors } ~on_close =
+let recovery_section { state; on_reload; on_retry; on_next } =
+  let module R = Pure_recovery in
+  let progress = function
+    | R.Worker.Outcome_unknown -> "Outcome unknown"
+    | Rejected _ -> "Not applied"
+    | Committed_pending_presentation _ -> "Committed; awaiting confirmation"
+    | Confirmed _ -> "Committed; awaiting application"
+  in
+  let rows =
+    Rrbvec.to_seq (R.items state)
+    |> Seq.map (fun (item : R.Worker.recovered_mutation) ->
+      V.column
+        ~alignment:Leading
+        ~spacing:4.
+        [ V.text (R.Worker.mutation_intent_id item.intent |> R.Worker.Uuid.to_string)
+        ; V.text (progress item.progress)
+        ])
+    |> List.of_seq
+  in
+  let status =
+    if not (R.available state)
+    then "Open a graph to view pending changes."
+    else if R.loading state
+    then "Loading pending changes…"
+    else (
+      match R.error state with
+      | Some message -> message
+      | None when R.loaded state ->
+        if rows = []
+        then "No entries on this page."
+        else
+          Printf.sprintf
+            "Page %d%s"
+            (R.page_number state)
+            (if R.can_next state then "; more available" else "; end of results")
+      | None -> "Pending changes have not been loaded.")
+  in
+  let button ~enabled label on_press =
+    V.button ~enabled ~child:(V.text label) ~on_press ()
+  in
+  Presentation.section
+    "Pending local changes"
+    ([ V.text "Viewing these records does not repeat or acknowledge a change."
+     ; V.text status
+     ]
+     @ rows
+     @ [ V.row
+           ~spacing:8.
+           ([ button
+                ~enabled:(R.available state && not (R.loading state))
+                "Reload pending changes"
+                on_reload
+            ]
+            @ (if R.error state = None
+               then []
+               else [ button ~enabled:(not (R.loading state)) "Retry loading" on_retry ])
+            @ [ button ~enabled:(R.can_next state) "Next pending changes" on_next ])
+       ])
+;;
+
+let view ?recovery { snapshot; graph; admission; diagnostics; application_errors } ~on_close =
   let groups =
     [ "Phases", diagnostic_phase_rows ~snapshot ~graph
     ; "Overlay DB", admission_rows admission
@@ -146,7 +326,7 @@ let view { snapshot; graph; admission; diagnostics; application_errors } ~on_clo
         ])
   in
   Presentation.form
-    (List.map
+    ((Option.to_list (Option.map recovery_section recovery)) @ List.map
        (fun (title, rows) ->
           Presentation.section
             title
