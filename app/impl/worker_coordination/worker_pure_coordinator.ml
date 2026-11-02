@@ -3,6 +3,7 @@ module Id = Logseq_db_worker_lui.Journal_worker_ids.Worker
 module Intents = Map.Make (String)
 module Slots = Map.Make (Int64)
 module Graphs = Map.Make (Worker.Uuid)
+module Sessions=Set.Make(struct type t=Worker.session let compare=Worker.compare_session end)
 module Asset_consumers=Map.Make(struct type t=Worker.asset_consumer let compare=Worker.compare_asset_consumer end)
 type asset_registration={consumer:Worker.asset_consumer;assets:Logseq_db_types.Asset_descriptor.t list;
   active:bool;notices:(Worker.asset_notice * Id.push_sequence) list}
@@ -190,6 +191,7 @@ type shutdown_state =
 type view =
   { bootstrap_state : Worker.bootstrap_state
   ; current : Worker.projection option
+  ; retired_host_sessions : Sessions.t
   ; entries : entry Slots.t
   ; handoffs : (Worker.handoff_id * Worker.handoff_state) list
   ; shutdown : shutdown_state
@@ -232,6 +234,12 @@ type t =
   ; release_pending : bool
   ; released : bool
   ; active_handoff : Worker.handoff_id option
+  ; host_plan : Worker.handoff_plan option
+  ; host_candidate : Worker.handoff_receipt option
+  ; host_consume_waiting : bool
+  ; host_consume_attempt : Worker.request_id option
+  ; host_consume_admitted : Id.request_id option
+  ; host_consume_early : (Id.request_id * (unit,Worker.error)result)option
   ; retired : Worker.projection Graphs.t
   ; fenced : Worker.host_change list
   }
@@ -247,11 +255,13 @@ let initial ~client_id =
   ; release_pending = false
   ; released = false
   ; active_handoff = None
+  ; host_plan=None;host_candidate=None;host_consume_waiting=false;host_consume_attempt=None;host_consume_admitted=None;host_consume_early=None
   ; retired = Graphs.empty
   ; fenced = []
   ; facts =
       { bootstrap_state = Worker.Awaiting_baseline
       ; current = None
+      ; retired_host_sessions=Sessions.empty
       ; entries = Slots.empty
       ; handoffs = []
       ; shutdown = Active
@@ -278,7 +288,7 @@ let initial ~client_id =
 ;;
 
 let current_session facts session =
-  match facts.bootstrap_state, facts.current with
+  not(Sessions.mem session facts.retired_host_sessions) && match facts.bootstrap_state, facts.current with
   | Worker.Ready _, Some p ->
     List.exists
       (fun r -> r.Worker.phase = Worker.Open && Worker.equal_session r.session session)
@@ -525,6 +535,7 @@ let equal_view a b =
   a == b
   || (a.bootstrap_state = b.bootstrap_state
       && a.current = b.current
+      && Sessions.equal a.retired_host_sessions b.retired_host_sessions
       && a.handoffs = b.handoffs
       && a.shutdown = b.shutdown
       && a.intents = b.intents
@@ -592,6 +603,10 @@ type event =
   | Forget : 'a ticket -> event
   | Release : 'a Worker.observation -> event
   | Handoff_completed of Worker.handoff_id * Worker.handoff_state
+  | Handoff_applied of Worker.handoff_id * Worker.request_id * Id.request_id * (unit,Worker.error)result
+  | Handoff_apply_admitted of Worker.handoff_id * Worker.request_id * Id.request_id
+  | Handoff_apply_rejected of Worker.handoff_id * Worker.request_id * Worker.error
+  | Handoff_apply_not_admitted of Worker.handoff_id * Worker.request_id * Worker.admission_error
   | Drain
 
 type instruction =
@@ -601,7 +616,8 @@ type instruction =
   | Bind_replacement
   | Send : 'a ticket * Worker.session * 'a Worker.request -> instruction
   | Cancel_request : 'a ticket -> instruction
-  | Quiesce of Worker.handoff_id * Worker.host_change
+  | Quiesce of Worker.handoff_plan
+  | Consume_handoff of Worker.handoff_receipt * Worker.request_id
   | Publish of view
   | Schedule_drain
 
@@ -639,10 +655,10 @@ let affected session = function
 let validate_session ?owner state session =
   if Option.exists (fun owner -> not (Worker.matches_scope session owner)) owner
   then Error Worker.Revoked_session
-  else if state.lifecycle <> Running || not (current_session state.facts session)
-  then Error Worker.Revoked_session
   else if List.exists (affected session) state.fenced
   then Error Worker.Host_change_in_progress
+  else if state.lifecycle <> Running || not (current_session state.facts session)
+  then Error Worker.Revoked_session
   else Ok ()
 ;;
 
@@ -2179,6 +2195,30 @@ let retain_asset_notice state notice sequence =
       changed {state with facts={state.facts with session_assets=Graphs.add graph(List.take 256 values)state.facts.session_assets}}[])
 ;;
 
+let matching_host_attempt state id attempt =
+  Option.exists(Worker.equal_handoff_id id)state.active_handoff
+  && Option.exists(fun actual->Worker.compare_request_id actual attempt=0)state.host_consume_attempt
+;;
+let finish_host_action state id result =
+  match handoff state.facts id,state.host_plan with
+  |Some(Worker.Applying_host_change receipt),Some plan when Worker.valid_handoff_receipt plan receipt->
+    let outcome=match result with Ok()->Worker.Host_change_applied receipt
+      |Error error->Worker.Handoff_failed(Worker.handoff_change receipt,error) in
+    let next={state with host_consume_waiting=false;host_consume_attempt=None;host_consume_admitted=None;host_consume_early=None;
+      facts={state.facts with handoffs=(id,outcome)::List.filter(fun(old,_)->not(Worker.equal_handoff_id old id))state.facts.handoffs}} in
+    let next=match result with Error _->next|Ok()->{next with active_handoff=None;host_plan=None;host_candidate=None;
+      fenced=List.filter((<>) (Worker.handoff_change receipt))state.fenced} in
+    changed next []
+  |_->unchanged state
+;;
+let plan_host_action_attempt (state:t) receipt =
+  if state.next=Int64.max_int then Error(Worker.Invalid_input "Host action attempt counter exhausted")else
+  let serial=Int64.succ state.next in
+  let attempt=Worker.request_id(identity state.client serial) in
+  Ok({state with next=serial;host_consume_attempt=Some attempt;host_consume_admitted=None;
+    host_consume_early=None;host_consume_waiting=false},Consume_handoff(receipt,attempt))
+;;
+
 let step_base state event =
   match event with
   | Import_source_reconciled proof->
@@ -2199,11 +2239,13 @@ let step_base state event =
       ; bootstrap_inflight = true
       ; bootstrap_mailbox = None
       ; active_handoff = None
+      ; host_plan=None;host_candidate=None;host_consume_waiting=false;host_consume_attempt=None;host_consume_admitted=None;host_consume_early=None
       ; retired = Graphs.empty
       ; fenced = []
       ; facts =
           { state.facts with
             current = None
+          ; retired_host_sessions=Sessions.empty
           ; bootstrap_state = Worker.Awaiting_baseline
           ; shutdown = Active
           ; change_batches = Graphs.empty
@@ -2458,24 +2500,36 @@ let step_base state event =
      | Operation (Worker.Observe _) -> forget_observation state ticket
      | _ -> cancel state ticket true)
   | Handoff_completed (id, outcome)
-    when Option.fold ~none:false ~some:(Worker.equal_handoff_id id) state.active_handoff
-    ->
-    changed
-      { state with
-        active_handoff =
-          (match outcome with
-           | Worker.Quiescing _ -> Some id
-           | _ -> None)
-      ; facts =
-          { state.facts with
-            handoffs =
-              (id, outcome)
-              :: List.filter
-                   (fun (old, _) -> not (Worker.equal_handoff_id old id))
-                   state.facts.handoffs
-          }
-      }
-      []
+    when Option.fold ~none:false ~some:(Worker.equal_handoff_id id)state.active_handoff->
+    (match state.host_plan,outcome with
+     |Some plan,Worker.Safe_to_proceed receipt when Worker.valid_handoff_receipt plan receipt->
+       changed{state with host_candidate=Some receipt}[]
+     |_,Worker.Handoff_failed(change,error)->
+       (match handoff state.facts id with
+        |Some(Worker.Quiescing expected)when expected=change->
+          changed{state with active_handoff=None;host_plan=None;host_candidate=None;
+            facts={state.facts with handoffs=(id,Worker.Handoff_failed(change,error))::
+              List.filter(fun(old,_)->not(Worker.equal_handoff_id old id))state.facts.handoffs}}[]
+        |_->unchanged state)
+     |_->unchanged state)
+  |Handoff_apply_not_admitted(id,attempt,Worker.Full)
+     when matching_host_attempt state id attempt && state.host_consume_admitted=None->
+    (match handoff state.facts id with Some(Worker.Applying_host_change _)->
+      changed{state with host_consume_waiting=true;host_consume_early=None}[]|_->unchanged state)
+  |Handoff_apply_not_admitted(id,attempt,_)when matching_host_attempt state id attempt && state.host_consume_admitted=None->
+    finish_host_action state id(Error(Worker.Service_failed "Worker unavailable before host action admission"))
+  |Handoff_apply_rejected(id,attempt,error)when matching_host_attempt state id attempt && state.host_consume_admitted=None->
+    finish_host_action state id(Error error)
+  |Handoff_apply_admitted(id,attempt,mailbox)when matching_host_attempt state id attempt
+     && state.host_consume_admitted=None && not state.host_consume_waiting->
+    let next={state with host_consume_admitted=Some mailbox;host_consume_early=None} in
+    (match state.host_consume_early with Some(actual,result)when Id.Request_id.equal mailbox actual->finish_host_action next id result
+     |_->unchanged next)
+  |Handoff_applied(id,attempt,mailbox,result)when matching_host_attempt state id attempt && not state.host_consume_waiting->
+    (match state.host_consume_admitted with
+     |Some actual when Id.Request_id.equal actual mailbox->finish_host_action state id result
+     |None when state.host_consume_early=None->unchanged{state with host_consume_early=Some(mailbox,result)}
+     |_->unchanged state)
   | Changefeed_notice (notice, sequence) ->
     let session = notice.Worker.notice_session in
     let graph = Worker.graph_id session in
@@ -2676,7 +2730,7 @@ let step_base state event =
        changed (retain_observed_value state value ~admitted:true ~cancelled:false) []
      | _ -> unchanged state)
   | Asset_received(notice,sequence)->retain_asset_notice state notice sequence
-  | Handoff_completed _ -> unchanged state
+  | Handoff_completed _ | Handoff_applied _ | Handoff_apply_admitted _ | Handoff_apply_rejected _ | Handoff_apply_not_admitted _ -> unchanged state
 ;;
 
 let plan_refresh ?(internal = false) (state : t) session handle =
@@ -2845,14 +2899,81 @@ let retire_completed_imports transition =
   changed{transition.next with facts={facts with imports;import_history}}(non_publications transition.instructions)
 ;;
 
+let host_sessions state change =
+  let add session values=if affected session change then Sessions.add session values else values in
+  let add_projection projection values=List.fold_left(fun values(resident:Worker.resident)->
+    add resident.session values)values(Worker.residents projection) in
+  let values=Option.fold ~none:Sessions.empty ~some:(fun projection->add_projection projection Sessions.empty)state.facts.current in
+  let values=Slots.fold(fun _ (Entry slot) values->
+    let session=match slot.ticket.target with Cleanup session|Direct session|Sealed(session,_)->Some session
+      |Presentation value->Some(Worker.presentation_session value)|Expected _->Option.map fst slot.origin in
+    Option.fold ~none:values ~some:(fun session->add session values)session)state.facts.entries values in
+  let values=Observation_ids.fold(fun _ (Observing value) values->add value.obs_session values)state.facts.observations values in
+  let values=Asset_consumers.fold(fun _ entry values->add(Worker.asset_consumer_session entry.consumer)values)state.facts.asset_consumers values in
+  let values=Observation_ids.fold(fun _ lease values->add(Worker.file_lease_session lease)values)state.facts.file_leases values in
+  let values=Observation_ids.fold(fun _ cleanup values->add(fst(resource_release cleanup.resource))values)state.facts.asset_cleanup values in
+  let values=Graphs.fold(fun _ saved values->add saved.source_owner values)state.facts.imports values in
+  Rrbvec.of_seq(Sessions.to_seq values)
+;;
+let progress_host_handoff ?(capacity=false) transition =
+  let state=transition.next in
+  match state.active_handoff with
+  |None->transition
+  |Some id->
+    let fail change error=changed{state with active_handoff=None;host_plan=None;host_candidate=None;host_consume_waiting=false;
+      host_consume_attempt=None;host_consume_admitted=None;host_consume_early=None;
+      facts={state.facts with handoffs=(id,Worker.Handoff_failed(change,error))::
+        List.filter(fun(old,_)->not(Worker.equal_handoff_id old id))state.facts.handoffs}}(non_publications transition.instructions) in
+    match handoff state.facts id,state.host_plan,state.host_candidate with
+    |Some(Worker.Quiescing change),_,_ when state.lifecycle<>Running->fail change Worker.Revoked_session
+    |Some(Worker.Safe_to_proceed receipt),_,_ when state.lifecycle<>Running->fail(Worker.handoff_change receipt)Worker.Revoked_session
+    |Some(Worker.Quiescing change),Some plan,_
+      when Option.exists(fun projection->not(Worker.valid_handoff_projection plan projection))state.facts.current->
+      fail change Worker.Revoked_session
+    |Some(Worker.Safe_to_proceed receipt),Some plan,_
+      when not(Option.exists(Worker.valid_handoff_projection plan)state.facts.current)->
+      fail(Worker.handoff_change receipt)Worker.Revoked_session
+    |Some(Worker.Quiescing change),None,_->
+      (match state.facts.current with
+       |None->transition
+       |Some projection->
+         (match Worker.host_change_plan projection ~handoff_id:id ~change ~sessions:(host_sessions state change)with
+          |Ok plan->
+            let retired_host_sessions=Rrbvec.fold_left(fun values session->Sessions.add session values)
+              state.facts.retired_host_sessions(host_sessions state change) in
+            changed{state with host_plan=Some plan;facts={state.facts with retired_host_sessions}}
+              (non_publications transition.instructions @ [Quiesce plan])
+          |Error error->changed{state with active_handoff=None;
+             facts={state.facts with handoffs=(id,Worker.Handoff_failed(change,error))::
+               List.filter(fun(old,_)->not(Worker.equal_handoff_id old id))state.facts.handoffs}}(non_publications transition.instructions)))
+    |Some(Worker.Quiescing change),Some plan,Some receipt when Worker.valid_handoff_receipt plan receipt
+       && Option.exists(Worker.valid_handoff_projection plan)state.facts.current->
+      let pending=Observation_ids.exists(fun _ (Observing value)->affected value.obs_session change)state.facts.observations
+        || Observation_ids.exists(fun _ lease->affected(Worker.file_lease_session lease)change)state.facts.file_leases
+        || Observation_ids.exists(fun _ cleanup->affected(fst(resource_release cleanup.resource))change)state.facts.asset_cleanup in
+      if pending then transition else changed{state with host_candidate=None;
+        facts={state.facts with handoffs=(id,Worker.Safe_to_proceed receipt)::
+          List.filter(fun(old,_)->not(Worker.equal_handoff_id old id))state.facts.handoffs}}(non_publications transition.instructions)
+    |Some(Worker.Applying_host_change receipt),Some plan,_ when state.host_consume_waiting
+      && (state.lifecycle<>Running || not(Option.exists(Worker.valid_handoff_projection plan)state.facts.current))->
+      fail(Worker.handoff_change receipt)Worker.Revoked_session
+    |Some(Worker.Applying_host_change receipt),Some plan,_ when capacity && state.host_consume_waiting
+       && state.lifecycle=Running && Worker.valid_handoff_receipt plan receipt
+       && Option.exists(Worker.valid_handoff_projection plan)state.facts.current->
+      (match plan_host_action_attempt state receipt with
+       |Ok(next,instruction)->changed next(non_publications transition.instructions @ [instruction])
+       |Error error->fail(Worker.handoff_change receipt)error)
+    |_->transition
+;;
+
 let step state event =
-  retire_completed_imports(progress_asset_cleanup ~capacity:(event=Capacity_available)
+  progress_host_handoff ~capacity:(event=Capacity_available)(retire_completed_imports(progress_asset_cleanup ~capacity:(event=Capacity_available)
   (progress_observations
     ~retry:
       (match event with
        | Capacity_available -> true
        | _ -> false)
-    (step_base state event)))
+    (step_base state event))))
 ;;
 
 let plan_mutation
@@ -3516,7 +3637,7 @@ let prepare_host_change state change =
       if affected(Worker.asset_consumer_session entry.consumer)change then {entry with active=false;notices=[]}else entry)facts.asset_consumers} in
     Ok
       ( id
-      , progress_asset_cleanup(progress_observations
+      , progress_host_handoff(progress_asset_cleanup(progress_observations
           ~retry:false
           (changed
              { state with
@@ -3525,7 +3646,20 @@ let prepare_host_change state change =
              ; active_handoff = Some id
              ; fenced = change :: state.fenced
              }
-             (cancels @ [ Quiesce (id, change) ]))) ))
+             cancels)))))
+;;
+
+let authorize_host_change state receipt =
+  let id=Worker.handoff_receipt_id receipt in
+  match state.lifecycle,state.active_handoff,state.host_plan,handoff state.facts id,state.facts.current with
+  |Running,Some active,Some plan,Some(Worker.Safe_to_proceed actual),Some projection
+    when Worker.equal_handoff_id active id && actual=receipt
+      && Worker.valid_handoff_receipt plan receipt && Worker.valid_handoff_projection plan projection->
+    let facts={state.facts with handoffs=(id,Worker.Applying_host_change receipt)::
+      List.filter(fun(old,_)->not(Worker.equal_handoff_id old id))state.facts.handoffs} in
+    Result.map(fun(next,instruction)->changed next[instruction])
+      (plan_host_action_attempt {state with facts} receipt)
+  |_->Error Worker.Revoked_session
 ;;
 
 module Response_ownership = struct

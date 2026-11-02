@@ -437,6 +437,7 @@ type local_deletion =
 
 type projection =
   { binding : binding
+  ; host_owner : Service.account_scope
   ; account : account_generation
   ; version : projection_version
   ; residents : resident list
@@ -465,11 +466,15 @@ type cleanup_resource =
   | Durable_intent
 
 type handoff_id = Uuid.t
-type handoff_receipt = |
+type handoff_plan={plan_binding:binding;plan_wire:Logseq_db_worker.host_plan;plan_change:host_change;
+  plan_sessions:session Rrbvec.t}
+type handoff_receipt={host_plan:handoff_plan;host_receipt:Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt}
 
 type handoff_state =
   | Quiescing of host_change
   | Safe_to_proceed of handoff_receipt
+  | Applying_host_change of handoff_receipt
+  | Host_change_applied of handoff_receipt
   | Handoff_failed of host_change * error
 
 module type ISSUER = sig
@@ -479,16 +484,16 @@ module type ISSUER = sig
   val binding_released : Service.response -> (unit, error) result
 
   val handoff_request
-    :  handoff_id:handoff_id
-    -> host_change
+    :  handoff_plan
     -> (Service.request, error) result
 
   val handoff_receipt
-    :  handoff_id:handoff_id
-    -> host_change
+    :  handoff_plan
     -> Service.response
     -> (handoff_receipt, error) result
 
+  val consume_handoff_request : handoff_receipt -> (Service.request,error)result
+  val handoff_consumed : handoff_receipt -> Service.response -> (unit,error)result
   val bootstrap_request : unit -> (Service.request, error) result
   val bootstrap : Service.response -> (bootstrap_state, error) result
 
@@ -590,6 +595,12 @@ let equal_session (a : session) (b : session) =
   && a.lifecycle = b.lifecycle
   && a.generation = b.generation
   && Uuid.equal a.graph b.graph
+;;
+
+let compare_session (a:session)(b:session)=
+  let key (s:session)=(s.binding.incarnation,s.binding.serial,s.binding.origin,s.binding.user,
+    s.account,s.lifecycle,s.generation,s.graph) in
+  Stdlib.compare(key a)(key b)
 ;;
 
 let matches_asset_scope (session:session) (scope:Service.asset_scope)=
@@ -989,29 +1000,53 @@ let removal_target = function
 let handoff_id id = id
 let equal_handoff_id = Uuid.equal
 
-let handoff_receipt_id (x : handoff_receipt) =
-  match x with
-  | _ -> .
+let host_affected session = function
+  |Account_will_change|Connection_will_stop->true
+  |Graph_will_close id|Graph_will_remove(id,_)->Uuid.equal session.graph id
 ;;
-
-let handoff_binding (x : handoff_receipt) =
-  match x with
-  | _ -> .
+let host_change_plan (projection:projection) ~handoff_id ~change ~sessions =
+  let binding=projection.binding in
+  let valid (session:session)=session.binding.incarnation=binding.incarnation
+    && session.binding.origin=binding.origin && session.binding.user=binding.user
+    && host_affected session change in
+  if Rrbvec.length sessions>8192 || not(Rrbvec.fold_left(fun ok session->ok && valid session)true sessions)
+  then Error(Invalid_input "The host plan contains a foreign or unbounded execution roster") else
+  let change_wire=match change with
+    |Graph_will_close id->Logseq_db_worker_pure_reducer.Core.Host_handoff.Close_graph id
+    |Graph_will_remove(id,Ordinary)->Remove_graph(id,Normal)
+    |Graph_will_remove(id,Force)->Remove_graph(id,Force)
+    |Account_will_change->Replace_account|Connection_will_stop->Stop_connection in
+  Ok{plan_binding=binding;plan_change=change;plan_sessions=sessions;
+    plan_wire={version=projection.version;id=handoff_id;registration=binding.serial;
+      owner=projection.host_owner;change=change_wire;expected=Rrbvec.map(fun session->session.asset_scope)sessions}}
 ;;
-
-let handoff_sessions (x : handoff_receipt) =
-  match x with
-  | _ -> .
+let handoff_plan_id plan=plan.plan_wire.id
+let handoff_plan_change plan=plan.plan_change
+let handoff_plan_binding plan=plan.plan_binding
+let handoff_receipt_id receipt=receipt.host_plan.plan_wire.id
+let handoff_binding receipt=receipt.host_plan.plan_binding
+let handoff_sessions receipt=receipt.host_plan.plan_sessions
+let handoff_change receipt=receipt.host_plan.plan_change
+let handoff_pending _=[]
+let valid_handoff_projection plan (projection:projection)=
+  let expected=plan.plan_wire.owner and actual=projection.host_owner in
+  equal_binding plan.plan_binding projection.binding
+  && expected.user_id=actual.user_id && Uri.equal expected.managed_sync_origin actual.managed_sync_origin
+  && expected.account_generation=actual.account_generation && expected.lifecycle_generation=actual.lifecycle_generation
+  && List.for_all(fun(resident:resident)->not(host_affected resident.session plan.plan_change)
+    || Rrbvec.fold_left(fun found session->found || equal_session session resident.session)false plan.plan_sessions)
+      projection.residents
 ;;
-
-let handoff_change (x : handoff_receipt) =
-  match x with
-  | _ -> .
-;;
-
-let handoff_pending (x : handoff_receipt) =
-  match x with
-  | _ -> .
+let valid_handoff_receipt plan receipt=
+  let module H=Logseq_db_worker_pure_reducer.Core.Host_handoff in
+  let actual=H.receipt_request receipt.host_receipt in
+  equal_binding plan.plan_binding receipt.host_plan.plan_binding
+  && plan.plan_wire.id=actual.id && plan.plan_wire.registration=actual.registration
+  && plan.plan_wire.version=actual.version && plan.plan_wire.change=actual.change
+  && plan.plan_wire.owner=actual.owner
+  && Rrbvec.length plan.plan_wire.expected=Rrbvec.length actual.expected
+  && snd(Rrbvec.fold_left(fun(index,ok) scope->
+    index+1,ok && scope=Rrbvec.nth actual.expected index)(0,true)plan.plan_wire.expected)
 ;;
 
 let query_command
@@ -1525,8 +1560,23 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
         | _ -> Error (Protocol_mismatch "Unexpected registration release ACK")
       ;;
 
-      let handoff_request ~handoff_id:_ _ = unavailable "Writer and local-copy fencing"
-      let handoff_receipt ~handoff_id:_ _ _ = unavailable "Writer and local-copy fencing"
+      let handoff_request plan=
+        if !revoked || not(equal_binding binding plan.plan_binding) then Error Revoked_session
+        else Ok(Service.Coordination_prepare_host_change plan.plan_wire)
+      let handoff_receipt plan=function
+        |Service.Coordination_host_prepared actual when not !revoked
+           && equal_binding binding plan.plan_binding->
+          let receipt={host_plan=plan;host_receipt=actual} in
+          if valid_handoff_receipt plan receipt then Ok receipt
+          else Error(Protocol_mismatch "The physical handoff receipt does not match its immutable plan")
+        |_->Error(Protocol_mismatch "Unexpected physical host handoff response")
+      let consume_handoff_request receipt=
+        if !revoked || not(equal_binding binding(handoff_binding receipt)) then Error Revoked_session
+        else Ok(Service.Coordination_apply_host_change receipt.host_receipt)
+      let handoff_consumed receipt=function
+        |Service.Coordination_host_applied id when id=handoff_receipt_id receipt
+           && equal_binding binding(handoff_binding receipt)->Ok()
+        |_->Error(Protocol_mismatch "The host action did not acknowledge its exact consumed permission")
 
       let bootstrap_request () =
         if !revoked
@@ -1676,6 +1726,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                        in
                        let projection =
                          { binding
+                         ; host_owner=account
                          ; account = account.account_generation
                          ; version = b.baseline.version
                          ; residents

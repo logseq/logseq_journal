@@ -310,6 +310,79 @@ let with_client ?epoch_ms ?favorites ?assets ?statuses ?prepare f =
     (fun start -> f (start ()))
 ;;
 
+(* Actual Service/DB/Sync ownership is not expressible by injecting Core
+   completions. Exercise the real retained listener, close, consume and reopen. *)
+let test_real_host_close_keeps_other_resident_and_reopens () =
+  with_client(fun client->
+    let events=Queue.create() and state=ref(C.initial ~client_id) in
+    let runner=R.create ~client ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
+      ~post:(fun event->Queue.add event events) ~publish:(fun _->()) |> Result.get_ok in
+    let apply transition=state:=transition.C.next;List.iter(R.submit runner)transition.instructions in
+    let host_responses=ref 0 in
+    Mailbox.on_event client(fun event->
+      let delivery=R.on_event runner event in
+      match event with
+      |Mailbox.Response{outcome=Completed(Service.Coordination_host_prepared _|Coordination_host_applied _);_}->
+        incr host_responses;
+        require(delivery.disposition=R.Consumed)"actual host receipt escaped its exclusive response owner";
+        let terminals()=Queue.fold(fun count->function C.Handoff_completed _|C.Handoff_applied _->count+1|_->count)0 events in
+        let count=terminals() in
+        require((R.on_event runner event).disposition=R.Consumed)"duplicate host receipt became unowned";
+        require(terminals()=count)"duplicate host response posted another terminal completion"
+      |_->());
+    let pump()=Mailbox.Private.deliver client ~max_events:64;
+      let count=Queue.length events in for _=1 to count do apply(C.step !state(Queue.take events)) done in
+    let wait label predicate=
+      let deadline=Unix.gettimeofday()+.4. in
+      while not(predicate()) && Unix.gettimeofday()<deadline do pump();Thread.delay 0.001 done;
+      require(predicate())label in
+    ignore(Mailbox.send client(Service.Client_command(Restore_local_account{user_id="user-1"})));
+    let open_sessions()=match C.projection(C.view !state)with None->[]|Some projection->
+      W.residents projection |> List.filter_map(fun resident->if resident.W.phase=W.Open then Some resident.session else None) in
+    wait "host initial actual DB did not open" (fun()->List.length(open_sessions())=1);
+    ignore(Mailbox.send client(Service.Client_command(Configure_resident_graphs[Test_support.graph_uuid;second_graph])));
+    wait "host two actual residents did not open" (fun()->List.length(open_sessions())=2);
+    let first=List.find(fun session->W.graph_id session=Test_support.graph_uuid)(open_sessions())
+    and second=List.find(fun session->W.graph_id session=second_graph)(open_sessions()) in
+    let budget=W.read_budget first ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
+    let observed,registration=C.request !state first(W.Observe(budget,W.Graph_info)) |> Result.get_ok in
+    apply registration;wait "actual host listener not registered"(fun()->Option.is_some(C.reply(C.view !state)observed));
+    let observation=match C.reply(C.view !state)observed with Some(W.Answered(Ok value))->value.W.observation
+      |_->failwith "actual host observation did not sample" in
+    let id,prepare=C.prepare_host_change !state(W.Graph_will_close(W.graph_id first)) |> Result.get_ok in
+    apply prepare;
+    let receipt=ref None in
+    wait "actual host prepare did not settle"(fun()->match C.handoff(C.view !state)id with
+      |Some(W.Safe_to_proceed value)->receipt:=Some value;true
+      |Some(W.Handoff_failed(_,(W.Service_failed message|W.Protocol_mismatch message)))->failwith message
+      |Some(W.Handoff_failed _)->failwith "actual host prepare failed"
+      |_->false);
+    require(C.observed(C.view !state)observation=None)"host Safe published before its listener retirement ACK";
+    let query session=
+      let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
+      let ticket,transition=C.request !state session(W.Query(budget,W.Graph_info)) |> Result.get_ok in
+      apply transition;wait "unrelated resident read did not finish"(fun()->Option.is_some(C.reply(C.view !state)ticket));
+      let info=match C.reply(C.view !state)ticket with Some(W.Answered(Ok info))->info|_->failwith "actual host read failed" in
+      apply(C.step !state(C.Forget ticket));info in
+    require((query second).graph_uuid=second_graph)"closing first resident interrupted the other actual DB";
+    let receipt=Option.get !receipt in
+    apply(C.authorize_host_change !state receipt |> Result.get_ok);
+    wait "actual host consume did not acknowledge"(fun()->match C.handoff(C.view !state)id with
+      |Some(W.Host_change_applied _)->true
+      |Some(W.Handoff_failed(_,(W.Service_failed message|W.Protocol_mismatch message)))->failwith message
+      |Some(W.Handoff_failed _)->failwith "actual host consume failed"|_->false);
+    require(C.validate_session !state first=Error W.Revoked_session)"actual consume revived its old execution";
+    ignore(Mailbox.send client(Service.Client_command(Configure_resident_graphs[Test_support.graph_uuid;second_graph])));
+    wait "actual graph could not reopen after consumed close"(fun()->List.length(open_sessions())=2);
+    let reopened=List.find(fun session->W.graph_id session=Test_support.graph_uuid)(open_sessions()) in
+    require(not(W.equal_session first reopened))"actual reopen reused old execution generation";
+    require((query reopened).graph_uuid=Test_support.graph_uuid)"new execution remained fenced after close";
+    require(Result.is_error(C.authorize_host_change !state receipt))"old safe permission consumed after real reopen";
+    require(!host_responses=2)"host prepare/consume did not own exactly two real responses";
+    apply(C.step !state C.Shutdown_requested);
+    wait "real host coordination did not drain"(fun()->C.shutdown_state(C.view !state)=C.Stopped))
+;;
+
 let test_client_to_typed_read () =
   with_client ~favorites:true ~statuses:true (fun client ->
     let events = Queue.create ()
@@ -3887,6 +3960,9 @@ let test_service_changefeed_has_one_owner () =
 ;;
 
 let () =
+  let host_only=Array.exists((=)"--host-handoff-only")Sys.argv in
+  test_real_host_close_keeps_other_resident_and_reopens();
+  if host_only then (print_endline "Real host close/observe/consume/reopen and exclusive responses passed";exit 0);
   test_service_writer_fence_waits_for_canceled_protected_commit ();
   test_prepared_import_survives_worker_lifetime ();
   test_service_import_rejects_retired_registration ();

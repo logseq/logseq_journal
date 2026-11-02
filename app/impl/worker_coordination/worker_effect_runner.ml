@@ -13,6 +13,8 @@ type flight =
       -> flight
   | Unobserve of (module Worker.ISSUER) * Worker.session * Worker.request_id
   | Unregister of (module Worker.ISSUER)
+  | Handoff of (module Worker.ISSUER) * Worker.handoff_plan
+  | Consume of (module Worker.ISSUER) * Worker.handoff_receipt * Worker.request_id
 
 type t =
   { client : client
@@ -162,18 +164,24 @@ let submit t = function
            Mailbox.cancel t.client ~request_id:id
          | _ -> ())
       t.pending
-  | Quiesce (id, change) ->
-    let module I = (val t.issuer : Worker.ISSUER) in
-    (match I.handoff_request ~handoff_id:id change with
-     | Error e -> t.post (Core.Handoff_completed (id, Worker.Handoff_failed (change, e)))
-     | Ok _ ->
-       t.post
-         (Core.Handoff_completed
-            ( id
-            , Worker.Handoff_failed
-                ( change
-                , Worker.Unsupported_operation
-                    "Backend quiescence interpreter is not available" ) )))
+  |Quiesce plan->
+    let module I=(val t.issuer:Worker.ISSUER) in
+    let id=Worker.handoff_plan_id plan and change=Worker.handoff_plan_change plan in
+    let fail error=t.post(Core.Handoff_completed(id,Worker.Handoff_failed(change,error))) in
+    (match I.handoff_request plan with
+     |Error error->fail error
+     |Ok request->match admit t request(Handoff(t.issuer,plan))with
+       |Accepted _->()
+       |Full->fail(Worker.Service_failed "Host preparation was not admitted: queue full")
+       |Not_ready|Stopping->fail(Worker.Service_failed "Host preparation was not admitted: Worker unavailable"))
+  |Consume_handoff(receipt,attempt)->
+    let module I=(val t.issuer:Worker.ISSUER) in
+    let id=Worker.handoff_receipt_id receipt in
+    (match I.consume_handoff_request receipt with
+     |Error error->t.post(Core.Handoff_apply_rejected(id,attempt,error))
+     |Ok request->match admit t request(Consume(t.issuer,receipt,attempt))with
+       |Accepted mailbox->t.post(Core.Handoff_apply_admitted(id,attempt,mailbox))
+       |result->t.post(Core.Handoff_apply_not_admitted(id,attempt,refused result)))
   | Publish view ->
     t.latest <- Some view;
     t.publish view
@@ -277,6 +285,22 @@ let on_event t event =
                        "Observation release did not acknowledge physical retirement")
               in
               t.post (Core.Observation_release_completed (session, id, result))
+            |Consume(issuer,receipt,attempt)->
+              let module I=(val issuer:Worker.ISSUER) in
+              let result=match outcome with
+                |Completed response->I.handoff_consumed receipt response
+                |Failed message->Error(Worker.Service_failed message)
+                |Cancelled|Shutdown->Error(Worker.Service_failed "Host action outcome is unknown; original permission cannot be replayed") in
+              t.post(Core.Handoff_applied(Worker.handoff_receipt_id receipt,attempt,request_id,result))
+            |Handoff(issuer,plan)->
+              let module I=(val issuer:Worker.ISSUER) in
+              let id=Worker.handoff_plan_id plan and change=Worker.handoff_plan_change plan in
+              let result=match outcome with
+                |Completed response->I.handoff_receipt plan response
+                |Failed message->Error(Worker.Service_failed message)
+                |Cancelled|Shutdown->Error(Worker.Service_failed "Host preparation was interrupted; cleanup ownership retained") in
+              t.post(Core.Handoff_completed(id,match result with
+                |Ok receipt->Worker.Safe_to_proceed receipt|Error error->Worker.Handoff_failed(change,error)))
             | Unregister issuer ->
               let module I = (val issuer : Worker.ISSUER) in
               let result =
@@ -351,9 +375,12 @@ let on_event t event =
     { disposition; error = !error })
 ;;
 
-let authorize_host_change _ _ =
-  Error
-    (Worker.Unsupported_operation "Backend writer/local-copy fence is not implemented")
+let authorize_host_change t receipt ~attempt =
+  let module I=(val t.issuer:Worker.ISSUER) in
+  Result.bind(I.consume_handoff_request receipt)(fun request->
+    match admit t request(Consume(t.issuer,receipt,attempt))with
+    |Accepted id->Ok id
+    |_->Error(Worker.Service_failed "Host action was not admitted; no consumption ACK"))
 ;;
 
 type shutdown_state =

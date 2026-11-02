@@ -141,6 +141,10 @@ type event =
   | Forget : 'a ticket -> event
   | Release : 'a Worker.observation -> event
   | Handoff_completed of Worker.handoff_id * Worker.handoff_state
+  | Handoff_applied of Worker.handoff_id * Worker.request_id * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id * (unit,Worker.error)result
+  | Handoff_apply_admitted of Worker.handoff_id * Worker.request_id * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id
+  | Handoff_apply_rejected of Worker.handoff_id * Worker.request_id * Worker.error
+  | Handoff_apply_not_admitted of Worker.handoff_id * Worker.request_id * Worker.admission_error
   | Drain
 
 type instruction =
@@ -150,7 +154,8 @@ type instruction =
   | Bind_replacement
   | Send : 'a ticket * Worker.session * 'a Worker.request -> instruction
   | Cancel_request : 'a ticket -> instruction
-  | Quiesce of Worker.handoff_id * Worker.host_change
+  | Quiesce of Worker.handoff_plan
+  | Consume_handoff of Worker.handoff_receipt * Worker.request_id
   | Publish of view
   | Schedule_drain
 
@@ -266,6 +271,11 @@ val prepare_host_change
   :  t
   -> Worker.host_change
   -> (Worker.handoff_id * transition, Worker.error) result
+
+(** Admit one consume attempt from the current Safe frame. Applying is not an
+    ACK. Only the exact attempt and admitted Mailbox terminal ACK publishes Host_change_applied and removes
+    the graph-level gate; its original executions remain permanently retired. *)
+val authorize_host_change:t -> Worker.handoff_receipt -> (transition,Worker.error)result
 
 (** Pure compressed ownership history for real mailbox-ID association. *)
 module Response_ownership : sig

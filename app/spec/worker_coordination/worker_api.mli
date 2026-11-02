@@ -26,6 +26,7 @@ val presentation_generation : presentation -> presentation_generation
 val presentation_session : presentation -> session
 val graph_id : session -> Uuid.t
 val equal_session : session -> session -> bool
+val compare_session : session -> session -> int
 val same_logical_graph : session -> session -> bool
 val matches_scope : session -> Service.timeline_scope -> bool
 val matches_asset_scope : session -> Service.asset_scope -> bool
@@ -716,17 +717,31 @@ type handoff_id
 val handoff_id : Uuid.t -> handoff_id
 val equal_handoff_id : handoff_id -> handoff_id -> bool
 
+type handoff_plan
+
+(** Deterministic snapshot of the exact authoritative frame. The effect runner
+    forwards it without choosing another account/version from a later callback. *)
+val host_change_plan : projection -> handoff_id:handoff_id -> change:host_change
+  -> sessions:session Rrbvec.t -> (handoff_plan,error)result
+val handoff_plan_id : handoff_plan -> handoff_id
+val handoff_plan_change : handoff_plan -> host_change
+val handoff_plan_binding : handoff_plan -> binding
+
 type handoff_receipt
+val valid_handoff_receipt : handoff_plan -> handoff_receipt -> bool
+val valid_handoff_projection : handoff_plan -> projection -> bool
 
 val handoff_receipt_id : handoff_receipt -> handoff_id
 val handoff_binding : handoff_receipt -> binding
-val handoff_sessions : handoff_receipt -> session list
+val handoff_sessions : handoff_receipt -> session Rrbvec.t
 val handoff_change : handoff_receipt -> host_change
 val handoff_pending : handoff_receipt -> cleanup_resource list
 
 type handoff_state =
   | Quiescing of host_change
   | Safe_to_proceed of handoff_receipt
+  | Applying_host_change of handoff_receipt
+  | Host_change_applied of handoff_receipt
   | Handoff_failed of host_change * error
 
 (** Prepare immediately fences new admission for affected owners and retires their
@@ -743,8 +758,13 @@ type handoff_state =
     failure is retryable; no stale callback may re-enable the retired owner.
     Receipts bind exact handoff ID, binding, affected execution generations and
     removal's local-copy incarnation even when no DB can open. Before the host
-    acts, runner.authorize_host_change validates and consumes the current receipt;
-    old safe receipts cannot authorize a reopened graph or replacement account. *)
+    acts, the pure coordinator plans one consume against the current receipt;
+    the runner forwards its exact attempt to the existing Service owner. Mailbox
+    admission is not an action ACK. Only Host_change_applied acknowledges actual
+    consumption/action; old safe receipts cannot authorize a reopened graph or
+    replacement account. Close was already physically settled during prepare,
+    and removal uses the bound existing deletion owner. Do not dispatch a second
+    legacy Close/Delete after that ACK. Auth/UI/client lifecycle stay with host. *)
 
 (** Connection-bound validation used inside the direct effect runner. Methods below
     map concrete Service messages, not fictional bytes or a separate adapter. The
@@ -766,26 +786,26 @@ module type ISSUER = sig
       idempotent. Do not abandon an old registration on retry/rebind/shutdown. *)
 
   val handoff_request
-    :  handoff_id:handoff_id
-    -> host_change
+    :  handoff_plan
     -> (Service.request, error) result
 
   val handoff_receipt
-    :  handoff_id:handoff_id
-    -> host_change
+    :  handoff_plan
     -> Service.response
     -> (handoff_receipt, error) result
 
   (** Match the tracked host transition and actual writer/resource fence. This
-      is not Client_command_completed interpreted as proof of quiescence. Until
-      Service exposes such evidence, return Unsupported_operation and retain the
-      failed/pending handoff; host may use its existing independently proven
-      lifecycle/deletion owner, but must never fabricate this receipt. *)
+      is not Client_command_completed interpreted as proof of quiescence. The
+      actual Service frame binds backend lifetime, original version, captured
+      resources and held local-copy preparation. No readback callback may choose
+      another target or reconstruct an absent receipt. *)
 
   (** The actual Service owner registers and samples one lifecycle version.
       Baselines carry caller-known registration IDs, effective limits and exact
       resident/account identities. Ordinary query families map to Protocol V2;
       unsupported durability/resource capabilities fail before enqueue. *)
+  val consume_handoff_request : handoff_receipt -> (Service.request,error)result
+  val handoff_consumed : handoff_receipt -> Service.response -> (unit,error)result
   val bootstrap_request : unit -> (Service.request, error) result
 
   val bootstrap : Service.response -> (bootstrap_state, error) result

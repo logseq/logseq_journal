@@ -17,6 +17,25 @@ let ready binding projection =
   (C.step state (C.Bootstrap_received (binding, W.Ready projection))).next
 ;;
 
+(* Only a deterministic codec fixture. Real physical settlement is separately
+   exercised through Service/DB/Sync; this helper cannot supply that evidence. *)
+let pure_host_receipt_fixture issuer plan =
+  let module I=(val issuer:W.ISSUER) in
+  let request=match I.handoff_request plan |> Result.get_ok with
+    |S.Coordination_prepare_host_change request->request|_->assert false in
+  let module H=Logseq_db_worker_pure_reducer.Core.Host_handoff in
+  let catalog=match request.change with H.Close_graph id|Remove_graph(id,_)->Rrbvec.singleton id|_->Rrbvec.empty in
+  let facts:H.facts={authenticated=true;version=request.version;registration=Some request.registration;
+    account=Some request.owner;scopes=request.expected;catalog} in
+  let backend:H.request={version=request.version;id=request.id;registration=request.registration;
+    owner=request.owner;change=request.change;expected=request.expected;captured=request.expected} in
+  let pending,admission=H.prepare(H.empty ~lifetime:(uuid "98000000-0000-4000-8000-000000009899"))facts backend in
+  let attempt=match admission with H.Start value->value|_->failwith "invalid pure host codec fixture" in
+  let safe=H.settled pending attempt ~copy_generation:None in
+  let receipt=match H.phase safe request.id with Some(H.Safe value)->value|_->failwith "invalid pure settlement input" in
+  I.handoff_receipt plan(S.Coordination_host_prepared receipt) |> Result.get_ok
+;;
+
 let checked_import_reply issuer session ticket intent receipt =
   let module I=(val issuer:W.ISSUER) in
   let response=match I.request session ~request_id:(C.ticket_id ticket)(W.Import intent) |> Result.get_ok with
@@ -374,6 +393,111 @@ let test_new_host_source_proof_retires_only_identical_unknown () =
     "new host's exact durable source proof stranded old Unknown source ownership";
   check(C.equal_view(C.view reconciled)(C.view(C.step reconciled(C.Import_source_reconciled proof)).next))
     "duplicate source proof changed the old stopped host"
+;;
+
+(* The issuer may observe a later baseline before Core handles its queued
+   event. The pure plan pins the original owner/version; no closure may retarget
+   the host action at whatever happens to be latest. Physical settlement is
+   proved by the real Service tests, not by this validation fixture. *)
+let test_host_consumption_keeps_old_execution_retired () =
+  let issuer,raw,projection,session=fixture 9873L in
+  let module I=(val issuer:W.ISSUER) in
+  let initial=ready I.binding projection in
+  let id,prepared=C.prepare_host_change initial(W.Graph_will_close(W.graph_id session)) |> Result.get_ok in
+  let plan=List.find_map(function C.Quiesce plan->Some plan|_->None)prepared.instructions |> Option.get in
+  let request=match I.handoff_request plan |> Result.get_ok with
+    |S.Coordination_prepare_host_change value->value|_->assert false in
+  let module H=Logseq_db_worker_pure_reducer.Core.Host_handoff in
+  let facts:H.facts={authenticated=false;version=request.version;registration=Some request.registration;
+    account=Some request.owner;scopes=request.expected;catalog=Rrbvec.singleton(W.graph_id session)} in
+  let backend:H.request={version=request.version;id=request.id;registration=request.registration;
+    owner=request.owner;change=request.change;expected=request.expected;captured=request.expected} in
+  let pending,admission=H.prepare(H.empty ~lifetime:(uuid "98000000-0000-4000-8000-000000009873"))facts backend in
+  let attempt=match admission with H.Start value->value|_->assert false in
+  let safe=H.settled pending attempt ~copy_generation:None in
+  let actual=match H.phase safe request.id with Some(H.Safe value)->value|_->assert false in
+  let receipt=I.handoff_receipt plan(S.Coordination_host_prepared actual) |> Result.get_ok in
+  let retiring=(C.step prepared.next C.Shutdown_requested).next in
+  let late=(C.step retiring(C.Handoff_completed(id,W.Safe_to_proceed receipt))).next in
+  check(match C.handoff(C.view late)id with Some(W.Safe_to_proceed _)->false|_->true)
+    "late physical receipt published Safe after local retirement";
+  let safe=(C.step prepared.next(C.Handoff_completed(id,W.Safe_to_proceed receipt))).next in
+  let consuming=C.authorize_host_change safe receipt |> Result.get_ok in
+  check(Result.is_error(C.authorize_host_change consuming.next receipt))"same permission planned a second consume";
+  let attempt=List.find_map(function C.Consume_handoff(_,attempt)->Some attempt|_->None)consuming.instructions |> Option.get in
+  let full=(C.step consuming.next(C.Handoff_apply_not_admitted(id,attempt,W.Full))).next in
+  let retiring=(C.step full C.Shutdown_requested).next in
+  let after_capacity=C.step retiring C.Capacity_available in
+  check(not(List.exists(function C.Consume_handoff _->true|_->false)after_capacity.instructions))
+    "unadmitted host action retried after retirement";
+  let retry=C.step full C.Capacity_available in
+  let retry_attempt=List.find_map(function C.Consume_handoff(_,attempt)->Some attempt|_->None)retry.instructions |> Option.get in
+  check(W.compare_request_id attempt retry_attempt<>0)"Full retry reused the old admission attempt";
+  let retry_mailbox=Id.Worker.Request_id.of_int64 9874L in
+  let admitted_retry=(C.step retry.next(C.Handoff_apply_admitted(id,retry_attempt,retry_mailbox))).next in
+  let old_full=(C.step admitted_retry(C.Handoff_apply_not_admitted(id,attempt,W.Full))).next in
+  check(not(List.exists(function C.Consume_handoff _->true|_->false)(C.step old_full C.Capacity_available).instructions))
+    "old Full retargeted an already accepted newer consume attempt";
+  let early=(C.step retry.next(C.Handoff_applied(id,retry_attempt,retry_mailbox,Ok()))).next in
+  check(match C.handoff(C.view early)id with Some(W.Applying_host_change _)->true|_->false)
+    "early host completion fabricated admission before its mailbox ACK";
+  let early_admitted=(C.step early(C.Handoff_apply_admitted(id,retry_attempt,retry_mailbox))).next in
+  check(match C.handoff(C.view early_admitted)id with Some(W.Host_change_applied _)->true|_->false)
+    "matching late admission lost the actual early terminal result";
+  let mailbox=Id.Worker.Request_id.of_int64 9873L in
+  let admitted=(C.step consuming.next(C.Handoff_apply_admitted(id,attempt,mailbox))).next in
+  let applied=(C.step admitted(C.Handoff_applied(id,attempt,mailbox,Ok()))).next in
+  let retiring_admitted=(C.step admitted C.Shutdown_requested).next in
+  let settled_retired=(C.step retiring_admitted(C.Handoff_applied(id,attempt,mailbox,Ok()))).next in
+  check(match C.handoff(C.view settled_retired)id with Some(W.Host_change_applied _)->true|_->false)
+    "retirement discarded the terminal evidence of an actually admitted host action";
+  check(C.validate_session applied session=Error W.Revoked_session)
+    "old baseline revived its retired execution after consume ACK";
+  let scope,physical=List.hd raw.baseline.state.residents in
+  let next_scope={scope with graph_generation=scope.graph_generation+1} in
+  let next_raw={raw with baseline={raw.baseline with version=3L;
+    state={residents=[next_scope,{physical with generation=next_scope.graph_generation}];
+      sync={raw.baseline.state.sync with residents=List.map(fun(_,state)->next_scope,
+        {state with Sync.snapshot={state.Sync.snapshot with startup={state.snapshot.startup with graph_generation=next_scope.graph_generation}}})raw.baseline.state.sync.residents;
+        selected=None}}}} in
+  let reopened=match I.bootstrap(S.Coordination_registered next_raw) |> Result.get_ok with
+    |W.Ready projection->projection|_->failwith "new host generation fixture" in
+  let resumed=(C.step applied(C.Projection_received reopened)).next in
+  let new_session=(List.hd(W.residents reopened)).session in
+  check(C.validate_session resumed new_session=Ok())"completed graph close fenced a future execution forever";
+  check(Result.is_error(C.authorize_host_change resumed receipt))"old safe receipt consumed against a reopened execution"
+;;
+
+let test_host_plan_pins_original_authoritative_frame () =
+  let issuer,raw,projection,session=fixture 9871L in
+  let module I=(val issuer:W.ISSUER) in
+  let id=W.handoff_id(uuid "98000000-0000-4000-8000-000000009871") in
+  let plan=W.host_change_plan projection ~handoff_id:id
+    ~change:(W.Graph_will_close(W.graph_id session)) ~sessions:(Rrbvec.singleton session) |> Result.get_ok in
+  let _=I.bootstrap(S.Coordination_registered{raw with baseline={raw.baseline with version=2L}}) |> Result.get_ok in
+  let request=match I.handoff_request plan |> Result.get_ok with
+    |S.Coordination_prepare_host_change request->request|_->failwith "host plan bypassed actual Service" in
+  check(request.version=raw.baseline.version)"issuer retargeted host preparation at a later version";
+  check(Rrbvec.length request.expected=1 && W.matches_asset_scope session(Rrbvec.nth request.expected 0))
+    "issuer replaced planned execution owner";
+  let module H=Logseq_db_worker_pure_reducer.Core.Host_handoff in
+  let facts:H.facts={authenticated=false;version=request.version;registration=Some request.registration;
+    account=Some request.owner;scopes=request.expected;catalog=Rrbvec.singleton(W.graph_id session)} in
+  let backend:H.request={version=request.version;id=request.id;registration=request.registration;
+    owner=request.owner;change=request.change;expected=request.expected;captured=request.expected} in
+  let pending,admission=H.prepare(H.empty ~lifetime:(uuid "98000000-0000-4000-8000-000000009870"))facts backend in
+  let attempt=match admission with H.Start value->value|_->failwith "invalid pure host validation fixture" in
+  let safe=H.settled pending attempt ~copy_generation:None in
+  let actual=match H.phase safe request.id with Some(H.Safe value)->value|_->assert false in
+  let receipt=I.handoff_receipt plan(S.Coordination_host_prepared actual) |> Result.get_ok in
+  check(W.valid_handoff_receipt plan receipt)"matching actual backend receipt was rejected";
+  check(W.equal_handoff_id id(W.handoff_receipt_id receipt))"handoff identity drifted";
+  let foreign=W.host_change_plan projection
+    ~handoff_id:(W.handoff_id(uuid "98000000-0000-4000-8000-000000009872"))
+    ~change:(W.Graph_will_close(W.graph_id session)) ~sessions:(Rrbvec.singleton session) |> Result.get_ok in
+  check(not(W.valid_handoff_receipt foreign receipt))"foreign round accepted a retained safe receipt";
+  check(Result.is_error(I.handoff_receipt foreign(S.Coordination_host_prepared actual)))
+    "issuer reassociated an old physical receipt with a fresh round"
 ;;
 
 let test_query_origin_boundary () =
@@ -1791,6 +1915,30 @@ let pure_observation_response issuer raw session ticket operation epoch revision
                 }
           }
     }
+;;
+
+let test_host_candidate_waits_for_own_observation_ack () =
+  let issuer,raw,projection,session=fixture 9876L in
+  let module I=(val issuer:W.ISSUER) in
+  let initial=ready I.binding projection in
+  let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
+  let operation=W.Observe(budget,W.Graph_info) in
+  let ticket,planned=C.request initial session operation |> Result.get_ok in
+  let response=pure_observation_response issuer raw session ticket operation 0L "host-observation" in
+  let observed=match I.reply session ~request_id:(C.ticket_id ticket)operation response |> Result.get_ok with
+    |W.Answered(Ok value)->value|_->assert false in
+  let admitted=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
+  let sampled=(C.step admitted(C.Completed(ticket,W.Answered(Ok observed)))).next in
+  let id,preparing=C.prepare_host_change sampled(W.Graph_will_close(W.graph_id session)) |> Result.get_ok in
+  let plan=List.find_map(function C.Quiesce plan->Some plan|_->None)preparing.instructions |> Option.get in
+  let receipt=pure_host_receipt_fixture issuer plan in
+  let candidate=(C.step preparing.next(C.Handoff_completed(id,W.Safe_to_proceed receipt))).next in
+  check(match C.handoff(C.view candidate)id with Some(W.Quiescing _)->true|_->false)
+    "backend receipt bypassed the coordinator's own pending release ACK";
+  check(Result.is_error(C.authorize_host_change candidate receipt))"candidate receipt admitted consume before local cleanup ACK";
+  let released=(C.step candidate(C.Observation_release_completed(session,W.observation_id observed.observation,Ok()))).next in
+  check(match C.handoff(C.view released)id with Some(W.Safe_to_proceed _)->true|_->false)
+    "original release ACK did not expose the already captured exact backend receipt"
 ;;
 
 let test_observation_retains_typed_value () =
@@ -3799,6 +3947,82 @@ let test_atomic_append_intent_and_admission () =
     "Append bypassed the existing durable Service channel"
 ;;
 
+let test_host_handoff_properties () =
+  let issuer,raw,projection,session=fixture 9879L in
+  let module I=(val issuer:W.ISSUER) in
+  let scope,physical=List.hd raw.baseline.state.residents in
+  let projections=Array.init 16(fun n->
+    let scope={scope with graph_generation=scope.graph_generation+n+1} in
+    let sync={raw.baseline.state.sync with selected=None;
+      residents=List.map(fun(_,(state:Sync.state))->scope,{state with Sync.snapshot={state.snapshot with
+        startup={state.snapshot.startup with graph_generation=scope.graph_generation}}})raw.baseline.state.sync.residents} in
+    let raw={raw with baseline={raw.baseline with version=Int64.of_int(n+2);
+      state={sync;residents=[scope,{physical with generation=scope.graph_generation}]}}} in
+    match I.bootstrap(S.Coordination_registered raw) |> Result.get_ok with W.Ready value->value|_->assert false) in
+  let run trace=
+    let state=ref(ready I.binding projection) and preparations=ref [] and attempts=ref []
+      and receipts=ref [] and accepted=ref [] and rejected=ref [] and applied=ref [] and retired=ref [] in
+    let consume instructions=List.iter(function
+      |C.Quiesce plan->let receipt=pure_host_receipt_fixture issuer plan in
+        preparations:=(W.handoff_plan_id plan,receipt)::!preparations;receipts:=receipt::!receipts
+      |C.Consume_handoff(receipt,attempt)->
+        let mailbox=Id.Worker.Request_id.of_int64(Int64.of_int(10000+List.length !attempts)) in
+        attempts:=(W.handoff_receipt_id receipt,attempt,mailbox)::!attempts
+      |_->())instructions in
+    let event value=let transition=C.step !state value in state:=transition.next;consume transition.instructions in
+    let pick values n=if values=[]then None else Some(List.nth values(n mod List.length values)) in
+    let equal_attempt a b=W.compare_request_id a b=0 in
+    List.iteri(fun index action->
+      let before= !state and before_view=C.view !state in
+      let old_facts=List.map(fun(id,_)->id,C.handoff before_view id)!preparations in
+      (match action mod 13 with
+       |0|1->(match C.prepare_host_change !state(W.Graph_will_close(W.graph_id session))with
+         |Error _->()|Ok(_,transition)->
+           (match C.projection before_view with None->()|Some projection->
+             retired:=List.map(fun resident->resident.W.session)(W.residents projection) @ !retired);
+           state:=transition.next;consume transition.instructions)
+       |2->(match pick !preparations(action/13)with Some(id,receipt)->event(C.Handoff_completed(id,W.Safe_to_proceed receipt))|_->())
+       |3->(match pick !receipts(action/13)with Some receipt->
+         (match C.authorize_host_change !state receipt with Error _->()|Ok transition->state:=transition.next;consume transition.instructions)|_->())
+       |4->(match pick !attempts(action/13)with Some(id,attempt,_)->
+         if not(List.exists(fun(_,actual,_)->equal_attempt actual attempt)!accepted)then rejected:=attempt::!rejected;
+         event(C.Handoff_apply_not_admitted(id,attempt,W.Full))|_->())
+       |5->event C.Capacity_available
+       |6->(match pick !attempts(action/13)with Some(id,attempt,mailbox)->
+         if not(List.exists(equal_attempt attempt)!rejected)then accepted:=(id,attempt,mailbox)::!accepted;
+         event(C.Handoff_apply_admitted(id,attempt,mailbox))|_->())
+       |7->(match pick !attempts(action/13)with Some(id,attempt,mailbox)->event(C.Handoff_applied(id,attempt,mailbox,Ok()))|_->())
+       |8->event(C.Projection_received projections.((action/13)mod Array.length projections))
+       |9 when index>=List.length trace-8->event C.Shutdown_requested
+       |10->(match pick !attempts(action/13)with Some(id,attempt,_)->
+         event(C.Handoff_applied(id,attempt,Id.Worker.Request_id.of_int64 999999L,Ok()))|_->())
+       |11->(match pick !receipts(action/13)with Some receipt when List.exists(W.equal_handoff_id(W.handoff_receipt_id receipt))!applied->
+         check(Result.is_error(C.authorize_host_change !state receipt))"applied permission planned another action"|_->())
+       |12 when index>=List.length trace-4->event(C.Binding_invalidated I.binding)
+       |_->event C.Capacity_available);
+      List.iter(fun(id,value)->check(C.handoff(C.view before)id=value)"handoff step mutated its prior immutable state")old_facts;
+      List.iter(fun(id,_)->match C.handoff(C.view !state)id with
+        |Some(W.Host_change_applied _)->
+          check(List.exists(fun(actual,_,_)->W.equal_handoff_id actual id)!accepted)
+            "terminal host success has no admitted mailbox owner";
+          if not(List.exists(W.equal_handoff_id id)!applied)then applied:=id::!applied
+        |Some(W.Safe_to_proceed receipt)->
+          check(not(List.exists(W.equal_handoff_id id)!applied))"old Safe revived a terminal permission";
+          check(W.equal_handoff_id(W.handoff_receipt_id receipt)id)"foreign receipt completed another round"
+        |_->())!preparations;
+      List.iter(fun session->check(Result.is_error(C.validate_session !state session))
+        "retired original execution became eligible again")!retired)trace in
+  let prefixes=[[0;2;3;4;5;6;7];[0;2;3;7;6];[0;2;3;4;5;6;4;5;7];[0;8;2;3;6;7];[0;2;3;6;10;7]] in
+  let fails trace=try run trace;false with _->true in
+  List.iter run prefixes;
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x484F5354;seed|] in
+    let trace=List.nth prefixes(seed mod List.length prefixes) @ List.init 80(fun _->Random.State.int random 1300) in
+    if fails trace then failwith(Printf.sprintf "host handoff seed=%d shrunk=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink fails trace))))
+  done
+;;
+
 let () =
   test_asset_demand_notice_has_one_registered_owner ();
   test_asset_cleanup_ack_and_shutdown_retry ();
@@ -3822,6 +4046,7 @@ let () =
   test_change_application_properties ();
   test_scoped_change_notices_and_lifecycle ();
   test_observation_planning_is_pure ();
+  test_host_candidate_waits_for_own_observation_ack ();
   test_observation_retains_typed_value ();
   test_observation_cancel_requires_ack ();
   test_observation_read_failure_and_refresh ();
@@ -3831,6 +4056,9 @@ let () =
   test_observation_full_batch_does_not_self_wake ();
   test_observation_focus_and_reopen_fences ();
   test_observation_retirement_capacity_resets_only_after_binding_ack ();
+  test_host_handoff_properties ();
+  test_host_consumption_keeps_old_execution_retired ();
+  test_host_plan_pins_original_authoritative_frame ();
   test_query_origin_boundary ();
   test_durable_readback_reservation ();
   test_durable_mutation_properties ();
@@ -3844,5 +4072,5 @@ let () =
   test_opening_query_retires_on_removal ();
   print_endline
     "Pure coordinator: invariants, 500 lifecycle + 250 queued-read + 250 ordinary/250 Append durable traces, \
-     100 ownership + 300 observation + 250 application + 200 live-binding + 200 recovery/ACK + 200 retired-intent + 200 queued-presentation traces and shrinking passed"
+     100 ownership + 100 host-handoff + 300 observation + 250 application + 200 live-binding + 200 recovery/ACK + 200 retired-intent + 200 queued-presentation traces and shrinking passed"
 ;;

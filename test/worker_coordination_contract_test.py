@@ -252,10 +252,11 @@ let retire state uuid = C.prepare_host_change state (W.Graph_will_remove(uuid,W.
 let host_can_proceed view id =
   match C.handoff view id with
   | Some(W.Safe_to_proceed receipt) -> Some(W.handoff_change receipt,W.handoff_pending receipt)
-  | Some(W.Quiescing _ | W.Handoff_failed _) | None -> None
-let authorize runner receipt =
+  | Some(W.Quiescing _ | W.Applying_host_change _ | W.Host_change_applied _ | W.Handoff_failed _) | None -> None
+let authorize state receipt =
   W.handoff_receipt_id receipt,W.handoff_binding receipt,W.handoff_sessions receipt,
-  R.authorize_host_change runner receipt
+  C.authorize_host_change state receipt
+let send_consume runner receipt attempt = R.authorize_host_change runner receipt ~attempt
 let stop runner =
   match R.shutdown runner with
   | R.Draining -> `Pump_again
@@ -272,8 +273,8 @@ let capability session = W.capabilities session
 let can_observe session query = W.supports_observation session query
 let release_baseline (module Issuer : W.ISSUER) response =
   Issuer.revoke (); Issuer.release_binding_request (),Issuer.binding_released response
-let handoff (module Issuer : W.ISSUER) handoff_id change response =
-  Issuer.handoff_request ~handoff_id change,Issuer.handoff_receipt ~handoff_id change response
+let handoff (module Issuer : W.ISSUER) plan response =
+  Issuer.handoff_request plan,Issuer.handoff_receipt plan response
 """,
 })
 

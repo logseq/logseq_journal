@@ -180,6 +180,7 @@ module Asset : sig
         }
 end
 
+type account_scope = Logseq_sync_pure_reducer.Core.account_scope
 type asset_scope = Logseq_sync_pure_reducer.Core.graph_scope
 
 type asset_notice = Logseq_db_worker_pure_reducer.Core.asset_notice =

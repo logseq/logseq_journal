@@ -74,16 +74,16 @@ val submit : t -> Worker_pure_coordinator.instruction -> unit
     signs out, or stops the shared client. Host must also join legacy owners.
     Schedule_drain queues a later turn; Publish goes to host without recursive step. *)
 
-val authorize_host_change : t -> Worker.handoff_receipt -> (unit, Worker.error) result
+val authorize_host_change : t -> Worker.handoff_receipt -> attempt:Worker.request_id -> (Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id, Worker.error) result
 
-(** Nonblocking one-shot consume of this runner's current safe receipt. Verify ID,
-    binding/account, exact affected resident/local-copy generations, target change
-    and no renewed admission; reject stale/already-consumed/foreign receipts. Host
-    calls immediately before dispatching its actual lifecycle action on the same
-    serialized turn, after joining legacy owners and obtaining any confirmation.
-    Backend admission independently rechecks ownership/generation. If dispatch
-    fails or the outcome is unknown, inspect the actual owner before a fresh
-    prepare/retry; never reuse this permission for a different/reopened copy. *)
+(** Transport admission only: Ok carries a Mailbox ID, never permission or an
+    action ACK. Production plans through Core.authorize_host_change; Consume_handoff
+    reports attempt-tagged admission and terminal events through the serial outlet.
+    Only matching Host_change_applied permits host UI/auth/client continuation.
+    The existing Service deletion owner executes a bound removal; the host must
+    not send another legacy Close/Delete. Unknown accepted outcomes retain their
+    original permission and cleanup owner; they are never replayed with a fresh
+    receipt. Quiesce itself neither deletes a graph nor signs out/stops a client. *)
 
 type shutdown_state = Draining | Stopped | Shutdown_failed of Worker.error
 val shutdown : t -> shutdown_state
