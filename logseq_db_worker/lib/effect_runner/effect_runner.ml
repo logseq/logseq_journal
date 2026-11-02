@@ -353,7 +353,8 @@ type protected_waiter =
   }
 
 type change_window =
-  { id : string
+  { encoded_bytes : int
+  ; id : string
   ; predecessor : string
   ; successor : string
   ; block_uuids : Graph.block_uuid list
@@ -369,6 +370,7 @@ type database_session =
   ; mutable next_window : int
   ; mutable acknowledged_through : string
   ; mutable windows : change_window Rrbvec.t
+  ; mutable changefeed : Core.Changefeed_owner.t
   }
 
 type observation_result = (int64 * Protocol.response, string) result
@@ -950,22 +952,25 @@ let publish_projection_change t session = function
     if not (String.equal generation session.generation)
     then (
       session.generation <- generation;
+      session.changefeed<-Core.Changefeed_owner.invalidate session.changefeed;
       session.windows <- Rrbvec.empty;
       session.next_window <- 1;
       session.acknowledged_through <- "change-window:v1:0");
     let id = Printf.sprintf "change-window:v1:%d" session.next_window in
     session.next_window <- session.next_window + 1;
-    session.windows
-    <- Rrbvec.push_back
-         session.windows
-         { id
-         ; predecessor = Overlay.Projection_revision.to_string before_revision
-         ; successor = Overlay.Projection_revision.to_string after_revision
-         ; block_uuids
-         ; page_uuids
-         ; structure_interests =
-             List.map structure_interest_to_protocol structure_interests
-         };
+    let window:Protocol.v2_change_window=
+      {id;predecessor=Overlay.Projection_revision.to_string before_revision;
+       successor=Overlay.Projection_revision.to_string after_revision;block_uuids;page_uuids;
+       structure_interests=List.map structure_interest_to_protocol structure_interests} in
+    let encoded_bytes=Protocol.encoded_response_bytes(Protocol.V2_response
+      {api_version=Protocol.api_version;request_id=session.graph_scope.graph_id;
+       outcome=Protocol.V2_changes{generation;from_exclusive=None;through=id;next=None;windows=[window]}}) in
+    let retained,keep=Core.Changefeed_owner.retain_window session.changefeed ~encoded_bytes in
+    session.changefeed<-retained;
+    if keep then session.windows<-Rrbvec.push_back session.windows
+      {encoded_bytes;id;predecessor=window.predecessor;successor=window.successor;
+       block_uuids;page_uuids;structure_interests=window.structure_interests}
+    else (session.windows<-Rrbvec.empty;session.acknowledged_through<-id);
     (try
        report_warning ("journal-timeline: " ^ Yojson.Safe.to_string (`Assoc
          [ "stage", `String "worker-change-window"; "generation", `String generation
@@ -979,12 +984,15 @@ let publish_projection_change t session = function
      with _ -> ());
     t.post
       (Core.Projection_push_for_scope
-         (session.graph_scope, Protocol.V2_changes_available
-            { api_version = Protocol.api_version; generation; through = id }))
+         (session.graph_scope, if keep then Protocol.V2_changes_available
+            { api_version = Protocol.api_version; generation; through = id }
+          else Protocol.V2_resync_required_push{api_version=Protocol.api_version;generation;
+            reason="changeHistoryRetentionExceeded"}))
   | Overlay.Projection_resync_required { generation; reason; _ } ->
     let generation = Overlay.Generation.to_string generation in
     if not (String.equal generation session.generation) then session.next_window <- 1;
     session.generation <- generation;
+    session.changefeed<-Core.Changefeed_owner.invalidate session.changefeed;
     session.windows <- Rrbvec.empty;
     session.acknowledged_through
     <- Printf.sprintf "change-window:v1:%d" (session.next_window - 1);
@@ -1858,6 +1866,9 @@ let acknowledge_changes session request generation through =
     match index_after session through with
     | None -> cursor_resync session request "changeCursorUnavailable"
     | Some start ->
+      let removed=Rrbvec.subvec session.windows 0 start |> Option.get in
+      let encoded_bytes=Rrbvec.fold_left(fun total window->total+window.encoded_bytes)0 removed in
+      session.changefeed<-Core.Changefeed_owner.release_windows session.changefeed ~count:start ~encoded_bytes;
       session.windows
       <- Rrbvec.subvec session.windows start (Rrbvec.length session.windows) |> Option.get;
       session.acknowledged_through <- through;
@@ -1867,9 +1878,11 @@ let acknowledge_changes session request generation through =
 let execute_database ~on_enrichment_error session ~response_budget_bytes request =
   match request.Protocol.command with
   | Protocol.V2_pull_changes { generation; after; limit } ->
-    pull_changes session request generation after limit
+    if Core.Changefeed_owner.legacy session.changefeed then pull_changes session request generation after limit
+    else failure request Invalid_request "The changefeed is owned by the registered coordinator."
   | V2_ack_changes { generation; through } ->
-    acknowledge_changes session request generation through
+    if Core.Changefeed_owner.legacy session.changefeed then acknowledge_changes session request generation through
+    else failure request Invalid_request "The changefeed is owned by the registered coordinator."
   | V2_inspect_admission ->
     let result=inspect_admission session.database request in
     if Protocol.encoded_response_bytes result<=min response_budget_bytes Protocol.maximum_response_bytes
@@ -2077,6 +2090,54 @@ let sync_result ?event ?(lifecycle = Core.Lifecycle_unchanged) () =
 
 let attached_session t scope =
   Option.bind (Hashtbl.find_opt t.attachments scope) (Hashtbl.find_opt t.databases)
+;;
+
+let retire_changefeed t ~registration =
+  Hashtbl.iter(fun _ session->session.changefeed<-Core.Changefeed_owner.retire session.changefeed ~registration) t.databases
+;;
+let coordinated_changefeed t ~registration ~scope ~request ~maximum_bytes ~current =
+  if t.stopped || not(current ()) || request.Protocol.api_version<>Protocol.api_version
+      || maximum_bytes<=0 || maximum_bytes>Protocol.maximum_response_bytes
+  then Error "The registered changefeed execution is unavailable"
+  else match attached_session t scope with
+  | None -> Error "The scoped changefeed database is no longer attached"
+  | Some session ->
+    let state,claimed=Core.Changefeed_owner.claim session.changefeed ~registration in
+    session.changefeed<-state;
+    if not claimed then Error "Another registration still owns the changefeed" else
+    let generation=match request.command with
+      | Protocol.V2_pull_changes query->Some query.generation
+      | V2_ack_changes query->Some query.generation
+      | _->None in
+    if Option.exists(fun generation->generation<>session.generation) generation
+    then Ok(cursor_resync session request "generationChanged") else
+    match request.command with
+    | Protocol.V2_pull_changes query ->
+      if query.generation<>session.generation then Ok(cursor_resync session request "generationChanged") else
+      (match Core.Changefeed_owner.pull state ~registration ~request ~maximum_bytes with
+       | Refused->Error "The pending changefeed batch must be applied and acknowledged first"
+       | Cached response->Ok response
+       | Read ->
+         let rec fit limit =
+           let response=pull_changes session request query.generation query.after limit in
+           if Protocol.encoded_response_bytes response<=maximum_bytes then response
+           else if limit>1 then fit(max 1(limit/2)) else
+             failure request Response_too_large "The change window exceeds its encoded-byte budget" in
+         let response=fit query.limit in
+         (match response with
+          | Protocol.V2_response{outcome=Protocol.V2_changes _;_}->
+            Result.map(fun state->session.changefeed<-state;response)
+              (Core.Changefeed_owner.remember state ~registration ~request ~maximum_bytes response)
+          | _ -> Ok response))
+    | V2_ack_changes _ when Core.Changefeed_owner.needs_resync state ->
+      Ok(cursor_resync session request "changeHistoryInvalidated")
+    | V2_ack_changes query when Core.Changefeed_owner.may_ack state ~registration
+        ~generation:query.generation ~through:query.through ->
+      let response=acknowledge_changes session request query.generation query.through in
+      session.changefeed<-Core.Changefeed_owner.acknowledged session.changefeed ~registration ~request response;
+      Ok response
+    | V2_ack_changes _ -> Error "The changefeed ACK is not backed by this owner's delivered batch"
+    | _ -> Error "This operation is not Changes or its ACK"
 ;;
 
 let run_durable_mutation t ~(scope : Sync.graph_scope) ~request_id ~intent ~current =
@@ -2803,6 +2864,7 @@ let handle_sync_worker_effect t = function
                ; next_window = 1
                ; acknowledged_through = "change-window:v1:0"
                ; windows = Rrbvec.empty
+               ; changefeed=Core.Changefeed_owner.empty
                }
              in
              Hashtbl.replace t.databases database_id session;

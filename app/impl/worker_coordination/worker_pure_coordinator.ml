@@ -11,6 +11,7 @@ module Observation_ids = Map.Make (struct
   end)
 
 type _ kind =
+  | Change_ack : Worker.change_ack kind
   | Unit : unit kind
   | Observed : 'a kind -> 'a Worker.observed kind
   | Mutation : Worker.mutation_progress kind
@@ -56,6 +57,7 @@ let rec same_kind : type a b. a kind -> b kind -> (a, b) Worker.equality option 
     (match same_kind a b with
      | Some Refl -> Some Refl
      | None -> None)
+  | Change_ack, Change_ack -> Some Refl
   | Unit, Unit -> Some Refl
   | Mutation, Mutation -> Some Refl
   | Info, Info -> Some Refl
@@ -100,6 +102,7 @@ type 'a slot =
   { ticket : 'a ticket
   ; dispatched : bool
   ; admitted : Id.request_id option
+  ; change_version : int64
   ; sample_epoch : Worker.observation_epoch option
   ; origin : (Worker.session * Worker.read_budget) option
   ; result : 'a Worker.reply option
@@ -132,6 +135,26 @@ type 'a observation_state =
 
 type observation_entry = Observing : 'a observation_state -> observation_entry
 
+type change_application =
+  { application_id : Worker.request_id
+  ; application_batch : Worker.change_batch
+  }
+
+type consumer_state =
+  { consumer_expanded : bool
+  ; consumer_applied : bool
+  }
+
+let waiting_consumer = { consumer_expanded = false; consumer_applied = false }
+
+type application_state =
+  { token : change_application
+  ; pending_consumers : consumer_state Graphs.t
+  ; issued_consumers : unit Graphs.t
+  ; issued_count : int
+  ; failed_consumers : Worker.error Graphs.t
+  }
+
 type shutdown_state =
   | Active
   | Draining
@@ -145,6 +168,12 @@ type view =
   ; handoffs : (Worker.handoff_id * Worker.handoff_state) list
   ; shutdown : shutdown_state
   ; intents : Worker.mutation_progress Intents.t
+  ; applications : application_state Graphs.t
+  ; change_notices : (Worker.session * Id.push_sequence) Graphs.t
+  ; change_projections : string Graphs.t
+  ; change_versions : int64 Graphs.t
+  ; change_batches : (Worker.change_batch * Worker.read_budget) Graphs.t
+  ; change_acks : Worker.change_ack Graphs.t
   ; observations : observation_entry Observation_ids.t
   ; retired_observations : Worker.session Observation_ids.t
   ; retired_observation_count : int
@@ -193,6 +222,12 @@ let initial ~client_id =
       ; handoffs = []
       ; shutdown = Active
       ; intents = Intents.empty
+      ; applications = Graphs.empty
+      ; change_notices = Graphs.empty
+      ; change_projections = Graphs.empty
+      ; change_versions = Graphs.empty
+      ; change_batches = Graphs.empty
+      ; change_acks = Graphs.empty
       ; observations = Observation_ids.empty
       ; retired_observations = Observation_ids.empty
       ; retired_observation_count = 0
@@ -207,6 +242,12 @@ let current_session facts session =
       (fun r -> r.Worker.phase = Worker.Open && Worker.equal_session r.session session)
       (Worker.residents p)
   | _ -> false
+;;
+
+let change_version facts session =
+  Option.value
+    (Graphs.find_opt (Worker.graph_id session) facts.change_versions)
+    ~default:0L
 ;;
 
 let view t = t.facts
@@ -338,6 +379,41 @@ let observation_matches : type a. a observation_state -> a Worker.observation ->
   && value.obs_query = Worker.observation_query observation
 ;;
 
+let owns_change_batch facts batch =
+  match
+    Graphs.find_opt
+      (Worker.graph_id (Worker.change_batch_session batch))
+      facts.change_batches
+  with
+  | Some (actual, _) -> actual = batch
+  | _ -> false
+;;
+
+let application_for_batch facts batch =
+  match
+    Graphs.find_opt
+      (Worker.graph_id (Worker.change_batch_session batch))
+      facts.applications
+  with
+  | Some application when application.token.application_batch = batch -> Some application
+  | _ -> None
+;;
+
+let change_application_started facts batch = application_for_batch facts batch <> None
+
+let change_application_ready facts batch =
+  match application_for_batch facts batch with
+  | Some application ->
+    Graphs.is_empty application.pending_consumers
+    && Graphs.is_empty application.failed_consumers
+  | _ -> false
+;;
+
+let change_application_error facts batch =
+  Option.bind (application_for_batch facts batch) (fun application ->
+    Option.map snd (Graphs.choose_opt application.failed_consumers))
+;;
+
 let equal_observation_entry (Observing a) (Observing b) =
   match same_kind (kind a.obs_query) (kind b.obs_query) with
   | Some Worker.Refl -> a = b
@@ -349,6 +425,7 @@ let equal_entry (Entry a) (Entry b) =
   | Some Worker.Refl ->
     a.dispatched = b.dispatched
     && a.admitted = b.admitted
+    && a.change_version = b.change_version
     && a.sample_epoch = b.sample_epoch
     && a.origin = b.origin
     && a.result = b.result
@@ -365,6 +442,12 @@ let equal_view a b =
       && a.handoffs = b.handoffs
       && a.shutdown = b.shutdown
       && a.intents = b.intents
+      && Graphs.equal ( = ) a.applications b.applications
+      && Graphs.equal ( = ) a.change_notices b.change_notices
+      && Graphs.equal String.equal a.change_projections b.change_projections
+      && Graphs.equal Int64.equal a.change_versions b.change_versions
+      && Graphs.equal ( = ) a.change_batches b.change_batches
+      && Graphs.equal ( = ) a.change_acks b.change_acks
       && a.retired_observation_count = b.retired_observation_count
       && Observation_ids.equal
            Worker.equal_session
@@ -389,6 +472,15 @@ type event =
   | Bootstrap_received of Worker.binding * Worker.bootstrap_state
   | Completed : 'a ticket * 'a Worker.reply -> event
   | Projection_received of Worker.projection
+  | Changefeed_notice of
+      Worker.changefeed_notice
+      * Logseq_db_worker_lui.Journal_worker_ids.Worker.push_sequence
+  | Change_application_retired of change_application
+  | Change_consumer_expanded of
+      change_application * Worker.Uuid.t * Worker.Uuid.t Rrbvec.t
+  | Change_consumer_applied of
+      change_application * Worker.Uuid.t * (unit, Worker.error) result
+  | Change_consumer_retired of change_application * Worker.Uuid.t
   | Observation_registered :
       'a Worker.observed ticket * 'a Worker.observation * Worker.observation_epoch
       -> event
@@ -561,8 +653,105 @@ let cancel_entries ?(waiting = true) predicate facts =
   { facts with entries }, List.rev !instructions
 ;;
 
-let dispatch_waiting ?(publish = false) state instructions =
+let validate_change_query
+  : type a.
+    view
+    -> Worker.session
+    -> Worker.read_budget
+    -> a Worker.query
+    -> (unit, Worker.error) result
+  =
+  fun facts session budget query ->
+  match query with
+  | Worker.Changes { generation; after } ->
+    let invalid () =
+      Error
+        (Worker.Invalid_input
+           "The Changes cursor or budget is outside its owned unapplied chain")
+    in
+    (match Graphs.find_opt (Worker.graph_id session) facts.change_batches with
+     | Some (batch, original_budget)
+       when Worker.equal_session session (Worker.change_batch_session batch) ->
+       if
+         generation = batch.generation
+         && ((after = batch.from_exclusive && budget = original_budget)
+             || after = Some batch.through)
+       then Ok ()
+       else invalid ()
+     | _ ->
+       (match after, Graphs.find_opt (Worker.graph_id session) facts.change_acks with
+        | None, _ -> Ok ()
+        | Some through, Some ack
+          when Worker.equal_session session (Worker.change_ack_session ack)
+               && generation = Worker.change_ack_generation ack
+               && through = Worker.change_ack_through ack -> Ok ()
+        | _ -> invalid ()))
+  | _ -> Ok ()
+;;
+
+let active_change_reads facts =
+  Slots.fold
+    (fun _ (Entry slot) owners ->
+       match slot.ticket.query, slot.origin with
+       | Read (Worker.Changes _), Some (session, _)
+         when slot.dispatched && slot.result = None && current_session facts session ->
+         Graphs.add (Worker.graph_id session) session owners
+       | _ -> owners)
+    facts.entries
+    Graphs.empty
+;;
+
+let change_read_available owners session =
+  match Graphs.find_opt (Worker.graph_id session) owners with
+  | Some owner -> not (Worker.equal_session owner session)
+  | None -> true
+;;
+
+let change_query_ready
+  : type a. view -> Worker.session -> Worker.read_budget -> a Worker.query -> bool
+  =
+  fun facts session budget query ->
+  match query with
+  | Worker.Changes query ->
+    (match Graphs.find_opt (Worker.graph_id session) facts.change_batches with
+     | Some (batch, original_budget)
+       when Worker.equal_session session (Worker.change_batch_session batch) ->
+       query.generation = batch.generation
+       && query.after = batch.from_exclusive
+       && budget = original_budget
+       && change_application_error facts batch <> None
+     | _ -> true)
+  | _ -> true
+;;
+
+let change_ack_known facts batch =
+  let session = Worker.change_batch_session batch in
+  match Graphs.find_opt (Worker.graph_id session) facts.change_acks with
+  | Some ack ->
+    Worker.equal_session session (Worker.change_ack_session ack)
+    && Worker.change_ack_generation ack = batch.Worker.generation
+    && Worker.change_ack_through ack = batch.through
+  | _ -> false
+;;
+
+let dispatch_waiting ?(publish = false) ?(retry_acks = false) state instructions =
   let sends = ref [] in
+  let active = ref (active_change_reads state.facts) in
+  let ready : type a. Worker.session -> Worker.read_budget -> a Worker.query -> bool =
+    fun session budget query ->
+    change_query_ready state.facts session budget query
+    &&
+    match query with
+    | Worker.Changes _ -> change_read_available !active session
+    | _ -> true
+  in
+  let mark : type a. Worker.session -> a Worker.request -> unit =
+    fun session operation ->
+    match operation with
+    | Worker.Query (_, Worker.Changes _) ->
+      active := Graphs.add (Worker.graph_id session) session !active
+    | _ -> ()
+  in
   let entries =
     Slots.map
       (fun (Entry slot as entry) ->
@@ -572,58 +761,134 @@ let dispatch_waiting ?(publish = false) state instructions =
            let reject error =
              Entry { slot with result = Some (Worker.Answered (Error error)) }
            in
-           match slot.ticket.target, state.facts.bootstrap_state, state.facts.current with
-           | ( Expected (owner, maximum_items, maximum_bytes)
-             , Worker.Ready _
-             , Some projection ) ->
-             (match
-                List.find_opt
-                  (fun r -> Worker.matches_scope r.Worker.session owner)
-                  (Worker.residents projection)
-              with
-              | None
-                when Worker.scope_is_superseded
-                       ?previous:(Graphs.find_opt owner.graph_id state.retired)
-                       projection
-                       owner -> reject Worker.Revoked_session
-              | None -> entry
-              | Some { phase = Worker.Open; session; _ } ->
-                let planned =
-                  Result.bind
-                    (Worker.read_budget
-                       session
-                       ~maximum_items:
-                         (min maximum_items Worker.Protocol.maximum_page_size)
-                       ~maximum_bytes:
-                         (min
-                            maximum_bytes
-                            (Worker.capabilities session).limits.response_budget_bytes))
-                    (fun budget ->
-                       match slot.ticket.query with
-                       | Read query ->
-                         Result.map
-                           (fun () -> Worker.Query (budget, query))
-                           (Worker.validate_request
-                              session
-                              (Worker.Query (budget, query)))
-                       | Operation _ ->
-                         Error (Worker.Invalid_input "An effect cannot wait as a read"))
-                in
-                (match planned with
+           match slot.ticket.query with
+           | Operation (Worker.Acknowledge_changes batch) ->
+             let session = Worker.change_batch_session batch in
+             (match validate_session state session with
+              | Error error -> reject error
+              | Ok () ->
+                if
+                  (slot.early <> Some (Worker.Not_admitted Worker.Full) || retry_acks)
+                  && (change_ack_known state.facts batch
+                      || change_application_ready state.facts batch)
+                then (
+                  sends
+                  := Send (slot.ticket, session, Worker.Acknowledge_changes batch)
+                     :: !sends;
+                  Entry
+                    { slot with
+                      dispatched = true
+                    ; early = None
+                    ; change_version = change_version state.facts session
+                    })
+                else (
+                  match
+                    Graphs.find_opt (Worker.graph_id session) state.facts.change_batches
+                  with
+                  | Some (actual, _) when actual = batch -> entry
+                  | _ ->
+                    reject
+                      (Worker.Resync_required "The unapplied change batch was retired")))
+           | Read (Worker.Changes _ as query)
+             when match slot.ticket.target with
+                  | Sealed _ -> true
+                  | _ -> false ->
+             (match slot.ticket.target with
+              | Sealed (session, budget) ->
+                (match validate_session state session with
                  | Error error -> reject error
-                 | Ok operation ->
-                   sends := Send (slot.ticket, session, operation) :: !sends;
-                   let origin =
-                     match operation with
-                     | Worker.Query (budget, _) -> Some (session, budget)
-                     | _ -> None
+                 | Ok () ->
+                   (match validate_change_query state.facts session budget query with
+                    | Error _ ->
+                      reject
+                        (Worker.Stale_read
+                           "The queued change cursor was superseded by an applied page")
+                    | Ok () when ready session budget query ->
+                      mark session (Worker.Query (budget, query));
+                      sends
+                      := Send (slot.ticket, session, Worker.Query (budget, query))
+                         :: !sends;
+                      Entry
+                        { slot with
+                          dispatched = true
+                        ; origin = Some (session, budget)
+                        ; change_version = change_version state.facts session
+                        }
+                    | Ok () -> entry))
+              | _ -> entry)
+           | _ ->
+             (match
+                slot.ticket.target, state.facts.bootstrap_state, state.facts.current
+              with
+              | ( Expected (owner, maximum_items, maximum_bytes)
+                , Worker.Ready _
+                , Some projection ) ->
+                (match
+                   List.find_opt
+                     (fun r -> Worker.matches_scope r.Worker.session owner)
+                     (Worker.residents projection)
+                 with
+                 | None
+                   when Worker.scope_is_superseded
+                          ?previous:(Graphs.find_opt owner.graph_id state.retired)
+                          projection
+                          owner -> reject Worker.Revoked_session
+                 | None -> entry
+                 | Some { phase = Worker.Open; session; _ } ->
+                   let planned =
+                     Result.bind
+                       (Worker.read_budget
+                          session
+                          ~maximum_items:
+                            (min maximum_items Worker.Protocol.maximum_page_size)
+                          ~maximum_bytes:
+                            (min
+                               maximum_bytes
+                               (Worker.capabilities session).limits.response_budget_bytes))
+                       (fun budget ->
+                          match slot.ticket.query with
+                          | Read query ->
+                            Result.bind
+                              (validate_change_query state.facts session budget query)
+                              (fun () ->
+                                 Result.map
+                                   (fun () -> Worker.Query (budget, query))
+                                   (Worker.validate_request
+                                      session
+                                      (Worker.Query (budget, query))))
+                          | Operation _ ->
+                            Error (Worker.Invalid_input "An effect cannot wait as a read"))
                    in
-                   Entry { slot with dispatched = true; origin })
-              | Some { phase = Worker.Opening; _ } -> entry
-              | Some { phase = Worker.Failed error; _ } -> reject error
-              | Some { phase = Worker.Closing; _ } -> reject Worker.Revoked_session)
-           | _, (Worker.Bootstrap_failed error | Binding_revoked error), _ -> reject error
-           | _ -> entry))
+                   (match planned with
+                    | Error error ->
+                      (match slot.ticket.query with
+                       | Read (Worker.Changes _) ->
+                         reject
+                           (Worker.Stale_read
+                              "The queued change cursor was superseded by an applied page")
+                       | _ -> reject error)
+                    | Ok (Worker.Query (budget, query))
+                      when not (ready session budget query) -> entry
+                    | Ok operation ->
+                      mark session operation;
+                      sends := Send (slot.ticket, session, operation) :: !sends;
+                      let origin =
+                        match operation with
+                        | Worker.Query (budget, _) -> Some (session, budget)
+                        | _ -> None
+                      in
+                      Entry
+                        { slot with
+                          dispatched = true
+                        ; origin
+                        ; change_version = change_version state.facts session
+                        })
+                 | Some { phase = Worker.Opening; _ } -> entry
+                 | Some { phase = Worker.Failed error; _ } -> reject error
+                 | Some { phase = Worker.Closing; _ } -> reject Worker.Revoked_session)
+              | _, (Worker.Bootstrap_failed error | Binding_revoked error), _ ->
+                reject error
+              | _ -> entry)))
       state.facts.entries
   in
   let next = { state with facts = { state.facts with entries } } in
@@ -699,6 +964,50 @@ let apply_baseline state binding incoming =
         | _ -> state.retired
       in
       let facts = { state.facts with current; bootstrap_state = incoming } in
+      let facts =
+        { facts with
+          change_notices =
+            Graphs.filter
+              (fun _ (session, _) -> current_session facts session)
+              facts.change_notices
+        ; change_projections =
+            Graphs.filter
+              (fun graph _ ->
+                 match Graphs.find_opt graph facts.change_acks with
+                 | Some ack -> current_session facts (Worker.change_ack_session ack)
+                 | None -> false)
+              facts.change_projections
+        ; applications =
+            Graphs.filter
+              (fun _ application ->
+                 current_session
+                   facts
+                   (Worker.change_batch_session application.token.application_batch))
+              facts.applications
+        ; change_versions =
+            Graphs.filter
+              (fun graph _ ->
+                 Option.fold
+                   ~none:false
+                   ~some:(fun p ->
+                     List.exists
+                       (fun resident ->
+                          resident.Worker.phase = Worker.Open
+                          && Worker.Uuid.equal graph (Worker.graph_id resident.session))
+                       (Worker.residents p))
+                   facts.current)
+              facts.change_versions
+        ; change_batches =
+            Graphs.filter
+              (fun _ (batch, _) ->
+                 current_session facts (Worker.change_batch_session batch))
+              facts.change_batches
+        ; change_acks =
+            Graphs.filter
+              (fun _ ack -> current_session facts (Worker.change_ack_session ack))
+              facts.change_acks
+        }
+      in
       let facts, instructions =
         cancel_entries
           ~waiting:false
@@ -735,6 +1044,80 @@ let checked_result : type a. view -> a ticket -> a Worker.reply -> a Worker.repl
             "Mutation receipt identity or original point does not match its ticket"))
   in
   match ticket.query, result with
+  | Read (Worker.Changes _), Worker.Answered _
+    when match Slots.find_opt ticket.serial facts.entries with
+         | Some (Entry { origin = Some (session, _); change_version = sent; _ }) ->
+           sent <> change_version facts session
+         | _ -> true ->
+    Worker.Answered
+      (Error
+         (Worker.Stale_read "The Changes request predates the current acknowledged chain"))
+  | Read (Worker.Changes query), Worker.Answered (Ok batch) ->
+    let origin =
+      match Slots.find_opt ticket.serial facts.entries with
+      | Some (Entry slot) -> slot.origin
+      | _ -> None
+    in
+    (match origin with
+     | Some (session, _)
+       when Worker.equal_session session (Worker.change_batch_session batch)
+            && query.generation = batch.generation
+            && query.after = batch.from_exclusive ->
+       let graph = Worker.graph_id session in
+       let expected_projection =
+         match Graphs.find_opt graph facts.change_acks with
+         | Some ack when Worker.change_ack_generation ack = batch.generation ->
+           Graphs.find_opt graph facts.change_projections
+         | _ -> None
+       in
+       let held_conflict =
+         match Graphs.find_opt graph facts.change_batches with
+         | Some (current, _)
+           when Worker.equal_session session (Worker.change_batch_session current) ->
+           current <> batch
+         | _ -> false
+       in
+       let gap =
+         match batch.windows, expected_projection with
+         | first :: _, Some predecessor ->
+           first.Logseq_db_worker.Protocol.predecessor <> predecessor
+         | [], _ ->
+           (match Graphs.find_opt graph facts.change_acks with
+            | Some ack when Worker.change_ack_generation ack = batch.generation ->
+              batch.through <> Worker.change_ack_through ack
+            | _ -> false)
+         | _ -> false
+       in
+       if held_conflict || gap
+       then
+         Worker.Answered
+           (Error (Worker.Resync_required "Changefeed projection continuity was lost"))
+       else result
+     | _ ->
+       Worker.Answered
+         (Error
+            (Worker.Protocol_mismatch
+               "Changes batch owner/chain differs from its exact ticket")))
+  | Operation (Worker.Acknowledge_changes batch), Worker.Answered _
+    when (not (change_ack_known facts batch))
+         &&
+         match Slots.find_opt ticket.serial facts.entries with
+         | Some (Entry slot) ->
+           slot.change_version <> change_version facts (Worker.change_batch_session batch)
+         | None -> true ->
+    Worker.Answered
+      (Error (Worker.Stale_read "The ACK belongs to a retired change application epoch"))
+  | Operation (Worker.Acknowledge_changes batch), Worker.Answered (Ok ack) ->
+    if
+      Worker.equal_session
+        (Worker.change_batch_session batch)
+        (Worker.change_ack_session ack)
+      && batch.generation = Worker.change_ack_generation ack
+      && batch.through = Worker.change_ack_through ack
+    then result
+    else
+      Worker.Answered
+        (Error (Worker.Protocol_mismatch "Changes ACK differs from its delivered batch"))
   | Operation (Worker.Observe (_, query)), Worker.Answered (Ok value) ->
     (match find_observation facts ticket.id query with
      | Some owned when observation_matches owned value.observation -> result
@@ -916,6 +1299,148 @@ let retain_observation_result
   | _ -> state
 ;;
 
+let retire_change_proof state session =
+  if not (current_session state.facts session)
+  then state
+  else (
+    let facts = state.facts
+    and graph = Worker.graph_id session in
+    { state with
+      facts =
+        { facts with
+          change_batches = Graphs.remove graph facts.change_batches
+        ; applications = Graphs.remove graph facts.applications
+        ; change_acks = Graphs.remove graph facts.change_acks
+        ; change_projections = Graphs.remove graph facts.change_projections
+        ; change_versions =
+            Graphs.add
+              graph
+              (Int64.succ (change_version facts session))
+              facts.change_versions
+        }
+    })
+;;
+
+let retain_change_result : type a. t -> a ticket -> a Worker.reply -> t =
+  fun state ticket result ->
+  let facts = state.facts in
+  match ticket.query, result with
+  | Read (Worker.Changes _), Worker.Answered (Ok batch)
+    when current_session facts (Worker.change_batch_session batch) ->
+    (match Slots.find_opt ticket.serial facts.entries with
+     | Some (Entry { origin = Some (_, budget); _ }) ->
+       { state with
+         facts =
+           { facts with
+             change_batches =
+               Graphs.add
+                 (Worker.graph_id (Worker.change_batch_session batch))
+                 (batch, budget)
+                 facts.change_batches
+           }
+       }
+     | _ -> state)
+  | Operation (Worker.Acknowledge_changes batch), Worker.Answered (Ok ack)
+    when current_session facts (Worker.change_ack_session ack) ->
+    let graph = Worker.graph_id (Worker.change_ack_session ack) in
+    let owned =
+      match Graphs.find_opt graph facts.change_batches with
+      | Some (current, _) -> current = batch
+      | _ -> false
+    in
+    let repeated =
+      match Graphs.find_opt graph facts.change_acks with
+      | Some previous ->
+        Worker.equal_session
+          (Worker.change_ack_session previous)
+          (Worker.change_ack_session ack)
+        && Worker.change_ack_generation previous = Worker.change_ack_generation ack
+        && Worker.change_ack_through previous = Worker.change_ack_through ack
+      | _ -> false
+    in
+    if not (owned || repeated)
+    then state
+    else (
+      let change_batches =
+        if owned then Graphs.remove graph facts.change_batches else facts.change_batches
+      in
+      let version = change_version facts (Worker.change_ack_session ack) in
+      let change_versions =
+        if owned
+        then Graphs.add graph (Int64.succ version) facts.change_versions
+        else facts.change_versions
+      in
+      let applications =
+        match Graphs.find_opt graph facts.applications with
+        | Some application when application.token.application_batch = batch ->
+          Graphs.remove graph facts.applications
+        | _ -> facts.applications
+      in
+      let change_projections =
+        match List.rev batch.windows with
+        | last :: _ ->
+          Graphs.add
+            graph
+            last.Logseq_db_worker.Protocol.successor
+            facts.change_projections
+        | [] ->
+          (match Graphs.find_opt graph facts.change_acks with
+           | Some previous
+             when Worker.change_ack_generation previous = Worker.change_ack_generation ack
+             -> facts.change_projections
+           | _ -> Graphs.remove graph facts.change_projections)
+      in
+      { state with
+        facts =
+          { facts with
+            change_batches
+          ; change_versions
+          ; change_projections
+          ; applications
+          ; change_acks = Graphs.add graph ack facts.change_acks
+          }
+      })
+  | Read (Worker.Changes _), Worker.Answered (Error (Worker.Resync_required _)) ->
+    (match Slots.find_opt ticket.serial facts.entries with
+     | Some (Entry { origin = Some (session, _); _ }) -> retire_change_proof state session
+     | _ -> state)
+  | ( Operation (Worker.Acknowledge_changes batch)
+    , Worker.Answered (Error (Worker.Resync_required _)) ) ->
+    retire_change_proof state (Worker.change_batch_session batch)
+  | ( Operation (Worker.Acknowledge_changes batch)
+    , (Worker.Answered (Error _) | Worker.Interrupted _ | Worker.Not_admitted _) ) ->
+    let graph = Worker.graph_id (Worker.change_batch_session batch) in
+    (match
+       Graphs.find_opt graph facts.change_batches, application_for_batch facts batch
+     with
+     | Some (actual, _), Some application
+       when actual = batch && current_session facts (Worker.change_batch_session batch) ->
+       let error =
+         match result with
+         | Worker.Answered (Error error) -> error
+         | Worker.Interrupted _ ->
+           Worker.Service_failed "The change acknowledgement was interrupted"
+         | _ -> Worker.Service_failed "The change acknowledgement was not admitted"
+       in
+       let application =
+         { application with
+           failed_consumers =
+             Graphs.add
+               (match Graphs.choose_opt application.issued_consumers with
+                | Some (id, _) -> id
+                | None -> Worker.graph_id (Worker.change_batch_session batch))
+               error
+               application.failed_consumers
+         }
+       in
+       { state with
+         facts =
+           { facts with applications = Graphs.add graph application facts.applications }
+       }
+     | _ -> state)
+  | _ -> state
+;;
+
 let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
   fun state ticket result require_admission ->
   match Slots.find_opt ticket.serial state.facts.entries with
@@ -958,6 +1483,7 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
              ~admitted:(slot.admitted <> None)
              ~cancelled:slot.cancelled
          in
+         let state = retain_change_result state ticket result in
          let intents : Worker.mutation_progress Intents.t =
            match ticket.query with
            | Operation (Worker.Mutate intent) ->
@@ -1216,6 +1742,22 @@ let cancel : type a. t -> a ticket -> bool -> transition =
   | None -> unchanged state
 ;;
 
+let change_consumer state token operation =
+  let batch = token.application_batch in
+  let graph = Worker.graph_id (Worker.change_batch_session batch) in
+  match Graphs.find_opt graph state.facts.applications with
+  | Some application
+    when Worker.equal_request_id application.token.application_id token.application_id
+         && application.token.application_batch = token.application_batch
+         && validate_session state (Worker.change_batch_session batch) = Ok () ->
+    let next = operation application in
+    let facts =
+      { state.facts with applications = Graphs.add graph next state.facts.applications }
+    in
+    dispatch_waiting ~publish:true { state with facts } []
+  | _ -> unchanged state
+;;
+
 let step_base state event =
   match event with
   | Worker_bound binding when state.binding = None || state.lifecycle = Rebinding ->
@@ -1236,6 +1778,11 @@ let step_base state event =
             current = None
           ; bootstrap_state = Worker.Awaiting_baseline
           ; shutdown = Active
+          ; change_batches = Graphs.empty
+          ; change_acks = Graphs.empty
+          ; change_versions = Graphs.empty
+          ; change_projections = Graphs.empty
+          ; applications = Graphs.empty
           ; retired_observations =
               (if state.lifecycle = Rebinding
                then Observation_ids.empty
@@ -1372,7 +1919,7 @@ let step_base state event =
          ; bootstrap_mailbox = None
          }
          [ Bootstrap ]
-     | _, Running -> dispatch_waiting state []
+     | _, Running -> dispatch_waiting ~retry_acks:(event = Capacity_available) state []
      | _ -> unchanged state)
   | Admitted (ticket, id) ->
     (match Slots.find_opt ticket.serial state.facts.entries with
@@ -1407,6 +1954,33 @@ let step_base state event =
              changed next (if slot.cancelled then [ Cancel_request ticket ] else []))
         | _ -> unchanged state)
      | None -> unchanged state)
+  | Admission_refused (ticket, Worker.Full) ->
+    (match Slots.find_opt ticket.serial state.facts.entries with
+     | Some (Entry slot) ->
+       (match same_ticket ticket slot.ticket, slot.ticket.query with
+        | Some Worker.Refl, Operation (Worker.Acknowledge_changes _)
+          when slot.dispatched
+               && slot.admitted = None
+               && slot.result = None
+               && not slot.cancelled ->
+          changed
+            { state with
+              facts =
+                { state.facts with
+                  entries =
+                    Slots.add
+                      ticket.serial
+                      (Entry
+                         { slot with
+                           dispatched = false
+                         ; early = Some (Worker.Not_admitted Worker.Full)
+                         })
+                      state.facts.entries
+                }
+            }
+            []
+        | _ -> finish state ticket (Worker.Not_admitted Worker.Full) false)
+     | None -> unchanged state)
   | Admission_refused (ticket, error) ->
     finish state ticket (Worker.Not_admitted error) false
   | Admission_failed (ticket, error) ->
@@ -1437,6 +2011,109 @@ let step_base state event =
           }
       }
       []
+  | Changefeed_notice (notice, sequence) ->
+    let session = notice.Worker.notice_session in
+    let graph = Worker.graph_id session in
+    let fresh =
+      match Graphs.find_opt graph state.facts.change_notices with
+      | Some (previous, seen) when Worker.equal_session previous session ->
+        Id.Push_sequence.compare sequence seen > 0
+      | _ -> true
+    in
+    if (not (current_session state.facts session)) || not fresh
+    then unchanged state
+    else (
+      let state =
+        { state with
+          facts =
+            { state.facts with
+              change_notices =
+                Graphs.add graph (session, sequence) state.facts.change_notices
+            }
+        }
+      in
+      let state =
+        match notice.notice with
+        | Worker.Protocol.V2_resync_required_push _ -> retire_change_proof state session
+        | V2_changes_available _ -> state
+      in
+      dispatch_waiting ~publish:true state [])
+  | Change_application_retired token ->
+    change_consumer state token (fun application ->
+      { application with
+        pending_consumers = Graphs.empty
+      ; failed_consumers = Graphs.empty
+      })
+  | Change_consumer_expanded (token, parent, children) ->
+    change_consumer state token (fun application ->
+      match Graphs.find_opt parent application.pending_consumers with
+      | Some parent_state when not parent_state.consumer_expanded ->
+        let application =
+          Rrbvec.fold_left
+            (fun application child ->
+               if Graphs.mem child application.issued_consumers
+               then application
+               else if application.issued_count >= 8192
+               then
+                 { application with
+                   failed_consumers =
+                     Graphs.add
+                       parent
+                       (Worker.Resync_required
+                          "Change application consumer bound exceeded")
+                       application.failed_consumers
+                 }
+               else
+                 { application with
+                   pending_consumers =
+                     Graphs.add child waiting_consumer application.pending_consumers
+                 ; issued_consumers = Graphs.add child () application.issued_consumers
+                 ; issued_count = application.issued_count + 1
+                 })
+            application
+            children
+        in
+        let pending_consumers =
+          if
+            parent_state.consumer_applied
+            && not (Graphs.mem parent application.failed_consumers)
+          then Graphs.remove parent application.pending_consumers
+          else
+            Graphs.add
+              parent
+              { parent_state with consumer_expanded = true }
+              application.pending_consumers
+        in
+        { application with pending_consumers }
+      | _ -> application)
+  | Change_consumer_applied (token, consumer, result) ->
+    change_consumer state token (fun application ->
+      match Graphs.find_opt consumer application.pending_consumers with
+      | None -> application
+      | Some status ->
+        (match result with
+         | Ok () when not (Graphs.mem consumer application.failed_consumers) ->
+           let pending_consumers =
+             if status.consumer_expanded
+             then Graphs.remove consumer application.pending_consumers
+             else
+               Graphs.add
+                 consumer
+                 { status with consumer_applied = true }
+                 application.pending_consumers
+           in
+           { application with pending_consumers }
+         | Ok () -> application
+         | Error error ->
+           { application with
+             failed_consumers = Graphs.add consumer error application.failed_consumers
+           }))
+  | Change_consumer_retired (token, consumer) ->
+    change_consumer state token (fun application ->
+      { application with
+        pending_consumers = Graphs.remove consumer application.pending_consumers
+      ; failed_consumers = Graphs.remove consumer application.failed_consumers
+      })
   | Observation_registered (ticket, handle, epoch) ->
     retain_registration state ticket handle epoch
   | Observation_release_completed (session, id, result) ->
@@ -1560,6 +2237,7 @@ let plan_refresh ?(internal = false) (state : t) session handle =
         { ticket
         ; dispatched = true
         ; admitted = None
+        ; change_version = 0L
         ; sample_epoch = None
         ; origin = Some (session, owned.obs_budget)
         ; result = None
@@ -1733,6 +2411,7 @@ let plan_mutation
       { ticket
       ; dispatched = true
       ; admitted = None
+      ; change_version = 0L
       ; sample_epoch = None
       ; origin = None
       ; result = None
@@ -1787,6 +2466,7 @@ let plan_observation (state : t) session budget query =
       { ticket
       ; dispatched = true
       ; admitted = None
+      ; change_version = 0L
       ; sample_epoch = None
       ; origin = Some (session, budget)
       ; result = None
@@ -1865,6 +2545,7 @@ let plan_release state session handle =
       { ticket
       ; dispatched = false
       ; admitted = None
+      ; change_version = 0L
       ; sample_epoch = None
       ; origin = None
       ; result = (if acknowledged then Some (Worker.Answered (Ok ())) else None)
@@ -1879,6 +2560,57 @@ let plan_release state session handle =
       ( ticket
       , progress_observations ~retry:true (changed { state with next = serial; facts } [])
       ))
+;;
+
+let plan_change_ack state session batch =
+  let graph = Worker.graph_id session in
+  let owned =
+    match Graphs.find_opt graph state.facts.change_batches with
+    | Some (actual, _) -> actual = batch
+    | _ -> false
+  in
+  let acknowledged =
+    match Graphs.find_opt graph state.facts.change_acks with
+    | Some ack ->
+      Worker.equal_session session (Worker.change_ack_session ack)
+      && Worker.change_ack_generation ack = batch.Worker.generation
+      && Worker.change_ack_through ack = batch.through
+    | _ -> false
+  in
+  if not (owned || acknowledged)
+  then
+    Error
+      (Worker.Invalid_input
+         "Only a coordinator-delivered Changes batch may be acknowledged")
+  else if state.next = Int64.max_int
+  then Error (Worker.Invalid_input "Request counter exhausted")
+  else (
+    let serial = Int64.succ state.next in
+    let ticket =
+      { id = Worker.request_id (identity state.client serial)
+      ; serial
+      ; kind = Change_ack
+      ; query = Operation (Worker.Acknowledge_changes batch)
+      ; target = Direct session
+      }
+    in
+    let slot =
+      { ticket
+      ; dispatched = false
+      ; admitted = None
+      ; change_version = 0L
+      ; sample_epoch = None
+      ; origin = None
+      ; result = None
+      ; early = None
+      ; cancelled = false
+      ; forgotten = false
+      }
+    in
+    let facts =
+      { state.facts with entries = Slots.add serial (Entry slot) state.facts.entries }
+    in
+    Ok (ticket, dispatch_waiting ~publish:true { state with next = serial; facts } []))
 ;;
 
 let request
@@ -1902,41 +2634,55 @@ let request
             | Worker.Observe (budget, query) ->
               plan_observation state session budget query
             | Worker.Refresh handle -> plan_refresh state session handle
+            | Worker.Acknowledge_changes batch -> plan_change_ack state session batch
             | Worker.Query (budget, query) ->
-              if state.next = Int64.max_int
-              then Error (Worker.Invalid_input "Request counter exhausted")
-              else (
-                let serial = Int64.succ state.next in
-                let ticket =
-                  { id = Worker.request_id (identity state.client serial)
-                  ; serial
-                  ; kind = kind query
-                  ; query = Read query
-                  ; target = Sealed (session, budget)
-                  }
-                in
-                let slot =
-                  { ticket
-                  ; dispatched = true
-                  ; admitted = None
-                  ; sample_epoch = None
-                  ; origin = Some (session, budget)
-                  ; result = None
-                  ; early = None
-                  ; cancelled = false
-                  ; forgotten = false
-                  }
-                in
-                let facts =
-                  { state.facts with
-                    entries = Slots.add serial (Entry slot) state.facts.entries
-                  }
-                in
-                Ok
-                  ( ticket
-                  , changed
-                      { state with next = serial; facts }
-                      [ Send (ticket, session, operation) ] ))
+              Result.bind
+                (validate_change_query state.facts session budget query)
+                (fun () ->
+                   if state.next = Int64.max_int
+                   then Error (Worker.Invalid_input "Request counter exhausted")
+                   else (
+                     let serial = Int64.succ state.next in
+                     let ticket =
+                       { id = Worker.request_id (identity state.client serial)
+                       ; serial
+                       ; kind = kind query
+                       ; query = Read query
+                       ; target = Sealed (session, budget)
+                       }
+                     in
+                     let ready =
+                       change_query_ready state.facts session budget query
+                       &&
+                       match query with
+                       | Worker.Changes _ ->
+                         change_read_available (active_change_reads state.facts) session
+                       | _ -> true
+                     in
+                     let slot =
+                       { ticket
+                       ; dispatched = ready
+                       ; admitted = None
+                       ; change_version = change_version state.facts session
+                       ; sample_epoch = None
+                       ; origin = (if ready then Some (session, budget) else None)
+                       ; result = None
+                       ; early = None
+                       ; cancelled = false
+                       ; forgotten = false
+                       }
+                     in
+                     let facts =
+                       { state.facts with
+                         entries = Slots.add serial (Entry slot) state.facts.entries
+                       }
+                     in
+                     Ok
+                       ( ticket
+                       , changed
+                           { state with next = serial; facts }
+                           (if ready then [ Send (ticket, session, operation) ] else [])
+                       )))
             | Worker.Mutate intent ->
               plan_mutation state session operation intent (Direct session)
             | Worker.Confirm (presentation, receipt) ->
@@ -1952,6 +2698,49 @@ let request
                    "Operation needs backend durability/resource conformance")
           in
           planned))
+;;
+
+let begin_change_application state batch ~root =
+  let session = Worker.change_batch_session batch in
+  let graph = Worker.graph_id session in
+  Result.bind (validate_session state session) (fun () ->
+    let owned =
+      match Graphs.find_opt graph state.facts.change_batches with
+      | Some (actual, _) -> actual = batch
+      | _ -> false
+    in
+    if not owned
+    then
+      Error (Worker.Invalid_input "Change application requires an owned delivered batch")
+    else if
+      Option.exists
+        (fun application -> Graphs.is_empty application.failed_consumers)
+        (application_for_batch state.facts batch)
+    then Error (Worker.Invalid_input "The change application attempt is already active")
+    else if state.next = Int64.max_int
+    then Error (Worker.Invalid_input "Change application counter exhausted")
+    else (
+      let serial = Int64.succ state.next in
+      let token =
+        { application_id = Worker.request_id (identity state.client serial)
+        ; application_batch = batch
+        }
+      in
+      let consumers = Graphs.singleton root waiting_consumer in
+      let application =
+        { token
+        ; pending_consumers = consumers
+        ; issued_consumers = Graphs.singleton root ()
+        ; issued_count = 1
+        ; failed_consumers = Graphs.empty
+        }
+      in
+      let facts =
+        { state.facts with
+          applications = Graphs.add graph application state.facts.applications
+        }
+      in
+      Ok (token, changed { state with next = serial; facts } [])))
 ;;
 
 let plan_query state ~owner ~maximum_items ~maximum_bytes query =
@@ -1983,6 +2772,7 @@ let plan_query state ~owner ~maximum_items ~maximum_bytes query =
       { ticket
       ; dispatched = false
       ; admitted = None
+      ; change_version = 0L
       ; sample_epoch = None
       ; origin = None
       ; result = None
@@ -2065,3 +2855,4 @@ module Response_ownership = struct
 
   let spans = Ranges.cardinal
 end
+

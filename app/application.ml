@@ -3518,6 +3518,7 @@ let start
   in
   let graph_runtime_cell = graph_ref (fun () ->
     Journal_graph_runtime.create
+      ~on_change:(fun event->Option.iter(fun(_,host)->Coordination_host.post host event)!coordination_host)
       ~validate_session:(fun session -> match current_owner(),!coordination_host with
         | Some owner,Some (_,host) -> Coordination_host.validate_session ~owner host session
         | _ -> Error Wc.Revoked_session)
@@ -3791,38 +3792,51 @@ let start
   let graph_worker_requests_cell = graph_ref (fun () ->
     Hashtbl.create 16) in
   let coordinated_read_finished = ref (fun (_:Graph_service.timeline_scope)
-      (_:Logseq_db_worker.Protocol.request) (_: (Wc.session * Wc.read_budget) option) (_:(Journal_graph_runtime.worker_read_result,string) result) -> ()) in
-  let send_coordinated_read request = function
+      (_:Logseq_db_worker.Protocol.request) (_:Coordination.change_application option) (_: (Wc.session * Wc.read_budget) option) (_:(Journal_graph_runtime.worker_read_result,string) result) -> ()) in
+  let send_coordinated_read request read =
+    match read with
     | Journal_graph_runtime.Unowned_read _ -> Journal_graph_transport.Not_ready
-    | Read read ->
-    match current_owner(),ensure_coordination() with
+    | _ -> match current_owner(),ensure_coordination() with
     | Some owner,Ok host ->
-      (match Coordination_host.plan_query host ~owner ~maximum_items:read.maximum_items
-          ~maximum_bytes:Logseq_db_worker.Protocol.maximum_response_bytes read.query with
-       | Error _ -> Journal_graph_transport.Not_ready
-       | Ok ticket ->
-         observe_projection_request request;
-         Coordination_host.watch_read host ticket ~f:(fun origin reply ->
-           let result=match reply with
-             | Wc.Answered(Ok value) ->
-               (match origin with Some (session,_) when (match !coordination_host with
-                 | Some (_,current) -> Coordination_host.validate_session ~owner current session=Ok ()
-                 | None -> false) -> Ok(read.outcome value)
-                | _ -> Error "The graph execution changed before the read was delivered.")
-             | Answered(Error(Wc.Stale_read message)) -> Ok(Journal_graph_runtime.Ordinary_read(V2_failed{code="staleReadCursor";message}))
-             | Answered(Error Wc.Response_budget_exceeded) -> Ok(Journal_graph_runtime.Ordinary_read(V2_failed{code="responseTooLarge";message="The read exceeded its response budget."}))
-             | Answered(Error(Wc.Db_error error)) -> Error(Logseq_db_worker.Error.message error)
-             | Answered(Error(Wc.Service_failed message | Resync_required message)) -> Error message
-             | Answered(Error Revoked_session) -> Error "The graph execution changed before the read completed."
-             | Answered(Error _) -> Error "The typed graph read could not be validated."
-             | Not_admitted Full -> Error "Worker request queue is full"
-             | Not_admitted Not_ready -> Error "Worker is not ready"
-             | Not_admitted Stopping -> Error "Worker is stopping"
-             | Not_admitted(Unsupported_request message) -> Error message
-             | Interrupted _ -> Error "Worker read was interrupted" in
-           !coordinated_read_finished owner request origin result);
-         Journal_graph_transport.Accepted)
-    | _ -> Journal_graph_transport.Not_ready in
+      let application=Journal_graph_runtime.application_for_request (!graph_runtime_cell) ~request_id:request.Logseq_db_worker.Protocol.request_id in
+      let watch : type a. Wc.session option -> a Coordination.ticket -> (a -> Journal_graph_runtime.worker_read_result) -> unit =
+        fun expected_session ticket outcome ->
+        observe_projection_request request;
+        Coordination_host.watch_read host ticket ~f:(fun origin reply ->
+          let is_changes=match request.command with Logseq_db_worker.Protocol.V2_pull_changes _|V2_ack_changes _->true|_->false in
+          let result=match reply with
+            | Wc.Answered(Ok value) ->
+              let session=match expected_session,origin with Some session,_->Some session|None,Some(session,_)->Some session|_->None in
+              (match session,!coordination_host with
+               | Some session,Some(_,current) when Coordination_host.validate_session ~owner current session=Ok () ->Ok(outcome value)
+               | _->Error "The graph execution changed before the read was delivered.")
+            | Answered(Error(Wc.Stale_read _)) when is_changes ->Ok Journal_graph_runtime.Changes_retired
+            | Answered(Error(Wc.Resync_required message)) when is_changes ->Ok(Journal_graph_runtime.Changes_resync message)
+            | Answered(Error(Wc.Stale_read message))->Ok(Journal_graph_runtime.Ordinary_read(V2_failed{code="staleReadCursor";message}))
+            | Answered(Error Wc.Response_budget_exceeded)->Ok(Journal_graph_runtime.Ordinary_read(V2_failed{code="responseTooLarge";message="The read exceeded its response budget."}))
+            | Answered(Error(Wc.Db_error error))->Error(Logseq_db_worker.Error.message error)
+            | Answered(Error(Wc.Service_failed message|Resync_required message))->Error message
+            | Answered(Error Revoked_session)->Error "The graph execution changed before the read completed."
+            | Answered(Error _)->Error "The typed graph read could not be validated."
+            | Not_admitted Full->Error "Worker request queue is full"
+            | Not_admitted Not_ready->Error "Worker is not ready"
+            | Not_admitted Stopping->Error "Worker is stopping"
+            | Not_admitted(Unsupported_request message)->Error message
+            | Interrupted _->Error "Worker read was interrupted" in
+          !coordinated_read_finished owner request application origin result)
+      in
+      (match read with
+       | Journal_graph_runtime.Read read ->
+         (match Coordination_host.plan_query host ~owner ~maximum_items:read.maximum_items
+           ~maximum_bytes:Logseq_db_worker.Protocol.maximum_response_bytes read.query with
+          | Ok ticket->watch None ticket read.outcome;Journal_graph_transport.Accepted
+          | Error _->Journal_graph_transport.Not_ready)
+       | Acknowledge read ->
+         (match Coordination_host.request host (Wc.change_batch_session read.batch)(Wc.Acknowledge_changes read.batch) with
+          | Ok ticket->watch(Some(Wc.change_batch_session read.batch))ticket read.outcome;Journal_graph_transport.Accepted
+          | Error _->Journal_graph_transport.Not_ready)
+       | Unowned_read _->Journal_graph_transport.Not_ready)
+    | _->Journal_graph_transport.Not_ready in
   let deliver_output (output : Journal_graph_runtime.output) =
     List.iter
       (fun response ->
@@ -3919,8 +3933,22 @@ let start
         | Some set_state ->
           set_state (fun state -> apply_delivery_responses state delivery))
   in
-  coordinated_read_finished := (fun owner request origin result ->
+  coordinated_read_finished := (fun owner request application origin result ->
     if runtime_owner_is_live !state_ref owner then run_owned (Some owner) (fun () ->
+      let application,result=match result,!coordination_host with
+        | Ok(Journal_graph_runtime.Changes_read batch),Some(_,host) ->
+          let view=Coordination_host.view host in
+          if not(Coordination.owns_change_batch view batch)
+             || (Coordination.change_application_started view batch && Coordination.change_application_error view batch=None)
+          then None,Ok Journal_graph_runtime.Changes_retired
+          else (match Coordination_host.begin_change_application host batch ~root:request.request_id with
+            | Ok token when Journal_graph_runtime.set_change_application (!graph_runtime_cell) ~request_id:request.request_id token ->Some token,result
+            | _->None,Error "The graph change application could not be started.")
+        | _->application,result in
+      let resync_generation= !state_ref.next_request_generation in
+      let prepare=match result with
+        | Ok(Journal_graph_runtime.Changes_resync _)->set_state(fun state->{state with next_request_generation=Int64.max state.next_request_generation(Int64.succ resync_generation)})
+        | _->Effect.ignore in
       let output=match result with
         | Ok result ->
           (match result with
@@ -3945,20 +3973,28 @@ let start
                  {lookup=value.lookup;page=value.page;items=value.items;next_cursor=None;
                   scope_revision=value.scope_revision;generation=value.generation;
                   projection_revision=value.projection_revision}})
+           | Changes_read _|Changes_acknowledged _|Changes_resync _|Changes_retired
            | Task_catalog_read _ -> forget_projection_request request.request_id
            | Favorites_read{first_page;value}->
              Journal_media_runtime.forget_request (!media_runtime_cell) request.request_id;
              Journal_asset_runtime.observe_favorites_result (!asset_runtime_cell)
                ~request_id:request.request_id ~first_page value);
-          Journal_graph_runtime.receive_worker_read ?origin (!graph_runtime_cell) ~request_id:request.request_id result
+          Journal_graph_runtime.receive_worker_read ~resync_generation ?origin (!graph_runtime_cell) ~request_id:request.request_id result
         | Error message -> forget_projection_request request.request_id;
           Journal_graph_runtime.fail_request (!graph_runtime_cell) request ~message in
+      Effect.bind prepare ~f:(fun()->
       Effect.bind (Effect.of_thunk(fun()->deliver_output output)) ~f:(fun delivery ->
         Effect.bind (apply_graph_responses set_state_and_effect delivery.responses) ~f:(fun()->
+          Option.iter(fun token->Option.iter(fun(_,host)->Coordination_host.post host
+            (Coordination.Change_consumer_applied(token,request.request_id,
+              match result,delivery.error with
+              | Error message,_->Error(Wc.Service_failed message)
+              | _,Some message->Error(Wc.Service_failed message)
+              | _->Ok())))!coordination_host) application;
           set_state(fun state->match delivery.error with
             | None->state
             | Some message when Option.is_some state.feed_refresh->fail_feed_transport state message
-            | Some message->fail_graph_transport state message)))));
+            | Some message->fail_graph_transport state message))))));
   let observe_graph_state
         set_state
         set_state_and_effect
@@ -6320,7 +6356,7 @@ let start
     if visible then Option.iter (fun owner ->
       let key=owner_key owner in
       match Hashtbl.find_opt pending_graph_pushes key with
-      | None->() | Some build->Hashtbl.remove pending_graph_pushes key;Effect.run(build ())) (timeline_scope model);
+      | None->() | Some(_,push,build)->Hashtbl.remove pending_graph_pushes key;Effect.run(build push)) (timeline_scope model);
     let model=sync_startup_presentation model |> run_edge_callbacks |> prune_resident_models in
     let model=if visible then prepare_presentation model else model in
     state_ref:=model;save_runtime ();processing_owner:=previous;
@@ -7302,7 +7338,17 @@ let start
         List.iter (fun (scope,push) -> let owner=owner_of_scope scope in
           if model_key !state_ref=Some(owner_key owner) then
             run_owned (Some owner) (fun () -> deliver (Worker.Push {envelope with payload=Graph_service.Graph_push push}))
-          else Hashtbl.replace pending_graph_pushes (owner_key owner) (fun () -> deliver (Worker.Push {envelope with payload=Graph_service.Graph_push push}))) pushes
+          else (
+            let key=owner_key owner in
+            let push=match Hashtbl.find_opt pending_graph_pushes key with
+              | Some(previous,old,_) when previous=scope ->
+                (match Graph_service.coalesce_push ~topic:envelope.topic
+                  (Graph_service.Graph_pushes[scope,old]) (Graph_service.Graph_pushes[scope,push]) with
+                 | Graph_service.Graph_pushes[_,merged]->merged
+                 | _->push)
+              | _->push in
+            Hashtbl.replace pending_graph_pushes key (scope,push,
+              fun push->deliver(Worker.Push{envelope with payload=Graph_service.Graph_push push})))) pushes
       | _ -> Effect.run (deliver event)));
 
   (* The worker fires the wakeup on its own domain whenever output lands;

@@ -167,7 +167,8 @@ type children = private
   }
 
 type change_batch = private
-  { generation : string
+  { change_owner : session
+  ; generation : string
   ; from_exclusive : string option
   ; through : string
   ; windows : Protocol.v2_change_window list
@@ -259,8 +260,10 @@ val supports_observation : session -> 'a query -> bool
     affected consumer state is applied (or explicitly retired); a normal read
     failure cannot discard a window. Gaps/resync require a fresh baseline, not an
     invented acknowledgement. next retains the exact pull chain. *)
-val change_ack_generation : change_ack -> string
+val change_batch_session : change_batch -> session
 
+val change_ack_session : change_ack -> session
+val change_ack_generation : change_ack -> string
 val change_ack_through : change_ack -> string
 
 type capture_node =
@@ -420,6 +423,11 @@ type 'a reply =
     unknown state and reconcile the same durable intent. V2_failed without known
     non-commit evidence cannot become Rejected. Replay must be durable/idempotent
     across restart, not merely a process-local duplicate cache. *)
+
+type changefeed_notice = private
+  { notice_session : session
+  ; notice : Protocol.push
+  }
 
 type observation_epoch
 
@@ -783,6 +791,7 @@ module type ISSUER = sig
     -> Service.response
     -> ('a observation * observation_epoch, error) result
 
+  val changefeed_notices : Service.push -> (changefeed_notice Rrbvec.t, error) result
   val observation_notices : Service.push -> (observation_notice Rrbvec.t, error) result
 
   (** Settle a caller-known pending logical registration even when cancellation

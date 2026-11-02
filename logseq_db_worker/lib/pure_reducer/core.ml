@@ -1224,7 +1224,7 @@ let step state event =
         [Run_worker(Request(ticket,Handle_sync_worker_effect request))]
     | _->next,[] in
   let effects=List.map (function
-    | Publish (Graph_push push) when known ->
+    | Publish (Graph_push push) ->
       (match owner with Some scope->Publish (Scoped_graph_push (scope,push)) | None->Publish (Graph_push push))
     | instruction -> instruction) (transition.effects @ drains @ account_effects) in
   let next={next with graph_sessions=List.filter (fun session ->
@@ -1456,3 +1456,183 @@ module Observation_registry = struct
     { entries; active; retained }
   ;;
 end
+
+module Changefeed_owner = struct
+  type ownership =
+    | Legacy
+    | Registered of int64
+    | Retired of int64
+
+  type retained =
+    { command : Protocol.command
+    ; maximum_bytes : int
+    ; response : Protocol.response
+    }
+
+  type t =
+    { owner : ownership
+    ; pending : retained option
+    ; acknowledged : (string * string) option
+    ; resync : bool
+    ; windows : int
+    ; bytes : int
+    }
+
+  type pull =
+    | Read
+    | Cached of Protocol.response
+    | Refused
+
+  let empty =
+    { owner = Legacy
+    ; pending = None
+    ; acknowledged = None
+    ; resync = false
+    ; windows = 0
+    ; bytes = 0
+    }
+  ;;
+
+  let legacy state = state.owner = Legacy
+  let needs_resync state = state.resync
+  let owns state registration = state.owner = Registered registration
+
+  let claim state ~registration =
+    if registration <= 0L
+    then state, false
+    else (
+      match state.owner with
+      | Legacy -> { state with owner = Registered registration }, true
+      | Registered actual -> state, actual = registration
+      | Retired previous when registration > previous ->
+        ( { state with
+            owner = Registered registration
+          ; pending = None
+          ; acknowledged = None
+          ; resync = false
+          }
+        , true )
+      | Retired _ -> state, false)
+  ;;
+
+  let pull state ~registration ~(request : Protocol.request) ~maximum_bytes =
+    if
+      (not (owns state registration))
+      || maximum_bytes <= 0
+      || maximum_bytes > Protocol.maximum_response_bytes
+    then Refused
+    else (
+      match request.command, state.pending with
+      | Protocol.V2_pull_changes _, None -> Read
+      | Protocol.V2_pull_changes _, Some retained
+        when request.command = retained.command && maximum_bytes = retained.maximum_bytes
+        ->
+        let (Protocol.V2_response response) = retained.response in
+        Cached (Protocol.V2_response { response with request_id = request.request_id })
+      | _ -> Refused)
+  ;;
+
+  let remember state ~registration ~(request : Protocol.request) ~maximum_bytes response =
+    match pull state ~registration ~request ~maximum_bytes, request.command, response with
+    | Read, Protocol.V2_pull_changes query, Protocol.V2_response raw
+      when raw.api_version = Protocol.api_version
+           && raw.request_id = request.request_id
+           && Protocol.encoded_response_bytes response <= maximum_bytes ->
+      (match raw.outcome with
+       | Protocol.V2_changes batch
+         when batch.generation = query.generation
+              && batch.from_exclusive = query.after
+              && List.length batch.windows <= query.limit ->
+         Ok
+           { state with
+             pending = Some { command = request.command; maximum_bytes; response }
+           ; resync = false
+           }
+       | _ -> Error "Changefeed response does not match its retained pull")
+    | _ -> Error "Changefeed ownership or retained response mismatch"
+  ;;
+
+  let pending_matches state generation through =
+    match state.pending with
+    | Some
+        { response = Protocol.V2_response { outcome = Protocol.V2_changes batch; _ }; _ }
+      -> batch.generation = generation && batch.through = through
+    | _ -> false
+  ;;
+
+  let may_ack state ~registration ~generation ~through =
+    owns state registration
+    && (pending_matches state generation through
+        || state.acknowledged = Some (generation, through))
+  ;;
+
+  let acknowledged state ~registration ~(request : Protocol.request) response =
+    match request.command, response with
+    | Protocol.V2_ack_changes query, Protocol.V2_response raw
+      when raw.api_version = Protocol.api_version && raw.request_id = request.request_id
+      ->
+      (match raw.outcome with
+       | Protocol.V2_changes_acknowledged ack
+         when ack.generation = query.generation
+              && ack.through = query.through
+              && may_ack
+                   state
+                   ~registration
+                   ~generation:ack.generation
+                   ~through:ack.through ->
+         { state with
+           acknowledged = Some (ack.generation, ack.through)
+         ; pending =
+             (if pending_matches state ack.generation ack.through
+              then None
+              else state.pending)
+         }
+       | _ -> state)
+    | _ -> state
+  ;;
+
+  let invalidate state =
+    { state with
+      pending = None
+    ; acknowledged = None
+    ; resync = true
+    ; windows = 0
+    ; bytes = 0
+    }
+  ;;
+
+  let retain_window state ~encoded_bytes =
+    if
+      encoded_bytes <= 0
+      || state.windows >= 256
+      || encoded_bytes > Protocol.maximum_response_bytes - state.bytes
+    then invalidate state, false
+    else
+      ( { state with windows = state.windows + 1; bytes = state.bytes + encoded_bytes }
+      , true )
+  ;;
+
+  let release_windows state ~count ~encoded_bytes =
+    if
+      count < 0
+      || count > state.windows
+      || encoded_bytes < 0
+      || encoded_bytes > state.bytes
+    then invalid_arg "Changefeed retention accounting mismatch"
+    else
+      { state with windows = state.windows - count; bytes = state.bytes - encoded_bytes }
+  ;;
+
+  let retire state ~registration =
+    if owns state registration
+    then
+      { state with
+        owner = Retired registration
+      ; pending = None
+      ; acknowledged = None
+      ; resync = false
+      }
+    else state
+  ;;
+end
+

@@ -299,3 +299,54 @@ module Observation_registry : sig
   (** Only after all physical listeners/read leases of this binding settled. *)
   val retire_registration : t -> registration:int64 -> t
 end
+
+(** One changefeed consumer for one physical DB session. Legacy ownership can be
+    transferred once; registered replacements require actual prior retirement.
+    An unapplied pull is retained verbatim until its exact ACK succeeds. *)
+module Changefeed_owner : sig
+  type t
+
+  type pull =
+    | Read
+    | Cached of Logseq_db_worker_contract.Protocol.response
+    | Refused
+
+  val empty : t
+  val legacy : t -> bool
+  val needs_resync : t -> bool
+  val claim : t -> registration:int64 -> t * bool
+
+  val pull
+    :  t
+    -> registration:int64
+    -> request:Logseq_db_worker_contract.Protocol.request
+    -> maximum_bytes:int
+    -> pull
+
+  val remember
+    :  t
+    -> registration:int64
+    -> request:Logseq_db_worker_contract.Protocol.request
+    -> maximum_bytes:int
+    -> Logseq_db_worker_contract.Protocol.response
+    -> (t, string) result
+
+  val may_ack : t -> registration:int64 -> generation:string -> through:string -> bool
+
+  val acknowledged
+    :  t
+    -> registration:int64
+    -> request:Logseq_db_worker_contract.Protocol.request
+    -> Logseq_db_worker_contract.Protocol.response
+    -> t
+
+  (** Physical history has at most 256 windows and one maximum response's
+      conservative encoded-byte budget. False requires the I/O owner to discard
+      that history and publish resync; it does not acknowledge any consumer. *)
+  val retain_window : t -> encoded_bytes:int -> t * bool
+
+  val release_windows : t -> count:int -> encoded_bytes:int -> t
+  val invalidate : t -> t
+  val retire : t -> registration:int64 -> t
+end
+

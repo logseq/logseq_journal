@@ -124,6 +124,8 @@ let with_worker
             ~sync_runner
             ~publish:(function
               | Core.Graph_push push -> Queue.add push pushes
+              | Core.Scoped_graph_push(scope,push)
+                when List.exists((=)scope)(Core.graph_scopes !state) -> Queue.add push pushes
               | _ -> ())
           |> Result.get_ok
         in

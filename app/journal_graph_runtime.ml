@@ -7,8 +7,13 @@ module Favorites = Journal_graph_favorites_plan
 module Feed = Journal_graph_feed_plan
 module Confirmation = Journal_graph_mutation_confirmation
 module Worker = Journal_worker_coordination.Worker_api
+module Coordination = Journal_worker_coordination.Worker_pure_coordinator
 
 type worker_read_result =
+  | Changes_resync of string
+  | Changes_retired
+  | Changes_read of Worker.change_batch
+  | Changes_acknowledged of Worker.change_ack
   | Root_tree_read of {page:Graph.Uuid.t;value:Protocol.v2_tree_member Worker.slice}
   | Child_members_read of Worker.children
   | Target_summary_read of Worker.block_summary
@@ -204,7 +209,7 @@ type operation =
       { request_generation : int64
       ; generation : string
       }
-  | Acknowledge_changes
+  | Acknowledge_changes of { batch:Worker.change_batch option; continuation:int64 option }
   | Detail_block of
       { generation : int64
       ; block_id : string
@@ -294,12 +299,16 @@ type pending_operation =
   { operation : operation
   ; source_epoch : int64
   ; failure_owner : failure_owner option
+  ; mutable change_application : Coordination.change_application option
   ; mutable background : bool
   ; mutable delivery : request_delivery
   }
 
 type t =
-  { validate_session : Worker.session -> (unit, Worker.error) result
+  { on_change : Coordination.event -> unit
+  ; mutable application_context : (Coordination.change_application * Graph.Uuid.t * Graph.Uuid.t Rrbvec.t ref) option
+  ; mutable latest_application : Coordination.change_application option
+  ; validate_session : Worker.session -> (unit, Worker.error) result
   ; pending : (string, pending_operation) Hashtbl.t
   ; hydration_queue : Protocol.request Queue.t
   ; hydration_active : (string, unit) Hashtbl.t
@@ -358,8 +367,8 @@ let day_failure ~day request_generation message =
     ]
 ;;
 
-let create ?(localtime = Unix.localtime) ?(validate_session = fun _ -> Error Worker.Revoked_session) () =
-  { validate_session
+let create ?(on_change=fun _->()) ?(localtime = Unix.localtime) ?(validate_session = fun _ -> Error Worker.Revoked_session) () =
+  { validate_session;on_change;application_context=None;latest_application=None
   ; pending = Hashtbl.create 32
   ; hydration_queue = Queue.create ()
   ; hydration_active = Hashtbl.create 4
@@ -398,6 +407,8 @@ let create ?(localtime = Unix.localtime) ?(validate_session = fun _ -> Error Wor
 ;;
 
 let reset t =
+  Option.iter(fun token->t.on_change(Coordination.Change_application_retired token)) t.latest_application;
+  t.latest_application<-None;t.application_context<-None;
   Hashtbl.clear t.pending;
   Queue.clear t.hydration_queue;
   Hashtbl.clear t.hydration_active;
@@ -478,10 +489,13 @@ let make_request ?source_epoch ?(background = false) t operation command =
           Hashtbl.replace t.task_lookup_epochs (Graph.Uuid.to_string uuid) source_epoch)
        ids
    | _ -> ());
+  let participates=match command with Protocol.V2_ack_changes _->false|_->true in
   Hashtbl.replace
     t.pending
     (Graph.Uuid.to_string request_id)
-    { operation; source_epoch; failure_owner = None; background; delivery = Planned };
+    { operation; source_epoch; failure_owner = None; background; delivery = Planned;
+      change_application=(if participates then Option.map(fun(token,_,_)->token)t.application_context else None) };
+  if participates then Option.iter(fun(_,_,children)->children:=Rrbvec.push_back !children request_id)t.application_context;
   Protocol.{ api_version; request_id; command }
 ;;
 
@@ -1226,7 +1240,9 @@ let drain_hydration t =
       | Some pending when pending.delivery = Queued ->
         if favorite_request_current t pending
         then drain (issue_request t request :: reversed)
-        else (Hashtbl.remove t.pending key; drain reversed)
+        else (
+          Option.iter(fun token->t.on_change(Coordination.Change_consumer_retired(token,request.request_id))) pending.change_application;
+          Hashtbl.remove t.pending key; drain reversed)
       | None | Some _ -> drain reversed)
   in
   drain []
@@ -1720,7 +1736,7 @@ let operation_name = function
   | Graph_info -> "graphInfo"
   | Admission_info _ -> "inspectAdmission"
   | Pull_changes _ -> "pullChanges"
-  | Acknowledge_changes -> "ackChanges"
+  | Acknowledge_changes _ -> "ackChanges"
   | Detail_block _ -> "loadDetailBlock"
   | Detail_page _ -> "loadDetailPage"
   | Child_insert _ -> "appendChild"
@@ -1795,7 +1811,7 @@ let failure_output
     -> request_target_summary t page (Update_conflict_refresh { block_id })
   | Graph_info -> responses [ response (Open_failed worker_failure) ]
   | Admission_info request -> responses [ response (Admission_unavailable request) ]
-  | Pull_changes _ | Acknowledge_changes ->
+  | Pull_changes _ | Acknowledge_changes _ ->
     responses [ response (Rejected (Worker_failure worker_failure)) ]
   | Detail_block { generation; block_id; _ } ->
     responses
@@ -1950,9 +1966,11 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
         | Pull_changes { request_generation; _ } ->
           rehydrate_current_interests t ~request_generation ~generation
         | _ -> failure_output t operation request_id reason)
-     | V2_graph_info_outcome { journal_title_format; _ } ->
+     | V2_graph_info_outcome { journal_title_format; generation; _ } ->
        (match operation with
         | Graph_info ->
+          if t.change_generation<>Some generation then t.change_cursor<-None;
+          t.change_generation<-Some generation;
           let catalog =
             if t.task_catalog_started then [] else [ request_task_catalog t ]
           in
@@ -2566,7 +2584,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                    })
             ]
         | _ -> failure_output t operation request_id "Unexpected mutation response.")
-     | V2_changes { generation; through; windows; _ } ->
+     | V2_changes { generation; through; windows; next; _ } ->
        (match operation with
         | Pull_changes { request_generation; _ } ->
           report_timeline "runtime-change-window"
@@ -2581,9 +2599,9 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
             ; "truncated", `Bool (List.length windows > 16)
             ];
           t.change_generation <- Some generation;
-          t.change_cursor <- Some through;
+          let batch=match read_result with Some(Changes_read batch)->Some batch|_->None in
           let acknowledgement =
-            read t Acknowledge_changes (Protocol.V2_ack_changes { generation; through })
+            read t (Acknowledge_changes {batch;continuation=Option.map(fun _->request_generation)next}) (Protocol.V2_ack_changes { generation; through })
           in
           let hydration = hydration_for_changes t ~request_generation windows in
           let catalog_requests =
@@ -2619,14 +2637,18 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
           ; responses = response (Projection_changes windows) :: hydration.responses
           }
         | _ -> failure_output t operation request_id "Unexpected changes response.")
-     | V2_changes_acknowledged _ ->
+     | V2_changes_acknowledged {generation;through} ->
        (match operation with
-        | Acknowledge_changes -> empty
+        | Acknowledge_changes {continuation;_} ->
+          t.change_generation<-Some generation;t.change_cursor<-Some through;
+          (match continuation with None->empty|Some request_generation ->
+            requests[read t (Pull_changes{request_generation;generation})
+              (Protocol.V2_pull_changes{generation;after=Some through;limit=Protocol.maximum_page_size})])
         | _ ->
           failure_output t operation request_id "Unexpected acknowledgement response.")))
 ;;
 
-let receive_delivery t ~read_result ~origin (protocol_response : Protocol.response) =
+let receive_delivery_body t ~read_result ~origin (protocol_response : Protocol.response) =
   let (Protocol.V2_response { request_id; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
   let pending = Hashtbl.find_opt t.pending key in
@@ -2734,14 +2756,76 @@ let receive_delivery t ~read_result ~origin (protocol_response : Protocol.respon
   dispatch_output t { output with requests = output.requests @ references.requests })
 ;;
 
+let application_for_request t ~request_id =
+  match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request_id) with
+  | Some {delivery=Dispatched;change_application;_}->change_application
+  | _->None
+;;
+let set_change_application t ~request_id token =
+  match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request_id) with
+  | Some pending when pending.delivery=Dispatched ->
+    pending.change_application<-Some token;t.latest_application<-Some token;true
+  | _ -> false
+;;
+let response_application_error response =
+  let failure=function Worker_failure failure->Worker.Db_error failure.error
+    | Projection_failure message->Worker.Service_failed message in
+  match response.payload with
+  | Rejected source | Feed_failed {failure=source;_} | Day_blocks_failed {failure=source;_}
+  | Child_failed {failure=source;_} | Mutation_failed {failure=source;_} -> Some(failure source)
+  | Detail_failed {missing=false;failure=source;_}->Some(failure source)
+  | Open_failed value->Some(Worker.Db_error value.error)
+  | Task_statuses_changed {error=Some message;_}|Favorites_failed(_,_,message)->Some(Worker.Service_failed message)
+  | Projection_unavailable _->Some(Worker.Service_failed "The change consumer projection is unavailable")
+  | _->None
+;;
+let receive_delivery t ~read_result ~origin (Protocol.V2_response raw as protocol_response) =
+  let token=application_for_request t ~request_id:raw.request_id in
+  match token with
+  | None->receive_delivery_body t ~read_result ~origin protocol_response
+  | Some token ->
+    let previous=t.application_context and children=ref Rrbvec.empty in
+    t.application_context<-Some(token,raw.request_id,children);
+    let output=Fun.protect ~finally:(fun()->t.application_context<-previous)
+      (fun()->receive_delivery_body t ~read_result ~origin protocol_response) in
+    t.on_change(Coordination.Change_consumer_expanded(token,raw.request_id,!children));
+    let error=match raw.outcome with
+      | Protocol.V2_failed{code;message}->Some(Worker.Service_failed(code^": "^message))
+      | V2_resync_required{reason;_}->Some(Worker.Resync_required reason)
+      | _->List.find_map response_application_error output.responses in
+    Option.iter(fun error->t.on_change(Coordination.Change_consumer_applied(token,raw.request_id,Error error))) error;
+    output
+;;
+
 (* Route accepted Worker terminal failures through the same owner as protocol
    failures. This removes pending/active markers and drains queued hydration;
    a later completion for the request is then unowned and ignored. *)
 let receive t response = receive_delivery t ~read_result:None ~origin:None response
 
-let receive_worker_read ?origin t ~request_id result =
+let receive_worker_read ?resync_generation ?origin t ~request_id result =
+  match result with
+  | Changes_retired ->
+    Hashtbl.remove t.pending(Graph.Uuid.to_string request_id);
+    Hashtbl.remove t.hydration_active(Graph.Uuid.to_string request_id);empty
+  | Changes_resync reason ->
+    let key=Graph.Uuid.to_string request_id in
+    (match Hashtbl.find_opt t.pending key,resync_generation with
+     | Some {delivery=Dispatched;operation=(Pull_changes _ | Acknowledge_changes _);_},Some request_generation ->
+       Hashtbl.remove t.pending key;Hashtbl.remove t.hydration_active key;
+       Option.iter(fun token->t.on_change(Coordination.Change_application_retired token)) t.latest_application;
+       t.latest_application<-None;
+       let generation=Option.value t.change_generation ~default:"" in
+       dispatch_output t (rehydrate_current_interests t ~request_generation ~generation)
+     | _ -> responses[response(Rejected(Projection_failure reason))])
+  | _ ->
   let outcome =
     match result with
+    | Changes_resync _ | Changes_retired -> Protocol.V2_failed
+      {code="invalidRequest";message="The change continuation was retired"}
+    | Changes_read batch -> Protocol.V2_changes{generation=batch.generation;from_exclusive=batch.from_exclusive;
+      through=batch.through;windows=batch.windows;next=batch.next}
+    | Changes_acknowledged ack -> Protocol.V2_changes_acknowledged
+      {generation=Worker.change_ack_generation ack;through=Worker.change_ack_through ack}
     | Ordinary_read outcome -> outcome
     | Root_tree_read {page;value} -> Protocol.V2_page_tree_outcome
         {page;maximum_depth=0;items=value.items;next_cursor=None}
@@ -2862,10 +2946,22 @@ type worker_read =
       ; outcome : 'a -> worker_read_result
       }
       -> worker_read
+  | Acknowledge : {batch:Worker.change_batch;outcome:Worker.change_ack -> worker_read_result} -> worker_read
   | Unowned_read of string
 
 let worker_read t (request : Protocol.request) =
   match request.command with
+  | V2_pull_changes {generation;after;limit} ->
+    (match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
+     | Some{operation=Pull_changes _;delivery=Dispatched;_}->Some(Read
+       {query=Worker.Changes{generation;after};maximum_items=limit;outcome=(fun batch->Changes_read batch)})
+     | _->Some(Unowned_read "Changefeed pull is no longer owned by its business request"))
+  | V2_ack_changes _ ->
+    (match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
+     | Some{operation=Acknowledge_changes{batch=Some batch;_};delivery=Dispatched;_}->
+       Some(Acknowledge{batch;outcome=(fun ack->Changes_acknowledged ack)})
+     | Some{operation=Acknowledge_changes{batch=None;_};delivery=Dispatched;_}->None
+     | _->Some(Unowned_read "Changefeed ACK is no longer owned by its delivered batch"))
   | V2_graph_info ->
     Some
       (Read

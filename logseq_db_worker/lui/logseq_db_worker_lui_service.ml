@@ -481,6 +481,13 @@ let merge_scoped previous next =
     List.filter (fun (owner,_) -> owner<>scope) entries @ [scope,value]) previous next in
   if List.length merged>128 then failwith "Worker pending graph scope limit exceeded";
   merged
+let merge_graph_pushes previous next =
+  List.fold_left(fun entries (scope,push)->
+    let push=match List.assoc_opt scope entries,push with
+      | Some(Protocol.V2_resync_required_push _ as required),Protocol.V2_changes_available _->required
+      | _->push in
+    merge_scoped entries [scope,push]) previous next
+;;
 module Observation_facts = Map.Make (struct
     type t = int64 * Logseq_db_types.Graph_types.Uuid.t
 
@@ -528,7 +535,7 @@ let coalesce_push ~topic previous next =
       update :: List.filter(fun old -> id old<>id update) entries) previous next in
     if List.length merged>8 then failwith "Pending coordination binding limit exceeded";
     Coordination_updates merged
-  | Graph_pushes previous,Graph_pushes next -> Graph_pushes (merge_scoped previous next)
+  | Graph_pushes previous,Graph_pushes next -> Graph_pushes (merge_graph_pushes previous next)
   | Graph_states previous,Graph_states next -> Graph_states (merge_scoped previous next)
   | Session_states previous,Session_states next -> Session_states (merge_scoped previous next)
   | _ -> if not (ID.Worker.Push_topic.equal topic asset_topic)
@@ -1179,8 +1186,9 @@ let create ~(dependencies : dependencies) =
         Ok(Coordination_released registration)
       | Coordination_query {registration;owner;request;response_budget_bytes} ->
         let current ()=Db.coordination_current session.worker ~registration in
-        if not(coordination_read request.command) then
-          Error "This registration supports ordinary reads only; mutation/changefeed ownership was not admitted."
+        let changefeed=match request.command with Protocol.V2_pull_changes _|V2_ack_changes _->true|_->false in
+        if not(coordination_read request.command || changefeed) then
+          Error "This registration supports scoped reads and owned Changes/ACK, not mutation commands."
         else if response_budget_bytes<=0 || response_budget_bytes>Protocol.maximum_response_bytes
         then Error "Invalid coordination read byte budget"
         else if not(current ()) then Error "Coordination binding retired"
@@ -1194,8 +1202,11 @@ let create ~(dependencies : dependencies) =
                  id=scope.graph_id && generation=scope.graph_generation
                | _ -> false) in
             if not(authorized ()) then Error "Coordination account authority changed" else
-            let response=Db.request_for_scope ~response_budget_bytes session.worker ~scope request in
-            if authorized () then Ok(Graph_response response) else Error "Coordination binding retired")
+            let result=if changefeed then Db.coordinated_changefeed session.worker ~registration ~scope ~request
+              ~maximum_bytes:response_budget_bytes ~current:authorized
+            else Ok(Db.request_for_scope ~response_budget_bytes session.worker ~scope request) in
+            Result.bind result(fun response->
+              if authorized () then Ok(Graph_response response) else Error "Coordination binding retired"))
       | Coordination_mutation {registration;owner;request_id;intent} ->
         let current ()=Db.coordination_current session.worker ~registration in
         if not(current ()) then Error "Coordination binding retired"

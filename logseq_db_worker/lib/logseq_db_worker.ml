@@ -238,7 +238,8 @@ let release_coordination t ~registration =
   if registration>=t.coordination_registration then (
     t.coordination_registration<-registration;
     t.coordination_notify<-None);
-  Effect_runner.release_observations t.runner ~registration
+  Effect_runner.release_observations t.runner ~registration;
+  Effect_runner.retire_changefeed t.runner ~registration
 ;;
 
 let revoke_coordination t = t.coordination_notify<-None
@@ -443,4 +444,12 @@ let confirm_mutation_for_scope t ~scope ~request_id ~intent ~original ~current =
        id=scope.Sync.graph_id && generation=scope.graph_generation
      | _->false) in
   Effect_runner.confirm_mutation t.runner ~scope ~request_id ~intent ~original ~current
+;;
+
+let coordinated_changefeed t ~registration ~scope ~request ~maximum_bytes ~current =
+  let current ()=coordination_current t ~registration && current () &&
+    match Pure_reducer.graph_state_for_scope !(t.state) scope with
+    | Some {phase=Graph_open;graph_id=Some id;generation;_}->id=scope.Sync.graph_id && generation=scope.graph_generation
+    | _ -> false in
+  Effect_runner.coordinated_changefeed t.runner ~registration ~scope ~request ~maximum_bytes ~current
 ;;

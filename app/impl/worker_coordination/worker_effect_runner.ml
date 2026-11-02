@@ -280,6 +280,15 @@ let on_event t event =
               in
               t.post (Core.Binding_release_completed (I.binding, result)));
            Consumed)
+      | Push { payload = Service.Graph_pushes _ as payload; push_sequence; _ } ->
+        let module I = (val t.issuer : Worker.ISSUER) in
+        (match I.changefeed_notices payload with
+         | Ok notices ->
+           Rrbvec.iter
+             (fun notice -> t.post (Core.Changefeed_notice (notice, push_sequence)))
+             notices
+         | Error e -> error := Some e);
+        Broadcast
       | Push { payload = Service.Coordination_updates updates; _ } ->
         let module I = (val t.issuer : Worker.ISSUER) in
         List.iter

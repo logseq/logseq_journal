@@ -162,3 +162,10 @@ val observation_scope
   -> registration:int64
   -> id:Logseq_db_types.Graph_types.Uuid.t
   -> Logseq_sync_pure_reducer.Core.graph_scope option
+
+(** Exclusive registered Changes/ACK on the actual scoped database. A pull retains
+    its exact bounded batch until a matching physical ACK; legacy access is fenced. *)
+val coordinated_changefeed
+  : t -> registration:int64 -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> request:Logseq_db_worker_contract.Protocol.request -> maximum_bytes:int
+  -> current:(unit -> bool) -> (Logseq_db_worker_contract.Protocol.response,string) result

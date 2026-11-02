@@ -1890,7 +1890,891 @@ let test_observation_properties () =
   done
 ;;
 
+let test_changefeed_planning_owns_its_typed_ticket () =
+  let issuer, _, projection, session = fixture 731L in
+  let module I = (val issuer : W.ISSUER) in
+  let state = ready I.binding projection in
+  let budget =
+    W.read_budget session ~maximum_items:32 ~maximum_bytes:65536 |> Result.get_ok
+  in
+  let ticket, planned =
+    match
+      C.request
+        state
+        session
+        (W.Query
+           (budget, W.Changes { generation = "generation:v1:synthetic"; after = None }))
+    with
+    | Ok value -> value
+    | Error _ -> failwith "typed changefeed pull is still rejected before owned planning"
+  in
+  check
+    (List.exists
+       (function
+         | C.Send (actual, owner, W.Query (_, W.Changes _)) ->
+           W.equal_session owner session
+           && W.equal_request_id (C.ticket_id actual) (C.ticket_id ticket)
+         | _ -> false)
+       planned.instructions)
+    "Changes did not use its exact pure coordinator ticket";
+  check (C.reply (C.view planned.next) ticket = None) "planned Changes fabricated a batch"
+;;
+
+let test_changes_serial_and_ack_capacity () =
+  let issuer, _, projection, session = fixture 736L in
+  let module I = (val issuer : W.ISSUER) in
+  let state = ref (ready I.binding projection) in
+  let budget =
+    W.read_budget session ~maximum_items:32 ~maximum_bytes:65536 |> Result.get_ok
+  in
+  let operation = W.Query (budget, W.Changes { generation = "g"; after = None }) in
+  let first, planned = C.request !state session operation |> Result.get_ok in
+  let second, queued = C.request planned.next session operation |> Result.get_ok in
+  check
+    (not
+       (List.exists
+          (function
+            | C.Send _ -> true
+            | _ -> false)
+          queued.instructions))
+    "same-session Changes dispatched concurrently";
+  let failed = C.step queued.next (C.Admission_refused (first, W.Full)) in
+  let retry = C.step failed.next C.Capacity_available in
+  check
+    (List.exists
+       (function
+         | C.Send (ticket, _, W.Query (_, W.Changes _)) ->
+           W.equal_request_id (C.ticket_id ticket) (C.ticket_id second)
+         | _ -> false)
+       retry.instructions)
+    "queued Changes did not progress after the earlier request terminated";
+  state := retry.next;
+  let request_id =
+    match
+      I.request session ~request_id:(C.ticket_id second) operation |> Result.get_ok
+    with
+    | S.Coordination_query value -> value.request.request_id
+    | _ -> assert false
+  in
+  let batch =
+    match
+      I.reply
+        session
+        ~request_id:(C.ticket_id second)
+        operation
+        (S.Graph_response
+           (P.V2_response
+              { api_version = P.api_version
+              ; request_id
+              ; outcome =
+                  P.V2_changes
+                    { generation = "g"
+                    ; from_exclusive = None
+                    ; through = "zero"
+                    ; windows = []
+                    ; next = None
+                    }
+              }))
+    with
+    | Ok (W.Answered (Ok value)) -> value
+    | _ -> failwith "serial Changes fixture"
+  in
+  state := (C.step !state (C.Admitted (second, Id.Worker.Request_id.one))).next;
+  state := (C.step !state (C.Completed (second, W.Answered (Ok batch)))).next;
+  let root = uuid "98000000-0000-4000-8000-000000007361" in
+  let token, begun = C.begin_change_application !state batch ~root |> Result.get_ok in
+  state
+  := (C.step begun.next (C.Change_consumer_expanded (token, root, Rrbvec.empty))).next;
+  state := (C.step !state (C.Change_consumer_applied (token, root, Ok ()))).next;
+  let ack, planned =
+    C.request !state session (W.Acknowledge_changes batch) |> Result.get_ok
+  in
+  let full = C.step planned.next (C.Admission_refused (ack, W.Full)) in
+  check
+    (C.reply (C.view full.next) ack = None)
+    "Full terminated an ACK while retaining its only unapplied chain";
+  let drained = C.step full.next C.Drain in
+  check
+    (not
+       (List.exists
+          (function
+            | C.Send _ -> true
+            | _ -> false)
+          drained.instructions))
+    "Full ACK self-retried without a capacity notification";
+  let available = C.step drained.next C.Capacity_available in
+  check
+    (List.exists
+       (function
+         | C.Send (ticket, _, W.Acknowledge_changes _) ->
+           W.equal_request_id (C.ticket_id ticket) (C.ticket_id ack)
+         | _ -> false)
+       available.instructions)
+    "capacity did not retry the exact unapplied ACK";
+  let duplicate = C.step available.next C.Capacity_available in
+  check
+    (not
+       (List.exists
+          (function
+            | C.Send _ -> true
+            | _ -> false)
+          duplicate.instructions))
+    "capacity duplicated an in-flight ACK";
+  let admitted =
+    C.step duplicate.next (C.Admitted (ack, Id.Worker.Request_id.of_int64 2L))
+  in
+  let failed =
+    C.step
+      admitted.next
+      (C.Completed (ack, W.Answered (Error (W.Service_failed "transient ACK failure"))))
+  in
+  check
+    (C.change_application_error (C.view failed.next) batch
+     = Some (W.Service_failed "transient ACK failure"))
+    "failed ACK left the unapplied chain permanently ready but unrepeatable";
+  let retry, planned = C.request failed.next session operation |> Result.get_ok in
+  check
+    (List.exists
+       (function
+         | C.Send (ticket, _, W.Query (_, W.Changes _)) ->
+           W.equal_request_id (C.ticket_id ticket) (C.ticket_id retry)
+         | _ -> false)
+       planned.instructions)
+    "later refresh could not reread the exact failed ACK chain"
+;;
+
+let test_changefeed_ack_requires_owned_delivered_batch () =
+  let issuer, _, projection, session = fixture 732L in
+  let module I = (val issuer : W.ISSUER) in
+  let state = ready I.binding projection in
+  let budget =
+    W.read_budget session ~maximum_items:32 ~maximum_bytes:65536 |> Result.get_ok
+  in
+  let operation =
+    W.Query (budget, W.Changes { generation = "generation:v1:synthetic"; after = None })
+  in
+  let ticket, planned = C.request state session operation |> Result.get_ok in
+  let window : P.v2_change_window =
+    { id = "window-1"
+    ; predecessor = "projection-0"
+    ; successor = "projection-1"
+    ; block_uuids = [ graph ]
+    ; page_uuids = []
+    ; structure_interests = []
+    }
+  in
+  let response =
+    S.Graph_response
+      (P.V2_response
+         { api_version = P.api_version
+         ; request_id =
+             (match
+                I.request session ~request_id:(C.ticket_id ticket) operation
+                |> Result.get_ok
+              with
+              | S.Coordination_query v -> v.request.request_id
+              | _ -> assert false)
+         ; outcome =
+             P.V2_changes
+               { generation = "generation:v1:synthetic"
+               ; from_exclusive = None
+               ; through = "window-1"
+               ; windows = [ window ]
+               ; next = None
+               }
+         })
+  in
+  let batch =
+    match I.reply session ~request_id:(C.ticket_id ticket) operation response with
+    | Ok (W.Answered (Ok batch)) -> batch
+    | _ -> failwith "checked Changes batch codec"
+  in
+  check
+    (Result.is_error (C.request planned.next session (W.Acknowledge_changes batch)))
+    "a decoded batch was ACKed before coordinator delivery/admission";
+  let late, late_plan = C.request planned.next session operation |> Result.get_ok in
+  let admitted = C.step late_plan.next (C.Admitted (ticket, Id.Worker.Request_id.one)) in
+  let completed = C.step admitted.next (C.Completed (ticket, W.Answered (Ok batch))) in
+  let forgotten = C.step completed.next (C.Forget ticket) in
+  let root = uuid "98000000-0000-4000-8000-000000007321" in
+  let application, begun =
+    C.begin_change_application forgotten.next batch ~root |> Result.get_ok
+  in
+  let pending_ack, pending_plan =
+    C.request begun.next session (W.Acknowledge_changes batch) |> Result.get_ok
+  in
+  check
+    (not
+       (List.exists
+          (function
+            | C.Send _ -> true
+            | _ -> false)
+          pending_plan.instructions))
+    "Changes ACK was sent before its consumer root was applied";
+  let child = uuid "98000000-0000-4000-8000-000000007322" in
+  let early =
+    C.step pending_plan.next (C.Change_consumer_applied (application, root, Ok ()))
+  in
+  check
+    (not
+       (List.exists
+          (function
+            | C.Send _ -> true
+            | _ -> false)
+          early.instructions))
+    "UI completion ACKed before the full causal work set was sealed";
+  let root_applied =
+    C.step
+      early.next
+      (C.Change_consumer_expanded (application, root, Rrbvec.singleton child))
+  in
+  check
+    (not (C.change_application_ready (C.view root_applied.next) batch))
+    "root application ignored its child";
+  let failed =
+    C.step
+      root_applied.next
+      (C.Change_consumer_applied (application, child, Error W.Response_budget_exceeded))
+  in
+  check
+    (C.change_application_error (C.view failed.next) batch
+     = Some W.Response_budget_exceeded)
+    "failed consumer discarded its change window";
+  let retry_root = uuid "98000000-0000-4000-8000-000000007323" in
+  let retry, restarted =
+    C.begin_change_application failed.next batch ~root:retry_root |> Result.get_ok
+  in
+  let old =
+    C.step restarted.next (C.Change_consumer_applied (application, child, Ok ()))
+  in
+  check
+    (not (C.change_application_ready (C.view old.next) batch))
+    "old callback applied a retried consumer window";
+  let expanded =
+    C.step old.next (C.Change_consumer_expanded (retry, retry_root, Rrbvec.empty))
+  in
+  let applied =
+    C.step expanded.next (C.Change_consumer_applied (retry, retry_root, Ok ()))
+  in
+  check
+    (C.change_application_ready (C.view applied.next) batch)
+    "complete consumer state was not eligible for ACK";
+  check
+    (List.exists
+       (function
+         | C.Send (actual, _, W.Acknowledge_changes _) ->
+           W.equal_request_id (C.ticket_id actual) (C.ticket_id pending_ack)
+         | _ -> false)
+       applied.instructions)
+    "queued ACK did not wait for the actual consumer application barrier";
+  let forgotten = { forgotten with C.next = applied.next } in
+  let ack, ack_plan =
+    match C.request forgotten.next session (W.Acknowledge_changes batch) with
+    | Ok value -> value
+    | _ -> failwith "owned delivered batch cannot plan its typed ACK"
+  in
+  let resync_admitted =
+    C.step ack_plan.next (C.Admitted (ack, Id.Worker.Request_id.one))
+  in
+  let resync =
+    C.step
+      resync_admitted.next
+      (C.Completed
+         (ack, W.Answered (Error (W.Resync_required "authoritative generation changed"))))
+  in
+  check
+    (Result.is_ok
+       (C.request
+          resync.next
+          session
+          (W.Query (budget, W.Changes { generation = "fresh-generation"; after = None }))))
+    "ACK resync retained an old batch and blocked a fresh baseline";
+  let _, ack_command =
+    match
+      I.request session ~request_id:(C.ticket_id ack) (W.Acknowledge_changes batch)
+      |> Result.get_ok
+    with
+    | S.Coordination_query v -> v.request.request_id, v.request.command
+    | _ -> assert false
+  in
+  let response =
+    match ack_command with
+    | P.V2_ack_changes value ->
+      S.Graph_response
+        (P.V2_response
+           { api_version = P.api_version
+           ; request_id =
+               (match
+                  I.request
+                    session
+                    ~request_id:(C.ticket_id ack)
+                    (W.Acknowledge_changes batch)
+                  |> Result.get_ok
+                with
+                | S.Coordination_query v -> v.request.request_id
+                | _ -> assert false)
+           ; outcome =
+               P.V2_changes_acknowledged
+                 { generation = value.generation; through = value.through }
+           })
+    | _ -> failwith "ACK codec used a non-ACK command"
+  in
+  let receipt =
+    match
+      I.reply session ~request_id:(C.ticket_id ack) (W.Acknowledge_changes batch) response
+    with
+    | Ok (W.Answered (Ok receipt)) -> receipt
+    | _ -> failwith "actual ACK receipt codec"
+  in
+  let admitted = C.step ack_plan.next (C.Admitted (ack, Id.Worker.Request_id.one)) in
+  let completed = C.step admitted.next (C.Completed (ack, W.Answered (Ok receipt))) in
+  let forgotten = C.step completed.next (C.Forget ack) in
+  check
+    (Result.is_ok (C.request forgotten.next session (W.Acknowledge_changes batch)))
+    "duplicate ACK lost the exact consumed-window proof";
+  let late_admitted =
+    C.step forgotten.next (C.Admitted (late, Id.Worker.Request_id.one))
+  in
+  let stale = C.step late_admitted.next (C.Completed (late, W.Answered (Ok batch))) in
+  check
+    (match C.reply (C.view stale.next) late with
+     | None | Some (W.Answered (Error (W.Stale_read _))) -> true
+     | _ -> false)
+    "a late pull reintroduced a batch after its ACK completed";
+  check
+    (Result.is_error
+       (C.request
+          forgotten.next
+          session
+          (W.Query
+             ( budget
+             , W.Changes { generation = batch.generation; after = Some "foreign-window" }
+             ))))
+    "arbitrary Changes cursor escaped the owned chain"
+;;
+
+let test_empty_change_batch_ack_retires_old_reads () =
+  let issuer, _, projection, session = fixture 733L in
+  let module I = (val issuer : W.ISSUER) in
+  let state = ref (ready I.binding projection) in
+  let budget =
+    W.read_budget session ~maximum_items:32 ~maximum_bytes:65536 |> Result.get_ok
+  in
+  let apply tr = state := tr.C.next in
+  let step event = apply (C.step !state event) in
+  let pull after through windows =
+    let operation = W.Query (budget, W.Changes { generation = "g"; after }) in
+    let ticket, tr = C.request !state session operation |> Result.get_ok in
+    apply tr;
+    let request_id =
+      match
+        I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok
+      with
+      | S.Coordination_query value -> value.request.request_id
+      | _ -> assert false
+    in
+    let batch =
+      match
+        I.reply
+          session
+          ~request_id:(C.ticket_id ticket)
+          operation
+          (S.Graph_response
+             (P.V2_response
+                { api_version = P.api_version
+                ; request_id
+                ; outcome =
+                    P.V2_changes
+                      { generation = "g"
+                      ; from_exclusive = after
+                      ; through
+                      ; windows
+                      ; next = None
+                      }
+                }))
+      with
+      | Ok (W.Answered (Ok value)) -> value
+      | _ -> failwith "empty batch fixture"
+    in
+    ticket, batch
+  in
+  let complete (ticket, batch) =
+    step (C.Admitted (ticket, Id.Worker.Request_id.one));
+    step (C.Completed (ticket, W.Answered (Ok batch)))
+  in
+  let ack n batch =
+    let root = uuid (Printf.sprintf "98000000-0000-4000-8000-%012d" (7330 + n)) in
+    let token, tr = C.begin_change_application !state batch ~root |> Result.get_ok in
+    apply tr;
+    step (C.Change_consumer_expanded (token, root, Rrbvec.empty));
+    step (C.Change_consumer_applied (token, root, Ok ()));
+    let ticket, tr =
+      C.request !state session (W.Acknowledge_changes batch) |> Result.get_ok
+    in
+    apply tr;
+    let request_id =
+      match
+        I.request session ~request_id:(C.ticket_id ticket) (W.Acknowledge_changes batch)
+        |> Result.get_ok
+      with
+      | S.Coordination_query value -> value.request.request_id
+      | _ -> assert false
+    in
+    let receipt =
+      match
+        I.reply
+          session
+          ~request_id:(C.ticket_id ticket)
+          (W.Acknowledge_changes batch)
+          (S.Graph_response
+             (P.V2_response
+                { api_version = P.api_version
+                ; request_id
+                ; outcome =
+                    P.V2_changes_acknowledged
+                      { generation = batch.W.generation; through = batch.through }
+                }))
+      with
+      | Ok (W.Answered (Ok value)) -> value
+      | _ -> failwith "empty batch ACK fixture"
+    in
+    step (C.Admitted (ticket, Id.Worker.Request_id.one));
+    step (C.Completed (ticket, W.Answered (Ok receipt)))
+  in
+  let window id before after : P.v2_change_window =
+    { id
+    ; predecessor = before
+    ; successor = after
+    ; block_uuids = [ graph ]
+    ; page_uuids = []
+    ; structure_interests = []
+    }
+  in
+  let a = pull None "a" [ window "a" "p0" "p1" ] in
+  complete a;
+  ack 1 (snd a);
+  let b = pull (Some "a") "a" [] in
+  let late = pull (Some "a") "a" [] in
+  complete b;
+  ack 2 (snd b);
+  let c = pull (Some "a") "c" [ window "c" "p1" "p2" ] in
+  complete c;
+  complete late;
+  check
+    (match C.reply (C.view !state) (fst late) with
+     | None | Some (W.Answered (Error (W.Stale_read _))) -> true
+     | _ -> false)
+    "empty batch ACK did not fence its old read epoch";
+  check
+    (Result.is_ok (C.request !state session (W.Acknowledge_changes (snd c))))
+    "a late empty batch overwrote the later nonempty batch";
+  ack 3 (snd c);
+  step C.Capacity_available;
+  check
+    (match C.reply (C.view !state) (fst late) with
+     | Some (W.Answered (Error (W.Stale_read _))) -> true
+     | _ -> false)
+    "obsolete queued continuation demanded a fresh graph baseline instead of retiring \
+     only its read";
+  let gap = pull (Some "c") "gap" [ window "gap" "unrelated-projection" "p3" ] in
+  complete gap;
+  check
+    (match C.reply (C.view !state) (fst gap) with
+     | Some (W.Answered (Error (W.Resync_required _))) -> true
+     | _ -> false)
+    "cross-batch projection gap was treated as a continuous change chain";
+  check
+    (Result.is_ok
+       (C.request
+          !state
+          session
+          (W.Query (budget, W.Changes { generation = "fresh-generation"; after = None }))))
+    "projection gap did not retire its proof for a fresh baseline"
+;;
+
+let test_scoped_change_notices_and_lifecycle () =
+  let issuer, raw, projection, session = fixture 735L in
+  let module I = (val issuer : W.ISSUER) in
+  let scope = fst (List.hd raw.baseline.state.residents) in
+  let available =
+    P.V2_changes_available
+      { api_version = P.api_version; generation = "g"; through = "w" }
+  in
+  let resync =
+    P.V2_resync_required_push
+      { api_version = P.api_version; generation = "g"; reason = "history gap" }
+  in
+  let decode scope push =
+    I.changefeed_notices (S.Graph_pushes [ scope, push ]) |> Result.get_ok
+  in
+  let fact = Option.get (Rrbvec.nth_opt (decode scope available) 0) in
+  let reset = Option.get (Rrbvec.nth_opt (decode scope resync) 0) in
+  let state = ready I.binding projection in
+  let seen =
+    C.step state (C.Changefeed_notice (fact, Id.Worker.Push_sequence.of_int64 2L))
+  in
+  let old = C.step seen.next (C.Changefeed_notice (reset, Id.Worker.Push_sequence.one)) in
+  check
+    (C.equal_view (C.view seen.next) (C.view old.next))
+    "stale scoped resync reset a newer producer sequence";
+  let bad = { scope with account = { scope.account with user_id = "another-user" } } in
+  check
+    (Rrbvec.is_empty (decode bad resync))
+    "foreign account manufactured a checked change notice";
+  let other_life =
+    { scope with
+      account =
+        { scope.account with
+          lifecycle_generation = Int64.succ scope.account.lifecycle_generation
+        }
+    }
+  in
+  check
+    (Rrbvec.is_empty (decode other_life resync))
+    "unregistered lifecycle manufactured a checked change notice";
+  check
+    (I.changefeed_notices (S.Graph_push available) = Ok Rrbvec.empty)
+    "unscoped broadcast borrowed the selected session's authority";
+  let bump (scope : S.asset_scope) =
+    { scope with
+      account =
+        { scope.account with
+          lifecycle_generation = Int64.succ scope.account.lifecycle_generation
+        }
+    }
+  in
+  let baseline =
+    { raw.baseline with
+      version = 2L
+    ; state =
+        { sync =
+            { raw.baseline.state.sync with
+              account =
+                Option.map
+                  (fun (account : Sync.account_scope) ->
+                     { account with
+                       lifecycle_generation = Int64.succ account.lifecycle_generation
+                     })
+                  raw.baseline.state.sync.account
+            ; residents =
+                List.map
+                  (fun (scope, state) -> bump scope, state)
+                  raw.baseline.state.sync.residents
+            }
+        ; residents =
+            List.map
+              (fun (scope, state) -> bump scope, state)
+              raw.baseline.state.residents
+        }
+    }
+  in
+  let next =
+    match I.bootstrap (S.Coordination_registered { raw with baseline }) with
+    | Ok (W.Ready value) -> value
+    | _ -> failwith "new lifecycle baseline"
+  in
+  let current = (List.hd (W.residents next)).session in
+  check
+    ((not (W.equal_session session current)) && W.same_logical_graph session current)
+    "physical lifecycle was conflated with durable logical graph identity";
+  let changed = C.step seen.next (C.Projection_received next) in
+  let late =
+    C.step
+      changed.next
+      (C.Changefeed_notice (reset, Id.Worker.Push_sequence.of_int64 100L))
+  in
+  check
+    (C.equal_view (C.view changed.next) (C.view late.next))
+    "old lifecycle notice changed the reopened owner";
+  check
+    (Rrbvec.is_empty (decode scope resync))
+    "old lifecycle decoded under the replacement resident";
+  check
+    (match
+       I.request
+         session
+         ~request_id:(W.request_id graph)
+         (W.Query
+            ( W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
+            , W.Graph_info ))
+     with
+     | Error W.Revoked_session -> true
+     | _ -> false)
+    "old lifecycle retained data admission"
+;;
+
+let test_change_application_properties () =
+  let issuer, raw, projection, session = fixture 734L in
+  let module I = (val issuer : W.ISSUER) in
+  let budget =
+    W.read_budget session ~maximum_items:32 ~maximum_bytes:65536 |> Result.get_ok
+  in
+  let operation = W.Query (budget, W.Changes { generation = "g"; after = None }) in
+  let ticket, tr =
+    C.request (ready I.binding projection) session operation |> Result.get_ok
+  in
+  let request_id =
+    match
+      I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok
+    with
+    | S.Coordination_query value -> value.request.request_id
+    | _ -> assert false
+  in
+  let batch =
+    match
+      I.reply
+        session
+        ~request_id:(C.ticket_id ticket)
+        operation
+        (S.Graph_response
+           (P.V2_response
+              { api_version = P.api_version
+              ; request_id
+              ; outcome =
+                  P.V2_changes
+                    { generation = "g"
+                    ; from_exclusive = None
+                    ; through = "w"
+                    ; next = None
+                    ; windows =
+                        [ { id = "w"
+                          ; predecessor = "p0"
+                          ; successor = "p1"
+                          ; block_uuids = [ graph ]
+                          ; page_uuids = []
+                          ; structure_interests = []
+                          }
+                        ]
+                    }
+              }))
+    with
+    | Ok (W.Answered (Ok value)) -> value
+    | _ -> failwith "application property batch fixture"
+  in
+  let admitted = (C.step tr.next (C.Admitted (ticket, Id.Worker.Request_id.one))).next in
+  let start = (C.step admitted (C.Completed (ticket, W.Answered (Ok batch)))).next in
+  let closed =
+    match
+      I.bootstrap
+        (S.Coordination_registered
+           { raw with
+             baseline =
+               { version = 2L
+               ; presentation = 2L
+               ; state =
+                   { sync =
+                       { raw.baseline.state.sync with
+                         desired_residents = []
+                       ; residents = []
+                       ; selected = None
+                       }
+                   ; residents = []
+                   }
+               }
+           })
+    with
+    | Ok (W.Ready value) -> value
+    | _ -> failwith "application property close fixture"
+  in
+  let node n = uuid (Printf.sprintf "98000000-0000-4000-8000-%012d" (7340 + n)) in
+  let run trace =
+    let state = ref start
+    and live = ref true
+    and current = ref None
+    and serial = ref 0
+    and tokens = ref [] in
+    let nodes : (bool * bool * bool) option array = Array.make 9 None
+    and seen = Array.make 9 false in
+    let failed () =
+      Array.exists
+        (function
+          | Some (_, _, true) -> true
+          | _ -> false)
+        nodes
+    in
+    let ready () = !current <> None && Array.for_all Option.is_none nodes in
+    let verify () =
+      check
+        (C.change_application_started (C.view !state) batch = (!current <> None))
+        "application token was lost or revived";
+      check
+        (C.change_application_ready (C.view !state) batch = ready ())
+        "consumer phase barrier disagrees with independent model";
+      check
+        (Option.is_some (C.change_application_error (C.view !state) batch) = failed ())
+        "consumer failure was lost or invented"
+    in
+    let apply tr =
+      check
+        (List.length tr.C.instructions < 1000)
+        "unbounded change application instruction batch";
+      List.iter
+        (function
+          | C.Send (_, _, W.Acknowledge_changes _) ->
+            check
+              (!live && ready ())
+              "ACK sent before every consumer expanded and applied/retired"
+          | _ -> ())
+        tr.instructions;
+      state := tr.next;
+      verify ()
+    in
+    let step event =
+      let before = C.view !state in
+      let a = C.step !state event
+      and b = C.step !state event in
+      check
+        (C.equal_view (C.view a.next) (C.view b.next) && a.instructions = b.instructions)
+        "change application step is nondeterministic";
+      check
+        (C.equal_view before (C.view !state))
+        "change application mutated a prior immutable view";
+      apply a
+    in
+    let selected n f =
+      match List.nth_opt !tokens (n mod max 1 (List.length !tokens)) with
+      | Some (token, index) -> f token (!current = Some index)
+      | _ -> ()
+    in
+    List.iter
+      (fun (op, n) ->
+         let parent = n mod 9 in
+         match op with
+         | 0 ->
+           let allowed = !live && (!current = None || failed ()) in
+           let planned = C.begin_change_application !state batch ~root:(node parent) in
+           check
+             (Result.is_ok planned = allowed)
+             "duplicate/failed application admission disagrees with model";
+           (match planned with
+            | Ok (token, tr) ->
+              let again =
+                C.begin_change_application !state batch ~root:(node parent)
+                |> Result.get_ok
+              in
+              check
+                (token = fst again
+                 && tr.instructions = (snd again).instructions
+                 && C.equal_view (C.view tr.next) (C.view (snd again).next))
+                "application planning is nondeterministic";
+              incr serial;
+              current := Some !serial;
+              tokens := (token, !serial) :: !tokens;
+              Array.fill nodes 0 9 None;
+              Array.fill seen 0 9 false;
+              nodes.(parent) <- Some (false, false, false);
+              seen.(parent) <- true;
+              apply tr
+            | _ -> ())
+         | 1 | 8 ->
+           selected n (fun token valid ->
+             let children =
+               if op = 8 then [] else [ (parent + 1) mod 9; (parent + 2) mod 9 ]
+             in
+             if valid
+             then (
+               match nodes.(parent) with
+               | Some (false, applied, error) ->
+                 List.iter
+                   (fun child ->
+                      if not seen.(child)
+                      then (
+                        seen.(child) <- true;
+                        nodes.(child) <- Some (false, false, false)))
+                   children;
+                 nodes.(parent)
+                 <- (if applied && not error then None else Some (true, applied, error))
+               | _ -> ());
+             step
+               (C.Change_consumer_expanded
+                  (token, node parent, Rrbvec.of_list (List.map node children))))
+         | 2 | 3 ->
+           selected n (fun token valid ->
+             if valid
+             then (
+               match nodes.(parent) with
+               | Some (expanded, applied, error) ->
+                 nodes.(parent)
+                 <- (if op = 3
+                     then Some (expanded, applied, true)
+                     else if error
+                     then Some (expanded, applied, error)
+                     else if expanded
+                     then None
+                     else Some (false, true, false))
+               | _ -> ());
+             step
+               (C.Change_consumer_applied
+                  ( token
+                  , node parent
+                  , if op = 3 then Error W.Response_budget_exceeded else Ok () )))
+         | 4 ->
+           selected n (fun token valid ->
+             if valid then nodes.(parent) <- None;
+             step (C.Change_consumer_retired (token, node parent)))
+         | 5 ->
+           selected n (fun token valid ->
+             if valid then Array.fill nodes 0 9 None;
+             step (C.Change_application_retired token))
+         | 6 ->
+           let planned = C.request !state session (W.Acknowledge_changes batch) in
+           check (Result.is_ok planned = !live) "ACK planning borrowed a closed owner";
+           (match planned with
+            | Ok (_, tr) -> apply tr
+            | _ -> ())
+         | 7 -> step C.Capacity_available
+         | _ ->
+           live := false;
+           current := None;
+           Array.fill nodes 0 9 None;
+           step (C.Projection_received closed))
+      trace
+  in
+  let prefixes =
+    [ [ 0, 0; 6, 0; 2, 0; 8, 0 ]
+    ; [ 0, 0; 1, 0; 3, 1; 0, 2; 2, 1; 8, 2; 2, 2 ]
+    ; [ 0, 0; 1, 0; 4, 1; 4, 2; 2, 0; 6, 0 ]
+    ; [ 0, 0; 1, 0; 9, 0; 2, 0; 5, 0; 6, 0 ]
+    ]
+  in
+  for seed = 0 to 249 do
+    let random = Random.State.make [| 0xa9911; seed |] in
+    let trace =
+      List.nth prefixes (seed mod List.length prefixes)
+      @ List.init 96 (fun _ ->
+        let op = Random.State.int random 10 in
+        (if op = 9 && seed mod 5 <> 0 then 8 else op), Random.State.int random 27)
+    in
+    let fails trace =
+      try
+        run trace;
+        false
+      with
+      | _ -> true
+    in
+    if fails trace
+    then (
+      let reduced = shrink fails trace in
+      try run reduced with
+      | error ->
+        failwith
+          (Printf.sprintf
+             "application property seed=%d minimal=[%s] %s"
+             seed
+             (String.concat
+                ";"
+                (List.map (fun (op, n) -> Printf.sprintf "%d:%d" op n) reduced))
+             (Printexc.to_string error)))
+  done
+;;
+
 let () =
+  test_changes_serial_and_ack_capacity ();
+  test_changefeed_planning_owns_its_typed_ticket ();
+  test_changefeed_ack_requires_owned_delivered_batch ();
+  test_empty_change_batch_ack_retires_old_reads ();
+  test_change_application_properties ();
+  test_scoped_change_notices_and_lifecycle ();
   test_observation_planning_is_pure ();
   test_observation_retains_typed_value ();
   test_observation_cancel_requires_ack ();
@@ -1913,5 +2797,5 @@ let () =
   test_opening_query_retires_on_removal ();
   print_endline
     "Pure coordinator: invariants, 500 lifecycle + 250 queued-read + 250 durable traces, \
-     100 ownership + 300 observation traces and shrinking passed"
+     100 ownership + 300 observation + 250 application traces and shrinking passed"
 ;;

@@ -116,7 +116,7 @@ type output =
 (** The host supplies the pure coordinator's current session/owner eligibility
     check for buffered Tree DTOs. Its default rejects execution provenance; tests
     can supply an explicit pure coordinator snapshot. *)
-val create : ?localtime:(float -> Unix.tm) -> ?validate_session:(Journal_worker_coordination.Worker_api.session -> (unit, Journal_worker_coordination.Worker_api.error) result) -> unit -> t
+val create : ?on_change:(Journal_worker_coordination.Worker_pure_coordinator.event -> unit) -> ?localtime:(float -> Unix.tm) -> ?validate_session:(Journal_worker_coordination.Worker_api.session -> (unit, Journal_worker_coordination.Worker_api.error) result) -> unit -> t
 val reset : t -> unit
 val set_calendar : t -> Journal_calendar.t -> unit
 val start : t -> Logseq_db_worker.Protocol.request
@@ -136,6 +136,10 @@ module Copy = Journal_copy
 module Worker = Journal_worker_coordination.Worker_api
 
 type worker_read_result =
+  | Changes_resync of string
+  | Changes_retired
+  | Changes_read of Worker.change_batch
+  | Changes_acknowledged of Worker.change_ack
   | Root_tree_read of {page:Logseq_db_types.Graph_types.Uuid.t;value:Logseq_db_worker.Protocol.v2_tree_member Worker.slice}
   | Child_members_read of Worker.children
   | Target_summary_read of Worker.block_summary
@@ -154,6 +158,7 @@ type worker_read =
       ; outcome : 'a -> worker_read_result
       }
       -> worker_read
+  | Acknowledge : {batch:Worker.change_batch;outcome:Worker.change_ack -> worker_read_result} -> worker_read
   | Unowned_read of string
 
 (** Business DTO interoperability. Favorites keeps its sealed continuation in
@@ -161,4 +166,9 @@ type worker_read =
     with the coordinator. No raw continuation extraction or cursor registry. *)
 val worker_read : t -> Logseq_db_worker.Protocol.request -> worker_read option
 
-val receive_worker_read : ?origin:(Worker.session * Worker.read_budget) -> t -> request_id:Worker.Uuid.t -> worker_read_result -> output
+(** The token only associates a business request with its pure application
+    ledger. It never grants a new session or advances the ACK chain. *)
+val application_for_request : t -> request_id:Worker.Uuid.t -> Journal_worker_coordination.Worker_pure_coordinator.change_application option
+val set_change_application : t -> request_id:Worker.Uuid.t -> Journal_worker_coordination.Worker_pure_coordinator.change_application -> bool
+
+val receive_worker_read : ?resync_generation:int64 -> ?origin:(Worker.session * Worker.read_budget) -> t -> request_id:Worker.Uuid.t -> worker_read_result -> output

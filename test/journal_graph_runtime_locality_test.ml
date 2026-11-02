@@ -4023,6 +4023,28 @@ let test_favorite_dependency_limit () =
   drain 0 output.requests
 ;;
 
+let test_changes_more_continues_after_ack () =
+  let runtime=Runtime.create () in
+  let first=pull runtime in
+  let output=Runtime.receive runtime(response first(Protocol.V2_changes
+    {generation="generation-1";from_exclusive=None;through="w1";
+     windows=[window ~blocks:[unrelated_uuid]()];next=Some "w1"})) in
+  let ack=only "first page waits for ACK" output.requests in
+  (match ack.command with Protocol.V2_ack_changes _->()|_->Alcotest.fail "More bypassed first page application ACK");
+  let output=Runtime.receive runtime(response ack(Protocol.V2_changes_acknowledged
+    {generation="generation-1";through="w1"})) in
+  let next=only "More schedules its next page after actual ACK" output.requests in
+  (match next.command with Protocol.V2_pull_changes{generation="generation-1";after=Some "w1";_}->()
+   | _->Alcotest.fail "More lost its actual acknowledged cursor");
+  let output=Runtime.receive runtime(response next(Protocol.V2_changes
+    {generation="generation-1";from_exclusive=Some "w1";through="w2";
+     windows=[window ~blocks:[unrelated_uuid]()];next=None})) in
+  let ack=only "last page ACK" output.requests in
+  let output=Runtime.receive runtime(response ack(Protocol.V2_changes_acknowledged
+    {generation="generation-1";through="w2"})) in
+  Alcotest.(check int) "no pull loop after Complete" 0(List.length output.requests)
+;;
+
 let test_projection_changes_are_owned () =
   let runtime = Runtime.create () in
   let output =
@@ -9413,7 +9435,7 @@ let () =
             test_resync_and_dependent_reads_share_hydration_bound
         ] )
     ; ( "changes"
-      , [ Alcotest.test_case
+      , [ Alcotest.test_case "More continues only after ACK" `Quick test_changes_more_continues_after_ack; Alcotest.test_case
             "Worker generation change restarts pull without a cursor"
             `Quick
             test_worker_generation_change_restarts_pull_without_cursor

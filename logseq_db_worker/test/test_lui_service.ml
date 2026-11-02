@@ -1577,7 +1577,12 @@ let test_resident_invalidations_survive_coalescing () =
     (Service.Graph_pushes [scope,push 1]) (Service.Graph_pushes [other,push 2]) in
   T.require (merged=Service.Graph_pushes [scope,push 1;other,push 2]) "hidden graph invalidation was overwritten";
   let latest=Service.coalesce_push ~topic:Service.invalidation_topic merged (Service.Graph_pushes [scope,push 3]) in
-  T.require (latest=Service.Graph_pushes [other,push 2;scope,push 3]) "latest update must replace only its exact graph scope"
+  T.require (latest=Service.Graph_pushes [other,push 2;scope,push 3]) "latest update must replace only its exact graph scope";
+  let resync=P.V2_resync_required_push{api_version=P.api_version;generation="g";reason="retention gap"} in
+  let sticky=Service.coalesce_push ~topic:Service.invalidation_topic
+    (Service.Graph_pushes[scope,resync])(Service.Graph_pushes[scope,push 4;other,push 5]) in
+  T.require(sticky=Service.Graph_pushes[scope,resync;other,push 5])
+    "later availability hid the prerequisite resync for its physical owner"
 ;;
 let test_observation_invalidations_are_bounded_latest_facts () =
   let scope = asset_scope 1 in

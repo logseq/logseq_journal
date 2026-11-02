@@ -1115,14 +1115,14 @@ let run_favorites_native_visibility
                     (if offset + length < count
                      then Some (G.Cursor.of_string (string_of_int (offset + length)) |> Result.get_ok) else None)
                 }
-            | V2_pull_changes _ ->
+            | V2_pull_changes {generation;after;_} ->
               V2_changes
-                { generation = "g"
-                ; from_exclusive = Some "p"
+                { generation
+                ; from_exclusive = after
                 ; through = "p2"
                 ; next = None
                 ; windows =
-                    [ { id = "covered-update"
+                    [ { id = "p2"
                       ; predecessor = "p"
                       ; successor = "p2"
                       ; block_uuids =
@@ -1134,9 +1134,9 @@ let run_favorites_native_visibility
                       }
                     ]
                 }
-            | V2_ack_changes _ ->
+            | V2_ack_changes {generation;through} ->
               Atomic.set changes_acknowledged true;
-              V2_changes_acknowledged { generation = "g"; through = "p2" }
+              V2_changes_acknowledged {generation;through}
             | V2_get_outline_block { block; _ } ->
               V2_block_outcome
                 (match
@@ -4540,16 +4540,16 @@ let test_reference_outer_terminals cancel =
            | V2_get_children {parent;_} ->
              completed request (V2_children_outcome
                {parent;revision_scope=V2_children_revision parent;scope_revision="children";items=[];next_cursor=None})
-           | V2_pull_changes _ ->
+           | V2_pull_changes {generation;after;_} ->
              completed
                request
                (V2_changes
-                  { generation = "g"
-                  ; from_exclusive = Some "p"
+                  { generation
+                  ; from_exclusive = after
                   ; through = "r2"
                   ; next = None
                   ; windows =
-                      [ { id = "c1"
+                      [ { id = "r2"
                         ; predecessor = "p"
                         ; successor = "r2"
                         ; block_uuids = Array.to_list (Array.sub targets 0 4)

@@ -452,6 +452,7 @@ let test_client_to_typed_read () =
             "typed graph info did not reach actual business projection"
         | _ -> failwith "typed business graph-info read failed")
      | Some (Journal_graph_runtime.Unowned_read message) -> failwith message
+     | Some (Journal_graph_runtime.Acknowledge _) -> failwith "graph-info dispatch became an ACK"
      | None -> failwith "business graph-info path was not migrated");
     let _, page =
       request
@@ -1745,12 +1746,342 @@ let test_host_preserves_query_origin_before_forget () =
     require (!calls = 1) "query origin callback was delivered more than once")
 ;;
 
-let with_observation_service ?epoch_ms f =
+let test_changefeed_business_waits_for_ui_application () =
+  let module Host = Journal_worker_coordination_host in
+  let module Business = Journal_graph_runtime in
+  with_client (fun client ->
+    let jobs = Queue.create () in
+    let host =
+      Host.create
+        ~client
+        ~client_id
+        ~managed_origin:"https://api.logseq.io"
+        ~user_id:"user-1"
+        ~enqueue:(fun f -> Queue.add f jobs)
+        ~changed:(fun _ -> ())
+      |> Result.get_ok
+    in
+    let process_push = ref (fun (_ : P.push) -> ())
+    and acks = ref 0 in
+    Mailbox.on_event client (fun event ->
+      let delivery = Host.on_event host event in
+      match event, delivery.R.disposition with
+      | ( Mailbox.Response
+            { outcome =
+                Completed
+                  (Service.Graph_response
+                     (P.V2_response { outcome = P.V2_changes_acknowledged _; _ }))
+            ; _
+            }
+        , R.Consumed ) -> incr acks
+      | Mailbox.Push { payload = Service.Graph_push push; _ }, R.Broadcast ->
+        Queue.add (fun () -> !process_push push) jobs
+      | Mailbox.Push { payload = Service.Graph_pushes values; _ }, R.Broadcast ->
+        List.iter
+          (fun ((scope : Service.asset_scope), push) ->
+             if scope.graph_id = Test_support.graph_uuid
+             then Queue.add (fun () -> !process_push push) jobs)
+          values
+      | _ -> ());
+    let pump () =
+      Mailbox.Private.deliver client ~max_events:64;
+      let count = Queue.length jobs in
+      for _ = 1 to count do
+        (Queue.take jobs) ()
+      done
+    in
+    let wait predicate =
+      let deadline = Unix.gettimeofday () +. 6. in
+      while (not (predicate ())) && Unix.gettimeofday () < deadline do
+        pump ();
+        Thread.delay 0.001
+      done;
+      require (predicate ()) "typed Changes business/client did not settle"
+    in
+    ignore
+      (Mailbox.send
+         client
+         (Service.Client_command (Restore_local_account { user_id = "user-1" })));
+    let session () =
+      Option.bind
+        (C.projection (Host.view host))
+        (fun p ->
+           List.find_map
+             (fun r -> if r.W.phase = W.Open then Some r.session else None)
+             (W.residents p))
+    in
+    wait (fun () -> Option.is_some (session ()));
+    let session = Option.get (session ()) in
+    let owner : Service.timeline_scope =
+      { startup = { account_generation = 1; presentation_generation = 1 }
+      ; graph_id = Test_support.graph_uuid
+      ; graph_generation = 1
+      }
+    in
+    let business =
+      Business.create
+        ~validate_session:(Host.validate_session ~owner host)
+        ~on_change:(Host.post host)
+        ()
+    in
+    let calendar =
+      Journal_calendar.Sampler.create
+        ~clock:(fun () -> 1788307200.)
+        ~localtime:Unix.gmtime
+        ()
+    in
+    Business.set_calendar
+      business
+      (Journal_calendar.Sampler.sample calendar |> Result.get_ok);
+    let ui_title = ref None
+    and detail_loaded = ref false
+    and held = ref None
+    and hold_once = ref true in
+    let expected_failure = ref false
+    and fail_budget_once = ref false
+    and saw_failure = ref false in
+    let more_seen = ref false in
+    let active = ref false
+    and notices = ref 0
+    and generation = ref 1000L
+    and batch = ref None in
+    let ui responses =
+      List.iter
+        (fun (response : Business.response) ->
+           match response.payload with
+           | Business.Detail_loaded { detail; _ } ->
+             detail_loaded := true;
+             ui_title := Some (Journal_model.source detail.root)
+           | Children_reconciled detail ->
+             ui_title := Some (Journal_model.source detail.root)
+           | Block_updated { block; _ } -> ui_title := Some (Journal_model.source block)
+           | Rejected _ | Feed_failed _ | Open_failed _
+           | Task_statuses_changed { error = Some _; _ } ->
+             if !expected_failure
+             then saw_failure := true
+             else failwith "typed business change application rejected valid data"
+           | _ -> ())
+        responses
+    in
+    let rec deliver output =
+      List.iter send output.Business.requests;
+      ui output.responses
+    and send request =
+      let application =
+        Business.application_for_request business ~request_id:request.P.request_id
+      in
+      match Business.worker_read business request with
+      | Some (Business.Read read) ->
+        let maximum_bytes =
+          if !fail_budget_once && application <> None
+          then (
+            fail_budget_once := false;
+            64)
+          else 65536
+        in
+        let maximum_items =
+          match read.query with
+          | W.Changes _ -> 1
+          | _ -> read.maximum_items
+        in
+        let ticket =
+          Host.plan_query host ~owner ~maximum_items ~maximum_bytes read.query
+          |> Result.get_ok
+        in
+        Host.watch_read host ticket ~f:(fun origin reply ->
+          match reply with
+          | W.Answered (Ok value) ->
+            finished request application origin (read.outcome value)
+          | W.Answered (Error (W.Stale_read _)) ->
+            finished request application origin Business.Changes_retired
+          | W.Answered (Error W.Response_budget_exceeded) when !expected_failure ->
+            finished
+              request
+              application
+              origin
+              (Business.Ordinary_read
+                 (P.V2_failed
+                    { code = "responseTooLarge"
+                    ; message = "Actual encoded read budget failure"
+                    }))
+          | _ -> failwith "real typed Changes business query failed")
+      | Some (Business.Acknowledge read) ->
+        let ticket =
+          Host.request
+            host
+            (W.change_batch_session read.batch)
+            (W.Acknowledge_changes read.batch)
+          |> Result.get_ok
+        in
+        Host.watch_read host ticket ~f:(fun origin reply ->
+          match reply with
+          | W.Answered (Ok value) -> finished request None origin (read.outcome value)
+          | _ -> failwith "real typed Changes business ACK failed")
+      | Some (Business.Unowned_read message) -> failwith message
+      | None -> failwith "Changes business flow fell back to legacy transport"
+    and finished request application origin result =
+      let application, discard =
+        match result with
+        | Business.Changes_read value ->
+          if value.next <> None then more_seen := true;
+          let view = Host.view host in
+          if
+            C.change_application_started view value
+            && C.change_application_error view value = None
+          then None, true
+          else (
+            let token =
+              Host.begin_change_application host value ~root:request.P.request_id
+              |> Result.get_ok
+            in
+            require
+              (Business.set_change_application
+                 business
+                 ~request_id:request.request_id
+                 token)
+              "business application root was not owned";
+            batch := Some value;
+            Some token, false)
+        | _ -> application, false
+      in
+      if discard
+      then Business.abandon business request
+      else (
+        let output =
+          Business.receive_worker_read
+            ?origin
+            business
+            ~request_id:request.request_id
+            result
+        in
+        List.iter send output.requests;
+        let apply () =
+          ui output.responses;
+          Option.iter
+            (fun token ->
+               Host.post
+                 host
+                 (C.Change_consumer_applied (token, request.request_id, Ok ())))
+            application
+        in
+        let child =
+          match request.command with
+          | P.V2_pull_changes _ | V2_ack_changes _ -> false
+          | _ -> true
+        in
+        if !active && !hold_once && child && application <> None
+        then (
+          hold_once := false;
+          held := Some apply)
+        else apply ())
+    in
+    send (Business.start business);
+    deliver
+      (Business.submit
+         business
+         (Load_detail
+            { block_id = W.Uuid.to_string Test_support.authoritative_block_uuid
+            ; after = None
+            ; limit = 1
+            ; request_generation = 900L
+            }));
+    wait (fun () -> !detail_loaded);
+    active := true;
+    (process_push
+     := fun push ->
+          incr notices;
+          generation := Int64.succ !generation;
+          deliver (Business.reconcile_push business ~request_generation:!generation push));
+    let write n title =
+      let revision = ref None in
+      let budget =
+        W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
+      in
+      let ticket =
+        Host.request
+          host
+          session
+          (W.Query
+             ( budget
+             , W.Outline_block
+                 { uuid = Test_support.authoritative_block_uuid; revision = None } ))
+        |> Result.get_ok
+      in
+      Host.watch host ticket ~f:(function
+        | W.Answered (Ok (P.V2_present_block value)) -> revision := Some value.revision
+        | _ -> failwith "write revision query failed");
+      wait (fun () -> !revision <> None);
+      let intent =
+        W.mutation_intent
+          session
+          ~mutation_id:(uuid (Printf.sprintf "9d000000-0000-4000-8000-%012d" (7000 + n)))
+          (W.Save_block
+             { block = Test_support.authoritative_block_uuid
+             ; title
+             ; preconditions =
+                 { blocks =
+                     [ Test_support.authoritative_block_uuid, Option.get !revision ]
+                 ; pages = []
+                 ; scopes = []
+                 }
+             })
+        |> Result.get_ok
+      in
+      let done_ = ref false in
+      let ticket = Host.request host session (W.Mutate intent) |> Result.get_ok in
+      Host.watch host ticket ~f:(function
+        | W.Answered (Ok (W.Committed_pending_presentation _)) -> done_ := true
+        | _ -> failwith "business window write failed");
+      wait (fun () -> !done_)
+    in
+    write 1 "Business change A";
+    wait (fun () -> !held <> None);
+    require (!acks = 0) "real ACK preceded the held UI application";
+    require
+      (not (C.change_application_ready (Host.view host) (Option.get !batch)))
+      "held UI consumer became ready";
+    write 2 "Business change B";
+    wait (fun () -> !notices >= 2);
+    require (!acks = 0) "a newer push ACKed an unapplied older consumer";
+    write 3 "Business change C";
+    wait (fun () -> !notices >= 3);
+    Queue.add (Option.get !held) jobs;
+    held := None;
+    wait (fun () -> !acks >= 3 && !ui_title = Some "Business change C");
+    require !more_seen "real byte/item-bounded Changes did not exercise More";
+    require
+      (C.change_application_error (Host.view host) (Option.get !batch) = None)
+      "real applied consumers retained a failure";
+    let before = !acks in
+    expected_failure := true;
+    fail_budget_once := true;
+    write 4 "Business change D";
+    wait (fun () ->
+      !saw_failure
+      && Option.exists
+           (fun value -> C.change_application_error (Host.view host) value <> None)
+           !batch);
+    require (!acks = before) "an actual failed read acknowledged its unapplied window";
+    active := false;
+    ui_title := None;
+    detail_loaded := false;
+    Business.reset business;
+    wait (fun () -> !acks = before + 1);
+    require
+      (!ui_title = None)
+      "retired consumer callbacks revived the discarded business scope";
+    ignore (Host.shutdown host);
+    wait (fun () -> C.shutdown_state (Host.view host) = C.Stopped))
+;;
+
+let with_observation_service ?epoch_ms ?(observe_push=fun _->()) f =
   with_client ?epoch_ms (fun client ->
     let replies = Hashtbl.create 16
     and baseline = ref None
     and notices = ref Rrbvec.empty in
-    Mailbox.on_event client (function
+    Mailbox.on_event client (fun event ->
+      (match event with Mailbox.Push {payload;_}->observe_push payload|_->());
+      match event with
       | Response { request_id; outcome; _ } -> Hashtbl.replace replies request_id outcome
       | Push { payload = Service.Coordination_updates updates; _ } ->
         List.iter
@@ -2311,7 +2642,262 @@ let test_service_unallocated_observation_cleanup_after_close () =
     ignore(call(Service.Release_coordination registration)))
 ;;
 
+let test_service_changefeed_has_one_owner () =
+  let pushes = ref Rrbvec.empty
+  and pulses = ref 0
+  and resyncs = ref 0 in
+  let observe_push payload =
+    (match payload with
+     | Service.Graph_push (P.V2_changes_available _ | V2_resync_required_push _)
+     | Graph_pushes _ -> incr pulses
+     | _ -> ());
+    match payload with
+    | Service.Graph_push (P.V2_changes_available value) ->
+      pushes := Rrbvec.push_back !pushes value.through
+    | Service.Graph_pushes values ->
+      List.iter
+        (function
+          | _, P.V2_changes_available value ->
+            pushes := Rrbvec.push_back !pushes value.through
+          | _, P.V2_resync_required_push _ -> incr resyncs)
+        values
+    | _ -> ()
+  in
+  with_observation_service
+    ~observe_push
+    (fun _ ~call ~send:_ ~wait ~replies:_ ~notices:_ ~baseline:_ ~owner ~registration ->
+       let id n = uuid (Printf.sprintf "9d000000-0000-4000-8000-%012d" (6000 + n)) in
+       let wire n command =
+         { P.api_version = P.api_version; request_id = id n; command }
+       in
+       let legacy request = call (Service.Graph_request_at (owner, request)) in
+       let generation =
+         match legacy (wire 0 P.V2_graph_info) with
+         | Completed
+             (Service.Graph_response
+                (P.V2_response { outcome = P.V2_graph_info_outcome info; _ })) ->
+           info.generation
+         | _ -> failwith "changefeed fixture graph info"
+       in
+       let coordinated registration n command =
+         call
+           (Service.Coordination_query
+              { registration
+              ; owner
+              ; request = wire n command
+              ; response_budget_bytes = 16384
+              })
+       in
+       let pull = P.V2_pull_changes { generation; after = None; limit = 32 } in
+       let write n title =
+         let revision =
+           match
+             legacy
+               (wire
+                  (n + 100)
+                  (P.V2_get_outline_block
+                     { block = Test_support.authoritative_block_uuid; revision = None }))
+           with
+           | Completed
+               (Service.Graph_response
+                  (P.V2_response
+                     { outcome = P.V2_block_outcome (P.V2_present_block { revision; _ })
+                     ; _
+                     })) -> revision
+           | _ -> failwith "changefeed write revision"
+         in
+         let before = !pulses in
+         require
+           (match
+              legacy
+                (wire
+                   n
+                   (P.V2_save_block
+                      { mutation_id = id n
+                      ; block = Test_support.authoritative_block_uuid
+                      ; title
+                      ; preconditions =
+                          { blocks = [ Test_support.authoritative_block_uuid, revision ]
+                          ; pages = []
+                          ; scopes = []
+                          }
+                      }))
+            with
+            | Completed
+                (Service.Graph_response
+                   (P.V2_response { outcome = P.V2_mutation_committed _; _ })) -> true
+            | _ -> false)
+           "real changefeed write failed";
+         wait (fun () -> !pulses > before)
+       in
+       write 20 "Owned change window A";
+       let first =
+         match coordinated registration 1 pull with
+         | Completed
+             (Service.Graph_response (P.V2_response { outcome = P.V2_changes batch; _ }))
+           -> batch.through, batch.windows, batch.next
+         | _ -> failwith "scoped coordinated changefeed pull is not implemented"
+       in
+       require
+         (let _, windows, _ = first in
+          windows <> [])
+         "actual write produced no retained change window";
+       write 21 "Owned change window B";
+       require
+         (match
+            legacy
+              (wire
+                 2
+                 (P.V2_ack_changes
+                    { generation
+                    ; through =
+                        (let through, _, _ = first in
+                         through)
+                    }))
+          with
+          | Completed
+              (Service.Graph_response (P.V2_response { outcome = P.V2_failed _; _ })) ->
+            true
+          | _ -> false)
+         "legacy ACK could consume the coordinator's window";
+       require
+         (match legacy (wire 3 pull) with
+          | Completed
+              (Service.Graph_response (P.V2_response { outcome = P.V2_failed _; _ })) ->
+            true
+          | _ -> false)
+         "legacy pull remained an active second changefeed owner";
+       require
+         (match coordinated registration 4 pull with
+          | Completed
+              (Service.Graph_response
+                 (P.V2_response { request_id; outcome = P.V2_changes batch; _ })) ->
+            request_id = id 4 && (batch.through, batch.windows, batch.next) = first
+          | _ -> false)
+         "unapplied batch was lost or duplicate RPC kept an old ID";
+       require
+         (match
+            coordinated
+              registration
+              5
+              (P.V2_ack_changes { generation; through = "unowned-window" })
+          with
+          | Failed _
+          | Completed
+              (Service.Graph_response (P.V2_response { outcome = P.V2_failed _; _ })) ->
+            true
+          | _ -> false)
+         "unknown window received a fabricated acknowledgement";
+       require
+         (match
+            coordinated
+              registration
+              7
+              (P.V2_ack_changes
+                 { generation = "retired-generation"
+                 ; through =
+                     (let through, _, _ = first in
+                      through)
+                 })
+          with
+          | Completed
+              (Service.Graph_response
+                 (P.V2_response { outcome = P.V2_resync_required value; _ })) ->
+            value.generation = generation
+          | _ -> false)
+         "stale generation ACK did not return the actual resync baseline";
+       let through, _, _ = first in
+       require
+         (match coordinated registration 6 (P.V2_ack_changes { generation; through }) with
+          | Completed
+              (Service.Graph_response
+                 (P.V2_response { outcome = P.V2_changes_acknowledged ack; _ })) ->
+            ack.generation = generation && ack.through = through
+          | _ -> false)
+         "owned applied window did not receive an actual ACK";
+       let second =
+         match
+           coordinated
+             registration
+             8
+             (P.V2_pull_changes { generation; after = Some through; limit = 32 })
+         with
+         | Completed
+             (Service.Graph_response (P.V2_response { outcome = P.V2_changes batch; _ }))
+           -> batch.through, batch.windows, batch.next
+         | _ -> failwith "actual change continuation failed"
+       in
+       require
+         (let second_through, windows, _ = second in
+          second_through <> through && windows <> [])
+         "ACK lost the second actual write window";
+       ignore (call (Service.Release_coordination registration));
+       let replacement = Int64.succ registration in
+       require
+         (match call (Service.Register_coordination replacement) with
+          | Completed (Service.Coordination_registered _) -> true
+          | _ -> false)
+         "replacement binding did not register";
+       require
+         (match coordinated replacement 9 pull with
+          | Completed
+              (Service.Graph_response (P.V2_response { outcome = P.V2_changes batch; _ }))
+            -> (batch.through, batch.windows, batch.next) = second
+          | _ -> false)
+         "binding retirement discarded an unapplied physical window";
+       let second_through, _, _ = second in
+       require
+         (match
+            coordinated
+              registration
+              10
+              (P.V2_ack_changes { generation; through = second_through })
+          with
+          | Failed _ -> true
+          | _ -> false)
+         "old binding consumed the replacement's retained window";
+       require
+         (match
+            coordinated
+              replacement
+              11
+              (P.V2_ack_changes { generation; through = second_through })
+          with
+          | Completed
+              (Service.Graph_response
+                 (P.V2_response { outcome = P.V2_changes_acknowledged value; _ })) ->
+            value.through = second_through
+          | _ -> false)
+         "replacement could not apply and ACK the retained window";
+       write 3000 "held retention window";
+       let held =
+         match coordinated replacement 3001 pull with
+         | Completed
+             (Service.Graph_response (P.V2_response { outcome = P.V2_changes batch; _ }))
+           -> batch.through
+         | _ -> failwith "retention fixture pull"
+       in
+       for n = 3002 to 3258 do
+         write n (Printf.sprintf "retention change %d" n)
+       done;
+       require
+         (!resyncs > 0)
+         "unacknowledged physical change windows grew without an explicit retention \
+          resync";
+       require
+         (match
+            coordinated replacement 3260 (P.V2_ack_changes { generation; through = held })
+          with
+          | Completed
+              (Service.Graph_response
+                 (P.V2_response { outcome = P.V2_resync_required _; _ })) -> true
+          | _ -> false)
+         "retention overflow fabricated ACK of discarded physical history";
+       ignore (call (Service.Release_coordination replacement)))
+;;
+
 let () =
+  test_service_changefeed_has_one_owner ();
   test_service_unallocated_observation_cleanup_after_close ();
   test_service_observation_read_failure_retains_interest ();
   test_service_observation_lifecycle ();
@@ -2319,6 +2905,7 @@ let () =
   let observations_only = Array.exists (( = ) "--observations-only") Sys.argv in
   if not observations_only
   then (
+    test_changefeed_business_waits_for_ui_application ();
     test_host_preserves_query_origin_before_forget ();
     test_client_to_typed_read ();
     test_read_completion_rechecks_graph_owner ();

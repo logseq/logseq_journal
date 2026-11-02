@@ -6,6 +6,7 @@ module Worker = Worker_api
 type t
 type view
 type 'a ticket
+type change_application
 
 val initial : client_id:Worker.Uuid.t -> t
 val view : t -> view
@@ -47,6 +48,15 @@ val observation_handle : view -> 'a Worker.observed ticket -> 'a Worker.observat
 
 val observation_error : view -> 'a Worker.observation -> Worker.error option
 val observed : view -> 'a Worker.observation -> 'a Worker.observed option
+
+(** The business owner reports causal read creation, then application to its UI
+    (or explicit consumer retirement). A read failure retains its window. Tokens
+    bind one application attempt and reject callbacks from prior retries. *)
+val owns_change_batch : view -> Worker.change_batch -> bool
+
+val change_application_started : view -> Worker.change_batch -> bool
+val change_application_ready : view -> Worker.change_batch -> bool
+val change_application_error : view -> Worker.change_batch -> Worker.error option
 val equal_view : view -> view -> bool
 
 type shutdown_state =
@@ -88,6 +98,15 @@ type event =
   | Bootstrap_received of Worker.binding * Worker.bootstrap_state
   | Completed : 'a ticket * 'a Worker.reply -> event
   | Projection_received of Worker.projection
+  | Changefeed_notice of
+      Worker.changefeed_notice
+      * Logseq_db_worker_lui.Journal_worker_ids.Worker.push_sequence
+  | Change_application_retired of change_application
+  | Change_consumer_expanded of
+      change_application * Worker.Uuid.t * Worker.Uuid.t Rrbvec.t
+  | Change_consumer_applied of
+      change_application * Worker.Uuid.t * (unit, Worker.error) result
+  | Change_consumer_retired of change_application * Worker.Uuid.t
   | Observation_registered :
       'a Worker.observed ticket * 'a Worker.observation * Worker.observation_epoch
       -> event
@@ -158,6 +177,15 @@ val request
   -> Worker.session
   -> 'a Worker.request
   -> ('a ticket * transition, Worker.error) result
+
+(** Start application of an actually delivered batch. An active successful
+    attempt cannot be replaced by a duplicate pull; an explicit retry after a
+    failure gets a new token. The root itself is applied only after its UI state. *)
+val begin_change_application
+  :  t
+  -> Worker.change_batch
+  -> root:Worker.Uuid.t
+  -> (change_application * transition, Worker.error) result
 
 (** Queue a business read against its exact host execution identity while the
     first registered baseline is pending. This does not construct a session:

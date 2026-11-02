@@ -1725,6 +1725,84 @@ let test_observation_registry_traces () =
   done
 ;;
 
+let test_single_graph_change_broadcast_keeps_scope () =
+  let state,scope=worker_open_graph () in
+  let push=Protocol.V2_resync_required_push{api_version=Protocol.api_version;generation="g";reason="actual producer resync"} in
+  let result=Core.step state(Core.Projection_push_for_scope(scope,push)) in
+  Alcotest.(check bool) "one resident preserves its actual event scope" true
+    (List.exists(function Core.Publish(Core.Scoped_graph_push(actual,value))->actual=scope && value=push|_->false)result.effects)
+;;
+
+let test_changefeed_owner_properties () =
+  let module O=Core.Changefeed_owner in
+  let request_id=uuid "10000000-0000-4000-8000-000000007004" in
+  let pull:Protocol.request={api_version=Protocol.api_version;request_id;command=V2_pull_changes{generation="g";after=None;limit=32}} in
+  let packet request_id outcome=Protocol.V2_response{api_version=Protocol.api_version;request_id;outcome} in
+  let response=packet request_id(Protocol.V2_changes{generation="g";from_exclusive=None;through="w1";next=None;
+    windows=[{id="w1";predecessor="p0";successor="p1";block_uuids=[];page_uuids=[];structure_interests=[]}]}) in
+  let run trace =
+    let state=ref O.empty and owner=ref 0 and pending=ref false and acked=ref false and resync=ref false in
+    let same n= !owner=n in
+    let verify ()=
+      if O.legacy !state<>(!owner=0) || O.needs_resync !state<> !resync then failwith "ownership/resync state mismatch";
+      List.iter(fun n->if O.may_ack !state ~registration:(Int64.of_int n) ~generation:"g" ~through:"w1"
+        <>(same n && (!pending || !acked)) then failwith "unknown or retired ACK was admitted") [71;72] in
+    List.iteri(fun index op->
+      let n=if op mod 2=0 then 71 else 72 in
+      let registration=Int64.of_int n in
+      (match op with
+       | 0|1 ->
+         let next,actual=O.claim !state ~registration in
+         let expected= !owner=0 || same n || (!owner<0 && n > - !owner) in
+         if actual<>expected then failwith "claim bypassed an active owner or reused a retired generation";
+         if expected && !owner<>n then (
+           if !owner<0 then (pending:=false;acked:=false;resync:=false);
+           owner:=n);
+         state:=next
+       | 2|3 ->
+         state:=O.retire !state ~registration;
+         if same n then(owner:= -n;pending:=false;acked:=false;resync:=false)
+       | 4|5 ->
+         let actual=O.remember !state ~registration ~request:pull ~maximum_bytes:16384 response in
+         let expected=same n && not !pending in
+         if Result.is_ok actual<>expected then failwith "read allocation bypassed ownership or replaced unapplied data";
+         (match actual with Ok next->state:=next;pending:=true;resync:=false|_->())
+       | 6|7 ->
+         let request={pull with command=Protocol.V2_ack_changes{generation="g";through="w1"}} in
+         state:=O.acknowledged !state ~registration ~request
+           (packet request_id(Protocol.V2_changes_acknowledged{generation="g";through="w1"}));
+         if same n && (!pending || !acked) then(pending:=false;acked:=true)
+       | 8 -> state:=O.invalidate !state;pending:=false;acked:=false;resync:=true
+       | 9|10 ->
+         let n=if op=9 then 71 else 72 in
+         let actual_id=uuid(Printf.sprintf "10000000-0000-4000-8000-%012d"(20000+index)) in
+         (match O.pull !state ~registration:(Int64.of_int n) ~request:{pull with request_id=actual_id} ~maximum_bytes:16384 with
+          | O.Read when same n && not !pending -> ()
+          | Cached(Protocol.V2_response value) when same n && !pending && value.request_id=actual_id -> ()
+          | Refused when not(same n)->()
+          | _->failwith "cached batch or duplicate RPC correlation changed")
+       | 11 -> if O.may_ack !state ~registration:71L ~generation:"g" ~through:"future" then failwith "future ACK invented proof"
+       | _ ->
+         let bad=packet (uuid "10000000-0000-4000-8000-000000007099")
+           (Protocol.V2_changes{generation="g";from_exclusive=None;through="w1";windows=[];next=None}) in
+         if Result.is_ok(O.remember !state ~registration:71L ~request:pull ~maximum_bytes:16384 bad)
+         then failwith "foreign request ID became retained change evidence");verify()) trace in
+  let prefixes=[[0;4;9;6;6;2;1;5;10];[0;4;8;6;4;6];[1;5;2;0;3;0;4];[0;1;5;4;7;6;11;12]] in
+  for seed=0 to 199 do
+    let random=Random.State.make[|0xc4a6e;seed|] in
+    let trace=List.nth prefixes(seed mod List.length prefixes) @ List.init 100(fun _->Random.State.int random 13) in
+    let fails trace=try run trace;false with _->true in
+    if fails trace then (
+      let rec shrink trace size=if size=0 then trace else
+        let rec find start=if start>=List.length trace then shrink trace(size/2) else
+          let next=List.filteri(fun i _->i<start || i>=start+size)trace in
+          if fails next then shrink next size else find(start+1) in find 0 in
+      let reduced=shrink trace(max 1(List.length trace/2)) in
+      (try run reduced with error->Alcotest.failf "changefeed seed=%d minimal=[%s] %s" seed
+        (String.concat ","(List.map string_of_int reduced))(Printexc.to_string error)))
+  done
+;;
+
 let test_unallocated_observation_fence () =
   let module O = Core.Observation_registry in
   let _, scope = worker_open_graph () in
@@ -1838,6 +1916,8 @@ let () =
   Alcotest.run
     "logseq db worker pure reducer"
     [ ( "resident graphs", [
+        Alcotest.test_case "single graph broadcast identity" `Quick test_single_graph_change_broadcast_keeps_scope;
+        Alcotest.test_case "generated changefeed owner/ACK traces" `Quick test_changefeed_owner_properties;
         Alcotest.test_case "unallocated observation fence" `Quick test_unallocated_observation_fence;
         Alcotest.test_case "coordination owner snapshot" `Quick test_coordination_owner_snapshot;
         Alcotest.test_case "cold cached membership opens every DB" `Quick test_resident_worker_cold_restore_keeps_open_tickets;

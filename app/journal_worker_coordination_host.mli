@@ -21,6 +21,12 @@ val request
   -> 'a Worker.request
   -> ('a Core.ticket, Worker.error) result
 
+val begin_change_application
+  :  t
+  -> Worker.change_batch
+  -> root:Worker.Uuid.t
+  -> (Core.change_application, Worker.error) result
+
 val post : t -> Core.event -> unit
 
 val plan_query
@@ -45,7 +51,11 @@ val watch_read
   -> f:((Worker.session * Worker.read_budget) option -> 'a Worker.reply -> unit)
   -> unit
 
-val validate_session : ?owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope -> t -> Worker.session -> (unit, Worker.error) result
+val validate_session
+  :  ?owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
+  -> t
+  -> Worker.session
+  -> (unit, Worker.error) result
 
 val on_event
   :  t

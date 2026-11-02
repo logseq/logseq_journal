@@ -67,6 +67,13 @@ let request host session operation =
     ticket)
 ;;
 
+let begin_change_application host batch ~root =
+  Core.begin_change_application !(host.state) batch ~root
+  |> Result.map (fun (token, transition) ->
+    apply host.state host.runner transition;
+    token)
+;;
+
 let post host event =
   host.enqueue (fun () -> apply host.state host.runner (Core.step !(host.state) event))
 ;;
@@ -81,7 +88,9 @@ let plan_query host ~owner ~maximum_items ~maximum_bytes query =
     ticket)
 ;;
 
-let validate_session ?owner host session = Core.validate_session ?owner !(host.state) session
+let validate_session ?owner host session =
+  Core.validate_session ?owner !(host.state) session
+;;
 
 let watch_read host ticket ~f =
   host.watches := Rrbvec.push_back !(host.watches) (Watch (ticket, f));

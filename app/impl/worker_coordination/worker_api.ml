@@ -24,6 +24,7 @@ type session =
   { binding : binding
   ; graph : Uuid.t
   ; account : account_generation
+  ; lifecycle : int64
   ; generation : graph_generation
   ; scope : Service.timeline_scope
   ; limits : Protocol.v2_capability_limits
@@ -138,7 +139,8 @@ type children =
   }
 
 type change_batch =
-  { generation : string
+  { change_owner : session
+  ; generation : string
   ; from_exclusive : string option
   ; through : string
   ; windows : Protocol.v2_change_window list
@@ -146,7 +148,8 @@ type change_batch =
   }
 
 type change_ack =
-  { generation : string
+  { ack_owner : session
+  ; generation : string
   ; through : string
   }
 
@@ -308,6 +311,11 @@ type 'a reply =
   | Not_admitted of admission_error
   | Answered of ('a, error) result
   | Interrupted of interruption
+
+type changefeed_notice =
+  { notice_session : session
+  ; notice : Protocol.push
+  }
 
 type observation_epoch = int64
 
@@ -500,6 +508,7 @@ module type ISSUER = sig
     -> Service.response
     -> ('a observation * observation_epoch, error) result
 
+  val changefeed_notices : Service.push -> (changefeed_notice Rrbvec.t, error) result
   val observation_notices : Service.push -> (observation_notice Rrbvec.t, error) result
 
   val release_observation_registration
@@ -558,6 +567,7 @@ let graph_id (s : session) = s.graph
 let equal_session (a : session) (b : session) =
   equal_binding a.binding b.binding
   && a.account = b.account
+  && a.lifecycle = b.lifecycle
   && a.generation = b.generation
   && Uuid.equal a.graph b.graph
 ;;
@@ -625,6 +635,8 @@ let block_uuid (b : block) = b.data.block.uuid
 let block_title (b : block) = b.data.block.title
 let block_data (b : block) = b.data
 let block_revision (b : block) = b.revision
+let change_batch_session (batch : change_batch) = batch.change_owner
+let change_ack_session (ack : change_ack) = ack.ack_owner
 let change_ack_generation (a : change_ack) = a.generation
 let change_ack_through (a : change_ack) = a.through
 
@@ -1026,7 +1038,8 @@ let rec validate_request : type a. session -> a request -> (unit, error) result 
     if equal_session session observation.observation_owner
     then Ok ()
     else Error Revoked_session
-  | Query (_, Changes _) -> unavailable "Changefeed ownership transfer"
+  | Acknowledge_changes batch ->
+    if equal_session session batch.change_owner then Ok () else Error Revoked_session
   | Query (budget, query) ->
     Result.bind (checked_command session budget query) (fun command ->
       Protocol.request_of_yojson
@@ -1177,15 +1190,41 @@ let decode
          (bounded a.items)
      | Changes { generation; after }, V2_changes b
        when generation = b.generation && after = b.from_exclusive ->
-       Result.map
-         (fun windows ->
-            { generation
-            ; from_exclusive = b.from_exclusive
-            ; through = b.through
-            ; windows
-            ; next = b.next
-            })
-         (bounded b.windows)
+       let rec chain seen previous = function
+         | [] -> true
+         | (window : Protocol.v2_change_window) :: rest ->
+           window.id <> ""
+           && window.predecessor <> ""
+           && window.successor <> ""
+           && (not (List.mem window.id seen))
+           && Option.fold ~none:true ~some:(String.equal window.predecessor) previous
+           && chain (window.id :: seen) (Some window.successor) rest
+       in
+       let through_matches =
+         match List.rev b.windows with
+         | last :: _ -> b.through = last.Protocol.id
+         | [] -> Option.fold ~none:(b.through <> "") ~some:(String.equal b.through) after
+       in
+       if
+         generation = ""
+         || (not through_matches)
+         || (not (chain [] None b.windows))
+         ||
+         match b.next with
+         | None -> false
+         | Some next -> next <> b.through || b.windows = []
+       then Error (Protocol_mismatch "Changefeed window chain or continuation mismatch")
+       else
+         Result.map
+           (fun windows ->
+              { change_owner = session
+              ; generation
+              ; from_exclusive = b.from_exclusive
+              ; through = b.through
+              ; windows
+              ; next = b.next
+              })
+           (bounded b.windows)
      | _ -> mismatch ())
 ;;
 
@@ -1444,6 +1483,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                                 { binding
                                 ; graph = scope.graph_id
                                 ; account = scope.account.account_generation
+                                ; lifecycle = scope.account.lifecycle_generation
                                 ; generation = scope.graph_generation
                                 ; limits = b.limits
                                 ; scope =
@@ -1710,6 +1750,54 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
         | _ -> Error (Protocol_mismatch "Not an observation notice batch")
       ;;
 
+      let changefeed_notices = function
+        | Service.Graph_pushes notices ->
+          if List.length notices > 128
+          then Error (Protocol_mismatch "Scoped change notice bound exceeded")
+          else if !revoked
+          then Ok Rrbvec.empty
+          else (
+            let residents = Option.fold ~none:[] ~some:(fun p -> p.residents) !latest in
+            List.fold_left
+              (fun result ((scope : Service.asset_scope), push) ->
+                 Result.bind result (fun notices ->
+                   let owner =
+                     List.find_opt
+                       (fun resident ->
+                          let session = resident.session in
+                          resident.phase = Open
+                          && session.graph = scope.graph_id
+                          && session.generation = scope.graph_generation
+                          && session.account = scope.account.account_generation
+                          && session.lifecycle = scope.account.lifecycle_generation
+                          && binding.user = scope.account.user_id
+                          && Uri.equal
+                               (Uri.of_string binding.origin)
+                               scope.account.managed_sync_origin)
+                       residents
+                   in
+                   match owner with
+                   | None -> Ok notices
+                   | Some resident ->
+                     let version =
+                       match push with
+                       | Protocol.V2_changes_available value -> value.api_version
+                       | V2_resync_required_push value -> value.api_version
+                     in
+                     if version <> Protocol.api_version
+                     then
+                       Error
+                         (Protocol_mismatch "Scoped change notice API version mismatch")
+                     else
+                       Ok
+                         (Rrbvec.push_back
+                            notices
+                            { notice_session = resident.session; notice = push })))
+              (Ok Rrbvec.empty)
+              notices)
+        | _ -> Ok Rrbvec.empty
+      ;;
+
       let request
         : type a.
           session -> request_id:request_id -> a request -> (Service.request, error) result
@@ -1767,6 +1855,22 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                       ; request
                       ; response_budget_bytes = budget.maximum_bytes
                       })))
+            | Acknowledge_changes batch ->
+              Result.map
+                (fun () ->
+                   Service.Coordination_query
+                     { registration = binding.serial
+                     ; owner = session.scope
+                     ; response_budget_bytes = session.limits.response_budget_bytes
+                     ; request =
+                         { Protocol.api_version = Protocol.api_version
+                         ; request_id
+                         ; command =
+                             Protocol.V2_ack_changes
+                               { generation = batch.generation; through = batch.through }
+                         }
+                     })
+                (validate_request session operation)
             | Confirm (presentation, receipt) ->
               if not (presentation_live presentation)
               then Error Revoked_session
@@ -1836,6 +1940,33 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                 > budget.maximum_bytes
               then Ok (Answered (Error Response_budget_exceeded))
               else Ok (Answered (decode session budget query r.outcome))
+            | ( Acknowledge_changes batch
+              , Service.Graph_response (Protocol.V2_response raw as packet) )
+              when raw.api_version = Protocol.api_version
+                   && equal_request_id raw.request_id request_id
+                   && equal_session session batch.change_owner ->
+              if
+                Protocol.encoded_response_bytes packet
+                > session.limits.response_budget_bytes
+              then Ok (Answered (Error Response_budget_exceeded))
+              else (
+                match raw.outcome with
+                | Protocol.V2_changes_acknowledged ack
+                  when ack.generation = batch.generation && ack.through = batch.through ->
+                  Ok
+                    (Answered
+                       (Ok
+                          { ack_owner = session
+                          ; generation = ack.generation
+                          ; through = ack.through
+                          }))
+                | V2_resync_required { reason; _ } ->
+                  Ok (Answered (Error (Resync_required reason)))
+                | V2_failed { code; message } ->
+                  Ok (Answered (Error (Service_failed (code ^ ": " ^ message))))
+                | _ ->
+                  Error
+                    (Protocol_mismatch "Changefeed ACK owner/generation/window mismatch"))
             | ( Confirm (presentation, receipt)
               , Service.Graph_response (Protocol.V2_response response as raw) )
               when response.api_version = Protocol.api_version
