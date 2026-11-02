@@ -14,13 +14,16 @@ type read_request = private
 type t
 
 val create_coordinated
-  :  read:(read_request -> bool)
+  :  ?read_planned:(Logseq_db_types.Graph_types.Uuid.t -> unit)
+  -> ?read_retired:(Logseq_db_types.Graph_types.Uuid.t -> unit)
+  -> read:(read_request -> bool)
   -> send:(Logseq_db_worker_lui.Logseq_db_worker_lui_service.request -> bool)
   -> changed:
        (int option
         -> Journal_asset_policy.offline
         -> Journal_asset_policy.offline
         -> unit)
+  -> unit
   -> t
 
 val receive_read
@@ -57,6 +60,16 @@ val observe_response : t -> Logseq_db_worker.Protocol.response -> unit
 (** Reconcile only dependency-intersecting bounded recursive root batches.
     Unknown holders use bounded point reads instead of invalidating all scans. *)
 val changes : t -> Logseq_db_worker.Protocol.v2_change_window list -> unit
+
+val owns_read : t -> Logseq_db_types.Graph_types.Uuid.t -> bool
+val projection_read_error : t -> string option
+val change_application_error : t -> Logseq_db_worker.Protocol.v2_change_window list -> string option
+
+(** Only demand notices which may plan a deferred read carry these bounded
+    business obligations. Availability/download completion is not a read ACK. *)
+val notice_reads : t -> Logseq_db_worker_lui.Logseq_db_worker_lui_service.asset_scope
+  -> Logseq_db_worker_lui.Logseq_db_worker_lui_service.asset_notice
+  -> Logseq_db_types.Graph_types.Uuid.t list
 
 (** Explicit projection resync restarts the configured index enumerations. *)
 val resync : t -> unit

@@ -548,6 +548,7 @@ let run_favorites_native_visibility
       ?(media_change_descendant = false)
       ?(media_descendant_failure = false)
       ?(check_asset_scan_owner = false)
+      ?asset_change
       ?media_navigation
       ()
   =
@@ -814,6 +815,12 @@ let run_favorites_native_visibility
   let manager=if check_copy then manager else fixture_with_scope manager in
   let point_reads=Atomic.make 0 and legacy_point_reads=Atomic.make 0 in
   let offline_scans=Atomic.make 0 and legacy_offline_scans=Atomic.make 0 in
+  let asset_change_armed = Atomic.make false in
+  let asset_change_entered = Atomic.make false in
+  let asset_change_release = Atomic.make false in
+  let asset_more_entered = Atomic.make false in
+  let asset_more_release = Atomic.make false in
+  let offline_demand = Atomic.make None in
   let media_listings=Atomic.make 0 and legacy_media_listings=Atomic.make 0 in
   let coordination_registration=Atomic.make None in
   let coordination_release_entered = Atomic.make false in
@@ -846,7 +853,7 @@ let run_favorites_native_visibility
       ~push_topic_count:8
       ~merge_push:Service.coalesce_push
       ~concurrency:
-        (if check_capture_imports || Option.is_some detail_capture || check_media_change_ack
+        (if check_capture_imports || Option.is_some detail_capture || check_media_change_ack || Option.is_some asset_change
          then Concurrent { max_in_flight = 2 }
          else Serial)
       ~init:(fun context _ ->
@@ -892,6 +899,19 @@ let run_favorites_native_visibility
            while not(Atomic.get media_descendant_release) do
              Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done
          | _->());
+        (match normalized with
+         | Service.Graph_request {command=P.V2_list_assets {recursive=true;cursor;_};_}
+           when Atomic.get asset_change_armed ->
+           (match cursor with
+            | None ->
+              Atomic.set asset_change_entered true;
+              while not(Atomic.get asset_change_release) do
+                Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done
+            | Some _ ->
+              Atomic.set asset_more_entered true;
+              while not(Atomic.get asset_more_release) do
+                Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done)
+         | _ -> ());
         match normalized with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
         | Register_coordination registration ->
@@ -977,6 +997,10 @@ let run_favorites_native_visibility
                ; phase = Graph_open
                ; error = None
                })
+        | Asset_command { command = Replace_asset_demand {consumer;_};_ }
+          when asset_change = Some `More ->
+          Atomic.set offline_demand (Some consumer);
+          Ok Service.Client_command_completed
         | Asset_command { command = Replace_asset_demand { consumer; assets; _ }; _ }
           when Option.is_some media_rows ->
           List.iter
@@ -1179,11 +1203,12 @@ let run_favorites_native_visibility
                       ; predecessor = "p"
                       ; successor = "p2"
                       ; block_uuids =
-                          (if Atomic.get media_metadata_changed
+                          (if Option.is_some asset_change then [] else if Atomic.get media_metadata_changed
                            then [ uuid 20000 ]
                            else [if check_point_read_owner then uuid 1 else uuid 2])
                       ; page_uuids = []
-                      ; structure_interests = []
+                      ; structure_interests = (if Option.is_some asset_change
+                          then [V2_page_tree_interest page.uuid] else [])
                       }
                     ]
                 }
@@ -1439,6 +1464,17 @@ let run_favorites_native_visibility
                        Some (G.Cursor.of_string (string_of_int through) |> Result.get_ok)
                      else None)
                 }
+            | V2_list_assets { roots; recursive; cursor; _ }
+              when recursive && Atomic.get asset_change_armed && asset_change = Some `Failure ->
+              let _ = roots,cursor in
+              V2_failed {code="FixtureReadFailure";message="Synthetic offline listing failed"}
+            | V2_list_assets { recursive=true;cursor=None;_ }
+              when Atomic.get asset_change_armed && asset_change=Some `More ->
+              let module A=Logseq_db_types.Asset_descriptor in
+              V2_assets_outcome {generation="g";projection_revision="p";
+                items=[A.create ~uuid:(uuid 99000) ~source:(Managed None)
+                  ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok];
+                next_cursor=Some(G.Cursor.of_string "offline-next" |> Result.get_ok)}
             | V2_list_assets { roots; _ } ->
               if !fail_this_media_listing || (Atomic.get fail_media_listings && List.exists(G.Uuid.equal(uuid 1))roots) then V2_failed {code="FixtureReadFailure";message="Synthetic Media listing failed"}
               else (
@@ -1674,6 +1710,8 @@ let run_favorites_native_visibility
       Atomic.set coordination_release_allowed true;
       Atomic.set changed_media_fact_release true;
       Atomic.set media_descendant_release true;
+      Atomic.set asset_change_release true;
+      Atomic.set asset_more_release true;
       Atomic.set delete_release true;
       Atomic.set status_release true;
       Atomic.set child_release true;
@@ -1721,7 +1759,7 @@ let run_favorites_native_visibility
        wait "Journals mounted" (fun () ->
          Option.is_some (find "accessibility-label" "Favorites")
          && Option.is_some (find "text" "Timeline fixture 2"));
-       if check_asset_scan_owner then (
+       if check_asset_scan_owner || (Option.is_some asset_change && asset_change<>Some `Unconfigured) then (
          let settings=Option.get(find "_extension" "journal-asset-settings") in
          hooks.extension_event settings "event"
            (Yojson.Safe.to_string (`Assoc ["id",`Int 1;"payload",`String "days:7"])) |> consume;
@@ -1736,6 +1774,48 @@ let run_favorites_native_visibility
            | None->false);
          Alcotest.(check int) "offline scans have one typed response owner" 0
            (Atomic.get legacy_offline_scans));
+       if Option.is_some asset_change then (
+         Atomic.set changes_acknowledged false;
+         Atomic.set asset_change_armed true;
+         Atomic.set publish_block true;
+         ignore(W.send(Option.get !client)Service.Get_graph_state);
+         if asset_change=Some `Unconfigured then
+           wait "unconfigured Asset does not block Changes" (fun()->Atomic.get changes_acknowledged)
+         else (
+           wait "actual offline listing is held" (fun()->Atomic.get asset_change_entered);
+           for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+           Alcotest.(check bool) "Changes ACK waits for offline DTO application" false
+             (Atomic.get changes_acknowledged);
+           Atomic.set asset_change_release true;
+           if asset_change=Some `More then (
+             wait "offline More is deferred behind its exact demand" (fun()->Option.is_some(Atomic.get offline_demand));
+             for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+             Alcotest.(check bool) "deferred offline More retains causal obligation" false
+               (Atomic.get changes_acknowledged);
+             W.Session_context.emit (Option.get !worker_context) ~topic:Service.asset_topic
+               (Service.Asset_notice(scope,Service.Asset_backpressure(Option.get(Atomic.get offline_demand))));
+             for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+             Alcotest.(check bool) "backpressure preserves the deferred read obligation" false
+               (Atomic.get changes_acknowledged);
+             W.Session_context.emit (Option.get !worker_context) ~topic:Service.asset_topic
+               (Service.Asset_notice(scope,Service.Asset_demand_accepted(Option.get(Atomic.get offline_demand))));
+             wait "offline More reaches actual Worker" (fun()->Atomic.get asset_more_entered);
+             for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+             Alcotest.(check bool) "Changes ACK waits for offline More DTO" false
+               (Atomic.get changes_acknowledged);
+             Atomic.set asset_more_release true);
+           if asset_change=Some `Failure then (
+             for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+             Alcotest.(check bool) "failed offline read preserves window" false
+               (Atomic.get changes_acknowledged);
+             let pulls=Atomic.get change_pull_reads in
+             Atomic.set publish_block true;
+             ignore(W.send(Option.get !client)Service.Get_graph_state);
+             wait "failed offline application receives repeated Changes" (fun()->Atomic.get change_pull_reads>pulls);
+             for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+             Alcotest.(check bool) "offline read failure survives repeated application" false
+               (Atomic.get changes_acknowledged))
+           else wait "offline DTO application permits Changes ACK" (fun()->Atomic.get changes_acknowledged)));
        let fixture_root_count = Option.value media_rows ~default:timeline_rows in
        if fixture_root_count > 30 then (
          let list_node = Option.get (find "_extension" "journal-list") in
@@ -7731,7 +7811,15 @@ let () =
         ] )
     ; ( "offline asset coordination"
       , [ Alcotest.test_case "mounted catalog and asset scans use typed owner" `Quick
-            (fun ()->run_favorites_native_visibility ~check_asset_scan_owner:true ()) ] )
+            (fun ()->run_favorites_native_visibility ~check_asset_scan_owner:true ());
+          Alcotest.test_case "held offline DTO prevents ACK" `Quick
+            (fun ()->run_favorites_native_visibility ~asset_change:`Held ());
+          Alcotest.test_case "failed offline DTO retains window across delivery" `Quick
+            (fun ()->run_favorites_native_visibility ~asset_change:`Failure ());
+          Alcotest.test_case "demand deferred More retains original cause" `Quick
+            (fun ()->run_favorites_native_visibility ~asset_change:`More ());
+          Alcotest.test_case "unconfigured offline owner does not block" `Quick
+            (fun ()->run_favorites_native_visibility ~asset_change:`Unconfigured ()) ] )
     ; ( "media changes application barrier"
       , [Alcotest.test_case "held typed Media Facts prevents ACK" `Quick (fun()->
           run_favorites_native_visibility ~media_rows:3 ~media_navigation:`Offscreen

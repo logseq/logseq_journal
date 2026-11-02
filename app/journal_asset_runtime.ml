@@ -62,6 +62,8 @@ type dependency =
 
 type t =
   { read_port : (read_request -> bool) option
+  ; read_planned : Graph.Uuid.t -> unit
+  ; read_retired : Graph.Uuid.t -> unit
   ; send : Service.request -> bool
   ; changed : int option -> Policy.offline -> Policy.offline -> unit
   ; mutable published : (int option * Policy.offline * Policy.offline) option
@@ -76,8 +78,8 @@ type t =
   ; assets : (string, unit) Hashtbl.t
   ; requests : (string, int * Protocol.command) Hashtbl.t
   ; dependencies : (string, dependency * int) Hashtbl.t
-  ; dependency_queue : dependency Queue.t
-  ; dependency_waiting : (string, unit) Hashtbl.t
+  ; dependency_queue : (dependency * Graph.Uuid.t) Queue.t
+  ; dependency_waiting : (string, Graph.Uuid.t) Hashtbl.t
   ; mutable serial : int
   ; dirty : (string, Graph.block option * Uuids.t * int * bool) Hashtbl.t
   ; mutable barrier : int
@@ -86,8 +88,10 @@ type t =
   ; mutable favorite_members : Uuids.t
   }
 
-let create_state ~read_port ~send ~changed =
+let create_state ~read_port ~read_planned ~read_retired ~send ~changed =
   { read_port
+  ; read_planned
+  ; read_retired
   ; send
   ; changed
   ; published = None
@@ -113,10 +117,51 @@ let create_state ~read_port ~send ~changed =
   }
 ;;
 
-let create ~send ~changed = create_state ~read_port:None ~send ~changed
+let create ~send ~changed =
+  create_state ~read_port:None ~read_planned:(fun _ -> ()) ~read_retired:(fun _ -> ()) ~send ~changed
 
-let create_coordinated ~read ~send ~changed =
-  create_state ~read_port:(Some read) ~send ~changed
+let create_coordinated ?(read_planned=fun _->()) ?(read_retired=fun _->()) ~read ~send ~changed () =
+  create_state ~read_port:(Some read) ~read_planned ~read_retired ~send ~changed
+;;
+
+let scan_request_id id =
+  Graph.Uuid.of_string(Printf.sprintf "a55e7000-0000-4000-8000-%012x" id) |> Result.get_ok
+
+let dependency_id (dependency : _ Policy.read_dependency) =
+  match dependency.after_demand with
+  | None -> scan_request_id dependency.ticket.id
+  | Some _ ->
+    Graph.Uuid.of_string(Printf.sprintf "a55e7200-0000-4000-8000-%012x" dependency.ticket.id)
+    |> Result.get_ok
+
+let clear_dependency_queue t =
+  Queue.iter(fun(_,id)->t.read_retired id)t.dependency_queue;
+  Queue.clear t.dependency_queue;
+  Hashtbl.clear t.dependency_waiting
+
+let retire_policy_reads t =
+  List.iter(fun dependency->t.read_retired(dependency_id dependency))(Policy.read_dependencies t.policy)
+
+let retire_dependency_reads t =
+  Hashtbl.iter(fun id _->t.read_retired(Graph.Uuid.of_string id |> Result.get_ok))t.dependencies;
+  clear_dependency_queue t
+
+let owns_read t request_id =
+  let key=Graph.Uuid.to_string request_id in
+  Hashtbl.mem t.pending key || Hashtbl.mem t.dependencies key
+
+let projection_read_error t =
+  if t.configuration<>None && t.degraded
+  then Some "Offline attachment dependencies could not be read" else None
+
+let notice_reads t (scope:Service.asset_scope) notice =
+  if t.generation <> Some scope.graph_generation then [] else
+  let event=match notice with
+    | Service.Asset_demand_accepted consumer -> Some(Policy.Demand_accepted consumer)
+    | Asset_backpressure consumer -> Some(Policy.Backpressure consumer)
+    | _ -> None in
+  match event with None->[]|Some event->
+    Policy.completed_deferred_reads t.policy event |> List.map dependency_id
 ;;
 
 let wire_cursor = function
@@ -146,6 +191,8 @@ let degrade t =
   if not t.degraded
   then (
     t.degraded <- true;
+    retire_policy_reads t;
+    clear_dependency_queue t;
     let policy, _ = Policy.step t.policy Dependencies_unavailable in
     t.policy <- policy;
     let recent = Policy.offline t.policy Recent
@@ -182,10 +229,7 @@ let observe_request t (request : Protocol.request) =
 
 let execute t = function
   | Policy.Read ticket ->
-    let request_id =
-      Graph.Uuid.of_string (Printf.sprintf "a55e7000-0000-4000-8000-%012x" ticket.id)
-      |> Result.get_ok
-    in
+    let request_id = scan_request_id ticket.id in
     let accepted =
       match t.read_port with
       | None ->
@@ -296,6 +340,12 @@ let dependency_key = function
 
 let enqueue t dependency =
   let key = dependency_key dependency in
+  let existing=match Hashtbl.find_opt t.dependency_waiting key with
+    | Some id->Some id
+    | None->Hashtbl.fold(fun id (item,_) found->
+        if dependency_key item=key then Some(Graph.Uuid.of_string id |> Result.get_ok) else found)
+        t.dependencies None in
+  Option.iter t.read_planned existing;
   if
     Option.is_some t.configuration
     && (not t.degraded)
@@ -309,8 +359,11 @@ let enqueue t dependency =
     if Queue.length t.dependency_queue >= maximum_queued_dependency_reads
     then degrade t
     else (
-      Queue.add dependency t.dependency_queue;
-      Hashtbl.replace t.dependency_waiting key ())
+      t.serial <- t.serial+1;
+      let request_id=Graph.Uuid.of_string(Printf.sprintf "a55e7100-0000-4000-8000-%012x" t.serial) |> Result.get_ok in
+      t.read_planned request_id;
+      Queue.add (dependency,request_id) t.dependency_queue;
+      Hashtbl.replace t.dependency_waiting key request_id)
 ;;
 
 let rec pump_dependencies t =
@@ -318,11 +371,7 @@ let rec pump_dependencies t =
   then
     if not (Queue.is_empty t.dependency_queue)
     then (
-      let dependency = Queue.peek t.dependency_queue in
-      let request_id =
-        Graph.Uuid.of_string (Printf.sprintf "a55e7100-0000-4000-8000-%012x" t.serial)
-        |> Result.get_ok
-      in
+      let dependency,request_id = Queue.peek t.dependency_queue in
       let command =
         match dependency with
         | Block block -> Protocol.V2_get_outline_block { block; revision = None }
@@ -336,7 +385,7 @@ let rec pump_dependencies t =
           t.dependencies
           (Graph.Uuid.to_string request_id)
           (dependency, t.serial);
-        ignore (Queue.take t.dependency_queue : dependency);
+        ignore (Queue.take t.dependency_queue : dependency * Graph.Uuid.t);
         Hashtbl.remove t.dependency_waiting (dependency_key dependency);
         pump_dependencies t))
 ;;
@@ -371,8 +420,13 @@ let publish t =
 ;;
 
 let dispatch t event =
-  let policy, instructions = Policy.step t.policy event in
+  let previous=Policy.read_dependencies t.policy in
+  let policy, instructions, dependencies = Policy.step_with_dependencies t.policy event in
   t.policy <- policy;
+  let current=Policy.read_dependencies policy in
+  List.iter(fun dependency->if not(List.mem dependency current)
+    then t.read_retired(dependency_id dependency))previous;
+  List.iter(fun dependency->t.read_planned(dependency_id dependency))dependencies;
   List.iter (fun instruction -> Queue.add instruction t.queued) instructions;
   pump t;
   publish t
@@ -382,6 +436,7 @@ let refresh t ~graph_generation ~today ~settings =
   let configuration = graph_generation, today, settings in
   if t.configuration <> Some configuration
   then (
+    retire_policy_reads t;
     Hashtbl.clear t.pending;
     if t.generation <> Some graph_generation
     then (
@@ -391,9 +446,8 @@ let refresh t ~graph_generation ~today ~settings =
       Hashtbl.clear t.assets;
       Hashtbl.clear t.dirty;
       Hashtbl.clear t.requests;
+      retire_dependency_reads t;
       Hashtbl.clear t.dependencies;
-      Queue.clear t.dependency_queue;
-      Hashtbl.clear t.dependency_waiting;
       t.favorites_page <- None;
       t.favorite_members <- Uuids.empty;
       t.degraded <- false);
@@ -409,8 +463,7 @@ let resync t =
   Hashtbl.clear t.pages;
   Hashtbl.clear t.page_dirty;
   Hashtbl.clear t.assets;
-  Queue.clear t.dependency_queue;
-  Hashtbl.clear t.dependency_waiting;
+  retire_dependency_reads t;
   t.degraded <- false;
   t.barrier <- t.serial;
   dispatch t Resync
@@ -531,6 +584,24 @@ let roots_for_uuid t uuid =
        | None | Some _ -> roots)
     t.facts
     roots
+;;
+
+let change_application_error t windows =
+  let failed reason = Policy.progress t.policy reason = Policy.Failed in
+  let root uuid =
+    Seq.exists(Graph.Uuid.equal uuid)(all_roots t)
+    || not(Uuids.is_empty(roots_for_uuid t uuid)) in
+  let needed = List.exists(fun (window:Protocol.v2_change_window)->
+    List.exists(function
+      | Protocol.V2_journal_index_interest -> failed Recent
+      | V2_children_interest uuid | V2_page_tree_interest uuid -> root uuid
+        || (t.degraded && not(Hashtbl.mem t.pages(Graph.Uuid.to_string uuid))))window.structure_interests
+    || List.exists(fun uuid->not(Hashtbl.mem t.assets(Graph.Uuid.to_string uuid))
+      && (root uuid || (t.degraded && not(Hashtbl.mem t.facts(Graph.Uuid.to_string uuid)))))window.block_uuids
+    || List.exists(fun uuid->root uuid || (t.degraded && t.favorites_page=None))window.page_uuids)windows in
+  if t.configuration<>None && needed
+    && (t.degraded || failed Recent || failed Favorites)
+  then Some "Offline attachment enumeration could not be applied" else None
 ;;
 
 let property_membership_equal =
@@ -884,6 +955,7 @@ let changes t windows =
 ;;
 
 let shutdown t =
+  retire_dependency_reads t;
   retain_releases t;
   dispatch t Shutdown;
   Hashtbl.clear t.pending;
@@ -894,8 +966,7 @@ let shutdown t =
   Hashtbl.clear t.dirty;
   Hashtbl.clear t.requests;
   Hashtbl.clear t.dependencies;
-  Queue.clear t.dependency_queue;
-  Hashtbl.clear t.dependency_waiting;
+  clear_dependency_queue t;
   t.favorites_page <- None;
   t.favorite_members <- Uuids.empty;
   retain_releases t;
@@ -987,8 +1058,7 @@ let receive t (Protocol.V2_response { request_id; outcome; _ } as response) =
        then (
          Hashtbl.clear t.dirty;
          Hashtbl.clear t.page_dirty;
-         Queue.clear t.dependency_queue;
-         Hashtbl.clear t.dependency_waiting;
+         clear_dependency_queue t;
          degrade t);
        observe_response t response;
        (match dependency with
@@ -1039,8 +1109,7 @@ let reject t ~request_id =
     then (
       Hashtbl.clear t.dirty;
       Hashtbl.clear t.page_dirty;
-      Queue.clear t.dependency_queue;
-      Hashtbl.clear t.dependency_waiting;
+      clear_dependency_queue t;
       degrade t);
     Hashtbl.remove t.dependencies key;
     Hashtbl.remove t.requests key;

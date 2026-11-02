@@ -981,6 +981,8 @@ let runtime_registry_capacity () =
   check
     (!status = P.Failed)
     "4096 accepted nonterminal registrations expose capacity failure";
+  check(Runtime.projection_read_error r<>None)
+    "shared DTO ownership capacity failure has no read application error";
   check (Queue.is_empty sent) "capacity failure cannot trigger an unbounded rescan";
   Runtime.resync r;
   let request =
@@ -999,6 +1001,13 @@ let runtime_registry_capacity () =
        ; next_cursor = None
        });
   check (Queue.is_empty sent) "bounded registry preserves real resync terminal ownership"
+;;
+
+let runtime_unconfigured_shared_capacity () =
+  let runtime=Runtime.create ~send:(fun _->true) ~changed:(fun _ _ _->()) in
+  for n=1 to 4200 do raw runtime (10000+n) (block n 9999 9999 []) done;
+  check(Runtime.projection_read_error runtime=None)
+    "unconfigured shared DTO cache overflow invented an offline ACK consumer"
 ;;
 
 let dependency_capacity_status () =
@@ -1290,12 +1299,49 @@ let repeated_cursor_fails () =
 
 (* The pure scan owns continuations and lifecycle decisions; this generator
    supplies equality-comparable payloads without access to any cursor decoder. *)
+let deferred_read_identity () =
+  let s,ins=refresh P.empty in
+  let s,ins=P.step s (Roots_loaded(read Favorites ins,[uuid 1],None)) in
+  let ticket=read Favorites ins in
+  let awaiting,ins,dependencies=P.step_with_dependencies s (Assets_loaded(ticket,[asset 2],Some cursor)) in
+  let consumer,_=demand ins in
+  check (List.exists(fun (d:_ P.read_dependency)->d.ticket=ticket && d.after_demand=Some consumer)dependencies)
+    "deferred More lost the exact source before its parent completed";
+  let paused,_,joined=P.step_with_dependencies awaiting (Backpressure consumer) in
+  check (joined=dependencies) "backpressure changed the deferred read identity";
+  check(P.completed_deferred_reads awaiting (Backpressure consumer)=[])
+    "backpressure completed the deferred consumer";
+  check(P.completed_deferred_reads paused (Demand_accepted consumer)=dependencies)
+    "accepted demand failed to complete its exact deferred consumer";
+  let same,_=refresh paused in
+  check (P.read_dependencies same=P.read_dependencies paused) "same config retired deferred read";
+  let untouched,_,joined=P.step_with_dependencies paused (Demand_accepted "old-consumer") in
+  check (joined=[] && P.read_dependencies untouched=P.read_dependencies paused)
+    "unowned demand notice re-associated a read";
+  let reading,ins,joined=P.step_with_dependencies paused (Demand_accepted consumer) in
+  let next=read Favorites ins in
+  check (List.exists(fun (d:_ P.read_dependency)->d.ticket=next && d.after_demand=None)joined)
+    "accepted demand did not expand into its actual next read";
+  let final,ins=P.step reading (Assets_loaded(next,[asset 3],None)) in
+  let final_consumer,_=demand ins in
+  check (not(List.exists(fun (d:_ P.read_dependency)->d.ticket.reason=Favorites)(P.read_dependencies final)))
+    "final download demand unnecessarily blocks a read ACK";
+  let dirty,_,joined=P.step_with_dependencies final (Index_changed Favorites) in
+  check (List.exists(fun (d:_ P.read_dependency)->d.after_demand=Some final_consumer)joined)
+    "coalesced index work behind demand lost its cause";
+  let closed,_=P.step dirty Shutdown in
+  check (P.read_dependencies closed=[]) "shutdown retained causal read work";
+  let late,ins=P.step closed (Demand_accepted final_consumer) in
+  check (ins=[] && P.read_dependencies late=[]) "old demand revived a closed scan"
+;;
+
 let opaque_cursor_properties () =
   let snapshot state =
     ( P.offline state Recent
     , P.offline state Favorites
     , List.of_seq (P.roots state Recent)
-    , List.of_seq (P.roots state Favorites) )
+    , List.of_seq (P.roots state Favorites)
+    , P.read_dependencies state )
   in
   let run seed actions =
     let state = ref P.empty
@@ -1311,14 +1357,23 @@ let opaque_cursor_properties () =
     in
     let apply event =
       let before = snapshot !state in
-      let next, instructions = P.step !state event in
-      let repeated, again = P.step !state event in
+      let next, instructions, dependencies = P.step_with_dependencies !state event in
+      let repeated, again, repeated_dependencies = P.step_with_dependencies !state event in
       check (snapshot !state = before) "pure scan mutated a previous state";
       check
-        (snapshot next = snapshot repeated && instructions = again)
+        (snapshot next = snapshot repeated && instructions = again && dependencies=repeated_dependencies)
         "pure scan is nondeterministic";
+      let ordinary,ordinary_instructions=P.step !state event in
+      check(snapshot ordinary=snapshot next && ordinary_instructions=instructions)
+        "causal planning changed policy transport decisions";
       state := next;
       record instructions;
+      check(List.length(P.read_dependencies next)<=2) "causal work exceeds the two configured reasons";
+      List.iter(fun (dependency:_ P.read_dependency)->
+        check(List.mem dependency.ticket !tickets) "causal work fabricated a source ticket";
+        Option.iter(fun consumer->check(List.mem consumer !consumers)
+          "deferred work fabricated a resource demand")dependency.after_demand)
+        (P.read_dependencies next);
       match event with
       | P.Roots_loaded _ | Assets_loaded _ | Read_failed _ ->
         let duplicate, extra = P.step !state event in
@@ -1332,9 +1387,11 @@ let opaque_cursor_properties () =
     List.iteri
       (fun index action ->
          let picked () =
-           List.nth_opt !tickets (action mod max 1 (List.length !tickets))
+           if action mod 3=0 then
+             List.find_map(fun (d:_ P.read_dependency)->if d.after_demand=None then Some d.ticket else None)(P.read_dependencies !state)
+           else List.nth_opt !tickets (action mod max 1 (List.length !tickets))
          in
-         match action mod 8 with
+         match action mod 11 with
          | 0 | 1 | 2 ->
            Option.iter
              (fun ticket ->
@@ -1380,7 +1437,10 @@ let opaque_cursor_properties () =
            Option.iter
              (fun consumer -> apply (Demand_accepted consumer))
              (List.nth_opt !consumers 0)
-         | _ -> apply Capacity_available)
+         | 7 -> apply Capacity_available
+         | 8 -> apply(Index_changed Favorites)
+         | 9 -> apply(Roots_changed[uuid(index+1)])
+         | _ -> Option.iter(fun consumer->apply(Backpressure consumer))(List.nth_opt !consumers 0))
       actions
   in
   let failed seed actions =
@@ -1433,7 +1493,8 @@ let () =
        | exn ->
          incr failed;
          Printf.printf "FAIL %s: %s\n%!" name (Printexc.to_string exn))
-    [ "repeated and cyclic opaque More", repeated_cursor_fails
+    [ "deferred read identity and resource-independent final page", deferred_read_identity
+    ; "repeated and cyclic opaque More", repeated_cursor_fails
     ; "opaque cursor 200 seeded traces and shrinking", opaque_cursor_properties
     ; "runtime never configured changes", runtime_unconfigured_changes false
     ; "runtime shutdown changes", runtime_unconfigured_changes true
@@ -1447,6 +1508,7 @@ let () =
     ; "immutable pending residency", pending_preserves_ready
     ; "runtime actual Capture sibling", runtime_real_capture_sibling
     ; "runtime accepted registry capacity", runtime_registry_capacity
+    ; "unconfigured shared DTO capacity has no ACK consumer", runtime_unconfigured_shared_capacity
     ; "dependency capacity preserves lease", dependency_capacity_status
     ; "immutable paginated index diff", index_pagination
     ; "runtime unknown ancestor", runtime_unknown_ancestor

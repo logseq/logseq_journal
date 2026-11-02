@@ -1856,7 +1856,7 @@ let test_offline_asset_scans_use_typed_reads () =
         | _->failwith "real typed offline asset read failed");true in
     let assets=Assets.create_coordinated ~read
       ~send:(function Service.Graph_request _->incr legacy_reads;false|_->true)
-      ~changed:(fun _ recent favorites->status:=Some(recent,favorites)) in
+      ~changed:(fun _ recent favorites->status:=Some(recent,favorites)) () in
     runtime:=Some assets;
     Assets.refresh assets ~graph_generation:1 ~today:20260901 ~settings:Journal_asset_policy.default_settings;
     require(!legacy_reads=0) "offline asset scan still sent a legacy graph query";

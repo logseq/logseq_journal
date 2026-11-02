@@ -3613,7 +3613,7 @@ let start
       Journal_media_view.Store.reset (!media_store_cell);
       Journal_media_runtime.reset (!media_runtime_cell) ~graph_generation:(Option.map fst key))
   in
-  let flush_media set_state =
+  let flush_media_only set_state =
     let changes = Hashtbl.to_seq (!media_changes_cell) |> List.of_seq in
     Hashtbl.clear (!media_changes_cell);
     let context = !media_context in
@@ -3648,20 +3648,14 @@ let start
   let drain_capture_imports = ref (fun () -> Effect.ignore) in
   let coordinated_asset_point = ref(fun (_:Graph_service.request)->None) in
   let coordinated_asset_read = ref(fun (_:Journal_asset_runtime.read_request)->false) in
+  let asset_changes_cell = graph_ref (fun () -> None) in
   let asset_runtime_cell = graph_ref (fun () ->
     Journal_asset_runtime.create_coordinated
+      ~read_planned:(fun request_id->Journal_graph_runtime.register_external_read (!graph_runtime_cell) ~request_id)
+      ~read_retired:(fun request_id->Journal_graph_runtime.retire_external_read (!graph_runtime_cell) ~request_id)
       ~read:(fun request-> !coordinated_asset_read request)
       ~changed:(fun generation recent favorites ->
-        Option.iter
-          (fun set_state ->
-             Effect.run
-               (set_state (fun state ->
-                  match generation with
-                  | Some generation when state.graph_state.generation = generation ->
-                    { state with asset_offline = Some (recent, favorites) }
-                  | None -> { state with asset_offline = None }
-                  | Some _ -> state)))
-          !set_state_ref)
+        asset_changes_cell := Some(generation,recent,favorites))
       ~send:(fun request ->
         match !coordinated_asset_point request with
         | Some accepted->accepted
@@ -3669,7 +3663,24 @@ let start
           | Graph_service.Graph_request _ -> false
           | _->match dispatch_worker request with
             | Worker.Accepted _->true
-            | Full | Not_ready | Stopping -> false)) in
+            | Full | Not_ready | Stopping -> false) ()) in
+  let flush_media set_state =
+    Effect.bind (flush_media_only set_state) ~f:(fun()->
+      match !asset_changes_cell with
+      | None -> Effect.ignore
+      | Some(generation,recent,favorites) ->
+        asset_changes_cell := None;
+        set_state(fun state->match generation with
+          | Some generation when state.graph_state.generation=generation ->
+            {state with asset_offline=Some(recent,favorites)}
+          | None -> {state with asset_offline=None}
+          | Some _ -> state)) in
+  let media_changes = !media_projection_changes in
+  media_projection_changes := (fun windows->
+    media_changes windows;
+    Journal_asset_runtime.changes (!asset_runtime_cell) windows;
+    Option.iter(fun message->Journal_graph_runtime.report_projection_failure (!graph_runtime_cell)
+      (Wc.Service_failed message))(Journal_asset_runtime.change_application_error (!asset_runtime_cell) windows));
   let observe_projection_request request =
     sync_media !state_ref;
     Journal_media_runtime.observe_request (!media_runtime_cell) request;
@@ -3739,16 +3750,34 @@ let start
                | Error _->Journal_media_runtime.reject (!media_runtime_cell) request.ticket;owned)));
          true)
     | _->false);
+  let apply_asset_read ~request_id ~result ~f =
+    Effect.bind (Effect.of_thunk(fun()->
+      let consumed,application=Journal_graph_runtime.with_external_read (!graph_runtime_cell) ~request_id ~f in
+      let result=match result,Journal_asset_runtime.projection_read_error (!asset_runtime_cell) with
+        | Ok(),Some message->Error(Wc.Service_failed message)|_->result in
+      let result=Hashtbl.fold(fun root (_:Journal_media_runtime.view) result->
+        match result,Journal_media_runtime.projection_read_error (!media_runtime_cell) ~root with
+        | Ok(),Some message->Error(Wc.Service_failed message)|_->result)(!media_changes_cell)result in
+      consumed,application,result)) ~f:(fun(consumed,application,result)->
+      let flush=match !set_state_ref with None->Effect.ignore|Some set_state->flush_media set_state in
+      Effect.bind flush ~f:(fun()->
+        Option.iter(fun token->Option.iter(fun(_,host)->Coordination_host.post host
+          (if consumed then Coordination.Change_consumer_applied(token,request_id,result)
+           else Coordination.Change_consumer_retired(token,request_id)))!coordination_host)application;
+        Effect.ignore)) in
   coordinated_asset_point := (fun request ->
     let result=send_coordinated_point request ~finish:(fun result->
-      Effect.of_thunk(fun()->match request with
+      match request with
         | Graph_service.Graph_request original ->
-          (match result with
-           | Ok response when Journal_asset_runtime.receive (!asset_runtime_cell) response->
-             Journal_media_runtime.observe_response (!media_runtime_cell) response
-           | _->forget_projection_request original.request_id;
-             Journal_asset_runtime.reject (!asset_runtime_cell) ~request_id:original.request_id)
-        | _->())) in
+          apply_asset_read ~request_id:original.request_id ~result:(Result.map(fun _->())result) ~f:(fun()->
+            let owned=Journal_asset_runtime.owns_read (!asset_runtime_cell) original.request_id in
+            (match result with
+             | Ok response when Journal_asset_runtime.receive (!asset_runtime_cell) response->
+               Journal_media_runtime.observe_response (!media_runtime_cell) response
+             | _->forget_projection_request original.request_id;
+               Journal_asset_runtime.reject (!asset_runtime_cell) ~request_id:original.request_id);
+            owned)
+        | _->Effect.ignore) in
     (match result,request with Some true,Graph_service.Graph_request original->
       Journal_media_runtime.observe_request (!media_runtime_cell) original|_->());
     result);
@@ -3766,19 +3795,26 @@ let start
           | _->());
          Coordination_host.watch_read host ticket ~f:(fun origin reply->
            if runtime_owner_is_live !state_ref owner then run_owned (Some owner) (fun()->
-             Effect.of_thunk(fun()->
-               match origin,reply with
+             let value=match origin,reply with
                | Some(session,_),Wc.Answered(Ok value)
-                 when Coordination_host.validate_session ~owner host session=Ok()->
-                 if Journal_asset_runtime.receive_read (!asset_runtime_cell)
-                     ~request_id:request.request_id (request.outcome value) then (
+                 when Coordination_host.validate_session ~owner host session=Ok()->Ok value
+               | _,Wc.Answered(Error error)->Error error
+               | _->Error(Wc.Service_failed "The offline attachment read was interrupted or retired") in
+             apply_asset_read ~request_id:request.request_id ~result:(Result.map(fun _->())value) ~f:(fun()->
+               let owned=Journal_asset_runtime.owns_read (!asset_runtime_cell) request.request_id in
+               match value with
+               | Ok value ->
+                 let consumed=Journal_asset_runtime.receive_read (!asset_runtime_cell)
+                     ~request_id:request.request_id (request.outcome value) in
+                 if consumed then (
                    match request.query with
                    | Wc.Journals _->Journal_media_runtime.observe_journals_result (!media_runtime_cell)
                        ~request_id:request.request_id value
                    | _->())
-                 else forget_projection_request request.request_id
-               | _->Journal_asset_runtime.reject (!asset_runtime_cell) ~request_id:request.request_id;
-                 Journal_media_runtime.forget_request (!media_runtime_cell) request.request_id)));
+                 else forget_projection_request request.request_id;
+                 consumed
+               | Error _->Journal_asset_runtime.reject (!asset_runtime_cell) ~request_id:request.request_id;
+                 Journal_media_runtime.forget_request (!media_runtime_cell) request.request_id;owned)));
          true)
     | _->false);
   let asset_settings = ref None in
@@ -3968,8 +4004,7 @@ let start
     List.iter
       (fun response ->
          match response.Journal_graph_runtime.payload with
-         | Projection_changes windows ->
-           Journal_asset_runtime.changes (!asset_runtime_cell) windows
+         | Projection_changes _ -> ()
          | Projection_resync ->
            Journal_media_runtime.resync (!media_runtime_cell);
            Journal_asset_runtime.resync (!asset_runtime_cell)
@@ -4087,9 +4122,11 @@ let start
       let prepare=match result with
         | Ok(Journal_graph_runtime.Changes_resync _)->set_state(fun state->{state with next_request_generation=Int64.max state.next_request_generation(Int64.succ resync_generation)})
         | _->Effect.ignore in
+      let asset_projection_error=ref None in
       let output=match result with
         | Ok result ->
           Journal_graph_runtime.with_read_projection (!graph_runtime_cell) ~request_id:request.request_id ~f:(fun()->
+          let asset_error_before=Journal_asset_runtime.projection_read_error (!asset_runtime_cell) in
           (match result with
            | Journal_graph_runtime.Ordinary_read outcome -> observe_projection_response
              (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
@@ -4117,7 +4154,10 @@ let start
            | Favorites_read{first_page;value}->
              Journal_media_runtime.forget_request (!media_runtime_cell) request.request_id;
              Journal_asset_runtime.observe_favorites_result (!asset_runtime_cell)
-               ~request_id:request.request_id ~first_page value));
+               ~request_id:request.request_id ~first_page value);
+          asset_projection_error :=
+            (if asset_error_before=None then Journal_asset_runtime.projection_read_error (!asset_runtime_cell)
+             else None));
           Journal_graph_runtime.receive_worker_read ~resync_generation ?origin (!graph_runtime_cell) ~request_id:request.request_id result
         | Error message -> forget_projection_request request.request_id;
           Journal_graph_runtime.fail_request (!graph_runtime_cell) request ~message in
@@ -4126,10 +4166,13 @@ let start
         Effect.bind (apply_graph_responses set_state_and_effect delivery.responses) ~f:(fun()->
           let media_error=Hashtbl.fold(fun root (_view:Journal_media_runtime.view) found->
             match found,Journal_media_runtime.projection_read_error (!media_runtime_cell) ~root with None,Some message->Some message|_->found)(!media_changes_cell)None in
+          let projection_error=match media_error with
+            | Some _->media_error
+            | None-> !asset_projection_error in
           Effect.bind(flush_media set_state) ~f:(fun()->
           Option.iter(fun token->Option.iter(fun(_,host)->Coordination_host.post host
             (Coordination.Change_consumer_applied(token,request.request_id,
-              match result,delivery.error,media_error with
+              match result,delivery.error,projection_error with
               | Error message,_,_|_,Some message,_|_,_,Some message->Error(Wc.Service_failed message)
               | _->Ok())))!coordination_host) application;
           set_state(fun state->match delivery.error with
@@ -4594,12 +4637,18 @@ let start
             refresh_after_worker_event))
     | Worker.Push { payload = (Asset_notice _ | Asset_notices _) as payload; _ } ->
       let notices = Graph_service.asset_notices payload in
-      List.iter
-        (fun (scope, notice) ->
-           Journal_asset_runtime.notice (!asset_runtime_cell) scope notice;
-           Journal_media_runtime.notice (!media_runtime_cell) scope notice)
-        notices;
-      Effect.many
+      let apply_notice (scope,notice) =
+        let apply () =
+          Journal_asset_runtime.notice (!asset_runtime_cell) scope notice;
+          Journal_media_runtime.notice (!media_runtime_cell) scope notice;
+          true in
+        match Journal_asset_runtime.notice_reads (!asset_runtime_cell) scope notice with
+        | [request_id] -> apply_asset_read ~request_id ~result:(Ok()) ~f:apply
+        | [] -> Effect.of_thunk(fun()->ignore(apply():bool))
+        | _ -> assert false in
+      let applied=List.fold_left(fun pending notice->Effect.bind pending ~f:(fun()->apply_notice notice))
+        Effect.ignore notices in
+      Effect.bind applied ~f:(fun()->Effect.many
         [ flush_media set_state
         ; set_state (fun state ->
             { state with
@@ -4610,7 +4659,7 @@ let start
                   (Journal_uploads.sync state.uploads (upload_context state))
                   notices
             })
-        ]
+        ])
     | Worker.Response { request_id; outcome = Completed (Asset_imported result); _ } ->
       let pending = Hashtbl.find_opt (!import_worker_requests_cell) request_id in
       Hashtbl.remove (!import_worker_requests_cell) request_id;
@@ -5534,7 +5583,7 @@ let start
                (fun request -> ignore (dispatch_worker request : Worker.send_result))
                (Journal_uploads.retry uploads operation))
        | Some (Days settings) ->
-         Effect.of_thunk (fun () ->
+         Effect.bind (Effect.of_thunk (fun () ->
            (* The extension re-emits its preference on every remount; only a
               real change may refresh (each refresh republishes the model and
               would loop under the full-remount view). *)
@@ -5546,7 +5595,7 @@ let start
              then
                refresh_assets
                  ~graph_generation:current.graph_state.generation
-                 current.calendar)))
+                 current.calendar))) ~f:(fun()->flush_media set_state))
     | Native_payload (Ui.Event.Payload.Confirmation_response response) ->
       set_state_and_effect (fun state ->
         match state.modal with
@@ -7421,7 +7470,8 @@ let start
       drain_retired_runtimes ();
       let deliver event=Effect.bind
         (Effect.bind (handle_worker_event event) ~f:drain_startup_commands)
-        ~f:(fun()->Effect.bind(drain_focus_refresh()) ~f:finish_termination) in
+        ~f:(fun()->Effect.bind(flush_media set_state) ~f:(fun()->
+          Effect.bind(drain_focus_refresh()) ~f:finish_termination)) in
       match event with
       | Worker.Response {request_id;_} ->
         let owner=Hashtbl.find_opt worker_owners request_id in

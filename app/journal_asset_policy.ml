@@ -113,6 +113,7 @@ type 'cursor pending_demand =
   { consumer : string
   ; assets : Asset.t list
   ; continuation : 'cursor query option
+  ; source : 'cursor ticket
   }
 
 type 'cursor phase =
@@ -748,7 +749,7 @@ let step_policy state = function
                  ticket.revision
                  ticket.id
              in
-             let pending = { consumer; assets; continuation } in
+             let pending = { consumer; assets; continuation; source = ticket } in
              ( with_scan
                  state
                  { scan with
@@ -1002,4 +1003,60 @@ let roots state reason =
   match List.find_opt (fun scan -> scan.reason = reason) state.scans with
   | None -> Seq.empty
   | Some scan -> Uuids.to_seq scan.known_roots
+;;
+
+type 'cursor read_dependency =
+  { ticket : 'cursor ticket
+  ; after_demand : string option
+  }
+
+let scan_dependencies (scan : 'cursor scan) =
+  match scan.phase with
+  | Reading ticket -> [ { ticket; after_demand = None } ]
+  | Awaiting pending | Pressured pending
+    when pending.continuation <> None || scan.dirty || scan.index_dirty
+         || not (Uuids.is_empty scan.changed_roots) ->
+    [ { ticket = pending.source; after_demand = Some pending.consumer } ]
+  | Awaiting _ | Pressured _ | Finished | Broken -> []
+;;
+
+let read_dependencies state = List.concat_map scan_dependencies state.scans
+
+let completed_deferred_reads state event =
+  let next,_=step state event in
+  let pending=read_dependencies next in
+  List.filter(fun dependency->dependency.after_demand<>None && not(List.mem dependency pending))
+    (read_dependencies state)
+;;
+
+let affected_reasons state event =
+  List.filter_map
+    (fun (scan : 'cursor scan) ->
+       let affected = match event with
+         | Refresh {graph_generation;today;settings} ->
+           state.configuration <> Some(graph_generation,today,settings)
+         | Resync | Dependencies_unavailable | Shutdown -> scan.enabled
+         | Roots_changed roots ->
+           List.exists (fun root -> Uuids.mem root scan.known_roots) roots
+         | Index_changed reason -> scan.enabled && scan.reason = reason
+         | Roots_loaded(ticket,_,_) | Assets_loaded(ticket,_,_) | Read_failed ticket ->
+           (match scan.phase with Reading expected -> expected = ticket | _ -> false)
+         | Demand_accepted consumer | Backpressure consumer ->
+           (match scan.phase with Awaiting p | Pressured p -> p.consumer = consumer | _ -> false)
+         | Capacity_available | Availability _ | Visible _ | Hidden _ -> false
+       in
+       if affected then Some scan.reason else None)
+    state.scans
+;;
+
+let step_with_dependencies state event =
+  let reasons = affected_reasons state event in
+  let next,instructions = step state event in
+  let dependencies =
+    read_dependencies next
+    |> List.filter (fun dependency ->
+      List.mem dependency.ticket.reason reasons
+      || not (List.mem dependency (read_dependencies state)))
+  in
+  next,instructions,dependencies
 ;;

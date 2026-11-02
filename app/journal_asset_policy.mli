@@ -86,6 +86,19 @@ val step : 'cursor t -> 'cursor event -> 'cursor t * 'cursor instruction list
 val page_size : int
 val roots : 'cursor t -> reason -> Graph.Uuid.t Seq.t
 
+(** Pending causal read work, including pagination whose I/O is deferred until
+    this exact demand is accepted. A final demand with no future read is absent. *)
+type 'cursor read_dependency = private
+  { ticket : 'cursor ticket
+  ; after_demand : string option
+  }
+
+val read_dependencies : 'cursor t -> 'cursor read_dependency list
+val completed_deferred_reads : 'cursor t -> 'cursor event -> 'cursor read_dependency list
+val affected_reasons : 'cursor t -> 'cursor event -> reason list
+val step_with_dependencies : 'cursor t -> 'cursor event
+  -> 'cursor t * 'cursor instruction list * 'cursor read_dependency list
+
 type offline =
   { enumeration : progress
   ; total : int
