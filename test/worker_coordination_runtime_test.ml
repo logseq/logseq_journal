@@ -1682,6 +1682,65 @@ let test_read_completion_rechecks_graph_owner ?(durable = false) () =
            | _ -> failwith "durable unknown did not reconcile across close/reopen")))
 ;;
 
+let test_host_durable_recovery_confirmation_ack () =
+  let module Host=Journal_worker_coordination_host in
+  with_client(fun client->
+    let jobs=Queue.create() in
+    let host=Host.create ~client ~client_id ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
+      ~enqueue:(fun job->Queue.add job jobs) ~changed:(fun _->()) |> Result.get_ok in
+    let consumed=ref 0 in
+    Mailbox.on_event client(fun event->let delivery=Host.on_event host event in
+      if delivery.R.disposition=R.Consumed then incr consumed);
+    let pump()=Mailbox.Private.deliver client ~max_events:64;
+      let count=Queue.length jobs in for _=1 to count do (Queue.take jobs)() done in
+    let wait predicate=let deadline=Unix.gettimeofday()+.6. in
+      while not(predicate()) && Unix.gettimeofday()<deadline do pump();Thread.delay 0.001 done;
+      require(predicate()) "typed durable lifecycle did not settle" in
+    ignore(Mailbox.send client(Service.Client_command(Restore_local_account{user_id="user-1"})));
+    wait(fun()->Option.exists(fun projection->Option.is_some(W.selected projection)
+      && List.exists(fun resident->resident.W.phase=W.Open)(W.residents projection))
+      (C.projection(Host.view host)));
+    let presentation=Option.get(Option.bind(C.projection(Host.view host))W.selected) in
+    let session=W.presentation_session presentation in
+    let call : type a. a W.request -> a W.reply = fun operation->
+      let before= !consumed in
+      let ticket=Host.request host session operation |> Result.get_ok in
+      let result=ref None in
+      Host.watch host ticket ~f:(fun reply->result:=Some reply);
+      require(!result=None) "typed durable callback recursively completed admission";
+      wait(fun()-> !result<>None);
+      require(!consumed=before+1) "typed lifecycle response has duplicate or missing owner";
+      Option.get !result in
+    let value : type a. a W.reply -> a = function W.Answered(Ok value)->value|_->failwith "typed lifecycle operation failed" in
+    let budget=W.read_budget session ~maximum_items:8 ~maximum_bytes:16384 |> Result.get_ok in
+    let read()=value(call(W.Query(budget,W.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None}))) in
+    let revision=match read() with P.V2_present_block{revision;_}->revision|_->assert false in
+    let intent=W.mutation_intent session ~mutation_id:(uuid "9f000000-0000-4000-8000-000000001000")
+      (W.Save_block{block=Test_support.authoritative_block_uuid;title="Typed applied readback";
+        preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}) |> Result.get_ok in
+    let receipt=match value(call(W.Mutate intent)) with W.Committed_pending_presentation receipt->receipt|_->failwith "typed write lost proof" in
+    require(Result.is_error(Host.request host session(W.Acknowledge_intent intent))) "typed unconfirmed commit admitted ACK";
+    let recover()=value(call(W.Recover_mutations{after=None;maximum_items=8;maximum_bytes=W.maximum_mutation_recovery_bytes})) in
+    let page=recover() in
+    require(Rrbvec.length page.items=1) "typed recovery lost the persisted intent";
+    require(match(Rrbvec.nth page.items 0).progress with W.Committed_pending_presentation actual->
+      W.receipt_revisions actual=W.receipt_revisions receipt|_->false) "typed recovery replaced original proof";
+    let confirmation=match value(call(W.Confirm(presentation,receipt))) with W.Confirmed value->value|_->failwith "typed confirmation failed" in
+    let ui_applied=match W.confirmation_primary confirmation with
+      | W.Confirmed_block{lookup=V2_present_block{value;_};_}->value.block.title="Typed applied readback"
+      | _->false in
+    require ui_applied "canonical DTO was not applied to the consuming projection";
+    ignore(value(call(W.Acknowledge_intent intent)));
+    require(C.intent_progress(Host.view host)intent=None) "actual typed ACK did not retire pure ownership";
+    require(Rrbvec.is_empty(recover()).items) "actual typed ACK did not settle database recovery entry";
+    let before=read() in
+    require(match value(call(W.Mutate intent)) with W.Committed_pending_presentation original->
+      W.receipt_revisions original=W.receipt_revisions receipt|_->false) "typed ACK removed original idempotency proof";
+    require(read()=before) "typed same-intent reconciliation executed a second write";
+    ignore(Host.shutdown host);
+    wait(fun()->C.shutdown_state(Host.view host)=C.Stopped))
+;;
+
 let test_host_preserves_query_origin_before_forget () =
   let module Host = Journal_worker_coordination_host in
   with_client (fun client ->
@@ -3371,6 +3430,7 @@ let test_service_changefeed_has_one_owner () =
 ;;
 
 let () =
+  test_host_durable_recovery_confirmation_ack ();
   test_service_unknown_recovery_is_read_only ~large:true ();
   test_service_unknown_recovery_is_read_only ();
   test_service_durable_recovery_and_ack ();

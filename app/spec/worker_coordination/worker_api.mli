@@ -408,6 +408,16 @@ type admission_error =
   | Stopping
   | Unsupported_request of string
 
+(** Recovery is read-only and returns complete immutable payloads. Its independent
+    artifact byte ceiling accommodates a full legal intent and proof; ordinary
+    query read_budget limits do not apply. Cursors bind session and both budgets. *)
+type mutation_recovery_cursor
+type recovered_mutation = private { intent : mutation_intent; progress : mutation_progress }
+type mutation_recovery = private
+  { items : recovered_mutation Rrbvec.t; next : mutation_recovery_cursor option }
+
+val maximum_mutation_recovery_bytes : int
+
 type interruption =
   | Cancelled
   | Transport_lost
@@ -547,6 +557,10 @@ type _ request =
   | Append : append_intent -> mutation_progress request
   | Mutate : mutation_intent -> mutation_progress request
   | Confirm : presentation * receipt -> mutation_progress request
+  | Recover_mutations :
+      { after : mutation_recovery_cursor option; maximum_items : int; maximum_bytes : int }
+      -> mutation_recovery request
+  | Acknowledge_intent : mutation_intent -> unit request
   | Acknowledge_changes : change_batch -> change_ack request
   | Import : asset_import_intent -> import_progress request
   | Replace_asset_demand :
@@ -766,6 +780,13 @@ module type ISSUER = sig
     -> request_id:request_id
     -> 'a request
     -> (Service.request, error) result
+
+  (** Pure coordinator supplies the captured current presentation and original
+      proof. None denotes a known rejection, never Unknown. The runner only
+      encodes this decision; it does not infer acknowledgement from UI callbacks. *)
+  val acknowledge_mutation_request
+    : session -> request_id:request_id -> presentation:presentation
+    -> intent:mutation_intent -> original:receipt option -> (Service.request,error) result
 
   val reply
     :  session

@@ -979,6 +979,274 @@ let test_durable_readback_reservation () =
     "bounded intent keys admitted unreserved confirmation snapshots"
 ;;
 
+let test_recovery_cursor_and_capacity_bounds () =
+  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  let issuer,_,projection,session=fixture 1906L in
+  let module I=(val issuer:W.ISSUER) in
+  let make n=W.mutation_intent session ~mutation_id:(uuid(Printf.sprintf "98000000-0000-4000-8000-%012d" (2000+n)))
+    (W.Save_block{block=graph;title="bounded recovered item";
+      preconditions={blocks=[graph,"block-state:v1:synthetic"];pages=[];scopes=[]}}) |> Result.get_ok in
+  let item n=Wire.{intent=Bytes.to_string(W.encode_mutation_intent(make n));outcome=Unknown} in
+  let id=W.request_id(uuid "98000000-0000-4000-8000-000000001906") in
+  let request_id=uuid "98000000-0000-4000-8000-000000001906" in
+  let operation=W.Recover_mutations{after=None;maximum_items=1;maximum_bytes=W.maximum_mutation_recovery_bytes} in
+  let raw items next=S.Coordination_mutations_recovered{request_id;page=Wire.{items;next}} in
+  let page=match I.reply session ~request_id:id operation(raw(Rrbvec.singleton(item 1))(Some 1L)) with
+    | Ok(W.Answered(Ok page))->page|_->failwith "valid recovery cursor codec failed" in
+  check(W.validate_request session(W.Recover_mutations{after=page.next;maximum_items=1;maximum_bytes=W.maximum_mutation_recovery_bytes})=Ok())
+    "sealed recovery cursor lost same-budget ownership";
+  check(Result.is_error(W.validate_request session(W.Recover_mutations{after=page.next;maximum_items=2;
+    maximum_bytes=W.maximum_mutation_recovery_bytes}))) "recovery cursor adopted a new item budget";
+  let _,_,_,other=fixture 1907L in
+  check(Result.is_error(W.validate_request other(W.Recover_mutations{after=page.next;maximum_items=1;
+    maximum_bytes=W.maximum_mutation_recovery_bytes}))) "foreign session adopted recovery cursor";
+  check(Result.is_error(I.reply session ~request_id:id operation(raw Rrbvec.empty(Some 1L)))) "empty More became recovery completeness";
+  let after=W.Recover_mutations{after=page.next;maximum_items=1;maximum_bytes=W.maximum_mutation_recovery_bytes} in
+  check(Result.is_error(I.reply session ~request_id:id after(raw(Rrbvec.singleton(item 1))(Some 1L))))
+    "recovery cursor repeated without progress";
+  let many=W.Recover_mutations{after=None;maximum_items=70;maximum_bytes=W.maximum_mutation_recovery_bytes} in
+  check(Result.is_error(I.reply session ~request_id:id many(raw(Rrbvec.of_list[item 1;item 1])None)))
+    "duplicate recovered mutation identity was accepted";
+  let oversized=Wire.{intent=(item 1).intent;outcome=Rejected(P.V2_response{api_version=P.api_version;
+    request_id;outcome=V2_failed{code="conflict";message=String.make P.maximum_response_bytes 'x'}})} in
+  check(Result.is_error(I.reply session ~request_id:id operation(raw(Rrbvec.singleton oversized)None)))
+    "recovered rejection bypassed its reserved protocol-result budget";
+  let ticket,planned=C.request(ready I.binding projection)session many |> Result.get_ok in
+  let request_id=match I.request session ~request_id:(C.ticket_id ticket)many with
+    | Ok(S.Coordination_recover_mutations{request_id;_})->request_id|_->assert false in
+  let page=match I.reply session ~request_id:(C.ticket_id ticket)many
+    (S.Coordination_mutations_recovered{request_id;page=Wire.{items=Rrbvec.init 70 item;next=None}}) with
+    | Ok(W.Answered(Ok page))->page|_->failwith "valid bounded storage page failed codec" in
+  let state=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.of_int64 30L))).next in
+  let state=(C.step state(C.Completed(ticket,W.Answered(Ok page)))).next in
+  check(match C.reply(C.view state)ticket with Some(W.Answered(Error _))->true|_->false)
+    "over-capacity recovery silently skipped entries";
+  for n=0 to 69 do check(C.intent_progress(C.view state)(make n)=None) "failed recovery partially adopted its page" done
+;;
+
+let test_durable_recovery_and_ack_purity () =
+  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  let issuer,_,projection,session=fixture 1903L in
+  let module I=(val issuer:W.ISSUER) in
+  let intent=W.mutation_intent session ~mutation_id:(uuid "98000000-0000-4000-8000-000000001903")
+    (W.Save_block{block=graph;title="recovered choice";
+      preconditions={blocks=[graph,"block-state:v1:synthetic"];pages=[];scopes=[]}}) |> Result.get_ok in
+  let operation=W.Recover_mutations{after=None;maximum_items=8;maximum_bytes=W.maximum_mutation_recovery_bytes} in
+  let answer ticket progress =
+    let request_id=match I.request session ~request_id:(C.ticket_id ticket) operation with
+      | Ok(S.Coordination_recover_mutations{request_id;_})->request_id|_->failwith "recovery codec request" in
+    let outcome=if progress then Wire.Rejected(P.V2_response{api_version=P.api_version;request_id;
+      outcome=V2_failed{code="conflict";message="known not applied"}}) else Wire.Unknown in
+    match I.reply session ~request_id:(C.ticket_id ticket) operation
+      (S.Coordination_mutations_recovered{request_id;page=Wire.{items=Rrbvec.singleton
+        {intent=Bytes.to_string(W.encode_mutation_intent intent);outcome};next=None}}) with
+    | Ok(W.Answered(Ok page))->page|_->failwith "recovery codec response" in
+  let state=ref(ready I.binding projection) in
+  check(Result.is_error(C.request !state session(W.Acknowledge_intent intent))) "unknown intent admitted ACK";
+  let ticket,planned=match C.request !state session operation with
+    | Ok value->value|Error _->failwith "typed durable recovery has no pure planning" in
+  state:=planned.next;
+  check(Result.is_error(C.request !state session operation)) "parallel recovery bypassed response retention bound";
+  state:=(C.step !state(C.Admitted(ticket,Id.Worker.Request_id.of_int64 10L))).next;
+  state:=(C.step !state(C.Completed(ticket,W.Answered(Ok(answer ticket false))))).next;
+  check(C.intent_progress(C.view !state)intent=Some W.Outcome_unknown) "recovery did not retain Unknown";
+  check(Result.is_error(C.request !state session(W.Acknowledge_intent intent))) "recovered Unknown admitted ACK";
+  state:=(C.step !state(C.Forget ticket)).next;
+  let ticket,planned=C.request !state session operation |> Result.get_ok in
+  state:=planned.next;
+  state:=(C.step !state(C.Admitted(ticket,Id.Worker.Request_id.of_int64 11L))).next;
+  state:=(C.step !state(C.Completed(ticket,W.Answered(Ok(answer ticket true))))).next;
+  check(match C.intent_progress(C.view !state)intent with Some(W.Rejected _)->true|_->false)
+    "known rejection was lost during recovery";
+  state:=(C.step !state(C.Forget ticket)).next;
+  let stale,planned=C.request !state session operation |> Result.get_ok in
+  state:=planned.next;
+  state:=(C.step !state(C.Admitted(stale,Id.Worker.Request_id.of_int64 12L))).next;
+  let ack,planned=C.request !state session(W.Acknowledge_intent intent) |> Result.get_ok in
+  check(match C.ticket_acknowledgement ack with Some(_,None)->true|_->false)
+    "known rejection ACK did not carry the pure no-commit decision";
+  state:=planned.next;
+  state:=(C.step !state(C.Admitted(ack,Id.Worker.Request_id.of_int64 13L))).next;
+  state:=(C.step !state(C.Completed(ack,W.Interrupted W.Transport_lost))).next;
+  check(C.intent_progress(C.view !state)intent<>None) "interrupted ACK erased durable ownership";
+  state:=(C.step !state(C.Forget ack)).next;
+  let ack,planned=C.request !state session(W.Acknowledge_intent intent) |> Result.get_ok in
+  state:=planned.next;
+  state:=(C.step !state(C.Admitted(ack,Id.Worker.Request_id.of_int64 14L))).next;
+  state:=(C.step !state(C.Completed(ack,W.Answered(Ok())))).next;
+  check(C.intent_progress(C.view !state)intent=None) "true durable ACK did not free coordination capacity";
+  state:=(C.step !state(C.Completed(stale,W.Answered(Ok(answer stale true))))).next;
+  check(C.intent_progress(C.view !state)intent=None) "old recovery resurrected an acknowledged intent";
+  check(match C.reply(C.view !state)stale with Some(W.Answered(Error _))->true|_->false)
+    "stale recovery was exposed as a current pending page"
+;;
+
+let test_committed_ack_requires_current_confirmation () =
+  let issuer,_,projection,session=fixture 1905L in
+  let module I=(val issuer:W.ISSUER) in
+  let presentation=Option.get(W.selected projection) in
+  let intent=W.mutation_intent session ~mutation_id:(uuid "98000000-0000-4000-8000-000000001905")
+    (W.Save_block{block=graph;title="confirmed choice";
+      preconditions={blocks=[graph,"block-state:v1:synthetic"];pages=[];scopes=[]}}) |> Result.get_ok in
+  let ticket,planned=C.request(ready I.binding projection)session(W.Mutate intent) |> Result.get_ok in
+  let request_id=match I.request session ~request_id:(C.ticket_id ticket)(W.Mutate intent) with
+    | Ok(S.Coordination_mutation{request_id;_})->request_id|_->assert false in
+  let receipt=I.mutation_receipt session ~request_id:(C.ticket_id ticket) ~intent
+    (P.V2_response{api_version=P.api_version;request_id;outcome=V2_mutation_committed
+      {mutation_id=W.mutation_intent_id intent;status=V2_applied;generation="generation:v1:1:1";
+       before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"}}) |> Result.get_ok in
+  let state=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.of_int64 20L))).next in
+  let state=(C.step state(C.Completed(ticket,W.Answered(Ok(W.Committed_pending_presentation receipt))))).next in
+  check(Result.is_error(C.request state session(W.Acknowledge_intent intent))) "unconfirmed commit admitted ACK";
+  let confirmation=I.confirmation session ~presentation receipt(P.V2_response
+    {api_version=P.api_version;request_id;outcome=V2_block_summary_outcome
+      {lookup=V2_missing_block{uuid=graph;revision="block-state:v1:missing"};page=None;items=[];next_cursor=None;
+       scope_revision="scope-revision:v1:missing";generation="generation:v1:1:1";projection_revision="projection:v1:1"}})
+    |> Result.get_ok in
+  let confirm,planned=C.request state session(W.Confirm(presentation,receipt)) |> Result.get_ok in
+  let state=(C.step planned.next(C.Admitted(confirm,Id.Worker.Request_id.of_int64 21L))).next in
+  let state=(C.step state(C.Completed(confirm,W.Answered(Ok(W.Confirmed confirmation))))).next in
+  let ack,planned=match C.request state session(W.Acknowledge_intent intent) with
+    | Ok value->value|Error _->failwith "current Confirmed intent could not plan ACK" in
+  check(match C.ticket_acknowledgement ack with Some(actual,Some proof)->
+    actual=presentation && W.receipt_revisions proof=W.receipt_revisions receipt|_->false)
+    "ACK did not capture exact presentation and original proof";
+  let admitted=(C.step planned.next(C.Admitted(ack,Id.Worker.Request_id.of_int64 22L))).next in
+  let retired=(C.step admitted C.Shutdown_requested).next in
+  let late=(C.step retired(C.Completed(ack,W.Answered(Ok())))).next in
+  check(C.intent_progress(C.view late)intent<>None) "old execution ACK erased current recovery ownership";
+  let completed=(C.step admitted(C.Completed(ack,W.Answered(Ok())))).next in
+  check(C.intent_progress(C.view completed)intent=None) "confirmed ACK retained completed intent";
+  let retry,planned=C.request state session(W.Mutate intent) |> Result.get_ok in
+  let again,planned=C.request planned.next session(W.Confirm(presentation,receipt)) |> Result.get_ok in
+  let other=W.mutation_intent session ~mutation_id:(uuid "98000000-0000-4000-8000-000000001908")
+    (W.Save_block{block=graph;title="independent accepted write";
+      preconditions={blocks=[graph,"block-state:v1:synthetic"];pages=[];scopes=[]}}) |> Result.get_ok in
+  let independent,planned=C.request planned.next session(W.Mutate other) |> Result.get_ok in
+  let old_ack,planned=C.request planned.next session(W.Acknowledge_intent intent) |> Result.get_ok in
+  let ack,planned=C.request planned.next session(W.Acknowledge_intent intent) |> Result.get_ok in
+  let state=(C.step planned.next(C.Admitted(retry,Id.Worker.Request_id.of_int64 23L))).next in
+  let state=(C.step state(C.Admitted(again,Id.Worker.Request_id.of_int64 24L))).next in
+  let state=(C.step state(C.Admitted(independent,Id.Worker.Request_id.of_int64 25L))).next in
+  let state=(C.step state(C.Admitted(old_ack,Id.Worker.Request_id.of_int64 28L))).next in
+  let state=(C.step state(C.Admitted(ack,Id.Worker.Request_id.of_int64 26L))).next in
+  let acknowledged=(C.step state(C.Completed(ack,W.Answered(Ok())))).next in
+  let late=(C.step acknowledged(C.Completed(retry,W.Answered(Ok(W.Committed_pending_presentation receipt))))).next in
+  check(C.intent_progress(C.view late)intent=None) "pre-ACK mutation completion resurrected settled intent";
+  check(match C.reply(C.view late)retry with Some(W.Answered(Error _))->true|_->false)
+    "pre-ACK mutation completion was published as fresh ownership";
+  let late=(C.step acknowledged(C.Completed(retry,W.Interrupted W.Transport_lost))).next in
+  check(C.intent_progress(C.view late)intent=None) "pre-ACK interruption resurrected Unknown intent";
+  let late=(C.step acknowledged(C.Completed(again,W.Answered(Ok(W.Confirmed confirmation))))).next in
+  check(C.intent_progress(C.view late)intent=None) "pre-ACK confirmation resurrected settled intent";
+  let request_id=match I.request session ~request_id:(C.ticket_id independent)(W.Mutate other) with
+    | Ok(S.Coordination_mutation{request_id;_})->request_id|_->assert false in
+  let other_receipt=I.mutation_receipt session ~request_id:(C.ticket_id independent) ~intent:other
+    (P.V2_response{api_version=P.api_version;request_id;outcome=V2_mutation_committed
+      {mutation_id=W.mutation_intent_id other;status=V2_applied;generation="generation:v1:1:1";
+       before_projection_revision="projection:v1:1";after_projection_revision="projection:v1:2"}}) |> Result.get_ok in
+  let other_done=(C.step acknowledged(C.Completed(independent,W.Answered(Ok(W.Committed_pending_presentation other_receipt))))).next in
+  check(match C.intent_progress(C.view other_done)other with Some(W.Committed_pending_presentation _)->true|_->false)
+    "ACK of another intent discarded an independent accepted write";
+  let fresh,planned=C.request acknowledged session(W.Mutate intent) |> Result.get_ok in
+  let fresh_admitted=(C.step planned.next(C.Admitted(fresh,Id.Worker.Request_id.of_int64 27L))).next in
+  let fresh_done=(C.step fresh_admitted(C.Completed(fresh,W.Answered(Ok(W.Committed_pending_presentation receipt))))).next in
+  check(C.intent_progress(C.view fresh_done)intent<>None) "explicit request planned after ACK was confused with an old completion";
+  let stale_ack=(C.step fresh_done(C.Completed(old_ack,W.Answered(Ok())))).next in
+  check(C.intent_progress(C.view stale_ack)intent<>None) "old ACK retired a newly reconciled intent lifecycle";
+  check(match C.reply(C.view stale_ack)old_ack with Some(W.Answered(Error _))->true|_->false)
+    "old ACK was published as the current lifecycle settlement";
+  let run actions =
+    let state=ref fresh_done in
+    List.iter(fun action->
+      let event=match action with
+        | 0->C.Completed(retry,W.Answered(Ok(W.Committed_pending_presentation receipt)))
+        | 1->C.Completed(retry,W.Interrupted W.Transport_lost)
+        | 2->C.Cancel retry | 3->C.Forget retry
+        | 4->C.Completed(again,W.Answered(Ok(W.Confirmed confirmation)))
+        | 5->C.Completed(again,W.Interrupted W.Transport_lost)
+        | 6->C.Cancel again | 7->C.Forget again
+        | 8->C.Completed(old_ack,W.Answered(Ok()))
+        | 9->C.Completed(old_ack,W.Interrupted W.Transport_lost)
+        | 10->C.Cancel old_ack | 11->C.Forget old_ack
+        | 12->C.Completed(independent,W.Answered(Ok(W.Committed_pending_presentation other_receipt)))
+        | _->C.Drain in
+      let before=C.view !state in
+      let first=C.step !state event and second=C.step !state event in
+      check(C.equal_view before(C.view !state)) "retired intent step mutated old view";
+      check(C.equal_view(C.view first.next)(C.view second.next)) "retired intent step nondeterministic";
+      state:=first.next;
+      check(C.intent_progress(C.view !state)intent=Some(W.Committed_pending_presentation receipt))
+        "late pre-ACK event replaced the explicitly rebuilt lifecycle";
+      check(C.intent_progress(C.view !state)other<>None) "retirement of another intent lost accepted evidence")actions in
+  for seed=0 to 199 do
+    let random=Random.State.make[|0xAC20;seed|] in
+    let prefix=Array.of_list(if seed mod 2=0 then [0;4;8;12] else [1;5;9;12]) in
+    for n=Array.length prefix-1 downto 1 do let j=Random.State.int random(n+1) in
+      let old=prefix.(n) in prefix.(n)<-prefix.(j);prefix.(j)<-old done;
+    let actions=Array.to_list prefix@List.init 64(fun _->Random.State.int random 14) in
+    let fails actions=try run actions;false with _->true in
+    if fails actions then let minimal=shrink fails actions in
+      failwith(Printf.sprintf "retired-intent seed=%d shrunk=%s" seed
+        (String.concat ","(List.map string_of_int minimal)))
+  done
+;;
+
+let test_durable_recovery_ack_properties () =
+  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  let issuer,_,projection,session=fixture 1904L in
+  let module I=(val issuer:W.ISSUER) in
+  let intent=W.mutation_intent session ~mutation_id:(uuid "98000000-0000-4000-8000-000000001904")
+    (W.Save_block{block=graph;title="property choice";
+      preconditions={blocks=[graph,"block-state:v1:synthetic"];pages=[];scopes=[]}}) |> Result.get_ok in
+  let operation=W.Recover_mutations{after=None;maximum_items=1;maximum_bytes=W.maximum_mutation_recovery_bytes} in
+  let run trace =
+    let state=ref(ready I.binding projection) and reads=ref [] and acks=ref [] and settled=ref false in
+    let step event =
+      let before=C.view !state in
+      let first=C.step !state event and again=C.step !state event in
+      check(C.equal_view(C.view first.next)(C.view again.next)) "lifecycle step nondeterministic";
+      check(C.equal_view before(C.view !state)) "lifecycle step mutated previous state";
+      state:=first.next;
+      List.iter(fun ticket->if C.reply(C.view !state)ticket=Some(W.Answered(Ok())) then settled:=true)!acks;
+      if !settled then check(C.intent_progress(C.view !state)intent=None) "late event revived acknowledged intent" in
+    let read n f=Option.iter f(List.nth_opt !reads(n mod max 1(List.length !reads))) in
+    let ack n f=Option.iter f(List.nth_opt !acks(n mod max 1(List.length !acks))) in
+    List.iter(fun(op,n)->match op with
+      | 0->(match C.request !state session operation with Error _->()|Ok(ticket,next)->
+          state:=next.next;reads:=(ticket,!settled)::List.take 7 !reads)
+      | 1->read n(fun(ticket,_)->step(C.Admitted(ticket,Id.Worker.Request_id.of_int64(Int64.of_int(100+n)))))
+      | 2 | 3->read n(fun(ticket,after_ack)->
+          let request_id=match I.request session ~request_id:(C.ticket_id ticket)operation with
+            | Ok(S.Coordination_recover_mutations{request_id;_})->request_id|_->assert false in
+          let items=if after_ack then Rrbvec.empty else Rrbvec.singleton Wire.{intent=Bytes.to_string(W.encode_mutation_intent intent);
+            outcome=(if op=2 then Unknown else Rejected(P.V2_response{api_version=P.api_version;request_id;
+              outcome=V2_failed{code="conflict";message="known rejection"}}))} in
+          let reply=I.reply session ~request_id:(C.ticket_id ticket)operation
+            (S.Coordination_mutations_recovered{request_id;page=Wire.{items;next=None}}) |> Result.get_ok in
+          step(C.Completed(ticket,reply)))
+      | 4->read n(fun(ticket,_)->step(C.Forget ticket))
+      | 5->(match C.request !state session(W.Acknowledge_intent intent) with Error _->()|Ok(ticket,next)->
+          check(match C.intent_progress(C.view !state)intent with Some(W.Rejected _)->true|_->false)
+            "ACK admitted without known settled evidence";
+          state:=next.next;acks:=ticket::List.take 7 !acks)
+      | 6->ack n(fun ticket->step(C.Admitted(ticket,Id.Worker.Request_id.of_int64(Int64.of_int(200+n)))))
+      | 7->ack n(fun ticket->step(C.Completed(ticket,W.Answered(Ok()))))
+      | 8->ack n(fun ticket->step(C.Completed(ticket,W.Interrupted W.Transport_lost)))
+      | 9->ack n(fun ticket->step(C.Cancel ticket))
+      | 10->ack n(fun ticket->step(C.Forget ticket))
+      | _->step C.Drain)trace in
+  let prefix=[0,0;1,0;3,0;4,0;0,0;1,0;5,0;6,0;7,0;3,0] in
+  for seed=0 to 199 do
+    let random=Random.State.make[|0xAC19;seed|] in
+    let trace=prefix@List.init 64(fun _->Random.State.int random 12,Random.State.int random 8) in
+    let fails trace=try run trace;false with _->true in
+    if fails trace then let minimal=shrink fails trace in
+      failwith(Printf.sprintf "recovery-ack seed=%d shrunk=%s" seed
+        (String.concat ","(List.map(fun(op,n)->Printf.sprintf "%d:%d" op n)minimal)))
+  done
+;;
+
 let test_observation_planning_is_pure () =
   let issuer, _, projection, session = fixture 720L in
   let module I = (val issuer : W.ISSUER) in
@@ -3021,6 +3289,10 @@ let test_change_application_properties () =
 ;;
 
 let () =
+  test_recovery_cursor_and_capacity_bounds ();
+  test_durable_recovery_and_ack_purity ();
+  test_committed_ack_requires_current_confirmation ();
+  test_durable_recovery_ack_properties ();
   test_dependency_read_waits_for_capacity ();
   test_live_binding_invalidation_is_pure ();
   test_changes_serial_and_ack_capacity ();
@@ -3051,5 +3323,5 @@ let () =
   test_opening_query_retires_on_removal ();
   print_endline
     "Pure coordinator: invariants, 500 lifecycle + 250 queued-read + 250 durable traces, \
-     100 ownership + 300 observation + 250 application + 200 live-binding traces and shrinking passed"
+     100 ownership + 300 observation + 250 application + 200 live-binding + 200 recovery/ACK + 200 retired-intent traces and shrinking passed"
 ;;

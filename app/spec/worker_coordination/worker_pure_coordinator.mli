@@ -14,6 +14,10 @@ val bootstrap : view -> Worker.bootstrap_state
 val projection : view -> Worker.projection option
 val mutation_progress : view -> Worker.append_intent -> Worker.mutation_progress option
 val intent_progress : view -> Worker.mutation_intent -> Worker.mutation_progress option
+
+(** Immutable acknowledgement decision captured while planning this ticket.
+    The effect interpreter forwards it without consulting a later UI/view. *)
+val ticket_acknowledgement : unit ticket -> (Worker.presentation * Worker.receipt option) option
 val import_progress : view -> Worker.asset_import_intent -> Worker.import_progress option
 val handoff : view -> Worker.handoff_id -> Worker.handoff_state option
 val asset_notices : view -> Worker.asset_consumer -> Worker.asset_notice list

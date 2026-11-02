@@ -15,6 +15,7 @@ type _ kind =
   | Unit : unit kind
   | Observed : 'a kind -> 'a Worker.observed kind
   | Mutation : Worker.mutation_progress kind
+  | Recovery : Worker.mutation_recovery kind
   | Info : Worker.graph_info kind
   | Admission : Worker.Protocol.v2_admission_inspection kind
   | Journal : Worker.page option kind
@@ -60,6 +61,7 @@ let rec same_kind : type a b. a kind -> b kind -> (a, b) Worker.equality option 
   | Change_ack, Change_ack -> Some Refl
   | Unit, Unit -> Some Refl
   | Mutation, Mutation -> Some Refl
+  | Recovery, Recovery -> Some Refl
   | Info, Info -> Some Refl
   | Admission, Admission -> Some Refl
   | Journal, Journal -> Some Refl
@@ -96,6 +98,8 @@ type 'a ticket =
   ; kind : 'a kind
   ; query : 'a planned
   ; target : query_target
+  ; planned_intent_epoch : int64
+  ; acknowledgement : (Worker.presentation * Worker.receipt option) option
   }
 
 type 'a slot =
@@ -110,6 +114,7 @@ type 'a slot =
   ; early : 'a Worker.reply option
   ; cancelled : bool
   ; forgotten : bool
+  ; retired_by_ack : bool
   }
 
 type entry = Entry : 'a slot -> entry
@@ -169,6 +174,7 @@ type view =
   ; handoffs : (Worker.handoff_id * Worker.handoff_state) list
   ; shutdown : shutdown_state
   ; intents : Worker.mutation_progress Intents.t
+  ; intent_epoch : int64
   ; applications : application_state Graphs.t
   ; change_notices : (Worker.session * Id.push_sequence) Graphs.t
   ; change_projections : string Graphs.t
@@ -223,6 +229,7 @@ let initial ~client_id =
       ; handoffs = []
       ; shutdown = Active
       ; intents = Intents.empty
+      ; intent_epoch = 0L
       ; applications = Graphs.empty
       ; change_notices = Graphs.empty
       ; change_projections = Graphs.empty
@@ -270,12 +277,14 @@ let handoff v id =
 let asset_notices _ _ = []
 let session_asset_notices _ _ = []
 let ticket_id ticket = ticket.id
+let ticket_acknowledgement ticket = ticket.acknowledgement
 
 let same_ticket : type a b. a ticket -> b ticket -> (a, b) Worker.equality option =
   fun a b ->
   match same_kind a.kind b.kind with
   | Some Worker.Refl
-    when Worker.equal_request_id a.id b.id && a.target = b.target && a.query = b.query ->
+    when Worker.equal_request_id a.id b.id && a.target = b.target && a.query = b.query
+         && a.planned_intent_epoch=b.planned_intent_epoch && a.acknowledgement=b.acknowledgement ->
     Some Refl
   | _ -> None
 ;;
@@ -434,6 +443,7 @@ let equal_entry (Entry a) (Entry b) =
     && a.early = b.early
     && a.cancelled = b.cancelled
     && a.forgotten = b.forgotten
+    && a.retired_by_ack = b.retired_by_ack
   | None -> false
 ;;
 
@@ -444,6 +454,7 @@ let equal_view a b =
       && a.handoffs = b.handoffs
       && a.shutdown = b.shutdown
       && a.intents = b.intents
+      && a.intent_epoch = b.intent_epoch
       && Graphs.equal ( = ) a.applications b.applications
       && Graphs.equal ( = ) a.change_notices b.change_notices
       && Graphs.equal String.equal a.change_projections b.change_projections
@@ -1055,6 +1066,47 @@ let receipt_agrees facts intent receipt =
        (known_receipt facts key)
 ;;
 
+let intent_capacity intents =
+  let bytes=Intents.fold(fun key _ total->total+String.length key)intents 0 in
+  Intents.cardinal intents<=256 && bytes<=4194304
+  && bytes+(Intents.cardinal intents*Worker.Protocol.maximum_response_bytes)<=16777216
+;;
+
+let recovered_intents facts session (page:Worker.mutation_recovery) =
+  let merged=Rrbvec.fold_left(fun result (item:Worker.recovered_mutation)->
+    Result.bind result(fun intents->
+      Result.bind(Worker.validate_request session(Worker.Mutate item.intent))(fun()->
+        let key=intent_key item.intent in
+        let old=Intents.find_opt key intents in
+        let valid=match old,item.progress with
+          | _,Worker.Confirmed _ -> false
+          | Some(Worker.Rejected _),Worker.Committed_pending_presentation _ -> false
+          | Some(Worker.Committed_pending_presentation _|Confirmed _),Worker.Rejected _ -> false
+          | _,Worker.Committed_pending_presentation receipt -> receipt_agrees facts item.intent receipt
+          | _->true in
+        if not valid then Error(Worker.Protocol_mismatch "Recovered intent replaced settled evidence") else
+        let progress=match old,item.progress with
+          | Some((Worker.Rejected _|Committed_pending_presentation _|Confirmed _) as known),Worker.Outcome_unknown->known
+          | Some(Worker.Confirmed _ as known),Worker.Committed_pending_presentation _->known
+          | _,progress->progress in
+        Ok(Intents.add key progress intents))))(Ok facts.intents)page.items in
+  Result.bind merged(fun intents->if intent_capacity intents then Ok intents
+    else Error(Worker.Invalid_input "Recovered intent coordination capacity exhausted"))
+;;
+
+let retire_intent_attempts entries intent =
+  let key=intent_key intent in
+  let matches actual=actual==intent ||
+    (Worker.Uuid.equal(Worker.mutation_intent_id actual)(Worker.mutation_intent_id intent)
+     && intent_key actual=key) in
+  Slots.map(fun (Entry slot as entry)->
+    let same_intent=match slot.ticket.query with
+      | Operation(Worker.Mutate actual|Acknowledge_intent actual)->matches actual
+      | Operation(Worker.Confirm(_,receipt))->matches(Worker.receipt_intent receipt)
+      | _->false in
+    if slot.result=None && same_intent then Entry{slot with retired_by_ack=true} else entry)entries
+;;
+
 let checked_result : type a. view -> a ticket -> a Worker.reply -> a Worker.reply =
   fun facts ticket result ->
   let mismatch () =
@@ -1064,6 +1116,16 @@ let checked_result : type a. view -> a ticket -> a Worker.reply -> a Worker.repl
             "Mutation receipt identity or original point does not match its ticket"))
   in
   match ticket.query, result with
+  | Operation(Worker.Recover_mutations parameters),Worker.Answered(Ok page)->
+    if ticket.planned_intent_epoch<>facts.intent_epoch
+    then Worker.Answered(Error(Worker.Stale_read "Recovery predates a settled intent acknowledgement"))
+    else (match ticket.target with
+      | Direct session->
+        let valid=Worker.validate_request session(Worker.Recover_mutations
+          {parameters with after=page.next}) in
+        (match Result.bind valid(fun()->recovered_intents facts session page) with
+         | Ok _->result|Error error->Worker.Answered(Error error))
+      | _->Worker.Answered(Error(Worker.Protocol_mismatch "Recovery has no execution owner")))
   | Read (Worker.Changes _), Worker.Answered _
     when match Slots.find_opt ticket.serial facts.entries with
          | Some (Entry { origin = Some (session, _); change_version = sent; _ }) ->
@@ -1471,7 +1533,9 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
             && (slot.early = None || not require_admission)
             && (require_admission || slot.admitted = None)
             && slot.dispatched ->
-       let result = checked_result state.facts ticket result in
+       let result = if slot.retired_by_ack
+         then Worker.Answered(Error(Worker.Stale_read "This intent attempt predates its durable acknowledgement"))
+         else checked_result state.facts ticket result in
        if require_admission && slot.admitted = None
        then (
          let state =
@@ -1505,7 +1569,7 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
          in
          let state = retain_change_result state ticket result in
          let intents : Worker.mutation_progress Intents.t =
-           match ticket.query with
+           if slot.retired_by_ack then state.facts.intents else match ticket.query with
            | Operation (Worker.Mutate intent) ->
              let key = intent_key intent in
              let previous = Intents.find_opt key state.facts.intents in
@@ -1542,8 +1606,24 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
                     key
                     (Worker.Committed_pending_presentation receipt)
                     state.facts.intents)
+           | Operation(Worker.Recover_mutations _)->
+             (match result,ticket.target with
+              | Worker.Answered(Ok page),Direct session
+                when state.lifecycle=Running && current_target state.facts ticket.target ->
+                (match recovered_intents state.facts session page with Ok intents->intents|Error _->state.facts.intents)
+              | _->state.facts.intents)
+           | Operation(Worker.Acknowledge_intent intent)->
+             (match result with
+              | Worker.Answered(Ok()) when state.lifecycle=Running && current_target state.facts ticket.target->
+                Intents.remove(intent_key intent)state.facts.intents
+              | _->state.facts.intents)
            | _ -> state.facts.intents
          in
+         let intent_epoch=match ticket.query,result with
+           | Operation(Worker.Acknowledge_intent intent),Worker.Answered(Ok())
+             when Intents.mem(intent_key intent)state.facts.intents && not(Intents.mem(intent_key intent)intents)->
+             Int64.succ state.facts.intent_epoch
+           | _->state.facts.intent_epoch in
          let result =
            let cancelled_observe =
              match ticket.query with
@@ -1556,16 +1636,20 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
            then result
            else Worker.Answered (Error Worker.Revoked_session)
          in
+         let previous_entries=match ticket.query with
+           | Operation(Worker.Acknowledge_intent intent) when intent_epoch<>state.facts.intent_epoch->
+             retire_intent_attempts state.facts.entries intent
+           | _->state.facts.entries in
          let entries =
            if slot.forgotten
-           then Slots.remove ticket.serial state.facts.entries
+           then Slots.remove ticket.serial previous_entries
            else
              Slots.add
                ticket.serial
                (Entry { slot with result = Some result; early = None })
-               state.facts.entries
+               previous_entries
          in
-         settle { state with facts = { state.facts with entries; intents } } [])
+         settle { state with facts = { state.facts with entries; intents; intent_epoch } } [])
      | _ -> unchanged state)
   | None -> unchanged state
 ;;
@@ -2257,6 +2341,8 @@ let plan_refresh ?(internal = false) (state : t) session handle =
         { id = Worker.request_id (identity state.client serial)
         ; serial
         ; kind = Observed (kind owned.obs_query)
+        ; planned_intent_epoch = state.facts.intent_epoch
+        ; acknowledgement = None
         ; query = Operation (Worker.Refresh handle)
         ; target = Sealed (session, owned.obs_budget)
         }
@@ -2273,6 +2359,7 @@ let plan_refresh ?(internal = false) (state : t) session handle =
         ; early = None
         ; cancelled = false
         ; forgotten = internal
+        ; retired_by_ack = false
         }
       in
       let facts =
@@ -2432,6 +2519,8 @@ let plan_mutation
       { id = Worker.request_id (identity state.client serial)
       ; serial
       ; kind = Mutation
+      ; planned_intent_epoch = state.facts.intent_epoch
+      ; acknowledgement = None
       ; query = Operation operation
       ; target
       }
@@ -2447,6 +2536,7 @@ let plan_mutation
       ; result = None
       ; early = None
       ; cancelled = false
+      ; retired_by_ack = false
       ; forgotten = false
       }
     in
@@ -2474,6 +2564,43 @@ let plan_mutation
       ))
 ;;
 
+let plan_intent_lifecycle
+  : type a. t -> Worker.session -> a Worker.request -> a kind -> query_target
+    -> (Worker.presentation * Worker.receipt option) option
+    -> (a ticket * transition,Worker.error) result
+  = fun state session operation kind target acknowledgement ->
+  if state.next=Int64.max_int then Error(Worker.Invalid_input "Request counter exhausted") else
+  let serial=Int64.succ state.next in
+  let ticket={id=Worker.request_id(identity state.client serial);serial;kind;query=Operation operation;target;
+    planned_intent_epoch=state.facts.intent_epoch;acknowledgement} in
+  let slot={ticket;wait_for_capacity=false;dispatched=true;admitted=None;change_version=0L;
+    sample_epoch=None;origin=None;result=None;early=None;cancelled=false;forgotten=false;retired_by_ack=false} in
+  let facts={state.facts with entries=Slots.add serial(Entry slot)state.facts.entries} in
+  Ok(ticket,changed{state with next=serial;facts}[Send(ticket,session,operation)])
+;;
+
+let plan_recovery state session operation =
+  let retained=Slots.exists(fun _ (Entry slot)->match slot.ticket.query with
+    | Operation(Worker.Recover_mutations _)->true|_->false)state.facts.entries in
+  if retained then Error(Worker.Invalid_input "Release the previous recovery ticket before paging")
+  else plan_intent_lifecycle state session operation Recovery (Direct session) None
+;;
+
+let plan_intent_ack state session intent =
+  if state.facts.intent_epoch=Int64.max_int then Error(Worker.Invalid_input "Intent lifecycle counter exhausted") else
+  match Option.bind state.facts.current Worker.selected with
+  | Some presentation when Worker.equal_session session(Worker.presentation_session presentation)->
+    let proof=match Intents.find_opt(intent_key intent)state.facts.intents with
+      | Some(Worker.Rejected _)->Ok None
+      | Some(Worker.Confirmed confirmation)
+        when Worker.confirmation_presentation confirmation=presentation->
+        Ok(Some(Worker.confirmation_receipt confirmation))
+      | _->Error(Worker.Invalid_input "Acknowledge only an applied rejection or current confirmation") in
+    Result.bind proof(fun original->plan_intent_lifecycle state session(Worker.Acknowledge_intent intent)
+      Unit (Presentation presentation)(Some(presentation,original)))
+  | _->Error Worker.Revoked_session
+;;
+
 let plan_observation (state : t) session budget query =
   if
     state.next = Int64.max_int
@@ -2488,6 +2615,8 @@ let plan_observation (state : t) session budget query =
       { id = Worker.request_id (identity state.client serial)
       ; serial
       ; kind = Observed (kind query)
+      ; planned_intent_epoch = state.facts.intent_epoch
+      ; acknowledgement = None
       ; query = Operation (Worker.Observe (budget, query))
       ; target = Sealed (session, budget)
       }
@@ -2503,6 +2632,7 @@ let plan_observation (state : t) session budget query =
       ; result = None
       ; early = None
       ; cancelled = false
+      ; retired_by_ack = false
       ; forgotten = false
       }
     in
@@ -2568,6 +2698,8 @@ let plan_release state session handle =
       { id = Worker.request_id (identity state.client serial)
       ; serial
       ; kind = Unit
+      ; planned_intent_epoch = state.facts.intent_epoch
+      ; acknowledgement = None
       ; query = Operation (Worker.Release handle)
       ; target = Cleanup session
       }
@@ -2583,6 +2715,7 @@ let plan_release state session handle =
       ; result = (if acknowledged then Some (Worker.Answered (Ok ())) else None)
       ; early = None
       ; cancelled = false
+      ; retired_by_ack = false
       ; forgotten = false
       }
     in
@@ -2622,6 +2755,8 @@ let plan_change_ack state session batch =
       { id = Worker.request_id (identity state.client serial)
       ; serial
       ; kind = Change_ack
+      ; planned_intent_epoch = state.facts.intent_epoch
+      ; acknowledgement = None
       ; query = Operation (Worker.Acknowledge_changes batch)
       ; target = Direct session
       }
@@ -2637,6 +2772,7 @@ let plan_change_ack state session batch =
       ; result = None
       ; early = None
       ; cancelled = false
+      ; retired_by_ack = false
       ; forgotten = false
       }
     in
@@ -2668,6 +2804,8 @@ let request
               plan_observation state session budget query
             | Worker.Refresh handle -> plan_refresh state session handle
             | Worker.Acknowledge_changes batch -> plan_change_ack state session batch
+            | Worker.Recover_mutations _ -> plan_recovery state session operation
+            | Worker.Acknowledge_intent intent -> plan_intent_ack state session intent
             | Worker.Query (budget, query) ->
               Result.bind
                 (validate_change_query state.facts session budget query)
@@ -2680,6 +2818,8 @@ let request
                        { id = Worker.request_id (identity state.client serial)
                        ; serial
                        ; kind = kind query
+                       ; planned_intent_epoch = state.facts.intent_epoch
+                       ; acknowledgement = None
                        ; query = Read query
                        ; target = Sealed (session, budget)
                        }
@@ -2703,6 +2843,7 @@ let request
                        ; result = None
                        ; early = None
                        ; cancelled = false
+                       ; retired_by_ack = false
                        ; forgotten = false
                        }
                      in
@@ -2805,6 +2946,8 @@ let plan_query_internal
       { id = Worker.request_id (identity state.client serial)
       ; serial
       ; kind = kind query
+      ; planned_intent_epoch = state.facts.intent_epoch
+      ; acknowledgement = None
       ; query = Read query
       ; target
       }
@@ -2820,6 +2963,7 @@ let plan_query_internal
       ; result = None
       ; early = None
       ; cancelled = false
+      ; retired_by_ack = false
       ; forgotten = false
       }
     in

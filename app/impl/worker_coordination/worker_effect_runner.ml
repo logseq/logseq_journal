@@ -141,7 +141,14 @@ let submit t = function
        t.post (Core.Worker_bound I.binding))
   | Send (ticket, session, operation) ->
     let module I = (val t.issuer : Worker.ISSUER) in
-    (match I.request session ~request_id:(Core.ticket_id ticket) operation with
+    let request=match operation with
+      | Worker.Acknowledge_intent intent->
+        (match Core.ticket_acknowledgement ticket with
+         | Some(presentation,original)->I.acknowledge_mutation_request session
+             ~request_id:(Core.ticket_id ticket) ~presentation ~intent ~original
+         | None->Error(Worker.Invalid_input "The pure acknowledgement decision is missing"))
+      | _->I.request session ~request_id:(Core.ticket_id ticket) operation in
+    (match request with
      | Error e -> t.post (Core.Admission_failed (ticket, e))
      | Ok request ->
        (match admit t request (Query (t.issuer, ticket, session, operation)) with

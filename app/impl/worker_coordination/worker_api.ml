@@ -296,6 +296,13 @@ type mutation_progress =
   | Committed_pending_presentation of receipt
   | Confirmed of confirmation
 
+type mutation_recovery_cursor =
+  { recovery_owner : session; after : int64; maximum_items : int; maximum_bytes : int }
+type recovered_mutation = { intent : mutation_intent; progress : mutation_progress }
+type mutation_recovery = { items : recovered_mutation Rrbvec.t; next : mutation_recovery_cursor option }
+
+let maximum_mutation_recovery_bytes = Wire.maximum_recovery_bytes
+
 type admission_error =
   | Full
   | Not_ready
@@ -373,6 +380,10 @@ type _ request =
   | Append : append_intent -> mutation_progress request
   | Mutate : mutation_intent -> mutation_progress request
   | Confirm : presentation * receipt -> mutation_progress request
+  | Recover_mutations :
+      { after : mutation_recovery_cursor option; maximum_items : int; maximum_bytes : int }
+      -> mutation_recovery request
+  | Acknowledge_intent : mutation_intent -> unit request
   | Acknowledge_changes : change_batch -> change_ack request
   | Import : asset_import_intent -> import_progress request
   | Replace_asset_demand :
@@ -486,6 +497,10 @@ module type ISSUER = sig
     -> request_id:request_id
     -> 'a request
     -> (Service.request, error) result
+
+  val acknowledge_mutation_request
+    : session -> request_id:request_id -> presentation:presentation
+    -> intent:mutation_intent -> original:receipt option -> (Service.request,error) result
 
   val reply
     :  session
@@ -704,10 +719,10 @@ let validate_intent session intent =
   |> Result.map (fun _ -> ())
 ;;
 
-let receipt_intent receipt = receipt.intent
-let receipt_mutation_id receipt = Wire.mutation_id receipt.intent
+let receipt_intent (receipt:receipt) = receipt.intent
+let receipt_mutation_id (receipt:receipt) = Wire.mutation_id receipt.intent
 let receipt_revisions receipt = receipt.generation, receipt.before, receipt.after
-let receipt_targets receipt = Wire.targets receipt.intent
+let receipt_targets (receipt:receipt) = Wire.targets receipt.intent
 
 let decode_mutation_receipt session ~request_id ~intent response =
   Result.bind (validate_intent session intent) (fun () ->
@@ -729,10 +744,57 @@ let confirmation_additional confirmation = confirmation.additional
 let confirmation_receipt confirmation = confirmation.receipt
 let confirmation_presentation confirmation = confirmation.presentation
 
-let validate_confirmation session (presentation : presentation) receipt =
+let validate_confirmation session (presentation : presentation) (receipt:receipt) =
   if not (equal_session session presentation.session)
   then Error Revoked_session
   else validate_intent session receipt.intent
+;;
+
+let validate_recovery session ~after ~maximum_items ~maximum_bytes =
+  if maximum_items<=0 || maximum_items>256 || maximum_bytes<=0
+     || maximum_bytes>maximum_mutation_recovery_bytes
+  then Error(Invalid_input "Invalid durable recovery budget")
+  else match after with
+  | None->Ok()
+  | Some cursor when not(equal_session cursor.recovery_owner session)->Error Revoked_session
+  | Some cursor when cursor.maximum_items<>maximum_items || cursor.maximum_bytes<>maximum_bytes->
+    Error(Stale_read "Durable recovery cursor budgets changed")
+  | Some _->Ok()
+;;
+
+let decode_mutation_progress session ~request_id ~intent outcome =
+  Result.bind(validate_intent session intent)(fun()->match outcome with
+    | Wire.Unknown->Ok Outcome_unknown
+    | Wire.Committed response->decode_mutation_receipt session ~request_id ~intent response
+      |> Result.map(fun receipt->Committed_pending_presentation receipt)
+    | Wire.Rejected(Protocol.V2_response{api_version;request_id=actual;outcome=V2_failed{code;message}} as response)
+      when api_version=Protocol.api_version && Uuid.equal actual request_id->
+      if Protocol.encoded_response_bytes response>session.limits.response_budget_bytes
+      then Error Response_budget_exceeded
+      else Ok(Rejected(Service_failed(code^": "^message)))
+    | _->Error(Protocol_mismatch "Invalid known mutation rejection"))
+;;
+
+module Mutation_ids=Set.Make(Uuid)
+
+let decode_recovery session ~request_id ~after ~maximum_items ~maximum_bytes (page:Wire.recovery_page) =
+  Result.bind(validate_recovery session ~after ~maximum_items ~maximum_bytes)(fun()->
+    if Rrbvec.length page.items>maximum_items || Wire.recovery_page_bytes page>maximum_bytes
+    then Error Response_budget_exceeded
+    else if Option.exists(fun next->next<=0L || Rrbvec.is_empty page.items
+      || Option.exists(fun previous->next<=previous.after)after)page.next
+    then Error(Protocol_mismatch "Durable recovery continuation did not advance")
+    else
+      let decoded=Rrbvec.fold_left(fun result (item:Wire.recovery_item)->
+        Result.bind result (fun(items,seen)->
+          Result.bind(restore_mutation_intent session(Bytes.of_string item.intent))(fun intent->
+            let id=Wire.mutation_id intent in
+            if Mutation_ids.mem id seen then Error(Protocol_mismatch "Duplicate recovered intent identity") else
+            Result.map(fun progress->Rrbvec.push_back items {intent;progress},Mutation_ids.add id seen)
+              (decode_mutation_progress session ~request_id ~intent item.outcome))))
+        (Ok(Rrbvec.empty,Mutation_ids.empty))page.items in
+      Result.map(fun(items,_)->{items;next=Option.map(fun after->
+        {recovery_owner=session;after;maximum_items;maximum_bytes})page.next})decoded)
 ;;
 
 let compare_observation_epoch = Int64.compare
@@ -1023,6 +1085,8 @@ let rec validate_request : type a. session -> a request -> (unit, error) result 
   fun session -> function
   | Mutate intent -> validate_intent session intent
   | Confirm (presentation, receipt) -> validate_confirmation session presentation receipt
+  | Recover_mutations {after;maximum_items;maximum_bytes}->validate_recovery session ~after ~maximum_items ~maximum_bytes
+  | Acknowledge_intent intent->validate_intent session intent
   | Observe (budget, query) ->
     if supports_observation session query
     then validate_request session (Query (budget, query))
@@ -1104,7 +1168,7 @@ let decode
           Ok (Some { data = item.page; revision = item.revision })
         | _ -> mismatch ())
      | Journals _, V2_journals_outcome { items; next_cursor } ->
-       Result.map (fun items -> { items; next = next next_cursor }) (bounded items)
+       Result.map (fun items -> ({ items; next = next next_cursor } : _ slice)) (bounded items)
      | Page { uuid; _ }, V2_page_outcome lookup when page_matches uuid lookup -> Ok lookup
      | Outline_block { uuid; _ }, V2_block_outcome lookup when block_matches uuid lookup
        -> Ok lookup
@@ -1126,13 +1190,13 @@ let decode
        ->
        Result.map
          (fun items ->
-            { items =
+            ({ items =
                 List.map
                   (fun (i : Protocol.v2_child_member) ->
                      { data = i.value; revision = i.revision })
                   items
             ; next = next c.next_cursor
-            })
+            } : block slice))
          (bounded c.items)
      | Child_members { parent; _ }, V2_children_outcome c
        when Uuid.equal parent c.parent && c.revision_scope = V2_children_revision parent
@@ -1148,7 +1212,7 @@ let decode
          (bounded c.items)
      | Tree { page; maximum_depth; _ }, V2_page_tree_outcome t
        when Uuid.equal page t.page && maximum_depth = t.maximum_depth ->
-       Result.map (fun items -> { items; next = next t.next_cursor }) (bounded t.items)
+       Result.map (fun items -> ({ items; next = next t.next_cursor } : _ slice)) (bounded t.items)
      | Favorites _, V2_favorites_outcome f ->
        Result.map
          (fun items ->
@@ -1798,6 +1862,21 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
         | _ -> Ok Rrbvec.empty
       ;;
 
+      let acknowledge_mutation_request session ~request_id ~(presentation:presentation) ~intent ~original =
+        if not(live session && presentation_live presentation)
+           || not(equal_session session presentation.session)
+        then Error Revoked_session
+        else Result.bind(validate_intent session intent)(fun()->
+          let proof=match original with
+            | None->Ok None
+            | Some (receipt:receipt) when Wire.encode receipt.intent=Wire.encode intent->
+              Result.map(fun()->Some(receipt_revisions receipt))(validate_confirmation session presentation receipt)
+            | Some _->Error(Protocol_mismatch "Acknowledgement replaced the immutable intent") in
+          Result.map(fun original->Service.Coordination_acknowledge_mutation
+            {registration=binding.serial;owner=session.scope;presentation=presentation.generation;
+             request_id;intent=Wire.encode intent;original})proof)
+      ;;
+
       let request
         : type a.
           session -> request_id:request_id -> a request -> (Service.request, error) result
@@ -1896,6 +1975,11 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                      ; intent = Wire.encode intent
                      })
                 (validate_intent session intent)
+            | Recover_mutations {after;maximum_items;maximum_bytes}->
+              Result.map(fun()->Service.Coordination_recover_mutations
+                {registration=binding.serial;owner=session.scope;request_id;
+                 after=Option.map(fun cursor->cursor.after)after;maximum_items;maximum_bytes})
+                (validate_recovery session ~after ~maximum_items ~maximum_bytes)
             | _ -> unavailable "This operation's resource/durability")
       ;;
 
@@ -1976,24 +2060,18 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
               else
                 decode_confirmation session ~presentation receipt raw
                 |> Result.map (fun confirmation -> Answered (Ok (Confirmed confirmation)))
+            | (Recover_mutations {after;maximum_items;maximum_bytes},
+               Service.Coordination_mutations_recovered{request_id=actual;page})
+              when Uuid.equal actual request_id->
+              decode_recovery session ~request_id ~after ~maximum_items ~maximum_bytes page
+              |> Result.map(fun page->Answered(Ok page))
+            | Acknowledge_intent _,Service.Coordination_mutation_acknowledged{request_id=actual}
+              when Uuid.equal actual request_id->Ok(Answered(Ok()))
             | ( Mutate intent
               , Service.Coordination_mutation_result { request_id = actual; outcome } )
               when Uuid.equal request_id actual ->
-              (match outcome with
-               | Wire.Unknown -> Ok (Answered (Ok Outcome_unknown))
-               | Wire.Committed response ->
-                 decode_mutation_receipt session ~request_id ~intent response
-                 |> Result.map (fun receipt ->
-                   Answered (Ok (Committed_pending_presentation receipt)))
-               | Wire.Rejected
-                   (Protocol.V2_response
-                      { api_version
-                      ; request_id = actual
-                      ; outcome = V2_failed { code; message }
-                      })
-                 when api_version = Protocol.api_version && Uuid.equal actual request_id
-                 -> Ok (Answered (Ok (Rejected (Service_failed (code ^ ": " ^ message)))))
-               | _ -> Error (Protocol_mismatch "Invalid known mutation rejection"))
+              decode_mutation_progress session ~request_id ~intent outcome
+              |> Result.map(fun progress->Answered(Ok progress))
             | _ -> Error (Protocol_mismatch "Unexpected owned query receipt"))
       ;;
 
