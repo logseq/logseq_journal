@@ -27,6 +27,14 @@ let fixture_observations ?(observed=(fun _->())) ?(released=(fun _->())) handle 
       | Error error->Error error
       | Ok _->Error "Observation fixture expected a query response" in
     match request with
+    | Service.Coordination_import value->
+      let owner:Service.timeline_scope={startup={account_generation=value.owner.account.account_generation;
+        presentation_generation=value.owner.account.presentation_generation};graph_id=value.owner.graph_id;graph_generation=value.owner.graph_generation} in
+      (match handle context state(Service.Import_asset_at(owner,value.source)) with
+       |Ok(Service.Asset_imported result)->Ok(Service.Coordination_imported{registration=value.registration;
+         owner=value.owner;request_id=value.request_id;result})
+       |Error message->Error message
+       |_->Error "Typed Import fixture expected its source receipt")
     | Service.Coordination_observe value->
       observed request;
       read value.registration value.owner value.observation_id 0L value.request value.maximum_bytes
@@ -1019,7 +1027,7 @@ let run_favorites_native_visibility
          | _ -> ());
         match normalized with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration ->
           Atomic.set coordination_registration(Some registration);
           Ok(Service.Coordination_registered(coordination_baseline registration))
@@ -4519,7 +4527,7 @@ let run_favorites_native_visibility
               Alcotest.(check bool) "unsettled Capture keeps original staged bytes" true
                 (List.for_all Sys.file_exists !staged_paths);
               dispatch(Lui_protocol.Press(ancestor_property(Option.get(find "text" "Retry"))"press-enabled"))
-            | None|Some `Paged->());
+            | None|Some (`Paged|`Closed_import|`Closed_failed_import)->());
            (try wait "first attachment enters actual Worker handler" (fun () ->
              Atomic.get imports_entered <> []) with error->
              Printf.eprintf "CAPTURE retry mutations=%d confirms=%d acks=%d texts=%s\n%!"
@@ -4531,6 +4539,26 @@ let run_favorites_native_visibility
            Alcotest.(check int) "Capture has no legacy write consumer" 0(Atomic.get legacy_capture_writes);
            Alcotest.(check int) "canonical Capture was ACKed before imports" (if capture_case=Some `Ack_failed then 2 else 1)
              (Atomic.get typed_status_acks);
+           if List.mem capture_case [Some `Closed_import;Some `Closed_failed_import] then (
+             let completed=capture_case=Some `Closed_failed_import in
+             if completed then (Atomic.set import_release true;
+               wait "Unknown import reaches visible retry feedback" (fun()->Atomic.get imports_finished=2
+                 && Option.is_some(find "accessibility-label" "Error info")));
+             let closed={manager with snapshot={manager.snapshot with selected_graph=None;
+               resident_graphs=[];resident_scopes=[];
+               startup={manager.snapshot.startup with awaiting_selection=true;graph_generation=2}}} in
+             W.Session_context.emit(Option.get !worker_context) ~topic:Service.manager_topic(Service.Client_state_changed closed);
+             for _=0 to 40 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+             if not completed then Alcotest.(check int) "retired graph import has not completed its source preparation" 0(Atomic.get imports_finished);
+             Alcotest.(check bool) "closing graph retains a typed in-flight or Unknown import source" true
+               (if completed then Sys.file_exists(List.hd !staged_paths) else List.for_all Sys.file_exists !staged_paths);
+             if not completed then (
+               Atomic.set import_release true;
+               wait "retired source handler reaches its actual terminal outcome" (fun()->Atomic.get imports_finished=1);
+               for _=0 to 20 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+               Alcotest.(check bool) "unknown import retains the original source for reconciliation" true
+                 (List.for_all Sys.file_exists !staged_paths)))
+           else (
            Atomic.set import_probe true;
            ignore (W.send (Option.get !client) Service.Get_graph_state);
            wait "second Worker lane reaches ordered request barrier" (fun () ->
@@ -4572,7 +4600,7 @@ let run_favorites_native_visibility
            dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Close")));
            dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Dismiss")));
            wait "explicit discard releases failed retry bytes" (fun () ->
-             List.for_all (fun path -> not (Sys.file_exists path)) !staged_paths));
+             List.for_all (fun path -> not (Sys.file_exists path)) !staged_paths)));
          if check_ios_capture
          then (
            dispatch
@@ -4789,6 +4817,7 @@ let run_favorites_native_visibility
             has a Capture opener of its own. *)
          if check_draft then
            dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Capture")));
+         if not(List.mem capture_case [Some `Closed_import;Some `Closed_failed_import]) then (
          let favorites = Option.get (find "accessibility-label" "Favorites") in
          if check_visible
          then (
@@ -4931,7 +4960,7 @@ let run_favorites_native_visibility
            Alcotest.(check int) "Favorites has no media body or lease acquisition" 0
              (if Option.is_some (find "path" "/tmp/targeted-media.png") then 1 else 0);
            Alcotest.(check bool) "Favorites visible range does not hydrate media roots" true
-             (Atomic.get queried=before))))));
+             (Atomic.get queried=before)))))));
   if check_point_read_owner then (
     Alcotest.(check bool) "media fixture actually exercised listing reads" true(Atomic.get media_listings>0);
     Alcotest.(check int) "media listings have one typed response owner" 0(Atomic.get legacy_media_listings);
@@ -5044,7 +5073,7 @@ let test_reference_outer_terminals cancel =
         in
         match fixture_request request with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration -> Ok(Service.Coordination_registered(fixture_coordination manager registration))
         | Release_coordination registration -> Ok(Service.Coordination_released registration)
         | Coordination_query _ -> Error "Fixture normalization failed"
@@ -6235,7 +6264,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
         in
         match fixture_request request with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration -> Ok(Service.Coordination_registered(
             fixture_coordination ~phase:(Atomic.get graph_phase) (Atomic.get current) registration))
         | Release_coordination registration -> Ok(Service.Coordination_released registration)
@@ -7256,7 +7285,7 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
         match (match request with Service.Client_command (Focus_resident_graph _) when check_recovery_focus -> request
           | Service.Client_command _ when scenario=`Retry_local || scenario=`Retry_graph_phase -> request | _ -> fixture_request request) with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration ->
           Atomic.set coordination_registration(Some registration);
           Ok(Service.Coordination_registered(fixture_coordination
@@ -8342,7 +8371,11 @@ let () =
           Alcotest.test_case "atomic Append unknown retry keeps exact intent" `Quick
             (fun ()->run_favorites_native_visibility ~check_capture_imports:true ~capture_case:`Unknown ());
           Alcotest.test_case "partial Append summary keeps an applied lower bound" `Quick
-            (fun ()->run_favorites_native_visibility ~check_capture_imports:true ~capture_case:`Paged ())
+            (fun ()->run_favorites_native_visibility ~check_capture_imports:true ~capture_case:`Paged ());
+          Alcotest.test_case "retired typed import retains unstaged source" `Quick
+            (fun ()->run_favorites_native_visibility ~check_capture_imports:true ~capture_case:`Closed_import ());
+          Alcotest.test_case "retired Unknown import retains failed batch source" `Quick
+            (fun ()->run_favorites_native_visibility ~check_capture_imports:true ~capture_case:`Closed_failed_import ())
         ] )
     ; ( "offline asset coordination"
       , [ Alcotest.test_case "mounted catalog and asset scans use typed owner" `Quick

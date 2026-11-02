@@ -377,14 +377,14 @@ let with_cleanup (transition : discard:(Journal_asset_import.staged -> unit) -> 
   state, !cleanup
 ;;
 
-let run_cleanup cleanup =
+let run_cleanup ?(allow_discard=fun _->true) cleanup =
   Rrbvec.iter (function
-    | Discard_staged_file staged -> Journal_asset_import.discard_staged_file staged)
+    | Discard_staged_file staged -> if allow_discard staged then Journal_asset_import.discard_staged_file staged)
     cleanup
 ;;
 
-let finish_cleanup (state, cleanup) =
-  run_cleanup cleanup;
+let finish_cleanup ?allow_discard (state, cleanup) =
+  run_cleanup ?allow_discard cleanup;
   state
 ;;
 
@@ -2045,16 +2045,16 @@ let secondary_text value =
 
 (* App-only adapters interpret cleanup at the old transition boundary, before
    Update publishes state_ref. Never suppress a plan when the state is unchanged. *)
-let step_root state event = finish_cleanup (Root_navigation.step state event)
+let step_root ?allow_discard state event = finish_cleanup ?allow_discard (Root_navigation.step state event)
 
 let worker_response_transition state response =
   finish_cleanup (with_cleanup (fun ~discard -> apply_worker_response ~discard state response))
 ;;
 
-let manager_state_transition state (manager : Graph_service.state) =
+let manager_state_transition ?allow_discard state (manager : Graph_service.state) =
   let was_pending = unlock_pending state.unlock in
   let state =
-    finish_cleanup (with_cleanup (fun ~discard -> apply_manager_state ~discard state manager))
+    finish_cleanup ?allow_discard (with_cleanup (fun ~discard -> apply_manager_state ~discard state manager))
   in
   let snapshot = manager.snapshot in
   if unlock_pending state.unlock <> was_pending then
@@ -2067,8 +2067,8 @@ let manager_state_transition state (manager : Graph_service.state) =
   state
 ;;
 
-let import_failure_transition state batch =
-  finish_cleanup (with_cleanup (fun ~discard -> retain_import_failure ~discard state batch))
+let import_failure_transition ?allow_discard state batch =
+  finish_cleanup ?allow_discard (with_cleanup (fun ~discard -> retain_import_failure ~discard state batch))
 ;;
 
 type command =
@@ -3404,6 +3404,21 @@ let start
   let all_coordination_hosts () = match !coordination_host with
     | None-> !retired_coordination_hosts
     | Some(_,host)->Rrbvec.push_back !retired_coordination_hosts host in
+  let prune_retired_coordination_hosts () =
+    retired_coordination_hosts:=Rrbvec.filter(fun host->
+      Coordination.shutdown_state(Coordination_host.view host)<>Coordination.Stopped
+      || Coordination.import_sources_pending(Coordination_host.view host) ~owner:None)!retired_coordination_hosts in
+  let allow_import_source_discard staged=
+    match Wc.Uuid.of_string(Journal_asset_import.staged_token staged) with
+    |Error _->true
+    |Ok operation->not(Rrbvec.exists(fun host->Coordination.import_source_pending(Coordination_host.view host) ~operation)
+        (all_coordination_hosts())) in
+  let explicit_finish_cleanup=finish_cleanup in
+  let run_cleanup cleanup=run_cleanup ~allow_discard:allow_import_source_discard cleanup in
+  let finish_cleanup transition=finish_cleanup ~allow_discard:allow_import_source_discard transition in
+  let step_root state event=step_root ~allow_discard:allow_import_source_discard state event in
+  let manager_state_transition state manager=manager_state_transition ~allow_discard:allow_import_source_discard state manager in
+  let import_failure_transition state batch=import_failure_transition ~allow_discard:allow_import_source_discard state batch in
   let shutdown_coordination () =
     Rrbvec.iter(fun host->ignore(Coordination_host.shutdown host))(all_coordination_hosts()) in
   let coordination_stopped () = Rrbvec.fold_left(fun stopped host->
@@ -3476,10 +3491,7 @@ let start
       if delivery.Runner.disposition=Runner.Consumed then consumed:=true in
     Option.iter deliver active;
     Rrbvec.iter deliver !retired_coordination_hosts;
-    retired_coordination_hosts:=Rrbvec.fold_left(fun retained host->
-      match Coordination_host.shutdown host with
-      | Runner.Stopped->retained|Draining|Shutdown_failed _->Rrbvec.push_back retained host)
-      Rrbvec.empty !retired_coordination_hosts;
+    prune_retired_coordination_hosts();
     !consumed
   in
   let projection_request_accepted = ref (fun _ -> ()) in
@@ -3516,6 +3528,7 @@ let start
         | Coordination_observe _ -> "coordinationObserve"
         | Coordination_refresh_observation _ -> "coordinationRefreshObservation"
         | Coordination_release_observation _ -> "coordinationReleaseObservation"
+        | Coordination_import _ -> "coordinationImport"
         | Coordination_asset_demand _ -> "coordinationAssetDemand"
         | Coordination_release_asset_demand _ -> "coordinationReleaseAssetDemand"
       in
@@ -3744,8 +3757,14 @@ let start
   let prev_detail_media_routes = graph_ref (fun () -> initial_state.routes) in
   let coordinated_media_point = ref(fun (_:Journal_media_runtime.ticket option) (_:Graph_service.request)->None) in
   let coordinated_media_read = ref(fun (_:Journal_media_runtime.read_request)->false) in
+  let release_coordinated_file lease =
+    Option.is_some(Rrbvec.find_map(fun host->
+      match Coordination_host.request host(Wc.file_lease_session lease)(Wc.Release_file lease) with
+      |Ok ticket->Coordination_host.watch host ticket ~f:(fun _->());Some()
+      |Error _->None)(all_coordination_hosts())) in
   let media_runtime_cell = graph_ref (fun () ->
     Journal_media_runtime.create_coordinated
+      ~release_file:release_coordinated_file
       ~read_planned:(fun request_id->Journal_graph_runtime.register_external_read (!graph_runtime_cell) ~request_id)
       ~read_retired:(fun request_id->Journal_graph_runtime.retire_external_read (!graph_runtime_cell) ~request_id)
       ~read:(fun request-> !coordinated_media_read request)
@@ -3799,8 +3818,6 @@ let start
             changes;
           state))
   in
-  let import_worker_requests_cell = graph_ref (fun () ->
-    Hashtbl.create 2) in
   (* operation token -> staged pick whose temp copy is removed on completion *)
   let capture_staged_items_cell = graph_ref (fun () ->
     Hashtbl.create 2) in
@@ -4957,11 +4974,14 @@ let start
             ~graph_open:(graph_state.phase = Graph_open)
         ])
   in
+  let import_sources_pending owner=Rrbvec.exists(fun host->
+    Coordination.import_sources_pending(Coordination_host.view host) ~owner:(Some owner))(all_coordination_hosts()) in
   let release_runtime_staging () =
+    if Option.exists import_sources_pending(current_owner()) then () else (
     Queue.iter (fun (_,_,staged)->run_cleanup(Rrbvec.singleton(Discard_staged_file staged))) (!capture_import_queue_cell);
     Queue.clear (!capture_import_queue_cell);
     Hashtbl.iter (fun _ batch->run_cleanup(cleanup_batches [batch])) (!capture_staged_items_cell);
-    Hashtbl.clear (!capture_staged_items_cell)
+    Hashtbl.clear (!capture_staged_items_cell))
   in
   let retire_absent_runtimes next =
     let restore=snapshot_cells () and active= !active_runtime and previous= !processing_owner in
@@ -4989,7 +5009,8 @@ let start
       Journal_media_runtime.pump (!media_runtime_cell);Journal_asset_runtime.pump (!asset_runtime_cell);
       save_runtime ();
       if not(Hashtbl.to_seq_values worker_owners |> Seq.exists(fun scope->owner_key scope=key))
-         && Journal_media_runtime.idle (!media_runtime_cell) && Journal_asset_runtime.idle (!asset_runtime_cell) then (
+         && Journal_media_runtime.idle (!media_runtime_cell) && Journal_asset_runtime.idle (!asset_runtime_cell)
+         && not(import_sources_pending owner) then (
         release_runtime_staging ();Hashtbl.remove retired_runtimes key));
     List.iter(fun restore->restore ()) current;active_runtime:=active;processing_owner:=previous
   in
@@ -5002,7 +5023,9 @@ let start
       termination_in_flight:=false;
       platform_request Journal_platform.termination_ready_request ~f:(fun _->Effect.ignore))
     else Effect.ignore in
-  coordination_lifecycle_changed:=(fun()->Effect.run(finish_termination()));
+  coordination_lifecycle_changed:=(fun()->
+    drain_retired_runtimes();prune_retired_coordination_hosts();
+    Effect.run(finish_termination()));
   let apply_manager_transition set_state set_state_and_effect manager_state =
     let manager = manager_state.Graph_service.snapshot in
     let previous_scopes = match !state_ref.manager with
@@ -5086,6 +5109,123 @@ let start
             ~graph_open:(snapshot.graph_state.phase = Graph_open)
         ])
   in
+  let complete_import pending typed_result =
+    let result=Result.map Wc.import_data typed_result in
+      let capture_completion =
+        match pending with
+        | Some (_, operation, _) ->
+          (match Hashtbl.find_opt (!capture_staged_items_cell) operation with
+           | None -> Effect.ignore
+           | Some batch ->
+             Hashtbl.remove (!capture_staged_items_cell) operation;
+             (match result with
+              | Ok _ ->
+                run_cleanup (cleanup_batches [ batch ]);
+                Effect.ignore
+              | Error _ -> set_state (fun state -> import_failure_transition state batch)))
+        | None -> Effect.ignore
+      in
+      let completion =
+        let current =
+          match pending with
+          | Some (generation, operation, owner) ->
+            let snapshot = !state_ref in
+            generation = snapshot.graph_state.generation
+            &&
+            let routes =
+              Option.bind owner (fun (entry_id, request_generation) ->
+                Option.bind
+                  (Journal_routes.at_entry snapshot.routes ~entry_id)
+                  (fun routes ->
+                     if
+                       Journal_routes.detail_request_generation routes
+                       = request_generation
+                     then Some routes
+                     else None))
+            in
+            (match result, owner, Option.bind routes Journal_routes.detail with
+             | Ok receipt, None, _ ->
+               Logseq_db_types.Graph_types.Uuid.to_string receipt.operation = operation
+               && receipt.graph_generation = generation
+             | Ok receipt, Some _, Some detail ->
+               Journal_model.id (Journal_detail.root detail)
+               = Logseq_db_types.Graph_types.Uuid.to_string receipt.target
+             | Error _, _, _ -> true
+             | _ -> false)
+          | None -> false
+        in
+        Effect.bind
+          (Effect.of_thunk (fun () ->
+             sync_media !state_ref;
+             Result.iter (Journal_media_runtime.imported_coordinated (!media_runtime_cell) ~current) typed_result))
+          ~f:(fun () ->
+            Effect.many
+              [ flush_media set_state
+              ; (match pending with
+                 | None -> Effect.ignore
+                 | Some (generation, operation, owner) ->
+                   set_state (fun state ->
+                     if
+                       state.graph_state.generation <> generation
+                       || Option.fold
+                            ~none:false
+                            ~some:(fun (entry_id, request_generation) ->
+                              match Journal_routes.at_entry state.routes ~entry_id with
+                              | Some routes ->
+                                Journal_routes.detail_request_generation routes
+                                <> request_generation
+                              | None -> true)
+                            owner
+                     then state
+                     else
+                       { state with
+                         timeline_notice =
+                           (match owner, result with
+                            | None, Error message -> Some (Import_failed message)
+                            | _ -> state.timeline_notice)
+                       ; import_completion =
+                           Some
+                             ( operation
+                             , match result with
+                               | Ok _ -> None
+                               | Error message -> Some message )
+                       }))
+              ])
+      in
+      Effect.bind
+        (Effect.many [ capture_completion; completion ])
+        ~f:(fun () -> !drain_capture_imports ())
+  in
+  let send_coordinated_import source pending =
+    match current_owner(),ensure_coordination() with
+    |Some owner,Ok host->
+      let session=Option.bind(Coordination.projection(Coordination_host.view host))(fun projection->
+        List.find_map(fun resident->if resident.Wc.phase=Wc.Open && Wc.matches_scope resident.session owner
+          then Some resident.session else None)(Wc.residents projection)) in
+      (match session with
+       |None->Error "The destination is not ready for imports."
+       |Some session->(match Wc.asset_import_intent session source with
+         |Error _->Error "The attachment source or immutable identity is invalid."
+         |Ok intent->(match Coordination_host.request host session(Wc.Import intent) with
+           |Error _->Error "Import is temporarily unavailable. Retry the same attachment when the graph is ready."
+           |Ok ticket->
+             Coordination_host.watch host ticket ~f:(fun reply->
+               Option.iter(fun proof->Rrbvec.iter(fun previous->Coordination_host.post previous
+                 (Coordination.Import_source_reconciled proof))(all_coordination_hosts()))
+                 (Coordination.import_source_proof(Coordination_host.view host)intent);
+               let result=match reply with
+                 |Wc.Answered(Ok(Wc.Imported imported))->Ok imported
+                 |Answered(Error(Wc.Service_failed message|Invalid_input message))->Error message
+                 |_->let _,operation,_=pending in
+                   Error(if Hashtbl.mem (!capture_staged_items_cell) operation
+                     then "Import was interrupted. Select Retry imports to try again."
+                     else "Import was interrupted. Select the file again.") in
+               if runtime_owner_is_live !state_ref owner then
+                 run_owned(Some owner)(fun()->complete_import(Some pending)result)
+               else Result.iter(fun imported->Option.iter(fun lease->ignore(release_coordinated_file lease:bool))(Wc.import_preview imported))result);
+             Ok())))
+    |_->Error "The destination is not ready for imports."
+  in
   let handle_worker_event event =
     let retired = match event with
       | Worker.Response { request_id; _ } -> Journal_worker_admission.retire worker_admission request_id
@@ -5095,7 +5235,7 @@ let start
     Journal_media_runtime.pump (!media_runtime_cell);
     match event with
     | Worker.Push {payload=Graph_service.Coordination_updates _ | Coordination_observations _;_}
-    | Worker.Response {outcome=Completed(Graph_service.Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _);_}->Effect.ignore
+    | Worker.Response {outcome=Completed(Graph_service.Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _ | Coordination_imported _);_}->Effect.ignore
     | Worker.Push {payload=Graph_service.Graph_pushes _ | Graph_states _ | Session_states _;_} -> Effect.ignore
     | Worker.Response { request_id; outcome; _ }
       when Hashtbl.mem local_copy_requests request_id ->
@@ -5282,136 +5422,7 @@ let start
                   notices
             })
         ])
-    | Worker.Response { request_id; outcome = Completed (Asset_imported result); _ } ->
-      let pending = Hashtbl.find_opt (!import_worker_requests_cell) request_id in
-      Hashtbl.remove (!import_worker_requests_cell) request_id;
-      let capture_completion =
-        match pending with
-        | Some (_, operation, _) ->
-          (match Hashtbl.find_opt (!capture_staged_items_cell) operation with
-           | None -> Effect.ignore
-           | Some batch ->
-             Hashtbl.remove (!capture_staged_items_cell) operation;
-             (match result with
-              | Ok _ ->
-                run_cleanup (cleanup_batches [ batch ]);
-                Effect.ignore
-              | Error _ -> set_state (fun state -> import_failure_transition state batch)))
-        | None -> Effect.ignore
-      in
-      let completion =
-        let current =
-          match pending with
-          | Some (generation, operation, owner) ->
-            let snapshot = !state_ref in
-            generation = snapshot.graph_state.generation
-            &&
-            let routes =
-              Option.bind owner (fun (entry_id, request_generation) ->
-                Option.bind
-                  (Journal_routes.at_entry snapshot.routes ~entry_id)
-                  (fun routes ->
-                     if
-                       Journal_routes.detail_request_generation routes
-                       = request_generation
-                     then Some routes
-                     else None))
-            in
-            (match result, owner, Option.bind routes Journal_routes.detail with
-             | Ok receipt, None, _ ->
-               Logseq_db_types.Graph_types.Uuid.to_string receipt.operation = operation
-               && receipt.graph_generation = generation
-             | Ok receipt, Some _, Some detail ->
-               Journal_model.id (Journal_detail.root detail)
-               = Logseq_db_types.Graph_types.Uuid.to_string receipt.target
-             | Error _, _, _ -> true
-             | _ -> false)
-          | None -> false
-        in
-        Effect.bind
-          (Effect.of_thunk (fun () ->
-             sync_media !state_ref;
-             Result.iter (Journal_media_runtime.imported (!media_runtime_cell) ~current) result))
-          ~f:(fun () ->
-            Effect.many
-              [ flush_media set_state
-              ; (match pending with
-                 | None -> Effect.ignore
-                 | Some (generation, operation, owner) ->
-                   set_state (fun state ->
-                     if
-                       state.graph_state.generation <> generation
-                       || Option.fold
-                            ~none:false
-                            ~some:(fun (entry_id, request_generation) ->
-                              match Journal_routes.at_entry state.routes ~entry_id with
-                              | Some routes ->
-                                Journal_routes.detail_request_generation routes
-                                <> request_generation
-                              | None -> true)
-                            owner
-                     then state
-                     else
-                       { state with
-                         timeline_notice =
-                           (match owner, result with
-                            | None, Error message -> Some (Import_failed message)
-                            | _ -> state.timeline_notice)
-                       ; import_completion =
-                           Some
-                             ( operation
-                             , match result with
-                               | Ok _ -> None
-                               | Error message -> Some message )
-                       }))
-              ])
-      in
-      Effect.bind
-        (Effect.many [ capture_completion; completion ])
-        ~f:(fun () -> !drain_capture_imports ())
-    | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
-      when Hashtbl.mem (!import_worker_requests_cell) request_id ->
-      let generation, operation, owner = Hashtbl.find (!import_worker_requests_cell) request_id in
-      Hashtbl.remove (!import_worker_requests_cell) request_id;
-      let interruption =
-        if Hashtbl.mem (!capture_staged_items_cell) operation then
-          "Import was interrupted. Select Retry imports to try again."
-        else "Import was interrupted. Select the file again."
-      in
-      let capture_completion =
-        match Hashtbl.find_opt (!capture_staged_items_cell) operation with
-        | None -> Effect.ignore
-        | Some batch ->
-          Hashtbl.remove (!capture_staged_items_cell) operation;
-          set_state (fun state -> import_failure_transition state batch)
-      in
-      let completion =
-        set_state (fun state ->
-          if
-            state.graph_state.generation <> generation
-            || Option.fold
-                 ~none:false
-                 ~some:(fun (entry_id, request_generation) ->
-                   match Journal_routes.at_entry state.routes ~entry_id with
-                   | Some routes ->
-                     Journal_routes.detail_request_generation routes <> request_generation
-                   | None -> true)
-                 owner
-          then state
-          else
-            { state with
-              timeline_notice =
-                (match owner with
-                 | None ->
-                   Some (Import_failed interruption)
-                 | Some _ -> state.timeline_notice)
-            ; import_completion =
-                Some (operation, Some interruption)
-            })
-      in
-      Effect.bind
-        (Effect.many [ capture_completion; completion ])
-        ~f:(fun () -> !drain_capture_imports ())
+    | Worker.Response {outcome=Completed(Asset_imported _);_}->Effect.ignore
     | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
       when Option.fold ~none:false ~some:(fun (owned, _) -> owned = request_id) !unlock_request ->
       let _, owner = Option.get !unlock_request in
@@ -5868,25 +5879,13 @@ let start
           || !state_ref.graph_state.generation <> generation
         then Some "The destination is no longer ready for imports."
         else (
-          match
-            dispatch_worker (Graph_service.Import_asset
-                 { graph_generation = generation
-                 ; source = Journal_asset_import.to_import staged ~target
-                 })
-          with
-          | Accepted request_id ->
-            Hashtbl.replace (!import_worker_requests_cell) request_id (generation, operation, None);
-            Hashtbl.replace
-              (!capture_staged_items_cell)
-              operation
-              { batch_generation = generation
-              ; batch_target = Logseq_db_types.Graph_types.Uuid.to_string target
-              ; batch_items = [ staged ]
-              };
+          match send_coordinated_import (Journal_asset_import.to_import staged ~target)
+            (generation,operation,None) with
+          |Ok()->
+            Hashtbl.replace (!capture_staged_items_cell) operation
+              {batch_generation=generation;batch_target=Logseq_db_types.Graph_types.Uuid.to_string target;batch_items=[staged]};
             None
-          | Full | Not_ready | Stopping ->
-            Some
-              "Import is temporarily unavailable. Retry imports when the graph is ready.")
+          |Error message->Some message)
       in
       match failure with
       | None -> Effect.ignore
@@ -6461,26 +6460,11 @@ let start
                   if not snapshot.write_enabled
                   then Some "The destination is not ready for imports"
                   else (
-                    match
-                      dispatch_worker (Graph_service.Import_asset { graph_generation; source })
-                    with
-                    | Accepted id ->
-                      Hashtbl.replace
-                        (!import_worker_requests_cell)
-                        id
-                        ( graph_generation
-                        , operation
-                        , Option.map
-                            (fun id ->
-                               ( id
-                               , Journal_routes.detail_request_generation snapshot.routes
-                               ))
-                            (Journal_routes.active_entry_id snapshot.routes) );
-                      None
-                    | Full | Not_ready | Stopping ->
-                      Some
-                        "Import is temporarily unavailable. Retry imports when the graph \
-                         is ready.")))
+                    let owner=Option.map(fun id->id,Journal_routes.detail_request_generation snapshot.routes)
+                      (Journal_routes.active_entry_id snapshot.routes) in
+                    match send_coordinated_import source(graph_generation,operation,owner) with
+                    |Ok()->None
+                    |Error message->Some message)))
                ~f:(function
                  | None -> Effect.ignore
                  | Some message ->
@@ -6734,7 +6718,7 @@ let start
             batches;
           !drain_capture_imports ())
     | Dismiss_operation_error ->
-      update (fun state -> finish_cleanup (with_cleanup (fun ~discard ->
+      update (fun state -> explicit_finish_cleanup (with_cleanup (fun ~discard ->
         match state.timeline_notice with
         | Some (Delete_failed _ | Delete_changed _ | Status_failed _ | Copy_failed _ | Import_failed _) ->
           discard_import_batches ~discard state.failed_capture_imports;
@@ -8153,9 +8137,13 @@ let start
     let all=Hashtbl.to_seq runtime_sessions |> List.of_seq
       |> List.map(fun(key,restore)->key,restore)
       |> fun active -> active @ (Hashtbl.to_seq retired_runtimes |> List.of_seq |> List.map(fun(key,(_,restore))->key,restore)) in
-    List.iter(fun(_,restore)->List.iter(fun restore->restore ()) restore;
+    let previous= !processing_owner in
+    List.iter(fun(key,restore)->List.iter(fun restore->restore ()) restore;
+      processing_owner:=(match Hashtbl.find_opt runtime_owners key with Some owner->Some owner
+        |None->Option.map fst(Hashtbl.find_opt retired_runtimes key));
       Journal_media_runtime.reset (!media_runtime_cell) ~graph_generation:None;
       Journal_asset_runtime.shutdown (!asset_runtime_cell);release_runtime_staging ()) all;
+    processing_owner:=previous;
     Hashtbl.clear runtime_sessions;Hashtbl.clear runtime_owners;Hashtbl.clear retired_runtimes
   in
   let fail_platform tag reason supplied_scope =
@@ -8204,7 +8192,7 @@ let start
               Effect.run(deliver event);save_runtime ();
               if not(Hashtbl.to_seq_values worker_owners |> Seq.exists(fun scope->owner_key scope=key))
                  && Journal_media_runtime.idle (!media_runtime_cell)
-                 && Journal_asset_runtime.idle (!asset_runtime_cell) then (
+                 && Journal_asset_runtime.idle (!asset_runtime_cell) && not(import_sources_pending owner) then (
                 release_runtime_staging ();Hashtbl.remove retired_runtimes key);
               List.iter(fun restore->restore ()) current;active_runtime:=active;processing_owner:=previous)
          | _ -> run_owned owner (fun () -> deliver event))

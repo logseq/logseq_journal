@@ -68,6 +68,8 @@ type scan_cursor =
   | Wire_cursor of G.Cursor.t
   | Sealed_cursor of Asset.t Worker.continuation
 
+type local_import={data:Logseq_db_worker.import_receipt;authority:Worker.imported option}
+
 type group =
   { root : string
   ; epoch : int
@@ -80,7 +82,7 @@ type group =
   ; mutable pending : G.Uuid.t option
   ; mutable cursor : scan_cursor option
   ; mutable error : string option
-  ; mutable local : Logseq_db_worker.import_receipt list
+  ; mutable local : local_import list
   ; mutable controllers : controller list
   ; mutable last_view : view option
   }
@@ -88,6 +90,7 @@ type group =
 type outgoing_request =
   | Command of Service.request
   | Listing of read_request
+  | Release_preview of Worker.file_lease
 
 type outgoing =
   { ticket : ticket option
@@ -107,7 +110,8 @@ type page_fact =
   }
 
 type t =
-  { read_port : (read_request -> bool) option
+  { release_file : (Worker.file_lease -> bool) option
+  ; read_port : (read_request -> bool) option
   ; read_planned : G.Uuid.t -> unit
   ; read_retired : G.Uuid.t -> unit
   ; send : ticket option -> Service.request -> bool
@@ -127,8 +131,9 @@ type t =
   ; mutable queued : outgoing list
   }
 
-let create_state ~read_port ~read_planned ~read_retired ~send ~changed =
-  { read_port
+let create_state ~release_file ~read_port ~read_planned ~read_retired ~send ~changed =
+  { release_file
+  ; read_port
   ; read_planned
   ; read_retired
   ; send
@@ -151,6 +156,7 @@ let create_state ~read_port ~read_planned ~read_retired ~send ~changed =
 
 let create ~send ~changed =
   create_state
+    ~release_file:None
     ~read_port:None
     ~read_planned:(fun _ -> ())
     ~read_retired:(fun _ -> ())
@@ -159,6 +165,7 @@ let create ~send ~changed =
 ;;
 
 let create_coordinated
+      ?release_file
       ?(read_planned = fun _ -> ())
       ?(read_retired = fun _ -> ())
       ~read
@@ -166,7 +173,7 @@ let create_coordinated
       ~changed
       ()
   =
-  create_state ~read_port:(Some read) ~read_planned ~read_retired ~send ~changed
+  create_state ~release_file ~read_port:(Some read) ~read_planned ~read_retired ~send ~changed
 ;;
 
 let owns_read t request_id =
@@ -199,7 +206,8 @@ let notify t g =
   let view =
     { items =
         List.filter_map
-          (fun (receipt : Logseq_db_worker.import_receipt) ->
+          (fun (local:local_import) ->
+         let receipt=local.data in
              Option.map
                (fun (_, path) ->
                   { token = "import:" ^ G.Uuid.to_string receipt.operation
@@ -228,8 +236,8 @@ let notify t g =
                (fun c ->
                   not
                     (List.exists
-                       (fun (local : Logseq_db_worker.import_receipt) ->
-                          local.asset.uuid = c.asset.uuid)
+                       (fun (local:local_import) ->
+                          local.data.asset.uuid = c.asset.uuid)
                        g.local))
                g.controllers)
     ; more = Option.is_some g.cursor
@@ -333,6 +341,7 @@ let rec pump t =
       | Command request -> t.send next.ticket request
       | Listing request ->
         Option.fold t.read_port ~none:false ~some:(fun read -> read request)
+      | Release_preview lease->Option.fold t.release_file ~none:false ~some:(fun release->release lease)
     then (
       (match next.request with
        | Command (Service.Graph_request request) -> observe_request t request
@@ -404,17 +413,20 @@ let dispatch t g c event =
   instructions t g c effects
 ;;
 
-let release_import t (receipt : Logseq_db_worker.import_receipt) =
-  Option.iter
-    (fun (handle, _) ->
-       enqueue t (Service.Release_asset_file { scope = receipt.scope; handle }))
-    receipt.preview
+let release_import t local =
+  match local.authority with
+  | Some imported->Option.iter(fun lease->
+      t.queued<-t.queued @ [{ticket=None;request=Release_preview lease;current=(fun()->true)}])
+      (Worker.import_preview imported)
+  | None->let receipt=local.data in
+    Option.iter(fun(handle,_)->enqueue t(Service.Release_asset_file{scope=receipt.scope;handle}))receipt.preview
 ;;
 
 let handoff_imports t g =
   let completed, pending =
     List.partition
-      (fun (receipt : Logseq_db_worker.import_receipt) ->
+      (fun (local:local_import) ->
+         let receipt=local.data in
          let token = "import:" ^ G.Uuid.to_string receipt.operation in
          (not
             (Hashtbl.to_seq_values t.previews
@@ -704,7 +716,8 @@ let preview_visible t ~owner ~slot ~root ~asset visible =
                 | _ -> false)
              g.controllers
            || List.exists
-                (fun (receipt : Logseq_db_worker.import_receipt) ->
+                (fun (local:local_import) ->
+         let receipt=local.data in
                    asset = "import:" ^ G.Uuid.to_string receipt.operation
                    && Option.is_some receipt.preview)
                 g.local ->
@@ -1277,7 +1290,8 @@ let receive_listing t ~root ~epoch ~request_id listing =
                g.visible
                && (not c.shown)
                && List.exists
-                    (fun (receipt : Logseq_db_worker.import_receipt) ->
+                    (fun (local:local_import) ->
+         let receipt=local.data in
                        receipt.asset.uuid = c.asset.uuid)
                     g.local
              then (
@@ -1405,7 +1419,8 @@ let notice t scope = function
       (fun g ->
          let cancelled, pending =
            List.partition
-             (fun (receipt : Logseq_db_worker.import_receipt) ->
+             (fun (local:local_import) ->
+         let receipt=local.data in
                 receipt.operation = operation && receipt.scope = scope)
              g.local
          in
@@ -1428,9 +1443,10 @@ let notice t scope = function
       (Hashtbl.find_opt t.consumers consumer)
 ;;
 
-let imported t ~current (receipt : Logseq_db_worker.import_receipt) =
+let imported_local t ~current local =
+  let receipt=local.data in
   if (not current) || t.generation <> Some receipt.graph_generation
-  then release_import t receipt
+  then release_import t local
   else (
     let root = G.Uuid.to_string receipt.target in
     let group =
@@ -1460,31 +1476,35 @@ let imported t ~current (receipt : Logseq_db_worker.import_receipt) =
       | None -> None
     in
     match group with
-    | None -> release_import t receipt
+    | None -> release_import t local
     | Some g ->
       let duplicate, retained =
         List.partition
-          (fun (old : Logseq_db_worker.import_receipt) ->
-             old.operation = receipt.operation)
+          (fun (old:local_import) ->
+             old.data.operation = receipt.operation)
           g.local
       in
       List.iter
         (fun old ->
            if
-             old.Logseq_db_worker.preview <> receipt.preview || old.scope <> receipt.scope
+             old.data.preview <> receipt.preview || old.data.scope <> receipt.scope
            then release_import t old)
         duplicate;
       if List.length retained >= 16
       then (
-        release_import t receipt;
+        release_import t local;
         g.error <- Some "Too many open attachment previews")
       else (
-        g.local <- (retained @ if receipt.preview = None then [] else [ receipt ]);
+        g.local <- (retained @ if receipt.preview = None then [] else [ local ]);
         if receipt.preview = None
         then g.error <- Some "Local attachment preview unavailable";
         if g.visible && g.pending = None then read t g None);
       notify t g);
   pump t
 ;;
+
+let imported t ~current data=imported_local t ~current {data;authority=None}
+let imported_coordinated t ~current imported=
+  imported_local t ~current {data=Worker.import_data imported;authority=Some imported}
 
 let idle t = t.queued = []

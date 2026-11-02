@@ -240,6 +240,9 @@ type observation_signal =
   | Observation_invalidated of observation_invalidation
   | Observations_resync
 type request =
+  | Coordination_import of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       source:Logseq_db_types.Asset_import.t}
   | Coordination_asset_demand of
       {registration:int64;owner:timeline_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
        consumer:string;priority:Logseq_sync_pure_reducer.Asset_transfer.priority;
@@ -313,6 +316,9 @@ type request =
       }
 
 type response =
+  | Coordination_imported of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       result:(Logseq_db_worker.import_receipt,string)result}
   | Coordination_asset_demand_accepted of {request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_asset_demand_released of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}

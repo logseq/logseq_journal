@@ -39,7 +39,8 @@ val create
     the read result on a later turn of the existing serial App event entrance.
     Transport IDs and continuation construction stay with the coordinator SDK. *)
 val create_coordinated
-  :  ?read_planned:(Logseq_db_types.Graph_types.Uuid.t -> unit)
+  :  ?release_file:(Worker.file_lease -> bool)
+  -> ?read_planned:(Logseq_db_types.Graph_types.Uuid.t -> unit)
   -> ?read_retired:(Logseq_db_types.Graph_types.Uuid.t -> unit)
   -> read:(read_request -> bool)
   -> send:(ticket option -> Service.request -> bool)
@@ -110,3 +111,7 @@ val change_application_error : t -> Protocol.v2_change_window list -> string opt
 (** Only failed DTO/dependency reads, excluding download/lease/import status. An
     actual queued listing retry remains an obligation rather than a final error. *)
 val projection_read_error : t -> root:string -> string option
+
+(** Retains the actual typed import preview until its business consumers leave.
+    Cleanup uses the fixed sealed-lease port and remains owned by the coordinator. *)
+val imported_coordinated : t -> current:bool -> Worker.imported -> unit

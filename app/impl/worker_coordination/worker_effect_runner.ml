@@ -258,7 +258,9 @@ let on_event t event =
                      error := Some e;
                      Worker.Answered (Error e))
                 | Failed message ->
-                  Worker.Answered (Error (Worker.Service_failed message))
+                  (match request with
+                   | Worker.Import _ -> Worker.Interrupted Worker.Transport_lost
+                   | _ -> Worker.Answered (Error (Worker.Service_failed message)))
                 | Cancelled -> Worker.Interrupted Worker.Cancelled
                 | Shutdown -> Worker.Interrupted Worker.Worker_stopped
               in

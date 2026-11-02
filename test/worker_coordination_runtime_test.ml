@@ -385,12 +385,13 @@ let test_client_to_typed_read () =
     let budget =
       W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
     in
-    let request operation =
+    let request_in session operation =
       let ticket, transition = C.request !state session operation |> Result.get_ok in
       apply transition;
       wait (fun () -> Option.is_some (C.reply (C.view !state) ticket));
       ticket, C.reply (C.view !state) ticket |> Option.get
     in
+    let request operation=request_in session operation in
     let asset_consumer=W.asset_consumer session ~name:"runtime-synthetic-demand" |> Result.get_ok in
     let asset=Logseq_db_types.Asset_descriptor.create
       ~uuid:(uuid "9c000000-0000-4000-8000-000000000881") ~source:(Managed None)
@@ -1500,6 +1501,44 @@ let test_client_to_typed_read () =
     (match reconfirmed with
      | W.Answered (Ok (W.Confirmed _)) -> ()
      | _ -> failwith "new explicit Confirm could not use preserved receipt");
+    let source_file=Filename.temp_file "journal-coordination-synthetic-import-" ".png" in
+    Out_channel.with_open_bin source_file(fun output->output_string output "file");
+    let source:Logseq_db_types.Asset_import.t=
+      {operation=uuid "9c000000-0000-4000-8000-000000000885";
+       asset=uuid "9c000000-0000-4000-8000-000000000886";target=Test_support.authoritative_block_uuid;
+       replace_reference=None;local_mutation=uuid "9c000000-0000-4000-8000-000000000887";
+       metadata_mutation=uuid "9c000000-0000-4000-8000-000000000888";
+       source_file;title="Synthetic typed import";file_type="png"} in
+    let import_bytes,original_import_asset=Fun.protect ~finally:(fun()->if Sys.file_exists source_file then Sys.remove source_file)(fun()->
+      let intent=W.asset_import_intent session source |> Result.get_ok in
+      let imported_ticket,reply=request(W.Import intent) in
+      let imported=match reply with W.Answered(Ok(W.Imported imported))->imported
+        |W.Answered(Error(W.Service_failed message))->failwith("actual typed import failed: "^message)
+        |_->failwith "actual typed import did not return its durable source receipt" in
+      let preview=W.import_preview imported |> Option.get in
+      require(Sys.file_exists(W.file_path preview)) "actual imported preview did not own staged bytes";
+      require((W.import_data imported).operation=source.operation) "actual import changed its stable operation";
+      Sys.remove source_file;
+      let acquire,reply=request(W.Acquire_imported_file imported) in
+      let retained=match reply with W.Answered(Ok(Some lease))->lease|_->failwith "actual imported source could not be re-retained after picker removal" in
+      require(W.file_lease_id retained<>W.file_lease_id preview) "two real acquisitions shared one lease identity";
+      let release,reply=request(W.Release_file retained) in
+      require(reply=W.Answered(Ok())) "actual retained lease release did not ACK";
+      let released_previews=ref [] and raw_release=ref 0 in
+      let media=Journal_media_runtime.create_coordinated ~read:(fun _->false)
+        ~release_file:(fun lease->released_previews:=lease::!released_previews;true)
+        ~send:(fun _ request->(match request with Service.Release_asset_file _->incr raw_release|_->());false)
+        ~changed:(fun _ _->())() in
+      Journal_media_runtime.reset media ~graph_generation:(Some(W.import_data imported).graph_generation);
+      Journal_media_runtime.imported_coordinated media ~current:true imported;
+      Journal_media_runtime.reset media ~graph_generation:None;
+      require(!raw_release=0 && List.exists(fun lease->W.file_lease_id lease=W.file_lease_id preview)!released_previews)
+        "typed Media preview cleanup fell back to raw handle ownership";
+      let release_preview,reply=request(W.Release_file preview) in
+      require(reply=W.Answered(Ok())) "actual preview lease release did not ACK";
+      apply(C.step !state(C.Forget imported_ticket));apply(C.step !state(C.Forget acquire));
+      apply(C.step !state(C.Forget release));apply(C.step !state(C.Forget release_preview));
+      W.encode_asset_import_intent intent,(W.import_data imported).asset) in
     apply (C.step !state C.Retry_bootstrap);
     require
       (Result.is_error (C.request !state session (W.Query (budget, W.Graph_info))))
@@ -1513,6 +1552,18 @@ let test_client_to_typed_read () =
       ((R.on_event runner owned).disposition = R.Consumed)
       "rebind lost old response ownership";
     let replacement = Option.get (current_session ()) in
+    let restored_import=W.restore_asset_import_intent replacement import_bytes |> Result.get_ok in
+    let restored_ticket,restored_reply=request_in replacement(W.Import restored_import) in
+    let restored_imported=match restored_reply with W.Answered(Ok(W.Imported imported))->imported
+      |_->failwith "new binding could not reconcile the original staged import after picker removal" in
+    require((W.import_data restored_imported).asset=original_import_asset) "import reconciliation changed original descriptor/source bytes";
+    require((W.import_data restored_imported).operation=source.operation && (W.import_data restored_imported).target=source.target)
+      "import reconciliation changed original operation or target";
+    let preview=W.import_preview restored_imported |> Option.get in
+    require(Sys.file_exists(W.file_path preview)) "reconciled import lost durable staged source";
+    let released,reply=request_in replacement(W.Release_file preview) in
+    require(reply=W.Answered(Ok())) "new-binding source preview did not physically release";
+    apply(C.step !state(C.Forget restored_ticket));apply(C.step !state(C.Forget released));
     let next_budget =
       W.read_budget replacement ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
     in
@@ -2728,6 +2779,43 @@ let with_observation_service ?epoch_ms ?prepare ?(observe_push=fun _->()) f =
     f client ~call ~send ~wait ~replies ~notices ~baseline ~owner ~registration)
 ;;
 
+let test_service_import_rejects_retired_registration () =
+  with_client(fun client->
+    let replies=Hashtbl.create 16 and baseline=ref None in
+    Mailbox.on_event client(function
+      |Mailbox.Response{request_id;outcome;_}->Hashtbl.replace replies request_id outcome
+      |Push{payload=Service.Coordination_updates updates;_}->List.iter(function Service.Coordination_snapshot value->baseline:=Some value|_->())updates
+      |_->());
+    let wait predicate=
+      let deadline=Unix.gettimeofday()+.4. in
+      while not(predicate()) && Unix.gettimeofday()<deadline do Mailbox.Private.deliver client ~max_events:64;Thread.delay 0.001 done;
+      require(predicate()) "typed Import registration fixture did not settle" in
+    let call request=let id=match Mailbox.send client request with Accepted id->id|_->failwith "typed Import fixture admission" in
+      wait(fun()->Hashtbl.mem replies id);Hashtbl.find replies id in
+    ignore(call(Service.Client_command(Restore_local_account{user_id="user-1"})));
+    let issuer=W.issuer ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
+      ~runtime_epoch:(Mailbox.runtime_epoch client) ~worker_generation:(Mailbox.worker_generation client) |> Result.get_ok in
+    let module I=(val issuer:W.ISSUER) in
+    (match call(I.bootstrap_request() |> Result.get_ok)with
+      |Completed(Service.Coordination_registered value)->baseline:=Some value|_->failwith "typed Import baseline request failed");
+    wait(fun()->Option.exists(fun value->List.exists(fun(_,graph)->graph.Logseq_db_worker.phase=Graph_open)value.Service.baseline.state.residents)!baseline);
+    let raw=Option.get !baseline in
+    let projection=match I.bootstrap(Service.Coordination_registered raw)with Ok(W.Ready value)->value|_->failwith "typed Import baseline invalid" in
+    let session=(List.hd(W.residents projection)).session in
+    let path=Filename.temp_file "journal-retired-import-synthetic-" ".png" in
+    Fun.protect ~finally:(fun()->if Sys.file_exists path then Sys.remove path)(fun()->
+      Out_channel.with_open_bin path(fun output->output_string output "file");
+      let source:Logseq_db_types.Asset_import.t={operation=uuid "9c000000-0000-4000-8000-000000001885";
+        asset=uuid "9c000000-0000-4000-8000-000000001886";target=Test_support.authoritative_block_uuid;replace_reference=None;
+        local_mutation=uuid "9c000000-0000-4000-8000-000000001887";metadata_mutation=uuid "9c000000-0000-4000-8000-000000001888";
+        source_file=path;title="Retired registration import";file_type="png"} in
+      let intent=W.asset_import_intent session source |> Result.get_ok in
+      let queued=I.request session ~request_id:(W.request_id source.operation)(W.Import intent) |> Result.get_ok in
+      ignore(call(Service.Release_coordination raw.registration));
+      require((match call queued with Mailbox.Failed _->true|_->false))
+        "retired coordination registration still prepared a queued typed Import"))
+;;
+
 let test_service_observation_lifecycle () =
   with_observation_service
     (fun client ~call ~send:_ ~wait ~replies:_ ~notices ~baseline ~owner ~registration ->
@@ -3655,6 +3743,7 @@ let test_service_changefeed_has_one_owner () =
 ;;
 
 let () =
+  test_service_import_rejects_retired_registration ();
   test_host_durable_recovery_confirmation_ack ();
   test_service_unknown_recovery_is_read_only ~large:true ();
   test_service_unknown_recovery_is_read_only ();

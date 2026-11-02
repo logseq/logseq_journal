@@ -501,11 +501,20 @@ val compare_asset_consumer : asset_consumer -> asset_consumer -> int
 val bind_asset_consumer : asset_consumer -> round:request_id -> asset_consumer
 val asset_consumer_round : asset_consumer -> request_id option
 val file_lease_session : file_lease -> session
+val file_lease_id : file_lease -> request_id
 val imported_session : imported -> session
 val file_path : file_lease -> string
 val file_type : file_lease -> string
 val import_data : imported -> Logseq_db_worker.import_receipt
 val import_preview : imported -> file_lease option
+val without_import_preview : imported -> imported
+
+(** Checked durable source adoption, bound to the complete logical intent bytes.
+    It grants no lease, data-session or destructive authority. It may retire an
+    old host's identical Unknown picker-source obligation after reconciliation. *)
+type import_source_proof
+val import_source_proof : imported -> import_source_proof
+val import_source_proof_id : import_source_proof -> Uuid.t
 
 type asset_import_intent
 
@@ -516,6 +525,7 @@ val asset_import_intent
 
 val asset_import_intent_id : asset_import_intent -> Uuid.t
 val encode_asset_import_intent : asset_import_intent -> bytes
+val import_source_proof_matches : asset_import_intent -> import_source_proof -> bool
 val restore_asset_import_intent : session -> bytes -> (asset_import_intent, error) result
 
 (** Stable import/metadata/local mutation IDs, exact target, descriptor and source

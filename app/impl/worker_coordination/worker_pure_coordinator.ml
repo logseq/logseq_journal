@@ -19,6 +19,8 @@ type _ kind =
   | Observed : 'a kind -> 'a Worker.observed kind
   | Mutation : Worker.mutation_progress kind
   | Recovery : Worker.mutation_recovery kind
+  | Import : Worker.import_progress kind
+  | Lease : Worker.file_lease option kind
   | Info : Worker.graph_info kind
   | Admission : Worker.Protocol.v2_admission_inspection kind
   | Journal : Worker.page option kind
@@ -65,6 +67,8 @@ let rec same_kind : type a b. a kind -> b kind -> (a, b) Worker.equality option 
   | Unit, Unit -> Some Refl
   | Mutation, Mutation -> Some Refl
   | Recovery, Recovery -> Some Refl
+  | Import, Import -> Some Refl
+  | Lease, Lease -> Some Refl
   | Info, Info -> Some Refl
   | Admission, Admission -> Some Refl
   | Journal, Journal -> Some Refl
@@ -144,8 +148,12 @@ type 'a observation_state =
 
 type observation_entry = Observing : 'a observation_state -> observation_entry
 
+type import_registration={import_intent:Worker.asset_import_intent;source_owner:Worker.session;source_adopted:bool;progress:Worker.import_progress option}
+
+type cleanup_resource=Demand_resource of Worker.asset_consumer | Lease_resource of Worker.file_lease
+
 type asset_cleanup =
-  { consumer:Worker.asset_consumer
+  { resource:cleanup_resource
   ; attempt:Worker.request_id option
   ; waiters:int64 list
   ; wait_for_capacity:bool
@@ -196,6 +204,10 @@ type view =
   ; observations : observation_entry Observation_ids.t
   ; asset_consumers : asset_registration Asset_consumers.t
   ; asset_cleanup : asset_cleanup Observation_ids.t
+  ; file_leases : Worker.file_lease Observation_ids.t
+  ; imports : import_registration Graphs.t
+  ; import_history : Worker.import_source_proof Graphs.t
+  ; released_leases : Worker.session Observation_ids.t
   ; session_assets : (Worker.asset_notice * Id.push_sequence) list Graphs.t
   ; retired_observations : Worker.session Observation_ids.t
   ; retired_observation_count : int
@@ -254,6 +266,10 @@ let initial ~client_id =
       ; observations = Observation_ids.empty
       ; asset_consumers = Asset_consumers.empty
       ; asset_cleanup = Observation_ids.empty
+      ; file_leases=Observation_ids.empty
+      ; imports=Graphs.empty
+      ; import_history=Graphs.empty
+      ; released_leases=Observation_ids.empty
       ; session_assets = Graphs.empty
       ; retired_observations = Observation_ids.empty
       ; retired_observation_count = 0
@@ -283,7 +299,39 @@ let shutdown_state v = v.shutdown
 let mutation_progress _ _ = None
 let intent_key intent = Bytes.to_string (Worker.encode_mutation_intent intent)
 let intent_progress view intent = Intents.find_opt (intent_key intent) view.intents
-let import_progress _ _ = None
+let import_progress facts intent =
+  let key=Worker.asset_import_intent_id intent in
+  let progress=Option.bind(Graphs.find_opt key facts.imports)(fun saved->
+    if Worker.encode_asset_import_intent saved.import_intent=Worker.encode_asset_import_intent intent then saved.progress else None) in
+  Option.map(function
+    | Worker.Imported imported as progress->
+      (match Worker.import_preview imported with
+       | Some lease when Observation_ids.mem(Worker.file_lease_id lease)facts.asset_cleanup
+           || not(Observation_ids.mem(Worker.file_lease_id lease)facts.file_leases)->
+         Worker.Imported(Worker.without_import_preview imported)
+       | _->progress)
+    | progress->progress)progress
+
+let import_source_unsettled facts id saved=not saved.source_adopted && match saved.progress with
+  |Some Worker.Import_unknown->true
+  |Some(Worker.Imported _ | Import_rejected _)->false
+  |None->Slots.exists(fun _ (Entry slot)->slot.result=None && match slot.ticket.query with
+    |Operation(Worker.Import intent)->Worker.Uuid.equal(Worker.asset_import_intent_id intent)id
+    |_->false)facts.entries
+let import_sources_pending facts ~owner =
+  Graphs.exists(fun id saved->Option.fold ~none:true ~some:(Worker.matches_scope saved.source_owner) owner
+    && import_source_unsettled facts id saved)facts.imports
+let import_source_pending facts ~operation =
+  Option.exists(import_source_unsettled facts operation)(Graphs.find_opt operation facts.imports)
+;;
+let import_source_proof facts intent =
+  let id=Worker.asset_import_intent_id intent in
+  let proof=match Graphs.find_opt id facts.imports with
+    |Some{progress=Some(Worker.Imported imported);_}->Some(Worker.import_source_proof imported)
+    |_->Graphs.find_opt id facts.import_history in
+  Option.bind proof(fun proof->if Worker.import_source_proof_matches intent proof then Some proof else None)
+;;
+
 
 let handoff v id =
   List.find_map
@@ -483,6 +531,10 @@ let equal_view a b =
       && a.intent_epoch = b.intent_epoch
       && Asset_consumers.equal(=)a.asset_consumers b.asset_consumers
       && Observation_ids.equal(=)a.asset_cleanup b.asset_cleanup
+      && Observation_ids.equal(=)a.file_leases b.file_leases
+      && Graphs.equal(=)a.imports b.imports
+      && Graphs.equal(=)a.import_history b.import_history
+      && Observation_ids.equal Worker.equal_session a.released_leases b.released_leases
       && Graphs.equal(=)a.session_assets b.session_assets
       && Graphs.equal ( = ) a.applications b.applications
       && Graphs.equal ( = ) a.change_notices b.change_notices
@@ -534,6 +586,7 @@ type event =
   | Observation_notice of Worker.observation_notice
   | Observation_notices_failed of Worker.binding * Worker.error
   | Observation_received : 'a Worker.observed -> event
+  | Import_source_reconciled of Worker.import_source_proof
   | Asset_received of Worker.asset_notice * Id.push_sequence
   | Cancel : 'a ticket -> event
   | Forget : 'a ticket -> event
@@ -1021,16 +1074,31 @@ let queue_asset_cleanup facts consumer ?waiter () =
           | None->false)old.waiters in
         {old with error=None;wait_for_capacity=false;
           waiters=(match waiter with None->retained|Some serial->serial::retained)}
-      | None->{consumer;attempt=None;waiters=Option.to_list waiter;wait_for_capacity=false;error=None} in
+      | None->{resource=Demand_resource consumer;attempt=None;waiters=Option.to_list waiter;wait_for_capacity=false;error=None} in
     {facts with asset_cleanup=Observation_ids.add round cleanup facts.asset_cleanup}
+;;
+
+let queue_file_cleanup facts lease ?waiter () =
+  let key=Worker.file_lease_id lease in
+  let cleanup=match Observation_ids.find_opt key facts.asset_cleanup with
+    | Some previous->
+      let waiters=List.filter(fun serial->match Slots.find_opt serial facts.entries with
+        |Some(Entry slot)->slot.result=None && not slot.cancelled && not slot.forgotten|_->false)previous.waiters in
+      {previous with error=None;wait_for_capacity=false;waiters=(match waiter with None->waiters|Some id->id::waiters)}
+    |None->{resource=Lease_resource lease;attempt=None;waiters=Option.to_list waiter;wait_for_capacity=false;error=None} in
+  {facts with asset_cleanup=Observation_ids.add key cleanup facts.asset_cleanup}
+;;
+let resource_release = function
+  | Demand_resource consumer->Worker.asset_consumer_session consumer,Worker.Release_asset_demand consumer
+  | Lease_resource lease->Worker.file_lease_session lease,Worker.Release_file lease
 ;;
 
 let progress_asset_cleanup ?(capacity=false) transition =
   let next=ref transition.next and effects=ref [] in
   Observation_ids.iter(fun round cleanup->
     if cleanup.attempt=None && cleanup.error=None && (capacity || not cleanup.wait_for_capacity) then
-      let session=Worker.asset_consumer_session cleanup.consumer in
-      match plan_intent_lifecycle !next session(Worker.Release_asset_demand cleanup.consumer)Unit(Cleanup session)None with
+      let session,operation=resource_release cleanup.resource in
+      match plan_intent_lifecycle !next session operation Unit(Cleanup session)None with
       | Error error->next:={!next with facts={!next.facts with asset_cleanup=Observation_ids.add round {cleanup with error=Some error} !next.facts.asset_cleanup}}
       | Ok(ticket,planned)->
         let entries=match Slots.find_opt ticket.serial planned.next.facts.entries with
@@ -1047,6 +1115,7 @@ let progress_asset_cleanup ?(capacity=false) transition =
 let retire state lifecycle =
   let facts, instructions = cancel_entries (fun _ -> true) state.facts in
   let facts=Asset_consumers.fold(fun _ (entry:asset_registration) facts->queue_asset_cleanup facts entry.consumer ())facts.asset_consumers facts in
+  let facts=Observation_ids.fold(fun _ lease facts->queue_file_cleanup facts lease ())facts.file_leases facts in
   let facts =
     { facts with
       asset_consumers=Asset_consumers.map(fun (entry:asset_registration)->{entry with active=false;notices=[]})facts.asset_consumers
@@ -1164,6 +1233,9 @@ let apply_baseline state binding incoming =
       let facts=Asset_consumers.fold(fun _ (entry:asset_registration) facts->
         if entry.active && not(current_session facts(Worker.asset_consumer_session entry.consumer))
         then queue_asset_cleanup facts entry.consumer () else facts)facts.asset_consumers facts in
+      let facts=Observation_ids.fold(fun _ lease facts->
+        if not(current_session facts(Worker.file_lease_session lease)) then queue_file_cleanup facts lease () else facts)
+        facts.file_leases facts in
       let asset_consumers=Asset_consumers.map(fun (entry:asset_registration)->
         if not(current_session facts(Worker.asset_consumer_session entry.consumer))
         then {entry with active=false;notices=[]}else entry)facts.asset_consumers in
@@ -1238,6 +1310,16 @@ let checked_result : type a. view -> a ticket -> a Worker.reply -> a Worker.repl
             "Mutation receipt identity or original point does not match its ticket"))
   in
   match ticket.query, result with
+  | Operation(Worker.Import intent),Worker.Answered(Ok(Worker.Imported imported))->
+    let owner=match ticket.target with Direct session->Some session|_->None in
+    if not(Worker.Uuid.equal(Worker.import_data imported).operation(Worker.asset_import_intent_id intent))
+       || not(Option.exists(fun session->Worker.equal_session session(Worker.imported_session imported))owner)
+       || Option.exists(fun lease->not(Worker.equal_request_id(Worker.file_lease_id lease)ticket.id))(Worker.import_preview imported)
+    then mismatch() else result
+  | Operation(Worker.Acquire_imported_file _),Worker.Answered(Ok(Some lease))->
+    if not(Worker.equal_request_id(Worker.file_lease_id lease)ticket.id)
+       || not(match ticket.target with Direct session->Worker.equal_session session(Worker.file_lease_session lease)|_->false)
+    then mismatch() else result
   | Operation(Worker.Recover_mutations parameters),Worker.Answered(Ok page)->
     if ticket.planned_intent_epoch<>facts.intent_epoch
     then Worker.Answered(Error(Worker.Stale_read "Recovery predates a settled intent acknowledgement"))
@@ -1661,10 +1743,8 @@ let complete_asset_waiters facts waiters (result:unit Worker.reply) =
     | _->entries)facts.entries waiters in
   {facts with entries}
 ;;
-let retain_asset_command_result : type a. t -> a ticket -> a Worker.reply -> t =
-  fun state ticket result->match ticket.query with
-  | Operation(Worker.Release_asset_demand consumer)->
-    (match Option.bind(Worker.asset_consumer_round consumer)(fun round->
+let finish_resource_release state (ticket:unit ticket) (result:unit Worker.reply) key =
+    (match Option.bind key(fun round->
       Option.map(fun cleanup->round,cleanup)(Observation_ids.find_opt round state.facts.asset_cleanup)) with
      | Some(round,cleanup) when cleanup.attempt=Some ticket.id->
        (match result with
@@ -1675,15 +1755,53 @@ let retain_asset_command_result : type a. t -> a ticket -> a Worker.reply -> t =
           let error=if success then None else Some(asset_cleanup_error result) in
           let facts=complete_asset_waiters state.facts cleanup.waiters
             (match error with None->Worker.Answered(Ok())|Some error->Worker.Answered(Error error)) in
-          let asset_consumers=match Asset_consumers.find_opt consumer facts.asset_consumers with
-            | Some entry when success && not entry.active
-                && Worker.asset_consumer_round entry.consumer=Some round->Asset_consumers.remove consumer facts.asset_consumers
-            | _->facts.asset_consumers in
+          let asset_consumers=match cleanup.resource with
+            |Demand_resource consumer->(match Asset_consumers.find_opt consumer facts.asset_consumers with
+              | Some entry when success && not entry.active && Worker.asset_consumer_round entry.consumer=Some round->Asset_consumers.remove consumer facts.asset_consumers
+              | _->facts.asset_consumers)
+            |Lease_resource _->facts.asset_consumers in
+          let file_leases=if success then Observation_ids.remove round facts.file_leases else facts.file_leases in
+          let released_leases=match success,cleanup.resource with true,Lease_resource lease->
+            Observation_ids.add round(Worker.file_lease_session lease)facts.released_leases|_->facts.released_leases in
           let asset_cleanup=if success then Observation_ids.remove round facts.asset_cleanup else
             Observation_ids.add round {cleanup with attempt=None;waiters=[];wait_for_capacity=false;error}facts.asset_cleanup in
-          {state with facts={facts with asset_consumers;asset_cleanup}})
+          {state with facts={facts with asset_consumers;asset_cleanup;file_leases;released_leases}})
      | _->state)
+
+;;
+let retain_asset_command_result : type a. t -> a ticket -> a Worker.reply -> t =
+  fun state ticket result->match ticket.query with
+  | Operation(Worker.Release_asset_demand consumer)->finish_resource_release state ticket result(Worker.asset_consumer_round consumer)
+  | Operation(Worker.Release_file lease)->finish_resource_release state ticket result(Some(Worker.file_lease_id lease))
   | _->state
+;;
+
+let import_key intent=Worker.asset_import_intent_id intent
+let adopt_file_result : type a. t -> a slot -> a Worker.reply -> t =
+  fun state slot result->
+  let orphan=slot.cancelled || slot.forgotten || state.lifecycle<>Running || not(current_target state.facts slot.ticket.target) in
+  let adopt facts lease=
+    if not(Worker.equal_request_id slot.ticket.id(Worker.file_lease_id lease)) then facts else
+    let facts={facts with file_leases=Observation_ids.add(Worker.file_lease_id lease)lease facts.file_leases} in
+    if orphan then queue_file_cleanup facts lease () else facts in
+  let facts=match slot.ticket.query,result with
+    |Operation(Worker.Import intent),_->
+      let key=import_key intent in
+      let previous=Option.bind(Graphs.find_opt key state.facts.imports)(fun saved->saved.progress) in
+      let progress=match result with
+        |Worker.Answered(Ok progress)->Some progress
+        |Worker.Not_admitted _ when slot.admitted=None->previous
+        |_->(match previous with Some(Worker.Imported _ | Import_rejected _)->previous|_->Some Worker.Import_unknown) in
+      let facts=match progress with Some(Worker.Imported imported)->
+        Option.fold ~none:state.facts ~some:(adopt state.facts)(Worker.import_preview imported)|_->state.facts in
+      let source_owner=match Graphs.find_opt key facts.imports with Some saved->saved.source_owner
+        |None->(match slot.ticket.target with Direct session->session|_->assert false) in
+      let imports=Graphs.add key {import_intent=intent;source_owner;progress;source_adopted=(match progress with Some(Worker.Imported _)->true
+          |_->Option.exists(fun saved->saved.source_adopted)(Graphs.find_opt key facts.imports))}facts.imports in
+      {facts with imports}
+    |Operation(Worker.Acquire_imported_file _),Worker.Answered(Ok(Some lease))->adopt state.facts lease
+    |_->state.facts in
+  {state with facts}
 ;;
 
 let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
@@ -1730,6 +1848,7 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
              ~admitted:(slot.admitted <> None)
              ~cancelled:slot.cancelled
          in
+         let state=adopt_file_result state slot result in
          let state = retain_change_result state ticket result in
          let state = retain_asset_command_result state ticket result in
          let intents : Worker.mutation_progress Intents.t =
@@ -1791,7 +1910,7 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
          let result =
            let cancelled_observe =
              match ticket.query with
-             | Operation (Worker.Observe _) -> slot.cancelled
+             | Operation (Worker.Observe _ | Worker.Import _ | Worker.Acquire_imported_file _) -> slot.cancelled
              | _ -> false
            in
            if cancelled_observe
@@ -2062,6 +2181,13 @@ let retain_asset_notice state notice sequence =
 
 let step_base state event =
   match event with
+  | Import_source_reconciled proof->
+    let id=Worker.import_source_proof_id proof in
+    (match Graphs.find_opt id state.facts.imports with
+     |Some saved when not saved.source_adopted
+       && Worker.import_source_proof_matches saved.import_intent proof->
+       changed{state with facts={state.facts with imports=Graphs.add id{saved with source_adopted=true}state.facts.imports}}[]
+     |_->unchanged state)
   | Worker_bound binding when state.binding = None || state.lifecycle = Rebinding ->
     changed
       { state with
@@ -2085,6 +2211,8 @@ let step_base state event =
           ; change_versions = Graphs.empty
           ; change_projections = Graphs.empty
           ; applications = Graphs.empty
+          ; released_leases=(if state.lifecycle=Rebinding then Observation_ids.empty else state.facts.released_leases)
+          ; import_history=(if state.lifecycle=Rebinding then Graphs.empty else state.facts.import_history)
           ; retired_observations =
               (if state.lifecycle = Rebinding
                then Observation_ids.empty
@@ -2186,10 +2314,11 @@ let step_base state event =
        (* Unregister's checked ACK covers every demand allocated by this
           binding. Independent release responses can still be in the mailbox;
           they retain their ticket fence but cannot revive these obligations. *)
-       let facts=Observation_ids.fold(fun _ cleanup facts->
-         complete_asset_waiters facts cleanup.waiters(Worker.Answered(Ok())))
-         facts.asset_cleanup facts in
-       let facts={facts with asset_cleanup=Observation_ids.empty;
+       let facts=Observation_ids.fold(fun _ cleanup facts->match cleanup.resource with
+         |Demand_resource _->complete_asset_waiters facts cleanup.waiters(Worker.Answered(Ok()))
+         |Lease_resource _->facts)facts.asset_cleanup facts in
+       let asset_cleanup=Observation_ids.filter(fun _ cleanup->match cleanup.resource with Lease_resource _->true|_->false)facts.asset_cleanup in
+       let facts={facts with asset_cleanup;
          asset_consumers=Asset_consumers.empty;session_assets=Graphs.empty;
          shutdown=(if state.lifecycle=Stopping then Draining else facts.shutdown)} in
        settle { state with facts; released = true; release_pending = false } []
@@ -2260,7 +2389,17 @@ let step_base state event =
                 state.facts.observations
             | _ -> state.facts.observations
           in
-          let state = { state with facts = { state.facts with observations } } in
+          let imports=match ticket.query with
+            |Operation(Worker.Import intent)->
+              let key=import_key intent in
+              let progress=match Graphs.find_opt key state.facts.imports with
+                |Some{progress=Some progress;_}->progress|_->Worker.Import_unknown in
+              let source_owner=match Graphs.find_opt key state.facts.imports with Some saved->saved.source_owner
+                |None->(match slot.ticket.target with Direct session->session|_->assert false) in
+              Graphs.add key{import_intent=intent;source_owner;progress=Some progress;
+                source_adopted=Option.exists(fun saved->saved.source_adopted)(Graphs.find_opt key state.facts.imports)}state.facts.imports
+            |_->state.facts.imports in
+          let state = { state with facts = { state.facts with observations;imports } } in
           let next =
             { state with
               facts =
@@ -2688,14 +2827,32 @@ let progress_observations ~retry transition =
        @ if !count = 128 then [ Schedule_drain ] else [])
 ;;
 
+let retire_completed_imports transition =
+  let facts=transition.next.facts in
+  let imports,import_history=Graphs.fold(fun id saved (active,history)->
+    let live_ticket=Slots.exists(fun _ (Entry slot)->match slot.ticket.query with
+      |Operation(Worker.Import intent)->Worker.Uuid.equal(Worker.asset_import_intent_id intent)id
+      |_->false)facts.entries in
+    let leased=match saved.progress with
+      |Some(Worker.Imported imported)->Option.exists(fun lease->Observation_ids.mem(Worker.file_lease_id lease)facts.file_leases)
+          (Worker.import_preview imported)
+      |_->true in
+    match saved.progress with
+    |Some(Worker.Imported imported) when not live_ticket && not leased->
+      Graphs.remove id active,Graphs.add id(Worker.import_source_proof imported)history
+    |_->active,history)facts.imports(facts.imports,facts.import_history) in
+  if imports==facts.imports then transition else
+  changed{transition.next with facts={facts with imports;import_history}}(non_publications transition.instructions)
+;;
+
 let step state event =
-  progress_asset_cleanup ~capacity:(event=Capacity_available)
+  retire_completed_imports(progress_asset_cleanup ~capacity:(event=Capacity_available)
   (progress_observations
     ~retry:
       (match event with
        | Capacity_available -> true
        | _ -> false)
-    (step_base state event))
+    (step_base state event)))
 ;;
 
 let plan_mutation
@@ -2811,7 +2968,7 @@ let plan_asset_release state session consumer =
   let bound=match Asset_consumers.find_opt consumer state.facts.asset_consumers with
     | Some entry->Some entry.consumer
     | None->Observation_ids.fold(fun _ cleanup found->match found with Some _->found|None->
-        if Worker.equal_asset_consumer consumer cleanup.consumer then Some cleanup.consumer else None)
+        match cleanup.resource with Demand_resource bound when Worker.equal_asset_consumer consumer bound->Some bound|_->None)
         state.facts.asset_cleanup None in
   let operation=Worker.Release_asset_demand(Option.value bound ~default:consumer) in
   Result.map(fun((ticket:unit ticket),planned)->
@@ -2829,11 +2986,67 @@ let plan_asset_release state session consumer =
           | None->facts.asset_consumers
           | Some entry->Asset_consumers.add consumer {entry with active=false;notices=[]}facts.asset_consumers in
         let asset_cleanup=Observation_ids.map(fun cleanup->
-          if Worker.equal_asset_consumer cleanup.consumer consumer then {cleanup with error=None;wait_for_capacity=false}
-          else cleanup)facts.asset_cleanup in
+          match cleanup.resource with Demand_resource bound when Worker.equal_asset_consumer bound consumer->{cleanup with error=None;wait_for_capacity=false}
+          |_->cleanup)facts.asset_cleanup in
         queue_asset_cleanup {facts with asset_consumers;asset_cleanup} bound ~waiter:ticket.serial () in
     ticket,progress_asset_cleanup(changed {planned.next with facts}[]))
     (plan_intent_lifecycle state session operation Unit(Cleanup session)None)
+;;
+
+let plan_file_release state session lease =
+  let key=Worker.file_lease_id lease in
+  let known=Option.exists(fun actual->Worker.equal_session session(Worker.file_lease_session actual))
+    (Observation_ids.find_opt key state.facts.file_leases) in
+  let settled=Option.exists(Worker.equal_session session)(Observation_ids.find_opt key state.facts.released_leases) in
+  if not(Worker.equal_session session(Worker.file_lease_session lease)) || not(known||settled)
+  then Error Worker.Revoked_session
+  else if Slots.cardinal state.facts.entries>=512 then Error(Worker.Invalid_input "Release completed cleanup waiters first") else
+  Result.map(fun((ticket:unit ticket),planned)->
+    let entries=match Slots.find_opt ticket.serial planned.next.facts.entries with
+      |Some(Entry slot)->(match same_ticket ticket slot.ticket with
+        |Some Worker.Refl->Slots.add ticket.serial(Entry{slot with dispatched=false;result=(if settled then Some(Worker.Answered(Ok()))else None)})planned.next.facts.entries
+        |_->assert false)|_->assert false in
+    let facts={planned.next.facts with entries} in
+    let facts=if settled then facts else queue_file_cleanup facts lease ~waiter:ticket.serial () in
+    ticket,progress_asset_cleanup(changed{planned.next with facts}[]))
+    (plan_intent_lifecycle state session(Worker.Release_file lease)Unit(Cleanup session)None)
+;;
+
+let lease_ownership_full state =
+  let pending=Slots.fold(fun _ (Entry slot) total->if slot.result<>None then total else match slot.ticket.query with
+    |Operation(Worker.Import _ | Worker.Acquire_imported_file _)->total+1|_->total)state.facts.entries 0 in
+  let retained=Observation_ids.cardinal state.facts.file_leases+pending in
+  retained>=256 || retained+Observation_ids.cardinal state.facts.released_leases>=8192
+;;
+
+let plan_import state session intent operation =
+  let key=import_key intent in
+  let pending=Slots.exists(fun _ (Entry slot)->slot.result=None && match slot.ticket.query with
+    |Operation(Worker.Import previous)->import_key previous=key|_->false)state.facts.entries in
+  if pending then Error(Worker.Invalid_input "This exact import operation is already pending")
+  else if Option.exists(fun proof->not(Worker.import_source_proof_matches intent proof))(Graphs.find_opt key state.facts.import_history)
+  then Error(Worker.Invalid_input "This completed import operation owns different immutable bytes")
+  else if Graphs.cardinal state.facts.import_history>=8192 && not(Graphs.mem key state.facts.import_history)
+  then Error(Worker.Invalid_input "Import identity history is full. Rebind the Worker before admitting a new operation")
+  else if Option.exists(fun saved->Worker.encode_asset_import_intent saved.import_intent<>Worker.encode_asset_import_intent intent)
+    (Graphs.find_opt key state.facts.imports)
+  then Error(Worker.Invalid_input "This import operation already owns a different immutable source or target")
+  else if Graphs.cardinal state.facts.imports>=128 && not(Graphs.mem key state.facts.imports)
+  then Error(Worker.Invalid_input "Import recovery capacity is full")
+  else
+    let state=if Graphs.mem key state.facts.imports then state else
+      {state with facts={state.facts with imports=Graphs.add key{import_intent=intent;source_owner=session;source_adopted=false;progress=None}state.facts.imports}} in
+    match import_progress state.facts intent with
+    |Some(Worker.Imported imported as progress) when Worker.equal_session session(Worker.imported_session imported)->
+      Result.map(fun((ticket:Worker.import_progress ticket),planned)->
+        let entries=match Slots.find_opt ticket.serial planned.next.facts.entries with
+          |Some(Entry slot)->(match same_ticket ticket slot.ticket with
+            |Some Worker.Refl->Slots.add ticket.serial(Entry{slot with dispatched=false;result=Some(Worker.Answered(Ok progress))})planned.next.facts.entries
+            |_->assert false)|_->assert false in
+        ticket,changed{planned.next with facts={planned.next.facts with entries}}[])
+        (plan_intent_lifecycle state session operation Import(Direct session)None)
+    |_->if lease_ownership_full state then Error(Worker.Invalid_input "File lease ownership capacity is full")
+      else plan_intent_lifecycle state session operation Import(Direct session)None
 ;;
 
 let plan_recovery state session operation =
@@ -3056,6 +3269,7 @@ let rec request
         (fun mutation->request state session(Worker.Mutate mutation)))
   | Worker.Release handle -> plan_release state session handle
   | Worker.Release_asset_demand consumer->plan_asset_release state session consumer
+  | Worker.Release_file lease->plan_file_release state session lease
   | _ ->
     Result.bind (validate_session state session) (fun () ->
       if Slots.cardinal state.facts.entries >= 256
@@ -3069,6 +3283,11 @@ let rec request
             | Worker.Refresh handle -> plan_refresh state session handle
             | Worker.Acknowledge_changes batch -> plan_change_ack state session batch
             | Worker.Replace_asset_demand(consumer,_,assets)->plan_asset_command state session operation consumer assets
+            | Worker.Import intent->plan_import state session intent operation
+            | Worker.Acquire_imported_file _->
+              if lease_ownership_full state
+              then Error(Worker.Invalid_input "File lease ownership capacity is full") else
+              plan_intent_lifecycle state session operation Lease(Direct session)None
             | Worker.Retry_asset _->plan_intent_lifecycle state session operation Unit(Direct session)None
             | Worker.Retry_upload _->plan_intent_lifecycle state session operation Unit(Direct session)None
             | Worker.Recover_mutations _ -> plan_recovery state session operation
@@ -3291,6 +3510,8 @@ let prepare_host_change state change =
     let facts=Asset_consumers.fold(fun _ (entry:asset_registration) facts->
       if affected(Worker.asset_consumer_session entry.consumer)change
       then queue_asset_cleanup facts entry.consumer () else facts)facts.asset_consumers facts in
+    let facts=Observation_ids.fold(fun _ lease facts->
+      if affected(Worker.file_lease_session lease)change then queue_file_cleanup facts lease () else facts)facts.file_leases facts in
     let facts={facts with asset_consumers=Asset_consumers.map(fun (entry:asset_registration)->
       if affected(Worker.asset_consumer_session entry.consumer)change then {entry with active=false;notices=[]}else entry)facts.asset_consumers} in
     Ok

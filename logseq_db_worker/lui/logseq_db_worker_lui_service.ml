@@ -317,6 +317,9 @@ type observation_signal =
   | Observation_invalidated of observation_invalidation
   | Observations_resync
 type request =
+  | Coordination_import of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       source:Logseq_db_types.Asset_import.t}
   | Coordination_asset_demand of
       {registration:int64;owner:timeline_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
        consumer:string;priority:Logseq_sync_pure_reducer.Asset_transfer.priority;
@@ -390,6 +393,9 @@ type request =
       }
 
 type response =
+  | Coordination_imported of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       result:(Logseq_db_worker.import_receipt,string)result}
   | Coordination_asset_demand_accepted of {request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_asset_demand_released of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
@@ -949,6 +955,7 @@ let reserved_asset_command = function
 let discarded_asset_retain request response =
   match request,response with
   | (Acquire_asset_file{scope;_}|Acquire_imported_file{scope;_}),Asset_file(Some(handle,_))->Some(scope,handle)
+  | Coordination_import _,Coordination_imported{result=Ok receipt;_}
   | (Import_asset_at _|Import_asset _),Asset_imported(Ok receipt)->
     Option.map(fun(handle,_)->receipt.Db.scope,handle)receipt.preview
   | _->None
@@ -1164,6 +1171,21 @@ let create ~(dependencies : dependencies) =
         scope.account.account_generation=owner.startup.account_generation && scope.graph_id=owner.graph_id
           && scope.graph_generation=owner.graph_generation) (Db.graph_scopes session.worker) in
       match request with
+      | Coordination_import{registration;owner;request_id;source}->
+        let timeline:timeline_scope={startup={account_generation=owner.account.account_generation;
+          presentation_generation=owner.account.presentation_generation};graph_id=owner.graph_id;graph_generation=owner.graph_generation} in
+        (match resolve timeline with
+         |None->Error "The import graph session is no longer open."
+         |Some scope->
+           let authorized()=Db.coordination_current session.worker ~registration
+             && resolve timeline=Some scope
+             && scope.account.user_id=owner.account.user_id
+             && Uri.equal scope.account.managed_sync_origin owner.account.managed_sync_origin
+             && scope.account.lifecycle_generation=owner.account.lifecycle_generation
+             && (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+           if not(authorized()) then Error "The import registration or account authority retired." else
+           Ok(Coordination_imported{registration;owner=scope;request_id;
+             result=Db.import_asset ~scope ~current:authorized session.worker ~graph_generation:scope.graph_generation source}))
       | Coordination_asset_demand{registration;owner;request_id;consumer;priority;assets}->
         (match resolve owner with
          | None->Error "The asset demand graph session is not open."
@@ -1327,7 +1349,10 @@ let create ~(dependencies : dependencies) =
         (match Option.bind (resolve owner) (fun scope->Db.graph_state_for_scope session.worker ~scope) with
          | Some state -> Ok (Graph_state state) | None -> Error "The graph session is no longer open.")
       | Import_asset_at (owner,source) ->
-        (match resolve owner with Some scope -> Ok (Asset_imported (Db.import_asset session.worker ~graph_generation:scope.graph_generation source))
+        (match resolve owner with Some scope ->
+           let current()=resolve owner=Some scope && (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+           if not(current()) then Error "The import account authority retired." else
+           Ok (Asset_imported (Db.import_asset ~scope ~current session.worker ~graph_generation:scope.graph_generation source))
          | None -> Error "The graph session is no longer open.")
       | Asset_command_at (_,command) when reserved_asset_command command->Error "Use the typed asset coordination entry."
       | Asset_command_at (owner,command) ->

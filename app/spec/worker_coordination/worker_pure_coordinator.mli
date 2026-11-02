@@ -25,6 +25,13 @@ val revalidate_reply : view -> 'a ticket -> 'a Worker.reply -> 'a Worker.reply
     The effect interpreter forwards it without consulting a later UI/view. *)
 val ticket_acknowledgement : unit ticket -> (Worker.presentation * Worker.receipt option) option
 val import_progress : view -> Worker.asset_import_intent -> Worker.import_progress option
+
+(** App-owned picker/staged sources cannot retire until accepted source preparation
+    has a checked durable Imported receipt or known rejection. Unknown keeps its
+    original execution owner across binding retry, without replaying the operation. *)
+val import_sources_pending : view -> owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope option -> bool
+val import_source_pending : view -> operation:Worker.Uuid.t -> bool
+val import_source_proof : view -> Worker.asset_import_intent -> Worker.import_source_proof option
 val handoff : view -> Worker.handoff_id -> Worker.handoff_state option
 val asset_notices : view -> Worker.asset_consumer -> Worker.asset_notice list
 val session_asset_notices : view -> Worker.session -> Worker.asset_notice list
@@ -128,6 +135,7 @@ type event =
   | Observation_notice of Worker.observation_notice
   | Observation_notices_failed of Worker.binding * Worker.error
   | Observation_received : 'a Worker.observed -> event
+  | Import_source_reconciled of Worker.import_source_proof
   | Asset_received of Worker.asset_notice * Logseq_db_worker_lui.Journal_worker_ids.Worker.push_sequence
   | Cancel : 'a ticket -> event
   | Forget : 'a ticket -> event

@@ -359,10 +359,12 @@ type asset_consumer =
   }
 
 type asset_file = { asset_owner:session; asset_consumer:asset_consumer; asset:Uuid.t; source_handle:string }
-type file_lease = |
+type file_lease = {lease_owner:session;lease_id:request_id;lease_handle:string;lease_path:string;lease_type:string}
 type upload_operation = { upload_owner:session; operation:Uuid.t }
-type imported = |
-type asset_import_intent = |
+type import_source_proof={source_operation:Uuid.t;source_fingerprint:string}
+type imported = {import_owner:session;import_receipt:Logseq_db_worker.import_receipt;import_preview:file_lease option;source_proof:import_source_proof}
+type asset_import_intent =
+  {import_source:Logseq_db_types.Asset_import.t;import_encoded:string}
 
 type import_progress =
   | Import_rejected of error
@@ -628,7 +630,7 @@ let capabilities (s : session) =
   { limits = s.limits
   ; atomic_append = true
   ; durable_mutations = true
-  ; durable_import = false
+  ; durable_import = true
   ; observations = true
   }
 ;;
@@ -902,49 +904,85 @@ let decode_asset_consumer session wire =
 let asset_file_consumer (file:asset_file)=file.asset_consumer
 let asset_file_asset (file:asset_file)=file.asset
 
-let file_lease_session (x : file_lease) =
-  match x with
-  | _ -> .
+let file_lease_session lease=lease.lease_owner
+let file_lease_id lease=lease.lease_id
+let imported_session imported=imported.import_owner
+let file_path lease=lease.lease_path
+let file_type lease=lease.lease_type
+let import_data imported=imported.import_receipt
+let import_preview imported=imported.import_preview
+let import_source_proof imported=imported.source_proof
+let import_source_proof_id proof=proof.source_operation
+let without_import_preview imported={imported with import_preview=None;import_receipt={imported.import_receipt with preview=None}}
+
+module Import_json = struct
+  type t =
+    { schema:int; namespace:string; operation:Uuid.t; asset:Uuid.t; target:Uuid.t
+    ; replace_reference:Uuid.t option; local_mutation:Uuid.t; metadata_mutation:Uuid.t
+    ; source_file:string; title:string; file_type:string }
+  let to_yojson value = `Assoc
+    ["schema",`Int value.schema;"namespace",`String value.namespace;
+     "operation",Uuid.to_yojson value.operation;"asset",Uuid.to_yojson value.asset;
+     "target",Uuid.to_yojson value.target;
+     "replace_reference",(match value.replace_reference with None->`Null|Some id->Uuid.to_yojson id);
+     "local_mutation",Uuid.to_yojson value.local_mutation;"metadata_mutation",Uuid.to_yojson value.metadata_mutation;
+     "source_file",`String value.source_file;"title",`String value.title;"file_type",`String value.file_type]
+  let of_yojson = function
+    | `Assoc fields when List.length fields=11->
+      let ( let* )=Result.bind in
+      let get key=Option.value(List.assoc_opt key fields)~default:`Null in
+      let text key=match get key with `String value->Ok value|_->Error("Invalid import "^key) in
+      let* schema=match get "schema" with `Int value->Ok value|_->Error "Invalid import schema" in
+      let* namespace=text "namespace" in
+      let* operation=Uuid.of_yojson(get "operation") in
+      let* asset=Uuid.of_yojson(get "asset") in
+      let* target=Uuid.of_yojson(get "target") in
+      let* replace_reference=match get "replace_reference" with `Null->Ok None|value->Result.map Option.some(Uuid.of_yojson value) in
+      let* local_mutation=Uuid.of_yojson(get "local_mutation") in
+      let* metadata_mutation=Uuid.of_yojson(get "metadata_mutation") in
+      let* source_file=text "source_file" in let* title=text "title" in let* file_type=text "file_type" in
+      Ok{schema;namespace;operation;asset;target;replace_reference;local_mutation;metadata_mutation;source_file;title;file_type}
+    | _->Error "Invalid complete asset import object"
+end
+
+let import_namespace (session:session)=Wire.namespace_for_owner
+  ~origin:(Uri.of_string session.binding.origin) ~user:session.binding.user ~graph:session.graph
+
+let asset_import_intent session (source:Logseq_db_types.Asset_import.t) =
+  let text ~maximum value=value<>"" && String.length value<=maximum
+    && String.is_valid_utf_8 value && not(String.contains value '\000') in
+  if not(text ~maximum:8192 source.source_file) || not(text ~maximum:1024 source.title)
+    || String.trim source.title="" || source.replace_reference=Some source.asset
+    || Uuid.equal source.local_mutation source.metadata_mutation
+  then Error(Invalid_input "Invalid immutable asset import source or identity") else
+  Result.bind(Logseq_db_types.Asset_descriptor.version ~checksum:(String.make 64 '0') ~file_type:source.file_type
+    |> Result.map_error(fun message->Invalid_input message))(fun _->
+    let namespace=import_namespace session in
+    let json=Import_json.{schema=1;namespace;operation=source.operation;asset=source.asset;target=source.target;
+      replace_reference=source.replace_reference;local_mutation=source.local_mutation;metadata_mutation=source.metadata_mutation;
+      source_file=source.source_file;title=source.title;file_type=source.file_type} in
+    let encoded=Import_json.to_yojson json |> Yojson.Safe.sort |> Yojson.Safe.to_string in
+    if String.length encoded>16384 then Error(Invalid_input "Asset import payload exceeds its byte bound") else
+    Ok{import_source=source;import_encoded=encoded})
 ;;
-
-let imported_session (x : imported) =
-  match x with
-  | _ -> .
+let asset_import_intent_id intent=intent.import_source.operation
+let encode_asset_import_intent intent=Bytes.of_string intent.import_encoded
+let import_source_proof_matches intent proof=proof.source_operation=intent.import_source.operation
+  && proof.source_fingerprint=(Digestif.SHA256.digest_string intent.import_encoded |> Digestif.SHA256.to_hex)
+let restore_asset_import_intent session bytes =
+  if Bytes.length bytes>16384 then Error(Invalid_input "Asset import payload exceeds its byte bound") else
+  try
+    let json=Yojson.Safe.from_string(Bytes.to_string bytes) in
+    Result.bind(Logseq_db_types.Json_codec.decode ~maximum_bytes:16384 Import_json.of_yojson json
+      |> Result.map_error(fun message->Invalid_input message))(fun saved->
+      if saved.schema<>1 || saved.namespace<>import_namespace session then Error Revoked_session else
+      let source:Logseq_db_types.Asset_import.t={operation=saved.operation;asset=saved.asset;target=saved.target;
+        replace_reference=saved.replace_reference;local_mutation=saved.local_mutation;metadata_mutation=saved.metadata_mutation;
+        source_file=saved.source_file;title=saved.title;file_type=saved.file_type} in
+      Result.bind(asset_import_intent session source)(fun intent->
+        if intent.import_encoded<>Bytes.to_string bytes then Error(Invalid_input "Asset import bytes are not canonical") else Ok intent))
+  with Yojson.Json_error _ | Failure _ | Invalid_argument _ ->Error(Invalid_input "Invalid asset import bytes")
 ;;
-
-let file_path (x : file_lease) =
-  match x with
-  | _ -> .
-;;
-
-let file_type (x : file_lease) =
-  match x with
-  | _ -> .
-;;
-
-let import_data (x : imported) =
-  match x with
-  | _ -> .
-;;
-
-let import_preview (x : imported) =
-  match x with
-  | _ -> .
-;;
-
-let asset_import_intent _ _ = unavailable "Durable import recovery"
-
-let asset_import_intent_id (x : asset_import_intent) =
-  match x with
-  | _ -> .
-;;
-
-let encode_asset_import_intent (x : asset_import_intent) =
-  match x with
-  | _ -> .
-;;
-
-let restore_asset_import_intent _ _ = unavailable "Durable import recovery"
 
 let asset_notice_session (x:asset_notice)=x.notice_owner
 
@@ -1132,6 +1170,9 @@ let rec validate_request : type a. session -> a request -> (unit, error) result 
   | Append intent ->
     if not(capabilities session).atomic_append then unavailable "Atomic Append"
     else Result.map(fun _->())(restore_append_intent session(encode_append_intent intent))
+  | Import intent->Result.map(fun _->())(restore_asset_import_intent session(encode_asset_import_intent intent))
+  | Acquire_imported_file imported->if equal_session session imported.import_owner then Ok() else Error Revoked_session
+  | Release_file lease->if equal_session session lease.lease_owner then Ok() else Error Revoked_session
   | Mutate intent -> validate_intent session intent
   | Confirm (presentation, receipt) -> validate_confirmation session presentation receipt
   | Recover_mutations {after;maximum_items;maximum_bytes}->validate_recovery session ~after ~maximum_items ~maximum_bytes
@@ -1951,6 +1992,9 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
         =
         fun session ~request_id operation ->
         match operation with
+        | Release_file lease->
+          if not(equal_binding session.binding binding) || not(equal_session session lease.lease_owner)
+          then Error Revoked_session else Ok(Service.Release_asset_file{scope=session.asset_scope;handle=lease.lease_handle})
         | Release_asset_demand consumer->
           if not(equal_binding session.binding binding) then Error Revoked_session else
           Result.bind(validate_request session operation)(fun()->
@@ -2049,6 +2093,9 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                      ; intent = Wire.encode intent
                      })
                 (validate_intent session intent)
+            | Import intent->Result.map(fun()->Service.Coordination_import{registration=binding.serial;owner=session.asset_scope;request_id;source=intent.import_source})(validate_request session operation)
+            | Acquire_imported_file imported->Result.map(fun()->Service.Acquire_imported_file{scope=session.asset_scope;operation=imported.import_receipt.operation})
+                (validate_request session operation)
             | Replace_asset_demand(consumer,priority,assets)->
               Result.bind(validate_request session operation)(fun()->
               Result.map(fun consumer->Service.Coordination_asset_demand
@@ -2076,6 +2123,36 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
         =
         fun session ~request_id operation response ->
         match operation with
+        | Release_file lease->
+          if not(equal_binding session.binding binding) || not(equal_session session lease.lease_owner) then Error Revoked_session else
+          (match response with Service.Client_command_completed->Ok(Answered(Ok()))
+           | _->Error(Protocol_mismatch "File release did not acknowledge actual checked release"))
+        | Import intent->
+          if not(equal_binding session.binding binding)
+            || Result.is_error(restore_asset_import_intent session(encode_asset_import_intent intent))
+          then Error Revoked_session else
+          (match response with
+           | Service.Coordination_imported{registration;owner;request_id=actual;result=Error message}
+             when registration=binding.serial && actual=request_id && matches_asset_scope session owner->Ok(Answered(Error(Service_failed message)))
+           | Service.Coordination_imported{registration;owner;request_id=actual;result=Ok receipt}
+             when registration=binding.serial && actual=request_id && matches_asset_scope session owner && matches_asset_scope session receipt.scope
+               && receipt.graph_generation=session.generation && receipt.operation=intent.import_source.operation
+               && receipt.target=intent.import_source.target && receipt.asset.uuid=intent.import_source.asset
+               && receipt.file_type=intent.import_source.file_type && receipt.asset.current_checksum<>None->
+             let preview=Option.map(fun(handle,path)->{lease_owner=session;lease_id=request_id;lease_handle=handle;lease_path=path;lease_type=receipt.file_type})receipt.preview in
+             if Option.exists(fun lease->lease.lease_handle="" || lease.lease_path="")preview
+             then Error(Protocol_mismatch "Imported preview omitted its acquired file capability") else
+             Ok(Answered(Ok(Imported{import_owner=session;import_receipt=receipt;import_preview=preview;
+               source_proof={source_operation=intent.import_source.operation;
+                 source_fingerprint=(Digestif.SHA256.digest_string intent.import_encoded |> Digestif.SHA256.to_hex)}})))
+           | _->Error(Protocol_mismatch "Import receipt changed its exact owner or immutable identity"))
+        | Acquire_imported_file imported->
+          if not(equal_binding session.binding binding) || not(equal_session session imported.import_owner) then Error Revoked_session else
+          (match response with
+           | Service.Asset_file None->Ok(Answered(Ok None))
+           | Service.Asset_file(Some(handle,path)) when handle<>"" && path<>""->
+             Ok(Answered(Ok(Some{lease_owner=session;lease_id=request_id;lease_handle=handle;lease_path=path;lease_type=imported.import_receipt.file_type})))
+           | _->Error(Protocol_mismatch "Imported acquire omitted its actual lease capability"))
         | Release_asset_demand consumer->
           if not(equal_binding session.binding binding)
              || not(equal_asset_consumer consumer {consumer with session}) then Error Revoked_session else

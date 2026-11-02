@@ -403,25 +403,34 @@ type import_receipt =
   ; preview : (string * string) option
   }
 
-let import_asset t ~graph_generation request =
-  match Pure_reducer.import_context !(t.state) ~graph_generation with
+let import_asset ?scope ?(current=(fun()->true)) t ~graph_generation request =
+  let authorized=current in
+  let context=match scope with None->Pure_reducer.import_context !(t.state) ~graph_generation
+    |Some (scope:Sync.graph_scope) when scope.graph_generation=graph_generation->Pure_reducer.import_context_for_scope !(t.state) scope
+    |Some _->None in
+  match context with
   | None -> Error "The graph is unavailable or its import queue is full"
   | Some context ->
     let current () =
-      (not t.stopped)
+      (not t.stopped) && authorized()
       &&
-      match Pure_reducer.import_context !(t.state) ~graph_generation with
+      match Pure_reducer.import_context_for_scope !(t.state) context.scope with
       | Some latest -> latest.scope = context.scope
       | None -> false
     in
-    Result.map
+    Result.bind
+      (Effect_runner.prepare_import t.runner ~context request ~current)
       (fun intent -> Eio.Cancel.protect(fun()->
+         if not(current()) then Error "The import owner retired after source preparation." else
          let preview =
            Effect_runner.retain_imported_file
              t.runner
              ~scope:context.scope
              ~operation:intent.Logseq_db_types.Asset_upload_intent.operation_id
          in
+         if not(current()) then (
+           Option.iter(fun(handle,_)->Effect_runner.abandon_asset_file t.runner ~scope:context.scope ~handle)preview;
+           Error "The import owner retired after preview acquisition.") else
          let asset =
            Logseq_db_types.Asset_descriptor.create
              ~uuid:intent.asset
@@ -436,7 +445,7 @@ let import_asset t ~graph_generation request =
            (Pure_reducer.Upload_requested_for_scope
               (context.scope, intent.Logseq_db_types.Asset_upload_intent.operation_id,
                 Logseq_db_worker_pure_reducer.Asset_upload.Restore intent));
-         { operation = intent.operation_id
+         Ok { operation = intent.operation_id
          ; graph_generation
          ; scope = context.scope
          ; target = intent.target
@@ -444,7 +453,6 @@ let import_asset t ~graph_generation request =
          ; file_type = intent.version.file_type
          ; preview
          }))
-      (Effect_runner.prepare_import t.runner ~context request ~current)
 ;;
 
 let retain_imported_file t ~scope ~operation =

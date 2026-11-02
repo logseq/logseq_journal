@@ -17,6 +17,14 @@ let ready binding projection =
   (C.step state (C.Bootstrap_received (binding, W.Ready projection))).next
 ;;
 
+let checked_import_reply issuer session ticket intent receipt =
+  let module I=(val issuer:W.ISSUER) in
+  let response=match I.request session ~request_id:(C.ticket_id ticket)(W.Import intent) |> Result.get_ok with
+    |S.Coordination_import{registration;owner;request_id;_}->S.Coordination_imported{registration;owner;request_id;result=Ok receipt}
+    |_->failwith "Import bypassed its registration-owned Service entry" in
+  I.reply session ~request_id:(C.ticket_id ticket)(W.Import intent)response |> Result.get_ok
+;;
+
 let test_asset_demand_notice_has_one_registered_owner () =
   let issuer,raw,projection,session=fixture 881L in
   let module I=(val issuer:W.ISSUER) in
@@ -164,6 +172,205 @@ let test_asset_cleanup_round_properties () =
     if fails actions then failwith(Printf.sprintf "asset round seed=%d minimized=[%s]" seed
       (String.concat ";"(List.map string_of_int(shrink actions))))
   done
+;;
+
+let test_import_intent_preserves_complete_source () =
+  let _,_,_,session=fixture 885L in
+  let source:Logseq_db_types.Asset_import.t=
+    {operation=uuid "98000000-0000-4000-8000-000000000885";
+     asset=uuid "98000000-0000-4000-8000-000000000886";target=graph;replace_reference=None;
+     local_mutation=uuid "98000000-0000-4000-8000-000000000887";
+     metadata_mutation=uuid "98000000-0000-4000-8000-000000000888";
+     source_file="/tmp/synthetic-picker-885.png";title="Synthetic attachment";file_type="png"} in
+  let intent=W.asset_import_intent session source |> Result.get_ok in
+  let encoded=W.encode_asset_import_intent intent in
+  check(W.asset_import_intent_id intent=source.operation) "import minted a replacement operation identity";
+  let _,_,_,restarted=fixture ~graph_generation:99 886L in
+  let restored=W.restore_asset_import_intent restarted encoded |> Result.get_ok in
+  check(W.encode_asset_import_intent restored=encoded) "import restore changed exact source/target/IDs";
+  let _,_,_,foreign=fixture ~graph:client 887L in
+  check(Result.is_error(W.restore_asset_import_intent foreign encoded)) "import restore crossed logical graph";
+  check(Result.is_error(W.asset_import_intent session {source with metadata_mutation=source.local_mutation}))
+    "import accepted shared metadata/local mutation identity";
+  check(Result.is_error(W.asset_import_intent session {source with source_file=""})) "import omitted source ownership";
+  let changed=W.asset_import_intent session {source with target=client} |> Result.get_ok in
+  check(W.encode_asset_import_intent changed<>encoded) "same operation's changed target had identical immutable bytes";
+  check(Result.is_error(W.restore_asset_import_intent restarted(Bytes.of_string "{\"schema\":1,\"schema\":1}")))
+    "import accepted duplicate JSON ownership fields"
+;;
+
+let test_import_preview_late_result_is_cleanup_owned () =
+  let issuer,raw,projection,session=fixture 888L in
+  let module I=(val issuer:W.ISSUER) in
+  let source:Logseq_db_types.Asset_import.t=
+    {operation=uuid "98000000-0000-4000-8000-000000000885";
+     asset=uuid "98000000-0000-4000-8000-000000000886";target=graph;replace_reference=None;
+     local_mutation=uuid "98000000-0000-4000-8000-000000000887";
+     metadata_mutation=uuid "98000000-0000-4000-8000-000000000888";
+     source_file="/tmp/synthetic-import-888.png";title="Synthetic preview";file_type="png"} in
+  let intent=W.asset_import_intent session source |> Result.get_ok in
+  let ticket,planned=C.request(ready I.binding projection)session(W.Import intent) |> Result.get_ok in
+  let changed=W.asset_import_intent session {source with target=client} |> Result.get_ok in
+  check(Result.is_error(C.request planned.next session(W.Import changed)))
+    "an accepted/pending import operation changed target under the same identity";
+  let owner=fst(List.hd raw.baseline.state.sync.residents) in
+  let asset=Logseq_db_types.Asset_descriptor.create ~uuid:source.asset ~source:(Managed None)
+    ~current_checksum:(Some(String.make 64 '1')) ~size:(Some 4L) ~dimensions:None |> Result.get_ok in
+  let receipt:Logseq_db_worker.import_receipt={operation=source.operation;graph_generation=owner.graph_generation;
+    scope=owner;target=source.target;asset;file_type="png";preview=Some("held-preview-888","/tmp/synthetic-owned-preview-888.png")} in
+  let reply=checked_import_reply issuer session ticket intent receipt in
+  let admitted=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
+  let retired=(C.step admitted(C.Forget ticket)).next in
+  let done_state=C.step retired(C.Completed(ticket,reply)) in
+  check(C.reply(C.view done_state.next)ticket=None) "forgotten import revived its public callback";
+  check(List.exists(function C.Send(_,_,W.Release_file lease)->
+    W.file_path lease="/tmp/synthetic-owned-preview-888.png"|_->false)done_state.instructions)
+    "late published Import preview disappeared without an actual release instruction";
+  check(C.import_progress(C.view done_state.next)intent<>None) "accepted forgotten import lost its durable operation fact";
+  let lease=match reply with W.Answered(Ok(W.Imported imported))->W.import_preview imported |> Option.get|_->failwith "expected sealed imported preview" in
+  let release_ticket instructions=
+    let find : C.instruction -> unit C.ticket option=function C.Send(ticket,_,W.Release_file _)->Some ticket|_->None in
+    List.find_map find instructions |> Option.get in
+  let physical=release_ticket done_state.instructions in
+  let waiter,waiting=C.request done_state.next session(W.Release_file lease) |> Result.get_ok in
+  check(C.reply(C.view waiting.next)waiter=None) "lease release returned admission as physical ACK";
+  let admitted=(C.step waiting.next(C.Admitted(physical,Id.Worker.Request_id.of_int64 4L))).next in
+  let failed=C.step admitted(C.Completed(physical,W.Answered(Error(W.Service_failed "synthetic file release failure")))) in
+  check((match C.reply(C.view failed.next)waiter with Some(W.Answered(Error _))->true|_->false)) "lease release failure disappeared";
+  let retry_waiter,retry=C.request failed.next session(W.Release_file lease) |> Result.get_ok in
+  let retry_physical=release_ticket retry.instructions in
+  let old=(C.step retry.next(C.Completed(physical,W.Answered(Ok())))).next in
+  check(C.reply(C.view old)retry_waiter=None) "old failed lease attempt settled a new release waiter";
+  let admitted=(C.step old(C.Admitted(retry_physical,Id.Worker.Request_id.of_int64 5L))).next in
+  let released=(C.step admitted(C.Completed(retry_physical,W.Answered(Ok())))).next in
+  check(C.reply(C.view released)retry_waiter=Some(W.Answered(Ok()))) "exact physical file ACK did not settle waiter";
+  let repeated,repeat=C.request released session(W.Release_file lease) |> Result.get_ok in
+  check(C.reply(C.view repeat.next)repeated=Some(W.Answered(Ok())) && not(List.exists(function C.Send _->true|_->false)repeat.instructions))
+    "settled lease release was not idempotent";
+  check((match C.import_progress(C.view released)intent with Some(W.Imported imported)->W.import_preview imported=None|None->true|_->false))
+    "import progress reissued a released preview capability"
+;;
+
+let test_import_cancelled_preview_properties () =
+  let run actions =
+    let issuer,raw,projection,session=fixture 889L in
+    let module I=(val issuer:W.ISSUER) in
+    let source:Logseq_db_types.Asset_import.t={operation=uuid "98000000-0000-4000-8000-000000000891";
+      asset=uuid "98000000-0000-4000-8000-000000000892";target=graph;replace_reference=None;
+      local_mutation=uuid "98000000-0000-4000-8000-000000000893";
+      metadata_mutation=uuid "98000000-0000-4000-8000-000000000894";
+      source_file="/tmp/synthetic-property-import.png";title="Synthetic property import";file_type="png"} in
+    let intent=W.asset_import_intent session source |> Result.get_ok in
+    let ticket,planned=C.request(ready I.binding projection)session(W.Import intent) |> Result.get_ok in
+    let owner=fst(List.hd raw.baseline.state.sync.residents) in
+    let asset=Logseq_db_types.Asset_descriptor.create ~uuid:source.asset ~source:(Managed None)
+      ~current_checksum:(Some(String.make 64 'a')) ~size:(Some 4L) ~dimensions:None |> Result.get_ok in
+    let receipt:Logseq_db_worker.import_receipt={operation=source.operation;graph_generation=owner.graph_generation;
+      scope=owner;target=source.target;asset;file_type="png";preview=Some("property-lease","/tmp/synthetic-property-owned.png")} in
+    let reply=checked_import_reply issuer session ticket intent receipt in
+    let state=ref planned.next and releases=ref [] in
+    let forgotten=ref false and admitted=ref false and success=ref false and stopped=ref false and ack=ref false in
+    let apply event=
+      let transition=C.step !state event in state:=transition.next;
+      let release : C.instruction -> unit C.ticket option=function C.Send(ticket,_,W.Release_file _)->Some ticket|_->None in
+      releases:= !releases @ List.filter_map release transition.instructions in
+    List.iter(fun action->
+      (match action mod 10 with
+       |0->admitted:=true;apply(C.Admitted(ticket,Id.Worker.Request_id.one))
+       |1|7->success:=true;apply(C.Completed(ticket,reply))
+       |2->forgotten:=true;apply(C.Forget ticket)
+       |3->apply(C.Cancel ticket)
+       |4->stopped:=true;apply C.Shutdown_requested
+       |5->apply(C.Binding_release_completed(I.binding,Ok()))
+       |6->let waiting= !releases in releases:=[];List.iter(fun cleanup->
+         apply(C.Admitted(cleanup,Id.Worker.Request_id.of_int64 20L));apply(C.Completed(cleanup,W.Answered(Ok())));ack:=true)waiting
+       |8->apply(C.Projection_received projection)
+       |_->apply C.Capacity_available);
+      if !forgotten then check(C.reply(C.view !state)ticket=None) "forgotten import callback revived";
+      if !stopped && !admitted && !success && not !ack
+      then check(C.shutdown_state(C.view !state)<>C.Stopped) "shutdown consumed lease without its physical release ACK";
+      if !admitted && (not !success || not !ack)
+      then check(C.import_progress(C.view !state)intent<>None) "unsettled accepted import lost its stable recovery fact")actions
+  in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec remove prefix=function []->actions
+      | _::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      | action::rest->remove(action::prefix)rest in remove [] actions in
+  let prefixes=[[0;2;1];[1;4;5;0];[0;4;1;5];[0;1;2;4];[4;1;0;5]] in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x1A90;seed|] in
+    let actions=List.nth prefixes(seed mod List.length prefixes) @ List.init 40(fun _->Random.State.int random 10) in
+    if fails actions then failwith(Printf.sprintf "import ownership seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions))))
+  done
+;;
+
+let test_completed_imports_release_active_recovery_capacity () =
+  let issuer,raw,projection,session=fixture 890L in
+  let module I=(val issuer:W.ISSUER) in
+  let state=ref(ready I.binding projection) in
+  let id n=uuid(Printf.sprintf "98000000-0000-4000-8000-%012d" n) in
+  let source n:Logseq_db_types.Asset_import.t={operation=id(9000+n);asset=id(10000+n);target=graph;replace_reference=None;
+    local_mutation=id(11000+n);metadata_mutation=id(12000+n);source_file="/tmp/synthetic-capacity.png";
+    title="Synthetic capacity import";file_type="png"} in
+  let owner=fst(List.hd raw.baseline.state.sync.residents) in
+  for n=0 to 128 do
+    let source=source n in let intent=W.asset_import_intent session source |> Result.get_ok in
+    let ticket,planned=C.request !state session(W.Import intent) |> Result.get_ok in
+    let asset=Logseq_db_types.Asset_descriptor.create ~uuid:source.asset ~source:(Managed None)
+      ~current_checksum:(Some(String.make 64 'a')) ~size:(Some 4L) ~dimensions:None |> Result.get_ok in
+    let receipt:Logseq_db_worker.import_receipt={operation=source.operation;graph_generation=owner.graph_generation;
+      scope=owner;target=source.target;asset;file_type="png";preview=None} in
+    let reply=checked_import_reply issuer session ticket intent receipt in
+    state:=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.of_int64(Int64.of_int(n+1))))).next;
+    state:=(C.step !state(C.Completed(ticket,reply))).next;
+    state:=(C.step !state(C.Forget ticket)).next
+  done;
+  let changed=W.asset_import_intent session {(source 0)with target=client} |> Result.get_ok in
+  check(Result.is_error(C.request !state session(W.Import changed))) "completed import history allowed operation payload substitution"
+;;
+
+let test_new_host_source_proof_retires_only_identical_unknown () =
+  let first,_,projection,session=fixture 891L in
+  let module I=(val first:W.ISSUER) in
+  let source:Logseq_db_types.Asset_import.t={operation=uuid "98000000-0000-4000-8000-000000001891";
+    asset=uuid "98000000-0000-4000-8000-000000001892";target=graph;replace_reference=None;
+    local_mutation=uuid "98000000-0000-4000-8000-000000001893";metadata_mutation=uuid "98000000-0000-4000-8000-000000001894";
+    source_file="/tmp/synthetic-original-owned-source.png";title="Synthetic source ownership";file_type="png"} in
+  let intent=W.asset_import_intent session source |> Result.get_ok in
+  let ticket,planned=C.request(ready I.binding projection)session(W.Import intent) |> Result.get_ok in
+  let old=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
+  let old=(C.step old(C.Completed(ticket,W.Interrupted W.Transport_lost))).next in
+  let old=(C.step old(C.Forget ticket)).next in
+  let old=(C.step old C.Shutdown_requested).next in
+  let old=(C.step old(C.Binding_release_completed(I.binding,Ok()))).next in
+  check(C.shutdown_state(C.view old)=C.Stopped && C.import_sources_pending(C.view old) ~owner:None)
+    "old stopped host did not preserve original Unknown source";
+  let second,raw,next_projection,next_session=fixture ~graph_generation:99 892L in
+  let module N=(val second:W.ISSUER) in
+  let next_intent=W.restore_asset_import_intent next_session(W.encode_asset_import_intent intent) |> Result.get_ok in
+  let make_proof intent target=
+    let ticket,plan=C.request(ready N.binding next_projection)next_session(W.Import intent) |> Result.get_ok in
+    let owner=fst(List.hd raw.baseline.state.sync.residents) in
+    let asset=Logseq_db_types.Asset_descriptor.create ~uuid:source.asset ~source:(Managed None)
+      ~current_checksum:(Some(String.make 64 'a')) ~size:(Some 4L) ~dimensions:None |> Result.get_ok in
+    let receipt:Logseq_db_worker.import_receipt={operation=source.operation;graph_generation=owner.graph_generation;scope=owner;
+      target;asset;file_type="png";preview=None} in
+    let reply=checked_import_reply second next_session ticket intent receipt in
+    let next=(C.step plan.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
+    let next=(C.step next(C.Completed(ticket,reply))).next in
+    let next=(C.step next(C.Forget ticket)).next in
+    C.import_source_proof(C.view next)intent |> Option.get in
+  let wrong=W.asset_import_intent next_session {source with target=client} |> Result.get_ok in
+  let ignored=(C.step old(C.Import_source_reconciled(make_proof wrong client))).next in
+  check(C.import_sources_pending(C.view ignored) ~owner:None) "same UUID different payload retired an unrelated source";
+  let proof=make_proof next_intent source.target in
+  let reconciled=(C.step ignored(C.Import_source_reconciled proof)).next in
+  check(not(C.import_sources_pending(C.view reconciled) ~owner:None))
+    "new host's exact durable source proof stranded old Unknown source ownership";
+  check(C.equal_view(C.view reconciled)(C.view(C.step reconciled(C.Import_source_reconciled proof)).next))
+    "duplicate source proof changed the old stopped host"
 ;;
 
 let test_query_origin_boundary () =
@@ -3593,6 +3800,11 @@ let () =
   test_asset_demand_notice_has_one_registered_owner ();
   test_asset_cleanup_ack_and_shutdown_retry ();
   test_asset_cleanup_round_properties ();
+  test_import_intent_preserves_complete_source ();
+  test_import_preview_late_result_is_cleanup_owned ();
+  test_import_cancelled_preview_properties ();
+  test_completed_imports_release_active_recovery_capacity ();
+  test_new_host_source_proof_retires_only_identical_unknown ();
   test_atomic_append_intent_and_admission ();
   test_recovery_cursor_and_capacity_bounds ();
   test_durable_recovery_and_ack_purity ();

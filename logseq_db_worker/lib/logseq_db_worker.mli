@@ -94,7 +94,9 @@ type import_receipt =
   }
 
 val import_asset
-  :  t
+  :  ?scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> ?current:(unit -> bool)
+  -> t
   -> graph_generation:int
   -> Logseq_db_types.Asset_import.t
   -> (import_receipt, string) result
