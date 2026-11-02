@@ -56,6 +56,14 @@ let apply_local model = function
              else candidate)
           model.blocks
     }
+  | Append_journal{page;title;journal_day;root;_}->
+    let chosen=List.find_opt(fun(page:page)->not page.deleted && page.journal_day=Some journal_day)model.pages in
+    let owner=match chosen with Some page->page|None->{uuid=page;title;journal_day=Some journal_day;deleted=false} in
+    let rec insert parent blocks (node:Types.append_node)=
+      let block={uuid=node.uuid;title=node.title;parent;
+        task_status=Option.map(fun id->Types.Status_uuid id)node.task_status;deleted=false} in
+      Rrbvec.fold_left(insert node.uuid)(replace_block block blocks)node.children in
+    {blocks=insert owner.uuid model.blocks root;pages=replace_page owner model.pages}
   | Insert_blocks { tree; parent; _ } ->
     { model with blocks = insert_tree parent model.blocks tree }
   | Delete_blocks { root; _ } ->

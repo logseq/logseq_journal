@@ -441,6 +441,15 @@ val find_local_intent : t -> namespace:string -> mutation_id:Graph.Uuid.t
 val local_intent_id : local_intent -> Graph.Uuid.t
 val local_intent_payload : local_intent -> string
 
+(** [Append_journal] resolves an existing non-recycled journal by day while
+    holding the state owner lock. Only when absent may its candidate page be
+    created. Trees are bounded to 2,000 unique nodes and depth 64. The complete
+    root/child/status payload, one outbox entry,
+    and original evidence commit together; no intermediate page or partial tree
+    is observable. A retry retains the original intent and proof even after ACK
+    or reopening. No client children scan or optimistic candidate UUID grants
+    ownership of the resolved page. *)
+
 (** Outbox publication and immutable original commit evidence share one SQLite
     transaction. Retrying returns that same evidence, including after reopening;
     it never replaces the commit revision with a current read revision. *)

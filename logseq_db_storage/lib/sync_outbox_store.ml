@@ -41,6 +41,7 @@ type mutation_identity_wire =
   | Save_block of mutation_identity
   | Publish_asset of mutation_identity
   | Set_asset_reference of mutation_identity
+  | Append_journal of mutation_identity
   | Insert_blocks of mutation_identity
   | Delete_blocks of mutation_identity
   | Create_journal_page of mutation_identity
@@ -71,6 +72,7 @@ let payload_identity record =
       | Save_block x
       | Publish_asset x
       | Set_asset_reference x
+      | Append_journal x
       | Insert_blocks x
       | Delete_blocks x
       | Create_journal_page x

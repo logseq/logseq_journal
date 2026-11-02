@@ -1157,8 +1157,125 @@ let custom_status_writes_exact_reference database =
   | _ -> Alcotest.fail "locally deleted status remained selectable"
 ;;
 
+let atomic_append_reuses_day_and_full_tree ?(remote=false) database =
+  T.seed_task_statuses database;
+  let behavior="atomic append resolves day and complete status tree" in
+  let page=T.page_uuid and candidate=T.mutation_uuid 7701 in
+  let day=20260902 in
+  let existing=T.create_journal_page ~ordinal:7700 () in
+  let existing_page=match existing with Create_journal_page{page;_}->page|_->assert false in
+  if remote then (
+    let module J=Transit_core.Json in
+    let page=J.String "web-created-day" in
+    let add attribute value=T.status_add page attribute value in
+    T.apply_test_transaction database ~cursor:2
+      [add "block/uuid" (J.Uuid(Graph.Uuid.to_string existing_page));
+       add "block/title" (J.String "Web journal");add "block/name" (J.String "web-journal");
+       add "block/journal-day" (J.Int day)])
+  else ignore(Database.commit_local database ~expected:(journal_precondition database existing_page behavior)
+    existing |> T.require_ok ~behavior);
+  let root:Types.append_node={uuid=T.mutation_uuid 7702;title="Atomic root";
+    task_status=Some(T.status_uuid 2);children=Rrbvec.singleton
+      {uuid=T.mutation_uuid 7703;title="Nested status";task_status=Some(T.status_uuid 3);children=Rrbvec.empty}} in
+  let mutation=Types.Append_journal{mutation_id=T.mutation_uuid 7704;page=candidate;title="Fallback journal";journal_day=day;root} in
+  let expected=Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> T.require_ok ~behavior in
+  let intent=Database.persist_local_intent database ~namespace:(String.make 64 'a') ~payload:"atomic append complete payload"
+    ~expected mutation |> T.require_ok ~behavior in
+  let proof=match Database.commit_local_intent database intent with
+    | Ok proof->proof
+    | Error(Types.Invalid_local_mutation message|Local_commit_persistence_failed message)->Alcotest.fail message
+    | Error Planner_limit_exceeded->Alcotest.fail "Append exceeded planner bounds"
+    | Error _->Alcotest.fail "Append failed before atomic commit" in
+  let original=Database.intent_commit_outcome proof in
+  if not remote then (
+    let sync=Database.inspect_sync database |> T.require_ok ~behavior in
+    match Database.begin_outbox_transition database ~expected:(Types.sync_view_token sync)
+      (Types.Submit_group [original.mutation_id]) with
+    | Error(Types.Outbox_dependency_ineligible id) when id=original.mutation_id->()
+    | _->Alcotest.fail "append submitted before the unresolved local day owner");
+  current_snapshot database behavior(fun snapshot->
+    (match Database.get_pages snapshot [candidate;existing_page;page] |> T.require_ok ~behavior with
+     | Missing_page _::Present_page _::_->()|_->Alcotest.fail "append created a second journal page");
+    match Database.get_outline_blocks snapshot [root.uuid;T.mutation_uuid 7703] |> T.require_ok ~behavior with
+    | [Present_block{value=root_value;_};Present_block{value=child;_}]->
+      T.require(root_value.block.parent=existing_page && root_value.block.page=existing_page)
+        "append did not reuse the existing day owner";
+      T.require(root_value.block.title=root.title && root_value.task_status=Some(Status_uuid(T.status_uuid 2)))
+        "append root status/source was not atomic";
+      T.require(child.block.parent=root.uuid && child.block.page=existing_page
+        && child.task_status=Some(Status_uuid(T.status_uuid 3))) "append nested status/tree was incomplete"
+    | _->Alcotest.fail "append lost its complete tree");
+  Database.acknowledge_local_intent database proof |> T.require_ok ~behavior;
+  let again=Database.commit_local_intent database intent |> T.require_ok ~behavior in
+  T.require(Database.intent_commit_outcome again=original) "append retry changed original evidence"
+;;
+
+let atomic_append_rejects_sparse_identity ~candidate database =
+  let behavior="append never upserts a sparse existing identity" in
+  let occupied=T.mutation_uuid 7784 in
+  let module J=Transit_core.Json in
+  let entity=J.String "existing-sparse-entity" in
+  T.apply_test_transaction database ~cursor:1
+    [T.status_add entity "block/uuid" (J.Uuid(Graph.Uuid.to_string occupied));
+     T.status_add entity "block/title" (J.String "Existing sparse")];
+  let expected=Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> T.require_ok ~behavior in
+  let root:Types.append_node={uuid=(if candidate then T.mutation_uuid 7785 else occupied);title="Must not upsert";
+    task_status=None;children=Rrbvec.empty} in
+  let mutation=Types.Append_journal{mutation_id=T.mutation_uuid 7786;
+    page=(if candidate then occupied else T.mutation_uuid 7785);title="Must not replace";journal_day=20261102;root} in
+  let before=Database.inspect_sync database |> T.require_ok ~behavior in
+  (match Database.commit_local database ~expected mutation with
+   | Error(Types.Invalid_local_mutation _)->()
+   | _->Alcotest.fail "append admitted an existing sparse UUID");
+  let after=Database.inspect_sync database |> T.require_ok ~behavior in
+  T.require(Types.sync_view_submissions before=Types.sync_view_submissions after)
+    "rejected sparse identity changed durable outbox"
+;;
+
+let atomic_append_rejects_invalid_day database =
+  let behavior="append validates a real Gregorian day" in
+  let expected=Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> T.require_ok ~behavior in
+  let root:Types.append_node={uuid=T.mutation_uuid 7781;title="Invalid day";task_status=None;children=Rrbvec.empty} in
+  let mutation=Types.Append_journal{mutation_id=T.mutation_uuid 7782;page=T.mutation_uuid 7783;title="Invalid day";
+    journal_day=20260230;root} in
+  T.require(Result.is_error(Database.persist_local_intent database ~namespace:(String.make 64 'e')
+    ~payload:"invalid append day" ~expected mutation)) "append admitted February 30"
+;;
+
+let atomic_append_keeps_existing_tree_budget database =
+  let behavior="atomic append preserves the existing 2000-node protocol budget" in
+  let root:Types.append_node={uuid=T.mutation_uuid 30000;title="Large append";task_status=None;
+    children=Rrbvec.init 1999(fun index->{uuid=T.mutation_uuid(30001+index);title="Child";
+      task_status=None;children=Rrbvec.empty})} in
+  let mutation=Types.Append_journal{mutation_id=T.mutation_uuid 33000;page=T.mutation_uuid 33001;
+    title="Large day";journal_day=20261102;root} in
+  let expected=Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> T.require_ok ~behavior in
+  let intent=Database.persist_local_intent database ~namespace:(String.make 64 'd') ~payload:"complete large append"
+    ~expected mutation |> T.require_ok ~behavior in
+  let proof=Database.commit_local_intent database intent |> T.require_ok ~behavior in
+  T.require(Rrbvec.length(Database.intent_commit_targets proof)=2000) "append truncated its durable target tree";
+  current_snapshot database behavior(fun snapshot->
+    let selected=Rrbvec.to_seq root.children |> Seq.take 64 |> Seq.map(fun(node:Types.append_node)->node.uuid) |> List.of_seq in
+    Gc.full_major();
+    let allocated_before=Gc.allocated_bytes() in
+    let values=Database.get_outline_blocks snapshot selected |> T.require_ok ~behavior in
+    let allocated=Gc.allocated_bytes()-.allocated_before in
+    T.require(List.length values=64) "large append lost bounded point reads";
+    T.require(allocated<64.*.1024.*.1024.) "bounded Append hydration repeatedly decoded the entire transaction";
+    match Database.get_structure snapshot(Children{parent=root.uuid;limit=200;cursor=None}) |> T.require_ok ~behavior with
+    | Children_result{items;next_cursor=Some _;_}->
+      T.require(List.length items=200) "large append did not preserve a bounded Partial child page"
+    | _->Alcotest.fail "large append pretended its first child page was complete")
+;;
+
 let cases =
-  [ T.database_case
+  [ T.database_case "atomic append preserves tree node budget" atomic_append_keeps_existing_tree_budget
+    ; T.database_case "atomic append rejects sparse root identity" (atomic_append_rejects_sparse_identity ~candidate:false)
+    ; T.database_case "atomic append rejects sparse page identity" (atomic_append_rejects_sparse_identity ~candidate:true)
+    ; T.database_case "atomic append validates Gregorian day" atomic_append_rejects_invalid_day
+    ; T.database_case "atomic append resolves existing day and full tree" (atomic_append_reuses_day_and_full_tree ~remote:false)
+    ; T.database_case "atomic append resolves Web-created day" (atomic_append_reuses_day_and_full_tree ~remote:true)
+    ; T.database_case
       "custom status UUID mutation and explicit clear"
       custom_status_writes_exact_reference
   ; T.database_case
@@ -1322,7 +1439,7 @@ let durable_intent_keeps_original_commit database =
     (Database.intent_commit_outcome stored = original)
 ;;
 
-let durable_intent_survives_restart_and_rollback () =
+let durable_intent_survives_restart_and_rollback ?(append=false) () =
   let behavior = "durable intent atomicity and restart" in
   T.with_temp_directory "durable-intent-reopen-" (fun support ->
     let path = T.seed_mirror support in
@@ -1366,11 +1483,11 @@ let durable_intent_survives_restart_and_rollback () =
                 ~namespace
                 ~payload:"stable restart payload"
                 ~expected
-                (Save_block
-                   { mutation_id = T.mutation_uuid 7610
-                   ; block = T.authoritative_block_uuid
-                   ; title = "Atomic restart edit"
-                   })
+                (if append then Types.Append_journal
+                   {mutation_id=T.mutation_uuid 7610;page=T.mutation_uuid 7720;title="New atomic day";journal_day=20261102;
+                    root={uuid=T.mutation_uuid 7721;title="New atomic root";task_status=None;children=Rrbvec.singleton
+                      {uuid=T.mutation_uuid 7722;title="New atomic child";task_status=None;children=Rrbvec.empty}}}
+                 else Save_block {mutation_id=T.mutation_uuid 7610;block=T.authoritative_block_uuid;title="Atomic restart edit"})
               |> T.require_ok ~behavior
             in
             let before =
@@ -1398,6 +1515,12 @@ let durable_intent_survives_restart_and_rollback () =
               "failed transaction restores projection"
               true
               (before = after);
+            if append then current_snapshot database behavior(fun snapshot->
+              T.require(match Database.get_pages snapshot [T.mutation_uuid 7720] |> T.require_ok ~behavior with
+                |[Missing_page _]->true|_->false) "failed append left an empty journal page";
+              T.require(match Database.get_outline_blocks snapshot [T.mutation_uuid 7721;T.mutation_uuid 7722]
+                |> T.require_ok ~behavior with [Missing_block _;Missing_block _]->true|_->false)
+                "failed append left a partial tree");
             sql "DROP TRIGGER reject_intent_commit";
             Database.commit_local_intent database intent
             |> T.require_ok ~behavior
@@ -1424,6 +1547,15 @@ let durable_intent_survives_restart_and_rollback () =
             "restart preserves original commit point"
             true
             (Database.intent_commit_outcome proof = original);
+          if append then current_snapshot database behavior(fun snapshot->
+            T.require(match Database.get_pages snapshot [T.mutation_uuid 7720] |> T.require_ok ~behavior with
+              |[Present_page{value;_}]->value.page.kind=Graph.Journal_page{journal_day=20261102}
+              |_->false) "reopen lost the atomically created day";
+            T.require(match Database.get_outline_blocks snapshot [T.mutation_uuid 7721;T.mutation_uuid 7722]
+              |> T.require_ok ~behavior with
+              |[Present_block{value=root;_};Present_block{value=child;_}]->
+                root.block.page=T.mutation_uuid 7720 && child.block.parent=root.block.uuid
+              |_->false) "reopen lost the complete atomic tree");
           let fresh = block_precondition database T.authoritative_block_uuid behavior in
           ignore
             (Database.commit_local
@@ -1640,7 +1772,9 @@ let cases =
     ; Alcotest.test_case
         "durable intent survives restart and rollback"
         `Quick
-        durable_intent_survives_restart_and_rollback
+        (durable_intent_survives_restart_and_rollback ~append:false)
+    ; Alcotest.test_case "atomic append rollback and restart" `Quick
+        (durable_intent_survives_restart_and_rollback ~append:true)
     ]
 ;;
 

@@ -1703,6 +1703,7 @@ let graph_attached core (attachment : graph_attachment) =
 
 let operation_name = function
   | Overlay.Save_block_operation -> "save-block"
+  | Append_journal_operation -> "append-journal"
   | Insert_blocks_operation -> "insert-blocks"
   | Delete_blocks_operation -> "delete-blocks"
   | Create_journal_page_operation -> "create-journal-page"

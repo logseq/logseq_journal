@@ -90,6 +90,9 @@ let namespace_valid source =
 ;;
 
 let targets = function
+  | Types.Append_journal{root;_} ->
+    Overlay_planner.append_nodes root |> Rrbvec.map(fun (node:Types.append_node)->node.uuid)
+    |> Rrbvec.sort_uniq U.compare
   | Types.Insert_blocks { tree; _ } ->
     let nodes = ref (Rrbvec.singleton tree)
     and found = ref Rrbvec.empty

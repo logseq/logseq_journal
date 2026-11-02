@@ -77,6 +77,7 @@ type outbox_record = Persistence_outbox_v16.t =
   ; fingerprint : string
   ; mutation : Types.local_mutation
   ; normalized_transaction : string
+  ; append_create : bool
   ; mutable dependency_shadows : dependency_shadows
   ; effect_footprint : footprint
   ; delete_artifacts : delete_artifacts option
@@ -1440,6 +1441,8 @@ type hydration_cache =
   ; authoritative_blocks : (string, Types.block_record option) Hashtbl.t
   ; uuid_entities : (string, int option) Hashtbl.t
   ; block_presence : (string, bool) Hashtbl.t
+  ; append_nodes : (string, (Types.append_node * Graph.Uuid.t) Uuid_map.t) Hashtbl.t
+  ; insert_orders : (string, string Uuid_map.t) Hashtbl.t
   ; property_class : int option
   ; property_definitions : (string, Graph.property_summary option) Hashtbl.t
   ; ident_entities : (string, int) Hashtbl.t
@@ -1460,6 +1463,8 @@ let hydration_cache ?(index_idents = true) database =
   ; authoritative_blocks = Hashtbl.create 16
   ; uuid_entities = Hashtbl.create 16
   ; block_presence = Hashtbl.create 8
+  ; append_nodes = Hashtbl.create 4
+  ; insert_orders = Hashtbl.create 4
   ; property_class =
       (if index_idents
        then Hashtbl.find_opt ident_entities "logseq.class/Property"
@@ -2236,6 +2241,12 @@ let frozen_outbox (records : outbox_record list) =
     records
 ;;
 
+let page_projection_effects (record:outbox_record) =
+  match record.mutation with
+  | Types.Append_journal _ when not record.append_create -> []
+  | _ -> record.effect_footprint.page_uuids
+;;
+
 let queryable_outbox_root (records : outbox_record list) =
   let outbox = frozen_outbox records in
   ( outbox
@@ -2252,7 +2263,7 @@ let queryable_outbox_root (records : outbox_record list) =
       outbox
   , index_ordered_effects
       (fun record ->
-         record.effect_footprint.page_uuids
+         page_projection_effects record
          @
          if record_has_active_dependency_shadows record
          then
@@ -2458,7 +2469,7 @@ let logical_page_revision uuid value =
 
 let assigned_orders (record : outbox_record) =
   match record.mutation with
-  | Types.Insert_blocks _ ->
+  | Types.Insert_blocks _ | Append_journal _ ->
     Sync_tx_codec.inserted_orders record.normalized_transaction
     |> Result.get_ok
     |> List.to_seq
@@ -2467,6 +2478,19 @@ let assigned_orders (record : outbox_record) =
 ;;
 
 let assigned_order orders uuid = Uuid_map.find (Graph.Uuid.to_string uuid) orders
+
+let cached_insert_orders cache (record:outbox_record) =
+  memoized cache.insert_orders (Graph.Uuid.to_string record.mutation_id)(fun()->assigned_orders record)
+;;
+
+let cached_append_node cache (record:outbox_record) root uuid =
+  let nodes=memoized cache.append_nodes (Graph.Uuid.to_string record.mutation_id)(fun()->
+    let rec index parent found (node:Types.append_node) =
+      let found=Uuid_map.add(Graph.Uuid.to_string node.uuid)(node,parent)found in
+      Rrbvec.fold_left(index node.uuid)found node.children in
+    index(List.hd record.effect_footprint.page_uuids)Uuid_map.empty root) in
+  Uuid_map.find_opt(Graph.Uuid.to_string uuid)nodes
+;;
 
 let rec tree_children parent (tree : Types.block_tree) =
   if Graph.Uuid.equal tree.uuid parent
@@ -2479,6 +2503,17 @@ let rec tree_children_interests (tree : Types.block_tree) =
   | [] -> []
   | children ->
     Types.Children_interest tree.uuid :: List.concat_map tree_children_interests children
+;;
+
+let append_uuids root =
+  Overlay_planner.append_nodes root |> Rrbvec.map(fun(node:Types.append_node)->node.uuid)
+  |> Rrbvec.to_list
+;;
+
+let append_interests root =
+  Overlay_planner.append_nodes root |> Rrbvec.filter_map(fun(node:Types.append_node)->
+    if Rrbvec.is_empty node.children then None else Some(Types.Children_interest node.uuid))
+  |> Rrbvec.to_list
 ;;
 
 let rec inserted_block
@@ -2598,6 +2633,51 @@ let logical_page_at ?cache ?initial (snapshot : snapshot) uuid =
        then current
        else (
          match record.mutation with
+         | Types.Append_journal { title; journal_day; _ }
+           when record.append_create && record.effect_footprint.page_uuids=[uuid] ->
+           let page=uuid in
+           let properties =
+             []
+             |> set_property_values
+                  ?cache
+                  authoritative
+                  "block/title"
+                  [ Datascript.String title ]
+             |> set_property_values
+                  ?cache
+                  authoritative
+                  "block/created-at"
+                  [ Datascript.Int64 record.intent_time_ms ]
+             |> set_property_values
+                  ?cache
+                  authoritative
+                  "block/updated-at"
+                  [ Datascript.Int64 record.intent_time_ms ]
+             |> set_property_values
+                  ?cache
+                  authoritative
+                  "block/journal-day"
+                  [ Datascript.Int64 (Int64.of_int journal_day) ]
+           in
+           Some
+             Types.
+               { page =
+                   Graph.
+                     { uuid = page
+                     ; name = String.lowercase_ascii title
+                     ; title
+                     ; kind = Journal_page { journal_day }
+                     ; created_at_ms = record.intent_time_ms
+                     ; updated_at_ms = record.intent_time_ms
+                     ; tags =
+                         Option.bind
+                           (entity_of_ident authoritative "logseq.class/Journal")
+                           (uuid_of_entity authoritative)
+                         |> Option.to_list
+                     ; properties
+                     ; recycled = false
+                     }
+               }
          | Types.Create_journal_page { page; title; journal_day; _ }
            when Graph.Uuid.equal page uuid ->
            let properties =
@@ -2811,6 +2891,23 @@ let logical_block_at ?cache ?initial (snapshot : snapshot) uuid =
                           }
                     })
                current
+           | Append_journal {root;_} ->
+             let page=List.hd record.effect_footprint.page_uuids in
+             let node=match cache with
+               | Some cache->cached_append_node cache record root uuid
+               | None->Overlay_planner.append_parent ~parent:page ~target:uuid root in
+             (match node with
+              | None->current
+              | Some(node,parent)->
+                let leaf:Types.block_tree={uuid=node.uuid;title=node.title;children=[]} in
+                let inserted=inserted_block ?cache authoritative ~target:uuid ~parent ~page
+                  ~orders:(match cache with Some cache->cached_insert_orders cache record|None->assigned_orders record)
+                  ~now:record.intent_time_ms leaf |> Option.get in
+                let properties=match node.task_status with None->inserted.block.properties
+                  |Some status->(match status_entity authoritative (Types.Status_uuid status) with None->inserted.block.properties
+                    |Some entity->set_property_values ?cache authoritative "logseq.property/status"
+                      [Datascript.Ref entity] inserted.block.properties) in
+                Some{inserted with block={inserted.block with properties};task_status=Option.map(fun id->Types.Status_uuid id)node.task_status})
            | Insert_blocks { parent; tree; asset; _ } ->
              let page =
                match record.effect_footprint.page_uuids with
@@ -3138,6 +3235,7 @@ let block_is_tombstoned (snapshot : snapshot) uuid =
       List.exists (Graph.Uuid.equal uuid) artifacts.frontier
     | ( ( Save_block _
         | Insert_blocks _
+        | Append_journal _
         | Delete_blocks _
         | Create_journal_page _
         | Set_task_status _
@@ -3259,6 +3357,11 @@ let local_child_facts ?cache (snapshot : snapshot) parent =
     else (
       let inserted =
         match record.mutation with
+        | Types.Append_journal{root;_} ->
+          let children=if record.effect_footprint.page_uuids=[parent] then Rrbvec.singleton root
+            else Overlay_planner.append_children root parent in
+          let orders=assigned_orders record in
+          Rrbvec.map(fun(child:Types.append_node)->assigned_order orders child.uuid,child.uuid)children |> Rrbvec.to_list
         | Types.Insert_blocks { parent = candidate; tree; _ } ->
           let children =
             if Graph.Uuid.equal parent candidate
@@ -3403,6 +3506,9 @@ let local_journal_candidates (snapshot : snapshot) =
   List.fold_left
     (fun candidates (record : outbox_record) ->
        match record.mutation with
+       | Types.Append_journal{journal_day;_} when record_is_logically_active record ->
+         let page=List.hd record.effect_footprint.page_uuids in
+         Uuid_map.add(Graph.Uuid.to_string page){day=journal_day;uuid=page;entity=None} candidates
        | Types.Create_journal_page { page; journal_day; _ }
          when record_is_logically_active record ->
          Uuid_map.add
@@ -3972,7 +4078,6 @@ type tree_read_cache =
   ; fields : (int, Datascript.datom list) Hashtbl.t
   ; authoritative_candidates : (string, tree_candidate option) Hashtbl.t
   ; logical_candidates : (string, tree_candidate option) Hashtbl.t
-  ; insert_orders : (string, string Uuid_map.t) Hashtbl.t
   }
 
 let tree_entity snapshot cache uuid =
@@ -4024,14 +4129,7 @@ let authoritative_tree_candidate snapshot cache uuid =
     candidate
 ;;
 
-let tree_insert_orders cache (record : outbox_record) =
-  let key = Graph.Uuid.to_string record.mutation_id in
-  match Hashtbl.find_opt cache.insert_orders key with
-  | Some orders -> orders
-  | None ->
-    let orders = assigned_orders record in
-    Hashtbl.add cache.insert_orders key orders;
-    orders
+let tree_insert_orders cache record = cached_insert_orders cache.hydration record
 ;;
 
 let logical_tree_candidate snapshot cache uuid =
@@ -4069,6 +4167,10 @@ let logical_tree_candidate snapshot cache uuid =
            then current
            else (
              match record.mutation with
+             | Types.Append_journal{root;_} ->
+               (match cached_append_node cache.hydration record root uuid with
+                | Some(_,parent)->Some{tree_uuid=uuid;tree_parent=parent;tree_order=assigned_order(tree_insert_orders cache record)uuid}
+                | None->current)
              | Types.Insert_blocks { parent; tree; _ } ->
                let rec find parent (tree : Types.block_tree) =
                  if Graph.Uuid.equal tree.uuid uuid
@@ -4127,6 +4229,10 @@ let ordered_tree_children snapshot cache parent =
       else (
         let inserted =
           match record.mutation with
+          | Types.Append_journal{root;_} ->
+            (if record.effect_footprint.page_uuids=[parent] then Rrbvec.singleton root
+             else Overlay_planner.append_children root parent)
+            |> Rrbvec.map(fun(tree:Types.append_node)->tree.uuid) |> Rrbvec.to_list
           | Types.Insert_blocks { parent = candidate; tree; _ } ->
             (if Graph.Uuid.equal parent candidate
              then [ tree ]
@@ -4175,7 +4281,6 @@ let paginate_page_tree snapshot ~page ~maximum_depth ~limit ~offset =
     ; fields = Hashtbl.create 64
     ; authoritative_candidates = Hashtbl.create 64
     ; logical_candidates = Hashtbl.create 64
-    ; insert_orders = Hashtbl.create 8
     }
   in
   let rec walk depth parent () =
@@ -4477,6 +4582,55 @@ let write_precondition ~blocks ~pages ~scopes =
         | None -> Ok { blocks; pages; scopes }))
 ;;
 
+let mutation_introduced_uuids (record:outbox_record) = match record.mutation with
+  | Types.Append_journal{root;_}->
+    (if record.append_create then record.effect_footprint.page_uuids else [])
+    @ (append_uuids root)
+  | Types.Insert_blocks { tree; _ } -> Outliner.Tree.uuids tree
+  | Create_journal_page { page; _ } -> [ page ]
+  | Save_block _
+  | Publish_asset _
+  | Set_asset_reference _
+  | Delete_blocks _
+  | Set_task_status _
+  | Clear_task_status _ -> []
+;;
+
+let append_identity_present (snapshot:snapshot) uuid =
+  let introduced index =
+    Uuid_map.find_opt(Graph.Uuid.to_string uuid)index |> Option.value ~default:Rrbvec.empty
+    |> Rrbvec.exists(fun(record:outbox_record)->record_is_logically_active record
+      && List.exists(Graph.Uuid.equal uuid)(mutation_introduced_uuids record)) in
+  entity_of_uuid (Option.get snapshot.authoritative_database)uuid<>None
+  || introduced(Option.get snapshot.block_effects) || introduced(Option.get snapshot.page_effects)
+;;
+
+let authoritative_append_page snapshot day =
+  indexed_journal_candidates snapshot ~from_day:day ~upper_day:day ~locals:Uuid_map.empty
+  |> Seq.find_map(fun candidate->
+    match page_of_database (Option.get snapshot.authoritative_database)candidate.uuid with
+    | Some page when not page.page.recycled ->Some candidate.uuid
+    | _->None)
+;;
+
+let resolve_append_page snapshot ~candidate ~day =
+  match authoritative_append_page snapshot day with
+  | Some page->page
+  | None->
+    let chosen=Uuid_map.fold(fun _ effects chosen->
+      Rrbvec.fold_left(fun chosen (record:outbox_record)->
+        let page=match record.mutation with
+          | Types.Create_journal_page{page;journal_day;_} when record_is_logically_active record && journal_day=day ->Some page
+          | Append_journal{journal_day;_} when record_is_logically_active record && journal_day=day ->
+            Some(List.hd record.effect_footprint.page_uuids)
+          | _->None in
+        match page with
+        | Some page when Option.exists(fun(value:Types.page_record)->not value.page.recycled)(logical_page_at snapshot page)->
+          (match chosen with None->Some page|Some old->Some(if Graph.Uuid.compare old page<0 then old else page))
+        | _->chosen) chosen effects) (Option.get snapshot.page_effects) None in
+    Option.value chosen ~default:candidate
+;;
+
 let mutation_id = Overlay_planner.mutation_id
 let operation_of_mutation = Overlay_planner.operation
 
@@ -4486,19 +4640,31 @@ let uuid_lookup uuid =
 
 let uuid_temp prefix uuid = Datascript.Temp_id (prefix ^ ":" ^ Graph.Uuid.to_string uuid)
 
-let insertion_orders context = function
-  | Types.Insert_blocks { parent; tree; _ } ->
-    let lower = snd (read_siblings context parent) in
-    let rec assign orders order (tree : Types.block_tree) =
-      let orders = Uuid_map.add (Graph.Uuid.to_string tree.uuid) order orders in
-      List.fold_left2
-        assign
-        orders
-        (Outliner_order.generate_n ~lower:None ~upper:None (List.length tree.children))
-        tree.children
-    in
-    assign Uuid_map.empty (Outliner_order.generate ~lower ~upper:None) tree
-  | _ -> Uuid_map.empty
+let tree_orders lower tree =
+  let rec assign orders order (tree:Types.block_tree) =
+    let orders=Uuid_map.add(Graph.Uuid.to_string tree.uuid)order orders in
+    List.fold_left2 assign orders
+      (Outliner_order.generate_n ~lower:None ~upper:None(List.length tree.children))tree.children in
+  assign Uuid_map.empty(Outliner_order.generate ~lower ~upper:None)tree
+;;
+
+let append_orders lower root =
+  let rec assign orders order (node:Types.append_node) =
+    let orders=Uuid_map.add(Graph.Uuid.to_string node.uuid)order orders in
+    fst(Rrbvec.fold_left(fun(orders,lower)child->
+      let order=Outliner_order.generate ~lower ~upper:None in assign orders order child,Some order)
+      (orders,None)node.children) in
+  assign Uuid_map.empty(Outliner_order.generate ~lower ~upper:None)root
+;;
+
+let insertion_orders ?append_parent context = function
+  | Types.Append_journal{page;journal_day;root;_}->
+    let lower=match append_parent with Some(_,lower)->lower|None->
+      let parent=resolve_append_page context.read_snapshot ~candidate:page ~day:journal_day in
+      snd(read_siblings context parent) in
+    append_orders lower root
+  | Types.Insert_blocks{parent;tree;_}->tree_orders(snd(read_siblings context parent))tree
+  | _->Uuid_map.empty
 ;;
 
 module Asset_descriptor = Logseq_db_types.Asset_descriptor
@@ -4628,7 +4794,8 @@ let published_asset_matches descriptor version =
   | _ -> false
 ;;
 
-let local_operations
+let rec local_operations
+      ~append_create
       ~fingerprint:_
       ~intent_time_ms
       ~next_tx
@@ -4657,6 +4824,33 @@ let local_operations
       ; Add (uuid_lookup block, "block/updated-at", Int64 (Int64.of_int now))
       ; Add (uuid_lookup block, "block/tx-id", Int64 (Int64.of_int next_tx))
       ]
+    | Types.Append_journal{mutation_id;page=_;title;journal_day;root}->
+      let page=List.hd effect_footprint.page_uuids in
+      let run mutation=local_operations ~append_create:false ~fingerprint:""
+        ~intent_time_ms ~next_tx ~orders ~effect_footprint ~delete_artifacts:None mutation in
+      let creation=if append_create then run(Types.Create_journal_page{mutation_id;page;title;journal_day}) else [] in
+      let rec add_tree parent_ref (node:Types.append_node) =
+        let node_ref=uuid_temp "overlay-insert" node.uuid in
+        let fields=Datascript.[
+          Add(node_ref,"block/uuid",Uuid(Graph.Uuid.to_string node.uuid));Add(node_ref,"block/title",String node.title);
+          Add(node_ref,"block/parent",Ref_to parent_ref);Add(node_ref,"block/page",Ref_to(uuid_lookup page));
+          Add(node_ref,"block/order",String(assigned_order orders node.uuid));
+          Add(node_ref,"block/created-at",Int64 intent_time_ms);Add(node_ref,"block/updated-at",Int64 intent_time_ms);
+          Add(node_ref,"block/tx-id",Int64(Int64.of_int next_tx))] in
+        Seq.append(List.to_seq fields)(Rrbvec.to_seq node.children |> Seq.flat_map(add_tree node_ref)) in
+      let insertion=add_tree(uuid_lookup page)root |> List.of_seq in
+      let statuses=Overlay_planner.append_nodes root |> Rrbvec.to_seq
+        |> Seq.flat_map(fun(node:Types.append_node)->match node.task_status with
+          |None->Seq.empty
+          |Some status->run(Types.Set_task_status{mutation_id;block=node.uuid;status=Types.Status_uuid status}) |> List.to_seq)
+        |> List.of_seq in
+      let operations=creation@insertion@statuses in
+      if not append_create then operations else
+        let page_ref=uuid_temp "overlay-page" page in
+        List.map(function
+          | Datascript.Add(entity,attribute,Ref_to reference) when reference=uuid_lookup page ->
+            Datascript.Add(entity,attribute,Ref_to page_ref)
+          | operation->operation)operations
     | Types.Save_block { block; title; _ } ->
       let entity = uuid_lookup block in
       [ Datascript.Add (entity, "block/title", String title)
@@ -4778,6 +4972,7 @@ let local_operations
 ;;
 
 let normalized_transaction_in
+      ~append_create
       authoritative_database
       ~fingerprint
       ~intent_time_ms
@@ -4788,6 +4983,7 @@ let normalized_transaction_in
       mutation
   =
   local_operations
+    ~append_create
     ~fingerprint
     ~intent_time_ms
     ~next_tx:planned_tx
@@ -4806,7 +5002,7 @@ let normalized_transaction database ~planned_tx =
 
 let fingerprint = Overlay_planner.fingerprint
 
-let dependency_shadows_are_canonical mutation shadows =
+let dependency_shadows_are_canonical ~effect_footprint mutation shadows =
   let find_block uuid =
     List.find_opt
       (fun shadow -> Graph.Uuid.equal shadow.shadow_block_uuid uuid)
@@ -4852,6 +5048,10 @@ let dependency_shadows_are_canonical mutation shadows =
     | Types.Save_block { block; _ }
     | Set_task_status { block; _ }
     | Clear_task_status { block; _ } -> add_block [] [] block
+    | Append_journal{journal_day;_} ->
+      if List.length effect_footprint.page_uuids=1 && List.for_all(fun shadow->
+        not shadow.shadow_recycled && shadow.shadow_page_kind=Graph.Journal_page{journal_day})shadows.shadow_pages
+      then Some([],effect_footprint.page_uuids) else None
     | Insert_blocks { parent; _ } -> add_parent [] [] parent
     | Delete_blocks _ | Create_journal_page _ -> Some ([], [])
   in
@@ -4923,7 +5123,7 @@ let outbox_record_is_canonical (record : outbox_record) =
     | Submitted _
     | Accepted_pending_authoritative _
     | Stale_rejected_pending_authoritative _ ->
-      dependency_shadows_are_canonical record.mutation record.dependency_shadows
+      dependency_shadows_are_canonical ~effect_footprint:record.effect_footprint record.mutation record.dependency_shadows
   in
   Result.is_ok (Sync_tx_codec.protected_values record.normalized_transaction)
   && String.equal record.fingerprint (fingerprint record.mutation)
@@ -4965,6 +5165,7 @@ let outbox_record_is_canonical (record : outbox_record) =
   | Delete_blocks _, None -> false
   | ( ( Save_block _
       | Insert_blocks _
+      | Append_journal _
       | Create_journal_page _
       | Set_task_status _
       | Clear_task_status _
@@ -4973,6 +5174,7 @@ let outbox_record_is_canonical (record : outbox_record) =
     , None ) -> true
   | ( ( Save_block _
       | Insert_blocks _
+      | Append_journal _
       | Create_journal_page _
       | Set_task_status _
       | Clear_task_status _
@@ -5121,6 +5323,7 @@ let has_children_precondition (expected : write_precondition) parent =
 ;;
 
 let required_preconditions (expected : write_precondition) = function
+  | Types.Append_journal _ -> Ok ()
   | Types.Set_asset_reference { block; _ }
   | Types.Publish_asset { block; _ }
   | Set_task_status { block; _ }
@@ -5395,6 +5598,21 @@ let delete_artifacts database context ~now root =
 ;;
 
 let planned_effect database context ~now = function
+  | Types.Append_journal{page;root;journal_day;_}->
+    let resolved=resolve_append_page context.read_snapshot ~candidate:page ~day:journal_day in
+    let nodes=Overlay_planner.append_nodes root in
+    let invalid=Rrbvec.find_map(fun(node:Types.append_node)->
+      if append_identity_present context.read_snapshot node.uuid then Some "An append block UUID is already present."
+      else match node.task_status with
+        |Some status when task_status_at context.read_snapshot status=None ->Some "Append status is missing or recycled."
+        |_->None) nodes in
+    (match invalid,read_page context resolved with
+     | Some message,_->Error(Types.Invalid_local_mutation message)
+     | _,Some page when page.page.recycled || page.page.kind<>Graph.Journal_page{journal_day}->
+       Error(Types.Invalid_local_mutation "Append candidate belongs to another page.")
+     | _,None when append_identity_present context.read_snapshot resolved ->Error(Types.Invalid_local_mutation "Append candidate UUID is already occupied.")
+     | _->Ok({block_uuids=append_uuids root;page_uuids=[resolved];structure_interests=
+         [Types.Children_interest resolved;Page_tree_interest resolved;Journal_index_interest]@append_interests root},None))
   | Types.Set_asset_reference { block; previous; asset; _ } ->
     (match read_block context block, asset_descriptor_at context.read_snapshot asset with
      | Some holder, Ok (Some _) when asset_reference_matches holder previous ->
@@ -5494,7 +5712,7 @@ let planned_effect database context ~now = function
       , None )
 ;;
 
-let dependency_shadows_for_snapshot snapshot mutation =
+let dependency_shadows_for_snapshot ?append_page snapshot mutation =
   let shadow_blocks = ref [] in
   let shadow_pages = ref [] in
   let add_page uuid =
@@ -5551,6 +5769,7 @@ let dependency_shadows_for_snapshot snapshot mutation =
    | Types.Save_block { block; _ }
    | Set_task_status { block; _ }
    | Clear_task_status { block; _ } -> add_block block
+   | Append_journal{page;journal_day;_}->add_page(match append_page with Some page->page|None->resolve_append_page snapshot ~candidate:page ~day:journal_day)
    | Insert_blocks { parent; _ } -> add_block parent
    | Delete_blocks _ | Create_journal_page _ -> ());
   { shadow_blocks =
@@ -5566,8 +5785,10 @@ let dependency_shadows_for_snapshot snapshot mutation =
   }
 ;;
 
-let dependency_shadows_for database mutation =
-  dependency_shadows_for_snapshot (snapshot_of_database database) mutation
+let dependency_shadows_for database (record:outbox_record) =
+  let append_page=match record.mutation,record.effect_footprint.page_uuids with
+    | Types.Append_journal _,[page]->Some page|_->None in
+  dependency_shadows_for_snapshot ?append_page (snapshot_of_database database) record.mutation
 ;;
 
 let local_candidate_record
@@ -5588,11 +5809,16 @@ let local_candidate_record
     + 1
   in
   let planned_tx = (authoritative_database database).Datascript.max_tx + 1 in
+  let append_create=match mutation,effect_footprint.page_uuids with
+    | Types.Append_journal _,[page]->read_page context page=None
+    | _->false in
   { mutation_id
+  ; append_create
   ; fingerprint
   ; mutation
   ; normalized_transaction =
       normalized_transaction
+        ~append_create
         database
         ~fingerprint
         ~intent_time_ms
@@ -5654,6 +5880,7 @@ let bounded_logical_summary database ~block_uuids ~page_uuids ~structure_interes
 ;;
 
 let logical_change_for_effects database ~before ~after effects =
+  let before_context=read_context before and after_context=read_context after in
   let block_candidates, page_candidates, structure_interests =
     List.fold_left
       (fun (blocks, pages, interests) footprint ->
@@ -5668,12 +5895,12 @@ let logical_change_for_effects database ~before ~after effects =
     block_candidates
     |> List.sort_uniq Graph.Uuid.compare
     |> List.filter (fun uuid ->
-      logical_block_at before uuid <> logical_block_at after uuid)
+      read_block before_context uuid <> read_block after_context uuid)
   in
   let page_uuids =
     page_candidates
     |> List.sort_uniq Graph.Uuid.compare
-    |> List.filter (fun uuid -> logical_page_at before uuid <> logical_page_at after uuid)
+    |> List.filter (fun uuid -> read_page before_context uuid <> read_page after_context uuid)
   in
   if block_uuids = [] && page_uuids = []
   then Types.No_logical_change
@@ -5693,7 +5920,7 @@ let mutation_has_logical_effect context mutation =
   | Set_task_status { block; _ }
   | Clear_task_status { block; _ } -> Option.is_some (read_block context block)
   | Delete_blocks { root; _ } -> Option.is_some (read_block context root)
-  | Insert_blocks _ | Create_journal_page _ -> true
+  | Append_journal _ | Insert_blocks _ | Create_journal_page _ -> true
 ;;
 
 let open_owned ~sw dependencies inspection ~graph_name ownership =
@@ -6574,20 +6801,11 @@ let records_for_ids records ids =
     ids
 ;;
 
-let block_tree_uuids = Outliner.Tree.uuids
-
-let mutation_introduced_uuids = function
-  | Types.Insert_blocks { tree; _ } -> block_tree_uuids tree
-  | Create_journal_page { page; _ } -> [ page ]
-  | Save_block _
-  | Publish_asset _
-  | Set_asset_reference _
-  | Delete_blocks _
-  | Set_task_status _
-  | Clear_task_status _ -> []
-;;
-
-let mutation_required_uuids = function
+let mutation_required_uuids (record:outbox_record) = match record.mutation with
+  | Types.Append_journal{root;_}->
+    (if record.append_create then [] else record.effect_footprint.page_uuids)
+    @ (Overlay_planner.append_nodes root
+       |> Rrbvec.filter_map(fun(node:Types.append_node)->node.task_status) |> Rrbvec.to_list)
   | Types.Set_asset_reference { block; asset; _ } -> [ block; asset ]
   | Types.Publish_asset { block; _ }
   | Types.Save_block { block; _ }
@@ -6617,7 +6835,7 @@ let ineligible_submission_dependency database selected =
            && candidate.transport_state = Types.Queued
            && List.exists
                 (Graph.Uuid.equal required)
-                (mutation_introduced_uuids candidate.mutation))
+                (mutation_introduced_uuids candidate))
          |> function
          | None -> false
          | Some owner ->
@@ -6627,7 +6845,7 @@ let ineligible_submission_dependency database selected =
                 selected)
        in
        if
-         List.exists has_unselected_queued_owner (mutation_required_uuids record.mutation)
+         List.exists has_unselected_queued_owner (mutation_required_uuids record)
        then Some record.mutation_id
        else None)
     selected
@@ -6639,20 +6857,20 @@ let rejection_suffix_records records (partition : Types.rejection_member_partiti
     ref
       (partition.missing_uuids
        @ List.concat_map
-           (fun (record : outbox_record) -> mutation_introduced_uuids record.mutation)
+           (fun (record : outbox_record) -> mutation_introduced_uuids record)
            failed)
   in
   records_for_ids records partition.unexecuted_suffix
   |> List.fold_left
        (fun (dependent, independent) (record : outbox_record) ->
           let is_dependent =
-            mutation_required_uuids record.mutation
+            mutation_required_uuids record
             |> List.exists (fun required ->
               List.exists (Graph.Uuid.equal required) !unavailable)
           in
           if is_dependent
           then (
-            unavailable := mutation_introduced_uuids record.mutation @ !unavailable;
+            unavailable := mutation_introduced_uuids record @ !unavailable;
             record :: dependent, independent)
           else dependent, record :: independent)
        ([], [])
@@ -6726,6 +6944,17 @@ let authoritative_import_matches
 ;;
 
 let authoritative_satisfies_mutation_in database = function
+  | Types.Append_journal{root;journal_day;_}->
+    let rec matches parent (node:Types.append_node)=match block_of_database database node.uuid with
+      | Some value->(match parent with None->true|Some parent->value.block.parent=parent)
+        && value.block.title=node.title && value.task_status=Option.map(fun id->Types.Status_uuid id)node.task_status
+        && Rrbvec.for_all(matches(Some node.uuid))node.children
+      | None->false in
+    matches None root && (match block_of_database database root.uuid with
+      | Some value->(match page_of_database database value.block.page with
+        |Some page->not page.page.recycled && page.page.kind=Graph.Journal_page{journal_day}
+          && value.block.parent=page.page.uuid|None->false)
+      |None->false)
   | Types.Set_asset_reference { block; asset; _ } ->
     block_of_database database block
     |> option_satisfies (fun holder -> asset_reference_matches holder (Some asset))
@@ -6899,6 +7128,7 @@ let begin_outbox_transition database ~expected transition =
                   records
                   |> List.concat_map (fun (record : outbox_record) ->
                     local_operations
+                      ~append_create:record.append_create
                       ~fingerprint:record.fingerprint
                       ~intent_time_ms:record.intent_time_ms
                       ~next_tx:record.planned_tx
@@ -7121,7 +7351,8 @@ let make_batch preparation encrypted =
         | (record : outbox_record) :: rest ->
           let expected =
             local_operations
-              ~fingerprint:record.fingerprint
+              ~append_create:record.append_create
+                      ~fingerprint:record.fingerprint
               ~intent_time_ms:record.intent_time_ms
               ~next_tx:record.planned_tx
               ~orders:(assigned_orders record)
@@ -7135,7 +7366,8 @@ let make_batch preparation encrypted =
           let encrypted, remaining = take_prefix expected [] remaining in
           let operations =
             local_operations
-              ~fingerprint:record.fingerprint
+              ~append_create:record.append_create
+                      ~fingerprint:record.fingerprint
               ~intent_time_ms:record.intent_time_ms
               ~next_tx:record.planned_tx
               ~orders:(assigned_orders record)
@@ -7207,7 +7439,7 @@ let outbox_fits_submission preparation records batch =
           transport_state = Types.Submitted id
         ; dependency_shadows =
             (if capture_dependency_shadows
-             then dependency_shadows_for database record.mutation
+             then dependency_shadows_for database record
              else record.dependency_shadows)
         ; protected_transaction = Some protected_transaction
         ; attempt_count = record.attempt_count + 1
@@ -7309,7 +7541,7 @@ let update_submitted database ~capture_dependency_shadows records batch =
   List.iteri
     (fun index (record : outbox_record) ->
        if capture_dependency_shadows
-       then record.dependency_shadows <- dependency_shadows_for database record.mutation;
+       then record.dependency_shadows <- dependency_shadows_for database record;
        record.transport_state <- Types.Submitted id;
        record.acceptance_barrier <- None;
        record.attempt_count <- record.attempt_count + 1;
@@ -7428,7 +7660,8 @@ let split_prefix count values =
 
 let synchronized_record_operations (record : outbox_record) =
   local_operations
-    ~fingerprint:record.fingerprint
+    ~append_create:record.append_create
+                      ~fingerprint:record.fingerprint
     ~intent_time_ms:record.intent_time_ms
     ~next_tx:record.planned_tx
     ~orders:(assigned_orders record)
@@ -7469,6 +7702,7 @@ let integrity_record_context (record : outbox_record) =
   let mutation =
     match record.mutation with
     | Types.Save_block _ -> "save-block"
+    | Append_journal _ -> "append-journal"
     | Insert_blocks _ -> "insert-blocks"
     | Create_journal_page _ -> "create-journal-page"
     | Delete_blocks _ -> "delete-blocks"
@@ -7569,6 +7803,7 @@ let report_integrity_evidence owner batch record cursor root_before expected act
     let target, day =
       match record.mutation with
       | Types.Create_journal_page { page; journal_day; _ } -> page, Some journal_day
+      | Append_journal {root;journal_day;_}->root.uuid,Some journal_day
       | Insert_blocks { tree; _ } -> tree.uuid, None
       | Delete_blocks { root; _ } -> root, None
       | Save_block { block; _ } | Set_task_status { block; _ }
@@ -7859,6 +8094,7 @@ let delete_conflict_kinds_between before after (record : outbox_record) =
     | Types.Delete_blocks { root; _ } -> root
     | Save_block _
     | Insert_blocks _
+    | Append_journal _
     | Create_journal_page _
     | Set_task_status _
     | Clear_task_status _
@@ -8321,6 +8557,7 @@ let prepare_authoritative_candidate preparation ~decrypted =
                   | ( Submitted _
                     , ( Save_block _
                       | Insert_blocks _
+                      | Append_journal _
                       | Create_journal_page _
                       | Set_task_status _
                       | Clear_task_status _
@@ -8454,6 +8691,17 @@ let rec logical_tree_is_present snapshot ~parent (tree : Types.block_tree) =
 ;;
 
 let logical_snapshot_satisfies_mutation snapshot = function
+  | Types.Append_journal{root;journal_day;_}->
+    let rec matches parent (node:Types.append_node)=match logical_block_at snapshot node.uuid with
+      | Some value->(match parent with None->true|Some parent->value.block.parent=parent)
+        && value.block.title=node.title && value.task_status=Option.map(fun id->Types.Status_uuid id)node.task_status
+        && Rrbvec.for_all(matches(Some node.uuid))node.children
+      | None->false in
+    matches None root && (match logical_block_at snapshot root.uuid with
+      | Some value->(match logical_page_at snapshot value.block.page with
+        |Some page->not page.page.recycled && page.page.kind=Graph.Journal_page{journal_day}
+          && value.block.parent=page.page.uuid|None->false)
+      |None->false)
   | Types.Set_asset_reference { block; asset; _ } ->
     logical_block_at snapshot block
     |> option_satisfies (fun holder -> asset_reference_matches holder (Some asset))
@@ -8500,7 +8748,11 @@ let logical_snapshot_satisfies_mutation snapshot = function
       Option.is_none record.task_status)
 ;;
 
-let ordinary_effect_footprint snapshot = function
+let ordinary_effect_footprint ?append_owner snapshot = function
+  | Types.Append_journal{page;root;journal_day;_}->
+    let page=match append_owner with Some(page,_)->page|None->resolve_append_page snapshot ~candidate:page ~day:journal_day in
+    {block_uuids=append_uuids root;page_uuids=[page];structure_interests=
+      [Types.Children_interest page;Page_tree_interest page;Journal_index_interest]@append_interests root}
   | Types.Set_asset_reference { block; _ }
   | Types.Publish_asset { block; _ }
   | Types.Save_block { block; _ }
@@ -8527,15 +8779,7 @@ let ordinary_effect_footprint snapshot = function
   | Delete_blocks _ -> invalid_arg "ordinary_effect_footprint: delete mutation"
 ;;
 
-let introduced_uuids = function
-  | Types.Insert_blocks { tree; _ } -> tree_uuids tree
-  | Create_journal_page { page; _ } -> [ page ]
-  | Save_block _
-  | Publish_asset _
-  | Set_asset_reference _
-  | Delete_blocks _
-  | Set_task_status _
-  | Clear_task_status _ -> []
+let introduced_uuids = mutation_introduced_uuids
 ;;
 
 let unavailable_dependency unavailable uuid =
@@ -8545,9 +8789,19 @@ let unavailable_dependency unavailable uuid =
     unavailable
 ;;
 
-let invalid_replan_dependency snapshot mutation =
+let invalid_replan_dependency ?append_owner snapshot mutation =
   let missing uuid present = if present then None else Some uuid in
   match mutation with
+  | Types.Append_journal{page;root;journal_day;_}->
+    let page,value=match append_owner with Some value->value|None->
+      let page=resolve_append_page snapshot ~candidate:page ~day:journal_day in page,logical_page_at snapshot page in
+    let conflict=match value with
+      |Some value->value.page.recycled || value.page.kind<>Graph.Journal_page{journal_day}
+      |None->append_identity_present snapshot page in
+    if conflict then Some page else
+      Overlay_planner.append_nodes root |> Rrbvec.find_map(fun(node:Types.append_node)->
+        if append_identity_present snapshot node.uuid then Some node.uuid
+        else match node.task_status with Some status when task_status_at snapshot status=None->Some status|_->None)
   | Types.Set_asset_reference { block; previous; asset; _ } ->
     (match logical_block_at snapshot block, asset_descriptor_at snapshot asset with
      | Some holder, Ok (Some _) when asset_reference_matches holder previous -> None
@@ -8627,22 +8881,87 @@ let replan_queued_ordinary database authoritative_database records =
       index
       (select (record.effect_footprint : effect_footprint))
   in
-  let add_record records block_effects page_effects record =
+  (* An in-flight operation retains its dependency facts independently of
+     sequence position. Sample those shadow tails once, before earlier queued
+     Appends are replanned; a late ACK cannot make a visible sibling vanish. *)
+  let shadow_tails=Hashtbl.create 16 and shadow_presence=Hashtbl.create 16 in
+  let shadow_cache=hydration_cache ~index_idents:false authoritative_database in
+  let maximum_order lower order=Some(Option.fold ~none:order
+    ~some:(fun old->if String.compare old order>=0 then old else order)lower) in
+  List.iter(fun(record:outbox_record)->
+    if record_has_active_dependency_shadows record && record_is_logically_active record then
+      List.iter(fun shadow->
+        let key=Graph.Uuid.to_string shadow.shadow_block_uuid in
+        let present=match Hashtbl.find_opt shadow_presence key with Some present->present|None->
+          let present=authoritative_block_present authoritative_database shadow_cache shadow.shadow_block_uuid in
+          Hashtbl.add shadow_presence key present;present in
+        if not present then (
+          let parent=Graph.Uuid.to_string shadow.shadow_parent in
+          let lower=Hashtbl.find_opt shadow_tails parent |> Option.join in
+          Hashtbl.replace shadow_tails parent(maximum_order lower shadow.shadow_order)))
+        record.dependency_shadows.shadow_blocks)records;
+  let local_days=Hashtbl.create 16 and remote_days=Hashtbl.create 16
+  and day_owners=Hashtbl.create 16 and parent_tails=Hashtbl.create 16 in
+  let append_owner snapshot page day =
+    match Hashtbl.find_opt day_owners day with
+    | Some owner->owner
+    | None->
+      let remote=match Hashtbl.find_opt remote_days day with Some value->value|None->
+        let value=authoritative_append_page snapshot day in Hashtbl.add remote_days day value;value in
+      let existing=match remote with Some _->remote|None->Hashtbl.find_opt local_days day in
+      let resolved=Option.value existing ~default:page in
+      let owner=resolved,logical_page_at snapshot resolved in
+      if existing<>None then Hashtbl.replace day_owners day owner;
+      owner in
+  let record_append_indexes (record:outbox_record) =
+    let day_page=match record.mutation with
+      | Types.Create_journal_page{page;journal_day;_}->Some(journal_day,page)
+      | Append_journal{journal_day;_}->Some(journal_day,List.hd record.effect_footprint.page_uuids)
+      | _->None in
+    Option.iter(fun(day,page)->
+      match Hashtbl.find_opt local_days day with
+      | Some old when Graph.Uuid.compare old page<=0->()
+      | _->Hashtbl.replace local_days day page;Hashtbl.remove day_owners day)day_page;
+    let inserted=match record.mutation with
+      | Types.Insert_blocks{parent;tree;_}->Some(parent,tree.uuid)
+      | Append_journal{root;_}->Some(List.hd record.effect_footprint.page_uuids,root.uuid)
+      | _->None in
+    Option.iter(fun(parent,root)->
+      let key=Graph.Uuid.to_string parent in
+      match Hashtbl.find_opt parent_tails key with
+      | None->()
+      | Some lower->let order=assigned_order(assigned_orders record)root in
+        Hashtbl.replace parent_tails key (Some(Option.fold ~none:order
+          ~some:(fun old->if String.compare old order>=0 then old else order)lower))) inserted in
+  let add_record records block_effects page_effects children_effects record =
     if not (record_is_logically_active record)
-    then records, block_effects, page_effects
+    then records, block_effects, page_effects, children_effects
     else (
+      record_append_indexes record;
       let block_effects =
         add_indexed_record block_effects (fun value -> value.block_uuids) record
       in
       let page_effects =
-        add_indexed_record page_effects (fun value -> value.page_uuids) record
+        let pages=page_projection_effects record @
+          (if record_has_active_dependency_shadows record then
+             List.map(fun shadow->shadow.shadow_page_uuid)record.dependency_shadows.shadow_pages else []) in
+        add_indexed_record page_effects (fun _->List.sort_uniq Graph.Uuid.compare pages)record
       in
-      record :: records, block_effects, page_effects)
+      let parents=List.filter_map(function Types.Children_interest parent->Some parent|_->None)
+        record.effect_footprint.structure_interests
+        @ (if record_has_active_dependency_shadows record then
+             List.map(fun shadow->shadow.shadow_parent)record.dependency_shadows.shadow_blocks else []) in
+      let children_effects=List.fold_left(fun index parent->
+        let key=Graph.Uuid.to_string parent in
+        Uuid_map.add key (record::Option.value(Uuid_map.find_opt key index) ~default:[]) index)
+        children_effects (List.sort_uniq Graph.Uuid.compare parents) in
+      record :: records, block_effects, page_effects, children_effects)
   in
   let rec loop
             accumulated
             block_effects
             page_effects
+            children_effects
             unavailable
             replanned
             no_change
@@ -8652,13 +8971,14 @@ let replan_queued_ordinary database authoritative_database records =
     | (record : outbox_record) :: rest ->
       (match record.transport_state, record.mutation with
        | Types.Queued, (Types.Delete_blocks _ as _mutation) ->
-         let accumulated, block_effects, page_effects =
-           add_record accumulated block_effects page_effects record
+         let accumulated, block_effects, page_effects, children_effects =
+           add_record accumulated block_effects page_effects children_effects record
          in
          loop
            accumulated
            block_effects
            page_effects
+           children_effects
            unavailable
            replanned
            no_change
@@ -8676,25 +8996,29 @@ let replan_queued_ordinary database authoritative_database records =
            ; outbox = None
            ; block_effects = Some block_effects
            ; page_effects = Some page_effects
-           ; children_effects = None
+           ; children_effects = Some children_effects
            ; released = false
            ; active_reads = 0
            ; drain_waiters = []
            }
          in
+         let append_owner=match mutation with
+           | Types.Append_journal{page;journal_day;_}->Some(append_owner snapshot page journal_day)
+           | _->None in
          if logical_snapshot_satisfies_mutation snapshot mutation
          then
            loop
              accumulated
              block_effects
              page_effects
+             children_effects
              unavailable
              replanned
              (record :: no_change)
              blocked
              rest
          else (
-           match invalid_replan_dependency snapshot mutation with
+           match invalid_replan_dependency ?append_owner snapshot mutation with
            | Some uuid ->
              let reason =
                match unavailable_dependency unavailable uuid with
@@ -8706,61 +9030,79 @@ let replan_queued_ordinary database authoritative_database records =
                List.fold_left
                  (fun unavailable uuid -> (uuid, record.mutation_id) :: unavailable)
                  unavailable
-                 (introduced_uuids mutation)
+                 (introduced_uuids record)
              in
              loop
                (record :: accumulated)
                block_effects
                page_effects
+               children_effects
                unavailable
                replanned
                no_change
                (record :: blocked)
                rest
            | None ->
-             let effect_footprint = ordinary_effect_footprint snapshot mutation in
+             let effect_footprint = ordinary_effect_footprint ?append_owner snapshot mutation in
              let planned_tx = authoritative_database.Datascript.max_tx + 1 in
+             let append_create=match mutation,effect_footprint.page_uuids with
+               | Types.Append_journal _,[_]->Option.bind append_owner snd=None
+               | _->false in
+             let orders=match mutation,append_owner with
+               | Types.Append_journal _,Some(parent,_)->
+                 let key=Graph.Uuid.to_string parent in
+                 let lower=match Hashtbl.find_opt parent_tails key with Some lower->lower|None->
+                   let lower=snd(read_siblings(read_context snapshot)parent) in
+                   let lower=match Hashtbl.find_opt shadow_tails key |> Option.join with
+                     |None->lower|Some shadow->maximum_order lower shadow in
+                   Hashtbl.replace parent_tails key lower;lower in
+                 insertion_orders ~append_parent:(parent,lower)(read_context snapshot)mutation
+               | _->assigned_orders record in
              let record =
                { record with
                  normalized_transaction =
                    normalized_transaction_in
                      authoritative_database
-                     ~fingerprint:record.fingerprint
+                     ~append_create
+                      ~fingerprint:record.fingerprint
                      ~intent_time_ms:record.intent_time_ms
                      ~planned_tx
-                     ~orders:(assigned_orders record)
+                     ~orders
                      ~effect_footprint
                      ~delete_artifacts:None
                      mutation
+               ; append_create
                ; effect_footprint
                ; dependency_shadows = empty_dependency_shadows
                ; planned_tx
                ; protected_transaction = None
                }
              in
-             let accumulated, block_effects, page_effects =
-               add_record accumulated block_effects page_effects record
+             let accumulated, block_effects, page_effects, children_effects =
+               add_record accumulated block_effects page_effects children_effects record
              in
              loop
                accumulated
                block_effects
                page_effects
+               children_effects
                unavailable
                (record :: replanned)
                no_change
                blocked
                rest)
-       | Types.Blocked, mutation ->
+       | Types.Blocked, _mutation ->
          let unavailable =
            List.fold_left
              (fun unavailable uuid -> (uuid, record.mutation_id) :: unavailable)
              unavailable
-             (introduced_uuids mutation)
+             (introduced_uuids record)
          in
          loop
            (record :: accumulated)
            block_effects
            page_effects
+           children_effects
            unavailable
            replanned
            no_change
@@ -8770,20 +9112,21 @@ let replan_queued_ordinary database authoritative_database records =
            | Accepted_pending_authoritative _
            | Stale_rejected_pending_authoritative _ )
          , _ ) ->
-         let accumulated, block_effects, page_effects =
-           add_record accumulated block_effects page_effects record
+         let accumulated, block_effects, page_effects, children_effects =
+           add_record accumulated block_effects page_effects children_effects record
          in
          loop
            accumulated
            block_effects
            page_effects
+           children_effects
            unavailable
            replanned
            no_change
            blocked
            rest)
   in
-  loop [] Uuid_map.empty Uuid_map.empty [] [] [] [] records
+  loop [] Uuid_map.empty Uuid_map.empty Uuid_map.empty [] [] [] [] records
 ;;
 
 let settle_stale_records ~checkpoint ~origins records =
@@ -9030,6 +9373,7 @@ let apply_outbox_transition database preparation ~encrypted =
                          match record.mutation with
                          | Save_block _
                          | Insert_blocks _
+                         | Append_journal _
                          | Create_journal_page _
                          | Set_task_status _
                          | Clear_task_status _
@@ -9491,6 +9835,7 @@ let logical_change_footprint
       ~transaction_data
       ~outbox_effects
   =
+  let before_context=read_context before and after_context=read_context after in
   let direct =
     changed_entity_uuids authoritative_before authoritative_after transaction_data
   in
@@ -9536,7 +9881,7 @@ let logical_change_footprint
   in
   let changed_pages =
     List.filter
-      (fun uuid -> logical_page_at before uuid <> logical_page_at after uuid)
+      (fun uuid -> read_page before_context uuid <> read_page after_context uuid)
       page_candidates
   in
   let maximum_dependents = before.owner.dependencies.limits.change_max_items in
@@ -9574,8 +9919,8 @@ let logical_change_footprint
   let block_uuids =
     List.filter
       (fun uuid ->
-         let before_value = logical_block_at before uuid in
-         let after_value = logical_block_at after uuid in
+         let before_value = read_block before_context uuid in
+         let after_value = read_block after_context uuid in
          before_value <> after_value)
       block_candidates
     |> fun changed ->
@@ -9584,8 +9929,8 @@ let logical_change_footprint
   let parents, membership_pages =
     List.fold_left
       (fun (parents, pages) uuid ->
-         let before = logical_block_at before uuid in
-         let after = logical_block_at after uuid in
+         let before = read_block before_context uuid in
+         let after = read_block after_context uuid in
          let membership_equal =
            match before, after with
            | Some (before : Types.block_record), Some (after : Types.block_record) ->
@@ -9834,6 +10179,7 @@ let commit_authoritative_candidate database prepared =
                 (match record.mutation with
                  | Save_block _
                  | Insert_blocks _
+                 | Append_journal _
                  | Create_journal_page _
                  | Set_task_status _
                  | Clear_task_status _
@@ -10379,7 +10725,6 @@ let get_assets_under_roots snapshot ~recursive ~roots ~limit ~cursor =
         ; fields = Hashtbl.create 16
         ; authoritative_candidates = Hashtbl.create 16
         ; logical_candidates = Hashtbl.create 16
-        ; insert_orders = Hashtbl.create 4
         }
       in
       let rec live seen uuid =
