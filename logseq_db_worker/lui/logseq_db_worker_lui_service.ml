@@ -317,6 +317,8 @@ type observation_signal =
   | Observation_invalidated of observation_invalidation
   | Observations_resync
 type request =
+  | Coordination_quiesce_writers of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_import of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
        source:Logseq_db_types.Asset_import.t}
@@ -393,6 +395,8 @@ type request =
       }
 
 type response =
+  | Coordination_writers_quiesced of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_imported of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
        result:(Logseq_db_worker.import_receipt,string)result}
@@ -1171,6 +1175,17 @@ let create ~(dependencies : dependencies) =
         scope.account.account_generation=owner.startup.account_generation && scope.graph_id=owner.graph_id
           && scope.graph_generation=owner.graph_generation) (Db.graph_scopes session.worker) in
       match request with
+      | Coordination_quiesce_writers{registration;owner;request_id}->
+        let timeline:timeline_scope={startup={account_generation=owner.account.account_generation;
+          presentation_generation=owner.account.presentation_generation};graph_id=owner.graph_id;graph_generation=owner.graph_generation} in
+        (match resolve timeline with
+         |Some scope when scope.account.user_id=owner.account.user_id
+           && Uri.equal scope.account.managed_sync_origin owner.account.managed_sync_origin
+           && scope.account.lifecycle_generation=owner.account.lifecycle_generation
+           && (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id)->
+           Db.quiesce_writers session.worker ~registration ~scope
+           |> Result.map(fun()->Coordination_writers_quiesced{registration;owner=scope;request_id})
+         |_->Error "The writer fence account or graph owner retired.")
       | Coordination_import{registration;owner;request_id;source}->
         let timeline:timeline_scope={startup={account_generation=owner.account.account_generation;
           presentation_generation=owner.account.presentation_generation};graph_id=owner.graph_id;graph_generation=owner.graph_generation} in

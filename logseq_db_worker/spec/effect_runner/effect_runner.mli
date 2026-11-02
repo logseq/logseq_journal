@@ -213,3 +213,9 @@ val coordinated_changefeed
   -> request:Logseq_db_worker_contract.Protocol.request -> maximum_bytes:int
   -> current:(unit -> bool) -> (Logseq_db_worker_contract.Protocol.response,string) result
 val retire_changefeed : t -> registration:int64 -> unit
+
+(** Permanently stop new physical graph-operation admission for this incarnation,
+    join already reserved protected tasks even if Service waiters canceled, then
+    join their actual serial reducer callback barrier. This is only writer evidence;
+    resources, exclusive local-copy ownership and host permits require further ACKs. *)
+val quiesce_writers : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> (unit,string) result

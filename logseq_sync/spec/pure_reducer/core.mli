@@ -301,6 +301,9 @@ type asset_action =
   | Release_asset_file of string
   | Release_staged_file of string
   | Prune_asset_staging of string list
+  (** Join already admitted actual asset I/O tasks and their callback posting.
+      This read-only barrier neither closes caches nor grants a host permit. *)
+  | Await_asset_operations
   | Close_asset_scope
   (** Cancels every target generation and waits for operations/native leases.
       New target work remains blocked until its terminal action; lease release

@@ -196,3 +196,7 @@ val coordinated_changefeed
   : t -> registration:int64 -> scope:Logseq_sync_pure_reducer.Core.graph_scope
   -> request:Logseq_db_worker_contract.Protocol.request -> maximum_bytes:int
   -> current:(unit -> bool) -> (Logseq_db_worker_contract.Protocol.response,string) result
+
+(** Writer-only actual I/O/callback barrier. No resource settlement or host permit
+    is implied; the scope remains fenced until its execution incarnation retires. *)
+val quiesce_writers : t -> registration:int64 -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> (unit,string) result

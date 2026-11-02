@@ -430,6 +430,9 @@ type asset_action =
   | Release_asset_file of string
   | Release_staged_file of string
   | Prune_asset_staging of string list
+  (** Join already admitted actual asset I/O tasks and their callback posting.
+      This read-only barrier neither closes caches nor grants a host permit. *)
+  | Await_asset_operations
   | Close_asset_scope
   | Prepare_graph_asset_deletion of retirement_id
   | Commit_graph_asset_deletion of asset_deletion
@@ -3452,6 +3455,7 @@ let asset_cleanup_action = function
   | Release_asset_file _
   | Release_staged_file _
   | Close_asset_scope
+  | Await_asset_operations
   | Prepare_graph_asset_deletion _
   | Commit_graph_asset_deletion _
   | Cancel_graph_asset_deletion _
@@ -3506,6 +3510,7 @@ let asset_result_matches (request : asset_io_request) = function
      | Release_staged_file _, Asset_unit
      | Prune_asset_staging _, Asset_pruned _
      | Close_asset_scope, Asset_unit
+     | Await_asset_operations, Asset_unit
      -> true
      | Prepare_graph_asset_deletion retirement, Asset_deletion_prepared deletion ->
        retirement = deletion.retirement && request.context.scope = deletion.deletion_scope

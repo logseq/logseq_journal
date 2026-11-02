@@ -392,3 +392,23 @@ module Demand_registry : sig
       tombstones. Unsettled resource owners remain pending. *)
   val forget_settled:t -> registration:int64 -> t
 end
+
+(** Pure admission and completion ledger for physical graph operations. A fence
+    blocks that graph incarnation across focus/foreground changes. Finishing an
+    operation is an interpreter input after its actual I/O and callback posting.
+    Drained is only a writer fact: it grants no resource, deletion or host permit. *)
+module Writer_fence : sig
+  type t
+  type operation
+  type fence
+  type error = Fenced | Full
+  val empty : t
+  val admit : t -> Logseq_sync_pure_reducer.Core.graph_scope -> t * (operation,error) result
+  val finish : t -> operation -> t
+  val freeze : t -> Logseq_sync_pure_reducer.Core.graph_scope -> t * (fence,error) result
+  val drained : t -> fence -> bool
+  val fenced : t -> Logseq_sync_pure_reducer.Core.graph_scope -> bool
+  val pending : t -> Logseq_sync_pure_reducer.Core.graph_scope -> int
+  val operation_id : operation -> int64
+  val same_incarnation : Logseq_sync_pure_reducer.Core.graph_scope -> Logseq_sync_pure_reducer.Core.graph_scope -> bool
+end

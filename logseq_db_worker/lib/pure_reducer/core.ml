@@ -1734,3 +1734,45 @@ module Demand_registry = struct
     {closed=max t.closed registration;entries=Keys.filter(fun _ entry->
       entry.owner.registration>registration || not entry.settled)t.entries}
 end
+
+module Writer_fence = struct
+  module Scope = struct
+    type t=Logseq_sync_pure_reducer.Core.graph_scope
+    let key (scope:t)=
+      (Uri.to_string scope.account.managed_sync_origin,scope.account.user_id,
+       scope.account.account_generation,scope.graph_id,scope.graph_generation)
+    let compare a b=Stdlib.compare(key a)(key b)
+  end
+  module Scopes=Map.Make(Scope)
+  module Operations=Map.Make(Int64)
+  type operation={serial:int64;scope:Scope.t}
+  type fence={scope:Scope.t;serial:int64}
+  type error=Fenced|Full
+  type t={next:int64;operations:operation Operations.t;fences:fence Scopes.t}
+  let empty={next=0L;operations=Operations.empty;fences=Scopes.empty}
+  let same_incarnation a b=Scope.compare a b=0
+  let operation_id (operation:operation)=operation.serial
+  let pending state scope=Operations.fold(fun _ (op:operation) count->
+    count+(if same_incarnation op.scope scope then 1 else 0))state.operations 0
+  let fenced state scope=Scopes.mem scope state.fences
+  let admit state scope=
+    if fenced state scope then state,Error Fenced
+    else if Operations.cardinal state.operations>=256 || state.next=Int64.max_int then state,Error Full
+    else let serial=Int64.succ state.next in
+      let operation:operation={serial;scope} in
+      {state with next=serial;operations=Operations.add serial operation state.operations},Ok operation
+  let finish state (operation:operation)=
+    match Operations.find_opt operation.serial state.operations with
+    |Some actual when actual=operation->{state with operations=Operations.remove operation.serial state.operations}
+    |_->state
+  let freeze state scope=
+    match Scopes.find_opt scope state.fences with
+    |Some fence->state,Ok fence
+    |None when Scopes.cardinal state.fences>=8192 || state.next=Int64.max_int->state,Error Full
+    |None->let serial=Int64.succ state.next in
+      let fence:fence={scope;serial} in
+      {state with next=serial;fences=Scopes.add scope fence state.fences},Ok fence
+  let drained state (fence:fence)=
+    Option.exists(fun (actual:fence)->actual.serial=fence.serial && actual.scope=fence.scope)
+      (Scopes.find_opt fence.scope state.fences) && pending state fence.scope=0
+end

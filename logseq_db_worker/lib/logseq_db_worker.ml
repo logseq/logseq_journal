@@ -564,3 +564,11 @@ let coordinated_changefeed t ~registration ~scope ~request ~maximum_bytes ~curre
     | _ -> false in
   Effect_runner.coordinated_changefeed t.runner ~registration ~scope ~request ~maximum_bytes ~current
 ;;
+
+let quiesce_writers t ~registration ~scope =
+  if not(coordination_current t ~registration)
+     || not(List.exists(fun actual->Pure_reducer.Writer_fence.same_incarnation scope actual)(Pure_reducer.graph_scopes !(t.state)))
+  then Error "The writer fence owner is no longer current." else
+  Result.bind(Effect_runner.quiesce_writers t.runner ~scope)(fun()->
+    if coordination_current t ~registration then Ok() else Error "The writer fence binding retired.")
+;;

@@ -2052,6 +2052,69 @@ let test_demand_registry_properties () =
   done
 ;;
 
+let test_writer_fence_physical_completion () =
+  let module F=Core.Writer_fence in
+  let _,scope=worker_open_graph() in
+  let focus={scope with account={scope.account with presentation_generation=99;lifecycle_generation=99L}} in
+  let reopened={scope with graph_generation=scope.graph_generation+1} in
+  let state,first=F.admit F.empty scope in
+  let first=Result.get_ok first in
+  let state,second=F.admit state scope in
+  let second=Result.get_ok second in
+  let frozen,fence=F.freeze state scope in
+  let fence=Result.get_ok fence in
+  Alcotest.(check bool) "freeze cannot assert physical completion" false(F.drained frozen fence);
+  let unchanged,denied=F.admit frozen focus in
+  Alcotest.(check bool) "focus/lifecycle change cannot bypass closed incarnation" true
+    (denied=Error F.Fenced && unchanged=frozen);
+  let elsewhere,accepted=F.admit frozen reopened in
+  Alcotest.(check bool) "new graph incarnation is independent" true(Result.is_ok accepted);
+  let partial=F.finish elsewhere first in
+  Alcotest.(check bool) "one completion does not settle another writer" false(F.drained partial fence);
+  Alcotest.(check bool) "duplicate completion is inert" true(F.finish partial first=partial);
+  let drained=F.finish partial second in
+  Alcotest.(check bool) "only actual captured writers must finish" true(F.drained drained fence);
+  Alcotest.(check bool) "previous immutable state still pending" false(F.drained frozen fence);
+  let _,same=F.freeze drained focus in
+  Alcotest.(check bool) "repeat fence keeps exact physical obligation" true(same=Ok fence)
+;;
+
+let test_writer_fence_properties () =
+  let module F=Core.Writer_fence in
+  let _,base=worker_open_graph() in
+  let run actions=
+    let scopes=Array.init 4(fun n->{base with graph_generation=base.graph_generation+n}) in
+    let blocked=Array.make 4 false and pending=Array.make 4 0 in
+    let operations=ref [] and fences=Array.make 4 None and state=ref F.empty in
+    List.iter(fun action->
+      let n=(action/5)mod 4 in
+      let scope=scopes.(n) and before= !state in
+      (match action mod 5 with
+       |0|1->let next,outcome=F.admit before scope in state:=next;
+         if blocked.(n) then Alcotest.(check bool) "fenced never admits" true(outcome=Error F.Fenced)
+         else (let token=Result.get_ok outcome in operations:=(token,n,false)::!operations;pending.(n)<-pending.(n)+1)
+       |2->let next,outcome=F.freeze before scope in state:=next;blocked.(n)<-true;fences.(n)<-Some(Result.get_ok outcome)
+       |_->(match List.find_opt(fun(_,owner,done_)->owner=n && (action mod 5=4 || not done_))!operations with
+         |None->()|Some(token,_,done_)->state:=F.finish before token;
+           if not done_ then pending.(n)<-pending.(n)-1;
+           operations:=List.map(fun(actual,owner,settled)->actual,owner,settled || actual=token)!operations));
+      Array.iteri(fun n _->Option.iter(fun fence->
+        Alcotest.(check bool) "matching completion set controls drain" (pending.(n)=0)(F.drained !state fence))fences.(n))scopes;
+      (* Retaining and rereading the prior persistent value must not mutate it. *)
+      let _=F.pending before scopes.(n) in ())actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec remove prefix=function []->actions
+      |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      |action::rest->remove(action::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0xF3AC;seed|] in
+    let actions=[0;0;2;3;4;3;0;5;7;8] @ List.init 80(fun _->Random.State.int random 20) in
+    if fails actions then Alcotest.failf "writer fence seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+
 let () =
   Alcotest.run
     "logseq db worker pure reducer"
@@ -2102,6 +2165,7 @@ let () =
             `Quick
             test_asset_manual_retry_is_unlimited
         ] )
+    ; ( "writer fence",[Alcotest.test_case "only physical completion drains" `Quick test_writer_fence_physical_completion; Alcotest.test_case "generated scoped fence traces" `Quick test_writer_fence_properties])
     ; ( "typed demand registry",[Alcotest.test_case "generated owner retirement traces" `Quick test_demand_registry_properties; Alcotest.test_case "retirement and exact settlement" `Quick test_demand_registry_retirement_requires_physical_settlement])
     ; ( "orphan resource cleanup",[Alcotest.test_case "failed release and stale attempt ACK" `Quick test_orphan_cleanup_retains_failed_release])
     ; ( "observation registry", [Alcotest.test_case "registration cancellation epoch and owner" `Quick test_observation_registry;

@@ -365,6 +365,7 @@ type t =
   ; on_asset_diagnostic : scope:Core.graph_scope -> operation:string
       -> request_operation:string -> Failure_diagnostic.t -> unit
   ; operations : (string, operation) Hashtbl.t
+  ; asset_jobs : (string,Core.graph_scope * unit Eio.Promise.t)Hashtbl.t
   ; submitted_operations : Submitted_effects.t
   ; keys : (string, key_entry) Hashtbl.t
   ; websockets : (Core.connection_scope, Websocket_eio.t) Hashtbl.t
@@ -391,6 +392,7 @@ let create ?(on_asset_diagnostic=(fun ~scope:_ ~operation:_ ~request_operation:_
     ; post
     ; on_asset_diagnostic
     ; operations = Hashtbl.create 32
+    ; asset_jobs = Hashtbl.create 32
     ; submitted_operations = Submitted_effects.create 32
     ; keys = Hashtbl.create 8
     ; websockets = Hashtbl.create 4
@@ -1938,7 +1940,17 @@ let prune_staged_assets t ~scope ~keep =
       |> Result.map_error asset_cache_failure)
 ;;
 
-let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
+let capture_asset_jobs t (scope:Core.graph_scope) =
+  let same (actual:Core.graph_scope)=
+    Uri.equal actual.account.managed_sync_origin scope.account.managed_sync_origin
+    && actual.account.user_id=scope.account.user_id
+    && actual.account.account_generation=scope.account.account_generation
+    && actual.graph_id=scope.graph_id && actual.graph_generation=scope.graph_generation in
+  Hashtbl.fold(fun _ (owner,finished) jobs->
+    if same owner then Rrbvec.push_back jobs finished else jobs)t.asset_jobs Rrbvec.empty
+;;
+
+let execute_asset ?except_id ?(asset_snapshot=Rrbvec.empty) t (request : Core.asset_io_request) ~current =
   let scope = request.context.scope in
   let map_unit result = Result.map (fun () -> Core.Asset_unit) result in
   let storage_result result =
@@ -1952,7 +1964,7 @@ let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
       action
   in
   let permitted = match request.action with
-    | Core.Release_asset_file _ | Cancel_asset_operation _ | Prepare_graph_asset_deletion _
+    | Core.Release_asset_file _ | Await_asset_operations | Cancel_asset_operation _ | Prepare_graph_asset_deletion _
     | Commit_graph_asset_deletion _ | Cancel_graph_asset_deletion _ | Delete_account_assets -> true
     | _ -> not (asset_blocked t scope) in
   if not permitted then Error Core.Asset_cancelled else
@@ -2054,6 +2066,9 @@ let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
   | Prune_asset_staging keep ->
     prune_staged_assets t ~scope ~keep
     |> Result.map (fun count -> Core.Asset_pruned count)
+  | Await_asset_operations ->
+    Rrbvec.iter Eio.Promise.await asset_snapshot;
+    if t.closed then Error Core.Asset_cancelled else Ok Core.Asset_unit
   | Close_asset_scope ->
     close_asset_scope ?except_id t scope;
     Ok Core.Asset_unit
@@ -2101,6 +2116,17 @@ let claim_operation t instruction =
     true)
 ;;
 
+let fork_asset_task t id (request:Core.asset_io_request) task =
+  let finished,resolve=Eio.Promise.create() in
+  let tracked=match request.action with Core.Await_asset_operations->false|_->true in
+  if tracked then Hashtbl.add t.asset_jobs id(request.context.scope,finished);
+  let complete()=
+    if tracked then Hashtbl.remove t.asset_jobs id;
+    ignore(Eio.Promise.try_resolve resolve():bool) in
+  try t.dependencies.runtime.fork ~sw:t.sw(fun()->Fun.protect ~finally:complete task)
+  with error->complete();raise error
+;;
+
 let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
   let id =
     scoped_operation_id "asset" request.context.scope (Core.asset_ticket_id ticket)
@@ -2142,7 +2168,10 @@ let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
       }
     in
     Hashtbl.add t.operations id operation;
-    t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+    let asset_snapshot=match request.action with
+      |Core.Await_asset_operations->capture_asset_jobs t request.context.scope
+      |_->Rrbvec.empty in
+    fork_asset_task t id request (fun () ->
       let current () = (not t.closed) && not operation.cancelled in
       let result =
         Fun.protect
@@ -2160,7 +2189,7 @@ let submit_asset_io t instruction ticket (request : Core.asset_io_request) =
                  (fun () ->
                     if not (current ()) then raise Runner_cancelled;
                     with_asset_diagnostics t request ~current (fun () ->
-                      execute_asset ~except_id:id t request ~current))
+                      execute_asset ~except_id:id ~asset_snapshot t request ~current))
                  (fun () ->
                     Eio.Promise.await cancelled;
                     raise Runner_cancelled)
@@ -2233,6 +2262,7 @@ let cleanup_asset_action = function
   | Core.Release_asset_file _
   | Release_staged_file _
   | Close_asset_scope
+  | Await_asset_operations
   | Prepare_graph_asset_deletion _
   | Commit_graph_asset_deletion _
   | Cancel_graph_asset_deletion _
@@ -2251,9 +2281,9 @@ let cleanup_asset_action = function
 
 let submit t instruction =
   match instruction with
-  | Core.Asset_io (ticket, ({ action = Core.Prepare_graph_asset_deletion _; _ } as request)) ->
-    (* Deletion may wait for native leases. It must not block the event consumer
-       that delivers their release, and shutdown must revoke its execution. *)
+  | Core.Asset_io (ticket, ({ action = (Core.Prepare_graph_asset_deletion _ | Await_asset_operations); _ } as request)) ->
+    (* Waiting must leave the serial event consumer free to deliver the I/O
+       callbacks or native lease releases being joined. *)
     if t.closed
     then t.post (Core.Runner_completed (Core.Asset_completion (ticket, Error Core.Asset_cancelled)))
     else submit_asset_io t instruction ticket request

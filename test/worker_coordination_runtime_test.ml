@@ -2787,6 +2787,58 @@ let with_observation_service ?epoch_ms ?prepare ?(observe_push=fun _->()) f =
     f client ~call ~send ~wait ~replies ~notices ~baseline ~owner ~registration)
 ;;
 
+let test_service_writer_fence_waits_for_canceled_protected_commit () =
+  let armed=Atomic.make false and entered=Atomic.make false and released=Atomic.make false in
+  let epoch_ms()=
+    if Atomic.get armed then (Atomic.set entered true;
+      while not(Atomic.get released)do Eio.Fiber.yield() done);
+    1_700_000_000_000L in
+  Fun.protect ~finally:(fun()->Atomic.set released true)(fun()->
+    with_observation_service ~epoch_ms(fun client ~call ~send ~wait ~replies ~notices:_ ~baseline ~owner ~registration->
+      let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+      let id n=uuid(Printf.sprintf "9f000000-0000-4000-8000-%012d" (9000+n)) in
+      let read owner n=call(Service.Coordination_query{registration;owner;response_budget_bytes=16384;
+        request={P.api_version=P.api_version;request_id=id n;command=V2_get_outline_block
+          {block=Test_support.authoritative_block_uuid;revision=None}}}) in
+      let revision=match read owner 1 with
+        |Mailbox.Completed(Service.Graph_response(P.V2_response{outcome=V2_block_outcome(V2_present_block{revision;_});_}))->revision
+        |_->failwith "writer fence source read failed" in
+      let intent n title=Wire.create ~origin:(Uri.of_string "https://api.logseq.io") ~user:"user-1" ~graph:owner.graph_id
+        (P.V2_save_block{mutation_id=id n;block=Test_support.authoritative_block_uuid;title;
+          preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}) |> Result.get_ok in
+      let original=intent 2 "Protected writer actually committed" in
+      Atomic.set armed true;
+      let writer=send(Service.Coordination_mutation{registration;owner;request_id=id 3;intent=Wire.encode original}) in
+      wait(fun()->Atomic.get entered);
+      Mailbox.cancel client ~request_id:writer;
+      let scope=fst(List.find(fun((scope:Service.asset_scope),_)->scope.graph_id=owner.graph_id)
+        (Option.get !baseline).baseline.state.residents) in
+      let fence=send(Service.Coordination_quiesce_writers{registration;owner=scope;request_id=id 4}) in
+      let rejected=call(Service.Coordination_mutation{registration;owner;request_id=id 5;intent=Wire.encode(intent 6 "Must not enter held DB")}) in
+      require(match rejected with Mailbox.Completed(Service.Coordination_mutation_result{outcome=Wire.Unknown;_})->true|_->false)
+        "writer fence admitted another durable operation into the held database";
+      require(not(Hashtbl.mem replies fence)) "writer fence ACK preceded actual canceled protected commit";
+      Atomic.set armed false;Atomic.set released true;
+      wait(fun()->Hashtbl.mem replies fence);
+      require(match Hashtbl.find replies fence with
+        |Mailbox.Completed(Service.Coordination_writers_quiesced value)->
+          value.registration=registration && value.owner=scope && value.request_id=id 4
+        |_->false) "writer fence failed to join actual protected I/O and callback barrier";
+      require(match read owner 7 with Mailbox.Failed _->true
+        |Completed(Service.Graph_response(P.V2_response{outcome=V2_failed _;_}))->true|_->false)
+        "old graph incarnation resumed admission after writer fence";
+      ignore(call(Service.Client_command Return_to_graph_picker));
+      ignore(call(Service.Client_command(Select_graph owner.graph_id)));
+      wait(fun()->List.exists(fun((next:Service.asset_scope),graph)->next.graph_id=owner.graph_id
+        && next.graph_generation<>owner.graph_generation && graph.Logseq_db_worker.phase=Graph_open)
+        (Option.get !baseline).baseline.state.residents);
+      let fresh=Option.get(Option.get !baseline).baseline.state.sync.selected in
+      require(match read fresh 8 with
+        |Mailbox.Completed(Service.Graph_response(P.V2_response{outcome=V2_block_outcome(V2_present_block{value;_});_}))->
+          value.block.title="Protected writer actually committed"
+        |_->false) "new incarnation lost actual canceled commit or inherited the old admission fence"))
+;;
+
 let test_service_import_rejects_retired_registration () =
   with_client(fun client->
     let replies=Hashtbl.create 16 and baseline=ref None in
@@ -3835,6 +3887,7 @@ let test_service_changefeed_has_one_owner () =
 ;;
 
 let () =
+  test_service_writer_fence_waits_for_canceled_protected_commit ();
   test_prepared_import_survives_worker_lifetime ();
   test_service_import_rejects_retired_registration ();
   test_host_durable_recovery_confirmation_ack ();

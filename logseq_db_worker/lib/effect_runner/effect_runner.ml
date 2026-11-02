@@ -396,6 +396,8 @@ type asset_cleanup_job=
   {cleanup_id:int64;cleanup_scope:Sync.graph_scope;finished:unit Eio.Promise.t;
    mutable children:asset_cleanup_job Rrbvec.t}
 type asset_cleanup_snapshot={snapshot_scope:Sync.graph_scope;snapshot_jobs:asset_cleanup_job Rrbvec.t}
+type writer_job={writer_operation:Core.Writer_fence.operation;writer_scope:Sync.graph_scope;
+  writer_finished:unit Eio.Promise.t;writer_resolve:unit Eio.Promise.u}
 module Cleanup_ids=Set.Make(Int64)
 
 type t =
@@ -426,6 +428,8 @@ type t =
   ; asset_result_sources : ((Sync.graph_scope*string),Logseq_sync_pure_reducer.Asset_transfer.ticket)Hashtbl.t
   ; asset_cleanup_stopped : unit Eio.Promise.t * unit Eio.Promise.u
   ; resource_cleanup_owners : ((Sync.graph_scope * string),asset_cleanup_job) Hashtbl.t
+  ; mutable writer_fence : Core.Writer_fence.t
+  ; writer_jobs : (int64,writer_job)Hashtbl.t
   ; durable_slots : Eio.Semaphore.t
   ; databases : (string, database_session) Hashtbl.t
   ; inspections : (string, Database.mirror_inspection) Hashtbl.t
@@ -477,6 +481,8 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; asset_result_sources = Hashtbl.create 16
     ; asset_cleanup_stopped = Eio.Promise.create ()
     ; resource_cleanup_owners = Hashtbl.create 16
+    ; writer_fence = Core.Writer_fence.empty
+    ; writer_jobs = Hashtbl.create 32
     ; durable_slots = Eio.Semaphore.make 8
     ; databases = Hashtbl.create 4
     ; inspections = Hashtbl.create 4
@@ -662,6 +668,27 @@ let asset_unit ?(on_failure = fun _ -> ()) ?on_diagnostic t ~scope action =
   | Ok _ ->
     (try on_failure (Sync.Asset_invalid_content "Unexpected asset completion") with _ -> ());
     Error "Unexpected asset completion"
+;;
+
+let reserve_writer t scope =
+  if t.stopped then Error "The Worker stopped before graph operation admission." else
+  let next,outcome=Core.Writer_fence.admit t.writer_fence scope in
+  t.writer_fence<-next;
+  Result.map_error(function Core.Writer_fence.Fenced->"The graph incarnation is quiescing."
+    |Full->"Graph operation capacity is full.")outcome
+  |> Result.map(fun writer_operation->
+    let writer_finished,writer_resolve=Eio.Promise.create() in
+    let job={writer_operation;writer_scope=scope;writer_finished;writer_resolve} in
+    Hashtbl.add t.writer_jobs(Core.Writer_fence.operation_id writer_operation)job;job)
+;;
+let finish_writer t job =
+  t.writer_fence<-Core.Writer_fence.finish t.writer_fence job.writer_operation;
+  Hashtbl.remove t.writer_jobs(Core.Writer_fence.operation_id job.writer_operation);
+  ignore(Eio.Promise.try_resolve job.writer_resolve():bool)
+;;
+let with_writer t scope action =
+  Result.bind(reserve_writer t scope)(fun job->
+    Fun.protect ~finally:(fun()->finish_writer t job) action)
 ;;
 
 let with_staging_lock t action =
@@ -2235,30 +2262,32 @@ let run_durable_mutation t ~(scope:Sync.graph_scope) ~request_id ~intent ~curren
 ;;
 
 let durable_mutation t ~scope ~request_id ~intent ~current =
-  (* Own the accepted DB operation on the existing Worker switch. Cancelling a
-     Service waiter must release its mailbox lane without cancelling a protected
-     SQLite commit, just as ordinary Db.request does. Bound detached I/O owners. *)
-  Eio.Semaphore.acquire t.durable_slots;
-  let submitted = ref false in
-  let promise, resolve = Eio.Promise.create () in
-  Fun.protect
-    ~finally:(fun () -> if not !submitted then Eio.Semaphore.release t.durable_slots)
-    (fun () ->
-       Eio.Cancel.protect (fun () ->
-         t.dependencies.runtime.fork ~sw:t.sw (fun () ->
-           Fun.protect
-             ~finally:(fun () -> Eio.Semaphore.release t.durable_slots)
-             (fun () ->
-                let outcome =
-                  try run_durable_mutation t ~scope ~request_id ~intent ~current with
-                  | _ -> Logseq_db_worker_contract.Mutation_pure_wire.Unknown
-                in
-                ignore (Eio.Promise.try_resolve resolve outcome : bool)));
-         submitted := true);
-       Eio.Promise.await promise)
+  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  match reserve_writer t scope with
+  |Error _->Wire.Unknown
+  |Ok job->
+    (* Reservation precedes any semaphore wait or fork. Once submitted, only the
+       physical protected task releases it, even if its Service waiter cancels. *)
+    let submitted=ref false and acquired=ref false in
+    let promise,resolve=Eio.Promise.create() in
+    Fun.protect
+      ~finally:(fun()->if not !submitted then (
+        if !acquired then Eio.Semaphore.release t.durable_slots;
+        finish_writer t job))
+      (fun()->
+        Eio.Semaphore.acquire t.durable_slots;acquired:=true;
+        Eio.Cancel.protect(fun()->
+          t.dependencies.runtime.fork ~sw:t.sw(fun()->
+            Fun.protect ~finally:(fun()->
+              Eio.Semaphore.release t.durable_slots;finish_writer t job)
+              (fun()->
+                let outcome=try run_durable_mutation t ~scope ~request_id ~intent ~current with _->Wire.Unknown in
+                ignore(Eio.Promise.try_resolve resolve outcome:bool)));
+          submitted:=true);
+        Eio.Promise.await promise)
 ;;
 
-let confirm_mutation t ~(scope : Sync.graph_scope) ~request_id ~intent ~original ~current =
+let confirm_mutation_unfenced t ~(scope : Sync.graph_scope) ~request_id ~intent ~original ~current =
   let module Wire = Logseq_db_worker_contract.Mutation_pure_wire in
   let request command =
     { Protocol.api_version = Protocol.api_version; request_id; command }
@@ -2338,7 +2367,14 @@ let confirm_mutation t ~(scope : Sync.graph_scope) ~request_id ~intent ~original
          | _ -> fail "No immutable original commit evidence is available."))
 ;;
 
-let recover_mutations t ~(scope:Sync.graph_scope) ~request_id ~after ~maximum_items ~maximum_bytes ~current =
+let confirm_mutation t ~scope ~request_id ~intent ~original ~current =
+  match reserve_writer t scope with
+  |Error message->failure {Protocol.api_version=Protocol.api_version;request_id;command=Protocol.V2_graph_info} Conflict message
+  |Ok job->Fun.protect ~finally:(fun()->finish_writer t job)
+    (fun()->confirm_mutation_unfenced t ~scope ~request_id ~intent ~original ~current)
+;;
+
+let recover_mutations_unfenced t ~(scope:Sync.graph_scope) ~request_id ~after ~maximum_items ~maximum_bytes ~current =
   let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
   let fail error=Error(Logseq_db_worker_contract.Error.message(local_commit_error error)) in
   if maximum_items<=0 || maximum_items>256 || maximum_bytes<=0
@@ -2387,7 +2423,11 @@ let recover_mutations t ~(scope:Sync.graph_scope) ~request_id ~after ~maximum_it
       else Ok page)
 ;;
 
-let acknowledge_mutation t ~(scope:Sync.graph_scope) ~intent ~original ~current =
+let recover_mutations t ~scope ~request_id ~after ~maximum_items ~maximum_bytes ~current =
+  with_writer t scope(fun()->recover_mutations_unfenced t ~scope ~request_id ~after ~maximum_items ~maximum_bytes ~current)
+;;
+
+let acknowledge_mutation_unfenced t ~(scope:Sync.graph_scope) ~intent ~original ~current =
   let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
   let fail error=Error(Logseq_db_worker_contract.Error.message(local_commit_error error)) in
   match Wire.restore ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id intent with
@@ -2420,6 +2460,10 @@ let acknowledge_mutation t ~(scope:Sync.graph_scope) ~intent ~original ~current 
            | Error error->fail error
            | Ok() when current() && not t.stopped->Ok()
            | Ok()->Error "Durable acknowledgement completed after authority retired")
+;;
+
+let acknowledge_mutation t ~scope ~intent ~original ~current =
+  with_writer t scope(fun()->acknowledge_mutation_unfenced t ~scope ~intent ~original ~current)
 ;;
 
 let protected_envelope (iv, ciphertext) =
@@ -3135,21 +3179,49 @@ let run_request t (type a) (request : a Core.runner_request)
   | Handle_sync_worker_effect worker_effect -> handle_sync_worker_effect t worker_effect
 ;;
 
-let complete t (Core.Request (ticket, request)) =
+let complete t ?writer (Core.Request (ticket, request)) =
+  Fun.protect ~finally:(fun()->Option.iter(finish_writer t)writer)(fun()->
+    match request with
+    |Core.Execute_request _->let result=run_request t request in
+      t.post(Core.Runner_completed(Core.Execute_request_completed(ticket,result)))
+    |Close_database _->let result=run_request t request in
+      t.post(Core.Runner_completed(Core.Close_database_completed(ticket,result)))
+    |Handle_sync_worker_effect _->let result=run_request t request in
+      t.post(Core.Runner_completed(Core.Sync_worker_effect_completed(ticket,result))))
+;;
+let worker_operation_scope t (Core.Request(_,request)) =
   match request with
-  | Core.Execute_request _ ->
-    let result = run_request t request in
-    t.post (Core.Runner_completed (Core.Execute_request_completed (ticket, result)))
-  | Close_database _ ->
-    let result = run_request t request in
-    t.post (Core.Runner_completed (Core.Close_database_completed (ticket, result)))
-  | Handle_sync_worker_effect _ ->
-    let result = run_request t request in
-    t.post (Core.Runner_completed (Core.Sync_worker_effect_completed (ticket, result)))
+  |Core.Execute_request{database;_}->Option.map(fun session->session.graph_scope)
+      (Hashtbl.find_opt t.databases(Core.database_handle_id database))
+  |Close_database _->None
+  |Handle_sync_worker_effect worker_effect->
+    (match worker_effect with
+     |Sync.Inspect_mirror request|Attach_graph request->Some request.scope
+     |Activate_snapshot request->Some(Sync.snapshot_activation_scope request)
+     |Inspect_sync scope->Some scope
+     |Apply_outbox_transition request->Some request.scope
+     |Apply_authoritative_batch request->Some request.scope.graph
+     |Detach_graph _|Reset_managed_account _|Delete_mirror _->None)
+;;
+let submit_worker t (Core.Request(ticket,request) as packed) =
+  let fork ?writer ()=
+    try t.dependencies.runtime.fork ~sw:t.sw(fun()->complete t ?writer packed)
+    with error->Option.iter(finish_writer t)writer;raise error in
+  match worker_operation_scope t packed with
+  |None->fork()
+  |Some scope->match reserve_writer t scope with
+    |Ok writer->fork ~writer ()
+    |Error message->let error=effect_error message in
+      let result=match request with
+        |Core.Execute_request _->Core.Execute_request_completed(ticket,Error error)
+        |Close_database _->Core.Close_database_completed(ticket,Error error)
+        |Handle_sync_worker_effect _->Core.Sync_worker_effect_completed(ticket,Error error) in
+      t.post(Core.Runner_completed result)
 ;;
 
 let run_upload t (context : Sync.asset_context) instruction =
-  let current ticket = (not t.stopped) && t.upload_current ticket in
+  let current ticket = (not t.stopped) && t.upload_current ticket
+    && not(Core.Writer_fence.fenced t.writer_fence context.scope) in
   let on_diagnostic ticket detail =
     if current ticket then queue_notice_diagnostic t context.scope
       (Upload_notice ticket.Upload.operation) ticket.id detail in
@@ -3316,16 +3388,19 @@ let submit_upload t (context : Sync.asset_context) instruction =
   | Await_publication (ticket, _) ->
     if t.upload_current ticket && not (Hashtbl.mem t.upload_operations ticket)
     then (
-      clear_notice_diagnostic t context.scope (Upload_notice ticket.operation);
-      let cancelled, resolve = Eio.Promise.create () in
-      Hashtbl.add t.upload_operations ticket resolve;
-      t.dependencies.runtime.fork ~sw:t.sw (fun () ->
-        Fun.protect
-          ~finally:(fun () -> Hashtbl.remove t.upload_operations ticket)
-          (fun () ->
-             Eio.Fiber.first
+      match reserve_writer t context.scope with
+      |Error _->t.post(Core.Upload_completed(ticket,Upload.Failed Upload.Invalid_content))
+      |Ok job->
+        clear_notice_diagnostic t context.scope (Upload_notice ticket.operation);
+        let cancelled, resolve = Eio.Promise.create () in
+        Hashtbl.add t.upload_operations ticket resolve;
+        (try t.dependencies.runtime.fork ~sw:t.sw (fun () ->
+          Fun.protect
+            ~finally:(fun () -> Hashtbl.remove t.upload_operations ticket;finish_writer t job)
+            (fun () -> Eio.Fiber.first
                (fun () -> run_upload t context instruction)
-               (fun () -> Eio.Promise.await cancelled))))
+               (fun () -> Eio.Promise.await cancelled)))
+         with error->Hashtbl.remove t.upload_operations ticket;finish_writer t job;raise error))
 ;;
 
 let transfer_failure = function
@@ -3490,6 +3565,34 @@ let asset_callback_barrier t =
       (fun()->Eio.Promise.await promise)
       (fun()->Eio.Promise.await(fst t.asset_cleanup_stopped)))
 ;;
+let quiesce_writers t ~scope =
+  let next,outcome=Core.Writer_fence.freeze t.writer_fence scope in
+  t.writer_fence<-next;
+  match outcome with
+  |Error _->Error "Writer fence capacity is full."
+  |Ok fence->
+    let jobs=Hashtbl.fold(fun _ job jobs->
+      if Core.Writer_fence.same_incarnation job.writer_scope scope
+      then Rrbvec.push_back jobs job else jobs)t.writer_jobs Rrbvec.empty in
+    Eio.Fiber.first
+      (fun()->
+        Rrbvec.iter(fun job->Eio.Promise.await job.writer_finished)jobs;
+        (* Join the actual reducer callback outlet after each captured task has
+           posted. Work emitted by those callbacks meets the permanent gate. *)
+        asset_callback_barrier t;
+        (* Parent cancellation only requests Sync cancellation. Its physical task
+           and final callback remain owned by Sync until this actual I/O join. *)
+        let children=asset_call t ~scope Sync.Await_asset_operations in
+        asset_callback_barrier t;
+        if t.stopped then Error "The Worker stopped before writer settlement."
+        else match children with
+          |Ok Sync.Asset_unit when Core.Writer_fence.drained t.writer_fence fence->Ok()
+          |Ok _->Error "Graph writers remain unsettled."
+          |Error _->Error "Scoped asset child I/O did not settle.")
+      (fun()->Eio.Promise.await(fst t.asset_cleanup_stopped);
+        Error "The Worker stopped before writer settlement.")
+;;
+
 let start_asset_cleanup_job ?parent ?(prepare=(fun _->())) t ~scope work =
   if t.next_asset_cleanup=Int64.max_int then failwith "Asset cleanup counter exhausted";
   t.next_asset_cleanup<-Int64.succ t.next_asset_cleanup;
@@ -3666,28 +3769,22 @@ let submit t = function
      | Some waiter when waiter.request = output.request -> ()
      | Some _ | None -> reclaim_asset_output t output)
   | Core.Read_uploads ticket ->
-    if (not t.stopped) && t.recovery_current ticket
-    then
-      t.dependencies.runtime.fork ~sw:t.sw (fun () ->
-        if (not t.stopped) && t.recovery_current ticket
-        then (
-          let result =
-            with_staging_lock t (fun () ->
-              Result.bind
-                (reconcile_staging t ticket.scope ~current:(fun () ->
-                   t.recovery_current ticket))
-                (fun () ->
-                   with_upload_store t (fun db ->
-                     Logseq_db_storage.Asset_upload_store.list
-                       db
-                       ~origin:(Uri.to_string ticket.scope.account.managed_sync_origin)
-                       ~account:ticket.scope.account.user_id
-                       ~graph:ticket.scope.graph_id
-                       ~after:ticket.after
-                       ~limit:ticket.limit)))
-          in
-          if (not t.stopped) && t.recovery_current ticket
-          then t.post (Core.Uploads_loaded (ticket, result))))
+    if (not t.stopped) && t.recovery_current ticket then (
+      match reserve_writer t ticket.scope with
+      |Error message->t.post(Core.Uploads_loaded(ticket,Error message))
+      |Ok job->
+        (try t.dependencies.runtime.fork ~sw:t.sw(fun()->
+          Fun.protect ~finally:(fun()->finish_writer t job)(fun()->
+            if not t.stopped && t.recovery_current ticket then (
+              let current()=t.recovery_current ticket && not(Core.Writer_fence.fenced t.writer_fence ticket.scope) in
+              let result=with_staging_lock t(fun()->
+                Result.bind(reconcile_staging t ticket.scope ~current)(fun()->
+                  with_upload_store t(fun db->Logseq_db_storage.Asset_upload_store.list db
+                    ~origin:(Uri.to_string ticket.scope.account.managed_sync_origin)
+                    ~account:ticket.scope.account.user_id ~graph:ticket.scope.graph_id
+                    ~after:ticket.after ~limit:ticket.limit))) in
+              if not t.stopped && t.recovery_current ticket then t.post(Core.Uploads_loaded(ticket,result)))))
+         with error->finish_writer t job;raise error))
   | Core.Run_upload (context, instruction) ->
     if not t.stopped then submit_upload t context instruction
   | Core.Run_asset (context, instruction) ->
@@ -3702,10 +3799,10 @@ let submit t = function
       (Hashtbl.find_opt t.asset_cleanup_barriers token)
   | Core.Run_worker (Core.Request (_, Core.Handle_sync_worker_effect (Sync.Delete_mirror deletion)) as request) ->
     if deletion_authorized t deletion then t.deletion_owner <- Some deletion;
-    if not t.stopped then t.dependencies.runtime.fork ~sw:t.sw (fun () -> complete t request)
+    if not t.stopped then submit_worker t request
   | Core.Run_worker request ->
     if not t.stopped
-    then t.dependencies.runtime.fork ~sw:t.sw (fun () -> complete t request)
+    then submit_worker t request
   | Run_sync (Sync.Request (ticket, Sync.Delete_account_secrets account) as sync_effect)
     ->
     if not t.stopped
@@ -3792,7 +3889,8 @@ let shutdown t =
 ;;
 
 let retain_asset_file t ~scope ~handle =
-  if not(Core.Orphan_cleanup.acquisition_open t.orphan_cleanup) then None else
+  if t.stopped || Core.Writer_fence.fenced t.writer_fence scope
+    || not(Core.Orphan_cleanup.acquisition_open t.orphan_cleanup) then None else
   let detail = ref None in
   match asset_call ~on_diagnostic:(fun value -> detail := Some value) t ~scope (Sync.Retain_asset_file handle) with
   | Ok (Sync.Asset_retained file) -> file
@@ -3909,7 +4007,7 @@ let prepare_import_unlocked
       result
 ;;
 
-let prepare_import t ~(context : Sync.asset_context) request ~current =
+let prepare_import_unfenced t ~(context : Sync.asset_context) request ~current =
   with_staging_lock t (fun () ->
     let on_diagnostic detail = if current () then
       publish_failure (report_current_graph t context.scope) detail in
@@ -3937,8 +4035,13 @@ let prepare_import t ~(context : Sync.asset_context) request ~current =
       (prepare_import_unlocked ~on_diagnostic t ~context request ~current))
 ;;
 
+let prepare_import t ~(context:Sync.asset_context) request ~current =
+  with_writer t context.scope(fun()->prepare_import_unfenced t ~context request ~current)
+;;
+
 let retain_imported_file t ~(scope : Sync.graph_scope) ~operation =
-  if t.stopped || not(Core.Orphan_cleanup.acquisition_open t.orphan_cleanup)
+  if t.stopped || Core.Writer_fence.fenced t.writer_fence scope
+    || not(Core.Orphan_cleanup.acquisition_open t.orphan_cleanup)
   then None
   else (
     match

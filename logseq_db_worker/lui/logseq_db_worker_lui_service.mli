@@ -240,6 +240,8 @@ type observation_signal =
   | Observation_invalidated of observation_invalidation
   | Observations_resync
 type request =
+  | Coordination_quiesce_writers of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_import of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
        source:Logseq_db_types.Asset_import.t}
@@ -316,6 +318,8 @@ type request =
       }
 
 type response =
+  | Coordination_writers_quiesced of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_imported of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
        result:(Logseq_db_worker.import_receipt,string)result}

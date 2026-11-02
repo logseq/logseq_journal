@@ -14,12 +14,12 @@ let account ?(generation = 1) user_id : Sync.account_scope =
 
 module Sync_runner = Logseq_sync_effect_runner.Effect_runner
 
-let asset_io_runner ?on_asset_diagnostic ?(token_failure = "test must not use network") ~env ~sw ~support ~post () =
+let asset_io_runner ?(fork=(fun ~sw:_ task->task())) ?on_asset_diagnostic ?(token_failure = "test must not use network") ~env ~sw ~support ~post () =
   let module R = Sync_runner in
   let dependencies =
     R.dependencies
       ~runtime:
-        (R.runtime ~fork:(fun ~sw:_ task -> task ()) ~sleep:(fun _ -> ()) |> Result.get_ok)
+        (R.runtime ~fork ~sleep:(fun _ -> ()) |> Result.get_ok)
       ~transport:
         (R.transport
            ~tls_authenticator:(R.system_tls_authenticator () |> Result.get_ok)
@@ -561,10 +561,11 @@ let admitted_asset_state graph_id =
 ;;
 
 type asset_bridge_fixture =
-  { runner : Runner.t
+  { sw:Eio.Switch.t
+  ; runner : Runner.t
   ; context : Sync.asset_context
   ; support : string
-  ; gate : (Sync.asset_output -> bool) -> deliver_first:bool -> unit Eio.Promise.t
+  ; gate : ?hold_callback:bool -> (Sync.asset_output -> bool) -> deliver_first:bool -> unit Eio.Promise.t
   ; deliver_held : unit -> unit
   ; hold_asset_barrier : unit -> unit Eio.Promise.t
   ; deliver_asset_barriers : unit -> unit
@@ -575,7 +576,7 @@ type asset_bridge_fixture =
   ; fixture_asset : Sync.asset_action -> Sync.asset_value
   }
 
-let with_asset_bridge ?(asynchronous=false) run =
+let with_asset_bridge ?(asynchronous=false) ?(asynchronous_io=false) run =
   T.with_managed (fun fixture ->
     Eio_main.run (fun env ->
       Eio.Switch.run (fun sw ->
@@ -625,6 +626,7 @@ let with_asset_bridge ?(asynchronous=false) run =
         io_runner
         := Some
              (asset_io_runner
+                ~fork:(fun ~sw task->if asynchronous_io then Eio.Fiber.fork ~sw task else task())
                 ~on_asset_diagnostic:(fun ~scope ~operation ~request_operation detail ->
                   Runner.report_asset_diagnostic (Option.get !active_runner)
                     ~scope ~operation ~request_operation detail)
@@ -673,6 +675,7 @@ let with_asset_bridge ?(asynchronous=false) run =
                   ; operation = "fixture:" ^ string_of_int !serial
                   ; action
                   }));
+          while !fixture_output=None do Eio.Fiber.yield() done;
           Option.get !fixture_output |> Result.get_ok
         in
         let path_of_output (output : Sync.asset_output) =
@@ -686,29 +689,30 @@ let with_asset_bridge ?(asynchronous=false) run =
           | Ok (Sync.Asset_retained (Some (_, path))) -> Some path
           | _ -> None
         in
-        let gate predicate ~deliver_first =
+        let gate ?(hold_callback=false) predicate ~deliver_first =
           let reached, resolve = Eio.Promise.create () in
-          let never, _ = Eio.Promise.create () in
+          let callback_done, callback_resolve = Eio.Promise.create () in
           (output_handler
            := fun output ->
                 if not (predicate output)
                 then false
                 else (
                   held_path := path_of_output output;
-                  Queue.add (output, deliver_first) held;
+                  Queue.add (output, deliver_first,callback_resolve) held;
                   if deliver_first
                   then Runner.submit runner (Core.Deliver_asset_result output);
                   Eio.Promise.resolve resolve ();
-                  if deliver_first then Eio.Promise.await never;
+                  if deliver_first || hold_callback then Eio.Promise.await callback_done;
                   true));
           reached
         in
         let deliver_held () =
           (output_handler := fun _ -> false);
           Queue.iter
-            (fun (output, delivered) ->
+            (fun (output, delivered,callback_resolve) ->
                if not delivered
-               then Runner.submit runner (Core.Deliver_asset_result output))
+               then Runner.submit runner (Core.Deliver_asset_result output);
+               ignore(Eio.Promise.try_resolve callback_resolve():bool))
             held;
           Queue.clear held
         in
@@ -726,7 +730,7 @@ let with_asset_bridge ?(asynchronous=false) run =
           ~finally:(fun () -> Runner.shutdown runner)
           (fun () ->
              run
-               { runner
+               { sw;runner
                ; context
                ; support = fixture.config.application_support_directory
                ; gate
@@ -816,6 +820,66 @@ let cancelled_stage_output deliver_first () =
       "cancel before staging acceptance persists no import"
       true
       (durable = None))
+;;
+
+let test_asset_io_barrier_does_not_block_serial_submit () =
+  T.with_managed(fun fixture->Eio_main.run(fun env->Eio.Switch.run(fun sw->
+    let tasks=Queue.create() and events=ref [] in
+    let runner=asset_io_runner ~env ~sw ~support:fixture.config.application_support_directory
+      ~fork:(fun ~sw:_ task->Queue.add task tasks) ~post:(fun event->events:=event::!events)() in
+    Fun.protect ~finally:(fun()->Sync_runner.shutdown runner)(fun()->
+      let graph_id=Logseq_db_types.Graph_types.Uuid.of_string "22000000-0000-4000-8000-000000000001" |> Result.get_ok in
+      let initial,context=admitted_asset_state graph_id in
+      let source=picker_import fixture.config.application_support_directory 980 in
+      let issue state operation action=
+        let transition=Sync.step state(Sync.Asset_requested{scope=context.scope;operation;action}) in
+        let instruction=List.find_map(function Sync.Run instruction->Some instruction|_->None)transition.effects |> Option.get in
+        transition.next,instruction in
+      let pending,stage=issue initial "actual-stage-before-barrier"
+        (Sync.Stage_asset_file{operation=source.operation;file_type=source.file_type;source_file=source.source_file}) in
+      Sync_runner.submit runner stage;
+      let barrier_state,barrier=issue pending "actual-io-barrier" Sync.Await_asset_operations in
+      let returned=ref false in
+      Eio.Fiber.fork ~sw(fun()->Sync_runner.submit runner barrier;returned:=true);
+      Eio.Fiber.yield();
+      let blocked=not !returned in
+      let later_source=picker_import fixture.config.application_support_directory 990 in
+      let _,later=issue barrier_state "later-unrelated-stage"
+        (Sync.Stage_asset_file{operation=later_source.operation;file_type=later_source.file_type;source_file=later_source.source_file}) in
+      Sync_runner.submit runner later;
+      (Queue.take tasks)(); (* actual first source finishes; later source stays queued *)
+      let barrier_finished=ref false in
+      if not(Queue.is_empty tasks) then (
+        let task=Queue.take tasks in
+        Eio.Fiber.fork ~sw(fun()->task();barrier_finished:=true));
+      for _=1 to 4 do Eio.Fiber.yield() done;
+      let joined_later=not !barrier_finished in
+      while not(Queue.is_empty tasks)do (Queue.take tasks)() done;
+      while not !returned || not !barrier_finished do Eio.Fiber.yield() done;
+      Alcotest.(check bool) "Await submit must leave the serial callback consumer free" false blocked;
+      Alcotest.(check bool) "barrier cannot capture later unrelated I/O" false joined_later;
+      Alcotest.(check bool) "actual asset owner still reports completion" true(List.length !events>=3)))))
+;;
+
+let test_writer_fence_joins_actual_canceled_asset_callback () =
+  with_asset_bridge ~asynchronous:true ~asynchronous_io:true(fun fixture->
+    let source=picker_import fixture.support 970 in
+    let reached=fixture.gate ~hold_callback:true
+      (fun output->match output.Sync.request.action with Sync.Stage_asset_file _->true|_->false)
+      ~deliver_first:false in
+    Eio.Fiber.first
+      (fun()->ignore(Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true));
+        Alcotest.fail "held actual staging callback unexpectedly returned")
+      (fun()->Eio.Promise.await reached);
+    let outcome=ref None in
+    Eio.Fiber.fork ~sw:fixture.sw (fun()->
+      outcome:=Some(Runner.quiesce_writers fixture.runner ~scope:fixture.context.scope));
+    for _=1 to 20 do Eio.Fiber.yield() done;
+    let premature= !outcome<>None in
+    fixture.deliver_held();
+    while !outcome=None do Eio.Fiber.yield() done;
+    Alcotest.(check bool) "actual canceled Sync task callback must finish before writer ACK" false premature;
+    Alcotest.(check bool) "actual child callback allows writer barrier" true(!outcome=Some(Ok())))
 ;;
 
 let test_cancelled_retained_output () =
@@ -2666,7 +2730,9 @@ let () =
         ] )
     ; ( "unlock diagnostics", [Alcotest.test_case "typed finite runner observations" `Quick test_unlock_runner_logging] )
     ; ( "contract"
-      , [ Alcotest.test_case "asset cleanup joins queued result child" `Quick test_asset_cleanup_joins_queued_result_child
+      , [ Alcotest.test_case "asset IO barrier submit stays nonblocking" `Quick test_asset_io_barrier_does_not_block_serial_submit
+        ; Alcotest.test_case "writer fence joins actual canceled asset callback" `Quick test_writer_fence_joins_actual_canceled_asset_callback
+        ; Alcotest.test_case "asset cleanup joins queued result child" `Quick test_asset_cleanup_joins_queued_result_child
         ; Alcotest.test_case "asset cleanup ignores later unrelated work" `Quick test_asset_cleanup_ignores_later_unrelated_work
         ; Alcotest.test_case "asset cleanup stop returns failure" `Quick test_asset_cleanup_stop_does_not_wait_for_lost_io
         ; Alcotest.test_case "asset cleanup snapshot retains physical failure" `Quick test_asset_cleanup_snapshot_retains_physical_failure
