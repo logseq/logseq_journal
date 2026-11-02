@@ -1315,8 +1315,8 @@ let create ~(dependencies : dependencies) =
       | Acquire_asset_file { scope; handle } ->
         Ok (Asset_file (Db.retain_asset_file session.worker ~scope ~handle))
       | Release_asset_file { scope; handle } ->
-        Db.release_asset_file session.worker ~scope ~handle;
-        Ok Client_command_completed
+        Result.map(fun()->Client_command_completed)
+          (Db.release_asset_file_checked session.worker ~scope ~handle)
       | Client_command (Provide_token { request; token }) ->
         Worker_runner.provide_id_token session.token_cache request.request token;
         Ok Client_command_completed

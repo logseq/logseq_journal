@@ -3569,6 +3569,19 @@ let release_asset_file t ~scope ~handle =
   | Ok _ -> report_source_failure t scope "assetRelease" "invalidContent" "Unexpected asset completion"
 ;;
 
+let release_asset_file_checked t ~scope ~handle =
+  if t.stopped then Error "The Worker stopped before resource release." else
+  let detail=ref None in
+  match asset_call ~on_diagnostic:(fun value->detail:=Some value) t ~scope (Sync.Release_asset_file handle) with
+  | Ok Sync.Asset_unit -> Ok()
+  | Error failure ->
+    report_asset_failure ?detail:!detail t scope "assetRelease" failure;
+    Error(asset_failure_message failure)
+  | Ok _ ->
+    report_source_failure t scope "assetRelease" "invalidContent" "Unexpected asset completion";
+    Error "Unexpected asset release completion"
+;;
+
 let prepare_import_unlocked
       ~on_diagnostic
       t

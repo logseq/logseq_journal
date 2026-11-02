@@ -527,22 +527,32 @@ module Asset_cache = struct
       | None -> Option.map (pin_staged t) (Hashtbl.find_opt t.staged_handles handle))
   ;;
 
-  let release t handle =
+  let release_checked t handle =
     match Hashtbl.find_opt t.handles handle with
     | Some record ->
       record.pins <- record.pins - 1;
-      Hashtbl.remove t.handles handle
+      Hashtbl.remove t.handles handle;
+      Ok ()
     | None ->
       (match Hashtbl.find_opt t.staged_handles handle with
-       | None -> ()
+       | None -> Ok ()
        | Some record ->
          record.staged_pins <- record.staged_pins - 1;
-         Hashtbl.remove t.staged_handles handle;
-         if record.retired
-         then ignore (clean_retired_staging t record)
-         else if record.staged_pins = 0
-         then Hashtbl.remove t.staged_records record.staged_name)
+         let result=if record.retired then clean_retired_staging t record else Ok () in
+         match result with
+         | Error _ ->
+           (* The exact handle still owns this failed release. Restoring its pin
+              permits a same-handle retry without a second decrement. *)
+           record.staged_pins <- record.staged_pins + 1;
+           result
+         | Ok () ->
+           Hashtbl.remove t.staged_handles handle;
+           if not record.retired && record.staged_pins=0
+           then Hashtbl.remove t.staged_records record.staged_name;
+           Ok ())
   ;;
+
+  let release t handle = ignore(release_checked t handle)
 
   let close t =
     t.closed <- true;

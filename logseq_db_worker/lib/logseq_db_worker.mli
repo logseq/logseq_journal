@@ -66,6 +66,10 @@ val release_asset_file
   -> handle:string
   -> unit
 
+val release_asset_file_checked
+  : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> handle:string
+  -> (unit, string) result
+
 type import_receipt =
   { operation : Logseq_db_types.Graph_types.Uuid.t
   ; graph_generation : int

@@ -282,6 +282,21 @@ let asset_uuid suffix =
   |> Result.get_ok
 ;;
 
+let test_release_requires_physical_ack () =
+  T.with_managed(fun fixture->with_client fixture.config(fun client->
+    let request_id=Worker.send client
+      (Service.Release_asset_file{scope=asset_scope 1;handle="synthetic-unowned-lease"}) |> accepted in
+    let rec terminal () =
+      match Worker.For_testing.drain_events client ~max_events:64 |> List.find_map(function
+        | Worker.Response{request_id=actual;outcome;_}
+          when ID.Worker.Request_id.equal request_id actual -> Some outcome
+        | _->None) with
+      | Some outcome->outcome
+      | None->Worker.For_testing.await_output client;terminal() in
+    T.require (match terminal() with Worker.Failed _->true|_->false)
+      "retired scope cannot fabricate a successful physical release ACK"))
+;;
+
 let availability scope consumer asset state =
   Service.Asset_notice
     (scope, Asset_availability { consumer; asset; availability = state })
@@ -1736,7 +1751,8 @@ let test_observation_invalidations_are_bounded_latest_facts () =
 let () =
   T.run
     "lui worker service"
-    [ T.case "cancelled successful result is settled before terminal" (test_discarded_success_is_settled `Cancel)
+    [ T.case "release requires scoped physical ACK" test_release_requires_physical_ack
+    ; T.case "cancelled successful result is settled before terminal" (test_discarded_success_is_settled `Cancel)
     ; T.case "shutdown successful result is settled before terminal" (test_discarded_success_is_settled `Stop)
     ; T.case "delivered successful result keeps ownership" (test_discarded_success_is_settled `Complete)
     ; T.case "switch-finalizer discarded success is settled" (test_discarded_success_is_settled `Finalizer_failure)

@@ -95,6 +95,13 @@ val release_asset_file
   -> handle:string
   -> unit
 
+(** Success acknowledges this exact scoped physical release. Cancellation,
+    retired scope and storage failure remain errors; callers retain cleanup
+    ownership and retry the same handle rather than inventing an ACK. *)
+val release_asset_file_checked
+  : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> handle:string
+  -> (unit, string) result
+
 val prepare_import
   :  t
   -> context:Logseq_sync_pure_reducer.Core.asset_context

@@ -838,6 +838,50 @@ let test_cancelled_retained_output () =
       (Sys.file_exists path))
 ;;
 
+let test_checked_release_exact_physical_completion () =
+  with_asset_bridge(fun fixture->
+    let source=picker_import fixture.support 60 in
+    ignore(Runner.prepare_import fixture.runner ~context:fixture.context source
+      ~current:(fun()->true) |> Result.get_ok);
+    let lease,path=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope
+      ~operation:source.operation |> Option.get in
+    let wrong_scope={fixture.context.scope with graph_generation=fixture.context.scope.graph_generation+1} in
+    Alcotest.(check bool) "cancelled scoped release is not ACK" true
+      (Result.is_error(Runner.release_asset_file_checked fixture.runner ~scope:wrong_scope ~handle:lease));
+    Alcotest.(check bool) "old scope release leaves staged original intact" true (Sys.file_exists path);
+    let reached=fixture.gate (fun output->match output.Sync.request.action with
+      | Sync.Release_asset_file handle->handle=lease | _->false) ~deliver_first:false in
+    let completed=ref None in
+    Eio.Fiber.both
+      (fun()->completed:=Some(Runner.release_asset_file_checked fixture.runner ~scope:fixture.context.scope ~handle:lease))
+      (fun()->Eio.Promise.await reached;
+        Alcotest.(check bool) "release ACK waits for actual owner completion" true (!completed=None);
+        fixture.deliver_held());
+    Alcotest.(check bool) "exact physical release completes" true (!completed=Some(Ok()));
+    Runner.shutdown fixture.runner;
+    Alcotest.(check bool) "stopped runner cannot acknowledge release" true
+      (Result.is_error(Runner.release_asset_file_checked fixture.runner ~scope:fixture.context.scope ~handle:lease)))
+;;
+
+let test_checked_release_storage_retry () =
+  with_asset_bridge(fun fixture->
+    let source=picker_import fixture.support 80 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source
+      ~current:(fun()->true) |> Result.get_ok in
+    let lease,path=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope
+      ~operation:source.operation |> Option.get in
+    ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
+    let directory=Filename.dirname path in
+    Unix.chmod directory 0o500;
+    Fun.protect ~finally:(fun()->Unix.chmod directory 0o700)(fun()->
+      Alcotest.(check bool) "physical staging cleanup failure is not a release ACK" true
+        (Result.is_error(Runner.release_asset_file_checked fixture.runner ~scope:fixture.context.scope ~handle:lease));
+      Alcotest.(check bool) "failed release retains its bytes" true(Sys.file_exists path));
+    Alcotest.(check bool) "same exact handle can settle after storage recovers" true
+      (Runner.release_asset_file_checked fixture.runner ~scope:fixture.context.scope ~handle:lease=Ok());
+    Alcotest.(check bool) "successful retry actually removes retired staging" false(Sys.file_exists path))
+;;
+
 let test_db_shutdown_accepts_late_staging_completion () =
   let module Db = Logseq_db_worker in
   T.with_managed (fun fixture ->
@@ -2445,6 +2489,12 @@ let () =
     ; ( "unlock diagnostics", [Alcotest.test_case "typed finite runner observations" `Quick test_unlock_runner_logging] )
     ; ( "contract"
       , [ Alcotest.test_case
+            "checked release preserves storage failure for same-handle retry" `Quick
+            test_checked_release_storage_retry
+        ; Alcotest.test_case
+            "checked release awaits exact physical completion" `Quick
+            test_checked_release_exact_physical_completion
+        ; Alcotest.test_case
             "cancel queued staging output"
             `Quick
             (cancelled_stage_output false)

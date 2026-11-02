@@ -306,6 +306,10 @@ let release_asset_file t ~scope ~handle =
   Effect_runner.release_asset_file t.runner ~scope ~handle
 ;;
 
+let release_asset_file_checked t ~scope ~handle =
+  Effect_runner.release_asset_file_checked t.runner ~scope ~handle
+;;
+
 type import_receipt =
   { operation : Logseq_db_types.Graph_types.Uuid.t
   ; graph_generation : int

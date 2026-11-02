@@ -1649,10 +1649,10 @@ let retain_asset_file t ~scope ~handle =
 ;;
 
 let release_asset_file t ~scope ~handle =
-  Hashtbl.remove t.asset_leases (scope, handle);
-  Option.iter
-    (fun cache -> Asset_cache.release cache handle)
-    (Hashtbl.find_opt t.asset_caches scope)
+  let result=match Hashtbl.find_opt t.asset_caches scope with
+    | None -> Ok ()
+    | Some cache -> Asset_cache.release_checked cache handle |> Result.map_error asset_cache_failure in
+  Result.map(fun()->Hashtbl.remove t.asset_leases(scope,handle))result
 ;;
 
 let cancel_graph_asset_operations ?except_id t (request : Core.mirror_deletion) =
@@ -2048,8 +2048,7 @@ let execute_asset ?except_id t (request : Core.asset_io_request) ~current =
         Core.Asset_invalid_content "Attachment preview storage is unavailable"
       | failure -> failure)
   | Release_asset_file handle ->
-    release_asset_file t ~scope ~handle;
-    Ok Core.Asset_unit
+    release_asset_file t ~scope ~handle |> map_unit
   | Release_staged_file file ->
     release_staged_asset t ~scope ~file |> storage_result |> map_unit
   | Prune_asset_staging keep ->
