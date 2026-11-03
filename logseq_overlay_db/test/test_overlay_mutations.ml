@@ -1193,7 +1193,13 @@ let atomic_append_reuses_day_and_full_tree ?(remote=false) database =
       (Types.Submit_group [original.mutation_id]) with
     | Error(Types.Outbox_dependency_ineligible id) when id=original.mutation_id->()
     | _->Alcotest.fail "append submitted before the unresolved local day owner");
+  (* The public immutable-snapshot query owns journal candidate hydration;
+     checking mutation receipts alone misses the ordinary Timeline read. *)
   current_snapshot database behavior(fun snapshot->
+    let journals=Database.get_journals snapshot ~from_day:day ~through_day:day ~limit:1 ~cursor:None
+      |> T.require_ok ~behavior in
+    T.require(List.length journals.items=1 && (List.hd journals.items).page.page.uuid=existing_page)
+      "Append lost the existing day's journal catalog entry";
     (match Database.get_pages snapshot [candidate;existing_page;page] |> T.require_ok ~behavior with
      | Missing_page _::Present_page _::_->()|_->Alcotest.fail "append created a second journal page");
     match Database.get_outline_blocks snapshot [root.uuid;T.mutation_uuid 7703] |> T.require_ok ~behavior with

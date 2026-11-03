@@ -3999,7 +3999,15 @@ let get_journals snapshot ~from_day ~through_day ~limit ~cursor =
                    Option.bind candidate.entity (page_record_of_entity ~cache database)
                  in
                  let page =
-                   logical_page_at ~cache ~initial snapshot candidate.uuid |> Option.get
+                   (* A local Append candidate may reuse an authoritative page
+                      or a still-owned submitted shadow. Absent eager data must
+                      retain logical_page_at's existing fallback. *)
+                   let value =
+                     match initial with
+                     | Some page -> logical_page_at ~cache ~initial:(Some page) snapshot candidate.uuid
+                     | None -> logical_page_at ~cache snapshot candidate.uuid
+                   in
+                   Option.get value
                  in
                  Types.
                    { page

@@ -1398,6 +1398,38 @@ let atomic_append_tail_includes_later_submitted_shadow database =
     | _->Alcotest.fail "fixture lost the shadow or queued append")
 ;;
 
+let submitted_append_page_shadow_stays_in_journal_index database =
+  let behavior="journal catalog hydrates submitted Append's retained page shadow" in
+  let module J=Transit_core.Json in let module Codec=Transit_native.Transit.Json in
+  T.apply_test_transaction database ~cursor:1
+    [T.status_add(T.status_lookup T.page_uuid) "block/journal-day" (J.Int 20261102)];
+  let expected=Database.write_precondition ~blocks:[] ~pages:[] ~scopes:[] |> T.require_ok ~behavior in
+  let record=match T.commit_mutation database ~expected ~behavior
+    (Types.Append_journal{mutation_id=T.mutation_uuid 92900;page=T.mutation_uuid 92901;
+      title="Unused candidate";journal_day=20261102;
+      root={uuid=T.mutation_uuid 92902;title="Submitted root";task_status=None;children=Rrbvec.empty}}) with
+    |Local_committed record->record|_->Alcotest.fail "Append already existed" in
+  let submitted=submit_one database record behavior in
+  let own=server_transaction ~mutation_id:record.mutation_id ~operation:"append-journal" submitted in
+  let deletion=Codec.to_string ~mode:Codec.Verbose(J.Array[
+    J.Array[J.Keyword "db/retractEntity";T.status_lookup T.page_uuid]]) in
+  let batch=authoritative_batch ~maximum_count:16 ~maximum_bytes:65536
+    ~transactions:[authoritative_transaction ~cursor:(server_cursor 2) ~transaction:(encoded ~maximum_bytes:65536 own);
+      authoritative_transaction ~cursor:(server_cursor 3) ~transaction:(encoded deletion)]
+    ~through:(server_cursor 3) ~checksum:None |> T.require_ok ~behavior in
+  let view=Database.inspect_sync database |> T.require_ok ~behavior in
+  let prepared,crypto=Database.begin_authoritative database ~expected:(sync_view_token view)batch |> T.require_ok ~behavior in
+  let decrypted=Option.map(fun request->decrypt_submitted_request request behavior)crypto in
+  (match Database.apply_authoritative database prepared ~decrypted |> T.require_ok ~behavior with
+   |Authoritative_applied _->()|_->Alcotest.fail "valid delayed-ACK page shadow was deferred");
+  let snapshot=Database.current_snapshot database |> T.require_ok ~behavior in
+  Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
+    let journals=Database.get_journals snapshot ~from_day:20261102 ~through_day:20261102 ~limit:1 ~cursor:None
+      |> T.require_ok ~behavior in
+    T.require(List.length journals.items=1 && (List.hd journals.items).page.page.uuid=T.page_uuid)
+      "journal catalog discarded the still-owned submitted page shadow")
+;;
+
 let acceptance_is_transport_only database =
   let behavior = "acceptance is durable and transport-only" in
   let commit = commit_insert database ~ordinal:260 ~uuid:T.block_uuid behavior in
@@ -4669,7 +4701,8 @@ let () =
     [ "atomic append",[T.database_case "tail survives later submitted shadow" atomic_append_tail_includes_later_submitted_shadow;
       T.database_case "mixed-day queued prefix uses incremental owners" atomic_append_queue_replans_actual_owners;
       T.database_case "complete protected transaction echoes atomically" (atomic_append_submits_and_replays_complete_tree ~remote_day:false);
-      T.database_case "queued append adopts remote day and follows its tail" (atomic_append_submits_and_replays_complete_tree ~remote_day:true)]
+      T.database_case "queued append adopts remote day and follows its tail" (atomic_append_submits_and_replays_complete_tree ~remote_day:true);
+      T.database_case "journal catalog keeps submitted page shadow" submitted_append_page_shadow_stays_in_journal_index]
     ; "empty authoritative compatibility",
       [ T.database_case "empty array advances only sync state" (empty_authoritative_preserves_logical_state "[]")
       ; T.database_case "empty Transit list advances only sync state" (empty_authoritative_preserves_logical_state
