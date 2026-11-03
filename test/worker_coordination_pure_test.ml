@@ -480,13 +480,14 @@ let test_completed_imports_release_active_recovery_capacity () =
   let module I=(val issuer:W.ISSUER) in
   let state=ref(ready I.binding projection) in
   let id n=uuid(Printf.sprintf "98000000-0000-4000-8000-%012d" n) in
-  let source n:Logseq_db_types.Asset_import.t={operation=id(9000+n);asset=id(10000+n);target=graph;replace_reference=None;
-    local_mutation=id(11000+n);metadata_mutation=id(12000+n);source_file="/tmp/synthetic-capacity.png";
+  let source n:Logseq_db_types.Asset_import.t={operation=id(9000+4*n);asset=id(9001+4*n);target=graph;replace_reference=None;
+    local_mutation=id(9002+4*n);metadata_mutation=id(9003+4*n);source_file="/tmp/synthetic-capacity.png";
     title="Synthetic capacity import";file_type="png"} in
   let owner=fst(List.hd raw.baseline.state.sync.residents) in
-  for n=0 to 128 do
+  for n=0 to 8199 do
     let source=source n in let intent=W.asset_import_intent session source |> Result.get_ok in
-    let ticket,planned=C.request !state session(W.Import intent) |> Result.get_ok in
+    let ticket,planned=match C.request !state session(W.Import intent) with Ok value->value
+      |Error _->failwith(Printf.sprintf "returned Import proof history exhausted at operation %d" (n+1)) in
     let asset=Logseq_db_types.Asset_descriptor.create ~uuid:source.asset ~source:(Managed None)
       ~current_checksum:(Some(String.make 64 'a')) ~size:(Some 4L) ~dimensions:None |> Result.get_ok in
     let receipt:Logseq_db_worker.import_receipt={operation=source.operation;graph_generation=owner.graph_generation;
@@ -494,7 +495,10 @@ let test_completed_imports_release_active_recovery_capacity () =
     let reply=checked_import_reply issuer session ticket intent receipt in
     state:=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.of_int64(Int64.of_int(n+1))))).next;
     state:=(C.step !state(C.Completed(ticket,reply))).next;
-    state:=(C.step !state(C.Forget ticket)).next
+    state:=(C.step !state(C.Forget ticket)).next;
+    if n>0 then (
+      let proof=C.import_source_proof(C.view !state)intent |> Option.get in
+      state:=(C.step !state(C.Import_source_proof_returned proof)).next)
   done;
   let changed=W.asset_import_intent session {(source 0)with target=client} |> Result.get_ok in
   check(Result.is_error(C.request !state session(W.Import changed))) "completed import history allowed operation payload substitution"
@@ -538,8 +542,70 @@ let test_new_host_source_proof_retires_only_identical_unknown () =
   let reconciled=(C.step ignored(C.Import_source_reconciled proof)).next in
   check(not(C.import_sources_pending(C.view reconciled) ~owner:None))
     "new host's exact durable source proof stranded old Unknown source ownership";
+  check(Rrbvec.is_empty(C.completed_import_source_proofs(C.view reconciled)))
+    "an old recipient duplicated the provider's disposable proof history";
+  check(C.import_progress(C.view reconciled)intent=Some W.Import_unknown)
+    "source adoption rewrote an unknown durable import result";
   check(C.equal_view(C.view reconciled)(C.view(C.step reconciled(C.Import_source_reconciled proof)).next))
     "duplicate source proof changed the old stopped host"
+;;
+
+let test_import_proof_consumption_properties () =
+  let run actions =
+    let issuer,raw,projection,session=fixture 893L in
+    let module I=(val issuer:W.ISSUER) in
+    let id n=uuid(Printf.sprintf "98000000-0000-4000-8000-%012d" n) in
+    let source:Logseq_db_types.Asset_import.t={operation=id 18931;asset=id 18932;target=graph;replace_reference=None;
+      local_mutation=id 18933;metadata_mutation=id 18934;source_file="/tmp/synthetic-cross-host-input.png";
+      title="Synthetic source proof";file_type="png"} in
+    let intent=W.asset_import_intent session source |> Result.get_ok in
+    let pending client_id=
+      let initial=(C.step(C.initial ~client_id)(C.Worker_bound I.binding)).next in
+      let initial=(C.step initial(C.Bootstrap_received(I.binding,W.Ready projection))).next in
+      let ticket,planned=C.request initial session(W.Import intent) |> Result.get_ok in
+      ticket,ref(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
+    let first,one=pending(id 18935) and second,two=pending(id 18936) in
+    let ticket,planned=C.request(ready I.binding projection)session(W.Import intent) |> Result.get_ok in
+    let owner=fst(List.hd raw.baseline.state.sync.residents) in
+    let asset=Logseq_db_types.Asset_descriptor.create ~uuid:source.asset ~source:(Managed None)
+      ~current_checksum:(Some(String.make 64 'b')) ~size:(Some 4L) ~dimensions:None |> Result.get_ok in
+    let receipt:Logseq_db_worker.import_receipt={operation=source.operation;graph_generation=owner.graph_generation;
+      scope=owner;target=source.target;asset;file_type="png";preview=None} in
+    let created=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
+    let created=(C.step created(C.Completed(ticket,checked_import_reply issuer session ticket intent receipt))).next in
+    let provider=ref(C.step created(C.Forget ticket)).next in
+    let proof=C.import_source_proof(C.view !provider)intent |> Option.get in
+    let delivered=Array.make 2 false and terminal=Array.make 2 false in
+    let views()=Rrbvec.of_list[C.view !one;C.view !two;C.view !provider] in
+    List.iter(fun action->
+      let which=(action/2)mod 2 in
+      let state,ticket=if which=0 then one,first else two,second in
+      if action mod 2=0 && not delivered.(which) then (
+        delivered.(which)<-true;state:=(C.step !state(C.Import_source_reconciled proof)).next)
+      else if action mod 2=1 && not terminal.(which) then (
+        terminal.(which)<-true;state:=(C.step !state(C.Completed(ticket,W.Interrupted W.Transport_lost))).next;
+        state:=(C.step !state(C.Forget ticket)).next);
+      let consumed=C.import_source_proof_consumed proof(views()) in
+      check(consumed=(delivered.(0)&&delivered.(1))) "proof return skipped an old Host acknowledgement";
+      if consumed then provider:=(C.step !provider(C.Import_source_proof_returned proof)).next;
+      check((C.import_source_proof(C.view !provider)intent=None)=consumed) "provider lost an unconfirmed proof";
+      List.iter(fun state->check(Rrbvec.is_empty(C.completed_import_source_proofs(C.view !state)))
+        "proof recipients duplicated history")[one;two])actions;
+    List.iteri(fun which state->if terminal.(which) then
+      check(C.import_progress(C.view !state)intent=Some W.Import_unknown)
+        "proof consumption erased an Unknown durable outcome")[one;two]
+  in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec remove prefix=function []->actions
+      |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      |x::rest->remove(x::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x1A95;seed|] in
+    let actions=List.init 30(fun _->Random.State.int random 4)@[0;1;2;3] in
+    if fails actions then failwith(Printf.sprintf "Import proof consumption seed=%d shrunk=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions))))
+  done
 ;;
 
 (* The issuer may observe a later baseline before Core handles its queued
@@ -4476,6 +4542,7 @@ let test_returned_files_reuse_capacity () =
 ;;
 
 let () =
+  if Array.mem "--import-proof-return-only" Sys.argv then (test_completed_imports_release_active_recovery_capacity();exit 0);
   if Array.mem "--file-return-only" Sys.argv then (test_returned_files_reuse_capacity();exit 0);
   test_returned_observations_reuse_capacity ();
   test_returned_files_reuse_capacity ();
@@ -4490,6 +4557,7 @@ let () =
   test_import_cancelled_preview_properties ();
   test_completed_imports_release_active_recovery_capacity ();
   test_new_host_source_proof_retires_only_identical_unknown ();
+  test_import_proof_consumption_properties ();
   test_atomic_append_intent_and_admission ();
   test_recovery_cursor_and_capacity_bounds ();
   test_durable_recovery_and_ack_purity ();

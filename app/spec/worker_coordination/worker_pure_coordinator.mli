@@ -33,6 +33,12 @@ val import_sources_pending : view -> owner:Logseq_db_worker_lui.Logseq_db_worker
 val import_source_pending : view -> operation:Worker.Uuid.t -> bool
 val pending_import_source_intents:view -> Worker.asset_import_intent Rrbvec.t
 val import_source_proof : view -> Worker.asset_import_intent -> Worker.import_source_proof option
+
+(** Pending in-memory adoption proofs, separate from persistent original receipts.
+    Return only after all retained Hosts have applied the matching source proof;
+    never returns or erases an Unknown intent or its physical source obligation. *)
+val completed_import_source_proofs : view -> Worker.import_source_proof Rrbvec.t
+val import_source_proof_consumed : Worker.import_source_proof -> view Rrbvec.t -> bool
 val handoff : view -> Worker.handoff_id -> Worker.handoff_state option
 val asset_notices : view -> Worker.asset_consumer -> Worker.asset_notice list
 val session_asset_notices : view -> Worker.session -> Worker.asset_notice list
@@ -141,6 +147,7 @@ type event =
   | Observation_notices_failed of Worker.binding * Worker.error
   | Observation_received : 'a Worker.observed -> event
   | Import_source_reconciled of Worker.import_source_proof
+  | Import_source_proof_returned of Worker.import_source_proof
   | Asset_received of Worker.asset_notice * Logseq_db_worker_lui.Journal_worker_ids.Worker.push_sequence
   | Cancel : 'a ticket -> event
   | Forget : 'a ticket -> event

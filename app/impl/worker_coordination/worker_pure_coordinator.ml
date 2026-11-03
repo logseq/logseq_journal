@@ -374,6 +374,15 @@ let import_source_proof facts intent =
 ;;
 
 
+let import_source_proof_consumed proof recipients =
+  not(Rrbvec.exists(fun facts->Graphs.exists(fun id saved->
+    import_source_unsettled facts id saved && Worker.import_source_proof_matches saved.import_intent proof)
+    facts.imports)recipients)
+
+let completed_import_source_proofs facts =
+  Graphs.fold(fun _ proof values->Rrbvec.push_back values proof)facts.import_history Rrbvec.empty
+;;
+
 let handoff v id =
   List.find_map
     (fun (actual, value) ->
@@ -626,6 +635,7 @@ type event =
   | Observation_notices_failed of Worker.binding * Worker.error
   | Observation_received : 'a Worker.observed -> event
   | Import_source_reconciled of Worker.import_source_proof
+  | Import_source_proof_returned of Worker.import_source_proof
   | Asset_received of Worker.asset_notice * Id.push_sequence
   | Cancel : 'a ticket -> event
   | Forget : 'a ticket -> event
@@ -2375,7 +2385,19 @@ let plan_host_action_attempt (state:t) receipt =
 
 let step_base state event =
   match event with
-  | Import_source_reconciled proof->changed{state with facts=adopt_import_source state.facts proof}[]
+  | Import_source_proof_returned proof ->
+    let id=Worker.import_source_proof_id proof in
+    (match Graphs.find_opt id state.facts.import_history with
+     |Some held when held=proof->
+       changed{state with facts={state.facts with import_history=Graphs.remove id state.facts.import_history}}[]
+     |_->unchanged state)
+  | Import_source_reconciled proof ->
+    let id=Worker.import_source_proof_id proof in
+    (match Graphs.find_opt id state.facts.imports with
+     |Some saved when not saved.source_adopted && Worker.import_source_proof_matches saved.import_intent proof->
+       let imports=Graphs.add id {saved with source_adopted=true}state.facts.imports in
+       changed{state with facts={state.facts with imports}}[]
+     |_->unchanged state)
   | Worker_bound binding when state.binding = None || state.lifecycle = Rebinding ->
     changed
       { state with
@@ -3371,7 +3393,7 @@ let plan_import state session intent operation =
   else if Option.exists(fun proof->not(Worker.import_source_proof_matches intent proof))(Graphs.find_opt key state.facts.import_history)
   then Error(Worker.Invalid_input "This completed import operation owns different immutable bytes")
   else if Graphs.cardinal state.facts.import_history>=8192 && not(Graphs.mem key state.facts.import_history)
-  then Error(Worker.Invalid_input "Import identity history is full. Rebind the Worker before admitting a new operation")
+  then Error(Worker.Invalid_input "Return completed Import source proofs before admitting another operation")
   else if Option.exists(fun saved->Worker.encode_asset_import_intent saved.import_intent<>Worker.encode_asset_import_intent intent)
     (Graphs.find_opt key state.facts.imports)
   then Error(Worker.Invalid_input "This import operation already owns a different immutable source or target")

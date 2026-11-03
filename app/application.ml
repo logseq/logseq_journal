@@ -3455,6 +3455,23 @@ let start
     | Some(_,host)->Rrbvec.push_back !retired_coordination_hosts host in
   coordination_owner_allowed:=(fun owner->
     not(Rrbvec.exists(fun host->Coordination_host.host_change_blocks host ~owner)(all_coordination_hosts())));
+  let reconcile_import_sources () =
+    let hosts=all_coordination_hosts() in
+    Rrbvec.iter(fun recipient->
+      Rrbvec.iter(fun intent->
+        Option.iter(fun proof->Coordination_host.post recipient(Coordination.Import_source_reconciled proof))
+          (Rrbvec.find_map(fun provider->Coordination.import_source_proof(Coordination_host.view provider)intent)hosts))
+        (Coordination.pending_import_source_intents(Coordination_host.view recipient)))hosts;
+    Rrbvec.iter(fun provider->
+      Rrbvec.iter(fun proof->
+        (* Every reconciliation above is queued on this same serial pump. This
+           barrier observes actual recipient states after their pure steps, not
+           enqueue acceptance or the stale view captured by a Publish callback. *)
+        Journal_pump.enqueue pump(fun()->
+          let recipients=Rrbvec.map Coordination_host.view(all_coordination_hosts()) in
+          if Coordination.import_source_proof_consumed proof recipients then Coordination_host.post provider(Coordination.Import_source_proof_returned proof)))
+        (Coordination.completed_import_source_proofs(Coordination_host.view provider)))hosts
+  in
   let prune_retired_coordination_hosts () =
     retired_coordination_hosts:=Rrbvec.filter(fun host->
       Coordination.shutdown_state(Coordination_host.view host)<>Coordination.Stopped
@@ -3507,11 +3524,7 @@ let start
            ~client_id:(Wc.Uuid.of_string id |> Result.get_ok) ~managed_origin:origin ~user_id:user
            ~enqueue:(Journal_pump.enqueue pump)
            ~changed:(fun view->
-             Rrbvec.iter(fun previous->
-               Rrbvec.iter(fun intent->Option.iter(fun proof->Coordination_host.post previous
-                 (Coordination.Import_source_reconciled proof))(Coordination.import_source_proof view intent))
-                 (Coordination.pending_import_source_intents(Coordination_host.view previous)))
-               (all_coordination_hosts());
+             reconcile_import_sources();
              if !coordination_host_id=Some id then (
                Option.iter(fun poll->poll view)!copy_poll;
                !detail_observations_changed();
