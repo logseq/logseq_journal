@@ -2905,6 +2905,27 @@ let with_observation_service ?epoch_ms ?prepare ?(observe_push=fun _->()) f =
     f client ~call ~send ~wait ~replies ~notices ~baseline ~owner ~registration)
 ;;
 
+(* Pure registry retirement already passes; the defect is the absent production
+   Db -> runner -> registry call after the actual unregister joins. Exercise that
+   public Service boundary without injecting cleanup ACKs or registry state. *)
+let test_service_binding_retirement_reclaims_observation_history () =
+  with_observation_service(fun _ ~call ~send:_ ~wait:_ ~replies ~notices:_ ~baseline:_ ~owner ~registration ->
+    for round=0 to 8199 do
+      let registration=Int64.add registration(Int64.of_int round) in
+      if round>0 then require(match call(Service.Register_coordination registration) with
+        |Completed(Service.Coordination_registered _)->true|_->false)
+        "actual observation binding could not be registered again";
+      let id=uuid(Printf.sprintf "9d000000-0000-4000-8000-%012d" (100000+round)) in
+      require(match call(Service.Coordination_observe{registration;owner;observation_id=id;maximum_bytes=16384;
+        request={P.api_version=P.api_version;request_id=id;command=P.V2_graph_info}}) with
+        |Completed(Service.Coordination_observed _)->true|_->false)
+        (Printf.sprintf "actual binding retirement exhausted observation history at round %d" (round+1));
+      require(call(Service.Release_coordination registration)=Completed(Service.Coordination_released registration))
+        "actual observation unregister did not join its resource owner";
+      Hashtbl.clear replies
+    done)
+;;
+
 let test_service_writer_fence_waits_for_canceled_protected_commit () =
   let armed=Atomic.make false and entered=Atomic.make false and released=Atomic.make false in
   let epoch_ms()=
@@ -4109,6 +4130,10 @@ let test_mixed_mailbox_requests_do_not_exhaust_history () =
 ;;
 
 let () =
+  if Array.mem "--observation-retirement-only" Sys.argv then (
+    test_service_binding_retirement_reclaims_observation_history();
+    print_endline "8200 actual Service observation binding retirements passed";exit 0);
+  test_service_binding_retirement_reclaims_observation_history();
   test_mixed_mailbox_requests_do_not_exhaust_history();
   if Array.exists((=)"--ownership-only")Sys.argv then (print_endline "4100 real mixed Mailbox rounds passed";exit 0);
   test_revoked_hidden_lease_blocks_unregister_ack();

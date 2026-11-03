@@ -477,6 +477,7 @@ let release_coordination t ~registration =
      else ignore(Eio.Promise.try_resolve resolve(Error "Worker stopped before host retirement."):bool);
      Result.map(fun()->
        t.coordination_retirement<-Pure_reducer.Registration_retirement.released t.coordination_retirement ~registration;
+       Effect_runner.retire_observation_registration t.runner ~registration;
        t.demand_registry<-Pure_reducer.Demand_registry.forget_settled t.demand_registry ~registration)
        (Eio.Fiber.first(fun()->Eio.Promise.await promise)
          (fun()->Eio.Promise.await(fst t.host_stopped);Error "Worker stopped before host retirement.")))

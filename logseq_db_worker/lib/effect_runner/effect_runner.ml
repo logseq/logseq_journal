@@ -1212,6 +1212,10 @@ let finalize_observation t ~registration ~id ~owner =
   t.observation_registry<-next;result
 ;;
 
+let retire_observation_registration t ~registration =
+  t.observation_registry<-Core.Observation_registry.retire_registration t.observation_registry ~registration
+;;
+
 let release_unallocated_observation t ~registration ~id ~owner =
   if Hashtbl.mem t.observation_slots (registration, id)
   then Error "Known observation requires physical cleanup with its stored owner"
