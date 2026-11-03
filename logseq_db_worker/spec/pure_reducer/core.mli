@@ -415,6 +415,22 @@ module Writer_fence : sig
   val same_incarnation : Logseq_sync_pure_reducer.Core.graph_scope -> Logseq_sync_pure_reducer.Core.graph_scope -> bool
 end
 
+(** Pure unregister roster. The first authoritative account stays immutable
+    through revocation/replacement. Physical retirement is ACKed only by callers
+    that actually settled the returned scopes and optional old account IO. *)
+module Registration_retirement : sig
+  type t
+  type plan={owner:Logseq_sync_pure_reducer.Core.account_scope option;
+    scopes:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t;join_account:bool;blocked:bool}
+  val empty:t
+  val bind:t -> registration:int64 -> account:Logseq_sync_pure_reducer.Core.account_scope option -> (t,string)result
+  val observe:t -> registration:int64 option -> account:Logseq_sync_pure_reducer.Core.account_scope option -> t
+  val begin_release:t -> registration:int64 -> active_account:Logseq_sync_pure_reducer.Core.account_scope option
+    -> active_scopes:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t
+    -> physical_scopes:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t -> t * plan
+  val released:t -> registration:int64 -> t
+end
+
 (** Pure one-use host permission policy. External settlement inputs are supplied
     only after actual I/O/resource owners have acknowledged. This model itself
     performs no quiescence, callbacks, randomness, file inspection or deletion. *)
@@ -444,6 +460,11 @@ module Host_handoff : sig
   val failed:t -> attempt -> t
   val released_registration:t -> int64 -> t * Logseq_db_types.Graph_types.Uuid.t option
   val phase:t -> Logseq_db_types.Graph_types.Uuid.t -> phase option
+
+  (** Read-only exact original capability check. Only account replacement and
+      connection stop have no post-consumption physical action. Unavailable or
+      foreign rounds are errors, never evidence of absence. *)
+  val consumed:t -> receipt -> (bool,error)result
   val consume:t -> facts -> receipt -> t * (change,error)result
 
   (** Consuming is terminal for the capability but retains exclusivity until

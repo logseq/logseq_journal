@@ -494,6 +494,8 @@ module type ISSUER = sig
 
   val consume_handoff_request : handoff_receipt -> (Service.request,error)result
   val handoff_consumed : handoff_receipt -> Service.response -> (unit,error)result
+  val confirm_handoff_request : handoff_receipt -> (Service.request,error)result
+  val handoff_confirmed : handoff_receipt -> Service.response -> (bool,error)result
   val bootstrap_request : unit -> (Service.request, error) result
   val bootstrap : Service.response -> (bootstrap_state, error) result
 
@@ -1578,6 +1580,14 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
         |Service.Coordination_host_applied id when id=handoff_receipt_id receipt
            && equal_binding binding(handoff_binding receipt)->Ok()
         |_->Error(Protocol_mismatch "The host action did not acknowledge its exact consumed permission")
+
+      let confirm_handoff_request receipt=
+        if not(equal_binding binding(handoff_binding receipt)) then Error Revoked_session
+        else Ok(Service.Coordination_confirm_host_change receipt.host_receipt)
+      let handoff_confirmed receipt=function
+        |Service.Coordination_host_confirmed(actual,consumed) when actual=receipt.host_receipt
+          && equal_binding binding(handoff_binding receipt)->Ok consumed
+        |_->Error(Protocol_mismatch "The readback did not match its original host permission")
 
       let bootstrap_request () =
         if !revoked

@@ -208,3 +208,5 @@ type host_plan={version:int64;id:Logseq_db_types.Graph_types.Uuid.t;registration
   expected:Logseq_sync_pure_reducer.Core.graph_scope Rrbvec.t}
 val prepare_host_change:t -> host_plan -> (Pure_reducer.Host_handoff.receipt,string)result
 val apply_host_change:t -> Pure_reducer.Host_handoff.receipt -> (unit,string)result
+
+val confirm_host_change:t -> Pure_reducer.Host_handoff.receipt -> (bool,string)result

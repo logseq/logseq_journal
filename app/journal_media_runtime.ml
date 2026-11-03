@@ -1503,6 +1503,18 @@ let imported_local t ~current local =
   pump t
 ;;
 
+let retire_coordinated_previews t =
+  Hashtbl.iter(fun _ g->
+    let retiring,retained=List.partition(fun(local:local_import)->local.authority<>None)g.local in
+    if retiring<>[] then (
+      List.iter(release_import t)retiring;g.local<-retained;g.membership_changed<-true;notify t g))t.groups;
+  pump t
+;;
+let resume_coordinated_previews t =
+  Hashtbl.iter(fun _ g->if g.visible then ensure_fresh t g)t.groups;
+  pump t
+;;
+
 let imported t ~current data=imported_local t ~current {data;authority=None}
 let imported_coordinated t ~current imported=
   imported_local t ~current {data=Worker.import_data imported;authority=Some imported}

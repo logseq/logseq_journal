@@ -807,6 +807,11 @@ module type ISSUER = sig
       unsupported durability/resource capabilities fail before enqueue. *)
   val consume_handoff_request : handoff_receipt -> (Service.request,error)result
   val handoff_consumed : handoff_receipt -> Service.response -> (unit,error)result
+
+  (** Read-only original receipt confirmation, including after local revocation.
+      No initial prepare, consumption, graph deletion or account change occurs. *)
+  val confirm_handoff_request : handoff_receipt -> (Service.request,error)result
+  val handoff_confirmed : handoff_receipt -> Service.response -> (bool,error)result
   val bootstrap_request : unit -> (Service.request, error) result
 
   val bootstrap : Service.response -> (bootstrap_state, error) result

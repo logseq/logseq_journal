@@ -85,6 +85,7 @@ type queued_event =
   | Host_settled of Host.attempt * (Logseq_overlay_db.Types.mirror_generation option,string)result
       * (Host.receipt,string)result Eio.Promise.u
   | Host_consume of Host.receipt * (Host.change,string)result Eio.Promise.u
+  | Host_confirm of Host.receipt * (bool,string)result Eio.Promise.u
   | Host_complete of Host.receipt * (unit,string)result Eio.Promise.u
   | Host_release_registration of int64 * (unit,string)result Eio.Promise.u
   | Event of Pure_reducer.event
@@ -109,6 +110,7 @@ type t =
   ; mutable local_deletion_waiter : local_deletion_waiter option
   ; mutable coordination : coordination_snapshot
   ; mutable coordination_registration : int64
+  ; mutable coordination_retirement : Pure_reducer.Registration_retirement.t
   ; mutable coordination_notify : (int64 * (coordination_snapshot -> unit)) option
   ; mutable host_handoff : Host.t
   ; host_stopped : unit Eio.Promise.t * unit Eio.Promise.u
@@ -155,6 +157,8 @@ let dispatch t event =
         Int64.succ previous.presentation) in
     t.coordination <- {state;version=Int64.succ previous.version;presentation};
     Option.iter (fun (_,notify)->notify t.coordination) t.coordination_notify);
+  t.coordination_retirement<-Pure_reducer.Registration_retirement.observe t.coordination_retirement
+    ~registration:(Option.map fst t.coordination_notify) ~account:t.coordination.state.sync.account;
   t.host_handoff<-Host.observe t.host_handoff(host_facts t);
   (match Host.current t.host_handoff with
    |Some(request,Host.Consumed receipt) when request.change=Host.Replace_account
@@ -263,6 +267,8 @@ let dispatch_queued t = function
     (match result with Ok _->let request=Host.receipt_request receipt in
       Hashtbl.add t.host_tasks request.id(request.registration,Eio.Promise.create())|Error _->());
     ignore(Eio.Promise.try_resolve resolve(Result.map_error host_error result):bool)
+  |Host_confirm(receipt,resolve)->
+    ignore(Eio.Promise.try_resolve resolve(Result.map_error host_error(Host.consumed t.host_handoff receipt)):bool)
   |Host_complete(receipt,resolve)->
     t.host_handoff<-Host.completed t.host_handoff receipt;
     let id=(Host.receipt_request receipt).id in
@@ -328,7 +334,7 @@ let create ~sw ~config ~runner_dependencies =
          { state = state_ref; runner; events;followups=Queue.create(); next_request_id = 0L; stopped = false
          ; local_deletion_waiter = None
          ; coordination={version=0L;presentation=0L;state=Pure_reducer.coordination_state state}
-         ; coordination_registration=0L;coordination_notify=None
+         ; coordination_registration=0L;coordination_notify=None;coordination_retirement=Pure_reducer.Registration_retirement.empty
          ; host_handoff=Host.empty ~lifetime:(fresh_host_lifetime());host_stopped=Eio.Promise.create();host_tasks=Hashtbl.create 2
          ; demand_registry=Pure_reducer.Demand_registry.empty;next_asset_command_barrier=0L
          ; asset_command_waiters=Hashtbl.create 16 }
@@ -359,9 +365,12 @@ let register_coordination t ~registration ~notify =
   else if coordination_current t ~registration then Ok t.coordination
   else if registration<=t.coordination_registration then Error "Coordination binding retired"
   else (
-    t.coordination_registration<-registration;
-    t.coordination_notify<-Some(registration,notify);
-    Ok t.coordination)
+    Result.map(fun retirement->
+      t.coordination_retirement<-retirement;
+      t.coordination_registration<-registration;
+      t.coordination_notify<-Some(registration,notify);
+      t.coordination)(Pure_reducer.Registration_retirement.bind t.coordination_retirement
+        ~registration ~account:t.coordination.state.sync.account))
 ;;
 
 let run_asset_command_barrier t ~owner ~data event =
@@ -427,14 +436,29 @@ let release_coordination t ~registration =
   Pure_reducer.Demand_registry.pending t.demand_registry ~registration
   |> Rrbvec.iter(fun owner->record(release_coordinated_asset_demand t ~registration ~scope:owner.Pure_reducer.Demand_registry.scope ~consumer:owner.consumer));
   record(Effect_runner.release_observations_checked t.runner ~registration);
-  (match Host.current t.host_handoff with
-   |Some(request,phase) when request.registration=registration->
-     (match phase,request.change with
-      |Host.Consumed _,(Host.Stop_connection|Replace_account)->()
-      |_->
-       Rrbvec.iter(fun scope->record(Effect_runner.settle_host_scope t.runner ~scope))request.captured;
-       record(Effect_runner.release_host_copy t.runner ~registration))
-   |_->());
+  let plan_retirement ()=Pure_reducer.Registration_retirement.begin_release t.coordination_retirement
+    ~registration ~active_account:t.coordination.state.sync.account
+    ~active_scopes:(Rrbvec.of_list(Pure_reducer.graph_scopes !(t.state)))
+    ~physical_scopes:(Effect_runner.physical_host_scopes t.runner) in
+  let retirement,plan=plan_retirement() in t.coordination_retirement<-retirement;
+  if plan.blocked then record(Error "A newer live account still owns this resource namespace.") else (
+    (match Host.current t.host_handoff with
+     |Some(request,phase) when request.registration=registration->
+       (match phase,request.change with
+        |Host.Consumed _,(Host.Stop_connection|Replace_account)->()
+        |_->Rrbvec.iter(fun scope->record(Effect_runner.settle_host_scope t.runner ~scope))request.captured;
+          record(Effect_runner.release_host_copy t.runner ~registration))
+     |_->());
+    Rrbvec.iter(fun scope->record(Effect_runner.settle_host_scope t.runner ~scope))plan.scopes);
+  if plan.join_account then Option.iter(fun owner->
+    let scope={(Sync.effect_scope_of_account owner)with presentation_generation=None;lifecycle_generation=None} in
+    record(Effect_runner.await_sync_io t.runner ~scope))plan.owner;
+  (* Joining IO yields. Recheck the original pure owner before touching its
+     logical namespace; a later live incarnation cannot be purged by this ACK. *)
+  let retirement,current=plan_retirement() in t.coordination_retirement<-retirement;
+  if current.blocked then record(Error "The account reopened during physical retirement.")
+  else if plan.join_account && !error=None then Option.iter(fun owner->
+    record(Effect_runner.retire_account t.runner ~account:owner))plan.owner;
   Effect_runner.retire_changefeed t.runner ~registration;
   (match !error with
    | Some message->Error message
@@ -442,7 +466,9 @@ let release_coordination t ~registration =
      let promise,resolve=Eio.Promise.create() in
      if not t.stopped then Eio.Stream.add t.events(Host_release_registration(registration,resolve))
      else ignore(Eio.Promise.try_resolve resolve(Error "Worker stopped before host retirement."):bool);
-     Result.map(fun()->t.demand_registry<-Pure_reducer.Demand_registry.forget_settled t.demand_registry ~registration)
+     Result.map(fun()->
+       t.coordination_retirement<-Pure_reducer.Registration_retirement.released t.coordination_retirement ~registration;
+       t.demand_registry<-Pure_reducer.Demand_registry.forget_settled t.demand_registry ~registration)
        (Eio.Fiber.first(fun()->Eio.Promise.await promise)
          (fun()->Eio.Promise.await(fst t.host_stopped);Error "Worker stopped before host retirement.")))
 ;;
@@ -506,6 +532,8 @@ let shutdown t =
         ignore(Eio.Promise.try_resolve resolve(Error "Worker stopped before host settlement."):bool);drain()
       | Some(Host_consume(_,resolve))->
         ignore(Eio.Promise.try_resolve resolve(Error "Worker stopped before host consumption."):bool);drain()
+      | Some(Host_confirm(_,resolve))->
+        ignore(Eio.Promise.try_resolve resolve(Error "Worker stopped before host readback."):bool);drain()
       | Some(Host_release_registration(_,resolve))
       | Some(Host_complete(_,resolve))->
         ignore(Eio.Promise.try_resolve resolve(Error "Worker stopped before host action completion."):bool);drain()
@@ -773,4 +801,10 @@ let apply_host_change t receipt = Eio.Cancel.protect(fun()->
           ~account_generation:request.owner.account_generation ~graph_id in
         Result.bind(Effect_runner.release_host_copy t.runner ~registration:request.registration)(fun()->
           Result.bind(await_host_command t(fun resolve->Host_complete(receipt,resolve)))(fun()->result)))))
+;;
+
+let confirm_host_change t receipt = Eio.Cancel.protect(fun()->
+  let id=(Host.receipt_request receipt).id in
+  Option.iter(fun(_, (promise,_))->Eio.Promise.await promise)(Hashtbl.find_opt t.host_tasks id);
+  await_host_command t(fun resolve->Host_confirm(receipt,resolve)))
 ;;

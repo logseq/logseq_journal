@@ -2216,7 +2216,29 @@ let test_host_handoff_single_use_and_reopen () =
   let focus={facts with account=Some{scope.account with presentation_generation=99}} in
   let consumed,result=H.consume ready focus receipt in
   Alcotest.(check bool) "focus alone does not invalidate execution permission" true(result=Ok request.change);
+  Alcotest.(check bool) "late failed preparation cannot erase actual consumption" true
+    (H.phase(H.failed consumed attempt)request.id=Some(H.Consumed receipt));
   Alcotest.(check bool) "same receipt cannot consume twice" true(Result.is_error(snd(H.consume consumed facts receipt)));
+  List.iter(fun change->
+    let account_request={request with change} in
+    let preparing,decision=H.prepare initial facts account_request in
+    let attempt=match decision with H.Start value->value|_->assert false in
+    let safe=H.settled preparing attempt ~copy_generation:None in
+    let receipt=match H.phase safe request.id with Some(H.Safe receipt)->receipt|_->assert false in
+    Alcotest.(check bool) "issued but unused original permission is absent" true(H.consumed safe receipt=Ok false);
+    let consumed,_=H.consume safe facts receipt in
+    Alcotest.(check bool) "same owner confirms actual consumption" true(H.consumed consumed receipt=Ok true);
+    Alcotest.(check bool) "actual owner completion retains original consumption evidence" true(H.consumed(H.completed consumed receipt)receipt=Ok true);
+    Alcotest.(check bool) "late failure cannot turn consumed readback into false" true
+      (H.consumed(H.failed consumed attempt)receipt=Ok true);
+    Alcotest.(check bool) "readback does not mutate prior safe state" true(H.consumed safe receipt=Ok false);
+    let failed=H.failed safe attempt in
+    Alcotest.(check bool) "known original never consumed can be confirmed false" true(H.consumed failed receipt=Ok false);
+    let released,_=H.released_registration safe request.registration in
+    Alcotest.(check bool) "retired or missing capability is not evidence of absence" true(Result.is_error(H.consumed released receipt));
+    Alcotest.(check bool) "foreign lifetime cannot confirm consumption" true
+      (Result.is_error(H.consumed(H.empty ~lifetime:(uuid "10000000-0000-4000-8000-000000080099"))receipt)))
+    [H.Replace_account;H.Stop_connection];
   let next_request={request with id=uuid "10000000-0000-4000-8000-000000080003"} in
   Alcotest.(check bool) "consumption keeps physical action exclusive until completed" true
     (snd(H.prepare consumed facts next_request)=H.Refused H.Busy);
@@ -2269,7 +2291,7 @@ let test_host_handoff_properties () =
       (match action mod 8 with
        |0|1->incr serial;
          let request:H.request={version=(!facts).version;id=uuid(Printf.sprintf "10000000-0000-4000-8000-%012d" (81000+ !serial));registration=Option.value (!facts).registration ~default:!registration;
-           owner=Option.value (!facts).account ~default:scope.account;change=H.Close_graph scope.graph_id;expected=(!facts).scopes;
+           owner=Option.value (!facts).account ~default:scope.account;change=(match action/8 mod 3 with 0->H.Close_graph scope.graph_id|1->H.Replace_account|_->H.Stop_connection);expected=(!facts).scopes;
            captured=(!facts).scopes} in
          let next,outcome=H.prepare before !facts request in state:=next;
          (match outcome with H.Start ticket->attempts:=ticket::!attempts;active:=Some request.id|_->())
@@ -2277,6 +2299,10 @@ let test_host_handoff_properties () =
        |3->(match Option.bind !active(H.phase before)with Some(H.Safe receipt)->receipts:=receipt::!receipts;
          let next,outcome=H.consume before !facts receipt in state:=next;
          if Result.is_ok outcome then (
+           (match H.receipt_request receipt with {change=(H.Replace_account|Stop_connection);_}->
+             Alcotest.(check bool) "generated consumed fact survives delayed failed settlement" true
+               (H.consumed(H.failed next(List.hd !attempts))receipt=Ok true)
+            |_->());
            Alcotest.(check bool) "successful consume is permanently single-use" true
              (Result.is_error(snd(H.consume next !facts receipt)));state:=H.completed next receipt;active:=None)
          |_->())
@@ -2311,10 +2337,95 @@ let test_host_handoff_properties () =
   done
 ;;
 
+let test_registration_retirement_keeps_original_authority () =
+  let module R=Core.Registration_retirement in
+  let _,scope=worker_open_graph() in
+  let replacement={scope with graph_generation=scope.graph_generation+1} in
+  let foreign={scope with account={scope.account with user_id="other";account_generation=scope.account.account_generation+1}} in
+  let initial=R.bind R.empty ~registration:91L ~account:None |> Result.get_ok in
+  let owned=R.observe initial ~registration:(Some 91L) ~account:(Some scope.account) in
+  let changed=R.observe owned ~registration:(Some 91L) ~account:(Some foreign.account) in
+  let pending,plan=R.begin_release changed ~registration:91L ~active_account:(Some foreign.account)
+    ~active_scopes:(Rrbvec.singleton foreign) ~physical_scopes:(Rrbvec.of_list[scope;replacement;foreign;scope]) in
+  Alcotest.(check bool) "retirement keeps its first authoritative account" true(plan.owner=Some scope.account);
+  Alcotest.(check bool) "revocation joins old actual account IO" true plan.join_account;
+  Alcotest.(check int) "physical roster is exact, deduplicated and excludes other account" 2(Rrbvec.length plan.scopes);
+  let _,warm=R.begin_release owned ~registration:91L ~active_account:(Some scope.account)
+    ~active_scopes:(Rrbvec.singleton replacement) ~physical_scopes:(Rrbvec.of_list[scope;replacement;foreign]) in
+  Alcotest.(check bool) "warm binding retirement does not join active account producers" false warm.join_account;
+  Alcotest.(check bool) "warm binding does not close current graph incarnation" true
+    (Rrbvec.length warm.scopes=1 && Core.Writer_fence.same_incarnation(Rrbvec.nth warm.scopes 0)scope);
+  let reopened={scope.account with account_generation=scope.account.account_generation+1} in
+  let _,blocked=R.begin_release owned ~registration:91L ~active_account:(Some reopened)
+    ~active_scopes:Rrbvec.empty ~physical_scopes:(Rrbvec.singleton scope) in
+  Alcotest.(check bool) "old cleanup cannot purge a newer live logical account" true blocked.blocked;
+  Alcotest.(check int) "conflicted old cleanup performs no physical close" 0(Rrbvec.length blocked.scopes);
+  let pending=R.observe pending ~registration:(Some 91L) ~account:(Some foreign.account) in
+  let _,retry=R.begin_release pending ~registration:91L ~active_account:None
+    ~active_scopes:Rrbvec.empty ~physical_scopes:(Rrbvec.singleton scope) in
+  Alcotest.(check bool) "unacknowledged cleanup retains original retirement owner" true(retry.owner=Some scope.account);
+  let settled=R.released pending ~registration:91L in
+  Alcotest.(check bool) "released registration cannot bind another owner" true
+    (Result.is_error(R.bind settled ~registration:91L ~account:(Some foreign.account)));
+  let _,duplicate=R.begin_release settled ~registration:91L ~active_account:None
+    ~active_scopes:Rrbvec.empty ~physical_scopes:(Rrbvec.singleton foreign) in
+  Alcotest.(check bool) "duplicate unregister cannot adopt later physical ownership" true
+    (duplicate.owner=None && Rrbvec.length duplicate.scopes=0)
+;;
+
+let test_registration_retirement_properties () =
+  let module R=Core.Registration_retirement in
+  let _,scope=worker_open_graph() in
+  let replacement={scope with graph_generation=scope.graph_generation+1} in
+  let foreign={scope with account={scope.account with user_id="foreign";account_generation=scope.account.account_generation+1}} in
+  let reopened={scope.account with account_generation=scope.account.account_generation+1} in
+  let run actions=
+    let state=ref(R.bind R.empty ~registration:91L ~account:None |> Result.get_ok
+      |> fun state->R.observe state ~registration:(Some 91L) ~account:(Some scope.account)) in
+    let acknowledged=ref false in
+    List.iter(fun action->
+      let active=match action mod 4 with 0->Some scope.account|1->Some reopened|2->Some foreign.account|_->None in
+      let before= !state in
+      let _,original=R.begin_release before ~registration:91L ~active_account:active
+        ~active_scopes:(Rrbvec.singleton replacement) ~physical_scopes:(Rrbvec.of_list[scope;replacement;foreign;scope]) in
+      (match action mod 8 with
+       |0->state:=R.observe before ~registration:(Some 91L) ~account:(Some foreign.account)
+       |1->state:=R.observe before ~registration:(Some 91L) ~account:None
+       |2|5|6->let next,_=R.begin_release before ~registration:91L ~active_account:active
+         ~active_scopes:(Rrbvec.singleton replacement) ~physical_scopes:(Rrbvec.of_list[scope;replacement;foreign;scope]) in state:=next
+       |3->state:=R.released before ~registration:91L;acknowledged:=true
+       |4->state:=R.observe before ~registration:(Some 92L) ~account:(Some foreign.account)
+       |_->if !acknowledged then Alcotest.(check bool) "stale bind rejected" true
+         (Result.is_error(R.bind before ~registration:91L ~account:(Some foreign.account))));
+      let _,plan=R.begin_release !state ~registration:91L ~active_account:active
+        ~active_scopes:(Rrbvec.singleton replacement) ~physical_scopes:(Rrbvec.of_list[scope;replacement;foreign;scope]) in
+      Alcotest.(check bool) "original owner never retargets" true
+        (if !acknowledged then plan.owner=None else plan.owner=Some scope.account);
+      Alcotest.(check bool) "active replacement and foreign namespace never close" true
+        (Rrbvec.fold_left(fun valid actual->valid && Core.Writer_fence.same_incarnation actual scope)true plan.scopes);
+      if plan.blocked then Alcotest.(check int) "blocked retirement emits no physical close" 0(Rrbvec.length plan.scopes);
+      let _,unchanged=R.begin_release before ~registration:91L ~active_account:active
+        ~active_scopes:(Rrbvec.singleton replacement) ~physical_scopes:(Rrbvec.of_list[scope;replacement;foreign;scope]) in
+      Alcotest.(check bool) "prior pure state remains immutable" true(original=unchanged))actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=
+    let rec drop prefix=function []->actions
+      |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      |head::rest->drop(head::prefix)rest in drop [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x524547;seed|] in
+    let actions=[2;0;2;1;5;2;4;3;0;2;7;2] @ List.init 80(fun _->Random.State.int random 128) in
+    if fails actions then Alcotest.failf "registration retirement seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+
 let () =
   Alcotest.run
     "logseq db worker pure reducer"
-    [ ( "resident graphs", [
+    [ ("registration retirement",[Alcotest.test_case "original account and physical roster" `Quick test_registration_retirement_keeps_original_authority;
+        Alcotest.test_case "100 shrinking owner and ACK traces" `Quick test_registration_retirement_properties]);
+      ( "resident graphs", [
         Alcotest.test_case "single graph broadcast identity" `Quick test_single_graph_change_broadcast_keeps_scope;
         Alcotest.test_case "generated changefeed owner/ACK traces" `Quick test_changefeed_owner_properties;
         Alcotest.test_case "unallocated observation fence" `Quick test_unallocated_observation_fence;

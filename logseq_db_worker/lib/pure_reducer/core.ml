@@ -1788,10 +1788,49 @@ module Writer_fence = struct
       (Scopes.find_opt fence.scope state.fences) && pending state fence.scope=0
 end
 
+module Registration_retirement = struct
+  module Registrations=Map.Make(Int64)
+  module Scopes=Set.Make(Writer_fence.Scope)
+  type entry={owner:Sync.account_scope option;retiring:bool}
+  type t={closed:int64;entries:entry Registrations.t}
+  type plan={owner:Sync.account_scope option;scopes:Sync.graph_scope Rrbvec.t;join_account:bool;blocked:bool}
+  let empty={closed=0L;entries=Registrations.empty}
+  let bind state ~registration ~account =
+    if registration<=0L then Error "Invalid coordination registration."
+    else if Registrations.mem registration state.entries then Ok state
+    else if registration<=state.closed then Error "Coordination retirement registration already released."
+    else if Registrations.cardinal state.entries>=8192 then Error "Coordination retirement ownership is full."
+    else Ok{state with entries=Registrations.add registration{owner=account;retiring=false}state.entries}
+  let observe state ~registration ~account=match registration,account with
+    |Some registration,Some owner->
+      (match Registrations.find_opt registration state.entries with
+       |Some{owner=None;retiring=false}->{state with entries=Registrations.add registration{owner=Some owner;retiring=false}state.entries}
+       |_->state)
+    |_->state
+  let same_account (a:Sync.account_scope) (b:Sync.account_scope)=Uri.equal a.managed_sync_origin b.managed_sync_origin
+    && a.user_id=b.user_id && a.account_generation=b.account_generation
+  let begin_release (state:t) ~registration ~active_account ~active_scopes ~physical_scopes =
+    let entry=Registrations.find_opt registration state.entries in
+    let owner=Option.bind entry(fun(entry:entry)->entry.owner) in
+    let active=Rrbvec.fold_left(fun scopes scope->Scopes.add scope scopes)Scopes.empty active_scopes in
+    let scopes=Rrbvec.fold_left(fun scopes (scope:Sync.graph_scope)->
+      if Option.exists(fun owner->same_account owner scope.account)owner && not(Scopes.mem scope active)
+      then Scopes.add scope scopes else scopes)Scopes.empty physical_scopes |> Scopes.to_seq |> Rrbvec.of_seq in
+    let join_account=Option.exists(fun owner->not(Option.exists(fun actual->same_account owner actual
+      && owner.Sync.lifecycle_generation=actual.Sync.lifecycle_generation)active_account))owner in
+    let blocked=Option.exists(fun owner->Option.exists(fun actual->
+      Uri.equal owner.Sync.managed_sync_origin actual.Sync.managed_sync_origin && owner.user_id=actual.user_id
+      && (owner.account_generation<>actual.account_generation || owner.lifecycle_generation<>actual.lifecycle_generation))active_account)owner in
+    let state=match entry with None->state|Some entry->{state with entries=Registrations.add registration{entry with retiring=true}state.entries} in
+    state,{owner;scopes=(if blocked then Rrbvec.empty else scopes);join_account;blocked}
+  let released state ~registration={closed=max state.closed registration;entries=Registrations.remove registration state.entries}
+end
+
 module Host_handoff = struct
   module S=Logseq_sync_pure_reducer.Core
   module G=Logseq_db_types.Graph_types
   module Ids=Set.Make(G.Uuid)
+  module Receipts=Map.Make(G.Uuid)
   module Scopes=Set.Make(Writer_fence.Scope)
   type mode=Normal|Force
   type change=Close_graph of G.Uuid.t|Remove_graph of G.Uuid.t * mode|Replace_account|Stop_connection
@@ -1803,9 +1842,9 @@ module Host_handoff = struct
   type error=Busy|Retired|Mismatch|Owner_changed|Scopes_changed|Baseline_changed|Full|Missing_copy_witness|Not_settled
   type phase=Preparing|Safe of receipt|Consumed of receipt|Failed of error
   type entry={attempt:attempt;request:request;keys:Scopes.t;phase:phase;settlement_pending:bool}
-  type t={lifetime:G.Uuid.t;next:int64;active:entry option;retired:Ids.t}
+  type t={lifetime:G.Uuid.t;next:int64;active:entry option;retired:Ids.t;consumed_receipts:receipt Receipts.t;retained_cost:int}
   type admission=Start of attempt|Existing of phase|Refused of error
-  let empty ~lifetime={lifetime;next=0L;active=None;retired=Ids.empty}
+  let empty ~lifetime={lifetime;next=0L;active=None;retired=Ids.empty;consumed_receipts=Receipts.empty;retained_cost=0}
   let receipt_request (receipt:receipt)=receipt.request
   let receipt_copy_generation (receipt:receipt)=receipt.copy_generation
   let same_attempt (a:attempt)(b:attempt)=a.lifetime=b.lifetime && a.serial=b.serial && a.id=b.id
@@ -1847,6 +1886,7 @@ module Host_handoff = struct
     |previous->
       if state.next=Int64.max_int || Ids.cardinal state.retired + (if previous=None then 1 else 2)>8192
         || Rrbvec.length request.captured>8192 || Rrbvec.length request.expected>8192
+        || state.retained_cost + 1 + Rrbvec.length request.expected + Rrbvec.length request.captured > 32768
       then state,Refused Full else
       if request.version<>facts.version then state,Refused Baseline_changed else
       let catalog_allows=match request.change with
@@ -1890,14 +1930,31 @@ module Host_handoff = struct
       {state with active=None;retired=Ids.add receipt.request.id state.retired}
     |_->state
   let failed state attempt=match state.active with
+    |Some{phase=Consumed _;_}->state
     |Some entry when same_attempt entry.attempt attempt->{state with active=Some{entry with phase=Failed Not_settled;settlement_pending=false}}
     |_->state
+  let consumed state (receipt:receipt)=
+    if receipt.attempt.lifetime<>state.lifetime then Error Mismatch else
+    match Receipts.find_opt receipt.request.id state.consumed_receipts with
+    |Some actual when actual=receipt->Ok true
+    |Some _->Error Mismatch
+    |None->
+    match receipt.request.change,state.active with
+    |(Replace_account|Stop_connection),Some{phase=Consumed actual;_} when actual=receipt->Ok true
+    |(Replace_account|Stop_connection),Some{phase=Safe actual;_} when actual=receipt->Ok false
+    |(Replace_account|Stop_connection),Some{phase=Failed _;attempt;request;_}
+       when same_attempt attempt receipt.attempt && request=receipt.request && receipt.copy_generation=None->Ok false
+    |_->Error Not_settled
   let consume state (facts:facts) (receipt:receipt)=
     let state=observe state facts in
     if receipt.attempt.lifetime<>state.lifetime then state,Error Mismatch else
     match state.active with
     |Some{phase=Safe actual;_}when actual=receipt->
-      {state with active=Some{(Option.get state.active)with phase=Consumed actual}},Ok receipt.request.change
+      let consumed_receipts,retained_cost=match receipt.request.change with
+        |Replace_account|Stop_connection->Receipts.add receipt.request.id receipt state.consumed_receipts,
+          state.retained_cost+1+Rrbvec.length receipt.request.expected+Rrbvec.length receipt.request.captured
+        |Close_graph _|Remove_graph _->state.consumed_receipts,state.retained_cost in
+      {state with active=Some{(Option.get state.active)with phase=Consumed actual};consumed_receipts;retained_cost},Ok receipt.request.change
     |Some{phase=Failed error;_}->state,Error error
     |_->state,Error(if Ids.mem receipt.request.id state.retired then Retired else Not_settled)
 end

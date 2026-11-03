@@ -150,6 +150,9 @@ type event =
   | Handoff_apply_admitted of Worker.handoff_id * Worker.request_id * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id
   | Handoff_apply_rejected of Worker.handoff_id * Worker.request_id * Worker.error
   | Handoff_apply_not_admitted of Worker.handoff_id * Worker.request_id * Worker.admission_error
+  | Handoff_confirm_admitted of Worker.handoff_id * Worker.request_id * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id
+  | Handoff_confirm_not_admitted of Worker.handoff_id * Worker.request_id * Worker.admission_error
+  | Handoff_confirmed of Worker.handoff_id * Worker.request_id * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id option * (bool,Worker.error)result
   | Drain
 
 type instruction =
@@ -161,6 +164,7 @@ type instruction =
   | Cancel_request : 'a ticket -> instruction
   | Quiesce of Worker.handoff_plan
   | Consume_handoff of Worker.handoff_receipt * Worker.request_id
+  | Confirm_handoff of Worker.handoff_receipt * Worker.request_id
   | Publish of view
   | Schedule_drain
 
@@ -298,3 +302,6 @@ module Response_ownership : sig
   val mem : t -> Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id -> bool
   val spans : t -> int
 end
+
+(** A new round requires real binding release after a definitely unconsumed action. *)
+val handoff_restartable:view -> Worker.handoff_id -> bool

@@ -2037,6 +2037,37 @@ module Root_navigation = struct
   let favorites state = state.favorites
 end
 
+module Account_pure_lifecycle = struct
+  type verification={ticket:Journal_startup.Presentation.ticket;user_id:string option}
+  type claim={serial:int64;verification:verification}
+  type instruction=Revoke of claim|Retire_previous|Install of claim
+  type t={serial:int64;latest:claim option;waiting:bool;pending:claim option;stopping:bool}
+  let initial={serial=0L;latest=None;waiting=false;pending=None;stopping=false}
+  let verification (claim:claim)=claim.verification
+  let waiting state=state.waiting
+  let current state (claim:claim)=Option.exists(fun(latest:claim)->
+    latest.serial=claim.serial && latest.verification=claim.verification)state.latest
+    && (not state.stopping || claim.verification.user_id=None)
+  let invalidate state={state with latest=None;pending=None}
+  let stop state={state with latest=None;pending=None;stopping=true}
+  let resume state={state with latest=None;pending=None;stopping=false}
+  let observe state ~needs_retirement verification =
+    if state.stopping && verification.user_id<>None then state,[] else
+    let verification=if state.serial=Int64.max_int then {verification with user_id=None}else verification in
+    let serial=if state.serial=Int64.max_int then state.serial else Int64.succ state.serial in
+    let claim={serial;verification} in
+    let waiting=state.waiting || needs_retirement in
+    let begin_retirement=if needs_retirement && not state.waiting then [Retire_previous]else[] in
+    let state={state with serial;latest=Some claim;waiting} in
+    match verification.user_id with
+    |None->{state with pending=None},Revoke claim::begin_retirement
+    |Some _ when waiting->{state with pending=Some claim},Revoke claim::begin_retirement
+    |Some _->{state with pending=None},[Install claim]
+  let retired state=if not state.waiting then state,[] else
+    {state with waiting=false;pending=None},
+    (if state.stopping then []else Option.to_list(Option.map(fun claim->Install claim)state.pending))
+end
+
 let application_theme () = Ui.Theme.create ~mode:System ()
 
 let secondary_text value =
@@ -3394,7 +3425,10 @@ let start
   let coordination_sdk_seen = ref false in
   let retired_coordination_hosts = ref Rrbvec.empty in
   let coordination_lifecycle_changed = ref(fun()->()) in
+  let account_lifecycle=ref Account_pure_lifecycle.initial in
+  let account_lifecycle_changed=ref(fun()->()) in
   let detail_observations_changed = ref(fun()->()) in
+  let coordination_resources_rebound=ref(fun()->()) in
   let detail_observations_cell=graph_ref(fun()->Detail_observation.empty) in
   let observation_wanted routes =
     Lui_navigation.Path.entries(Journal_routes.path routes) |> List.to_seq
@@ -3446,6 +3480,7 @@ let start
       | _ -> None in
     match identity with
     | _ when !termination_in_flight->Error "Journal is closing."
+    | _ when Account_pure_lifecycle.waiting !account_lifecycle->Error "The previous account is still closing."
     | None->Error "The graph reader is still preparing. Try Copy again."
     | Some ((origin,user,_) as identity)->
       (match !coordination_host with
@@ -3456,13 +3491,19 @@ let start
            ignore(Coordination_host.shutdown host);
            retired_coordination_hosts:=Rrbvec.push_back !retired_coordination_hosts host)previous;
          let id=fresh_identity () in
+         let observed_binding=ref None in
          match Coordination_host.create ~client
            ~client_id:(Wc.Uuid.of_string id |> Result.get_ok) ~managed_origin:origin ~user_id:user
            ~enqueue:(Journal_pump.enqueue pump)
            ~changed:(fun view->
              if !coordination_host_id=Some id then (
                Option.iter(fun poll->poll view)!copy_poll;
-               !detail_observations_changed());
+               !detail_observations_changed();
+               (match Coordination.bootstrap view with
+                |Wc.Ready projection->let binding=Wc.projection_binding projection in
+                  if not(Option.exists(Wc.equal_binding binding)!observed_binding)then (
+                    observed_binding:=Some binding;!coordination_resources_rebound())
+                |_->()));
              !coordination_lifecycle_changed()) with
          | Error _->Error "Unable to bind the graph reader. Try Copy again."
          | Ok host->coordination_host_id:=Some id;coordination_host:=Some(identity,host);Ok host)
@@ -3537,6 +3578,7 @@ let start
         | Coordination_quiesce_writers _ -> "coordinationQuiesceWriters"
         | Coordination_prepare_host_change _ -> "coordinationPrepareHostChange"
         | Coordination_apply_host_change _ -> "coordinationApplyHostChange"
+        | Coordination_confirm_host_change _ -> "coordinationConfirmHostChange"
         | Coordination_asset_demand _ -> "coordinationAssetDemand"
         | Coordination_release_asset_demand _ -> "coordinationReleaseAssetDemand"
       in
@@ -4079,40 +4121,28 @@ let start
   let drain_visible_copies = ref (fun () -> Effect.ignore) in
   let cancel_local_copy_checks () =
     Queue.clear visible_copy_queue;
-    let cancelled = Hashtbl.fold (fun id (_, deleting, _) ids -> if deleting then ids else id :: ids)
-        local_copy_requests [] in
-    List.iter (fun id -> Worker.cancel client ~request_id:id; Hashtbl.remove local_copy_requests id) cancelled
+    Hashtbl.to_seq_keys local_copy_requests |> List.of_seq |> List.iter(fun id->
+      Worker.cancel client ~request_id:id;Hashtbl.remove local_copy_requests id)
   in
-  let local_copy_request ?(confirm = true) ~deleting (request : Graph_service.local_copy_request) =
-    Effect.of_thunk (fun () ->
+  let local_copy_request ?(confirm=true) (request:Graph_service.local_copy_request) =
+    Effect.of_thunk(fun()->
       if confirm then (
-        let superseded = Hashtbl.fold (fun id (previous, pending_delete, _) ids ->
-               if
-                 (not pending_delete)
-                 && previous.Graph_service.graph_id = request.graph_id
-             && previous.account_generation = request.account_generation
-          then id :: ids else ids) local_copy_requests [] in
-        List.iter (fun id ->
-          Hashtbl.remove local_copy_requests id;
-          Worker.cancel client ~request_id:id) superseded);
-      let command = if deleting then Graph_service.Delete_local_copy request else Inspect_local_copy request in
-      match dispatch_worker command with
-      | Worker.Accepted id -> Hashtbl.replace local_copy_requests id (request, deleting, confirm)
-      | Full | Not_ready | Stopping ->
-        set_state (fun state ->
-          if confirm then
-            { state with local_copy_check = None; local_copy_deleting = None
-              ; local_copy_message = Some "The local copy request could not start. Try again." }
-          else { state with local_copies = Local_copies.add
-              (Logseq_db_types.Graph_types.Uuid.to_string request.graph_id)
-              (Error "Unable to check the local copy. Try again.") state.local_copies }) ())
+        let superseded=Hashtbl.fold(fun id(previous,_) ids->
+          if previous.Graph_service.graph_id=request.graph_id
+            && previous.account_generation=request.account_generation then id::ids else ids)local_copy_requests [] in
+        List.iter(fun id->Hashtbl.remove local_copy_requests id;Worker.cancel client ~request_id:id)superseded);
+      match dispatch_worker(Graph_service.Inspect_local_copy request)with
+      |Worker.Accepted id->Hashtbl.replace local_copy_requests id(request,confirm)
+      |Full|Not_ready|Stopping->set_state(fun state->if confirm then
+          {state with local_copy_check=None;local_copy_message=Some "The local copy request could not start. Try again."}
+        else {state with local_copies=Local_copies.add(Logseq_db_types.Graph_types.Uuid.to_string request.graph_id)
+          (Error "Unable to check the local copy. Try again.")state.local_copies})())
   in
   (drain_visible_copies
    := fun () ->
     Effect.of_thunk (fun () ->
       let automatic_in_flight = Hashtbl.fold
-              (fun _ (_, deleting, confirm) active ->
-                 active || ((not deleting) && not confirm))
+              (fun _ (_,confirm) active ->active || not confirm)
           local_copy_requests false in
           if (not automatic_in_flight) && Hashtbl.length local_copy_requests < 2
           then (
@@ -4126,7 +4156,7 @@ let start
                 && (state.graph_picker_open || manager.startup.awaiting_selection)
                 && not (Local_copies.mem key state.local_copies)
               | None -> false in
-            if valid then Effect.run (local_copy_request ~confirm:false ~deleting:false request)
+            if valid then Effect.run (local_copy_request ~confirm:false request)
             else next ()
         in next ())));
   let discard_graph_copy_draft state graph_id =
@@ -5033,6 +5063,20 @@ let start
         release_runtime_staging ();Hashtbl.remove retired_runtimes key));
     List.iter(fun restore->restore ()) current;active_runtime:=active;processing_owner:=previous
   in
+  let with_live_runtime_resources action =
+    let restore=snapshot_cells() and active= !active_runtime and previous= !processing_owner in
+    Hashtbl.to_seq runtime_owners |> List.of_seq |> List.iter(fun(key,owner)->
+      Option.iter(fun saved->List.iter(fun restore->restore())saved;
+        active_runtime:=Some key;processing_owner:=Some owner;action();save_runtime())
+        (Hashtbl.find_opt runtime_sessions key));
+    List.iter(fun restore->restore())restore;active_runtime:=active;processing_owner:=previous in
+  coordination_resources_rebound:=(fun()->with_live_runtime_resources(fun()->
+    Journal_media_runtime.resume_coordinated_previews (!media_runtime_cell)));
+  let retry_failed_graph_handoff host =
+    with_live_runtime_resources(fun()->
+      Journal_media_runtime.retire_coordinated_previews (!media_runtime_cell);
+      Effect.run(flush_media set_state));
+    Coordination_host.post host Coordination.Retry_bootstrap in
   (* Only real legacy handle ownership is tracked here. The pure coordinator
      decides admission, snapshot validity, one-use consumption and failure. *)
   let legacy_host_joins=ref Rrbvec.empty in
@@ -5049,8 +5093,8 @@ let start
   let set_root_state_and_effect transition : unit Effect.t = fun()->send_action(Update transition) in
   let set_root_state transition : unit Effect.t =
     set_root_state_and_effect(fun state->transition state,Effect.ignore) in
-  let begin_host_change change ~f = Effect.of_thunk(fun()->
-    match ensure_coordination() with
+  let begin_host_change ?host change ~f = Effect.of_thunk(fun()->
+    match (match host with Some host->Ok host|None->ensure_coordination()) with
     |Error message->Effect.run(f(Error(Wc.Service_failed message)))
     |Ok host->
       let account=(startup_scope !state_ref).account_generation in
@@ -5069,22 +5113,33 @@ let start
                |Error error->finish(Error error)
                |Ok()->Coordination_host.watch_handoff host id ~f:watch)
             |Wc.Host_change_applied _->finish(Ok())
-            |Wc.Handoff_failed(_,error)->finish(Error error)
+            |Wc.Handoff_failed(_,error)->
+              finish(Error error);
+              (if current() && ((match change with Wc.Graph_will_close _|Graph_will_remove _->true|_->false)
+                || Coordination.handoff_restartable(Coordination_host.view host)id)then retry_failed_graph_handoff host)
             |Wc.Quiescing _|Wc.Applying_host_change _->() in
           Coordination_host.watch_handoff host id ~f:watch;
           progress_legacy_host_joins())) in
   let sign_out_in_flight = ref false in
+  let pending_termination_start=ref None in
+  let termination_requires_host=ref false and termination_host_completed=ref false in
+  let deletion_busy ()=local_deletion_active !state_ref || !state_ref.local_copy_deleting<>None in
   let finish_termination () =
-    let legacy_ready=local_deletion_active !state_ref || Option.fold ~none:false
-      ~some:(fun manager->manager.Graph_service.startup.awaiting_selection || not manager.startup.authenticated)
-      !state_ref.manager in
-    if !termination_in_flight && legacy_ready && coordination_stopped() then (
+    if !termination_in_flight && not(deletion_busy()) then (
+      let start= !pending_termination_start in pending_termination_start:=None;Option.iter(fun start->start())start);
+    let legacy_ready=not(deletion_busy()) && Hashtbl.length worker_owners=0
+      && Rrbvec.length !retired_runtime_io=0
+      && Option.fold ~none:true ~some:(fun manager->
+        manager.Graph_service.startup.awaiting_selection || not manager.startup.authenticated)!state_ref.manager in
+    if !termination_in_flight && !pending_termination_start=None
+      && (not !termination_requires_host || !termination_host_completed)
+      && legacy_ready && coordination_stopped() then (
       termination_in_flight:=false;
       platform_request Journal_platform.termination_ready_request ~f:(fun _->Effect.ignore))
     else Effect.ignore in
   coordination_lifecycle_changed:=(fun()->
     progress_legacy_host_joins();prune_retired_coordination_hosts();
-    Effect.run(finish_termination()));
+    !account_lifecycle_changed();Effect.run(finish_termination()));
   let apply_manager_transition set_state set_state_and_effect manager_state =
     let manager = manager_state.Graph_service.snapshot in
     let previous_scopes = match !state_ref.manager with
@@ -5294,33 +5349,18 @@ let start
     Journal_media_runtime.pump (!media_runtime_cell);
     match event with
     | Worker.Push {payload=Graph_service.Coordination_updates _ | Coordination_observations _;_}
-    | Worker.Response {outcome=Completed(Graph_service.Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _ | Coordination_imported _ | Coordination_writers_quiesced _ | Coordination_host_prepared _ | Coordination_host_applied _);_}->Effect.ignore
+    | Worker.Response {outcome=Completed(Graph_service.Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _ | Coordination_imported _ | Coordination_writers_quiesced _ | Coordination_host_prepared _ | Coordination_host_applied _ | Coordination_host_confirmed _);_}->Effect.ignore
     | Worker.Push {payload=Graph_service.Graph_pushes _ | Graph_states _ | Session_states _;_} -> Effect.ignore
     | Worker.Response { request_id; outcome; _ }
       when Hashtbl.mem local_copy_requests request_id ->
-      let request, deleting, confirm = Hashtbl.find local_copy_requests request_id in
+      let request, confirm = Hashtbl.find local_copy_requests request_id in
       Hashtbl.remove local_copy_requests request_id;
       Effect.bind (set_state (fun state ->
         let owned = match state.manager with
           | Some manager -> manager.startup.account_generation = request.Graph_service.account_generation
-               &&
-               if deleting
-               then state.local_copy_deleting = Some request
-               else (not confirm) || state.local_copy_check = Some request
-          | None -> false in
-        if not owned then state
-        else if deleting then (
-          let result = match outcome with
-            | Worker.Completed (Graph_service.Local_copy_deleted (actual, result)) when actual = request -> result
-            | _ -> Error "Local copy deletion was interrupted. Check the copy and try again." in
-          let state = { state with local_copy_deleting = None } in
-          match result with
-          | Error message -> { state with local_copy_message = Some message }
-          | Ok () -> { (discard_graph_copy_draft state request.graph_id) with
-              local_copies = Local_copies.add (Logseq_db_types.Graph_types.Uuid.to_string request.graph_id)
-                (Ok Graph_service.Not_downloaded) state.local_copies
-            ; local_copy_message = None })
-        else (
+               && ((not confirm) || state.local_copy_check=Some request)
+          |None->false in
+        if not owned then state else (
           let result = match outcome with
             | Worker.Completed (Graph_service.Local_copy_inspected (actual, result)) when actual = request -> result
             | _ -> Error "Unable to check the local copy. Try again." in
@@ -5620,27 +5660,49 @@ let start
           Effect.bind (install_calendar set_state calendar) ~f:(fun () ->
             send_manager (Graph_service.Set_foreground true))))
   in
+  let account_install ~revoke claim = Effect.of_thunk(fun()->
+    if Account_pure_lifecycle.current !account_lifecycle claim then (
+      let verification=Account_pure_lifecycle.verification claim in
+      let user_id=if revoke then None else verification.user_id in
+      coordination_sdk_seen:=true;coordination_account:=Some user_id;
+      Effect.run(Effect.bind(set_root_state(fun state->
+        if not(Account_pure_lifecycle.current !account_lifecycle claim)then state else
+        let ticket=Journal_startup.Presentation.account_ticket state.startup_presentation in
+        {state with startup_presentation=Journal_startup.Presentation.step state.startup_presentation
+          (Account(ticket,if user_id=None then No_user else User))}))
+        ~f:(fun()->if Account_pure_lifecycle.current !account_lifecycle claim
+          then send_manager(Graph_service.Reconcile_authenticated_user{user_id})else Effect.ignore)))) in
+  let run_account_instructions instructions=Effect.many(List.map(function
+    |Account_pure_lifecycle.Revoke claim->
+      if Account_pure_lifecycle.current !account_lifecycle claim then (cancel_copy();account_install ~revoke:true claim)else Effect.ignore
+    |Retire_previous->Effect.of_thunk shutdown_coordination
+    |Install claim->account_install ~revoke:false claim)instructions) in
+  account_lifecycle_changed:=(fun()->
+    if Account_pure_lifecycle.waiting !account_lifecycle && coordination_stopped()
+      && Hashtbl.length runtime_owners=0 && Hashtbl.length worker_owners=0
+      && Rrbvec.length !retired_runtime_io=0 then (
+      let next,instructions=Account_pure_lifecycle.retired !account_lifecycle in
+      account_lifecycle:=next;
+      Journal_pump.enqueue pump(fun()->Effect.run(run_account_instructions instructions))));
   let apply_authenticated_user ?ticket payload =
-    let key = Option.value ticket ~default:(Journal_startup.Presentation.account_ticket !state_ref.startup_presentation) in
-    if key <> Journal_startup.Presentation.account_ticket !state_ref.startup_presentation then Effect.ignore
-    else if Journal_platform.decode_authenticated_scope payload <> Ok (startup_scope !state_ref) then Effect.ignore
-    else (match Journal_platform.decode_authenticated_user payload with
-    | Error _ -> set_state (fun state -> {state with startup_presentation=
-        Journal_startup.Presentation.step state.startup_presentation (Account_error key)})
-    | Ok user_id ->
-        coordination_sdk_seen := true;
-        coordination_account := Some user_id;
-        (match !coordination_host with
-         | Some((_,previous,_),_) when user_id<>Some previous->cancel_copy();shutdown_coordination()
-         | _->());
-        (match user_id with
-         | None -> sign_out_in_flight := true
-         | Some _ -> ());
-      Effect.bind (set_state (fun state -> {state with startup_presentation=
-        Journal_startup.Presentation.step state.startup_presentation
-          (Account(key,if user_id=None then No_user else User))}))
-          ~f:(fun () ->
-            send_manager (Graph_service.Reconcile_authenticated_user { user_id })))
+    let key=Option.value ticket ~default:(Journal_startup.Presentation.account_ticket !state_ref.startup_presentation) in
+    if key<>Journal_startup.Presentation.account_ticket !state_ref.startup_presentation
+      || Journal_platform.decode_authenticated_scope payload<>Ok(startup_scope !state_ref) then Effect.ignore else
+    match Journal_platform.decode_authenticated_user payload with
+    |Error _->set_root_state(fun state->{state with startup_presentation=
+      Journal_startup.Presentation.step state.startup_presentation(Account_error key)})
+    |Ok user_id->
+      coordination_sdk_seen:=true;
+      let needs_retirement=Rrbvec.exists(fun host->
+        Coordination.shutdown_state(Coordination_host.view host)<>Coordination.Stopped
+        && (Coordination.shutdown_state(Coordination_host.view host)<>Coordination.Active
+          || match !coordination_host with Some((_,previous,_),active)when active==host->user_id<>Some previous|_->true))
+        (all_coordination_hosts()) in
+      let next,instructions=Account_pure_lifecycle.observe !account_lifecycle ~needs_retirement
+        {ticket=key;user_id} in
+      account_lifecycle:=next;
+      Effect.bind(run_account_instructions instructions) ~f:(fun()->Effect.of_thunk(fun()->
+        Journal_pump.enqueue pump(fun()-> !account_lifecycle_changed())))
   in
   let apply_local_account_binding ticket result =
     let decoded = Result.bind result Journal_platform.decode_local_account_binding in
@@ -5695,11 +5757,21 @@ let start
            if scope = startup_scope !state_ref then revoked_online_scope := Some scope))
         ~f:(fun () -> send_manager (Graph_service.Cancel_online scope))
     | Error _ -> if Journal_platform.is_prepare_to_terminate_event payload
-    then (
-      termination_in_flight:=true;
-      cancel_copy();shutdown_coordination();
-      if local_deletion_active !state_ref then finish_termination()
-      else send_manager Graph_service.Return_to_graph_picker)
+    then Effect.of_thunk(fun()->
+      if not !termination_in_flight then (
+        account_lifecycle:=Account_pure_lifecycle.stop !account_lifecycle;
+        let owner=ensure_coordination() in
+        termination_in_flight:=true;termination_host_completed:=false;
+        termination_requires_host:=Result.is_ok owner;
+        cancel_copy();
+        pending_termination_start:=Some(fun()->match owner with
+          |Error _->shutdown_coordination();Effect.run(send_manager Graph_service.Return_to_graph_picker)
+          |Ok host->Effect.run(begin_host_change ~host Wc.Connection_will_stop ~f:(function
+            |Error error->termination_in_flight:=false;
+              account_lifecycle:=Account_pure_lifecycle.resume !account_lifecycle;
+              set_root_state(fun state->{state with local_copy_message=Some(coordinated_error_message error)})
+            |Ok()->termination_host_completed:=true;shutdown_coordination();finish_termination())));
+        Effect.run(finish_termination())))
     else (
       match Journal_platform.decode_network_lifecycle payload with
       | Ok _ -> apply_network_lifecycle payload
@@ -6253,6 +6325,7 @@ let start
     in
     match payload with
     | Startup_retry ->
+      account_lifecycle:=Account_pure_lifecycle.invalidate !account_lifecycle;
       Effect.bind (update (fun state -> {state with startup_presentation=
         Journal_startup.Presentation.step state.startup_presentation Retry})) ~f:(fun () -> managed_startup)
     | Open_asset_settings ->
@@ -6305,7 +6378,16 @@ let start
                   ; local_copy_deleting = Some request
                   ; local_copy_message = None
                   }
-                , local_copy_request ~deleting:true request )
+                , Effect.bind(Effect.of_thunk cancel_local_copy_checks) ~f:(fun()->
+                    begin_host_change(Wc.Graph_will_remove(graph_id,Wc.Ordinary)) ~f:(fun result->
+                      Effect.bind(set_root_state(fun state->
+                        if state.local_copy_deleting<>Some request then state else
+                        let state={state with local_copy_deleting=None} in
+                        match result with
+                        |Error error->{state with local_copy_message=Some(coordinated_error_message error)}
+                        |Ok()->{(discard_graph_copy_draft state graph_id)with
+                          local_copies=Local_copies.add(Logseq_db_types.Graph_types.Uuid.to_string graph_id)
+                            (Ok Graph_service.Not_downloaded)state.local_copies;local_copy_message=None})) ~f:finish_termination)) )
               | _ -> { state with modal = No_modal }, Effect.ignore)
            | Action "cancel" | Dismissed -> { state with modal = No_modal }, Effect.ignore
            | Action _ -> state, Effect.ignore)
@@ -6826,7 +6908,7 @@ let start
             for index = first to min last (first + 20) - 1 do
               let graph = Rrbvec.nth state.graph_catalog index in
               let key = Logseq_db_types.Graph_types.Uuid.to_string graph.graph_id in
-              let in_flight = Hashtbl.fold (fun _ (request, _, _) found ->
+              let in_flight = Hashtbl.fold (fun _ (request, _) found ->
                 found || request.Graph_service.graph_id = graph.graph_id) local_copy_requests false in
                if (not (Local_copies.mem key state.local_copies)) && not in_flight
                then
@@ -6851,23 +6933,21 @@ let start
             { graph_id; account_generation = manager.startup.account_generation }
           in
           ( { state with local_copy_check = Some request; local_copy_message = None }
-          , local_copy_request ~deleting:false request )
+          , local_copy_request request )
         | _ -> state, Effect.ignore)
     | Sign_out ->
-      coordination_sdk_seen := true;
-      coordination_account := Some None;
-      shutdown_coordination ();
-      pending_startup_commands:=[];
-      Hashtbl.clear pending_scope_refreshes;
-      cancel_copy ();
-      retire_graph_scope ();
-      started_graph_generation := None;
-      sign_out_in_flight := true;
-      Effect.many
-        [ update (fun state -> let state=step_root state Account_cleared in
-            {state with startup_presentation=Journal_startup.Presentation.step state.startup_presentation Signed_out})
-        ; send_manager (Graph_service.Reconcile_authenticated_user { user_id = None })
-        ]
+      account_lifecycle:=Account_pure_lifecycle.invalidate !account_lifecycle;
+      begin_host_change Wc.Account_will_change ~f:(function
+        |Error error->set_root_state(fun state->{state with local_copy_message=Some(coordinated_error_message error)})
+        |Ok()->
+          coordination_sdk_seen:=true;coordination_account:=Some None;
+          pending_startup_commands:=[];Hashtbl.clear pending_scope_refreshes;
+          cancel_copy();retire_graph_scope();started_graph_generation:=None;
+          sign_out_in_flight:=true;
+          Effect.bind(set_root_state(fun state->let state=step_root state Account_cleared in
+            {state with startup_presentation=Journal_startup.Presentation.step state.startup_presentation Signed_out}))
+            ~f:(fun()->Effect.bind(send_manager(Graph_service.Reconcile_authenticated_user{user_id=None}))
+              ~f:(fun()->shutdown_coordination();Effect.ignore)))
     | Submit_e2ee_password ->
       let password = Journal_capture.source snapshot.e2ee_password in
       let challenge = Option.bind snapshot.manager (fun manager -> Unlock.unlock_challenge manager.unlock) in
@@ -7307,7 +7387,8 @@ let start
     let model=sync_startup_presentation model |> run_edge_callbacks |> prune_resident_models in
     let model=if visible then prepare_presentation model else model in
     state_ref:=model;save_runtime ();processing_owner:=previous;
-    if visible then (retire_absent_runtimes model;drain_retired_runtimes ());model in
+    if visible then (retire_absent_runtimes model;drain_retired_runtimes ();
+      Journal_pump.enqueue pump(fun()-> !account_lifecycle_changed()));model in
   let update model = function
     | Graph_update (owner,_) when not(runtime_owner_is_live model owner) -> model
     | Graph_update (owner,transition) ->
@@ -8307,7 +8388,7 @@ let start
             Hashtbl.replace pending_graph_pushes key (scope,push,
               fun push->deliver(Worker.Push{envelope with payload=Graph_service.Graph_push push})))) pushes
       | _ -> Effect.run (deliver event));
-      progress_legacy_host_joins());
+      progress_legacy_host_joins();!account_lifecycle_changed());
 
   (* The worker fires the wakeup on its own domain whenever output lands;
      enqueueing hops through the host wakeup onto the UI thread. An OCaml

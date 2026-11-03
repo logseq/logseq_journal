@@ -75,7 +75,7 @@ let fixture_with_scope (manager:Service.state) =
   {manager with snapshot={manager.snapshot with resident_scopes=scopes}}
 ;;
 
-let fixture_coordination ?(version=1L) ?(phase=Logseq_db_worker.Graph_open) (manager:Service.state) registration =
+let fixture_coordination ?account ?(version=1L) ?(phase=Logseq_db_worker.Graph_open) (manager:Service.state) registration =
   let module C=Logseq_sync_pure_reducer.Core in
   let module P=Logseq_db_worker.Protocol in
   let manager=fixture_with_scope manager in
@@ -94,7 +94,7 @@ let fixture_coordination ?(version=1L) ?(phase=Logseq_db_worker.Graph_open) (man
     ({startup={account_generation=scope.account.account_generation;
        presentation_generation=manager.snapshot.startup.presentation_generation};
       graph_id=id;graph_generation=scope.graph_generation}:Service.timeline_scope)) manager.snapshot.selected_graph in
-  let sync:C.coordination_state={account=Option.map(fun(scope:Service.asset_scope)->scope.account)(List.nth_opt scopes 0);
+  let sync:C.coordination_state={account=(match List.nth_opt scopes 0 with Some (scope:Service.asset_scope)->Some scope.account|None->account);
     desired_residents=List.map(fun(scope:Service.asset_scope)->scope.graph_id) scopes;
     residents;selected;deletion=None} in
   Service.{registration;authority_user=None;
@@ -129,6 +129,9 @@ let fixture_host_handoffs ~lifetime ~registered ~baseline ~apply =
       (match H.phase !state plan.id with Some(H.Safe receipt)->Ok(Service.Coordination_host_prepared receipt)
        |_->Error "UI fixture permission settlement failed")
      |_->Error "UI fixture refused host preparation")
+  |Coordination_confirm_host_change receipt->
+    H.consumed !state receipt |> Result.map_error(fun _->"Unknown original fixture receipt")
+      |> Result.map(fun consumed->Service.Coordination_host_confirmed(receipt,consumed))
   |Coordination_apply_host_change receipt->
     let request=H.receipt_request receipt in
     let next,result=H.consume !state (facts request.registration)receipt in state:=next;
@@ -940,23 +943,31 @@ let run_favorites_native_visibility
         account_generation=1;graph_generation=generation;presentation_generation=presentation}}} in
     let owner:Service.timeline_scope={startup={account_generation=1;presentation_generation=presentation};
       graph_id=scope.graph_id;graph_generation=generation} in
-    let sync:C.coordination_state={account=Some scope.account;desired_residents=[scope.graph_id];
-      residents=[scope,state];selected=Some owner;deletion=None} in
+    let sync:C.coordination_state={account=Some scope.account;desired_residents=(if Atomic.get host_closed then []else[scope.graph_id]);
+      residents=(if Atomic.get host_closed then []else[scope,state]);
+      selected=(if Atomic.get host_closed then None else Some owner);deletion=None} in
     let physical:Logseq_db_worker.graph_state={graph_id=Some scope.graph_id;generation;phase=Graph_open;error=None} in
     Service.{registration;authority_user=None;
       limits={response_budget_bytes=P.maximum_response_bytes;outbox_max_records=4096;outbox_max_bytes=8388608;
         change_max_items=4096;change_max_bytes=1048576;dispatcher_capacity=256;wire_batch_max_bytes=262144};
-      baseline={version=Int64.of_int presentation;presentation=Int64.of_int presentation;state={sync;residents=[scope,physical]}}}
+      baseline={version=Int64.of_int(presentation+(if Atomic.get host_closed then 1 else 0));
+        presentation=Int64.of_int presentation;state={sync;residents=(if Atomic.get host_closed then []else[scope,physical])}}}
   in
   let host_fixture=fixture_host_handoffs ~lifetime:(uuid 98000)
     ~registered:(fun()->Atomic.get coordination_registration) ~baseline:coordination_baseline
     ~apply:(fun context change->match change with
-      |Logseq_db_worker_pure_reducer.Core.Host_handoff.Close_graph graph when graph=scope.graph_id->
+      |change when (match change with Logseq_db_worker_pure_reducer.Core.Host_handoff.Close_graph graph->graph=scope.graph_id
+         |Stop_connection->true|_->false)->
         Atomic.set host_closed true;
+        if change=Logseq_db_worker_pure_reducer.Core.Host_handoff.Stop_connection then Atomic.set picker_returned true;
         let closed={manager with snapshot={manager.snapshot with selected_graph=None;
           resident_graphs=[];resident_scopes=[];
           startup={manager.snapshot.startup with awaiting_selection=true;graph_generation=2}}} in
-        W.Request_context.emit context ~topic:Service.manager_topic(Service.Client_state_changed closed);Ok()
+        W.Request_context.emit context ~topic:Service.manager_topic(Service.Client_state_changed closed);
+        Option.iter(fun registration->W.Request_context.emit context
+          ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+          (Service.Coordination_updates[Coordination_snapshot(coordination_baseline registration)]))
+          (Atomic.get coordination_registration);Ok()
       |_->Error "Unsupported host change in this UI fixture") in
   let durable_outcomes = Hashtbl.create 8 in
   let durable_intent intent = Logseq_db_worker_contract.Mutation_pure_wire.restore
@@ -1073,7 +1084,7 @@ let run_favorites_native_visibility
          | _ -> ());
         match normalized with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ ->host_fixture context normalized
+        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ ->host_fixture context normalized
         | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration ->
           Atomic.set coordination_registration(Some registration);
@@ -5130,7 +5141,7 @@ let test_reference_outer_terminals cancel =
         in
         match fixture_request request with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration -> Ok(Service.Coordination_registered(fixture_coordination manager registration))
         | Release_coordination registration -> Ok(Service.Coordination_released registration)
         | Coordination_query _ -> Error "Fixture normalization failed"
@@ -6321,7 +6332,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
         in
         match fixture_request request with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration -> Ok(Service.Coordination_registered(
             fixture_coordination ~phase:(Atomic.get graph_phase) (Atomic.get current) registration))
         | Release_coordination registration -> Ok(Service.Coordination_released registration)
@@ -7269,9 +7280,80 @@ let test_picker_presence_native_patch_lifecycle () =
        Some(Ok Service.Downloaded);None;Some(Ok Service.Not_downloaded);Some(Ok Service.Downloaded)])
 ;;
 
+let test_account_pure_lifecycle_latest_after_actual_retirement () =
+  let module A=Application.Account_pure_lifecycle in
+  let ticket=Journal_startup.Presentation.create() |> Journal_startup.Presentation.account_ticket in
+  let verified user_id:A.verification={ticket;user_id} in
+  let waiting,effects=A.observe A.initial ~needs_retirement:true(verified(Some "B")) in
+  Alcotest.(check bool) "new account revokes old authority before joining" true
+    (List.exists(function A.Revoke _->true|_->false)effects);
+  Alcotest.(check bool) "old resource owner must retire" true(List.mem A.Retire_previous effects);
+  Alcotest.(check bool) "new authority not installed before real retirement" false
+    (List.exists(function A.Install _->true|_->false)effects);
+  let latest,effects=A.observe waiting ~needs_retirement:true(verified(Some "C")) in
+  Alcotest.(check bool) "later verification does not repeat in-flight retirement" false(List.mem A.Retire_previous effects);
+  let settled,effects=A.retired latest in
+  let claim=match effects with [A.Install claim]->claim|_->Alcotest.fail "latest claim missing" in
+  Alcotest.(check bool) "only latest verified account installs after actual retirement" true
+    (A.verification claim=verified(Some "C") && A.current settled claim && not(A.waiting settled));
+  let revoked,_=A.observe settled ~needs_retirement:false(verified None) in
+  Alcotest.(check bool) "queued old install cannot undo a newer None" false(A.current revoked claim);
+  let changed,_=A.observe settled ~needs_retirement:false(verified(Some "D")) in
+  Alcotest.(check bool) "queued old install cannot undo a newer identity" false(A.current changed claim);
+  Alcotest.(check bool) "termination revokes queued install" false(A.current(A.stop settled)claim);
+  let stopped,pending=A.retired(A.stop latest) in
+  Alcotest.(check bool) "retirement during termination cannot emit an install" true(pending=[] && not(A.waiting stopped));
+  let revoked,effects=A.observe waiting ~needs_retirement:true(verified None) in
+  Alcotest.(check bool) "None revokes immediately during cleanup" true(List.exists(function A.Revoke _->true|_->false)effects);
+  let _,effects=A.retired revoked in
+  Alcotest.(check int) "late cleanup cannot resurrect prior pending account" 0(List.length effects)
+;;
+
+let test_account_pure_lifecycle_properties () =
+  let module A=Application.Account_pure_lifecycle in
+  let ticket=Journal_startup.Presentation.create() |> Journal_startup.Presentation.account_ticket in
+  let run actions=
+    let state=ref A.initial and latest=ref None and stopping=ref false and queued=ref [] in
+    let accept instructions=List.iter(function A.Install claim->queued:=claim::!queued|_->())instructions in
+    List.iter(fun action->
+      let before= !state in
+      let immutable=List.map(fun claim->claim,A.current before claim)!queued in
+      (match action mod 8 with
+       |0|1|2|3->
+         let verification:A.verification={ticket;user_id=(match action mod 3 with 0->None|1->Some "A"|_->Some "B")} in
+         if not !stopping || verification.user_id=None then latest:=Some verification;
+         let next,instructions=A.observe before ~needs_retirement:(action mod 2=0) verification in
+         if verification.user_id=None then Alcotest.(check bool) "None revokes immediately" true
+           (List.exists(function A.Revoke _->true|_->false)instructions);
+         state:=next;accept instructions
+       |4->let next,instructions=A.retired before in state:=next;accept instructions
+       |5->state:=A.stop before;stopping:=true;latest:=None
+       |6->state:=A.resume before;stopping:=false;latest:=None
+       |_->state:=A.invalidate before;latest:=None);
+      List.iter(fun(claim,was_current)->Alcotest.(check bool) "old pure account state remains immutable" was_current(A.current before claim))immutable;
+      List.iter(fun claim->if A.current !state claim then (
+        Alcotest.(check bool) "delayed install belongs to latest native verification" true(!latest=Some(A.verification claim));
+        Alcotest.(check bool) "delayed install cannot reopen a stopping application" false !stopping))!queued)actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=let rec drop prefix=function []->actions
+    |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+    |head::rest->drop(head::prefix)rest in drop [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x41555448;seed|] in
+    let actions=[2;1;4;0;4;5;4;6;2;4;7;4] @ List.init 80(fun _->Random.State.int random 128) in
+    if fails actions then Alcotest.failf "account lifecycle seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+
 let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
+  let lose_host_reply=List.mem scenario [`Sign_out_unknown;`Terminate_unknown] in
+  let scenario=match scenario with `Sign_out_unknown->`Sign_out|`Terminate_unknown->`Terminate|other->other in
+  let host_readbacks=Atomic.make 0 in
   let reordered=scenario=`Reordered_open || scenario=`Reordered_full in
-  let resident_scenario=scenario=`Current || scenario=`Remove || scenario=`Replace in
+  let automatic_auth=List.mem scenario [`Automatic_auth;`Automatic_direct;`Automatic_stop] in
+  let during_delete=List.mem scenario [`During_delete;`Terminate_during_delete] in
+  let resident_scenario=List.mem scenario [`Current;`Remove;`Replace;`Sign_out;`Terminate;`Automatic_auth;`Automatic_direct;`Automatic_stop] in
   let module W = Logseq_db_worker_lui.Journal_worker in
   let module P = Logseq_db_worker.Protocol in
   let uuid n = Logseq_db_types.Graph_types.Uuid.of_string
@@ -7299,11 +7381,17 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
         ; last_error_attention = None; last_error = None; local_deletion = None }
     ; diagnostics = { groups = [] } } in
   let manager=fixture_with_scope manager in
+  let picker_baseline ?(version=1L) (value:Service.state) registration=
+    fixture_coordination ~version ?account:(if value.snapshot.startup.authenticated then Some(resident_scope first 1).account else None) value registration in
   let coordination_registration=Atomic.make None and coordination_version=Atomic.make 1 in
   let current = Atomic.make manager and commands = Atomic.make [] in
   let module H=Logseq_db_worker_pure_reducer.Core.Host_handoff in
   let handoffs=ref(H.empty ~lifetime:(uuid 90000)) in
   let host_prepared=Atomic.make 0 and host_applied=Atomic.make 0 in
+  let legacy_deletions=Atomic.make 0 in
+  let failed_registration=Atomic.make None in
+  let termination_ready=ref 0 and native_sign_outs=ref 0 in
+  let auth_classified=ref [] and unregister_entered=Atomic.make false and unregister_allowed=Atomic.make true in
   let recovery_writes=Atomic.make 0 in
   let recovery_entered=Atomic.make false and recovery_release=Atomic.make false and recovery_finished=Atomic.make false in
   let inspections = Atomic.make 0 and deletions = Atomic.make [] in
@@ -7322,8 +7410,13 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
   let root_renders = ref 0 in
   let client = ref None in
   let service = W.Service.create ~push_topic_count:9
+      ~control_topic_count:1
+      ~classify_control:(function Service.Client_command(Reconcile_authenticated_user{user_id})when automatic_auth->
+        auth_classified:=user_id::!auth_classified;
+        Some(W.Latest{topic=0;key=Option.value user_id ~default:"<none>";invalidates=None})|_->None)
+      ~handle_control:(fun () _->())
       ~concurrency:(if check_recovery_focus || scenario = `Late_presence || scenario = `Late_graph_cancel
-                    then Concurrent { max_in_flight = 2 } else Serial)
+                    || automatic_auth then Concurrent { max_in_flight = 2 } else Serial)
       ~init:(fun context _ ->
         W.Session_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed manager);
         Ok ())
@@ -7336,10 +7429,21 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
           Atomic.incr coordination_version;
           Option.iter(fun registration->W.Request_context.emit context
             ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
-            (Service.Coordination_updates[Coordination_snapshot(fixture_coordination
+            (Service.Coordination_updates[Coordination_snapshot(picker_baseline
               ~version:(Int64.of_int(Atomic.get coordination_version)) value registration)]))
             (Atomic.get coordination_registration);
           W.Request_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed value) in
+        let delete_copy (request:Service.local_copy_request)=
+          Atomic.set deletions (request::Atomic.get deletions);
+          if during_delete then (
+            let previous=Atomic.get current in
+            publish{previous with snapshot={previous.snapshot with local_deletion=Some(Deletion_in_progress Deleting_mirror)}};
+            while not(Atomic.get finish_deletion)do Unix.sleepf 0.001 done;
+            let previous=Atomic.get current in
+            publish{previous with snapshot={previous.snapshot with local_deletion=None}});
+          if scenario=`Failure_select || (scenario=`Failure_retry && List.length(Atomic.get deletions)=1)
+          then (Atomic.set failed_registration(Atomic.get coordination_registration);
+            Error "Synthetic delete failed. Try again.") else Ok() in
         let query_owner=match request with
           | Service.Coordination_query{owner;_}|Graph_request_at(owner,_)->Some owner
           | _->None in
@@ -7347,7 +7451,7 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
           | Service.Client_command _ when scenario=`Retry_local || scenario=`Retry_graph_phase -> request | _ -> fixture_request request) with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
         | Coordination_prepare_host_change plan ->
-          let baseline=fixture_coordination ~version:(Int64.of_int(Atomic.get coordination_version))
+          let baseline=picker_baseline ~version:(Int64.of_int(Atomic.get coordination_version))
             (Atomic.get current) plan.registration in
           let scopes=Rrbvec.of_list(List.map fst baseline.baseline.state.sync.residents) in
           let facts:H.facts={authenticated=baseline.baseline.state.sync.account<>None;
@@ -7359,14 +7463,21 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
             captured=H.capture ~owner:plan.owner ~change:plan.change scopes} in
           let next,admission=H.prepare !handoffs facts request in handoffs:=next;
           (match admission with H.Start attempt->
-            handoffs:=H.settled !handoffs attempt ~copy_generation:None;
+            let copy_generation=match plan.change with H.Remove_graph _->
+              Some(Logseq_overlay_db.Types.Mirror_generation.of_string "mirror-generation:v1:ui-fixture-only" |> Result.get_ok)
+              |_->None in
+            handoffs:=H.settled !handoffs attempt ~copy_generation;
             (match H.phase !handoffs plan.id with Some(H.Safe receipt)->
               Atomic.incr host_prepared;Ok(Service.Coordination_host_prepared receipt)
              |_->Error "Fixture host settlement refused")
            |_->Error "Fixture host plan refused")
+        | Coordination_confirm_host_change receipt ->
+          Atomic.incr host_readbacks;
+          H.consumed !handoffs receipt |> Result.map_error(fun _->"Unknown original picker fixture receipt")
+            |> Result.map(fun consumed->Service.Coordination_host_confirmed(receipt,consumed))
         | Coordination_apply_host_change receipt ->
           let request=H.receipt_request receipt in
-          let baseline=fixture_coordination ~version:(Int64.of_int(Atomic.get coordination_version))
+          let baseline=picker_baseline ~version:(Int64.of_int(Atomic.get coordination_version))
             (Atomic.get current) request.registration in
           let facts:H.facts={authenticated=true;version=baseline.baseline.version;
             registration=Atomic.get coordination_registration;account=baseline.baseline.state.sync.account;
@@ -7380,13 +7491,27 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
               resident_scopes=List.filter(fun(scope:Service.asset_scope)->scope.graph_id<>graph_id)previous.snapshot.resident_scopes}};
             handoffs:=H.completed !handoffs receipt;Atomic.incr host_applied;
             Ok(Service.Coordination_host_applied request.id)
-           |_->Error "Fixture only accepts an exact one-use Close permission")
+           |Ok(H.Remove_graph(graph_id,_))->
+             let result=delete_copy{graph_id;account_generation=request.owner.account_generation} in
+             handoffs:=H.completed !handoffs receipt;Atomic.incr host_applied;
+             Result.map(fun()->Service.Coordination_host_applied request.id)result
+           |Ok(H.Replace_account|H.Stop_connection)->
+             let previous=Atomic.get current in
+             publish{previous with snapshot={previous.snapshot with selected_graph=None;
+               resident_graphs=[];resident_scopes=[];
+               startup={previous.snapshot.startup with awaiting_selection=true}}};
+             Atomic.incr host_applied;
+             if lose_host_reply then Error "Synthetic transport lost the accepted consume reply"
+             else Ok(Service.Coordination_host_applied request.id)
+           |_->Error "Fixture refused this host action")
         | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration ->
           Atomic.set coordination_registration(Some registration);
-          Ok(Service.Coordination_registered(fixture_coordination
+          Ok(Service.Coordination_registered(picker_baseline
             ~version:(Int64.of_int(Atomic.get coordination_version)) (Atomic.get current) registration))
         | Release_coordination registration ->
+          Atomic.set unregister_entered true;
+          while not(Atomic.get unregister_allowed)do Eio.Fiber.yield()done;
           if Atomic.get coordination_registration=Some registration then Atomic.set coordination_registration None;
           Ok(Service.Coordination_released registration)
         | Coordination_query _ -> Error "Fixture normalization failed"
@@ -7418,13 +7543,8 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
             if scenario = `Presence_failure || scenario = `Refresh_after_presence_failure then Error "Synthetic presence read failed. Try again."
             else Ok (if scenario = `Visible then Service.Not_downloaded else Service.Downloaded)))
         | Service.Delete_local_copy request ->
-          Atomic.set deletions (request :: Atomic.get deletions);
-          if scenario = `During_delete then (
-            let previous = Atomic.get current in
-            publish { previous with snapshot = { previous.snapshot with
-              local_deletion = Some (Deletion_in_progress Deleting_mirror) } };
-            while not (Atomic.get finish_deletion) do Unix.sleepf 0.001 done);
-          Ok (Service.Local_copy_deleted (request, if scenario = `Failure_select then Error "Synthetic delete failed. Try again." else Ok ()))
+          Atomic.incr legacy_deletions;
+          Ok(Service.Local_copy_deleted(request,delete_copy request))
         | Service.Get_graph_state ->
           let value = Atomic.get current in
           Ok (Service.Graph_state { generation = value.snapshot.startup.graph_generation
@@ -7435,6 +7555,15 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
           Atomic.set commands (command :: Atomic.get commands);
           let previous = Atomic.get current in
           (match command with
+           | Reconcile_authenticated_user{user_id} when automatic_auth ->
+             publish{previous with snapshot={previous.snapshot with selected_graph=None;resident_graphs=[];resident_scopes=[];
+               startup={previous.snapshot.startup with authenticated=user_id<>None;awaiting_selection=user_id<>None;
+                 account_generation=previous.snapshot.startup.account_generation+1}}}
+           | Reconcile_authenticated_user{user_id=None} when scenario=`Sign_out ->
+             if Atomic.get host_applied<>1 then failwith "Sign out bypassed its actual old owner permit";
+             publish{previous with snapshot={previous.snapshot with selected_graph=None;resident_graphs=[];resident_scopes=[];
+               startup={previous.snapshot.startup with authenticated=false;awaiting_selection=false;
+                 account_generation=previous.snapshot.startup.account_generation+1}}}
            | Return_to_graph_picker ->
              publish { previous with snapshot = { previous.snapshot with selected_graph = None
                ; startup = { previous.snapshot.startup with awaiting_selection = true } } }
@@ -7509,6 +7638,9 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
         | Import_asset _ -> Error "Unused graph-picker fixture import"))
       ~shutdown:(fun () -> ()) () in
   let hooks = Application.For_testing.app_with_service
+    ~on_platform_request:(fun packet->if Bytes.length packet>=32 then (
+      if Bytes.get_uint16_le packet 6=13 then incr termination_ready;
+      if Bytes.get_uint16_le packet 6=10 then incr native_sign_outs))
     ~on_view_region:(fun region -> if region = "root" then incr root_renders)
     ~on_client:(fun value ->
       client := Some value;
@@ -7526,6 +7658,8 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
             | Not_ready | Stopping -> failwith "fixture worker not ready" in
           fill 0
         | W.Push {payload=Service.Graph_states _;_} -> Atomic.set early_graph_observed true
+        | W.Response {outcome=Completed(Service.Coordination_host_applied _);_} when Atomic.get deletions<>[] ->
+          deletion_terminal:=true
         | W.Response { outcome = Completed (Service.Local_copy_deleted _); _ } ->
           deletion_terminal := true
         | W.Response {outcome=Completed(Service.Coordination_mutations_recovered _);_}->Atomic.set recovery_finished true
@@ -7591,6 +7725,7 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
       ~response_budget_bytes:P.maximum_response_bytes ~default_page_size:P.default_page_size
       |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
   Fun.protect ~finally:(fun () ->
+    Atomic.set unregister_allowed true;
     Atomic.set recovery_release true;
     Atomic.set release_refresh true;
     Atomic.set finish_deletion true;
@@ -7728,6 +7863,56 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
         Alcotest.(check int) "same viewport reuses presence observations" 2 (Atomic.get inspections);
         Alcotest.(check int) "presence does not reconstruct the graph catalog" before !root_renders
       | `Retry_local | `Retry_graph_phase -> ()
+      | `Automatic_auth | `Automatic_direct | `Automatic_stop ->
+        let native user_id=
+          let startup=(Atomic.get current).snapshot.startup in
+          let json=Yojson.Safe.to_string(`Assoc["userId",(match user_id with None->`Null|Some user->`String user);
+            "startupScope",`Assoc["accountGeneration",`Int startup.account_generation;"presentationGeneration",`Int startup.presentation_generation]]) |> Bytes.of_string in
+          let packet=Bytes.make(32+Bytes.length json)'\000' in Bytes.blit_string "LJP2" 0 packet 0 4;
+          Bytes.set_uint16_le packet 4 2;Bytes.set_uint16_le packet 6 7;
+          Bytes.set_int32_le packet 24(Int32.of_int(Bytes.length json));Bytes.blit json 0 packet 32(Bytes.length json);
+          hooks.platform_event(Bytes.to_string packet) in
+        Atomic.set unregister_allowed false;
+        (if scenario=`Automatic_auth then native None else native(Some "latest-user"));
+        wait "native None reaches authority immediately while cleanup is held" (fun()->
+          List.mem None !auth_classified && Atomic.get unregister_entered && not(Atomic.get current).snapshot.startup.authenticated);
+        wait "revoked manager frame reaches the actual UI before new native scope" (fun()->
+          Option.is_none(find "accessibility-identifier" ("graph-resident-remove:" ^ Logseq_db_types.Graph_types.Uuid.to_string first)));
+        Alcotest.(check int) "observed SDK revocation does not issue a new native Sign out" 0 !native_sign_outs;
+        if scenario=`Automatic_auth then (native(Some "next-user");native(Some "latest-user"));
+        if scenario=`Automatic_stop then (
+          let packet=Bytes.make 32 '\000' in Bytes.blit_string "LJP2" 0 packet 0 4;
+          Bytes.set_uint16_le packet 4 2;Bytes.set_uint16_le packet 6 12;
+          hooks.platform_event(Bytes.to_string packet));
+        for _=0 to 8 do consume(hooks.pump())done;
+        Alcotest.(check bool) "new authority waits for real old unregister ACK" false
+          (List.exists Option.is_some !auth_classified);
+        Atomic.set unregister_allowed true;
+        if scenario=`Automatic_stop then (
+          wait "termination joins held old cleanup without queued identity revival" (fun()-> !termination_ready=1);
+          for _=0 to 8 do consume(hooks.pump())done;
+          Alcotest.(check bool) "stopped application never installs its queued native identity" false
+            (List.exists Option.is_some !auth_classified))
+        else (
+          wait "latest native identity installs after actual old cleanup ACK" (fun()->List.mem(Some "latest-user")!auth_classified);
+          Alcotest.(check bool) "superseded native identity is never installed" false
+            (List.mem(Some "next-user")!auth_classified))
+      | `Sign_out | `Sign_out_unknown ->
+        press(Option.get(find "text" "Sign out"));
+        wait "sign out consumes actual old-account permission before reconcile" (fun()->
+          Atomic.get host_applied=1 && not(Atomic.get current).snapshot.startup.authenticated);
+        Alcotest.(check int) "one sign-out prepare" 1(Atomic.get host_prepared);
+        Alcotest.(check int) "unknown sign-out uses exact original readback" (if lose_host_reply then 1 else 0)(Atomic.get host_readbacks)
+      | `Terminate | `Terminate_unknown ->
+        let packet=Bytes.make 32 '\000' in Bytes.blit_string "LJP2" 0 packet 0 4;
+        Bytes.set_uint16_le packet 4 2;Bytes.set_uint16_le packet 6 12;
+        hooks.platform_event(Bytes.to_string packet);
+        wait "termination consumes actual owner permission before native Ready" (fun()->
+          Atomic.get host_applied=1 && !termination_ready=1);
+        Alcotest.(check int) "one stop prepare" 1(Atomic.get host_prepared);
+        Alcotest.(check int) "unknown stop uses exact original readback" (if lose_host_reply then 1 else 0)(Atomic.get host_readbacks);
+        Alcotest.(check bool) "typed stop has no second legacy picker close" false
+          (List.exists(function Service.Return_to_graph_picker->true|_->false)(Atomic.get commands))
       | `Replace ->
         press(node("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string(uuid 4)));
         wait "replacement slot choice is available" (fun()->Option.is_some(find "accessibility-identifier"
@@ -7801,9 +7986,11 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
        | `Confirm
        | `Reopen
        | `Failure_select
+       | `Failure_retry
        | `Presence_failure
        | `Refresh_after_presence_failure
        | `During_delete
+       | `Terminate_during_delete
        | `Late_presence ->
         let stable_select = node ("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second) in
         if scenario = `Failure_select then retained_select := Some stable_select;
@@ -7837,17 +8024,19 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
         if scenario = `Cancel then (
           press (Option.get (find "text" "Cancel"));
           Alcotest.(check int) "Cancel sends no deletion" 0 (List.length (Atomic.get deletions)))
-        else if scenario = `Confirm || scenario = `Reopen || scenario = `Failure_select || scenario = `During_delete || scenario = `Late_presence then (
+        else if scenario = `Confirm || scenario = `Reopen || scenario = `Failure_select || scenario=`Failure_retry || during_delete || scenario = `Late_presence then (
           let confirm = Hashtbl.fold (fun id values found ->
             if List.assoc_opt "text" values = Some (`String "Delete local copy")
               && List.assoc_opt "__kind" values <> Some (`String "menu-item")
             then Some id else found) props None |> Option.get in
           press confirm;
           wait "confirmed delete reaches account-scoped worker request" (fun () -> Atomic.get deletions <> []);
+          Alcotest.(check int) "confirmed delete prepares one typed owner" 1(Atomic.get host_prepared);
+          Alcotest.(check int) "confirmed delete has no legacy second consumer" 0(Atomic.get legacy_deletions);
           let deleted = List.hd (Atomic.get deletions) in
           Alcotest.(check bool) "deletion identity is exact" true
             (deleted.graph_id = second && deleted.account_generation = 1);
-          if scenario = `During_delete then (
+          if during_delete then (
             wait "worker publishes deletion in flight" (fun () ->
               (Atomic.get current).snapshot.local_deletion <> None);
             for _ = 1 to 8 do consume (hooks.pump ()) done;
@@ -7857,10 +8046,35 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
             press (Option.get (find "accessibility-label" "Capture"));
             wait "current graph Capture responds during noncurrent deletion" (fun () ->
               Option.is_some (find "accessibility-identifier" "journal-capture-composer"));
+            if scenario=`Terminate_during_delete then (
+              let packet=Bytes.make 32 '\000' in Bytes.blit_string "LJP2" 0 packet 0 4;
+              Bytes.set_uint16_le packet 4 2;Bytes.set_uint16_le packet 6 12;
+              hooks.platform_event(Bytes.to_string packet);
+              for _=0 to 8 do consume(hooks.pump())done;
+              Alcotest.(check int) "in-flight deletion is not a native shutdown ACK" 0 !termination_ready;
+              Alcotest.(check int) "stop does not overlap accepted removal owner" 1(Atomic.get host_prepared));
             Atomic.set finish_deletion true;
             wait "noncurrent deletion reaches its terminal" (fun () -> !deletion_terminal);
-            Alcotest.(check bool) "deletion completion preserves current graph composer" true
+            if scenario=`Terminate_during_delete then (
+              wait "actual delete terminal permits a distinct stop round" (fun()->Atomic.get host_applied=2 && !termination_ready=1);
+              Alcotest.(check int) "delete and stop each prepare their own owner round" 2(Atomic.get host_prepared))
+            else Alcotest.(check bool) "deletion completion preserves current graph composer" true
               (Option.is_some (find "accessibility-identifier" "journal-capture-composer")))
+          else if scenario=`Failure_retry then (
+            wait "first actual host failure remains visible" (fun()->Option.is_some(find "text" "Synthetic delete failed. Try again."));
+            let first_registration=Atomic.get failed_registration in
+            wait "failed permission cleans its binding before a new round" (fun()->
+              Atomic.get coordination_registration<>None && Atomic.get coordination_registration<>first_registration);
+            for _=0 to 8 do consume(hooks.pump())done;
+            press(node("graph-picker-delete:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+            wait "fresh presence read creates a new explicit confirmation" (fun()->Option.is_some(find "text" "Cancel"));
+            let confirm=Hashtbl.fold(fun id values found->
+              if List.assoc_opt "text" values=Some(`String "Delete local copy")
+                && List.assoc_opt "__kind" values<>Some(`String "menu-item") then Some id else found)props None |> Option.get in
+            press confirm;
+            wait "fresh explicit deletion succeeds after actual cleanup" (fun()->Atomic.get host_applied=2
+              && Option.is_some(find "text" "Download and open"));
+            Alcotest.(check int) "fresh permission instead of replaying old consume" 2(Atomic.get host_prepared))
           else if scenario = `Failure_select then (
             wait "delete failure is visible" (fun () -> Option.is_some (find "text" "Synthetic delete failed. Try again."));
                Alcotest.(check bool)
@@ -8322,6 +8536,15 @@ let () =
         Alcotest.test_case "offline deletion is disabled with explanation" `Quick (test_graph_picker_controls `Offline);
         Alcotest.test_case "refresh failure replaces old presence failure" `Quick (test_graph_picker_controls `Refresh_after_presence_failure);
         Alcotest.test_case "catalog refresh failure is visible" `Quick (test_graph_picker_controls `Refresh_failure);
+        Alcotest.test_case "termination waits for accepted delete then consumes its own stop round" `Quick (test_graph_picker_controls `Terminate_during_delete);
+        Alcotest.test_case "direct new native identity survives internal revocation ticket change" `Quick (test_graph_picker_controls `Automatic_direct);
+        Alcotest.test_case "termination revokes queued native identity installation" `Quick (test_graph_picker_controls `Automatic_stop);
+        Alcotest.test_case "failed accepted deletion cleans before a fresh confirmed round" `Quick (test_graph_picker_controls `Failure_retry);
+        Alcotest.test_case "automatic revocation joins old owner before latest identity" `Quick (test_graph_picker_controls `Automatic_auth);
+        Alcotest.test_case "sign out lost consume reply finishes by read-only original receipt" `Quick (test_graph_picker_controls `Sign_out_unknown);
+        Alcotest.test_case "termination lost consume reply finishes by read-only original receipt" `Quick (test_graph_picker_controls `Terminate_unknown);
+        Alcotest.test_case "manual sign out settles original account before revocation" `Quick (test_graph_picker_controls `Sign_out);
+        Alcotest.test_case "termination consumes actual stop permission before native Ready" `Quick (test_graph_picker_controls `Terminate);
         Alcotest.test_case "resident replacement closes old owner before new admission" `Quick (test_graph_picker_controls `Replace);
         Alcotest.test_case "resident removal uses one-use host permission" `Quick (test_graph_picker_controls `Remove);
         Alcotest.test_case "resident picker keeps native patch references alive" `Quick (test_graph_picker_controls `Current);
@@ -8369,7 +8592,9 @@ let () =
             (test_application_token_control ~saturated:false ~failure:true)
         ] )
     ; ( "native auth admission"
-      , [ Alcotest.test_case "Full older auth is superseded by accepted newer auth" `Quick
+      , [Alcotest.test_case "pure latest identity waits for actual owner retirement" `Quick test_account_pure_lifecycle_latest_after_actual_retirement;
+        Alcotest.test_case "100 shrinking account revocation/ACK traces" `Quick test_account_pure_lifecycle_properties;
+        Alcotest.test_case "Full older auth is superseded by accepted newer auth" `Quick
             (fun () -> test_pending_auth_never_replays_older_identity ~newer_accepted:true ())
         ; Alcotest.test_case "Full auth retains only latest identity" `Quick
             (fun () -> test_pending_auth_never_replays_older_identity ~newer_accepted:false ())

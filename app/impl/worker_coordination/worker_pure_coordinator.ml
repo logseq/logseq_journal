@@ -188,12 +188,16 @@ type shutdown_state =
   | Stopped
   | Shutdown_failed of Worker.error
 
+type host_confirmation={confirm_receipt:Worker.handoff_receipt;confirm_attempt:Worker.request_id;
+  confirm_mailbox:Id.request_id option;confirm_early:(Id.request_id * (bool,Worker.error)result)option;confirm_waiting:bool}
+
 type view =
   { bootstrap_state : Worker.bootstrap_state
   ; current : Worker.projection option
   ; retired_host_sessions : Sessions.t
   ; entries : entry Slots.t
   ; handoffs : (Worker.handoff_id * Worker.handoff_state) list
+  ; restartable_handoffs : Worker.handoff_id list
   ; shutdown : shutdown_state
   ; intents : Worker.mutation_progress Intents.t
   ; intent_epoch : int64
@@ -238,6 +242,7 @@ type t =
   ; host_legacy_pending : bool
   ; host_quiesce_sent : bool
   ; host_candidate : Worker.handoff_receipt option
+  ; host_confirmation : host_confirmation option
   ; host_consume_waiting : bool
   ; host_consume_attempt : Worker.request_id option
   ; host_consume_admitted : Id.request_id option
@@ -257,7 +262,7 @@ let initial ~client_id =
   ; release_pending = false
   ; released = false
   ; active_handoff = None
-  ; host_plan=None;host_candidate=None;host_legacy_pending=false;host_quiesce_sent=false;host_consume_waiting=false;host_consume_attempt=None;host_consume_admitted=None;host_consume_early=None
+  ; host_plan=None;host_candidate=None;host_confirmation=None;host_legacy_pending=false;host_quiesce_sent=false;host_consume_waiting=false;host_consume_attempt=None;host_consume_admitted=None;host_consume_early=None
   ; retired = Graphs.empty
   ; fenced = []
   ; facts =
@@ -265,7 +270,7 @@ let initial ~client_id =
       ; current = None
       ; retired_host_sessions=Sessions.empty
       ; entries = Slots.empty
-      ; handoffs = []
+      ; handoffs = [];restartable_handoffs=[]
       ; shutdown = Active
       ; intents = Intents.empty
       ; intent_epoch = 0L
@@ -351,6 +356,8 @@ let handoff v id =
        if Worker.equal_handoff_id actual id then Some value else None)
     v.handoffs
 ;;
+
+let handoff_restartable view id=List.exists(Worker.equal_handoff_id id)view.restartable_handoffs
 
 let asset_notices facts consumer =
   if not(current_session facts(Worker.asset_consumer_session consumer)) then [] else
@@ -538,7 +545,7 @@ let equal_view a b =
   || (a.bootstrap_state = b.bootstrap_state
       && a.current = b.current
       && Sessions.equal a.retired_host_sessions b.retired_host_sessions
-      && a.handoffs = b.handoffs
+      && a.handoffs = b.handoffs && a.restartable_handoffs=b.restartable_handoffs
       && a.shutdown = b.shutdown
       && a.intents = b.intents
       && a.intent_epoch = b.intent_epoch
@@ -610,6 +617,9 @@ type event =
   | Handoff_apply_admitted of Worker.handoff_id * Worker.request_id * Id.request_id
   | Handoff_apply_rejected of Worker.handoff_id * Worker.request_id * Worker.error
   | Handoff_apply_not_admitted of Worker.handoff_id * Worker.request_id * Worker.admission_error
+  | Handoff_confirm_admitted of Worker.handoff_id * Worker.request_id * Id.request_id
+  | Handoff_confirm_not_admitted of Worker.handoff_id * Worker.request_id * Worker.admission_error
+  | Handoff_confirmed of Worker.handoff_id * Worker.request_id * Id.request_id option * (bool,Worker.error)result
   | Drain
 
 type instruction =
@@ -621,6 +631,7 @@ type instruction =
   | Cancel_request : 'a ticket -> instruction
   | Quiesce of Worker.handoff_plan
   | Consume_handoff of Worker.handoff_receipt * Worker.request_id
+  | Confirm_handoff of Worker.handoff_receipt * Worker.request_id
   | Publish of view
   | Schedule_drain
 
@@ -2209,7 +2220,7 @@ let matching_host_attempt state id attempt =
   Option.exists(Worker.equal_handoff_id id)state.active_handoff
   && Option.exists(fun actual->Worker.compare_request_id actual attempt=0)state.host_consume_attempt
 ;;
-let finish_host_action state id result =
+let finish_host_terminal state id result =
   match handoff state.facts id,state.host_plan with
   |Some(Worker.Applying_host_change receipt),Some plan when Worker.valid_handoff_receipt plan receipt->
     let outcome=match result with Ok()->Worker.Host_change_applied receipt
@@ -2220,6 +2231,43 @@ let finish_host_action state id result =
       fenced=List.filter((<>) (Worker.handoff_change receipt))state.fenced} in
     changed next []
   |_->unchanged state
+;;
+let account_host receipt=match Worker.handoff_change receipt with
+  |Worker.Account_will_change|Connection_will_stop->true|_->false
+;;
+let plan_host_confirmation (state:t) receipt =
+  if state.next=Int64.max_int then finish_host_terminal state (Worker.handoff_receipt_id receipt)
+    (Error(Worker.Invalid_input "Host readback attempt counter exhausted")) else
+  let serial=Int64.succ state.next in
+  let attempt=Worker.request_id(identity state.client serial) in
+  changed{state with next=serial;host_candidate=Some receipt;
+    host_consume_attempt=None;host_consume_admitted=None;host_consume_early=None;host_consume_waiting=false;
+    host_confirmation=Some{confirm_receipt=receipt;confirm_attempt=attempt;confirm_mailbox=None;confirm_early=None;confirm_waiting=false}}
+    [Confirm_handoff(receipt,attempt)]
+;;
+let finish_host_action state id result =
+  match result,handoff state.facts id with
+  |Error _,Some(Worker.Applying_host_change receipt) when account_host receipt && state.host_consume_admitted<>None->
+    plan_host_confirmation state receipt
+  |_->
+    let state=match result,handoff state.facts id with
+      |Error _,Some(Worker.Applying_host_change receipt)when account_host receipt->
+        {state with facts={state.facts with restartable_handoffs=id::state.facts.restartable_handoffs}}
+      |_->state in
+    finish_host_terminal state id result
+;;
+let finish_host_confirmation state id result =
+  match state.host_confirmation with None->unchanged state|Some confirmation->
+  let state={state with host_confirmation=None} in
+  match result with
+  |Ok true->finish_host_terminal state id(Ok())
+  |Ok false->finish_host_terminal {state with facts={state.facts with restartable_handoffs=id::state.facts.restartable_handoffs}}
+      id(Error(Worker.Service_failed "The original host permission was not consumed; release its binding before a new round"))
+  |Error error->finish_host_terminal{state with host_candidate=Some confirmation.confirm_receipt}id(Error error)
+;;
+let matching_confirmation state id attempt=match state.host_confirmation with
+  |Some confirmation when Option.exists(Worker.equal_handoff_id id)state.active_handoff
+    && Worker.compare_request_id confirmation.confirm_attempt attempt=0->Some confirmation|_->None
 ;;
 let plan_host_action_attempt (state:t) receipt =
   if state.next=Int64.max_int then Error(Worker.Invalid_input "Host action attempt counter exhausted")else
@@ -2249,7 +2297,7 @@ let step_base state event =
       ; bootstrap_inflight = true
       ; bootstrap_mailbox = None
       ; active_handoff = None
-      ; host_plan=None;host_candidate=None;host_legacy_pending=false;host_quiesce_sent=false;host_consume_waiting=false;host_consume_attempt=None;host_consume_admitted=None;host_consume_early=None
+      ; host_plan=None;host_candidate=None;host_confirmation=None;host_legacy_pending=false;host_quiesce_sent=false;host_consume_waiting=false;host_consume_attempt=None;host_consume_admitted=None;host_consume_early=None
       ; retired = Graphs.empty
       ; fenced = []
       ; facts =
@@ -2513,7 +2561,7 @@ let step_base state event =
       && state.host_legacy_pending && not state.host_quiesce_sent->
     (match result,handoff state.facts id with
      |Ok(),Some(Worker.Quiescing _)->changed{state with host_legacy_pending=false}[]
-     |Error error,Some(Worker.Quiescing change)->changed{state with active_handoff=None;host_plan=None;host_candidate=None;host_legacy_pending=false;
+     |Error error,Some(Worker.Quiescing change)->changed{state with active_handoff=None;host_plan=None;host_candidate=None;host_confirmation=None;host_legacy_pending=false;
         facts={state.facts with handoffs=(id,Worker.Handoff_failed(change,error))::
           List.filter(fun(old,_)->not(Worker.equal_handoff_id old id))state.facts.handoffs}}[]
      |_->unchanged state)
@@ -2547,6 +2595,27 @@ let step_base state event =
     (match state.host_consume_admitted with
      |Some actual when Id.Request_id.equal actual mailbox->finish_host_action state id result
      |None when state.host_consume_early=None->unchanged{state with host_consume_early=Some(mailbox,result)}
+     |_->unchanged state)
+  |Handoff_confirm_admitted(id,attempt,mailbox)->
+    (match matching_confirmation state id attempt with
+     |Some confirmation when confirmation.confirm_mailbox=None && not confirmation.confirm_waiting->
+       let next={state with host_confirmation=Some{confirmation with confirm_mailbox=Some mailbox;confirm_early=None}} in
+       (match confirmation.confirm_early with Some(actual,result)when Id.Request_id.equal actual mailbox->finish_host_confirmation next id result
+        |_->unchanged next)
+     |_->unchanged state)
+  |Handoff_confirm_not_admitted(id,attempt,Worker.Full)->
+    (match matching_confirmation state id attempt with Some confirmation when confirmation.confirm_mailbox=None->
+      changed{state with host_confirmation=Some{confirmation with confirm_waiting=true;confirm_early=None}}[]|_->unchanged state)
+  |Handoff_confirm_not_admitted(id,attempt,_)->
+    (match matching_confirmation state id attempt with Some{confirm_mailbox=None;_}->
+      finish_host_confirmation state id(Error(Worker.Service_failed "Original host consumption could not be read; outcome remains unknown"))
+     |_->unchanged state)
+  |Handoff_confirmed(id,attempt,mailbox,result)->
+    (match matching_confirmation state id attempt,mailbox with
+     |Some{confirm_mailbox=None;confirm_waiting=false;_},None when Result.is_error result->finish_host_confirmation state id result
+     |Some{confirm_mailbox=Some actual;confirm_waiting=false;_},Some mailbox when Id.Request_id.equal actual mailbox->finish_host_confirmation state id result
+     |Some({confirm_mailbox=None;confirm_waiting=false;confirm_early=None;_}as confirmation),Some mailbox->
+       unchanged{state with host_confirmation=Some{confirmation with confirm_early=Some(mailbox,result)}}
      |_->unchanged state)
   | Changefeed_notice (notice, sequence) ->
     let session = notice.Worker.notice_session in
@@ -2942,6 +3011,12 @@ let progress_host_handoff ?(capacity=false) transition =
       host_consume_attempt=None;host_consume_admitted=None;host_consume_early=None;
       facts={state.facts with handoffs=(id,Worker.Handoff_failed(change,error))::
         List.filter(fun(old,_)->not(Worker.equal_handoff_id old id))state.facts.handoffs}}(non_publications transition.instructions) in
+    match state.host_confirmation with
+    |Some confirmation when capacity && confirmation.confirm_waiting->
+      let retry=plan_host_confirmation state confirmation.confirm_receipt in
+      {retry with instructions=non_publications transition.instructions @ retry.instructions}
+    |Some _->transition
+    |None->
     match handoff state.facts id,state.host_plan,state.host_candidate with
     |Some(Worker.Quiescing change),_,_ when state.lifecycle<>Running->fail change Worker.Revoked_session
     |Some(Worker.Safe_to_proceed receipt),_,_ when state.lifecycle<>Running->fail(Worker.handoff_change receipt)Worker.Revoked_session
@@ -3636,9 +3711,17 @@ let plan_query_internal
 ;;
 
 let prepare_host_change ?(legacy_pending=false) state change =
-  if state.active_handoff <> None
-  then Error Worker.Host_change_in_progress
-  else if state.binding = None || state.lifecycle <> Running
+  match state.active_handoff with
+  |Some id when (match handoff state.facts id,state.host_candidate with
+     |Some(Worker.Handoff_failed(actual,_)),Some receipt->actual=change && account_host receipt
+       && not(handoff_restartable state.facts id)|_->false)->
+    let receipt=Option.get state.host_candidate in
+    let state={state with facts={state.facts with handoffs=(id,Worker.Applying_host_change receipt)::
+      List.filter(fun(old,_)->not(Worker.equal_handoff_id old id))state.facts.handoffs}} in
+    Ok(id,plan_host_confirmation state receipt)
+  |Some _->Error Worker.Host_change_in_progress
+  |None->
+  if state.binding = None || state.lifecycle <> Running
   then Error Worker.Revoked_session
   else if List.length state.facts.handoffs >= 64 || state.next = Int64.max_int
   then Error (Worker.Invalid_input "Handoff history limit reached")

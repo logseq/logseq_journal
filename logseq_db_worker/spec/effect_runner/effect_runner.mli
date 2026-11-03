@@ -42,6 +42,7 @@ val runtime
 val sync_runner
   :  submit:(Logseq_sync_pure_reducer.Core.runner_effect -> unit)
   -> shutdown:(unit -> unit)
+  -> retire_account:(account:Logseq_sync_pure_reducer.Core.account_scope -> (unit,string)result)
   -> unit
   -> sync_runner
 
@@ -236,6 +237,10 @@ val physical_host_scopes : t -> Logseq_sync_pure_reducer.Core.graph_scope Rrbvec
     requires the actual scoped cache's checked close. A failed DB close remains
     a physical failure, even if its logical session has already retired. *)
 val settle_host_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> (unit,string) result
+
+(** Complete the real Sync account owner's checked secret/cache cleanup after
+    the pure owner has fenced its lifecycle and all admitted IO has joined. *)
+val retire_account:t -> account:Logseq_sync_pure_reducer.Core.account_scope -> (unit,string)result
 
 (** Hold the existing exclusive prepared_mirror_deletion owner before issuing a
     removal receipt, including copies whose DB cannot be opened. Retry may rebind

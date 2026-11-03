@@ -1556,7 +1556,8 @@ let () =
     ; "Request_local_cache_reset"
     ; "Action \"cancel\""
     ; "V.Confirmation.alert"
-    ; "Graph_service.Delete_local_copy"
+    ; "Wc.Graph_will_remove"
+    ; "Coordination_host.authorize_host_change"
     ; "Graph_service.Return_to_graph_picker"
     ; "Unsynced changes, drafts"
     ; "Your cloud copy will be"
@@ -1570,7 +1571,8 @@ let () =
   forbid_text
     root
     "app/application.ml"
-    [ "Ui.Material.dialog"
+    [ "Graph_service.Delete_local_copy"
+    ; "Ui.Material.dialog"
     ; "let page_body"
     ; "timeline_notice_view"
     ; "journal-delete-snackbar"

@@ -157,9 +157,17 @@ let test_host_handoff_real_service_single_use () =
     let receipt=match send(Service.Coordination_prepare_host_change plan)with
       |Coordination_host_prepared receipt->receipt|_->T.fail "missing actual host receipt" in
     T.require ((H.receipt_request receipt).id=plan.id) "actual receipt changed its handoff identity";
+    (match send(Service.Coordination_confirm_host_change receipt)with
+     |Coordination_host_confirmed(actual,false)->T.require(actual=receipt)"readback changed original receipt"
+     |_->T.fail "unused actual permission did not read back false");
     (match send(Service.Coordination_apply_host_change receipt)with
      |Coordination_host_applied id->T.require(id=plan.id)"actual consumed ACK changed identity"
      |_->T.fail "missing actual consume ACK");
+    for _=1 to 2 do
+      (match send(Service.Coordination_confirm_host_change receipt)with
+       |Coordination_host_confirmed(actual,true)->T.require(actual=receipt)"readback changed consumed receipt"
+       |_->T.fail "actual consumed permission did not read back true")
+    done;
     let id=Worker.send client(Service.Coordination_apply_host_change receipt) |> accepted in
     let rec terminal ()=match Worker.For_testing.drain_events client ~max_events:64 |> List.find_map(function
       |Worker.Response{request_id;outcome;_}when ID.Worker.Request_id.equal id request_id->Some outcome|_->None)with

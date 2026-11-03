@@ -455,7 +455,7 @@ let test_sync_and_publish_instructions_are_not_reduced_recursively () =
           |> Result.get_ok
         in
         let sync_runner =
-          Runner.sync_runner
+          Runner.sync_runner ~retire_account:(fun ~account:_->Alcotest.fail "Unexpected account retirement in fixture")
             ~submit:(fun runner_effect -> submitted := runner_effect :: !submitted)
             ~shutdown:(fun () -> ())
             ()
@@ -636,7 +636,7 @@ let with_asset_bridge ?(asynchronous=false) ?(asynchronous_io=false) run =
                 ~support:fixture.config.application_support_directory
                 ~post:(fun event -> post (Core.Sync_event event)) ());
         let sync_runner =
-          Runner.sync_runner
+          Runner.sync_runner ~retire_account:(Sync_runner.retire_account (Option.get !io_runner))
             ~submit:(fun runnable -> Sync_runner.submit (Option.get !io_runner) runnable)
             ~shutdown:(fun () -> Sync_runner.shutdown (Option.get !io_runner))
             ()
@@ -932,7 +932,7 @@ let test_host_followup_survives_full_actor_queue () =
     let module Db=Logseq_db_worker in
     let worker=ref None in
     let post event=Option.iter(fun worker->Db.post worker(Core.Sync_event event))!worker in
-    let sync_runner=Runner.sync_runner ~shutdown:(fun()->()) ~submit:(function
+    let sync_runner=Runner.sync_runner ~retire_account:(fun ~account:_->Alcotest.fail "Unexpected account retirement in fixture") ~shutdown:(fun()->()) ~submit:(function
       |Sync.Request(ticket,Sync.Load_catalog _)->post(Sync.Runner_completed(Sync.Completion(ticket,Ok None)))
       |Sync.Await_io(id,scope)->post(Sync.IO_fence_completed(id,scope,Ok()))
       |_->())() in
@@ -1305,7 +1305,7 @@ let test_db_shutdown_accepts_late_staging_completion () =
         in
         io_runner := Some (asset_io_runner ~env ~sw ~support ~post ());
         let sync_runner =
-          Runner.sync_runner
+          Runner.sync_runner ~retire_account:(Sync_runner.retire_account (Option.get !io_runner))
             ~submit:(function
               | Sync.Request (ticket, Sync.Fetch_catalog _) ->
                 Db.post
@@ -1523,7 +1523,7 @@ let test_upload_checkpoint_io ?(closed_stderr = false) () =
                 ~support:fixture.config.application_support_directory
                 ~post:(fun event -> post (Core.Sync_event event)) ());
         let sync_runner =
-          Runner.sync_runner
+          Runner.sync_runner ~retire_account:(Sync_runner.retire_account (Option.get !io_runner))
             ~submit:(fun runner_effect ->
               (match runner_effect with
                | Sync.Asset_io (_, { action = Sync.Stage_asset_file _; _ }) ->
@@ -2053,7 +2053,7 @@ let deletion_runtime_fixture ?deletion_case ?(journal_failure = false)
       let destructive_requests = ref 0 in
       let published = ref [] and blocked_states = ref None in
       let post event = Db.post (Option.get !worker) (Core.Sync_event event) in
-      let sync_runner = Runner.sync_runner ~submit:(function
+      let sync_runner = Runner.sync_runner ~retire_account:(fun ~account:_->Alcotest.fail "Unexpected account retirement in fixture") ~submit:(function
         | Sync.Request (ticket, Sync.Load_catalog _) ->
           post (Sync.Runner_completed (Sync.Completion (ticket, Ok None)))
         | Sync.Request (ticket, Sync.Save_catalog _) ->
@@ -2482,7 +2482,7 @@ let test_authoritative_rejection_diagnostics kind () =
         and connection = ref None in
         let post event = Queue.add event events in
         let sync_runner =
-          Runner.sync_runner
+          Runner.sync_runner ~retire_account:(fun ~account:_->Alcotest.fail "Unexpected account retirement in fixture")
             ~shutdown:(fun () -> ())
             ~submit:(function
               | Sync.Request (ticket, Sync.Fetch_catalog _) ->

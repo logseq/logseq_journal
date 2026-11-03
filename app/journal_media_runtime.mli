@@ -53,6 +53,10 @@ val create_coordinated
 val owns_read : t -> Logseq_db_types.Graph_types.Uuid.t -> bool
 
 val receive_read : t -> read_result -> bool
+(** Retire only imported preview leases owned by a replaced coordinator binding.
+    Keep ordinary display owners and rediscover visible roots after real rebind. *)
+val retire_coordinated_previews:t -> unit
+val resume_coordinated_previews:t -> unit
 val reset : t -> graph_generation:int option -> unit
 
 (** Visibility belongs to a retained presentation. Shared roots and assets are

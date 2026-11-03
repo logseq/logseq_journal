@@ -72,6 +72,7 @@ let with_worker
         in
         let sync_runner =
           Runner.sync_runner
+            ~retire_account:(fun ~account:_->failwith "Unexpected account retirement in mutation fixture")
             ~submit:(function
               | Sync.Request (ticket, Sync.Load_catalog _) ->
                 let cache =

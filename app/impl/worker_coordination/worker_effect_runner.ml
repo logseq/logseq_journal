@@ -15,6 +15,7 @@ type flight =
   | Unregister of (module Worker.ISSUER)
   | Handoff of (module Worker.ISSUER) * Worker.handoff_plan
   | Consume of (module Worker.ISSUER) * Worker.handoff_receipt * Worker.request_id
+  | Confirm of (module Worker.ISSUER) * Worker.handoff_receipt * Worker.request_id
 
 type t =
   { client : client
@@ -182,6 +183,14 @@ let submit t = function
      |Ok request->match admit t request(Consume(t.issuer,receipt,attempt))with
        |Accepted mailbox->t.post(Core.Handoff_apply_admitted(id,attempt,mailbox))
        |result->t.post(Core.Handoff_apply_not_admitted(id,attempt,refused result)))
+  |Confirm_handoff(receipt,attempt)->
+    let module I=(val t.issuer:Worker.ISSUER) in
+    let id=Worker.handoff_receipt_id receipt in
+    (match I.confirm_handoff_request receipt with
+     |Error error->t.post(Core.Handoff_confirmed(id,attempt,None,Error error))
+     |Ok request->match admit t request(Confirm(t.issuer,receipt,attempt))with
+       |Accepted mailbox->t.post(Core.Handoff_confirm_admitted(id,attempt,mailbox))
+       |result->t.post(Core.Handoff_confirm_not_admitted(id,attempt,refused result)))
   | Publish view ->
     t.latest <- Some view;
     t.publish view
@@ -292,6 +301,12 @@ let on_event t event =
                 |Failed message->Error(Worker.Service_failed message)
                 |Cancelled|Shutdown->Error(Worker.Service_failed "Host action outcome is unknown; original permission cannot be replayed") in
               t.post(Core.Handoff_applied(Worker.handoff_receipt_id receipt,attempt,request_id,result))
+            |Confirm(issuer,receipt,attempt)->
+              let module I=(val issuer:Worker.ISSUER) in
+              let result=match outcome with Completed response->I.handoff_confirmed receipt response
+                |Failed message->Error(Worker.Service_failed message)
+                |Cancelled|Shutdown->Error(Worker.Service_failed "Original host consumption readback is unavailable; outcome remains unknown") in
+              t.post(Core.Handoff_confirmed(Worker.handoff_receipt_id receipt,attempt,Some request_id,result))
             |Handoff(issuer,plan)->
               let module I=(val issuer:Worker.ISSUER) in
               let id=Worker.handoff_plan_id plan and change=Worker.handoff_plan_change plan in

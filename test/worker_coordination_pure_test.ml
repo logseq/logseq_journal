@@ -513,6 +513,67 @@ let test_host_consumption_keeps_old_execution_retired () =
   check(Result.is_error(C.authorize_host_change resumed receipt))"old safe receipt consumed against a reopened execution"
 ;;
 
+let test_account_host_unknown_requires_original_consumption_readback () =
+  let issuer,_,projection,_=fixture 9878L in
+  let module I=(val issuer:W.ISSUER) in
+  let module H=Logseq_db_worker_pure_reducer.Core.Host_handoff in
+  List.iter(fun change->
+    let id,prepared=C.prepare_host_change(ready I.binding projection)change |> Result.get_ok in
+    let plan=List.find_map(function C.Quiesce plan->Some plan|_->None)prepared.instructions |> Option.get in
+    let request=match I.handoff_request plan |> Result.get_ok with
+      |S.Coordination_prepare_host_change value->value|_->assert false in
+    let facts:H.facts={authenticated=true;version=request.version;registration=Some request.registration;
+      account=Some request.owner;scopes=request.expected;catalog=Rrbvec.empty} in
+    let backend:H.request={version=request.version;id=request.id;registration=request.registration;
+      owner=request.owner;change=request.change;expected=request.expected;captured=request.expected} in
+    let pending,admission=H.prepare(H.empty ~lifetime:(uuid "98000000-0000-4000-8000-000000009878"))facts backend in
+    let safe=H.settled pending (match admission with H.Start value->value|_->assert false) ~copy_generation:None in
+    let actual=match H.phase safe request.id with Some(H.Safe value)->value|_->assert false in
+    let receipt=I.handoff_receipt plan(S.Coordination_host_prepared actual) |> Result.get_ok in
+    let safe=(C.step prepared.next(C.Handoff_completed(id,W.Safe_to_proceed receipt))).next in
+    let consuming=C.authorize_host_change safe receipt |> Result.get_ok in
+    let attempt=List.find_map(function C.Consume_handoff(_,attempt)->Some attempt|_->None)consuming.instructions |> Option.get in
+    let mailbox=Id.Worker.Request_id.of_int64 9878L in
+    let admitted=(C.step consuming.next(C.Handoff_apply_admitted(id,attempt,mailbox))).next in
+    let unknown=C.step admitted(C.Handoff_applied(id,attempt,mailbox,Error(W.Service_failed "transport outcome unknown"))) in
+    check(match C.handoff(C.view unknown.next)id with Some(W.Applying_host_change _)->true|_->false)
+      "unknown accepted account/stop action ended before authoritative consumption readback";
+    check(not(List.exists(function C.Consume_handoff _->true|_->false)unknown.instructions))
+      "accepted unknown host action replayed its permission";
+    let original,confirmation=List.find_map(function C.Confirm_handoff(receipt,attempt)->Some(receipt,attempt)|_->None)
+      unknown.instructions |> Option.get in
+    check(original=receipt)"readback lost the exact original opaque receipt";
+    let readback=Id.Worker.Request_id.of_int64 9879L in
+    let confirmed=(C.step unknown.next(C.Handoff_confirm_admitted(id,confirmation,readback))).next in
+    let foreign=(C.step confirmed(C.Handoff_confirmed(id,confirmation,Some mailbox,Ok true))).next in
+    check(match C.handoff(C.view foreign)id with Some(W.Applying_host_change _)->true|_->false)
+      "foreign readback mailbox completed the host action";
+    let applied=(C.step foreign(C.Handoff_confirmed(id,confirmation,Some readback,Ok true))).next in
+    check(match C.handoff(C.view applied)id with Some(W.Host_change_applied _)->true|_->false)
+      "actual consumed readback did not finish the original host action";
+    let duplicate=(C.step applied(C.Handoff_confirmed(id,confirmation,Some readback,Ok false))).next in
+    check(match C.handoff(C.view duplicate)id with Some(W.Host_change_applied _)->true|_->false)
+      "late false readback erased the real consumed fact";
+    let absent=(C.step confirmed(C.Handoff_confirmed(id,confirmation,Some readback,Ok false))).next in
+    check(C.handoff_restartable(C.view absent)id)"definitely unconsumed action could not retire its binding";
+    check(not(C.handoff_restartable(C.view applied)id))"consumed host action became restartable";
+    let unavailable=(C.step confirmed(C.Handoff_confirmed(id,confirmation,Some readback,Error W.Revoked_session))).next in
+    check(not(C.handoff_restartable(C.view unavailable)id))"unavailable readback was treated as absence";
+    let same,retry=C.prepare_host_change unavailable change |> Result.get_ok in
+    check(W.equal_handoff_id id same)"unknown readback retry minted a different permission round";
+    check(List.exists(function C.Confirm_handoff(actual,_)->actual=receipt|_->false)retry.instructions)
+      "unknown retry did not query the exact original receipt";
+    check(not(List.exists(function C.Quiesce _|Consume_handoff _->true|_->false)retry.instructions))
+      "unknown host retry prepared or consumed another permission";
+    let full=(C.step unknown.next(C.Handoff_confirm_not_admitted(id,confirmation,W.Full))).next in
+    let retry=C.step full C.Capacity_available in
+    let newer=List.find_map(function C.Confirm_handoff(_,attempt)->Some attempt|_->None)retry.instructions |> Option.get in
+    check(W.compare_request_id newer confirmation<>0)"readback capacity retry reused its old attempt";
+    let stale=(C.step retry.next(C.Handoff_confirmed(id,confirmation,Some readback,Ok false))).next in
+    check(not(C.handoff_restartable(C.view stale)id))"old false readback overrode a newer pending attempt")
+    [W.Account_will_change;W.Connection_will_stop]
+;;
+
 let test_host_plan_pins_original_authoritative_frame () =
   let issuer,raw,projection,session=fixture 9871L in
   let module I=(val issuer:W.ISSUER) in
@@ -4115,6 +4176,7 @@ let () =
   test_host_prepare_waits_for_exact_legacy_owner ();
   test_host_handoff_properties ();
   test_host_consumption_keeps_old_execution_retired ();
+  test_account_host_unknown_requires_original_consumption_readback ();
   test_host_plan_pins_original_authoritative_frame ();
   test_query_origin_boundary ();
   test_durable_readback_reservation ();

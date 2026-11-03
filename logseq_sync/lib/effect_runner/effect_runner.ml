@@ -452,17 +452,15 @@ let delete_account_assets ?except_id t (account : Core.account_scope) =
          operation.cancel ()
        | Some _ | None -> ())
     t.operations;
-  Hashtbl.filter_map_inplace
-    (fun (scope : Core.graph_scope) cache ->
-       if
-         Uri.equal scope.account.managed_sync_origin account.managed_sync_origin
-         && String.equal scope.account.user_id account.user_id
-       then (
-         Asset_cache.close cache;
-         None)
-       else Some cache)
-    t.asset_caches;
-  Asset_cache.delete_account ~root:(asset_root t) ~account
+  let scopes=Hashtbl.to_seq_keys t.asset_caches |> Seq.filter(fun(scope:Core.graph_scope)->
+    Uri.equal scope.account.managed_sync_origin account.managed_sync_origin
+      && scope.account.user_id=account.user_id) |> Rrbvec.of_seq in
+  let closed=Rrbvec.fold_left(fun result scope->Result.bind result(fun()->
+    match Hashtbl.find_opt t.asset_caches scope with
+    |None->Ok()
+    |Some cache->Result.map(fun()->Hashtbl.remove t.asset_caches scope)(Asset_cache.close_checked cache)))
+    (Ok())scopes in
+  Result.bind closed(fun()->Asset_cache.delete_account ~root:(asset_root t) ~account)
   |> Result.map (fun () ->
     let origin = Uri.to_string account.managed_sync_origin in
     Hashtbl.filter_map_inplace (fun (actual_origin, user, _) retirement ->
@@ -470,6 +468,14 @@ let delete_account_assets ?except_id t (account : Core.account_scope) =
     Hashtbl.filter_map_inplace (fun ((scope : Core.graph_scope), _) () ->
       if Uri.equal scope.account.managed_sync_origin account.managed_sync_origin
          && scope.account.user_id=account.user_id then None else Some ()) t.asset_leases)
+;;
+
+let retire_account t ~account =
+  if t.closed then Error "Sync stopped before account retirement." else
+  let secrets=t.dependencies.secrets.delete_account_secrets
+    ~managed_sync_origin:account.Core.managed_sync_origin ~user_id:account.user_id in
+  Result.bind secrets(fun()->delete_account_assets t account
+    |> Result.map_error(fun _->"Account asset cache still has a physical cleanup obligation."))
 ;;
 
 let catalog_root local_store =
@@ -878,13 +884,7 @@ let execute_request
       |> map_error)
   | Delete_account_secrets account ->
     run_secret_action t (fun () ->
-      match delete_account_assets t account with
-      | Error _ -> Error (Core.Effect_failed "Account asset cache could not be removed.")
-      | Ok () ->
-        t.dependencies.secrets.delete_account_secrets
-          ~managed_sync_origin:account.managed_sync_origin
-          ~user_id:account.user_id
-        |> map_error)
+      retire_account t ~account |> Result.map_error(fun message->Core.Effect_failed message))
   | Encrypt_protected_values request ->
     Result.bind
       (Result.map_error

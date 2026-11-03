@@ -311,6 +311,7 @@ type runtime =
 type sync_runner =
   { submit : Sync.runner_effect -> unit
   ; shutdown : unit -> unit
+  ; retire_account : account:Sync.account_scope -> (unit,string)result
   }
 
 type dependencies =
@@ -455,7 +456,7 @@ type t =
   }
 
 let runtime ~fork ~sleep = Ok { fork; sleep }
-let sync_runner ~submit ~shutdown () = { submit; shutdown }
+let sync_runner ~submit ~shutdown ~retire_account () = { submit; shutdown;retire_account }
 
 let dependencies ~runtime ~config ~overlay ~sync_runner ~publish =
   Ok { runtime; config; overlay; sync_runner; publish }
@@ -3676,7 +3677,7 @@ let physical_host_scopes t =
   Hashtbl.fold(fun _ session scopes->Rrbvec.push_back scopes session.graph_scope)t.databases scopes
 ;;
 
-let settle_host_scope t ~scope =
+let settle_host_scope t ~(scope:Sync.graph_scope) =
   Result.bind(quiesce_writers t ~scope)(fun()->
     let io_scope={ (Sync.effect_scope_of_graph scope) with
       presentation_generation=None;lifecycle_generation=None;connection_generation=None } in
@@ -3694,6 +3695,9 @@ let settle_host_scope t ~scope =
             else (Hashtbl.filter_map_inplace(fun actual value->
               if Core.Writer_fence.same_incarnation actual scope then None else Some value)t.resource_scopes;
               Ok()))))))
+;;
+
+let retire_account t ~account=t.dependencies.sync_runner.retire_account ~account
 ;;
 
 let start_asset_cleanup_job ?parent ?(prepare=(fun _->())) t ~scope work =

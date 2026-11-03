@@ -1612,7 +1612,9 @@ let test_client_to_typed_read () =
         ~changed:(fun _ _->())() in
       Journal_media_runtime.reset media ~graph_generation:(Some(W.import_data imported).graph_generation);
       Journal_media_runtime.imported_coordinated media ~current:true imported;
+      Journal_media_runtime.retire_coordinated_previews media;
       Journal_media_runtime.reset media ~graph_generation:None;
+      require(List.length !released_previews=1)"binding cleanup and later reset released the same preview twice";
       require(!raw_release=0 && List.exists(fun lease->W.file_lease_id lease=W.file_lease_id preview)!released_previews)
         "typed Media preview cleanup fell back to raw handle ownership";
       let release_preview,reply=request(W.Release_file preview) in
@@ -2952,6 +2954,57 @@ let test_service_import_rejects_retired_registration () =
 (* This crosses actual Service/Db/runner lifetimes and reopens the source store.
    A pure reducer cannot establish that source bytes or the Prepared checkpoint
    survived closing their physical owners. No unprepared recovery is claimed. *)
+(* The facade's unregister implementation owns actual cache/DB/IO joins; Core
+   has no physical lease result from which to reproduce an optimistic ACK. *)
+let test_revoked_hidden_lease_blocks_unregister_ack () =
+  with_client(fun client->
+    let replies=Hashtbl.create 16 and baseline=ref None and manager=ref None in
+    Mailbox.on_event client(function
+      |Mailbox.Response{request_id;outcome;_}->Hashtbl.replace replies request_id outcome
+      |Push{payload=Service.Coordination_updates updates;_}->List.iter(function
+        |Service.Coordination_snapshot value->baseline:=Some value|_->())updates
+      |Push{payload=Service.Client_state_changed value;_}->manager:=Some value.snapshot
+      |_->());
+    let wait label predicate=let deadline=Unix.gettimeofday()+.4. in
+      while not(predicate()) && Unix.gettimeofday()<deadline do Mailbox.Private.deliver client ~max_events:64;Thread.delay 0.001 done;
+      require(predicate())label in
+    let call request=let id=match Mailbox.send client request with Accepted id->id|_->failwith "retirement fixture admission" in
+      wait "actual retirement command did not settle"(fun()->Hashtbl.mem replies id);Hashtbl.find replies id in
+    ignore(call(Service.Client_command(Restore_local_account{user_id="user-1"})));
+    (match call(Service.Register_coordination 7991L)with
+     |Completed(Service.Coordination_registered value)->baseline:=Some value|_->failwith "retirement baseline");
+    ignore(call(Service.Client_command(Configure_resident_graphs[Test_support.graph_uuid;second_graph])));
+    wait "two retirement residents did not open"(fun()->Option.exists(fun value->
+      List.length value.Service.baseline.state.residents=2 && List.for_all(fun(_,state)->state.Logseq_db_worker.phase=Graph_open)
+        value.baseline.state.residents)!baseline);
+    let scope=List.find_map(fun((scope:Service.asset_scope),_)->if scope.graph_id=second_graph then Some scope else None)
+      (Option.get !baseline).baseline.state.residents |> Option.get in
+    let owner:Service.timeline_scope={startup={account_generation=scope.account.account_generation;
+      presentation_generation=scope.account.presentation_generation};graph_id=scope.graph_id;graph_generation=scope.graph_generation} in
+    let source_file=Filename.temp_file "journal-unregister-synthetic-" ".png" in
+    Fun.protect ~finally:(fun()->if Sys.file_exists source_file then Sys.remove source_file)(fun()->
+      Out_channel.with_open_bin source_file(fun output->output_string output "file");
+      let source:Logseq_db_types.Asset_import.t={operation=uuid "9c000000-0000-4000-8000-000000003885";
+        asset=uuid "9c000000-0000-4000-8000-000000003886";target=Test_support.authoritative_block_uuid;replace_reference=None;
+        local_mutation=uuid "9c000000-0000-4000-8000-000000003887";metadata_mutation=uuid "9c000000-0000-4000-8000-000000003888";
+        source_file;title="Retired hidden preview";file_type="png"} in
+      let imported=match call(Service.Import_asset_at(owner,source))with
+        |Completed(Service.Asset_imported(Ok value))->value|_->failwith "actual hidden import failed" in
+      let handle,path=imported.preview |> Option.get in
+      require(Sys.file_exists path)"physical preview missing before revocation";
+      ignore(call(Service.Client_command(Reconcile_authenticated_user{user_id=None})));
+      wait "actual account authority was not revoked"(fun()->Option.exists(fun(value:Service.snapshot)->
+        not value.startup.authenticated && value.startup.account_generation<>scope.account.account_generation)!manager);
+      require(match call(Service.Release_coordination 7991L)with Mailbox.Failed _->true|_->false)
+        "unregister ACK escaped while an actual old hidden native lease remained live";
+      require(Sys.file_exists path)"failed unregister discarded retained renderer bytes";
+      require(call(Service.Release_asset_file{scope;handle})=Completed Service.Client_command_completed)
+        "revoked exact hidden lease lost physical cleanup authority";
+      require(call(Service.Release_coordination 7991L)=Completed(Service.Coordination_released 7991L))
+        "unregister did not retry its original physical cleanup after actual release";
+      require(not(Sys.file_exists path))"successful unregister left old scoped resource bytes live"))
+;;
+
 let test_prepared_import_survives_worker_lifetime () =
   with_client_sessions (fun start ->
     let source_file=Filename.temp_file "journal-restarted-import-synthetic-" ".png" in
@@ -3960,6 +4013,8 @@ let test_service_changefeed_has_one_owner () =
 ;;
 
 let () =
+  test_revoked_hidden_lease_blocks_unregister_ack();
+  if Array.exists((=)"--retirement-only")Sys.argv then (print_endline "Actual revoked hidden lease / unregister / retry passed";exit 0);
   let host_only=Array.exists((=)"--host-handoff-only")Sys.argv in
   test_real_host_close_keeps_other_resident_and_reopens();
   if host_only then (print_endline "Real host close/observe/consume/reopen and exclusive responses passed";exit 0);
