@@ -5680,20 +5680,29 @@ let test_page_detail_root_and_append () =
          (preconditions = {Protocol.blocks=[];pages=[page_uuid,"page-1"];
            scopes=[V2_children_scope page_uuid,"children-1"]})
      | _->Alcotest.fail "page append failed to issue scoped insert");
-    let child_read=Runtime.receive runtime (response request (Protocol.V2_mutation_committed
-      {mutation_id=unrelated_uuid;status=V2_applied;generation="graph-1";
-       before_projection_revision="projection-1";after_projection_revision="projection-2"}))
-      |> fun out->only "read inserted page child" out.requests in
+    let module W=Worker_producer.W in let module I=Worker_producer.I in
+    let presentation=Option.get(W.selected Worker_producer.projection) in
+    let mutation_id,mutation=Runtime.worker_mutation runtime request |> Option.get in
+    let intent=W.mutation_intent Worker_producer.session ~mutation_id mutation |> Result.get_ok in
+    Alcotest.(check bool) "page insertion bound to typed owner" true
+      (Runtime.bind_mutation runtime request ~presentation ~intent);
+    let receipt=I.mutation_receipt Worker_producer.session ~request_id:(W.request_id request.request_id) ~intent
+      (response request (V2_mutation_committed{mutation_id;status=V2_applied;generation="generation:v1:1:1";
+        before_projection_revision="projection:v1:1";after_projection_revision="projection:v1:2"})) |> Result.get_ok in
     let child=copy_child unrelated_uuid page_uuid command.source in
-    let parent_read=Runtime.receive runtime (response child_read (Protocol.V2_block_outcome
-      (V2_present_block {value=child.value;revision=child.revision})))
+    let confirmation=I.confirmation Worker_producer.session ~presentation receipt
+      (response request(V2_block_summary_outcome{lookup=V2_present_block{value=child.value;revision=child.revision};
+        page=Some(V2_present_page{page;revision="page-2"});items=[];next_cursor=None;
+        scope_revision="children-1";generation="generation:v1:1:1";projection_revision="projection:v1:2"})) |> Result.get_ok in
+    let parent_read=Runtime.receive_mutation runtime request(W.Confirmed confirmation)
       |> fun out->only "confirm selected page parent" out.requests in
     Alcotest.(check bool) "confirm page through page API" true
       (parent_read.command=V2_get_page {page=page_uuid;revision=None});
     let done_=Runtime.receive runtime (response parent_read (Protocol.V2_page_outcome
       (V2_present_page {page;revision="page-2"}))) in
     let child,parent=done_.responses |> List.find_map (fun r -> match r.Runtime.payload with
-      | Child_created {child;parent;_}->Some(child,parent) | _->None) |> Option.get in
+      | Child_projection_ready {result=Child_created{child;parent;_};_}->Some(child,parent)
+      | _->None) |> Option.get in
     Alcotest.(check string) "completed child page" (Graph.Uuid.to_string page_uuid) (Journal_model.page_id child);
     Alcotest.(check string) "completed parent is page" (Graph.Uuid.to_string page_uuid) (Journal_model.id parent))
     [[]; [copy_child block_uuid page_uuid "First child"]]
@@ -6200,20 +6209,6 @@ let child_identity_insert runtime =
   Runtime.submit runtime(Create_child command)
   |> fun output -> only "child insertion" output.Runtime.requests
 ;;
-let child_identity_status_command runtime =
-  let next output=only "child identity continuation" output.Runtime.requests in
-  let insert=child_identity_insert runtime in
-  let mutation_id=match insert.command with Protocol.V2_insert_blocks{mutation_id;_}->mutation_id|_->assert false in
-  let child=uuid "a1000000-0000-4000-9000-000000000081" in
-  let child_read=Runtime.receive runtime(response insert(V2_mutation_committed
-    {mutation_id;status=V2_already_applied;generation="g";before_projection_revision="p";after_projection_revision="p"})) |> next in
-  Runtime.receive runtime(response child_read(V2_block_outcome(V2_present_block
-    {value={record with block={block with uuid=child;parent=block_uuid};task_status=None};revision="child-1"}))) |> next
-;;
-let child_identity request=match request.Protocol.command with
-  | V2_set_task_status{mutation_id;_}->mutation_id
-  | _->Alcotest.fail "child did not produce its persistent status operation"
-;;
 let child_identity_runtime () =
   let runtime=Runtime.create () in seed_children_interest runtime;set_calendar runtime;runtime
 ;;
@@ -6302,99 +6297,6 @@ let test_typed_child_planning_refusal_retains_transport () =
     Alcotest.(check bool) "original child remains owned after refused transport" true
       ((Runtime.receive_mutation runtime insert W.Outcome_unknown).responses<>[]))
     Journal_graph_transport.[Full;Not_ready;Stopping]
-;;
-
-let test_child_status_identity_independent_reads () =
-  let first=child_identity_status_command(child_identity_runtime()) |> child_identity in
-  let runtime=child_identity_runtime() in
-  let noise=Runtime.submit runtime(Find_block(Graph.Uuid.to_string unrelated_uuid))
-    |> fun output->only "unrelated child identity read" output.requests in
-  Runtime.abandon runtime noise;
-  let second=child_identity_status_command runtime |> child_identity in
-  Alcotest.(check string) "unrelated reads cannot replace persistent child status intent"
-    (Graph.Uuid.to_string first)(Graph.Uuid.to_string second)
-;;
-let test_child_status_identity_after_lost_reply () =
-  let runtime=child_identity_runtime() in
-  let first=child_identity_status_command runtime in
-  ignore(Runtime.fail_request runtime first ~message:"The child status response was lost");
-  let second=child_identity_status_command runtime in
-  Alcotest.(check string) "retry cannot invent another status intent"
-    (Graph.Uuid.to_string(child_identity first))(Graph.Uuid.to_string(child_identity second))
-;;
-
-let test_child_recovery_explicit_clear () =
-  let runtime = Runtime.create () in
-  seed_children_interest runtime;
-  set_calendar runtime;
-  let child_uuid = uuid "a1000000-0000-4000-9000-000000000081" in
-  let creation_time =
-    Journal_time.create
-      ~instant_unix_ms:1_788_192_000_000L
-      ~local_day:20260901
-      ~local_minute_of_day:0
-    |> Result.get_ok
-  in
-  let next out = only "Append recovery continuation" out.Runtime.requests in
-  let insert =
-    Runtime.submit
-      runtime
-      (Create_child
-         { mutation_id = "a1000000-0000-4000-a000-000000000081"
-         ; block_id = Graph.Uuid.to_string child_uuid
-         ; parent_block_id = Graph.Uuid.to_string block_uuid
-         ; calendar_generation = 1L
-         ; status_intent_revision = 0L
-         ; expected_parent_revision = "block-detail-1"
-         ; sibling_order = "a"
-         ; source = "Retained child"
-         ; task_state = No_status
-         ; status_confirmation = true
-         ; creation_time
-         })
-    |> next
-  in
-  let mutation_id =
-    match insert.command with
-    | V2_insert_blocks { mutation_id; _ } -> mutation_id
-    | _ -> assert false
-  in
-  let read =
-    Runtime.receive
-      runtime
-      (response
-         insert
-         (V2_mutation_committed
-            { mutation_id
-            ; status = V2_already_applied
-            ; generation = "g"
-            ; before_projection_revision = "p"
-            ; after_projection_revision = "p"
-            }))
-    |> next
-  in
-  let clear =
-    Runtime.receive
-      runtime
-      (response
-         read
-         (V2_block_outcome
-            (V2_present_block
-               { value =
-                   { record with
-                     block = { block with uuid = child_uuid; parent = block_uuid }
-                   ; task_status = Some unrelated_uuid
-                   }
-               ; revision = "b"
-               })))
-    |> next
-  in
-  Alcotest.(check bool)
-    "Append Clear recovery writes explicit clear"
-    true
-    (match clear.command with
-     | V2_clear_task_status { block = id; _ } -> Graph.Uuid.equal id child_uuid
-     | _ -> false)
 ;;
 
 let test_task_catalog_generation_and_deltas () =
@@ -8735,10 +8637,6 @@ let () =
     "journal graph runtime locality"
     [ ( "status recovery"
       , [ Alcotest.test_case
-            "Append explicit clear after lost response"
-            `Quick
-            test_child_recovery_explicit_clear
-        ; Alcotest.test_case
             "catalog and delta cross fences"
             `Quick
             test_catalog_and_lookup_cross_fences
@@ -8840,9 +8738,7 @@ let () =
         Alcotest.test_case "typed insertion admission" `Quick test_child_typed_insert_admission;
         Alcotest.test_case "unknown Child preserves wire across reset" `Quick (fun ()->test_child_unknown_wire_survives_reset ());
         Alcotest.test_case "unknown Child status preserves preconditions across reset" `Quick (fun ()->test_child_unknown_wire_survives_reset ~status:true ());
-        Alcotest.test_case "typed admission refusal retains graph" `Quick test_typed_child_planning_refusal_retains_transport;
-        Alcotest.test_case "unrelated reads cannot change child status intent" `Quick test_child_status_identity_independent_reads;
-        Alcotest.test_case "lost response keeps the same child status intent" `Quick test_child_status_identity_after_lost_reply])
+        Alcotest.test_case "typed admission refusal retains graph" `Quick test_typed_child_planning_refusal_retains_transport])
     ; ( "copy subtree"
       , [ Alcotest.test_case
             "serialized clipboard payload bound"

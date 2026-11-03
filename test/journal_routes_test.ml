@@ -5560,3 +5560,28 @@ let () =
   require(R.bind_mutation runtime request ~presentation:fixture.presentation ~intent)
     "catalog update re-resolved and rejected the already frozen default"
 ;;
+
+let () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make ~task_state:child_status_a () in
+  let inserted,index,round,_=F.bind fixture fixture.initial fixture.action in
+  let unknown,_=C.receive inserted ~index ~round F.W.Outcome_unknown in
+  let command={fixture.command with task_state=Journal_model.No_status;
+    status_confirmation=true;status_intent_revision=1L} in
+  let selected=C.retarget unknown ~command ~resolved_status:None |> Result.get_ok in
+  let selected,retry=C.retry selected in
+  require(let _,_,wire=F.write retry and _,_,original=F.write fixture.action in wire=original)
+    "explicit Clear replaced the unknown original insertion";
+  let confirmed,parent=F.confirm fixture selected retry in
+  let cleared,action=F.flush_prefix fixture confirmed parent in
+  let _,_,wire=F.write action in
+  require(match wire with F.P.V2_clear_task_status{block;preconditions;_}->
+      block=(F.G.Uuid.of_string command.block_id |> Result.get_ok)
+      && preconditions.blocks=[block,"child-state:v1:0"] |_->false)
+    "No status after an uncertain insert skipped the real explicit Clear stage";
+  let bound,index,round,_=F.bind fixture cleared action in
+  let unknown,_=C.receive bound ~index ~round F.W.Outcome_unknown in
+  let _,retry=C.retry unknown in
+  require(let _,_,actual=F.write retry in actual=wire)
+    "unknown Clear retry replaced its original immutable payload"
+;;

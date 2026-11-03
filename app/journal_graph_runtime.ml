@@ -225,9 +225,6 @@ type operation =
   | Child_ack of { root : Graph.Uuid.t; index : int; round : int64;
       intent : Worker.mutation_intent; presentation : Worker.presentation }
   | Child_insert of Projection.create_child * Graph.page
-  | Child_read of Projection.create_child * Graph.page
-  | Child_status of Projection.create_child * Graph.page
-  | Child_parent of Projection.create_child * Graph.page * Projection.block_member
   | Changed_block of { block_id : string }
   | Changed_detail_block of { block_id : string; observed : bool }
   | Changed_point_context of
@@ -1242,38 +1239,6 @@ let request_delete_summary t block_id =
   | None->request_target_summary_without_interest t refresh
 ;;
 
-let status_mutation_id ~domain ~mutation_id ~revision ~block status =
-  (* A persistent sub-operation belongs to its composer intent, not the lifetime
-     of the request counter. Resolve Default_status before deriving the identity
-     so retrying one choice is stable. The business-owned revision distinguishes
-     choosing A again after B from replaying the first A operation. *)
-  let intent =
-    match status with
-    | None -> "clear"
-    | Some status -> "set:" ^ Graph.Uuid.to_string status
-  in
-  let bytes =
-    Printf.sprintf
-      "logseq-journal:%s-status:v1:%s:%s:%Ld:%s"
-      domain
-      (String.lowercase_ascii mutation_id)
-      (Graph.Uuid.to_string block)
-      revision
-      intent
-    |> Digest.BLAKE128.string
-    |> Bytes.of_string
-  in
-  (* Custom UUID version 8; keep the variant bits and remaining digest bits. *)
-  Bytes.set bytes 6 (Char.chr ((Char.code (Bytes.get bytes 6) land 0x0f) lor 0x80));
-  Bytes.set bytes 8 (Char.chr ((Char.code (Bytes.get bytes 8) land 0x3f) lor 0x80));
-  let hex = Digest.BLAKE128.to_hex (Bytes.to_string bytes) in
-  Printf.sprintf "%s-%s-%s-%s-%s"
-    (String.sub hex 0 8) (String.sub hex 8 4) (String.sub hex 12 4)
-    (String.sub hex 16 4) (String.sub hex 20 12)
-  |> Graph.Uuid.of_string
-  |> Result.get_ok
-;;
-
 let append_unique equal value values =
   if List.exists (equal value) values then values else values @ [ value ]
 ;;
@@ -1703,28 +1668,7 @@ let detail_projection t ~page ~time_context ~root children =
     (Projection.detail_on_page ~page ~time_context ~root children)
 ;;
 
-let read_child t command page =
-  requests
-    [ read
-        t
-        (Child_read (command, page))
-        (Protocol.V2_get_outline_block
-           { block = Graph.Uuid.of_string command.Projection.block_id |> Result.get_ok
-           ; revision = None
-           })
-    ]
-;;
-
-let read_child_parent t command page child =
-  let parent = Graph.Uuid.of_string command.Projection.parent_block_id |> Result.get_ok in
-  requests
-    [ read t (Child_parent (command, page, child))
-        (if Graph.Uuid.equal parent page.Graph.uuid
-         then Protocol.V2_get_page { page = parent; revision = None }
-         else Protocol.V2_get_outline_block { block = parent; revision = None }) ]
-;;
-
-let complete_child ?parent_child_count ?(child_child_count=0) ?(refresh=true) t (command : Projection.create_child) (page : Graph.page)
+let complete_child ~parent_child_count ~child_child_count t (command : Projection.create_child) (page : Graph.page)
       (child : Projection.block_member) (parent : Projection.block_member) =
   if Graph.Uuid.to_string parent.block.uuid <> command.parent_block_id
      || Graph.Uuid.to_string child.block.uuid <> command.block_id
@@ -1736,13 +1680,9 @@ let complete_child ?parent_child_count ?(child_child_count=0) ?(refresh=true) t 
     match projection_time_context t with
   | Error message -> reject message
   | Ok time_context ->
-    let old_count = Hashtbl.find_opt t.projected_blocks command.parent_block_id
-        |> Option.map Journal_model.child_count
-        |> Option.value ~default:0
-      in
       (match
       (Projection.block_on_page ~page ~revision:parent.revision
-         ~child_count:(Option.value parent_child_count ~default:(old_count + 1)) ~time_context parent.block,
+         ~child_count:parent_child_count ~time_context parent.block,
        Projection.block_on_page ~page ~revision:child.revision ~child_count:child_child_count
          ~time_context child.block) with
     | Ok parent, Ok child ->
@@ -1751,16 +1691,7 @@ let complete_child ?parent_child_count ?(child_child_count=0) ?(refresh=true) t 
       let child=Journal_model.with_tag_titles child
         ~tag_titles:(Option.value(Hashtbl.find_opt t.tag_titles command.block_id)~default:[]) in
       Hashtbl.replace t.projected_blocks command.parent_block_id parent;
-      let completion = response (Child_created {child;parent;timeline_entry_update=None}) in
-      let refresh = if not refresh then empty else match page_by_uuid t page.uuid with
-        | None -> empty
-        | Some page ->
-          (match Feed.reconcile_page t.feed ~ports:(feed_ports t) ~page
-            ~limit:Protocol.maximum_page_size with
-           | Some request -> requests [request]
-           | None -> empty)
-      in
-      {refresh with responses=completion::refresh.responses}
+      responses[response(Child_created{child;parent;timeline_entry_update=None})]
        | Error message, _ | _, Error message -> reject message))
 ;;
 
@@ -1778,7 +1709,7 @@ let finish_child_parent t ~root ~round ~(summary:Worker.block_summary) parent =
           fabricated parent total or an increment of an old projection. *)
        let output=complete_child ~parent_child_count:1
          ~child_child_count:(List.length summary.items + if summary.next=None then 0 else 1)
-         ~refresh:false t (Child.command chain) (Child.page chain) child parent in
+         t (Child.command chain) (Child.page chain) child parent in
        (match List.find_map (fun response->match response.payload with
           | Child_created _ as value->Some value|_->None) output.responses with
         | Some projection->child_action t root next (Some projection) action
@@ -1885,9 +1816,6 @@ let operation_name = function
   | Child_chain_parent _ -> "readCanonicalChildParent"
   | Child_ack _ -> "acknowledgeChildOutcome"
   | Child_insert _ -> "appendChild"
-  | Child_read _ -> "readAppendedChild"
-  | Child_status _ -> "setAppendedChildStatus"
-  | Child_parent _ -> "readAppendParent"
   | Changed_block _ -> "reconcileChangedBlock"
   | Changed_detail_block _ -> "reconcileChangedDetailBlock"
   | Changed_point_context _ -> "resolveChangedBlockPage"
@@ -1979,10 +1907,7 @@ let failure_output
     child_step t root(fun chain->Child.interrupted chain ~index ~round message)
   | Child_canonical{root;round}|Child_chain_parent{root;round;_}->
     child_step t root(fun chain->Child.read_failed chain ~round message)
-  | Child_insert (command, _)
-  | Child_read (command, _)
-  | Child_status (command, _)
-  | Child_parent (command, _, _) ->
+  | Child_insert (command, _) ->
     responses
       [ response
           (Child_failed
@@ -2271,11 +2196,6 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
           remember_page_revision t page.uuid revision;
           Hashtbl.replace t.graph_pages (Graph.Uuid.to_string page.uuid) page;
           finish_child_parent t ~root ~round ~summary (page_root_member page revision)
-        | V2_present_page {page;revision}, Child_parent (command,_,child)
-          when Graph.Uuid.to_string page.uuid = command.parent_block_id && not page.recycled ->
-          remember_page_revision t page.uuid revision;
-          Hashtbl.replace t.graph_pages command.parent_block_id page;
-          complete_child t command page child (page_root_member page revision)
         | _, Favorite_read value when Favorites.accepts_page t.favorites value ->
           let planned = Favorites.receive_page t.favorites ~ports:(favorites_ports t) value lookup in
           let output = favorites_output planned in
@@ -2497,36 +2417,9 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
           when Graph.Uuid.to_string uuid = block_id ->
           requests [read t (Detail_block {generation;block_id;limit;after})
             (Protocol.V2_get_page {page=uuid;revision=None})]
-        | V2_present_block { value; revision }, Child_read (command, page) ->
-          remember_block_revision t value.block.uuid revision;
-          let child = Projection.{ block = value.block; revision } in
-          (match task_status_uuid t command.task_state with
-           | Error message -> reject message
-           | Ok status
-             when value.task_status = status
-                  || (status = None && not command.status_confirmation) ->
-             read_child_parent t command page child
-           | Ok status ->
-             let block = value.block.uuid in
-             let mutation_id =
-               status_mutation_id ~domain:"child" ~mutation_id:command.mutation_id
-                 ~revision:command.status_intent_revision ~block status
-             in
-             let preconditions = preconditions ~blocks:[ block, revision ] () in
-             let mutation =
-               match status with
-               | None ->
-                 Protocol.V2_clear_task_status { mutation_id; block; preconditions }
-               | Some status ->
-                 V2_set_task_status { mutation_id; block; status; preconditions }
-             in
-             requests [ mutate t (Child_status (command, page)) mutation ])
         | V2_present_block {value;revision},Child_chain_parent{root;round;summary}->
           remember_block_revision t value.block.uuid revision;
           finish_child_parent t ~root ~round ~summary Projection.{block=value.block;revision}
-        | V2_present_block { value; revision }, Child_parent (command, page, child) ->
-          remember_block_revision t value.block.uuid revision;
-          complete_child t command page child Projection.{block=value.block;revision}
         | ( (V2_present_block _ | V2_missing_block _)
           , Reference_read ({ lookup = Reference.Outline_lookup; _ } as value) ) ->
           Reference.receive_outline t.references ~ports:(reference_ports t)
@@ -2655,8 +2548,6 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
         | _ -> failure_output t operation request_id "Unexpected children response.")
      | V2_mutation_committed _ ->
        (match operation with
-        | Child_insert (command, page) | Child_status (command, page) ->
-          read_child t command page
         | Mutation_refresh { page; refresh } -> request_target_summary t page refresh
         | Delete_mutation command ->
           responses
