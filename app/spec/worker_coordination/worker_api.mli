@@ -525,9 +525,21 @@ val asset_import_intent
   -> (asset_import_intent, error) result
 
 val asset_import_intent_id : asset_import_intent -> Uuid.t
+val asset_import_title:asset_import_intent -> string
 val encode_asset_import_intent : asset_import_intent -> bytes
 val import_source_proof_matches : asset_import_intent -> import_source_proof -> bool
 val restore_asset_import_intent : session -> bytes -> (asset_import_intent, error) result
+
+(** Read-only complete source recovery preserves immutable IDs and source bytes.
+    Original Prepared proof is logical adoption evidence, never a preview lease. *)
+type prepared_import_source
+type recovered_import_input=private {intent:asset_import_intent;prepared:prepared_import_source option;acknowledged:bool}
+type import_input_recovery_cursor
+type import_input_recovery=private {inputs:recovered_import_input Rrbvec.t;continuation:import_input_recovery_cursor option}
+val equal_prepared_import_source:prepared_import_source -> prepared_import_source -> bool
+val prepared_import_intent:prepared_import_source -> asset_import_intent
+val prepared_import_source_session:prepared_import_source -> session
+val prepared_import_adoption:prepared_import_source -> import_source_proof
 
 (** Stable import/metadata/local mutation IDs, exact target, descriptor and source
     are preserved. A lost import reply is not absence. Before retry after restart,
@@ -588,6 +600,10 @@ type _ request =
   | Acknowledge_intent : mutation_intent -> unit request
   | Acknowledge_changes : change_batch -> change_ack request
   | Import : asset_import_intent -> import_progress request
+  | Recover_import_inputs : {after:import_input_recovery_cursor option;maximum_items:int;maximum_bytes:int} -> import_input_recovery request
+  | Confirm_import_source : asset_import_intent -> recovered_import_input option request
+  | Acknowledge_import_source : prepared_import_source -> unit request
+
   | Replace_asset_demand :
       asset_consumer * asset_priority * Logseq_db_types.Asset_descriptor.t list
       -> unit request

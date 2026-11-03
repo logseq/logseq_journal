@@ -210,3 +210,11 @@ val prepare_host_change:t -> host_plan -> (Pure_reducer.Host_handoff.receipt,str
 val apply_host_change:t -> Pure_reducer.Host_handoff.receipt -> (unit,string)result
 
 val confirm_host_change:t -> Pure_reducer.Host_handoff.receipt -> (bool,string)result
+
+val recover_import_inputs_for_scope:t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> after:int64 option -> maximum_items:int -> maximum_bytes:int -> current:(unit -> bool)
+  -> (Logseq_db_types.Asset_import.Recovery.page,string)result
+val confirm_import_input_for_scope:t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> input:string -> current:(unit -> bool) -> (Logseq_db_types.Asset_import.Recovery.item option,string)result
+val acknowledge_import_input_for_scope:t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> input:string -> prepared:string -> current:(unit -> bool) -> (unit,string)result

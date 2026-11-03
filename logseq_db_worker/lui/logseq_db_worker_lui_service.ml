@@ -323,6 +323,13 @@ type request =
   | Coordination_apply_host_change of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt
   | Coordination_quiesce_writers of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_recover_import_inputs of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       after:int64 option;maximum_items:int;maximum_bytes:int}
+  | Coordination_confirm_import_input of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;input:string}
+  | Coordination_acknowledge_import_input of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;input:string;prepared:string}
   | Coordination_import of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
        source:Logseq_db_types.Asset_import.t}
@@ -403,6 +410,14 @@ type response =
   | Coordination_host_confirmed of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt * bool
   | Coordination_host_applied of Logseq_db_types.Graph_types.Uuid.t
   | Coordination_writers_quiesced of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_import_inputs_recovered of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       page:Logseq_db_types.Asset_import.Recovery.page}
+  | Coordination_import_input_confirmed of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       input:Logseq_db_types.Asset_import.Recovery.item option}
+  | Coordination_import_input_acknowledged of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_imported of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
@@ -1182,6 +1197,17 @@ let create ~(dependencies : dependencies) =
       let resolve (owner:timeline_scope) = List.find_opt (fun (scope:Sync.graph_scope) ->
         scope.account.account_generation=owner.startup.account_generation && scope.graph_id=owner.graph_id
           && scope.graph_generation=owner.graph_generation) (Db.graph_scopes session.worker) in
+      let with_import_input_owner ~registration ~(owner:asset_scope) action=
+        let timeline:timeline_scope={startup={account_generation=owner.account.account_generation;
+          presentation_generation=owner.account.presentation_generation};graph_id=owner.graph_id;graph_generation=owner.graph_generation} in
+        match resolve timeline with None->Error "The import source graph session is no longer open."
+        |Some scope->
+          let authorized()=Db.coordination_current session.worker ~registration && resolve timeline=Some scope
+            && scope.account.user_id=owner.account.user_id && Uri.equal scope.account.managed_sync_origin owner.account.managed_sync_origin
+            && scope.account.lifecycle_generation=owner.account.lifecycle_generation
+            && (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+          if not(authorized())then Error "Import source authority retired" else
+          Result.bind(action scope authorized)(fun value->if authorized()then Ok value else Error "Import source authority retired") in
       match request with
       | Coordination_prepare_host_change plan->
         if !(session.auth_seen) && !(session.authenticated_user)<>Some plan.owner.user_id
@@ -1205,6 +1231,18 @@ let create ~(dependencies : dependencies) =
            Db.quiesce_writers session.worker ~registration ~scope
            |> Result.map(fun()->Coordination_writers_quiesced{registration;owner=scope;request_id})
          |_->Error "The writer fence account or graph owner retired.")
+      | Coordination_recover_import_inputs{registration;owner;request_id;after;maximum_items;maximum_bytes}->
+        with_import_input_owner ~registration ~owner(fun scope current->
+          Db.recover_import_inputs_for_scope session.worker ~scope ~after ~maximum_items ~maximum_bytes ~current
+          |> Result.map(fun page->Coordination_import_inputs_recovered{registration;owner=scope;request_id;page}))
+      | Coordination_confirm_import_input{registration;owner;request_id;input}->
+        with_import_input_owner ~registration ~owner(fun scope current->
+          Db.confirm_import_input_for_scope session.worker ~scope ~input ~current
+          |> Result.map(fun input->Coordination_import_input_confirmed{registration;owner=scope;request_id;input}))
+      | Coordination_acknowledge_import_input{registration;owner;request_id;input;prepared}->
+        with_import_input_owner ~registration ~owner(fun scope current->
+          Db.acknowledge_import_input_for_scope session.worker ~scope ~input ~prepared ~current
+          |> Result.map(fun()->Coordination_import_input_acknowledged{registration;owner=scope;request_id}))
       | Coordination_import{registration;owner;request_id;source}->
         let timeline:timeline_scope={startup={account_generation=owner.account.account_generation;
           presentation_generation=owner.account.presentation_generation};graph_id=owner.graph_id;graph_generation=owner.graph_generation} in

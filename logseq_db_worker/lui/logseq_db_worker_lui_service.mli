@@ -246,6 +246,13 @@ type request =
   | Coordination_apply_host_change of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt
   | Coordination_quiesce_writers of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_recover_import_inputs of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       after:int64 option;maximum_items:int;maximum_bytes:int}
+  | Coordination_confirm_import_input of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;input:string}
+  | Coordination_acknowledge_import_input of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;input:string;prepared:string}
   | Coordination_import of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
        source:Logseq_db_types.Asset_import.t}
@@ -326,6 +333,14 @@ type response =
   | Coordination_host_confirmed of Logseq_db_worker_pure_reducer.Core.Host_handoff.receipt * bool
   | Coordination_host_applied of Logseq_db_types.Graph_types.Uuid.t
   | Coordination_writers_quiesced of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_import_inputs_recovered of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       page:Logseq_db_types.Asset_import.Recovery.page}
+  | Coordination_import_input_confirmed of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       input:Logseq_db_types.Asset_import.Recovery.item option}
+  | Coordination_import_input_acknowledged of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_imported of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;

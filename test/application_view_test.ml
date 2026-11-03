@@ -609,6 +609,7 @@ let run_favorites_native_visibility
       ?(check_chrome = false)
       ?(check_error_control = false)
       ?(check_pending_changes = false)
+      ?(check_import_recovery = false)
       ?malformed_native_event
       ?(check_ios_capture = false)
       ?(check_capture_imports = false)
@@ -654,6 +655,23 @@ let run_favorites_native_visibility
   let status_writes = Atomic.make [] in
   let typed_status_mutations=Atomic.make 0 and typed_status_confirms=Atomic.make 0 and typed_status_acks=Atomic.make 0 in
   let pending_change_reads = Atomic.make 0 in
+  let source_reads=Atomic.make 0 and source_acks=Atomic.make 0 and source_reviewed=Atomic.make false in
+  let source_fixture_item (owner:Service.asset_scope) ordinal prepared =
+    let module A=Logseq_db_types.Asset_import in
+    let module U=Logseq_db_types.Asset_upload_intent in
+    let source:A.t={operation=uuid ordinal;asset=uuid(ordinal+100);target=uuid 1;
+      local_mutation=uuid(ordinal+200);metadata_mutation=uuid(ordinal+300);replace_reference=None;
+      source_file="/isolated-picker/recorded-source.bin";
+      title=(if prepared then "Prepared attachment input" else "Unknown attachment input");file_type="bin"} in
+    let namespace=Logseq_db_worker_contract.Mutation_pure_wire.namespace_for_owner
+      ~origin:owner.account.managed_sync_origin ~user:owner.account.user_id ~graph:owner.graph_id in
+    let input=A.Pure_intent.create ~namespace source |> Result.get_ok |> A.Pure_intent.encode in
+    let proof=if not prepared then None else Some(U.prepare ~operation_id:source.operation
+      ~origin:(Uri.to_string owner.account.managed_sync_origin) ~account:owner.account.user_id ~graph:owner.graph_id
+      ~asset:source.asset ~version:(Logseq_db_types.Asset_descriptor.version ~checksum:(String.make 64 'a') ~file_type:"bin" |> Result.get_ok)
+      ~title:source.title ~size:4L ~staged_file:"isolated-prepared-input.bin" ~replace_reference:None ~target:source.target
+      ~local_mutation:source.local_mutation ~metadata_mutation:source.metadata_mutation |> Result.get_ok |> U.Pure_codec.encode) in
+    ({sequence=(if prepared then 1L else 2L);input;prepared=proof;acknowledged=false}:A.Recovery.item) in
   let detail_observes=Atomic.make 0 and detail_releases=Atomic.make 0 in
   let detail_observation_notice : Service.observation_invalidation option Atomic.t=Atomic.make None in
   let detail_observed_title=Atomic.make false and detail_observed_missing=Atomic.make false
@@ -1084,8 +1102,22 @@ let run_favorites_native_visibility
          | _ -> ());
         match normalized with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
+        | Coordination_recover_import_inputs{registration;owner;request_id;after;maximum_items;maximum_bytes} when check_import_recovery->
+          Atomic.incr source_reads;
+          let module R=Logseq_db_types.Asset_import.Recovery in
+          let rows=(if Atomic.get source_reviewed then []else[source_fixture_item owner 20100 true])
+            @[source_fixture_item owner 20101 false] in
+          let items=List.filter(fun(row:R.item)->row.sequence>Option.value after ~default:0L)rows |> List.take maximum_items in
+          let page:R.page={items;next=None} in
+          if R.page_encoded_bytes page>maximum_bytes then Error "Source fixture byte budget" else
+          Ok(Service.Coordination_import_inputs_recovered{registration;owner;request_id;page})
+        | Coordination_acknowledge_import_input{registration;owner;request_id;input;prepared} when check_import_recovery->
+          let original=source_fixture_item owner 20100 true in
+          if original.input<>input || original.prepared<>Some prepared then Error "Source fixture rejected changed original proof" else (
+            Atomic.incr source_acks;Atomic.set source_reviewed true;
+            Ok(Service.Coordination_import_input_acknowledged{registration;owner;request_id}))
         | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ ->host_fixture context normalized
-        | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration ->
           Atomic.set coordination_registration(Some registration);
           Ok(Service.Coordination_registered(coordination_baseline registration))
@@ -2222,6 +2254,25 @@ let run_favorites_native_visibility
          Alcotest.(check int) "viewing recovery never submits a mutation" 0 (Atomic.get typed_status_mutations);
          Alcotest.(check int) "viewing recovery never acknowledges an intent" 0 (Atomic.get typed_status_acks);
          dispatch (Lui_protocol.Press(Option.get(find "accessibility-identifier" "journal-diagnostics-close"))));
+       if check_import_recovery then (
+         dispatch(Lui_protocol.Press(Option.get(find "text" "Diagnostics")));
+         wait "prepared and unknown input rows mount from typed source recovery" (fun()->
+           Option.is_some(find "text" "Prepared attachment input") && Option.is_some(find "text" "Unknown attachment input"));
+         Alcotest.(check bool) "unprepared input keeps explicit unknown status" true
+           (Option.is_some(find "text" "Preparation outcome unknown; input retained."));
+         let review_buttons()=Hashtbl.fold(fun _ fields count->
+           if List.assoc_opt "text" fields=Some(`String "Mark reviewed")then count+1 else count)props 0 in
+         Alcotest.(check int) "only actual Prepared input exposes review ACK" 1(review_buttons());
+         dispatch(Lui_protocol.Press(ancestor_property(Option.get(find "text" "Mark reviewed"))"press-enabled"));
+         wait "source review performs one ACK then reloads pending membership" (fun()->
+           Atomic.get source_acks=1 && Atomic.get source_reads=2 && Option.is_none(find "text" "Prepared attachment input")
+           && Option.is_some(find "text" "Unknown attachment input"));
+         Alcotest.(check int) "unknown input has no review action" 0(review_buttons());
+         Alcotest.(check int) "review never issues a graph mutation" 0(Atomic.get typed_status_mutations);
+         let next=ancestor_property(Option.get(find "text" "Next attachment inputs"))"press-enabled" in
+         Alcotest.(check (option bool)) "complete source page disables next" (Some false)
+           (Option.map Yojson.Safe.Util.to_bool(List.assoc_opt "enabled"(Hashtbl.find props next)));
+         dispatch(Lui_protocol.Press(Option.get(find "accessibility-identifier" "journal-diagnostics-close"))));
        (* Delete admission is private to Application, absent from Root_navigation's
           public pure events. Use its existing public bridge and controlled Worker
           fixture to execute the actual UI admission/completion boundary. *)
@@ -5141,7 +5192,7 @@ let test_reference_outer_terminals cancel =
         in
         match fixture_request request with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration -> Ok(Service.Coordination_registered(fixture_coordination manager registration))
         | Release_coordination registration -> Ok(Service.Coordination_released registration)
         | Coordination_query _ -> Error "Fixture normalization failed"
@@ -6332,7 +6383,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
         in
         match fixture_request request with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration -> Ok(Service.Coordination_registered(
             fixture_coordination ~phase:(Atomic.get graph_phase) (Atomic.get current) registration))
         | Release_coordination registration -> Ok(Service.Coordination_released registration)
@@ -7346,7 +7397,8 @@ let test_account_pure_lifecycle_properties () =
   done
 ;;
 
-let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
+let test_graph_picker_controls ?(check_recovery_focus=false) ?(check_import_recovery_focus=false) scenario () =
+  let check_recovery_focus=check_recovery_focus || check_import_recovery_focus in
   let lose_host_reply=List.mem scenario [`Sign_out_unknown;`Terminate_unknown] in
   let scenario=match scenario with `Sign_out_unknown->`Sign_out|`Terminate_unknown->`Terminate|other->other in
   let host_readbacks=Atomic.make 0 in
@@ -7504,7 +7556,20 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
              if lose_host_reply then Error "Synthetic transport lost the accepted consume reply"
              else Ok(Service.Coordination_host_applied request.id)
            |_->Error "Fixture refused this host action")
-        | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_recover_import_inputs{registration;owner;request_id;_} when check_import_recovery_focus->
+          if owner.graph_id=first then (
+            Atomic.set recovery_entered true;
+            while not(Atomic.get recovery_release)do Eio.Fiber.yield()done);
+          let module A=Logseq_db_types.Asset_import in
+          let namespace=Logseq_db_worker_contract.Mutation_pure_wire.namespace_for_owner
+            ~origin:owner.account.managed_sync_origin ~user:owner.account.user_id ~graph:owner.graph_id in
+          let source:A.t={operation=uuid(30000+owner.graph_generation);asset=uuid(40000+owner.graph_generation);
+            target=uuid 100;local_mutation=uuid(50000+2*owner.graph_generation);metadata_mutation=uuid(50001+2*owner.graph_generation);
+            replace_reference=None;source_file="/isolated-picker/focus-source.bin";title="Resident source input";file_type="bin"} in
+          let input=A.Pure_intent.create ~namespace source |> Result.get_ok |> A.Pure_intent.encode in
+          Ok(Service.Coordination_import_inputs_recovered{registration;owner;request_id;
+            page={items=[{sequence=1L;input;prepared=None;acknowledged=false}];next=None}})
+        | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration ->
           Atomic.set coordination_registration(Some registration);
           Ok(Service.Coordination_registered(picker_baseline
@@ -7517,7 +7582,7 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
         | Coordination_query _ -> Error "Fixture normalization failed"
         | Coordination_observe _ | Coordination_refresh_observation _ | Coordination_release_observation _ ->
           Error "Observation is not used by this fixture"
-        | Coordination_recover_mutations {request_id;owner;_} when check_recovery_focus ->
+        | Coordination_recover_mutations {request_id;owner;_} when check_recovery_focus && not check_import_recovery_focus ->
           if owner.graph_id=first then (
             Atomic.set recovery_entered true;
             while not(Atomic.get recovery_release) do Eio.Fiber.yield () done);
@@ -7662,7 +7727,7 @@ let test_graph_picker_controls ?(check_recovery_focus=false) scenario () =
           deletion_terminal:=true
         | W.Response { outcome = Completed (Service.Local_copy_deleted _); _ } ->
           deletion_terminal := true
-        | W.Response {outcome=Completed(Service.Coordination_mutations_recovered _);_}->Atomic.set recovery_finished true
+        | W.Response {outcome=Completed(Service.Coordination_mutations_recovered _ | Coordination_import_inputs_recovered _);_}->Atomic.set recovery_finished true
         | W.Response { request_id; outcome = Cancelled; _ } ->
           incr inspection_terminals;
           if Atomic.get graph_read_worker = Some request_id then incr graph_read_cancellations
@@ -8550,6 +8615,8 @@ let () =
         Alcotest.test_case "resident picker keeps native patch references alive" `Quick (test_graph_picker_controls `Current);
         Alcotest.test_case "recovery completion returns to background resident" `Quick
           (test_graph_picker_controls ~check_recovery_focus:true `Current);
+        Alcotest.test_case "source recovery completion returns to background resident" `Quick
+          (test_graph_picker_controls ~check_import_recovery_focus:true `Current);
         Alcotest.test_case "close retains current session" `Quick (test_graph_picker_controls `Close);
         Alcotest.test_case "focus graph-state refresh survives full Worker lane" `Quick (test_graph_picker_controls `Reordered_full);
         Alcotest.test_case "graph open before membership still presents after focus" `Quick (test_graph_picker_controls `Reordered_open);
@@ -8942,6 +9009,8 @@ let () =
             `Quick
             test_block_identity_serialization_and_native_entropy
         ] )
+    ; ( "attachment input recovery", [Alcotest.test_case "typed prepared review and unknown membership" `Quick
+        (fun()->run_favorites_native_visibility ~check_import_recovery:true())])
     ; ( "worker presentation"
       , [ Alcotest.test_case "phase labels" `Quick test_phase_names
         ; Alcotest.test_case

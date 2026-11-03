@@ -819,11 +819,61 @@ let cancelled_stage_output deliver_first () =
       Logseq_db_storage.Asset_upload_store.read db ~operation:source.operation
       |> Result.get_ok
     in
+    let namespace=Logseq_db_worker_contract.Mutation_pure_wire.namespace_for_owner
+      ~origin:fixture.context.scope.account.managed_sync_origin ~user:fixture.context.scope.account.user_id
+      ~graph:fixture.context.scope.graph_id in
+    let reserved=Logseq_db_storage.Asset_upload_store.Inputs.read db
+      ~owner:{namespace;origin=Uri.to_string fixture.context.scope.account.managed_sync_origin;account=fixture.context.scope.account.user_id;graph=fixture.context.scope.graph_id} ~operation:source.operation |> Result.get_ok in
+    let expected=Logseq_db_types.Asset_import.Pure_intent.create ~namespace source |> Result.get_ok in
+    Alcotest.(check bool) "canceled staging retains complete durable Unknown input" true
+      (Option.exists(fun(row:Logseq_db_storage.Asset_upload_store.Inputs.record)->row.prepared=None && row.evidence=None
+        && Logseq_db_types.Asset_import.Pure_intent.encode row.input=Logseq_db_types.Asset_import.Pure_intent.encode expected)reserved);
     ignore (Sqlite3.db_close db);
     Alcotest.(check bool)
       "cancel before staging acceptance persists no import"
       true
       (durable = None))
+;;
+
+(* Only this actual interpreter can establish that source recovery opens an
+   existing SQLite file read-only and never stages, acquires, or replays work. *)
+let test_import_input_readonly_recovery_and_proof_ack () =
+  with_asset_bridge(fun fixture->
+    let module P=Logseq_db_types.Asset_import.Pure_intent in
+    let module W=Logseq_db_worker_contract.Mutation_pure_wire in
+    let scope=fixture.context.scope in
+    let store=Filename.concat fixture.support "asset-upload-intents.sqlite" in
+    let recover()=Runner.recover_import_inputs fixture.runner ~scope ~after:None ~maximum_items:2
+      ~maximum_bytes:32768 ~current:(fun()->true) |> Result.get_ok in
+    let empty=recover() in
+    Alcotest.(check bool) "absent readonly recovery is complete empty" true(empty.items=[] && empty.next=None);
+    Alcotest.(check bool) "readonly recovery cannot create store or schema" false(Sys.file_exists store);
+    let source=picker_import fixture.support 970 in
+    let namespace=W.namespace_for_owner ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id in
+    let input=P.create ~namespace source |> Result.get_ok |> P.encode in
+    Alcotest.(check bool) "readonly lookup of absent complete input is None" true
+      (Runner.confirm_import_input fixture.runner ~scope ~input ~current:(fun()->true)=Ok None);
+    Alcotest.(check bool) "readonly lookup cannot create store" false(Sys.file_exists store);
+    ignore(Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok);
+    let actions= !(fixture.actions) and modified=(Unix.stat store).st_mtime in
+    let page=recover() in
+    let row=match page.items with [row]->row|_->Alcotest.fail "missing complete prepared source recovery" in
+    Alcotest.(check string) "original complete input bytes preserved" input row.input;
+    let proof=Option.get row.prepared in
+    Alcotest.(check bool) "prepared input proof initially pending" false row.acknowledged;
+    Alcotest.(check bool) "actual readonly reopen retains original evidence" true
+      (Runner.confirm_import_input fixture.runner ~scope ~input ~current:(fun()->true)=Ok(Some row));
+    Alcotest.(check bool) "readonly recovery leaves store mtime unchanged" true((Unix.stat store).st_mtime=modified);
+    Alcotest.(check bool) "readonly recovery does no staging/lease/transport work" true(actions= !(fixture.actions));
+    Alcotest.(check bool) "stale caller cannot ACK original source" true
+      (Result.is_error(Runner.acknowledge_import_input fixture.runner ~scope ~input ~prepared:proof ~current:(fun()->false)));
+    Alcotest.(check bool) "forged evidence cannot ACK original source" true
+      (Result.is_error(Runner.acknowledge_import_input fixture.runner ~scope ~input ~prepared:(proof^" ") ~current:(fun()->true)));
+    Runner.acknowledge_import_input fixture.runner ~scope ~input ~prepared:proof ~current:(fun()->true) |> Result.get_ok;
+    let done_=recover() in
+    Alcotest.(check bool) "ACK removes only pending recovery membership" true(done_.items=[] && done_.next=None);
+    let saved=Runner.confirm_import_input fixture.runner ~scope ~input ~current:(fun()->true) |> Result.get_ok |> Option.get in
+    Alcotest.(check bool) "ACK retains original canonical bytes and proof" true(saved.input=input && saved.prepared=Some proof && saved.acknowledged))
 ;;
 
 let test_worker_sync_io_fence_correlates_real_child () =
@@ -1725,12 +1775,11 @@ let test_upload_checkpoint_io ?(closed_stderr = false) () =
              ~operation:source.operation
            = None);
         Runner.release_asset_file runner ~scope ~handle:lease;
+        Alcotest.(check bool) "same operation cannot replace its complete original source" true
+          (Result.is_error(Runner.prepare_import runner ~context
+            {source with source_file="picker-no-longer-available"} ~current:(fun()->true)));
         let duplicate =
-          Runner.prepare_import
-            runner
-            ~context
-            { source with source_file = "picker-no-longer-available" }
-            ~current:(fun () -> true)
+          Runner.prepare_import runner ~context source ~current:(fun () -> true)
           |> Result.get_ok
         in
         Alcotest.(check bool)
@@ -2876,7 +2925,8 @@ let () =
         ] )
     ; ( "unlock diagnostics", [Alcotest.test_case "typed finite runner observations" `Quick test_unlock_runner_logging] )
     ; ( "contract"
-      , [ Alcotest.test_case "host internal followup survives full actor queue" `Quick test_host_followup_survives_full_actor_queue
+      , [ Alcotest.test_case "readonly import input recovery and exact proof ACK" `Quick test_import_input_readonly_recovery_and_proof_ack
+        ; Alcotest.test_case "host internal followup survives full actor queue" `Quick test_host_followup_survives_full_actor_queue
         ; Alcotest.test_case "host scope settlement preserves real lease" `Quick test_host_scope_settlement_preserves_live_lease
         ; Alcotest.test_case "Worker Sync IO fence correlates actual child" `Quick test_worker_sync_io_fence_correlates_real_child
         ; Alcotest.test_case "Sync IO fence joins nonasset callback" `Quick test_sync_io_fence_joins_nonasset_callback

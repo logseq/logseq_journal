@@ -107,6 +107,7 @@ let reconcile_unlock previous (snapshot : Graph_service.snapshot) =
 
 module Admission_refresh = Journal_admission_refresh
 module Mutation_recovery = Journal_diagnostics_view.Pure_recovery
+module Import_recovery = Journal_diagnostics_view.Pure_import_recovery
 
 type pending_delete =
   { mutation_id:string
@@ -329,6 +330,7 @@ type state =
   ; diagnostics : Graph_service.diagnostics option
   ; admission_refresh : Admission_refresh.t
   ; mutation_recovery : Mutation_recovery.t
+  ; import_recovery : Import_recovery.t
   ; bootstrap_progress : Graph_service.bootstrap_progress option
   ; next_worker_error_sequence : int64
   ; worker_errors : worker_error_occurrence list
@@ -478,6 +480,7 @@ let initial_state =
   ; diagnostics = None
   ; admission_refresh = Admission_refresh.closed
   ; mutation_recovery = Mutation_recovery.closed
+  ; import_recovery = Import_recovery.closed
   ; bootstrap_progress = None
   ; next_worker_error_sequence = 1L
   ; worker_errors = []
@@ -673,6 +676,7 @@ let clear_graph_surface ~discard ?(discard_capture = true) state =
   ; presented_feed_context = None
   ; admission_refresh = Admission_refresh.closed
   ; mutation_recovery = fst (Mutation_recovery.step state.mutation_recovery Close)
+        ; import_recovery = fst(Import_recovery.step state.import_recovery Close)
   ; next_request_generation = Int64.succ state.next_request_generation
   ; next_local_sequence = Int64.succ state.next_local_sequence
   ; modal = No_modal
@@ -2130,6 +2134,10 @@ type command =
   | Reload_pending_changes
   | Retry_pending_changes
   | Next_pending_changes
+  | Reload_import_inputs
+  | Retry_import_inputs
+  | Next_import_inputs
+  | Mark_import_source_reviewed of Journal_worker_coordination.Worker_api.prepared_import_source
   | Open_error_info
   | Dismiss_operation_error
   | Retry_capture_imports
@@ -2820,12 +2828,17 @@ let error_info_page ~sync_error ~operation_failure occurrences dispatch =
   |> V.Body.with_test_id (Ui.Test_id.string "journal-error-info-page")
 ;;
 
-let diagnostics_page ?(errors = []) ?recovery ~snapshot ~graph ~admission diagnostics dispatch =
+let diagnostics_page ?(errors = []) ?recovery ?imports ~snapshot ~graph ~admission diagnostics dispatch =
   Journal_diagnostics_view.view
     ?recovery:(Option.map (fun state -> Journal_diagnostics_view.{state;
       on_reload=bind_action dispatch Reload_pending_changes;
       on_retry=bind_action dispatch Retry_pending_changes;
       on_next=bind_action dispatch Next_pending_changes}) recovery)
+    ?imports:(Option.map(fun import_state->Journal_diagnostics_view.{import_state;
+      on_import_reload=bind_action dispatch Reload_import_inputs;
+      on_import_retry=bind_action dispatch Retry_import_inputs;
+      on_import_next=bind_action dispatch Next_import_inputs;
+      on_import_review=(fun proof->bind_action dispatch(Mark_import_source_reviewed proof))})imports)
     { snapshot; graph; admission; diagnostics
     ; application_errors = application_error_rows errors
     }
@@ -3496,6 +3509,11 @@ let start
            ~client_id:(Wc.Uuid.of_string id |> Result.get_ok) ~managed_origin:origin ~user_id:user
            ~enqueue:(Journal_pump.enqueue pump)
            ~changed:(fun view->
+             Rrbvec.iter(fun previous->
+               Rrbvec.iter(fun intent->Option.iter(fun proof->Coordination_host.post previous
+                 (Coordination.Import_source_reconciled proof))(Coordination.import_source_proof view intent))
+                 (Coordination.pending_import_source_intents(Coordination_host.view previous)))
+               (all_coordination_hosts());
              if !coordination_host_id=Some id then (
                Option.iter(fun poll->poll view)!copy_poll;
                !detail_observations_changed();
@@ -3575,6 +3593,9 @@ let start
         | Coordination_refresh_observation _ -> "coordinationRefreshObservation"
         | Coordination_release_observation _ -> "coordinationReleaseObservation"
         | Coordination_import _ -> "coordinationImport"
+        | Coordination_recover_import_inputs _ -> "coordinationImportRecovery"
+        | Coordination_confirm_import_input _ -> "coordinationImportSourceConfirm"
+        | Coordination_acknowledge_import_input _ -> "coordinationImportSourceAck"
         | Coordination_quiesce_writers _ -> "coordinationQuiesceWriters"
         | Coordination_prepare_host_change _ -> "coordinationPrepareHostChange"
         | Coordination_apply_host_change _ -> "coordinationApplyHostChange"
@@ -4645,6 +4666,46 @@ let start
       in
       { state with mutation_recovery }, run_mutation_recovery request)
   in
+  let rec run_import_recovery = function
+    |None->Effect.ignore
+    |Some command->Effect.of_thunk(fun()->
+      let session=match command with Import_recovery.Read request->request.session|Acknowledge ack->ack.session in
+      let originating_owner=current_owner() in
+      let finish event ()=run_owned originating_owner(fun()->
+        set_state_and_effect(fun state->let import_recovery,next=Import_recovery.step state.import_recovery event in
+          {state with import_recovery},run_import_recovery next)) in
+      let outcome:type a. a Wc.reply -> (a,string)result=function
+        |Wc.Answered(Ok value)->Ok value
+        |Answered(Error(Protocol_mismatch _))->Error "An attachment record could not be verified. Its original input was kept."
+        |_->Error "Attachment records could not be checked. Reload to check the original records." in
+      let fail message=Effect.run(finish(match command with
+        |Import_recovery.Read request->Completed(request,Error message)
+        |Acknowledge ack->Acknowledged(ack,Error message))) in
+      match originating_owner,!coordination_host with
+      |Some owner,Some(_,host) when Wc.matches_scope session owner && Coordination_host.validate_session ~owner host session=Ok()->
+        let current()=match originating_owner,!coordination_host with
+          |Some owner,Some(_,active)when active==host->runtime_owner_is_live !state_ref owner
+            && Coordination_host.validate_session ~owner host session=Ok()
+          |_->false in
+        (match command with
+         |Import_recovery.Read request->
+           (match Coordination_host.request host session(Import_recovery.operation request)with
+            |Error _->fail "Attachment records are unavailable. Reopen Diagnostics and reload."
+            |Ok ticket->Coordination_host.watch host ticket ~f:(fun reply->
+              let result=if current()then outcome reply else Error "The graph changed. Reopen Diagnostics." in
+              Effect.run(finish(Completed(request,result)))))
+         |Acknowledge ack->
+           (match Coordination_host.request host session(Wc.Acknowledge_import_source ack.proof)with
+            |Error _->fail "The original source proof is no longer current. Reload the records."
+            |Ok ticket->Coordination_host.watch host ticket ~f:(fun reply->
+              let result=if current()then outcome reply else Error "The graph changed. Reload before reviewing its records." in
+              Effect.run(finish(Acknowledged(ack,result))))))
+      |_->fail "Open a graph and reload its attachment inputs.")
+  in
+  let update_import_recovery event=set_state_and_effect(fun state->
+    let import_recovery,command=Import_recovery.step state.import_recovery event in
+    {state with import_recovery},run_import_recovery command)
+  in
   let retry_media_change_application () =
     let generation= !state_ref.next_request_generation in
     Effect.bind(Effect.of_thunk(fun()->match !coordination_host with
@@ -5324,9 +5385,6 @@ let start
            |Error _->Error "Import is temporarily unavailable. Retry the same attachment when the graph is ready."
            |Ok ticket->
              Coordination_host.watch host ticket ~f:(fun reply->
-               Option.iter(fun proof->Rrbvec.iter(fun previous->Coordination_host.post previous
-                 (Coordination.Import_source_reconciled proof))(all_coordination_hosts()))
-                 (Coordination.import_source_proof(Coordination_host.view host)intent);
                let result=match reply with
                  |Wc.Answered(Ok(Wc.Imported imported))->Ok imported
                  |Answered(Error(Wc.Service_failed message|Invalid_input message))->Error message
@@ -5349,7 +5407,7 @@ let start
     Journal_media_runtime.pump (!media_runtime_cell);
     match event with
     | Worker.Push {payload=Graph_service.Coordination_updates _ | Coordination_observations _;_}
-    | Worker.Response {outcome=Completed(Graph_service.Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _ | Coordination_imported _ | Coordination_writers_quiesced _ | Coordination_host_prepared _ | Coordination_host_applied _ | Coordination_host_confirmed _);_}->Effect.ignore
+    | Worker.Response {outcome=Completed(Graph_service.Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _ | Coordination_imported _ | Coordination_writers_quiesced _ | Coordination_host_prepared _ | Coordination_host_applied _ | Coordination_host_confirmed _ | Coordination_import_inputs_recovered _ | Coordination_import_input_confirmed _ | Coordination_import_input_acknowledged _);_}->Effect.ignore
     | Worker.Push {payload=Graph_service.Graph_pushes _ | Graph_states _ | Session_states _;_} -> Effect.ignore
     | Worker.Response { request_id; outcome; _ }
       when Hashtbl.mem local_copy_requests request_id ->
@@ -6493,6 +6551,7 @@ let start
             modal = No_modal
           ; admission_refresh = Admission_refresh.close state.admission_refresh
           ; mutation_recovery = fst (Mutation_recovery.step state.mutation_recovery Close)
+        ; import_recovery = fst(Import_recovery.step state.import_recovery Close)
           }
         | No_modal -> state
         | Capture_sheet -> step_root state Capture_closed
@@ -6809,9 +6868,10 @@ let start
                 if Wc.matches_scope session owner then Some session else None))
           | _ -> None in
         let mutation_recovery, request = Mutation_recovery.step state.mutation_recovery (Open session) in
-        ( { state with modal = Diagnostics; admission_refresh; mutation_recovery }
+        let import_recovery,source_request=Import_recovery.step state.import_recovery(Open session) in
+        ( { state with modal = Diagnostics; admission_refresh; mutation_recovery;import_recovery }
         , Effect.many [run_admission_directive set_state_and_effect directive;
-            run_mutation_recovery request] ))
+            run_mutation_recovery request;run_import_recovery source_request] ))
     | Reload_pending_changes when snapshot.modal = Diagnostics ->
       update_mutation_recovery Reload
     | Retry_pending_changes when snapshot.modal = Diagnostics ->
@@ -6819,12 +6879,18 @@ let start
     | Next_pending_changes when snapshot.modal = Diagnostics ->
       update_mutation_recovery Next
     | Reload_pending_changes | Retry_pending_changes | Next_pending_changes -> Effect.ignore
+    | Reload_import_inputs when snapshot.modal=Diagnostics->update_import_recovery Reload
+    | Retry_import_inputs when snapshot.modal=Diagnostics->update_import_recovery Retry
+    | Next_import_inputs when snapshot.modal=Diagnostics->update_import_recovery Next
+    | Mark_import_source_reviewed proof when snapshot.modal=Diagnostics->update_import_recovery(Mark_reviewed proof)
+    | Reload_import_inputs|Retry_import_inputs|Next_import_inputs|Mark_import_source_reviewed _->Effect.ignore
     | Close_diagnostics ->
       update (fun state ->
         { state with
           modal = No_modal
         ; admission_refresh = Admission_refresh.close state.admission_refresh
         ; mutation_recovery = fst (Mutation_recovery.step state.mutation_recovery Close)
+        ; import_recovery = fst(Import_recovery.step state.import_recovery Close)
         })
     | Open_error_info ->
       update (fun state ->
@@ -7994,6 +8060,7 @@ let start
         Some
           (diagnostics_page
              ~recovery:state.mutation_recovery
+             ~imports:state.import_recovery
              ~errors:state.worker_errors
              ~snapshot:state.manager
              ~graph:state.graph_state

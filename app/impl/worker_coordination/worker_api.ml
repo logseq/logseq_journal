@@ -366,6 +366,11 @@ type import_source_proof={source_operation:Uuid.t;source_fingerprint:string}
 type imported = {import_owner:session;import_receipt:Logseq_db_worker.import_receipt;import_preview:file_lease option;source_proof:import_source_proof}
 type asset_import_intent = Import_wire.t
 
+type prepared_import_source={prepared_owner:session;prepared_intent:asset_import_intent;original_prepared:string;adoption:import_source_proof}
+type recovered_import_input={intent:asset_import_intent;prepared:prepared_import_source option;acknowledged:bool}
+type import_input_recovery_cursor={input_owner:session;input_after:int64;input_maximum_items:int;input_maximum_bytes:int}
+type import_input_recovery={inputs:recovered_import_input Rrbvec.t;continuation:import_input_recovery_cursor option}
+
 type import_progress =
   | Import_rejected of error
   | Import_unknown
@@ -391,6 +396,10 @@ type _ request =
   | Acknowledge_intent : mutation_intent -> unit request
   | Acknowledge_changes : change_batch -> change_ack request
   | Import : asset_import_intent -> import_progress request
+  | Recover_import_inputs : {after:import_input_recovery_cursor option;maximum_items:int;maximum_bytes:int} -> import_input_recovery request
+  | Confirm_import_source : asset_import_intent -> recovered_import_input option request
+  | Acknowledge_import_source : prepared_import_source -> unit request
+
   | Replace_asset_demand :
       asset_consumer * asset_priority * Logseq_db_types.Asset_descriptor.t list
       -> unit request
@@ -820,7 +829,7 @@ let decode_mutation_progress session ~request_id ~intent outcome =
 
 module Mutation_ids=Set.Make(Uuid)
 
-let decode_recovery session ~request_id ~after ~maximum_items ~maximum_bytes (page:Wire.recovery_page) =
+let decode_recovery session ~request_id ~after ~maximum_items ~maximum_bytes (page:Wire.recovery_page) : (mutation_recovery,error)result =
   Result.bind(validate_recovery session ~after ~maximum_items ~maximum_bytes)(fun()->
     if Rrbvec.length page.items>maximum_items || Wire.recovery_page_bytes page>maximum_bytes
     then Error Response_budget_exceeded
@@ -933,6 +942,7 @@ let import_namespace (session:session)=Wire.namespace_for_owner
 let import_wire_error=function Import_wire.Invalid message->Invalid_input message|Wrong_namespace->Revoked_session
 let asset_import_intent session source=Import_wire.create ~namespace:(import_namespace session) source |> Result.map_error import_wire_error
 let asset_import_intent_id=Import_wire.operation
+let asset_import_title intent=(Import_wire.source intent).title
 let encode_asset_import_intent intent=Bytes.of_string(Import_wire.encode intent)
 let import_source_proof_matches intent proof=proof.source_operation=Import_wire.operation intent
   && proof.source_fingerprint=(Digestif.SHA256.digest_string(Import_wire.encode intent) |> Digestif.SHA256.to_hex)
@@ -1146,12 +1156,66 @@ let supports_observation session query =
   | Error _ -> false
 ;;
 
+let equal_prepared_import_source a b=equal_session a.prepared_owner b.prepared_owner
+  && Import_wire.encode a.prepared_intent=Import_wire.encode b.prepared_intent && a.original_prepared=b.original_prepared
+let prepared_import_intent proof=proof.prepared_intent
+let prepared_import_source_session proof=proof.prepared_owner
+let prepared_import_adoption proof=proof.adoption
+let import_input_wire_owner (session:session) : Logseq_db_types.Asset_import.Recovery.owner =
+  {namespace=import_namespace session;origin=session.binding.origin;account=session.binding.user;graph=session.graph}
+;;
+let validate_import_recovery session ~after ~maximum_items ~maximum_bytes =
+  let module R=Logseq_db_types.Asset_import.Recovery in
+  if maximum_items<1 || maximum_items>R.maximum_items || maximum_bytes<R.maximum_page_overhead || maximum_bytes>R.maximum_bytes
+  then Error(Invalid_input "Invalid complete import input recovery budget") else
+  match after with
+  |None->Ok()
+  |Some cursor when not(equal_session session cursor.input_owner)->Error Revoked_session
+  |Some cursor when cursor.input_maximum_items<>maximum_items || cursor.input_maximum_bytes<>maximum_bytes->
+    Error(Stale_read "Import input cursor budgets changed")
+  |Some _->Ok()
+;;
+let decode_import_source session (row:Logseq_db_types.Asset_import.Recovery.item) =
+  Result.map(fun(value:Logseq_db_types.Asset_import.Recovery.checked)->
+    let prepared=Option.map(fun original_prepared->{prepared_owner=session;prepared_intent=value.input;original_prepared;
+      adoption={source_operation=Import_wire.operation value.input;
+        source_fingerprint=(Digestif.SHA256.digest_string(Import_wire.encode value.input) |> Digestif.SHA256.to_hex)}})value.evidence in
+    ({intent=value.input;prepared;acknowledged=value.acknowledged}:recovered_import_input))
+    (Logseq_db_types.Asset_import.Recovery.decode ~owner:(import_input_wire_owner session)row
+     |> Result.map_error(fun message->Protocol_mismatch message))
+;;
+let decode_import_recovery session ~after ~maximum_items ~maximum_bytes (page:Logseq_db_types.Asset_import.Recovery.page) : (import_input_recovery,error)result =
+  let module R=Logseq_db_types.Asset_import.Recovery in
+  Result.bind(validate_import_recovery session ~after ~maximum_items ~maximum_bytes)(fun()->
+    if List.compare_length_with page.items maximum_items>0 || R.page_encoded_bytes page>maximum_bytes
+    then Error(Protocol_mismatch "Import input recovery exceeded its declared bounds") else
+    let previous=Option.fold ~none:0L ~some:(fun cursor->cursor.input_after)after in
+    let module Operations=Set.Make(Uuid) in
+    let rec decode previous seen reversed=function
+      |[]->
+        if page.next<>None && (reversed=[] || page.next<>Some previous)
+        then Error(Protocol_mismatch "Import input recovery continuation did not advance from its last item")
+        else Ok{inputs=Rrbvec.of_list(List.rev reversed);continuation=Option.map(fun input_after->
+          {input_owner=session;input_after;input_maximum_items=maximum_items;input_maximum_bytes=maximum_bytes})page.next}
+      |(row:R.item)::rest->
+        if row.R.sequence<=previous || row.acknowledged then Error(Protocol_mismatch "Import recovery order or pending membership is invalid") else
+        Result.bind(decode_import_source session row)(fun value->
+          let id=Import_wire.operation value.intent in
+          if Operations.mem id seen then Error(Protocol_mismatch "Duplicate recovered complete import operation")
+          else decode row.sequence(Operations.add id seen)(value::reversed)rest) in
+    decode previous Operations.empty [] page.items)
+;;
+
 let rec validate_request : type a. session -> a request -> (unit, error) result =
   fun session -> function
   | Append intent ->
     if not(capabilities session).atomic_append then unavailable "Atomic Append"
     else Result.map(fun _->())(restore_append_intent session(encode_append_intent intent))
-  | Import intent->Result.map(fun _->())(restore_asset_import_intent session(encode_asset_import_intent intent))
+  | Import intent|Confirm_import_source intent->Result.map(fun _->())(restore_asset_import_intent session(encode_asset_import_intent intent))
+  | Recover_import_inputs{after;maximum_items;maximum_bytes}->validate_import_recovery session ~after ~maximum_items ~maximum_bytes
+  | Acknowledge_import_source proof->if equal_session session proof.prepared_owner
+      then Result.map(fun _->())(restore_asset_import_intent session(encode_asset_import_intent proof.prepared_intent))
+      else Error Revoked_session
   | Acquire_imported_file imported->if equal_session session imported.import_owner then Ok() else Error Revoked_session
   | Release_file lease->if equal_session session lease.lease_owner then Ok() else Error Revoked_session
   | Mutate intent -> validate_intent session intent
@@ -2110,6 +2174,17 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
             | Retry_asset asset->Ok(Service.Asset_command_at(session.scope,Retry_asset asset))
             | Retry_upload upload->Result.map(fun()->Service.Asset_command_at(session.scope,Retry_upload upload.operation))
                 (validate_request session operation)
+            | Recover_import_inputs{after;maximum_items;maximum_bytes}->
+              Result.map(fun()->Service.Coordination_recover_import_inputs
+                {registration=binding.serial;owner=session.asset_scope;request_id;
+                 after=Option.map(fun cursor->cursor.input_after)after;maximum_items;maximum_bytes})
+                (validate_import_recovery session ~after ~maximum_items ~maximum_bytes)
+            | Confirm_import_source intent->
+              Result.map(fun()->Service.Coordination_confirm_import_input{registration=binding.serial;owner=session.asset_scope;
+                request_id;input=Import_wire.encode intent})(validate_request session operation)
+            | Acknowledge_import_source proof->
+              Result.map(fun()->Service.Coordination_acknowledge_import_input{registration=binding.serial;owner=session.asset_scope;
+                request_id;input=Import_wire.encode proof.prepared_intent;prepared=proof.original_prepared})(validate_request session operation)
             | Recover_mutations {after;maximum_items;maximum_bytes}->
               Result.map(fun()->Service.Coordination_recover_mutations
                 {registration=binding.serial;owner=session.scope;request_id;
@@ -2132,6 +2207,25 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
           if not(equal_binding session.binding binding) || not(equal_session session lease.lease_owner) then Error Revoked_session else
           (match response with Service.Client_command_completed->Ok(Answered(Ok()))
            | _->Error(Protocol_mismatch "File release did not acknowledge actual checked release"))
+        | Recover_import_inputs{after;maximum_items;maximum_bytes}->
+          if not(equal_binding session.binding binding) then Error Revoked_session else
+          (match response with Service.Coordination_import_inputs_recovered{registration;owner;request_id=actual;page}
+             when registration=binding.serial && actual=request_id && matches_asset_scope session owner->
+             decode_import_recovery session ~after ~maximum_items ~maximum_bytes page |> Result.map(fun value->Answered(Ok value))
+           |_->Error(Protocol_mismatch "Import input recovery owner or request changed"))
+        | Confirm_import_source intent->
+          if not(equal_binding session.binding binding) || Result.is_error(validate_request session operation) then Error Revoked_session else
+          (match response with Service.Coordination_import_input_confirmed{registration;owner;request_id=actual;input}
+             when registration=binding.serial && actual=request_id && matches_asset_scope session owner->
+             (match input with None->Ok(Answered(Ok None))|Some row when row.Logseq_db_types.Asset_import.Recovery.input=Import_wire.encode intent->
+               decode_import_source session row |> Result.map(fun value->Answered(Ok(Some value)))
+              |Some _->Error(Protocol_mismatch "Source confirmation replaced the complete original input"))
+           |_->Error(Protocol_mismatch "Import source confirmation owner or request changed"))
+        | Acknowledge_import_source _->
+          if not(equal_binding session.binding binding) || Result.is_error(validate_request session operation) then Error Revoked_session else
+          (match response with Service.Coordination_import_input_acknowledged{registration;owner;request_id=actual}
+             when registration=binding.serial && actual=request_id && matches_asset_scope session owner->Ok(Answered(Ok()))
+           |_->Error(Protocol_mismatch "Import source ACK did not match its original owner and request"))
         | Import intent->
           if not(equal_binding session.binding binding)
             || Result.is_error(restore_asset_import_intent session(encode_asset_import_intent intent))

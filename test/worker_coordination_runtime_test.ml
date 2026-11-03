@@ -1622,6 +1622,14 @@ let test_client_to_typed_read () =
       apply(C.step !state(C.Forget imported_ticket));apply(C.step !state(C.Forget acquire));
       apply(C.step !state(C.Forget release));apply(C.step !state(C.Forget release_preview));
       W.encode_asset_import_intent intent,(W.import_data imported).asset) in
+    let source_page,source_reply=request(W.Recover_import_inputs{after=None;maximum_items=2;maximum_bytes=65536}) in
+    let source_rows=match source_reply with W.Answered(Ok page)->page.inputs|_->failwith "actual Service source recovery failed" in
+    require(Rrbvec.length source_rows=1)"actual source recovery lost its original input";
+    let original_source=Rrbvec.nth source_rows 0 in
+    require(W.encode_asset_import_intent original_source.intent=import_bytes && original_source.prepared<>None && not original_source.acknowledged)
+      "actual source recovery changed original input or Prepared membership";
+    let old_source_proof=Option.get original_source.prepared in
+    apply(C.step !state(C.Forget source_page));
     apply (C.step !state C.Retry_bootstrap);
     require
       (Result.is_error (C.request !state session (W.Query (budget, W.Graph_info))))
@@ -1636,6 +1644,28 @@ let test_client_to_typed_read () =
       "rebind lost old response ownership";
     let replacement = Option.get (current_session ()) in
     let restored_import=W.restore_asset_import_intent replacement import_bytes |> Result.get_ok in
+    require(Result.is_error(C.request !state replacement(W.Acknowledge_import_source old_source_proof)))
+      "old source proof authorized ACK across binding replacement";
+    let source_check,source_reply=request_in replacement(W.Confirm_import_source restored_import) in
+    let original_source=match source_reply with W.Answered(Ok(Some item))->item|_->failwith "cold read-only original source confirmation failed" in
+    require(W.encode_asset_import_intent original_source.intent=import_bytes && not original_source.acknowledged)
+      "cold source confirmation replaced input or fabricated ACK";
+    let current_proof=Option.get original_source.prepared in
+    require(W.import_source_proof_matches restored_import(W.prepared_import_adoption current_proof))
+      "cold source proof lost the exact original input adoption identity";
+    apply(C.step !state(C.Forget source_check));
+    let source_ack,source_reply=request_in replacement(W.Acknowledge_import_source current_proof) in
+    require(source_reply=W.Answered(Ok()))"actual source proof ACK failed";
+    apply(C.step !state(C.Forget source_ack));
+    let pending_sources,source_reply=request_in replacement(W.Recover_import_inputs{after=None;maximum_items=2;maximum_bytes=65536}) in
+    require(match source_reply with W.Answered(Ok page)->Rrbvec.is_empty page.inputs && page.continuation=None|_->false)
+      "actual source ACK retained pending membership or fabricated More";
+    apply(C.step !state(C.Forget pending_sources));
+    let original_check,source_reply=request_in replacement(W.Confirm_import_source restored_import) in
+    require(match source_reply with W.Answered(Ok(Some item))->item.acknowledged && item.prepared<>None
+      && W.encode_asset_import_intent item.intent=import_bytes|_->false)
+      "actual ACK erased the original Prepared proof or complete input";
+    apply(C.step !state(C.Forget original_check));
     let restored_ticket,restored_reply=request_in replacement(W.Import restored_import) in
     let restored_imported=match restored_reply with W.Answered(Ok(W.Imported imported))->imported
       |_->failwith "new binding could not reconcile the original staged import after picker removal" in

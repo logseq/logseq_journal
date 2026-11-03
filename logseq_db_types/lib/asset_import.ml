@@ -55,3 +55,38 @@ module Pure_intent = struct
   let source (intent:t)=intent.source
   let operation (intent:t)=intent.source.operation
 end
+
+module Recovery = struct
+  type item={sequence:int64;input:string;prepared:string option;acknowledged:bool}
+  type page={items:item list;next:int64 option}
+  let maximum_items=200
+  let maximum_bytes=4194304
+  let item_json (item:item)=`Assoc["sequence",`String(Int64.to_string item.sequence);"input",`String item.input;
+    "prepared",(match item.prepared with None->`Null|Some value->`String value);"acknowledged",`Bool item.acknowledged]
+  let item_encoded_bytes item=Yojson.Safe.to_string(item_json item) |> String.length
+  let page_encoded_bytes (page:page)=Yojson.Safe.to_string(`Assoc["items",`List(List.map item_json page.items);
+    "next",(match page.next with None->`Null|Some value->`String(Int64.to_string value))]) |> String.length
+  let maximum_page_overhead=page_encoded_bytes{items=[];next=Some Int64.max_int}
+  type owner={namespace:string;origin:string;account:string;graph:Graph_types.Uuid.t}
+  type checked={sequence:int64;input:Pure_intent.t;prepared:Asset_upload_intent.t option;
+    evidence:string option;acknowledged:bool}
+  let decode ~(owner:owner) (item:item)=
+    let (let*)=Result.bind in
+    let* input=Pure_intent.restore ~namespace:owner.namespace item.input
+      |> Result.map_error(fun _->"Stored complete import input is invalid") in
+    if item.sequence<=0L then Error "Stored import input sequence is invalid" else
+    let source=Pure_intent.source input in
+    let* prepared=match item.prepared with None->Ok None|Some evidence->
+      let* proof=Asset_upload_intent.Pure_codec.decode evidence in
+      if proof.phase<>Asset_upload_intent.Prepared || proof.revision<>0
+        || proof.origin<>owner.origin || proof.account<>owner.account || proof.graph<>owner.graph
+        || proof.operation_id<>source.operation || proof.asset<>source.asset || proof.target<>source.target
+        || proof.replace_reference<>source.replace_reference || proof.local_mutation<>source.local_mutation
+        || proof.metadata_mutation<>source.metadata_mutation || proof.title<>source.title
+        || proof.version.file_type<>source.file_type
+      then Error "Stored original Prepared proof does not match its complete input and logical owner"
+      else Ok(Some proof) in
+    if item.acknowledged && prepared=None then Error "Unknown import input was acknowledged without proof"
+    else Ok{sequence=item.sequence;input;prepared;evidence=item.prepared;acknowledged=item.acknowledged}
+
+end

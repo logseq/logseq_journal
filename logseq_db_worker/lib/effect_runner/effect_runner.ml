@@ -2787,6 +2787,7 @@ let recover_local_retirements ?on_diagnostic t (scope : Sync.graph_scope) =
       let expected = json |> member "expected" |> to_string |> Overlay.Mirror_generation.of_string |> Result.get_ok in
       let captured = json |> member "uploads" |> Logseq_db_storage.Asset_upload_store.captured_graph_of_yojson |> Result.get_ok in
       if not (Logseq_db_storage.Asset_upload_store.captured_graph_matches captured
+        ~namespace:(Logseq_db_worker_contract.Mutation_pure_wire.namespace_for_owner ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id)
         ~origin:(Uri.to_string scope.account.managed_sync_origin) ~account:scope.account.user_id ~graph:scope.graph_id)
       then failwith "Retirement journal account mismatch";
       let* prepared, generation = Database.prepare_mirror_deletion
@@ -2993,6 +2994,7 @@ let handle_sync_worker_effect t = function
         with_staging_lock t (fun () ->
           let* () = if current () then Ok () else Error "The graph account is no longer current." in
           let* captured = with_upload_store t (fun db -> Logseq_db_storage.Asset_upload_store.capture_graph db
+            ~namespace:(Logseq_db_worker_contract.Mutation_pure_wire.namespace_for_owner ~origin:request.account.managed_sync_origin ~user:request.account.user_id ~graph:request.graph_id)
             ~origin:(Uri.to_string request.account.managed_sync_origin) ~account:request.account.user_id ~graph:request.graph_id)
             |> Result.map_error (fun source ->
               report (failure_detail ~source ~operation:"deleteMirror" ~reason:"persistenceFailed" ()); source) in
@@ -4048,18 +4050,28 @@ let prepare_import_unlocked
   in
   let* version = source_error "invalidRequest" (A.version ~checksum:(String.make 64 '0') ~file_type:request.file_type) in
   let* _ = source_error "invalidRequest" (prepare version 0L "validation.bin") in
+  let namespace=Logseq_db_worker_contract.Mutation_pure_wire.namespace_for_owner
+    ~origin:context.scope.account.managed_sync_origin ~user:context.scope.account.user_id ~graph:context.scope.graph_id in
+  let input_owner:Logseq_db_storage.Asset_upload_store.Inputs.owner={namespace;
+    origin=Uri.to_string context.scope.account.managed_sync_origin;account=context.scope.account.user_id;graph=context.scope.graph_id} in
+  let* complete_input=Logseq_db_types.Asset_import.Pure_intent.create ~namespace request
+    |> Result.map_error(fun _->"Invalid complete import input") |> source_error "invalidRequest" in
   if (not (current ())) || t.stopped
   then Error "The selected graph is no longer active"
   else if not(Core.Orphan_cleanup.acquisition_open t.orphan_cleanup)
   then Error "Attachment cleanup is pending. Retry after cleanup succeeds."
   else
+    let* reserved=source_error "persistenceFailed" (Eio.Cancel.protect(fun()->
+      with_upload_store t(fun db->Logseq_db_storage.Asset_upload_store.Inputs.reserve db ~owner:input_owner ~input:complete_input))) in
     let* () = source_error "restoreFailed" (reconcile_staging t context.scope ~current) in
     let* existing =
       source_error "persistenceFailed" (with_upload_store t (fun db ->
         Logseq_db_storage.Asset_upload_store.read db ~operation:request.operation))
     in
-    match existing with
-    | Some intent
+    match existing,reserved.prepared with
+    | None,Some _->source_error "restoreFailed" (Error "The original input was Prepared but its local upload checkpoint is unavailable; it cannot be replayed")
+    | Some _,None->source_error "restoreFailed" (Error "The upload checkpoint has no atomic original input proof")
+    | Some intent,Some _
       when intent.origin = Uri.to_string context.scope.account.managed_sync_origin
            && intent.account = context.scope.account.user_id
            && intent.graph = context.scope.graph_id
@@ -4070,8 +4082,8 @@ let prepare_import_unlocked
            && intent.local_mutation = request.local_mutation
            && intent.replace_reference = request.replace_reference
            && intent.metadata_mutation = request.metadata_mutation -> Ok intent
-    | Some _ -> source_error "identityConflict" (Error "This import identity is already in use")
-    | None ->
+    | Some _,Some _ -> source_error "identityConflict" (Error "This import identity is already in use")
+    | None,None ->
       let detail = ref None in
       let* file, checksum, size =
         match
@@ -4103,7 +4115,7 @@ let prepare_import_unlocked
           let* () =
             source_error "persistenceFailed" (Eio.Cancel.protect (fun () ->
               with_upload_store t (fun db ->
-                Logseq_db_storage.Asset_upload_store.save db ~expected:None intent)))
+                Logseq_db_storage.Asset_upload_store.Inputs.commit_prepared db ~owner:input_owner ~input:complete_input intent |> Result.map(fun _->()))))
           in
           Ok intent)
       in
@@ -4172,4 +4184,71 @@ let retain_imported_file t ~(scope : Sync.graph_scope) ~operation =
        | Ok _ -> report_source_failure t scope "assetPreview" "invalidContent" "Unexpected asset completion"; None)
     | Ok _ -> None
     | Error source -> report_source_failure t scope "assetMetadata" "persistenceFailed" source; None)
+;;
+
+let import_input_owner (scope:Sync.graph_scope) : Logseq_db_storage.Asset_upload_store.Inputs.owner =
+  {namespace=Logseq_db_worker_contract.Mutation_pure_wire.namespace_for_owner
+     ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id;
+   origin=Uri.to_string scope.account.managed_sync_origin;account=scope.account.user_id;graph=scope.graph_id}
+;;
+
+let with_upload_store_readonly t ~absent action =
+  let path=Filename.concat t.dependencies.config.application_support_directory "asset-upload-intents.sqlite" in
+  try
+    let exists=try ignore(Unix.stat path);true with Unix.Unix_error(Unix.ENOENT,_,_)->false in
+    if not exists then Ok absent else
+    let db=Sqlite3.db_open ~mode:`READONLY path in
+    let result=try action db with exn->Error(Printexc.to_string exn) in
+    if Sqlite3.db_close db then result else Error "The source recovery SQLite handle could not close"
+  with exn->Error(Printexc.to_string exn)
+;;
+
+let import_input_wire (row:Logseq_db_storage.Asset_upload_store.Inputs.record) : Logseq_db_types.Asset_import.Recovery.item =
+  {sequence=row.sequence;input=Logseq_db_types.Asset_import.Pure_intent.encode row.input;
+    prepared=row.evidence;acknowledged=row.acknowledged}
+;;
+
+let recover_import_inputs t ~scope ~after ~maximum_items ~maximum_bytes ~current =
+  let module R=Logseq_db_types.Asset_import.Recovery in
+  if t.stopped || not(current()) then Error "Import source recovery authority retired" else
+  if maximum_items<1 || maximum_items>R.maximum_items || maximum_bytes<R.maximum_page_overhead
+     || maximum_bytes>R.maximum_bytes || Option.exists(fun after->after<0L)after
+  then Error "Invalid import source recovery bounds" else
+  let owner=import_input_owner scope in
+  let result=with_upload_store_readonly t ~absent:R.{items=[];next=None}(fun db->
+    Result.map(fun(page:Logseq_db_storage.Asset_upload_store.Inputs.page)->
+      R.{items=List.map import_input_wire page.items;next=page.next})
+      (Logseq_db_storage.Asset_upload_store.Inputs.pending db ~owner ~after ~maximum_items ~maximum_bytes)) in
+  if t.stopped || not(current()) then Error "Import source recovery authority retired" else
+  Result.bind result(fun page->if R.page_encoded_bytes page>maximum_bytes
+    then Error "Import source recovery exceeded its encoded byte budget" else Ok page)
+;;
+
+let decode_import_input ~scope input=
+  let owner=import_input_owner scope in
+  Result.map(fun input->owner,input)
+    (Logseq_db_types.Asset_import.Pure_intent.restore ~namespace:owner.namespace input
+      |> Result.map_error(fun _->"Invalid complete original import input or logical namespace"))
+;;
+
+let confirm_import_input t ~scope ~input ~current =
+  if t.stopped || not(current()) then Error "Import source confirmation authority retired" else
+  Result.bind(decode_import_input ~scope input)(fun(owner,intent)->
+    let result=with_upload_store_readonly t ~absent:None(fun db->
+      Result.bind(Logseq_db_storage.Asset_upload_store.Inputs.read db ~owner
+        ~operation:(Logseq_db_types.Asset_import.Pure_intent.operation intent))(function
+        |None->Ok None
+        |Some row when Logseq_db_types.Asset_import.Pure_intent.encode row.input=input->Ok(Some(import_input_wire row))
+        |Some _->Error "The stored import operation belongs to different complete input bytes")) in
+    if t.stopped || not(current()) then Error "Import source confirmation authority retired" else result)
+;;
+
+let acknowledge_import_input t ~scope ~input ~prepared ~current =
+  if t.stopped || not(current()) then Error "Import source acknowledgement authority retired" else
+  if String.length prepared=0 || String.length prepared>8192 then Error "Invalid original Prepared proof size" else
+  Result.bind(decode_import_input ~scope input)(fun(owner,intent)->
+    with_writer t scope(fun()->with_staging_lock t(fun()->
+      if t.stopped || not(current()) then Error "Import source acknowledgement authority retired" else
+      Eio.Cancel.protect(fun()->with_upload_store t(fun db->
+        Logseq_db_storage.Asset_upload_store.Inputs.acknowledge db ~owner ~input:intent ~evidence:prepared)))))
 ;;

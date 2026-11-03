@@ -5254,8 +5254,100 @@ let test_readonly_recovery_traces () =
   done
 ;;
 
+let test_import_recovery_ui_pure_owner_and_traces () =
+  let module R=Journal_diagnostics_view.Pure_import_recovery in
+  let module W=Journal_worker_coordination.Worker_api in
+  let module S=Logseq_db_worker_lui.Logseq_db_worker_lui_service in
+  let module A=Logseq_db_types.Asset_import in
+  let module U=Logseq_db_types.Asset_upload_intent in
+  let first=Coordination_test_fixture.fixture 5620L and second=Coordination_test_fixture.fixture 5621L in
+  let _,_,_,session=first and _,_,_,foreign=second in
+  let page (request:R.request) more prepared =
+    let issuer,raw,_,_=if W.equal_session request.session session then first else second in
+    let module I=(val issuer:W.ISSUER) in
+    let scope,_=List.hd raw.baseline.state.residents in
+    let request_id=W.Uuid.of_string "98000000-0000-4000-8000-000000005620" |> Result.get_ok in
+    let operation=R.operation request in
+    let after=match I.request request.session ~request_id:(W.request_id request_id)operation |> Result.get_ok with
+      |S.Coordination_recover_import_inputs{after;_}->Option.value after ~default:0L|_->assert false in
+    let sequence=Int64.succ after in
+    let uuid n=W.Uuid.of_string(Printf.sprintf "98000000-0000-4000-8000-%012Ld" (Int64.add (Int64.mul sequence 10L)(Int64.of_int n))) |> Result.get_ok in
+    let source:A.t={operation=uuid 0;asset=uuid 1;target=uuid 2;local_mutation=uuid 3;metadata_mutation=uuid 4;
+      replace_reference=None;source_file="/isolated-picker/source.bin";title="Recorded source";file_type="bin"} in
+    let intent=W.asset_import_intent request.session source |> Result.get_ok in
+    let proof=if not prepared then None else Some(U.prepare ~operation_id:source.operation ~origin:(Uri.to_string scope.account.managed_sync_origin)
+      ~account:scope.account.user_id ~graph:scope.graph_id ~asset:source.asset
+      ~version:(Logseq_db_types.Asset_descriptor.version ~checksum:(String.make 64 'a') ~file_type:"bin" |> Result.get_ok)
+      ~title:source.title ~size:4L ~staged_file:"isolated-input.bin" ~replace_reference:None ~target:source.target
+      ~local_mutation:source.local_mutation ~metadata_mutation:source.metadata_mutation |> Result.get_ok |> U.Pure_codec.encode) in
+    let row:A.Recovery.item={sequence;input=Bytes.to_string(W.encode_asset_import_intent intent);prepared=proof;acknowledged=false} in
+    match I.reply request.session ~request_id:(W.request_id request_id)operation
+      (S.Coordination_import_inputs_recovered{registration=raw.registration;owner=scope;request_id;
+        page={items=[row];next=(if more then Some sequence else None)}})with
+    |Ok(W.Answered(Ok page))->page|_->fail "source recovery UI fixture failed its public codec" in
+  let opening,command=R.step R.closed(Open(Some session)) in
+  let read=match command with Some(R.Read request)->request|_->fail "source UI did not request exactly one readonly page" in
+  let loaded,command=R.step opening(Completed(read,Ok(page read true true))) in
+  require(command=None && R.can_next loaded)"partial source page lost its continuation";
+  let proof=Option.get(Rrbvec.nth(R.items loaded)0).W.prepared in
+  let checking,command=R.step loaded(Mark_reviewed proof) in
+  let ack=match command with Some(R.Acknowledge ack)->ack|_->fail "reviewed original Prepared proof did not plan ACK" in
+  let same,command=R.step checking(Mark_reviewed proof) in
+  require(same==checking && command=None)"busy source UI planned duplicate ACK";
+  let resumed,command=R.step checking(Acknowledged(ack,Ok())) in
+  require(R.loading resumed && (match command with Some(R.Read _)->true|_->false))"real ACK did not refresh pending membership";
+  let unknown,_=R.step opening(Completed(read,Ok(page read false false))) in
+  let same,command=R.step unknown(Mark_reviewed proof) in
+  require(same==unknown && command=None)"unknown or different original source received an ACK";
+  let closed,_=R.step checking Close in
+  let reopened,_=R.step closed(Open(Some foreign)) in
+  let same,command=R.step reopened(Acknowledged(ack,Ok())) in
+  require(same==reopened && command=None)"old ACK reopened or refreshed a foreign source session";
+  let run actions=
+    let state=ref R.closed and pending=ref None and history=ref [] in
+    List.iter(fun action->
+      let before= !state in
+      let snapshot=R.items before,R.loading before,R.error before,R.page_number before in
+      let event=match action mod 11 with
+        |0->R.Open(Some session)|1->Open(Some foreign)|2->Close|3->Reload|4->Retry|5->Next
+        |6|7|8->(match !pending with
+          |Some(R.Read request)->
+            R.Completed(request,if action mod 11=6 then Error "Synthetic readonly error" else Ok(page request (action mod 2=0)(action mod 3<>0)))
+          |Some(R.Acknowledge ack)->R.Acknowledged(ack,if action mod 11=6 then Error "Unknown ACK" else Ok())
+          |None->Next)
+        |9->(match Rrbvec.to_seq(R.items before) |> Seq.find_map(fun(item:W.recovered_import_input)->item.prepared)with
+          |Some proof->Mark_reviewed proof|None->Next)
+        |_->(match !history with R.Read request::_->Completed(request,Error "Late reply")
+          |R.Acknowledge ack::_->Acknowledged(ack,Ok())|_->Next) in
+      let next,command=R.step before event and again,again_command=R.step before event in
+      require(next=again && command=again_command)"source UI transition is nondeterministic";
+      (match event with R.Close|Open None->pending:=None|_->());
+      (match event,!pending with
+       |R.Completed(request,_),Some(R.Read expected)when request=expected->pending:=None
+       |R.Acknowledged(ack,_),Some(R.Acknowledge expected)when ack=expected->pending:=None
+       |_->());
+      Option.iter(fun command->
+        (match command with R.Read request->require(W.validate_request request.session(R.operation request)=Ok())"source UI emitted an invalid cursor"
+         |Acknowledge ack->require(W.validate_request ack.session(W.Acknowledge_import_source ack.proof)=Ok())"source UI emitted foreign ACK");
+        pending:=Some command;history:=command::!history)command;
+      require(R.loading next=(!pending<>None))"source UI has multiple or unowned operations";
+      if not(R.available next)then require(Rrbvec.is_empty(R.items next))"closed source UI retained old records";
+      child_equal snapshot(R.items before,R.loading before,R.error before,R.page_number before)"source UI mutated earlier state";
+      state:=next)actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions=let rec remove prefix=function []->actions
+    |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+    |head::rest->remove(head::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x534f5552;seed|] in
+    let actions=List.init 100(fun _->Random.State.int random 256) in
+    if fails actions then fail "source UI seed=%d minimized=[%s]" seed(String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+
 let tests =
-  [ "Child generated lifecycle traces",(fun ()->test_child_chain_generated_traces ())
+  [ "Source recovery pure owner and generated traces",test_import_recovery_ui_pure_owner_and_traces
+  ; "Child generated lifecycle traces",(fun ()->test_child_chain_generated_traces ())
   ; "Rejected child status rebind reaches canonical ACK",test_child_rejected_status_rebound_canonical
   ; "Child prefixes progress through actual SDK capacity",test_child_chain_sdk_capacity_progress
   ; "Known child non-insertion is terminal",test_child_known_rejection_is_terminal

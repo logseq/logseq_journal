@@ -31,6 +31,7 @@ val import_progress : view -> Worker.asset_import_intent -> Worker.import_progre
     original execution owner across binding retry, without replaying the operation. *)
 val import_sources_pending : view -> owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope option -> bool
 val import_source_pending : view -> operation:Worker.Uuid.t -> bool
+val pending_import_source_intents:view -> Worker.asset_import_intent Rrbvec.t
 val import_source_proof : view -> Worker.asset_import_intent -> Worker.import_source_proof option
 val handoff : view -> Worker.handoff_id -> Worker.handoff_state option
 val asset_notices : view -> Worker.asset_consumer -> Worker.asset_notice list

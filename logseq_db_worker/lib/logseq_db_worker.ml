@@ -808,3 +808,20 @@ let confirm_host_change t receipt = Eio.Cancel.protect(fun()->
   Option.iter(fun(_, (promise,_))->Eio.Promise.await promise)(Hashtbl.find_opt t.host_tasks id);
   await_host_command t(fun resolve->Host_confirm(receipt,resolve)))
 ;;
+
+let import_input_current t ~scope ~current ()=
+  not t.stopped && current() &&
+  match Pure_reducer.graph_state_for_scope !(t.state) scope with
+  |Some{phase=Graph_open;graph_id=Some id;generation;_}->id=scope.Sync.graph_id && generation=scope.graph_generation
+  |_->false
+;;
+let recover_import_inputs_for_scope t ~scope ~after ~maximum_items ~maximum_bytes ~current =
+  Effect_runner.recover_import_inputs t.runner ~scope ~after ~maximum_items ~maximum_bytes
+    ~current:(import_input_current t ~scope ~current)
+;;
+let confirm_import_input_for_scope t ~scope ~input ~current =
+  Effect_runner.confirm_import_input t.runner ~scope ~input ~current:(import_input_current t ~scope ~current)
+;;
+let acknowledge_import_input_for_scope t ~scope ~input ~prepared ~current =
+  Effect_runner.acknowledge_import_input t.runner ~scope ~input ~prepared ~current:(import_input_current t ~scope ~current)
+;;

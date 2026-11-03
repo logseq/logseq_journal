@@ -193,6 +193,125 @@ let test_asset_cleanup_round_properties () =
   done
 ;;
 
+let test_import_source_recovery_owner_cursor_and_ack () =
+  let issuer,raw,projection,session=fixture 9888L in
+  let module I=(val issuer:W.ISSUER) in
+  let module U=Logseq_db_types.Asset_upload_intent in
+  let module R=Logseq_db_types.Asset_import.Recovery in
+  let scope,_=List.hd raw.baseline.state.residents in
+  let source:Logseq_db_types.Asset_import.t={operation=uuid "96000000-0000-4000-8000-000000008881";
+    asset=uuid "96000000-0000-4000-8000-000000008882";target=uuid "96000000-0000-4000-8000-000000008883";
+    local_mutation=uuid "96000000-0000-4000-8000-000000008884";metadata_mutation=uuid "96000000-0000-4000-8000-000000008885";
+    replace_reference=None;source_file="/isolated-picker/persisted.png";title="Original staged input";file_type="png"} in
+  let intent=W.asset_import_intent session source |> Result.get_ok in
+  let prepared=U.prepare ~operation_id:source.operation ~origin:(Uri.to_string scope.account.managed_sync_origin)
+      ~account:scope.account.user_id ~graph:scope.graph_id ~asset:source.asset
+      ~version:(Logseq_db_types.Asset_descriptor.version ~checksum:(String.make 64 'a') ~file_type:"png" |> Result.get_ok)
+      ~title:source.title ~size:4L ~staged_file:"isolated-prepared.bin" ~replace_reference:None ~target:source.target
+      ~local_mutation:source.local_mutation ~metadata_mutation:source.metadata_mutation |> Result.get_ok in
+  let row:R.item={sequence=1L;input=Bytes.to_string(W.encode_asset_import_intent intent);
+    prepared=Some(U.Pure_codec.encode prepared);acknowledged=false} in
+  let input_id=uuid "96000000-0000-4000-8000-000000008886" in
+  let mailbox=ref 9888L in
+  let consume state ticket reply=mailbox:=Int64.succ !mailbox;
+    (C.step(C.step state(C.Admitted(ticket,Id.Worker.Request_id.of_int64 !mailbox))).next(C.Completed(ticket,reply))).next in
+  let raw_id:type a. a C.ticket -> a W.request -> W.Uuid.t =fun ticket operation->
+    match I.request session ~request_id:(C.ticket_id ticket)operation |> Result.get_ok with
+    |S.Coordination_recover_import_inputs{request_id;_}|Coordination_confirm_import_input{request_id;_}
+    |Coordination_acknowledge_import_input{request_id;_}->request_id
+    |_->assert false in
+  let imported,planned=C.request(ready I.binding projection)session(W.Import intent) |> Result.get_ok in
+  let unknown=consume planned.next imported(W.Interrupted W.Transport_lost) in
+  check(C.import_source_pending(C.view unknown) ~operation:source.operation)"lost import reply did not retain its source";
+  let operation=W.Recover_import_inputs{after=None;maximum_items=2;maximum_bytes=65536} in
+  let recovery,planned=C.request unknown session operation |> Result.get_ok in
+  let recovery_id=raw_id recovery operation in
+  let frame request_id page=S.Coordination_import_inputs_recovered{registration=raw.registration;owner=scope;request_id;page} in
+  let page:R.page={items=[row];next=Some 1L} in
+  let reply=I.reply session ~request_id:(C.ticket_id recovery)operation(frame recovery_id page) |> Result.get_ok in
+  let decoded=match reply with W.Answered(Ok value)->value|_->assert false in
+  check(Rrbvec.length decoded.inputs=1 && decoded.continuation<>None)"partial import input recovery lost its More cursor";
+  let budget_changed=W.Recover_import_inputs{after=decoded.continuation;maximum_items=1;maximum_bytes=65536} in
+  check(Result.is_error(W.validate_request session budget_changed))"source cursor silently changed its budgets";
+  let _,_,_,other=fixture 9889L in
+  check(Result.is_error(W.validate_request other(W.Recover_import_inputs{after=decoded.continuation;maximum_items=2;maximum_bytes=65536})))
+    "source cursor crossed its original binding/session";
+  check(Result.is_error(I.reply session ~request_id:(C.ticket_id recovery)operation(frame input_id page)))
+    "foreign source recovery request consumed this ticket";
+  check(Result.is_error(I.reply session ~request_id:(C.ticket_id recovery)operation(frame recovery_id{page with next=Some 0L})))
+    "source recovery accepted a nonadvancing cursor";
+  check(Result.is_error(I.reply session ~request_id:(C.ticket_id recovery)operation
+    (frame recovery_id{items=[row;{row with sequence=2L}];next=None})))
+    "source recovery accepted duplicate original operation identities";
+  let confirmation,confirming=C.request planned.next session(W.Confirm_import_source intent) |> Result.get_ok in
+  let response input=S.Coordination_import_input_confirmed{registration=raw.registration;owner=scope;
+    request_id=raw_id confirmation(W.Confirm_import_source intent);input} in
+  let unknown_reply=I.reply session ~request_id:(C.ticket_id confirmation)(W.Confirm_import_source intent)
+    (response(Some{row with prepared=None})) |> Result.get_ok in
+  let still_unknown=consume confirming.next confirmation unknown_reply in
+  check(C.import_source_pending(C.view still_unknown) ~operation:source.operation)"unprepared readback discarded the original source";
+  let confirmed_reply=I.reply session ~request_id:(C.ticket_id confirmation)(W.Confirm_import_source intent)(response(Some row)) |> Result.get_ok in
+  let confirmed=consume confirming.next confirmation confirmed_reply in
+  check(not(C.import_source_pending(C.view confirmed) ~operation:source.operation))"real original Prepared readback failed to settle source ownership";
+  let source_proof=match confirmed_reply with W.Answered(Ok(Some item))->Option.get item.prepared|_->assert false in
+  check(Result.is_error(W.validate_request other(W.Acknowledge_import_source source_proof)))"Prepared proof authorized ACK in a reopened session";
+  let acknowledgement,acknowledging=C.request confirmed session(W.Acknowledge_import_source source_proof) |> Result.get_ok in
+  let acknowledged=consume acknowledging.next acknowledgement(W.Answered(Ok())) in
+  let stale=consume acknowledged recovery reply in
+  check(match C.reply(C.view stale)recovery with Some(W.Answered(Error(W.Stale_read _)))->true|_->false)
+    "old source page revived pending membership after actual ACK";
+  check(C.import_source_proof(C.view acknowledged)intent<>None)"source ACK erased immutable source adoption proof";
+  let duplicate=(C.step acknowledged(C.Completed(acknowledgement,W.Answered(Ok())))).next in
+  check(C.equal_view(C.view acknowledged)(C.view duplicate))"duplicate ACK mutated the source lifecycle twice"
+;;
+
+let test_import_recovery_pure_original_proof_owner () =
+  let module P=Logseq_db_types.Asset_import.Pure_intent in
+  let module I=Logseq_db_types.Asset_upload_intent in
+  let module R=Logseq_db_types.Asset_import.Recovery in
+  let namespace=String.make 64 'a' in
+  let owner:R.owner={namespace;origin="https://synthetic.invalid";account="source-owner";graph=client} in
+  let source:Logseq_db_types.Asset_import.t={operation=uuid "96000000-0000-4000-8000-000000007101";
+    asset=uuid "96000000-0000-4000-8000-000000007102";target=uuid "96000000-0000-4000-8000-000000007103";
+    local_mutation=uuid "96000000-0000-4000-8000-000000007104";metadata_mutation=uuid "96000000-0000-4000-8000-000000007105";
+    replace_reference=None;source_file="/isolated-picker/original.png";title="Pure original source";file_type="png"} in
+  let input=P.create ~namespace source |> Result.get_ok in
+  let prepared ?(account=owner.account) ?(graph=owner.graph) ?(target=source.target) ()=
+    I.prepare ~operation_id:source.operation ~origin:owner.origin ~account ~graph ~asset:source.asset
+      ~version:(Logseq_db_types.Asset_descriptor.version ~checksum:(String.make 64 'a') ~file_type:source.file_type |> Result.get_ok)
+      ~title:source.title ~size:4L ~staged_file:"isolated-original.bin" ~replace_reference:None ~target
+      ~local_mutation:source.local_mutation ~metadata_mutation:source.metadata_mutation |> Result.get_ok in
+  let original=prepared() in
+  let row:R.item={sequence=1L;input=P.encode input;prepared=Some(I.Pure_codec.encode original);acknowledged=false} in
+  check(I.Pure_codec.decode(I.Pure_codec.encode original)=Ok original)"pure checkpoint codec lost original fields";
+  let check_case action=
+    let candidate_owner,candidate,valid=match action mod 11 with
+      |0|1->owner,row,true
+      |2->{owner with account="foreign"},row,false
+      |3->owner,{row with prepared=Some(I.Pure_codec.encode(prepared ~target:client()))},false
+      |4->owner,{row with prepared=Some(I.Pure_codec.encode(I.advance original Local_committed |> Result.get_ok))},false
+      |5->owner,{row with prepared=None;acknowledged=true},false
+      |6->owner,{row with sequence=0L},false
+      |7->owner,{row with prepared=Some "malformed original proof"},false
+      |8->{owner with namespace=String.make 64 'b'},row,false
+      |9->owner,{row with input=row.input^" "},false
+      |_->owner,{row with prepared=Some(I.Pure_codec.encode(prepared ~graph:source.asset()))},false in
+    let first=R.decode ~owner:candidate_owner candidate in
+    check(Result.is_ok first=valid)"pure recovered input accepted wrong owner, status, or original identity";
+    check(first=R.decode ~owner:candidate_owner candidate)"same proof validation input changed its result";
+    check(P.encode input=row.input)"proof validation mutated the original complete input" in
+  let fails actions=try List.iter check_case actions;false with _->true in
+  let rec shrink actions=let rec remove prefix=function []->actions
+    |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+    |head::rest->remove(head::prefix)rest in remove [] actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x534f5552;seed|] in
+    let actions=List.init 11 Fun.id @ List.init 60(fun _->Random.State.int random 512) in
+    if fails actions then failwith(Printf.sprintf "source proof seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions))))
+  done
+;;
+
 let test_import_intent_preserves_complete_source () =
   let _,_,_,session=fixture 885L in
   let source:Logseq_db_types.Asset_import.t=
@@ -4144,6 +4263,8 @@ let () =
   test_asset_demand_notice_has_one_registered_owner ();
   test_asset_cleanup_ack_and_shutdown_retry ();
   test_asset_cleanup_round_properties ();
+  test_import_source_recovery_owner_cursor_and_ack ();
+  test_import_recovery_pure_original_proof_owner ();
   test_import_intent_preserves_complete_source ();
   test_import_preview_late_result_is_cleanup_owned ();
   test_import_cancelled_preview_properties ();

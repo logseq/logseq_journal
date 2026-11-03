@@ -252,3 +252,19 @@ val prepare_host_copy:t -> registration:int64 -> handoff_id:Logseq_db_types.Grap
 val bind_host_copy:t -> handoff_id:Logseq_db_types.Graph_types.Uuid.t
   -> Logseq_sync_pure_reducer.Core.mirror_deletion -> (unit,Logseq_db_worker_pure_reducer.Core.effect_error)result
 val release_host_copy:t -> registration:int64 -> (unit,string)result
+
+(** Read-only complete source recovery: missing store is known empty; no schema,
+    staging, acquisition or execution is performed. Cursor pages obey both item
+    and canonical encoded byte budgets. Every proof rechecks its logical owner. *)
+val recover_import_inputs:t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> after:int64 option -> maximum_items:int -> maximum_bytes:int -> current:(unit -> bool)
+  -> (Logseq_db_types.Asset_import.Recovery.page,string)result
+
+val confirm_import_input:t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> input:string -> current:(unit -> bool)
+  -> (Logseq_db_types.Asset_import.Recovery.item option,string)result
+
+(** Writes only the pending-membership ACK for exact stored original Prepared
+    evidence, under the existing writer fence. Complete bytes and proof remain. *)
+val acknowledge_import_input:t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> input:string -> prepared:string -> current:(unit -> bool) -> (unit,string)result

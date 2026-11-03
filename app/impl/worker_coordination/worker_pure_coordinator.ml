@@ -20,6 +20,8 @@ type _ kind =
   | Observed : 'a kind -> 'a Worker.observed kind
   | Mutation : Worker.mutation_progress kind
   | Recovery : Worker.mutation_recovery kind
+  | Import_inputs : Worker.import_input_recovery kind
+  | Import_source : Worker.recovered_import_input option kind
   | Import : Worker.import_progress kind
   | Lease : Worker.file_lease option kind
   | Info : Worker.graph_info kind
@@ -68,6 +70,8 @@ let rec same_kind : type a b. a kind -> b kind -> (a, b) Worker.equality option 
   | Unit, Unit -> Some Refl
   | Mutation, Mutation -> Some Refl
   | Recovery, Recovery -> Some Refl
+  | Import_inputs, Import_inputs -> Some Refl
+  | Import_source, Import_source -> Some Refl
   | Import, Import -> Some Refl
   | Lease, Lease -> Some Refl
   | Info, Info -> Some Refl
@@ -107,6 +111,7 @@ type 'a ticket =
   ; query : 'a planned
   ; target : query_target
   ; planned_intent_epoch : int64
+  ; planned_source_epoch : int64
   ; acknowledgement : (Worker.presentation * Worker.receipt option) option
   }
 
@@ -201,6 +206,7 @@ type view =
   ; shutdown : shutdown_state
   ; intents : Worker.mutation_progress Intents.t
   ; intent_epoch : int64
+  ; import_input_epoch : int64
   ; applications : application_state Graphs.t
   ; change_notices : (Worker.session * Id.push_sequence) Graphs.t
   ; change_projections : string Graphs.t
@@ -273,7 +279,7 @@ let initial ~client_id =
       ; handoffs = [];restartable_handoffs=[]
       ; shutdown = Active
       ; intents = Intents.empty
-      ; intent_epoch = 0L
+      ; intent_epoch = 0L;import_input_epoch=0L
       ; applications = Graphs.empty
       ; change_notices = Graphs.empty
       ; change_projections = Graphs.empty
@@ -316,6 +322,15 @@ let shutdown_state v = v.shutdown
 let mutation_progress _ _ = None
 let intent_key intent = Bytes.to_string (Worker.encode_mutation_intent intent)
 let intent_progress view intent = Intents.find_opt (intent_key intent) view.intents
+let adopt_import_source facts proof =
+  let id=Worker.import_source_proof_id proof in
+  let imports=match Graphs.find_opt id facts.imports with
+    |Some saved when Worker.import_source_proof_matches saved.import_intent proof->Graphs.add id{saved with source_adopted=true}facts.imports
+    |_->facts.imports in
+  let import_history=if Graphs.mem id facts.import_history || Graphs.cardinal facts.import_history<8192
+    then Graphs.add id proof facts.import_history else facts.import_history in
+  {facts with imports;import_history}
+;;
 let import_progress facts intent =
   let key=Worker.asset_import_intent_id intent in
   let progress=Option.bind(Graphs.find_opt key facts.imports)(fun saved->
@@ -335,6 +350,10 @@ let import_source_unsettled facts id saved=not saved.source_adopted && match sav
   |None->Slots.exists(fun _ (Entry slot)->slot.result=None && match slot.ticket.query with
     |Operation(Worker.Import intent)->Worker.Uuid.equal(Worker.asset_import_intent_id intent)id
     |_->false)facts.entries
+let pending_import_source_intents facts=
+  Graphs.fold(fun id saved inputs->if import_source_unsettled facts id saved
+    then Rrbvec.push_back inputs saved.import_intent else inputs)facts.imports Rrbvec.empty
+;;
 let import_sources_pending facts ~owner =
   Graphs.exists(fun id saved->Option.fold ~none:true ~some:(Worker.matches_scope saved.source_owner) owner
     && import_source_unsettled facts id saved)facts.imports
@@ -548,7 +567,7 @@ let equal_view a b =
       && a.handoffs = b.handoffs && a.restartable_handoffs=b.restartable_handoffs
       && a.shutdown = b.shutdown
       && a.intents = b.intents
-      && a.intent_epoch = b.intent_epoch
+      && a.intent_epoch = b.intent_epoch && a.import_input_epoch=b.import_input_epoch
       && Asset_consumers.equal(=)a.asset_consumers b.asset_consumers
       && Observation_ids.equal(=)a.asset_cleanup b.asset_cleanup
       && Observation_ids.equal(=)a.file_leases b.file_leases
@@ -1090,7 +1109,7 @@ let plan_intent_lifecycle
   if state.next=Int64.max_int then Error(Worker.Invalid_input "Request counter exhausted") else
   let serial=Int64.succ state.next in
   let ticket={id=Worker.request_id(identity state.client serial);serial;kind;query=Operation operation;target;
-    planned_intent_epoch=state.facts.intent_epoch;acknowledgement} in
+    planned_intent_epoch=state.facts.intent_epoch;planned_source_epoch=state.facts.import_input_epoch;acknowledgement} in
   let slot={ticket;wait_for_capacity=false;dispatched=true;admitted=None;change_version=0L;
     sample_epoch=None;origin=None;result=None;early=None;cancelled=false;forgotten=false;retired_by_ack=false} in
   let facts={state.facts with entries=Slots.add serial(Entry slot)state.facts.entries} in
@@ -1347,16 +1366,12 @@ let checked_result : type a. view -> a ticket -> a Worker.reply -> a Worker.repl
             "Mutation receipt identity or original point does not match its ticket"))
   in
   match ticket.query, result with
-  | Operation(Worker.Import intent),Worker.Answered(Ok(Worker.Imported imported))->
-    let owner=match ticket.target with Direct session->Some session|_->None in
-    if not(Worker.Uuid.equal(Worker.import_data imported).operation(Worker.asset_import_intent_id intent))
-       || not(Option.exists(fun session->Worker.equal_session session(Worker.imported_session imported))owner)
-       || Option.exists(fun lease->not(Worker.equal_request_id(Worker.file_lease_id lease)ticket.id))(Worker.import_preview imported)
-    then mismatch() else result
-  | Operation(Worker.Acquire_imported_file _),Worker.Answered(Ok(Some lease))->
-    if not(Worker.equal_request_id(Worker.file_lease_id lease)ticket.id)
-       || not(match ticket.target with Direct session->Worker.equal_session session(Worker.file_lease_session lease)|_->false)
-    then mismatch() else result
+  | Operation(Worker.Recover_import_inputs _),Worker.Answered(Ok _)
+      when ticket.planned_source_epoch<>facts.import_input_epoch->
+    Worker.Answered(Error(Worker.Stale_read "Source recovery predates a settled source acknowledgement"))
+  | Operation(Worker.Confirm_import_source _),Worker.Answered(Ok _)
+      when ticket.planned_source_epoch<>facts.import_input_epoch->
+    Worker.Answered(Error(Worker.Stale_read "Source confirmation predates a settled source acknowledgement"))
   | Operation(Worker.Recover_mutations parameters),Worker.Answered(Ok page)->
     if ticket.planned_intent_epoch<>facts.intent_epoch
     then Worker.Answered(Error(Worker.Stale_read "Recovery predates a settled intent acknowledgement"))
@@ -1818,7 +1833,6 @@ let adopt_file_result : type a. t -> a slot -> a Worker.reply -> t =
   fun state slot result->
   let orphan=slot.cancelled || slot.forgotten || state.lifecycle<>Running || not(current_target state.facts slot.ticket.target) in
   let adopt facts lease=
-    if not(Worker.equal_request_id slot.ticket.id(Worker.file_lease_id lease)) then facts else
     let facts={facts with file_leases=Observation_ids.add(Worker.file_lease_id lease)lease facts.file_leases} in
     if orphan then queue_file_cleanup facts lease () else facts in
   let facts=match slot.ticket.query,result with
@@ -1836,6 +1850,12 @@ let adopt_file_result : type a. t -> a slot -> a Worker.reply -> t =
       let imports=Graphs.add key {import_intent=intent;source_owner;progress;source_adopted=(match progress with Some(Worker.Imported _)->true
           |_->Option.exists(fun saved->saved.source_adopted)(Graphs.find_opt key facts.imports))}facts.imports in
       {facts with imports}
+    |Operation(Worker.Confirm_import_source _),Worker.Answered(Ok(Some recovered))->
+      Option.fold ~none:state.facts ~some:(fun proof->adopt_import_source state.facts(Worker.prepared_import_adoption proof))recovered.prepared
+    |Operation(Worker.Recover_import_inputs _),Worker.Answered(Ok page)->
+      Rrbvec.fold_left(fun facts (recovered:Worker.recovered_import_input)->
+        Option.fold ~none:facts ~some:(fun proof->adopt_import_source facts(Worker.prepared_import_adoption proof))recovered.prepared)
+        state.facts page.inputs
     |Operation(Worker.Acquire_imported_file _),Worker.Answered(Ok(Some lease))->adopt state.facts lease
     |_->state.facts in
   {state with facts}
@@ -1944,6 +1964,10 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
              when Intents.mem(intent_key intent)state.facts.intents && not(Intents.mem(intent_key intent)intents)->
              Int64.succ state.facts.intent_epoch
            | _->state.facts.intent_epoch in
+         let import_input_epoch=match ticket.query,result with
+           |Operation(Worker.Acknowledge_import_source _),Worker.Answered(Ok()) when state.facts.import_input_epoch<Int64.max_int->
+             Int64.succ state.facts.import_input_epoch
+           |_->state.facts.import_input_epoch in
          let result =
            let cancelled_observe =
              match ticket.query with
@@ -1970,7 +1994,7 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
                (Entry { slot with result = Some result; early = None })
                previous_entries
          in
-         settle { state with facts = { state.facts with entries; intents; intent_epoch } } [])
+         settle { state with facts = { state.facts with entries; intents; intent_epoch;import_input_epoch } } [])
      | _ -> unchanged state)
   | None -> unchanged state
 ;;
@@ -2279,13 +2303,7 @@ let plan_host_action_attempt (state:t) receipt =
 
 let step_base state event =
   match event with
-  | Import_source_reconciled proof->
-    let id=Worker.import_source_proof_id proof in
-    (match Graphs.find_opt id state.facts.imports with
-     |Some saved when not saved.source_adopted
-       && Worker.import_source_proof_matches saved.import_intent proof->
-       changed{state with facts={state.facts with imports=Graphs.add id{saved with source_adopted=true}state.facts.imports}}[]
-     |_->unchanged state)
+  | Import_source_reconciled proof->changed{state with facts=adopt_import_source state.facts proof}[]
   | Worker_bound binding when state.binding = None || state.lifecycle = Rebinding ->
     changed
       { state with
@@ -2837,6 +2855,7 @@ let plan_refresh ?(internal = false) (state : t) session handle =
         ; serial
         ; kind = Observed (kind owned.obs_query)
         ; planned_intent_epoch = state.facts.intent_epoch
+        ; planned_source_epoch = state.facts.import_input_epoch
         ; acknowledgement = None
         ; query = Operation (Worker.Refresh handle)
         ; target = Sealed (session, owned.obs_budget)
@@ -3114,6 +3133,7 @@ let plan_mutation
       ; serial
       ; kind = Mutation
       ; planned_intent_epoch = state.facts.intent_epoch
+        ; planned_source_epoch = state.facts.import_input_epoch
       ; acknowledgement = None
       ; query = Operation operation
       ; target
@@ -3307,6 +3327,7 @@ let plan_observation (state : t) session budget query =
       ; serial
       ; kind = Observed (kind query)
       ; planned_intent_epoch = state.facts.intent_epoch
+        ; planned_source_epoch = state.facts.import_input_epoch
       ; acknowledgement = None
       ; query = Operation (Worker.Observe (budget, query))
       ; target = Sealed (session, budget)
@@ -3390,6 +3411,7 @@ let plan_release state session handle =
       ; serial
       ; kind = Unit
       ; planned_intent_epoch = state.facts.intent_epoch
+        ; planned_source_epoch = state.facts.import_input_epoch
       ; acknowledgement = None
       ; query = Operation (Worker.Release handle)
       ; target = Cleanup session
@@ -3447,6 +3469,7 @@ let plan_change_ack state session batch =
       ; serial
       ; kind = Change_ack
       ; planned_intent_epoch = state.facts.intent_epoch
+        ; planned_source_epoch = state.facts.import_input_epoch
       ; acknowledgement = None
       ; query = Operation (Worker.Acknowledge_changes batch)
       ; target = Direct session
@@ -3511,6 +3534,14 @@ let rec request
               plan_intent_lifecycle state session operation Lease(Direct session)None
             | Worker.Retry_asset _->plan_intent_lifecycle state session operation Unit(Direct session)None
             | Worker.Retry_upload _->plan_intent_lifecycle state session operation Unit(Direct session)None
+            | Worker.Recover_import_inputs _ ->
+              if Slots.exists(fun _ (Entry slot)->match slot.ticket.query with Operation(Worker.Recover_import_inputs _)->true|_->false)state.facts.entries
+              then Error(Worker.Invalid_input "Release the previous import recovery ticket before paging")
+              else plan_intent_lifecycle state session operation Import_inputs(Direct session)None
+            | Worker.Confirm_import_source _->plan_intent_lifecycle state session operation Import_source(Direct session)None
+            | Worker.Acknowledge_import_source _->
+              if state.facts.import_input_epoch=Int64.max_int then Error(Worker.Invalid_input "Source lifecycle counter exhausted")
+              else plan_intent_lifecycle state session operation Unit(Direct session)None
             | Worker.Recover_mutations _ -> plan_recovery state session operation
             | Worker.Acknowledge_intent intent -> plan_intent_ack state session intent
             | Worker.Query (budget, query) ->
@@ -3526,6 +3557,7 @@ let rec request
                        ; serial
                        ; kind = kind query
                        ; planned_intent_epoch = state.facts.intent_epoch
+        ; planned_source_epoch = state.facts.import_input_epoch
                        ; acknowledgement = None
                        ; query = Read query
                        ; target = Sealed (session, budget)
@@ -3684,6 +3716,7 @@ let plan_query_internal
       ; serial
       ; kind = kind query
       ; planned_intent_epoch = state.facts.intent_epoch
+        ; planned_source_epoch = state.facts.import_input_epoch
       ; acknowledgement = None
       ; query = Read query
       ; target
