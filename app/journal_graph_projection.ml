@@ -55,13 +55,6 @@ type create_child =
   ; creation_time : Journal_time.t
   }
 
-type update_source =
-  { mutation_id : string
-  ; block_id : string
-  ; expected_revision : string
-  ; source : string
-  }
-
 type set_task_state =
   { mutation_id : string
   ; block_id : string

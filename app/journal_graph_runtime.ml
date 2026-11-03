@@ -55,7 +55,6 @@ type failure_source =
 
 type mutation_kind =
   | Capture_mutation
-  | Source_mutation
   | Status_mutation
   | Delete_subtree_mutation
 
@@ -1030,28 +1029,6 @@ let submit_unowned t (request : Journal_graph_request.t) =
        else match capture_append_wire t command with
        | Error message->responses[response(Capture_not_admitted{command;message})]
        | Ok wire->requests[mutate t (Capture_append command) wire])
-  | Update_source command ->
-    (match
-       mutation_context t command.mutation_id, parse_uuid "block UUID" command.block_id
-     with
-     | Ok mutation_id, Ok block ->
-       (match page_by_block t command.block_id with
-        | None -> reject "The block page is not retained."
-        | Some page ->
-          requests
-            [ mutate
-                t
-                (Mutation_refresh
-                   { page; refresh = Updated { block_id = command.block_id } })
-                (Protocol.V2_save_block
-                   { mutation_id
-                   ; block
-                   ; title = command.source
-                   ; preconditions =
-                       preconditions ~blocks:[ block, command.expected_revision ] ()
-                   })
-            ])
-     | Error message, _ | _, Error message -> reject message)
   | Set_task_state command ->
     (match
        mutation_context t command.mutation_id, parse_uuid "block UUID" command.block_id
@@ -1181,13 +1158,6 @@ let plan_request t (request : Journal_graph_request.t) =
       Some
         (Mutation_owner
            { kind = Capture_mutation
-           ; mutation_id = command.mutation_id
-           ; block_id = command.block_id
-           })
-    | Update_source command ->
-      Some
-        (Mutation_owner
-           { kind = Source_mutation
            ; mutation_id = command.mutation_id
            ; block_id = command.block_id
            })

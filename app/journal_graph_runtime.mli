@@ -10,7 +10,6 @@ type failure_source =
 
 type mutation_kind =
   | Capture_mutation
-  | Source_mutation
   | Status_mutation
   | Delete_subtree_mutation
 

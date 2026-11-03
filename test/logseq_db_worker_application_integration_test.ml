@@ -301,44 +301,6 @@ let test_admission_inspection_preserves_graph_generation () =
   | _ -> Alcotest.fail "admission inspection did not retain its graph generation"
 ;;
 
-let test_application_mutation_uses_target_local_revision () =
-  let runtime = Runtime.create () in
-  ignore (seed_visible_block runtime);
-  refresh_private_block_revision runtime "block-2";
-  let output =
-    Runtime.submit
-      runtime
-      (Journal_graph_request.Update_source
-         { mutation_id = "a2000000-0000-4000-a000-000000000001"
-         ; block_id = Graph.Uuid.to_string block_uuid
-         ; expected_revision = "block-1"
-         ; source = "Edited locally"
-         })
-  in
-  match output.requests with
-  | [ { Protocol.command =
-          V2_save_block
-            { block
-            ; title
-            ; preconditions = { blocks = [ (precondition_block, revision) ]; _ }
-            ; _
-            }
-      ; _
-      }
-    ] ->
-    Alcotest.(check string) "save title" "Edited locally" title;
-    Alcotest.(check string)
-      "save target"
-      (Graph.Uuid.to_string block_uuid)
-      (Graph.Uuid.to_string block);
-    Alcotest.(check string)
-      "precondition target"
-      (Graph.Uuid.to_string block_uuid)
-      (Graph.Uuid.to_string precondition_block);
-    Alcotest.(check string) "target-local revision" "block-1" revision
-  | _ -> Alcotest.fail "expected one Worker v2 saveBlock request"
-;;
-
 let test_unrelated_projection_revision_does_not_reject_status_mutation () =
   let runtime = Runtime.create () in
   ignore (observe_graph_revision runtime "projection-1");
@@ -841,10 +803,6 @@ let () =
             "admission inspection preserves graph generation"
             `Quick
             test_admission_inspection_preserves_graph_generation
-        ; Alcotest.test_case
-            "mutation uses target-local revision"
-            `Quick
-            test_application_mutation_uses_target_local_revision
         ; Alcotest.test_case
             "unrelated projection does not reject status mutation"
             `Quick

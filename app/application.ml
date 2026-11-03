@@ -1725,8 +1725,7 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
             pending_delete = None
           ; timeline_notice = Some (Delete_failed message)
           }
-        | _ -> state)
-     | Source_mutation -> state)
+        | _ -> state))
   | Rejected failure ->
     let state = record_failure_source state failure in
     show_sync_error
@@ -3553,8 +3552,6 @@ let start
     prune_retired_coordination_hosts();
     !consumed
   in
-  let projection_request_accepted = ref (fun _ -> ()) in
-  let projection_request_finished = ref (fun _ -> ()) in
   let report_worker_refusal (request : Graph_service.request) (refused : Worker.send_result) =
     (* Full keeps the staged latest-authentication control intent. *)
     match request, refused with
@@ -3600,45 +3597,26 @@ let start
       in
       Effect.run (set_state (fun state -> report_ui_error state ~operation ~phase:"admission"))
   in
-  (* One admission owner serves every DB Worker API consumer. Business ticket
-     registries stay with Copy/media/assets; this owns delivery and lease life. *)
+  (* Application owns host commands and manager state. Typed graph/resource
+     responses belong exclusively to the coordinator's existing client router. *)
   let worker_admission =
     Journal_worker_admission.create
       ~runtime_epoch:(Worker.runtime_epoch client)
       ~worker_generation:(Worker.worker_generation client)
       ~send:(Worker.send client)
-      ~cancel:(fun request_id -> Worker.cancel client ~request_id)
-      ~projection_accepted:(fun request -> !projection_request_accepted request)
-      ~projection_finished:(fun request_id -> !projection_request_finished request_id)
       ~refused:report_worker_refusal
   in
   let worker_owners = Hashtbl.create 64 in
-  let release_worker_requests = Hashtbl.create 16 in
-  let dispatch_worker ?observe_projection request =
+  let dispatch_worker request =
     let owner=current_owner () in
     let targeted,owner=match owner,request with
-      | Some owner,Graph_service.Graph_request request -> Graph_service.Graph_request_at (owner,request),Some owner
       | Some owner,Graph_service.Get_graph_state -> Graph_service.Get_graph_state_at owner,Some owner
-      | Some owner,Graph_service.Asset_command {command;_} -> Graph_service.Asset_command_at (owner,command),Some owner
-      | Some owner,Graph_service.Import_asset {source;_} -> Graph_service.Import_asset_at (owner,source),Some owner
-      | _,(Graph_request_at (scope,_) | Get_graph_state_at scope | Asset_command_at (scope,_) | Import_asset_at (scope,_)) -> request,Some scope
-      | _,(Acquire_asset_file {scope;_} | Acquire_imported_file {scope;_} | Release_asset_file {scope;_}) ->
-        request,Some(timeline_owner_of_scope scope)
+      | _,Get_graph_state_at scope -> request,Some scope
       | _,Client_command (Acknowledge_timeline_presented scope | Begin_online_recovery scope) -> request,Some scope
-      | _,request -> request,None in
-    let cleanup=match targeted with
-      |Graph_service.Release_asset_file _|Asset_command_at(_,Release_asset_demand _)
-      |Asset_command{command=Release_asset_demand _;_}->true|_->false in
-    let result=if not cleanup && Option.exists(fun owner->not(!coordination_owner_allowed owner))owner
-      then Worker.Not_ready
-      else Journal_worker_admission.dispatch worker_admission ?observe_projection targeted in
-    (match result,owner with Worker.Accepted id,Some owner ->
-      Hashtbl.replace worker_owners id owner;
-      (match targeted with
-       | Release_asset_file _ | Asset_command_at (_,Release_asset_demand _)
-       | Asset_command {command=Release_asset_demand _;_} -> Hashtbl.replace release_worker_requests id ()
-       | _ -> ())
-     | _->());
+      | _ -> request,None in
+    let result=if Option.exists(fun owner->not(!coordination_owner_allowed owner))owner
+      then Worker.Not_ready else Journal_worker_admission.dispatch worker_admission targeted in
+    (match result,owner with Worker.Accepted id,Some owner->Hashtbl.replace worker_owners id owner|_->());
     result
   in
   let pending_scope_refreshes = Hashtbl.create 3 in
@@ -3931,8 +3909,6 @@ let start
     Journal_media_runtime.forget_request (!media_runtime_cell) request_id;
     Journal_asset_runtime.forget_request (!asset_runtime_cell) ~request_id
   in
-  projection_request_accepted := observe_projection_request;
-  projection_request_finished := forget_projection_request;
   let observe_projection_response response =
     Journal_media_runtime.observe_response (!media_runtime_cell) response;
     Journal_asset_runtime.observe_response (!asset_runtime_cell) response
@@ -4282,8 +4258,6 @@ let start
   let fail_graph_transport state message =
     terminal_graph_state state (Transport_graph_error message)
   in
-  let graph_worker_requests_cell = graph_ref (fun () ->
-    Hashtbl.create 16) in
   let coordinated_read_finished = ref (fun (_:Graph_service.timeline_scope)
       (_:Logseq_db_worker.Protocol.request) (_:Coordination.change_application option) (_: (Wc.session * Wc.read_budget) option) (_:(Journal_graph_runtime.worker_read_result,string) result) -> ()) in
   let send_coordinated_read request read =
@@ -4472,18 +4446,10 @@ let start
         match Journal_graph_runtime.worker_mutation (!graph_runtime_cell) request with
         | Some mutation->send_coordinated_mutation request mutation
         | None->
-        match dispatch_worker ~observe_projection:true (Graph_service.Graph_request request) with
-        | Accepted worker_id ->
-          Hashtbl.replace (!graph_worker_requests_cell) worker_id request;
-          Journal_graph_transport.Accepted
-        | Full -> Full
-        | Not_ready -> Not_ready
-        | Stopping -> Stopping)
+        Journal_graph_transport.Not_ready)
       output
   in
   let retire_graph_scope () =
-    Journal_worker_admission.cancel_graph_scope worker_admission (current_owner ());
-    Hashtbl.clear (!graph_worker_requests_cell);
     Journal_graph_runtime.reset (!graph_runtime_cell)
   in
   let acknowledge_mutation ~applied_presentation intent =
@@ -5143,8 +5109,7 @@ let start
       Option.iter (List.iter(fun restore->restore ())) (Hashtbl.find_opt runtime_sessions key);
       processing_owner:=Some owner;active_runtime:=Some key;
       let pending=Hashtbl.to_seq worker_owners |> List.of_seq
-        |> List.filter_map(fun(id,scope)->if owner_key scope=key && not(Hashtbl.mem release_worker_requests id) then Some id else None) in
-      Journal_worker_admission.cancel_graph_scope worker_admission (Some owner);
+        |> List.filter_map(fun(id,scope)->if owner_key scope=key then Some id else None) in
       List.iter(fun id->Worker.cancel client ~request_id:id) pending;
       Journal_graph_runtime.reset (!graph_runtime_cell);
       Journal_media_runtime.reset (!media_runtime_cell) ~graph_generation:None;
@@ -5488,15 +5453,12 @@ let start
     |_->Error "The destination is not ready for imports."
   in
   let handle_worker_event event =
-    let retired = match event with
-      | Worker.Response { request_id; _ } -> Journal_worker_admission.retire worker_admission request_id
-      | _ -> false in
     Journal_asset_runtime.pump (!asset_runtime_cell);
     sync_media !state_ref;
     Journal_media_runtime.pump (!media_runtime_cell);
     match event with
     | Worker.Push {payload=Graph_service.Coordination_updates _ | Coordination_observations _;_}
-    | Worker.Response {outcome=Completed(Graph_service.Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _ | Coordination_imported _ | Coordination_writers_quiesced _ | Coordination_host_prepared _ | Coordination_host_applied _ | Coordination_host_confirmed _ | Coordination_import_inputs_recovered _ | Coordination_import_input_confirmed _ | Coordination_import_input_acknowledged _);_}->Effect.ignore
+    | Worker.Response {outcome=Completed(Graph_service.Graph_response _ | Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _ | Coordination_imported _ | Coordination_writers_quiesced _ | Coordination_host_prepared _ | Coordination_host_applied _ | Coordination_host_confirmed _ | Coordination_import_inputs_recovered _ | Coordination_import_input_confirmed _ | Coordination_import_input_acknowledged _);_}->Effect.ignore
     | Worker.Push {payload=Graph_service.Graph_pushes _ | Graph_states _ | Session_states _;_} -> Effect.ignore
     | Worker.Response { request_id; outcome; _ }
       when Hashtbl.mem local_copy_requests request_id ->
@@ -5574,63 +5536,6 @@ let start
                       | Some message -> fail_feed_transport state message
                       | None -> state)))
             ]))
-    | Worker.Response { outcome = Completed (Graph_service.Graph_response _); _ }
-      when retired ->
-      Effect.ignore
-    | Worker.Response
-        { request_id
-        ; outcome = Worker.Completed (Graph_service.Graph_response response)
-        ; _
-        } ->
-      let expected = Hashtbl.find_opt (!graph_worker_requests_cell) request_id in
-      let (Logseq_db_worker.Protocol.V2_response { request_id = actual; _ }) = response in
-      let owned =
-        match expected with
-        | Some request
-          when Logseq_db_types.Graph_types.Uuid.equal request.request_id actual ->
-          observe_projection_response response;
-          true
-        | Some request ->
-          forget_projection_request request.request_id;
-          false
-        | None -> false
-      in
-      Hashtbl.remove (!graph_worker_requests_cell) request_id;
-      let output =
-        if owned
-        then Journal_graph_runtime.receive (!graph_runtime_cell) response
-        else (
-          match expected with
-          | Some request ->
-            Journal_graph_runtime.fail_request
-              (!graph_runtime_cell)
-              request
-              ~message:"Worker response did not match the accepted request"
-          | None -> Journal_graph_runtime.{ requests = []; responses = [] })
-      in
-      Effect.bind
-        (Effect.of_thunk (fun () -> deliver_output output))
-        ~f:(fun delivery ->
-          let update = Effect.bind
-            (apply_graph_responses set_state_and_effect delivery.responses)
-            ~f:(fun () -> set_state (fun state ->
-              match delivery.error with
-              | None -> state
-              | Some message when Option.is_some state.feed_refresh -> fail_feed_transport state message
-              | Some message -> fail_graph_transport state message)) in
-          Effect.bind update ~f:(fun () ->
-            let refresh_after_worker_event =
-              let (Logseq_db_worker.Protocol.V2_response { outcome; _ }) = response in
-              match outcome with
-              | V2_mutation_committed _ when owned ->
-                let snapshot = !state_ref in
-                trigger_admission
-                  set_state_and_effect
-                  ~graph_generation:snapshot.graph_state.generation
-                  ~graph_open:(snapshot.graph_state.phase = Graph_open)
-              | _ -> Effect.ignore
-            in
-            refresh_after_worker_event))
     | Worker.Push { payload = (Asset_notice _ | Asset_notices _) as payload; _ } ->
       let notices = Graph_service.asset_notices payload in
       let apply_notice (scope,notice) =
@@ -5702,31 +5607,6 @@ let start
         | Some manager when manager.selected_graph = Some progress.graph_id ->
           { state with bootstrap_progress = Some progress }
         | None | Some _ -> state)
-    | Worker.Response
-        { request_id; outcome = (Failed _ | Cancelled | Shutdown) as outcome; _ }
-      when Hashtbl.mem (!graph_worker_requests_cell) request_id ->
-      let request = Hashtbl.find (!graph_worker_requests_cell) request_id in
-      Hashtbl.remove (!graph_worker_requests_cell) request_id;
-      forget_projection_request request.request_id;
-      let message =
-        match outcome with
-        | Failed message -> message
-        | Cancelled -> "Worker request cancelled"
-        | Shutdown -> "Worker request interrupted by shutdown"
-        | Completed _ -> assert false
-      in
-      let output = Journal_graph_runtime.fail_request (!graph_runtime_cell) request ~message in
-      Effect.bind
-        (Effect.of_thunk (fun () -> deliver_output output))
-        ~f:(fun delivery ->
-          Effect.bind (apply_graph_responses set_state_and_effect delivery.responses)
-            ~f:(fun () -> set_state (fun state ->
-              match delivery.error with
-              | None -> state
-              | Some message when Option.is_some state.feed_refresh -> fail_feed_transport state message
-              | Some message -> fail_graph_transport state message)))
-    | Worker.Response { outcome = Failed _ | Cancelled | Shutdown; _ } when retired ->
-      Effect.ignore
     | Worker.Response { outcome = Failed error; _ } ->
       set_state (fun state ->
         let worker_error = service_error ~operation:"handleRequest" error in
@@ -8503,12 +8383,11 @@ let start
       | Worker.Response {request_id;_} ->
         let owner=Hashtbl.find_opt worker_owners request_id in
         Hashtbl.remove worker_owners request_id;
-        Hashtbl.remove release_worker_requests request_id;
         (match owner with
          | Some owner when not(runtime_owner_is_live !state_ref owner) ->
            let key=owner_key owner in
            (match Hashtbl.find_opt retired_runtimes key with
-            | None -> ignore(Journal_worker_admission.retire worker_admission request_id)
+            | None -> ()
             | Some(_,restore) ->
               let current=snapshot_cells () and active= !active_runtime and previous= !processing_owner in
               List.iter(fun restore->restore ()) restore;active_runtime:=Some key;processing_owner:=Some owner;

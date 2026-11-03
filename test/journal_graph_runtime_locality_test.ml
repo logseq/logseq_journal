@@ -1328,8 +1328,8 @@ let test_status_failure_conversion () =
 ;;
 
 type refresh_case =
-  | Update
-  | Update_conflict
+  | Task_change
+  | Task_conflict
   | Delete_conflict
 
 type refresh_result =
@@ -1353,7 +1353,7 @@ let prepare_paged_refresh ?(ordinary=false) ?(defer=false) kind =
   let next description output = only description output.Runtime.requests in
   let page, mutation =
     match kind with
-    | Update | Update_conflict | Delete_conflict ->
+    | Task_change | Task_conflict | Delete_conflict ->
       let lookup =
         Runtime.submit
           runtime
@@ -1400,11 +1400,11 @@ let prepare_paged_refresh ?(ordinary=false) ?(defer=false) kind =
             ; expected_revision = "block-1"
             }
         else
-          Journal_graph_request.Update_source
+          Journal_graph_request.Set_task_state
             { mutation_id = Graph.Uuid.to_string mutation_id
             ; block_id = Graph.Uuid.to_string block_uuid
             ; expected_revision = "block-1"
-            ; source = "Committed target"
+            ; task_state = Journal_model.Status "00000002-1827-5820-8200-000000000000"
             }
       in
       page, Runtime.submit runtime command |> next "target mutation"
@@ -1413,7 +1413,7 @@ let prepare_paged_refresh ?(ordinary=false) ?(defer=false) kind =
     receive
       mutation
       (match kind with
-       | Update ->
+       | Task_change ->
          V2_mutation_committed
            { mutation_id
            ; status = V2_applied
@@ -1421,7 +1421,7 @@ let prepare_paged_refresh ?(ordinary=false) ?(defer=false) kind =
            ; before_projection_revision = "projection-1"
            ; after_projection_revision = "projection-2"
            }
-       | Update_conflict | Delete_conflict ->
+       | Task_conflict | Delete_conflict ->
          V2_failed
            { code = Logseq_db_worker.Error.code_string Conflict
            ; message = "Concurrent target change"
@@ -1511,7 +1511,7 @@ let test_paged_mutation_refresh kind result =
     match
       result, kind, (only "owned canonical target terminal" completed.responses).payload
     with
-    | Found, Update, Block_updated { block; _ } ->
+    | Found, Task_change, Block_updated { block; _ } ->
       Alcotest.(check string)
         "authoritative target after earlier siblings"
         "Committed target"
@@ -1521,7 +1521,7 @@ let test_paged_mutation_refresh kind result =
         "cursor failure category is preserved"
         true
         (Logseq_db_worker.Error.code failure.error = Stale_read_cursor)
-    | Found, Update_conflict, Update_conflict {block=actual;_}
+    | Found, Task_conflict, Update_conflict {block=actual;_}
     | Found, Delete_conflict, Delete_conflict {block=actual;_} ->
       Alcotest.(check string) "canonical conflicted target"
         "Committed target" (Journal_model.source actual)
@@ -1607,40 +1607,10 @@ let test_conflict_missing_after_empty_more changed_version () =
 (* F3 is owned by the public Runtime request/completion boundary. The original
    RED phase used wire representations before the new command existed,
    so baseline tests fail on the emitted read rather than missing OCaml types. *)
-let target_refresh kind =
-  match kind with
-  | `Update -> prepare_paged_refresh Update
-  | `Update_conflict -> prepare_paged_refresh Update_conflict
-  | `Delete_conflict -> prepare_paged_refresh Delete_conflict
-  | `Status ->
-    let runtime = Runtime.create ~localtime:Unix.gmtime () in
-    seed_feed runtime;
-    let mutation =
-      Runtime.submit
-        runtime
-        (Journal_graph_request.Set_task_state
-           { mutation_id = "a1000000-0000-4000-a000-000000000072"
-           ; block_id = Graph.Uuid.to_string block_uuid
-           ; expected_revision = "block-1"
-           ; task_state = Journal_model.Status "00000002-1827-5820-8200-000000000000"
-           })
-      |> fun output -> only "status mutation" output.requests
-    in
-    let refresh =
-      Runtime.receive
-        runtime
-        (response
-           mutation
-           (Protocol.V2_mutation_committed
-              { mutation_id = uuid "a1000000-0000-4000-a000-000000000072"
-              ; status = V2_applied
-              ; generation = "graph-1"
-              ; before_projection_revision = "projection-1"
-              ; after_projection_revision = "projection-2"
-              }))
-      |> fun output -> only "status confirmation" output.requests
-    in
-    runtime, page, refresh
+let target_refresh = function
+  | `Status->prepare_paged_refresh Task_change
+  | `Status_conflict->prepare_paged_refresh Task_conflict
+  | `Delete_conflict->prepare_paged_refresh Delete_conflict
 ;;
 
 let test_target_summary_uses_owned_worker_query () =
@@ -1704,7 +1674,7 @@ let test_target_confirmation kind title count =
   let payload = (only "target completion" complete.responses).payload in
   let actual, entry =
     match kind, payload with
-    | (`Update | `Status), Runtime.Block_updated { block; timeline_entry_update } ->
+    | `Status, Runtime.Block_updated { block; timeline_entry_update } ->
       block, timeline_entry_update
     | _ -> Alcotest.fail "target completion lost mutation ownership"
   in
@@ -1858,11 +1828,7 @@ let test_target_terminal kind terminal =
       Alcotest.(check bool)
         "mutation kind preserved"
         true
-        (actual
-         =
-         if kind = `Status
-         then Status_mutation
-         else Source_mutation);
+        (actual=Status_mutation);
       Alcotest.(check string)
         "mutation block identity"
         (Graph.Uuid.to_string block_uuid)
@@ -1911,7 +1877,7 @@ let test_target_version_fence () =
 ;;
 
 let test_target_rejects_wrong_identity () =
-  let runtime, page, refresh = target_refresh `Update in
+  let runtime, page, refresh = target_refresh `Status in
   check_target_summary refresh None;
   let output =
     Runtime.receive
@@ -1945,7 +1911,7 @@ let asset_type_property : Graph.property_summary =
 let test_target_blank_image_and_deep_child () =
   List.iter
     (fun child_target ->
-       let runtime, page, refresh = target_refresh `Update in
+       let runtime, page, refresh = target_refresh `Status in
        check_target_summary refresh None;
        let canonical =
          { record with
@@ -2019,16 +1985,16 @@ let test_target_stale_recovery_is_bounded () =
 ;;
 
 let test_target_newer_confirmation_fences_old () =
-  let runtime, page, old_read = target_refresh `Update in
+  let runtime, page, old_read = target_refresh `Status in
   check_target_summary old_read None;
   let mutation =
     Runtime.submit
       runtime
-      (Journal_graph_request.Update_source
+      (Journal_graph_request.Set_task_state
          { mutation_id = "a1000000-0000-4000-a000-000000000073"
          ; block_id = Graph.Uuid.to_string block_uuid
          ; expected_revision = "block-1"
-         ; source = "Newer intent"
+         ; task_state = Journal_model.No_status
          })
     |> fun output -> only "newer admitted update" output.requests
   in
@@ -2076,7 +2042,7 @@ let test_target_newer_confirmation_fences_old () =
 ;;
 
 let test_target_invisible_root_has_timeline_only_removal () =
-  let runtime, page, refresh = target_refresh `Update in
+  let runtime, page, refresh = target_refresh `Status in
   check_target_summary refresh None;
   let canonical =
     { record with
@@ -2164,23 +2130,6 @@ let test_target_confirmation_retains_child_mutation_context () =
           children
           None
           "projection-2"));
-  let source =
-    Runtime.submit
-      runtime
-      (Journal_graph_request.Update_source
-         { mutation_id = "a1000000-0000-4000-a000-000000000074"
-         ; block_id = Graph.Uuid.to_string child
-         ; expected_revision = "child-2"
-         ; source = "Child edited"
-         })
-  in
-  (match source.requests with
-   | [ { Protocol.command = V2_save_block { block; _ }; _ } ] ->
-     Alcotest.(check bool)
-       "canonical child keeps its page for source edits"
-       true
-       (Graph.Uuid.equal block child)
-   | _ -> Alcotest.fail "target summary lost child's mutation context");
   let status =
     Runtime.submit
       runtime
@@ -2975,10 +2924,6 @@ let test_submit_rejections_keep_admitted_identity () =
     Runtime.submit runtime request
     |> expect_admitted_failure "submit rejection" ~kind ~mutation_id ~block_id
   in
-  check
-    Source_mutation
-    (Journal_graph_request.Update_source
-       { mutation_id; block_id; expected_revision = "old"; source = "Draft" });
   check
     Status_mutation
     (Journal_graph_request.Set_task_state
@@ -4834,7 +4779,7 @@ let test_parent_visibility_confirmations () =
             (fun index (v, _) -> v, index)
             (let roots, _, _ = parent_visibility_fixture page in
              roots)))
-    [ `Update; `Status; `Update_conflict; `Delete_conflict ]
+    [ `Status; `Status_conflict; `Delete_conflict ]
 ;;
 
 
@@ -8711,12 +8656,11 @@ let () =
       ;Alcotest.test_case "Timeline-only property change does not hydrate" `Quick test_timeline_only_property_update_does_not_hydrate] )
     ; ( "parent-only Timeline visibility"
       , [Alcotest.test_case "feed day remote legacy and metadata" `Quick test_parent_visibility_tree_paths;
-         Alcotest.test_case "Update and Status completions" `Quick test_parent_visibility_confirmations])
+         Alcotest.test_case "Status completions" `Quick test_parent_visibility_confirmations])
     ; ( "bounded Timeline preview"
       , [ Alcotest.test_case "feed, day, remote and legacy refresh paths" `Quick test_bounded_preview_tree_paths
-        ; Alcotest.test_case "Update 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Update 10050)
         ; Alcotest.test_case "Status 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Status 10050)
-        ; Alcotest.test_case "Update conflict 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Update_conflict 10050)
+        ; Alcotest.test_case "Status conflict 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Status_conflict 10050)
         ; Alcotest.test_case "Delete conflict 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Delete_conflict 10050)
         ; Alcotest.test_case "Detail and Copy remain complete" `Quick test_preview_preserves_full_detail_and_copy
         ])
@@ -8862,14 +8806,14 @@ let () =
             (test_conflict_missing_after_empty_more false)
         ; Alcotest.test_case "conflict changed version retries before absence" `Quick
             (test_conflict_missing_after_empty_more true)
-        ; Alcotest.test_case "Update last root does not read siblings" `Quick (fun () ->
-            test_target_confirmation `Update "Stored update" 2)
+        ; Alcotest.test_case "Status last root does not read siblings" `Quick (fun () ->
+            test_target_confirmation `Status "Stored status target" 2)
         ; Alcotest.test_case "Status targeted confirmation" `Quick (fun () ->
             test_target_confirmation `Status "Retained block" 0)
         ; Alcotest.test_case
             "Blank canonical target completes without fabricated entry"
             `Quick
-            (fun () -> test_target_confirmation `Update "" 0)
+            (fun () -> test_target_confirmation `Status "" 0)
         ; Alcotest.test_case "Repeated target cursor settles" `Quick test_target_repeated_cursor_settles
         ; Alcotest.test_case
             "Target children paginate independently of siblings"
@@ -8919,7 +8863,7 @@ let () =
                       `Quick
                       (fun () -> test_target_terminal kind terminal))
                  [ "missing", `Missing; "failure", `Failure; "graph reset", `Reset ])
-            [ "Update", `Update; "Status", `Status ] )
+            [ "Status", `Status ] )
     ; ("ordinary delete readback",[
         Alcotest.test_case "known rejection reads ordinary current target" `Quick(test_ordinary_delete_readback false false);
         Alcotest.test_case "committed present ordinary target consumes actual DTO" `Quick(test_ordinary_delete_readback true false);
@@ -8934,8 +8878,8 @@ let () =
                     `Quick
                     (fun () -> test_paged_mutation_refresh kind result))
                [ "found", Found; "missing", Missing; "cursor error", Cursor_failed ])
-          [ "update", Update
-          ; "update conflict", Update_conflict
+          [ "status", Task_change
+          ; "status conflict", Task_conflict
           ; "delete conflict", Delete_conflict
           ] )
     ; ( "projection dependencies"
