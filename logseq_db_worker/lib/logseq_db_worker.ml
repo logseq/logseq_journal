@@ -405,6 +405,15 @@ let replace_coordinated_asset_demand t ~registration ~scope ~consumer ~priority 
         |> Result.map(fun _->()))
 ;;
 
+let asset_demand_creator_finished t ~registration ~consumer =
+  t.demand_registry<-Pure_reducer.Demand_registry.creator_finished t.demand_registry ~registration ~consumer
+;;
+let finalize_coordinated_asset_demand t ~registration ~scope ~consumer =
+  let owner:Pure_reducer.Demand_registry.owner={registration;scope;consumer} in
+  let next,result=Pure_reducer.Demand_registry.finalize t.demand_registry owner in
+  t.demand_registry<-next;result
+;;
+
 let release_coordinated_asset_demand t ~registration ~scope ~consumer =
   let module R=Pure_reducer.Demand_registry in
   if t.stopped then Error "The Worker stopped before resource release."
@@ -682,6 +691,13 @@ let observation_scope t ~registration ~id =
 let release_observation t ~registration ~id ~scope =
   Effect_runner.release_observation t.runner ~registration ~id ~scope
 ;;
+let observation_creator_finished t ~registration ~id =
+  Effect_runner.observation_creator_finished t.runner ~registration ~id
+;;
+let finalize_observation t ~registration ~id ~owner =
+  Effect_runner.finalize_observation t.runner ~registration ~id ~owner
+;;
+
 let release_unallocated_observation t ~registration ~id ~owner =
   Effect_runner.release_unallocated_observation t.runner ~registration ~id ~owner
 ;;

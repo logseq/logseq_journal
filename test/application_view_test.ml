@@ -46,6 +46,14 @@ let fixture_observations ?(observed=(fun _->())) ?(released=(fun _->()))
        |Ok Service.Client_command_completed->Ok(Service.Coordination_asset_demand_released{
          registration=value.registration;owner=value.owner;request_id=value.request_id;consumer=value.consumer})
        |Error error->Error error|Ok _->Error "Asset release fixture expected a checked acknowledgement")
+    |Service.Coordination_finalize_asset_demand value->
+      Ok(Service.Coordination_asset_demand_finalized{registration=value.registration;owner=value.owner;
+        request_id=value.request_id;consumer=value.consumer})
+    |Service.Coordination_finalize_observation value->
+      if Hashtbl.mem registrations(value.registration,value.observation_id)
+      then Error "Observation fixture finalized before release"
+      else Ok(Service.Coordination_observation_finalized{registration=value.registration;owner=value.owner;
+        observation_id=value.observation_id})
     | Service.Coordination_import value->
       let owner:Service.timeline_scope={startup={account_generation=value.owner.account.account_generation;
         presentation_generation=value.owner.account.presentation_generation};graph_id=value.owner.graph_id;graph_generation=value.owner.graph_generation} in
@@ -1148,7 +1156,7 @@ let run_favorites_native_visibility
             Atomic.incr source_acks;Atomic.set source_reviewed true;
             Ok(Service.Coordination_import_input_acknowledged{registration;owner;request_id}))
         | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ ->host_fixture context normalized
-        | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_finalize_asset_demand _ | Coordination_finalize_observation _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration ->
           Atomic.set coordination_registration(Some registration);
           Ok(Service.Coordination_registered(coordination_baseline registration))
@@ -5260,7 +5268,7 @@ let test_reference_outer_terminals cancel =
         in
         match fixture_request request with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ | Coordination_finalize_asset_demand _ | Coordination_finalize_observation _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration -> Ok(Service.Coordination_registered(fixture_coordination manager registration))
         | Release_coordination registration -> Ok(Service.Coordination_released registration)
         | Coordination_query _ -> Error "Fixture normalization failed"
@@ -6451,7 +6459,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
         in
         match fixture_request request with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
-        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ | Coordination_finalize_asset_demand _ | Coordination_finalize_observation _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration -> Ok(Service.Coordination_registered(
             fixture_coordination ~phase:(Atomic.get graph_phase) (Atomic.get current) registration))
         | Release_coordination registration -> Ok(Service.Coordination_released registration)
@@ -7637,7 +7645,7 @@ let test_graph_picker_controls ?(check_recovery_focus=false) ?(check_import_reco
           let input=A.Pure_intent.create ~namespace source |> Result.get_ok |> A.Pure_intent.encode in
           Ok(Service.Coordination_import_inputs_recovered{registration;owner;request_id;
             page={items=[{sequence=1L;input;prepared=None;acknowledged=false}];next=None}})
-        | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_finalize_asset_demand _ | Coordination_finalize_observation _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration ->
           Atomic.set coordination_registration(Some registration);
           Ok(Service.Coordination_registered(picker_baseline

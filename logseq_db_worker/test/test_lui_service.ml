@@ -501,7 +501,8 @@ let test_discarded_success_is_settled ?(slow = false) ending () =
   let started = Atomic.make false
   and release = Atomic.make false in
   let live = Atomic.make 0
-  and discarded = Atomic.make 0 in
+  and discarded = Atomic.make 0
+  and settled = Atomic.make 0 in
   let cleanup_started = Atomic.make false
   and cleanup_release = Atomic.make (not slow)
   and shutdown_called = Atomic.make false in
@@ -530,6 +531,11 @@ let test_discarded_success_is_settled ?(slow = false) ending () =
         T.require (request = response) "discard cleanup changed produced result";
         Atomic.incr discarded;
         Atomic.decr live)
+      ~request_settled:(fun _ ~request_id:_ _ ->
+        T.require (Atomic.get discarded = if ending = `Complete || ending = `Creator_failure then 0 else 1)
+          "creator completion overtook actual discard cleanup";
+        if ending=`Creator_failure then failwith "synthetic creator ledger failure";
+        Atomic.incr settled)
       ~shutdown:(fun _ ->
         Atomic.set shutdown_called true;
         Atomic.set live 0)
@@ -550,7 +556,7 @@ let test_discarded_success_is_settled ?(slow = false) ending () =
        (match ending with
         | `Cancel -> Worker.cancel client ~request_id:id
         | `Stop -> Worker.Private.request_stop client
-        | `Complete | `Finalizer_failure -> ());
+        | `Complete | `Finalizer_failure | `Creator_failure -> ());
        Atomic.set release true;
        if slow
        then (
@@ -558,6 +564,7 @@ let test_discarded_success_is_settled ?(slow = false) ending () =
          T.require
            (not (Atomic.get shutdown_called))
            "Service shutdown overtook yielding discard cleanup";
+         T.require (Atomic.get settled=0) "creator was marked settled during physical discard cleanup";
          T.require
            (not
               (List.exists
@@ -574,6 +581,8 @@ let test_discarded_success_is_settled ?(slow = false) ending () =
              | Worker.Response { request_id; outcome; _ } when request_id = id ->
                T.require (!terminal = None) "resource terminal published twice";
                terminal := Some outcome;
+               T.require (Atomic.get settled=(if ending=`Creator_failure then 0 else 1))
+                 "accepted creator did not settle exactly once before its terminal";
                T.require
                  (Atomic.get discarded = if ending = `Complete then 0 else 1)
                  "successful discarded result was not settled before terminal publication"
@@ -585,12 +594,39 @@ let test_discarded_success_is_settled ?(slow = false) ending () =
           | `Cancel, Some Worker.Cancelled
           | `Stop, Some Shutdown
           | `Complete, Some (Completed 7)
-          | `Finalizer_failure, Some (Failed _) -> true
+          | (`Finalizer_failure | `Creator_failure), Some (Failed _) -> true
           | _ -> false)
          "cleanup changed cancellation/stop/normal delivery semantics";
        T.require
          (ending <> `Complete || Atomic.get live = 1)
          "delivered resource was released as an orphan")
+;;
+
+(* Admission and the handler nursery are effect-owned. The public pure DB
+   reducers cannot witness a creator which was cancelled before its handler ran. *)
+let test_queued_creators_settle_without_starting () =
+  let entered=Atomic.make false and release=Atomic.make false in
+  let handled=Atomic.make 0 and settled=Array.init 4(fun _->Atomic.make 0) in
+  let service=Worker.Service.create ~push_topic_count:1 ~concurrency:Serial
+    ~init:(fun _ ()->Ok())
+    ~handle:(fun _ () value->
+      Atomic.incr handled;Atomic.set entered true;
+      while not(Atomic.get release) do Domain.cpu_relax() done;
+      Ok value)
+    ~request_settled:(fun () ~request_id:_ value->Atomic.incr settled.(value))
+    ~shutdown:(fun ()->()) () in
+  let client=Worker_runtime.start ~runtime_epoch:(ID.Runtime.Epoch.of_int64 2191L) service () |> Result.get_ok in
+  Fun.protect ~finally:(fun()->Atomic.set release true;Worker_runtime.stop client)(fun()->
+    ignore(Worker.send client 1 |> accepted);
+    control_wait "first creator entered" (fun()->Atomic.get entered);
+    let cancelled=Worker.send client 2 |> accepted in
+    Worker.cancel client ~request_id:cancelled;
+    ignore(Worker.send client 3 |> accepted);
+    Worker.Private.request_stop client;
+    Atomic.set release true;
+    control_wait "all accepted creators settled" (fun()->
+      Array.for_all(fun n->Atomic.get n=1)(Array.sub settled 1 3));
+    T.require(Atomic.get handled=1) "queued cancelled/stopped creator was executed")
 ;;
 
 type control_request =
@@ -1839,8 +1875,10 @@ let test_observation_invalidations_are_bounded_latest_facts () =
 let () =
   T.run
     "lui worker service"
-    [ T.case "discarded asset result keeps actual retained owner" test_discarded_asset_result_keeps_actual_lease_owner
+    [ T.case "accepted queued creators settle without handler execution" test_queued_creators_settle_without_starting
+    ; T.case "discarded asset result keeps actual retained owner" test_discarded_asset_result_keeps_actual_lease_owner
     ; T.case "release requires scoped physical ACK" test_release_requires_physical_ack
+    ; T.case "failed creator fact keeps unpublished result cleanup" (test_discarded_success_is_settled `Creator_failure)
     ; T.case "cancelled successful result is settled before terminal" (test_discarded_success_is_settled `Cancel)
     ; T.case "shutdown successful result is settled before terminal" (test_discarded_success_is_settled `Stop)
     ; T.case "delivered successful result keeps ownership" (test_discarded_success_is_settled `Complete)

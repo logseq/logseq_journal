@@ -12,6 +12,8 @@ type flight =
       (module Worker.ISSUER) * 'a Core.ticket * Worker.session * 'a Worker.request
       -> flight
   | Unobserve of (module Worker.ISSUER) * Worker.session * Worker.request_id
+  | Finalize_observation of (module Worker.ISSUER) * Worker.session * Worker.request_id
+  | Finalize_demand of (module Worker.ISSUER) * unit Core.ticket * Worker.session * Worker.asset_consumer
   | Unregister of (module Worker.ISSUER)
   | Handoff of (module Worker.ISSUER) * Worker.handoff_plan
   | Consume of (module Worker.ISSUER) * Worker.handoff_receipt * Worker.request_id
@@ -101,6 +103,20 @@ let submit t = function
         | Mailbox.Accepted _ -> ()
         | result ->
           t.post (Core.Observation_release_not_admitted (session, id, refused result))))
+  | Finalize_observation_registration(session,id)->
+    let module I=(val t.issuer:Worker.ISSUER) in
+    (match I.finalize_observation_registration session ~observation_id:id with
+     |Error error->t.post(Core.Observation_finalize_completed(session,id,Error error))
+     |Ok request->match admit t request(Finalize_observation(t.issuer,session,id)) with
+       |Accepted _->()
+       |result->t.post(Core.Observation_finalize_not_admitted(session,id,refused result)))
+  | Finalize_asset_demand(ticket,session,consumer)->
+    let module I=(val t.issuer:Worker.ISSUER) in
+    (match I.finalize_asset_demand session ~request_id:(Core.ticket_id ticket) consumer with
+     |Error error->t.post(Core.Admission_failed(ticket,error))
+     |Ok request->match admit t request(Finalize_demand(t.issuer,ticket,session,consumer)) with
+       |Accepted id->t.post(Core.Admitted(ticket,id))
+       |result->t.post(Core.Admission_refused(ticket,refused result)))
   | Release_binding binding ->
     let module I = (val t.issuer : Worker.ISSUER) in
     if not (Worker.equal_binding binding I.binding)
@@ -278,6 +294,18 @@ let on_event t event =
                        "Observation release did not acknowledge physical retirement")
               in
               t.post (Core.Observation_release_completed (session, id, result))
+            |Finalize_observation(issuer,session,id)->
+              let module I=(val issuer:Worker.ISSUER) in
+              let result=match outcome with Completed response->I.observation_registration_finalized session ~observation_id:id response
+                |_->Error(Worker.Service_failed "Observation finalization was not acknowledged") in
+              t.post(Core.Observation_finalize_completed(session,id,result))
+            |Finalize_demand(issuer,ticket,session,consumer)->
+              let module I=(val issuer:Worker.ISSUER) in
+              let result=match outcome with
+                |Completed response->Worker.Answered(I.asset_demand_finalized session ~request_id:(Core.ticket_id ticket) consumer response)
+                |Failed message->Worker.Answered(Error(Worker.Service_failed message))
+                |Cancelled->Worker.Interrupted Worker.Cancelled|Shutdown->Worker.Interrupted Worker.Worker_stopped in
+              t.post(Core.Completed(ticket,result))
             |Consume(issuer,receipt,attempt)->
               let module I=(val issuer:Worker.ISSUER) in
               let result=match outcome with

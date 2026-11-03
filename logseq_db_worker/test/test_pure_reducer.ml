@@ -1704,14 +1704,15 @@ let test_observation_registry_traces () =
         in
         check trace (decision = O.Invalid) "invalid request allocated a listener";
         next, model
-      | _ -> O.retire_registration state ~registration:72L, model
+      | _ -> O.retire_registration state ~registration:70L, model
     in
     verify trace state model;
     verify trace next next_model;
     next, next_model
   in
-  (* Exhaustive breadth-first generation covers legal histories and malicious
-     owner/ACK/replay orderings. First failure is already a shortest trace. *)
+  (* An older registration may finish retirement while current 71 is live.
+     A future unregistered ID is not a lifecycle completion from the owner.
+     First failure in these breadth-first histories is a shortest trace. *)
   for length = 0 to 5 do
     let rec walk trace state model remaining =
       verify trace state model;
@@ -2010,6 +2011,62 @@ let test_demand_registry_retirement_requires_physical_settlement () =
   Alcotest.(check bool) "Cancel before allocation has a distinct proof" true(result=R.Unknown);
   let _,result=R.reserve cancelled unknown ~priority:Foreground ~assets:[] in
   Alcotest.(check bool) "late allocation cannot follow no-allocation cleanup" true(result=R.Retired)
+;;
+
+(* Legal creator/release completion orders through the real public registries.
+   The terminal publication boundary is tested separately in Journal_worker. *)
+let test_resource_registry_finalization () =
+  let module O=Core.Observation_registry in let module D=Core.Demand_registry in
+  let _,scope=worker_open_graph() in
+  let timeline:Logseq_sync_pure_reducer.Core.timeline_scope={
+    startup={account_generation=scope.account.account_generation;presentation_generation=scope.account.presentation_generation};
+    graph_id=scope.graph_id;graph_generation=scope.graph_generation} in
+  let observation=ref O.empty and demand=ref D.empty in
+  for n=1 to 8200 do
+    let id=uuid(Printf.sprintf "10000000-0000-4000-a000-%012d" n) in
+    let owner:D.owner={registration=92L;scope;consumer=Printf.sprintf "actual-round-%d" n} in
+    let next,decision=O.reserve !observation ~registration:92L ~id ~scope ~command:Protocol.V2_graph_info ~maximum_bytes:16384 in
+    Alcotest.(check bool) "ordinary Detail never consumes a lifetime quota" true(decision=O.Start);
+    observation:=next;
+    let next,decision=D.reserve !demand owner ~priority:Foreground ~assets:[] in
+    Alcotest.(check bool) "ordinary media never consumes a lifetime quota" true(decision=D.Start);
+    demand:=next;
+    let creator ()=observation:=O.creator_finished !observation ~registration:92L ~id;
+      demand:=D.creator_finished !demand ~registration:92L ~consumer:owner.consumer in
+    let release ()=let next,_=O.release !observation ~registration:92L ~id ~scope in observation:=next;
+      let next,_=D.retire !demand owner in demand:=next in
+    let physical ()=observation:=O.released !observation ~registration:92L ~id ~scope;
+      demand:=D.settled !demand owner in
+    (match n mod 3 with
+     |0->creator();release();physical()
+     |1->release();creator();physical()
+     |_->release();physical();creator());
+    (* A real cancelled release can be retried before the caller sees its ACK. *)
+    release();physical();
+    let next,result=O.finalize !observation ~registration:92L ~id ~owner:timeline in
+    Alcotest.(check bool) "observation finalization joins both facts" true(result=Ok());observation:=next;
+    let next,result=D.finalize !demand owner in
+    Alcotest.(check bool) "demand finalization joins both facts" true(result=Ok());demand:=next;
+    Alcotest.(check int) "all old observation metadata retired" 0(O.retained !observation);
+    let repeated,result=O.finalize !observation ~registration:92L ~id ~owner:timeline in
+    Alcotest.(check bool) "finalization retry never allocates" true(result=Ok() && O.retained repeated=0);
+    let repeated,result=D.finalize !demand owner in
+    Alcotest.(check bool) "demand finalization retry is a no-op" true(result=Ok() && repeated= !demand)
+  done;
+  (* Accepted cancellation before allocation still has a unique actual creator
+     completion; cleanup can precede or follow it, but cannot forget it early. *)
+  List.iter(fun creator_first->
+    let id=uuid "10000000-0000-4000-a000-000000009999" in
+    let obs=ref O.empty in
+    if creator_first then obs:=O.creator_finished !obs ~registration:92L ~id;
+    let next,_=O.release_unallocated !obs ~registration:92L ~id ~owner:timeline in obs:=next;
+    if not creator_first then (
+      let _,decision=O.reserve !obs ~registration:92L ~id ~scope ~command:Protocol.V2_graph_info ~maximum_bytes:16384 in
+      Alcotest.(check bool) "release overtaking a queued creator fences its allocation" true(decision=O.Retired);
+      obs:=O.creator_finished !obs ~registration:92L ~id);
+    let next,result=O.finalize !obs ~registration:92L ~id ~owner:timeline in
+    Alcotest.(check bool) "cancelled unallocated creator leaves no permanent record" true(result=Ok() && O.retained next=0))
+    [false;true]
 ;;
 
 let test_demand_registry_properties () =
@@ -2474,7 +2531,7 @@ let () =
         ] )
     ; ( "host handoff",[Alcotest.test_case "revoked hidden resource cleanup owner" `Quick test_revoked_account_keeps_hidden_cleanup_owner; Alcotest.test_case "private deletion resource owner" `Quick test_host_deletion_private_resource_owner; Alcotest.test_case "account gate blocks catalog producer" `Quick test_account_host_gate_blocks_new_catalog_producer; Alcotest.test_case "target gate preserves other execution" `Quick test_host_gate_keeps_other_graph_live; Alcotest.test_case "single-use and reopen witness" `Quick test_host_handoff_single_use_and_reopen; Alcotest.test_case "generated owner/late result traces" `Quick test_host_handoff_properties])
     ; ( "writer fence",[Alcotest.test_case "only physical completion drains" `Quick test_writer_fence_physical_completion; Alcotest.test_case "generated scoped fence traces" `Quick test_writer_fence_properties])
-    ; ( "typed demand registry",[Alcotest.test_case "generated owner retirement traces" `Quick test_demand_registry_properties; Alcotest.test_case "retirement and exact settlement" `Quick test_demand_registry_retirement_requires_physical_settlement])
+    ; ( "typed demand registry",[Alcotest.test_case "generated owner retirement traces" `Quick test_demand_registry_properties; Alcotest.test_case "retirement and exact settlement" `Quick test_demand_registry_retirement_requires_physical_settlement; Alcotest.test_case "resource history finalization" `Quick test_resource_registry_finalization])
     ; ( "orphan resource cleanup",[Alcotest.test_case "failed release and stale attempt ACK" `Quick test_orphan_cleanup_retains_failed_release])
     ; ( "observation registry", [Alcotest.test_case "registration cancellation epoch and owner" `Quick test_observation_registry;
           Alcotest.test_case "exhaustive shortest lifecycle traces" `Quick test_observation_registry_traces;

@@ -5,8 +5,10 @@ module Slots = Map.Make (Int64)
 module Graphs = Map.Make (Worker.Uuid)
 module Sessions=Set.Make(struct type t=Worker.session let compare=Worker.compare_session end)
 module Asset_consumers=Map.Make(struct type t=Worker.asset_consumer let compare=Worker.compare_asset_consumer end)
+type asset_creation = Awaiting_admission | Creating | Finished | Not_created
+type cleanup_phase = Releasing_resource | Finalizing_resource
 type asset_registration={consumer:Worker.asset_consumer;assets:Logseq_db_types.Asset_descriptor.t list;
-  active:bool;notices:(Worker.asset_notice * Id.push_sequence) list}
+  creation:asset_creation;active:bool;notices:(Worker.asset_notice * Id.push_sequence) list}
 
 module Observation_ids = Map.Make (struct
     type t = Worker.request_id
@@ -142,6 +144,9 @@ type 'a observation_state =
   ; obs_registered : bool
   ; obs_admitted : bool
   ; obs_releasing : bool
+  ; obs_creator_finished : bool
+  ; obs_returned : bool
+  ; obs_release_done : bool
   ; obs_release_inflight : bool
   ; obs_cleanup_waiting : bool
   ; obs_attempt : Worker.request_id option
@@ -160,6 +165,9 @@ type cleanup_resource=Demand_resource of Worker.asset_consumer | Lease_resource 
 
 type asset_cleanup =
   { resource:cleanup_resource
+  ; creation:asset_creation
+  ; phase:cleanup_phase
+  ; returned:bool
   ; attempt:Worker.request_id option
   ; waiters:int64 list
   ; wait_for_capacity:bool
@@ -221,8 +229,6 @@ type view =
   ; import_history : Worker.import_source_proof Graphs.t
   ; released_leases : Worker.session Observation_ids.t
   ; session_assets : (Worker.asset_notice * Id.push_sequence) list Graphs.t
-  ; retired_observations : Worker.session Observation_ids.t
-  ; retired_observation_count : int
   }
 
 type lifecycle =
@@ -294,8 +300,6 @@ let initial ~client_id =
       ; import_history=Graphs.empty
       ; released_leases=Observation_ids.empty
       ; session_assets = Graphs.empty
-      ; retired_observations = Observation_ids.empty
-      ; retired_observation_count = 0
       }
   }
 ;;
@@ -319,7 +323,8 @@ let view t = t.facts
 let bootstrap v = v.bootstrap_state
 let projection v = v.current
 let shutdown_state v = v.shutdown
-let mutation_progress _ _ = None
+let mutation_progress view intent =
+  Intents.find_opt (Bytes.to_string(Worker.encode_append_intent intent)) view.intents
 let intent_key intent = Bytes.to_string (Worker.encode_mutation_intent intent)
 let intent_progress view intent = Intents.find_opt (intent_key intent) view.intents
 let adopt_import_source facts proof =
@@ -581,11 +586,6 @@ let equal_view a b =
       && Graphs.equal Int64.equal a.change_versions b.change_versions
       && Graphs.equal ( = ) a.change_batches b.change_batches
       && Graphs.equal ( = ) a.change_acks b.change_acks
-      && a.retired_observation_count = b.retired_observation_count
-      && Observation_ids.equal
-           Worker.equal_session
-           a.retired_observations
-           b.retired_observations
       && Observation_ids.equal equal_observation_entry a.observations b.observations
       && Slots.equal equal_entry a.entries b.entries)
 ;;
@@ -630,6 +630,10 @@ type event =
   | Cancel : 'a ticket -> event
   | Forget : 'a ticket -> event
   | Release : 'a Worker.observation -> event
+  | Observation_returned : 'a Worker.observation -> event
+  | File_lease_returned of Worker.file_lease
+  | Observation_finalize_completed of Worker.session * Worker.request_id * (unit,Worker.error)result
+  | Observation_finalize_not_admitted of Worker.session * Worker.request_id * Worker.admission_error
   | Legacy_handoff_completed of Worker.handoff_id * (unit,Worker.error)result
   | Handoff_completed of Worker.handoff_id * Worker.handoff_state
   | Handoff_applied of Worker.handoff_id * Worker.request_id * Id.request_id * (unit,Worker.error)result
@@ -645,6 +649,8 @@ type instruction =
   | Bootstrap
   | Release_binding of Worker.binding
   | Release_observation_registration of Worker.session * Worker.request_id
+  | Finalize_observation_registration of Worker.session * Worker.request_id
+  | Finalize_asset_demand of unit ticket * Worker.session * Worker.asset_consumer
   | Bind_replacement
   | Send : 'a ticket * Worker.session * 'a Worker.request -> instruction
   | Cancel_request : 'a ticket -> instruction
@@ -1128,6 +1134,16 @@ let plan_intent_lifecycle
 
 let non_publications instructions=List.filter(function Publish _->false|_->true)instructions
 
+let complete_asset_waiters facts waiters (result:unit Worker.reply) =
+  let entries=List.fold_left(fun entries serial->match Slots.find_opt serial entries with
+    | Some(Entry slot) when slot.result=None->
+      (match same_kind slot.ticket.kind Unit with
+       | Some Worker.Refl->if slot.forgotten then Slots.remove serial entries else
+         Slots.add serial(Entry{slot with result=Some result})entries
+       | None->entries)
+    | _->entries)facts.entries waiters in
+  {facts with entries}
+;;
 let queue_asset_cleanup facts consumer ?waiter () =
   match Worker.asset_consumer_round consumer with
   | None->facts
@@ -1139,18 +1155,22 @@ let queue_asset_cleanup facts consumer ?waiter () =
           | None->false)old.waiters in
         {old with error=None;wait_for_capacity=false;
           waiters=(match waiter with None->retained|Some serial->serial::retained)}
-      | None->{resource=Demand_resource consumer;attempt=None;waiters=Option.to_list waiter;wait_for_capacity=false;error=None} in
+      | None->
+        let creation=match Asset_consumers.find_opt consumer facts.asset_consumers with
+          |Some entry when Worker.asset_consumer_round entry.consumer=Some round->entry.creation
+          |_->Finished in
+        {resource=Demand_resource consumer;creation;phase=Releasing_resource;returned=true;attempt=None;waiters=Option.to_list waiter;wait_for_capacity=false;error=None} in
     {facts with asset_cleanup=Observation_ids.add round cleanup facts.asset_cleanup}
 ;;
 
-let queue_file_cleanup facts lease ?waiter () =
+let queue_file_cleanup facts lease ?waiter ?(returned=false) () =
   let key=Worker.file_lease_id lease in
   let cleanup=match Observation_ids.find_opt key facts.asset_cleanup with
     | Some previous->
       let waiters=List.filter(fun serial->match Slots.find_opt serial facts.entries with
         |Some(Entry slot)->slot.result=None && not slot.cancelled && not slot.forgotten|_->false)previous.waiters in
-      {previous with error=None;wait_for_capacity=false;waiters=(match waiter with None->waiters|Some id->id::waiters)}
-    |None->{resource=Lease_resource lease;attempt=None;waiters=Option.to_list waiter;wait_for_capacity=false;error=None} in
+      {previous with returned=previous.returned || returned;error=None;wait_for_capacity=false;waiters=(match waiter with None->waiters|Some id->id::waiters)}
+    |None->{resource=Lease_resource lease;creation=Finished;phase=Releasing_resource;returned;attempt=None;waiters=Option.to_list waiter;wait_for_capacity=false;error=None} in
   {facts with asset_cleanup=Observation_ids.add key cleanup facts.asset_cleanup}
 ;;
 let resource_release = function
@@ -1158,10 +1178,29 @@ let resource_release = function
   | Lease_resource lease->Worker.file_lease_session lease,Worker.Release_file lease
 ;;
 
+let asset_creator facts consumer round creation =
+  let asset_consumers=match Asset_consumers.find_opt consumer facts.asset_consumers with
+    |Some entry when Worker.asset_consumer_round entry.consumer=Some round->
+      Asset_consumers.add consumer {entry with creation} facts.asset_consumers
+    |_->facts.asset_consumers in
+  let asset_cleanup=match Observation_ids.find_opt round facts.asset_cleanup with
+    |Some cleanup->Observation_ids.add round {cleanup with creation} facts.asset_cleanup
+    |None->facts.asset_cleanup in
+  {facts with asset_consumers;asset_cleanup}
+;;
+
 let progress_asset_cleanup ?(capacity=false) transition =
   let next=ref transition.next and effects=ref [] in
   Observation_ids.iter(fun round cleanup->
-    if cleanup.attempt=None && cleanup.error=None && (capacity || not cleanup.wait_for_capacity) then
+    if cleanup.attempt=None && cleanup.creation=Not_created then (
+      let facts=complete_asset_waiters !next.facts cleanup.waiters (Worker.Answered(Ok())) in
+      let asset_consumers=match cleanup.resource with
+        |Demand_resource consumer->(match Asset_consumers.find_opt consumer facts.asset_consumers with
+          |Some entry when Worker.asset_consumer_round entry.consumer=Some round && not entry.active->Asset_consumers.remove consumer facts.asset_consumers
+          |_->facts.asset_consumers)
+        |Lease_resource _->facts.asset_consumers in
+      next:={!next with facts={facts with asset_consumers;asset_cleanup=Observation_ids.remove round facts.asset_cleanup}})
+    else if cleanup.creation=Finished && cleanup.attempt=None && cleanup.error=None && (capacity || not cleanup.wait_for_capacity) then
       let session,operation=resource_release cleanup.resource in
       match plan_intent_lifecycle !next session operation Unit(Cleanup session)None with
       | Error error->next:={!next with facts={!next.facts with asset_cleanup=Observation_ids.add round {cleanup with error=Some error} !next.facts.asset_cleanup}}
@@ -1171,7 +1210,10 @@ let progress_asset_cleanup ?(capacity=false) transition =
           | None->assert false in
         next:={planned.next with facts={planned.next.facts with entries;
           asset_cleanup=Observation_ids.add round {cleanup with attempt=Some ticket.id;wait_for_capacity=false}planned.next.facts.asset_cleanup}};
-        effects:=List.rev_append(non_publications planned.instructions)!effects)
+        let commands=match cleanup.phase,cleanup.resource with
+          |Finalizing_resource,Demand_resource consumer->[Finalize_asset_demand(ticket,session,consumer)]
+          |_->non_publications planned.instructions in
+        effects:=List.rev_append commands !effects)
     transition.next.facts.asset_cleanup;
   if !next==transition.next then transition else
     changed !next(non_publications transition.instructions @ List.rev !effects)
@@ -1796,16 +1838,6 @@ let asset_cleanup_error = function
   | Worker.Interrupted _->Worker.Service_failed "Asset cleanup was interrupted. Retry the same consumer."
   | Worker.Answered(Ok())->assert false
 
-let complete_asset_waiters facts waiters (result:unit Worker.reply) =
-  let entries=List.fold_left(fun entries serial->match Slots.find_opt serial entries with
-    | Some(Entry slot) when slot.result=None->
-      (match same_kind slot.ticket.kind Unit with
-       | Some Worker.Refl->if slot.forgotten then Slots.remove serial entries else
-         Slots.add serial(Entry{slot with result=Some result})entries
-       | None->entries)
-    | _->entries)facts.entries waiters in
-  {facts with entries}
-;;
 let finish_resource_release state (ticket:unit ticket) (result:unit Worker.reply) key =
     (match Option.bind key(fun round->
       Option.map(fun cleanup->round,cleanup)(Observation_ids.find_opt round state.facts.asset_cleanup)) with
@@ -1815,6 +1847,11 @@ let finish_resource_release state (ticket:unit ticket) (result:unit Worker.reply
             Observation_ids.add round {cleanup with attempt=None;wait_for_capacity=true}state.facts.asset_cleanup}}
         | _->
           let success=result=Worker.Answered(Ok()) in
+          if success && cleanup.phase=Releasing_resource && (match cleanup.resource with Demand_resource _->true|_->false)
+          then {state with facts={state.facts with asset_cleanup=Observation_ids.add round
+            {cleanup with phase=Finalizing_resource;attempt=None;wait_for_capacity=false;error=None}state.facts.asset_cleanup}}
+          else
+
           let error=if success then None else Some(asset_cleanup_error result) in
           let facts=complete_asset_waiters state.facts cleanup.waiters
             (match error with None->Worker.Answered(Ok())|Some error->Worker.Answered(Error error)) in
@@ -1824,7 +1861,7 @@ let finish_resource_release state (ticket:unit ticket) (result:unit Worker.reply
               | _->facts.asset_consumers)
             |Lease_resource _->facts.asset_consumers in
           let file_leases=if success then Observation_ids.remove round facts.file_leases else facts.file_leases in
-          let released_leases=match success,cleanup.resource with true,Lease_resource lease->
+          let released_leases=match success,cleanup.resource with true,Lease_resource lease when not cleanup.returned->
             Observation_ids.add round(Worker.file_lease_session lease)facts.released_leases|_->facts.released_leases in
           let asset_cleanup=if success then Observation_ids.remove round facts.asset_cleanup else
             Observation_ids.add round {cleanup with attempt=None;waiters=[];wait_for_capacity=false;error}facts.asset_cleanup in
@@ -1854,7 +1891,7 @@ let adopt_file_result : type a. t -> a slot -> a Worker.reply -> t =
     || (match slot.ticket.query with Operation(Worker.Acquire_asset_file file)->not(asset_file_current state.facts file)|_->false) in
   let adopt facts lease=
     let facts={facts with file_leases=Observation_ids.add(Worker.file_lease_id lease)lease facts.file_leases} in
-    if orphan then queue_file_cleanup facts lease () else facts in
+    if orphan then queue_file_cleanup facts lease ~returned:true () else facts in
   let facts=match slot.ticket.query,result with
     |Operation(Worker.Import intent),_->
       let key=import_key intent in
@@ -1926,6 +1963,17 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
              ~admitted:(slot.admitted <> None)
              ~cancelled:slot.cancelled
          in
+         let facts=match ticket.query with
+           |Operation(Worker.Observe _)->(match Observation_ids.find_opt ticket.id state.facts.observations with
+             |Some(Observing value)->Observation_ids.add ticket.id
+               (Observing{value with obs_creator_finished=true;
+                 obs_returned=value.obs_returned || slot.cancelled || value.obs_handle=None;
+                 obs_releasing=value.obs_releasing || slot.cancelled || value.obs_handle=None})state.facts.observations
+             |None->state.facts.observations) |> fun observations->{state.facts with observations}
+           |Operation(Worker.Replace_asset_demand(consumer,_,_))->
+             asset_creator state.facts consumer ticket.id (if slot.admitted=None then Not_created else Finished)
+           |_->state.facts in
+         let state={state with facts} in
          let state=adopt_file_result state slot result in
          let state = retain_change_result state ticket result in
          let state = retain_asset_command_result state ticket result in
@@ -2046,7 +2094,10 @@ let cancel_observation : type a. view -> a ticket -> view =
   | Operation (Worker.Observe _) ->
     (match Observation_ids.find_opt ticket.id facts.observations with
      | Some (Observing value) when Worker.equal_request_id ticket.id value.obs_initial.id
-       -> retire_observation facts value.obs_session ticket.id
+       ->
+       let facts=retire_observation facts value.obs_session ticket.id in
+       {facts with observations=Observation_ids.add ticket.id (Observing{value with
+         obs_releasing=true;obs_returned=true;obs_cleanup_waiting=false;obs_cleanup_error=None})facts.observations}
      | _ -> facts)
   | _ -> facts
 ;;
@@ -2151,16 +2202,13 @@ let release_observation_result state session id result =
   | Some (Observing value)
     when value.obs_releasing
          && value.obs_release_inflight
+         && not value.obs_release_done
          && Worker.equal_session session value.obs_session ->
     (match result with
      | Ok () ->
-       let facts =
-         { state.facts with
-           observations = Observation_ids.remove id state.facts.observations
-         ; retired_observations =
-             Observation_ids.add id session state.facts.retired_observations
-         ; retired_observation_count = state.facts.retired_observation_count + 1
-         }
+       let facts = {state.facts with observations=Observation_ids.add id
+         (Observing{value with obs_release_done=true;obs_release_inflight=false;
+           obs_registered=false;obs_latest=None;obs_cleanup_error=None;obs_cleanup_waiting=false})state.facts.observations}
        in
        changed { state with facts = complete_release_waiters facts session id } []
      | Error error ->
@@ -2356,14 +2404,7 @@ let step_base state event =
           ; applications = Graphs.empty
           ; released_leases=(if state.lifecycle=Rebinding then Observation_ids.empty else state.facts.released_leases)
           ; import_history=(if state.lifecycle=Rebinding then Graphs.empty else state.facts.import_history)
-          ; retired_observations =
-              (if state.lifecycle = Rebinding
-               then Observation_ids.empty
-               else state.facts.retired_observations)
-          ; retired_observation_count =
-              (if state.lifecycle = Rebinding
-               then 0
-               else state.facts.retired_observation_count)
+
           }
       }
       [ Bootstrap ]
@@ -2431,22 +2472,7 @@ let step_base state event =
     when is_binding state binding && state.lifecycle <> Running ->
     (match result with
      | Ok () ->
-       let retired_observations =
-         Observation_ids.fold
-           (fun id (Observing value) retired ->
-              Observation_ids.add id value.obs_session retired)
-           state.facts.observations
-           state.facts.retired_observations
-       in
-       let facts =
-         { state.facts with
-           observations = Observation_ids.empty
-         ; retired_observations
-         ; retired_observation_count =
-             state.facts.retired_observation_count
-             + Observation_ids.cardinal state.facts.observations
-         }
-       in
+       let facts = { state.facts with observations = Observation_ids.empty } in
        let facts =
          Observation_ids.fold
            (fun id (Observing value) facts ->
@@ -2542,7 +2568,11 @@ let step_base state event =
               Graphs.add key{import_intent=intent;source_owner;progress=Some progress;
                 source_adopted=Option.exists(fun saved->saved.source_adopted)(Graphs.find_opt key state.facts.imports)}state.facts.imports
             |_->state.facts.imports in
-          let state = { state with facts = { state.facts with observations;imports } } in
+          let facts={state.facts with observations;imports} in
+          let facts=match ticket.query with
+            |Operation(Worker.Replace_asset_demand(consumer,_,_))->asset_creator facts consumer ticket.id Creating
+            |_->facts in
+          let state = { state with facts } in
           let next =
             { state with
               facts =
@@ -2770,7 +2800,7 @@ let step_base state event =
   | Observation_release_not_admitted (session, id, admission) ->
     (match Observation_ids.find_opt id state.facts.observations with
      | Some (Observing value)
-       when Worker.equal_session session value.obs_session && value.obs_release_inflight
+       when Worker.equal_session session value.obs_session && value.obs_release_inflight && not value.obs_release_done
        ->
        let error =
          match admission with
@@ -2795,6 +2825,44 @@ let step_base state event =
          }
          []
      | _ -> unchanged state)
+  | Observation_returned handle ->
+    (match find_observation state.facts (Worker.observation_id handle) (Worker.observation_query handle) with
+     |Some owned when observation_matches owned handle->
+       let facts=retire_observation state.facts owned.obs_session owned.obs_initial.id in
+       let observations=Observation_ids.add owned.obs_initial.id (Observing{owned with
+         obs_releasing=true;obs_returned=true;obs_cleanup_waiting=false;obs_cleanup_error=None})facts.observations in
+       changed {state with facts={facts with observations}} []
+     |_->unchanged state)
+  | File_lease_returned lease ->
+    let id=Worker.file_lease_id lease in
+    let cleanup=Observation_ids.find_opt id state.facts.asset_cleanup in
+    let asset_cleanup=match cleanup with
+      |Some({resource=Lease_resource actual;_} as value)
+        when Worker.equal_session (Worker.file_lease_session actual) (Worker.file_lease_session lease)->
+          Observation_ids.add id {value with returned=true}state.facts.asset_cleanup
+      |_->state.facts.asset_cleanup in
+    let released_leases=match Observation_ids.find_opt id state.facts.released_leases with
+      |Some session when Worker.equal_session session(Worker.file_lease_session lease)->Observation_ids.remove id state.facts.released_leases
+      |_->state.facts.released_leases in
+    changed {state with facts={state.facts with asset_cleanup;released_leases}} []
+  | Observation_finalize_completed(session,id,result)->
+    (match Observation_ids.find_opt id state.facts.observations with
+     |Some(Observing value) when value.obs_release_done && value.obs_returned
+       && value.obs_release_inflight && Worker.equal_session session value.obs_session->
+       let observations=match result with
+         |Ok()->Observation_ids.remove id state.facts.observations
+         |Error error->Observation_ids.add id (Observing{value with obs_release_inflight=false;obs_cleanup_error=Some error})state.facts.observations in
+       changed {state with facts={state.facts with observations}} []
+     |_->unchanged state)
+  | Observation_finalize_not_admitted(session,id,admission)->
+    (match Observation_ids.find_opt id state.facts.observations with
+     |Some(Observing value) when value.obs_release_done && value.obs_release_inflight
+       && Worker.equal_session session value.obs_session->
+       let error=if admission=Worker.Full then None else Some(Worker.Service_failed "Observation finalization not admitted") in
+       let observations=Observation_ids.add id (Observing{value with obs_release_inflight=false;
+         obs_cleanup_waiting=admission=Worker.Full;obs_cleanup_error=error})state.facts.observations in
+       changed {state with facts={state.facts with observations}} []
+     |_->unchanged state)
   | Release handle ->
     (match
        find_observation
@@ -2929,14 +2997,18 @@ let progress_observations ~retry transition =
   let instructions = ref [] in
   let count = ref 0 in
   let observations =
-    Observation_ids.mapi
+    Observation_ids.filter_map
       (fun id (Observing value) ->
          let releasing =
            value.obs_releasing || validate_session state value.obs_session <> Ok ()
          in
          let value = { value with obs_releasing = releasing } in
-         if
+         if releasing && value.obs_creator_finished && not value.obs_admitted
+         then None
+         else if
            releasing
+           && value.obs_creator_finished
+           && (not value.obs_release_done || value.obs_returned)
            && state.lifecycle = Running
            && (not value.obs_release_inflight)
            && value.obs_cleanup_error = None
@@ -2945,14 +3017,15 @@ let progress_observations ~retry transition =
          then (
            incr count;
            instructions
-           := Release_observation_registration (value.obs_session, id) :: !instructions;
-           Observing
+           := (if value.obs_release_done then Finalize_observation_registration(value.obs_session,id)
+               else Release_observation_registration(value.obs_session,id)) :: !instructions;
+           Some(Observing
              { value with
                obs_release_inflight = true
              ; obs_cleanup_waiting = false
              ; obs_cleanup_error = None
-             })
-         else Observing value)
+             }))
+         else Some(Observing value))
       state.facts.observations
   in
   let next = ref { state with facts = { state.facts with observations } } in
@@ -3092,7 +3165,7 @@ let progress_host_handoff ?(capacity=false) transition =
           (non_publications transition.instructions @ [Quiesce plan]))
     |Some(Worker.Quiescing change),Some plan,Some receipt when Worker.valid_handoff_receipt plan receipt
        && Option.exists(Worker.valid_handoff_projection plan)state.facts.current->
-      let pending=Observation_ids.exists(fun _ (Observing value)->affected value.obs_session change)state.facts.observations
+      let pending=Observation_ids.exists(fun _ (Observing value)->not value.obs_release_done && affected value.obs_session change)state.facts.observations
         || Observation_ids.exists(fun _ lease->affected(Worker.file_lease_session lease)change)state.facts.file_leases
         || Observation_ids.exists(fun _ cleanup->affected(fst(resource_release cleanup.resource))change)state.facts.asset_cleanup in
       if pending then transition else changed{state with host_candidate=None;
@@ -3219,7 +3292,7 @@ let plan_asset_command state session operation consumer assets =
     | Some previous->queue_asset_cleanup state.facts previous.consumer () in
   Result.map(fun(ticket,transition)->
     let bound=Worker.bind_asset_consumer consumer ~round:ticket.id in
-    let entry={consumer=bound;assets;active=true;notices=[]} in
+    let entry={consumer=bound;assets;creation=Awaiting_admission;active=true;notices=[]} in
     let next={transition.next with facts={transition.next.facts with
       asset_consumers=Asset_consumers.add consumer entry transition.next.facts.asset_consumers}} in
     progress_asset_cleanup(changed next(non_publications transition.instructions)) |> fun transition->ticket,transition)
@@ -3287,7 +3360,7 @@ let lease_ownership_full state =
   let pending=Slots.fold(fun _ (Entry slot) total->if slot.result<>None then total else match slot.ticket.query with
     |Operation(Worker.Import _ | Worker.Acquire_asset_file _ | Worker.Acquire_imported_file _)->total+1|_->total)state.facts.entries 0 in
   let retained=Observation_ids.cardinal state.facts.file_leases+pending in
-  retained>=256 || retained+Observation_ids.cardinal state.facts.released_leases>=8192
+  retained+Observation_ids.cardinal state.facts.released_leases>=256
 ;;
 
 let plan_import state session intent operation =
@@ -3346,9 +3419,6 @@ let plan_observation (state : t) session budget query =
   if
     state.next = Int64.max_int
     || Observation_ids.cardinal state.facts.observations >= 256
-    || state.facts.retired_observation_count
-       + Observation_ids.cardinal state.facts.observations
-       >= 8192
   then Error (Worker.Invalid_input "Observation ownership capacity exhausted")
   else (
     let serial = Int64.succ state.next in
@@ -3388,6 +3458,9 @@ let plan_observation (state : t) session budget query =
       ; obs_registered = false
       ; obs_admitted = false
       ; obs_releasing = false
+      ; obs_creator_finished = false
+      ; obs_returned = false
+      ; obs_release_done = false
       ; obs_release_inflight = false
       ; obs_cleanup_waiting = false
       ; obs_attempt = None
@@ -3414,11 +3487,9 @@ let plan_observation (state : t) session budget query =
 
 let plan_release state session handle =
   let id = Worker.observation_id handle in
-  let acknowledged =
-    Option.exists
-      (Worker.equal_session session)
-      (Observation_ids.find_opt id state.facts.retired_observations)
-  in
+  let acknowledged = match find_observation state.facts id (Worker.observation_query handle) with
+    |Some value when observation_matches value handle->value.obs_release_done
+    |_->false in
   let owned =
     match find_observation state.facts id (Worker.observation_query handle) with
     | Some value ->

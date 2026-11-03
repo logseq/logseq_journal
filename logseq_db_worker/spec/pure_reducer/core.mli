@@ -297,10 +297,24 @@ module Observation_registry : sig
     -> id:Logseq_db_types.Graph_types.Uuid.t
     -> int64 option
 
+  (** Applied only after the unique Accepted creator has exited its actual
+      request Switch and discarded-result handling, including no-handler cancel.
+      This is not a physical cleanup ACK. *)
+  val creator_finished : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t -> t
+
+  (** Forget only after the caller consumed release success and returned its
+      capability. Existing entries require the original owner, creator completion
+      and physical settlement. Already absent is a non-allocating no-op; it grants
+      no release or host fence. Failures retain the same finalization obligation. *)
+  val finalize : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t
+    -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> t * (unit,string) result
+
   val active : t -> int
   val retained : t -> int
 
-  (** Only after all physical listeners/read leases of this binding settled. *)
+  (** Authoritative monotonic registration retirement, only after its physical
+      listeners/read leases settled. Fences this and older creator callbacks;
+      resources of another registration retain their own cleanup ledger. *)
   val retire_registration : t -> registration:int64 -> t
 end
 
@@ -389,6 +403,11 @@ module Demand_registry : sig
   val retire:t -> owner -> t * release
   val settled:t -> owner -> t
   val pending:t -> registration:int64 -> owner Rrbvec.t
+  val creator_finished:t -> registration:int64 -> consumer:string -> t
+
+  (** Exact settled owner only; absent is a non-allocating idempotent no-op.
+      Completion of the creator alone does not settle a physical demand. *)
+  val finalize:t -> owner -> t * (unit,string) result
 
   (** Permanently fences this and older registrations before pruning completed
       tombstones. Unsettled resource owners remain pending. *)

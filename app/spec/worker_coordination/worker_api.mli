@@ -887,6 +887,11 @@ module type ISSUER = sig
   (** Settle a caller-known pending logical registration even when cancellation
       hid its successful handle. Only the exact backend cleanup ACK is success;
       this is not a fabricated active observation. *)
+  val finalize_observation_registration : session -> observation_id:request_id -> (Service.request,error)result
+  val observation_registration_finalized : session -> observation_id:request_id -> Service.response -> (unit,error)result
+  val finalize_asset_demand : session -> request_id:request_id -> asset_consumer -> (Service.request,error)result
+  val asset_demand_finalized : session -> request_id:request_id -> asset_consumer -> Service.response -> (unit,error)result
+
   val release_observation_registration
     :  session
     -> observation_id:request_id

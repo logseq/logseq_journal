@@ -140,6 +140,7 @@ module Service = struct
     ; init : 'push Session_context.t -> 'config -> ('state, string) result
     ; handle : 'push Request_context.t -> 'state -> 'request -> ('response, string) result
     ; discard_response : 'state -> request_id:ID.Worker.request_id -> 'request -> 'response -> unit
+    ; request_settled : 'state -> request_id:ID.Worker.request_id -> 'request -> unit
     ; shutdown : 'state -> unit
     }
 
@@ -168,6 +169,7 @@ module Service = struct
         ?classify_control
         ?handle_control
         ?(discard_response = fun _ ~request_id:_ _ _ -> ())
+        ?(request_settled = fun _ ~request_id:_ _ -> ())
         ~init
         ~handle
         ~shutdown
@@ -194,6 +196,7 @@ module Service = struct
       ; init
       ; handle
       ; discard_response
+      ; request_settled
       ; shutdown
       }
   ;;
@@ -1127,17 +1130,32 @@ let run_direct_session
          | Service.Serial -> Eio.Semaphore.make 1
          | Concurrent { max_in_flight } -> Eio.Semaphore.make max_in_flight
        in
-       let publish_direct ?discard request_id outcome =
+       let publish_direct ?discard (request : _ request_envelope) outcome =
+         let request_id=request.request_id in
          let claimed=claim_direct_outcome client request_id outcome in
-         (match discard,claimed with
-          | Some(payload,response),(None | Some(Cancelled | Shutdown | Failed _))->
-            (* Claim ownership under the cancellation lock, then settle outside
-               every Mailbox lock and before the terminal can become visible. *)
-            (try Eio.Cancel.protect(fun()->callbacks.discard_response state ~request_id payload response)
-             with error->
-               if Option.is_none !fatal_error then fatal_error:=Some(exception_message error);
-               Eio.Condition.broadcast client.wake)
-          | _->());
+         let discarded=ref false in
+         let callback_failed error=
+           let message=exception_message error in
+           if Option.is_none !fatal_error then fatal_error:=Some message;
+           Eio.Condition.broadcast client.wake;
+           message in
+         let discard_produced ()=match discard with
+           |Some(payload,response) when not !discarded->
+             discarded:=true;
+             (try Eio.Cancel.protect(fun()->callbacks.discard_response state ~request_id payload response)
+              with error->ignore(callback_failed error))
+           |_->() in
+         (match claimed with
+          |None|Some(Cancelled|Shutdown|Failed _)->discard_produced()
+          |Some(Completed _)->());
+         let claimed=Option.map(fun outcome->
+           try
+             Eio.Cancel.protect(fun()->callbacks.request_settled state ~request_id request.payload);
+             outcome
+           with error->
+             (* A failed ownership fact cannot publish a successful result.
+                The same discarded-result owner settles its unpublished resource. *)
+             discard_produced();Failed(callback_failed error))claimed in
          Option.iter (publish_response client request_id) claimed
        in
        let request_finished () =
@@ -1212,7 +1230,7 @@ let run_direct_session
          if is_cancelled client request.request_id
          then
            publish_direct
-             request.request_id
+             request
              (if Atomic.get client.stop_requested then Shutdown else Cancelled)
          else (
            Atomic.incr client.active_request_fibers;
@@ -1228,9 +1246,9 @@ let run_direct_session
                let discard=Option.map(fun response->request.payload,response) !produced in
                match completion with
                | `No_outcome -> ()
-               | `Outcome outcome -> publish_direct ?discard request.request_id outcome
+               | `Outcome outcome -> publish_direct ?discard request outcome
                | `Fatal error ->
-                 publish_direct ?discard request.request_id (Failed error);
+                 publish_direct ?discard request (Failed error);
                  if Option.is_none !fatal_error then fatal_error := Some error;
                  Eio.Condition.broadcast client.wake)))
        in
@@ -1241,7 +1259,7 @@ let run_direct_session
              client.request_queue_wait_count
              client.max_request_queue_wait_ns
              request.enqueued_at_ns;
-           publish_direct request.request_id Shutdown)
+           publish_direct request Shutdown)
        in
        let shutdown_state () =
          let started = now_ns () in

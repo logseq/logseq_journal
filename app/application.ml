@@ -3592,6 +3592,8 @@ let start
         | Coordination_prepare_host_change _ -> "coordinationPrepareHostChange"
         | Coordination_apply_host_change _ -> "coordinationApplyHostChange"
         | Coordination_confirm_host_change _ -> "coordinationConfirmHostChange"
+        | Coordination_finalize_asset_demand _ -> "finalizeAssetDemand"
+        | Coordination_finalize_observation _ -> "finalizeObservation"
         | Coordination_asset_demand _ -> "coordinationAssetDemand"
         | Coordination_release_asset_demand _ -> "coordinationReleaseAssetDemand"
       in
@@ -3805,18 +3807,19 @@ let start
   let prev_detail_media_routes = graph_ref (fun () -> initial_state.routes) in
   let coordinated_media_point = ref(fun (_:Journal_media_runtime.ticket option) (_:Graph_service.request)->None) in
   let coordinated_media_read = ref(fun (_:Journal_media_runtime.read_request)->false) in
-  let release_coordinated_resource session operation =
+  let release_coordinated_resource ?returned session operation =
     let retry=ref false in
     let admitted=Rrbvec.find_map(fun host->
       match Coordination_host.request host session operation with
-      |Ok ticket->Coordination_host.watch host ticket ~f:(fun _->());Some()
+      |Ok ticket->Coordination_host.watch host ticket ~f:(fun _->());
+        Option.iter(fun event->Coordination_host.post host event)returned;Some()
       |Error Wc.Revoked_session->None
       |Error _->retry:=true;None)(all_coordination_hosts()) in
     (* Retired hosts remain registered until their real resource fence completes.
        A private capability absent from every owner is already settled; an actual
        capacity/error refusal keeps the presentation's queued cleanup intact. *)
     admitted<>None || not !retry in
-  let release_coordinated_file lease=release_coordinated_resource(Wc.file_lease_session lease)(Wc.Release_file lease) in
+  let release_coordinated_file lease=release_coordinated_resource ~returned:(Coordination.File_lease_returned lease)(Wc.file_lease_session lease)(Wc.Release_file lease) in
   let release_coordinated_consumer consumer=release_coordinated_resource(Wc.asset_consumer_session consumer)(Wc.Release_asset_demand consumer) in
   let media_runtime_cell = graph_ref (fun () ->
     let graph= !graph_runtime_cell and changes= !media_changes_cell in
@@ -4316,7 +4319,7 @@ let start
                       Rrbvec.iter(function
                         | Detail_observation.Cancel_initial ticket->Coordination_host.post host(Coordination.Cancel ticket)
                         | Forget_initial ticket->Coordination_host.post host(Coordination.Forget ticket)
-                        | Release handle->Coordination_host.post host(Coordination.Release handle)
+                        | Release handle->Coordination_host.post host(Coordination.Observation_returned handle)
                         | _->())cleanup;
                       !detail_observations_changed();
                       Some Journal_graph_transport.Accepted)
@@ -4891,7 +4894,7 @@ let start
         Rrbvec.iter(function
           | Detail_observation.Cancel_initial ticket->Coordination_host.post host(Coordination.Cancel ticket)
           | Forget_initial ticket->Coordination_host.post host(Coordination.Forget ticket)
-          | Release handle->Coordination_host.post host(Coordination.Release handle)
+          | Release handle->Coordination_host.post host(Coordination.Observation_returned handle)
           | Initial(context,sample) when live context ->
             let session=Wc.observation_session sample.observation in
             (match Coordination_host.validate_session ~owner:context.owner host session with
@@ -5458,7 +5461,7 @@ let start
     Journal_media_runtime.pump (!media_runtime_cell);
     match event with
     | Worker.Push {payload=Graph_service.Coordination_updates _ | Coordination_observations _;_}
-    | Worker.Response {outcome=Completed(Graph_service.Graph_response _ | Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _ | Coordination_imported _ | Coordination_writers_quiesced _ | Coordination_host_prepared _ | Coordination_host_applied _ | Coordination_host_confirmed _ | Coordination_import_inputs_recovered _ | Coordination_import_input_confirmed _ | Coordination_import_input_acknowledged _);_}->Effect.ignore
+    | Worker.Response {outcome=Completed(Graph_service.Coordination_asset_demand_finalized _ | Coordination_observation_finalized _ | Graph_response _ | Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _ | Coordination_imported _ | Coordination_writers_quiesced _ | Coordination_host_prepared _ | Coordination_host_applied _ | Coordination_host_confirmed _ | Coordination_import_inputs_recovered _ | Coordination_import_input_confirmed _ | Coordination_import_input_acknowledged _);_}->Effect.ignore
     | Worker.Push {payload=Graph_service.Graph_pushes _ | Graph_states _ | Session_states _;_} -> Effect.ignore
     | Worker.Response { request_id; outcome; _ }
       when Hashtbl.mem local_copy_requests request_id ->

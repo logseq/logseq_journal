@@ -55,6 +55,11 @@ completed requests do not consume a lifetime ownership quota.
    retained reconciliation or ACK a change window. A migrated interest has one
    invalidation owner; the legacy runtime and new runner cannot both rehydrate/ACK
    it. Release/registration races and orphan file acquisitions retain cleanup.
+   Forget drops a reply ticket, while Observation_returned/File_lease_returned
+   end presentation ownership. Actual creator completion and checked physical
+   release precede observation/demand metadata finalization. Failed or Full
+   finalization retains its phase and never replays physical release; completed
+   returned capabilities do not consume a lifetime quota.
    Observation support is per query kind, not the coarse feature flag alone;
    Changes is rejected before Observe allocates a handle, keeping pull/ACK ownership
    unique. Admission observation may be supported independently.
@@ -179,8 +184,8 @@ at least the following deterministic integration acceptance:
   input immutability, cancellation/admission reordering, terminal duplication,
   retired bindings, cleanup ACKs and stopping failures. It runs 500 fixed-seed
   state traces and 250 queued-read traces with a counterexample shrinker, plus
-  100 generated ownership-range
-  traces and a 16,384-ID compression check. Generators and seeds are outside the
+  100 generated resource-return/finalization traces, 100 demand-round traces
+  and 8,200 successive observation/file returns past the former lifetime quota. Generators and seeds are outside the
   pure state machine; no clock/random/IO or host callback is read by `step`.
 - `test/worker_coordination_runtime_test.ml` uses the actual Service and isolated
   synthetic mirrors/catalogs. It exercises baseline to Open session, bounded typed

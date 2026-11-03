@@ -3288,6 +3288,9 @@ let test_service_observation_lifecycle () =
            revision
          | _ -> failwith "real observation refresh failed"
        in
+       let finalize=Service.Coordination_finalize_observation{registration;owner;observation_id=logical} in
+       require(match call finalize with Failed _->true|_->false)
+         "actual Service finalized a live observation before physical release";
        let release =
          Service.Coordination_release_observation
            { registration; owner; observation_id = logical }
@@ -3307,6 +3310,11 @@ let test_service_observation_lifecycle () =
           | Failed _ -> true
           | _ -> false)
          "retired logical observation was allocated again";
+       require(match call finalize with Completed(Service.Coordination_observation_finalized value)->
+         value.registration=registration && value.owner=owner && value.observation_id=logical|_->false)
+         "actual creator/release ACK did not permit observation finalization";
+       require(match call finalize with Completed(Service.Coordination_observation_finalized _)->true|_->false)
+         "uncertain finalization retry was not idempotent";
        notices := Rrbvec.empty;
        require
          (match write 5 current_revision "After observation release" with

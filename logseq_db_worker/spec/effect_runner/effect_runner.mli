@@ -197,6 +197,10 @@ val release_observations_checked : t -> registration:int64 -> (unit,string) resu
 
 (** Retire only an unknown logical observation ID; no implicit-current graph or
     invented account lifecycle. A known physical allocation must use its owner. *)
+val observation_creator_finished : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t -> unit
+val finalize_observation : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t
+  -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> (unit,string) result
+
 val release_unallocated_observation
   : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t
   -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> (unit,string) result

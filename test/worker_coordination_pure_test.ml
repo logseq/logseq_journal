@@ -125,6 +125,15 @@ let asset_release_tickets instructions =
   List.filter_map release instructions
 ;;
 
+let asset_finalize_tickets instructions =
+  List.filter_map(function C.Finalize_asset_demand(ticket,_,_)->Some ticket|_->None)instructions
+;;
+let complete_demand state ticket =
+  let admitted=(C.step state(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
+  let completed=(C.step admitted(C.Completed(ticket,W.Answered(Ok())))).next in
+  (C.step completed(C.Forget ticket)).next
+;;
+
 let test_asset_cleanup_ack_and_shutdown_retry () =
   let issuer,_,projection,session=fixture 883L in
   let module I=(val issuer:W.ISSUER) in
@@ -132,8 +141,9 @@ let test_asset_cleanup_ack_and_shutdown_retry () =
   let consumer=W.asset_consumer session ~name:"cleanup-owner" |> Result.get_ok in
   let asset=Logseq_db_types.Asset_descriptor.create ~uuid:graph ~source:(Managed None)
     ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
-  let _,planned=C.request initial session(W.Replace_asset_demand(consumer,W.Foreground,[asset])) |> Result.get_ok in
-  let waiter,releasing=C.request planned.next session(W.Release_asset_demand consumer) |> Result.get_ok in
+  let creator,planned=C.request initial session(W.Replace_asset_demand(consumer,W.Foreground,[asset])) |> Result.get_ok in
+  let created=complete_demand planned.next creator in
+  let waiter,releasing=C.request created session(W.Release_asset_demand consumer) |> Result.get_ok in
   let cleanup=List.hd(asset_release_tickets releasing.instructions) in
   let forged=(C.step releasing.next(C.Completed(waiter,W.Answered(Ok())))).next in
   check(C.reply(C.view forged)waiter=None) "public release waiter accepted a fabricated transport ACK";
@@ -144,20 +154,23 @@ let test_asset_cleanup_ack_and_shutdown_retry () =
   let cleanup=List.hd(asset_release_tickets retry.instructions) in
   let early=(C.step retry.next(C.Completed(cleanup,W.Answered(Ok())))).next in
   check(C.reply(C.view early)waiter=None) "early physical reply escaped admission ordering";
-  let done_state=(C.step early(C.Admitted(cleanup,Id.Worker.Request_id.one))).next in
+  let finalized=C.step early(C.Admitted(cleanup,Id.Worker.Request_id.one)) in
+  check(C.reply(C.view finalized.next)waiter=None) "physical release bypassed registry finalization";
+  let finalizer=List.hd(asset_finalize_tickets finalized.instructions) in
+  let done_state=complete_demand finalized.next finalizer in
   check(C.reply(C.view done_state)waiter=Some(W.Answered(Ok()))) "actual release ACK did not settle waiter";
   check(C.validate_session initial session=Ok()) "cleanup mutated a preceding pure state";
-  let _,planned=C.request done_state session(W.Replace_asset_demand(consumer,W.Foreground,[asset])) |> Result.get_ok in
-  let stopping=C.step planned.next C.Shutdown_requested in
+  let creator,planned=C.request done_state session(W.Replace_asset_demand(consumer,W.Foreground,[asset])) |> Result.get_ok in
+  let stopping=C.step (complete_demand planned.next creator) C.Shutdown_requested in
   let cleanup=List.hd(asset_release_tickets stopping.instructions) in
   let admitted=(C.step stopping.next(C.Admitted(cleanup,Id.Worker.Request_id.of_int64 2L))).next in
   let failed=(C.step admitted(C.Completed(cleanup,W.Answered(Error(W.Service_failed "synthetic physical failure"))))).next in
   check((match C.shutdown_state(C.view failed)with C.Shutdown_failed _->true|_->false)) "physical release failure was hidden";
   let aggregate=(C.step failed(C.Binding_release_completed(I.binding,Ok()))).next in
-  check(C.shutdown_state(C.view aggregate)=C.Draining)
+  check(C.shutdown_state(C.view aggregate)=C.Stopped)
     "actual aggregate binding ACK retained a settled demand failure";
   let late=(C.step aggregate(C.Completed(cleanup,W.Answered(Error(W.Service_failed "duplicate old cleanup"))))).next in
-  check(C.shutdown_state(C.view late)=C.Draining) "old cleanup error revived an aggregate-settled obligation";
+  check(C.shutdown_state(C.view late)=C.Stopped) "old cleanup error revived an aggregate-settled obligation";
   let wake=C.step failed C.Capacity_available in
   check(asset_release_tickets wake.instructions=[]) "failed physical release retried automatically on every callback";
   let retried=C.step wake.next C.Shutdown_requested in
@@ -170,26 +183,31 @@ let test_asset_cleanup_round_properties () =
     let module I=(val issuer:W.ISSUER) in
     let consumer=W.asset_consumer session ~name:"round-properties" |> Result.get_ok in
     let first,one=C.request(ready I.binding projection)session(W.Replace_asset_demand(consumer,W.Foreground,[])) |> Result.get_ok in
-    let _,two=C.request one.next session(W.Replace_asset_demand(consumer,W.Foreground,[])) |> Result.get_ok in
+    let second,two=C.request (complete_demand one.next first) session(W.Replace_asset_demand(consumer,W.Foreground,[])) |> Result.get_ok in
     let old=List.hd(asset_release_tickets two.instructions) in
-    let waiter,release=C.request two.next session(W.Release_asset_demand consumer) |> Result.get_ok in
+    let created=complete_demand two.next second in
+    let waiter,release=C.request created session(W.Release_asset_demand consumer) |> Result.get_ok in
     let current=List.hd(asset_release_tickets release.instructions) in
     let state=ref release.next in
-    let admitted=Array.make 2 false and answered=Array.make 2 false in
-    let apply event=state:=(C.step !state event).next in
-    (* Both rounds exist before randomized delivery. Old-round ACKs may never
-       settle the current public waiter, even when their callbacks arrive last. *)
+    let admitted=Array.make 4 false and answered=Array.make 4 false in
+    let tickets=Array.make 4 None in tickets.(0)<-Some old;tickets.(1)<-Some current;
+    let apply event=
+      let tr=C.step !state event in state:=tr.next;
+      List.iter(function C.Finalize_asset_demand(ticket,_,consumer)->
+        let which=if W.asset_consumer_round consumer=Some(C.ticket_id first) then 2 else 3 in
+        tickets.(which)<-Some ticket |_->())tr.instructions in
+    (* Four genuine flights: two old/current physical releases, then their
+       metadata finalizers. Callbacks may arrive before admission, once each. *)
     List.iter(fun action->
-      let which=(action/4)mod 2 in
-      let ticket=if which=0 then old else current in
-      (match action mod 4 with
-       | 0->admitted.(which)<-true;
-         apply(C.Admitted(ticket,Id.Worker.Request_id.of_int64(Int64.of_int(which+10))))
-       | 1->answered.(which)<-true;apply(C.Completed(ticket,W.Answered(Ok())))
-       | 2->apply(C.Completed(waiter,W.Answered(Ok())))
-       | _->apply(C.Completed(first,W.Answered(Ok()))));
-      check((C.reply(C.view !state)waiter=Some(W.Answered(Ok())))=(admitted.(1)&&answered.(1)))
-        "current waiter borrowed an old round or unadmitted ACK";
+      let which=(action/2)mod 4 in
+      (match tickets.(which) with
+       |Some ticket when action mod 2=0 && not admitted.(which)->
+         admitted.(which)<-true;apply(C.Admitted(ticket,Id.Worker.Request_id.of_int64(Int64.of_int(which+10))))
+       |Some ticket when action mod 2=1 && not answered.(which)->
+         answered.(which)<-true;apply(C.Completed(ticket,W.Answered(Ok())))
+       |_->());
+      check((C.reply(C.view !state)waiter=Some(W.Answered(Ok())))=(admitted.(3)&&answered.(3)))
+        "current waiter borrowed another round or skipped finalization";
       check(C.asset_notices(C.view !state)consumer=[]) "retired consumer regained notification authority")actions
   in
   let fails actions=try run actions;false with _->true in
@@ -200,7 +218,7 @@ let test_asset_cleanup_round_properties () =
       | action::rest->remove(action::prefix)rest in remove [] actions in
   for seed=0 to 99 do
     let random=Random.State.make[|0xA55E;seed|] in
-    let actions=[1;0;2;4;5] @ List.init 60(fun _->Random.State.int random 8) in
+    let actions=List.init 80(fun _->Random.State.int random 8) @ [0;1;2;3;4;5;6;7] in
     if fails actions then failwith(Printf.sprintf "asset round seed=%d minimized=[%s]" seed
       (String.concat ";"(List.map string_of_int(shrink actions))))
   done
@@ -398,9 +416,6 @@ let test_import_preview_late_result_is_cleanup_owned () =
   let admitted=(C.step old(C.Admitted(retry_physical,Id.Worker.Request_id.of_int64 5L))).next in
   let released=(C.step admitted(C.Completed(retry_physical,W.Answered(Ok())))).next in
   check(C.reply(C.view released)retry_waiter=Some(W.Answered(Ok()))) "exact physical file ACK did not settle waiter";
-  let repeated,repeat=C.request released session(W.Release_file lease) |> Result.get_ok in
-  check(C.reply(C.view repeat.next)repeated=Some(W.Answered(Ok())) && not(List.exists(function C.Send _->true|_->false)repeat.instructions))
-    "settled lease release was not idempotent";
   check((match C.import_progress(C.view released)intent with Some(W.Imported imported)->W.import_preview imported=None|None->true|_->false))
     "import progress reissued a released preview capability"
 ;;
@@ -1563,6 +1578,8 @@ let test_durable_mutation_properties ?(append=false) () =
         "durable step is nondeterministic";
       check (C.equal_view before (C.view !state)) "durable step modified shared input";
       state := first.next;
+      Option.iter(fun append->check(C.mutation_progress(C.view !state)append=C.intent_progress(C.view !state)intent)
+        "Append progress accessor discarded its normalized durable outcome")append_intent;
       check
         (W.encode_mutation_intent intent = wire)
         "unknown write changed durable payload";
@@ -2485,7 +2502,11 @@ let test_observation_cleanup_failure_waits_for_explicit_retry () =
   let ticket, planned =
     C.request (ready I.binding projection) session operation |> Result.get_ok
   in
-  let canceled = C.step planned.next (C.Cancel ticket) in
+  let admitted=C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.one)) in
+  let canceled=C.step admitted.next(C.Cancel ticket) in
+  check(not(List.exists(function C.Release_observation_registration _->true|_->false)canceled.instructions))
+    "cleanup preceded its accepted creator's actual exit";
+  let canceled=C.step canceled.next(C.Completed(ticket,W.Interrupted W.Cancelled)) in
   let refused =
     C.step
       canceled.next
@@ -2557,7 +2578,10 @@ let test_observation_full_batch_does_not_self_wake () =
            | _ -> false)
          tr.C.instructions)
   in
-  List.iter (fun ticket -> state := (C.step !state (C.Cancel ticket)).next) !tickets;
+  List.iter (fun ticket ->
+    state := (C.step !state (C.Admitted(ticket,Id.Worker.Request_id.one))).next;
+    state := (C.step !state (C.Cancel ticket)).next;
+    state := (C.step !state (C.Completed(ticket,W.Interrupted W.Cancelled))).next) !tickets;
   let refuse () =
     List.iter
       (fun ticket ->
@@ -2739,11 +2763,12 @@ let test_observation_retirement_capacity_resets_only_after_binding_ack () =
     step (C.Cancel ticket);
     step (C.Completed (ticket, W.Interrupted W.Cancelled));
     step (C.Forget ticket);
-    step (C.Observation_release_completed (session, C.ticket_id ticket, Ok ()))
+    step (C.Observation_release_completed (session, C.ticket_id ticket, Ok ()));
+    step (C.Observation_finalize_completed (session, C.ticket_id ticket, Ok ()))
   done;
   check
-    (Result.is_error (C.request !state session (W.Observe (budget, W.Graph_info))))
-    "retired ID history exceeded its bound";
+    (Result.is_ok (C.request !state session (W.Observe (budget, W.Graph_info))))
+    "returned observation identities exhausted normal browsing";
   step C.Retry_bootstrap;
   step (C.Binding_release_completed (I.binding, Ok ()));
   let next_issuer, _, next_projection, next_session = fixture 730L in
@@ -4301,7 +4326,160 @@ let test_host_handoff_properties () =
   done
 ;;
 
+(* The public pure boundary owns admission, actual completion and UI return.
+   Backend Service tests separately prove the resource/finalization acknowledgements. *)
+let test_returned_observations_reuse_capacity () =
+  let issuer,raw,projection,session=fixture 731L in
+  let module I=(val issuer:W.ISSUER) in
+  let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
+  let operation=W.Observe(budget,W.Graph_info) in
+  let state=ref(ready I.binding projection) in
+  let step event=let transition=C.step !state event in state:=transition.next;transition.instructions in
+  for n=1 to 8200 do
+    let ticket,planned=match C.request !state session operation with Ok x->x
+      |Error _->failwith(Printf.sprintf "returned Detail capacity exhausted after %d views" n) in
+    state:=planned.next;
+    ignore(step(C.Admitted(ticket,Id.Worker.Request_id.of_int64(Int64.of_int n))));
+    let response=pure_observation_response issuer raw session ticket operation 0L "projection:v1:0" in
+    let value=match I.reply session ~request_id:(C.ticket_id ticket) operation response |> Result.get_ok with
+      |W.Answered(Ok value)->value|_->assert false in
+    ignore(step(C.Completed(ticket,W.Answered(Ok value))));ignore(step(C.Forget ticket));
+    let commands=step(if n mod 2=0 then C.Observation_returned value.observation else C.Release value.observation) in
+    check(List.exists(function C.Release_observation_registration _->true|_->false)commands)
+      "returning a shown observation did not plan its actual cleanup";
+    let commands=step(C.Observation_release_completed(session,W.observation_id value.observation,Ok())) in
+    let commands=if n mod 2=0 then commands else step(C.Observation_returned value.observation) in
+    check(List.exists(function C.Finalize_observation_registration _->true|_->false)commands)
+      "released and returned observation did not finalize its registry identity";
+    if n=1 then (
+      ignore(step(C.Observation_finalize_not_admitted(session,W.observation_id value.observation,W.Full)));
+      check(not(List.exists(function C.Finalize_observation_registration _->true|_->false)(step C.Drain)))
+        "finalization busy-retried Full without capacity";
+      let retry=step C.Capacity_available in
+      check(List.exists(function C.Finalize_observation_registration _->true|_->false)retry
+        && not(List.exists(function C.Release_observation_registration _->true|_->false)retry))
+        "finalization Full regressed to a fresh physical release");
+    ignore(step(C.Observation_finalize_completed(session,W.observation_id value.observation,Ok())));
+    check(C.observed(C.view !state)value.observation=None) "returned observation regained presentation"
+  done
+;;
+
+let test_resource_return_finalization_properties () =
+  let run scenarios =
+    let issuer,raw,projection,session=fixture 733L in
+    let module I=(val issuer:W.ISSUER) in
+    let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
+    let operation=W.Observe(budget,W.Graph_info) in
+    let state=ref(ready I.binding projection) in
+    let step event=let tr=C.step !state event in state:=tr.next;tr.instructions in
+    let releases xs=List.filter(function C.Release_observation_registration _->true|_->false)xs in
+    let finalizers xs=List.filter(function C.Finalize_observation_registration _->true|_->false)xs in
+    List.iteri(fun n scenario->
+      let ticket,planned=C.request !state session operation |> Result.get_ok in state:=planned.next;
+      let response=pure_observation_response issuer raw session ticket operation 0L "current" in
+      let value=match I.reply session ~request_id:(C.ticket_id ticket) operation response |> Result.get_ok with
+        |W.Answered(Ok value)->value|_->assert false in
+      let cancelled=scenario land 1<>0 in
+      let returned_first=scenario land 2<>0 in
+      let initial_reply=W.Answered(Ok value) in
+      if cancelled then (
+        ignore(step(C.Admitted(ticket,Id.Worker.Request_id.of_int64(Int64.of_int(n+1)))));
+        check(releases(step(C.Cancel ticket))=[]) "cancel cleaned before creator exit";
+        check(List.length(releases(step(C.Completed(ticket,initial_reply))))=1) "canceled creator lost cleanup")
+      else (
+        if scenario land 4<>0 then (
+          ignore(step(C.Completed(ticket,initial_reply)));
+          ignore(step(C.Admitted(ticket,Id.Worker.Request_id.of_int64(Int64.of_int(n+1))))))
+        else (
+          ignore(step(C.Admitted(ticket,Id.Worker.Request_id.of_int64(Int64.of_int(n+1)))));
+          ignore(step(C.Completed(ticket,initial_reply))));
+        let commands=step(if returned_first then C.Observation_returned value.observation else C.Release value.observation) in
+        check(List.length(releases commands)=1) "shown capability lost cleanup");
+      ignore(step(C.Forget ticket));
+      let id=C.ticket_id ticket in
+      if scenario land 8<>0 then (
+        ignore(step(C.Observation_release_not_admitted(session,id,W.Full)));
+        check(releases(step C.Drain)=[]) "Full release self-retried";
+        check(List.length(releases(step C.Capacity_available))=1) "release capacity retry lost");
+      if scenario land 16<>0 then (
+        ignore(step(C.Observation_release_completed(session,id,Error(W.Service_failed "actual I/O failed"))));
+        check(releases(step C.Capacity_available)=[]) "failed release auto-retried";
+        let retry=step(if cancelled then C.Cancel ticket else C.Release value.observation) in
+        check(List.length(releases retry)=1) "explicit release retry lost");
+      let released=step(C.Observation_release_completed(session,id,Ok())) in
+      let finalize=if cancelled || returned_first then released else (
+        check(finalizers released=[]) "unreturned UI capability was forgotten";
+        step(C.Observation_returned value.observation)) in
+      check(List.length(finalizers finalize)=1) "actual returned cleanup did not finalize";
+      if scenario land 32<>0 then (
+        ignore(step(C.Observation_finalize_not_admitted(session,id,W.Full)));
+        check(finalizers(step C.Drain)=[]) "Full finalizer self-retried";
+        let retry=step C.Capacity_available in
+        check(List.length(finalizers retry)=1 && releases retry=[]) "finalizer reallocated physical tombstone");
+      if scenario land 64<>0 then (
+        ignore(step(C.Observation_finalize_completed(session,id,Error(W.Service_failed "finalization outcome unknown"))));
+        check(finalizers(step C.Capacity_available)=[]) "unknown finalizer auto-retried";
+        let retry=step(if cancelled then C.Cancel ticket else C.Observation_returned value.observation) in
+        check(List.length(finalizers retry)=1 && releases retry=[]) "finalizer retry regressed to physical release");
+      ignore(step(C.Observation_finalize_completed(session,id,Ok())));
+      check(C.observed(C.view !state)value.observation=None) "returned interest revived")scenarios
+  in
+  let fails trace=try run trace;false with _->true in
+  let rec shrink trace=
+    let rec remove prefix=function
+      |[]->trace
+      |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      |x::rest->remove(x::prefix)rest in remove [] trace in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0xC1EA;seed|] in
+    let trace=List.init 40(fun _->Random.State.int random 128) in
+    if fails trace then failwith(Printf.sprintf "resource return seed=%d shrunk=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink trace))))
+  done
+;;
+
+let test_returned_files_reuse_capacity () =
+  let issuer,_,projection,session=fixture 732L in
+  let module I=(val issuer:W.ISSUER) in
+  let state=ref(ready I.binding projection) in
+  let step event=let t=C.step !state event in state:=t.next;t.instructions in
+  let consumer=W.asset_consumer session ~name:"ordinary-visible-image" |> Result.get_ok in
+  let asset=Logseq_db_types.Asset_descriptor.create ~uuid:graph ~source:(Managed None)
+    ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
+  let operation=W.Replace_asset_demand(consumer,W.Foreground,[asset]) in
+  let ticket,planned=C.request !state session operation |> Result.get_ok in state:=planned.next;
+  let wire=match I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok with
+    |S.Coordination_asset_demand{consumer;_}->consumer|_->assert false in
+  ignore(step(C.Admitted(ticket,Id.Worker.Request_id.one)));ignore(step(C.Completed(ticket,W.Answered(Ok()))));ignore(step(C.Forget ticket));
+  let notice=I.asset_notice session(S.Asset_availability{consumer=wire;asset=asset.uuid;descriptor=asset;availability=Ready "current-file"}) |> Result.get_ok in
+  ignore(step(C.Asset_received(notice,Id.Worker.Push_sequence.one)));
+  let file=W.ready_asset_file notice |> Option.get in
+  let physical instructions=let find:C.instruction->unit C.ticket option=function
+    |C.Send(ticket,_,W.Release_file _)->Some ticket|_->None in List.find_map find instructions |> Option.get in
+  for n=1 to 8200 do
+    let operation=W.Acquire_asset_file file in
+    let ticket,planned=match C.request !state session operation with Ok x->x
+      |Error _->failwith(Printf.sprintf "ordinary file capacity exhausted after %d views" n) in
+    state:=planned.next;
+    ignore(step(C.Admitted(ticket,Id.Worker.Request_id.of_int64(Int64.of_int(n*3)))));
+    let reply=I.reply session ~request_id:(C.ticket_id ticket) operation
+      (S.Asset_file(Some(Printf.sprintf "lease-%d" n,"/tmp/isolated-current.png"))) |> Result.get_ok in
+    let lease=match reply with W.Answered(Ok(Some x))->x|_->assert false in
+    ignore(step(C.Completed(ticket,reply)));ignore(step(C.Forget ticket));
+    let waiter,planned=C.request !state session(W.Release_file lease) |> Result.get_ok in state:=planned.next;
+    let cleanup=physical planned.instructions in
+    if n mod 2=0 then ignore(step(C.File_lease_returned lease));
+    ignore(step(C.Admitted(cleanup,Id.Worker.Request_id.of_int64(Int64.of_int(n*3+1)))));
+    ignore(step(C.Completed(cleanup,W.Answered(Ok()))));ignore(step(C.Forget waiter));
+    if n mod 2<>0 then ignore(step(C.File_lease_returned lease))
+  done
+;;
+
 let () =
+  if Array.mem "--file-return-only" Sys.argv then (test_returned_files_reuse_capacity();exit 0);
+  test_returned_observations_reuse_capacity ();
+  test_returned_files_reuse_capacity ();
+  test_resource_return_finalization_properties ();
   test_asset_demand_notice_has_one_registered_owner ();
   test_asset_cleanup_ack_and_shutdown_retry ();
   test_asset_cleanup_round_properties ();

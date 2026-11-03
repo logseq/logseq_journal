@@ -145,6 +145,10 @@ type event =
   | Cancel : 'a ticket -> event
   | Forget : 'a ticket -> event
   | Release : 'a Worker.observation -> event
+  | Observation_returned : 'a Worker.observation -> event
+  | File_lease_returned of Worker.file_lease
+  | Observation_finalize_completed of Worker.session * Worker.request_id * (unit,Worker.error)result
+  | Observation_finalize_not_admitted of Worker.session * Worker.request_id * Worker.admission_error
   | Legacy_handoff_completed of Worker.handoff_id * (unit,Worker.error)result
   | Handoff_completed of Worker.handoff_id * Worker.handoff_state
   | Handoff_applied of Worker.handoff_id * Worker.request_id * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id * (unit,Worker.error)result
@@ -156,10 +160,15 @@ type event =
   | Handoff_confirmed of Worker.handoff_id * Worker.request_id * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id option * (bool,Worker.error)result
   | Drain
 
+(** Return means no presentation consumer retains the capability. It is not an
+    I/O ACK: failed/in-flight cleanup and metadata finalization stay owned until
+    their matching real completions. Cleanup retries remain possible while owned. *)
 type instruction =
   | Bootstrap
   | Release_binding of Worker.binding
   | Release_observation_registration of Worker.session * Worker.request_id
+  | Finalize_observation_registration of Worker.session * Worker.request_id
+  | Finalize_asset_demand of unit ticket * Worker.session * Worker.asset_consumer
   | Bind_replacement
   | Send : 'a ticket * Worker.session * 'a Worker.request -> instruction
   | Cancel_request : 'a ticket -> instruction

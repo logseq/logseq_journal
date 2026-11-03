@@ -547,6 +547,11 @@ module type ISSUER = sig
   val changefeed_notices : Service.push -> (changefeed_notice Rrbvec.t, error) result
   val observation_notices : Service.push -> (observation_notice Rrbvec.t, error) result
 
+  val finalize_observation_registration : session -> observation_id:request_id -> (Service.request,error)result
+  val observation_registration_finalized : session -> observation_id:request_id -> Service.response -> (unit,error)result
+  val finalize_asset_demand : session -> request_id:request_id -> asset_consumer -> (Service.request,error)result
+  val asset_demand_finalized : session -> request_id:request_id -> asset_consumer -> Service.response -> (unit,error)result
+
   val release_observation_registration
     :  session
     -> observation_id:request_id
@@ -1868,6 +1873,29 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
              ~none:false
              ~some:(fun projection -> projection.selected = Some presentation)
              !latest
+      ;;
+
+      let finalize_observation_registration (session:session) ~observation_id =
+        if not(equal_binding session.binding binding) then Error Revoked_session else
+        Ok(Service.Coordination_finalize_observation{registration=binding.serial;owner=session.scope;observation_id})
+      ;;
+      let observation_registration_finalized (session:session) ~observation_id = function
+        |Service.Coordination_observation_finalized{registration;owner;observation_id=actual}
+          when equal_binding session.binding binding && registration=binding.serial
+            && matches_scope session owner && equal_request_id actual observation_id->Ok()
+        |_->Error(Protocol_mismatch "Observation finalization acknowledgement mismatch")
+      ;;
+      let finalize_asset_demand (session:session) ~request_id (consumer:asset_consumer) =
+        if not(equal_binding session.binding binding) || not(equal_session consumer.session session) then Error Revoked_session
+        else Result.map(fun consumer->Service.Coordination_finalize_asset_demand{
+          registration=binding.serial;owner=session.asset_scope;request_id;consumer})(asset_consumer_wire consumer)
+      ;;
+      let asset_demand_finalized (session:session) ~request_id (consumer:asset_consumer) response =
+        match response,asset_consumer_wire consumer with
+        |Service.Coordination_asset_demand_finalized{registration;owner;request_id=actual;consumer=wire},Ok expected
+          when equal_binding session.binding binding && registration=binding.serial
+            && matches_asset_scope session owner && equal_request_id actual request_id && wire=expected->Ok()
+        |_->Error(Protocol_mismatch "Asset finalization acknowledgement mismatch")
       ;;
 
       let release_observation_registration (session : session) ~observation_id =

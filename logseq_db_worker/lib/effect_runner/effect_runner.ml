@@ -1204,6 +1204,14 @@ let release_observation t ~registration ~id ~scope =
     Ok ()
 ;;
 
+let observation_creator_finished t ~registration ~id =
+  t.observation_registry<-Core.Observation_registry.creator_finished t.observation_registry ~registration ~id
+;;
+let finalize_observation t ~registration ~id ~owner =
+  let next,result=Core.Observation_registry.finalize t.observation_registry ~registration ~id ~owner in
+  t.observation_registry<-next;result
+;;
+
 let release_unallocated_observation t ~registration ~id ~owner =
   if Hashtbl.mem t.observation_slots (registration, id)
   then Error "Known observation requires physical cleanup with its stored owner"

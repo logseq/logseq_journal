@@ -80,6 +80,9 @@ val replace_coordinated_asset_demand : t -> registration:int64
   -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> consumer:string
   -> priority:Logseq_sync_pure_reducer.Asset_transfer.priority
   -> assets:Logseq_db_types.Asset_descriptor.t list -> (unit,string) result
+val asset_demand_creator_finished : t -> registration:int64 -> consumer:string -> unit
+val finalize_coordinated_asset_demand : t -> registration:int64
+  -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> consumer:string -> (unit,string) result
 val release_coordinated_asset_demand : t -> registration:int64
   -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> consumer:string -> (unit,string) result
 
@@ -180,6 +183,10 @@ val release_observation
 
 (** Retire only an unknown logical observation ID; no implicit-current graph or
     invented account lifecycle. A known physical allocation must use its owner. *)
+val observation_creator_finished : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t -> unit
+val finalize_observation : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t
+  -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> (unit,string) result
+
 val release_unallocated_observation
   : t -> registration:int64 -> id:Logseq_db_types.Graph_types.Uuid.t
   -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> (unit,string) result

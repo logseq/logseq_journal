@@ -334,6 +334,10 @@ type request =
   | Coordination_import of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
        source:Logseq_db_types.Asset_import.t}
+  | Coordination_finalize_asset_demand of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
+  | Coordination_finalize_observation of
+      {registration:int64;owner:timeline_scope;observation_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_asset_demand of
       {registration:int64;owner:timeline_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
        consumer:string;priority:Logseq_sync_pure_reducer.Asset_transfer.priority;
@@ -423,6 +427,10 @@ type response =
   | Coordination_imported of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;
        result:(Logseq_db_worker.import_receipt,string)result}
+  | Coordination_asset_demand_finalized of
+      {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
+  | Coordination_observation_finalized of
+      {registration:int64;owner:timeline_scope;observation_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_asset_demand_accepted of {request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_asset_demand_released of
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
@@ -1016,6 +1024,12 @@ let create ~(dependencies : dependencies) =
     ~discard_response:(fun session ~request_id:_ request response->
       Option.iter(fun(scope,handle)->Db.abandon_asset_file session.Session.worker ~scope ~handle)
         (discarded_asset_retain request response))
+    ~request_settled:(fun session ~request_id:_ -> function
+      | Coordination_observe{registration;observation_id;_}->
+        Db.observation_creator_finished session.Session.worker ~registration ~id:observation_id
+      | Coordination_asset_demand{registration;consumer;_}->
+        Db.asset_demand_creator_finished session.Session.worker ~registration ~consumer
+      | _->())
     ~data_directory:(fun config -> Ok config.Db.Config.application_support_directory)
     ~control_topic_count:2
     ~classify_control:(function
@@ -1259,6 +1273,13 @@ let create ~(dependencies : dependencies) =
            if not(authorized()) then Error "The import registration or account authority retired." else
            Ok(Coordination_imported{registration;owner=scope;request_id;
              result=Db.import_asset ~scope ~current:authorized session.worker ~graph_generation:scope.graph_generation source}))
+      | Coordination_finalize_asset_demand{registration;owner;request_id;consumer}->
+        if not(typed_asset_consumer_owner registration owner consumer) then Error "Asset finalization owner mismatch" else
+        Db.finalize_coordinated_asset_demand session.worker ~registration ~scope:owner ~consumer
+        |> Result.map(fun()->Coordination_asset_demand_finalized{registration;owner;request_id;consumer})
+      | Coordination_finalize_observation{registration;owner;observation_id}->
+        Db.finalize_observation session.worker ~registration ~id:observation_id ~owner
+        |> Result.map(fun()->Coordination_observation_finalized{registration;owner;observation_id})
       | Coordination_asset_demand{registration;owner;request_id;consumer;priority;assets}->
         (match resolve owner with
          | None->Error "The asset demand graph session is not open."

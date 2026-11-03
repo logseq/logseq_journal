@@ -1299,6 +1299,8 @@ module Observation_registry = struct
 
   type t =
     { entries : entry Entries.t
+    ; finished : unit Entries.t
+    ; closed : int64
     ; active : int
     ; retained : int
     }
@@ -1318,7 +1320,7 @@ module Observation_registry = struct
     | Release_full
     | Wrong_owner
 
-  let empty = { entries = Entries.empty; active = 0; retained = 0 }
+  let empty = { entries = Entries.empty; finished=Entries.empty; closed=0L; active = 0; retained = 0 }
 
   let same_scope (a : S.graph_scope) (b : S.graph_scope) =
     G.Uuid.equal a.graph_id b.graph_id
@@ -1349,7 +1351,7 @@ module Observation_registry = struct
       || maximum_bytes > Protocol.maximum_response_bytes
       || not (Protocol.is_observable_read command)
     then state, Invalid
-    else (
+    else if registration<=state.closed then state,Retired else (
       match Entries.find_opt key state.entries with
       | Some (Gone old | Closing old) ->
         state, if same_scope scope old then Retired else Mismatch
@@ -1363,9 +1365,10 @@ module Observation_registry = struct
             && old.maximum_bytes = maximum_bytes
           then Existing
           else Mismatch )
+      | None when Entries.mem key state.finished -> state,Retired
       | None when state.active >= 256 || state.retained >= 8192 -> state, Full
       | None ->
-        ( { entries =
+        ( { state with entries =
               Entries.add
                 key
                 (Live { scope; command; maximum_bytes; epoch = 0L })
@@ -1385,11 +1388,12 @@ module Observation_registry = struct
     | Some (Gone old) when same_scope scope old -> state, Already_released
     | Some (Gone_unallocated old) when same_owner scope old -> state, Already_released
     | Some _ -> state, Wrong_owner
+    | None when registration>0L && registration<=state.closed -> state,Unknown
     | None when registration <= 0L || state.retained >= 8192 -> state, Release_full
     | None ->
       ( { state with
           entries = Entries.add key (Gone scope) state.entries
-        ; retained = state.retained + 1
+        ; retained = state.retained + (if Entries.mem key state.finished then 0 else 1)
         }
       , Unknown )
   ;;
@@ -1399,6 +1403,7 @@ module Observation_registry = struct
     match Entries.find_opt key state.entries with
     | Some (Gone_unallocated old) when equal_owner owner old -> state, Already_released
     | Some _ -> state, Wrong_owner
+    | None when registration>0L && registration<=state.closed -> state,Unknown
     | None
       when registration <= 0L
            || owner.startup.account_generation < 0
@@ -1407,7 +1412,7 @@ module Observation_registry = struct
     | None ->
       ( { state with
           entries = Entries.add key (Gone_unallocated owner) state.entries
-        ; retained = state.retained + 1
+        ; retained = state.retained + (if Entries.mem key state.finished then 0 else 1)
         }
       , Unknown )
   ;;
@@ -1452,6 +1457,28 @@ module Observation_registry = struct
     | _ -> None
   ;;
 
+  let creator_finished state ~registration ~id =
+    let key=registration,id in
+    if registration<=0L || (registration<=state.closed && not(Entries.mem key state.entries))
+    then state else
+    let known=Entries.mem key state.entries || Entries.mem key state.finished in
+    {state with finished=Entries.add key () state.finished;
+      retained=state.retained+(if known then 0 else 1)}
+  ;;
+
+  let finalize state ~registration ~id ~owner =
+    let key=registration,id in
+    let remove ()=
+      let known=Entries.mem key state.entries || Entries.mem key state.finished in
+      {state with entries=Entries.remove key state.entries;finished=Entries.remove key state.finished;
+        retained=state.retained-(if known then 1 else 0)},Ok() in
+    match Entries.find_opt key state.entries with
+    |None->remove()
+    |Some(Gone scope) when same_owner scope owner && Entries.mem key state.finished->remove()
+    |Some(Gone_unallocated actual) when equal_owner actual owner && Entries.mem key state.finished->remove()
+    |Some _->state,Error "Observation owner, creator or physical cleanup is not settled"
+  ;;
+
   let active state = state.active
   let retained state = state.retained
 
@@ -1471,7 +1498,9 @@ module Observation_registry = struct
         entries
         (0, 0)
     in
-    { entries; active; retained }
+    let finished=Entries.filter(fun(binding,_) _->binding<>registration)state.finished in
+    let retained=Entries.fold(fun key () count->count+(if Entries.mem key entries then 0 else 1))finished retained in
+    { entries;finished;closed=max state.closed registration;active;retained }
   ;;
 end
 
@@ -1692,10 +1721,10 @@ module Demand_registry = struct
   module Keys=Map.Make(struct type t=int64*string let compare=Stdlib.compare end)
   type payload=Logseq_sync_pure_reducer.Asset_transfer.priority * Logseq_db_types.Asset_descriptor.t list
   type entry={owner:owner;payload:payload option;retired:bool;settled:bool}
-  type t={entries:entry Keys.t;closed:int64}
+  type t={entries:entry Keys.t;finished:unit Keys.t;closed:int64}
   type reservation=Start|Existing|Retired|Mismatch|Full|Invalid
   type release=Release|Already_settled|Unknown|Mismatch|Full
-  let empty={entries=Keys.empty;closed=0L}
+  let empty={entries=Keys.empty;finished=Keys.empty;closed=0L}
   let key owner=owner.registration,owner.consumer
   let same_scope (a:Logseq_sync_pure_reducer.Core.graph_scope) (b:Logseq_sync_pure_reducer.Core.graph_scope)=
     a.graph_id=b.graph_id && a.graph_generation=b.graph_generation
@@ -1717,6 +1746,7 @@ module Demand_registry = struct
     | Some{retired=true;_}->t,Retired
     | Some entry when entry.payload=Some(priority,assets)->t,Existing
     | Some _->t,Mismatch
+    | None when Keys.mem(key owner)t.finished->t,Retired
     | None->
       let pending=Keys.fold(fun _ entry count->count+(if entry.settled then 0 else 1))t.entries 0 in
       if pending>=128 || Keys.cardinal t.entries>=8192 then t,Full else
@@ -1737,9 +1767,21 @@ module Demand_registry = struct
   let pending t ~registration=Keys.fold(fun _ entry values->
     if entry.owner.registration=registration && not entry.settled then Rrbvec.push_back values entry.owner else values)
     t.entries Rrbvec.empty
+  let creator_finished t ~registration ~consumer =
+    let key=registration,consumer in
+    if registration<=0L || (registration<=t.closed && not(Keys.mem key t.entries)) then t
+    else {t with finished=Keys.add key () t.finished}
+  let finalize t owner =
+    let remove ()={t with entries=Keys.remove(key owner)t.entries;finished=Keys.remove(key owner)t.finished},Ok() in
+    match Keys.find_opt(key owner)t.entries with
+    |None->remove()
+    |Some entry when same_scope entry.owner.scope owner.scope && entry.retired && entry.settled
+        && Keys.mem(key owner)t.finished->remove()
+    |Some _->t,Error "Demand owner, creator or physical cleanup is not settled"
   let forget_settled t ~registration=
-    {closed=max t.closed registration;entries=Keys.filter(fun _ entry->
-      entry.owner.registration>registration || not entry.settled)t.entries}
+    let entries=Keys.filter(fun _ entry->entry.owner.registration>registration || not entry.settled)t.entries in
+    let finished=Keys.filter(fun((binding,_)as key) _->binding>registration || Keys.mem key entries)t.finished in
+    {closed=max t.closed registration;entries;finished}
 end
 
 module Writer_fence = struct
