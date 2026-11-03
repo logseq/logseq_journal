@@ -3686,7 +3686,8 @@ let request_asset core (request : asset_request) =
         cancel_asset_pending core (fun previous ->
           previous.context.scope = request.scope && previous.operation = operation)
       | Close_asset_scope ->
-        cancel_asset_pending core (fun previous -> previous.context.scope = request.scope)
+        cancel_asset_pending core (fun previous -> previous.context.scope = request.scope
+          && not(asset_cleanup_action previous.action))
       | Prepare_graph_asset_deletion retirement
         when not (Asset_retirement_set.mem (asset_retirement_key request.scope retirement) core.asset_retirement_observed) ->
         cancel_asset_pending core (fun previous ->

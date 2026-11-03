@@ -4638,6 +4638,26 @@ let asset_retry_completion_is_consumed_once () =
   check_instructions "asset timer replay" [] duplicate.effects
 ;;
 
+let asset_scope_close_keeps_pending_release () =
+  List.iter(fun action->
+    let core,scope=asset_fixture() in
+    let releasing,ticket,request=asset_issue core scope "preview-release" action in
+    let acquiring,_,acquire=asset_issue releasing.next scope "preview-retain" (Core.Retain_asset_file "preview") in
+    let closing,_,_=asset_issue acquiring.next scope "scope-close" Core.Close_asset_scope in
+    Alcotest.(check bool) "closing a scope cannot cancel its physical release ACK" false
+      (List.exists(fun(output:Core.asset_output)->output.request.operation=request.operation)
+        (asset_outputs closing.effects));
+    Alcotest.(check bool) "closing still cancels an in-flight acquisition" true
+      (List.exists(fun(output:Core.asset_output)->output.request=acquire && output.result=Error Core.Asset_cancelled)
+        (asset_outputs closing.effects));
+    let completed=asset_complete closing.next ticket(Ok Core.Asset_unit) in
+    Alcotest.(check bool) "actual release completion reaches its original owner" true
+      (asset_outputs completed.effects=[{Core.request;result=Ok Core.Asset_unit}]);
+    check_instructions "release terminal is consumed once" []
+      (asset_complete completed.next ticket(Ok Core.Asset_unit)).effects)
+    [Core.Release_asset_file "preview";Core.Release_staged_file "staged-preview"]
+;;
+
 let asset_cleanup_requires_admitted_scope () =
   let core, scope = asset_fixture () in
   let foreign =
@@ -4825,7 +4845,8 @@ let retirement_terminal_rejects_mismatched_token_scope () =
 ;;
 
 let asset_scenarios =
-  [ Alcotest.test_case "retirement replay preserves inflight and account cleanup" `Quick
+  [ Alcotest.test_case "scope close keeps pending physical release" `Quick asset_scope_close_keeps_pending_release
+  ; Alcotest.test_case "retirement replay preserves inflight and account cleanup" `Quick
       retirement_replay_preserves_inflight_and_account_cleanup
   ; Alcotest.test_case "retirement token scope is checked for active context" `Quick
       retirement_terminal_rejects_mismatched_token_scope
