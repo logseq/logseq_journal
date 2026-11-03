@@ -67,6 +67,7 @@ type instruction =
   | Notify of
       { consumer : string
       ; asset : Logseq_db_types.Graph_types.Uuid.t
+      ; descriptor : Asset.t
       ; availability : availability
       }
   | Backpressure of string
@@ -315,7 +316,6 @@ let same_version a b =
 let update_descriptor t descriptor =
   match Assets.find_opt descriptor.Asset.uuid t.entries with
   | None -> t, []
-  | Some { phase = Cached _; _ } -> t, []
   | Some entry when same_version entry.descriptor descriptor ->
     ( { t with entries = Assets.add descriptor.uuid { entry with descriptor } t.entries }
     , [] )
@@ -539,12 +539,13 @@ let notifications before after =
             let unchanged =
               match Assets.find_opt uuid before.entries with
               | Some old ->
-                Consumers.mem consumer old.consumers && status before old = availability
+                Consumers.mem consumer old.consumers && same_version old.descriptor entry.descriptor
+                && status before old = availability
               | None -> false
             in
             if unchanged
             then effects
-            else Notify { consumer; asset = uuid; availability } :: effects)
+            else Notify { consumer; asset = uuid; descriptor=entry.descriptor; availability } :: effects)
          entry.consumers
          effects)
     after.entries

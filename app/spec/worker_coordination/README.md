@@ -3,26 +3,26 @@
 This independent wrapped Dune virtual library is the target boundary for migrating
 App/Worker interaction. Its explicit implementation lives in
 `app/impl/worker_coordination/`: `worker_api`, `worker_pure_coordinator` and
-`worker_effect_runner`. The App uses it for **Copy** and the graph runtime's one-shot **Graph_info,
-Admission, Page, Outline_block and Task_status_definitions** reads.
+`worker_effect_runner`. The App uses it for graph reads, durable writes, observation and resources.
 The runner borrows the existing Service/client and the host's single event pump;
 there is no adapter, second client or extra `Mailbox.on_event` subscription.
 Navigation, feed/Favorites planning, Capture editing and media UI remain with their
 business reducers.
 
-The implementation currently advertises read capabilities only. Atomic Append,
-durable mutation/import reconciliation, observation/resource ACKs and writer/local
-copy fences are not implemented by this slice and are rejected before enqueue.
-Their existing App paths remain owned by the legacy runtime; the whole layer has
-**not** been migrated.
+The implementation now connects bounded typed reads, durable writes and atomic
+Append, presentation-bound Confirm/readback, mutation and Import recovery/ACK,
+observations/changefeed, asset demand/file leases, and host handoff to the real
+Service/DB/Sync owners. Application uses those paths while retaining UI planning,
+authentication/catalog, client lifetime and its serial event pump. This coverage
+does not by itself establish final GUI acceptance; the remaining migration and
+validation work is recorded in the task's evidence.
 
-The pure coordinator receives actual admission IDs, refusals, terminal replies and
-registration-release ACKs as explicit events. It decides cancellation races,
-bootstrap retry, revocation and nonblocking stop. The effect runner encodes/sends,
-associates actual mailbox IDs, decodes and queues later events. Ownership history
-uses a pure interval map, so sequential completed requests do not grow one entry
-per request. A bounded number of disjoint ownership ranges limits adversarial
-interleaving; it is distinct from the number of completed reads.
+The pure coordinator receives actual admission IDs, refusals, terminal replies,
+resource cleanup and registration-release ACKs as explicit events. It decides
+cancellation races, bootstrap retry, revocation and nonblocking stop. The runner
+encodes/sends, associates only actual in-flight Mailbox IDs, decodes and queues
+later events. Mailbox filters duplicate terminal events before subscriber delivery;
+completed requests do not consume a lifetime ownership quota.
 
 ## Construction, consumption and ownership
 
@@ -108,34 +108,22 @@ labelled a summary. Descriptor lookup has no continuation; list queries alone ma
 return one. Page/tree/children continuation ownership includes the query's exact
 parameters and snapshot, beyond the static result-item index.
 
-## Backend obligations and migration gate
+## Backend ownership and migration coverage
 
-The spec can express these current interaction paths; it does **not** make the
-current backend capable of them. In particular, a compile-only client that reaches
-Ready is a usability check, not evidence that today's Service can issue Ready.
-
-| Required guarantee | Current boundary / work still required |
+| Required guarantee | Implemented ownership |
 | --- | --- |
-| Authoritative registered baseline and ongoing version stream | Implemented for the read slice: Sync/Worker expose one immutable lifecycle snapshot; Db registers/samples without yielding, publishes versions before effects, and owns an independent presentation epoch. Service carries stable caller-known registration IDs, complete updates and exact unregister ACKs, fences release-before-register and revokes registrations at short authentication controls. Limits come from the actual immutable Database dependencies and effective Worker response budget. |
-| Existing typed read families and DTO validation | The Protocol V2 read commands already exist. Implement bounded mapping/decoding, ownership and cursor validation, and preserve existing projection conversion; these are not all Unsupported operations. Actual admission still needs the session/bootstrap above. |
-| Atomic durable Append including children/statuses and Web's existing journal page | Separate create/insert/status commands are insufficient. Worker must resolve/create and append transactionally with outbox/evidence; stable IDs bind the complete payload. Do not read an entire page merely to append. |
-| General mutation/import retry and confirmation | Existing command families and stable IDs remain the basis. Verify/implement durable outcome reconciliation per operation across restart and exact receipt/read-back matching before advertising the corresponding capability. A process-local duplicate cache or same visible text is insufficient. |
-| Observation register/sample/replay and release/fence ACK | Existing changes-available pushes and ordinary reads alone do not establish the target registration/epoch/ACK contract. Extend Worker ownership, including empty results, cancellation during registration and retained reconciliation. |
-| Lifecycle handoff and final resource ownership | Mailbox.cancel is cooperative. Require target writer/callback fencing, registration/lease ACKs and exact local-copy generation evidence or the existing independently proven lifecycle owner. A generic Client_command_completed is not a fence. Host must join legacy owners too. |
+| Registered baseline/version stream | Sync/Worker supply one immutable lifecycle snapshot; registration/sample is atomic, versions precede effects, and unregister has an exact ACK. |
+| Typed reads and DTOs | Existing Protocol V2 queries keep their real DTOs, revisions, bounded continuations and projection conversion. Copy retains its before/after revision checks. |
+| Atomic Append | Overlay resolves or creates today's page, appends the complete block tree/statuses, outbox and original commit evidence in one transaction. An existing Web page is reused. |
+| Durable mutation and Import recovery | Stable immutable intents and original receipts survive restart. Recovery is read-only and paginated; unknown outcomes do not replay or ACK. Confirm requires actual canonical readback in the bound presentation. |
+| Observations/changefeed | Initial sampling subscribes against its predecessor snapshot and replays invalidations. Empty results remain interests; derived consumer application precedes change ACK. |
+| Resources | Typed demand rounds and actual file leases retain their originating owner. Checked release waits for physical settlement; ordinary media versions do not relabel old Ready files, and previews retain old leases until released. |
+| Host changes | Real writer/callback/resource settlement precedes a one-use backend permission. Application joins still-live legacy owners before quiescence and keeps unknown outcomes for readback. |
 
-Until supported, the specific target operation fails explicitly before enqueue;
-bootstrap failure is visible, no fake session/receipt/ACK is issued. Capabilities
-are advertised by a verified baseline rather than guessed in App. Returning
-Unsupported for every entry is not an implemented migration.
-
-The first production slice is the existing Copy one-shot request/reply path,
-retaining its current business reducer and revision fences: Graph_info, UUID page/
-block lookup and Children. It uses the real bootstrap, exclusive routing and typed DTO mapping, while keeping
-the existing business reducer's before/after version checks. It does not advertise
-atomic Append or new observation. Do not replace
-Copy's before/after graph/revision checks just because the result is now typed.
-Whole-layer replacement additionally needs the remaining capability and lifecycle
-obligations above, plus explicit transfer of all legacy resource ownership.
+Capabilities are supplied by the checked baseline. An unsupported capability fails
+before enqueue; no fake session, receipt or cleanup ACK establishes support.
+Pure reducer tests prove decisions, while Service, persistence, mounted App and GUI
+evidence have separate acceptance scopes.
 
 ## Validation and independent review
 

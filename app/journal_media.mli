@@ -41,6 +41,8 @@ type event =
       ; asset : Asset.t
       }
   | Hide
+  | Pin_preview of string
+  | Unpin_preview of string
   | Availability of
       { scope : Service.asset_scope
       ; consumer : string

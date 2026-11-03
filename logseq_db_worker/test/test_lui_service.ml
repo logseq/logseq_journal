@@ -352,9 +352,14 @@ let test_discarded_asset_result_keeps_actual_lease_owner () =
     (Asset_imported(Error "failed"))=None) "failed import fabricated a cleanup capability"
 ;;
 
+let notice_descriptor asset =
+  Logseq_db_types.Asset_descriptor.create ~uuid:asset ~source:(Managed None)
+    ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok
+;;
+
 let availability scope consumer asset state =
   Service.Asset_notice
-    (scope, Asset_availability { consumer; asset; availability = state })
+    (scope, Asset_availability { consumer; asset; descriptor=notice_descriptor asset; availability = state })
 ;;
 
 let collect_asset_burst pushes =
@@ -380,7 +385,7 @@ let test_ready_survives_acceptance () =
     (collect_asset_burst [ ready; accepted ]
      = [ ( scope
          , Asset_availability
-             { consumer = "visible"; asset = asset_uuid 1; availability = Ready "cached" }
+             { consumer = "visible"; asset = asset_uuid 1; descriptor=notice_descriptor(asset_uuid 1); availability = Ready "cached" }
          )
        ; scope, Asset_demand_accepted "visible"
        ])
@@ -421,7 +426,7 @@ let test_retry_keeps_latest_fact_in_arrival_order () =
   T.require
     (collected
      = [ ( scope
-         , Asset_availability { consumer = "a"; asset; availability = Ready "retried" } )
+         , Asset_availability { consumer = "a"; asset; descriptor=notice_descriptor asset; availability = Ready "retried" } )
        ; scope, Asset_demand_accepted "a"
        ])
     "Retry should replace only the same fact, keeping Ready and latest admission ordered"
@@ -1635,7 +1640,7 @@ let test_asset_failure_rows () =
   let module D=Logseq_db_types.Failure_diagnostic in
   let uuid=Logseq_db_types.Graph_types.Uuid.of_string "94000000-0000-4000-8000-000000000799" |> Result.get_ok in
   let download ?(retry=false) failure = Service.Asset_availability
-    {consumer="PRIVATE_SYNTHETIC_PAYLOAD";asset=uuid;
+    {consumer="PRIVATE_SYNTHETIC_PAYLOAD";asset=uuid;descriptor=notice_descriptor uuid;
      availability=A.Failed{failure;attempts=2;retry_scheduled=retry}} in
   let upload failure = Service.Upload_status{operation=uuid;asset=uuid;target=uuid;
     title="PRIVATE_SYNTHETIC_PAYLOAD";status=U.Failed_upload failure} in

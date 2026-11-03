@@ -5523,3 +5523,40 @@ let () =
        test ())
     tests
 ;;
+
+(* The pure insertion reducer receives an already resolved choice. A catalog
+   update between Runtime planning and binding is owned by this public Runtime
+   boundary, and cannot be reproduced by giving the pure reducer bad input. *)
+let () =
+  let module R=Journal_graph_runtime in let module F=Child_chain_fixture in
+  let fixture=F.make ~append:true () in
+  let runtime=R.create ~localtime:Unix.gmtime () in
+  let sampler=Journal_calendar.Sampler.create
+    ~clock:(fun()->Int64.to_float(Journal_time.instant_unix_ms fixture.command.creation_time)/.1000.)
+    ~localtime:Unix.gmtime () in
+  let calendar=Journal_calendar.Sampler.sample sampler |> Result.get_ok in
+  R.set_calendar runtime calendar;
+  let only output=match output.R.requests with [request]->request|_->fail "expected one Runtime request" in
+  let status_a=F.G.Uuid.of_string "00000002-1615-5853-7700-000000000000" |> Result.get_ok in
+  let status_b=F.G.Uuid.of_string "00000002-1827-5820-8200-000000000000" |> Result.get_ok in
+  let catalog status=
+    let request=R.submit runtime Journal_graph_request.Load_task_statuses |> only in
+    let item uuid:F.G.task_status_definition={uuid;title=F.G.Uuid.to_string uuid;ident=None;order="a";checkbox_state=None} in
+    ignore(R.receive runtime(F.P.V2_response{api_version=F.P.api_version;request_id=request.request_id;
+      outcome=V2_task_statuses_outcome{property_uuid=None;default_status=Some status;
+        items=[item status_a;item status_b];next_cursor=None}})) in
+  catalog status_a;
+  let command:Journal_graph_projection.capture={mutation_id=fixture.command.mutation_id;
+    block_id=fixture.command.block_id;sibling_order=fixture.command.sibling_order;
+    source=fixture.command.source;task_state=Journal_model.Default_status;creation_time=fixture.command.creation_time;
+    children=[];status_confirmation=false;status_intent_revision=0L} in
+  let request=R.submit runtime(Capture{calendar_generation=Journal_calendar.generation calendar;command}) |> only in
+  let wire=R.worker_append runtime request |> Option.get |> Result.get_ok in
+  require(match wire with F.P.V2_append_journal{root;_}->root.task_status=Some status_a|_->false)
+    "initial Append did not freeze the resolved default";
+  catalog status_b;
+  require(R.worker_append runtime request=Some(Ok wire)) "catalog update replaced the planned atomic payload";
+  let intent=Journal_graph_mutation_confirmation.Pure_insertion.wire_intent fixture.session wire |> Result.get_ok in
+  require(R.bind_mutation runtime request ~presentation:fixture.presentation ~intent)
+    "catalog update re-resolved and rejected the already frozen default"
+;;

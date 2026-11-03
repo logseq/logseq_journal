@@ -1328,7 +1328,6 @@ let test_status_failure_conversion () =
 ;;
 
 type refresh_case =
-  | Capture
   | Update
   | Update_conflict
   | Delete_conflict
@@ -1337,24 +1336,6 @@ type refresh_result =
   | Found
   | Missing
   | Cursor_failed
-
-let earlier_members (page : Graph.page) =
-  List.init (Protocol.maximum_page_size + 1) (fun index ->
-    let block =
-      { block with
-        uuid = uuid (Printf.sprintf "a2000000-0000-4000-9000-%012d" (index + 1))
-      ; page = page.uuid
-      ; parent = page.uuid
-      ; order = Printf.sprintf "a0U%06dU" index
-      }
-    in
-    Protocol.
-      { value = { record with block }
-      ; revision = "earlier-1"
-      ; depth = 0
-      ; parent = page.uuid
-      })
-;;
 
 let prepare_paged_refresh ?(ordinary=false) ?(defer=false) kind =
   let page=if ordinary then {page with kind=Ordinary_page;name="ordinary";title="Ordinary"} else page in
@@ -1372,60 +1353,6 @@ let prepare_paged_refresh ?(ordinary=false) ?(defer=false) kind =
   let next description output = only description output.Runtime.requests in
   let page, mutation =
     match kind with
-    | Capture ->
-      let creation_time = Journal_time.of_calendar calendar |> Result.get_ok in
-      let lookup =
-        Runtime.submit
-          runtime
-          (Journal_graph_request.Capture
-             { calendar_generation = Journal_calendar.generation calendar
-             ; command =
-                 { mutation_id = Graph.Uuid.to_string mutation_id
-                 ; block_id = Graph.Uuid.to_string block_uuid
-                 ; sibling_order = "a1"
-                 ; source = "Committed target"
-                 ; task_state = Journal_model.No_status
-                 ; creation_time
-                 ; children = []
-                 ; status_confirmation = false
-                 ; status_intent_revision = 0L
-                 }
-             })
-        |> next "capture page lookup"
-      in
-      let page =
-        match lookup.command with
-        | V2_get_page { page = uuid; _ } ->
-          { page with
-            uuid
-          ; kind = Journal_page { journal_day = Journal_time.local_day creation_time }
-          }
-        | _ -> Alcotest.fail "capture did not request its journal page"
-      in
-      let children =
-        receive lookup (V2_page_outcome (V2_present_page { page; revision = "page-1" }))
-        |> next "capture children revision"
-      in
-      let mutation =
-        receive
-          children
-          (V2_children_outcome
-             { parent = page.uuid
-             ; revision_scope = V2_children_revision page.uuid
-             ; scope_revision = "children-1"
-             ; items =
-                 List.map
-                   (fun (item : Protocol.v2_tree_member) ->
-                      Protocol.{ value = item.value; revision = item.revision })
-                   (List.filteri
-                      (fun index _ -> index < Protocol.maximum_page_size)
-                      (earlier_members page))
-             ; next_cursor =
-                 Some (Graph.Cursor.of_string "existing-children" |> Result.get_ok)
-             })
-        |> next "capture insertion"
-      in
-      page, mutation
     | Update | Update_conflict | Delete_conflict ->
       let lookup =
         Runtime.submit
@@ -1486,7 +1413,7 @@ let prepare_paged_refresh ?(ordinary=false) ?(defer=false) kind =
     receive
       mutation
       (match kind with
-       | Capture | Update ->
+       | Update ->
          V2_mutation_committed
            { mutation_id
            ; status = V2_applied
@@ -1584,7 +1511,6 @@ let test_paged_mutation_refresh kind result =
     match
       result, kind, (only "owned canonical target terminal" completed.responses).payload
     with
-    | Found, Capture, Block_captured { block; _ }
     | Found, Update, Block_updated { block; _ } ->
       Alcotest.(check string)
         "authoritative target after earlier siblings"
@@ -1683,7 +1609,6 @@ let test_conflict_missing_after_empty_more changed_version () =
    so baseline tests fail on the emitted read rather than missing OCaml types. *)
 let target_refresh kind =
   match kind with
-  | `Capture -> prepare_paged_refresh Capture
   | `Update -> prepare_paged_refresh Update
   | `Update_conflict -> prepare_paged_refresh Update_conflict
   | `Delete_conflict -> prepare_paged_refresh Delete_conflict
@@ -1719,7 +1644,7 @@ let target_refresh kind =
 ;;
 
 let test_target_summary_uses_owned_worker_query () =
-  let runtime, _, request = target_refresh `Capture in
+  let runtime, _, request = target_refresh `Status in
   (match Production_runtime.worker_read runtime request with
    | Some
        (Production_runtime.Read
@@ -1779,7 +1704,6 @@ let test_target_confirmation kind title count =
   let payload = (only "target completion" complete.responses).payload in
   let actual, entry =
     match kind, payload with
-    | `Capture, Runtime.Block_captured { block; timeline_entry_update }
     | (`Update | `Status), Runtime.Block_updated { block; timeline_entry_update } ->
       block, timeline_entry_update
     | _ -> Alcotest.fail "target completion lost mutation ownership"
@@ -1812,7 +1736,7 @@ let test_target_confirmation kind title count =
 ;;
 
 let test_target_children_continue () =
-  let runtime, page, refresh = target_refresh `Capture in
+  let runtime, page, refresh = target_refresh `Status in
   let canonical =
     { record with
       block =
@@ -1851,7 +1775,7 @@ let test_target_children_continue () =
     if batch < 4
     then (
       Alcotest.(check int)
-        "partial target children do not complete Capture"
+        "partial target children do not complete Status"
         0
         (List.length output.responses);
       current := only "target child continuation" output.requests;
@@ -1859,7 +1783,7 @@ let test_target_children_continue () =
     else completion := output
   done;
   match (only "all canonical children" !completion.responses).payload with
-  | Block_captured { block; timeline_entry_update = Some entry } ->
+  | Block_updated { block; timeline_entry_update = Some entry } ->
     Alcotest.(check int)
       "child count is not truncated"
       201
@@ -1868,11 +1792,11 @@ let test_target_children_continue () =
       "bounded target child preview"
       3
       (List.length entry.child_summaries)
-  | _ -> Alcotest.fail "Capture lost its canonical children"
+  | _ -> Alcotest.fail "Status lost its canonical children"
 ;;
 
 let test_target_repeated_cursor_settles () =
-  let runtime, page, first = target_refresh `Capture in
+  let runtime, page, first = target_refresh `Status in
   let lookup =
     Protocol.V2_present_block
       { value =
@@ -1893,7 +1817,7 @@ let test_target_repeated_cursor_settles () =
     0
     (List.length output.requests);
   match (only "summary failure remains owned" output.responses).payload with
-  | Runtime.Mutation_failed { kind = Capture_mutation; _ } -> ()
+  | Runtime.Mutation_failed { kind = Status_mutation; _ } -> ()
   | _ -> Alcotest.fail "nonadvancing summary lost mutation owner"
 ;;
 
@@ -1936,9 +1860,7 @@ let test_target_terminal kind terminal =
         true
         (actual
          =
-         if kind = `Capture
-         then Capture_mutation
-         else if kind = `Status
+         if kind = `Status
          then Status_mutation
          else Source_mutation);
       Alcotest.(check string)
@@ -1949,7 +1871,7 @@ let test_target_terminal kind terminal =
 ;;
 
 let test_target_version_fence () =
-  let runtime, page, refresh = target_refresh `Capture in
+  let runtime, page, refresh = target_refresh `Status in
   check_target_summary refresh None;
   let canonical =
     { record with block = { block with page = page.uuid; parent = page.uuid } }
@@ -1976,12 +1898,12 @@ let test_target_version_fence () =
       (summary_response continuation page lookup [] None "projection-3")
   in
   Alcotest.(check bool)
-    "different snapshots cannot complete mixed Capture"
+    "different snapshots cannot complete mixed Status"
     false
     (List.exists
        (fun value ->
           match value.Runtime.payload with
-          | Block_captured _ -> true
+          | Block_updated _ -> true
           | _ -> false)
        result.responses);
   let retry = only "fresh canonical target retry" result.requests in
@@ -2072,7 +1994,7 @@ let test_target_blank_image_and_deep_child () =
 ;;
 
 let test_target_stale_recovery_is_bounded () =
-  let runtime, _, refresh = target_refresh `Capture in
+  let runtime, _, refresh = target_refresh `Status in
   check_target_summary refresh None;
   let stale request =
     response
@@ -2083,7 +2005,7 @@ let test_target_stale_recovery_is_bounded () =
   for _ = 1 to 2 do
     let output = Runtime.receive runtime (stale !current) in
     Alcotest.(check int)
-      "retry does not prematurely complete Capture"
+      "retry does not prematurely complete Status"
       0
       (List.length output.responses);
     current := only "bounded fresh target retry" output.requests;
@@ -2092,8 +2014,8 @@ let test_target_stale_recovery_is_bounded () =
   let exhausted = Runtime.receive runtime (stale !current) in
   Alcotest.(check int) "stale retries stop" 0 (List.length exhausted.requests);
   match (only "owned retry exhaustion" exhausted.responses).payload with
-  | Runtime.Mutation_failed { kind = Capture_mutation; _ } -> ()
-  | _ -> Alcotest.fail "stale retry exhaustion lost Capture owner"
+  | Runtime.Mutation_failed { kind = Status_mutation; _ } -> ()
+  | _ -> Alcotest.fail "stale retry exhaustion lost Status owner"
 ;;
 
 let test_target_newer_confirmation_fences_old () =
@@ -2188,7 +2110,7 @@ let test_target_invisible_root_has_timeline_only_removal () =
 ;;
 
 let test_target_confirmation_retains_page_interest completed =
-  let runtime, page, refresh = target_refresh `Capture in
+  let runtime, page, refresh = target_refresh `Status in
   check_target_summary refresh None;
   let canonical =
     { record with block = { block with page = page.uuid; parent = page.uuid } }
@@ -2214,19 +2136,19 @@ let test_target_confirmation_retains_page_interest completed =
     ->
     (match Production_runtime.worker_read runtime request with
      | Some (Production_runtime.Read {query = Worker_producer.W.Tree {maximum_depth=0;_};_}) -> ()
-     | _ -> Alcotest.fail "new Capture page refresh escaped typed Tree ownership");
+     | _ -> Alcotest.fail "target page refresh escaped typed Tree ownership");
     Alcotest.(check bool)
-      "new Capture page remains subscribed to structural changes"
+      "target page remains subscribed to structural changes"
       true
       (Graph.Uuid.equal actual page.uuid)
   | requests ->
     Alcotest.failf
-      "captured page lost its structural interest: %d hydration requests"
+      "target page lost its structural interest: %d hydration requests"
       (List.length requests)
 ;;
 
 let test_target_confirmation_retains_child_mutation_context () =
-  let runtime, page, refresh = target_refresh `Capture in
+  let runtime, page, refresh = target_refresh `Status in
   let canonical =
     { record with block = { block with page = page.uuid; parent = page.uuid } }
   in
@@ -2477,75 +2399,8 @@ let graph_info_outcome ~journal_title_format =
     }
 ;;
 
-let capture_format_read ~journal_day =
-  let runtime = Runtime.create ~localtime:Unix.gmtime () in
-  let sampler =
-    Journal_calendar.Sampler.create
-      ~clock:(fun () -> 1_788_192_000.)
-      ~localtime:Unix.gmtime
-      ()
-  in
-  let calendar = Journal_calendar.Sampler.sample sampler |> Result.get_ok in
-  Runtime.set_calendar runtime calendar;
-  let creation_time =
-    Journal_time.create
-      ~instant_unix_ms:1_788_192_000_000L
-      ~local_day:journal_day
-      ~local_minute_of_day:0
-    |> Result.get_ok
-  in
-  let lookup =
-    Runtime.submit
-      runtime
-      (Journal_graph_request.Capture
-         { calendar_generation = Journal_calendar.generation calendar
-         ; command =
-             { mutation_id = "a1000000-0000-4000-a000-0000000000c1"
-             ; block_id = Graph.Uuid.to_string block_uuid
-             ; sibling_order = "a1"
-             ; source = "Captured block"
-             ; task_state = Journal_model.No_status
-             ; creation_time
-             ; children = []
-             ; status_confirmation = false
-             ; status_intent_revision = 0L
-             }
-         })
-    |> fun output -> only "capture page lookup" output.requests
-  in
-  let page =
-    match lookup.command with
-    | V2_get_page { page; _ } -> page
-    | _ -> Alcotest.fail "capture did not request its journal page"
-  in
-  let format_read =
-    Runtime.receive
-      runtime
-      (response
-         lookup
-         (Protocol.V2_page_outcome (V2_missing_page { uuid = page; revision = "page-1" })))
-    |> fun output -> only "journal title format read" output.requests
-  in
-  (match format_read.command with
-   | V2_graph_info -> ()
-   | _ -> Alcotest.fail "missing journal page did not read the title format");
-  runtime, page, format_read
-;;
-
 let create_journal_title ~journal_day ~journal_title_format =
-  let runtime, page, format_read = capture_format_read ~journal_day in
-  let creation =
-    Runtime.receive
-      runtime
-      (response format_read (graph_info_outcome ~journal_title_format))
-    |> fun output -> only "journal page creation" output.requests
-  in
-  match creation.command with
-  | V2_create_journal_page { page = created; journal_day = day; title; _ } ->
-    Alcotest.(check bool) "journal page identity" true (Graph.Uuid.equal created page);
-    Alcotest.(check int) "journal day" journal_day day;
-    title
-  | _ -> Alcotest.fail "format read did not continue to journal page creation"
+  Logseq_db_types.Journal_title.for_journal_day ~pattern:journal_title_format journal_day |> Option.get
 ;;
 
 let test_journal_title_defaults_to_upstream_format () =
@@ -2573,27 +2428,6 @@ let test_journal_title_falls_back_on_invalid_format () =
     "unsupported token falls back to the upstream default"
     "Sep 19th, 2026"
     (create_journal_title ~journal_day:20260919 ~journal_title_format:(Some "yyyy-QQ-dd"))
-;;
-
-let test_journal_title_failed_format_read_rejects () =
-  let runtime, _, format_read = capture_format_read ~journal_day:20260919 in
-  let completed =
-    Runtime.receive
-      runtime
-      (response
-         format_read
-         (Protocol.V2_failed
-            { code = Logseq_db_worker.Error.code_string Closed_session
-            ; message = "Snapshot unavailable"
-            }))
-  in
-  Alcotest.(check int)
-    "no creation after a failed read"
-    0
-    (List.length completed.requests);
-  match (only "capture rejected" completed.responses).payload with
-  | Mutation_failed { kind = Capture_mutation; failure = Worker_failure _; _ } -> ()
-  | _ -> Alcotest.fail "a failed format read lost its admitted capture"
 ;;
 
 let test_journal_title_ordinals_and_boundaries () =
@@ -3068,7 +2902,7 @@ let expect_admitted_failure description ~kind ~mutation_id ~block_id output =
          true
          (Logseq_db_worker.Error.code failure.error = Closed_session)
      | Projection_failure _ -> ())
-  | Runtime.Capture_not_admitted{command;_} when kind=Capture_mutation ->
+  | Runtime.Capture_not_admitted{command;_} | Runtime.Capture_waiting{command;_} when kind=Capture_mutation ->
     Alcotest.(check string) "unadmitted mutation identity" mutation_id command.mutation_id;
     Alcotest.(check string) "unadmitted block identity" block_id command.block_id
   | _ -> Alcotest.fail (description ^ ": admitted owner was lost")
@@ -3085,7 +2919,15 @@ let test_background_failure_keeps_sync_owner () =
 ;;
 
 let test_capture_failure_keeps_admitted_owner () =
-  let runtime, _, request = capture_format_read ~journal_day:20260901 in
+  let runtime=Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let creation_time=Journal_time.create ~instant_unix_ms:1_788_192_000_000L
+    ~local_day:20260901 ~local_minute_of_day:0 |> Result.get_ok in
+  let request=Runtime.submit runtime(Capture{calendar_generation=1L;command={
+    mutation_id="a1000000-0000-4000-a000-0000000000c1";block_id=Graph.Uuid.to_string block_uuid;
+    sibling_order="a";source="Retained source";task_state=Journal_model.No_status;
+    creation_time;children=[];status_confirmation=false;status_intent_revision=0L}})
+    |> fun output->only "atomic Capture root" output.requests in
   Runtime.fail_request runtime request ~message:"Admitted capture unavailable"
   |> expect_admitted_failure
        "capture failure"
@@ -4992,7 +4834,7 @@ let test_parent_visibility_confirmations () =
             (fun index (v, _) -> v, index)
             (let roots, _, _ = parent_visibility_fixture page in
              roots)))
-    [ `Capture; `Update; `Status; `Update_conflict; `Delete_conflict ]
+    [ `Update; `Status; `Update_conflict; `Delete_conflict ]
 ;;
 
 
@@ -6479,283 +6321,6 @@ let test_child_status_identity_after_lost_reply () =
   let second=child_identity_status_command runtime in
   Alcotest.(check string) "retry cannot invent another status intent"
     (Graph.Uuid.to_string(child_identity first))(Graph.Uuid.to_string(child_identity second))
-;;
-
-let capture_identity_status_a = "00000002-1615-5853-7700-000000000000"
-let capture_identity_status_b = "00000002-1827-5820-8200-000000000000"
-let capture_identity_owner_a = "a1000000-0000-4000-a000-0000000000c1"
-let capture_identity_owner_b = "a1000000-0000-4000-a000-0000000000c2"
-
-let capture_identity_runtime ?default () =
-  let runtime = Runtime.create ~localtime:Unix.gmtime () in
-  set_calendar runtime;
-  Option.iter
-    (fun default_status ->
-       let catalog = Production_runtime.submit runtime Journal_graph_request.Load_task_statuses
-         |> fun output -> only "identity catalog" output.requests in
-       let definition id : Graph.task_status_definition =
-         {uuid=uuid id;title=id;ident=None;order=id;checkbox_state=None} in
-       ignore (Production_runtime.receive runtime
-         (response catalog (Protocol.V2_task_statuses_outcome
-           {property_uuid=Some page_uuid;default_status=Some (uuid default_status);
-            items=List.map definition [capture_identity_status_a;capture_identity_status_b];next_cursor=None}))))
-    default;
-  runtime
-;;
-
-let capture_identity_noise runtime =
-  let request = Production_runtime.submit runtime
-      (Journal_graph_request.Find_block (Graph.Uuid.to_string unrelated_uuid))
-    |> fun output -> only "unrelated identity read" output.requests in
-  Production_runtime.abandon runtime request
-;;
-
-(* Drive the production public boundary through an idempotent insert replay to
-   the actual persistent status command. No private allocator or DB is patched. *)
-let capture_identity_status_command ?command runtime ~owner ~target task_state =
-  let next description output = only description output.Production_runtime.requests in
-  let creation_time = Journal_time.create ~instant_unix_ms:1_788_192_000_000L
-      ~local_day:20260901 ~local_minute_of_day:0 |> Result.get_ok in
-  let command = Option.value command ~default:
-      Journal_graph_projection.{mutation_id=owner;block_id=target;sibling_order="a";
-        source="Retained task";task_state;creation_time;children=[];status_confirmation=true;status_intent_revision=0L} in
-  let lookup = Production_runtime.submit runtime (Journal_graph_request.Capture
-      {calendar_generation=1L;command})
-    |> next "identity capture page" in
-  let target_page = match lookup.command with
-    | Protocol.V2_get_page {page=id;_} -> {page with uuid=id}
-    | _ -> Alcotest.fail "Capture did not read page" in
-  let receive request outcome = Production_runtime.receive runtime (response request outcome) in
-  let children = receive lookup
-      (V2_page_outcome (V2_present_page {page=target_page;revision="page-1"}))
-    |> next "identity capture scope" in
-  let insert = receive children (V2_children_outcome
-      {parent=target_page.uuid;revision_scope=V2_children_revision target_page.uuid;
-       scope_revision="children-1";items=[];next_cursor=None})
-    |> next "identity capture insertion" in
-  let mutation_id = match insert.command with
-    | V2_insert_blocks {mutation_id;_} -> mutation_id
-    | _ -> Alcotest.fail "Capture did not insert" in
-  let read = receive insert (V2_mutation_committed
-      {mutation_id;status=V2_already_applied;generation="g";
-       before_projection_revision="p";after_projection_revision="p"})
-    |> next "identity capture canonical block" in
-  receive read (V2_block_outcome (V2_present_block
-      {value={record with block={block with uuid=uuid target;page=target_page.uuid};task_status=None};
-       revision="block-current"}))
-  |> next "identity capture status"
-;;
-
-let capture_identity_of_status (request:Protocol.request) = match request.command with
-  | V2_set_task_status {mutation_id;_} | V2_clear_task_status {mutation_id;_} -> mutation_id
-  | _ -> Alcotest.fail "Expected actual persistent task status command"
-;;
-
-let test_capture_status_identity_reselected_intent () =
-  let module Capture = Journal_capture in
-  let creation_time = Journal_time.create ~instant_unix_ms:1_788_192_000_000L
-      ~local_day:20260901 ~local_minute_of_day:0 |> Result.get_ok in
-  let draft = Capture.create ~session_number:1L ~source:"Retained task"
-    |> fun draft -> Capture.with_task_state draft (Status capture_identity_status_a) in
-  let draft, first = Capture.admit_save draft ~mutation_id:capture_identity_owner_a
-      ~block_id:(Graph.Uuid.to_string block_uuid) ~sibling_order:"a"
-      ~calendar_generation:1L ~creation_time in
-  let identity request =
-    let command = match request with
-      | Journal_graph_request.Capture {command;_} -> command
-      | _ -> Alcotest.fail "Expected Capture owner's request" in
-    capture_identity_status_command ~command (capture_identity_runtime ())
-      ~owner:command.mutation_id ~target:command.block_id command.task_state
-    |> capture_identity_of_status in
-  let first = identity (Option.get first) in
-  let failed = Capture.fail draft ~message:"Status committed; confirmation unavailable" in
-  let unchanged, retry = Capture.retry failed in
-  Alcotest.check Alcotest.bool "same intent retry retains identity" true
-    (Graph.Uuid.equal first (identity (Option.get retry)));
-  let choose draft state =
-    let draft = Capture.fail draft ~message:"Confirmation unavailable"
-      |> fun draft -> Capture.with_task_state draft state in
-    let draft, request = Capture.retry draft in
-    draft, identity (Option.get request) in
-  let second_draft, second = choose unchanged (Status capture_identity_status_b) in
-  let _, reselected = choose second_draft (Status capture_identity_status_a) in
-  Alcotest.check Alcotest.bool "changed intent has its own identity" false (Graph.Uuid.equal first second);
-  Alcotest.check Alcotest.bool "A after B is a new operation, not replay of first A" false
-    (Graph.Uuid.equal first reselected)
-;;
-
-let test_capture_status_identity_cross_runtime () =
-  let first=capture_identity_runtime () and second=capture_identity_runtime () in
-  let a=capture_identity_status_command first ~owner:capture_identity_owner_a
-      ~target:(Graph.Uuid.to_string block_uuid) (Status capture_identity_status_a) in
-  let b=capture_identity_status_command second ~owner:capture_identity_owner_b
-      ~target:(Graph.Uuid.to_string unrelated_uuid) (Status capture_identity_status_a) in
-  Alcotest.(check bool) "same read schedule control" true (Graph.Uuid.equal a.request_id b.request_id);
-  Alcotest.(check bool) "new Runtime and different Capture cannot reuse persistent status identity"
-    false (Graph.Uuid.equal (capture_identity_of_status a) (capture_identity_of_status b))
-;;
-
-let test_capture_status_identity_retry_same_runtime () =
-  let runtime=capture_identity_runtime () in
-  let status ()=capture_identity_status_command runtime ~owner:capture_identity_owner_a
-      ~target:(Graph.Uuid.to_string block_uuid) (Status capture_identity_status_a) in
-  let first=status () in
-  ignore (Production_runtime.fail_request runtime first ~message:"Response unavailable");
-  capture_identity_noise runtime;
-  let retry=status () in
-  Alcotest.(check bool) "same business retry must keep its persistent status identity" true
-    (Graph.Uuid.equal (capture_identity_of_status first) (capture_identity_of_status retry))
-;;
-
-let test_capture_status_identity_independent_reads () =
-  let read noise =
-    let runtime=capture_identity_runtime () in
-    for _=1 to noise do capture_identity_noise runtime done;
-    capture_identity_status_command runtime ~owner:capture_identity_owner_a
-      ~target:(Graph.Uuid.to_string block_uuid) (Status capture_identity_status_a)
-  in
-  let before=read 0 and after=read 3 in
-  Alcotest.(check bool) "noise changes protocol request identity" false (Graph.Uuid.equal before.request_id after.request_id);
-  Alcotest.(check bool) "same Capture survives a new Runtime and unrelated reads" true
-    (Graph.Uuid.equal (capture_identity_of_status before) (capture_identity_of_status after))
-;;
-
-let test_capture_status_identity_intent () =
-  let identity ~owner ~target state =
-    capture_identity_status_command (capture_identity_runtime ()) ~owner ~target state
-    |> capture_identity_of_status in
-  let target=Graph.Uuid.to_string block_uuid in
-  let a=identity ~owner:capture_identity_owner_a ~target (Status capture_identity_status_a) in
-  let b=identity ~owner:capture_identity_owner_a ~target (Status capture_identity_status_b) in
-  let clear=identity ~owner:capture_identity_owner_a ~target No_status in
-  let another_owner=identity ~owner:capture_identity_owner_b ~target (Status capture_identity_status_a) in
-  let another_target=identity ~owner:capture_identity_owner_a ~target:(Graph.Uuid.to_string unrelated_uuid) (Status capture_identity_status_a) in
-  let ids=[a;b;clear;another_owner;another_target] |> List.map Graph.Uuid.to_string in
-  Alcotest.(check int) "set A/set B/clear/other owner/other target are separate business intents"
-    5 (List.length (List.sort_uniq String.compare ids))
-;;
-
-let test_capture_status_identity_canonical_uuid () =
-  let identity owner target status =
-    capture_identity_status_command (capture_identity_runtime ()) ~owner ~target (Status status)
-    |> capture_identity_of_status in
-  let target=Graph.Uuid.to_string block_uuid in
-  let a=identity capture_identity_owner_a target capture_identity_status_a in
-  let b=identity (String.uppercase_ascii capture_identity_owner_a)
-      (String.uppercase_ascii target) (String.uppercase_ascii capture_identity_status_a) in
-  Alcotest.(check bool) "UUID spelling does not change the same status intent" true (Graph.Uuid.equal a b)
-;;
-
-let test_capture_status_identity_resolved_default () =
-  let identity default state =
-    let runtime=capture_identity_runtime ~default () in
-    capture_identity_status_command runtime ~owner:capture_identity_owner_a
-      ~target:(Graph.Uuid.to_string block_uuid) state |> capture_identity_of_status in
-  let default_a=identity capture_identity_status_a Default_status in
-  let explicit_a=identity capture_identity_status_a (Status capture_identity_status_a) in
-  let default_b=identity capture_identity_status_b Default_status in
-  Alcotest.(check bool) "same resolved status matches explicit choice" true (Graph.Uuid.equal default_a explicit_a);
-  Alcotest.(check bool) "changed default is a different status intent" false (Graph.Uuid.equal default_a default_b)
-;;
-
-let test_capture_recovery_explicit_clear () =
-  let runtime = Runtime.create () in
-  set_calendar runtime;
-  let creation_time =
-    Journal_time.create
-      ~instant_unix_ms:1_788_192_000_000L
-      ~local_day:20260901
-      ~local_minute_of_day:0
-    |> Result.get_ok
-  in
-  let next out = only "capture recovery continuation" out.Runtime.requests in
-  let lookup =
-    Runtime.submit
-      runtime
-      (Capture
-         { calendar_generation = 1L
-         ; command =
-             { mutation_id = "a1000000-0000-4000-a000-0000000000c1"
-             ; block_id = Graph.Uuid.to_string block_uuid
-             ; sibling_order = "a"
-             ; source = "Retained"
-             ; task_state = No_status
-             ; status_intent_revision = 0L
-             ; status_confirmation = true
-             ; creation_time
-             ; children = []
-             }
-         })
-    |> next
-  in
-  let target_page =
-    match lookup.command with
-    | V2_get_page { page = id; _ } -> { page with uuid = id }
-    | _ -> assert false
-  in
-  let children =
-    Runtime.receive
-      runtime
-      (response
-         lookup
-         (V2_page_outcome (V2_present_page { page = target_page; revision = "p" })))
-    |> next
-  in
-  let insert =
-    Runtime.receive
-      runtime
-      (response
-         children
-         (V2_children_outcome
-            { parent = target_page.uuid
-            ; revision_scope = V2_children_revision target_page.uuid
-            ; scope_revision = "c"
-            ; items = []
-            ; next_cursor = None
-            }))
-    |> next
-  in
-  let mutation_id =
-    match insert.command with
-    | V2_insert_blocks { mutation_id; _ } -> mutation_id
-    | _ -> assert false
-  in
-  let read =
-    Runtime.receive
-      runtime
-      (response
-         insert
-         (V2_mutation_committed
-            { mutation_id
-            ; status = V2_already_applied
-            ; generation = "g"
-            ; before_projection_revision = "p"
-            ; after_projection_revision = "p"
-            }))
-    |> next
-  in
-  let clear =
-    Runtime.receive
-      runtime
-      (response
-         read
-         (V2_block_outcome
-            (V2_present_block
-               { value =
-                   { record with
-                     block = { block with page = target_page.uuid }
-                   ; task_status = Some unrelated_uuid
-                   }
-               ; revision = "b"
-               })))
-    |> next
-  in
-  Alcotest.(check bool)
-    "Clear recovery writes explicit clear"
-    true
-    (match clear.command with
-     | V2_clear_task_status { block = id; _ } -> Graph.Uuid.equal id block_uuid
-     | _ -> false)
 ;;
 
 let test_child_recovery_explicit_clear () =
@@ -9170,10 +8735,6 @@ let () =
     "journal graph runtime locality"
     [ ( "status recovery"
       , [ Alcotest.test_case
-            "explicit clear after lost response"
-            `Quick
-            test_capture_recovery_explicit_clear
-        ; Alcotest.test_case
             "Append explicit clear after lost response"
             `Quick
             test_child_recovery_explicit_clear
@@ -9252,10 +8813,9 @@ let () =
       ;Alcotest.test_case "Timeline-only property change does not hydrate" `Quick test_timeline_only_property_update_does_not_hydrate] )
     ; ( "parent-only Timeline visibility"
       , [Alcotest.test_case "feed day remote legacy and metadata" `Quick test_parent_visibility_tree_paths;
-         Alcotest.test_case "Capture Update Status completions" `Quick test_parent_visibility_confirmations])
+         Alcotest.test_case "Update and Status completions" `Quick test_parent_visibility_confirmations])
     ; ( "bounded Timeline preview"
       , [ Alcotest.test_case "feed, day, remote and legacy refresh paths" `Quick test_bounded_preview_tree_paths
-        ; Alcotest.test_case "Capture 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Capture 10050)
         ; Alcotest.test_case "Update 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Update 10050)
         ; Alcotest.test_case "Status 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Status 10050)
         ; Alcotest.test_case "Update conflict 10050 children stays bounded" `Quick (test_bounded_preview_target_pages `Update_conflict 10050)
@@ -9283,15 +8843,6 @@ let () =
         Alcotest.test_case "typed admission refusal retains graph" `Quick test_typed_child_planning_refusal_retains_transport;
         Alcotest.test_case "unrelated reads cannot change child status intent" `Quick test_child_status_identity_independent_reads;
         Alcotest.test_case "lost response keeps the same child status intent" `Quick test_child_status_identity_after_lost_reply])
-    ; ( "Capture persistent status identity"
-      , [ Alcotest.test_case "distinct owners across Runtime restart" `Quick test_capture_status_identity_cross_runtime
-        ; Alcotest.test_case "same owner retry after lost response" `Quick test_capture_status_identity_retry_same_runtime
-        ; Alcotest.test_case "independent of unrelated read schedule" `Quick test_capture_status_identity_independent_reads
-        ; Alcotest.test_case "separate status clear owner and target intents" `Quick test_capture_status_identity_intent
-        ; Alcotest.test_case "canonical UUID spelling" `Quick test_capture_status_identity_canonical_uuid
-        ; Alcotest.test_case "resolved default status intent" `Quick test_capture_status_identity_resolved_default
-        ; Alcotest.test_case "reselecting earlier intent after partial commit" `Quick test_capture_status_identity_reselected_intent
-        ] )
     ; ( "copy subtree"
       , [ Alcotest.test_case
             "serialized clipboard payload bound"
@@ -9415,10 +8966,6 @@ let () =
             (test_conflict_missing_after_empty_more false)
         ; Alcotest.test_case "conflict changed version retries before absence" `Quick
             (test_conflict_missing_after_empty_more true)
-        ; Alcotest.test_case
-            "Capture targeted canonical block and children"
-            `Quick
-            (fun () -> test_target_confirmation `Capture "Stored capture" 3)
         ; Alcotest.test_case "Update last root does not read siblings" `Quick (fun () ->
             test_target_confirmation `Update "Stored update" 2)
         ; Alcotest.test_case "Status targeted confirmation" `Quick (fun () ->
@@ -9456,10 +9003,10 @@ let () =
             "Canonical child mutation context retained"
             `Quick
             test_target_confirmation_retains_child_mutation_context
-        ; Alcotest.test_case "Capture page retains structure interest" `Quick (fun () ->
+        ; Alcotest.test_case "Target page retains structure interest" `Quick (fun () ->
             test_target_confirmation_retains_page_interest true)
         ; Alcotest.test_case
-            "Pending Capture page retains structure interest"
+            "Pending Target page retains structure interest"
             `Quick
             (fun () -> test_target_confirmation_retains_page_interest false)
         ; Alcotest.test_case
@@ -9476,7 +9023,7 @@ let () =
                       `Quick
                       (fun () -> test_target_terminal kind terminal))
                  [ "missing", `Missing; "failure", `Failure; "graph reset", `Reset ])
-            [ "Capture", `Capture; "Update", `Update; "Status", `Status ] )
+            [ "Update", `Update; "Status", `Status ] )
     ; ("ordinary delete readback",[
         Alcotest.test_case "known rejection reads ordinary current target" `Quick(test_ordinary_delete_readback false false);
         Alcotest.test_case "committed present ordinary target consumes actual DTO" `Quick(test_ordinary_delete_readback true false);
@@ -9491,8 +9038,7 @@ let () =
                     `Quick
                     (fun () -> test_paged_mutation_refresh kind result))
                [ "found", Found; "missing", Missing; "cursor error", Cursor_failed ])
-          [ "capture", Capture
-          ; "update", Update
+          [ "update", Update
           ; "update conflict", Update_conflict
           ; "delete conflict", Delete_conflict
           ] )
@@ -9579,10 +9125,6 @@ let () =
             "invalid format falls back to the upstream default"
             `Quick
             test_journal_title_falls_back_on_invalid_format
-        ; Alcotest.test_case
-            "failed format read rejects the capture"
-            `Quick
-            test_journal_title_failed_format_read_rejects
         ; Alcotest.test_case
             "ordinal and calendar boundaries"
             `Quick

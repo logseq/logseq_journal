@@ -1861,8 +1861,8 @@ let test_upload_checkpoint_io ?(closed_stderr = false) () =
         let completion = List.find_map (function Core.Asset_completed (_, event) -> Some event | _ -> None) !posted |> Option.get in
         let _, work = Transfer.step transfer completion in
         let failures = List.filter_map (function
-          | Transfer.Notify {consumer;asset;availability=Failed _ as availability} ->
-            Some (Core.Asset_availability {consumer;asset;availability})
+          | Transfer.Notify {consumer;asset;descriptor;availability=Failed _ as availability} ->
+            Some (Core.Asset_availability {consumer;asset;descriptor;availability})
           | _ -> None) work in
         Alcotest.(check int) "real terminal failure notifies both consumers" 2 (List.length failures);
         List.iter (fun notice ->

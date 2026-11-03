@@ -359,7 +359,7 @@ type asset_consumer =
   ; round : request_id option
   }
 
-type asset_file = { asset_owner:session; asset_consumer:asset_consumer; asset:Uuid.t; source_handle:string }
+type asset_file = { asset_owner:session; asset_consumer:asset_consumer; asset:Uuid.t; descriptor:Logseq_db_types.Asset_descriptor.t; source_handle:string }
 type file_lease = {lease_owner:session;lease_id:request_id;lease_handle:string;lease_path:string;lease_type:string}
 type upload_operation = { upload_owner:session; operation:Uuid.t }
 type import_source_proof={source_operation:Uuid.t;source_fingerprint:string}
@@ -951,14 +951,15 @@ let restore_asset_import_intent session bytes=Import_wire.restore ~namespace:(im
 ;;
 
 let asset_notice_session (x:asset_notice)=x.notice_owner
+let asset_notice_scope (x:asset_notice)=x.notice_owner.asset_scope
 
 let asset_notice_data (x:asset_notice)=x.notice_data
 
 let asset_notice_consumer (x:asset_notice)=x.notice_consumer
 
 let ready_asset_file (x:asset_notice)=match x.notice_consumer,x.notice_data with
-  | Some consumer,Service.Asset_availability{asset;availability=Ready handle;_}->
-    Some{asset_owner=x.notice_owner;asset_consumer=consumer;asset;source_handle=handle}
+  | Some consumer,Service.Asset_availability{asset;descriptor;availability=Ready handle;_}->
+    Some{asset_owner=x.notice_owner;asset_consumer=consumer;asset;descriptor;source_handle=handle}
   | _->None
 ;;
 
@@ -2163,6 +2164,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                      })
                 (validate_intent session intent)
             | Import intent->Result.map(fun()->Service.Coordination_import{registration=binding.serial;owner=session.asset_scope;request_id;source=(Import_wire.source intent)})(validate_request session operation)
+            | Acquire_asset_file file->Result.map(fun()->Service.Acquire_asset_file{scope=session.asset_scope;handle=file.source_handle})(validate_request session operation)
             | Acquire_imported_file imported->Result.map(fun()->Service.Acquire_imported_file{scope=session.asset_scope;operation=imported.import_receipt.operation})
                 (validate_request session operation)
             | Replace_asset_demand(consumer,priority,assets)->
@@ -2245,6 +2247,17 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                source_proof={source_operation=(Import_wire.source intent).operation;
                  source_fingerprint=(Digestif.SHA256.digest_string (Import_wire.encode intent) |> Digestif.SHA256.to_hex)}})))
            | _->Error(Protocol_mismatch "Import receipt changed its exact owner or immutable identity"))
+        | Acquire_asset_file file->
+          if not(equal_binding session.binding binding) || not(equal_session session file.asset_owner) then Error Revoked_session else
+          (match response with
+           | Service.Asset_file None->Ok(Answered(Ok None))
+           | Service.Asset_file(Some(handle,path)) when handle<>"" && path<>""->
+             let file_type=match file.descriptor.source with
+               |Managed(Some version)->version.file_type
+               |Managed None|External _->Filename.extension path |> fun extension->
+                 if extension="" then "bin" else String.sub extension 1(String.length extension-1) in
+             Ok(Answered(Ok(Some{lease_owner=session;lease_id=request_id;lease_handle=handle;lease_path=path;lease_type=file_type})))
+           | _->Error(Protocol_mismatch "Asset acquisition omitted its actual lease capability"))
         | Acquire_imported_file imported->
           if not(equal_binding session.binding binding) || not(equal_session session imported.import_owner) then Error Revoked_session else
           (match response with

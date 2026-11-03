@@ -255,3 +255,8 @@ let format ~pattern ~year ~month ~day =
     in
     render specs None []
 ;;
+
+let for_journal_day ~pattern day =
+  let render pattern=format ~pattern ~year:(day/10000) ~month:(day/100 mod 100) ~day:(day mod 100) in
+  match Option.bind pattern render with Some _ as title->title |None->render default_format
+;;

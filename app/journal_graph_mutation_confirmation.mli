@@ -3,7 +3,6 @@ module Protocol = Logseq_db_worker.Protocol
 module Worker = Journal_worker_coordination.Worker_api
 
 type purpose =
-  | Captured of { block_id : string }
   | Updated of { block_id : string }
   | Update_conflict_refresh of { block_id : string }
   | Delete_conflict_refresh of { block_id : string }

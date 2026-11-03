@@ -41,6 +41,8 @@ type event =
       ; asset : Asset.t
       }
   | Hide
+  | Pin_preview of string
+  | Unpin_preview of string
   | Availability of
       { scope : Service.asset_scope
       ; consumer : string
@@ -63,11 +65,14 @@ type lease =
   ; lease : string
   }
 
+module Pins=Map.Make(String)
+
 type t =
   { selection : selection option
   ; pending : ticket option
   ; available : (Service.asset_scope * string) option
   ; lease : lease option
+  ; pins : lease Pins.t
   ; pressured : bool
   ; serial : int
   ; status : presentation
@@ -78,6 +83,7 @@ let empty =
   ; pending = None
   ; available = None
   ; lease = None
+  ; pins = Pins.empty
   ; pressured = false
   ; serial = 0
   ; status = Hidden
@@ -87,10 +93,17 @@ let empty =
 let presentation t = t.status
 let descriptor t = Option.map (fun selected -> selected.asset) t.selection
 
+let release_lease item=Release_file{scope=item.ticket.scope;lease=item.lease}
+let pinned t item=Pins.exists(fun _ held->held=item)t.pins
 let release_file t =
   match t.lease with
-  | None -> []
-  | Some item -> [ Release_file { scope = item.ticket.scope; lease = item.lease } ]
+  |Some item when not(pinned t item)->[release_lease item]
+  |None|Some _->[]
+;;
+let release_all_files t =
+  let held=Pins.fold(fun _ item held->item::held)t.pins(Option.to_list t.lease)
+    |> List.sort_uniq Stdlib.compare in
+  List.map release_lease held
 ;;
 
 let managed (a : Asset.t) =
@@ -248,10 +261,8 @@ let step t = function
        when old.graph_generation = graph_generation
             && old.consumer = consumer
             && old.asset.uuid = asset.uuid
-            && (match t.status with
-                | File _ -> true
-                | _ -> old.asset.source = asset.source
-                       && old.asset.current_checksum = asset.current_checksum) ->
+            && old.asset.source = asset.source
+            && old.asset.current_checksum = asset.current_checksum ->
        { t with selection = Some selected }, []
      | _ ->
        let effects =
@@ -266,7 +277,15 @@ let step t = function
          ; status = initial_status asset
          }
        , effects ))
-  | Hide -> { empty with serial = t.serial }, release_file t @ release t
+  | Hide -> { empty with serial = t.serial }, release_all_files t @ release t
+  | Pin_preview owner->
+    (match t.lease with Some lease when not(Pins.mem owner t.pins)->{t with pins=Pins.add owner lease t.pins},[]
+     |None|Some _->t,[])
+  | Unpin_preview owner->
+    (match Pins.find_opt owner t.pins with
+     |None->t,[]
+     |Some held->let next={t with pins=Pins.remove owner t.pins} in
+       next,(if next.lease=Some held || pinned next held then []else[release_lease held]))
   | Availability { scope; consumer; availability } ->
     (match t.selection with
      | Some selected
@@ -314,11 +333,9 @@ let step t = function
       | None -> { t with pending = None; status = Failed "Unable to open file" }, [])
     else
       ( t
-      , (match result, t.lease with
-         | Some (lease, _), Some held when held.ticket = ticket && held.lease = lease ->
-           []
-         | Some (lease, _), _ -> [ Release_file { scope = ticket.scope; lease } ]
-         | None, _ -> []) )
+      , (match result with
+         | Some (lease, _) -> [ Release_file { scope = ticket.scope; lease } ]
+         | None -> []) )
   | Retry_requested ->
     (match t.selection with
      | Some selected

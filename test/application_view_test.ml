@@ -15,7 +15,8 @@ let fixture_request = function
 
 (* Synthetic observation registration uses the same query handler, while
    preserving the real Service envelopes, identity, epochs and release ACK. *)
-let fixture_observations ?(observed=(fun _->())) ?(released=(fun _->())) handle =
+let fixture_observations ?(observed=(fun _->())) ?(released=(fun _->()))
+    ?(asset_scope=(fun (_:Service.timeline_scope)->None)) ?(asset_request=(fun _->())) handle =
   let registrations=Hashtbl.create 16 in
   fun context state request ->
     let read registration owner observation_id epoch query maximum_bytes =
@@ -27,6 +28,24 @@ let fixture_observations ?(observed=(fun _->())) ?(released=(fun _->())) handle 
       | Error error->Error error
       | Ok _->Error "Observation fixture expected a query response" in
     match request with
+    |Service.Coordination_asset_demand value->
+      asset_request request;
+      (match handle context state(Service.Asset_command_at(value.owner,Replace_asset_demand
+        {consumer=value.consumer;priority=value.priority;assets=value.assets})) with
+       |Ok Service.Client_command_completed->
+         Option.iter(fun scope->Logseq_db_worker_lui.Journal_worker.Request_context.emit context
+           ~topic:Service.asset_topic(Service.Asset_notice(scope,Asset_demand_accepted value.consumer)))
+           (asset_scope value.owner);
+         Ok(Service.Coordination_asset_demand_accepted{request_id=value.request_id})
+       |Error error->Error error|Ok _->Error "Asset demand fixture expected a command acknowledgement")
+    |Service.Coordination_release_asset_demand value->
+      asset_request request;
+      let owner:Service.timeline_scope={startup={account_generation=value.owner.account.account_generation;
+        presentation_generation=value.owner.account.presentation_generation};graph_id=value.owner.graph_id;graph_generation=value.owner.graph_generation} in
+      (match handle context state(Service.Asset_command_at(owner,Release_asset_demand value.consumer)) with
+       |Ok Service.Client_command_completed->Ok(Service.Coordination_asset_demand_released{
+         registration=value.registration;owner=value.owner;request_id=value.request_id;consumer=value.consumer})
+       |Error error->Error error|Ok _->Error "Asset release fixture expected a checked acknowledgement")
     | Service.Coordination_import value->
       let owner:Service.timeline_scope={startup={account_generation=value.owner.account.account_generation;
         presentation_generation=value.owner.account.presentation_generation};graph_id=value.owner.graph_id;graph_generation=value.owner.graph_generation} in
@@ -625,6 +644,8 @@ let run_favorites_native_visibility
       ?(on_initialized = fun () -> ())
       ?media_rows
       ?(shared_media = false)
+      ?(single_graph_shape = false)
+      ?(check_media_rebind = false)
       ?(check_point_read_owner = false)
       ?(check_media_change_ack = false)
       ?(media_change_failure = false)
@@ -717,11 +738,17 @@ let run_favorites_native_visibility
   let media_notices = Atomic.make [] in
   let media_delivered = Atomic.make 0 in
   let demands = Atomic.make [] in
+  let typed_asset_demands=Atomic.make 0 and legacy_asset_demands=Atomic.make 0 in
   let retries = Atomic.make 0 in
   let acquire_entered = Atomic.make 0 in
   let acquire_release = Atomic.make false in
   let released_files = Atomic.make 0 in
   let media_checksum = Atomic.make 'a' in
+  let media_descriptor asset =
+    let module A=Logseq_db_types.Asset_descriptor in
+    A.create ~uuid:asset ~source:(Managed(Some(A.version
+      ~checksum:(String.make 64(Atomic.get media_checksum)) ~file_type:"png" |> Result.get_ok)))
+      ~current_checksum:None ~size:None ~dimensions:(Some(120,80)) |> Result.get_ok in
   let media_metadata_changed = Atomic.make false in
   let detail_fixture = Atomic.make false in
   let detail_initial_limit = Atomic.make None in
@@ -932,7 +959,7 @@ let run_favorites_native_visibility
   in
   (* Copy specifically exercises ordinary single-graph/native authority. Other
      UI fixtures declare their synthetic manager owner directly. *)
-  let manager=if check_copy then manager else fixture_with_scope manager in
+  let manager=if check_copy || single_graph_shape then manager else fixture_with_scope manager in
   let point_reads=Atomic.make 0 and legacy_point_reads=Atomic.make 0 in
   let offline_scans=Atomic.make 0 and legacy_offline_scans=Atomic.make 0 in
   let asset_change_armed = Atomic.make false in
@@ -1006,11 +1033,15 @@ let run_favorites_native_visibility
           ~topic:Service.manager_topic
           (Service.Client_state_changed manager);
         Ok ())
-      ~handle:(fixture_observations ~observed:(fun request->Atomic.incr detail_observes;
+      ~handle:(fixture_observations
+        ~asset_scope:(fun owner->if asset_change=Some `More then None else Some(fixture_scope manager owner.graph_id))
+        ~asset_request:(function Service.Coordination_asset_demand _->Atomic.incr typed_asset_demands|_->())
+        ~observed:(fun request->Atomic.incr detail_observes;
         match request with Service.Coordination_observe value->
           Atomic.set detail_observation_notice(Some{registration_id=value.registration;owner=value.owner;
             observation_id=value.observation_id;epoch=0L})|_->()) ~released:(fun _->Atomic.incr detail_releases) (fun context () request ->
         (match request with
+         |Service.Asset_command{command=Replace_asset_demand _;_}->Atomic.incr legacy_asset_demands
          | Service.Coordination_mutation{intent;_}->
            Atomic.incr typed_status_mutations;
            Atomic.set typed_status_intents(intent::Atomic.get typed_status_intents)
@@ -1194,7 +1225,7 @@ let run_favorites_native_visibility
                        sync_phase = Option.value sync_phase ~default:Service.Current
                      ; last_error_attention = Option.value attention ~default:None
                      ; last_error = Option.value error ~default:None
-                     ; resident_scopes=(if check_copy then [] else [{scope with graph_generation=Atomic.get graph_generation}])
+                     ; resident_scopes=(if check_copy || single_graph_shape then [] else [{scope with graph_generation=Atomic.get graph_generation}])
                      ; startup = { manager.snapshot.startup with
                          graph_generation = Atomic.get graph_generation }
                      }
@@ -2022,7 +2053,7 @@ let run_favorites_native_visibility
       check_fixture_worker_idle ())
     (fun () ->
        hooks.init 2 2 startup |> consume;
-       if check_copy then (
+       if check_copy || single_graph_shape then (
          let json = Yojson.Safe.to_string (`Assoc
            [ "userId", `String "fixture";
              "managedSyncOrigin", `String "https://example.invalid" ]) in
@@ -3647,6 +3678,8 @@ let run_favorites_native_visibility
            settle ()
          done;
          settle ();
+         Alcotest.(check bool) "visible media uses typed demand admission" true(Atomic.get typed_asset_demands>=shown_count);
+         Alcotest.(check int) "visible media emits no legacy demand" 0(Atomic.get legacy_asset_demands);
          let title_ids =
            List.init count (fun n ->
              let title = Printf.sprintf "Timeline fixture %d" n in
@@ -3658,7 +3691,7 @@ let run_favorites_native_visibility
              media_notices
              (List.map
                 (fun (consumer, asset) ->
-                   Service.Asset_availability { consumer; asset; availability })
+                   Service.Asset_availability { consumer; asset; descriptor=media_descriptor asset; availability })
                 (Atomic.get demands));
            ignore (W.send (Option.get !client) Service.Get_graph_state);
            wait "public media notices delivered" (fun () ->
@@ -3768,7 +3801,34 @@ let run_favorites_native_visibility
                    (fun()->Atomic.get changes_acknowledged)))
              else wait "Changes ACK progresses after Media DTO and descendants apply"
                (fun()->Atomic.get changes_acknowledged))
-         ) else match media_navigation with
+         ) else if check_media_rebind then (
+           (* Core already retires real leases correctly. Its public reducer does
+              not own Application's kept native rows or binding-ready callback. *)
+           Atomic.set acquire_release true;
+           publish(Service.Asset.Ready "before-rebind");
+           wait "ordinary file is rendered before binding retirement" (fun()->
+             Option.is_some(find "path" "/tmp/targeted-media.png"));
+           let old=Option.get(Atomic.get coordination_registration) in
+           let before=Atomic.get typed_asset_demands and acquired=Atomic.get acquire_entered in
+           Atomic.set coordination_release_entered false;
+           Atomic.set coordination_release_allowed false;
+           W.Session_context.emit(Option.get !worker_context)
+             ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+             (Service.Coordination_updates[Coordination_revoked(old,"synthetic authority handover")]);
+           wait "old binding reaches real unregister" (fun()->Atomic.get coordination_release_entered);
+           wait "retired binding cannot leave an ordinary old file rendered" (fun()->
+             Option.is_none(find "path" "/tmp/targeted-media.png"));
+           Atomic.set coordination_release_allowed true;
+           wait "a distinct binding registers without changing UI scope" (fun()->
+             Option.exists((<>)old)(Atomic.get coordination_registration));
+           wait "visible ordinary media renews its typed demand without appearance replay" (fun()->
+             Atomic.get typed_asset_demands=before+shown_count);
+           let consumer,asset=List.hd(Atomic.get demands) in
+           W.Session_context.emit(Option.get !worker_context) ~topic:Service.asset_topic
+             (Service.Asset_notice(scope,Asset_availability{consumer;asset;descriptor=media_descriptor asset;availability=Ready "after-rebind"}));
+           wait "new binding acquires a new actual display lease" (fun()->
+             Atomic.get acquire_entered=acquired+1 && Option.is_some(find "path" "/tmp/targeted-media.png")))
+         else match media_navigation with
          | Some scenario ->
            let native_range first last =
              hooks.extension_event
@@ -3984,20 +4044,27 @@ let run_favorites_native_visibility
                    (fun (_, asset) -> not (G.Uuid.equal asset (uuid 20000)))
                    (Atomic.get demands)
                in
-               let child_ready () =
+               let child_ready ?(consumer=consumer) () =
                  W.Session_context.emit
                    (Option.get !worker_context)
                    ~topic:Service.asset_topic
                    (Service.Asset_notice
                       ( scope
                       , Service.Asset_availability
-                          { consumer; asset; availability = Ready "child-ready" } ))
+                          { consumer; asset; descriptor=media_descriptor asset; availability = Ready "child-ready" } ))
                in
-               let child_files () =
-                 List.filter
-                   (fun id -> within id detail_list)
-                   (all "accessibility-identifier" ("journal-media:" ^ consumer))
+               let matching_child_files () =
+                 Hashtbl.fold(fun id fields found->
+                   match List.assoc_opt "accessibility-identifier" fields with
+                   |Some(`String identifier) when String.starts_with ~prefix:"journal-media:" identifier->
+                     let logical=String.sub identifier 14(String.length identifier-14) in
+                     (* Relate actual rendered presentation tokens to this fixture's
+                        actual Service consumer; do not duplicate its wire codec. *)
+                     if String.ends_with ~suffix:(":"^logical)consumer
+                     then id::found else found
+                   |_->found)props []
                in
+               let child_files()=List.filter(fun id->within id detail_list)(matching_child_files()) in
                if scenario = `Detail_pending then Atomic.set acquire_release false;
                child_ready ();
                wait "child Acquire entered" (fun () -> Atomic.get acquire_entered = 2);
@@ -4062,7 +4129,7 @@ let run_favorites_native_visibility
                    true
                    (List.exists
                       (fun id -> within id list_node)
-                      (all "accessibility-identifier" ("journal-media:" ^ consumer)));
+                      (matching_child_files ()));
                  native_range 3 (count + 1));
                wait "retired child releases last file" (fun () ->
                  Atomic.get released_files - before_released = 1);
@@ -4100,7 +4167,8 @@ let run_favorites_native_visibility
                  appear_with_ancestors (waiting_for_row (child_label ())) detail_list;
                  wait "visible child sends one new demand" (fun () ->
                    List.length (Atomic.get demands) = 3);
-                 child_ready ();
+                 let fresh_consumer=List.find(fun(_,id)->G.Uuid.equal id asset)(Atomic.get demands) |> fst in
+                 child_ready ~consumer:fresh_consumer ();
                  wait "visible child acquires fresh lease" (fun () ->
                    Atomic.get acquire_entered = 3 && List.length (child_files ()) = 1);
                  Alcotest.(check bool)
@@ -8817,7 +8885,11 @@ let () =
           run_favorites_native_visibility ~media_rows:3 ~media_navigation:`Offscreen
             ~check_point_read_owner:true ~check_media_change_ack:true ~media_change_descendant:true ~media_descendant_failure:true ())] )
     ; ( "targeted media subscriptions"
-      , [ Alcotest.test_case "dependency points use typed owner" `Quick (fun () ->
+      , [ Alcotest.test_case "single-graph baseline owns media without manager resident scopes" `Quick(fun()->
+          run_favorites_native_visibility ~media_rows:3 ~single_graph_shape:true ~check_point_read_owner:true ());
+        Alcotest.test_case "ordinary display renews after authority rebind" `Quick(fun()->
+          run_favorites_native_visibility ~media_rows:3 ~check_media_rebind:true ());
+        Alcotest.test_case "dependency points use typed owner" `Quick (fun () ->
           run_favorites_native_visibility ~media_rows:3 ~media_navigation:`Offscreen ~check_point_read_owner:true ());
  Alcotest.test_case "single Ready and Acquire N=3" `Quick (fun () ->
             run_favorites_native_visibility ~media_rows:3 ())

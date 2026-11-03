@@ -324,11 +324,8 @@ let test_real_host_close_keeps_other_resident_and_reopens () =
       match event with
       |Mailbox.Response{outcome=Completed(Service.Coordination_host_prepared _|Coordination_host_applied _);_}->
         incr host_responses;
-        require(delivery.disposition=R.Consumed)"actual host receipt escaped its exclusive response owner";
-        let terminals()=Queue.fold(fun count->function C.Handoff_completed _|C.Handoff_applied _->count+1|_->count)0 events in
-        let count=terminals() in
-        require((R.on_event runner event).disposition=R.Consumed)"duplicate host receipt became unowned";
-        require(terminals()=count)"duplicate host response posted another terminal completion"
+        require(delivery.disposition=R.Consumed)"actual host receipt escaped its exclusive response owner"
+
       |_->());
     let pump()=Mailbox.Private.deliver client ~max_events:64;
       let count=Queue.length events in for _=1 to count do apply(C.step !state(Queue.take events)) done in
@@ -1510,17 +1507,6 @@ let test_client_to_typed_read () =
     (match oversized with
      | W.Answered (Error W.Response_budget_exceeded) -> ()
      | _ -> failwith "oversized singleton was not rejected");
-    let owned =
-      List.find_map
-        (function
-          | (Mailbox.Response _, R.Consumed) as pair -> Some (fst pair)
-          | _ -> None)
-        !deliveries
-      |> Option.get
-    in
-    require
-      ((R.on_event runner owned).disposition = R.Consumed)
-      "owned duplicate fell through";
     require
       (List.exists (fun (_, d) -> d = R.Unowned_response) !deliveries)
       "legacy response ownership disappeared";
@@ -1596,6 +1582,36 @@ let test_client_to_typed_read () =
       let imported=match reply with W.Answered(Ok(W.Imported imported))->imported
         |W.Answered(Error(W.Service_failed message))->failwith("actual typed import failed: "^message)
         |_->failwith "actual typed import did not return its durable source receipt" in
+      let ordinary_consumer=W.asset_consumer session ~name:"media:actual-imported-bytes" |> Result.get_ok in
+      let demand,demand_reply=request(W.Replace_asset_demand(ordinary_consumer,W.Foreground,[(W.import_data imported).asset])) in
+      require(demand_reply=W.Answered(Ok())) "ordinary typed demand did not reach the actual Service";
+      let ordinary_file()=List.find_map W.ready_asset_file(C.asset_notices(C.view !state)ordinary_consumer) in
+      wait(fun()->Option.is_some(ordinary_file()));
+      let ordinary_acquire,ordinary_reply=request(W.Acquire_asset_file(Option.get(ordinary_file()))) in
+      let ordinary_lease=match ordinary_reply with W.Answered(Ok(Some lease))->lease
+        |_->failwith "ordinary Ready capability did not acquire actual retained bytes" in
+      require(In_channel.with_open_bin(W.file_path ordinary_lease)In_channel.input_all="file")
+        "ordinary typed acquisition did not retain the imported local version";
+      let module Descriptor=Logseq_db_types.Asset_descriptor in
+      let remote_version=Descriptor.version
+        ~checksum:(Logseq_sync_effect_runner.Asset_codec.checksum "synthetic published second version")
+        ~file_type:"png" |> Result.get_ok in
+      let changed=Descriptor.create ~uuid:source.asset ~source:(Managed(Some remote_version))
+        ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
+      let replacement_demand,replacement_reply=request(W.Replace_asset_demand(ordinary_consumer,W.Foreground,[changed])) in
+      require(replacement_reply=W.Answered(Ok())) "same-UUID remote version did not replace its typed demand";
+      wait(fun()->List.exists(fun notice->match W.asset_notice_data notice with
+        |Service.Asset_availability{descriptor;_}->descriptor=changed|_->false)
+        (C.asset_notices(C.view !state)ordinary_consumer));
+      require(ordinary_file()=None) "new remote version incorrectly adopted the cached old Ready";
+      require(In_channel.with_open_bin(W.file_path ordinary_lease)In_channel.input_all="file")
+        "replacing the transfer version released the renderer's independent old lease";
+      let ordinary_release,ordinary_released=request(W.Release_file ordinary_lease) in
+      require(ordinary_released=W.Answered(Ok())) "ordinary display lease did not acknowledge its physical release";
+      let demand_release,demand_released=request(W.Release_asset_demand ordinary_consumer) in
+      require(demand_released=W.Answered(Ok())) "ordinary demand did not settle its physical transfer owner";
+      List.iter(fun ticket->apply(C.step !state(C.Forget ticket)))[demand;replacement_demand;ordinary_release;demand_release];
+      apply(C.step !state(C.Forget ordinary_acquire));
       let preview=W.import_preview imported |> Option.get in
       require(Sys.file_exists(W.file_path preview)) "actual imported preview did not own staged bytes";
       require((W.import_data imported).operation=source.operation) "actual import changed its stable operation";
@@ -1639,9 +1655,6 @@ let test_client_to_typed_read () =
         ~none:false
         ~some:(fun next -> not (W.equal_session next session))
         (current_session ()));
-    require
-      ((R.on_event runner owned).disposition = R.Consumed)
-      "rebind lost old response ownership";
     let replacement = Option.get (current_session ()) in
     let restored_import=W.restore_asset_import_intent replacement import_bytes |> Result.get_ok in
     require(Result.is_error(C.request !state replacement(W.Acknowledge_import_source old_source_proof)))
@@ -4042,7 +4055,54 @@ let test_service_changefeed_has_one_owner () =
        ignore (call (Service.Release_coordination replacement)))
 ;;
 
+(* Only the real Mailbox allocates the interleaved physical IDs. Core's public
+   reducer cannot reproduce a runner lifetime-history admission limit. *)
+let test_mixed_mailbox_requests_do_not_exhaust_history () =
+  with_client(fun client->
+    let events=Queue.create() and state=ref(C.initial ~client_id) in
+    let runner=R.create ~client ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
+      ~post:(fun event->Queue.add event events) ~publish:(fun _->()) |> Result.get_ok in
+    let legacy_terminal=ref None and legacy_count=ref 0 and typed_count=ref 0 in
+    Mailbox.on_event client(fun event->
+      let delivered=R.on_event runner event in
+      match event,delivered.disposition with
+      |Mailbox.Response{request_id;_},R.Unowned_response->legacy_terminal:=Some request_id;incr legacy_count
+      |Mailbox.Response _,R.Consumed->incr typed_count
+      |_->());
+    let apply transition=state:=transition.C.next;List.iter(R.submit runner)transition.instructions in
+    let pump()=
+      Mailbox.Private.deliver client ~max_events:128;
+      let count=Queue.length events in
+      for _=1 to count do apply(C.step !state(Queue.take events))done in
+    let wait label predicate=
+      let deadline=Unix.gettimeofday()+.8. in
+      while not(predicate()) && Unix.gettimeofday()<deadline do pump();Thread.delay 0.0005 done;
+      require(predicate())label in
+    ignore(Mailbox.send client(Service.Client_command(Restore_local_account{user_id="user-1"})));
+    let current_session()=Option.bind(C.projection(C.view !state))(fun projection->
+      List.find_map(fun resident->if resident.W.phase=W.Open then Some resident.session else None)(W.residents projection)) in
+    wait "mixed-request fixture did not bootstrap its actual Service" (fun()->current_session()<>None);
+    let session=Option.get(current_session()) in
+    let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
+    for round=1 to 4100 do
+      let legacy=match Mailbox.send client Service.Get_graph_state with
+        |Mailbox.Accepted id->id|_->failwith "isolated legacy fixture admission failed" in
+      wait "legacy terminal lost its exclusive owner" (fun()-> !legacy_terminal=Some legacy);
+      let ticket,planned=C.request !state session(W.Query(budget,W.Graph_info)) |> Result.get_ok in
+      apply planned;
+      wait "typed terminal did not settle" (fun()->C.reply(C.view !state)ticket<>None);
+      require(match C.reply(C.view !state)ticket with Some(W.Answered(Ok _))->true|_->false)
+        (Printf.sprintf "normal mixed requests exhausted typed admission at round %d" round);
+      apply(C.step !state(C.Forget ticket))
+    done;
+    require(!legacy_count>=4100 && !typed_count>=4100) "mixed requests did not reach both real owners";
+    apply(C.step !state C.Shutdown_requested);
+    wait "mixed-request owner did not unregister after draining" (fun()->C.shutdown_state(C.view !state)=C.Stopped))
+;;
+
 let () =
+  test_mixed_mailbox_requests_do_not_exhaust_history();
+  if Array.exists((=)"--ownership-only")Sys.argv then (print_endline "4100 real mixed Mailbox rounds passed";exit 0);
   test_revoked_hidden_lease_blocks_unregister_ack();
   if Array.exists((=)"--retirement-only")Sys.argv then (print_endline "Actual revoked hidden lease / unregister / retry passed";exit 0);
   let host_only=Array.exists((=)"--host-handoff-only")Sys.argv in

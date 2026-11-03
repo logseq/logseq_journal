@@ -91,6 +91,7 @@ type outgoing_request =
   | Command of Service.request
   | Listing of read_request
   | Release_preview of Worker.file_lease
+  | Release_consumer of Worker.asset_consumer
 
 type outgoing =
   { ticket : ticket option
@@ -111,6 +112,9 @@ type page_fact =
 
 type t =
   { release_file : (Worker.file_lease -> bool) option
+  ; release_consumer : (Worker.asset_consumer -> bool) option
+  ; bound_consumers : (string,Worker.asset_consumer)Hashtbl.t
+  ; mutable resource_binding : Worker.binding option
   ; read_port : (read_request -> bool) option
   ; read_planned : G.Uuid.t -> unit
   ; read_retired : G.Uuid.t -> unit
@@ -119,6 +123,7 @@ type t =
   ; groups : (string, group) Hashtbl.t
   ; consumers : (string, group * controller) Hashtbl.t
   ; previews : (string, string * string * string) Hashtbl.t
+  ; coordinated_leases : (string, Worker.file_lease) Hashtbl.t
   ; facts : (string, fact) Hashtbl.t
   ; pages : (string, page_fact) Hashtbl.t
   ; page_barriers : (string, int) Hashtbl.t
@@ -131,8 +136,11 @@ type t =
   ; mutable queued : outgoing list
   }
 
-let create_state ~release_file ~read_port ~read_planned ~read_retired ~send ~changed =
+let create_state ~release_file ~release_consumer ~read_port ~read_planned ~read_retired ~send ~changed =
   { release_file
+  ; release_consumer
+  ; bound_consumers=Hashtbl.create 32
+  ; resource_binding=None
   ; read_port
   ; read_planned
   ; read_retired
@@ -141,6 +149,7 @@ let create_state ~release_file ~read_port ~read_planned ~read_retired ~send ~cha
   ; groups = Hashtbl.create 16
   ; consumers = Hashtbl.create 32
   ; previews = Hashtbl.create 4
+  ; coordinated_leases=Hashtbl.create 16
   ; facts = Hashtbl.create 64
   ; pages = Hashtbl.create 16
   ; page_barriers = Hashtbl.create 16
@@ -157,6 +166,7 @@ let create_state ~release_file ~read_port ~read_planned ~read_retired ~send ~cha
 let create ~send ~changed =
   create_state
     ~release_file:None
+    ~release_consumer:None
     ~read_port:None
     ~read_planned:(fun _ -> ())
     ~read_retired:(fun _ -> ())
@@ -166,6 +176,7 @@ let create ~send ~changed =
 
 let create_coordinated
       ?release_file
+      ?release_consumer
       ?(read_planned = fun _ -> ())
       ?(read_retired = fun _ -> ())
       ~read
@@ -173,7 +184,7 @@ let create_coordinated
       ~changed
       ()
   =
-  create_state ~release_file ~read_port:(Some read) ~read_planned ~read_retired ~send ~changed
+  create_state ~release_file ~release_consumer ~read_port:(Some read) ~read_planned ~read_retired ~send ~changed
 ;;
 
 let owns_read t request_id =
@@ -342,6 +353,7 @@ let rec pump t =
       | Listing request ->
         Option.fold t.read_port ~none:false ~some:(fun read -> read request)
       | Release_preview lease->Option.fold t.release_file ~none:false ~some:(fun release->release lease)
+      | Release_consumer consumer->Option.fold t.release_consumer ~none:false ~some:(fun release->release consumer)
     then (
       (match next.request with
        | Command (Service.Graph_request request) -> observe_request t request
@@ -371,6 +383,25 @@ let current_group t g =
 
 let current_controller t g c = current_group t g && Hashtbl.mem t.consumers c.consumer
 
+let release_retained_file t scope handle =
+  match Hashtbl.find_opt t.coordinated_leases handle with
+  |Some lease->
+    Hashtbl.remove t.coordinated_leases handle;
+    t.queued<-t.queued @ [{ticket=None;request=Release_preview lease;current=(fun()->true)}]
+  |None->enqueue t(Service.Release_asset_file{scope;handle})
+;;
+
+let release_bound_consumer t graph_generation consumer =
+  match Hashtbl.find_opt t.bound_consumers consumer with
+  |Some bound->
+    Hashtbl.remove t.bound_consumers consumer;
+    t.queued<-t.queued @ [{ticket=None;request=Release_consumer bound;current=(fun()->true)}]
+  |None when t.release_consumer<>None->()
+  |None->enqueue t(Service.Asset_command{graph_generation;command=Release_asset_demand consumer})
+;;
+
+let bind_consumer t ~name consumer=Hashtbl.replace t.bound_consumers name consumer
+
 let instructions t g c effects =
   List.iter
     (function
@@ -385,11 +416,7 @@ let instructions t g c effects =
                  Replace_asset_demand
                    { consumer; priority = Foreground; assets = [ asset ] }
              })
-      | Release { graph_generation; consumer } ->
-        enqueue
-          t
-          (Service.Asset_command
-             { graph_generation; command = Release_asset_demand consumer })
+      | Release { graph_generation; consumer } -> release_bound_consumer t graph_generation consumer
       | Retry { graph_generation; asset } ->
         enqueue
           t
@@ -403,7 +430,7 @@ let instructions t g c effects =
           ~current:(fun () -> current_controller t g c && P.ticket_current c.state ticket)
           (Service.Acquire_asset_file { scope = ticket.scope; handle = ticket.handle })
       | Release_file { scope; lease } ->
-        enqueue t (Service.Release_asset_file { scope; handle = lease }))
+        release_retained_file t scope lease)
     effects
 ;;
 
@@ -630,6 +657,11 @@ let retain_visible_roots ?(owner = "default") t roots =
     t.groups
 ;;
 
+let unpin_preview t preview root asset =
+  Option.iter(fun g->Option.iter(fun c->dispatch t g c(P.Unpin_preview preview))
+    (List.find_opt(fun c->c.consumer=asset)g.controllers))(Hashtbl.find_opt t.groups root)
+;;
+
 let retain_owners t owners =
   let retained = Owners.of_list owners in
   Hashtbl.filter_map_inplace
@@ -637,6 +669,7 @@ let retain_owners t owners =
        if Owners.mem owner retained
        then Some (owner, root, asset)
        else (
+         unpin_preview t preview root asset;
          root_visible ~owner:preview t ~root false;
          None))
     t.previews;
@@ -694,7 +727,8 @@ let preview_visible t ~owner ~slot ~root ~asset visible =
   then (
     Hashtbl.remove t.previews preview;
     Option.iter
-      (fun (_, root, _) ->
+      (fun (_, root, asset) ->
+         unpin_preview t preview root asset;
          root_visible ~owner:preview t ~root false;
          Option.iter
            (fun g ->
@@ -723,7 +757,9 @@ let preview_visible t ~owner ~slot ~root ~asset visible =
                 g.local ->
       Hashtbl.replace t.previews preview selected;
       root_visible ~owner:preview t ~root true;
-      asset_visible ~owner:preview t ~root ~asset true
+      asset_visible ~owner:preview t ~root ~asset true;
+      Option.iter(fun c->dispatch t g c(P.Pin_preview preview))
+        (List.find_opt(fun c->c.consumer=asset)g.controllers)
     | _ -> ())
 ;;
 
@@ -1229,7 +1265,7 @@ let release_stale t ticket result =
   match result with
   | None -> ()
   | Some (lease, _) ->
-    enqueue t (Service.Release_asset_file { scope = ticket.P.scope; handle = lease })
+    release_retained_file t ticket.P.scope lease
 ;;
 
 let receive_listing t ~root ~epoch ~request_id listing =
@@ -1404,10 +1440,26 @@ let receive t ticket response =
   pump t
 ;;
 
+let acquisition_consumer = function Lease{consumer;_}->Some consumer|Query _|Facts _->None
+let consumer_names t=Hashtbl.to_seq_keys t.consumers
+let receive_file t ticket lease =
+  let result=Option.map(fun lease->
+    let handle=Printf.sprintf "coordinated-display-lease:%d" t.serial in
+    t.serial<-t.serial+1;
+    Hashtbl.replace t.coordinated_leases handle lease;
+    handle,Worker.file_path lease)lease in
+  receive t ticket(Service.Asset_file result)
+;;
+
 let reject t ticket = receive t ticket Service.Client_command_completed
 
+let demand_backpressured t consumer =
+  Option.iter(fun(g,c)->dispatch t g c P.Demand_backpressured)
+    (Hashtbl.find_opt t.consumers consumer)
+;;
+
 let notice t scope = function
-  | Service.Asset_availability { consumer; asset; availability } ->
+  | Service.Asset_availability { consumer; asset; availability; _ } ->
     (match Hashtbl.find_opt t.consumers consumer with
      | Some (g, c) when c.asset.uuid = asset ->
        dispatch t g c (Availability { scope; consumer; availability });
@@ -1433,10 +1485,7 @@ let notice t scope = function
   | Asset_capacity_available ->
     Hashtbl.iter (fun _ (g, c) -> dispatch t g c P.Capacity_available) t.consumers;
     pump t
-  | Asset_backpressure consumer ->
-    Option.iter
-      (fun (g, c) -> dispatch t g c P.Demand_backpressured)
-      (Hashtbl.find_opt t.consumers consumer)
+  | Asset_backpressure consumer -> demand_backpressured t consumer
   | Asset_demand_accepted consumer ->
     Option.iter
       (fun (g, c) -> dispatch t g c P.Demand_accepted)
@@ -1510,9 +1559,32 @@ let retire_coordinated_previews t =
       List.iter(release_import t)retiring;g.local<-retained;g.membership_changed<-true;notify t g))t.groups;
   pump t
 ;;
+let retire_coordinated_resources t =
+  if t.resource_binding<>None then (
+    t.resource_binding<-None;
+    t.queued<-List.filter(fun outgoing->match outgoing.request with
+      |Release_preview _|Release_consumer _->true
+      |Command _|Listing _->retire_outgoing t outgoing;false)t.queued;
+    Hashtbl.iter(fun _ id->t.read_retired id)t.fact_requests;
+    Hashtbl.clear t.fact_requests;Hashtbl.clear t.facts;Hashtbl.clear t.pages;
+    Hashtbl.clear t.page_barriers;Hashtbl.clear t.sources;Hashtbl.clear t.barriers;
+    retire_coordinated_previews t;
+    Hashtbl.iter(fun _ g->
+      Option.iter t.read_retired g.pending;g.pending<-None;g.cursor<-None;
+      g.membership_changed<-true;g.dependency_failed<-false;g.listing_failed<-false;g.error<-None;
+      List.iter(fun c->dispatch t g c P.Hide)g.controllers;
+      notify t g)t.groups;
+    pump t)
+;;
 let resume_coordinated_previews t =
   Hashtbl.iter(fun _ g->if g.visible then ensure_fresh t g)t.groups;
   pump t
+;;
+let bind_coordinated_resources t binding =
+  if Option.exists(fun previous->not(Worker.equal_binding previous binding))t.resource_binding
+  then retire_coordinated_resources t;
+  t.resource_binding<-Some binding;
+  resume_coordinated_previews t
 ;;
 
 let imported t ~current data=imported_local t ~current {data;authority=None}

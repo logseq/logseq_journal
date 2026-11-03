@@ -34,22 +34,18 @@ let () =
   let t = P.notice t scope (notice 3 U.Sending) in
   assert (List.length (P.rows t) = 1);
   assert (List.hd (P.rows t)).busy;
-  assert (P.retry t (uuid 3) = None);
+  assert (not(P.can_retry t (uuid 3)));
   let t = P.notice t scope (notice 3 (Failed_upload Network)) in
   assert (List.hd (P.rows t)).retry;
-  assert (
-    match P.retry t (uuid 3) with
-    | Some (S.Asset_command { graph_generation = 1; command = Retry_upload operation }) ->
-      operation = uuid 3
-    | _ -> false);
+  assert(P.can_retry t (uuid 3));
   let t = P.notice t scope (notice 3 U.Publishing) in
   assert ((List.hd (P.rows t)).message = "Publishing attachment metadata");
   let t = P.notice t scope (notice 3 U.Uploaded) in
-  assert ((not (List.hd (P.rows t)).busy) && P.retry t (uuid 3) = None);
+  assert ((not (List.hd (P.rows t)).busy) && not(P.can_retry t (uuid 3)));
   let foreign = P.notice t { scope with graph_id = uuid 9 } (notice 4 U.Sending) in
   assert (P.rows foreign = P.rows t);
   let cleared = P.sync t (Some (2, uuid 1)) in
-  assert (P.rows cleared = [] && P.retry cleared (uuid 3) = None);
+  assert (P.rows cleared = [] && not(P.can_retry cleared (uuid 3)));
   assert (P.rows (P.notice cleared scope (notice 3 U.Sending)) = []);
   let full =
     List.fold_left

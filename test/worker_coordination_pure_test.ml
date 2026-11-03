@@ -73,16 +73,29 @@ let test_asset_demand_notice_has_one_registered_owner () =
   check(Option.exists(W.equal_asset_consumer consumer)(W.asset_notice_consumer(List.hd values))) "notice guessed a different consumer association";
   let duplicate=(C.step announced(C.Asset_received(notice,Id.Worker.Push_sequence.of_int64 1L))).next in
   check(C.asset_notices(C.view duplicate)consumer=values) "duplicate acceptance accumulated an event log";
-  let asset_notice=I.asset_notice session(S.Asset_availability{consumer=wire_name;asset=asset.uuid;availability=Ready "real-ready-capability"}) |> Result.get_ok in
+  let asset_notice=I.asset_notice session(S.Asset_availability{consumer=wire_name;asset=asset.uuid;descriptor=asset;availability=Ready "real-ready-capability"}) |> Result.get_ok in
   let latest=(C.step duplicate(C.Asset_received(asset_notice,Id.Worker.Push_sequence.of_int64 3L))).next in
-  let old=I.asset_notice session(S.Asset_availability{consumer=wire_name;asset=asset.uuid;availability=Downloading}) |> Result.get_ok in
+  let old=I.asset_notice session(S.Asset_availability{consumer=wire_name;asset=asset.uuid;descriptor=asset;availability=Downloading}) |> Result.get_ok in
   let older=(C.step latest(C.Asset_received(old,Id.Worker.Push_sequence.of_int64 2L))).next in
   check(List.exists(fun notice->Option.is_some(W.ready_asset_file notice))(C.asset_notices(C.view older)consumer))
     "out-of-order notice rolled a Ready capability backwards";
+  let ready_file=W.ready_asset_file asset_notice |> Option.get in
+  let acquire,_=C.request older session(W.Acquire_asset_file ready_file) |> Result.get_ok in
+  check(match I.request session ~request_id:(C.ticket_id acquire)(W.Acquire_asset_file ready_file) with
+    |Ok(S.Acquire_asset_file _)->true|_->false) "registered Ready did not reach the existing scoped acquire";
   let version=Logseq_db_types.Asset_descriptor.version ~checksum:(String.make 64 '1') ~file_type:"png" |> Result.get_ok in
   let replacement=Logseq_db_types.Asset_descriptor.create ~uuid:asset.uuid ~source:(Managed(Some version))
     ~current_checksum:(Some version.checksum) ~size:None ~dimensions:None |> Result.get_ok in
-  let _,replaced=C.request older session(W.Replace_asset_demand(consumer,W.Foreground,[replacement])) |> Result.get_ok in
+  let replacement_ticket,replaced=C.request older session(W.Replace_asset_demand(consumer,W.Foreground,[replacement])) |> Result.get_ok in
+  let old_consumer=W.bind_asset_consumer consumer ~round:(C.ticket_id ticket) in
+  let _,late_release=C.request replaced.next session(W.Release_asset_demand old_consumer) |> Result.get_ok in
+  let new_wire=match I.request session ~request_id:(C.ticket_id replacement_ticket)
+    (W.Replace_asset_demand(consumer,W.Foreground,[replacement])) |> Result.get_ok with
+    |S.Coordination_asset_demand{consumer;_}->consumer|_->assert false in
+  let new_notice=I.asset_notice session(S.Asset_demand_accepted new_wire) |> Result.get_ok in
+  let after_late_release=(C.step late_release.next(C.Asset_received(new_notice,Id.Worker.Push_sequence.of_int64 5L))).next in
+  check(C.asset_notices(C.view after_late_release)consumer<>[])
+    "queued old-round release retired its replacement consumer";
   let old_ready=(C.step replaced.next(C.Asset_received(asset_notice,Id.Worker.Push_sequence.of_int64 4L))).next in
   check(not(List.exists(fun notice->Option.is_some(W.ready_asset_file notice))(C.asset_notices(C.view old_ready)consumer)))
     "old demand Ready capability survived a descriptor replacement round";
@@ -630,6 +643,64 @@ let test_host_consumption_keeps_old_execution_retired () =
   let new_session=(List.hd(W.residents reopened)).session in
   check(C.validate_session resumed new_session=Ok())"completed graph close fenced a future execution forever";
   check(Result.is_error(C.authorize_host_change resumed receipt))"old safe receipt consumed against a reopened execution"
+;;
+
+(* Repeated user close/reopen uses new authoritative graph generations. The
+   public pure boundary owns the admission history, so no I/O duplicate test. *)
+let test_repeated_graph_close_reopen_does_not_exhaust_handoff_history () =
+  let issuer,raw,projection,session=fixture 9875L in
+  let module I=(val issuer:W.ISSUER) in
+  let state=ref(ready I.binding projection) in
+  let old_receipts=ref [] in
+  for round=0 to 95 do
+    let id,prepared=match C.prepare_host_change !state(W.Graph_will_close(W.graph_id session)) with
+      |Ok value->value|Error _->failwith(Printf.sprintf "ordinary close/reopen refused at round %d" round) in
+    let plan=List.find_map(function C.Quiesce plan->Some plan|_->None)prepared.instructions |> Option.get in
+    let receipt=pure_host_receipt_fixture issuer plan in
+    let safe=(C.step prepared.next(C.Handoff_completed(id,W.Safe_to_proceed receipt))).next in
+    let consuming=C.authorize_host_change safe receipt |> Result.get_ok in
+    let attempt=List.find_map(function C.Consume_handoff(_,attempt)->Some attempt|_->None)consuming.instructions |> Option.get in
+    let mailbox=Id.Worker.Request_id.of_int64(Int64.of_int(10000+round)) in
+    let admitted=(C.step consuming.next(C.Handoff_apply_admitted(id,attempt,mailbox))).next in
+    let applied=(C.step admitted(C.Handoff_applied(id,attempt,mailbox,Ok()))).next in
+    let current=(List.hd(W.residents(Option.get(C.projection(C.view admitted))))).session in
+    check(C.validate_session applied current=Error W.Revoked_session) "close ACK revived its old execution";
+    let scope,physical=List.hd raw.baseline.state.residents in
+    let generation=scope.graph_generation+round+1 in
+    let scope={scope with graph_generation=generation} in
+    let next_raw={raw with baseline={raw.baseline with version=Int64.of_int(3+round);
+      state={residents=[scope,{physical with generation}];sync={raw.baseline.state.sync with
+        residents=List.map(fun(_,s)->scope,{s with Sync.snapshot={s.Sync.snapshot with
+          startup={s.snapshot.startup with graph_generation=generation}}})raw.baseline.state.sync.residents;
+        selected=None}}}} in
+    let reopened=match I.bootstrap(S.Coordination_registered next_raw) |> Result.get_ok with
+      |W.Ready projection->projection|_->failwith "invalid reopened fixture" in
+    state:=(C.step applied(C.Projection_received reopened)).next;
+    let current=(List.hd(W.residents reopened)).session in
+    check(C.validate_session !state current=Ok()) "new graph generation remained fenced";
+    List.iter(fun old->check(Result.is_error(C.authorize_host_change !state old))
+      "retired success receipt acquired another round") (receipt::!old_receipts);
+    old_receipts:=receipt::!old_receipts
+  done
+;;
+
+let test_determined_failed_handoff_retires_when_user_retries () =
+  let issuer,_,projection,session=fixture 9876L in
+  let module I=(val issuer:W.ISSUER) in
+  List.iter(fun legacy->
+    let state=ref(ready I.binding projection) and previous=ref None in
+    for _round=0 to 95 do
+      let change=W.Graph_will_close(W.graph_id session) in
+      let id,prepared=C.prepare_host_change ~legacy_pending:legacy !state change |> Result.get_ok in
+      Option.iter(fun old->check(C.handoff(C.view prepared.next)old=None)
+        "new Retry retained a determined inactive failure forever")!previous;
+      let error=W.Service_failed "synthetic actual cleanup failed" in
+      let failed=C.step prepared.next(if legacy then C.Legacy_handoff_completed(id,Error error)
+        else C.Handoff_completed(id,W.Handoff_failed(change,error))) in
+      check(C.handoff(C.view failed.next)id=Some(W.Handoff_failed(change,error)))
+        "cleanup failure disappeared before its observer";
+      state:=failed.next;previous:=Some id
+    done)[false;true]
 ;;
 
 let test_account_host_unknown_requires_original_consumption_readback () =
@@ -1451,35 +1522,6 @@ let test_queued_query_properties () =
            (String.concat
               ","
               (List.map (fun (op, n) -> Printf.sprintf "%d:%d" op n) minimal))))
-  done
-;;
-
-let test_compressed_response_ownership () =
-  let module O = C.Response_ownership in
-  let id n = Id.Worker.Request_id.of_int64 (Int64.of_int n) in
-  let history = ref O.empty in
-  for n = 1 to 16384 do
-    history := O.add !history (id n)
-  done;
-  check (O.spans !history = 1) "completed sequential requests expanded ownership history";
-  List.iter
-    (fun n -> check (O.mem !history (id n)) "old owned response lost disposition")
-    [ 1; 4096; 8192; 16384 ];
-  for seed = 0 to 99 do
-    let random = Random.State.make [| 0x0a11; seed |]
-    and expected = Array.make 128 false in
-    let history = ref O.empty in
-    for _ = 0 to 255 do
-      let n = Random.State.int random 128 in
-      expected.(n) <- true;
-      history := O.add !history (id (n + 1));
-      Array.iteri
-        (fun n owned ->
-           check
-             (O.mem !history (id (n + 1)) = owned)
-             "interval ownership swallowed a legacy gap")
-        expected
-    done
   done
 ;;
 
@@ -4297,6 +4339,8 @@ let () =
   test_host_prepare_waits_for_exact_legacy_owner ();
   test_host_handoff_properties ();
   test_host_consumption_keeps_old_execution_retired ();
+  test_repeated_graph_close_reopen_does_not_exhaust_handoff_history ();
+  test_determined_failed_handoff_retires_when_user_retries ();
   test_account_host_unknown_requires_original_consumption_readback ();
   test_host_plan_pins_original_authoritative_frame ();
   test_query_origin_boundary ();
@@ -4306,11 +4350,10 @@ let () =
   test_bootstrap_validation ();
   test_cleanup_admission_edges ();
   test_pure_properties ();
-  test_compressed_response_ownership ();
   test_reads_wait_for_verified_baseline ();
   test_queued_query_properties ();
   test_opening_query_retires_on_removal ();
   print_endline
     "Pure coordinator: invariants, 500 lifecycle + 250 queued-read + 250 ordinary/250 Append durable traces, \
-     100 ownership + 100 host-handoff + 300 observation + 250 application + 200 live-binding + 200 recovery/ACK + 200 retired-intent + 200 queued-presentation traces and shrinking passed"
+     100 host-handoff + 300 observation + 250 application + 200 live-binding + 200 recovery/ACK + 200 retired-intent + 200 queued-presentation traces and shrinking passed"
 ;;

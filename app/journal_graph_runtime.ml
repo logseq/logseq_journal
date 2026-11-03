@@ -43,32 +43,6 @@ let report_timeline stage fields =
   with _ -> ()
 ;;
 
-let report_capture_evidence ~stage ?result ?page_mutation ~request ~target
-    (command : Projection.capture) =
-  (* Capture IDs originate at the UI boundary. Never echo malformed input. *)
-  try
-    let capture_mutation =
-      match Graph.Uuid.of_string command.mutation_id with
-      | Ok uuid -> Graph.Uuid.to_string uuid
-      | Error _ -> "invalid"
-    in
-    let fields =
-      [ "stage", `String stage
-      ; "request", `String (Graph.Uuid.to_string request)
-      ; "target", `String (Graph.Uuid.to_string target)
-      ; "captureMutation", `String capture_mutation
-      ; "day", `Int (Journal_time.local_day command.creation_time)
-      ]
-      @ Option.fold ~none:[] ~some:(fun value -> [ "result", `String value ]) result
-      @ Option.fold ~none:[]
-          ~some:(fun uuid -> [ "pageMutation", `String (Graph.Uuid.to_string uuid) ])
-          page_mutation
-    in
-    output_string stderr ("journal-capture: " ^ Yojson.Safe.to_string (`Assoc fields) ^ "\n");
-    flush stderr
-  with _ -> ()
-;;
-
 type worker_failure =
   { operation : string
   ; request_id : Graph.Uuid.t
@@ -199,7 +173,6 @@ type payload =
 type response = { payload : payload }
 
 type refresh = Confirmation.purpose =
-  | Captured of { block_id : string }
   | Updated of { block_id : string }
   | Update_conflict_refresh of { block_id : string }
   | Delete_conflict_refresh of { block_id : string }
@@ -273,34 +246,7 @@ type operation =
       ; limit : int
       }
   | Changed_children of children_interest
-  | Capture_page of Projection.capture
-  | Capture_format of
-      { command : Projection.capture
-      ; page_uuid : Graph.page_uuid
-      ; page_revision : string
-      }
-  | Capture_create_page of
-      { command : Projection.capture
-      ; page_uuid : Graph.page_uuid
-      }
-  | Capture_children of
-      { command : Projection.capture
-      ; page : Projection.page
-      ; conflict_retries : int
-      }
-  | Capture_insert of
-      { command : Projection.capture
-      ; page : Projection.page
-      ; conflict_retries : int
-      }
-  | Capture_block of
-      { command : Projection.capture
-      ; page : Projection.page
-      }
-  | Capture_status of
-      { command : Projection.capture
-      ; page : Projection.page
-      }
+  | Capture_append of Projection.capture
   | Target_summary of Confirmation.read
   | Mutation_refresh of
       { page : Projection.page
@@ -655,18 +601,6 @@ let preconditions ?(blocks = []) ?(pages = []) ?(scopes = []) () =
   Protocol.{ blocks; pages; scopes }
 ;;
 
-let block_preconditions t block =
-  match Hashtbl.find_opt t.block_revisions (Graph.Uuid.to_string block) with
-  | None -> Error "The block revision is not retained."
-  | Some revision -> Ok (preconditions ~blocks:[ block, revision ] ())
-;;
-
-let page_preconditions t page =
-  match Hashtbl.find_opt t.page_revisions (Graph.Uuid.to_string page) with
-  | None -> Error "The page revision is not retained."
-  | Some revision -> Ok (page, revision)
-;;
-
 let scope_precondition t scope =
   match Hashtbl.find_opt t.scope_revisions (scope_key scope) with
   | None -> Error "The structure revision is not retained."
@@ -681,25 +615,6 @@ let journal_uuid day =
        "00000001-%s-%s-0000-000000000000"
        (String.sub text 0 4)
        (String.sub text 4 4))
-;;
-
-let journal_title ~format day =
-  let pattern = Option.value ~default:Journal_title.default_format format in
-  match
-    Journal_title.format
-      ~pattern
-      ~year:(day / 10_000)
-      ~month:(day / 100 mod 100)
-      ~day:(day mod 100)
-  with
-  | Some title -> title
-  | None ->
-    Option.get
-      (Journal_title.format
-         ~pattern:Journal_title.default_format
-         ~year:(day / 10_000)
-         ~month:(day / 100 mod 100)
-         ~day:(day mod 100))
 ;;
 
 let reject message = responses [ response (Rejected (Projection_failure message)) ]
@@ -1112,24 +1027,12 @@ let submit_unowned t (request : Journal_graph_request.t) =
               {pending with operation=Capture_chain{command;chain;projection}})
               (Hashtbl.find_opt t.pending(Graph.Uuid.to_string root));
             let next,action=Child.retry chain in child_action t root next projection action)
-     | None->(match capture_append_wire t command with
+     | None->
+       if not(calendar_generation_is_current t calendar_generation) then
+         responses[response(Capture_not_admitted{command;message="The local calendar changed before capture admission."})]
+       else match capture_append_wire t command with
        | Error message->responses[response(Capture_not_admitted{command;message})]
-       | Ok _->(match
-       ( calendar_generation_is_current t calendar_generation
-       , journal_uuid (Journal_time.local_day command.creation_time) )
-     with
-     | false, _ -> responses[response(Capture_not_admitted{command;message="The local calendar changed before capture admission."})]
-     | true, Error message -> reject message
-     | true, Ok page_uuid ->
-       (match task_status_uuid t command.task_state with
-        | Error message -> reject message
-        | Ok _ ->
-       requests
-         [ read
-             t
-             (Capture_page command)
-             (Protocol.V2_get_page { page = page_uuid; revision = None })
-            ]))))
+       | Ok wire->requests[mutate t (Capture_append command) wire])
   | Update_source command ->
     (match
        mutation_context t command.mutation_id, parse_uuid "block UUID" command.block_id
@@ -1339,70 +1242,6 @@ let request_delete_summary t block_id =
   | None->request_target_summary_without_interest t refresh
 ;;
 
-let capture_tree (command : Projection.capture) =
-  let project (child : Projection.capture_child) =
-    match parse_uuid "child UUID" child.block_id with
-    | Error _ as error -> error
-    | Ok uuid -> Ok Protocol.{ uuid; title = child.source; children = [] }
-  in
-  match parse_uuid "block UUID" command.Projection.block_id with
-  | Error _ as error -> error
-  | Ok uuid ->
-    let rec children reversed = function
-      | [] -> Ok (List.rev reversed)
-      | child :: rest ->
-        (match project child with
-         | Error _ as error -> error
-         | Ok child -> children (child :: reversed) rest)
-    in
-    Result.map
-      (fun children -> Protocol.{ uuid; title = command.source; children })
-      (children [] command.children)
-;;
-
-let capture_insert t (command : Projection.capture) page conflict_retries =
-  match
-    ( capture_tree command
-    , mutation_context t command.mutation_id
-    , parse_uuid "page UUID" page.Projection.id )
-  with
-  | Ok tree, Ok mutation_id, Ok page_uuid ->
-    let scope = Protocol.V2_children_scope page_uuid in
-    (match page_preconditions t page_uuid, scope_precondition t scope with
-     | Ok page_revision, Ok scope_revision ->
-       requests
-         [ mutate
-             t
-             (Capture_insert { command; page; conflict_retries })
-             (Protocol.V2_insert_blocks
-                { mutation_id
-                ; parent = page_uuid
-                ; roots = [ tree ]
-                ; preconditions =
-                    preconditions ~pages:[ page_revision ] ~scopes:[ scope_revision ] ()
-                })
-         ]
-     | Error message, _ | _, Error message -> reject message)
-  | Error message, _, _ | _, Error message, _ | _, _, Error message -> reject message
-;;
-
-let capture_children t command page conflict_retries =
-  match parse_uuid "page UUID" page.Projection.id with
-  | Error message -> reject message
-  | Ok parent ->
-    requests
-      [ read
-          t
-          (Capture_children { command; page; conflict_retries })
-          (Protocol.V2_get_children
-             { parent
-             ; limit = Protocol.maximum_page_size
-             ; cursor = None
-             ; revision = None
-             })
-      ]
-;;
-
 let status_mutation_id ~domain ~mutation_id ~revision ~block status =
   (* A persistent sub-operation belongs to its composer intent, not the lifetime
      of the request counter. Resolve Default_status before deriving the identity
@@ -1433,48 +1272,6 @@ let status_mutation_id ~domain ~mutation_id ~revision ~block status =
     (String.sub hex 16 4) (String.sub hex 20 12)
   |> Graph.Uuid.of_string
   |> Result.get_ok
-;;
-
-let capture_status_mutation_id (command : Projection.capture) ~block status =
-  status_mutation_id ~domain:"capture" ~mutation_id:command.mutation_id
-    ~revision:command.status_intent_revision ~block status
-;;
-
-let capture_status t (command : Projection.capture) page =
-  match task_status_uuid t command.task_state with
-  | Error message -> reject message
-  | Ok None when not command.status_confirmation ->
-    request_target_summary t page (Captured { block_id = command.block_id })
-  | Ok status ->
-    (match parse_uuid "block UUID" command.block_id with
-     | Error message -> reject message
-     | Ok block ->
-       (match block_preconditions t block with
-        | Error message -> reject message
-        | Ok preconditions ->
-          let mutation_id = capture_status_mutation_id command ~block status in
-          let command_status =
-            match status with
-            | None -> Protocol.V2_clear_task_status { mutation_id; block; preconditions }
-            | Some status ->
-              V2_set_task_status { mutation_id; block; status; preconditions }
-          in
-          requests [ mutate t (Capture_status { command; page }) command_status ]))
-;;
-
-let continue_capture t (command : Projection.capture) page =
-  if command.task_state = Journal_model.No_status && not command.status_confirmation
-  then capture_status t command page
-  else (
-    match parse_uuid "block UUID" command.block_id with
-     | Error message -> reject message
-     | Ok block ->
-       requests
-         [ read
-             t
-             (Capture_block { command; page })
-             (Protocol.V2_get_outline_block { block; revision = None })
-         ])
 ;;
 
 let append_unique equal value values =
@@ -2098,13 +1895,7 @@ let operation_name = function
   | Find_block_result -> "findBlock"
   | Detail_children _ -> "loadDetailChildren"
   | Changed_children _ -> "refreshChildren"
-  | Capture_page _ -> "findCapturePage"
-  | Capture_format _ -> "readJournalTitleFormat"
-  | Capture_create_page _ -> "createCapturePage"
-  | Capture_children _ -> "refreshCaptureChildren"
-  | Capture_insert _ -> "insertCaptureBlock"
-  | Capture_block _ -> "readCapturedBlock"
-  | Capture_status _ -> "setCaptureStatus"
+  | Capture_append _ -> "appendCapture"
   | Target_summary _ -> "readMutationTargetSummary"
   | Mutation_refresh _ -> "refreshMutation"
   | Delete_mutation _ -> "deleteSubtree"
@@ -2215,13 +2006,7 @@ let failure_output
   | Find_block_result
   | Changed_detail_page _
   | Changed_children _
-  | Capture_page _
-  | Capture_format _
-  | Capture_create_page _
-  | Capture_children _
-  | Capture_insert _
-  | Capture_block _
-  | Capture_status _
+  | Capture_append _
   | Target_summary _
   | Mutation_refresh _
   | Delete_mutation _ -> responses [ response (Rejected (Worker_failure worker_failure)) ]
@@ -2300,10 +2085,6 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
              (match Confirmation.retry_stale t.confirmations ~ports:(confirmation_ports t) summary with
               | Some planned -> confirmation_planning planned
               | None -> failure_output ~code:failure_code t operation request_id message)
-           | Capture_insert { command; page; conflict_retries }
-             when String.equal code (Error.code_string Error.Conflict)
-                  && conflict_retries < 2 ->
-             capture_children t command page (conflict_retries + 1)
            | Delete_mutation command
              when String.equal code (Error.code_string Error.Conflict) ->
              request_delete_summary t command.block_id
@@ -2313,7 +2094,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
         | Pull_changes { request_generation; _ } ->
           rehydrate_current_interests t ~request_generation ~generation
         | _ -> failure_output t operation request_id reason)
-     | V2_graph_info_outcome { journal_title_format; generation; _ } ->
+     | V2_graph_info_outcome { generation; _ } ->
        (match operation with
         | Graph_info ->
           if t.change_generation<>Some generation then t.change_cursor<-None;
@@ -2322,23 +2103,6 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
             if t.task_catalog_started then [] else [ request_task_catalog t ]
           in
           { requests = catalog; responses = [ response Graph_ready ] }
-        | Capture_format { command; page_uuid; page_revision } ->
-          let journal_day = Journal_time.local_day command.creation_time in
-          let page_mutation = request_uuid t in
-          let request = mutate
-                t
-                (Capture_create_page { command; page_uuid })
-                (Protocol.V2_create_journal_page
-                   { mutation_id = page_mutation
-                   ; page = page_uuid
-                   ; journal_day
-                   ; title = journal_title ~format:journal_title_format journal_day
-                   ; preconditions = preconditions ~pages:[ page_uuid, page_revision ] ()
-                   })
-          in
-          report_capture_evidence ~stage:"create-page" ~page_mutation
-            ~request:request.request_id ~target:page_uuid command;
-          requests [ request ]
         | _ -> failure_output t operation request_id "Unexpected graph-info response.")
      | V2_task_statuses_outcome { property_uuid; default_status; items; next_cursor } ->
        (match operation with
@@ -2580,15 +2344,6 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
           else (
             Hashtbl.replace t.graph_pages (Graph.Uuid.to_string page.uuid) page;
             detail_children t ~generation ~page ~root ~limit ~after)
-        | V2_present_page { page; revision }, Capture_page command ->
-          report_capture_evidence ~stage:"page-lookup" ~result:"present"
-            ~request:request_id ~target:page.uuid command;
-          remember_page_revision t page.uuid revision;
-          (match page_of_graph_page page with
-           | None -> reject "The target journal page is unavailable."
-           | Some page ->
-             remember_page t page;
-             capture_children t command page 0)
         | V2_missing_page _, Detail_page { generation; root; _ } ->
           responses
             [ response
@@ -2599,16 +2354,6 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                    ; stale_cursor = false
                    ; failure = Projection_failure "This block's page is unavailable."
                    })
-            ]
-        | V2_missing_page { uuid; revision }, Capture_page command ->
-          report_capture_evidence ~stage:"page-lookup" ~result:"missing"
-            ~request:request_id ~target:uuid command;
-          remember_page_revision t uuid revision;
-          requests
-            [ read
-                t
-                (Capture_format { command; page_uuid = uuid; page_revision = revision })
-                Protocol.V2_graph_info
             ]
         | _ -> failure_output t operation request_id "Unexpected page response.")
      | V2_block_summary_outcome
@@ -2710,12 +2455,6 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                                  item.value.tag_titles)
                             children;
                           (match purpose with
-                           | Captured _ ->
-                             responses
-                               [ response
-                                   (Block_captured
-                                      { block; timeline_entry_update = entry })
-                               ]
                            | Updated _ ->
                              responses
                                [ response
@@ -2826,11 +2565,6 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
             | Changed_detail_block {observed=true;_}->Block_observed_missing{block_id}
             | _->Block_removed{block_id} in
           responses [response payload]
-        | V2_present_block { value; revision }, Capture_block { command; page } ->
-          remember_block_revision t value.block.uuid revision;
-          capture_status t command page
-        | V2_missing_block _, Capture_block _ ->
-          reject "The captured block is unavailable."
         | _ -> failure_output t operation request_id "Unexpected block response.")
      | V2_children_outcome { revision_scope; scope_revision; items; next_cursor; _ } ->
        remember_scope_revision t revision_scope scope_revision;
@@ -2843,7 +2577,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
               item.value.tag_titles)
          items;
        (match operation with
-        | (Detail_children _ | Changed_children _ | Capture_children _)
+        | (Detail_children _ | Changed_children _)
           when children=None && next_cursor<>None ->
           failure_output t operation request_id "Unsealed child continuation"
         | Detail_children { generation; page; root; limit; _ } ->
@@ -2918,25 +2652,11 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
              (match detail_projection t ~page ~time_context ~root children with
               | Ok detail -> responses [ response (Children_reconciled detail) ]
               | Error message -> reject message))
-        | Capture_children { command; page; conflict_retries } ->
-          let children = children_result items None in
-          remember_blocks t page children.items;
-          capture_insert t command page conflict_retries
         | _ -> failure_output t operation request_id "Unexpected children response.")
      | V2_mutation_committed _ ->
        (match operation with
         | Child_insert (command, page) | Child_status (command, page) ->
           read_child t command page
-        | Capture_create_page { command; page_uuid } ->
-          requests
-            [ read
-                t
-                (Capture_page command)
-                (Protocol.V2_get_page { page = page_uuid; revision = None })
-            ]
-        | Capture_insert { command; page; _ } -> continue_capture t command page
-        | Capture_status { command; page } ->
-          request_target_summary t page (Captured { block_id = command.block_id })
         | Mutation_refresh { page; refresh } -> request_target_summary t page refresh
         | Delete_mutation command ->
           responses
@@ -3376,7 +3096,7 @@ let receive_worker_read ?resync_generation ?origin t ~request_id result =
 
 let worker_append t (request:Protocol.request) =
   match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
-  | Some{operation=Capture_page command;delivery=Dispatched;_}->Some(capture_append_wire t command)
+  | Some{operation=Capture_append _;delivery=Dispatched;original;_}->Some(Ok original.command)
   | Some{operation=Child_write{root;index;_};delivery=Dispatched;_}->
     Option.bind(child_root t root)(fun(_,chain,_)->match Child.stage_wire(Child.stage chain index) with
       | Protocol.V2_append_journal _ as wire->Some(Ok wire)|_->None)
@@ -3407,9 +3127,10 @@ let worker_mutation t (request:Protocol.request) =
 let bind_mutation t request ~presentation ~intent =
   let key=Graph.Uuid.to_string request.Protocol.request_id in
   match Hashtbl.find_opt t.pending key with
-  | Some ({operation=Capture_page command;delivery=Dispatched;_} as pending) ->
-    (match capture_append_wire t command,task_status_uuid t command.task_state with
-     | Ok insert,Ok resolved_status->
+  | Some ({operation=Capture_append command;delivery=Dispatched;_} as pending) ->
+    (match pending.original.command with
+     | (Protocol.V2_append_journal {root;_} as insert)->
+       let resolved_status=root.task_status in
        (match Child.start_capture ~command ~resolved_status ~insert with
         | Error _->false
         | Ok(chain,_)->match Child.bind chain ~index:0 ~round:1L ~intent ~presentation with
@@ -3552,7 +3273,7 @@ let child_projection_applied t ~root ~round ~presentation =
 
 let fail_request t (request : Protocol.request) ~message =
   match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
-  | Some{operation=Capture_page command;_}->
+  | Some{operation=Capture_append command;_}->
     Hashtbl.remove t.pending(Graph.Uuid.to_string request.request_id);
     responses[response(Capture_waiting{command;message})]
   | Some{operation=(Child_chain _|Capture_chain _|Child_write _|Child_ack _);_}->mutation_waiting t request message
@@ -3770,18 +3491,6 @@ let worker_read t (request : Protocol.request) =
                 Worker.Child_members
                   { parent = interest.root.block.uuid; revision = None; after = None }
             ; maximum_items = interest.limit
-            ; outcome = (fun value -> Child_members_read value)
-            })
-     | Some { operation = Capture_children { page; _ }; delivery = Dispatched; _ } ->
-       Some
-         (Read
-            { query =
-                Worker.Child_members
-                  { parent = Graph.Uuid.of_string page.id |> Result.get_ok
-                  ; revision = None
-                  ; after = None
-                  }
-            ; maximum_items = Protocol.maximum_page_size
             ; outcome = (fun value -> Child_members_read value)
             })
      | Some _ | None -> Some (Unowned_read "Child business request is no longer owned"))

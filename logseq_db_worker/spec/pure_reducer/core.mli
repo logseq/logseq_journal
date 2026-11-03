@@ -73,6 +73,7 @@ type asset_notice =
   | Asset_availability of
       { consumer : string
       ; asset : Logseq_db_types.Graph_types.Uuid.t
+      ; descriptor : Logseq_db_types.Asset_descriptor.t
       ; availability : Logseq_sync_pure_reducer.Asset_transfer.availability
       }
   | Asset_demand_accepted of string

@@ -186,14 +186,14 @@ let () =
   R.notice
     runtime
     scope
-    (Asset_availability { consumer; asset = asset.uuid; availability = Queued });
+    (Asset_availability { consumer; asset = asset.uuid; descriptor=asset; availability = Queued });
   check
     (!changes = before_waiting)
     "equal waiting availability must not republish the pending presentation";
   R.notice
     runtime
     scope
-    (Asset_availability { consumer; asset = asset.uuid; availability = Ready "cached" });
+    (Asset_availability { consumer; asset = asset.uuid; descriptor=asset; availability = Ready "cached" });
   let token, request = Queue.take sent in
   check
     (match request with
@@ -212,7 +212,7 @@ let () =
   R.notice
     runtime
     scope
-    (Asset_availability { consumer; asset = asset.uuid; availability = Ready "cached" });
+    (Asset_availability { consumer; asset = asset.uuid; descriptor=asset; availability = Ready "cached" });
   check
     (!changes = before_ready_duplicate)
     "duplicate readiness must not republish a retained file";
@@ -348,7 +348,7 @@ let test_preview_reference_when_requests_are_full () =
     runtime
     scope
     (Asset_availability
-       { consumer = token; asset = asset.uuid; availability = Ready "cached" });
+       { consumer = token; asset = asset.uuid; descriptor=asset; availability = Ready "cached" });
   let ticket, _ = Queue.take sent in
   R.receive
     runtime
@@ -742,7 +742,7 @@ let () =
             r
             scope
             (Asset_availability
-               { consumer = token; asset = asset.uuid; availability = Ready "cached" });
+               { consumer = token; asset = asset.uuid; descriptor=asset; availability = Ready "cached" });
           let ticket, _ = Queue.take q in
           R.receive r (Option.get ticket) (Asset_file (Some ("held", "/cache/held")));
           change r [ 1 ];
@@ -1074,7 +1074,7 @@ let () =
             ((List.hd (Hashtbl.find v (G.Uuid.to_string (uuid 1))).items).asset.uuid
              = uuid 3)
             "scope reset rejects old membership" )
-    ; ( "successful File survives descriptor and resync"
+    ; ( "successful File survives same-content metadata and resync"
       , fun () ->
           let r, q, v, _ = fixture () in
           let descriptor c =
@@ -1083,10 +1083,10 @@ let () =
               ~source:
                 (Managed
                    (Some
-                      (A.version ~checksum:(String.make 64 c) ~file_type:"png"
+                      (A.version ~checksum:(String.make 64 'a') ~file_type:"png"
                        |> Result.get_ok)))
               ~current_checksum:None
-              ~size:None
+              ~size:(Some(Int64.of_int(Char.code c)))
               ~dimensions:None
             |> Result.get_ok
           in
@@ -1112,7 +1112,7 @@ let () =
             r
             scope
             (Asset_availability
-               { consumer = token; asset = asset.uuid; availability = Ready "cached" });
+               { consumer = token; asset = asset.uuid; descriptor=asset; availability = Ready "cached" });
           let ticket, _ = Queue.take q in
           R.receive r (Option.get ticket) (Asset_file (Some ("held", "/cache/held")));
           observe r (raw_block ~refs:[ asset.uuid ] 1 900);
@@ -1251,7 +1251,7 @@ let test_import_handoff preview =
     runtime
     scope
     (Asset_availability
-       { consumer; asset = asset.uuid; availability = Ready "normal-cache" });
+       { consumer; asset = asset.uuid; descriptor=asset; availability = Ready "normal-cache" });
   let ticket, request = Queue.take sent in
   check
     (match request with

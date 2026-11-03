@@ -107,3 +107,5 @@ type offline =
   }
 
 val offline : 'cursor t -> reason -> offline
+
+val consumer_names : 'cursor t -> string Seq.t

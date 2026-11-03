@@ -76,18 +76,7 @@ let rows t =
     t.entries
 ;;
 
-let retry t operation =
-  Option.bind t.scope (fun scope ->
-    Option.bind
-      (List.find_opt (fun e -> e.operation = operation) t.entries)
-      (fun e ->
-         let _, _, retryable = describe e.status in
-         if retryable
-         then
-           Some
-             (Service.Asset_command
-                { graph_generation = scope.graph_generation
-                ; command = Retry_upload operation
-                })
-         else None))
+let can_retry t operation =
+  t.scope<>None && List.exists(fun entry->
+    entry.operation=operation && let _,_,retryable=describe entry.status in retryable)t.entries
 ;;

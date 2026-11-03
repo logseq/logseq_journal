@@ -3441,7 +3441,7 @@ let start
   let account_lifecycle=ref Account_pure_lifecycle.initial in
   let account_lifecycle_changed=ref(fun()->()) in
   let detail_observations_changed = ref(fun()->()) in
-  let coordination_resources_rebound=ref(fun()->()) in
+  let coordination_assets_changed=ref(fun()->()) in
   let detail_observations_cell=graph_ref(fun()->Detail_observation.empty) in
   let observation_wanted routes =
     Lui_navigation.Path.entries(Journal_routes.path routes) |> List.to_seq
@@ -3504,7 +3504,6 @@ let start
            ignore(Coordination_host.shutdown host);
            retired_coordination_hosts:=Rrbvec.push_back !retired_coordination_hosts host)previous;
          let id=fresh_identity () in
-         let observed_binding=ref None in
          match Coordination_host.create ~client
            ~client_id:(Wc.Uuid.of_string id |> Result.get_ok) ~managed_origin:origin ~user_id:user
            ~enqueue:(Journal_pump.enqueue pump)
@@ -3517,11 +3516,7 @@ let start
              if !coordination_host_id=Some id then (
                Option.iter(fun poll->poll view)!copy_poll;
                !detail_observations_changed();
-               (match Coordination.bootstrap view with
-                |Wc.Ready projection->let binding=Wc.projection_binding projection in
-                  if not(Option.exists(Wc.equal_binding binding)!observed_binding)then (
-                    observed_binding:=Some binding;!coordination_resources_rebound())
-                |_->()));
+               !coordination_assets_changed());
              !coordination_lifecycle_changed()) with
          | Error _->Error "Unable to bind the graph reader. Try Copy again."
          | Ok host->coordination_host_id:=Some id;coordination_host:=Some(identity,host);Ok host)
@@ -3797,8 +3792,6 @@ let start
         | _ -> Error Wc.Revoked_session)
       ~localtime:(Journal_calendar.Sampler.localtime calendar_sampler)
       ()) in
-  let media_worker_requests_cell = graph_ref (fun () ->
-    Hashtbl.create 16) in
   let media_changes_cell = graph_ref (fun () ->
     Hashtbl.create 16) in
   let media_store_cell = graph_ref (fun () ->
@@ -3827,36 +3820,36 @@ let start
       { state with timeline_structure_revision })
   in
   ignore (Journal_timeline.Store.synchronize (!timeline_store_cell) initial_state.timeline : int);
+  let coordinated_asset_projection_cell=graph_ref(fun()->Hashtbl.create 32) in
   let media_context = graph_ref (fun () -> None) in
   let prev_media_owners = graph_ref (fun () -> (media_presentation_scopes initial_state)) in
   let prev_detail_media_roots = graph_ref (fun () -> (media_detail_roots initial_state)) in
   let prev_detail_media_routes = graph_ref (fun () -> initial_state.routes) in
   let coordinated_media_point = ref(fun (_:Journal_media_runtime.ticket option) (_:Graph_service.request)->None) in
   let coordinated_media_read = ref(fun (_:Journal_media_runtime.read_request)->false) in
-  let release_coordinated_file lease =
-    Option.is_some(Rrbvec.find_map(fun host->
-      match Coordination_host.request host(Wc.file_lease_session lease)(Wc.Release_file lease) with
+  let release_coordinated_resource session operation =
+    let retry=ref false in
+    let admitted=Rrbvec.find_map(fun host->
+      match Coordination_host.request host session operation with
       |Ok ticket->Coordination_host.watch host ticket ~f:(fun _->());Some()
-      |Error _->None)(all_coordination_hosts())) in
+      |Error Wc.Revoked_session->None
+      |Error _->retry:=true;None)(all_coordination_hosts()) in
+    (* Retired hosts remain registered until their real resource fence completes.
+       A private capability absent from every owner is already settled; an actual
+       capacity/error refusal keeps the presentation's queued cleanup intact. *)
+    admitted<>None || not !retry in
+  let release_coordinated_file lease=release_coordinated_resource(Wc.file_lease_session lease)(Wc.Release_file lease) in
+  let release_coordinated_consumer consumer=release_coordinated_resource(Wc.asset_consumer_session consumer)(Wc.Release_asset_demand consumer) in
   let media_runtime_cell = graph_ref (fun () ->
+    let graph= !graph_runtime_cell and changes= !media_changes_cell in
     Journal_media_runtime.create_coordinated
       ~release_file:release_coordinated_file
-      ~read_planned:(fun request_id->Journal_graph_runtime.register_external_read (!graph_runtime_cell) ~request_id)
-      ~read_retired:(fun request_id->Journal_graph_runtime.retire_external_read (!graph_runtime_cell) ~request_id)
+      ~release_consumer:release_coordinated_consumer
+      ~read_planned:(fun request_id->Journal_graph_runtime.register_external_read graph ~request_id)
+      ~read_retired:(fun request_id->Journal_graph_runtime.retire_external_read graph ~request_id)
       ~read:(fun request-> !coordinated_media_read request)
-      ~send:(fun ticket request ->
-        match !coordinated_media_point ticket request with
-        | Some accepted->accepted
-        | None->match request with
-        | Graph_service.Graph_request _->false
-        | _->match dispatch_worker request with
-        | Accepted id ->
-          Option.iter
-            (fun ticket -> Hashtbl.replace (!media_worker_requests_cell) id ticket)
-            ticket;
-          true
-        | Full | Not_ready | Stopping -> false)
-      ~changed:(fun root view -> Hashtbl.replace (!media_changes_cell) root view) ()) in
+      ~send:(fun ticket request ->Option.value(!coordinated_media_point ticket request) ~default:false)
+      ~changed:(fun root view -> Hashtbl.replace changes root view) ()) in
   media_projection_changes:=(fun windows->
     Journal_media_runtime.changes (!media_runtime_cell) windows;
     Option.iter(fun message->Journal_graph_runtime.report_projection_failure (!graph_runtime_cell)
@@ -3905,19 +3898,13 @@ let start
   let asset_changes_cell = graph_ref (fun () -> None) in
   let asset_runtime_cell = graph_ref (fun () ->
     Journal_asset_runtime.create_coordinated
+      ~release_consumer:release_coordinated_consumer
       ~read_planned:(fun request_id->Journal_graph_runtime.register_external_read (!graph_runtime_cell) ~request_id)
       ~read_retired:(fun request_id->Journal_graph_runtime.retire_external_read (!graph_runtime_cell) ~request_id)
       ~read:(fun request-> !coordinated_asset_read request)
       ~changed:(fun generation recent favorites ->
         asset_changes_cell := Some(generation,recent,favorites))
-      ~send:(fun request ->
-        match !coordinated_asset_point request with
-        | Some accepted->accepted
-        | None->match request with
-          | Graph_service.Graph_request _ -> false
-          | _->match dispatch_worker request with
-            | Worker.Accepted _->true
-            | Full | Not_ready | Stopping -> false) ()) in
+      ~send:(fun request->Option.value(!coordinated_asset_point request) ~default:false) ()) in
   let flush_media set_state =
     Effect.bind (flush_media_only set_state) ~f:(fun()->
       match !asset_changes_cell with
@@ -3968,6 +3955,42 @@ let start
              else Coordination.Change_consumer_retired(token,request_id))) !coordination_host)application;
           Effect.ignore))
   in
+  let coordinated_asset_context () =
+    match current_owner(),ensure_coordination() with
+    |Some owner,Ok host->
+      Option.bind(Coordination.projection(Coordination_host.view host))(fun projection->
+        List.find_map(fun resident->if resident.Wc.phase=Wc.Open && Wc.matches_scope resident.session owner
+          then Some(owner,host,resident.session) else None)(Wc.residents projection))
+    |_->None in
+  let coordinated_asset_command ~bind request =
+    let send graph_generation make_operation =
+      Some(match coordinated_asset_context() with
+      |Some(owner,host,session) when owner.graph_generation=graph_generation->
+        (match make_operation session with
+         |Error _->false
+         |Ok(operation,consumer)->
+           match Coordination_host.request host session operation with
+           |Error _->false
+           |Ok ticket->
+             Option.iter(fun(name,consumer)->bind ~name
+               (Wc.bind_asset_consumer consumer ~round:(Coordination.ticket_id ticket)))consumer;
+             Coordination_host.watch host ticket ~f:(function
+               |Wc.Answered(Ok())|Answered(Error Revoked_session)|Interrupted Cancelled|Interrupted Worker_stopped->()
+               |_->Option.iter(fun(name,_)->if runtime_owner_is_live !state_ref owner then
+                 run_owned(Some owner)(fun()->Effect.of_thunk(fun()->
+                   Journal_media_runtime.demand_backpressured (!media_runtime_cell) name;
+                   Journal_asset_runtime.demand_backpressured (!asset_runtime_cell) name)))consumer);
+             true)
+      |_->false) in
+    match request with
+    |Graph_service.Asset_command{graph_generation;command=Replace_asset_demand{consumer=name;priority;assets}}->
+      send graph_generation(fun session->Result.map(fun consumer->
+        Wc.Replace_asset_demand(consumer,(match priority with Foreground->Wc.Foreground|Background->Background),assets),
+        Some(name,consumer))(Wc.asset_consumer session ~name))
+    |Asset_command{graph_generation;command=Retry_asset asset}->
+      send graph_generation(fun _->Ok(Wc.Retry_asset asset,None))
+    |Asset_command{command=Release_asset_demand _;_}->Some false
+    |_->None in
   coordinated_media_point := (fun ticket request ->
     match ticket,request with
     | Some ticket,Graph_service.Graph_request original->
@@ -3979,7 +4002,31 @@ let start
              | Ok response->Journal_media_runtime.receive (!media_runtime_cell) ticket (Graph_service.Graph_response response)
              | Error _->Journal_media_runtime.reject (!media_runtime_cell) ticket);
             owned))
-    | _->None);
+    |Some ticket,Graph_service.Acquire_asset_file{scope;handle}->
+      Some(match coordinated_asset_context(),Journal_media_runtime.acquisition_consumer ticket with
+      |Some(owner,host,session),Some name when Wc.matches_asset_scope session scope->
+        (match Wc.asset_consumer session ~name with
+         |Error _->false
+         |Ok consumer->
+           let file=List.find_map(fun notice->match Wc.asset_notice_data notice with
+             |Graph_service.Asset_availability{availability=Ready actual;_} when actual=handle->Wc.ready_asset_file notice
+             |_->None)(Coordination.asset_notices(Coordination_host.view host)consumer) in
+           match Option.bind file(fun file->Result.to_option(Coordination_host.request host session(Wc.Acquire_asset_file file))) with
+           |None->false
+           |Some acquire->
+             let runtime= !media_runtime_cell in
+             Coordination_host.watch host acquire ~f:(fun reply->
+               let lease=match reply with Wc.Answered(Ok lease)->lease|_->None in
+               if runtime_owner_is_live !state_ref owner then run_owned(Some owner)(fun()->
+                 Effect.bind(Effect.of_thunk(fun()->Journal_media_runtime.receive_file runtime ticket lease))
+                   ~f:(fun()->flush_media set_state))
+               else (
+                 Journal_media_runtime.reset runtime ~graph_generation:None;
+                 Journal_media_runtime.receive_file runtime ticket lease));
+             true)
+      |_->false)
+    |_,Graph_service.Release_asset_file _->Some false
+    |_->coordinated_asset_command ~bind:(Journal_media_runtime.bind_consumer (!media_runtime_cell)) request);
   coordinated_media_read := (fun (request:Journal_media_runtime.read_request)->
     match current_owner(),ensure_coordination() with
     | Some owner,Ok host->
@@ -4020,6 +4067,7 @@ let start
            else Coordination.Change_consumer_retired(token,request_id)))!coordination_host)application;
         Effect.ignore)) in
   coordinated_asset_point := (fun request ->
+    match coordinated_asset_command ~bind:(Journal_asset_runtime.bind_consumer (!asset_runtime_cell)) request with Some _ as result->result|None->
     let result=send_coordinated_point request ~finish:(fun result->
       match request with
         | Graph_service.Graph_request original ->
@@ -5131,11 +5179,52 @@ let start
         active_runtime:=Some key;processing_owner:=Some owner;action();save_runtime())
         (Hashtbl.find_opt runtime_sessions key));
     List.iter(fun restore->restore())restore;active_runtime:=active;processing_owner:=previous in
-  coordination_resources_rebound:=(fun()->with_live_runtime_resources(fun()->
-    Journal_media_runtime.resume_coordinated_previews (!media_runtime_cell)));
+  coordination_assets_changed:=(fun()->with_live_runtime_resources(fun()->
+    match current_owner(),!coordination_host with
+    |Some owner,Some(_,host)->
+      let view=Coordination_host.view host in
+      let projection=Coordination.projection view in
+      let session=Option.bind projection(fun projection->List.find_map(fun resident->
+        if resident.Wc.phase=Wc.Open && Wc.matches_scope resident.session owner then Some resident.session else None)
+        (Wc.residents projection)) in
+      (match projection,session with
+       |Some projection,Some session->
+         let binding=Wc.projection_binding projection in
+         Journal_media_runtime.bind_coordinated_resources (!media_runtime_cell) binding;
+         Journal_asset_runtime.bind_coordinated_resources (!asset_runtime_cell) binding;
+         let module Names=Set.Make(String) in
+            let names=Seq.append(Journal_media_runtime.consumer_names (!media_runtime_cell))
+              (Journal_asset_runtime.consumer_names (!asset_runtime_cell))
+              |> Seq.fold_left(fun names name->Names.add name names)Names.empty in
+            Hashtbl.filter_map_inplace(fun name values->if Names.mem name names then Some values else None)
+              (!coordinated_asset_projection_cell);
+            Names.iter(fun name->match Wc.asset_consumer session ~name with
+              |Error _->()
+              |Ok consumer->let notices=Coordination.asset_notices view consumer in
+                if Hashtbl.find_opt (!coordinated_asset_projection_cell) name<>Some notices then (
+                  Hashtbl.replace (!coordinated_asset_projection_cell) name notices;
+                  List.iter(fun notice->let data=Wc.asset_notice_data notice in
+                    let scope=Wc.asset_notice_scope notice in
+                    let apply()=
+                      Journal_media_runtime.notice (!media_runtime_cell) scope data;
+                      Journal_asset_runtime.notice (!asset_runtime_cell) scope data;true in
+                    let delivery=match Journal_asset_runtime.notice_reads (!asset_runtime_cell) scope data with
+                      |[request_id]->apply_asset_read ~request_id ~result:(Ok()) ~f:apply
+                      |[]->Effect.of_thunk(fun()->ignore(apply():bool))
+                      |_->assert false in
+                    Effect.run delivery)notices))names;
+            Journal_asset_runtime.pump (!asset_runtime_cell);
+            Journal_media_runtime.pump (!media_runtime_cell);
+            Effect.run(flush_media set_state)
+       |_->Journal_media_runtime.retire_coordinated_resources (!media_runtime_cell);
+         Journal_asset_runtime.retire_coordinated_resources (!asset_runtime_cell);
+         Hashtbl.clear (!coordinated_asset_projection_cell);
+         Effect.run(flush_media set_state))
+    |_->()));
   let retry_failed_graph_handoff host =
     with_live_runtime_resources(fun()->
-      Journal_media_runtime.retire_coordinated_previews (!media_runtime_cell);
+      Journal_media_runtime.retire_coordinated_resources (!media_runtime_cell);
+      Journal_asset_runtime.retire_coordinated_resources (!asset_runtime_cell);
       Effect.run(flush_media set_state));
     Coordination_host.post host Coordination.Retry_bootstrap in
   (* Only real legacy handle ownership is tracked here. The pure coordinator
@@ -5440,18 +5529,6 @@ let start
             | Ok Not_downloaded -> { state with local_copy_message = Some "No local copy on this device." }
                | Error message -> { state with local_copy_message = Some message }))))
         ~f:(fun () -> !drain_visible_copies ())
-    | Worker.Response { request_id; outcome = Completed response; _ }
-      when Hashtbl.mem (!media_worker_requests_cell) request_id ->
-      let ticket = Hashtbl.find (!media_worker_requests_cell) request_id in
-      Hashtbl.remove (!media_worker_requests_cell) request_id;
-      Journal_media_runtime.receive (!media_runtime_cell) ticket response;
-      flush_media set_state
-    | Worker.Response { request_id; outcome = Failed _ | Cancelled | Shutdown; _ }
-      when Hashtbl.mem (!media_worker_requests_cell) request_id ->
-      let ticket = Hashtbl.find (!media_worker_requests_cell) request_id in
-      Hashtbl.remove (!media_worker_requests_cell) request_id;
-      Journal_media_runtime.reject (!media_runtime_cell) ticket;
-      flush_media set_state
     | Worker.Push { payload = Graph_service.Graph_push push; _ } ->
       let snapshot = !state_ref in
       let admission_refresh =
@@ -5558,8 +5635,11 @@ let start
       let notices = Graph_service.asset_notices payload in
       let apply_notice (scope,notice) =
         let apply () =
-          Journal_asset_runtime.notice (!asset_runtime_cell) scope notice;
-          Journal_media_runtime.notice (!media_runtime_cell) scope notice;
+          (match notice with
+           |Graph_service.Upload_status _|Asset_capacity_available->
+             Journal_asset_runtime.notice (!asset_runtime_cell) scope notice;
+             Journal_media_runtime.notice (!media_runtime_cell) scope notice
+           |Asset_availability _|Asset_backpressure _|Asset_demand_accepted _->());
           true in
         match Journal_asset_runtime.notice_reads (!asset_runtime_cell) scope notice with
         | [request_id] -> apply_asset_read ~request_id ~result:(Ok()) ~f:apply
@@ -6395,13 +6475,24 @@ let start
          update (fun state -> { state with asset_settings_open = false })
        | Some (Retry_upload operation) ->
            Effect.of_thunk (fun () ->
-             let current = !state_ref in
-             let uploads =
-               Journal_uploads.sync current.uploads (upload_context current)
-             in
-             Option.iter
-               (fun request -> ignore (dispatch_worker request : Worker.send_result))
-               (Journal_uploads.retry uploads operation))
+             let uploads=Journal_uploads.sync !state_ref.uploads(upload_context !state_ref) in
+             if Journal_uploads.can_retry uploads operation then (
+               let fail message=set_state(fun state->report_ui_error state ~operation:"retryUpload" ~phase:"worker" ~message)() in
+               match coordinated_asset_context() with
+               |None->fail "The upload owner is not ready. Try again after the graph is ready."
+               |Some(owner,host,session)->
+                 let upload=List.find_map(fun notice->match Wc.asset_notice_data notice with
+                   |Graph_service.Upload_status value when Wc.Uuid.equal value.operation operation->Wc.upload_operation notice
+                   |_->None)(Coordination.session_asset_notices(Coordination_host.view host)session) in
+                 match upload with
+                 |None->fail "The current upload status is still loading. Try again after it refreshes."
+                 |Some upload->match Coordination_host.request host session(Wc.Retry_upload upload) with
+                   |Error error->fail(coordinated_error_message error)
+                   |Ok ticket->Coordination_host.watch host ticket ~f:(function
+                     |Wc.Answered(Ok())|Answered(Error Revoked_session)|Interrupted Cancelled|Interrupted Worker_stopped->()
+                     |_->if runtime_owner_is_live !state_ref owner then run_owned(Some owner)(fun()->
+                       set_state(fun state->report_ui_error state ~operation:"retryUpload" ~phase:"worker"
+                         ~message:"The upload retry did not finish. Check its status and retry the same attachment.")))))
        | Some (Days settings) ->
          Effect.bind (Effect.of_thunk (fun () ->
            (* The extension re-emits its preference on every remount; only a

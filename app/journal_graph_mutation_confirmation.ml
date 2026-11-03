@@ -3,7 +3,6 @@ module Protocol = Logseq_db_worker.Protocol
 module Worker = Journal_worker_coordination.Worker_api
 
 type purpose =
-  | Captured of { block_id : string }
   | Updated of { block_id : string }
   | Update_conflict_refresh of { block_id : string }
   | Delete_conflict_refresh of { block_id : string }
@@ -65,7 +64,6 @@ let plan t ~ports (value : read) cursor =
 let start t ~ports purpose =
   let block_id =
     match purpose with
-    | Captured { block_id }
     | Updated { block_id }
     | Update_conflict_refresh { block_id }
     | Delete_conflict_refresh { block_id } -> block_id
@@ -154,7 +152,7 @@ let receive_summary
            && items = [] && next_cursor = None && Rrbvec.is_empty summary.children ->
       (match summary.purpose with
        | Delete_conflict_refresh _ -> Absent {purpose=summary.purpose;block_id=summary.block_id}
-       | Captured _ | Updated _ | Update_conflict_refresh _ ->
+       | Updated _ | Update_conflict_refresh _ ->
          Failed "The canonical mutation target is unavailable.")
     | _ -> Failed "The canonical mutation target is unavailable or mismatched.")
 ;;

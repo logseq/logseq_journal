@@ -14,7 +14,8 @@ type read_request = private
 type t
 
 val create_coordinated
-  :  ?read_planned:(Logseq_db_types.Graph_types.Uuid.t -> unit)
+  :  ?release_consumer:(Worker.asset_consumer -> bool)
+  -> ?read_planned:(Logseq_db_types.Graph_types.Uuid.t -> unit)
   -> ?read_retired:(Logseq_db_types.Graph_types.Uuid.t -> unit)
   -> read:(read_request -> bool)
   -> send:(Logseq_db_worker_lui.Logseq_db_worker_lui_service.request -> bool)
@@ -95,3 +96,12 @@ val observe_favorites_result
   -> first_page:bool
   -> Journal_graph_request.favorites_result
   -> unit
+
+val consumer_names : t -> string Seq.t
+
+val bind_consumer : t -> name:string -> Worker.asset_consumer -> unit
+
+val retire_coordinated_resources : t -> unit
+val bind_coordinated_resources : t -> Worker.binding -> unit
+
+val demand_backpressured : t -> string -> unit

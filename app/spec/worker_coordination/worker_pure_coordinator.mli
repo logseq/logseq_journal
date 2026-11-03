@@ -187,8 +187,9 @@ type transition =
     Send acceptance is tracked by runner, not assumed by the pure transition.
 
     Cancel requests cooperative stop, not rollback or forgetting ownership. Forget
-    retires presentation of the result; runner retains Accepted IDs/tombstones,
-    orphan leases/observations and durable unknown/committed outcomes until safely
+    retires presentation of the result; runner retains the actual in-flight
+    Mailbox association until its terminal. The coordinator retains orphan
+    leases/observations and durable unknown/committed outcomes until safely
     reconciled. Cancel racing Observe/Acquire cannot leak a resource. Release is
     encoded with a unit ticket, retried until ACK; late updates cannot reactivate
     it. A query error never unregisters an interest or ACKs a change window.
@@ -293,16 +294,6 @@ val prepare_host_change
     ACK. Only the exact attempt and admitted Mailbox terminal ACK publishes Host_change_applied and removes
     the graph-level gate; its original executions remain permanently retired. *)
 val authorize_host_change:t -> Worker.handoff_receipt -> (transition,Worker.error)result
-
-(** Pure compressed ownership history for real mailbox-ID association. *)
-module Response_ownership : sig
-  type t
-
-  val empty : t
-  val add : t -> Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id -> t
-  val mem : t -> Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id -> bool
-  val spans : t -> int
-end
 
 (** A new round requires real binding release after a definitely unconsumed action. *)
 val handoff_restartable:view -> Worker.handoff_id -> bool

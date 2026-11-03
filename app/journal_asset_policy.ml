@@ -1060,3 +1060,5 @@ let step_with_dependencies state event =
   in
   next,instructions,dependencies
 ;;
+
+let consumer_names state=Consumers.to_seq state.residency |> Seq.map fst

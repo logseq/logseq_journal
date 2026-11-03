@@ -1331,10 +1331,7 @@ let rec append_node (node:Protocol.v2_append_node) : Overlay.append_node =
 ;;
 
 let journal_append_title format day =
-  let module Title=Logseq_db_types.Journal_title in
-  let render pattern=Title.format ~pattern ~year:(day/10000) ~month:(day/100 mod 100) ~day:(day mod 100) in
-  match render(Option.value format ~default:Title.default_format) with
-  |Some title->title|None->Option.get(render Title.default_format)
+  Option.get(Logseq_db_types.Journal_title.for_journal_day ~pattern:format day)
 ;;
 
 let local_mutation ?append_title = function

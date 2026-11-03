@@ -40,6 +40,7 @@ val create
     Transport IDs and continuation construction stay with the coordinator SDK. *)
 val create_coordinated
   :  ?release_file:(Worker.file_lease -> bool)
+  -> ?release_consumer:(Worker.asset_consumer -> bool)
   -> ?read_planned:(Logseq_db_types.Graph_types.Uuid.t -> unit)
   -> ?read_retired:(Logseq_db_types.Graph_types.Uuid.t -> unit)
   -> read:(read_request -> bool)
@@ -52,10 +53,18 @@ val create_coordinated
     are excluded. Planning is reported before a possible synchronous refusal. *)
 val owns_read : t -> Logseq_db_types.Graph_types.Uuid.t -> bool
 
+(** Logical presentation association only; physical ownership stays in Core. *)
+val bind_consumer:t -> name:string -> Worker.asset_consumer -> unit
+val acquisition_consumer:ticket -> string option
+val consumer_names:t -> string Seq.t
+val receive_file:t -> ticket -> Worker.file_lease option -> unit
+
 val receive_read : t -> read_result -> bool
 (** Retire only imported preview leases owned by a replaced coordinator binding.
     Keep ordinary display owners and rediscover visible roots after real rebind. *)
 val retire_coordinated_previews:t -> unit
+val retire_coordinated_resources:t -> unit
+val bind_coordinated_resources:t -> Worker.binding -> unit
 val resume_coordinated_previews:t -> unit
 val reset : t -> graph_generation:int option -> unit
 
@@ -92,6 +101,7 @@ val resync : t -> unit
 val receive : t -> ticket -> Service.response -> unit
 val reject : t -> ticket -> unit
 val notice : t -> Service.asset_scope -> Service.asset_notice -> unit
+val demand_backpressured : t -> string -> unit
 val pump : t -> unit
 val imported : t -> current:bool -> Logseq_db_worker.import_receipt -> unit
 val idle : t -> bool

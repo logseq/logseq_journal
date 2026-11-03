@@ -722,8 +722,17 @@ let current_presentation ?owner facts presentation =
   current_target facts (Presentation presentation)
   && Option.fold ~none:true ~some:(Worker.presentation_matches_scope presentation) owner
 
+let asset_round_current facts consumer round =
+  match Asset_consumers.find_opt consumer facts.asset_consumers with
+  |Some entry->entry.active && Worker.asset_consumer_round entry.consumer=Some round
+  |None->false
+;;
+
 let revalidate_reply : type a. view -> a ticket -> a Worker.reply -> a Worker.reply =
-  fun facts ticket reply -> match ticket.target,reply with
+  fun facts ticket reply ->
+  if (match ticket.query with Operation(Worker.Replace_asset_demand(consumer,_,_))->
+    not(asset_round_current facts consumer ticket.id)|_->false)
+  then Worker.Answered(Error Worker.Revoked_session) else match ticket.target,reply with
   | Presentation presentation,Worker.Answered(Ok _)
     when not(current_presentation facts presentation)->Worker.Answered(Error Worker.Revoked_session)
   | _->reply
@@ -1366,6 +1375,8 @@ let checked_result : type a. view -> a ticket -> a Worker.reply -> a Worker.repl
             "Mutation receipt identity or original point does not match its ticket"))
   in
   match ticket.query, result with
+  |Operation(Worker.Replace_asset_demand(consumer,_,_)),_
+    when not(asset_round_current facts consumer ticket.id)->Worker.Answered(Error Worker.Revoked_session)
   | Operation(Worker.Recover_import_inputs _),Worker.Answered(Ok _)
       when ticket.planned_source_epoch<>facts.import_input_epoch->
     Worker.Answered(Error(Worker.Stale_read "Source recovery predates a settled source acknowledgement"))
@@ -1828,10 +1839,19 @@ let retain_asset_command_result : type a. t -> a ticket -> a Worker.reply -> t =
   | _->state
 ;;
 
+let asset_file_current facts file =
+  let consumer=Worker.asset_file_consumer file in
+  match Asset_consumers.find_opt consumer facts.asset_consumers with
+  |Some entry when entry.active && Worker.asset_consumer_round consumer=Worker.asset_consumer_round entry.consumer->
+    List.exists(fun(notice,_)->Worker.ready_asset_file notice=Some file)entry.notices
+  |_->false
+;;
+
 let import_key intent=Worker.asset_import_intent_id intent
 let adopt_file_result : type a. t -> a slot -> a Worker.reply -> t =
   fun state slot result->
-  let orphan=slot.cancelled || slot.forgotten || state.lifecycle<>Running || not(current_target state.facts slot.ticket.target) in
+  let orphan=slot.cancelled || slot.forgotten || state.lifecycle<>Running || not(current_target state.facts slot.ticket.target)
+    || (match slot.ticket.query with Operation(Worker.Acquire_asset_file file)->not(asset_file_current state.facts file)|_->false) in
   let adopt facts lease=
     let facts={facts with file_leases=Observation_ids.add(Worker.file_lease_id lease)lease facts.file_leases} in
     if orphan then queue_file_cleanup facts lease () else facts in
@@ -1856,6 +1876,7 @@ let adopt_file_result : type a. t -> a slot -> a Worker.reply -> t =
       Rrbvec.fold_left(fun facts (recovered:Worker.recovered_import_input)->
         Option.fold ~none:facts ~some:(fun proof->adopt_import_source facts(Worker.prepared_import_adoption proof))recovered.prepared)
         state.facts page.inputs
+    |Operation(Worker.Acquire_asset_file _),Worker.Answered(Ok(Some lease))->adopt state.facts lease
     |Operation(Worker.Acquire_imported_file _),Worker.Answered(Ok(Some lease))->adopt state.facts lease
     |_->state.facts in
   {state with facts}
@@ -1971,11 +1992,13 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
          let result =
            let cancelled_observe =
              match ticket.query with
-             | Operation (Worker.Observe _ | Worker.Import _ | Worker.Acquire_imported_file _) -> slot.cancelled
+             | Operation (Worker.Observe _ | Worker.Import _ | Worker.Acquire_asset_file _ | Worker.Acquire_imported_file _) -> slot.cancelled
              | _ -> false
            in
            if cancelled_observe
            then Worker.Interrupted Worker.Cancelled
+           else if (match ticket.query with Operation(Worker.Acquire_asset_file file)->not(asset_file_current state.facts file)|_->false)
+           then Worker.Answered(Error Worker.Revoked_session)
            else if (state.lifecycle = Running || match ticket.target with Cleanup _->true|_->false)
                    && current_target state.facts ticket.target
            then result
@@ -2225,8 +2248,9 @@ let retain_asset_notice state notice sequence =
     (match Asset_consumers.find_opt consumer state.facts.asset_consumers with
      | Some entry when entry.active && Worker.asset_consumer_round consumer=Worker.asset_consumer_round entry.consumer->
        let owned=match Worker.asset_notice_data notice with
-         | Logseq_db_worker_lui.Logseq_db_worker_lui_service.Asset_availability{asset;_}->
-           List.exists(fun descriptor->descriptor.Logseq_db_types.Asset_descriptor.uuid=asset)entry.assets
+         | Logseq_db_worker_lui.Logseq_db_worker_lui_service.Asset_availability{asset;descriptor;_}->
+           List.exists(fun expected->expected.Logseq_db_types.Asset_descriptor.uuid=asset
+             && expected.source=descriptor.source && expected.current_checksum=descriptor.current_checksum)entry.assets
          | _->true in
        if not owned then unchanged state else
        (match replace entry.notices with None->unchanged state|Some notices->
@@ -2322,6 +2346,7 @@ let step_base state event =
           { state.facts with
             current = None
           ; retired_host_sessions=Sessions.empty
+          ; handoffs=[];restartable_handoffs=[]
           ; bootstrap_state = Worker.Awaiting_baseline
           ; shutdown = Active
           ; change_batches = Graphs.empty
@@ -3206,11 +3231,14 @@ let plan_asset_release state session consumer =
   then Error Worker.Revoked_session
   else if Slots.cardinal state.facts.entries>=512
   then Error(Worker.Invalid_input "Release completed cleanup tickets before adding another waiter") else
+  let same_round bound=Worker.equal_asset_consumer consumer bound
+    && (Worker.asset_consumer_round consumer=None || Worker.asset_consumer_round consumer=Worker.asset_consumer_round bound) in
   let bound=match Asset_consumers.find_opt consumer state.facts.asset_consumers with
-    | Some entry->Some entry.consumer
-    | None->Observation_ids.fold(fun _ cleanup found->match found with Some _->found|None->
-        match cleanup.resource with Demand_resource bound when Worker.equal_asset_consumer consumer bound->Some bound|_->None)
+    |Some entry when same_round entry.consumer->Some entry.consumer
+    |_->Observation_ids.fold(fun _ cleanup found->match found with Some _->found|None->
+        match cleanup.resource with Demand_resource bound when same_round bound->Some bound|_->None)
         state.facts.asset_cleanup None in
+  if bound=None && Worker.asset_consumer_round consumer<>None then Error Worker.Revoked_session else
   let operation=Worker.Release_asset_demand(Option.value bound ~default:consumer) in
   Result.map(fun((ticket:unit ticket),planned)->
     let entries=match Slots.find_opt ticket.serial planned.next.facts.entries with
@@ -3224,10 +3252,12 @@ let plan_asset_release state session consumer =
       | None->facts
       | Some bound->
         let asset_consumers=match Asset_consumers.find_opt consumer facts.asset_consumers with
-          | None->facts.asset_consumers
-          | Some entry->Asset_consumers.add consumer {entry with active=false;notices=[]}facts.asset_consumers in
+          | Some entry when Worker.asset_consumer_round entry.consumer=Worker.asset_consumer_round bound->
+            Asset_consumers.add consumer {entry with active=false;notices=[]}facts.asset_consumers
+          | None|Some _->facts.asset_consumers in
         let asset_cleanup=Observation_ids.map(fun cleanup->
-          match cleanup.resource with Demand_resource bound when Worker.equal_asset_consumer bound consumer->{cleanup with error=None;wait_for_capacity=false}
+          match cleanup.resource with Demand_resource actual when Worker.equal_asset_consumer actual bound
+            && Worker.asset_consumer_round actual=Worker.asset_consumer_round bound->{cleanup with error=None;wait_for_capacity=false}
           |_->cleanup)facts.asset_cleanup in
         queue_asset_cleanup {facts with asset_consumers;asset_cleanup} bound ~waiter:ticket.serial () in
     ticket,progress_asset_cleanup(changed {planned.next with facts}[]))
@@ -3255,7 +3285,7 @@ let plan_file_release state session lease =
 
 let lease_ownership_full state =
   let pending=Slots.fold(fun _ (Entry slot) total->if slot.result<>None then total else match slot.ticket.query with
-    |Operation(Worker.Import _ | Worker.Acquire_imported_file _)->total+1|_->total)state.facts.entries 0 in
+    |Operation(Worker.Import _ | Worker.Acquire_asset_file _ | Worker.Acquire_imported_file _)->total+1|_->total)state.facts.entries 0 in
   let retained=Observation_ids.cardinal state.facts.file_leases+pending in
   retained>=256 || retained+Observation_ids.cardinal state.facts.released_leases>=8192
 ;;
@@ -3528,6 +3558,11 @@ let rec request
             | Worker.Acknowledge_changes batch -> plan_change_ack state session batch
             | Worker.Replace_asset_demand(consumer,_,assets)->plan_asset_command state session operation consumer assets
             | Worker.Import intent->plan_import state session intent operation
+            | Worker.Acquire_asset_file file when not(asset_file_current state.facts file)->Error Worker.Revoked_session
+            | Worker.Acquire_asset_file _->
+              if lease_ownership_full state
+              then Error(Worker.Invalid_input "File lease ownership capacity is full") else
+              plan_intent_lifecycle state session operation Lease(Direct session)None
             | Worker.Acquire_imported_file _->
               if lease_ownership_full state
               then Error(Worker.Invalid_input "File lease ownership capacity is full") else
@@ -3754,10 +3789,14 @@ let prepare_host_change ?(legacy_pending=false) state change =
     Ok(id,plan_host_confirmation state receipt)
   |Some _->Error Worker.Host_change_in_progress
   |None->
+  (* No active round remains: the next user attempt retires determined outcomes
+     of earlier attempts. Unknown consumption/readback keeps active_handoff and
+     cannot enter here. Resource and execution retirement facts are independent. *)
+  let state={state with facts={state.facts with handoffs=[];restartable_handoffs=[]}} in
   if state.binding = None || state.lifecycle <> Running
   then Error Worker.Revoked_session
-  else if List.length state.facts.handoffs >= 64 || state.next = Int64.max_int
-  then Error (Worker.Invalid_input "Handoff history limit reached")
+  else if state.next = Int64.max_int
+  then Error (Worker.Invalid_input "Handoff request counter exhausted")
   else (
     let serial = Int64.succ state.next in
     let id = Worker.handoff_id (identity state.client serial) in
@@ -3804,43 +3843,6 @@ let authorize_host_change state receipt =
       (plan_host_action_attempt {state with facts} receipt)
   |_->Error Worker.Revoked_session
 ;;
-
-module Response_ownership = struct
-  module Ranges = Map.Make (Int64)
-
-  type t = int64 Ranges.t
-
-  let empty = Ranges.empty
-
-  let mem history id =
-    let id = Id.Request_id.to_int64 id in
-    match Ranges.find_last_opt (fun start -> start <= id) history with
-    | Some (_, finish) -> id <= finish
-    | None -> false
-  ;;
-
-  let add history request_id =
-    if mem history request_id
-    then history
-    else (
-      let id = Id.Request_id.to_int64 request_id in
-      let start, history =
-        match Ranges.find_last_opt (fun start -> start <= id) history with
-        | Some (start, finish) when finish <> Int64.max_int && Int64.succ finish = id ->
-          start, Ranges.remove start history
-        | _ -> id, history
-      in
-      let finish, history =
-        match Ranges.find_first_opt (fun next -> next >= id) history with
-        | Some (next, finish) when id <> Int64.max_int && Int64.succ id = next ->
-          finish, Ranges.remove next history
-        | _ -> id, history
-      in
-      Ranges.add start finish history)
-  ;;
-
-  let spans = Ranges.cardinal
-end
 
 let plan_query state ~owner ~maximum_items ~maximum_bytes query =
   plan_query_internal

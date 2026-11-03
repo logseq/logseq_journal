@@ -15,4 +15,4 @@ val empty : t
 val sync : t -> (int * Uuid.t) option -> t
 val notice : t -> Service.asset_scope -> Service.asset_notice -> t
 val rows : t -> row list
-val retry : t -> Uuid.t -> Service.request option
+val can_retry : t -> Uuid.t -> bool

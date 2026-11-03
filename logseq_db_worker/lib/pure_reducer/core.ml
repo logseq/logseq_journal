@@ -77,6 +77,7 @@ type asset_notice =
   | Asset_availability of
       { consumer : string
       ; asset : Logseq_db_types.Graph_types.Uuid.t
+      ; descriptor : Logseq_db_types.Asset_descriptor.t
       ; availability : Logseq_sync_pure_reducer.Asset_transfer.availability
       }
   | Asset_demand_accepted of string
@@ -779,10 +780,10 @@ let asset_unlocked (context : Sync.asset_context) =
 let asset_instructions (context : Sync.asset_context) instructions =
   List.map
     (function
-      | Transfer.Notify { consumer; asset; availability } ->
+      | Transfer.Notify { consumer; asset; descriptor; availability } ->
         Publish
           (Asset_notice
-             (context.scope, Asset_availability { consumer; asset; availability }))
+             (context.scope, Asset_availability { consumer; asset; descriptor; availability }))
       | Backpressure consumer ->
         Publish (Asset_notice (context.scope, Asset_backpressure consumer))
       | Capacity_available ->

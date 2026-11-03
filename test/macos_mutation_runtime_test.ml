@@ -576,44 +576,27 @@ let runtime () =
   runtime
 ;;
 
+(* These are reconciliation/delete fixtures. Atomic Append's full Service/UI
+   lifecycle is covered by worker_coordination_runtime/application_view tests;
+   seed through the real durable owner instead of reviving old Capture stages. *)
 let capture worker runtime ordinal task_state =
-  let creation_time =
-    Journal_time.create
-      ~instant_unix_ms:1_704_067_200_000L
-      ~local_day:20240101
-      ~local_minute_of_day:0
-    |> Result.get_ok
-  in
-  let output =
-    Runtime.submit
-      runtime
-      (Journal_graph_request.Capture
-         { calendar_generation = 1L
-         ; command =
-             { mutation_id = Graph.Uuid.to_string (Fixture.mutation_uuid ordinal)
-             ; block_id = Graph.Uuid.to_string (Fixture.mutation_uuid (ordinal + 100))
-             ; sibling_order = string_of_int ordinal
-             ; source = "Captured regression block"
-             ; task_state
-             ; creation_time
-             ; children = []
-             ; status_confirmation = false
-             ; status_intent_revision = 0L
-}
-         })
-  in
-  match deliver worker runtime output with
-  | [ { Runtime.payload = Block_captured { block; _ } } ] -> block
-  | responses ->
-    List.iter
-      (fun response ->
-         match response.Runtime.payload with
-         | Rejected (Worker_failure failure) ->
-           print_endline (Logseq_db_worker.Error.message failure.error)
-         | Rejected (Projection_failure message) -> print_endline message
-         | _ -> ())
-      responses;
-    failwith "capture did not complete"
+  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  let block=Fixture.mutation_uuid(ordinal+100) in
+  let task_status=match task_state with Journal_model.Status value->Some(uuid value)
+    |No_status->None|Default_status->failwith "fixture requires an explicit status" in
+  let wire=P.V2_append_journal{mutation_id=Fixture.mutation_uuid ordinal;
+    page=uuid "00000001-2024-0101-0000-000000000000";journal_day=20240101;
+    root={block_id=block;title="Captured regression block";task_status;children=Rrbvec.empty}} in
+  let intent=Wire.create ~origin:worker.scope.account.managed_sync_origin
+    ~user:worker.scope.account.user_id ~graph:worker.scope.graph_id wire |> Result.get_ok in
+  (match Runner.durable_mutation worker.runner ~scope:worker.scope
+      ~request_id:(Fixture.mutation_uuid ordinal) ~intent:(Wire.encode intent) ~current:(fun()->true) with
+   |Wire.Committed _->()|_->failwith "durable fixture Append failed");
+  worker.drain();
+  let output=Runtime.submit runtime(Load_detail{block_id=Graph.Uuid.to_string block;
+    request_generation=Int64.of_int ordinal;limit=32;after=None}) |> deliver worker runtime in
+  match List.find_map(function {Runtime.payload=Detail_loaded{detail;_}}->Some detail.root|_->None) output with
+  |Some block->block|None->failwith "seeded durable target did not reach Detail projection"
 ;;
 
 let test_delete_conflict_recovery () =

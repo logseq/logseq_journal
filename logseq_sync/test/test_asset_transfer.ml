@@ -309,41 +309,24 @@ let duplicate_retry_while_loading () =
   Alcotest.(check bool) "download stays current" true (T.ticket_current t (T.Download download))
 ;;
 
-let ready_does_not_refresh () =
-  let t, effects = replace (initial ()) "visible" Foreground [ asset 2 ] in
-  let t, _ = T.step t (Cache_checked (only (checks effects), Ok (Some "displayed"))) in
-  let t, effects = T.step t (Retry (uuid 2)) in
-  check "Ready ignores manual retry" 0 (List.length effects);
-  let descriptors =
-    [ asset 2
-    ; asset ~checksum:(String.make 64 'b') 2
-    ; asset ~remote:false 2
-    ; get
-        (A.create
-           ~uuid:(uuid 2)
-           ~source:(External "https://example/new-image")
-           ~current_checksum:None
-           ~size:None
-           ~dimensions:None)
-    ]
-  in
-  let t =
-    List.fold_left
-      (fun t descriptor ->
-         let t, effects = T.step t (Descriptor_changed descriptor) in
-         check
-           "Ready descriptor refresh has no IO or notification"
-           0
-           (List.length effects);
-         Alcotest.(check bool) "displayed file remains Ready" true (ready t "visible");
-         t)
-      t
-      descriptors
-  in
-  let _, effects =
-    replace t "visible" Foreground [ asset ~checksum:(String.make 64 'b') 2 ]
-  in
-  check "replacing demand keeps displayed resource" 0 (List.length effects)
+let ready_version_changes () =
+  let original=asset 2 in
+  let t,effects=replace(initial()) "visible" Foreground [original] in
+  let t,_=T.step t(Cache_checked(only(checks effects),Ok(Some "displayed"))) in
+  let t,effects=T.step t(Retry(uuid 2)) in
+  check "Ready ignores manual retry" 0(List.length effects);
+  let t,effects=T.step t(Descriptor_changed original) in
+  check "same version retains Ready without IO" 0(List.length effects);
+  Alcotest.(check bool) "same version remains ready" true(ready t "visible");
+  let changed=asset ~checksum:(String.make 64 'b') 2 in
+  let t,effects=T.step t(Descriptor_changed changed) in
+  Alcotest.(check bool) "new content cannot reuse old Ready" false(ready t "visible");
+  check "new version checks its own cache" 1(List.length(checks effects));
+  Alcotest.(check bool) "old transfer retain is released" true
+    (List.exists(function T.Release_handle "displayed"->true|_->false)effects);
+  let t,_=T.step t(Cache_checked(only(checks effects),Ok(Some "new-content"))) in
+  Alcotest.(check bool) "new content becomes Ready" true
+    (T.availability t ~consumer:"visible"=[uuid 2,T.Ready "new-content"])
 ;;
 
 let manual_retry_fences_old_work () =
@@ -459,7 +442,7 @@ let () =
           ; "manual retry finds local file", manual_retry_cached_file
           ; "manual retry downloads only after local miss", manual_retry_missing_file
           ; "manual retry is inert while loading", duplicate_retry_while_loading
-          ; "Ready ignores Retry and descriptor refresh", ready_does_not_refresh
+          ; "Ready tracks current content version", ready_version_changes
           ; "manual retry fences old work", manual_retry_fences_old_work
           ] )
     ]

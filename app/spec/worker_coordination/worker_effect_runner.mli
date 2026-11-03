@@ -32,9 +32,11 @@ val on_event : t -> (Service.response, Service.push) Mailbox.event -> delivery
 (** One shared host router calls this BEFORE legacy response dispatch. Ownership
     is decided by the actual Accepted mailbox ID in the checked epoch/generation,
     not result shape or success/failure. Consumed includes owned errors, cancels,
-    duplicate/retired/late replies and malformed owned receipts, even when error is
-    Some. Never fall through to the old Application generic Failed/Cancelled path.
-    Retain bounded tombstones until the Worker lifetime/fence proves no late reply.
+    late terminal replies and malformed owned receipts, even when error is Some.
+    Never fall through to the old Application generic Failed/Cancelled path.
+    Inputs come from the existing Mailbox outlet, which filters duplicate terminal
+    replies before invoking the host. Retain only actual in-flight ownership until
+    that terminal arrives; completed IDs do not consume lifetime admission capacity.
 
     Unowned_response is permitted only for a response from the same live channel
     not owned by this runner; host forwards it to its OTHER REGISTERED request owner,

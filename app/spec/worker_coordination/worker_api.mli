@@ -558,6 +558,9 @@ type asset_priority =
 type asset_notice
 
 val asset_notice_session : asset_notice -> session
+
+(** Read-only owner data from the checked notice; it grants no new authority. *)
+val asset_notice_scope : asset_notice -> Service.asset_scope
 val asset_notice_data : asset_notice -> Service.asset_notice
 val asset_notice_consumer : asset_notice -> asset_consumer option
 

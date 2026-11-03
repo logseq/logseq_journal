@@ -26,7 +26,6 @@ type t =
   ; mutable issuer : (module Worker.ISSUER)
   ; mutable registration : int64 option
   ; pending : (Id.Worker.request_id, flight) Hashtbl.t
-  ; mutable owned : Core.Response_ownership.t
   ; mutable latest : Core.view option
   ; mutable shutdown_posted : bool
   }
@@ -48,7 +47,6 @@ let create ~client ~managed_origin ~user_id ~post ~publish =
       ; issuer
       ; registration = None
       ; pending = Hashtbl.create 32
-      ; owned = Core.Response_ownership.empty
       ; latest = None
       ; shutdown_posted = false
       }
@@ -69,20 +67,9 @@ type delivery =
   }
 
 let admit t request flight =
-  let limit =
-    match flight with
-    | Unregister _ | Unobserve _ -> 8192
-    | _ -> 4096
-  in
-  if Core.Response_ownership.spans t.owned >= limit
-  then Mailbox.Full
-  else (
-    match Mailbox.send t.client request with
-    | Mailbox.Accepted id as result ->
-      Hashtbl.add t.pending id flight;
-      t.owned <- Core.Response_ownership.add t.owned id;
-      result
-    | result -> result)
+  match Mailbox.send t.client request with
+  |Mailbox.Accepted id as result->Hashtbl.add t.pending id flight;result
+  |result->result
 ;;
 
 let refused = function
@@ -214,10 +201,7 @@ let on_event t event =
       match event with
       | Mailbox.Response { request_id; outcome; _ } ->
         (match Hashtbl.find_opt t.pending request_id with
-         | None ->
-           if Core.Response_ownership.mem t.owned request_id
-           then Consumed
-           else Unowned_response
+         | None -> Unowned_response
          | Some flight ->
            Hashtbl.remove t.pending request_id;
            (match flight with

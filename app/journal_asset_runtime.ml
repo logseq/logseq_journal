@@ -62,6 +62,10 @@ type dependency =
 
 type t =
   { read_port : (read_request -> bool) option
+  ; release_consumer : (Worker.asset_consumer -> bool) option
+  ; bound_consumers : (string,Worker.asset_consumer)Hashtbl.t
+  ; mutable resource_binding : Worker.binding option
+  ; mutable resume_configuration : (int*int*Policy.settings)option
   ; read_planned : Graph.Uuid.t -> unit
   ; read_retired : Graph.Uuid.t -> unit
   ; send : Service.request -> bool
@@ -88,8 +92,12 @@ type t =
   ; mutable favorite_members : Uuids.t
   }
 
-let create_state ~read_port ~read_planned ~read_retired ~send ~changed =
+let create_state ~release_consumer ~read_port ~read_planned ~read_retired ~send ~changed =
   { read_port
+  ; release_consumer
+  ; bound_consumers=Hashtbl.create 32
+  ; resource_binding=None
+  ; resume_configuration=None
   ; read_planned
   ; read_retired
   ; send
@@ -118,10 +126,10 @@ let create_state ~read_port ~read_planned ~read_retired ~send ~changed =
 ;;
 
 let create ~send ~changed =
-  create_state ~read_port:None ~read_planned:(fun _ -> ()) ~read_retired:(fun _ -> ()) ~send ~changed
+  create_state ~release_consumer:None ~read_port:None ~read_planned:(fun _ -> ()) ~read_retired:(fun _ -> ()) ~send ~changed
 
-let create_coordinated ?(read_planned=fun _->()) ?(read_retired=fun _->()) ~read ~send ~changed () =
-  create_state ~read_port:(Some read) ~read_planned ~read_retired ~send ~changed
+let create_coordinated ?release_consumer ?(read_planned=fun _->()) ?(read_retired=fun _->()) ~read ~send ~changed () =
+  create_state ~release_consumer ~read_port:(Some read) ~read_planned ~read_retired ~send ~changed
 ;;
 
 let scan_request_id id =
@@ -321,12 +329,12 @@ let execute t = function
             ; command = Replace_asset_demand { consumer; priority; assets }
             }))
   | Release consumer ->
-    (match t.generation with
-     | None -> true
-     | Some graph_generation ->
-       t.send
-         (Service.Asset_command
-            { graph_generation; command = Release_asset_demand consumer }))
+    (match Hashtbl.find_opt t.bound_consumers consumer,t.release_consumer with
+     |Some bound,Some release->
+       if release bound then (Hashtbl.remove t.bound_consumers consumer;true)else false
+     |None,Some _->true
+     |_,None->match t.generation with None->true|Some graph_generation->
+       t.send(Service.Asset_command{graph_generation;command=Release_asset_demand consumer}))
 ;;
 
 let forget_request t ~request_id =
@@ -433,6 +441,7 @@ let dispatch t event =
 ;;
 
 let refresh t ~graph_generation ~today ~settings =
+  t.resume_configuration<-None;
   let configuration = graph_generation, today, settings in
   if t.configuration <> Some configuration
   then (
@@ -955,6 +964,8 @@ let changes t windows =
 ;;
 
 let shutdown t =
+  t.resource_binding<-None;t.resume_configuration<-None;
+  retire_policy_reads t;
   retire_dependency_reads t;
   retain_releases t;
   dispatch t Shutdown;
@@ -974,6 +985,22 @@ let shutdown t =
   t.configuration <- None;
   t.generation <- None;
   publish t
+;;
+
+let retire_coordinated_resources t =
+  if t.resource_binding<>None then (
+    let configuration=t.configuration in
+    shutdown t;
+    t.resume_configuration<-configuration)
+;;
+let bind_coordinated_resources t binding =
+  if Option.exists(fun previous->not(Worker.equal_binding previous binding))t.resource_binding
+  then retire_coordinated_resources t;
+  let resume=t.resume_configuration in
+  t.resource_binding<-Some binding;t.resume_configuration<-None;
+  match resume with
+  |Some(graph_generation,today,settings)->refresh t ~graph_generation ~today ~settings
+  |None->pump t
 ;;
 
 let receive_read t ~request_id result =
@@ -1119,6 +1146,8 @@ let reject t ~request_id =
     dispatch t (Read_failed ticket)
 ;;
 
+let demand_backpressured t consumer=dispatch t(Policy.Backpressure consumer)
+
 let notice
       t
       (scope : Logseq_db_worker_lui.Logseq_db_worker_lui_service.asset_scope)
@@ -1131,8 +1160,12 @@ let notice
     | Asset_backpressure consumer -> dispatch t (Backpressure consumer)
     | Upload_status _ -> ()
     | Asset_capacity_available -> dispatch t Capacity_available
-    | Asset_availability { consumer; asset; availability } ->
+    | Asset_availability { consumer; asset; availability; _ } ->
       dispatch t (Availability { consumer; asset; availability }))
 ;;
 
 let idle t = Queue.is_empty t.queued
+
+let consumer_names t=Policy.consumer_names t.policy
+
+let bind_consumer t ~name consumer=Hashtbl.replace t.bound_consumers name consumer
