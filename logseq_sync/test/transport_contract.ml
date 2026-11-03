@@ -33,22 +33,34 @@ listener.listen(8); listener.settimeout(5); listener4.listen(8)
 with open(root+'/ready.tmp','w') as f: f.write(str(listener.getsockname()[1]))
 os.replace(root+'/ready.tmp', root+'/ready')
 report=[]; stalled=[]
-def observe_stalled_tls(raw, item):
+def observe_stalled_tls(raw, item, index):
   try:
-    while raw.recv(16384): pass
-    item['closed']=True
+    hello=b''
+    while True:
+      part=raw.recv(16384)
+      if not part:
+        item['closed']=True; break
+      if not item['client_hello']:
+        hello+=part
+        if len(hello)>5:
+          record_length=int.from_bytes(hello[3:5],'big')
+          if len(hello)>=5+record_length and hello[0]==22 and hello[5]==1:
+            item['client_hello']=True
+            path=root+'/client-hello-'+str(index)
+            with open(path+'.tmp','w') as f: f.write('ClientHello observed')
+            os.replace(path+'.tmp',path)
   except (ConnectionResetError, BrokenPipeError): item['closed']=True
   except socket.timeout: pass
   finally: raw.close()
 try:
-  for case in cases:
+  for index,case in enumerate(cases):
     ready,_,_=select.select([listener,listener4],[],[],5)
     if not ready: raise RuntimeError('no client connection')
     raw,_ = ready[0].accept()
     raw.settimeout(2)
     if case.get('stall_tls'):
-      item={'closed':False}; report.append(item)
-      worker=threading.Thread(target=observe_stalled_tls,args=(raw,item),daemon=True)
+      item={'closed':False,'client_hello':False}; report.append(item)
+      worker=threading.Thread(target=observe_stalled_tls,args=(raw,item,index),daemon=True)
       worker.start(); stalled.append(worker); continue
     time.sleep(case.get('tls_delay',0))
     try: conn=ctx.wrap_socket(raw,server_side=True)
@@ -1379,11 +1391,43 @@ let test_setup_cancel ~websocket ~dns () =
       (descriptors () <= before))
   else (
     let stalled = `Assoc [ "stall_tls", `Bool true ] in
-    ignore (with_peer [ stalled ] run);
-    Alcotest.(check bool)
-      "TLS setup cancellation joins within bound"
-      true
-      (Unix.gettimeofday () -. started < 1.))
+    let report=with_peer [stalled] (fun ~environment ~sw ~support ~origin->
+      let posted=ref [] and invalidations=ref 0 in
+      let t=runner ~environment ~sw ~support ~posted ~invalidations () in
+      Fun.protect ~finally:(fun()->Runner.shutdown t)(fun()->
+        let op=if websocket then websocket_start origin else operation ~download:false origin in
+        Runner.submit t op;
+        (* The peer has consumed a complete TLS record carrying ClientHello and
+           sends no handshake response. No process startup or polling guess is
+           part of the cancellation interval. *)
+        wait (Eio.Stdenv.clock environment)(fun()->
+          Sys.file_exists(Filename.concat support "client-hello-0"));
+        Alcotest.(check bool) "TLS setup is still pending when cancellation starts" true
+          (if websocket then not(List.exists(function Core.Websocket_closed _->true|_->false)!posted)
+           else Option.is_none(completed !posted));
+        let scope=Core.runner_effect_scope op in
+        let retired()=if websocket then
+          let connection=match op with Core.Start_websocket request->request.scope|_->assert false in
+          List.exists(function Core.Websocket_retired actual->actual=connection|_->false)!posted
+        else List.exists(function Core.IO_fence_completed(98001L,actual,Ok())->actual=scope|_->false)!posted in
+        let clock=Eio.Stdenv.mono_clock environment in
+        let began=Eio.Time.Mono.now clock in
+        let elapsed()=Mtime.Span.to_float_ns(Mtime.span began(Eio.Time.Mono.now clock))/.1e9 in
+        Runner.submit t(cancellation_effect scope);
+        if not websocket then (
+          let initialized,_=bootstrap origin in
+          let fence=Core.step initialized.next(Core.IO_fence_requested(98001L,scope)) in
+          List.iter(function Core.Run instruction->Runner.submit t instruction|_->())fence.effects);
+        (try Eio.Time.Timeout.run_exn(Eio.Time.Timeout.seconds clock 1.)(fun()->
+           while not(retired()) do Eio.Time.Mono.sleep clock 0.001 done)
+         with Eio.Time.Timeout->Alcotest.failf "%s TLS cancellation has no actual retirement after %.6fs"
+           (if websocket then "WebSocket" else "HTTP")(elapsed()));
+        Printf.printf "%s TLS cancel -> actual scope retirement: %.6fs\n%!"
+          (if websocket then "WebSocket" else "HTTP")(elapsed());
+        Alcotest.(check bool) "TLS cancellation reaches actual retirement within bound" true(elapsed()<1.))) in
+    check_retired report;
+    List.iter(fun row->Alcotest.(check bool) "peer received ClientHello before cancellation" true
+      Yojson.Basic.Util.(row |> member "client_hello" |> to_bool))Yojson.Basic.Util.(to_list report))
 ;;
 
 let test_alternate_address ~websocket () =
