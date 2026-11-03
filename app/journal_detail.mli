@@ -227,3 +227,9 @@ module Pure_observation : sig
     Protocol.v2_block_lookup Worker.observation option
 
 end
+
+val await_child_confirmation : t -> block_id:string -> t
+val await_retained_confirmation : retained_composer -> block_id:string -> retained_composer
+
+val pending_submission : t -> (Journal_graph_projection.create_child * Journal_graph_mutation_confirmation.Pure_insertion.t) option
+val retained_pending_submission : retained_composer -> (Journal_graph_projection.create_child * Journal_graph_mutation_confirmation.Pure_insertion.t) option

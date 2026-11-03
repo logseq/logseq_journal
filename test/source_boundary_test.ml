@@ -1290,7 +1290,6 @@ let () =
     root
     "app/application.ml"
     [ "Journal_header.view"
-    ; "arrow.clockwise"
     ; "V.Navigation_stack.create"
     ; "V.Sheet.create"
     ; "Journal_composer_view.content"

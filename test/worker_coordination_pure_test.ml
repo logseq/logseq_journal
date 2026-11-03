@@ -252,6 +252,11 @@ let test_import_source_recovery_owner_cursor_and_ack () =
     |Coordination_acknowledge_import_input{request_id;_}->request_id
     |_->assert false in
   let imported,planned=C.request(ready I.binding projection)session(W.Import intent) |> Result.get_ok in
+  check(Rrbvec.is_empty(C.pending_import_source_intents(C.view planned.next)))
+    "source lookup raced the pending original Import";
+  let admitted=(C.step planned.next(C.Admitted(imported,Id.Worker.Request_id.of_int64 9889L))).next in
+  check(Rrbvec.is_empty(C.pending_import_source_intents(C.view admitted)))
+    "source lookup raced the admitted original Import";
   let unknown=consume planned.next imported(W.Interrupted W.Transport_lost) in
   check(C.import_source_pending(C.view unknown) ~operation:source.operation)"lost import reply did not retain its source";
   let operation=W.Recover_import_inputs{after=None;maximum_items=2;maximum_bytes=65536} in
@@ -275,6 +280,13 @@ let test_import_source_recovery_owner_cursor_and_ack () =
     (frame recovery_id{items=[row;{row with sequence=2L}];next=None})))
     "source recovery accepted duplicate original operation identities";
   let confirmation,confirming=C.request planned.next session(W.Confirm_import_source intent) |> Result.get_ok in
+  let full=C.step confirming.next(C.Admission_refused(confirmation,W.Full))in
+  check(C.reply(C.view full.next)confirmation=None) "source read Full consumed its recovery attempt";
+  let capacity=C.step full.next C.Capacity_available in
+  check(List.exists(function C.Send(ticket,_,W.Confirm_import_source original)->
+    W.equal_request_id(C.ticket_id ticket)(C.ticket_id confirmation)
+    && W.encode_asset_import_intent original=W.encode_asset_import_intent intent|_->false)capacity.instructions)
+    "source read did not keep its original ticket for actual capacity";
   let response input=S.Coordination_import_input_confirmed{registration=raw.registration;owner=scope;
     request_id=raw_id confirmation(W.Confirm_import_source intent);input} in
   let unknown_reply=I.reply session ~request_id:(C.ticket_id confirmation)(W.Confirm_import_source intent)
@@ -2545,7 +2557,18 @@ let test_observation_notice_plans_one_refresh () =
           "an old retained sample cleared the newer refresh failure";
         check
           (count (C.step failed.next C.Capacity_available) = 0)
-          "sample failure busy-retried without a newer invalidation"
+          "sample failure busy-retried without a newer invalidation";
+        let transient=C.step admitted.next(C.Completed(refresh,W.Answered(Error(W.Service_failed "local refresh interrupted"))))in
+        check(count transient=1) "transient observation failure did not recover in the same epoch";
+        List.iter(function
+          |C.Send(again,_,W.Refresh same)->
+            check(W.equal_request_id(W.observation_id same)(W.observation_id value.observation))
+              "background recovery replaced the registered observation";
+            let admitted=C.step transient.next(C.Admitted(again,Id.Worker.Request_id.one))in
+            let failed=C.step admitted.next(C.Completed(again,W.Answered(Error(W.Service_failed "still unavailable"))))in
+            check(count failed=0 && count(C.step failed.next C.Capacity_available)=0)
+              "persistent observation failure restarted an automatic loop"
+          |_->())transient.instructions
       | _ -> ())
     invalidated.instructions;
   let duplicate = C.step invalidated.next (C.Observation_notice (notice 1L)) in

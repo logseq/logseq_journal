@@ -37,6 +37,18 @@ private func journalOCamlSetWakeupCallback(_ callback: WakeupCallback?)
 @_silgen_name("journal_ocaml_set_platform_request_callback")
 private func journalOCamlSetPlatformRequestCallback(_ callback: PlatformRequestCallback?)
 
+/// Owns the native connection for the SwiftUI host's structural lifetime.
+/// A system fullscreen preview can hide the host without removing this owner.
+@Observable @MainActor final class JournalRuntimeLifetime {
+  var runtime: JournalRuntime?
+  var startingRuntime: JournalRuntime?
+
+  isolated deinit {
+    runtime?.stop()
+    startingRuntime?.stop()
+  }
+}
+
 nonisolated(unsafe) private var activeRuntime: JournalRuntime?
 
 /// The C bridge invokes this on the main actor after releasing the runtime.
@@ -123,7 +135,7 @@ private let platformRequest: PlatformRequestCallback = { data, length in
     case platformFailure = "runtime.platformFailure.failed"
     case stop = "runtime.stop.failed"
     var errorDescription: String? {
-      "Journal could not complete a native operation (\(rawValue)). Retry opening Journal."
+      "Journal could not complete a native operation (\(rawValue))."
     }
   }
   struct FailureDetail: Error, LocalizedError {

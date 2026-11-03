@@ -678,6 +678,7 @@ let run_favorites_native_visibility
     | Some _ -> Some "doing"
     | None -> None) in
   let durable_case=match durable_status with Some _->durable_status|None->durable_delete in
+  let edit_pending=List.mem capture_case[Some `Edit_pending;Some `Reopen_pending]in
   let delete_writes = Atomic.make 0 in
   let delete_release = Atomic.make false in
   let delete_notices = ref 0 in
@@ -711,11 +712,12 @@ let run_favorites_native_visibility
   let status_summary_queries=Atomic.make 0 in
   let status_more_entered=Atomic.make false and status_more_release=Atomic.make(durable_status<>Some `Paged) in
   let status_confirm_entered=Atomic.make false in
-  let status_confirm_release=Atomic.make(durable_case<>Some `Held && capture_case<>Some `Held) in
+  let status_confirm_release=Atomic.make(durable_case<>Some `Held && capture_case<>Some `Held && not edit_pending) in
   let status_revision () = if Atomic.get status_writes = [] then "root" else "status-updated" in
   let status_release = Atomic.make (status_scenario <> Some "duplicate") in
   let graph_generation = Atomic.make 1 in
   let status_presentation=Atomic.make 1 in
+  let status_away=Atomic.make false in
   let client = ref None in
   let worker_context = ref None in
   let shutdown_called = Atomic.make false in
@@ -737,6 +739,8 @@ let run_favorites_native_visibility
       ~localtime:(fun instant -> Unix.gmtime (instant +. !calendar_offset)) ()) calendar_change in
   let publish_block = Atomic.make false in
   let fail_media_listings=Atomic.make false in
+  let hold_failed_media_recovery=Atomic.make false and failed_media_recovery_entered=Atomic.make false
+    and failed_media_recovery_release=Atomic.make false in
   let media_reference_changed=Atomic.make false
   and hold_media_descendant=Atomic.make false and media_descendant_entered=Atomic.make false
   and media_descendant_release=Atomic.make false in
@@ -939,7 +943,7 @@ let run_favorites_native_visibility
   let manager : Service.state =
     { snapshot =
         { sync_phase = Current
-        ; catalog = (if capture_case=Some `Closed_failed_import then
+        ; catalog = (if List.mem capture_case[Some `Closed_failed_import;Some `Reopen_pending]then
             [({graph_id=uuid 900;name="Unknown Import synthetic graph";
               schema={major=65;minor=33;exact=true};encrypted=false}:Service.graph)] else [])
     ; resident_graphs=[];resident_scopes=[]
@@ -982,6 +986,14 @@ let run_favorites_native_visibility
   let coordination_release_allowed = Atomic.make true in
   let picker_returned = Atomic.make false in
   let host_closed=Atomic.make false in
+  let status_other_scope:Service.asset_scope={scope with graph_id=uuid 901;graph_generation=2}in
+  let status_focus_manager () =
+    if durable_status<>Some `Background_ack then manager else
+    let selected=if Atomic.get status_away then status_other_scope else scope in
+    {manager with snapshot={manager.snapshot with selected_graph=Some selected.graph_id;
+      resident_graphs=[scope.graph_id;status_other_scope.graph_id];resident_scopes=[scope;status_other_scope];
+      startup={manager.snapshot.startup with graph_generation=selected.graph_generation;
+        presentation_generation=Atomic.get status_presentation}}}in
   let coordination_baseline registration =
     let module C=Logseq_sync_pure_reducer.Core in
     let generation=Atomic.get graph_generation in
@@ -996,15 +1008,22 @@ let run_favorites_native_visibility
         account_generation=1;graph_generation=generation;presentation_generation=presentation}}} in
     let owner:Service.timeline_scope={startup={account_generation=1;presentation_generation=presentation};
       graph_id=scope.graph_id;graph_generation=generation} in
-    let sync:C.coordination_state={account=Some scope.account;desired_residents=(if Atomic.get host_closed then []else[scope.graph_id]);
-      residents=(if Atomic.get host_closed then []else[scope,state]);
+    let extra=durable_status=Some `Background_ack in
+    let selected_scope=if Atomic.get status_away then status_other_scope else scope in
+    let owner=if extra then {owner with graph_id=selected_scope.graph_id;graph_generation=selected_scope.graph_generation}else owner in
+    let extra_state={state with snapshot={state.snapshot with selected_graph=Some status_other_scope.graph_id;
+      startup={state.snapshot.startup with graph_generation=2}}}in
+    let sync:C.coordination_state={account=Some scope.account;desired_residents=(if Atomic.get host_closed then []else if extra then[scope.graph_id;status_other_scope.graph_id]else[scope.graph_id]);
+      residents=(if Atomic.get host_closed then []else if extra then[scope,state;status_other_scope,extra_state]else[scope,state]);
       selected=(if Atomic.get host_closed then None else Some owner);deletion=None} in
     let physical:Logseq_db_worker.graph_state={graph_id=Some scope.graph_id;generation;phase=Graph_open;error=None} in
     Service.{registration;authority_user=None;
       limits={response_budget_bytes=P.maximum_response_bytes;outbox_max_records=4096;outbox_max_bytes=8388608;
         change_max_items=4096;change_max_bytes=1048576;dispatcher_capacity=256;wire_batch_max_bytes=262144};
       baseline={version=Int64.of_int(presentation+(if Atomic.get host_closed then 1 else 0));
-        presentation=Int64.of_int presentation;state={sync;residents=(if Atomic.get host_closed then []else[scope,physical])}}}
+        presentation=Int64.of_int presentation;state={sync;residents=(if Atomic.get host_closed then []else if extra then
+          [scope,physical;status_other_scope,{physical with graph_id=Some status_other_scope.graph_id;generation=2}]
+          else[scope,physical])}}}
   in
   let host_fixture=fixture_host_handoffs ~lifetime:(uuid 98000)
     ~registered:(fun()->Atomic.get coordination_registration) ~baseline:coordination_baseline
@@ -1062,8 +1081,22 @@ let run_favorites_native_visibility
          | Coordination_query{request={command=P.V2_get_outline_block_summary _;_};_}->Atomic.incr status_summary_queries
          | _->());
         if (match request with Service.Coordination_acknowledge_mutation _->
-          (durable_case=Some `Ack_failed || durable_case=Some `Reconfirm_failed || capture_case=Some `Ack_failed) && Atomic.get typed_status_acks=1|_->false)
-        then Error "Fixture acknowledgement failed after UI application" else
+          (durable_case=Some `Ack_failed || durable_case=Some `Reconfirm_failed || durable_case=Some `Background_ack || capture_case=Some `Ack_failed) && Atomic.get typed_status_acks=1|_->false)
+        then (
+          if durable_status=Some `Reconfirm_failed then (
+            Atomic.set status_presentation 3;
+            let current={manager with snapshot={manager.snapshot with startup={manager.snapshot.startup with presentation_generation=3}}}in
+            W.Request_context.emit context ~topic:Service.manager_topic(Service.Client_state_changed current);
+            W.Request_context.emit context ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+              (Service.Coordination_updates[Service.Coordination_snapshot
+                (coordination_baseline(Option.get(Atomic.get coordination_registration)))]));
+          if durable_status=Some `Background_ack then (
+            Atomic.set status_away true;Atomic.set status_presentation 3;
+            W.Request_context.emit context ~topic:Service.manager_topic(Service.Client_state_changed(status_focus_manager()));
+            W.Request_context.emit context ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+              (Service.Coordination_updates[Service.Coordination_snapshot
+                (coordination_baseline(Option.get(Atomic.get coordination_registration)))]));
+          Error "Fixture acknowledgement failed after UI application") else
         let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
         let cached=match request with
           | Service.Coordination_mutation{request_id;intent;_} ->
@@ -1116,6 +1149,11 @@ let run_favorites_native_visibility
              Atomic.set changed_media_fact_entered true;
              fail_this_media_read:=media_change_failure;
              while not(Atomic.get changed_media_fact_release) do
+               Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done;
+             if media_change_retire then Atomic.set hold_failed_media_recovery true)
+           else if Atomic.compare_and_set hold_failed_media_recovery true false then (
+             Atomic.set failed_media_recovery_entered true;
+             while not(Atomic.get failed_media_recovery_release) do
                Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done)
            else if Atomic.get changed_media_fact_entered then Atomic.incr changed_other_fact_completed
          | Service.Graph_request {command=P.V2_list_assets {recursive=false;roots=[root];_};_}
@@ -1215,11 +1253,11 @@ let run_favorites_native_visibility
           let sync_phase = Atomic.exchange publish_phase None in
           let error = Atomic.exchange publish_error None in
           let attention = Atomic.exchange publish_attention None in
-          let manager = if check_error_control then Atomic.get latest_error_manager else manager in
+          let manager = if check_error_control || capture_case=Some `Reopen_pending then Atomic.get latest_error_manager else manager in
           (* A current graph must carry the same manager generation. The
              startup owner deliberately rejects mixed old/new graph snapshots. *)
           if sync_phase <> None || error <> None
-             || Atomic.get graph_generation <> manager.snapshot.startup.graph_generation
+             || (capture_case<>Some `Reopen_pending && Atomic.get graph_generation <> manager.snapshot.startup.graph_generation)
           then (
             if check_error_control && Atomic.exchange publish_graph_first false then
               W.Request_context.emit context ~topic:Service.graph_state_topic
@@ -1248,12 +1286,14 @@ let run_favorites_native_visibility
               (Service.Graph_state_changed
                 {generation=Atomic.get graph_generation;graph_id=Some(uuid 900);
                  phase=Graph_open;error=None});
+          let closed=capture_case=Some `Reopen_pending && Atomic.get host_closed in
+          let focused=if durable_status=Some `Background_ack && Atomic.get status_away then status_other_scope else scope in
           Ok
             (Service.Graph_state
-               { generation = Option.value (Atomic.get reported_graph_generation)
-                   ~default:(Atomic.get graph_generation)
-               ; graph_id = Some (uuid 900)
-               ; phase = Graph_open
+               { generation = (if durable_status=Some `Background_ack then focused.graph_generation else Option.value (Atomic.get reported_graph_generation)
+                   ~default:(if closed then manager.snapshot.startup.graph_generation else Atomic.get graph_generation))
+               ; graph_id = (if closed then None else Some focused.graph_id)
+               ; phase = (if closed then Graph_closed else Graph_open)
                ; error = None
                })
         | Asset_command { command = Replace_asset_demand {consumer;_};_ }
@@ -1339,7 +1379,7 @@ let run_favorites_native_visibility
                  (Ok
                     { operation = source.operation
                     ; graph_generation
-                    ; scope
+                    ; scope={scope with graph_generation}
                     ; target = source.target
                     ; asset
                     ; file_type = source.file_type
@@ -1348,6 +1388,11 @@ let run_favorites_native_visibility
         | Import_asset _ -> Error "unexpected import"
         | Graph_request request ->
           let commit_status mutation_id block value =
+            if detail_capture=Some "status-rejected" then (
+              Alcotest.(check bool) "status failure belongs to the already inserted child"true
+                (List.exists(fun(_,root)->root.P.uuid=block)(Atomic.get detail_captures));
+              Atomic.set status_writes(Atomic.get status_writes @ [value]);
+              P.V2_failed{code="invalidRequest";message="Fixture child status rejected"})else (
             Alcotest.(check string) "status mutation keeps target UUID"
               (G.Uuid.to_string (uuid 1)) (G.Uuid.to_string block);
             Atomic.set status_writes (Atomic.get status_writes @ [ value ]);
@@ -1359,7 +1404,7 @@ let run_favorites_native_visibility
             else (
               Atomic.set status_value value;
               P.V2_mutation_committed { mutation_id; status = V2_applied; generation = "g"
-                ; before_projection_revision = "p"; after_projection_revision = "p2" })
+                ; before_projection_revision = "p"; after_projection_revision = "p2" }))
           in
           let outcome =
             match request.command with
@@ -1396,7 +1441,8 @@ let run_favorites_native_visibility
                   (if durable_delete=Some `Conflict then Conflict else Invalid_request); message = "Fixture delete failed" }
               else P.V2_mutation_committed { mutation_id; status = V2_applied; generation = "g"
                 ; before_projection_revision = "p"; after_projection_revision = "p2" }
-            | V2_set_task_status { mutation_id; block; status; _ } when Option.is_some status_scenario ->
+            | V2_set_task_status { mutation_id; block; status; _ }
+              when Option.is_some status_scenario || detail_capture=Some "status-rejected" ->
               let value =
                 List.find_map
                   (fun (slug, (d : G.task_status_definition)) ->
@@ -1405,7 +1451,8 @@ let run_favorites_native_visibility
                 |> Option.value ~default:(G.Uuid.to_string status)
               in
               commit_status mutation_id block (Some value)
-            | V2_clear_task_status { mutation_id; block; _ } when Option.is_some status_scenario ->
+            | V2_clear_task_status { mutation_id; block; _ }
+              when Option.is_some status_scenario || detail_capture=Some "status-rejected" ->
               commit_status mutation_id block None
             | P.V2_graph_info ->
               P.V2_graph_info_outcome
@@ -1477,7 +1524,7 @@ let run_favorites_native_visibility
               Atomic.set changes_acknowledged true;
               V2_changes_acknowledged {generation;through}
             | V2_get_outline_block { block; _ } ->
-              if Atomic.get detail_observed_failure && block=uuid 1 then V2_failed{
+              if block=uuid 1 && Atomic.exchange detail_observed_failure false then V2_failed{
                 code=Logseq_db_worker.Error.code_string Invalid_request;message="Observation sample failed"}
               else if Atomic.get detail_observed_missing && block=uuid 1 then
                 V2_block_outcome(V2_missing_block{uuid=block;revision="observed-missing"})
@@ -1777,7 +1824,9 @@ let run_favorites_native_visibility
                   ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok];
                 next_cursor=Some(G.Cursor.of_string "offline-next" |> Result.get_ok)}
             | V2_list_assets { roots; _ } ->
-              if !fail_this_media_listing || (Atomic.get fail_media_listings && List.exists(G.Uuid.equal(uuid 1))roots) then V2_failed {code="FixtureReadFailure";message="Synthetic Media listing failed"}
+              if !fail_this_media_listing || (Atomic.get fail_media_listings && List.exists(G.Uuid.equal(uuid 1))roots) then (
+                Atomic.set fail_media_listings false;
+                V2_failed {code="FixtureReadFailure";message="Synthetic Media listing failed"})
               else (
               Atomic.set queried (List.rev_append roots (Atomic.get queried));
               V2_assets_outcome
@@ -1873,9 +1922,10 @@ let run_favorites_native_visibility
                       before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"}})
                 | _->Wire.Rejected response in
               Hashtbl.replace durable_outcomes intent outcome;
-              Service.Coordination_mutation_result{request_id;outcome=(if (durable_case=Some `Unknown || capture_case=Some `Unknown)
+              Service.Coordination_mutation_result{request_id;outcome=(if (durable_case=Some `Unknown || capture_case=Some `Unknown || edit_pending)
                 && Atomic.get typed_status_mutations=1 then Wire.Unknown else outcome)}
             | Coordination_confirm _ when (durable_case=Some `Confirm_failed && Atomic.get typed_status_confirms=1)
+              || (edit_pending && Atomic.get typed_status_confirms=1)
               || (durable_status=Some `Reconfirm_failed && Atomic.get typed_status_confirms=2) ->
               Service.Graph_response(P.V2_response{api_version=2;request_id=request.request_id;
                 outcome=V2_failed{code="invalidRequest";message="Fixture canonical read failed"}})
@@ -1887,7 +1937,8 @@ let run_favorites_native_visibility
             | Coordination_confirm _ ->
               Service.Graph_response(match response with P.V2_response({outcome=V2_block_summary_outcome value;_}as response)->
                 P.V2_response{response with outcome=V2_block_summary_outcome{value with
-                  generation="generation:v1:1:1";projection_revision="projection:v1:1"}}|_->response)
+                  generation=Printf.sprintf "generation:v1:1:%d"(Atomic.get graph_generation);
+                  projection_revision="projection:v1:1"}}|_->response)
             | _->Service.Graph_response response)))
       ~shutdown:(fun () -> Atomic.set shutdown_called true)
       ()
@@ -2041,6 +2092,7 @@ let run_favorites_native_visibility
   in
   Fun.protect
     ~finally:(fun () ->
+      Atomic.set failed_media_recovery_release true;
       Atomic.set coordination_release_allowed true;
       Atomic.set changed_media_fact_release true;
       Atomic.set media_descendant_release true;
@@ -2272,46 +2324,17 @@ let run_favorites_native_visibility
            wait "returning to an earlier cause becomes a new latest occurrence" (fun () -> syntax_occurrences ()=2);
            dispatch (Lui_protocol.Press (Option.get
              (find "accessibility-identifier" "journal-diagnostics-close"))))) malformed_native_event;
-       if check_pending_changes then (
+       if check_pending_changes || check_import_recovery then (
          dispatch (Lui_protocol.Press (Option.get (find "text" "Diagnostics")));
-         let first=G.Uuid.to_string(uuid 20000) and last=G.Uuid.to_string(uuid 20020) in
-         wait "recovery renders its first bounded page" (fun () ->
-           Option.is_some(find "text" first) && Option.is_some(find "text" "Page 1; more available"));
-         Alcotest.(check bool) "recovery labels uncertainty" true
-           (Option.is_some(find "text" "Outcome unknown"));
-         let press_text text = dispatch (Lui_protocol.Press
-           (ancestor_property (Option.get(find "text" text)) "press-enabled")) in
-         press_text "Next pending changes";
-         wait "recovery renders the next page" (fun () ->
-           Option.is_some(find "text" last) && Option.is_some(find "text" "Page 2; end of results"));
-         Alcotest.(check bool) "recovery only retains the current bounded page" true
-           (Option.is_none(find "text" first));
-         Alcotest.(check int) "More consumes exactly one cursor" 2 (Atomic.get pending_change_reads);
-         press_text "Reload pending changes";
-         wait "explicit recovery reload returns to first page" (fun () ->
-           Option.is_some(find "text" first) && Atomic.get pending_change_reads=3);
-         Alcotest.(check int) "viewing recovery never submits a mutation" 0 (Atomic.get typed_status_mutations);
-         Alcotest.(check int) "viewing recovery never acknowledges an intent" 0 (Atomic.get typed_status_acks);
+         wait "original Diagnostics opens" (fun () -> Option.is_some(find "text" "Phases"));
+         Alcotest.(check bool) "refactor keeps the original Diagnostics sections" true
+           (Option.is_none(find "text" "Pending local changes")
+            && Option.is_none(find "text" "Recorded attachment inputs"));
+         Alcotest.(check int) "opening Diagnostics does not add recovery reads" 0
+           (Atomic.get pending_change_reads + Atomic.get source_reads);
+         Alcotest.(check int) "opening Diagnostics does not acknowledge recovery" 0
+           (Atomic.get source_acks + Atomic.get typed_status_acks);
          dispatch (Lui_protocol.Press(Option.get(find "accessibility-identifier" "journal-diagnostics-close"))));
-       if check_import_recovery then (
-         dispatch(Lui_protocol.Press(Option.get(find "text" "Diagnostics")));
-         wait "prepared and unknown input rows mount from typed source recovery" (fun()->
-           Option.is_some(find "text" "Prepared attachment input") && Option.is_some(find "text" "Unknown attachment input"));
-         Alcotest.(check bool) "unprepared input keeps explicit unknown status" true
-           (Option.is_some(find "text" "Preparation outcome unknown; input retained."));
-         let review_buttons()=Hashtbl.fold(fun _ fields count->
-           if List.assoc_opt "text" fields=Some(`String "Mark reviewed")then count+1 else count)props 0 in
-         Alcotest.(check int) "only actual Prepared input exposes review ACK" 1(review_buttons());
-         dispatch(Lui_protocol.Press(ancestor_property(Option.get(find "text" "Mark reviewed"))"press-enabled"));
-         wait "source review performs one ACK then reloads pending membership" (fun()->
-           Atomic.get source_acks=1 && Atomic.get source_reads=2 && Option.is_none(find "text" "Prepared attachment input")
-           && Option.is_some(find "text" "Unknown attachment input"));
-         Alcotest.(check int) "unknown input has no review action" 0(review_buttons());
-         Alcotest.(check int) "review never issues a graph mutation" 0(Atomic.get typed_status_mutations);
-         let next=ancestor_property(Option.get(find "text" "Next attachment inputs"))"press-enabled" in
-         Alcotest.(check (option bool)) "complete source page disables next" (Some false)
-           (Option.map Yojson.Safe.Util.to_bool(List.assoc_opt "enabled"(Hashtbl.find props next)));
-         dispatch(Lui_protocol.Press(Option.get(find "accessibility-identifier" "journal-diagnostics-close"))));
        (* Delete admission is private to Application, absent from Root_navigation's
           public pure events. Use its existing public bridge and controlled Worker
           fixture to execute the actual UI admission/completion boundary. *)
@@ -2346,11 +2369,8 @@ let run_favorites_native_visibility
             Alcotest.(check int) "unconfirmed deletion cannot ACK" 0(Atomic.get typed_status_acks);
             Atomic.set status_confirm_release true
           | Some(`Unknown|`Confirm_failed|`Ack_failed)->
-            wait "unsettled deletion exposes same-intent Retry" (fun()->Option.is_some(find "accessibility-label" "Retry delete"));
-            Alcotest.(check bool) "unknown accepted deletion is not called failed" true(Option.is_none(find "text" "Delete failed"));
-            Alcotest.(check int) "unsettled deletion has no completed ACK"
-              (if durable_delete=Some `Ack_failed then 1 else 0)(Atomic.get typed_status_acks);
-            dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Retry delete")))
+            Alcotest.(check bool) "local deletion never exposes user Retry" true
+              (Option.is_none(find "accessibility-label" "Retry delete"))
           | _->());
          wait "delete completion updates content or shows failure" (fun () ->
            if scenario = "failure" then Option.is_some (find "text" "Delete failed")
@@ -2465,21 +2485,18 @@ let run_favorites_native_visibility
               Alcotest.(check bool) "pending status cannot reopen another operation" true (Option.is_none (option "doing"));
               Atomic.set status_release true);
             (match durable_status with
-             | Some `Reconfirm_failed->
-               wait "initial ACK failure offers cleanup Retry" (fun()->Option.is_some(find "accessibility-label" "Retry status"));
-               Atomic.set status_presentation 3;
-               let manager={manager with snapshot={manager.snapshot with startup={manager.snapshot.startup with presentation_generation=3}}} in
-               W.Session_context.emit(Option.get !worker_context) ~topic:Service.manager_topic(Service.Client_state_changed manager);
-               W.Session_context.emit(Option.get !worker_context)
-                 ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+             | Some `Background_ack->
+               wait "ACK returns while another actual resident is selected"(fun()->Atomic.get typed_status_acks=1);
+               for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+               Atomic.set status_away false;Atomic.set status_presentation 4;
+               let context=Option.get !worker_context in
+               W.Session_context.emit context ~topic:Service.manager_topic(Service.Client_state_changed(status_focus_manager()));
+               W.Session_context.emit context ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
                  (Service.Coordination_updates[Service.Coordination_snapshot
-                   (coordination_baseline(Option.get(Atomic.get coordination_registration)))]);
-               for _=1 to 80 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
-               dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Retry status")));
-               wait "re-confirmation failure restores same-intent Retry" (fun()->
-                 Atomic.get typed_status_confirms=2 && Option.is_some(find "accessibility-label" "Retry status"));
-               Alcotest.(check int) "failed new presentation cannot ACK old UI proof" 1(Atomic.get typed_status_acks);
-               dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Retry status")))
+                   (coordination_baseline(Option.get(Atomic.get coordination_registration)))])
+             | Some `Reconfirm_failed->
+               Alcotest.(check bool) "focus recovery does not expose local Retry" true
+                 (Option.is_none(find "accessibility-label" "Retry status"))
              | Some `Paged->
                wait "canonical More request is held" (fun()->Atomic.get status_more_entered);
                for _=1 to 50 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
@@ -2495,12 +2512,8 @@ let run_favorites_native_visibility
                Alcotest.(check bool) "unconfirmed status cannot start another choice" true(Option.is_none(option "doing"));
                Atomic.set status_confirm_release true
              | Some(`Unknown|`Confirm_failed|`Ack_failed)->
-               wait "unsettled status offers same-intent Retry" (fun()->Option.is_some(find "accessibility-label" "Retry status"));
-               Alcotest.(check bool) "unsettled accepted write is not reported as unchanged" true
-                 (Option.is_none(find "text" "Status not changed"));
-               Alcotest.(check int) "unsettled status has no completed durable ACK"
-                 (if durable_status=Some `Ack_failed then 1 else 0)(Atomic.get typed_status_acks);
-               dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Retry status")))
+               Alcotest.(check bool) "local status never exposes user Retry" true
+                 (Option.is_none(find "accessibility-label" "Retry status"))
              | _->());
             wait "status operation completes" (fun () ->
               if scenario = "failure" then Option.is_some (find "text" "Status not changed")
@@ -2533,9 +2546,9 @@ let run_favorites_native_visibility
            Alcotest.(check int) "status UI uses typed durable intent" (if durable_status=Some `Unknown then 2 else 1)
              (Atomic.get typed_status_mutations);
            Alcotest.(check int) "known rejection needs no canonical readback"
-             (match durable_status with Some(`Rejected|`Conflict)->0|Some `Confirm_failed->2|Some `Reconfirm_failed->3|_->1)
+             (match durable_status with Some(`Rejected|`Conflict)->0|Some `Confirm_failed->2|Some `Reconfirm_failed->3|Some `Background_ack->2|_->1)
              (Atomic.get typed_status_confirms);
-           Alcotest.(check int) "only failed ACK is retried" (if durable_status=Some `Ack_failed || durable_status=Some `Reconfirm_failed then 2 else 1)
+           Alcotest.(check int) "only failed ACK is retried" (if durable_status=Some `Ack_failed || durable_status=Some `Reconfirm_failed || durable_status=Some `Background_ack then 2 else 1)
              (Atomic.get typed_status_acks);
            if durable_status=Some `Conflict then Alcotest.(check int)
              "known conflict uses ordinary canonical read without another write" 1(Atomic.get status_summary_queries);
@@ -2853,20 +2866,20 @@ let run_favorites_native_visibility
                  enter 0
                | Some `Failure->
                  let registrations=Atomic.get detail_observes and releases=Atomic.get detail_releases in
+                 Atomic.set detail_observed_title true;
                  Atomic.set detail_observed_failure true;invalidate 1L;
-                 (try wait "observation read failure keeps its source in Detail" (fun()->Option.is_some(find "text" "invalidRequest: Observation sample failed"))
-                  with error->Printf.eprintf "OBSERVATION visible texts=%s\n%!"
-                    (Hashtbl.fold(fun _ values texts->match List.assoc_opt "text" values with
-                      | Some(`String text)->text::texts|_->texts)props[] |> String.concat " | ");raise error);
+                 dispatch(Lui_protocol.Press(Option.get(find "text" "Diagnostics")));
+                 wait "observation read failure uses existing Diagnostics" (fun()->Option.is_some(find "text" "invalidRequest: Observation sample failed"));
+                 dispatch(Lui_protocol.Press(Option.get(find "accessibility-identifier" "journal-diagnostics-close")));
+                 Alcotest.(check bool) "refactor adds no observation retry control" true
+                   (Option.is_none(find "text" "Retry observation"));
                  Alcotest.(check bool) "failed refresh preserves existing Detail content" true
                    (Option.is_some(find "accessibility-identifier" ("detail-block:"^G.Uuid.to_string(uuid 1))));
                  Alcotest.(check int) "failed read does not unregister" releases(Atomic.get detail_releases);
-                 Atomic.set detail_observed_failure false;Atomic.set detail_observed_title true;
-                 dispatch(Lui_protocol.Press(ancestor_property(Option.get(find "text" "Retry observation"))"press-enabled"));
-                 wait "failed observation recovers without a new registration" (fun()->Option.is_some(find "text" "Observed root updated"));
+                 wait "failed observation automatically recovers without another invalidation or registration" (fun()->Option.is_some(find "text" "Observed root updated"));
                  Alcotest.(check int) "read recovery retains exact registration" registrations(Atomic.get detail_observes);
-                 Alcotest.(check bool) "successful refresh clears only its owned read error" true
-                   (Option.is_none(find "text" "invalidRequest: Observation sample failed"))
+                 Alcotest.(check bool) "successful refresh adds no new Detail feedback" true
+                   (Option.is_none(find "text" "Retry observation"))
                | None->()));
             if scenario = "legacy-interrupted" then (
               (* No pure reducer owns native completion copy or the Worker queue.
@@ -2935,7 +2948,7 @@ let run_favorites_native_visibility
             if
               List.mem
                 scenario
-                [ "attachments"; "attachment-only"; "offscreen-attachments"; "selection-error"; "picker-owner"; "retry-imports"; "attachment-limit"; "interrupted-imports" ]
+                [ "attachments"; "status-rejected"; "attachment-only"; "offscreen-attachments"; "selection-error"; "picker-owner"; "retry-imports"; "attachment-limit"; "interrupted-imports" ]
             then (
               dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Files")));
               let adapter, request =
@@ -3063,6 +3076,7 @@ let run_favorites_native_visibility
                 (Atomic.get child_attempts);
               open_capture ();
               edit "New root draft");
+            if scenario="status-rejected"then dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Task")));
             dispatch (Lui_protocol.Press (send ()));
             wait "child command is admitted" (fun () -> Atomic.get child_attempts = 1);
             if scenario = "duplicate"
@@ -3092,6 +3106,10 @@ let run_favorites_native_visibility
               dispatch (Lui_protocol.Press (send ())));
             wait "one committed child is retained" (fun () ->
               List.length (Atomic.get detail_captures) = 1);
+            if scenario="status-rejected"then (
+              wait "known rejected status completes both actual ACKs"(fun()->Atomic.get typed_status_acks=2);
+              wait "applied creation does not remain in Saving"(fun()->Option.is_none(find "text" "Saving…"));
+              Alcotest.(check bool) "status failure adds no user Retry"true(Option.is_none(find "text" "Retry")));
             let parent, child = List.hd (Atomic.get detail_captures) in
             Alcotest.(check string)
               "Send targets current Detail root"
@@ -3117,24 +3135,11 @@ let run_favorites_native_visibility
               wait "both imports finish" (fun () -> Atomic.get imports_finished = 2);
               if List.mem scenario ["retry-imports";"interrupted-imports"]
               then (
-                wait "failed import exposes target retry" (fun () ->
-                  Option.is_some (find "accessibility-label" "Retry imports"));
-                dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Details")));
-                wait "retained imports explain in-place retry" (fun () ->
-                    Option.is_some
-                      (find
-                         "text"
-                         "Your journal entry and other attachments are kept. Select \
-                          Retry imports to try again."));
-                if scenario = "interrupted-imports" then
-                  Alcotest.(check bool) "interrupted retained import gives retry guidance" true
-                    (Option.is_some (find "text" "Import was interrupted. Select Retry imports to try again."));
-                Alcotest.(check bool) "retained import never requires reselection" true
-                    (Option.is_none
-                       (find
-                          "text"
-                          "Your journal entry and other attachments are kept. Select the \
-                           file again to retry."));
+                wait "failed import retains Details" (fun()->Option.is_some(find "accessibility-label" "Details"));
+                Alcotest.(check bool) "local import has no user Retry" true
+                  (Option.is_none(find "accessibility-label" "Retry imports"));
+                dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Details")));
+                wait "retained imports keep existing entry" (fun()->Option.is_some(find "text" "Your journal entry and other attachments are kept."));
                 dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Close")));
                 (* Routes reducers own the path, but cannot express native
                    feedback ancestry or layout. Mount the real failure through the
@@ -3154,7 +3159,7 @@ let run_favorites_native_visibility
                   (Some "root")
                   (Option.map Yojson.Safe.Util.to_string (navigation_page root_actions));
                 let detail_actions =
-                  all "accessibility-label" "Retry imports"
+                  all "accessibility-label" "Details"
                   |> List.find (fun id -> navigation_page id <> Some (`String "root"))
                 in
                 Alcotest.(check bool)
@@ -3220,30 +3225,20 @@ let run_favorites_native_visibility
                   "retired Detail feedback cannot start an import retry"
                   2
                   (Atomic.get imports_finished);
-                let current_retry =
-                  all "accessibility-label" "Retry imports"
-                  |> List.find (fun id ->
-                    match navigation_page id with
-                    | Some (`String entry) -> entry <> "root"
-                    | _ -> false)
-                in
-                dispatch (Lui_protocol.Press current_retry);
-                wait "same child import retries" (fun () ->
-                  Atomic.get imports_finished = 3);
-                wait "successful retry retires both feedback controls" (fun () ->
-                  all "accessibility-label" "Retry imports" = []);
-                Alcotest.(check int)
-                  "import retry does not create another child"
-                  1
-                  (Atomic.get child_attempts));
+                Alcotest.(check bool) "local import error has no retry controls" true
+                  (all "accessibility-label" "Retry imports" = []);
+                Alcotest.(check int) "no implicit Import replay creates another child" 1(Atomic.get child_attempts));
               if not (List.mem scenario [ "retry-imports"; "interrupted-imports"; "selection-error" ]) then (
                 wait "failed import offers explicit discard" (fun () -> Option.is_some (find "accessibility-label" "Dismiss"));
                 dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Dismiss"))));
-              wait "all staging files are released" (fun () ->
-                List.for_all (fun p -> not (Sys.file_exists p)) !staged_paths);
+              if List.mem scenario ["retry-imports";"interrupted-imports"] then (
+                Alcotest.(check bool) "Unknown input retains its original source" true(Sys.file_exists(List.hd !staged_paths));
+                Alcotest.(check bool) "successful independent input releases staging" true
+                  (not(Sys.file_exists(List.nth !staged_paths 1))))
+              else wait "all staging files are released" (fun()->List.for_all(fun p->not(Sys.file_exists p))!staged_paths);
               Alcotest.(check (list string))
                 "imports target the newly appended child"
-                (List.init (if List.mem scenario ["retry-imports";"interrupted-imports"] then 3 else 2) (fun _ -> G.Uuid.to_string child.uuid))
+                (List.init 2 (fun _ -> G.Uuid.to_string child.uuid))
                 (List.map G.Uuid.to_string (Atomic.get import_targets));
               if scenario = "offscreen-attachments"
               then
@@ -3255,12 +3250,17 @@ let run_favorites_native_visibility
             then (
               wait "completion closes the entire Detail Composer after durable ACK" (fun () ->
                 Option.is_none (find "accessibility-identifier" "journal-append-composer"));
-              Alcotest.(check int) "child UI consumed each durable outcome" (if scenario="failure" then 2 else 1)
+              Alcotest.(check int) "child UI consumed each durable outcome" (if scenario="failure" || scenario="status-rejected" then 2 else 1)
                 (Atomic.get typed_status_acks);
-              Alcotest.(check int) "child writes use the typed channel" (if scenario="failure" then 2 else 1)
+              Alcotest.(check int) "child writes use the typed channel" (if scenario="failure" || scenario="status-rejected" then 2 else 1)
                 (Atomic.get typed_status_mutations);
               Alcotest.(check bool) "child completion used canonical confirmation" true (Atomic.get typed_status_confirms>=1);
               Alcotest.(check int) "child writes have no legacy second consumer" 0 (Atomic.get legacy_child_writes);
+              if scenario="status-rejected"then (
+                dispatch(Lui_protocol.Press(Option.get(find "text" "Diagnostics")));
+                wait "known failed status remains in existing Diagnostics" (fun () ->
+                  Option.is_some (find "text" "Fixture child status rejected"));
+                dispatch(Lui_protocol.Press(Option.get(find "accessibility-identifier" "journal-diagnostics-close"))));
               if scenario = "selection-error" then (
                 open_capture ();
                 Alcotest.(check bool) "completed Detail retires picker failure" true
@@ -3780,33 +3780,21 @@ let run_favorites_native_visibility
                  (Atomic.get changes_acknowledged);
                Atomic.set media_descendant_release true);
              if media_change_failure || media_descendant_failure then (
-               wait "failed Media dependency has explicit Retry feedback" (fun()->Option.is_some(find "text" "Retry attachments"));
-               for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
-               Alcotest.(check bool) "failed Media consumer preserves unACKed window" false
-                 (Atomic.get changes_acknowledged);
-               for _round=1 to (if media_descendant_failure then 2 else 1) do
-               let pulls=Atomic.get change_pull_reads in
-               Atomic.set publish_block true;
-               ignore(W.send(Option.get !client)Service.Get_graph_state);
-               wait "failed application receives another actual Changes delivery" (fun()->Atomic.get change_pull_reads>pulls);
-               for _=1 to 100 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
-               Alcotest.(check bool) "new application retains its failed Media interest" false
-                 (Atomic.get changes_acknowledged);
-               done;
+               Alcotest.(check bool) "local Media failure offers no Retry" true
+                 (Option.is_none(find "text" "Retry attachments"));
                if media_change_retire then (
+                 wait "automatic Media recovery is genuinely in flight" (fun()->Atomic.get failed_media_recovery_entered);
+                 Alcotest.(check bool) "unapplied recovery keeps Changes unACKed" false(Atomic.get changes_acknowledged);
                  hooks.extension_event list_node "event"
                    (Yojson.Safe.to_string(`Assoc["id",`Int 1;"payload",`String
                      (Yojson.Safe.to_string(`Assoc["type",`String "visible_range";"first",`Int 2;"last",`Int(count+1)]))])) |> consume;
+                 Atomic.set failed_media_recovery_release true;
                  let pulls=Atomic.get change_pull_reads in
                  Atomic.set publish_block true;
                  ignore(W.send(Option.get !client)Service.Get_graph_state);
-                 wait "business retirement is followed by an actual Changes delivery" (fun()->Atomic.get change_pull_reads>pulls);
-                 wait "retired Media interest does not block the new application" (fun()->Atomic.get changes_acknowledged))
-               else (
-                 Atomic.set fail_media_listings false;
-                 dispatch(Lui_protocol.Press(Option.get(find "text" "Retry attachments")));
-                 wait "explicit Media Retry rejoins and completes the retained Changes application"
-                   (fun()->Atomic.get changes_acknowledged)))
+                 wait "retirement receives another actual Changes delivery" (fun()->Atomic.get change_pull_reads>pulls);
+                 wait "retired interest no longer blocks Changes" (fun()->Atomic.get changes_acknowledged))
+               else wait "automatic Media recovery applies before Changes ACK" (fun()->Atomic.get changes_acknowledged))
              else wait "Changes ACK progresses after Media DTO and descendants apply"
                (fun()->Atomic.get changes_acknowledged))
          ) else if check_media_rebind then (
@@ -4690,37 +4678,76 @@ let run_favorites_native_visibility
                    ("composer-attachment:" ^ G.Uuid.to_string (uuid 30001))));
            dispatch (Lui_protocol.Press (Option.get (find "accessibility-label" "Send")));
            (match capture_case with
-            | Some `Held->
+            | Some (`Held|`Edit_pending|`Reopen_pending)->
               wait "Capture canonical read is held" (fun()->Atomic.get status_confirm_entered);
+              Alcotest.(check bool) "ordinary Saving retains original composer" true
+                (Option.is_none(find "text" "The entry may already be saved. Choose a status and retry to confirm it before editing."));
               Alcotest.(check int) "unapplied canonical result cannot ACK" 0(Atomic.get typed_status_acks);
               Alcotest.(check int) "unapplied canonical result cannot import" 0(Atomic.get imports_finished);
               Alcotest.(check bool) "held canonical result keeps staged attachments" true
                 (List.for_all Sys.file_exists !staged_paths);
               Alcotest.(check bool) "held result retains Composer" true
                 (Option.is_some(find "accessibility-identifier" "journal-capture-composer"));
-              Atomic.set status_confirm_release true
+              if edit_pending then (
+                let editor=Option.get(find "style-class" "composer-input")in
+                dispatch(Lui_protocol.TextChanged(editor,"New draft while original settles"));
+                wait "pending native composer accepts newer text"(fun()->
+                  Option.is_some(find "text" "New draft while original settles"));
+                dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Send")));
+                Alcotest.(check int) "pending draft cannot issue another physical creation" 1(Atomic.get capture_append_writes));
+              Atomic.set status_confirm_release true;
+              if capture_case=Some `Reopen_pending then (
+                settle_worker();
+                Alcotest.(check bool) "failed original confirmation has not started imports"true(Atomic.get imports_entered=[]);
+                Atomic.set host_closed true;Atomic.set status_presentation 2;
+                let context=Option.get !worker_context in
+                let push state graph=
+                  Atomic.set latest_error_manager state;
+                  W.Session_context.emit context ~topic:Service.manager_topic(Service.Client_state_changed state);
+                  W.Session_context.emit context ~topic:Service.graph_state_topic(Service.Graph_state_changed graph);
+                  W.Session_context.emit context ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+                    (Service.Coordination_updates[Service.Coordination_snapshot
+                      (coordination_baseline(Option.get(Atomic.get coordination_registration)))])in
+                let closed={manager with snapshot={manager.snapshot with selected_graph=None;resident_graphs=[];resident_scopes=[];
+                  startup={manager.snapshot.startup with awaiting_selection=true;graph_generation=2;presentation_generation=2}}}in
+                push closed {Logseq_db_worker.graph_id=None;generation=2;phase=Graph_closed;error=None};
+                wait "actual closed-owner snapshot retires the graph surface"(fun()->Option.is_some(find "accessibility-identifier"
+                  ("graph-picker:" ^ G.Uuid.to_string scope.graph_id)));
+                for _=1 to 600 do hooks.pump() |> consume;Unix.sleepf 0.001 done;
+                Alcotest.(check int) "retired owner timer cannot issue another confirmation"1(Atomic.get typed_status_confirms);
+                Atomic.set host_closed false;Atomic.set graph_generation 2;Atomic.set status_presentation 4;
+                let fresh={scope with graph_generation=2}in
+                let reopened={manager with snapshot={manager.snapshot with selected_graph=Some scope.graph_id;
+                  resident_graphs=[scope.graph_id];resident_scopes=[fresh];
+                  startup={manager.snapshot.startup with awaiting_selection=false;graph_generation=2;presentation_generation=4}}}in
+                push reopened {Logseq_db_worker.graph_id=Some scope.graph_id;generation=2;phase=Graph_open;error=None})
             | Some (`Ack_failed|`Unknown)->
-              wait "Capture exposes retry after uncertain settlement" (fun()->
-                (if capture_case=Some `Ack_failed then Atomic.get typed_status_acks=1
-                   && Option.is_some(find "text" "The child result is applied. Retry finishes its durable acknowledgement.")
-                 else Atomic.get typed_status_mutations=1
-                   && Option.is_some(find "text" "The child outcome is unknown. Retry checks the same operation."))
-                && Option.is_some(find "text" "Retry"));
-              Alcotest.(check int) "unsettled Capture cannot start imports" 0(Atomic.get imports_finished);
-              Alcotest.(check bool) "unsettled Capture retains Composer" true
-                (Option.is_some(find "accessibility-identifier" "journal-capture-composer"));
-              Alcotest.(check bool) "unsettled Capture keeps original staged bytes" true
-                (List.for_all Sys.file_exists !staged_paths);
-              dispatch(Lui_protocol.Press(ancestor_property(Option.get(find "text" "Retry"))"press-enabled"))
+              wait "Capture automatically reconciles its original operation" (fun()->
+                Atomic.get imports_entered <> []);
+              Alcotest.(check bool) "local recovery has no user Retry" true
+                (Option.is_none(find "text" "Retry"))
             | None|Some (`Paged|`Closed_import|`Closed_failed_import)->());
            (try wait "first attachment enters actual Worker handler" (fun () ->
              Atomic.get imports_entered <> []) with error->
+             if capture_case=Some `Reopen_pending then (
+               Option.iter(fun id->dispatch(Lui_protocol.Press id))(find "text" "Diagnostics");
+               for _=1 to 5 do hooks.pump() |> consume done);
              Printf.eprintf "CAPTURE retry mutations=%d confirms=%d acks=%d texts=%s\n%!"
                (Atomic.get typed_status_mutations)(Atomic.get typed_status_confirms)(Atomic.get typed_status_acks)
                (Hashtbl.fold(fun _ values texts->match List.assoc_opt "text" values with
                  | Some(`String text)->text::texts|_->texts)props[] |> String.concat " | ");
              raise error);
            Alcotest.(check int) "Capture performs exactly one physical Append" 1(Atomic.get capture_append_writes);
+           if edit_pending then (
+             if capture_case=Some `Reopen_pending then (
+               wait "new binding resumes the retained original creation"(fun()->Atomic.get typed_status_acks=1);
+               wait "settled new owner exposes the existing Capture action"(fun()->Option.is_some(find "accessibility-label" "Capture"));
+               dispatch(Lui_protocol.Press(Option.get(find "accessibility-label" "Capture"))));
+             wait "late original ACK preserves the edited native draft"(fun()->
+               Option.is_some(find "text" "New draft while original settles"));
+             Alcotest.(check bool) "original durable payload never uses the newer buffer" true
+               (List.for_all(fun encoded->match Logseq_db_worker_contract.Mutation_pure_wire.command(durable_intent encoded)with
+                 |P.V2_append_journal{root;_}->root.title="First attachment"|_->false)(Atomic.get typed_status_intents)));
            Alcotest.(check int) "Capture has no legacy write consumer" 0(Atomic.get legacy_capture_writes);
            Alcotest.(check int) "canonical Capture was ACKed before imports" (if capture_case=Some `Ack_failed then 2 else 1)
              (Atomic.get typed_status_acks);
@@ -6762,15 +6789,12 @@ let test_local_account_failure_retries_local_discovery ?(typed_reason=false) ?(r
         (Option.is_none(find "journal-startup-retry")));
     hooks.platform_failure (if typed_reason then typed_failure 0L
       else Bytes.to_string (List.hd (local_requests ())));
-    wait "transient local failure retains a local Retry" (fun () -> Option.is_some (find "journal-startup-retry"));
+    wait "local failure reaches its existing error page" (fun()->Hashtbl.fold(fun _ props found->found || List.assoc_opt "text" props=Some(`String "Unable to prepare your account"))props false);
+    Alcotest.(check bool) "local failure has no user Retry" true(Option.is_none(find "journal-startup-retry"));
     if typed_reason then (
       consume(hooks.dispatch(Lui_protocol.Press(Option.get(find "journal-startup-diagnostics"))));
-      wait "typed platform reason reaches mounted diagnostics" (fun () -> Hashtbl.fold (fun _ props found -> found ||
-        List.assoc_opt "text" props=Some(`String "native.platform.network · The native account request could not connect. Check your connection and retry.")) props false))
-    else (
-      let before=List.length (local_requests ()) in
-      consume (hooks.dispatch (Lui_protocol.Press (Option.get (find "journal-startup-retry"))));
-      wait "Retry reissues local discovery" (fun () -> List.length (local_requests ()) = before+1));
+      wait "typed platform reason reaches mounted diagnostics" (fun()->Hashtbl.fold(fun _ props found->found ||
+        List.assoc_opt "text" props=Some(`String "native.platform.network · The native account request could not connect. Check your connection and retry."))props false));
     Alcotest.(check bool) "local retry requests no online permission" false
       (List.exists (fun bytes -> Bytes.get_uint16_le bytes 6 = 30) !requests))
 ;;
@@ -7473,15 +7497,15 @@ let test_account_pure_lifecycle_properties () =
   done
 ;;
 
-let test_graph_picker_controls ?(check_recovery_focus=false) ?(check_import_recovery_focus=false) scenario () =
-  let check_recovery_focus=check_recovery_focus || check_import_recovery_focus in
+let test_graph_picker_controls scenario () =
   let lose_host_reply=List.mem scenario [`Sign_out_unknown;`Terminate_unknown] in
   let scenario=match scenario with `Sign_out_unknown->`Sign_out|`Terminate_unknown->`Terminate|other->other in
   let host_readbacks=Atomic.make 0 in
   let reordered=scenario=`Reordered_open || scenario=`Reordered_full in
   let automatic_auth=List.mem scenario [`Automatic_auth;`Automatic_direct;`Automatic_stop] in
   let during_delete=List.mem scenario [`During_delete;`Terminate_during_delete] in
-  let resident_scenario=List.mem scenario [`Current;`Remove;`Replace;`Sign_out;`Terminate;`Automatic_auth;`Automatic_direct;`Automatic_stop] in
+  let held_close=List.mem scenario[`Remove_reopen;`Remove_select;`Remove_cancel;`Remove_failure;`Remove_sign_out] in
+  let resident_scenario=List.mem scenario [`Current;`Remove;`Remove_current;`Remove_reopen;`Remove_select;`Remove_cancel;`Remove_failure;`Remove_sign_out;`Replace;`Sign_out;`Terminate;`Automatic_auth;`Automatic_direct;`Automatic_stop] in
   let module W = Logseq_db_worker_lui.Journal_worker in
   let module P = Logseq_db_worker.Protocol in
   let uuid n = Logseq_db_types.Graph_types.Uuid.of_string
@@ -7516,12 +7540,12 @@ let test_graph_picker_controls ?(check_recovery_focus=false) ?(check_import_reco
   let module H=Logseq_db_worker_pure_reducer.Core.Host_handoff in
   let handoffs=ref(H.empty ~lifetime:(uuid 90000)) in
   let host_prepared=Atomic.make 0 and host_applied=Atomic.make 0 in
+  let prepare_held=Atomic.make false and release_prepare=Atomic.make false in
+  let prepare_failed=Atomic.make false and registration_count=Atomic.make 0 in
   let legacy_deletions=Atomic.make 0 in
   let failed_registration=Atomic.make None in
   let termination_ready=ref 0 and native_sign_outs=ref 0 in
   let auth_classified=ref [] and unregister_entered=Atomic.make false and unregister_allowed=Atomic.make true in
-  let recovery_writes=Atomic.make 0 in
-  let recovery_entered=Atomic.make false and recovery_release=Atomic.make false and recovery_finished=Atomic.make false in
   let inspections = Atomic.make 0 and deletions = Atomic.make [] in
   let finish_deletion = Atomic.make false in
   let deletion_terminal = ref false in
@@ -7543,14 +7567,12 @@ let test_graph_picker_controls ?(check_recovery_focus=false) ?(check_import_reco
         auth_classified:=user_id::!auth_classified;
         Some(W.Latest{topic=0;key=Option.value user_id ~default:"<none>";invalidates=None})|_->None)
       ~handle_control:(fun () _->())
-      ~concurrency:(if check_recovery_focus || scenario = `Late_presence || scenario = `Late_graph_cancel
-                    || automatic_auth then Concurrent { max_in_flight = 2 } else Serial)
+      ~concurrency:(if scenario = `Late_presence || scenario = `Late_graph_cancel
+                    || automatic_auth || held_close then Concurrent { max_in_flight = 2 } else Serial)
       ~init:(fun context _ ->
         W.Session_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed manager);
         Ok ())
       ~handle:(fixture_observations (fun context () request ->
-        (match request with Service.Coordination_mutation _ | Coordination_acknowledge_mutation _ ->
-          Atomic.incr recovery_writes | _ -> ());
         let publish value =
           let value=fixture_with_scope value in
           Atomic.set current value;
@@ -7575,11 +7597,15 @@ let test_graph_picker_controls ?(check_recovery_focus=false) ?(check_import_reco
         let query_owner=match request with
           | Service.Coordination_query{owner;_}|Graph_request_at(owner,_)->Some owner
           | _->None in
-        match (match request with Service.Client_command (Focus_resident_graph _) when check_recovery_focus -> request
-          | Service.Client_command _ when scenario=`Retry_local || scenario=`Retry_graph_phase -> request | _ -> fixture_request request) with
+        match (match request with Service.Client_command _ when scenario=`Retry_local || scenario=`Retry_graph_phase -> request | _ -> fixture_request request) with
         | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
         | Coordination_prepare_host_change plan ->
-          let baseline=picker_baseline ~version:(Int64.of_int(Atomic.get coordination_version))
+          if held_close then (
+            Atomic.set prepare_held true;
+            while not(Atomic.get release_prepare)do Eio.Fiber.yield()done);
+          if scenario=`Remove_failure && not(Atomic.exchange prepare_failed true)then
+            Error "Synthetic close preparation failed"
+          else let baseline=picker_baseline ~version:(Int64.of_int(Atomic.get coordination_version))
             (Atomic.get current) plan.registration in
           let scopes=Rrbvec.of_list(List.map fst baseline.baseline.state.sync.residents) in
           let facts:H.facts={authenticated=baseline.baseline.state.sync.account<>None;
@@ -7614,9 +7640,15 @@ let test_graph_picker_controls ?(check_recovery_focus=false) ?(check_import_reco
           let next,result=H.consume !handoffs facts receipt in handoffs:=next;
           (match result with Ok(H.Close_graph graph_id)->
             let previous=Atomic.get current in
-            publish{previous with snapshot={previous.snapshot with
-              resident_graphs=List.filter((<>)graph_id)previous.snapshot.resident_graphs;
-              resident_scopes=List.filter(fun(scope:Service.asset_scope)->scope.graph_id<>graph_id)previous.snapshot.resident_scopes}};
+            let resident_graphs=List.filter((<>)graph_id)previous.snapshot.resident_graphs in
+            let resident_scopes=List.filter(fun(scope:Service.asset_scope)->scope.graph_id<>graph_id)previous.snapshot.resident_scopes in
+            let selected_graph=if previous.snapshot.selected_graph=Some graph_id then List.nth_opt resident_graphs 0
+              else previous.snapshot.selected_graph in
+            let graph_generation=Option.fold ~none:previous.snapshot.startup.graph_generation
+              ~some:(fun graph->match List.find_opt(fun(scope:Service.asset_scope)->scope.graph_id=graph)resident_scopes with
+                |Some scope->scope.graph_generation|None->previous.snapshot.startup.graph_generation)selected_graph in
+            publish{previous with snapshot={previous.snapshot with resident_graphs;resident_scopes;selected_graph;
+              startup={previous.snapshot.startup with graph_generation;awaiting_selection=selected_graph=None}}};
             handoffs:=H.completed !handoffs receipt;Atomic.incr host_applied;
             Ok(Service.Coordination_host_applied request.id)
            |Ok(H.Remove_graph(graph_id,_))->
@@ -7632,21 +7664,9 @@ let test_graph_picker_controls ?(check_recovery_focus=false) ?(check_import_reco
              if lose_host_reply then Error "Synthetic transport lost the accepted consume reply"
              else Ok(Service.Coordination_host_applied request.id)
            |_->Error "Fixture refused this host action")
-        | Coordination_recover_import_inputs{registration;owner;request_id;_} when check_import_recovery_focus->
-          if owner.graph_id=first then (
-            Atomic.set recovery_entered true;
-            while not(Atomic.get recovery_release)do Eio.Fiber.yield()done);
-          let module A=Logseq_db_types.Asset_import in
-          let namespace=Logseq_db_worker_contract.Mutation_pure_wire.namespace_for_owner
-            ~origin:owner.account.managed_sync_origin ~user:owner.account.user_id ~graph:owner.graph_id in
-          let source:A.t={operation=uuid(30000+owner.graph_generation);asset=uuid(40000+owner.graph_generation);
-            target=uuid 100;local_mutation=uuid(50000+2*owner.graph_generation);metadata_mutation=uuid(50001+2*owner.graph_generation);
-            replace_reference=None;source_file="/isolated-picker/focus-source.bin";title="Resident source input";file_type="bin"} in
-          let input=A.Pure_intent.create ~namespace source |> Result.get_ok |> A.Pure_intent.encode in
-          Ok(Service.Coordination_import_inputs_recovered{registration;owner;request_id;
-            page={items=[{sequence=1L;input;prepared=None;acknowledged=false}];next=None}})
         | Coordination_finalize_asset_demand _ | Coordination_finalize_observation _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration ->
+          Atomic.incr registration_count;
           Atomic.set coordination_registration(Some registration);
           Ok(Service.Coordination_registered(picker_baseline
             ~version:(Int64.of_int(Atomic.get coordination_version)) (Atomic.get current) registration))
@@ -7658,17 +7678,6 @@ let test_graph_picker_controls ?(check_recovery_focus=false) ?(check_import_reco
         | Coordination_query _ -> Error "Fixture normalization failed"
         | Coordination_observe _ | Coordination_refresh_observation _ | Coordination_release_observation _ ->
           Error "Observation is not used by this fixture"
-        | Coordination_recover_mutations {request_id;owner;_} when check_recovery_focus && not check_import_recovery_focus ->
-          if owner.graph_id=first then (
-            Atomic.set recovery_entered true;
-            while not(Atomic.get recovery_release) do Eio.Fiber.yield () done);
-          let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
-          let intent=Wire.create ~origin:(Uri.of_string "https://example.invalid") ~user:"synthetic"
-            ~graph:owner.graph_id (P.V2_save_block {mutation_id=uuid(30000+owner.graph_generation);
-              block=uuid 100;title="Never replay resident recovery";
-              preconditions={blocks=[uuid 100,"block-state:v1:synthetic"];pages=[];scopes=[]}}) |> Result.get_ok in
-          Ok(Service.Coordination_mutations_recovered {request_id;
-            page=Wire.{items=Rrbvec.singleton{intent=Wire.encode intent;outcome=Unknown};next=None}})
         | Coordination_mutation _ | Coordination_confirm _ | Coordination_recover_mutations _ | Coordination_acknowledge_mutation _ -> Error "Unused durable coordination fixture"
         | Service.Inspect_local_copy request ->
           let index = Atomic.fetch_and_add inspections 1 in
@@ -7723,18 +7732,18 @@ let test_graph_picker_controls ?(check_recovery_focus=false) ?(check_import_reco
              while not(Atomic.get early_graph_observed) do Eio.Fiber.yield () done;
              publish {previous with snapshot={previous.snapshot with resident_graphs=ids;
                resident_scopes=[resident_scope first 1;resident_scope second 2]}}
+           | Configure_resident_graphs ids when held_close ->
+             publish{previous with snapshot={previous.snapshot with resident_graphs=ids;
+               resident_scopes=List.map(fun id->match List.find_opt(fun(s:Service.asset_scope)->s.graph_id=id)previous.snapshot.resident_scopes with
+                 |Some scope->scope|None->resident_scope id 4)ids}}
            | Configure_resident_graphs ids when scenario=`Replace ->
              if Atomic.get host_applied<>1 then failwith "Replacement bypassed its old owner's permission";
              publish{previous with snapshot={previous.snapshot with resident_graphs=ids;
                resident_scopes=List.mapi(fun index id->resident_scope id (index+1))ids}}
-           | Focus_resident_graph id when check_recovery_focus ->
-             let scope=List.find(fun(scope:Service.asset_scope)->scope.graph_id=id)previous.snapshot.resident_scopes in
-             publish {previous with snapshot={previous.snapshot with selected_graph=Some id;
-               startup={previous.snapshot.startup with awaiting_selection=false;
-                 graph_generation=scope.graph_generation;
-                 presentation_generation=previous.snapshot.startup.presentation_generation+1}}}
            | Select_graph id ->
-             let generation = previous.snapshot.startup.graph_generation + 1 in
+             let generation = if held_close then
+               (List.find(fun(s:Service.asset_scope)->s.graph_id=id)previous.snapshot.resident_scopes).graph_generation
+               else previous.snapshot.startup.graph_generation + 1 in
              publish { previous with snapshot = { previous.snapshot with selected_graph = Some id
                ; startup = { previous.snapshot.startup with awaiting_selection = false; graph_generation = generation } } };
              if not reordered then
@@ -7803,7 +7812,6 @@ let test_graph_picker_controls ?(check_recovery_focus=false) ?(check_import_reco
           deletion_terminal:=true
         | W.Response { outcome = Completed (Service.Local_copy_deleted _); _ } ->
           deletion_terminal := true
-        | W.Response {outcome=Completed(Service.Coordination_mutations_recovered _ | Coordination_import_inputs_recovered _);_}->Atomic.set recovery_finished true
         | W.Response { request_id; outcome = Cancelled; _ } ->
           incr inspection_terminals;
           if Atomic.get graph_read_worker = Some request_id then incr graph_read_cancellations
@@ -7867,7 +7875,7 @@ let test_graph_picker_controls ?(check_recovery_focus=false) ?(check_import_reco
       |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
   Fun.protect ~finally:(fun () ->
     Atomic.set unregister_allowed true;
-    Atomic.set recovery_release true;
+    Atomic.set release_prepare true;
     Atomic.set release_refresh true;
     Atomic.set finish_deletion true;
     Atomic.set release_automatic_inspection true;
@@ -7877,52 +7885,13 @@ let test_graph_picker_controls ?(check_recovery_focus=false) ?(check_import_reco
     (fun () ->
       consume (hooks.init 2 2 config);
       if scenario=`Retry_local || scenario=`Retry_graph_phase then (
-        wait "failed resident offers local retry" (fun()->Option.is_some(find "accessibility-identifier" "graph-picker-retry"));
-        press(node "graph-picker-retry");
-        wait "local retry actually restarts resident open" (fun()->List.exists(function Service.Select_graph id->id=first|_->false)(Atomic.get commands));
-        Alcotest.(check bool) "retry retains second resident" true (List.mem second (Atomic.get current).snapshot.resident_graphs)
+        wait "failed local resident retains graph selection" (fun()->Option.is_some(find "text" "Unable to open graph"));
+        Alcotest.(check bool) "failed local resident has no Retry" true
+          (Option.is_none(find "accessibility-identifier" "graph-picker-retry"));
+        Alcotest.(check bool) "failure retains second resident" true (List.mem second (Atomic.get current).snapshot.resident_graphs)
       ) else (
       wait "Switch graph action mounts" (fun () -> Option.is_some (find "text" "Switch graph"));
-      if check_recovery_focus then (
-        let focused key value =
-          let state=(Atomic.get current).snapshot in
-          let selected=Option.get state.selected_graph in
-          let scope=List.find(fun(scope:Service.asset_scope)->scope.graph_id=selected)state.resident_scopes in
-          let expected=Printf.sprintf "1:%s:%d" (Logseq_db_types.Graph_types.Uuid.to_string selected) scope.graph_generation in
-          let rec belongs id =
-            let fields=Option.value(Hashtbl.find_opt props id)~default:[] in
-            let host=match List.assoc_opt "payload" fields with
-              | Some(`String payload)->(try let open Yojson.Safe.Util in let json=Yojson.Safe.from_string payload in
-                  if member "mode" json=`String "timeline-host" then Some(member "ownerID" json= `String expected) else None
-                with _->None)
-              | _->None in
-            match host with Some value->value|None->Option.fold~none:false~some:belongs(Hashtbl.find_opt page_parents id) in
-          Hashtbl.to_seq props |> Seq.find_map(fun(id,fields)->
-            if List.assoc_opt key fields=Some(`String value) && belongs id then Some id else None) in
-        press(Option.get(focused "text" "Diagnostics"));
-        wait "resident A recovery is held in flight" (fun()->Atomic.get recovery_entered);
-        let select graph_id =
-          (match W.send (Option.get !client) (Service.Client_command(Focus_resident_graph graph_id)) with
-           | W.Accepted _->()|_->Alcotest.fail "resident focus was not admitted");
-          wait "resident focus publication" (fun()->(Atomic.get current).snapshot.selected_graph=Some graph_id);
-          for _=1 to 8 do consume(hooks.pump()) done in
-        select second;
-        Atomic.set recovery_release true;
-        wait "A recovery completes while B remains focused" (fun()->Atomic.get recovery_finished);
-        wait "B Diagnostics control belongs to its materialized host" (fun()->focused "text" "Diagnostics"<>None);
-        press(Option.get(focused "text" "Diagnostics"));
-        wait "B recovery applies after A later-turn callback" (fun()->
-          Option.is_some(find "text" (Logseq_db_types.Graph_types.Uuid.to_string(uuid 30002))));
-        Alcotest.(check bool) "A completion keeps B focused" true
-          ((Atomic.get current).snapshot.selected_graph=Some second);
-        select first;
-        if Option.is_none(focused "accessibility-identifier" "journal-diagnostics-dialog-page") then
-          press(Option.get(focused "text" "Diagnostics"));
-        wait "returning to A settles its original recovery owner" (fun()->
-          Option.is_some(find "text" (Logseq_db_types.Graph_types.Uuid.to_string(uuid 30001))));
-        Alcotest.(check int) "focus recovery never writes or ACKs" 0 (Atomic.get recovery_writes);
-        press(Option.get(focused "accessibility-identifier" "journal-diagnostics-close")))
-      else (
+
       if scenario=`Current then
         wait "native swipe admission follows graph readiness" (fun () ->
           Hashtbl.to_seq_values props |> Seq.exists(fun fields->match List.assoc_opt "payload" fields with
@@ -8064,12 +8033,51 @@ let test_graph_picker_controls ?(check_recovery_focus=false) ?(check_import_reco
         Alcotest.(check int) "replacement prepares exactly once" 1(Atomic.get host_prepared);
         Alcotest.(check bool) "replacement preserves other slots" true
           ((Atomic.get current).snapshot.resident_graphs=[first;uuid 4;uuid 3])
-      | `Remove ->
+      | `Remove_reopen | `Remove_select | `Remove_cancel | `Remove_failure | `Remove_sign_out ->
+        (* Application owns manager command admission; its public pure route
+           reducer has no handoff completion input. Exercise the mounted owner. *)
         press(node("graph-resident-remove:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        wait "real close preparation is held" (fun()->Atomic.get prepare_held);
+        press(node("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        if scenario=`Remove_select then
+          press(node("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string(uuid 3)));
+        if scenario=`Remove_cancel then press(node "graph-picker-close");
+        if scenario=`Remove_sign_out then press(Option.get(find "text" "Sign out"));
+        let target=if scenario=`Remove_select then uuid 3
+          else if scenario=`Remove_cancel || scenario=`Remove_sign_out then first else second in
+        for _=0 to 32 do consume(hooks.pump());Unix.sleepf 0.001 done;
+        Alcotest.(check bool) "reopen waits for actual close instead of being overwritten" false
+          (List.exists(function Service.Select_graph id->id=second|Configure_resident_graphs _->true|_->false)(Atomic.get commands));
+        Atomic.set release_prepare true;
+        if scenario=`Remove_failure then
+          wait "failed old round rebinds before original selection resumes" (fun()->
+            Atomic.get registration_count>=2 && (Atomic.get current).snapshot.selected_graph=Some target)
+        else wait "one click reopens after exact old handoff completes" (fun()->
+          Atomic.get host_applied=1 && (Atomic.get current).snapshot.selected_graph=Some target
+          && List.mem target(Atomic.get current).snapshot.resident_graphs);
+        for _=0 to 32 do consume(hooks.pump());Unix.sleepf 0.001 done;
+        Alcotest.(check bool) "selection remains current after completion callbacks drain" true
+          ((Atomic.get current).snapshot.selected_graph=Some target);
+        if scenario=`Remove_select || scenario=`Remove_cancel || scenario=`Remove_sign_out then
+          Alcotest.(check bool) "latest selection cannot resurrect the closed unrelated graph" false
+            (List.mem second(Atomic.get current).snapshot.resident_graphs);
+        Alcotest.(check int) "close permit consumed only after success"
+          (if scenario=`Remove_failure then 0 else 1)(Atomic.get host_applied)
+      | `Remove | `Remove_current ->
+        (* Picker admission/completion is private to Application, absent from
+           Root_navigation's public pure event/state surface. Drive its actual
+           mounted command with the real manager fallback-selection shape. *)
+        let removed=if scenario=`Remove_current then first else second in
+        press(node("graph-resident-remove:" ^ Logseq_db_types.Graph_types.Uuid.to_string removed));
         wait "resident removal consumes typed permission" (fun()->Atomic.get host_applied=1);
         Alcotest.(check int) "one actual prepare envelope" 1 (Atomic.get host_prepared);
         Alcotest.(check bool) "other residents stay admitted" true
-          ((Atomic.get current).snapshot.resident_graphs=[first;uuid 3]);
+          ((Atomic.get current).snapshot.resident_graphs=(if scenario=`Remove_current then [second;uuid 3] else [first;uuid 3]));
+        if scenario=`Remove_current then
+          wait "closing current graph keeps base navigation back to retained graph" (fun()->
+            Option.is_none(find "accessibility-identifier" "graph-picker-list"))
+        else Alcotest.(check bool) "closing other graph keeps base picker open" true
+          (Option.is_some(find "accessibility-identifier" "graph-picker-list"));
         Alcotest.(check bool) "typed removal has no second legacy configure" false
           (List.exists(function Service.Configure_resident_graphs _->true|_->false)(Atomic.get commands))
       | `Current ->
@@ -8254,7 +8262,7 @@ let test_graph_picker_controls ?(check_recovery_focus=false) ?(check_import_reco
       | `Current_menu ->
         ignore (node ("graph-picker-options:" ^ Logseq_db_types.Graph_types.Uuid.to_string first));
         Alcotest.(check bool) "current protection explains switching first" true
-          (Option.is_some (find "text" "Switch graphs first.")))))
+          (Option.is_some (find "text" "Switch graphs first."))))
 ;;
 
 (* Compose the production runtime's public completions with the Application
@@ -8532,6 +8540,8 @@ let () =
            run_favorites_native_visibility ~status_scenario:"failure" ~durable_status:`Conflict ());
         Alcotest.test_case "canonical More applies before ACK" `Quick (fun()->
            run_favorites_native_visibility ~status_scenario:"select" ~durable_status:`Paged ());
+        Alcotest.test_case "late ACK at another resident resumes on return" `Quick(fun()->
+           run_favorites_native_visibility ~status_scenario:"select" ~durable_status:`Background_ack ());
         Alcotest.test_case "focus re-confirmation failure restores Retry" `Quick(fun()->
            run_favorites_native_visibility ~status_scenario:"select" ~durable_status:`Reconfirm_failed ())])
     ; ("Favorites compact title",[Alcotest.test_case "Favorite Page uses shared reference lookup" `Quick test_favorite_page_uses_shared_reference_lookup; Alcotest.test_case "page property values keep name without duplication" `Quick test_detail_page_property_value_presentation; Alcotest.test_case "root Capture only in Journals" `Quick test_root_capture_placement; Alcotest.test_case "LUI titles icons and no arrow" `Quick test_favorites_compact_shared_titles; Alcotest.test_case "page outline click and native Back" `Quick (fun () -> run_favorites_native_visibility ~check_favorite_targets:true ())])
@@ -8556,12 +8566,14 @@ let () =
         Alcotest.test_case "manual sign out settles original account before revocation" `Quick (test_graph_picker_controls `Sign_out);
         Alcotest.test_case "termination consumes actual stop permission before native Ready" `Quick (test_graph_picker_controls `Terminate);
         Alcotest.test_case "resident replacement closes old owner before new admission" `Quick (test_graph_picker_controls `Replace);
+        Alcotest.test_case "failed close round releases navigation after real rebind" `Quick (test_graph_picker_controls `Remove_failure);
+        Alcotest.test_case "sign out cancels selection waiting for close" `Quick (test_graph_picker_controls `Remove_sign_out);
+        Alcotest.test_case "closing picker cancels selection waiting for close" `Quick (test_graph_picker_controls `Remove_cancel);
+        Alcotest.test_case "latest selection during close does not restore old slots" `Quick (test_graph_picker_controls `Remove_select);
+        Alcotest.test_case "reopen during close retains one original click" `Quick (test_graph_picker_controls `Remove_reopen);
         Alcotest.test_case "resident removal uses one-use host permission" `Quick (test_graph_picker_controls `Remove);
+        Alcotest.test_case "current resident removal preserves base navigation" `Quick (test_graph_picker_controls `Remove_current);
         Alcotest.test_case "resident picker keeps native patch references alive" `Quick (test_graph_picker_controls `Current);
-        Alcotest.test_case "recovery completion returns to background resident" `Quick
-          (test_graph_picker_controls ~check_recovery_focus:true `Current);
-        Alcotest.test_case "source recovery completion returns to background resident" `Quick
-          (test_graph_picker_controls ~check_import_recovery_focus:true `Current);
         Alcotest.test_case "close retains current session" `Quick (test_graph_picker_controls `Close);
         Alcotest.test_case "focus graph-state refresh survives full Worker lane" `Quick (test_graph_picker_controls `Reordered_full);
         Alcotest.test_case "graph open before membership still presents after focus" `Quick (test_graph_picker_controls `Reordered_open);
@@ -8686,7 +8698,7 @@ let () =
             test_fixture_exception_cleanup Exit)
         ] )
     ; ( "Pending changes recovery"
-      , [Alcotest.test_case "bounded readonly pages" `Quick (fun () ->
+      , [Alcotest.test_case "keeps original Diagnostics without recovery controls" `Quick (fun () ->
           run_favorites_native_visibility ~check_pending_changes:true ())] )
     ; ( "Detail observation",[
         Alcotest.test_case "actual registration and native Back release" `Quick
@@ -8715,6 +8727,7 @@ let () =
           ; "attachment-limit"
           ; "interrupted-imports"
           ; "legacy-interrupted"
+          ; "status-rejected"
           ] )
     ; ( "Capture attachment imports"
       , [ Alcotest.test_case
@@ -8723,6 +8736,10 @@ let () =
             (fun () -> run_favorites_native_visibility ~check_capture_imports:true ());
           Alcotest.test_case "atomic Append waits for canonical UI application" `Quick
             (fun ()->run_favorites_native_visibility ~check_capture_imports:true ~capture_case:`Held ());
+          Alcotest.test_case "atomic unknown Append preserves later native edits" `Quick
+            (fun ()->run_favorites_native_visibility ~check_capture_imports:true ~capture_case:`Edit_pending ());
+          Alcotest.test_case "closed and reopened unknown Append resumes original submission" `Quick
+            (fun ()->run_favorites_native_visibility ~check_capture_imports:true ~capture_case:`Reopen_pending ());
           Alcotest.test_case "atomic Append ACK retry preserves draft and attachments" `Quick
             (fun ()->run_favorites_native_visibility ~check_capture_imports:true ~capture_case:`Ack_failed ());
           Alcotest.test_case "atomic Append unknown retry keeps exact intent" `Quick
@@ -8958,7 +8975,7 @@ let () =
             `Quick
             test_block_identity_serialization_and_native_entropy
         ] )
-    ; ( "attachment input recovery", [Alcotest.test_case "typed prepared review and unknown membership" `Quick
+    ; ( "attachment input recovery", [Alcotest.test_case "keeps original Diagnostics without input review controls" `Quick
         (fun()->run_favorites_native_visibility ~check_import_recovery:true())])
     ; ( "worker presentation"
       , [ Alcotest.test_case "phase labels" `Quick test_phase_names

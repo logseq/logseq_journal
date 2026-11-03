@@ -178,21 +178,22 @@ let () =
       ; Waiting_network, "Available when online"
       ; Waiting_unlock, "Unlock graph to view file"
       ]);
-  run "failed local open retries only acquisition" (fun () ->
+  run "local acquisition failure has no user retry" (fun () ->
     let waiting, _ = P.step P.empty (show (asset 'a')) in
     let pending, effects = ready waiting "local" in
     let old = acquire effects in
     let failed, effects = P.step pending (Acquired (old, None)) in
-    check
-      (effects = [] && P.presentation failed = Failed "Unable to open file")
-      "local failure has explicit Retry";
-    let pending, effects = P.step failed Retry_requested in
-    check
-      (P.presentation pending = Placeholder "Loading" && List.length effects = 1)
-      "local Retry only reacquires";
-    let current = acquire effects in
-    let visible, _ = P.step pending (Acquired (current, Some ("held", "/cache/current"))) in
-    check(P.presentation visible=File "/cache/current") "explicit local retry displays its acquired bytes");
+    check (effects=[] && P.presentation failed=Failed "Unable to open file") "local error remains visible";
+    let same,effects=P.step failed Retry_requested in
+    check(same=failed && effects=[]) "local file failure must not expose a retry operation");
+  run "non-network availability failures have no user retry" (fun () ->
+    List.iter(fun failure ->
+      let waiting,_=P.step P.empty (show(asset 'a')) in
+      let failed,_=P.step waiting(Availability{scope;consumer="visible";
+        availability=Failed{failure;attempts=1;retry_scheduled=false}}) in
+      let same,effects=P.step failed Retry_requested in
+      check(same=failed && effects=[]) "non-network failure admitted manual retry")
+      [S.Asset.Not_found;Checksum_mismatch;Authentication;Locked;Storage_full;Invalid_content "Synthetic"]);
   run "loading cannot Retry" (fun () ->
     let loading, _ = P.step P.empty (show (asset 'a')) in
     let _, effects = P.step loading Retry_requested in
@@ -352,13 +353,8 @@ let () =
     "external media has no managed demand";
   let missing, _ = P.step pending (Acquired (ticket, None)) in
   let _, effects = P.step missing Retry_requested in
-  check
-    (List.exists
-       (function
-         | P.Acquire _ -> true
-         | _ -> false)
-       effects)
-    "failed lease acquisition is retried independently of an already ready transfer"
+  check (effects=[])
+    "failed local lease acquisition cannot be retried by the user"
 ;;
 
 (* Generate actual preview actions and exactly-once asynchronous completions.

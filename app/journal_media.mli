@@ -11,6 +11,7 @@ type presentation =
   | Hidden
   | Placeholder of string
   | Failed of string
+  | Network_failed of string
   | File of string
   | External of string
 

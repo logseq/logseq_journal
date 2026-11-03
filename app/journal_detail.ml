@@ -126,28 +126,30 @@ let retain_composer (t : t) =
 
 let complete_retained_composer draft ~child ~parent =
   if matching_child draft.draft_pending ~root_id:draft.draft_parent ~child ~parent
-  then None
+  then Option.map(fun capture->{draft with draft_capture=capture;draft_mode=Reading;
+    draft_pending=None;draft_error=None;draft_projection=None})
+      (Journal_capture.finish_submission draft.draft_capture)
   else Some draft
 ;;
 
-let lock_retained_attempt draft =
+let lock_retained_attempt draft ~message =
   match draft.draft_pending with
   | Some (Journal_graph_request.Create_child _) ->
-    { draft with draft_capture = Journal_capture.lock_for_retry draft.draft_capture }
+    { draft with draft_capture = Journal_capture.fail draft.draft_capture ~message }
   | _ -> draft
 ;;
 
 let fail_retained_composer draft ~block_id ~message =
   if pending_child draft.draft_pending block_id
-  then { (lock_retained_attempt draft) with draft_mode = Failed message }
+  then { (lock_retained_attempt draft ~message) with draft_mode = Failed message }
   else draft
 ;;
 
 let interrupt_retained_composer draft =
   match draft.draft_mode with
   | Saving_child ->
-    { (lock_retained_attempt draft) with
-      draft_mode = Failed "Save was interrupted. Retry to confirm the original attempt."
+    { (lock_retained_attempt draft ~message:"Save was interrupted.") with
+      draft_mode = Failed "Save was interrupted."
     }
   | Reading | Failed _ -> draft
 ;;
@@ -467,8 +469,7 @@ let fail_child_attempt (t : t) message =
   { t with
     mode = Failed message
   ; child_capture =
-      (if lock
-       then Option.map Journal_capture.lock_for_retry t.child_capture
+      (if lock then Option.map(fun capture->Journal_capture.fail capture ~message)t.child_capture
        else t.child_capture)
   }
 ;;
@@ -593,32 +594,20 @@ let row_key = function
 ;;
 
 let update_child_source (t : t) source =
-  if
-    t.mode = Saving_child
-    || Option.fold ~none:false ~some:Journal_capture.retry_identity_locked t.child_capture
-  then t
-  else (
-    let capture =
-      match t.child_capture with
-      | None -> Journal_capture.create ~session_number:t.session_number ~source
-      | Some capture -> Journal_capture.update_source capture ~source
-    in
-    { t with child_capture = Some capture; mode = Reading; pending = None;child_error=None })
+  let capture=match t.child_capture with
+    |None->Journal_capture.create ~session_number:t.session_number ~source
+    |Some capture->Journal_capture.update_source capture ~source in
+  if t.pending<>None then {t with child_capture=Some capture}
+  else {t with child_capture=Some capture;mode=Reading;child_error=None}
 ;;
 
 let apply_child_edit t edit =
-  if t.mode = Saving_child
-  then t
-  else (
-    let initial =
-      Option.value
-        t.child_capture
-        ~default:(Journal_capture.create ~session_number:t.session_number ~source:"")
-    in
-    let capture = Journal_capture.apply_text_edit initial edit in
-    if capture = initial
-    then t
-    else { t with child_capture = Some capture; mode = Reading; pending = None;child_error=None })
+  let initial=Option.value t.child_capture
+    ~default:(Journal_capture.create ~session_number:t.session_number ~source:"")in
+  let capture=Journal_capture.apply_text_edit initial edit in
+  if capture==initial then t
+  else if t.pending<>None then {t with child_capture=Some capture}
+  else {t with child_capture=Some capture;mode=Reading;child_error=None}
 ;;
 
 let set_child_task (t : t) task_state =
@@ -659,8 +648,6 @@ let admit_child
       ~creation_time
   =
   match t.mode, t.child_capture with
-  | Reading, Some capture when Journal_capture.can_save capture && Journal_capture.admission_error capture<>None ->
-    {t with child_error=Journal_capture.admission_error capture},None
   | Reading, Some capture when Journal_capture.can_save capture ->
     let request =
       Journal_graph_request.Create_child
@@ -678,11 +665,22 @@ let admit_child
         ; task_state = Journal_capture.task_state capture
         }
     in
-    { t with mode = Saving_child; pending = Some request;child_error=None }, Some request
+    { t with mode = Saving_child; pending = Some request;child_error=None;
+      child_capture=Some(Journal_capture.begin_submission capture) }, Some request
   | _ -> t, None
 ;;
 
 let fail (t : t) ~message = if t.pending = None then t else fail_child_attempt t message
+let await_child_confirmation (t:t) ~block_id =
+  if not(pending_child t.pending block_id)then t else
+    {t with mode=Saving_child;child_error=None;
+      child_capture=Option.map Journal_capture.await_confirmation t.child_capture}
+;;
+let await_retained_confirmation draft ~block_id =
+  if not(pending_child draft.draft_pending block_id)then draft else
+    {draft with draft_mode=Saving_child;draft_error=None;
+      draft_capture=Journal_capture.await_confirmation draft.draft_capture}
+;;
 
 let retry (t : t) =
   match t.mode, t.pending with
@@ -814,7 +812,7 @@ let apply_child_created (t : t) ~child ~parent =
                ~some:(fun capture ->
                  ID.Text_input.Session_id.to_int64 (Journal_capture.session_id capture))
                t.child_capture)
-      ; child_capture = None
+      ; child_capture = Option.bind t.child_capture Journal_capture.finish_submission
       ; child_error = None
       ; composer_revision = Int64.succ t.composer_revision
       ; reveal_id = Some id
@@ -1113,3 +1111,12 @@ module Pure_observation = struct
       if entry.context.request_generation=request_generation && entry.context.root=root then entry.handle else None)
 
 end
+
+let failed_child_submission pending capture mode = match pending,capture,mode with
+  |Some(Journal_graph_request.Create_child command),Some capture,Failed _->
+    Option.map(fun chain->command,chain)(Journal_capture.retained_chain capture)
+  |_->None
+;;
+let pending_submission (t:t)=failed_child_submission t.pending t.child_capture t.mode
+let retained_pending_submission draft=
+  failed_child_submission draft.draft_pending(Some draft.draft_capture)draft.draft_mode

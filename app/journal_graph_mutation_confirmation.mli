@@ -108,6 +108,11 @@ module Pure_insertion : sig
   val receive : t -> index:int -> round:int64 -> Worker.mutation_progress -> t * action
   val read_child : t -> round:int64 -> Worker.block_summary -> t * action
   val projection_ready : t -> round:int64 -> t * action
+  type recovery = private {mutation_id:string;round:int64;delay:float}
+  (** One scheduled continuation after immediate recovery is exhausted. No clock
+      is read here; the host returns the exact token after its external timer. *)
+  val take_recovery : t -> t * recovery option
+  val resume_recovery : t -> recovery -> t * action
   val retry : t -> t * action
   val applied : t -> round:int64 -> Worker.presentation -> t * action
   val acknowledged : t -> index:int -> round:int64 -> (unit,string) result -> t * action

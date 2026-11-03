@@ -155,6 +155,7 @@ type 'a observation_state =
   ; obs_epoch : Worker.observation_epoch option
   ; obs_dirty : bool
   ; obs_retry : bool
+  ; obs_error_recovered : bool
   }
 
 type observation_entry = Observing : 'a observation_state -> observation_entry
@@ -356,7 +357,13 @@ let import_source_unsettled facts id saved=not saved.source_adopted && match sav
     |Operation(Worker.Import intent)->Worker.Uuid.equal(Worker.asset_import_intent_id intent)id
     |_->false)facts.entries
 let pending_import_source_intents facts=
-  Graphs.fold(fun id saved inputs->if import_source_unsettled facts id saved
+  (* An admitted Import is initially Unknown too. Its original handler must
+     exit before an absent Prepared proof is a stable read, including cancel. *)
+  let creating=Slots.fold(fun _ (Entry slot) creating->match slot.result,slot.ticket.query with
+    |None,Operation(Worker.Import intent)->Graphs.add(Worker.asset_import_intent_id intent)()creating
+    |_->creating)facts.entries Graphs.empty in
+  Graphs.fold(fun id saved inputs->
+    if not(Graphs.mem id creating) && import_source_unsettled facts id saved
     then Rrbvec.push_back inputs saved.import_intent else inputs)facts.imports Rrbvec.empty
 ;;
 let import_sources_pending facts ~owner =
@@ -982,6 +989,13 @@ let dispatch_waiting ?(publish = false) ?(retry_full = false) state instructions
                      sends:=Send(slot.ticket,session,operation)::!sends;
                      Entry{slot with dispatched=true;early=None})
                 | _->reject Worker.Revoked_session)
+             | Operation (Worker.Confirm_import_source _ as operation) ->
+               (match slot.ticket.target with
+                |Direct session->(match validate_session state session with
+                  |Error error->reject error
+                  |Ok()->sends:=Send(slot.ticket,session,operation)::!sends;
+                    Entry{slot with dispatched=true;early=None})
+                |_->reject Worker.Revoked_session)
              | Operation (Worker.Acknowledge_changes batch) ->
                let session = Worker.change_batch_session batch in
                (match validate_session state session with
@@ -1607,6 +1621,14 @@ let retain_observed_value state value ~admitted ~cancelled =
   | _ -> state
 ;;
 
+let failed_observation_sample owned error =
+  let recover=not owned.obs_error_recovered && match error with
+    |Worker.Service_failed _->true
+    |_->false in
+  {owned with obs_error=Some error;obs_dirty=owned.obs_dirty || recover;
+    obs_error_recovered=owned.obs_error_recovered || recover}
+;;
+
 let retain_observation_error state ticket handle error =
   let id = Worker.observation_id handle in
   let sample_epoch =
@@ -1629,7 +1651,7 @@ let retain_observation_error state ticket handle error =
           observations =
             Observation_ids.add
               id
-              (Observing { owned with obs_error = Some error })
+              (Observing (failed_observation_sample owned error))
               state.facts.observations
         }
     }
@@ -1659,7 +1681,7 @@ let retain_observation_result
              observations =
                Observation_ids.add
                  ticket.id
-                 (Observing { owned with obs_error = Some error })
+                 (Observing (failed_observation_sample owned error))
                  state.facts.observations
            }
        }
@@ -2617,7 +2639,7 @@ let step_base state event =
           when (slot.wait_for_capacity
                 ||
                 match slot.ticket.query with
-                | Operation (Worker.Acknowledge_changes _ | Worker.Acknowledge_intent _) -> true
+                | Operation (Worker.Acknowledge_changes _ | Worker.Acknowledge_intent _ | Worker.Confirm_import_source _) -> true
                 | _ -> false)
                && slot.dispatched
                && slot.admitted = None
@@ -2910,7 +2932,7 @@ let step_base state event =
                  ~some:(fun epoch ->
                    Worker.compare_observation_epoch notice.epoch epoch > 0)
                  value.obs_epoch ->
-       let value = { value with obs_epoch = Some notice.epoch; obs_dirty = true } in
+       let value = { value with obs_epoch = Some notice.epoch; obs_dirty = true; obs_error_recovered=false } in
        changed
          { state with
            facts =
@@ -2926,7 +2948,7 @@ let step_base state event =
     let observations =
       Observation_ids.map
         (fun (Observing value) ->
-           Observing { value with obs_dirty = not value.obs_releasing })
+           Observing { value with obs_dirty = not value.obs_releasing;obs_error_recovered=false })
         state.facts.observations
     in
     changed { state with facts = { state.facts with observations } } []
@@ -3491,6 +3513,7 @@ let plan_observation (state : t) session budget query =
       ; obs_epoch = None
       ; obs_dirty = false
       ; obs_retry = false
+      ; obs_error_recovered = false
       }
     in
     let facts =

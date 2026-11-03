@@ -59,5 +59,5 @@ let () =
     (fun failure ->
        let t = P.notice t scope (notice 3 (Failed_upload failure)) in
        assert (not (List.hd (P.rows t)).retry))
-    [ U.Missing_source; Size_rejected; Invalid_content ]
+    [ U.Missing_source; Size_rejected; Invalid_content; Authentication; Revoked_access; Persistence_failed "Synthetic" ]
 ;;

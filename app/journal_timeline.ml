@@ -2,11 +2,6 @@ module Timeline = Journal_timeline_state
 module Ui = Journal_view
 module V = Ui.View
 
-let for_block handler block_id =
-  Ui.Event.Handler.create ~name:("journal-block:" ^ block_id) (fun _ ->
-    Ui.Event.Handler.Private.invoke handler (Ui.Event.Payload.Text block_id))
-;;
-
 let same_creation_minute left right =
   let left = Journal_model.creation_time left in
   let right = Journal_model.creation_time right in
@@ -233,7 +228,7 @@ let view
       ~day_presentation
       ~on_visible_range
       ~on_scroll_completed
-      ~on_retry_day
+      ~on_retry_day:_
       ~on_open_block
       ~delete_enabled
       ~actions_enabled
@@ -310,16 +305,7 @@ let view
         (match Timeline.day_error state ~day with
          | None -> V.loading ~message:"Loading more journal entries" ()
          | Some message ->
-           V.column
-             [ V.text message
-             ; V.button
-                 ~enabled:(Option.is_none (Timeline.pending_request state))
-                 ~on_press:(for_block on_retry_day (string_of_int day))
-                 ~child:(V.text "Retry")
-                 ()
-               |> V.with_test_id
-                    (Ui.Test_id.string ("journal-day-retry:" ^ string_of_int day))
-             ])
+           V.text message)
       | Feed_continuation _ -> V.loading ~message:"Loading older journal days" ()
     in
     V.column ~key:(Ui.Key.string (Timeline.slot_key slot)) [ child ]

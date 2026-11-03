@@ -60,9 +60,9 @@ let describe = function
   | Failed_upload failure ->
     (match failure with
      | Network -> "Upload interrupted", false, true
-     | Authentication -> "Sign in or unlock the graph to upload", false, true
-     | Persistence_failed _ -> "Could not save upload progress", false, true
-     | Revoked_access -> "Upload access denied", false, true
+     | Authentication -> "Sign in or unlock the graph to upload", false, false
+     | Persistence_failed _ -> "Could not save upload progress", false, false
+     | Revoked_access -> "Upload access denied", false, false
      | Missing_source -> "Source file unavailable; attach the file again", false, false
      | Size_rejected -> "File too large to upload", false, false
      | Invalid_content -> "File cannot be uploaded; attach the file again", false, false)

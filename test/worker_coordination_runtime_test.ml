@@ -4129,7 +4129,78 @@ let test_mixed_mailbox_requests_do_not_exhaust_history () =
     wait "mixed-request owner did not unregister after draining" (fun()->C.shutdown_state(C.view !state)=C.Stopped))
 ;;
 
+let test_host_recovers_only_pending_import_sources () =
+  let module Host=Journal_worker_coordination_host in
+  with_client ~statuses:true ~prepare:prepare_atomic_append_fixture(fun client ->
+    let jobs=Queue.create() and active=ref None and confirmations=ref 0 in
+    Mailbox.on_event client(fun event->
+      (match event with Mailbox.Response{outcome=Completed(Service.Coordination_import_input_confirmed _);_}->incr confirmations|_->());
+      Option.iter(fun host->ignore(Host.on_event host event)) !active);
+    let pump()=Mailbox.Private.deliver client ~max_events:64;
+      let count=Queue.length jobs in for _=1 to count do (Queue.take jobs)()done in
+    let wait label condition=let deadline=Unix.gettimeofday()+.5. in
+      while not(condition()) && Unix.gettimeofday()<deadline do pump();Unix.sleepf 0.001 done;
+      require(condition())label in
+    let create suffix =
+      let host=Host.create ~client ~client_id:(uuid suffix) ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
+        ~enqueue:(fun f->Queue.add f jobs) ~changed:(fun _->()) |> Result.get_ok in
+      active:=Some host;
+      if suffix="9f000000-0000-4000-8000-000000004001" then
+        ignore(Mailbox.send client(Service.Client_command(Restore_local_account{user_id="user-1"})));
+      wait ("source host did not bootstrap: "^suffix) (fun()->Option.exists(fun p->W.selected p<>None && List.exists(fun resident->resident.W.phase=W.Open)(W.residents p))(C.projection(Host.view host)));
+      host in
+    let old=create "9f000000-0000-4000-8000-000000004001" in
+    let session=W.presentation_session(Option.get(Option.bind(C.projection(Host.view old))W.selected)) in
+    let call : type a. a W.request -> a = fun operation->
+      let ticket=Host.request old session operation |> Result.get_ok in
+      let result=ref None in Host.watch old ticket ~f:(fun reply->result:=Some reply);
+      wait "original source operation did not finish" (fun()-> !result<>None);
+      match Option.get !result with W.Answered(Ok value)->value|_->failwith "real source operation failed" in
+    let source_file=Filename.temp_file "journal-background-source-synthetic-" ".png" in
+    Fun.protect ~finally:(fun()->if Sys.file_exists source_file then Sys.remove source_file)(fun()->
+      Out_channel.with_open_bin source_file(fun output->output_string output "file");
+      let source:Logseq_db_types.Asset_import.t={operation=uuid "9f000000-0000-4000-8000-000000004010";
+        asset=uuid "9f000000-0000-4000-8000-000000004011";target=Test_support.authoritative_block_uuid;
+        local_mutation=uuid "9f000000-0000-4000-8000-000000004012";
+        metadata_mutation=uuid "9f000000-0000-4000-8000-000000004013";replace_reference=None;
+        source_file;title="Prepared synthetic source";file_type="png"} in
+      let intent=W.asset_import_intent session source |> Result.get_ok in
+      let imported=match call(W.Import intent)with W.Imported value->value|_->failwith "source did not prepare" in
+      Option.iter(fun lease->ignore(call(W.Release_file lease)))(W.import_preview imported);
+      ignore(Host.shutdown old);wait "original source registration did not release" (fun()->C.shutdown_state(Host.view old)=C.Stopped);
+      let current=create "9f000000-0000-4000-8000-000000004002" in
+      require(C.import_source_proof(Host.view current)intent=None) "new host inherited fabricated evidence";
+      let pending=Rrbvec.singleton intent in
+      for _=1 to 3 do Host.recover_import_sources current pending ~failed:(fun _ _->failwith "source proof lookup failed")done;
+      wait "background source lookup did not adopt real Prepared proof" (fun()->C.import_source_proof(Host.view current)intent<>None);
+      for _=1 to 8 do Host.recover_import_sources current pending ~failed:(fun _ _->failwith "source proof lookup failed");pump()done;
+      require(!confirmations=1) "repeated publication duplicated source proof reads";
+      let fresh=W.presentation_session(Option.get(Option.bind(C.projection(Host.view current))W.selected))in
+      let unknown={source with operation=uuid "9f000000-0000-4000-8000-000000004020";
+        asset=uuid "9f000000-0000-4000-8000-000000004021";
+        local_mutation=uuid "9f000000-0000-4000-8000-000000004022";
+        metadata_mutation=uuid "9f000000-0000-4000-8000-000000004023"}in
+      let unknown=W.asset_import_intent fresh unknown |> Result.get_ok in
+      let pending=Rrbvec.of_list[intent;unknown]in
+      Host.recover_import_sources current pending ~failed:(fun _ _->failwith "unknown source lookup failed");
+      wait "missing input was not inspected" (fun()-> !confirmations=2);
+      for _=1 to 8 do Host.recover_import_sources current pending ~failed:(fun _ _->failwith "unknown source lookup failed");pump()done;
+      require(!confirmations=2 && C.import_source_proof(Host.view current)unknown=None)
+        "None source proof replayed an Import or entered a query loop";
+      let ticket=Host.request current fresh(W.Recover_import_inputs{after=None;maximum_items=8;maximum_bytes=65536}) |> Result.get_ok in
+      let result=ref None in Host.watch current ticket ~f:(fun reply->result:=Some reply);
+      wait "original input ledger could not be inspected" (fun()-> !result<>None);
+      require(match Option.get !result with W.Answered(Ok page)->Rrbvec.length page.inputs=1
+        && not(Rrbvec.nth page.inputs 0).acknowledged|_->false)
+        "background source confirmation replayed Import or ACKed reviewed input";
+      require(Sys.file_exists source_file) "read-only source lookup removed picker bytes";
+      ignore(Host.shutdown current);wait "source provider registration did not release" (fun()->C.shutdown_state(Host.view current)=C.Stopped)))
+;;
+
 let () =
+  if Array.mem "--source-recovery-only" Sys.argv then (
+    test_host_recovers_only_pending_import_sources();print_endline "Exact pending source evidence recovery passed";exit 0);
+  test_host_recovers_only_pending_import_sources();
   if Array.mem "--observation-retirement-only" Sys.argv then (
     test_service_binding_retirement_reclaims_observation_history();
     print_endline "8200 actual Service observation binding retirements passed";exit 0);

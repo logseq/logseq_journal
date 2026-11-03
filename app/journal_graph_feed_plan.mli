@@ -35,7 +35,7 @@ val reset : t -> now:(unit -> int64) -> unit
 val failure_scope : operation -> failure_scope
 val operation_name : operation -> string
 val is_current : t -> operation -> bool
-val superseded : t -> operation -> output
+val superseded : t -> ports:ports -> operation -> output
 type journal_request =
   { from_day : Worker.journal_day
   ; through_day : Worker.journal_day

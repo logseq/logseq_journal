@@ -119,10 +119,7 @@ let view
              (Page (page + 1))
          ]
        else [])
-    @
-    if error <> None
-    then [ page_control "journal-status-retry" "Retry statuses" Retry ]
-    else []
+
   in
   V.of_lui
     (Lui_elements.scroll ~orientation:`vertical ~padding:20

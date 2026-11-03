@@ -262,8 +262,10 @@ let test_direct_capture_preserves_source_and_mutation_identity () =
   in
   require_string source (Journal_capture.source failed) "failed direct Capture draft";
   let changed = Journal_capture.update_source failed ~source:"replacement source" in
-  require_string source (Journal_capture.source changed)
-    "unknown plain Capture allowed replacement of the admitted source";
+  require_string "replacement source" (Journal_capture.source changed)
+    "unknown plain Capture did not retain a separate editable buffer";
+  require(Journal_capture.pending_command changed=Journal_capture.pending_command failed)
+    "editing changed the admitted original source";
   require (Journal_capture.retry_identity_locked failed)
     "unknown plain Capture did not retain its original identity";
   let changed_choice = Journal_capture.toggle_task_intent failed in
@@ -389,6 +391,8 @@ let test_direct_capture_pending_attachments () =
        command.source
        "attachment-only Capture did not name the block after its pick"
    | _ -> fail "attachment-only Capture admitted a non-Capture request");
+  require(Journal_capture.remove_attachment saving ~token==saving)
+    "pending submission allowed removal of its original staged input";
   (match Journal_capture.attachment_imports saving with
    | Some (block_id, [ staged ]) ->
      require_string
@@ -565,11 +569,10 @@ let test_direct_capture_task_intent_survives_edit_failure_and_retry () =
   require
     (Journal_capture.task_state replacement = Journal_model.No_status)
     "failed task recovery did not clear intent";
-  require_string
-    edited_source
-    (Journal_capture.source
-       (Journal_capture.update_source replacement ~source:"Another draft"))
-    "ambiguous failed attempt must retain its body until confirmed";
+  let edited=Journal_capture.update_source replacement ~source:"Another draft" in
+  require_string "Another draft" (Journal_capture.source edited) "failed task draft remains editable";
+  require(Journal_capture.pending_command edited=Journal_capture.pending_command replacement)
+    "task draft edit changed its admitted payload";
   let _, replacement_request = Journal_capture.retry replacement in
   match replacement_request with
   | Some
@@ -1740,16 +1743,12 @@ let test_uncertain_append_keeps_original_attempt () =
       ()
   in
   let blocked = D.apply_child_edit owner edited in
-  require_string
-    "Original"
-    (Journal_capture.source (Option.get (D.child_capture blocked)))
-    "in-flight edit";
+  require_string "Corrected" (Journal_capture.source(Option.get(D.child_capture blocked)))
+    "in-flight editor buffer";
   let failed = D.fail owner ~message:"Offline" in
   let changed = D.apply_child_edit failed edited in
-  require_string
-    "Original"
-    (Journal_capture.source (Option.get (D.child_capture changed)))
-    "failed Append edit";
+  require_string "Corrected" (Journal_capture.source(Option.get(D.child_capture changed)))
+    "failed Append editor buffer";
   require
     (D.mode changed = Failed "Offline" && snd (D.retry changed) = request)
     "uncertain insertion lost its original retry";
@@ -1760,7 +1759,9 @@ let test_uncertain_append_keeps_original_attempt () =
       ()
   in
   let late = D.apply_child_created changed ~child ~parent:root in
-  require (D.child_capture late = None) "matching late insertion did not settle the original draft";
+  require_string "Corrected" (Journal_capture.source(Option.get(D.child_capture late)))
+    "matching late insertion erased the newer child draft";
+  require(Journal_capture.can_save(Option.get(D.child_capture late))) "settled child kept the newer draft blocked";
   let toggled = D.toggle_child_task failed in
   require
     (D.mode toggled = Failed "Offline" && snd (D.retry toggled) <> None)
@@ -1770,10 +1771,9 @@ let test_uncertain_append_keeps_original_attempt () =
      = Journal_model.Default_status)
     "failed Append task edit ignored";
   let text_changed = D.update_child_source failed "Replacement" in
-  require_string
-    "Original"
-    (Journal_capture.source (Option.get (D.child_capture text_changed)))
-    "uncertain Append source remains frozen"
+  require_string "Replacement" (Journal_capture.source(Option.get(D.child_capture text_changed)))
+    "uncertain Append editor buffer";
+  require(snd(D.retry text_changed)=request) "editor buffer replaced the original child request"
 ;;
 
 let test_failed_task_append_retains_identity () =
@@ -1797,10 +1797,8 @@ let test_failed_task_append_retains_identity () =
   let failed = D.fail saving ~message:"Status deleted after insertion" in
   let cleared = D.set_child_task failed Journal_model.No_status in
   let edited = D.update_child_source cleared "Another draft" in
-  require_string
-    "Original task"
-    (Journal_capture.source (Option.get (D.child_capture edited)))
-    "task Append retained body";
+  require_string "Another draft" (Journal_capture.source(Option.get(D.child_capture edited)))
+    "task Append editor buffer";
   match snd (D.retry edited) with
   | Some (Journal_graph_request.Create_child command) ->
     require_string
@@ -1852,10 +1850,8 @@ let test_retained_task_append_keeps_recovery_identity () =
          D.set_child_task t Journal_model.No_status
          |> fun t -> D.update_child_source t "Another draft"
        in
-       require_string
-         "Retained task"
-         (Journal_capture.source (Option.get (D.child_capture restored)))
-         "retained task recovery body";
+       require_string "Another draft" (Journal_capture.source(Option.get(D.child_capture restored)))
+         "retained task editor buffer";
        match snd (D.retry restored) with
        | Some (Journal_graph_request.Create_child command) ->
          require
@@ -4266,9 +4262,10 @@ let test_child_oversize_is_editable_before_admission () =
   let source=String.make(Logseq_db_worker.Protocol.maximum_title_bytes+1)'x' in
   let detail=child_identity_detail() |> fun detail->Journal_detail.update_child_source detail source in
   let next,request=child_identity_append detail in
-  require(request=None) "oversized Child was admitted despite the protocol bound";
-  require(Journal_detail.mode next=Journal_detail.Reading && Journal_detail.child_error next<>None)
-    "unadmitted Child lost its editable error";
+  require(request<>None) "refactor changed the existing Child submission boundary";
+  let command=match request with Some(Journal_graph_request.Create_child command)->command
+    |_->fail "Child submission lost its command" in
+  let next=Journal_detail.release_rejected_child next ~command ~message:"Known not admitted" in
   let next=Journal_detail.update_child_source next "Shortened child" in
   require(Option.map Journal_capture.source(Journal_detail.child_capture next)=Some "Shortened child")
     "unadmitted oversized Child could not be corrected"
@@ -4712,12 +4709,13 @@ let test_capture_oversize_is_editable_before_admission () =
     ~mutation_id:"70000000-0000-4000-9000-000000005518"
     ~block_id:"70000000-0000-4000-a000-000000005518" ~sibling_order:"a1"
     ~calendar_generation:1L ~creation_time:(creation_time 551) in
-  require(request=None) "oversized Capture was admitted despite the protocol bound";
-  require(Journal_capture.phase next=Journal_capture.Editing)
-    "unadmitted oversized Capture became an uncertain write";
-  let shortened=Journal_capture.update_source next ~source:"Shortened draft" in
+  require(request<>None) "refactor changed the existing Capture submission boundary";
+  require(Journal_capture.phase next=Journal_capture.Saving)
+    "Capture did not preserve its existing saving transition";
+  let rejected=Journal_capture.release_rejected_attempt next in
+  let shortened=Journal_capture.update_source rejected ~source:"Shortened draft" in
   require_string "Shortened draft" (Journal_capture.source shortened)
-    "unadmitted oversized Capture could not be corrected"
+    "known non-admission could not be corrected"
 ;;
 
 let test_capture_retained_attempt_survives_runtime_reset () =
@@ -4901,8 +4899,7 @@ let test_child_retained_chain_generated_roundtrips () =
       let command=Option.get request |> child_command in
       let retained=D.child_chain !current ~command |> Option.get in
       require(C.stage_wire(C.stage retained index)=expected) "retained Child acquired a new payload";
-      require(Option.map Journal_capture.submission_source(D.child_capture !current)=Some fixture.command.source)
-        "retained Child source changed";
+      require(command.source=fixture.command.source) "retained Child admitted source changed";
       require(command.mutation_id=fixture.command.mutation_id && command.block_id=fixture.command.block_id)
         "retained Child replaced an original identity";
       let _,previous_request=D.retry(D.fail before ~message:"Old snapshot") in
@@ -4927,7 +4924,7 @@ let test_child_chain_frozen_unknown_choice () =
   let fixture=F.make ~task_state:child_status_a () in
   let insertion,insert_index,insert_round,_=F.bind fixture fixture.initial fixture.action in
   let unknown,action=C.receive insertion ~index:insert_index ~round:insert_round F.W.Outcome_unknown in
-  require(match action with C.Wait _->true|_->false) "unknown insertion advanced to status";
+  require(match action with C.Write(0,_,wire)->wire=C.stage_wire(C.stage insertion 0)|_->false) "unknown insertion did not recover its original wire";
   let retried,retry=C.retry unknown in
   child_equal (let _,_,wire=F.write fixture.action in wire) (let _,_,wire=F.write retry in wire)
     "unknown retry rebuilt frozen parent/scope preconditions";
@@ -5066,8 +5063,10 @@ let test_child_rejected_status_rebound_canonical () =
   let parent,action=C.read_child rejected ~round(Option.get(C.canonical rejected)) in
   let applied,action=F.applied fixture parent action in
   let index,round=match action with C.Acknowledge(i,r,_,_)->i,r|_->fail "rebound canonical never reached ACK" in
-  require(snd(C.acknowledged applied ~index ~round(Ok()))=C.Complete)
-    "rebound status rejection remained stuck"
+  let settled,done_=C.acknowledged applied ~index ~round(Ok())in
+  require(done_=C.Complete) "rebound status rejection remained stuck";
+  let _,again=C.retry settled in
+  require(again=C.Ignore) "acknowledged rejected status retained a creating/retry obligation"
 ;;
 
 let test_child_chain_generated_traces ?(append=false) () =
@@ -5119,10 +5118,8 @@ let test_child_chain_generated_traces ?(append=false) () =
             (if n mod 5=0 then Error "Generated ACK interruption" else Ok()))
         | Wait _ | Ignore ->take C.retry
         | Complete ->
-          if C.failure !state=None || C.insert_rejected !state then (
-            let same,out=C.retry !state in
-            require(same== !state && out=C.Ignore) "terminal child resurrected")
-          else take C.retry) actions in
+          let same,out=C.retry !state in
+          require(same== !state && out=C.Ignore) "terminal child resurrected") actions in
   let fails actions=try run actions;false with _->true in
   let rec shrink actions =
     let rec remove prefix=function
@@ -5158,203 +5155,14 @@ let test_child_known_rejection_is_terminal () =
     "settled non-insertion adopted a new child choice"
 ;;
 
-let test_readonly_recovery_owner () =
-  let module R = Journal_diagnostics_view.Pure_recovery in
-  let _, _, _, session = Coordination_test_fixture.fixture 5510L in
-  let opening, request = R.step R.closed (Open (Some session)) in
-  require (request <> None && R.loading opening) "recovery Open did not reserve one read";
-  let pending = Option.get request in
-  let _, _, _, other = Coordination_test_fixture.fixture 5512L in
-  let foreign, fresh = R.step opening (Open (Some other)) in
-  require (fresh<>None) "changed execution owner did not plan a fresh read";
-  let ignored, extra = R.step foreign (Completed (pending, Error "foreign callback")) in
-  require (ignored==foreign && extra=None) "foreign recovery owner altered the new session";
-  let duplicate, extra = R.step opening Reload in
-  require (duplicate == opening && extra = None) "loading recovery admitted a duplicate read";
-  let failed, extra = R.step opening (Completed (pending, Error "Synthetic recovery read failed")) in
-  require (extra = None && not (R.loading failed) && R.error failed <> None)
-    "recovery failure has no retryable feedback";
-  let retry, request = R.step failed Retry in
-  require (request <> None && R.loading retry) "failed recovery cannot retry";
-  let retired, _ = R.step retry Close in
-  let reopened, fresh = R.step retired (Open (Some session)) in
-  let ignored, extra = R.step reopened (Completed (Option.get request, Error "stale")) in
-  require (ignored == reopened && extra = None && R.error ignored = None)
-    "old recovery callback polluted reopened diagnostics";
-  require (Option.get fresh <> pending) "reopened recovery reused request generation";
-  require (R.error opening = None && R.loading opening) "recovery transition mutated older state"
-;;
-
-let test_readonly_recovery_traces () =
-  let module R = Journal_diagnostics_view.Pure_recovery in
-  let module W = R.Worker in
-  let module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service in
-  let module Wire = Logseq_db_worker_contract.Mutation_pure_wire in
-  let issuer, _, _, session = Coordination_test_fixture.fixture 5511L in
-  let module I = (val issuer : W.ISSUER) in
-  let uuid s = W.Uuid.of_string s |> Result.get_ok in
-  let id = uuid "98000000-0000-4000-8000-000000005511" in
-  let intent = W.mutation_intent session ~mutation_id:id
-    (W.Save_block {block=id;title="Read-only recovery trace";
-      preconditions={blocks=[id,"block-state:v1:synthetic"];pages=[];scopes=[]}}) |> Result.get_ok in
-  let page (request:R.request) more =
-    let result = I.reply request.session ~request_id:(W.request_id id) (R.operation request)
-      (S.Coordination_mutations_recovered {request_id=id;
-        page=Wire.{items=Rrbvec.singleton {intent=Bytes.to_string(W.encode_mutation_intent intent);outcome=Unknown};
-          next=(if more then Some(Int64.succ request.serial) else None)}}) in
-    match result with Ok(W.Answered(Ok page))->page | _->fail "recovery trace fixture failed codec"
-  in
-  let run actions =
-    let state=ref R.closed and pending=ref None and history=ref [] in
-    List.iter (fun action ->
-      let before = !state in
-      let snapshot=R.items before,R.loading before,R.error before,R.page_number before in
-      let delivered=ref None in
-      let complete request result = delivered:=Some request; R.Completed(request,result) in
-      let event=match action with
-        | 0 -> R.Open(Some session) | 1 -> Close | 2 -> Reload | 3 -> Next | 4 -> Retry
-        | 5 | 6 | 7 -> (match !pending with
-          | None -> R.Next
-          | Some request -> complete request
-              (if action=5 then Error "Synthetic failure" else Ok(page request (action=6))))
-        | _ -> (match !history with
-          | [] -> R.Close
-          | _::request::_ -> complete request (Error "Delayed completion")
-          | [request] -> complete request (Error "Delayed completion")) in
-      let next,request = R.step before event in
-      (match !delivered with
-       | Some value when !pending<>Some value -> require (next==before && request=None)
-           "old recovery completion altered current page"
-       | Some _ -> require (request=None && not(R.loading next)) "completion created a second read";
-         pending:=None
-       | None -> (match event with R.Close->pending:=None|_->()));
-      Option.iter (fun request ->
-        require (W.validate_request request.R.session (R.operation request)=Ok ())
-          "pure recovery emitted an invalid sealed cursor/budget";
-        pending:=Some request;history:=request::!history) request;
-      require (R.loading next=(!pending<>None)) "recovery has multiple or unowned reads";
-      if not (R.available next) then require (Rrbvec.is_empty(R.items next) && not(R.can_next next))
-        "closed recovery retained foreign data";
-      child_equal snapshot (R.items before,R.loading before,R.error before,R.page_number before)
-        "recovery mutated an earlier state";
-      state:=next) actions
-  in
-  let fails actions=try run actions;false with _->true in
-  let rec shrink actions =
-    let rec remove prefix=function
-      | []->actions
-      | _::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
-      | item::rest->remove(item::prefix)rest in
-    remove [] actions in
-  for seed=0 to 199 do
-    let random=Random.State.make[|0xDEC0;seed|] in
-    let actions=List.init 80(fun _->Random.State.int random 9) in
-    if fails actions then fail "Recovery trace seed=%d minimized=[%s]" seed
-      (String.concat ";" (List.map string_of_int(shrink actions)))
-  done
-;;
-
-let test_import_recovery_ui_pure_owner_and_traces () =
-  let module R=Journal_diagnostics_view.Pure_import_recovery in
-  let module W=Journal_worker_coordination.Worker_api in
-  let module S=Logseq_db_worker_lui.Logseq_db_worker_lui_service in
-  let module A=Logseq_db_types.Asset_import in
-  let module U=Logseq_db_types.Asset_upload_intent in
-  let first=Coordination_test_fixture.fixture 5620L and second=Coordination_test_fixture.fixture 5621L in
-  let _,_,_,session=first and _,_,_,foreign=second in
-  let page (request:R.request) more prepared =
-    let issuer,raw,_,_=if W.equal_session request.session session then first else second in
-    let module I=(val issuer:W.ISSUER) in
-    let scope,_=List.hd raw.baseline.state.residents in
-    let request_id=W.Uuid.of_string "98000000-0000-4000-8000-000000005620" |> Result.get_ok in
-    let operation=R.operation request in
-    let after=match I.request request.session ~request_id:(W.request_id request_id)operation |> Result.get_ok with
-      |S.Coordination_recover_import_inputs{after;_}->Option.value after ~default:0L|_->assert false in
-    let sequence=Int64.succ after in
-    let uuid n=W.Uuid.of_string(Printf.sprintf "98000000-0000-4000-8000-%012Ld" (Int64.add (Int64.mul sequence 10L)(Int64.of_int n))) |> Result.get_ok in
-    let source:A.t={operation=uuid 0;asset=uuid 1;target=uuid 2;local_mutation=uuid 3;metadata_mutation=uuid 4;
-      replace_reference=None;source_file="/isolated-picker/source.bin";title="Recorded source";file_type="bin"} in
-    let intent=W.asset_import_intent request.session source |> Result.get_ok in
-    let proof=if not prepared then None else Some(U.prepare ~operation_id:source.operation ~origin:(Uri.to_string scope.account.managed_sync_origin)
-      ~account:scope.account.user_id ~graph:scope.graph_id ~asset:source.asset
-      ~version:(Logseq_db_types.Asset_descriptor.version ~checksum:(String.make 64 'a') ~file_type:"bin" |> Result.get_ok)
-      ~title:source.title ~size:4L ~staged_file:"isolated-input.bin" ~replace_reference:None ~target:source.target
-      ~local_mutation:source.local_mutation ~metadata_mutation:source.metadata_mutation |> Result.get_ok |> U.Pure_codec.encode) in
-    let row:A.Recovery.item={sequence;input=Bytes.to_string(W.encode_asset_import_intent intent);prepared=proof;acknowledged=false} in
-    match I.reply request.session ~request_id:(W.request_id request_id)operation
-      (S.Coordination_import_inputs_recovered{registration=raw.registration;owner=scope;request_id;
-        page={items=[row];next=(if more then Some sequence else None)}})with
-    |Ok(W.Answered(Ok page))->page|_->fail "source recovery UI fixture failed its public codec" in
-  let opening,command=R.step R.closed(Open(Some session)) in
-  let read=match command with Some(R.Read request)->request|_->fail "source UI did not request exactly one readonly page" in
-  let loaded,command=R.step opening(Completed(read,Ok(page read true true))) in
-  require(command=None && R.can_next loaded)"partial source page lost its continuation";
-  let proof=Option.get(Rrbvec.nth(R.items loaded)0).W.prepared in
-  let checking,command=R.step loaded(Mark_reviewed proof) in
-  let ack=match command with Some(R.Acknowledge ack)->ack|_->fail "reviewed original Prepared proof did not plan ACK" in
-  let same,command=R.step checking(Mark_reviewed proof) in
-  require(same==checking && command=None)"busy source UI planned duplicate ACK";
-  let resumed,command=R.step checking(Acknowledged(ack,Ok())) in
-  require(R.loading resumed && (match command with Some(R.Read _)->true|_->false))"real ACK did not refresh pending membership";
-  let unknown,_=R.step opening(Completed(read,Ok(page read false false))) in
-  let same,command=R.step unknown(Mark_reviewed proof) in
-  require(same==unknown && command=None)"unknown or different original source received an ACK";
-  let closed,_=R.step checking Close in
-  let reopened,_=R.step closed(Open(Some foreign)) in
-  let same,command=R.step reopened(Acknowledged(ack,Ok())) in
-  require(same==reopened && command=None)"old ACK reopened or refreshed a foreign source session";
-  let run actions=
-    let state=ref R.closed and pending=ref None and history=ref [] in
-    List.iter(fun action->
-      let before= !state in
-      let snapshot=R.items before,R.loading before,R.error before,R.page_number before in
-      let event=match action mod 11 with
-        |0->R.Open(Some session)|1->Open(Some foreign)|2->Close|3->Reload|4->Retry|5->Next
-        |6|7|8->(match !pending with
-          |Some(R.Read request)->
-            R.Completed(request,if action mod 11=6 then Error "Synthetic readonly error" else Ok(page request (action mod 2=0)(action mod 3<>0)))
-          |Some(R.Acknowledge ack)->R.Acknowledged(ack,if action mod 11=6 then Error "Unknown ACK" else Ok())
-          |None->Next)
-        |9->(match Rrbvec.to_seq(R.items before) |> Seq.find_map(fun(item:W.recovered_import_input)->item.prepared)with
-          |Some proof->Mark_reviewed proof|None->Next)
-        |_->(match !history with R.Read request::_->Completed(request,Error "Late reply")
-          |R.Acknowledge ack::_->Acknowledged(ack,Ok())|_->Next) in
-      let next,command=R.step before event and again,again_command=R.step before event in
-      require(next=again && command=again_command)"source UI transition is nondeterministic";
-      (match event with R.Close|Open None->pending:=None|_->());
-      (match event,!pending with
-       |R.Completed(request,_),Some(R.Read expected)when request=expected->pending:=None
-       |R.Acknowledged(ack,_),Some(R.Acknowledge expected)when ack=expected->pending:=None
-       |_->());
-      Option.iter(fun command->
-        (match command with R.Read request->require(W.validate_request request.session(R.operation request)=Ok())"source UI emitted an invalid cursor"
-         |Acknowledge ack->require(W.validate_request ack.session(W.Acknowledge_import_source ack.proof)=Ok())"source UI emitted foreign ACK");
-        pending:=Some command;history:=command::!history)command;
-      require(R.loading next=(!pending<>None))"source UI has multiple or unowned operations";
-      if not(R.available next)then require(Rrbvec.is_empty(R.items next))"closed source UI retained old records";
-      child_equal snapshot(R.items before,R.loading before,R.error before,R.page_number before)"source UI mutated earlier state";
-      state:=next)actions in
-  let fails actions=try run actions;false with _->true in
-  let rec shrink actions=let rec remove prefix=function []->actions
-    |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
-    |head::rest->remove(head::prefix)rest in remove [] actions in
-  for seed=0 to 99 do
-    let random=Random.State.make[|0x534f5552;seed|] in
-    let actions=List.init 100(fun _->Random.State.int random 256) in
-    if fails actions then fail "source UI seed=%d minimized=[%s]" seed(String.concat ";"(List.map string_of_int(shrink actions)))
-  done
-;;
 
 let tests =
-  [ "Source recovery pure owner and generated traces",test_import_recovery_ui_pure_owner_and_traces
-  ; "Child generated lifecycle traces",(fun ()->test_child_chain_generated_traces ())
+  [ "Child generated lifecycle traces",(fun ()->test_child_chain_generated_traces ())
   ; "Rejected child status rebind reaches canonical ACK",test_child_rejected_status_rebound_canonical
   ; "Child prefixes progress through actual SDK capacity",test_child_chain_sdk_capacity_progress
   ; "Known child non-insertion is terminal",test_child_known_rejection_is_terminal
   ; "Child chain freezes unknown writes and status choices",test_child_chain_frozen_unknown_choice
   ; "Child chain ACK failure retains original proofs",test_child_chain_ack_failure_keeps_proofs
-  ; "Read-only recovery pure generated traces",test_readonly_recovery_traces
-  ; "Read-only recovery pure request owner",test_readonly_recovery_owner
   ; "Uncertain plain child preserves insertion identity",test_uncertain_plain_child_keeps_identity
   ; "Child reselected status is a distinct sub-operation",test_child_reselected_status_intent
   ; "Retained child status preserves its admitted owner",test_retained_child_status_keeps_frozen_attempt
@@ -5585,3 +5393,268 @@ let () =
   require(let _,_,actual=F.write retry in actual=wire)
     "unknown Clear retry replaced its original immutable payload"
 ;;
+
+
+(* The insertion reducer owns bounded recovery; UI callbacks do not decide retries. *)
+let test_insertion_recovers_without_user_retry () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  List.iter(fun interrupted ->
+    let fixture=F.make () in
+    let state,index,round,intent=F.bind fixture fixture.initial fixture.action in
+    let snapshot=Marshal.to_string state [] in
+    let next,action=if interrupted then C.interrupted state ~index ~round "Local reply unavailable"
+      else C.receive state ~index ~round F.W.Outcome_unknown in
+    let i,r,wire=F.write action in
+    require(wire=C.stage_wire(C.stage state index) && i=index && r>round)
+      "background recovery changed the original insertion";
+    require(snapshot=Marshal.to_string state []) "background recovery mutated its input";
+    let same,late=C.receive next ~index ~round F.W.Outcome_unknown in
+    require(same==next && late=C.Ignore) "late original completion restarted recovery";
+    let next=C.bind next ~index:i ~round:r ~intent ~presentation:fixture.presentation |> Option.get in
+    let _,again=C.receive next ~index:i ~round:r F.W.Outcome_unknown in
+    require(match again with C.Wait _->true|_->false) "persistent local error entered an automatic loop";
+    let confirmed,parent=F.confirm fixture next action in
+    let _,done_=F.flush_prefix fixture confirmed parent in
+    require(done_=C.Complete) "same intent did not settle after background recovery") [false;true]
+;;
+let () = test_insertion_recovers_without_user_retry ()
+
+let test_insertion_recovery_budgets_follow_stages () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make ~task_state:child_status_a () in
+  let bound,index,round,_=F.bind fixture fixture.initial fixture.action in
+  let recovering,wire=C.receive bound ~index ~round F.W.Outcome_unknown in
+  let confirmed,parent=F.confirm fixture recovering wire in
+  let applied,ack=F.applied fixture confirmed parent in
+  let index,round=match ack with C.Acknowledge(index,round,_,_)->index,round|_->fail "missing insertion ACK" in
+  let recovering,wire=C.acknowledged applied ~index ~round (Error "Transient local ACK failure") in
+  ignore(F.write wire);
+  let confirmed,parent=F.confirm fixture recovering wire in
+  let progressed,status=F.flush_prefix fixture confirmed parent in
+  let bound,index,round,_=F.bind fixture progressed status in
+  let _,wire=C.receive bound ~index ~round F.W.Outcome_unknown in
+  require(match wire with C.Write(1,_,_)->true|_->false) "prior insertion recovery exhausted a distinct status stage"
+;;
+let () = test_insertion_recovery_budgets_follow_stages ()
+
+let source_recovery_fixture () =
+  let module W=Journal_worker_coordination.Worker_api in
+  let module C=Journal_worker_coordination.Worker_pure_coordinator in
+  let fixture=Child_chain_fixture.make()in
+  let ready=(C.step (C.step(C.initial ~client_id:(W.Uuid.of_string "70000000-0000-4000-9000-000000005590" |> Result.get_ok))
+    (C.Worker_bound fixture.binding)).next (C.Bootstrap_received(fixture.binding,W.Ready fixture.projection))).next in
+  let source:Logseq_db_types.Asset_import.t={operation=W.Uuid.of_string "70000000-0000-4000-9000-000000005591" |> Result.get_ok;
+    asset=W.Uuid.of_string "70000000-0000-4000-9000-000000005592" |> Result.get_ok;
+    target=W.Uuid.of_string fixture.command.block_id |> Result.get_ok;replace_reference=None;
+    local_mutation=W.Uuid.of_string "70000000-0000-4000-9000-000000005593" |> Result.get_ok;
+    metadata_mutation=W.Uuid.of_string "70000000-0000-4000-9000-000000005594" |> Result.get_ok;
+    source_file="/isolated/synthetic-source.png";title="Synthetic source";file_type="png"}in
+  let intent=W.asset_import_intent fixture.session source |> Result.get_ok in
+  ready,intent
+;;
+let test_source_lookup_completion_after_owner_retirement () =
+  let module M=Journal_worker_coordination_host.Pure_source_recovery in
+  let ready,intent=source_recovery_fixture()in
+  let state,reads=M.plan M.empty ready(Rrbvec.singleton intent)in
+  require(Rrbvec.length reads=1) "pending source did not plan one read";
+  let read=Rrbvec.nth reads 0 in
+  let state,retired=M.plan state ready Rrbvec.empty in
+  require(Rrbvec.is_empty retired) "retired source created another request";
+  let _,completion=M.completed state read ~retryable:true in
+  require(match completion with M.Ignored->true|_->false) "late source error must not notify a retired owner"
+;;
+let () = test_source_lookup_completion_after_owner_retirement ()
+
+let test_source_recovery_generated_lifetimes () =
+  let module M=Journal_worker_coordination_host.Pure_source_recovery in
+  let module W=Journal_worker_coordination.Worker_api in
+  let ready,intent=source_recovery_fixture()in
+  let encoded=W.encode_asset_import_intent intent in
+  let run actions =
+    let state=ref M.empty and active=ref true and current=ref None and old=ref [] and sent=ref 0 in
+    let observe read =
+      incr sent;
+      require(!sent<=2) "one pending source exceeded its bounded read attempts";
+      require(W.encode_asset_import_intent read.M.intent=encoded) "recovery changed the frozen input";
+      current:=Some read in
+    List.iter(fun action->
+      let before= !state and snapshot=Marshal.to_string !state [] in
+      (match action mod 5 with
+       |0|1->let intents=if !active then Rrbvec.singleton intent else Rrbvec.empty in
+         let next,reads=M.plan before ready intents and again,duplicates=M.plan before ready intents in
+         require(Marshal.to_string next []=Marshal.to_string again []
+           && Marshal.to_string reads []=Marshal.to_string duplicates []) "source planning is nondeterministic";
+         state:=next;Rrbvec.iter observe reads
+       |2->Option.iter(fun read->
+         let next,result=M.completed before read ~retryable:(action land 8<>0)in
+         state:=next;old:=read::!old;
+         (match result with M.Retry read->observe read|Ignored|Settled->current:=None))!current
+       |3->(match !old with []->()|read::_->
+         let next,result=M.completed before read ~retryable:true in
+         require(match result with M.Ignored->true|_->false) "duplicate source completion notified or retried";
+         state:=next)
+       |_->active:=false;state:=fst(M.plan before ready Rrbvec.empty));
+      require(snapshot=Marshal.to_string before []) "source transition mutated a shared prior snapshot")actions in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions =
+    let rec drop prefix=function
+      |[]->actions
+      |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      |action::rest->drop(action::prefix)rest in drop []actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0x5011CE;seed|]in
+    let actions=List.init 60(fun _->Random.State.int random 80)in
+    if fails actions then fail "source recovery seed=%d minimized=[%s]" seed
+      (String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+let () = test_source_recovery_generated_lifetimes ()
+
+(* Root owns the editable buffer; its admitted submission remains immutable
+   until the real settled completion supplied by Runtime. *)
+let test_pending_capture_edits_keep_original_submission () =
+  let module R=Root_state in
+  let original="Original submission" in
+  let state=root_navigation ~graph_generation:1 |> fun state->R.step state(Capture_edited original) in
+  let capture,request=Journal_capture.admit_save(Option.get(R.capture state))
+    ~mutation_id:"70000000-0000-4000-9000-000000005601"
+    ~block_id:"70000000-0000-4000-a000-000000005601" ~sibling_order:"z"
+    ~calendar_generation:1L ~creation_time:(creation_time 550)in
+  let command=match Option.get request with Journal_graph_request.Capture{command;_}->command|_->assert false in
+  let waiting=R.step (R.step state(Capture_admitted capture))
+    (Completed{payload=Capture_waiting{command;message="Original local result is not available"}})in
+  require(Journal_capture.phase(Option.get(R.capture waiting))=Journal_capture.Saving)
+    "unknown creation became a separate failed/readonly UI state";
+  let edited=R.step waiting(Capture_edited "Newer draft")in
+  let draft=Option.get(R.capture edited)in
+  require_string "Newer draft" (Journal_capture.source draft) "pending editor buffer";
+  require(Journal_capture.pending_command draft=Some command) "editing rewrote the original submission";
+  require(not(Journal_capture.can_save draft)) "unknown original admitted another creation";
+  let completed=R.step edited(Completed{payload=Block_captured{
+    block=block ~id:command.block_id ~source:original();timeline_entry_update=None}})in
+  let draft=Option.get(R.capture completed)in
+  require_string "Newer draft" (Journal_capture.source draft) "late submission erased the current editor";
+  require(Journal_capture.pending_command draft=None && Journal_capture.can_save draft)
+    "settled original did not release the edited draft";
+  let duplicate=R.step completed(Completed{payload=Block_captured{
+    block=block ~id:command.block_id ~source:original();timeline_entry_update=None}})in
+  require(R.capture duplicate=R.capture completed) "duplicate original completion changed the new draft"
+;;
+let ()=test_pending_capture_edits_keep_original_submission()
+
+let test_insertion_delayed_recovery_tokens () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make()in
+  let state,index,round,_=F.bind fixture fixture.initial fixture.action in
+  let state,action=C.receive state ~index ~round F.W.Outcome_unknown in
+  let state,index,round,_=F.bind fixture state action in
+  let state,wait=C.receive state ~index ~round F.W.Outcome_unknown in
+  require(match wait with C.Wait _->true|_->false) "exhausted immediate recovery replayed without a timer";
+  let current=ref state and previous=ref None and last_delay=ref 0. in
+  for _=0 to 10 do
+    let snapshot=Marshal.to_string !current []in
+    let armed,recovery=C.take_recovery !current in
+    require(snapshot=Marshal.to_string !current []) "arming recovery mutated its old snapshot";
+    let recovery=Option.get recovery in
+    require(recovery.delay>= !last_delay && recovery.delay<=30.) "recovery backoff is unbounded or decreasing";
+    last_delay:=recovery.delay;
+    let duplicate,twice=C.take_recovery armed in
+    require(twice=None && duplicate==armed) "duplicate publish created a second recovery timer";
+    Option.iter(fun old->let same,ignored=C.resume_recovery armed old in
+      require(same==armed && ignored=C.Ignore) "obsolete timer restarted a later attempt")!previous;
+    let retrying,action=C.resume_recovery armed recovery in
+    let _,_,wire=F.write action in
+    require(wire=C.stage_wire(C.stage state 0)) "timer replaced the original durable payload";
+    let duplicate,ignored=C.resume_recovery retrying recovery in
+    require(duplicate==retrying && ignored=C.Ignore) "timer fired the same attempt twice";
+    let bound,index,round,_=F.bind fixture retrying action in
+    let failed,wait=C.receive bound ~index ~round F.W.Outcome_unknown in
+    require(match wait with C.Wait _->true|_->false) "persistent error caused an immediate retry loop";
+    previous:=Some recovery;current:=failed
+  done;
+  require(!last_delay=30.) "background recovery never reached its capped interval"
+;;
+let ()=test_insertion_delayed_recovery_tokens()
+
+let test_pending_capture_buffer_traces () =
+  let module R=Root_state in
+  let run actions =
+    let original="Original source 中文"in
+    let initial=root_navigation ~graph_generation:1 |> fun state->R.step state(Capture_edited original)in
+    let capture,request=Journal_capture.admit_save(Option.get(R.capture initial))
+      ~mutation_id:"70000000-0000-4000-9000-000000005602"
+      ~block_id:"70000000-0000-4000-a000-000000005602" ~sibling_order:"z"
+      ~calendar_generation:1L ~creation_time:(creation_time 550)in
+    let command=match Option.get request with Journal_graph_request.Capture{command;_}->command|_->assert false in
+    let state=ref(R.step initial(Capture_admitted capture))and expected=ref original in
+    List.iteri(fun index action->
+      let before= !state and snapshot=Marshal.to_string !state []in
+      let current=Option.get(R.capture before)in
+      let event:R.event=match action mod 5 with
+        |0|1->let text=if action land 8=0 then original else Printf.sprintf "Buffer 中文 %d"index in
+          expected:=text;
+          let offset=Ui.Text_editing.Utf16.length text in
+          Capture_native_edit(edit ~session_id:(Journal_capture.session_id current)
+            ~local_revision:(Int64.succ(Journal_ids.Text_input.Local_revision.to_int64(Journal_capture.accepted_local_revision current)))
+            ~base_document_revision:(Journal_ids.Text_input.Document_revision.to_int64(Journal_capture.document_revision current))
+            ~text ~selection_start:offset ~selection_end:offset())
+        |2->Completed{payload=Capture_waiting{command;message="Local confirmation unavailable"}}
+        |3->Completed{payload=Block_captured{block=block ~id:"70000000-0000-4000-a000-000000005603"();timeline_entry_update=None}}
+        |_->Capture_native_edit(edit ~session_id:(Journal_ids.Text_input.Session_id.of_int64 99999L)
+          ~local_revision:1L ~base_document_revision:0L ~text:"Obsolete editor" ~selection_start:0 ~selection_end:0())in
+      let next=R.step before event and again=R.step before event in
+      require(Marshal.to_string next []=Marshal.to_string again []) "pending buffer transition is nondeterministic";
+      state:=next;
+      let current=Option.get(R.capture next)in
+      require_string !expected(Journal_capture.source current) "pending buffer trace";
+      require(Journal_capture.pending_command current=Some command && not(Journal_capture.can_save current))
+        "pending buffer trace changed an immutable submission or admitted a new one";
+      require(snapshot=Marshal.to_string before []) "pending buffer trace mutated a prior snapshot")actions;
+    let completed=R.step !state(Completed{payload=Block_captured{
+      block=block ~id:command.block_id ~source:original();timeline_entry_update=None}})in
+    if !expected=original then require(R.capture completed=None) "unchanged submitted buffer did not finish"
+    else let draft=Option.get(R.capture completed)in
+      require_string !expected(Journal_capture.source draft) "settled buffer trace";
+      require(Journal_capture.pending_command draft=None && Journal_capture.can_save draft)
+        "settled original kept the new draft owned"in
+  let fails actions=try run actions;false with _->true in
+  let rec shrink actions =
+    let rec remove prefix=function []->actions
+      |_::rest when fails(List.rev_append prefix rest)->shrink(List.rev_append prefix rest)
+      |event::rest->remove(event::prefix)rest in remove []actions in
+  for seed=0 to 99 do
+    let random=Random.State.make[|0xB0FF;seed|]in
+    let actions=List.init 60(fun _->Random.State.int random 80)in
+    if fails actions then fail "pending buffer seed=%d minimized=[%s]"seed
+      (String.concat ";"(List.map string_of_int(shrink actions)))
+  done
+;;
+let ()=test_pending_capture_buffer_traces()
+
+let test_delayed_recovery_cannot_borrow_another_submission () =
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make()in
+  let arm state action =
+    let state,index,round,_=F.bind fixture state action in
+    let state,action=C.receive state ~index ~round F.W.Outcome_unknown in
+    let state,index,round,_=F.bind fixture state action in
+    let state,_=C.receive state ~index ~round F.W.Outcome_unknown in
+    let state,token=C.take_recovery state in state,Option.get token in
+  let _,old=arm fixture.initial fixture.action in
+  let command={fixture.command with mutation_id="70000000-0000-4000-9000-000000005604";
+    block_id="70000000-0000-4000-a000-000000005604"}in
+  let wire=match C.stage_wire(C.stage fixture.initial 0)with
+    |F.P.V2_insert_blocks({roots=[root];_}as value)->F.P.V2_insert_blocks{value with
+      mutation_id=F.G.Uuid.of_string command.mutation_id |> Result.get_ok;
+      roots=[{root with uuid=F.G.Uuid.of_string command.block_id |> Result.get_ok}]}
+    |_->assert false in
+  let initial,action=C.start ~command ~page:(C.page fixture.initial) ~resolved_status:None ~insert:wire |> Result.get_ok in
+  let current,token=arm initial action in
+  require(old.round=token.round && old.delay=token.delay) "foreign timer test did not reproduce reused local counters";
+  let same,out=C.resume_recovery current old in
+  require(same==current && out=C.Ignore) "old submission timer borrowed a different immutable intent";
+  let _,out=C.resume_recovery current token in
+  let _,_,actual=F.write out in
+  require(actual=wire) "current submission timer did not retain its own payload"
+;;
+let ()=test_delayed_recovery_cannot_borrow_another_submission()

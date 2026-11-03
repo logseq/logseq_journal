@@ -19,6 +19,7 @@ type payload =
         command : Journal_graph_projection.create_child;
         presentation : Journal_worker_coordination.Worker_api.presentation;
         result : payload; failure : Journal_worker_coordination.Worker_api.error option }
+  | Child_not_admitted of {command:Journal_graph_projection.create_child;message:string}
   | Child_waiting of {command:Journal_graph_projection.create_child;message:string}
   | Child_projection_settled of
       { command : Journal_graph_projection.create_child; presentation : Journal_worker_coordination.Worker_api.presentation option; result : payload;
@@ -240,6 +241,10 @@ val mutation_presentation : t -> Logseq_db_worker.Protocol.request ->
   Journal_worker_coordination.Worker_api.presentation option
 
 val acknowledge_mutation : t -> Journal_worker_coordination.Worker_api.mutation_intent -> unit
+val begin_mutation_acknowledgement : t -> Journal_worker_coordination.Worker_api.mutation_intent -> bool
+val finish_mutation_acknowledgement : t -> Journal_worker_coordination.Worker_api.mutation_intent -> unit
+val claim_mutation_ack_recovery : t -> Journal_worker_coordination.Worker_api.mutation_intent
+  -> presentation:Journal_worker_coordination.Worker_api.presentation -> bool
 
 val worker_child_ack : t -> Logseq_db_worker.Protocol.request ->
   (Journal_worker_coordination.Worker_api.mutation_intent * Journal_worker_coordination.Worker_api.presentation) option
@@ -269,3 +274,7 @@ val plan_observed_detail : t -> generation:int64 -> limit:int -> root:Logseq_db_
   Logseq_db_worker.Protocol.request
 
 val owns_read : t -> Logseq_db_worker.Protocol.request -> bool
+
+val take_insertion_recoveries : t -> (Logseq_db_types.Graph_types.Uuid.t * Journal_graph_mutation_confirmation.Pure_insertion.recovery) Rrbvec.t
+val resume_insertion_recovery : t -> root:Logseq_db_types.Graph_types.Uuid.t
+  -> Journal_graph_mutation_confirmation.Pure_insertion.recovery -> output

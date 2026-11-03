@@ -15,6 +15,9 @@ type feed_scan =
   ; root_generation : int64
   ; root_start_day : int option
   ; root_before_day : int option
+  ; root_source_cursor : Projection.feed_cursor option
+  ; root_requested_root_limit : int
+  ; root_requested_day_limit : int
   ; root_skipped_day : int option
   ; mutable root_date_boundary : int option
   ; mutable root_priority_pending : bool
@@ -182,23 +185,6 @@ let root_failure batch message =
   match batch.root_owner with
   | Feed_roots scan -> scan_failure scan message
   | Changed_roots _ -> reject message
-;;
-
-let superseded_root_batch t batch =
-  match batch.root_owner with
-  | Feed_roots scan when root_owner_current t batch.root_owner ->
-    (match scan.root_start_day with
-     | None ->
-       feed_failure
-         scan.root_generation
-         "The Timeline changed while loading. Retry to read the current prefix."
-     | Some day ->
-       responses
-         [ response
-             (Failed { scope = Day { day; request_generation = scan.root_generation };
-                   stale_cursor = true; message = "The root read was superseded by a refresh." })
-         ])
-  | Feed_roots _ | Changed_roots _ -> empty
 ;;
 
 let make_root_batch t ~ports owner (page : Projection.page) cursor limit =
@@ -650,6 +636,98 @@ let next_root_preview t ~ports batch =
       requests [ read_root_preview ~ports preview ])
 ;;
 
+let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation ?after () =
+  let before_day = Option.bind cursor (fun c -> c.Projection.before_day) in
+  let start_day = Option.map (fun ((page : Projection.page), _) -> page.day) after in
+  if root_limit <= 0 || day_limit <= 0
+  then (
+    match start_day with
+    | None ->
+      feed_failure request_generation "The root and date packet limits must be positive."
+    | Some day -> day_failure ~day request_generation "The root limit must be positive.")
+  else if Option.exists (fun (_,cursor) -> Option.exists (fun cursor ->
+      match cursor.Projection.protocol_cursor with
+        | Some (Projection.Child_cursor _) -> true
+        | Some (Projection.Root_tree_cursor _) | None -> false) cursor) after
+  then (match start_day with
+    | Some day -> day_failure ~day request_generation "A Detail child cursor cannot continue Timeline roots."
+    | None -> feed_failure request_generation "A Detail child cursor cannot continue Timeline roots.")
+  else if Option.exists (fun day -> Result.is_error (Worker.journal_day day)) before_day
+  then (
+    match start_day with
+    | None -> feed_failure request_generation "The date continuation boundary is invalid."
+    | Some day -> day_failure ~day request_generation "The date continuation boundary is invalid.")
+  else (
+    t.feed_session <- ports.now ();
+    if cursor = None && after = None
+    then t.initial_feed_spec <- Some (root_limit, day_limit);
+    let scan =
+      { root_session = t.feed_session
+      ; root_generation = request_generation
+      ; root_start_day = start_day
+      ; root_before_day = before_day
+      ; root_source_cursor = cursor
+      ; root_requested_root_limit = root_limit
+      ; root_requested_day_limit = day_limit
+      ; root_skipped_day =
+          (match cursor, after with
+           | Some c, _ -> c.Projection.skipped_day
+           | None, None -> (ports.context ()).today
+           | None, Some _ -> None)
+      ; root_date_boundary = before_day
+      ; root_priority_pending = cursor = None && after = None
+      ; root_publish_partial = cursor = None && after = None
+      ; root_consumed_by_page = Hashtbl.create 32
+      ; root_remaining = root_limit
+      ; root_page_size = min root_limit Protocol.maximum_page_size
+      ; root_list_size = min day_limit Protocol.maximum_page_size
+      ; root_days = Rrbvec.empty
+      ; root_queued = Rrbvec.empty
+      ; root_journal_cursor = None
+      ; root_journal_through =
+          Option.fold ~none:99_999_999 ~some:previous_journal_day before_day
+      ; root_journal_boundary = None
+      ; root_journal_boundary_pages = Hashtbl.create 8
+      ; root_date_retries = 0
+      ; root_journals_done = after <> None && cursor = None
+      }
+    in
+    match after with
+    | None -> next_feed_batch t ~ports scan
+    | Some (page, cursor) ->
+      if Option.is_some cursor
+      then
+        Hashtbl.replace
+          scan.root_consumed_by_page
+          page.id
+          (Option.value (Hashtbl.find_opt t.root_page_counts page.id) ~default:0);
+      continue_root_batch t ~ports (Feed_roots scan) page
+        (Option.bind cursor (fun c -> match c.Projection.protocol_cursor with
+          | Some (Projection.Root_tree_cursor cursor)->Some cursor
+          | Some (Projection.Child_cursor _) | None->None))
+        scan.root_page_size)
+;;
+let superseded_root_batch t ~ports batch =
+  match batch.root_owner with
+  | Feed_roots scan when root_owner_current t batch.root_owner ->
+    (match scan.root_start_day with
+     | None ->
+       (* A canonical local completion can invalidate a page while startup is
+          still reading it. Retire that whole prefix, preserve its demand, and
+          let the current owner read a fresh prefix without a new UI state. *)
+       start_feed_scan t ~ports ~cursor:scan.root_source_cursor
+         ~root_limit:scan.root_requested_root_limit
+         ~day_limit:scan.root_requested_day_limit
+         ~request_generation:scan.root_generation ()
+     | Some day ->
+       responses
+         [ response
+             (Failed { scope = Day { day; request_generation = scan.root_generation };
+                   stale_cursor = true; message = "The root read was superseded by a refresh." })
+         ])
+  | Feed_roots _ | Changed_roots _ -> empty
+;;
+
 let receive_root_tree t ~ports ~origin ~cached batch items next_cursor =
   let items = Rrbvec.of_list items in
   if not (root_batch_current t batch)
@@ -745,7 +823,7 @@ let resume_cached t ~ports batch =
   | None -> root_failure batch "The retained root packet lost its cursor."
   | Some cursor ->
     if not (root_batch_current t batch)
-    then superseded_root_batch t batch
+    then superseded_root_batch t ~ports batch
     else (
       match ports.validate_session cursor.Projection.session with
       | Error _ ->
@@ -840,74 +918,6 @@ let receive_root_preview t ~ports preview parent revision items next_cursor =
            next_root_preview t ~ports { batch with root_members = Rrbvec.append batch.root_members selected }))
 ;;
 
-let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation ?after () =
-  let before_day = Option.bind cursor (fun c -> c.Projection.before_day) in
-  let start_day = Option.map (fun ((page : Projection.page), _) -> page.day) after in
-  if root_limit <= 0 || day_limit <= 0
-  then (
-    match start_day with
-    | None ->
-      feed_failure request_generation "The root and date packet limits must be positive."
-    | Some day -> day_failure ~day request_generation "The root limit must be positive.")
-  else if Option.exists (fun (_,cursor) -> Option.exists (fun cursor ->
-      match cursor.Projection.protocol_cursor with
-        | Some (Projection.Child_cursor _) -> true
-        | Some (Projection.Root_tree_cursor _) | None -> false) cursor) after
-  then (match start_day with
-    | Some day -> day_failure ~day request_generation "A Detail child cursor cannot continue Timeline roots."
-    | None -> feed_failure request_generation "A Detail child cursor cannot continue Timeline roots.")
-  else if Option.exists (fun day -> Result.is_error (Worker.journal_day day)) before_day
-  then (
-    match start_day with
-    | None -> feed_failure request_generation "The date continuation boundary is invalid."
-    | Some day -> day_failure ~day request_generation "The date continuation boundary is invalid.")
-  else (
-    t.feed_session <- ports.now ();
-    if cursor = None && after = None
-    then t.initial_feed_spec <- Some (root_limit, day_limit);
-    let scan =
-      { root_session = t.feed_session
-      ; root_generation = request_generation
-      ; root_start_day = start_day
-      ; root_before_day = before_day
-      ; root_skipped_day =
-          (match cursor, after with
-           | Some c, _ -> c.Projection.skipped_day
-           | None, None -> (ports.context ()).today
-           | None, Some _ -> None)
-      ; root_date_boundary = before_day
-      ; root_priority_pending = cursor = None && after = None
-      ; root_publish_partial = cursor = None && after = None
-      ; root_consumed_by_page = Hashtbl.create 32
-      ; root_remaining = root_limit
-      ; root_page_size = min root_limit Protocol.maximum_page_size
-      ; root_list_size = min day_limit Protocol.maximum_page_size
-      ; root_days = Rrbvec.empty
-      ; root_queued = Rrbvec.empty
-      ; root_journal_cursor = None
-      ; root_journal_through =
-          Option.fold ~none:99_999_999 ~some:previous_journal_day before_day
-      ; root_journal_boundary = None
-      ; root_journal_boundary_pages = Hashtbl.create 8
-      ; root_date_retries = 0
-      ; root_journals_done = after <> None && cursor = None
-      }
-    in
-    match after with
-    | None -> next_feed_batch t ~ports scan
-    | Some (page, cursor) ->
-      if Option.is_some cursor
-      then
-        Hashtbl.replace
-          scan.root_consumed_by_page
-          page.id
-          (Option.value (Hashtbl.find_opt t.root_page_counts page.id) ~default:0);
-      continue_root_batch t ~ports (Feed_roots scan) page
-        (Option.bind cursor (fun c -> match c.Projection.protocol_cursor with
-          | Some (Projection.Root_tree_cursor cursor)->Some cursor
-          | Some (Projection.Child_cursor _) | None->None))
-        scan.root_page_size)
-;;
 let failure_scope = function
   | Root_dates (scan, _) | Root_today (scan, _) ->
     (match scan.root_start_day with None -> Feed scan.root_generation
@@ -922,9 +932,9 @@ let operation_name = function Root_dates _ | Root_today _ -> "listTimelineDates"
 let is_current t = function Root_dates (scan, _) | Root_today (scan, _) -> root_owner_current t (Feed_roots scan)
   | Root_tree batch -> root_batch_current t batch
   | Root_preview preview -> root_batch_current t preview.preview_batch
-let superseded t = function Root_dates _ | Root_today _ -> empty
-  | Root_tree batch -> superseded_root_batch t batch
-  | Root_preview preview -> superseded_root_batch t preview.preview_batch
+let superseded t ~ports = function Root_dates _ | Root_today _ -> empty
+  | Root_tree batch -> superseded_root_batch t ~ports batch
+  | Root_preview preview -> superseded_root_batch t ~ports preview.preview_batch
 let handles operation outcome = match operation,outcome with
   | (Root_dates _ | Root_today _), Protocol.V2_journals_outcome _
   | Root_tree _, Protocol.V2_page_tree_outcome _

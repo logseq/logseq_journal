@@ -57,7 +57,6 @@ type t =
   ; next_session : int64
   ; next_retained : int64
   ; drafts : detached Drafts.t
-  ; observation_errors : (int64 * string * bool) Owners.t
   }
 
 let create () =
@@ -68,7 +67,6 @@ let create () =
   ; next_session = 1L
   ; next_retained = 1L
   ; drafts = Drafts.empty
-  ; observation_errors = Owners.empty
   }
 ;;
 
@@ -632,6 +630,14 @@ let apply_child_failure t ~block_id ~message =
     fst (Journal_detail.step detail (Append_failed (block_id, message))))
 ;;
 
+let await_child_confirmation t ~block_id =
+  let drafts=Drafts.map(fun draft->
+    let composer=Journal_detail.await_retained_confirmation draft.composer ~block_id in
+    if composer==draft.composer then draft else {draft with composer})t.drafts in
+  let t=if drafts==t.drafts then t else {t with drafts}in
+  map_details t ~f:(fun detail->Journal_detail.await_child_confirmation detail ~block_id)
+;;
+
 let accept_path t path =
   let original = Path.entries t.path
   and next = Path.entries path in
@@ -662,8 +668,7 @@ let accept_path t path =
            then t
            else (
              let t = retain_owner t entry.id in
-             { t with owners = Owners.remove entry.id t.owners;
-               observation_errors=Owners.remove entry.id t.observation_errors }))
+             { t with owners = Owners.remove entry.id t.owners }))
         t
         original
     in
@@ -996,26 +1001,17 @@ let observation_recover t ~entry_id ~request_generation ~block_id =
   | _->t
 ;;
 
-let observation_error t =
-  Option.bind(active_entry_id t)(fun id->
-    Option.bind(Owners.find_opt id t.observation_errors)(fun(generation,message,refreshing)->
-      if generation=detail_request_generation t then Some(message,refreshing) else None))
-;;
-let observation_failed t ~entry_id ~request_generation ~message =
-  match Owners.find_opt entry_id t.owners with
-  | Some view when view_generation view=request_generation ->
-    {t with observation_errors=Owners.add entry_id(request_generation,message,false)t.observation_errors}
-  | _->t
-;;
-let observation_refreshing t ~entry_id ~request_generation =
-  match Owners.find_opt entry_id t.observation_errors with
-  | Some(generation,message,_) when generation=request_generation ->
-    {t with observation_errors=Owners.add entry_id(generation,message,true)t.observation_errors}
-  | _->t
-;;
-let observation_clear t ~entry_id ~request_generation =
-  match Owners.find_opt entry_id t.observation_errors with
-  | Some(generation,_,_) when generation=request_generation ->
-    {t with observation_errors=Owners.remove entry_id t.observation_errors}
-  | _->t
-;;
+let pending_child_submissions t =
+  let remember submissions ((command:Journal_graph_projection.create_child),chain) =
+    match Drafts.find_opt command.Journal_graph_projection.mutation_id submissions with
+    |Some((previous:Journal_graph_projection.create_child),_) when previous.status_intent_revision>=command.status_intent_revision->submissions
+    |_->Drafts.add command.mutation_id(command,chain)submissions in
+  let submissions=Owners.fold(fun _ view submissions->
+    let pending=match view with
+      |Detail_view{detail;_}|Detail_loading_view{staged_detail=Some detail;_}->Journal_detail.pending_submission detail
+      |_->None in
+    Option.fold ~none:submissions ~some:(remember submissions)pending)t.owners Drafts.empty in
+  let submissions=Drafts.fold(fun _ draft submissions->
+    Option.fold ~none:submissions ~some:(remember submissions)
+      (Journal_detail.retained_pending_submission draft.composer))t.drafts submissions in
+  Drafts.fold(fun _ submission out->Rrbvec.push_back out submission)submissions Rrbvec.empty

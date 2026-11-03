@@ -62,6 +62,7 @@ type payload =
   | Child_projection_ready of
       { root : Graph.Uuid.t; round : int64; command : Projection.create_child;
         presentation : Worker.presentation; result : payload; failure : Worker.error option }
+  | Child_not_admitted of {command:Journal_graph_projection.create_child;message:string}
   | Child_waiting of {command:Journal_graph_projection.create_child;message:string}
   | Child_projection_settled of
       { command : Projection.create_child; presentation : Worker.presentation option; result : payload; failure : Worker.error option;
@@ -271,6 +272,9 @@ type durable_operation =
   ; presentation : Worker.presentation
   ; confirm_readback : bool
   ; root_request : Protocol.request
+  ; submission_recovered : bool
+  ; acknowledgement_recovered : Worker.presentation option
+  ; acknowledgement_in_flight : bool
   }
 
 type pending_operation =
@@ -294,6 +298,7 @@ type t =
   ; mutable latest_change_batch : Worker.change_batch option
   ; validate_session : Worker.session -> (unit, Worker.error) result
   ; pending : (string, pending_operation) Hashtbl.t
+  ; mutable insertion_recoveries : (Graph.Uuid.t * Child.recovery) Rrbvec.t
   ; hydration_queue : Protocol.request Queue.t
   ; hydration_active : (string, unit) Hashtbl.t
   ; mutable next_request : int64
@@ -354,6 +359,7 @@ let day_failure ~day request_generation message =
 let create ?(on_change=fun _->()) ?(on_projection_changes=fun _->()) ?(localtime = Unix.localtime) ?(validate_session = fun _ -> Error Worker.Revoked_session) () =
   { validate_session;on_change;on_projection_changes;external_reads=Hashtbl.create 16;application_context=None;latest_application=None;latest_change_batch=None
   ; pending = Hashtbl.create 32
+  ; insertion_recoveries=Rrbvec.empty
   ; hydration_queue = Queue.create ()
   ; hydration_active = Hashtbl.create 4
   ; next_request = 1L
@@ -395,6 +401,7 @@ let reset t =
   t.latest_application<-None;t.latest_change_batch<-None;t.application_context<-None;
   Hashtbl.clear t.external_reads;
   Hashtbl.clear t.pending;
+  t.insertion_recoveries<-Rrbvec.empty;
   Queue.clear t.hydration_queue;
   Hashtbl.clear t.hydration_active;
   Hashtbl.clear t.task_definitions;
@@ -759,7 +766,7 @@ let child_error_message = function
   | Worker.Db_error error -> Error.message error
   | Invalid_input message | Service_failed message | Unsupported_operation message
   | Protocol_mismatch message | Stale_read message | Resync_required message -> message
-  | Revoked_session -> "The child graph session changed. Retry in the current graph."
+  | Revoked_session -> "The child graph session changed."
   | Host_change_in_progress -> "The graph is closing. The child outcome is retained."
   | Response_budget_exceeded -> "The child result exceeded its response budget."
 ;;
@@ -881,6 +888,8 @@ let capture_append_wire t (command:Projection.capture) =
         journal_day=Journal_time.local_day command.creation_time;root}))))))
 ;;
 let child_action t root chain projection action =
+  let chain,recovery=Child.take_recovery chain in
+  Option.iter(fun recovery->t.insertion_recoveries<-Rrbvec.push_back t.insertion_recoveries(root,recovery))recovery;
   update_child_root t root chain projection;
   let command=Child.command chain in
   let capture=capture_root_command t root in
@@ -925,8 +934,7 @@ let child_action t root chain projection action =
     let result=match projection with Some result->result
       | None->(child_failure command (Option.fold ~none:"The child was not inserted."
           ~some:child_error_message(Child.failure chain))).payload in
-    if Child.failure chain=None || insert_rejected then
-      Hashtbl.filter_map_inplace (fun key pending ->
+    Hashtbl.filter_map_inplace (fun key pending ->
         if key=Graph.Uuid.to_string root || child_request_root pending.operation=Some root then None
         else Some pending) t.pending;
     let refresh=if Child.canonical chain=None then [] else
@@ -946,6 +954,9 @@ let child_step t root transition = match child_root t root with
   | None -> empty
   | Some(_,chain,projection) ->
     let next,action=transition chain in child_action t root next projection action
+;;
+let take_insertion_recoveries t =
+  let pending=t.insertion_recoveries in t.insertion_recoveries<-Rrbvec.empty;pending
 ;;
 
 let submit_unowned t (request : Journal_graph_request.t) =
@@ -1080,16 +1091,7 @@ let submit_unowned t (request : Journal_graph_request.t) =
              let projection=Option.bind(child_root t root)(fun(_,_,projection)->projection) in
              child_action t root next projection action))
      | None ->
-    let reject message =
-      responses
-        [ response
-            (Child_failed
-               { mutation_id = command.mutation_id
-               ; block_id = command.block_id
-               ; failure = Projection_failure message
-               })
-        ]
-    in
+    let reject message = responses[response(Child_not_admitted{command;message})]in
     if not (calendar_generation_is_current t command.calendar_generation)
     then reject "The local calendar changed before child admission."
     else if Result.is_error (task_status_uuid t command.task_state)
@@ -1929,7 +1931,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
   match Hashtbl.find_opt t.pending key with
   | None -> empty
   | Some {operation=Feed_read operation;_} when not (Feed.is_current t.feed operation) ->
-    Hashtbl.remove t.pending key; Feed.superseded t.feed operation |> feed_output t
+    Hashtbl.remove t.pending key; Feed.superseded t.feed ~ports:(feed_ports t) operation |> feed_output t
   | Some {operation;source_epoch;_} when not(changed_point_current t operation source_epoch)->
     Hashtbl.remove t.pending key;empty
   | Some { operation = Target_summary summary; source_epoch; _ }
@@ -2754,7 +2756,9 @@ let retry_failed_change_application t ~view ~request_generation =
   match t.latest_change_batch with
   | Some batch
     when Coordination.owns_change_batch view batch
-         && Option.is_some (Coordination.change_application_error view batch) ->
+         && Option.is_some (Coordination.change_application_error view batch)
+         && not(Hashtbl.to_seq_values t.pending |> Seq.exists(fun pending->match pending.operation with
+           |Pull_changes pending->pending.generation=batch.generation|_->false)) ->
     dispatch_output
       t
       (requests
@@ -3016,7 +3020,11 @@ let bind_mutation t request ~presentation ~intent =
        (match Child.bind chain ~index ~round ~intent ~presentation with
         | None->false|Some chain->update_child_root t root chain projection;true))
   | Some pending when pending.delivery=Dispatched ->
-    Hashtbl.replace t.pending key {pending with durable=Some{intent;presentation;confirm_readback=true;root_request=request}};true
+    let durable=match pending.durable with
+      | Some durable -> {durable with intent;presentation;confirm_readback=true}
+      | None -> {intent;presentation;confirm_readback=true;root_request=request;
+          submission_recovered=false;acknowledgement_recovered=None;acknowledgement_in_flight=false} in
+    Hashtbl.replace t.pending key {pending with durable=Some durable};true
   | _->false
 ;;
 
@@ -3039,15 +3047,52 @@ let acknowledge_mutation t intent =
   | None->()
 ;;
 
-let mutation_waiting t (request:Protocol.request) message =
+let update_mutation_acknowledgement t intent f =
+  match pending_mutation t ~mutation_id:(Graph.Uuid.to_string(Worker.mutation_intent_id intent)) with
+  |None->false
+  |Some request->let key=Graph.Uuid.to_string request.Protocol.request_id in
+    match Hashtbl.find_opt t.pending key with
+    |Some({durable=Some durable;_}as pending)->
+      (match f durable with None->false|Some durable->
+        Hashtbl.replace t.pending key {pending with durable=Some durable};true)
+    |_->false
+;;
+let begin_mutation_acknowledgement t intent =
+  update_mutation_acknowledgement t intent(fun durable->
+    if durable.acknowledgement_in_flight then None else Some{durable with acknowledgement_in_flight=true})
+;;
+let finish_mutation_acknowledgement t intent =
+  ignore(update_mutation_acknowledgement t intent(fun durable->Some{durable with acknowledgement_in_flight=false}))
+;;
+let claim_mutation_ack_recovery t intent ~presentation =
+  match pending_mutation t ~mutation_id:(Graph.Uuid.to_string(Worker.mutation_intent_id intent)) with
+  | None->false
+  | Some request->let key=Graph.Uuid.to_string request.Protocol.request_id in
+    (match Hashtbl.find_opt t.pending key with
+     | Some({durable=Some durable;_}as pending) when not durable.acknowledgement_in_flight && durable.acknowledgement_recovered<>Some presentation ->
+       Hashtbl.replace t.pending key {pending with durable=Some{durable with acknowledgement_recovered=Some presentation}};true
+     | _->false)
+;;
+
+let mutation_waiting_unissued t (request:Protocol.request) message =
   match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
   | Some {operation=(Child_chain _|Capture_chain _);_} ->
     child_step t request.request_id(fun chain->Child.interrupted chain ~index:0 ~round:1L message)
   | Some {operation=(Child_write{root;index;round}|Child_ack{root;index;round;_});_} ->
+    Hashtbl.remove t.pending(Graph.Uuid.to_string request.request_id);
     child_step t root(fun chain->Child.interrupted chain ~index ~round message)
+  | Some ({durable=Some durable;failure_owner=Some(Mutation_owner _);_}as pending)
+    when not durable.submission_recovered ->
+    Hashtbl.replace t.pending (Graph.Uuid.to_string request.request_id)
+      {pending with durable=Some{durable with submission_recovered=true};delivery=Planned};
+    requests[durable.root_request]
   | Some {failure_owner=Some(Mutation_owner{mutation_id;block_id;_});_}->
     responses[response(Mutation_waiting{mutation_id;block_id;message})]
   | _->empty
+;;
+
+let mutation_waiting t request message =
+  dispatch_output t(mutation_waiting_unissued t request message)
 ;;
 
 let receive_mutation t (request:Protocol.request) progress =
@@ -3103,7 +3148,7 @@ let receive_mutation t (request:Protocol.request) progress =
            (Hashtbl.find_opt t.pending key))output.requests;
        {output with responses=List.map(fun value->{payload=Mutation_settled(durable.intent,durable.presentation,value.payload)})output.responses}
      | Confirmed _ | Outcome_unknown | Committed_pending_presentation _ ->
-       mutation_waiting t request "The change is awaiting confirmation. Retry checks the same change.")
+       mutation_waiting t request "The change is awaiting confirmation.")
   | _->empty
 ;;
 
@@ -3120,6 +3165,10 @@ let rebind_child_ack t (request:Protocol.request) ~presentation =
       | None->false|Some chain->update_child_root t root chain projection;true)
   | _->false
 ;;
+let resume_insertion_recovery t ~root recovery =
+  dispatch_output t(child_step t root(fun chain->Child.resume_recovery chain recovery))
+;;
+
 let receive_child_ack t (request:Protocol.request) result =
   let key=Graph.Uuid.to_string request.request_id in
   match Hashtbl.find_opt t.pending key with
@@ -3136,7 +3185,10 @@ let fail_request t (request : Protocol.request) ~message =
   match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
   | Some{operation=Capture_append command;_}->
     Hashtbl.remove t.pending(Graph.Uuid.to_string request.request_id);
-    responses[response(Capture_waiting{command;message})]
+    responses[response(Capture_not_admitted{command;message})]
+  | Some{operation=Child_insert(command,_);_}->
+    Hashtbl.remove t.pending(Graph.Uuid.to_string request.request_id);
+    responses[response(Child_not_admitted{command;message})]
   | Some{operation=(Child_chain _|Capture_chain _|Child_write _|Child_ack _);_}->mutation_waiting t request message
   | _->receive
     t

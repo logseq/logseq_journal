@@ -833,28 +833,50 @@ let () =
           change r [ 60 ];
           reply_missing r q 60;
           check (list_reads q = 1) "new parent deletion still selects moved root" )
-    ; ( "dependency failure stays visible until explicit Retry"
+    ; ( "dependency failure recovers once without user Retry"
       , fun () ->
-          let r, q, v, _ = fixture () in
-          observe r (raw_block 1 60);
-          loaded r q (G.Uuid.to_string (uuid 1)) [];
-          change r [ 80 ];
-          let ticket, request = Queue.take q in
-          (match ticket, request with
-           | Some ticket, S.Graph_request { command = P.V2_get_outline_block { block; _ }; _ }
-             when block = uuid 60 -> R.reject r ticket
-           | _ -> failwith "missing ancestor must have one owned fact read");
-          let root = G.Uuid.to_string (uuid 1) in
-          check
-            (Option.is_some (Hashtbl.find v root).error)
-            "failed dependency lookup is visible";
-          R.pump r;
-          change r [ 81 ];
-          check
-            (Queue.is_empty q)
-            "unrelated changes cannot automatically retry failed dependency lookup";
-          R.retry r ~root ~asset:"";
-          check (not (Queue.is_empty q)) "explicit Retry can retry the dependency lookup"
+          let r,q,v,_=fixture() in
+          observe r(raw_block 1 60); loaded r q(G.Uuid.to_string(uuid 1))[];
+          change r[80];
+          let ticket,request=Queue.take q in
+          (match ticket,request with
+           |Some ticket,S.Graph_request{command=P.V2_get_outline_block{block;_};_} when block=uuid 60 ->R.reject r ticket
+           |_->failwith "missing ancestor must have one owned fact read");
+          check(not(Queue.is_empty q)) "first dependency failure must recover in the background";
+          let attempts=ref 0 in
+          while not(Queue.is_empty q) && !attempts<8 do
+            let ticket,_=Queue.take q in incr attempts;Option.iter(R.reject r)ticket
+          done;
+          check(Queue.is_empty q) "persistent dependency failures entered an automatic loop";
+          let root=G.Uuid.to_string(uuid 1) in
+          check(Option.is_some(Hashtbl.find v root).error) "persistent dependency error disappeared";
+          change r[81];R.pump r;
+          check(Queue.is_empty q) "unrelated changes replayed exhausted dependency recovery"
+      )
+    ; ( "cached facts cannot reset a failed dependency budget"
+      , fun () ->
+          let r,q,_,_=fixture() in
+          seed r q 1 [];
+          observe r(raw_block 1 900);
+          let fact_reads=ref 0 and listings=ref 0 in
+          for _=1 to 3 do
+            change r[1];
+            let attempts=ref 0 in
+            while not(Queue.is_empty q) && !attempts<20 do
+              incr attempts;
+              let ticket,request=Queue.take q in
+              match ticket,request with
+              |Some ticket,S.Graph_request{command=P.V2_get_outline_block _;_}->
+                incr fact_reads;R.reject r ticket
+              |Some ticket,S.Graph_request{request_id;command=(P.V2_list_assets _ as command);_}->
+                incr listings;reply r(ticket,request_id,command)[]
+              |_->()
+            done;
+            check(Queue.is_empty q) "cached dependency recovery did not terminate"
+          done;
+          (* Each reapplication can request its root, but a successful asset
+             listing cannot grant another dependency recovery on old facts. *)
+          check(!fact_reads>=2 && !fact_reads<=3 && !listings=1) "cached old facts restarted failed dependency recovery"
       )
     ; ( "late owned raw response cannot revert reference facts"
       , fun () ->
@@ -1044,21 +1066,15 @@ let () =
           check (list_reads q = 0) "last owner hide retires requests never admitted";
           R.root_visible r ~root:(G.Uuid.to_string (uuid 1)) true;
           check (list_reads q = 1) "reactivation starts exactly one first page" )
-    ; ( "metadata failure requires explicit Retry"
+    ; ( "metadata failure recovers once without user Retry"
       , fun () ->
-          let r, q, v, _ = fixture () in
-          seed r q 1 [];
-          membership_change r 1 70;
-          let ticket, _, _ = take_metadata q in
-          R.reject r ticket;
-          let root = G.Uuid.to_string (uuid 1) in
-          R.root_visible r ~root true;
-          R.pump r;
-          check
-            (list_reads q = 0 && Option.is_some (Hashtbl.find v root).error)
-            "failed membership stays failed without automatic retry";
-          R.retry r ~root ~asset:"";
-          check (list_reads q = 1) "explicit Retry starts one metadata read" )
+          let r,q,v,_=fixture() in seed r q 1[];membership_change r 1 70;
+          let ticket,_,_=take_metadata q in R.reject r ticket;
+          check(list_reads q=1) "first metadata failure did not recover automatically";
+          let ticket,_,_=take_metadata q in R.reject r ticket;
+          let root=G.Uuid.to_string(uuid 1) in R.root_visible r ~root true;R.pump r;
+          check(list_reads q=0 && Option.is_some(Hashtbl.find v root).error)
+            "persistent metadata error was hidden or retried indefinitely" )
     ; ( "scope reset rejects late membership"
       , fun () ->
           let r, q, v, _ = fixture () in

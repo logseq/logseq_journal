@@ -2,6 +2,15 @@ module Worker = Journal_worker_coordination.Worker_api
 module Core = Journal_worker_coordination.Worker_pure_coordinator
 module Runner = Journal_worker_coordination.Worker_effect_runner
 
+module Pure_source_recovery : sig
+  type t
+  type read = private {session:Worker.session;intent:Worker.asset_import_intent;attempt:int}
+  type completion = Ignored | Settled | Retry of read
+  val empty : t
+  val plan : t -> Core.t -> Worker.asset_import_intent Rrbvec.t -> t * read Rrbvec.t
+  val completed : t -> read -> retryable:bool -> t * completion
+end
+
 type t
 
 val create
@@ -103,3 +112,7 @@ val authorize_host_change : t -> Worker.handoff_receipt -> (unit,Worker.error)re
 val watch_handoff : t -> Worker.handoff_id -> f:(Worker.handoff_state -> unit) -> unit
 
 val host_change_blocks : t -> owner:Runner.Service.timeline_scope -> bool
+
+(** Read only the original source evidence of actually pending imports; no replay or review ACK. *)
+val recover_import_sources : t -> Worker.asset_import_intent Rrbvec.t
+  -> failed:(Worker.session -> Worker.error -> unit) -> unit

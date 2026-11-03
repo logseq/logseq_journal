@@ -34,7 +34,17 @@ let journalAppIcons: [String: String] = [:]
       extensionRegistry: LUIAppleExtensionRegistry())
     var reported: Error?
     do { try runtime.start() } catch { reported = error }
-    if scenario == "stop-retry" || scenario == "stop-failure" {
+    if scenario == "host-lifetime" {
+      precondition(reported == nil && platform.connected)
+      var owner: JournalRuntimeLifetime? = JournalRuntimeLifetime()
+      owner?.runtime = runtime
+      weak var released = owner
+      precondition(platform.connected && stopCount() == 0,
+        "A mounted owner keeps the runtime connected independently of visible presentation")
+      owner = nil
+      precondition(released == nil && !platform.connected && stopCount() == 1,
+        "Removing the actual host owner releases native runtime exactly once")
+    } else if scenario == "stop-retry" || scenario == "stop-failure" {
       precondition(reported == nil && platform.connected)
       runtime.stop()
       precondition(runtime.failure == .stop && !platform.connected,

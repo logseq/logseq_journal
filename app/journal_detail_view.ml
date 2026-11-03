@@ -147,16 +147,9 @@ let view
           else
             V.column
               (Option.to_list (Option.map live_region_text error)
-               @ [ button
-                     ~enabled
-                     ~id:("detail-more:" ^ parent_id)
-                     ~command:(Load_more parent_id)
-                     ~symbol:
-                       (if Option.is_some error then "arrow.clockwise" else "ellipsis")
-                     (if Option.is_some error
-                      then "Retry loading children"
-                      else "Load more")
-                 ]
+               @ (if error<>None then [] else [ button
+                     ~enabled ~id:("detail-more:" ^ parent_id)
+                     ~command:(Load_more parent_id) ~symbol:"ellipsis" "Load more" ])
                @ if enabled
                  then []
                  else [ V.text "Waiting for another branch to finish" ])
@@ -269,12 +262,7 @@ let view
            ~title:"Unable to open block"
            ~symbol:"exclamationmark.triangle"
            ~message
-           ~actions:
-             (button
-                ~id:"detail-retry"
-                ~command:Retry
-                ~symbol:"arrow.clockwise"
-                "Retry")
+           ~actions:(V.empty ())
        | Ready _ | Empty -> V.empty ())
       |> V.Body.static
   in

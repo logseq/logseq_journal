@@ -2996,10 +2996,10 @@ let test_child_failure_retains_admitted_child () =
   in
   let check output =
     match (only "child failure" output.Runtime.responses).payload with
-    | Child_failed owner ->
-      Alcotest.(check string) "admitted child" block_id owner.block_id;
-      Alcotest.(check string) "admitted child mutation" mutation_id owner.mutation_id
-    | _ -> Alcotest.fail "child failure lost admitted child owner"
+    | Child_not_admitted {command;_} ->
+      Alcotest.(check string) "unsent child" block_id command.block_id;
+      Alcotest.(check string) "unsent child mutation" mutation_id command.mutation_id
+    | _ -> Alcotest.fail "unsent child failure lost its draft identity"
   in
   check
     (Runtime.submit
@@ -6154,6 +6154,25 @@ let child_identity_insert runtime =
   Runtime.submit runtime(Create_child command)
   |> fun output -> only "child insertion" output.Runtime.requests
 ;;
+(* SDK progress alone cannot exercise the business dispatcher's delivery state.
+   Use its public transition, with the same typed intent as a real bound write. *)
+let test_unknown_mutation_recovery_issues_original () =
+  let module W=Worker_producer.W in
+    let runtime,_,request=prepare_paged_refresh ~ordinary:true ~defer:true Delete_conflict in
+    let mutation_id,command=Runtime.worker_mutation runtime request |> Option.get in
+    let presentation=Option.get(W.selected Worker_producer.projection) in
+    let intent=W.mutation_intent Worker_producer.session ~mutation_id command |> Result.get_ok in
+    Alcotest.(check bool) "original mutation bound before Unknown" true
+      (Runtime.bind_mutation runtime request ~presentation ~intent);
+    let output=Runtime.receive_mutation runtime request W.Outcome_unknown in
+    let resumed=only "one automatic original-intent continuation" output.requests in
+    Alcotest.(check bool) "continuation preserves original wire" true (resumed=request);
+    Alcotest.(check bool) "public transition issues continuation before returning" true
+      (Runtime.worker_mutation runtime resumed=Some(mutation_id,command));
+    Alcotest.(check bool) "same-intent continuation can bind its next receipt" true
+      (Runtime.bind_mutation runtime resumed ~presentation ~intent)
+;;
+
 let child_identity_runtime () =
   let runtime=Runtime.create () in seed_children_interest runtime;set_calendar runtime;runtime
 ;;
@@ -6239,9 +6258,55 @@ let test_typed_child_planning_refusal_retains_transport () =
       {Runtime.requests=insert::ordinary.requests;responses=[]} in
     Alcotest.(check bool) "ordinary failures in a mixed batch remain transport failures" true
       (mixed.error<>None);
-    Alcotest.(check bool) "original child remains owned after refused transport" true
-      ((Runtime.receive_mutation runtime insert W.Outcome_unknown).responses<>[]))
+    let retained=Production_runtime.retained_child_chains runtime in
+    Alcotest.(check int) "original child remains owned after refused transport" 1(Rrbvec.length retained);
+    let command,_=Rrbvec.nth retained 0 in
+    Alcotest.(check string) "refused transport retains the original immutable mutation"
+      (Graph.Uuid.to_string id)command.mutation_id;
+    let late=Runtime.receive_mutation runtime insert W.Outcome_unknown in
+    Alcotest.(check bool) "late completion from the earlier round cannot restart work" true
+      (late.requests=[] && late.responses=[]))
     Journal_graph_transport.[Full;Not_ready;Stopping]
+;;
+
+let test_unbound_child_refusal_is_not_admitted () =
+  let runtime=child_identity_runtime()in
+  let request=child_identity_insert runtime in
+  let delivery=Journal_graph_transport.deliver ~runtime ~send:(fun _->Journal_graph_transport.Not_ready)
+    {Runtime.requests=[request];responses=[]}in
+  Alcotest.(check bool) "known unsent child is not an unknown outcome"true
+    (match delivery.responses with [{Runtime.payload=Child_not_admitted _}]->true|_->false);
+  Alcotest.(check (option string)) "local refusal does not retire the graph"None delivery.error
+;;
+
+let test_child_error_continuations_retire () =
+  let module W=Journal_worker_coordination.Worker_api in
+  let runtime=child_identity_runtime()in
+  let original=child_identity_insert runtime in
+  let _,_,projection,session=Coordination_test_fixture.fixture 5521L in
+  let presentation=Option.get(W.selected projection)in
+  let request=ref original in
+  for _=1 to 20 do
+    let id,command=Runtime.worker_mutation runtime !request |> Option.get in
+    let intent=W.mutation_intent session ~mutation_id:id command |> Result.get_ok in
+    Alcotest.(check bool) "actual continuation binds before its completion"true
+      (Runtime.bind_mutation runtime !request ~presentation ~intent);
+    let previous= !request in
+    let output=Runtime.mutation_waiting runtime previous "Transient confirmation failure"in
+    if previous.request_id<>original.request_id then
+      Alcotest.(check bool) "completed physical request no longer owns a route"true
+        (Runtime.worker_mutation runtime previous=None);
+    let output=if output.requests<>[]then output else
+      let pending=Production_runtime.take_insertion_recoveries runtime in
+      Alcotest.(check int) "one delayed continuation only"1(Rrbvec.length pending);
+      let root,recovery=Rrbvec.nth pending 0 in
+      Production_runtime.resume_insertion_recovery runtime ~root recovery in
+    request:=only "next original continuation"output.requests;
+    Alcotest.(check bool) "public error transition issued its actual continuation"true
+      (Runtime.worker_mutation runtime !request<>None);
+    Alcotest.(check int) "the immutable root remains owned"1
+      (Rrbvec.length(Production_runtime.retained_child_chains runtime))
+  done
 ;;
 
 let test_task_catalog_generation_and_deltas () =
@@ -8214,6 +8279,41 @@ let test_newer_reconciliation_fences_old_results () =
   Alcotest.(check int) "retired graph cannot continue" 0 (List.length retired.requests)
 ;;
 
+(* The epoch belongs to the public business read planner, not the pure SDK.
+   A real page reconciliation can finish while the first prefix is still held. *)
+let test_initial_reconciliation_restarts_prefix () =
+  let runtime=Runtime.create ~localtime:Unix.gmtime () in
+  set_calendar runtime;
+  let fixture=root_fixture 0 40 0 in
+  let day=match fixture.owner.kind with Journal_page{journal_day}->journal_day|_->assert false in
+  let rec hold_roots output =
+    let request=only "initial date/root request" output.Runtime.requests in
+    match request.command with
+    | Protocol.V2_get_page_tree _->request
+    | V2_list_journals{from_day;through_day;_}->
+      let items=if from_day<=day && day<=through_day then
+        [Protocol.{page=fixture.owner;journal_day=day;revision="page-1"}] else [] in
+      hold_roots(Runtime.receive runtime(response request(V2_journals_outcome{items;next_cursor=None})))
+    | _->Alcotest.fail "unexpected initial query"
+  in
+  let old=hold_roots(initial_roots runtime 77L)in
+  let refreshed=changed runtime(window ~scopes:[Protocol.V2_page_tree_interest fixture.owner.uuid]())in
+  ignore(drive_root_output runtime[fixture]refreshed);
+  let packet=response old(Protocol.V2_page_tree_outcome
+    {page=fixture.owner.uuid;maximum_depth=0;
+     items=List.take 30 fixture.roots |> List.map(fun value->Protocol.{value;revision="old";depth=0;parent=fixture.owner.uuid});
+     next_cursor=Some(root_cursor 30)})in
+  let restarted=Runtime.receive runtime packet in
+  Alcotest.(check bool) "reconciliation restarts the initial prefix without user failure"true
+    (restarted.requests<>[] && not(List.exists(fun r->match r.Runtime.payload with Feed_failed _->true|_->false)restarted.responses));
+  let feed,_=drive_roots runtime[fixture]restarted in
+  Alcotest.(check int) "restart preserves the original visible root budget"30
+    (List.fold_left(fun n (day:Journal_graph_projection.day_feed)->n+List.length day.entries)0 feed.days);
+  let duplicate=Runtime.receive runtime packet in
+  Alcotest.(check bool) "retired prefix cannot restart or publish twice"true
+    (duplicate.requests=[] && duplicate.responses=[])
+;;
+
 let test_initial_later_read_superseded () =
   let runtime = Runtime.create ~localtime:Unix.gmtime () in
   set_calendar runtime;
@@ -8682,7 +8782,9 @@ let () =
         Alcotest.test_case "typed insertion admission" `Quick test_child_typed_insert_admission;
         Alcotest.test_case "unknown Child preserves wire across reset" `Quick (fun ()->test_child_unknown_wire_survives_reset ());
         Alcotest.test_case "unknown Child status preserves preconditions across reset" `Quick (fun ()->test_child_unknown_wire_survives_reset ~status:true ());
-        Alcotest.test_case "typed admission refusal retains graph" `Quick test_typed_child_planning_refusal_retains_transport])
+        Alcotest.test_case "typed admission refusal retains graph" `Quick test_typed_child_planning_refusal_retains_transport;
+        Alcotest.test_case "failed physical continuations retire before delayed recovery" `Quick test_child_error_continuations_retire;
+        Alcotest.test_case "unbound child refusal remains known not admitted" `Quick test_unbound_child_refusal_is_not_admitted])
     ; ( "copy subtree"
       , [ Alcotest.test_case
             "serialized clipboard payload bound"
@@ -8773,6 +8875,7 @@ let () =
         Alcotest.test_case "restart retains loaded suffix through insertion" `Quick test_initial_refresh_after_restarting_prefix;
         Alcotest.test_case "empty Today sync retires initial feed" `Quick test_empty_today_sync_retires_initial_feed;
         Alcotest.test_case "superseded continuation settles" `Quick test_initial_later_read_superseded;
+        Alcotest.test_case "reconciliation restarts held initial prefix" `Quick test_initial_reconciliation_restarts_prefix;
         Alcotest.test_case "later batch fills across dates" `Quick test_later_thirty_crosses_dates;
         Alcotest.test_case "date cursor recovery is bounded and owned" `Quick test_date_cursor_recovery_is_bounded_and_owned;
         Alcotest.test_case "later date cursor failure settles" `Quick test_later_date_cursor_no_progress_settles;
@@ -8991,6 +9094,8 @@ let () =
             "child failure retains admitted child"
             `Quick
             test_child_failure_retains_admitted_child
+        ; Alcotest.test_case "Unknown mutation issues original continuation" `Quick
+            test_unknown_mutation_recovery_issues_original
         ] )
     ; ( "mutation conversion"
       , [ Alcotest.test_case

@@ -81,10 +81,16 @@ val release_rejected_attempt : t -> t
 
 val pending_command : t -> Journal_graph_projection.capture option
 
-val admission_error : t -> string option
 
 val retained_chain : t -> Journal_graph_mutation_confirmation.Pure_insertion.t option
 val retain_chain : t -> Journal_graph_mutation_confirmation.Pure_insertion.t -> t
 
 val retain_child_chain : t -> command:Journal_graph_projection.create_child ->
   Journal_graph_mutation_confirmation.Pure_insertion.t -> t
+
+(** Freeze submission ownership independently of subsequent editor changes. *)
+val begin_submission : t -> t
+val await_confirmation : t -> t
+(** Consume only a settled submission. Retain newer text as an editable draft;
+    the caller transfers the original attachments before consuming this value. *)
+val finish_submission : t -> t option

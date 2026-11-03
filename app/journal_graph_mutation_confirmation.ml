@@ -183,8 +183,11 @@ module Pure_insertion = struct
     ; binding : (Worker.mutation_intent * Worker.presentation) option
     ; outcome : Worker.mutation_progress option
     ; acknowledged : bool
+    ; submission_recovered : bool
+    ; acknowledgement_recovered : bool
     }
   type phase = Writing of int | Canonical of int * bool | Parent | Applying | Acknowledging of int | Finished
+  type recovery = {mutation_id:string;round:int64;delay:float}
   type t =
     { command : Journal_graph_projection.create_child
     ; page : Graph.page option
@@ -199,6 +202,10 @@ module Pure_insertion = struct
     ; current : Worker.presentation option
     ; applied : Worker.presentation option
     ; origin : Worker.session option
+    ; read_recovered : bool
+    ; recovery : recovery option
+    ; recovery_armed : bool
+    ; backoff : int
     }
   type action =
     | Write of int * int64 * Protocol.command
@@ -257,12 +264,12 @@ module Pure_insertion = struct
   let writing t index =
     if t.round=Int64.max_int then t,Wait "Child attempt counter exhausted."
     else let round=Int64.succ t.round in
-      {t with phase=Writing index;round},Write(index,round,(stage t index).wire)
+      {t with phase=Writing index;round;recovery=None;recovery_armed=false},Write(index,round,(stage t index).wire)
   let choice_matches task_state resolved = match task_state,resolved with
     | Journal_model.No_status,None | Default_status,Some _ -> true
     | Status value,Some id -> String.lowercase_ascii value=Graph.Uuid.to_string id
     | _ -> false
-  let fresh wire choice = {wire;choice;binding=None;outcome=None;acknowledged=false}
+  let fresh wire choice = {wire;choice;binding=None;outcome=None;acknowledged=false;submission_recovered=false;acknowledgement_recovered=false}
   let start_value ~(command:Journal_graph_projection.create_child) ~page ~resolved_status ~insert =
     let desired={revision=command.status_intent_revision;task_state=command.task_state;
       resolved=resolved_status;required=command.status_confirmation} in
@@ -283,7 +290,7 @@ module Pure_insertion = struct
     if not valid || command.status_intent_revision<0L || not(choice_matches command.task_state resolved_status)
     then Error "The initial child payload does not match its admitted business command."
     else Ok({command;page;append_day;capture=None;desired;stages=Rrbvec.singleton value;phase=Writing 0;round=1L;
-      canonical=None;failure=None;current=None;applied=None;origin=None}, Write(0,1L,insert))
+      canonical=None;failure=None;current=None;applied=None;origin=None;read_recovered=false;recovery=None;recovery_armed=false;backoff=0}, Write(0,1L,insert))
   let start ~command ~page ~resolved_status ~insert =
     start_value ~command ~page:(Some page) ~resolved_status ~insert
   let capture_command (capture:Journal_graph_projection.capture) : Journal_graph_projection.create_child =
@@ -308,7 +315,7 @@ module Pure_insertion = struct
   let insert_rejected t = Rrbvec.exists (fun stage ->
     (match stage.wire with Protocol.V2_insert_blocks _|V2_append_journal _->true|_->false) &&
     match stage.outcome with Some(Worker.Rejected _)->true|_->false) t.stages
-  let terminal t = t.phase=Finished && (t.failure=None || insert_rejected t)
+  let terminal t = t.phase=Finished
   let retarget t ~(command:Journal_graph_projection.create_child) ~resolved_status =
     let original=t.command in
     if terminal t then Error "This child operation is already settled."
@@ -389,6 +396,39 @@ module Pure_insertion = struct
          from earlier indices, while each wire retains its original intent. *)
       writing {(canonical_state t summary) with stages=Rrbvec.of_list [previous;next];
         failure=None;applied=None} 1
+  let retry t = match t.phase with
+    | Writing index->writing t index
+    | Finished when terminal t ->t,Ignore
+    | Canonical(index,next) ->
+      if t.round=Int64.max_int then t,Wait "Child attempt counter exhausted."
+      else let round=Int64.succ t.round in
+        {t with phase=Canonical(index,next);round;recovery=None;recovery_armed=false},Read_child round
+    | Parent|Applying|Acknowledging _|Finished->
+      let index=Rrbvec.length t.stages-1 in
+      writing {t with applied=None} index
+  let recover t message =
+    let next=match t.phase with
+      | Writing index ->
+        let current=stage t index in
+        if current.submission_recovered then None
+        else Some(replace_stage t index {current with submission_recovered=true})
+      | Acknowledging index ->
+        let current=stage t index in
+        if current.acknowledgement_recovered then None
+        else Some(replace_stage t index {current with acknowledgement_recovered=true})
+      | Canonical _|Parent|Applying|Finished ->
+        if t.read_recovered then None else Some{t with read_recovered=true} in
+    match next with
+    |Some next->retry next
+    |None when t.recovery<>None->t,Wait message
+    |None->let delay=min 30.(0.5 *. (2. ** float_of_int t.backoff))in
+      {t with recovery=Some{mutation_id=t.command.mutation_id;round=t.round;delay};recovery_armed=false;backoff=min 6(t.backoff+1)},Wait message
+  let take_recovery t = match t.recovery,t.recovery_armed with
+    |Some recovery,false->{t with recovery_armed=true},Some recovery
+    |_->t,None
+  let resume_recovery t recovery =
+    if t.recovery=Some recovery && t.recovery_armed then retry t else t,Ignore
+
   let receive t ~index ~round progress =
     match t.phase with
     | Writing expected when expected=index && round=t.round ->
@@ -425,7 +465,7 @@ module Pure_insertion = struct
            | Some(Worker.Confirmed _|Committed_pending_presentation _) as known->known
            | _->Some progress in
          let next=replace_stage t index {current with outcome} in
-         next,Wait "The child outcome is unknown. Retry checks the same operation."
+         recover next "The save could not be confirmed."
        | _->t,Wait "The child confirmation does not match its bound operation.")
     | _->t,Ignore
   let read_child t ~round summary =
@@ -436,16 +476,6 @@ module Pure_insertion = struct
   let projection_ready t ~round = match t.phase with
     | Parent when t.round=round ->{t with phase=Applying},Present t.round
     | _->t,Ignore
-  let retry t = match t.phase with
-    | Writing index->writing t index
-    | Finished when terminal t ->t,Ignore
-    | Canonical(index,next) ->
-      if t.round=Int64.max_int then t,Wait "Child attempt counter exhausted."
-      else let round=Int64.succ t.round in
-        {t with phase=Canonical(index,next);round},Read_child round
-    | Parent|Applying|Acknowledging _|Finished->
-      let index=Rrbvec.length t.stages-1 in
-      writing {t with applied=None} index
   let canonical t = t.canonical
   let presentation t = t.current
   let rec settle_from t presentation index =
@@ -481,7 +511,7 @@ module Pure_insertion = struct
   let acknowledged t ~index ~round result = match t.phase,t.applied with
     | Acknowledging expected,Some presentation when expected=index && round=t.round ->
       (match result with
-       | Error message->t,Wait message
+       | Error message->recover t message
        | Ok ()->settle_from (replace_stage t index {(stage t index)with acknowledged=true}) presentation (index+1))
     | _->t,Ignore
 
@@ -495,11 +525,11 @@ module Pure_insertion = struct
 
   let resolved_status t = t.desired.resolved
   let interrupted t ~index ~round message = match t.phase with
-    | Writing expected | Acknowledging expected when expected=index && t.round=round -> t,Wait message
+    | Writing expected | Acknowledging expected when expected=index && t.round=round -> recover t message
     | _ -> t,Ignore
   let read_failed t ~round message =
     if t.round=round && (match t.phase with Parent|Canonical _|Writing _->true|_->false)
-    then t,Wait message else t,Ignore
+    then recover t message else t,Ignore
 
 end
 

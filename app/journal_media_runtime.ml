@@ -79,6 +79,9 @@ type group =
   ; mutable invalidation : int
   ; mutable dependency_failed : bool
   ; mutable listing_failed : bool
+  ; mutable listing_recovered : bool
+  ; mutable dependency_recovered : bool
+  ; mutable failed_dependencies : Owners.t
   ; mutable pending : G.Uuid.t option
   ; mutable cursor : scan_cursor option
   ; mutable error : string option
@@ -299,9 +302,20 @@ let dependency_failure t node message =
        if group_reaches t g node
        then (
          g.dependency_failed <- true;
+         g.failed_dependencies <- Owners.add node g.failed_dependencies;
          g.error <- Some message;
          notify t g))
     t.groups
+;;
+
+let dependency_received t node =
+  Hashtbl.iter(fun _ g->
+    if Owners.mem node g.failed_dependencies then (
+      g.failed_dependencies<-Owners.remove node g.failed_dependencies;
+      if Owners.is_empty g.failed_dependencies then (
+        g.dependency_recovered<-false;
+        g.dependency_failed<-false;
+        if not g.listing_failed then g.error<-None)))t.groups
 ;;
 
 let observe_journals_request t ~request_id =
@@ -317,7 +331,7 @@ let observe_request t (request : Protocol.request) =
       dependency_failure
         t
         (G.Uuid.to_string uuid)
-        "Attachment dependency requests are full. Retry."
+        "Attachment dependency requests are full."
     in
     match request.command with
     | Protocol.V2_get_outline_block { block; _ }
@@ -327,7 +341,7 @@ let observe_request t (request : Protocol.request) =
       dependency_failure
         t
         ("page:" ^ G.Uuid.to_string page)
-        "Attachment page requests are full. Retry."
+        "Attachment page requests are full."
     | V2_list_assets { roots; _ } -> List.iter fail roots
     | _ -> ())
 ;;
@@ -551,7 +565,7 @@ let read t g cursor =
            t.queued
          @ [ { ticket = Some ticket; request = Listing request; current } ])
   else if g.pending = None
-  then g.error <- Some "Attachment requests are busy. Retry shortly."
+  then g.error <- Some "Attachment requests are busy."
 ;;
 
 let ensure_fresh t g = if g.membership_changed && g.pending = None then read t g None
@@ -633,6 +647,9 @@ let root_visible ?(owner = "default") t ~root visible =
          ; invalidation = 0
          ; dependency_failed = false
          ; listing_failed = false
+         ; listing_recovered = false
+         ; dependency_recovered = false
+         ; failed_dependencies = Owners.empty
          ; pending = None
          ; cursor = None
          ; error = None
@@ -976,9 +993,10 @@ let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
             Hashtbl.to_seq_values t.groups |> Seq.exists (fun g -> group_reaches t g key)
         in
         Hashtbl.replace t.facts key { value; issued; edges_changed };
+        dependency_received t key;
         if Hashtbl.mem t.barriers key then changed := true)
       else if issued > barrier && issued >= prior && not (Hashtbl.mem t.facts key)
-      then dependency_failure t key "Attachment dependency cache is full. Retry."
+      then dependency_failure t key "Attachment dependency cache is full."
     in
     let remember_page uuid alive =
       let page = G.Uuid.to_string uuid in
@@ -999,13 +1017,14 @@ let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
             | None -> true
           in
           Hashtbl.replace t.pages page { alive; issued };
+          dependency_received t ("page:" ^ page);
           if was_alive <> alive
           then
             Hashtbl.iter
               (fun _ g ->
                  if group_page t g = Some page then invalidate t g (max barrier issued))
               t.groups)
-        else dependency_failure t ("page:" ^ page) "Attachment page cache is full. Retry."
+        else dependency_failure t ("page:" ^ page) "Attachment page cache is full."
     in
     let page_lookup = function
       | Protocol.V2_present_page { page; _ } ->
@@ -1092,7 +1111,7 @@ let affected_by_changes t g windows =
 
 let group_read_error g =
   if g.visible && (g.dependency_failed || (g.listing_failed && g.pending = None))
-  then Some (Option.value g.error ~default:"Attachment reads require Retry")
+  then Some (Option.value g.error ~default:"Attachment reads could not finish")
   else None
 ;;
 
@@ -1129,7 +1148,7 @@ let changes t windows =
              if group_reaches t g key || not (chain_complete t g)
              then (
                g.dependency_failed <- true;
-               g.error <- Some "Attachment change dependencies are full. Retry.";
+               g.error <- Some "Attachment change dependencies are full.";
                notify t g))
           t.groups
   in
@@ -1153,7 +1172,7 @@ let changes t windows =
                 dependency_failure
                   t
                   ("page:" ^ page)
-                  "Attachment page dependencies are full. Retry.")
+                  "Attachment page dependencies are full.")
          window.page_uuids)
     windows;
   reconcile_dependencies t;
@@ -1261,6 +1280,18 @@ let retry ?(owner = "default") t ~root ~asset =
     pump t
 ;;
 
+let recover_failed_reads t =
+  Hashtbl.iter(fun _ g ->
+    if g.visible then (
+      if g.dependency_failed && not g.dependency_recovered then (
+        g.dependency_recovered <- true;
+        retry t ~root:g.root ~asset:"")
+      ;
+      if g.listing_failed && g.pending=None && not g.listing_recovered then (
+        g.listing_recovered <- true;
+        retry t ~root:g.root ~asset:""))) t.groups
+;;
+
 let release_stale t ticket result =
   match result with
   | None -> ()
@@ -1279,6 +1310,7 @@ let receive_listing t ~root ~epoch ~request_id listing =
       match listing with
       | Some (items, next_cursor) when List.length items <= 16 ->
         g.listing_failed <- false;
+        g.listing_recovered <- false;
         let old = g.controllers in
         let controllers =
           List.map
@@ -1344,7 +1376,8 @@ let receive_listing t ~root ~epoch ~request_id listing =
           controllers
       | _ ->
         g.listing_failed <- true;
-        g.error <- Some "Unable to load attachments. Retry.");
+        g.error <- Some "Unable to load attachments.");
+    recover_failed_reads t;
     notify t g;
     true
   | _ -> false
@@ -1396,7 +1429,7 @@ let receive t ticket response =
           | V2_block_outcome _ when superseded || Hashtbl.mem t.facts block -> ()
           | V2_page_outcome _ when String.starts_with ~prefix:"page:" block -> ()
           | _ ->
-            dependency_failure t block "Unable to load attachment dependencies. Retry.");
+            dependency_failure t block "Unable to load attachment dependencies.");
          reconcile_dependencies t;
          (match outcome with
           | V2_block_outcome _ when superseded && fact_needed t block ->
@@ -1404,7 +1437,7 @@ let receive t ticket response =
           | _ -> ())
        | _ ->
          Hashtbl.remove t.sources request_id;
-         dependency_failure t block "Unable to load attachment dependencies. Retry.")
+         dependency_failure t block "Unable to load attachment dependencies.")
    | Query { root; epoch; request_id } ->
      (match response with
       | Service.Graph_response _ when Option.is_some t.read_port -> ()
@@ -1437,6 +1470,7 @@ let receive t ticket response =
            notify t g
          | None -> release_stale t ticket result)
       | _ -> release_stale t ticket result));
+  recover_failed_reads t;
   pump t
 ;;
 
@@ -1512,6 +1546,9 @@ let imported_local t ~current local =
           ; invalidation = 0
           ; dependency_failed = false
           ; listing_failed = false
+         ; listing_recovered = false
+         ; dependency_recovered = false
+         ; failed_dependencies = Owners.empty
           ; pending = None
           ; cursor = None
           ; error = None

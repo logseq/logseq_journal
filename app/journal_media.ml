@@ -11,6 +11,7 @@ type presentation =
   | Hidden
   | Placeholder of string
   | Failed of string
+  | Network_failed of string
   | File of string
   | External of string
 
@@ -227,21 +228,20 @@ let status = function
   | Waiting_unlock -> Placeholder "Unlock graph to view file"
   | Ready _ -> Placeholder "Loading"
   | Failed { failure; _ } ->
-    Failed
-      (match failure with
-       | Network -> "Unable to download file"
-       | Not_found -> "File is not available on the server"
-       | Checksum_mismatch -> "File verification failed"
-       | Authentication -> "Sign in to download file"
-       | Locked -> "Unlock graph to view file"
-       | Storage_full -> "Not enough cache space"
-       | Invalid_content _ -> "Unable to read file")
+    (match failure with
+     | Network -> Network_failed "Unable to download file"
+     | Not_found -> Failed "File is not available on the server"
+     | Checksum_mismatch -> Failed "File verification failed"
+     | Authentication -> Failed "Sign in to download file"
+     | Locked -> Failed "Unlock graph to view file"
+     | Storage_full -> Failed "Not enough cache space"
+     | Invalid_content _ -> Failed "Unable to read file")
 ;;
 
 let step t = function
   | Demand_backpressured ->
     (match t.status with
-     | File _ | Failed _ -> t, []
+     | File _ | Failed _ | Network_failed _ -> t, []
      | _ -> { t with pressured = true }, [])
   | Demand_accepted -> { t with pressured = false }, []
   | Capacity_available ->
@@ -251,7 +251,7 @@ let step t = function
             && managed selected.asset
             &&
             match t.status with
-            | File _ | Failed _ -> false
+            | File _ | Failed _ | Network_failed _ -> false
             | _ -> true -> { t with pressured = false }, [ demand selected ]
      | _ -> t, [])
   | Show { graph_generation; consumer; asset } ->
@@ -342,7 +342,7 @@ let step t = function
        when managed selected.asset
             &&
             match t.status with
-            | Failed _ -> true
+            | Network_failed _ -> true
             | _ -> false ->
        (match t.available with
         | Some (scope, handle) ->

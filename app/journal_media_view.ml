@@ -298,7 +298,7 @@ let view_content
                      match current.presentation with
                      | Journal_media.File path ->
                        Some (owner, candidate.token, path, root ^ ":" ^ candidate.token)
-                     | Hidden | Placeholder _ | Failed _ | External _ -> None)))
+                     | Hidden | Placeholder _ | Failed _ | Network_failed _ | External _ -> None)))
               image_slots
           else [ selected ]
         in
@@ -430,7 +430,7 @@ let view_content
           ~accessibility_identifier:id
           ~on_appear:visible
           []
-      | Placeholder message | Failed message ->
+      | Placeholder message | Failed message | Network_failed message ->
         L.column
           ~key:item.token
           ~gap:6
@@ -442,7 +442,7 @@ let view_content
           ([ L.text ~value:message ~style_class:"caption" ~foreground:"secondary" [] ]
            @
            match item.presentation with
-           | Failed _ ->
+           | Network_failed _ ->
              [ L.text
                  ~value:"Retry"
                  ~style_class:"caption"
@@ -468,7 +468,7 @@ let view_content
         | Some item ->
           let message =
             match item.presentation with
-            | Placeholder message | Failed message -> message
+            | Placeholder message | Failed message | Network_failed message -> message
             | Hidden -> "Waiting for file"
             | External _ | File _ -> "Waiting for file"
           in
@@ -486,7 +486,7 @@ let view_content
              ]
              @
              match item.presentation with
-             | Failed _ ->
+             | Network_failed _ ->
                [ L.text
                    ~value:"Retry"
                    ~style_class:"caption"
@@ -548,13 +548,7 @@ let view_content
       match error with
       | None -> []
       | Some message ->
-        [ L.text ~value:message ~style_class:"caption" ~foreground:"secondary" []
-        ; L.text
-            ~value:"Retry attachments"
-            ~on_press:(fun _ ->
-              List.iter (fun target_root -> emit ~target_root Retry) observed_roots)
-            []
-        ]
+        [ L.text ~value:message ~style_class:"caption" ~foreground:"secondary" [] ]
     in
     let more_rows =
       if more

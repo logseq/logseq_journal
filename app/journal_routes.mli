@@ -167,7 +167,8 @@ val retain_child_chain : t -> command:Journal_graph_projection.create_child ->
 val observation_missing : t -> entry_id:string -> request_generation:int64 -> block_id:string -> t
 val observation_recover : t -> entry_id:string -> request_generation:int64 -> block_id:string -> t
 
-val observation_error : t -> (string * bool) option
-val observation_failed : t -> entry_id:string -> request_generation:int64 -> message:string -> t
-val observation_refreshing : t -> entry_id:string -> request_generation:int64 -> t
-val observation_clear : t -> entry_id:string -> request_generation:int64 -> t
+val await_child_confirmation : t -> block_id:string -> t
+
+(** Failed retained submissions only, deduplicated by original mutation and latest
+    explicit status choice. The current editor text is not a submitted payload. *)
+val pending_child_submissions : t -> (Journal_graph_projection.create_child * Journal_graph_mutation_confirmation.Pure_insertion.t) Rrbvec.t
