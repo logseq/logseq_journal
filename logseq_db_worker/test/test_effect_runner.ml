@@ -558,7 +558,7 @@ type asset_bridge_fixture =
   ; context : Sync.asset_context
   ; support : string
   ; gate : ?hold_callback:bool -> (Sync.asset_output -> bool) -> deliver_first:bool -> unit Eio.Promise.t
-  ; deliver_held : unit -> unit
+  ; deliver_held : ?keep_gate:bool -> unit -> unit
   ; hold_asset_barrier : unit -> unit Eio.Promise.t
   ; deliver_asset_barriers : unit -> unit
   ; set_asset_current : (Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool) -> unit
@@ -703,13 +703,13 @@ let with_asset_bridge ?(asynchronous=false) ?(asynchronous_io=false) run =
                   Queue.add (output, deliver_first,callback_resolve) held;
                   if deliver_first
                   then Runner.submit runner (Core.Deliver_asset_result output);
-                  Eio.Promise.resolve resolve ();
+                  ignore(Eio.Promise.try_resolve resolve ():bool);
                   if deliver_first || hold_callback then Eio.Promise.await callback_done;
                   true));
           reached
         in
-        let deliver_held () =
-          (output_handler := fun _ -> false);
+        let deliver_held ?(keep_gate=false) () =
+          if not keep_gate then (output_handler := fun _ -> false);
           Queue.iter
             (fun (output, delivered,callback_resolve) ->
                if not delivered
@@ -1189,6 +1189,37 @@ let test_discarded_retain_retries_real_storage_cleanup () =
     done;
     Alcotest.(check int) "actual background ACK settles the obligation" 0(Runner.unsettled_orphan_retains fixture.runner);
     Alcotest.(check bool) "actual retry removes the retired staging bytes" false(Sys.file_exists path))
+;;
+
+(* The public pure cleanup owner correctly queues both releases. Its state cannot
+   reproduce the interpreter's job finishing before queued physical IO starts. *)
+let test_asset_cleanup_snapshot_joins_queued_release () =
+  with_asset_bridge ~asynchronous:true ~asynchronous_io:true(fun fixture->
+    let source=picker_import fixture.support 87 in
+    let prepared=Runner.prepare_import fixture.runner ~context:fixture.context source ~current:(fun()->true) |> Result.get_ok in
+    let retain()=Runner.retain_imported_file fixture.runner ~scope:fixture.context.scope ~operation:source.operation |> Option.get |> fst in
+    let first=retain() and second=retain() in
+    ignore(fixture.fixture_asset(Sync.Release_staged_file prepared.staged_file));
+    let second_reached,resolve_second=Eio.Promise.create() in
+    let reached=fixture.gate(fun output->match output.Sync.request.action with
+      | Sync.Release_asset_file handle when handle=first->true
+      | Sync.Release_asset_file handle when handle=second->Eio.Promise.resolve resolve_second();true
+      | _->false) ~deliver_first:false in
+    let release handle=Runner.submit fixture.runner(Core.Run_asset(fixture.context,
+      Logseq_sync_pure_reducer.Asset_transfer.Release_handle handle)) in
+    release first;
+    Eio.Promise.await reached;
+    release second;
+    let snapshot=Runner.asset_cleanup_snapshot fixture.runner ~scope:fixture.context.scope in
+    let completed=ref None in
+    Eio.Fiber.both
+      (fun()->completed:=Some(Runner.await_asset_cleanup fixture.runner snapshot))
+      (fun()->fixture.deliver_held ~keep_gate:true();
+        Eio.Promise.await second_reached;
+        Alcotest.(check bool) "queued physical release has not returned an ACK" true(!completed=None);
+        fixture.deliver_held());
+    Alcotest.(check bool) "queued real release is joined before settlement ACK" true(!completed=Some(Ok()));
+    Alcotest.(check int) "both original resource releases are settled" 0(Runner.unsettled_orphan_retains fixture.runner))
 ;;
 
 let test_asset_cleanup_snapshot_joins_physical_release () =
@@ -2937,6 +2968,7 @@ let () =
         ; Alcotest.test_case "asset cleanup ignores later unrelated work" `Quick test_asset_cleanup_ignores_later_unrelated_work
         ; Alcotest.test_case "asset cleanup stop returns failure" `Quick test_asset_cleanup_stop_does_not_wait_for_lost_io
         ; Alcotest.test_case "asset cleanup snapshot retains physical failure" `Quick test_asset_cleanup_snapshot_retains_physical_failure
+        ; Alcotest.test_case "asset cleanup snapshot joins queued release" `Quick test_asset_cleanup_snapshot_joins_queued_release
         ; Alcotest.test_case "asset cleanup snapshot joins physical release" `Quick test_asset_cleanup_snapshot_joins_physical_release
         ; Alcotest.test_case "discarded retain retries actual storage cleanup" `Quick
             test_discarded_retain_retries_real_storage_cleanup

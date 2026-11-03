@@ -435,6 +435,7 @@ type t =
   ; asset_result_sources : ((Sync.graph_scope*string),Logseq_sync_pure_reducer.Asset_transfer.ticket)Hashtbl.t
   ; asset_cleanup_stopped : unit Eio.Promise.t * unit Eio.Promise.u
   ; resource_cleanup_owners : ((Sync.graph_scope * string),asset_cleanup_job) Hashtbl.t
+  ; resource_release_waiters : ((Sync.graph_scope * string),unit Eio.Promise.u list) Hashtbl.t
   ; mutable writer_fence : Core.Writer_fence.t
   ; writer_jobs : (int64,writer_job)Hashtbl.t
   ; resource_scopes : (Sync.graph_scope,unit)Hashtbl.t
@@ -492,6 +493,7 @@ let create ~sw dependencies ~post ~recovery_current ~upload_current ~asset_curre
     ; asset_result_sources = Hashtbl.create 16
     ; asset_cleanup_stopped = Eio.Promise.create ()
     ; resource_cleanup_owners = Hashtbl.create 16
+    ; resource_release_waiters = Hashtbl.create 16
     ; writer_fence = Core.Writer_fence.empty
     ; writer_jobs = Hashtbl.create 32
     ; resource_scopes = Hashtbl.create 16
@@ -3575,10 +3577,20 @@ let release_orphan_work t work =
       ~report_failure:(Core.Orphan_cleanup.first_attempt work))
     with _->Error "Attachment cleanup was interrupted." in
   t.orphan_cleanup<-Core.Orphan_cleanup.completed t.orphan_cleanup work result;
+  let key=resource.scope,resource.handle in
+  let waiters=Option.value(Hashtbl.find_opt t.resource_release_waiters key)~default:[] in
+  Hashtbl.remove t.resource_release_waiters key;
+  List.iter(fun resolve->ignore(Eio.Promise.try_resolve resolve():bool))waiters;
   if result=Ok() then Hashtbl.remove t.resource_cleanup_owners(resource.scope,resource.handle)
 ;;
 
 let abandon_asset_file_internal ?cleanup_job t ~scope ~handle =
+  let first_release=Option.map(fun _->
+    let finished,resolve=Eio.Promise.create() in
+    let key=scope,handle in
+    Hashtbl.replace t.resource_release_waiters key
+      (resolve::Option.value(Hashtbl.find_opt t.resource_release_waiters key)~default:[]);
+    finished)cleanup_job in
   Option.iter(fun job->Hashtbl.replace t.resource_cleanup_owners(scope,handle)job)cleanup_job;
   t.orphan_cleanup<-Core.Orphan_cleanup.track t.orphan_cleanup {scope;handle};
   if not t.orphan_cleanup_running && not t.stopped then (
@@ -3596,7 +3608,13 @@ let abandon_asset_file_internal ?cleanup_job t ~scope ~handle =
               match work with None->()|Some work->
                 t.dependencies.runtime.sleep(Core.Orphan_cleanup.retry_delay work);
                 if not t.stopped then (release_orphan_work t work;retry())) in
-          retry())))
+          retry())));
+  (* A second release can queue behind an in-flight release. Its cleanup job
+     ends after its own real first attempt, so a host fence cannot mistake
+     ordinary queued IO for a failed physical release. Failures stay retained. *)
+  Option.iter(fun finished->Eio.Fiber.first
+    (fun()->Eio.Promise.await finished)
+    (fun()->Eio.Promise.await(fst t.asset_cleanup_stopped)))first_release
 ;;
 
 
