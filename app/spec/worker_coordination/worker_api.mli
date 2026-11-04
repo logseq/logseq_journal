@@ -903,27 +903,6 @@ module type ISSUER = sig
     -> Service.response
     -> (unit, error) result
 
-  val receipt
-    :  session
-    -> request_id:request_id
-    -> intent:append_intent
-    -> Protocol.response
-    -> (receipt, error) result
-
-  val mutation_receipt
-    :  session
-    -> request_id:request_id
-    -> intent:mutation_intent
-    -> Protocol.response
-    -> (receipt, error) result
-
-  val confirmation
-    :  session
-    -> presentation:presentation
-    -> receipt
-    -> Protocol.response
-    -> (confirmation, error) result
-
   val asset_notice : session -> Service.asset_notice -> (asset_notice, error) result
 end
 

@@ -1552,12 +1552,20 @@ let test_ordinary_delete_readback committed paged () =
     let intent=W.mutation_intent session ~mutation_id(W.Delete_blocks{root;preconditions}) |> Result.get_ok in
     Alcotest.(check bool) "ordinary mutation business owner bound" true
       (Production_runtime.bind_mutation runtime request ~presentation ~intent);
-    let receipt=I.mutation_receipt session ~request_id:(W.request_id request.request_id) ~intent
-      (response request(V2_mutation_committed{mutation_id;status=V2_applied;generation="generation:v1:1:1";
-        before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"})) |> Result.get_ok in
-    let confirmation=I.confirmation session ~presentation receipt
-      (summary request.request_id(if paged then Some(Graph.Cursor.of_string "ordinary-more" |> Result.get_ok) else None))
-      |> Result.get_ok in
+    let receipt=(let (Protocol.V2_response receipt_packet as packet) = (response request(V2_mutation_committed{mutation_id;status=V2_applied;generation="generation:v1:1:1";
+        before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"})) in
+      match I.reply session ~request_id:(W.request_id request.request_id) (W.Mutate intent)
+        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
+          {request_id=receipt_packet.request_id;
+           outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
+      | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
+      | _ -> failwith "Production mutation receipt was rejected") in
+    let confirmation=(let (Protocol.V2_response confirmation_packet as packet) = (summary request.request_id(if paged then Some(Graph.Cursor.of_string "ordinary-more" |> Result.get_ok) else None)) in
+      match I.reply session ~request_id:(W.request_id confirmation_packet.request_id)
+        (W.Confirm(presentation,receipt))
+        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response packet) with
+      | Ok(W.Answered(Ok(W.Confirmed proof))) -> proof
+      | _ -> failwith "Production confirmation was rejected") in
     let output=Production_runtime.receive_mutation runtime request(W.Confirmed confirmation) in
     if paged then (
       Alcotest.(check bool) "ordinary More cannot settle before final DTO" false
@@ -5679,14 +5687,23 @@ let test_page_detail_root_and_append () =
     let intent=W.mutation_intent Worker_producer.session ~mutation_id mutation |> Result.get_ok in
     Alcotest.(check bool) "page insertion bound to typed owner" true
       (Runtime.bind_mutation runtime request ~presentation ~intent);
-    let receipt=I.mutation_receipt Worker_producer.session ~request_id:(W.request_id request.request_id) ~intent
-      (response request (V2_mutation_committed{mutation_id;status=V2_applied;generation="generation:v1:1:1";
-        before_projection_revision="projection:v1:1";after_projection_revision="projection:v1:2"})) |> Result.get_ok in
+    let receipt=(let (Protocol.V2_response receipt_packet as packet) = (response request (V2_mutation_committed{mutation_id;status=V2_applied;generation="generation:v1:1:1";
+        before_projection_revision="projection:v1:1";after_projection_revision="projection:v1:2"})) in
+      match I.reply Worker_producer.session ~request_id:(W.request_id request.request_id) (W.Mutate intent)
+        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
+          {request_id=receipt_packet.request_id;
+           outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
+      | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
+      | _ -> failwith "Production mutation receipt was rejected") in
     let child=copy_child unrelated_uuid page_uuid command.source in
-    let confirmation=I.confirmation Worker_producer.session ~presentation receipt
-      (response request(V2_block_summary_outcome{lookup=V2_present_block{value=child.value;revision=child.revision};
+    let confirmation=(let (Protocol.V2_response confirmation_packet as packet) = (response request(V2_block_summary_outcome{lookup=V2_present_block{value=child.value;revision=child.revision};
         page=Some(V2_present_page{page;revision="page-2"});items=[];next_cursor=None;
-        scope_revision="children-1";generation="generation:v1:1:1";projection_revision="projection:v1:2"})) |> Result.get_ok in
+        scope_revision="children-1";generation="generation:v1:1:1";projection_revision="projection:v1:2"})) in
+      match I.reply Worker_producer.session ~request_id:(W.request_id confirmation_packet.request_id)
+        (W.Confirm(presentation,receipt))
+        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response packet) with
+      | Ok(W.Answered(Ok(W.Confirmed proof))) -> proof
+      | _ -> failwith "Production confirmation was rejected") in
     let parent_read=Runtime.receive_mutation runtime request(W.Confirmed confirmation)
       |> fun out->only "confirm selected page parent" out.requests in
     Alcotest.(check bool) "confirm page through page API" true
@@ -6241,13 +6258,23 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
     else (
       let child=uuid "a1000000-0000-4000-9000-000000000081" in
       let target={record with block={block with uuid=child;title="Stable child";parent=block_uuid};task_status=None} in
-      let receipt=I.mutation_receipt session ~request_id:(W.request_id insert.request_id) ~intent:original
-        (response insert(V2_mutation_committed{mutation_id;status=V2_applied;generation="generation:v1:1:1";
-          before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"})) |> Result.get_ok in
+      let receipt=(let (Protocol.V2_response receipt_packet as packet) = (response insert(V2_mutation_committed{mutation_id;status=V2_applied;generation="generation:v1:1:1";
+          before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"})) in
+      match I.reply session ~request_id:(W.request_id insert.request_id) (W.Mutate original)
+        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
+          {request_id=receipt_packet.request_id;
+           outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
+      | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
+      | _ -> failwith "Production mutation receipt was rejected") in
       let summary=Protocol.V2_block_summary_outcome{lookup=V2_present_block{value=target;revision="original-child-precondition"};
         page=Some(V2_present_page{page;revision="page-original"});items=[];next_cursor=None;
         scope_revision="original-child-scope";generation="generation:v1:1:1";projection_revision="projection:v1:1"} in
-      let proof=I.confirmation session ~presentation receipt (response insert summary) |> Result.get_ok in
+      let proof=(let (Protocol.V2_response confirmation_packet as packet) = (response insert summary) in
+      match I.reply session ~request_id:(W.request_id confirmation_packet.request_id)
+        (W.Confirm(presentation,receipt))
+        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response packet) with
+      | Ok(W.Answered(Ok(W.Confirmed proof))) -> proof
+      | _ -> failwith "Production confirmation was rejected") in
       let parent=Production_runtime.receive_mutation runtime insert(W.Confirmed proof)
         |> fun output->only "canonical Child parent" output.Runtime.requests in
       let output=Production_runtime.receive runtime(response parent(V2_block_outcome(V2_present_block{value=record;revision="new-parent-state"}))) in

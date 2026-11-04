@@ -38,8 +38,8 @@ let reply = function
   | W.Answered (Ok progress) -> phase progress
 """,
     "receipt_validation": """
-let checked (module Issuer : W.ISSUER) session request_id intent wire =
-  Issuer.receipt session ~request_id ~intent wire
+let checked (module Issuer : W.ISSUER) session request_id intent response =
+  Issuer.reply session ~request_id (W.Append intent) response
 """,
     "observe_empty_page_and_release": """
 let observe session budget day = request (session, W.Observe (budget, W.Journal day))
@@ -67,8 +67,8 @@ module Validate (Issuer : W.ISSUER) = struct
     Issuer.reply session ~request_id request response
   let update session request_id observation (response : Service.response) =
     Issuer.observation session ~request_id observation response
-  let confirm session presentation receipt (response : Logseq_db_worker.Protocol.response) =
-    Issuer.confirmation session ~presentation receipt response
+  let confirm session request_id presentation receipt (response : Service.response) =
+    Issuer.reply session ~request_id (W.Confirm(presentation, receipt)) response
 end
 """,
     "release_has_a_typed_acknowledgement": """
@@ -298,8 +298,8 @@ NEGATIVE.update({
 
 POSITIVE.update({
     "presentation_and_registration_identity_are_explicit": """
-let confirm (module Issuer:W.ISSUER) session presentation receipt response =
-  Issuer.confirmation session ~presentation receipt response
+let confirm (module Issuer:W.ISSUER) session request_id presentation receipt response =
+  Issuer.reply session ~request_id (W.Confirm(presentation, receipt)) response
 let bound (module Issuer:W.ISSUER) state =
   C.Worker_bound Issuer.binding,C.Bootstrap_received(Issuer.binding,state)
 let cleanup handle =

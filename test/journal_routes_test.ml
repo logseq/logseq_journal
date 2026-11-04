@@ -4656,21 +4656,30 @@ module Child_chain_fixture = struct
       let id=W.mutation_intent_id intent in
       let request_id=W.request_id id in
       let after=Printf.sprintf "projection:v1:%d" (index+1) in
-      let receipt=I.mutation_receipt session ~request_id ~intent(P.V2_response
+      let receipt=(let (P.V2_response receipt_packet as packet) = (P.V2_response
         {api_version=P.api_version;request_id=id;outcome=V2_mutation_committed
           {mutation_id=id;status=V2_applied;generation="generation:v1:1:1";
-           before_projection_revision=Printf.sprintf "projection:v1:%d" index;after_projection_revision=after}})
-        |> Result.get_ok in
+           before_projection_revision=Printf.sprintf "projection:v1:%d" index;after_projection_revision=after}}) in
+        match I.reply session ~request_id (W.Mutate intent)
+          (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
+            {request_id=receipt_packet.request_id;
+             outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
+        | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
+        | _ -> failwith "Production mutation receipt was rejected") in
       let block:G.block={uuid=child;title=command.source;parent;page=page.uuid;order="a";
         created_at_ms=1L;updated_at_ms=1L;refs=[];tags=[];properties=[]} in
       (* Equal visible status is deliberately insufficient to prove a status sub-operation. *)
       let value:P.v2_block_record={block;task_status=resolved_status;rendered_page_title=page.title;tag_titles=[]} in
-      let confirmation=I.confirmation session ~presentation receipt(P.V2_response
+      let confirmation=(let (P.V2_response confirmation_packet as packet) = (P.V2_response
         {api_version=P.api_version;request_id=id;outcome=V2_block_summary_outcome
           {lookup=V2_present_block{value;revision=Printf.sprintf "child-state:v1:%d" index};
            page=Some(V2_present_page{page;revision="page-state:v1:1"});items=[];next_cursor=None;
-           scope_revision="children-state:v1:1";generation="generation:v1:1:1";projection_revision=after}})
-        |> Result.get_ok in
+           scope_revision="children-state:v1:1";generation="generation:v1:1:1";projection_revision=after}}) in
+      match I.reply session ~request_id:(W.request_id confirmation_packet.request_id)
+        (W.Confirm(presentation,receipt))
+        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response packet) with
+      | Ok(W.Answered(Ok(W.Confirmed proof))) -> proof
+      | _ -> failwith "Production confirmation was rejected") in
       W.Confirmed confirmation in
     {initial;action;command;session;presentation;projection;binding=I.binding;confirm}
   let write = function C.Write(index,round,wire)->index,round,wire|_->fail "expected a child write"

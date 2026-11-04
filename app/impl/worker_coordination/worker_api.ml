@@ -563,27 +563,6 @@ module type ISSUER = sig
     -> Service.response
     -> (unit, error) result
 
-  val receipt
-    :  session
-    -> request_id:request_id
-    -> intent:append_intent
-    -> Protocol.response
-    -> (receipt, error) result
-
-  val mutation_receipt
-    :  session
-    -> request_id:request_id
-    -> intent:mutation_intent
-    -> Protocol.response
-    -> (receipt, error) result
-
-  val confirmation
-    :  session
-    -> presentation:presentation
-    -> receipt
-    -> Protocol.response
-    -> (confirmation, error) result
-
   val asset_notice : session -> Service.asset_notice -> (asset_notice, error) result
 end
 
@@ -2390,15 +2369,6 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
               decode_mutation_progress session ~request_id ~intent outcome
               |> Result.map(fun progress->Answered(Ok progress))
             | _ -> Error (Protocol_mismatch "Unexpected owned query receipt"))
-      ;;
-
-      let receipt session ~request_id ~intent response = decode_mutation_receipt session ~request_id ~intent response
-      let mutation_receipt = decode_mutation_receipt
-
-      let confirmation session ~presentation receipt response =
-        if not (presentation_live presentation)
-        then Error Revoked_session
-        else decode_confirmation session ~presentation receipt response
       ;;
 
       let asset_notice session data =

@@ -1744,12 +1744,13 @@ let test_durable_mutation_properties ?(append=false) () =
                  }
              in
              let receipt =
-               I.mutation_receipt
-                 session
-                 ~request_id:(C.ticket_id ticket)
-                 ~intent:receipt_intent
-                 response
-               |> Result.get_ok
+               (let (P.V2_response receipt_packet as packet) = response in
+      match I.reply session ~request_id:(C.ticket_id ticket) (W.Mutate receipt_intent)
+        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
+          {request_id=receipt_packet.request_id;
+           outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
+      | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
+      | _ -> failwith "Production mutation receipt was rejected")
              in
              apply
                (C.Completed
@@ -1958,10 +1959,15 @@ let test_committed_ack_requires_current_confirmation () =
   let ticket,planned=C.request(ready I.binding projection)session(W.Mutate intent) |> Result.get_ok in
   let request_id=match I.request session ~request_id:(C.ticket_id ticket)(W.Mutate intent) with
     | Ok(S.Coordination_mutation{request_id;_})->request_id|_->assert false in
-  let receipt=I.mutation_receipt session ~request_id:(C.ticket_id ticket) ~intent
-    (P.V2_response{api_version=P.api_version;request_id;outcome=V2_mutation_committed
+  let receipt=(let (P.V2_response receipt_packet as packet) = (P.V2_response{api_version=P.api_version;request_id;outcome=V2_mutation_committed
       {mutation_id=W.mutation_intent_id intent;status=V2_applied;generation="generation:v1:1:1";
-       before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"}}) |> Result.get_ok in
+       before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"}}) in
+      match I.reply session ~request_id:(C.ticket_id ticket) (W.Mutate intent)
+        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
+          {request_id=receipt_packet.request_id;
+           outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
+      | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
+      | _ -> failwith "Production mutation receipt was rejected") in
   let state=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.of_int64 20L))).next in
   let state=(C.step state(C.Completed(ticket,W.Answered(Ok(W.Committed_pending_presentation receipt))))).next in
   check(Result.is_error(C.request state session(W.Acknowledge_intent intent))) "unconfirmed commit admitted ACK";
@@ -1971,11 +1977,15 @@ let test_committed_ack_requires_current_confirmation () =
     "reconciliation rewrote a known committed intent";
   check(C.intent_progress(C.view state)intent=Some(W.Committed_pending_presentation receipt))
     "reconciliation mutated its previous state";
-  let confirmation=I.confirmation session ~presentation receipt(P.V2_response
+  let confirmation=(let (P.V2_response confirmation_packet as packet) = (P.V2_response
     {api_version=P.api_version;request_id;outcome=V2_block_summary_outcome
       {lookup=V2_missing_block{uuid=graph;revision="block-state:v1:missing"};page=None;items=[];next_cursor=None;
-       scope_revision="scope-revision:v1:missing";generation="generation:v1:1:1";projection_revision="projection:v1:1"}})
-    |> Result.get_ok in
+       scope_revision="scope-revision:v1:missing";generation="generation:v1:1:1";projection_revision="projection:v1:1"}}) in
+      match I.reply session ~request_id:(W.request_id confirmation_packet.request_id)
+        (W.Confirm(presentation,receipt))
+        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response packet) with
+      | Ok(W.Answered(Ok(W.Confirmed proof))) -> proof
+      | _ -> failwith "Production confirmation was rejected") in
   let confirm,planned=C.request state session(W.Confirm(presentation,receipt)) |> Result.get_ok in
   let state=(C.step planned.next(C.Admitted(confirm,Id.Worker.Request_id.of_int64 21L))).next in
   let state=(C.step state(C.Completed(confirm,W.Answered(Ok(W.Confirmed confirmation))))).next in
@@ -2001,11 +2011,15 @@ let test_committed_ack_requires_current_confirmation () =
         C.Send(_,_,W.Confirm(actual,proof))->actual=latest && W.receipt_revisions proof=W.receipt_revisions receipt
         | _->false)transition.instructions|_->false)
     "cleanup retry across focus did not re-confirm original proof";
-  let next_confirmation=I.confirmation session ~presentation:latest receipt(P.V2_response
+  let next_confirmation=(let (P.V2_response confirmation_packet as packet) = (P.V2_response
     {api_version=P.api_version;request_id;outcome=V2_block_summary_outcome
       {lookup=V2_missing_block{uuid=graph;revision="block-state:v1:missing"};page=None;items=[];next_cursor=None;
-       scope_revision="scope-revision:v1:missing";generation="generation:v1:1:1";projection_revision="projection:v1:1"}})
-    |> Result.get_ok in
+       scope_revision="scope-revision:v1:missing";generation="generation:v1:1:1";projection_revision="projection:v1:1"}}) in
+      match I.reply session ~request_id:(W.request_id confirmation_packet.request_id)
+        (W.Confirm(latest,receipt))
+        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response packet) with
+      | Ok(W.Answered(Ok(W.Confirmed proof))) -> proof
+      | _ -> failwith "Production confirmation was rejected") in
   let next_ticket,next_plan=C.request focused session(W.Confirm(latest,receipt)) |> Result.get_ok in
   let next_admitted=(C.step next_plan.next(C.Admitted(next_ticket,Id.Worker.Request_id.of_int64 24L))).next in
   let next_state=(C.step next_admitted(C.Completed(next_ticket,W.Answered(Ok(W.Confirmed next_confirmation))))).next in
@@ -2109,10 +2123,15 @@ let test_committed_ack_requires_current_confirmation () =
   check(C.intent_progress(C.view late)intent=None) "pre-ACK confirmation resurrected settled intent";
   let request_id=match I.request session ~request_id:(C.ticket_id independent)(W.Mutate other) with
     | Ok(S.Coordination_mutation{request_id;_})->request_id|_->assert false in
-  let other_receipt=I.mutation_receipt session ~request_id:(C.ticket_id independent) ~intent:other
-    (P.V2_response{api_version=P.api_version;request_id;outcome=V2_mutation_committed
+  let other_receipt=(let (P.V2_response receipt_packet as packet) = (P.V2_response{api_version=P.api_version;request_id;outcome=V2_mutation_committed
       {mutation_id=W.mutation_intent_id other;status=V2_applied;generation="generation:v1:1:1";
-       before_projection_revision="projection:v1:1";after_projection_revision="projection:v1:2"}}) |> Result.get_ok in
+       before_projection_revision="projection:v1:1";after_projection_revision="projection:v1:2"}}) in
+      match I.reply session ~request_id:(C.ticket_id independent) (W.Mutate other)
+        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
+          {request_id=receipt_packet.request_id;
+           outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
+      | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
+      | _ -> failwith "Production mutation receipt was rejected") in
   let other_done=(C.step acknowledged(C.Completed(independent,W.Answered(Ok(W.Committed_pending_presentation other_receipt))))).next in
   check(match C.intent_progress(C.view other_done)other with Some(W.Committed_pending_presentation _)->true|_->false)
     "ACK of another intent discarded an independent accepted write";
