@@ -3017,16 +3017,60 @@ let test_child_failure_retains_admitted_child () =
     (List.length duplicate.responses)
 ;;
 
-module Copy = Journal_copy
+module Copy = Journal_copy.Pure
+module Copy_worker = Journal_worker_coordination.Worker_api
+
+type copy_query = Query : 'a Copy_worker.query -> copy_query
+
+module Copy_issuer = struct
+  let issuer, _, _, session = Coordination_test_fixture.fixture
+    ~graph:(uuid "a1000000-0000-4000-8000-0000000000ff")
+    ~limits:{Coordination_test_fixture.limits with
+      response_budget_bytes=Protocol.maximum_response_bytes} 2840L
+  module I = (val issuer : Copy_worker.ISSUER)
+  let serial = ref 0
+  let next_id () =
+    incr serial;
+    uuid(Printf.sprintf "a1000000-0000-4000-9000-%012x" !serial)
+  let request query =
+    let budget=Copy_worker.read_budget session ~maximum_items:Protocol.maximum_page_size
+      ~maximum_bytes:Protocol.maximum_response_bytes |> Result.get_ok in
+    Copy_worker.Query(budget,query)
+  let wire query = I.request session ~request_id:(Copy_worker.request_id(next_id()))
+    (request query) |> Result.get_ok
+  let decode (type a) (query:a Copy_worker.query) outcome : (a, string) result =
+    let id=next_id() in
+    let request=request query in
+    match I.request session ~request_id:(Copy_worker.request_id id) request with
+    | Error _ -> Error "Read was not admitted"
+    | Ok _ ->
+      match I.reply session ~request_id:(Copy_worker.request_id id) request
+        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response
+          (Protocol.V2_response {api_version=Protocol.api_version;request_id=id;outcome})) with
+      | Ok (Copy_worker.Answered(Ok value)) -> Ok value
+      | Error _ | Ok _ -> Error "Worker rejected the read result"
+end
 
 let copy_read = function
-  | [ Copy.Read (ticket, command) ] -> ticket, command
+  | [ Copy.Read (ticket, query, _) ] -> ticket, Query query
   | _ -> Alcotest.fail "Copy must issue one bounded subtree read"
 ;;
 
-let copy_reply state effects outcome =
-  let ticket, _ = copy_read effects in
-  Copy.step state (Copy.Completed (ticket, outcome))
+let copy_reply state effects packet =
+  match effects with
+  | [Copy.Read(ticket,query,outcome)] ->
+    Copy.step state (match Copy_issuer.decode query packet with
+      | Ok value -> Copy.Completed(ticket,outcome value)
+      | Error message -> Copy.Read_failed(ticket,message))
+  | effects -> Alcotest.failf "Copy must await one typed read (%s)"
+    (String.concat "; " (List.map (function
+      | Copy.Failed message -> "failed: " ^ message
+      | Copied _ -> "copied" | Read _ -> "read") effects))
+;;
+
+let copy_info_result () =
+  Copy_issuer.decode Copy_worker.Graph_info (graph_info_outcome ~journal_title_format:None)
+  |> Result.get_ok |> fun info -> Copy.Info_result info
 ;;
 
 let copy_start root =
@@ -3034,7 +3078,7 @@ let copy_start root =
   Alcotest.(check bool)
     "Copy begins with graph version"
     true
-    (snd (copy_read effects) = Protocol.V2_graph_info);
+    (match snd(copy_read effects) with Query Copy_worker.Graph_info -> true | _ -> false);
   let state, effects =
     copy_reply state effects (graph_info_outcome ~journal_title_format:None)
   in
@@ -3042,7 +3086,7 @@ let copy_start root =
     "Copy reads selected root only"
     true
     (match snd (copy_read effects) with
-     | Protocol.V2_get_outline_block { block; _ } -> Graph.Uuid.equal block root
+     | Query (Copy_worker.Outline_block { uuid; _ }) -> Graph.Uuid.equal uuid root
      | _ -> false);
   state, effects
 ;;
@@ -3074,12 +3118,11 @@ let copy_child id parent title : Protocol.v2_child_member =
 
 let copy_parent effects expected =
   match snd (copy_read effects) with
-  | Protocol.V2_get_children { parent; limit; _ } ->
+  | Query (Copy_worker.Child_members { parent; _ }) ->
     Alcotest.(check bool)
       "selected subtree parent"
       true
-      (Graph.Uuid.equal parent expected);
-    Alcotest.(check bool) "bounded child page" true (limit <= Protocol.maximum_page_size)
+      (Graph.Uuid.equal parent expected)
   | _ -> Alcotest.fail "Copy attempted a read outside the selected subtree"
 ;;
 
@@ -3102,7 +3145,11 @@ let test_copy_nested_paginated_text () =
     "all child pages requested"
     true
     (match snd (copy_read effects) with
-     | Protocol.V2_get_children { cursor = Some value; _ } -> value = cursor
+     | Query (Copy_worker.Child_members _ as query) ->
+       (match Copy_issuer.wire query with
+        | Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_query
+            {request={command=V2_get_children {cursor=Some value;_};_};_} -> value=cursor
+        | _ -> false)
      | _ -> false);
   let state, effects =
     copy_reply
@@ -3121,7 +3168,7 @@ let test_copy_nested_paginated_text () =
   Alcotest.(check bool)
     "verify graph version after complete subtree"
     true
-    (snd (copy_read effects) = Protocol.V2_graph_info);
+    (match snd(copy_read effects) with Query Copy_worker.Graph_info -> true | _ -> false);
   let _, effects =
     copy_reply state effects (graph_info_outcome ~journal_title_format:None)
   in
@@ -3155,7 +3202,7 @@ let test_copy_cancel_and_replacement () =
   let _, effects =
     Copy.step
       canceled
-      (Copy.Completed (ticket, graph_info_outcome ~journal_title_format:None))
+      (Copy.Completed (ticket, copy_info_result ()))
   in
   Alcotest.(check bool) "late cancelled completion ignored" true (effects = []);
   let replacement, effects = Copy.step state (Copy.Start unrelated_uuid) in
@@ -3166,7 +3213,7 @@ let test_copy_cancel_and_replacement () =
   let _, effects =
     Copy.step
       replacement
-      (Copy.Completed (ticket, graph_info_outcome ~journal_title_format:None))
+      (Copy.Completed (ticket, copy_info_result ()))
   in
   Alcotest.(check bool) "late replaced completion ignored" true (effects = [])
 ;;
@@ -3250,54 +3297,55 @@ let test_copy_rejects_oversized_text () =
 
 let test_copy_result_fits_serialized_clipboard () =
   let maximum = 256 * 1024 in
-  let complete source =
-    let state, effects = copy_start block_uuid in
-    let state, effects = copy_root state effects source in
-    let state, effects = copy_reply state effects (copy_children block_uuid []) in
-    snd (copy_reply state effects (graph_info_outcome ~journal_title_format:None))
-  in
   let check source effects =
     match Journal_platform.copy_text_request ~text:source with
     | Ok _ ->
-      Alcotest.(check bool)
-        "encodable text is copied exactly"
-        true
+      Alcotest.(check bool) "encodable outline is copied exactly" true
         (effects = [ Copy.Copied source ])
     | Error _ ->
-      Alcotest.(check bool)
-        "unencodable JSON never produces Copied"
-        true
-        (match effects with
-         | [ Copy.Failed message ] -> message <> ""
-         | _ -> false)
+      Alcotest.(check bool) "unencodable outline never produces Copied" true
+        (match effects with [ Copy.Failed message ] -> message <> "" | _ -> false)
   in
-  List.iter
-    (fun source -> check source (complete source))
-    [ String.make maximum 'x'
-    ; String.make (maximum - 11) 'x'
-    ; String.make (maximum - 10) 'x'
-    ; String.make (maximum / 2) '"'
-    ; String.make (maximum / 2) '\\'
-    ; String.make (maximum / 2) '\n'
-    ; String.make (maximum / 6) '\001'
-    ; String.make ((maximum - 11) / 2) '\n' ^ "a"
-    ; String.make ((maximum - 11) / 2) '\n' ^ "ab"
-    ];
-  List.iter
-    (fun root_length ->
-       let root = String.make root_length 'x' in
-       let child = copy_child unrelated_uuid block_uuid "\"" in
-       let state, effects = copy_start block_uuid in
-       let state, effects = copy_root state effects root in
-       let state, effects =
-         copy_reply state effects (copy_children block_uuid [ child ])
-       in
-       let state, effects = copy_reply state effects (copy_children unrelated_uuid []) in
-       let _, effects =
-         copy_reply state effects (graph_info_outcome ~journal_title_format:None)
-       in
-       check (root ^ "\n  - \"") effects)
-    [ maximum - 19; maximum - 18 ]
+  (* Each result stays inside the real read budget. The large clipboard value
+     comes from an outline gathered across pages, as it does in production. *)
+  let complete length character =
+    let count=40 in
+    let width=if character='\n' then 5 else 1 in
+    let payload=length-4-(5*count) in
+    let prefix="Root" ^ String.make (payload mod width) 'x' in
+    let payload=payload/width in
+    let children=List.init count (fun index ->
+      let size=payload/count+(if index<payload mod count then 1 else 0) in
+      copy_child (uuid(Printf.sprintf "a1000000-0000-4000-9100-%012x" index))
+        block_uuid (String.make size character)) in
+    let source=prefix ^ String.concat "" (List.map (fun (child:Protocol.v2_child_member) ->
+      "\n  - " ^ String.concat "\n    "
+        (String.split_on_char '\n' child.Protocol.value.block.title)) children) in
+    let state,effects=copy_start block_uuid in
+    let state,effects=copy_root state effects prefix in
+    let rec gather state effects page = function
+      | [] -> state,effects
+      | child::rest ->
+        let cursor=if rest=[] then None else Some(Graph.Cursor.of_string
+          (Printf.sprintf "copy-sized-page-%d" page) |> Result.get_ok) in
+        let state,effects=copy_reply state effects
+          (copy_children ?cursor block_uuid [child]) in
+        gather state effects (page+1) rest in
+    let state,effects=gather state effects 0 children in
+    let state,effects=List.fold_left (fun (state,effects) (child:Protocol.v2_child_member) ->
+      copy_reply state effects (copy_children child.Protocol.value.block.uuid []))
+      (state,effects) children in
+    let effects=match effects with
+      | [Copy.Read _] -> snd(copy_reply state effects
+          (graph_info_outcome ~journal_title_format:None))
+      | effects -> effects in
+    source,effects
+  in
+  List.iter (fun (length,character) ->
+    let source,effects=complete length character in check source effects)
+    [maximum,'x'; maximum-11,'x'; maximum-10,'x'; maximum/2,'x';
+     maximum/2,'"'; maximum/2,'\\'; maximum/2,'\n'; maximum/6,'\001';
+     maximum/2+1,'\n'; maximum/2+2,'\n']
 ;;
 
 let seed_ordinary_detail runtime =
@@ -5994,7 +6042,9 @@ let test_copy_page_root () =
     let state,effects=copy_reply state effects (Protocol.V2_block_outcome
       (V2_missing_block {uuid=page_uuid;revision="no-outline"})) in
     Alcotest.(check bool) "copy resolves exact page" true
-      (snd(copy_read effects)=V2_get_page {page=page_uuid;revision=None});
+      (match snd(copy_read effects) with
+       | Query(Copy_worker.Page {uuid;revision=None}) -> Graph.Uuid.equal uuid page_uuid
+       | _ -> false);
     let state,effects=copy_reply state effects (Protocol.V2_page_outcome
       (V2_present_page {page;revision="page-1"})) in
     copy_parent effects page_uuid;

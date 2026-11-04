@@ -3254,7 +3254,6 @@ let reconcile_push t ~request_generation push =
   dispatch_output t output
 ;;
 
-module Copy = Journal_copy
 
 type worker_read =
   | Confirm_readback of {intent:Worker.mutation_intent;presentation:Worker.presentation}

@@ -1,14 +1,15 @@
 module Pure = struct
   module Graph = Logseq_db_types.Graph_types
-  module Protocol = Logseq_db_worker.Protocol
+  module Worker = Journal_worker_coordination.Worker_api
+  module Protocol = Worker.Protocol
   module Keys = Set.Make (String)
 
-  type 'cursor frame =
+  type frame =
     { parent : Graph.Uuid.t
     ; depth : int
-    ; cursor : 'cursor option
+    ; cursor : Protocol.v2_child_member Worker.continuation option
     ; revision : string option
-    ; cursors : 'cursor Rrbvec.t
+    ; cursors : Protocol.v2_child_member Worker.continuation Rrbvec.t
     ; gathered : Protocol.v2_child_member Rrbvec.t
     ; gathered_bytes : int
     ; remaining : int option
@@ -21,57 +22,37 @@ module Pure = struct
     | Children
     | After
 
-  type 'cursor job =
+  type job =
     { root : Graph.block_uuid
     ; page : Graph.page_uuid option
     ; version : (Graph.Uuid.t * string * string) option
     ; phase : phase
-    ; frames : 'cursor frame list
+    ; frames : frame list
     ; visited : Keys.t
     ; fragments : string Rrbvec.t
     ; bytes : int
     }
 
-  type 'cursor t =
+  type t =
     { next_ticket : int64
     ; awaiting : int64 option
-    ; job : 'cursor job option
+    ; job : job option
     }
 
-  type 'cursor query =
-    | Info_query
-    | Block_query of Graph.Uuid.t
-    | Page_query of Graph.Uuid.t
-    | Children_query of
-        { parent : Graph.Uuid.t
-        ; cursor : 'cursor option
-        }
-
-  type 'cursor result =
-    | Info_result of
-        { graph_uuid : Graph.Uuid.t
-        ; generation : string
-        ; projection_revision : string
-        }
+  type result =
+    | Info_result of Worker.graph_info
     | Block_result of Protocol.v2_block_lookup
     | Page_result of Protocol.v2_page_lookup
-    | Children_result of
-        { parent : Graph.Uuid.t
-        ; revision_scope : Protocol.v2_revision_scope
-        ; scope_revision : string
-        ; items : Protocol.v2_child_member list
-        ; next_cursor : 'cursor option
-        }
-    | Read_error of string
+    | Children_result of Worker.children
 
-  type 'cursor event =
+  type event =
     | Start of Graph.block_uuid
-    | Completed of int64 * 'cursor result
+    | Completed of int64 * result
     | Read_failed of int64 * string
     | Cancel
 
-  type 'cursor output_action =
-    | Read of int64 * 'cursor query
+  type output_action =
+    | Read : int64 * 'a Worker.query * ('a -> result) -> output_action
     | Copied of string
     | Failed of string
 
@@ -79,10 +60,10 @@ module Pure = struct
   let maximum_text_bytes = 256 * 1024
   let fail t message = { t with awaiting = None; job = None }, [ Failed message ]
 
-  let read t job command =
+  let read t job query result =
     let ticket = t.next_ticket in
     ( { next_ticket = Int64.succ ticket; awaiting = Some ticket; job = Some job }
-    , [ Read (ticket, command) ] )
+    , [ Read (ticket, query, result) ] )
   ;;
 
   let frame parent depth =
@@ -98,7 +79,9 @@ module Pure = struct
   ;;
 
   let read_children t job current =
-    read t job (Children_query { parent = current.parent; cursor = current.cursor })
+    read t job
+      (Worker.Child_members { parent = current.parent; revision = None; after = current.cursor })
+      (fun children -> Children_result children)
   ;;
 
   let add_text job text =
@@ -120,7 +103,7 @@ module Pure = struct
 
   let rec advance t job =
     match job.frames with
-    | [] -> read t { job with phase = After } Info_query
+    | [] -> read t { job with phase = After } Worker.Graph_info (fun info -> Info_result info)
     | current :: parents ->
       (match current.remaining with
        | None -> read_children t { job with phase = Children } current
@@ -155,7 +138,8 @@ module Pure = struct
           phase = Root
         ; version = Some (info.graph_uuid, info.generation, info.projection_revision)
         }
-        (Block_query job.root)
+        (Worker.Outline_block { uuid = job.root; revision = None })
+        (fun block -> Block_result block)
     | Root, Block_result (V2_present_block { value; _ })
       when Graph.Uuid.equal value.block.uuid job.root ->
       (match add_text job value.block.title with
@@ -172,7 +156,8 @@ module Pure = struct
            current)
     | Root, Block_result (V2_missing_block { uuid; _ })
       when Graph.Uuid.equal uuid job.root ->
-      read t { job with phase = Page_root } (Page_query job.root)
+      read t { job with phase = Page_root }
+        (Worker.Page { uuid = job.root; revision = None }) (fun page -> Page_result page)
     | Page_root, Page_result (V2_present_page { page; _ })
       when Graph.Uuid.equal page.uuid job.root && not page.recycled ->
       (match add_text job page.title with
@@ -217,7 +202,7 @@ module Pure = struct
             if job.bytes + gathered_bytes > maximum_text_bytes
             then fail t "The selected block is too large to copy."
             else (
-              match result.next_cursor with
+              match result.next with
               | Some cursor
                 when Rrbvec.fold_left
                        (fun found previous -> found || previous = cursor)
@@ -249,7 +234,6 @@ module Pure = struct
       (match Journal_platform.copy_text_request ~text with
        | Ok _ -> { t with awaiting = None; job = None }, [ Copied text ]
        | Error _ -> fail t "The selected block is too large to copy.")
-    | _, Read_error message -> fail t ("Unable to copy block: " ^ message)
     | Root, Block_result (V2_missing_block _) ->
       fail t "The selected block no longer exists."
     | _ -> fail t "The graph changed or returned an unexpected copy result. Try again."
@@ -269,7 +253,7 @@ module Pure = struct
         ; bytes = 0
         }
       in
-      read t job Info_query
+      read t job Worker.Graph_info (fun info -> Info_result info)
     | Completed (ticket, outcome) when t.awaiting = Some ticket ->
       (match t.job with
        | Some job -> complete t job outcome
@@ -279,70 +263,3 @@ module Pure = struct
     | Completed _ | Read_failed _ -> t, []
   ;;
 end
-
-module Graph = Logseq_db_types.Graph_types
-module Protocol = Logseq_db_worker.Protocol
-
-type t = Graph.Cursor.t Pure.t
-
-type event =
-  | Start of Graph.block_uuid
-  | Completed of int64 * Protocol.v2_outcome
-  | Read_failed of int64 * string
-  | Cancel
-
-type output_action =
-  | Read of int64 * Protocol.command
-  | Copied of string
-  | Failed of string
-
-let initial = Pure.initial
-
-let step t event =
-  let input =
-    match event with
-    | Start id -> Pure.Start id
-    | Cancel -> Pure.Cancel
-    | Read_failed (id, error) -> Pure.Read_failed (id, error)
-    | Completed (id, result) ->
-      Pure.Completed
-        ( id
-        , match result with
-          | Protocol.V2_graph_info_outcome i ->
-            Pure.Info_result
-              { graph_uuid = i.graph_uuid
-              ; generation = i.generation
-              ; projection_revision = i.projection_revision
-              }
-          | V2_block_outcome block -> Pure.Block_result block
-          | V2_page_outcome page -> Pure.Page_result page
-          | V2_children_outcome c ->
-            Pure.Children_result
-              { parent = c.parent
-              ; revision_scope = c.revision_scope
-              ; scope_revision = c.scope_revision
-              ; items = c.items
-              ; next_cursor = c.next_cursor
-              }
-          | V2_failed { message; _ } -> Pure.Read_error message
-          | _ -> Pure.Read_error "Unexpected copy response" )
-  in
-  let next, actions = Pure.step t input in
-  ( next
-  , List.map
-      (function
-        | Pure.Copied text -> Copied text
-        | Pure.Failed error -> Failed error
-        | Pure.Read (id, query) ->
-          Read
-            ( id
-            , match query with
-              | Pure.Info_query -> Protocol.V2_graph_info
-              | Block_query block -> V2_get_outline_block { block; revision = None }
-              | Page_query page -> V2_get_page { page; revision = None }
-              | Children_query { parent; cursor } ->
-                V2_get_children
-                  { parent; cursor; revision = None; limit = Protocol.maximum_page_size }
-            ))
-      actions )
-;;

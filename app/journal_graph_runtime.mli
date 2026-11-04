@@ -154,7 +154,6 @@ val reconcile_push
   -> Logseq_db_worker.Protocol.push
   -> output
 
-module Copy = Journal_copy
 
 module Worker = Journal_worker_coordination.Worker_api
 

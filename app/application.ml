@@ -3369,7 +3369,7 @@ let start
   let module Coordination = Journal_worker_coordination.Worker_pure_coordinator in
   let module Coordination_host = Journal_worker_coordination_host in
   let module Copy = Journal_copy.Pure in
-  let copy_state : Wc.Protocol.v2_child_member Wc.continuation Copy.t ref = ref Copy.initial in
+  let copy_state : Copy.t ref = ref Copy.initial in
   let copy_owner = ref None in
   let copy_sequence = ref 0L in
   let termination_in_flight = ref false in
@@ -3633,7 +3633,7 @@ let start
       else state)
   in
   let schedule_copy_read (type a) owner (query:a Wc.query)
-      (convert:a -> Wc.Protocol.v2_child_member Wc.continuation Copy.result) completed =
+      (convert:a -> Copy.result) completed =
     Effect.of_thunk(fun()->match ensure_coordination() with
       | Error message->completed(Error message)
       | Ok host->
@@ -3709,17 +3709,10 @@ let start
                          { feedback with copy_phase = Copied } }
                    | _ -> state)
                | Error message -> copy_error owner message)))
-    | Read(ticket,query)->
+    | Read(ticket,query,outcome)->
       let completed result=if copy_current owner then Effect.run(copy_transition owner
         (match result with Ok result->Copy.Completed(ticket,result)|Error message->Copy.Read_failed(ticket,message))) in
-      match query with
-      | Copy.Info_query->schedule_copy_read owner Wc.Graph_info
-          (fun info->Copy.Info_result{graph_uuid=info.Wc.graph_uuid;generation=info.generation;projection_revision=info.projection_revision})completed
-      | Block_query uuid->schedule_copy_read owner(Wc.Outline_block{uuid;revision=None})(fun result->Copy.Block_result result)completed
-      | Page_query uuid->schedule_copy_read owner(Wc.Page{uuid;revision=None})(fun result->Copy.Page_result result)completed
-      | Children_query{parent;cursor}->schedule_copy_read owner(Wc.Child_members{parent;revision=None;after=cursor})
-          (fun result->Copy.Children_result{parent=result.Wc.parent;revision_scope=result.revision_scope;
-            scope_revision=result.scope_revision;items=result.items;next_cursor=result.next})completed
+      schedule_copy_read owner query outcome completed
   in
   let begin_copy block_id =
     match Logseq_db_types.Graph_types.Uuid.of_string block_id with
