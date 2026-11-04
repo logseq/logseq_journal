@@ -10,15 +10,13 @@ type scan_cursor =
   | Favorites_cursor of Worker_pure_data.favorite_item Worker.continuation
   | Assets_cursor of Logseq_db_types.Asset_descriptor.t Worker.continuation
 
-type read_packet =
-  | Journals_packet of Worker_pure_data.journal_item Worker.slice
-  | Favorites_packet of Worker.favorites
-  | Assets_packet of Worker.asset_listing
-
 type read_result =
-  { read_id : Graph.Uuid.t
-  ; packet : read_packet
-  }
+  | Read_result :
+      { read_id : Graph.Uuid.t
+      ; query : 'a Worker.query
+      ; value : 'a
+      }
+      -> read_result
 
 type read_request =
   | Read :
@@ -256,13 +254,13 @@ let execute t = function
         then observe_request t Protocol.{ api_version = 2; request_id; command };
         accepted
       | Some read ->
-        let submit query packet =
+        let submit query =
           read
             (Read
                { request_id
                ; maximum_items = Policy.page_size
                ; query
-               ; outcome = (fun value -> { read_id = request_id; packet = packet value })
+               ; outcome = (fun value -> Read_result { read_id = request_id; query; value })
                })
         in
         (match ticket.query with
@@ -277,7 +275,6 @@ let execute t = function
             | Ok from_day, Ok through_day ->
               submit
                 (Worker.Journals { from_day; through_day; revision = None; after })
-                (fun value -> Journals_packet value)
             | _ -> false)
          | Favorite_roots cursor ->
            let after =
@@ -286,7 +283,7 @@ let execute t = function
              | Some (Favorites_cursor c) -> Some c
              | Some _ -> invalid_arg "Wrong favorites continuation"
            in
-           submit (Worker.Favorites after) (fun value -> Favorites_packet value)
+           submit (Worker.Favorites after)
          | Assets { roots; cursor } ->
            let after =
              match cursor with
@@ -295,8 +292,7 @@ let execute t = function
              | Some _ -> invalid_arg "Wrong assets continuation"
            in
            submit
-             (Worker.Assets { recursive = true; roots; after })
-             (fun value -> Assets_packet value))
+             (Worker.Assets { recursive = true; roots; after }))
     in
     if accepted
     then (
@@ -368,15 +364,22 @@ let rec pump_dependencies t =
     if not (Queue.is_empty t.dependency_queue)
     then (
       let dependency,request_id = Queue.peek t.dependency_queue in
-      let command =
-        match dependency with
-        | Block block -> Protocol.V2_get_outline_block { block; revision = None }
-        | Page page -> V2_get_page { page; revision = None }
-      in
-      let request = Protocol.{ api_version = 2; request_id; command } in
-      if t.send (Service.Graph_request request)
-      then (
-        observe_request t request;
+      let accepted = match t.read_port with
+        | None ->
+          let command = match dependency with
+            | Block block -> Protocol.V2_get_outline_block { block; revision = None }
+            | Page page -> V2_get_page { page; revision = None } in
+          t.send (Service.Graph_request Protocol.{ api_version = 2; request_id; command })
+        | Some read ->
+          let submit query = read (Read
+            { request_id; maximum_items = 1; query
+            ; outcome = (fun value -> Read_result { read_id = request_id; query; value })
+            }) in
+          match dependency with
+          | Block uuid -> submit (Worker.Outline_block { uuid; revision = None })
+          | Page uuid -> submit (Worker.Page { uuid; revision = None }) in
+      if accepted then (
+        observe_fact_request t ~request_id ~first_page:false;
         Hashtbl.replace
           t.dependencies
           (Graph.Uuid.to_string request_id)
@@ -680,6 +683,33 @@ let settle_dirty t =
   pump t
 ;;
 
+let remember_block_value t ~issuance uuid block =
+  let key = Graph.Uuid.to_string uuid in
+  let prior = Hashtbl.find_opt t.facts key in
+  if
+    (Hashtbl.length t.facts < maximum_dependency_facts || Option.is_some prior)
+    &&
+    match prior with
+    | None -> true
+    | Some fact -> issuance >= fact.issuance
+  then (
+    Hashtbl.replace
+      t.facts
+      key
+      { block
+      ; issuance
+      ; references = Option.fold ~none:Uuids.empty ~some:references block
+      };
+    if Seq.exists (Graph.Uuid.equal uuid) (all_roots t)
+    then
+      Option.iter
+        (fun (block : Graph.block) -> ignore (path t block.parent : Uuids.t))
+        block)
+  else if Option.is_none prior
+  then degrade t
+
+;;
+
 let remember_page_value t ~issuance uuid page =
   let key = Graph.Uuid.to_string uuid in
   let prior = Hashtbl.find_opt t.pages key in
@@ -761,31 +791,7 @@ let observe_fact_result t ~request_id apply =
 
 let observe_response_internal t (Protocol.V2_response { request_id; outcome; _ }) =
   observe_fact_result t ~request_id (fun issuance first_page ->
-      let remember_block uuid block =
-        let key = Graph.Uuid.to_string uuid in
-        let prior = Hashtbl.find_opt t.facts key in
-        if
-          (Hashtbl.length t.facts < maximum_dependency_facts || Option.is_some prior)
-          &&
-          match prior with
-          | None -> true
-          | Some fact -> issuance >= fact.issuance
-        then (
-          Hashtbl.replace
-            t.facts
-            key
-            { block
-            ; issuance
-            ; references = Option.fold ~none:Uuids.empty ~some:references block
-            };
-          if Seq.exists (Graph.Uuid.equal uuid) (all_roots t)
-          then
-            Option.iter
-              (fun (block : Graph.block) -> ignore (path t block.parent : Uuids.t))
-              block)
-        else if Option.is_none prior
-        then degrade t
-      in
+      let remember_block = remember_block_value t ~issuance in
       let remember_lookup = function
         | Worker_pure_data.V2_present_block { value; _ } ->
           remember_block value.block.uuid (Some value.block)
@@ -846,14 +852,29 @@ let observe_favorites_result
     observe_favorites t ~first_page ~favorites_page:value.favorites_page value.items)
 ;;
 
-let observe_journals_result t ~request_id (value : Worker_pure_data.journal_item Worker.slice) =
-  observe_fact_result t ~request_id (fun issuance _ ->
-    List.iter (fun (item : Worker_pure_data.journal_item) ->
-      remember_page_value t ~issuance item.page.uuid (Some item.page)) value.items)
-;;
-
-let observe_assets_result t ~request_id (value : Worker.asset_listing) =
-  observe_fact_result t ~request_id (fun _ _ -> remember_assets t value.items)
+let observe_query_result
+    : type a. t -> request_id:Graph.Uuid.t -> a Worker.query -> a -> unit
+  = fun t ~request_id query value ->
+  observe_fact_result t ~request_id (fun issuance first_page ->
+    match query with
+    | Worker.Outline_block _ ->
+      (match value with
+       | Worker_pure_data.V2_present_block { value; _ } ->
+         remember_block_value t ~issuance value.block.uuid (Some value.block)
+       | Worker_pure_data.V2_missing_block { uuid; _ } -> remember_block_value t ~issuance uuid None)
+    | Page _ ->
+      (match value with
+       | Worker_pure_data.V2_present_page { page; _ } ->
+         remember_page_value t ~issuance page.uuid (Some page);
+         if page.name = "$$$favorites" && t.favorites_page <> Some page.uuid
+         then dispatch t (Index_changed Favorites)
+       | Worker_pure_data.V2_missing_page { uuid; _ } -> remember_page_value t ~issuance uuid None)
+    | Journals _ -> List.iter (fun (item : Worker_pure_data.journal_item) ->
+        remember_page_value t ~issuance item.page.uuid (Some item.page)) value.items
+    | Worker.Favorites _ ->
+      observe_favorites t ~first_page ~favorites_page:value.favorites_page value.items
+    | Assets _ -> remember_assets t value.items
+    | _ -> ())
 ;;
 
 let changes t windows =
@@ -993,51 +1014,60 @@ let bind_coordinated_resources t binding =
   |None->pump t
 ;;
 
-let receive_read t ~request_id result =
+let complete_dependency t ~request_id dependency issuance observe =
+  Hashtbl.remove t.dependencies (Graph.Uuid.to_string request_id);
+  observe ();
+  (match dependency with
+   | Block uuid ->
+     (match Hashtbl.find_opt t.dirty (Graph.Uuid.to_string uuid) with
+      | Some (_, _, barrier, _) when issuance <= barrier -> enqueue t dependency
+      | _ -> ())
+   | Page uuid ->
+     (match Hashtbl.find_opt t.page_dirty (Graph.Uuid.to_string uuid) with
+      | Some (_, _, barrier, _) when issuance <= barrier -> enqueue t dependency
+      | _ -> ()));
+  pump t;
+  true
+;;
+
+let receive_read t ~request_id (Read_result { read_id; query; value }) =
   let key = Graph.Uuid.to_string request_id in
-  if not (Graph.Uuid.equal request_id result.read_id)
-  then false
-  else (
-    match Hashtbl.find_opt t.pending key with
+  if not (Graph.Uuid.equal request_id read_id) then false
+  else match Hashtbl.find_opt t.pending key with
+  | None ->
+    (match Hashtbl.find_opt t.dependencies key with
+     | Some ((Block _ as dependency), issuance) ->
+       (match query with
+        | Worker.Outline_block _ -> complete_dependency t ~request_id dependency issuance
+            (fun () -> observe_query_result t ~request_id query value)
+        | _ -> false)
+     | Some ((Page _ as dependency), issuance) ->
+       (match query with
+        | Worker.Page _ -> complete_dependency t ~request_id dependency issuance
+            (fun () -> observe_query_result t ~request_id query value)
+        | _ -> false)
+     | None -> false)
+  | Some ticket ->
+    let event = match ticket.query, query with
+      | Policy.Recent_roots _, Worker.Journals _ -> Some (Policy.Roots_loaded
+          (ticket, List.map (fun (item : Worker_pure_data.journal_item) -> item.page.uuid) value.items,
+           Option.map (fun c -> Journals_cursor c) value.next))
+      | Favorite_roots _, Worker.Favorites _ -> Some (Policy.Roots_loaded
+          (ticket, List.map (fun (item : Worker_pure_data.favorite_item) ->
+             match item.target with
+             | Worker_pure_data.V2_favorite_page { uuid; _ }
+             | Worker_pure_data.V2_favorite_block { uuid; _ } -> uuid) value.items,
+           Option.map (fun c -> Favorites_cursor c) value.next))
+      | Assets _, Worker.Assets _ -> Some (Policy.Assets_loaded
+          (ticket, value.items, Option.map (fun c -> Assets_cursor c) value.next))
+      | _ -> None in
+    match event with
     | None -> false
-    | Some ticket ->
-      let delivery =
-        match ticket.query, result.packet with
-        | Policy.Recent_roots _, Journals_packet value ->
-          Some
-            ( Policy.Roots_loaded
-                ( ticket
-                , List.map
-                    (fun (item : Worker_pure_data.journal_item) -> item.page.uuid)
-                    value.items
-                , Option.map (fun c -> Journals_cursor c) value.next )
-            , (fun () -> observe_journals_result t ~request_id value) )
-        | Favorite_roots cursor, Favorites_packet value ->
-          Some
-            ( Policy.Roots_loaded
-                ( ticket
-                , List.map
-                    (fun (item : Worker_pure_data.favorite_item) ->
-                       match item.target with
-                       | Worker_pure_data.V2_favorite_page { uuid; _ } | Worker_pure_data.V2_favorite_block { uuid; _ } ->
-                         uuid)
-                    value.items
-                , Option.map (fun c -> Favorites_cursor c) value.next )
-            , (fun () -> observe_favorites_result t ~request_id ~first_page:(cursor = None) value) )
-        | Assets _, Assets_packet value ->
-          Some
-            ( Policy.Assets_loaded
-                (ticket, value.items, Option.map (fun c -> Assets_cursor c) value.next)
-            , (fun () -> observe_assets_result t ~request_id value) )
-        | _ -> None
-      in
-      (match delivery with
-       | None -> false
-       | Some (event, observe) ->
-         Hashtbl.remove t.pending key;
-         observe ();
-         dispatch t event;
-         true))
+    | Some event ->
+      Hashtbl.remove t.pending key;
+      observe_query_result t ~request_id query value;
+      dispatch t event;
+      true
 ;;
 
 let receive t (Protocol.V2_response { request_id; outcome; _ } as response) =
@@ -1047,7 +1077,7 @@ let receive t (Protocol.V2_response { request_id; outcome; _ } as response) =
     (match Hashtbl.find_opt t.dependencies key with
      | None -> false
      | Some (dependency, issuance) ->
-       Hashtbl.remove t.dependencies key;
+       complete_dependency t ~request_id dependency issuance (fun () ->
        let expected =
          match dependency, outcome with
          | Block _, Protocol.V2_block_outcome _ | Page _, V2_page_outcome _ -> true
@@ -1059,18 +1089,7 @@ let receive t (Protocol.V2_response { request_id; outcome; _ } as response) =
          Hashtbl.clear t.page_dirty;
          clear_dependency_queue t;
          degrade t);
-       observe_response t response;
-       (match dependency with
-        | Block uuid ->
-          (match Hashtbl.find_opt t.dirty (Graph.Uuid.to_string uuid) with
-           | Some (_, _, barrier, _) when issuance <= barrier -> enqueue t dependency
-           | _ -> ())
-        | Page uuid ->
-          (match Hashtbl.find_opt t.page_dirty (Graph.Uuid.to_string uuid) with
-           | Some (_, _, barrier, _) when issuance <= barrier -> enqueue t dependency
-           | _ -> ()));
-       pump t;
-       true)
+       observe_response t response))
   | Some _ when Option.is_some t.read_port -> false
   | Some ticket ->
     Hashtbl.remove t.pending key;

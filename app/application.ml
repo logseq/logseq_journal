@@ -4019,22 +4019,7 @@ let start
            else Coordination.Change_consumer_retired(token,request_id)))!coordination_host)application;
         Effect.ignore)) in
   coordinated_asset_point := (fun request ->
-    match coordinated_asset_command ~bind:(Journal_asset_runtime.bind_consumer (!asset_runtime_cell)) request with Some _ as result->result|None->
-    let result=send_coordinated_point request ~finish:(fun result->
-      match request with
-        | Graph_service.Graph_request original ->
-          apply_asset_read ~request_id:original.request_id ~result:(Result.map(fun _->())result) ~f:(fun()->
-            let owned=Journal_asset_runtime.owns_read (!asset_runtime_cell) original.request_id in
-            (match result with
-             | Ok response when Journal_asset_runtime.receive (!asset_runtime_cell) response->
-               Journal_media_runtime.observe_response (!media_runtime_cell) response
-             | _->forget_projection_request original.request_id;
-               Journal_asset_runtime.reject (!asset_runtime_cell) ~request_id:original.request_id);
-            owned)
-        | _->Effect.ignore) in
-    (match result,request with Some true,Graph_service.Graph_request original->
-      Journal_media_runtime.observe_request (!media_runtime_cell) original|_->());
-    result);
+    coordinated_asset_command ~bind:(Journal_asset_runtime.bind_consumer (!asset_runtime_cell)) request);
   coordinated_asset_read := (fun (Journal_asset_runtime.Read request) ->
     match current_owner(),ensure_coordination() with
     | Some owner,Ok host ->
@@ -4043,10 +4028,13 @@ let start
           ~maximum_bytes:Worker_pure_data.maximum_response_bytes request.query with
        | Error _->false
        | Ok ticket ->
-         (match request.query with
-          | Wc.Journals _->Journal_media_runtime.observe_query (!media_runtime_cell)
-              ~request_id:request.request_id request.query
-          | _->());
+         let shared = match request.query with
+           | Wc.Journals _ -> true
+           | Wc.Page _ -> true
+           | Wc.Outline_block _ -> true
+           | _ -> false in
+         if shared then Journal_media_runtime.observe_query (!media_runtime_cell)
+           ~request_id:request.request_id request.query;
          Coordination_host.watch_read host ticket ~f:(fun origin reply->
            if runtime_owner_is_live !state_ref owner then run_owned (Some owner) (fun()->
              let value=match origin,reply with
@@ -4061,10 +4049,8 @@ let start
                  let consumed=Journal_asset_runtime.receive_read (!asset_runtime_cell)
                      ~request_id:request.request_id (request.outcome value) in
                  if consumed then (
-                   match request.query with
-                   | Wc.Journals _->Journal_media_runtime.observe_query_result (!media_runtime_cell)
-                       ~request_id:request.request_id request.query value
-                   | _->())
+                   if shared then Journal_media_runtime.observe_query_result (!media_runtime_cell)
+                     ~request_id:request.request_id request.query value)
                  else forget_projection_request request.request_id;
                  consumed
                | Error _->Journal_asset_runtime.reject (!asset_runtime_cell) ~request_id:request.request_id;
