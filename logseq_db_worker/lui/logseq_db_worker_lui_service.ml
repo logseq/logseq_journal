@@ -493,11 +493,11 @@ type asset_notice_batch =
 type push =
   | Coordination_observations of observation_signal Rrbvec.t
   | Coordination_updates of coordination_update list
-  | Graph_pushes of (asset_scope * Logseq_db_worker.Protocol.push) list
+  | Graph_pushes of (asset_scope * Worker_pure_data.changefeed_signal) list
   | Graph_states of (asset_scope * Logseq_db_worker.graph_state) list
   | Session_states of (asset_scope * state) list
   | Asset_notices of asset_notice_batch
-  | Graph_push of Protocol.push
+  | Graph_push of Worker_pure_data.changefeed_signal
   | Client_state_changed of state
   | Need_id_token of token_request
   | Bootstrap_progress of bootstrap_progress
@@ -554,7 +554,7 @@ let merge_scoped previous next =
 let merge_graph_pushes previous next =
   List.fold_left(fun entries (scope,push)->
     let push=match List.assoc_opt scope entries,push with
-      | Some(Protocol.V2_resync_required_push _ as required),Protocol.V2_changes_available _->required
+      | Some(Worker_pure_data.Resync_required _ as required),Worker_pure_data.Changes_available _->required
       | _->push in
     merge_scoped entries [scope,push]) previous next
 ;;

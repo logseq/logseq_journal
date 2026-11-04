@@ -3916,12 +3916,10 @@ let test_scoped_change_notices_and_lifecycle () =
   let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let scope = fst (List.hd raw.baseline.state.residents) in
   let available =
-    P.V2_changes_available
-      { api_version = P.api_version; generation = "g"; through = "w" }
+    Worker_pure_data.Changes_available {generation="g";through="w"}
   in
   let resync =
-    P.V2_resync_required_push
-      { api_version = P.api_version; generation = "g"; reason = "history gap" }
+    Worker_pure_data.Resync_required {generation="g";reason="history gap"}
   in
   let decode scope push =
     I.changefeed_notices (S.Graph_pushes [ scope, push ]) |> Result.get_ok

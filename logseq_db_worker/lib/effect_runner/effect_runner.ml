@@ -997,7 +997,7 @@ let revision_scope_to_protocol = function
   | Overlay.Children_revision parent -> Worker_pure_data.V2_children_revision parent
 ;;
 
-let structure_interest_to_protocol = function
+let structure_interest_to_data = function
   | Overlay.Children_interest parent -> Worker_pure_data.V2_children_interest parent
   | Page_tree_interest page -> Worker_pure_data.V2_page_tree_interest page
   | Journal_index_interest -> Worker_pure_data.V2_journal_index_interest
@@ -1032,10 +1032,11 @@ let publish_projection_change t session = function
     let window:Worker_pure_data.change_window=
       {id;predecessor=Overlay.Projection_revision.to_string before_revision;
        successor=Overlay.Projection_revision.to_string after_revision;block_uuids;page_uuids;
-       structure_interests=List.map structure_interest_to_protocol structure_interests} in
-    let encoded_bytes=Protocol.encoded_response_bytes(Protocol.V2_response
-      {api_version=Protocol.api_version;request_id=session.graph_scope.graph_id;
-       outcome=Protocol.V2_changes{generation;from_exclusive=None;through=id;next=None;windows=[window]}}) in
+       structure_interests=List.map structure_interest_to_data structure_interests} in
+    (* Retention owns the complete physical window and its generation, not an
+       RPC response. Count that artifact directly, before admitting the window. *)
+    let encoded_bytes=String.length(Yojson.Safe.to_string(`Assoc
+      ["generation",`String generation;"window",Worker_pure_data.change_window_to_yojson window])) in
     let retained,keep=Core.Changefeed_owner.retain_window session.changefeed ~encoded_bytes in
     session.changefeed<-retained;
     if keep then session.windows<-Rrbvec.push_back session.windows
@@ -1055,10 +1056,8 @@ let publish_projection_change t session = function
      with _ -> ());
     t.post
       (Core.Projection_push_for_scope
-         (session.graph_scope, if keep then Protocol.V2_changes_available
-            { api_version = Protocol.api_version; generation; through = id }
-          else Protocol.V2_resync_required_push{api_version=Protocol.api_version;generation;
-            reason="changeHistoryRetentionExceeded"}))
+         (session.graph_scope, if keep then Worker_pure_data.Changes_available {generation=generation;through=id}
+          else Worker_pure_data.Resync_required {generation=generation;reason="changeHistoryRetentionExceeded"}))
   | Overlay.Projection_resync_required { generation; reason; _ } ->
     let generation = Overlay.Generation.to_string generation in
     if not (String.equal generation session.generation) then session.next_window <- 1;
@@ -1069,11 +1068,7 @@ let publish_projection_change t session = function
     <- Printf.sprintf "change-window:v1:%d" (session.next_window - 1);
     t.post
       (Core.Projection_push_for_scope
-         (session.graph_scope, Protocol.V2_resync_required_push
-            { api_version = Protocol.api_version
-            ; generation
-            ; reason = resync_reason reason
-            }))
+         (session.graph_scope, Worker_pure_data.Resync_required {generation=generation;reason=resync_reason reason}))
 ;;
 
 let report_current_graph t (scope : Sync.graph_scope) code =

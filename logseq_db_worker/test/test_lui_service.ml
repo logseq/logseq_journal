@@ -1,5 +1,4 @@
 module T = Logseq_db_worker_test_support.Test_support
-module P = Logseq_db_worker.Protocol
 module ID = Journal_worker_ids
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Runner = Logseq_sync_effect_runner.Effect_runner
@@ -1783,14 +1782,13 @@ let test_authoritative_detail_budget () =
 
 let test_resident_invalidations_survive_coalescing () =
   let scope=asset_scope 1 and other=asset_scope 2 in
-  let push n=Logseq_db_worker.Protocol.V2_changes_available {api_version=Logseq_db_worker.Protocol.api_version;
-    generation="generation:v1:1:1";through="change-window:v1:" ^ string_of_int n} in
+  let push n=Worker_pure_data.Changes_available {generation="generation:v1:1:1";through="change-window:v1:" ^ string_of_int n} in
   let merged=Service.coalesce_push ~topic:Service.invalidation_topic
     (Service.Graph_pushes [scope,push 1]) (Service.Graph_pushes [other,push 2]) in
   T.require (merged=Service.Graph_pushes [scope,push 1;other,push 2]) "hidden graph invalidation was overwritten";
   let latest=Service.coalesce_push ~topic:Service.invalidation_topic merged (Service.Graph_pushes [scope,push 3]) in
   T.require (latest=Service.Graph_pushes [other,push 2;scope,push 3]) "latest update must replace only its exact graph scope";
-  let resync=P.V2_resync_required_push{api_version=P.api_version;generation="g";reason="retention gap"} in
+  let resync=Worker_pure_data.Resync_required {generation="g";reason="retention gap"} in
   let sticky=Service.coalesce_push ~topic:Service.invalidation_topic
     (Service.Graph_pushes[scope,resync])(Service.Graph_pushes[scope,push 4;other,push 5]) in
   T.require(sticky=Service.Graph_pushes[scope,resync;other,push 5])

@@ -3658,11 +3658,11 @@ let test_service_durable_recovery_and_ack () =
 let test_service_changefeed_has_one_owner () =
   let pulses=ref 0 and resyncs=ref 0 in
   let observe_push=function
-    |Service.Graph_push(P.V2_changes_available _)->incr pulses
-    |Graph_push(V2_resync_required_push _)->incr pulses;incr resyncs
+    |Service.Graph_push(Worker_pure_data.Changes_available _)->incr pulses
+    |Graph_push(Worker_pure_data.Resync_required _)->incr pulses;incr resyncs
     |Graph_pushes values->List.iter(function
-      |_,P.V2_changes_available _->incr pulses
-      |_,P.V2_resync_required_push _->incr pulses;incr resyncs)values
+      |_,Worker_pure_data.Changes_available _->incr pulses
+      |_,Worker_pure_data.Resync_required _->incr pulses;incr resyncs)values
     |_->() in
   with_observation_service ~observe_push
     (fun client ~call ~send:_ ~wait ~replies:_ ~notices:_ ~baseline ~owner ~registration ->

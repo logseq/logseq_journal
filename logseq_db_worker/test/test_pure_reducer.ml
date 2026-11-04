@@ -1673,7 +1673,7 @@ let test_observation_registry_traces () =
 
 let test_single_graph_change_broadcast_keeps_scope () =
   let state,scope=worker_open_graph () in
-  let push=Protocol.V2_resync_required_push{api_version=Protocol.api_version;generation="g";reason="actual producer resync"} in
+  let push=Worker_pure_data.Resync_required {generation="g";reason="actual producer resync"} in
   let result=Core.step state(Core.Projection_push_for_scope(scope,push)) in
   Alcotest.(check bool) "one resident preserves its actual event scope" true
     (List.exists(function Core.Publish(Core.Scoped_graph_push(actual,value))->actual=scope && value=push|_->false)result.effects)

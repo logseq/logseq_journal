@@ -523,23 +523,8 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                    match owner with
                    | None -> Ok notices
                    | Some resident ->
-                     let version =
-                       match push with
-                       | Protocol.V2_changes_available value -> value.api_version
-                       | V2_resync_required_push value -> value.api_version
-                     in
-                     if version <> Protocol.api_version
-                     then
-                       Error
-                         (Protocol_mismatch "Scoped change notice API version mismatch")
-                     else
-                       Ok
-                         (Rrbvec.push_back
-                            notices
-                            { notice_session = resident.session
-                            ; notice = (match push with
-                              | Protocol.V2_changes_available {generation;through;_}->Data.Changes_available {generation;through}
-                              | V2_resync_required_push {generation;reason;_}->Data.Resync_required {generation;reason}) })))
+                     Ok(Rrbvec.push_back notices
+                       {notice_session=resident.session;notice=push})))
               (Ok Rrbvec.empty)
               notices)
         | _ -> Ok Rrbvec.empty

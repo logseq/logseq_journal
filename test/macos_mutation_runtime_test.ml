@@ -20,7 +20,7 @@ type worker =
   ; sw : Eio.Switch.t
   ; request : P.request -> P.response
   ; drain : unit -> unit
-  ; pushes : P.push Queue.t
+  ; pushes : Worker_pure_data.changefeed_signal Queue.t
   }
 
 let with_worker
@@ -290,7 +290,7 @@ let test_asset_reference_command () =
      | P.V2_mutation_committed _ -> ()
      | _ -> failwith "worker did not execute reference mutation");
     (match last_push worker with
-     | P.V2_changes_available _ -> ()
+     | Worker_pure_data.Changes_available _ -> ()
      | _ -> failwith "reference mutation did not notify graph consumers");
     match
       outcome
@@ -313,7 +313,7 @@ let test_acknowledged_cursor () =
     save worker 901 Fixture.authoritative_block_uuid "First visible change";
     let generation =
       match last_push worker with
-      | P.V2_changes_available { generation; _ } -> generation
+      | Worker_pure_data.Changes_available {generation=generation;_=_} -> generation
       | _ -> failwith "expected exact change push"
     in
     let first =
@@ -532,7 +532,7 @@ let test_resync_clears_retained_windows () =
      | V2_mutation_committed _ -> ()
      | _ -> failwith "resync insertion failed");
     (match last_push worker with
-     | P.V2_resync_required_push _ -> ()
+     | Worker_pure_data.Resync_required _ -> ()
      | _ -> failwith "oversized publication did not request resync");
     (match
        outcome worker 3105 (P.V2_pull_changes { generation; after = None; limit = 100 })
@@ -657,8 +657,8 @@ let test_reconciled_capture_status () =
     let sync () =
       let push = last_push worker in
       let signal=match push with
-        |P.V2_changes_available{generation;through;_}->Worker_pure_data.Changes_available{generation;through}
-        |V2_resync_required_push{generation;reason;_}->Worker_pure_data.Resync_required{generation;reason} in
+        |Worker_pure_data.Changes_available {generation=generation;through=through;_=_}->Worker_pure_data.Changes_available{generation;through}
+        |Worker_pure_data.Resync_required {generation=generation;reason=reason;_=_}->Worker_pure_data.Resync_required{generation;reason} in
       Runtime.reconcile_signal runtime ~request_generation:11L signal
       |> deliver worker runtime
     in

@@ -89,11 +89,11 @@ type asset_notice =
 type output =
   | Asset_notice of Logseq_sync_pure_reducer.Core.graph_scope * asset_notice
   | Reply of request_id * Worker_pure_read.answer
-  | Graph_push of Logseq_db_worker_contract.Protocol.push
+  | Graph_push of Worker_pure_data.changefeed_signal
   | Sync_output of Logseq_sync_pure_reducer.Core.output
   | Graph_state_changed of graph_state
   | Scoped_graph_state_changed of Logseq_sync_pure_reducer.Core.graph_scope * graph_state
-  | Scoped_graph_push of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_worker_contract.Protocol.push
+  | Scoped_graph_push of Logseq_sync_pure_reducer.Core.graph_scope * Worker_pure_data.changefeed_signal
   | Diagnostic of string
 
 type upload_recovery_ticket = private
@@ -167,7 +167,7 @@ type event =
       ; id : request_id
       ; read : Worker_pure_read.packed_query
       }
-  | Projection_push_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_worker_contract.Protocol.push
+  | Projection_push_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Worker_pure_data.changefeed_signal
   | Asset_requested_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_sync_pure_reducer.Asset_transfer.event
   | Upload_requested_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_types.Graph_types.Uuid.t * Asset_upload.event
   | Start
@@ -176,7 +176,7 @@ type event =
       ; read : Worker_pure_read.packed_query
       }
   | Sync_event of Logseq_sync_pure_reducer.Core.event
-  | Projection_push of Logseq_db_worker_contract.Protocol.push
+  | Projection_push of Worker_pure_data.changefeed_signal
   | Set_foreground of bool
   | Runner_completed of runner_completion
   | Shutdown
@@ -314,8 +314,8 @@ module Observation_registry : sig
   val retire_registration : t -> registration:int64 -> t
 end
 
-(** One changefeed consumer for one physical DB session. Legacy ownership can be
-    transferred once; registered replacements require actual prior retirement.
+(** One registered changefeed consumer for one physical DB session.
+    Registered replacements require actual prior retirement.
     An unapplied pull is retained verbatim until its exact ACK succeeds. *)
 module Changefeed_owner : sig
   type t

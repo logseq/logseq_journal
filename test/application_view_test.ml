@@ -1549,7 +1549,7 @@ let run_favorites_native_visibility
             W.Request_context.emit
               context
               ~topic:Service.invalidation_topic
-              (Service.Graph_pushes [scope, P.V2_changes_available { api_version = 2; generation = "g"; through = "p2" }]));
+              (Service.Graph_pushes [scope, Worker_pure_data.Changes_available {generation="g";through="p2"}]));
           List.iter
             (fun notice ->
                Atomic.incr media_delivered;
@@ -4173,7 +4173,7 @@ let run_favorites_native_visibility
                  W.Session_context.emit
                    (Option.get !worker_context)
                    ~topic:Service.invalidation_topic
-                   (Service.Graph_pushes [scope, P.V2_changes_available { api_version = 2; generation = "g"; through = "p2" }]);
+                   (Service.Graph_pushes [scope, Worker_pure_data.Changes_available {generation="g";through="p2"}]);
                  wait "metadata changes acknowledged" (fun () ->
                    Atomic.get changes_acknowledged);
                  settle ();
@@ -5174,7 +5174,7 @@ let test_reference_outer_terminals cancel =
             W.Request_context.emit
               context
               ~topic:Service.invalidation_topic
-              (Service.Graph_pushes [scope, P.V2_changes_available { api_version = P.api_version; generation = "g"; through = "r2" }]);
+              (Service.Graph_pushes [scope, Worker_pure_data.Changes_available {generation="g";through="r2"}]);
           Ok (Service.Graph_state graph_state)
         | Client_command _ | Asset_command _ | Asset_command_at _ | Release_asset_file _ ->
           Ok Service.Client_command_completed
@@ -8287,8 +8287,7 @@ let test_worker_response_routing () =
   check A.Dropped_envelope (A.receive f.owner (terminal 9L));
   let push worker = W.Push {runtime_epoch=epoch 1L;worker_generation=generation worker;
     push_sequence=Ids.Worker.Push_sequence.one;topic=Service.invalidation_topic;
-    payload=Service.Graph_push (F.Protocol.V2_changes_available
-      {api_version=F.Protocol.api_version;generation="db";through="r1"})} in
+    payload=Service.Graph_push (Worker_pure_data.Changes_available {generation="db";through="r1"})} in
   check A.Broadcast (A.receive f.owner (push 2L));
   check A.Dropped_envelope (A.receive f.owner (push 9L));
   check A.Registered_response (A.receive f.owner (response 1L W.Shutdown));

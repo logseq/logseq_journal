@@ -400,11 +400,11 @@ type asset_notice_batch
 type push =
   | Coordination_observations of observation_signal Rrbvec.t
   | Coordination_updates of coordination_update list
-  | Graph_pushes of (asset_scope * Logseq_db_worker.Protocol.push) list
+  | Graph_pushes of (asset_scope * Worker_pure_data.changefeed_signal) list
   | Graph_states of (asset_scope * Logseq_db_worker.graph_state) list
   | Session_states of (asset_scope * state) list
   | Asset_notices of asset_notice_batch
-  | Graph_push of Logseq_db_worker.Protocol.push
+  | Graph_push of Worker_pure_data.changefeed_signal
   | Client_state_changed of state
   | Need_id_token of token_request
   | Bootstrap_progress of bootstrap_progress

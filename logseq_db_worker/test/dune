@@ -43,6 +43,7 @@
  (modules test_lui_service)
  (libraries logseq_db_worker.identity
   datascript-ocaml-native
+  logseq_db_worker.typed_data
   datascript_ocaml
   datascript_ocaml.types
   logseq_db_worker

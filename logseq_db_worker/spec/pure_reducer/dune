@@ -7,6 +7,7 @@
  (libraries
   rrbvec
   logseq_db_worker.typed_read
+  logseq_db_worker.typed_data
   logseq_db_worker.contract
   logseq_db_types
   logseq_overlay_db
