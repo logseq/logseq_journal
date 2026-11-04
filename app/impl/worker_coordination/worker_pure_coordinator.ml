@@ -1,6 +1,6 @@
 module Worker = Worker_api
 module Data = Worker.Data
-module Id = Logseq_db_worker_lui.Journal_worker_ids.Worker
+module Id = Journal_worker_ids.Worker
 module Intents = Map.Make (String)
 module Slots = Map.Make (Int64)
 module Graphs = Map.Make (Worker.Uuid)
@@ -637,7 +637,7 @@ type event =
   | Projection_received of Worker.projection
   | Changefeed_notice of
       Worker.changefeed_notice
-      * Logseq_db_worker_lui.Journal_worker_ids.Worker.push_sequence
+      * Journal_worker_ids.Worker.push_sequence
   | Change_application_retired of change_application
   | Change_consumer_expanded of
       change_application * Worker.Uuid.t * Worker.Uuid.t Rrbvec.t
@@ -2196,7 +2196,7 @@ let retain_registration
         Worker.equal_request_id ticket.id value.obs_initial.id
       | Operation (Worker.Refresh original) ->
         Worker.same_observation original handle <> None
-      | _ -> false
+      | _ -> .
     in
     if not matches
     then unchanged state
@@ -3359,7 +3359,7 @@ let plan_mutation
           (match operation with
            | Worker.Mutate _ | Worker.Append _ -> Worker.Outcome_unknown
            | Worker.Confirm (_, receipt) -> Worker.Committed_pending_presentation receipt
-           | _ -> assert false)
+           | _ -> .)
           state.facts.intents
     in
     let facts =

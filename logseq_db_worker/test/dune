@@ -41,7 +41,7 @@
 (test
  (name test_lui_service)
  (modules test_lui_service)
- (libraries
+ (libraries logseq_db_worker.identity
   datascript-ocaml-native
   datascript_ocaml
   datascript_ocaml.types
@@ -108,7 +108,7 @@
 (executable
  (name test_managed_sync_e2e)
  (modules test_managed_sync_e2e managed_sync_protocol_probe)
- (libraries
+ (libraries logseq_db_worker.identity
   bigstringaf
   ca-certs-nss
   cstruct

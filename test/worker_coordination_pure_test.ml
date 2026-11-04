@@ -2,7 +2,7 @@ module W = Journal_worker_coordination.Worker_api
 module C = Journal_worker_coordination.Worker_pure_coordinator
 module P = Logseq_db_worker.Protocol
 module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
-module Id = Logseq_db_worker_lui.Journal_worker_ids
+module Id = Journal_worker_ids
 module Sync = Logseq_sync_pure_reducer.Core
 
 let check condition message = if not condition then failwith message

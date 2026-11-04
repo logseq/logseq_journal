@@ -74,7 +74,7 @@ val submit : t -> Worker_pure_coordinator.instruction -> unit
     signs out, or stops the shared client. Host must also join legacy owners.
     Schedule_drain queues a later turn; Publish goes to host without recursive step. *)
 
-val authorize_host_change : t -> Worker.handoff_receipt -> attempt:Worker.request_id -> (Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id, Worker.error) result
+val authorize_host_change : t -> Worker.handoff_receipt -> attempt:Worker.request_id -> (Journal_worker_ids.Worker.request_id, Worker.error) result
 
 (** Transport admission only: Ok carries a Mailbox ID, never permission or an
     action ACK. Production plans through Core.authorize_host_change; Consume_handoff

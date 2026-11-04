@@ -15,7 +15,7 @@ module Protocol = Logseq_db_worker.Protocol
 module Support = Managed_sync_e2e_support
 module Probe = Managed_sync_protocol_probe
 module Sync_protocol = Logseq_sync_pure_reducer.Sync_protocol
-module ID = Logseq_db_worker_lui.Journal_worker_ids
+module ID = Journal_worker_ids
 
 exception E2e_failure of string
 

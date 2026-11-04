@@ -93,8 +93,8 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
   then Error (Invalid_input "A verified account and managed origin are required")
   else (
     let key =
-      ( Logseq_db_worker_lui.Journal_worker_ids.Runtime.Epoch.to_int64 runtime_epoch
-      , Logseq_db_worker_lui.Journal_worker_ids.Worker.Generation.to_int64
+      ( Journal_worker_ids.Runtime.Epoch.to_int64 runtime_epoch
+      , Journal_worker_ids.Worker.Generation.to_int64
           worker_generation )
     in
     Option.iter (fun revoked -> revoked := true) (Hashtbl.find_opt predecessors key);
@@ -103,11 +103,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
     let revoked = ref false in
     Hashtbl.replace predecessors key revoked;
     let binding =
-      { serial = Int64.of_int (serial + 1)
-      ; incarnation = worker_incarnation ~runtime_epoch ~worker_generation
-      ; origin = managed_origin
-      ; user = user_id
-      }
+      (For_worker.binding ~serial:(Int64.of_int (serial + 1)) ~incarnation:(worker_incarnation ~runtime_epoch ~worker_generation) ~origin:(managed_origin) ~user:(user_id))
     in
     let latest = ref None
     and last_seen = ref None
@@ -115,10 +111,10 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
     let module I = struct
       let binding = binding
       let revoke () = revoked := true
-      let release_binding_request () = Ok (Service.Release_coordination binding.serial)
+      let release_binding_request () = Ok (Service.Release_coordination (For_worker.binding_serial binding))
 
       let binding_released = function
-        | Service.Coordination_released id when id = binding.serial ->
+        | Service.Coordination_released id when id = (For_worker.binding_serial binding) ->
           if
             Option.fold
               ~none:false
@@ -158,12 +154,12 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
       let bootstrap_request () =
         if !revoked
         then Error Revoked_session
-        else Ok (Service.Register_coordination binding.serial)
+        else Ok (Service.Register_coordination (For_worker.binding_serial binding))
       ;;
 
       let bootstrap response =
         match response with
-        | Service.Coordination_registered b when b.registration = binding.serial ->
+        | Service.Coordination_registered b when b.registration = (For_worker.binding_serial binding) ->
           if !revoked
           then Ok (Binding_revoked Revoked_session)
           else if
@@ -221,15 +217,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                            (fun ( (scope : Service.asset_scope)
                                 , (graph : Logseq_db_worker.graph_state) ) ->
                               let session =
-                                { binding
-                                ; graph = scope.graph_id
-                                ; account = scope.account.account_generation
-                                ; lifecycle = scope.account.lifecycle_generation
-                                ; generation = scope.graph_generation
-                                ; limits = b.limits
-                                ; asset_scope = scope
-                                ; scope =
-                                    { startup =
+                                (For_worker.session ~binding ~graph:(scope.graph_id) ~account:(scope.account.account_generation) ~lifecycle:(scope.account.lifecycle_generation) ~generation:(scope.graph_generation) ~limits:(b.limits) ~asset_scope:(scope) ~scope:({ startup =
                                         { account_generation =
                                             scope.account.account_generation
                                         ; presentation_generation =
@@ -237,8 +225,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                                         }
                                     ; graph_id = scope.graph_id
                                     ; graph_generation = scope.graph_generation
-                                    }
-                                }
+                                    }))
                               in
                               let phase =
                                 match graph.phase with
@@ -271,8 +258,8 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                               List.find_map
                                 (fun r ->
                                    if
-                                     r.session.graph = owner.graph_id
-                                     && r.session.generation = owner.graph_generation
+                                     (graph_id r.session) = owner.graph_id
+                                     && (For_worker.session_generation r.session) = owner.graph_generation
                                    then
                                      Some
                                        { session = r.session
@@ -335,8 +322,8 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
           (match
              List.find_opt
                (function
-                 | Service.Coordination_snapshot b -> b.registration = binding.serial
-                 | Coordination_revoked (id, _) -> id = binding.serial)
+                 | Service.Coordination_snapshot b -> b.registration = (For_worker.binding_serial binding)
+                 | Coordination_revoked (id, _) -> id = (For_worker.binding_serial binding))
                updates
            with
            | Some (Coordination_snapshot b) ->
@@ -353,7 +340,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
 
       let live (session : session) =
         (not !revoked)
-        && equal_binding session.binding binding
+        && equal_binding (For_worker.session_binding session) binding
         && Option.fold
              ~none:false
              ~some:(fun p ->
@@ -372,42 +359,42 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
       ;;
 
       let finalize_observation_registration (session:session) ~observation_id =
-        if not(equal_binding session.binding binding) then Error Revoked_session else
-        Ok(Service.Coordination_finalize_observation{registration=binding.serial;owner=session.scope;observation_id})
+        if not(equal_binding (For_worker.session_binding session) binding) then Error Revoked_session else
+        Ok(Service.Coordination_finalize_observation{registration=(For_worker.binding_serial binding);owner=(For_worker.session_scope session);observation_id})
       ;;
       let observation_registration_finalized (session:session) ~observation_id = function
         |Service.Coordination_observation_finalized{registration;owner;observation_id=actual}
-          when equal_binding session.binding binding && registration=binding.serial
+          when equal_binding (For_worker.session_binding session) binding && registration=(For_worker.binding_serial binding)
             && matches_scope session owner && equal_request_id actual observation_id->Ok()
         |_->Error(Protocol_mismatch "Observation finalization acknowledgement mismatch")
       ;;
       let finalize_asset_demand (session:session) ~request_id (consumer:asset_consumer) =
-        if not(equal_binding session.binding binding) || not(equal_session consumer.session session) then Error Revoked_session
+        if not(equal_binding (For_worker.session_binding session) binding) || not(equal_session consumer.session session) then Error Revoked_session
         else Result.map(fun consumer->Service.Coordination_finalize_asset_demand{
-          registration=binding.serial;owner=session.asset_scope;request_id;consumer})(asset_consumer_wire consumer)
+          registration=(For_worker.binding_serial binding);owner=(For_worker.session_asset_scope session);request_id;consumer})(asset_consumer_wire consumer)
       ;;
       let asset_demand_finalized (session:session) ~request_id (consumer:asset_consumer) response =
         match response,asset_consumer_wire consumer with
         |Service.Coordination_asset_demand_finalized{registration;owner;request_id=actual;consumer=wire},Ok expected
-          when equal_binding session.binding binding && registration=binding.serial
+          when equal_binding (For_worker.session_binding session) binding && registration=(For_worker.binding_serial binding)
             && matches_asset_scope session owner && equal_request_id actual request_id && wire=expected->Ok()
         |_->Error(Protocol_mismatch "Asset finalization acknowledgement mismatch")
       ;;
 
       let release_observation_registration (session : session) ~observation_id =
-        if not (equal_binding session.binding binding)
+        if not (equal_binding (For_worker.session_binding session) binding)
         then Error Revoked_session
         else
           Ok
             (Service.Coordination_release_observation
-               { registration = binding.serial; owner = session.scope; observation_id })
+               { registration = (For_worker.binding_serial binding); owner = (For_worker.session_scope session); observation_id })
       ;;
 
       let observation_registration_released (session : session) ~observation_id = function
         | Service.Coordination_observation_released
             { registration; owner; observation_id = actual }
-          when equal_binding session.binding binding
-               && registration = binding.serial
+          when equal_binding (For_worker.session_binding session) binding
+               && registration = (For_worker.binding_serial binding)
                && matches_scope session owner
                && equal_request_id actual observation_id -> Ok ()
         | _ -> Error (Protocol_mismatch "Observation cleanup acknowledgement mismatch")
@@ -446,8 +433,8 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
               ; epoch
               ; response = Protocol.V2_response raw
               }
-            when equal_binding session.binding binding
-                 && registration = binding.serial
+            when equal_binding (For_worker.session_binding session) binding
+                 && registration = (For_worker.binding_serial binding)
                  && matches_scope session owner
                  && equal_request_id observation_id observation.observation_key
                  && raw.api_version = Protocol.api_version
@@ -471,7 +458,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                      { response = Protocol.V2_response raw as packet; _ } ) ->
                  if
                    Protocol.encoded_response_bytes packet
-                   > observation.observation_budget.maximum_bytes
+                   > (For_worker.read_budget_maximum_bytes observation.observation_budget)
                  then Error Response_budget_exceeded
                  else
                    Result.map
@@ -496,7 +483,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                    | Service.Observations_resync ->
                      Ok (Rrbvec.push_back notices (Observations_resync binding))
                    | Observation_invalidated value
-                     when value.registration_id <> binding.serial -> Ok notices
+                     when value.registration_id <> (For_worker.binding_serial binding) -> Ok notices
                    | Observation_invalidated value
                      when value.epoch < 0L
                           || value.owner.startup.account_generation < 0
@@ -533,13 +520,13 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                        (fun resident ->
                           let session = resident.session in
                           resident.phase = Open
-                          && session.graph = scope.graph_id
-                          && session.generation = scope.graph_generation
-                          && session.account = scope.account.account_generation
-                          && session.lifecycle = scope.account.lifecycle_generation
-                          && binding.user = scope.account.user_id
+                          && (graph_id session) = scope.graph_id
+                          && (For_worker.session_generation session) = scope.graph_generation
+                          && (For_worker.session_account session) = scope.account.account_generation
+                          && (For_worker.session_lifecycle session) = scope.account.lifecycle_generation
+                          && (For_worker.binding_user binding) = scope.account.user_id
                           && Uri.equal
-                               (Uri.of_string binding.origin)
+                               (Uri.of_string (For_worker.binding_origin binding))
                                scope.account.managed_sync_origin)
                        residents
                    in
@@ -579,7 +566,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
               Result.map(fun()->Some(receipt_revisions receipt))(validate_confirmation session presentation receipt)
             | Some _->Error(Protocol_mismatch "Acknowledgement replaced the immutable intent") in
           Result.map(fun original->Service.Coordination_acknowledge_mutation
-            {registration=binding.serial;owner=session.scope;presentation=presentation.generation;
+            {registration=(For_worker.binding_serial binding);owner=(For_worker.session_scope session);presentation=presentation.generation;
              request_id;intent=Bytes.to_string(encode_durable_intent intent);original})proof)
       ;;
 
@@ -590,13 +577,13 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
         fun session ~request_id operation ->
         match operation with
         | Release_file lease->
-          if not(equal_binding session.binding binding) || not(equal_session session lease.lease_owner)
-          then Error Revoked_session else Ok(Service.Release_asset_file{scope=session.asset_scope;handle=lease.lease_handle})
+          if not(equal_binding (For_worker.session_binding session) binding) || not(equal_session session lease.lease_owner)
+          then Error Revoked_session else Ok(Service.Release_asset_file{scope=(For_worker.session_asset_scope session);handle=lease.lease_handle})
         | Release_asset_demand consumer->
-          if not(equal_binding session.binding binding) then Error Revoked_session else
+          if not(equal_binding (For_worker.session_binding session) binding) then Error Revoked_session else
           Result.bind(validate_request session operation)(fun()->
             Result.map(fun consumer->Service.Coordination_release_asset_demand
-              {registration=binding.serial;owner=session.asset_scope;request_id;consumer})
+              {registration=(For_worker.binding_serial binding);owner=(For_worker.session_asset_scope session);request_id;consumer})
               (asset_consumer_wire consumer))
         | Release observation ->
           Result.bind (validate_request session operation) (fun () ->
@@ -613,23 +600,23 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                 Result.map
                   (fun command ->
                      Service.Coordination_observe
-                       { registration = binding.serial
-                       ; owner = session.scope
+                       { registration = (For_worker.binding_serial binding)
+                       ; owner = (For_worker.session_scope session)
                        ; observation_id = request_id
                        ; request =
                            { Protocol.api_version = Protocol.api_version
                            ; request_id
                            ; command
                            }
-                       ; maximum_bytes = budget.maximum_bytes
+                       ; maximum_bytes = (For_worker.read_budget_maximum_bytes budget)
                        })
                   (checked_command session budget query))
             | Refresh observation ->
               Result.map
                 (fun () ->
                    Service.Coordination_refresh_observation
-                     { registration = binding.serial
-                     ; owner = session.scope
+                     { registration = (For_worker.binding_serial binding)
+                     ; owner = (For_worker.session_scope session)
                      ; observation_id = observation.observation_key
                      ; request_id
                      })
@@ -644,18 +631,18 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                   |> Result.map_error (fun e -> Db_error e)
                   |> Result.map (fun request ->
                     Service.Coordination_query
-                      { registration = binding.serial
-                      ; owner = session.scope
+                      { registration = (For_worker.binding_serial binding)
+                      ; owner = (For_worker.session_scope session)
                       ; request
-                      ; response_budget_bytes = budget.maximum_bytes
+                      ; response_budget_bytes = (For_worker.read_budget_maximum_bytes budget)
                       })))
             | Acknowledge_changes batch ->
               Result.map
                 (fun () ->
                    Service.Coordination_query
-                     { registration = binding.serial
-                     ; owner = session.scope
-                     ; response_budget_bytes = session.limits.response_budget_bytes
+                     { registration = (For_worker.binding_serial binding)
+                     ; owner = (For_worker.session_scope session)
+                     ; response_budget_bytes = (For_worker.session_limits session).response_budget_bytes
                      ; request =
                          { Protocol.api_version = Protocol.api_version
                          ; request_id
@@ -672,8 +659,8 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                 Result.map
                   (fun () ->
                      Service.Coordination_confirm
-                       { registration = binding.serial
-                       ; owner = session.scope
+                       { registration = (For_worker.binding_serial binding)
+                       ; owner = (For_worker.session_scope session)
                        ; presentation = presentation.generation
                        ; request_id
                        ; intent = Bytes.to_string(encode_durable_intent receipt.intent)
@@ -683,42 +670,42 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
             | Mutate intent ->
               Result.map
                 (fun () -> Service.Coordination_mutation
-                  { registration=binding.serial;owner=session.scope;request_id;
+                  { registration=(For_worker.binding_serial binding);owner=(For_worker.session_scope session);request_id;
                     intent=Bytes.to_string(encode_durable_intent(Mutation_intent intent)) })
                 (validate_intent session (Mutation_intent intent))
             | Append intent ->
               Result.map
                 (fun () -> Service.Coordination_mutation
-                  { registration=binding.serial;owner=session.scope;request_id;
+                  { registration=(For_worker.binding_serial binding);owner=(For_worker.session_scope session);request_id;
                     intent=Bytes.to_string(encode_durable_intent(Append_intent intent)) })
                 (validate_request session operation)
-            | Import intent->Result.map(fun()->Service.Coordination_import{registration=binding.serial;owner=session.asset_scope;request_id;source=(Import_wire.source intent)})(validate_request session operation)
-            | Acquire_asset_file file->Result.map(fun()->Service.Acquire_asset_file{scope=session.asset_scope;handle=file.source_handle})(validate_request session operation)
-            | Acquire_imported_file imported->Result.map(fun()->Service.Acquire_imported_file{scope=session.asset_scope;operation=imported.import_receipt.operation})
+            | Import intent->Result.map(fun()->Service.Coordination_import{registration=(For_worker.binding_serial binding);owner=(For_worker.session_asset_scope session);request_id;source=(Import_wire.source intent)})(validate_request session operation)
+            | Acquire_asset_file file->Result.map(fun()->Service.Acquire_asset_file{scope=(For_worker.session_asset_scope session);handle=file.source_handle})(validate_request session operation)
+            | Acquire_imported_file imported->Result.map(fun()->Service.Acquire_imported_file{scope=(For_worker.session_asset_scope session);operation=imported.import_receipt.operation})
                 (validate_request session operation)
             | Replace_asset_demand(consumer,priority,assets)->
               Result.bind(validate_request session operation)(fun()->
               Result.map(fun consumer->Service.Coordination_asset_demand
-                {registration=binding.serial;owner=session.scope;request_id;consumer;
+                {registration=(For_worker.binding_serial binding);owner=(For_worker.session_scope session);request_id;consumer;
                  priority=(match priority with Foreground->Service.Asset.Foreground|Background->Background);
                  assets})(asset_consumer_wire(bind_asset_consumer consumer ~round:request_id)))
-            | Retry_asset asset->Ok(Service.Asset_command_at(session.scope,Retry_asset asset))
-            | Retry_upload upload->Result.map(fun()->Service.Asset_command_at(session.scope,Retry_upload upload.operation))
+            | Retry_asset asset->Ok(Service.Asset_command_at((For_worker.session_scope session),Retry_asset asset))
+            | Retry_upload upload->Result.map(fun()->Service.Asset_command_at((For_worker.session_scope session),Retry_upload upload.operation))
                 (validate_request session operation)
             | Recover_import_inputs{after;maximum_items;maximum_bytes}->
               Result.map(fun()->Service.Coordination_recover_import_inputs
-                {registration=binding.serial;owner=session.asset_scope;request_id;
+                {registration=(For_worker.binding_serial binding);owner=(For_worker.session_asset_scope session);request_id;
                  after=Option.map(fun cursor->cursor.input_after)after;maximum_items;maximum_bytes})
                 (validate_import_recovery session ~after ~maximum_items ~maximum_bytes)
             | Confirm_import_source intent->
-              Result.map(fun()->Service.Coordination_confirm_import_input{registration=binding.serial;owner=session.asset_scope;
+              Result.map(fun()->Service.Coordination_confirm_import_input{registration=(For_worker.binding_serial binding);owner=(For_worker.session_asset_scope session);
                 request_id;input=Import_wire.encode intent})(validate_request session operation)
             | Acknowledge_import_source proof->
-              Result.map(fun()->Service.Coordination_acknowledge_import_input{registration=binding.serial;owner=session.asset_scope;
+              Result.map(fun()->Service.Coordination_acknowledge_import_input{registration=(For_worker.binding_serial binding);owner=(For_worker.session_asset_scope session);
                 request_id;input=Import_wire.encode proof.prepared_intent;prepared=proof.original_prepared})(validate_request session operation)
             | Recover_mutations {after;maximum_items;maximum_bytes}->
               Result.map(fun()->Service.Coordination_recover_mutations
-                {registration=binding.serial;owner=session.scope;request_id;
+                {registration=(For_worker.binding_serial binding);owner=(For_worker.session_scope session);request_id;
                  after=Option.map(fun cursor->cursor.after)after;maximum_items;maximum_bytes})
                 (validate_recovery session ~after ~maximum_items ~maximum_bytes)
             | _ -> unavailable "This operation's resource/durability")
@@ -735,38 +722,38 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
         fun session ~request_id operation response ->
         match operation with
         | Release_file lease->
-          if not(equal_binding session.binding binding) || not(equal_session session lease.lease_owner) then Error Revoked_session else
+          if not(equal_binding (For_worker.session_binding session) binding) || not(equal_session session lease.lease_owner) then Error Revoked_session else
           (match response with Service.Client_command_completed->Ok(Answered(Ok()))
            | _->Error(Protocol_mismatch "File release did not acknowledge actual checked release"))
         | Recover_import_inputs{after;maximum_items;maximum_bytes}->
-          if not(equal_binding session.binding binding) then Error Revoked_session else
+          if not(equal_binding (For_worker.session_binding session) binding) then Error Revoked_session else
           (match response with Service.Coordination_import_inputs_recovered{registration;owner;request_id=actual;page}
-             when registration=binding.serial && actual=request_id && matches_asset_scope session owner->
+             when registration=(For_worker.binding_serial binding) && actual=request_id && matches_asset_scope session owner->
              decode_import_recovery session ~after ~maximum_items ~maximum_bytes page |> Result.map(fun value->Answered(Ok value))
            |_->Error(Protocol_mismatch "Import input recovery owner or request changed"))
         | Confirm_import_source intent->
-          if not(equal_binding session.binding binding) || Result.is_error(validate_request session operation) then Error Revoked_session else
+          if not(equal_binding (For_worker.session_binding session) binding) || Result.is_error(validate_request session operation) then Error Revoked_session else
           (match response with Service.Coordination_import_input_confirmed{registration;owner;request_id=actual;input}
-             when registration=binding.serial && actual=request_id && matches_asset_scope session owner->
+             when registration=(For_worker.binding_serial binding) && actual=request_id && matches_asset_scope session owner->
              (match input with None->Ok(Answered(Ok None))|Some row when row.Logseq_db_types.Asset_import.Recovery.input=Import_wire.encode intent->
                decode_import_source session row |> Result.map(fun value->Answered(Ok(Some value)))
               |Some _->Error(Protocol_mismatch "Source confirmation replaced the complete original input"))
            |_->Error(Protocol_mismatch "Import source confirmation owner or request changed"))
         | Acknowledge_import_source _->
-          if not(equal_binding session.binding binding) || Result.is_error(validate_request session operation) then Error Revoked_session else
+          if not(equal_binding (For_worker.session_binding session) binding) || Result.is_error(validate_request session operation) then Error Revoked_session else
           (match response with Service.Coordination_import_input_acknowledged{registration;owner;request_id=actual}
-             when registration=binding.serial && actual=request_id && matches_asset_scope session owner->Ok(Answered(Ok()))
+             when registration=(For_worker.binding_serial binding) && actual=request_id && matches_asset_scope session owner->Ok(Answered(Ok()))
            |_->Error(Protocol_mismatch "Import source ACK did not match its original owner and request"))
         | Import intent->
-          if not(equal_binding session.binding binding)
+          if not(equal_binding (For_worker.session_binding session) binding)
             || Result.is_error(restore_asset_import_intent session(encode_asset_import_intent intent))
           then Error Revoked_session else
           (match response with
            | Service.Coordination_imported{registration;owner;request_id=actual;result=Error message}
-             when registration=binding.serial && actual=request_id && matches_asset_scope session owner->Ok(Answered(Error(Service_failed message)))
+             when registration=(For_worker.binding_serial binding) && actual=request_id && matches_asset_scope session owner->Ok(Answered(Error(Service_failed message)))
            | Service.Coordination_imported{registration;owner;request_id=actual;result=Ok receipt}
-             when registration=binding.serial && actual=request_id && matches_asset_scope session owner && matches_asset_scope session receipt.scope
-               && receipt.graph_generation=session.generation && receipt.operation=(Import_wire.source intent).operation
+             when registration=(For_worker.binding_serial binding) && actual=request_id && matches_asset_scope session owner && matches_asset_scope session receipt.scope
+               && receipt.graph_generation=(For_worker.session_generation session) && receipt.operation=(Import_wire.source intent).operation
                && receipt.target=(Import_wire.source intent).target && receipt.asset.uuid=(Import_wire.source intent).asset
                && receipt.file_type=(Import_wire.source intent).file_type && receipt.asset.current_checksum<>None->
              let preview=Option.map(fun(handle,path)->{lease_owner=session;lease_id=request_id;lease_handle=handle;lease_path=path;lease_type=receipt.file_type})receipt.preview in
@@ -777,7 +764,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                  source_fingerprint=(Digestif.SHA256.digest_string (Import_wire.encode intent) |> Digestif.SHA256.to_hex)}})))
            | _->Error(Protocol_mismatch "Import receipt changed its exact owner or immutable identity"))
         | Acquire_asset_file file->
-          if not(equal_binding session.binding binding) || not(equal_session session file.asset_owner) then Error Revoked_session else
+          if not(equal_binding (For_worker.session_binding session) binding) || not(equal_session session file.asset_owner) then Error Revoked_session else
           (match response with
            | Service.Asset_file None->Ok(Answered(Ok None))
            | Service.Asset_file(Some(handle,path)) when handle<>"" && path<>""->
@@ -788,18 +775,18 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
              Ok(Answered(Ok(Some{lease_owner=session;lease_id=request_id;lease_handle=handle;lease_path=path;lease_type=file_type})))
            | _->Error(Protocol_mismatch "Asset acquisition omitted its actual lease capability"))
         | Acquire_imported_file imported->
-          if not(equal_binding session.binding binding) || not(equal_session session imported.import_owner) then Error Revoked_session else
+          if not(equal_binding (For_worker.session_binding session) binding) || not(equal_session session imported.import_owner) then Error Revoked_session else
           (match response with
            | Service.Asset_file None->Ok(Answered(Ok None))
            | Service.Asset_file(Some(handle,path)) when handle<>"" && path<>""->
              Ok(Answered(Ok(Some{lease_owner=session;lease_id=request_id;lease_handle=handle;lease_path=path;lease_type=imported.import_receipt.file_type})))
            | _->Error(Protocol_mismatch "Imported acquire omitted its actual lease capability"))
         | Release_asset_demand consumer->
-          if not(equal_binding session.binding binding)
+          if not(equal_binding (For_worker.session_binding session) binding)
              || not(equal_asset_consumer consumer {consumer with session}) then Error Revoked_session else
           (match response,asset_consumer_wire consumer with
            | Service.Coordination_asset_demand_released value,Ok expected
-             when value.registration=binding.serial && value.request_id=request_id
+             when value.registration=(For_worker.binding_serial binding) && value.request_id=request_id
                && value.consumer=expected && matches_asset_scope session value.owner->Ok(Answered(Ok()))
            | _->Error(Protocol_mismatch "Asset cleanup did not acknowledge actual scoped settlement"))
         | Release observation ->
@@ -834,7 +821,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
               if
                 String.length
                   (Yojson.Safe.to_string (Protocol.response_to_yojson response))
-                > budget.maximum_bytes
+                > (For_worker.read_budget_maximum_bytes budget)
               then Ok (Answered (Error Response_budget_exceeded))
               else Ok (Answered (decode session budget query r.outcome))
             | ( Acknowledge_changes batch
@@ -844,7 +831,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                    && equal_session session batch.change_owner ->
               if
                 Protocol.encoded_response_bytes packet
-                > session.limits.response_budget_bytes
+                > (For_worker.session_limits session).response_budget_bytes
               then Ok (Answered (Error Response_budget_exceeded))
               else (
                 match raw.outcome with
@@ -853,10 +840,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                   Ok
                     (Answered
                        (Ok
-                          { ack_owner = session
-                          ; generation = ack.generation
-                          ; through = ack.through
-                          }))
+                          (For_worker.change_ack ~ack_owner:(session) ~generation:(ack.generation) ~through:(ack.through))))
                 | V2_resync_required { reason; _ } ->
                   Ok (Answered (Error (Resync_required reason)))
                 | V2_failed { code; message } ->

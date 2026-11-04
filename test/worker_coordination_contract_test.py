@@ -174,8 +174,8 @@ NEGATIVE = {
     "committed_receipts_are_not_client_constructible": (
         "let wrong : W.receipt = ()", ("W.receipt",)),
     "mailbox_generations_are_not_runtime_epochs": (
-        """let wrong (runtime_epoch : Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch)
-    (worker_generation : Logseq_db_worker_lui.Journal_worker_ids.Worker.generation) =
+        """let wrong (runtime_epoch : Journal_worker_ids.Runtime.epoch)
+    (worker_generation : Journal_worker_ids.Worker.generation) =
   Worker_effect_authority.issuer ~managed_origin:"https://example.invalid" ~user_id:"fixture"
     ~runtime_epoch:worker_generation ~worker_generation:runtime_epoch""",
         ("Worker.generation", "Runtime.epoch")),
@@ -313,7 +313,7 @@ NEGATIVE.update({
       ("W.session", "W.presentation")),
     "binding_is_not_worker_incarnation": (
       "let wrong (worker:W.worker_incarnation) = C.Worker_bound worker",
-      ("W.worker_incarnation", "Worker_effect_authority.binding")),
+      ("W.worker_incarnation", "Worker_pure_read.binding")),
     "observation_value_cannot_cross_without_equality": (
       "let wrong (type a b) (left:a W.observation) (right:b W.observation) (value:b) : a = value",
       ("b", "a")),

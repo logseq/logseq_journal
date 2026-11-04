@@ -1,7 +1,7 @@
 module Worker = Worker_api
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Mailbox = Logseq_db_worker_lui.Journal_worker
-module Id = Logseq_db_worker_lui.Journal_worker_ids
+module Id = Journal_worker_ids
 module Core = Worker_pure_coordinator
 
 type client = (Service.request, Service.response, Service.push) Mailbox.client

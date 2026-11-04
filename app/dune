@@ -71,7 +71,7 @@
   journal_timeline_state
   journal_visual_tokens
   journal_symbols)
- (libraries
+ (libraries logseq_db_worker.identity
   datascript-ocaml-native
   journal_app_business
   rrbvec

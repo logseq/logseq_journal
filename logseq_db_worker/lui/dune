@@ -2,13 +2,12 @@
  (name logseq_db_worker_lui)
  (public_name logseq_db_worker.lui)
  (modules
-  journal_worker_ids
   journal_bounded_mailbox
   journal_worker_eio_backend
   journal_worker_runtime
   journal_worker
   logseq_db_worker_lui_service)
- (libraries
+ (libraries logseq_db_worker.identity
   eio
   eio.core
   eio.unix

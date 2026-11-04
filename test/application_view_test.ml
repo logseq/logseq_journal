@@ -1037,7 +1037,7 @@ let run_favorites_native_visibility
           startup={manager.snapshot.startup with awaiting_selection=true;graph_generation=2}}} in
         W.Request_context.emit context ~topic:Service.manager_topic(Service.Client_state_changed closed);
         Option.iter(fun registration->W.Request_context.emit context
-          ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+          ~topic:(Journal_worker_ids.Worker.Push_topic.of_int 7)
           (Service.Coordination_updates[Coordination_snapshot(coordination_baseline registration)]))
           (Atomic.get coordination_registration);Ok()
       |_->Error "Unsupported host change in this UI fixture") in
@@ -1087,13 +1087,13 @@ let run_favorites_native_visibility
             Atomic.set status_presentation 3;
             let current={manager with snapshot={manager.snapshot with startup={manager.snapshot.startup with presentation_generation=3}}}in
             W.Request_context.emit context ~topic:Service.manager_topic(Service.Client_state_changed current);
-            W.Request_context.emit context ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+            W.Request_context.emit context ~topic:(Journal_worker_ids.Worker.Push_topic.of_int 7)
               (Service.Coordination_updates[Service.Coordination_snapshot
                 (coordination_baseline(Option.get(Atomic.get coordination_registration)))]));
           if durable_status=Some `Background_ack then (
             Atomic.set status_away true;Atomic.set status_presentation 3;
             W.Request_context.emit context ~topic:Service.manager_topic(Service.Client_state_changed(status_focus_manager()));
-            W.Request_context.emit context ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+            W.Request_context.emit context ~topic:(Journal_worker_ids.Worker.Push_topic.of_int 7)
               (Service.Coordination_updates[Service.Coordination_snapshot
                 (coordination_baseline(Option.get(Atomic.get coordination_registration)))]));
           Error "Fixture acknowledgement failed after UI application") else
@@ -1229,7 +1229,7 @@ let run_favorites_native_visibility
         | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
         | Service.Get_graph_state ->
           Option.iter(fun registration->W.Request_context.emit context
-            ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+            ~topic:(Journal_worker_ids.Worker.Push_topic.of_int 7)
             (Service.Coordination_updates[Service.Coordination_snapshot(coordination_baseline registration)]))
             (Atomic.get coordination_registration);
           if Atomic.get import_probe then Atomic.set import_probed true;
@@ -2489,7 +2489,7 @@ let run_favorites_native_visibility
                Atomic.set status_away false;Atomic.set status_presentation 4;
                let context=Option.get !worker_context in
                W.Session_context.emit context ~topic:Service.manager_topic(Service.Client_state_changed(status_focus_manager()));
-               W.Session_context.emit context ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+               W.Session_context.emit context ~topic:(Journal_worker_ids.Worker.Push_topic.of_int 7)
                  (Service.Coordination_updates[Service.Coordination_snapshot
                    (coordination_baseline(Option.get(Atomic.get coordination_registration)))])
              | Some `Reconfirm_failed->
@@ -2834,7 +2834,7 @@ let run_favorites_native_visibility
               enter 0;
               let notice=Atomic.get detail_observation_notice |> Option.get in
               let invalidate epoch = W.Session_context.emit (Option.get !worker_context)
-                ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 8)
+                ~topic:(Journal_worker_ids.Worker.Push_topic.of_int 8)
                 (Service.Coordination_observations(Rrbvec.singleton(Service.Observation_invalidated{notice with epoch}))) in
               (match detail_observation_case with
                | Some `Refresh->
@@ -3807,7 +3807,7 @@ let run_favorites_native_visibility
            Atomic.set coordination_release_entered false;
            Atomic.set coordination_release_allowed false;
            W.Session_context.emit(Option.get !worker_context)
-             ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+             ~topic:(Journal_worker_ids.Worker.Push_topic.of_int 7)
              (Service.Coordination_updates[Coordination_revoked(old,"synthetic authority handover")]);
            wait "old binding reaches real unregister" (fun()->Atomic.get coordination_release_entered);
            wait "retired binding cannot leave an ordinary old file rendered" (fun()->
@@ -4701,7 +4701,7 @@ let run_favorites_native_visibility
                   Atomic.set latest_error_manager state;
                   W.Session_context.emit context ~topic:Service.manager_topic(Service.Client_state_changed state);
                   W.Session_context.emit context ~topic:Service.graph_state_topic(Service.Graph_state_changed graph);
-                  W.Session_context.emit context ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+                  W.Session_context.emit context ~topic:(Journal_worker_ids.Worker.Push_topic.of_int 7)
                     (Service.Coordination_updates[Service.Coordination_snapshot
                       (coordination_baseline(Option.get(Atomic.get coordination_registration)))])in
                 let closed={manager with snapshot={manager.snapshot with selected_graph=None;resident_graphs=[];resident_scopes=[];
@@ -7573,7 +7573,7 @@ let test_graph_picker_controls scenario () =
           Atomic.set current value;
           Atomic.incr coordination_version;
           Option.iter(fun registration->W.Request_context.emit context
-            ~topic:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Push_topic.of_int 7)
+            ~topic:(Journal_worker_ids.Worker.Push_topic.of_int 7)
             (Service.Coordination_updates[Coordination_snapshot(picker_baseline
               ~version:(Int64.of_int(Atomic.get coordination_version)) value registration)]))
             (Atomic.get coordination_registration);
@@ -8397,15 +8397,15 @@ let test_retired_feed_failure_does_not_publish_diagnostics projection =
 
 module Admission_fixture = struct
   module Worker=Logseq_db_worker_lui.Journal_worker
-  module Id=Logseq_db_worker_lui.Journal_worker_ids.Worker.Request_id
+  module Id=Journal_worker_ids.Worker.Request_id
   module Protocol=Logseq_db_worker.Protocol
   type t={owner:Journal_worker_admission.t;sent:Service.request list ref;
     refused:(Service.request*Worker.send_result)list ref;results:Worker.send_result list ref}
   let create () =
     let sent=ref [] and refused=ref [] and results=ref [] and next=ref 0L in
     let owner=Journal_worker_admission.create
-      ~runtime_epoch:(Logseq_db_worker_lui.Journal_worker_ids.Runtime.Epoch.of_int64 1L)
-      ~worker_generation:(Logseq_db_worker_lui.Journal_worker_ids.Worker.Generation.of_int64 2L)
+      ~runtime_epoch:(Journal_worker_ids.Runtime.Epoch.of_int64 1L)
+      ~worker_generation:(Journal_worker_ids.Worker.Generation.of_int64 2L)
       ~send:(fun request->sent:=request::!sent;next:=Int64.succ !next;
         match !results with result::rest->results:=rest;result|[]->Worker.Accepted(Id.of_int64 !next))
       ~refused:(fun request result->refused:=(request,result)::!refused) in
@@ -8416,7 +8416,7 @@ let test_worker_response_routing () =
   let module F = Admission_fixture in
   let module A = Journal_worker_admission in
   let module W = F.Worker in
-  let module Ids = Logseq_db_worker_lui.Journal_worker_ids in
+  let module Ids = Journal_worker_ids in
   let epoch n = Ids.Runtime.Epoch.of_int64 n in
   let generation n = Ids.Worker.Generation.of_int64 n in
   let response ?(runtime = 1L) ?(worker = 2L) n outcome =

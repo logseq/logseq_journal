@@ -4369,7 +4369,7 @@ module Detail_observation_fixture = struct
   module C=Journal_worker_coordination.Worker_pure_coordinator
   module P=Logseq_db_worker.Protocol
   module S=Logseq_db_worker_lui.Logseq_db_worker_lui_service
-  module Id=Logseq_db_worker_lui.Journal_worker_ids
+  module Id=Journal_worker_ids
   let root=W.Uuid.of_string "70000000-0000-4000-a000-000000005540" |> Result.get_ok
   let make ?(failed=false) () =
     let issuer,raw,projection,session=Coordination_test_fixture.fixture 5540L in
@@ -4943,7 +4943,7 @@ let test_child_chain_ack_failure_keeps_proofs () =
 let test_child_chain_sdk_capacity_progress () =
   let module F=Child_chain_fixture in let module B=F.C in
   let module K=Journal_worker_coordination.Worker_pure_coordinator in
-  let module Id=Logseq_db_worker_lui.Journal_worker_ids in
+  let module Id=Journal_worker_ids in
   let fixture=F.make() in
   let client=F.G.Uuid.of_string "98000000-0000-4000-8000-000000005515" |> Result.get_ok in
   let boot=K.step(K.initial ~client_id:client)(Worker_bound fixture.binding) in

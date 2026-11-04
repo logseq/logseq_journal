@@ -32,8 +32,8 @@ val matches_asset_scope : session -> Worker_effect_authority.Service.asset_scope
 val presentation_matches_scope : presentation -> Worker_effect_authority.Service.timeline_scope -> bool
 
 val worker_incarnation
-  :  runtime_epoch:Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch
-  -> worker_generation:Logseq_db_worker_lui.Journal_worker_ids.Worker.generation
+  :  runtime_epoch:Journal_worker_ids.Runtime.epoch
+  -> worker_generation:Journal_worker_ids.Worker.generation
   -> worker_incarnation
 
 (** Sessions survive focus changes while resident. Close/reopen, account changes,

@@ -1,6 +1,6 @@
 module T = Logseq_db_worker_test_support.Test_support
 module P = Logseq_db_worker.Protocol
-module ID = Logseq_db_worker_lui.Journal_worker_ids
+module ID = Journal_worker_ids
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Runner = Logseq_sync_effect_runner.Effect_runner
 module Worker = Logseq_db_worker_lui.Journal_worker

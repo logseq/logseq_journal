@@ -1,8 +1,8 @@
 type t
 
 val create
-  :  runtime_epoch:Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch
-  -> worker_generation:Logseq_db_worker_lui.Journal_worker_ids.Worker.generation
+  :  runtime_epoch:Journal_worker_ids.Runtime.epoch
+  -> worker_generation:Journal_worker_ids.Worker.generation
   -> send:
        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.request
         -> Logseq_db_worker_lui.Journal_worker.send_result)

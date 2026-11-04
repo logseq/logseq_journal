@@ -1,7 +1,7 @@
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Worker = Logseq_db_worker_lui.Journal_worker
-module Id = Logseq_db_worker_lui.Journal_worker_ids.Worker
-module Runtime = Logseq_db_worker_lui.Journal_worker_ids.Runtime
+module Id = Journal_worker_ids.Worker
+module Runtime = Journal_worker_ids.Runtime
 
 type t =
   { runtime_epoch : Runtime.epoch

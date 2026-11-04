@@ -8,16 +8,16 @@ module Uuid = Graph.Uuid
 module Data = Worker_pure_data
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 
-type account_generation
-type graph_generation
+type account_generation = Worker_pure_read.account_generation
+type graph_generation = Worker_pure_read.graph_generation
 type presentation_generation
-type worker_incarnation
-type binding
+type worker_incarnation = Worker_pure_read.worker_incarnation
+type binding = Worker_pure_read.binding
 
 val binding_incarnation : binding -> worker_incarnation
 val equal_binding : binding -> binding -> bool
 
-type session
+type session = Worker_pure_read.session
 type presentation
 
 val account_generation : session -> account_generation
@@ -33,14 +33,14 @@ val matches_asset_scope : session -> Service.asset_scope -> bool
 val presentation_matches_scope : presentation -> Service.timeline_scope -> bool
 
 val worker_incarnation
-  :  runtime_epoch:Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch
-  -> worker_generation:Logseq_db_worker_lui.Journal_worker_ids.Worker.generation
+  :  runtime_epoch:Journal_worker_ids.Runtime.epoch
+  -> worker_generation:Journal_worker_ids.Worker.generation
   -> worker_incarnation
 
 (** Sessions survive focus changes while resident. Close/reopen, account changes,
     removal and rebinding revoke execution authority. Presentation has a separate
     lifetime. Admission and completion recheck all identities, not just UUID. *)
-type error =
+type error = Worker_pure_read.error =
   | Revoked_session
   | Invalid_input of string
   | Response_budget_exceeded
@@ -68,7 +68,7 @@ type capabilities = private
 
 val capabilities : session -> capabilities
 
-type read_budget
+type read_budget = Worker_pure_read.read_budget
 
 (** Validate positive item/encoded-byte bounds against this session's advertised
     limits. Every final enriched result, including summary/refs/properties, fits
@@ -80,12 +80,12 @@ val read_budget
   -> maximum_bytes:int
   -> (read_budget, error) result
 
-type journal_day
+type journal_day = Worker_pure_read.journal_day
 
 val journal_day : int -> (journal_day, error) result
 
-type page
-type block
+type page = Worker_pure_read.page
+type block = Worker_pure_read.block
 
 val page_uuid : page -> Uuid.t
 val page_title : page -> string
@@ -103,9 +103,9 @@ val page_revision : page -> string
 val block_data : block -> Worker_pure_data.block_record
 val block_revision : block -> string
 
-type 'a continuation
+type 'a continuation = 'a Worker_pure_read.continuation
 
-type 'a slice = private
+type 'a slice = 'a Worker_pure_read.slice = private
   { items : 'a list
   ; next : 'a continuation option
   }
@@ -115,7 +115,7 @@ type 'a slice = private
     static guarantee; runtime rejects a different parent/range/depth/filter or
     stale snapshot. Ordinary reads do not change an observation epoch. *)
 
-type graph_info = private
+type graph_info = Worker_pure_read.graph_info = private
   { graph_uuid : Uuid.t
   ; graph_name : string
   ; schema : Graph.schema_version
@@ -126,7 +126,7 @@ type graph_info = private
   ; projection_revision : string
   }
 
-type block_summary = private
+type block_summary = Worker_pure_read.block_summary = private
   { lookup : Worker_pure_data.block_lookup
   ; page : Worker_pure_data.page_lookup option
   ; items : Worker_pure_data.child_member list
@@ -139,7 +139,7 @@ type block_summary = private
 (** Canonical target, owning page and direct children share one DB snapshot,
     as in today's V2_get_outline_block_summary. Count is exact only at next=None.
     No sequential page/children calls may masquerade as this atomic summary. *)
-type favorites = private
+type favorites = Worker_pure_read.favorites = private
   { favorites_page : Uuid.t option
   ; generation : string
   ; projection_revision : string
@@ -147,21 +147,21 @@ type favorites = private
   ; next : Worker_pure_data.favorite_item continuation option
   }
 
-type task_status_catalog = private
+type task_status_catalog = Worker_pure_read.task_status_catalog = private
   { property_uuid : Uuid.t option
   ; default_status : Uuid.t option
   ; items : Graph.task_status_definition list
   ; next : Graph.task_status_definition continuation option
   }
 
-type asset_listing = private
+type asset_listing = Worker_pure_read.asset_listing = private
   { generation : string
   ; projection_revision : string
   ; items : Logseq_db_types.Asset_descriptor.t list
   ; next : Logseq_db_types.Asset_descriptor.t continuation option
   }
 
-type children = private
+type children = Worker_pure_read.children = private
   { parent : Uuid.t
   ; revision_scope : Worker_pure_data.revision_scope
   ; scope_revision : string
@@ -169,7 +169,7 @@ type children = private
   ; next : Worker_pure_data.child_member continuation option
   }
 
-type change_batch = private
+type change_batch = Worker_pure_read.change_batch = private
   { change_owner : session
   ; generation : string
   ; from_exclusive : string option
@@ -178,7 +178,7 @@ type change_batch = private
   ; next : string option
   }
 
-type change_ack
+type change_ack = Worker_pure_read.change_ack
 
 (** Typed forms of the existing App query families, not an untyped command escape
     hatch. Journal is a bounded single-day convenience; it preserves page revision
@@ -186,7 +186,7 @@ type change_ack
     exposes the exact scope revision required by current planners/confirmation.
     Typed results preserve present/missing and full metadata without UI layout
     types. List/lookup result ordering matches input IDs, including missing slots. *)
-type _ query =
+type 'a query = 'a Worker_pure_read.query =
   | Graph_info : graph_info query
   | Admission : Worker_pure_data.admission_inspection query
   | Journal : journal_day -> page option query
@@ -911,8 +911,8 @@ end
 val issuer
   :  managed_origin:string
   -> user_id:string
-  -> runtime_epoch:Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch
-  -> worker_generation:Logseq_db_worker_lui.Journal_worker_ids.Worker.generation
+  -> runtime_epoch:Journal_worker_ids.Runtime.epoch
+  -> worker_generation:Journal_worker_ids.Worker.generation
   -> ((module ISSUER), error) result
 
 (** Factory binds verified logical origin/account and real mailbox identities.

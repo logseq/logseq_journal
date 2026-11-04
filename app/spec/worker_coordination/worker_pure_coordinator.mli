@@ -124,12 +124,12 @@ type event =
   | Retry_bootstrap
   | Binding_invalidated of Worker.binding
   | Admitted :
-      'a ticket * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id
+      'a ticket * Journal_worker_ids.Worker.request_id
       -> event
   | Admission_refused : 'a ticket * Worker.admission_error -> event
   | Admission_failed : 'a ticket * Worker.error -> event
   | Bootstrap_admitted of
-      Worker.binding * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id
+      Worker.binding * Journal_worker_ids.Worker.request_id
   | Bootstrap_not_admitted of Worker.binding * Worker.admission_error
   | Binding_release_completed of Worker.binding * (unit, Worker.error) result
   | Binding_release_not_admitted of Worker.binding * Worker.admission_error
@@ -140,7 +140,7 @@ type event =
   | Projection_received of Worker.projection
   | Changefeed_notice of
       Worker.changefeed_notice
-      * Logseq_db_worker_lui.Journal_worker_ids.Worker.push_sequence
+      * Journal_worker_ids.Worker.push_sequence
   | Change_application_retired of change_application
   | Change_consumer_expanded of
       change_application * Worker.Uuid.t * Worker.Uuid.t Rrbvec.t
@@ -159,7 +159,7 @@ type event =
   | Observation_received : 'a Worker.observed -> event
   | Import_source_reconciled of Worker.import_source_proof
   | Import_source_proof_returned of Worker.import_source_proof
-  | Asset_received of Worker.asset_notice * Logseq_db_worker_lui.Journal_worker_ids.Worker.push_sequence
+  | Asset_received of Worker.asset_notice * Journal_worker_ids.Worker.push_sequence
   | Cancel : 'a ticket -> event
   | Forget : 'a ticket -> event
   | Release : 'a Worker.observation -> event
@@ -169,13 +169,13 @@ type event =
   | Observation_finalize_not_admitted of Worker.session * Worker.request_id * Worker.admission_error
   | Legacy_handoff_completed of Worker.handoff_id * (unit,Worker.error)result
   | Handoff_completed of Worker.handoff_id * Worker.handoff_state
-  | Handoff_applied of Worker.handoff_id * Worker.request_id * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id * (unit,Worker.error)result
-  | Handoff_apply_admitted of Worker.handoff_id * Worker.request_id * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id
+  | Handoff_applied of Worker.handoff_id * Worker.request_id * Journal_worker_ids.Worker.request_id * (unit,Worker.error)result
+  | Handoff_apply_admitted of Worker.handoff_id * Worker.request_id * Journal_worker_ids.Worker.request_id
   | Handoff_apply_rejected of Worker.handoff_id * Worker.request_id * Worker.error
   | Handoff_apply_not_admitted of Worker.handoff_id * Worker.request_id * Worker.admission_error
-  | Handoff_confirm_admitted of Worker.handoff_id * Worker.request_id * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id
+  | Handoff_confirm_admitted of Worker.handoff_id * Worker.request_id * Journal_worker_ids.Worker.request_id
   | Handoff_confirm_not_admitted of Worker.handoff_id * Worker.request_id * Worker.admission_error
-  | Handoff_confirmed of Worker.handoff_id * Worker.request_id * Logseq_db_worker_lui.Journal_worker_ids.Worker.request_id option * (bool,Worker.error)result
+  | Handoff_confirmed of Worker.handoff_id * Worker.request_id * Journal_worker_ids.Worker.request_id option * (bool,Worker.error)result
   | Drain
 
 (** Return means no presentation consumer retains the capability. It is not an

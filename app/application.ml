@@ -5,7 +5,7 @@ module V = Ui.View
 module Graph_service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Worker = Logseq_db_worker_lui.Journal_worker
 module Journal_worker_runtime = Logseq_db_worker_lui.Journal_worker_runtime
-module Journal_worker_ids = Logseq_db_worker_lui.Journal_worker_ids
+module Journal_worker_ids = Journal_worker_ids
 
 let unlock_log_count = Atomic.make 0
 

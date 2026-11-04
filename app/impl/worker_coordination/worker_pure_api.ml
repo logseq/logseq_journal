@@ -1,57 +1,22 @@
-module Graph = Logseq_db_types.Graph_types
-module Uuid = Graph.Uuid
 module Protocol = Logseq_db_worker.Protocol
-module Data = Worker_pure_data
 module Wire = Logseq_db_worker_contract.Mutation_pure_wire
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Import_wire=Logseq_db_types.Asset_import.Pure_intent
 
-type account_generation = int
-type graph_generation = int
+include Worker_pure_read
+
+type request_id = Uuid.t
+let request_id id = id
+let equal_request_id = Uuid.equal
+let compare_request_id = Uuid.compare
+
 type presentation_generation = int64
-
-type worker_incarnation =
-  { runtime_epoch : Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch
-  ; worker_generation : Logseq_db_worker_lui.Journal_worker_ids.Worker.generation
-  }
-
-type binding =
-  { serial : int64
-  ; incarnation : worker_incarnation
-  ; origin : string
-  ; user : string
-  }
-
-type session =
-  { binding : binding
-  ; graph : Uuid.t
-  ; account : account_generation
-  ; lifecycle : int64
-  ; generation : graph_generation
-  ; scope : Service.timeline_scope
-  ; asset_scope : Service.asset_scope
-  ; limits : Worker_pure_data.capability_limits
-  }
 
 type presentation =
   { session : session
   ; generation : presentation_generation
   ; host_generation : int
   }
-
-type error =
-  | Revoked_session
-  | Invalid_input of string
-  | Response_budget_exceeded
-  | Stale_read of string
-  | Resync_required of string
-  | Host_change_in_progress
-  | Protocol_mismatch of string
-  | Db_error of Logseq_db_worker.Error.t
-  | Service_failed of string
-  | Unsupported_operation of string
-
-type request_id = Uuid.t
 
 type capabilities =
   { limits : Worker_pure_data.capability_limits
@@ -60,166 +25,6 @@ type capabilities =
   ; durable_import : bool
   ; observations : bool
   }
-
-type read_budget =
-  { owner : session
-  ; maximum_items : int
-  ; maximum_bytes : int
-  }
-
-type journal_day = int
-
-type page =
-  { data : Graph.page
-  ; revision : string
-  }
-
-type block =
-  { data : Worker_pure_data.block_record
-  ; revision : string
-  }
-
-type 'a continuation =
-  { owner : session
-  ; key : string
-  ; budget : read_budget
-  ; cursor : Graph.Cursor.t
-  }
-
-type 'a slice =
-  { items : 'a list
-  ; next : 'a continuation option
-  }
-
-type graph_info =
-  { graph_uuid : Uuid.t
-  ; graph_name : string
-  ; schema : Graph.schema_version
-  ; admission_facts : Graph.admission_fact list
-  ; journal_title_format : string option
-  ; limits : Worker_pure_data.capability_limits
-  ; generation : string
-  ; projection_revision : string
-  }
-
-type block_summary =
-  { lookup : Worker_pure_data.block_lookup
-  ; page : Worker_pure_data.page_lookup option
-  ; items : Worker_pure_data.child_member list
-  ; next : Worker_pure_data.child_member continuation option
-  ; scope_revision : string
-  ; generation : string
-  ; projection_revision : string
-  }
-
-type favorites =
-  { favorites_page : Uuid.t option
-  ; generation : string
-  ; projection_revision : string
-  ; items : Worker_pure_data.favorite_item list
-  ; next : Worker_pure_data.favorite_item continuation option
-  }
-
-type task_status_catalog =
-  { property_uuid : Uuid.t option
-  ; default_status : Uuid.t option
-  ; items : Graph.task_status_definition list
-  ; next : Graph.task_status_definition continuation option
-  }
-
-type asset_listing =
-  { generation : string
-  ; projection_revision : string
-  ; items : Logseq_db_types.Asset_descriptor.t list
-  ; next : Logseq_db_types.Asset_descriptor.t continuation option
-  }
-
-type children =
-  { parent : Uuid.t
-  ; revision_scope : Worker_pure_data.revision_scope
-  ; scope_revision : string
-  ; items : Worker_pure_data.child_member list
-  ; next : Worker_pure_data.child_member continuation option
-  }
-
-type change_batch =
-  { change_owner : session
-  ; generation : string
-  ; from_exclusive : string option
-  ; through : string
-  ; windows : Worker_pure_data.change_window list
-  ; next : string option
-  }
-
-type change_ack =
-  { ack_owner : session
-  ; generation : string
-  ; through : string
-  }
-
-type _ query =
-  | Graph_info : graph_info query
-  | Admission : Worker_pure_data.admission_inspection query
-  | Journal : journal_day -> page option query
-  | Journals :
-      { from_day : journal_day
-      ; through_day : journal_day
-      ; revision : string option
-      ; after : Worker_pure_data.journal_item continuation option
-      }
-      -> Worker_pure_data.journal_item slice query
-  | Page :
-      { uuid : Uuid.t
-      ; revision : string option
-      }
-      -> Worker_pure_data.page_lookup query
-  | Outline_block :
-      { uuid : Uuid.t
-      ; revision : string option
-      }
-      -> Worker_pure_data.block_lookup query
-  | Block_summary :
-      { block : Uuid.t
-      ; after : Worker_pure_data.child_member continuation option
-      }
-      -> block_summary query
-  | Children :
-      { parent : Uuid.t
-      ; after : block continuation option
-      }
-      -> block slice query
-  | Child_members :
-      { parent : Uuid.t
-      ; revision : string option
-      ; after : Worker_pure_data.child_member continuation option
-      }
-      -> children query
-  | Tree :
-      { page : Uuid.t
-      ; maximum_depth : int
-      ; revision : string option
-      ; after : Worker_pure_data.tree_member continuation option
-      }
-      -> Worker_pure_data.tree_member slice query
-  | Favorites : Worker_pure_data.favorite_item continuation option -> favorites query
-  | Task_statuses :
-      Graph.task_status_definition continuation option
-      -> task_status_catalog query
-  | Task_status_definitions :
-      Uuid.t list
-      -> Graph.task_status_definition option list query
-  | Asset_descriptors : Uuid.t list -> asset_listing query
-  | Assets :
-      { recursive : bool
-      ; roots : Uuid.t list
-      ; after : Logseq_db_types.Asset_descriptor.t continuation option
-      }
-      -> asset_listing query
-  | Changes :
-      { generation : string
-      ; after : string option
-      }
-      -> change_batch query
 
 type append_intent = Wire.t
 
@@ -447,7 +252,7 @@ type local_deletion =
 type projection =
   { binding : binding
   ; host_owner : Service.account_scope
-  ; account : account_generation
+  ; account : int
   ; version : projection_version
   ; residents : resident list
   ; selected : presentation option
@@ -486,119 +291,21 @@ type handoff_state =
   | Host_change_applied of handoff_receipt
   | Handoff_failed of host_change * error
 
-let binding_incarnation (b : binding) = b.incarnation
-
-let equal_binding (a : binding) (b : binding) =
-  a.serial = b.serial
-  && Logseq_db_worker_lui.Journal_worker_ids.Runtime.Epoch.equal
-       a.incarnation.runtime_epoch
-       b.incarnation.runtime_epoch
-  && Logseq_db_worker_lui.Journal_worker_ids.Worker.Generation.equal
-       a.incarnation.worker_generation
-       b.incarnation.worker_generation
-;;
-
-let account_generation (s : session) = s.account
-let graph_generation (s : session) = s.generation
 let presentation_generation (p : presentation) = p.generation
 let presentation_session (p : presentation) = p.session
-let graph_id (s : session) = s.graph
-
-let equal_session (a : session) (b : session) =
-  equal_binding a.binding b.binding
-  && a.account = b.account
-  && a.lifecycle = b.lifecycle
-  && a.generation = b.generation
-  && Uuid.equal a.graph b.graph
-;;
-
-let compare_session (a:session)(b:session)=
-  let key (s:session)=(s.binding.incarnation,s.binding.serial,s.binding.origin,s.binding.user,
-    s.account,s.lifecycle,s.generation,s.graph) in
-  Stdlib.compare(key a)(key b)
-;;
-
-let matches_asset_scope (session:session) (scope:Service.asset_scope)=
-  let expected=session.asset_scope in
-  expected.graph_id=scope.graph_id && expected.graph_generation=scope.graph_generation
-  && expected.account.user_id=scope.account.user_id
-  && Uri.equal expected.account.managed_sync_origin scope.account.managed_sync_origin
-  && expected.account.account_generation=scope.account.account_generation
-  && expected.account.lifecycle_generation=scope.account.lifecycle_generation
-;;
-
-let same_logical_graph (a : session) (b : session) =
-  a.binding.origin = b.binding.origin
-  && a.binding.user = b.binding.user
-  && Uuid.equal a.graph b.graph
-;;
-
-let matches_scope (session : session) (scope : Service.timeline_scope) =
-  session.account = scope.startup.account_generation
-  && session.generation = scope.graph_generation
-  && Uuid.equal session.graph scope.graph_id
-;;
-
 let presentation_matches_scope (presentation:presentation) (scope:Service.timeline_scope) =
   matches_scope presentation.session scope
   && presentation.host_generation=scope.startup.presentation_generation
 ;;
 
-let worker_incarnation ~runtime_epoch ~worker_generation =
-  { runtime_epoch; worker_generation }
-;;
-
-let request_id id = id
-let equal_request_id = Uuid.equal
-let compare_request_id = Uuid.compare
-
 let capabilities (s : session) =
-  { limits = s.limits
+  { limits = (For_worker.session_limits s)
   ; atomic_append = true
   ; durable_mutations = true
   ; durable_import = true
   ; observations = true
   }
 ;;
-
-let read_budget (owner : session) ~maximum_items ~maximum_bytes =
-  if
-    maximum_items <= 0
-    || maximum_items > Worker_pure_data.maximum_page_size
-    || maximum_bytes <= 0
-    || maximum_bytes > owner.limits.response_budget_bytes
-  then Error (Invalid_input "Read budget exceeds advertised limits")
-  else Ok { owner; maximum_items; maximum_bytes }
-;;
-
-let journal_day day =
-  let year = day / 10000
-  and month = day / 100 mod 100
-  and date = day mod 100 in
-  let leap = year mod 400 = 0 || (year mod 4 = 0 && year mod 100 <> 0) in
-  let days =
-    match month with
-    | 2 -> if leap then 29 else 28
-    | 4 | 6 | 9 | 11 -> 30
-    | _ -> 31
-  in
-  if year < 1 || year > 9999 || month < 1 || month > 12 || date < 1 || date > days
-  then Error (Invalid_input "Invalid journal day")
-  else Ok day
-;;
-
-let page_uuid (p : page) = p.data.uuid
-let page_title (p : page) = p.data.title
-let page_data (p : page) = p.data
-let page_revision (p : page) = p.revision
-let block_uuid (b : block) = b.data.block.uuid
-let block_title (b : block) = b.data.block.title
-let block_data (b : block) = b.data
-let block_revision (b : block) = b.revision
-let change_batch_session (batch : change_batch) = batch.change_owner
-let change_ack_session (ack : change_ack) = ack.ack_owner
-let change_ack_generation (a : change_ack) = a.generation
-let change_ack_through (a : change_ack) = a.through
 
 let unavailable feature =
   Error (Unsupported_operation (feature ^ " backend guarantee is not available"))
@@ -607,13 +314,14 @@ let unavailable feature =
 let append_intent (session:session) ~mutation_id ~block_id ~day ~title ~task_status ~children =
   let root:Worker_pure_data.append_node={block_id;title;task_status;children} in
   if not(Worker_pure_data.valid_append_node root) then Error(Invalid_input "Invalid bounded Append tree")
-  else Result.bind(journal_day day)(fun day->
+  else
+    let day=For_worker.journal_day_value day in
     let digits=Printf.sprintf "%08d" day in
     let page=Uuid.of_string(Printf.sprintf "00000001-%s-%s-0000-000000000000"
       (String.sub digits 0 4)(String.sub digits 4 4)) |> Result.get_ok in
-    Wire.create ~origin:(Uri.of_string session.binding.origin) ~user:session.binding.user ~graph:session.graph
+    Wire.create ~origin:(Uri.of_string (For_worker.binding_origin (For_worker.session_binding session))) ~user:(For_worker.binding_user (For_worker.session_binding session)) ~graph:(graph_id session)
       (Protocol.V2_append_journal{mutation_id;page;journal_day=day;root})
-    |> Result.map_error(fun message->Invalid_input message))
+    |> Result.map_error(fun message->Invalid_input message)
 ;;
 
 let append_intent_id = Wire.mutation_id
@@ -627,7 +335,7 @@ let wire_command ~mutation_id = function
     Protocol.V2_delete_blocks { mutation_id; root; preconditions }
   | Create_journal { page; day; title; preconditions } ->
     Protocol.V2_create_journal_page
-      { mutation_id; page; journal_day = day; title; preconditions }
+      { mutation_id; page; journal_day = For_worker.journal_day_value day; title; preconditions }
   | Set_task_status { block; status; preconditions } ->
     Protocol.V2_set_task_status { mutation_id; block; status; preconditions }
   | Clear_task_status { block; preconditions } ->
@@ -638,9 +346,9 @@ let wire_command ~mutation_id = function
 
 let mutation_intent (session : session) ~mutation_id command =
   Wire.create
-    ~origin:(Uri.of_string session.binding.origin)
-    ~user:session.binding.user
-    ~graph:session.graph
+    ~origin:(Uri.of_string (For_worker.binding_origin (For_worker.session_binding session)))
+    ~user:(For_worker.binding_user (For_worker.session_binding session))
+    ~graph:(graph_id session)
     (wire_command ~mutation_id command)
   |> Result.map_error (fun message -> Invalid_input message)
 ;;
@@ -650,9 +358,9 @@ let durable_intent_id intent = Wire.mutation_id (durable_wire intent)
 let encode_durable_intent intent = Bytes.of_string (Wire.encode (durable_wire intent))
 let restore_durable_intent (session : session) bytes =
   Wire.restore
-    ~origin:(Uri.of_string session.binding.origin)
-    ~user:session.binding.user
-    ~graph:session.graph
+    ~origin:(Uri.of_string (For_worker.binding_origin (For_worker.session_binding session)))
+    ~user:(For_worker.binding_user (For_worker.session_binding session))
+    ~graph:(graph_id session)
     (Bytes.to_string bytes)
   |> Result.map (fun intent -> match Wire.command intent with
     | Protocol.V2_append_journal _ -> Append_intent intent
@@ -661,8 +369,8 @@ let restore_durable_intent (session : session) bytes =
 ;;
 
 let validate_intent (session:session) intent =
-  let namespace=Wire.namespace_for_owner ~origin:(Uri.of_string session.binding.origin)
-    ~user:session.binding.user ~graph:session.graph in
+  let namespace=Wire.namespace_for_owner ~origin:(Uri.of_string (For_worker.binding_origin (For_worker.session_binding session)))
+    ~user:(For_worker.binding_user (For_worker.session_binding session)) ~graph:(graph_id session) in
   if String.equal namespace (Wire.namespace(durable_wire intent)) then Ok ()
   else Error(Invalid_input "Durable intent belongs to another logical graph")
 ;;
@@ -674,7 +382,7 @@ let receipt_targets (receipt:receipt) = Wire.targets (durable_wire receipt.inten
 
 let decode_mutation_receipt session ~request_id ~intent response =
   Result.bind (validate_intent session intent) (fun () ->
-    if Protocol.encoded_response_bytes response > session.limits.response_budget_bytes
+    if Protocol.encoded_response_bytes response > (For_worker.session_limits session).response_budget_bytes
     then Error Response_budget_exceeded
     else
       Wire.committed_point (durable_wire intent) ~request_id response
@@ -717,7 +425,7 @@ let decode_mutation_progress session ~request_id ~intent outcome =
       |> Result.map(fun receipt->Committed_pending_presentation receipt)
     | Wire.Rejected(Protocol.V2_response{api_version;request_id=actual;outcome=V2_failed{code;message}} as response)
       when api_version=Protocol.api_version && Uuid.equal actual request_id->
-      if Protocol.encoded_response_bytes response>session.limits.response_budget_bytes
+      if Protocol.encoded_response_bytes response>(For_worker.session_limits session).response_budget_bytes
       then Error Response_budget_exceeded
       else (match Logseq_db_worker.Error.code_of_string code with
         | Some code ->
@@ -802,11 +510,11 @@ let equal_asset_consumer (a : asset_consumer) (b : asset_consumer) =
 ;;
 
 let asset_consumer_prefix (session:session) =
-  let module Id=Logseq_db_worker_lui.Journal_worker_ids in
+  let module Id=Journal_worker_ids in
   Printf.sprintf "journal-asset/v1:%Ld:%Ld:%Ld:%d:%Ld:%s:%d:"
-    (Id.Runtime.Epoch.to_int64 session.binding.incarnation.runtime_epoch)
-    (Id.Worker.Generation.to_int64 session.binding.incarnation.worker_generation)
-    session.binding.serial session.account session.lifecycle (Uuid.to_string session.graph) session.generation
+    (Id.Runtime.Epoch.to_int64 (For_worker.worker_incarnation_runtime_epoch (binding_incarnation (For_worker.session_binding session))))
+    (Id.Worker.Generation.to_int64 (For_worker.worker_incarnation_worker_generation (binding_incarnation (For_worker.session_binding session))))
+    (For_worker.binding_serial (For_worker.session_binding session)) (For_worker.session_account session) (For_worker.session_lifecycle session) (Uuid.to_string (graph_id session)) (For_worker.session_generation session)
 let asset_consumer_key (consumer:asset_consumer)=asset_consumer_prefix consumer.session^consumer.name
 let compare_asset_consumer a b=String.compare(asset_consumer_key a)(asset_consumer_key b)
 let bind_asset_consumer consumer ~round={consumer with round=Some round}
@@ -839,7 +547,7 @@ let import_source_proof_id proof=proof.source_operation
 let without_import_preview imported={imported with import_preview=None;import_receipt={imported.import_receipt with preview=None}}
 
 let import_namespace (session:session)=Wire.namespace_for_owner
-  ~origin:(Uri.of_string session.binding.origin) ~user:session.binding.user ~graph:session.graph
+  ~origin:(Uri.of_string (For_worker.binding_origin (For_worker.session_binding session))) ~user:(For_worker.binding_user (For_worker.session_binding session)) ~graph:(graph_id session)
 let import_wire_error=function Import_wire.Invalid message->Invalid_input message|Wrong_namespace->Revoked_session
 let asset_import_intent session source=Import_wire.create ~namespace:(import_namespace session) source |> Result.map_error import_wire_error
 let asset_import_intent_id=Import_wire.operation
@@ -852,8 +560,8 @@ let restore_asset_import_intent session bytes=Import_wire.restore ~namespace:(im
 ;;
 
 let asset_notice_session (x:asset_notice)=x.notice_owner
-let changefeed_notice_scope (x:changefeed_notice)=x.notice_session.asset_scope
-let asset_notice_scope (x:asset_notice)=x.notice_owner.asset_scope
+let changefeed_notice_scope (x:changefeed_notice)=(For_worker.session_asset_scope x.notice_session)
+let asset_notice_scope (x:asset_notice)=(For_worker.session_asset_scope x.notice_owner)
 
 let asset_notice_data (x:asset_notice)=x.notice_data
 
@@ -871,7 +579,7 @@ let upload_operation (x:asset_notice)=match x.notice_data with
 ;;
 
 let compare_projection_version = Int64.compare
-let projection_incarnation (p : projection) = p.binding.incarnation
+let projection_incarnation (p : projection) = (binding_incarnation p.binding)
 let projection_binding (p : projection) = p.binding
 let projection_version (p : projection) = p.version
 let residents (p : projection) = p.residents
@@ -881,16 +589,16 @@ let equal_projection (a : projection) (b : projection) = a = b
 
 let scope_is_superseded ?previous (p : projection) (owner : Service.timeline_scope) =
   let at_or_after (session : session) =
-    session.account = owner.startup.account_generation
-    && Uuid.equal session.graph owner.graph_id
-    && session.generation >= owner.graph_generation
+    (For_worker.session_account session) = owner.startup.account_generation
+    && Uuid.equal (graph_id session) owner.graph_id
+    && (For_worker.session_generation session) >= owner.graph_generation
   in
   p.account > owner.startup.account_generation
   || (p.account = owner.startup.account_generation
       && List.exists
            (fun resident ->
               at_or_after resident.session
-              && resident.session.generation > owner.graph_generation)
+              && (For_worker.session_generation resident.session) > owner.graph_generation)
            p.residents)
   || Option.fold
        ~none:false
@@ -917,12 +625,12 @@ let equal_handoff_id = Uuid.equal
 
 let host_affected session = function
   |Account_will_change|Connection_will_stop->true
-  |Graph_will_close id|Graph_will_remove(id,_)->Uuid.equal session.graph id
+  |Graph_will_close id|Graph_will_remove(id,_)->Uuid.equal (graph_id session) id
 ;;
 let host_change_plan (projection:projection) ~handoff_id ~change ~sessions =
   let binding=projection.binding in
-  let valid (session:session)=session.binding.incarnation=binding.incarnation
-    && session.binding.origin=binding.origin && session.binding.user=binding.user
+  let valid (session:session)=(binding_incarnation (For_worker.session_binding session))=(binding_incarnation binding)
+    && (For_worker.binding_origin (For_worker.session_binding session))=(For_worker.binding_origin binding) && (For_worker.binding_user (For_worker.session_binding session))=(For_worker.binding_user binding)
     && host_affected session change in
   if Rrbvec.length sessions>8192 || not(Rrbvec.fold_left(fun ok session->ok && valid session)true sessions)
   then Error(Invalid_input "The host plan contains a foreign or unbounded execution roster") else
@@ -932,8 +640,8 @@ let host_change_plan (projection:projection) ~handoff_id ~change ~sessions =
     |Graph_will_remove(id,Force)->Remove_graph(id,Force)
     |Account_will_change->Replace_account|Connection_will_stop->Stop_connection in
   Ok{plan_binding=binding;plan_change=change;plan_sessions=sessions;
-    plan_wire={version=projection.version;id=handoff_id;registration=binding.serial;
-      owner=projection.host_owner;change=change_wire;expected=Rrbvec.map(fun session->session.asset_scope)sessions}}
+    plan_wire={version=projection.version;id=handoff_id;registration=(For_worker.binding_serial binding);
+      owner=projection.host_owner;change=change_wire;expected=Rrbvec.map(fun session->(For_worker.session_asset_scope session))sessions}}
 ;;
 let handoff_plan_id plan=plan.plan_wire.id
 let handoff_plan_change plan=plan.plan_change
@@ -969,15 +677,15 @@ let query_command
   : type a. read_budget -> a query -> Graph.Cursor.t option -> Protocol.command
   =
   fun budget query cursor ->
-  let limit = budget.maximum_items in
+  let limit = (For_worker.read_budget_maximum_items budget) in
   match query with
   | Graph_info -> V2_graph_info
   | Admission -> V2_inspect_admission
   | Journal day ->
     V2_list_journals
-      { from_day = day; through_day = day; limit = 1; cursor = None; revision = None }
+      { from_day = For_worker.journal_day_value day; through_day = For_worker.journal_day_value day; limit = 1; cursor = None; revision = None }
   | Journals { from_day; through_day; revision; _ } ->
-    V2_list_journals { from_day; through_day; revision; limit; cursor }
+    V2_list_journals { from_day=For_worker.journal_day_value from_day; through_day=For_worker.journal_day_value through_day; revision; limit; cursor }
   | Page { uuid; revision } -> V2_get_page { page = uuid; revision }
   | Outline_block { uuid; revision } -> V2_get_outline_block { block = uuid; revision }
   | Block_summary { block; _ } -> V2_get_outline_block_summary { block; limit; cursor }
@@ -1014,10 +722,10 @@ let checked_command
     match after with
     | None -> Ok None
     | Some next
-      when equal_session next.owner session
-           && next.key = key
-           && next.budget.maximum_items = budget.maximum_items
-           && next.budget.maximum_bytes = budget.maximum_bytes -> Ok (Some next.cursor)
+      when equal_session (For_worker.continuation_owner next) session
+           && (For_worker.continuation_key next) = key
+           && (For_worker.read_budget_maximum_items (For_worker.continuation_budget next)) = (For_worker.read_budget_maximum_items budget)
+           && (For_worker.read_budget_maximum_bytes (For_worker.continuation_budget next)) = (For_worker.read_budget_maximum_bytes budget) -> Ok (Some (For_worker.continuation_cursor next))
     | Some _ ->
       Error
         (Invalid_input "Continuation does not belong to this query, session and budget")
@@ -1040,19 +748,16 @@ let checked_command
     | Asset_descriptors ids -> List.length ids
     | _ -> 1
   in
-  if not (equal_session budget.owner session)
+  if not (equal_session (For_worker.read_budget_owner budget) session)
   then Error Revoked_session
-  else if count > budget.maximum_items
+  else if count > (For_worker.read_budget_maximum_items budget)
   then Error (Invalid_input "Lookup exceeds item budget")
   else Result.map (query_command budget query) cursor
 ;;
 
 let supports_observation session query =
   let budget =
-    { owner = session
-    ; maximum_items = Worker_pure_data.maximum_page_size
-    ; maximum_bytes = session.limits.response_budget_bytes
-    }
+    (For_worker.read_budget ~owner:(session) ~maximum_items:(Worker_pure_data.maximum_page_size) ~maximum_bytes:((For_worker.session_limits session).response_budget_bytes))
   in
   match checked_command session budget query with
   | Ok command -> Protocol.is_observable_read command
@@ -1065,7 +770,7 @@ let prepared_import_intent proof=proof.prepared_intent
 let prepared_import_source_session proof=proof.prepared_owner
 let prepared_import_adoption proof=proof.adoption
 let import_input_wire_owner (session:session) : Logseq_db_types.Asset_import.Recovery.owner =
-  {namespace=import_namespace session;origin=session.binding.origin;account=session.binding.user;graph=session.graph}
+  {namespace=import_namespace session;origin=(For_worker.binding_origin (For_worker.session_binding session));account=(For_worker.binding_user (For_worker.session_binding session));graph=(graph_id session)}
 ;;
 let validate_import_recovery session ~after ~maximum_items ~maximum_bytes =
   let module R=Logseq_db_types.Asset_import.Recovery in
@@ -1147,7 +852,7 @@ let rec validate_request : type a. session -> a request -> (unit, error) result 
     else if List.length assets>Worker_pure_data.maximum_page_size
     then Error(Invalid_input "Asset demand exceeds the bounded member batch")
     else
-      let limit=min session.limits.response_budget_bytes Worker_pure_data.maximum_response_bytes in
+      let limit=min (For_worker.session_limits session).response_budget_bytes Worker_pure_data.maximum_response_bytes in
       let bytes=List.fold_left(fun bytes asset->if bytes>limit then bytes else
         bytes+1+String.length(Yojson.Safe.to_string(Logseq_db_types.Asset_descriptor.to_yojson asset)))2 assets in
       if bytes>limit then Error(Invalid_input "Asset demand exceeds the encoded payload bound") else Ok()
@@ -1174,11 +879,11 @@ let decode
   fun session budget query outcome ->
   let next cursor =
     Option.map
-      (fun cursor -> { owner = session; budget; key = query_key budget query; cursor })
+      (fun cursor -> (For_worker.continuation ~owner:(session) ~budget ~key:(query_key budget query) ~cursor))
       cursor
   in
   let bounded items =
-    if List.length items > budget.maximum_items
+    if List.length items > (For_worker.read_budget_maximum_items budget)
     then Error Response_budget_exceeded
     else Ok items
   in
@@ -1206,26 +911,18 @@ let decode
   | _ ->
     (match query, outcome with
      | Graph_info, Protocol.V2_graph_info_outcome i
-       when Uuid.equal session.graph i.graph_uuid ->
+       when Uuid.equal (graph_id session) i.graph_uuid ->
        Ok
-         { graph_uuid = i.graph_uuid
-         ; graph_name = i.graph_name
-         ; schema = i.schema
-         ; admission_facts = i.admission_facts
-         ; journal_title_format = i.journal_title_format
-         ; limits = i.limits
-         ; generation = i.generation
-         ; projection_revision = i.projection_revision
-         }
+         (For_worker.graph_info ~graph_uuid:(i.graph_uuid) ~graph_name:(i.graph_name) ~schema:(i.schema) ~admission_facts:(i.admission_facts) ~journal_title_format:(i.journal_title_format) ~limits:(i.limits) ~generation:(i.generation) ~projection_revision:(i.projection_revision))
      | Admission, V2_admission_outcome inspection -> Ok inspection
      | Journal day, V2_journals_outcome { items; next_cursor = None } ->
        (match items with
         | [] -> Ok None
-        | [ item ] when item.journal_day = day ->
-          Ok (Some { data = item.page; revision = item.revision })
+        | [ item ] when item.journal_day = For_worker.journal_day_value day ->
+          Ok (Some (For_worker.page ~data:(item.page) ~revision:(item.revision)))
         | _ -> mismatch ())
      | Journals _, V2_journals_outcome { items; next_cursor } ->
-       Result.map (fun items -> ({ items; next = next next_cursor } : _ slice)) (bounded items)
+       Result.map (fun items -> ((For_worker.slice ~items ~next:(next next_cursor)) : _ slice)) (bounded items)
      | Page { uuid; _ }, V2_page_outcome lookup when page_matches uuid lookup -> Ok lookup
      | Outline_block { uuid; _ }, V2_block_outcome lookup when block_matches uuid lookup
        -> Ok lookup
@@ -1233,81 +930,49 @@ let decode
        when block_matches block s.lookup ->
        Result.map
          (fun items ->
-            { lookup = s.lookup
-            ; page = s.page
-            ; items
-            ; next = next s.next_cursor
-            ; scope_revision = s.scope_revision
-            ; generation = s.generation
-            ; projection_revision = s.projection_revision
-            })
+            (For_worker.block_summary ~lookup:(s.lookup) ~page:(s.page) ~items ~next:(next s.next_cursor) ~scope_revision:(s.scope_revision) ~generation:(s.generation) ~projection_revision:(s.projection_revision)))
          (bounded s.items)
      | Children { parent; _ }, V2_children_outcome c
        when Uuid.equal parent c.parent && c.revision_scope = Worker_pure_data.V2_children_revision parent
        ->
        Result.map
          (fun items ->
-            ({ items =
-                List.map
+            ((For_worker.slice ~items:(List.map
                   (fun (i : Worker_pure_data.child_member) ->
-                     { data = i.value; revision = i.revision })
-                  items
-            ; next = next c.next_cursor
-            } : block slice))
+                     (For_worker.block ~data:(i.value) ~revision:(i.revision)))
+                  items) ~next:(next c.next_cursor)) : block slice))
          (bounded c.items)
      | Child_members { parent; _ }, V2_children_outcome c
        when Uuid.equal parent c.parent && c.revision_scope = Worker_pure_data.V2_children_revision parent
        ->
        Result.map
          (fun items ->
-            { parent
-            ; revision_scope = c.revision_scope
-            ; scope_revision = c.scope_revision
-            ; items
-            ; next = next c.next_cursor
-            })
+            (For_worker.children ~parent ~revision_scope:(c.revision_scope) ~scope_revision:(c.scope_revision) ~items ~next:(next c.next_cursor)))
          (bounded c.items)
      | Tree { page; maximum_depth; _ }, V2_page_tree_outcome t
        when Uuid.equal page t.page && maximum_depth = t.maximum_depth ->
-       Result.map (fun items -> ({ items; next = next t.next_cursor } : _ slice)) (bounded t.items)
+       Result.map (fun items -> ((For_worker.slice ~items ~next:(next t.next_cursor)) : _ slice)) (bounded t.items)
      | Favorites _, V2_favorites_outcome f ->
        Result.map
          (fun items ->
-            { favorites_page = f.favorites_page
-            ; generation = f.generation
-            ; projection_revision = f.projection_revision
-            ; items
-            ; next = next f.next_cursor
-            })
+            (For_worker.favorites ~favorites_page:(f.favorites_page) ~generation:(f.generation) ~projection_revision:(f.projection_revision) ~items ~next:(next f.next_cursor)))
          (bounded f.items)
      | Task_statuses _, V2_task_statuses_outcome s ->
        Result.map
          (fun items ->
-            { property_uuid = s.property_uuid
-            ; default_status = s.default_status
-            ; items
-            ; next = next s.next_cursor
-            })
+            (For_worker.task_status_catalog ~property_uuid:(s.property_uuid) ~default_status:(s.default_status) ~items ~next:(next s.next_cursor)))
          (bounded s.items)
      | Task_status_definitions ids, V2_task_status_definitions_outcome items
        when List.length ids = List.length items -> bounded items
      | Asset_descriptors _, V2_assets_outcome a when a.next_cursor = None ->
        Result.map
          (fun items ->
-            { generation = a.generation
-            ; projection_revision = a.projection_revision
-            ; items
-            ; next = None
-            })
+            (For_worker.asset_listing ~generation:(a.generation) ~projection_revision:(a.projection_revision) ~items ~next:(None)))
          (bounded a.items)
      | Assets _, V2_assets_outcome a ->
        Result.map
          (fun items ->
-            { generation = a.generation
-            ; projection_revision = a.projection_revision
-            ; items
-            ; next = next a.next_cursor
-            })
+            (For_worker.asset_listing ~generation:(a.generation) ~projection_revision:(a.projection_revision) ~items ~next:(next a.next_cursor)))
          (bounded a.items)
      | Changes { generation; after }, V2_changes b
        when generation = b.generation && after = b.from_exclusive ->
@@ -1338,13 +1003,7 @@ let decode
        else
          Result.map
            (fun windows ->
-              { change_owner = session
-              ; generation
-              ; from_exclusive = b.from_exclusive
-              ; through = b.through
-              ; windows
-              ; next = b.next
-              })
+              (For_worker.change_batch ~change_owner:(session) ~generation ~from_exclusive:(b.from_exclusive) ~through:(b.through) ~windows ~next:(b.next)))
            (bounded b.windows)
      | _ -> mismatch ())
 ;;
@@ -1352,13 +1011,10 @@ let decode
 let decode_confirmation session ~presentation receipt response =
   Result.bind (validate_confirmation session presentation receipt) (fun () ->
     let budget =
-      { owner = session
-      ; maximum_items = Worker_pure_data.default_page_size
-      ; maximum_bytes = session.limits.response_budget_bytes
-      }
+      (For_worker.read_budget ~owner:(session) ~maximum_items:(Worker_pure_data.default_page_size) ~maximum_bytes:((For_worker.session_limits session).response_budget_bytes))
     in
     let response_size = Protocol.encoded_response_bytes response in
-    if response_size > budget.maximum_bytes
+    if response_size > (For_worker.read_budget_maximum_bytes budget)
     then Error Response_budget_exceeded
     else (
       match response with
