@@ -540,28 +540,17 @@ let block n parent page refs =
     }
 ;;
 
-let present (block : G.block) =
-  Wire.V2_block_outcome
-    (Worker_pure_data.V2_present_block
-       { value =
-           { block; task_status = None; rendered_page_title = "page"; tag_titles = [] }
-       ; revision = "r"
-       })
+let block_value (block : G.block) : Worker_pure_data.block_lookup =
+  Worker_pure_data.V2_present_block
+    {value={block;task_status=None;rendered_page_title="page";tag_titles=[]};revision="r"}
 ;;
 
+let present block = Wire.V2_block_outcome (block_value block)
+
 let raw r n (block : G.block) =
-  let request =
-    Wire.
-      { api_version = 2
-      ; request_id = uuid n
-      ; command = V2_get_outline_block { block = block.uuid; revision = None }
-      }
-  in
-  Runtime.observe_request r request;
-  Runtime.observe_response
-    r
-    (V2_response
-       { api_version = 2; request_id = request.request_id; outcome = present block })
+  let query = W.Outline_block { uuid = block.uuid; revision = None } in
+  Runtime.observe_query r ~request_id:(uuid n) query;
+  Runtime.observe_query_result r ~request_id:(uuid n) query (block_value block)
 ;;
 
 let runtime_scope : Service.asset_scope =
@@ -715,15 +704,9 @@ let runtime_unconfigured_changes after_shutdown () =
      configuration has admitted any recursive root or attachment consumer. *)
   raw r 600 (block 200 1 1 []);
   for n = 1 to 4 do
-    let request =
-      Wire.
-        { api_version = 2
-        ; request_id = uuid (600 + n)
-        ; command = V2_get_outline_block { block = uuid n; revision = None }
-        }
-    in
-    Runtime.observe_request r request;
-    Runtime.forget_request r ~request_id:request.request_id
+    let id = uuid (600+n) in
+    Runtime.observe_query r ~request_id:id (W.Outline_block{uuid=uuid n;revision=None});
+    Runtime.forget_request r ~request_id:id
   done;
   Runtime.changes r [ window 1 [ 1; 2; 3; 4 ] [] ];
   Runtime.pump r;
@@ -862,19 +845,10 @@ let runtime_late_fact () =
   let r, sent = runtime_fixture () in
   let old = block 2 1 1 [] in
   raw r 600 old;
-  let late_request =
-    Wire.
-      { api_version = 2
-      ; request_id = uuid 601
-      ; command = V2_get_outline_block { block = uuid 2; revision = None }
-      }
-  in
-  Runtime.observe_request r late_request;
+  let query = W.Outline_block { uuid=uuid 2;revision=None } in
+  Runtime.observe_query r ~request_id:(uuid 601) query;
   Runtime.changes r [ window 1 [ 2 ] [] ];
-  Runtime.observe_response
-    r
-    (V2_response
-       { api_version = 2; request_id = late_request.request_id; outcome = present old });
+  Runtime.observe_query_result r ~request_id:(uuid 601) query (block_value old);
   let request =
     match Queue.take sent with
     | Read request -> request
@@ -895,27 +869,19 @@ let runtime_late_fact () =
 
 let runtime_known_asset_immutable () =
   let r, sent = runtime_fixture () in
-  let request =
-    Wire.
-      { api_version = 2
-      ; request_id = uuid 600
-      ; command = V2_get_asset_descriptors { assets = [ uuid 50 ] }
-      }
-  in
-  Runtime.observe_request r request;
-  Runtime.observe_response
-    r
-    (V2_response
-       { api_version = 2
-       ; request_id = request.request_id
-       ; outcome =
-           V2_assets_outcome
-             { generation = "g"
-             ; projection_revision = "r"
-             ; items = [ asset 50 ]
-             ; next_cursor = None
-             }
-       });
+  let query = W.Asset_descriptors [ uuid 50 ] in
+  let id = uuid 600 in
+  Runtime.observe_query r ~request_id:id query;
+  let issuer,_,_,session=Lazy.force producer in
+  let module I=(val issuer : Worker_effect_authority.ISSUER) in
+  let budget=W.read_budget session ~maximum_items:32 ~maximum_bytes:65536 |> Result.get_ok in
+  let operation=W.Query(budget,query) in
+  ignore(I.request session ~request_id:(W.request_id id) operation |> Result.get_ok);
+  let response=Service.Graph_response(Wire.V2_response{api_version=2;request_id=id;
+    outcome=V2_assets_outcome{generation="g";projection_revision="r";items=[asset 50];next_cursor=None}}) in
+  let value=match I.reply session ~request_id:(W.request_id id) operation response with
+    | Ok(W.Answered(Ok value))->value|_->failwith "invalid descriptor fixture" in
+  Runtime.observe_query_result r ~request_id:id query value;
   Runtime.changes r [ window 1 [ 50 ] [] ];
   check
     (Queue.is_empty sent)
@@ -977,13 +943,8 @@ let runtime_registry_capacity () =
     runtime_fixture ~changed:(fun _ _ favorites -> status := favorites.P.enumeration) ()
   in
   for n = 1000 to 5199 do
-    Runtime.observe_request
-      r
-      Wire.
-        { api_version = 2
-        ; request_id = uuid n
-        ; command = V2_get_outline_block { block = uuid 99; revision = None }
-        }
+    Runtime.observe_query r ~request_id:(uuid n)
+      (W.Outline_block{uuid=uuid 99;revision=None})
   done;
   check
     (!status = P.Failed)

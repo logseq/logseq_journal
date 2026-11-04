@@ -119,5 +119,3 @@ module Pure_insertion : sig
   val rebind_ack : t -> index:int -> round:int64 -> intent:Worker.mutation_intent
     -> presentation:Worker.presentation -> t option
 end
-
-module Pure_child = Pure_insertion

@@ -1,5 +1,4 @@
 module Policy = Journal_asset_policy
-module Protocol = Logseq_db_worker.Protocol
 module Graph = Logseq_db_types.Graph_types
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Worker = Journal_worker_coordination.Worker_api
@@ -206,12 +205,7 @@ let observe_fact_request t ~request_id ~first_page =
       Hashtbl.replace t.requests key (t.serial, first_page)))
 ;;
 
-let observe_request t (request : Protocol.request) =
-  let first_page = match request.command with
-    | Protocol.V2_list_favorites { cursor; _ } -> cursor = None
-    | _ -> false in
-  observe_fact_request t ~request_id:request.request_id ~first_page
-;;
+
 
 let execute t = function
   | Policy.Read ticket ->
@@ -745,69 +739,6 @@ let observe_fact_result t ~request_id apply =
       settle_dirty t)
 ;;
 
-let observe_response_internal t (Protocol.V2_response { request_id; outcome; _ }) =
-  observe_fact_result t ~request_id (fun issuance first_page ->
-      let remember_block = remember_block_value t ~issuance in
-      let remember_lookup = function
-        | Worker_pure_data.V2_present_block { value; _ } ->
-          remember_block value.block.uuid (Some value.block)
-        | Worker_pure_data.V2_missing_block { uuid; _ } -> remember_block uuid None
-      in
-      let remember_page_value = remember_page_value t ~issuance in
-      let remember_page = function
-        | Worker_pure_data.V2_present_page { page; _ } ->
-          remember_page_value page.uuid (Some page)
-        | Worker_pure_data.V2_missing_page { uuid; _ } -> remember_page_value uuid None
-      in
-      (match outcome with
-       | V2_block_outcome lookup -> remember_lookup lookup
-       | V2_page_outcome lookup ->
-         remember_page lookup;
-         (match lookup with
-          | Worker_pure_data.V2_present_page { page; _ }
-            when page.name = "$$$favorites" && t.favorites_page <> Some page.uuid ->
-            dispatch t (Index_changed Favorites)
-          | _ -> ())
-       | V2_block_summary_outcome { lookup; page; items; _ } ->
-         remember_lookup lookup;
-         Option.iter remember_page page;
-         List.iter
-           (fun (item : Worker_pure_data.child_member) ->
-              remember_block item.value.block.uuid (Some item.value.block))
-           items
-       | V2_children_outcome { items; _ } ->
-         List.iter
-           (fun (item : Worker_pure_data.child_member) ->
-              remember_block item.value.block.uuid (Some item.value.block))
-           items
-       | V2_page_tree_outcome { items; _ } ->
-         List.iter
-           (fun (item : Worker_pure_data.tree_member) ->
-              remember_block item.value.block.uuid (Some item.value.block))
-           items
-       | V2_journals_outcome { items; _ } ->
-         List.iter
-           (fun (item : Worker_pure_data.journal_item) ->
-              remember_page_value item.page.uuid (Some item.page))
-           items
-       | V2_favorites_outcome { favorites_page; items; _ } ->
-         observe_favorites t ~first_page ~favorites_page items
-       | V2_assets_outcome { items; _ } -> remember_assets t items
-       | _ -> ()))
-;;
-
-let observe_response t response = observe_response_internal t response
-
-let observe_favorites_result
-      t
-      ~request_id
-      ~first_page
-      (value : Journal_worker_coordination.Worker_api.favorites)
-  =
-  observe_fact_result t ~request_id (fun _ _ ->
-    observe_favorites t ~first_page ~favorites_page:value.favorites_page value.items)
-;;
-
 let observe_query : type a. t -> request_id:Graph.Uuid.t -> a Worker.query -> unit =
   fun t ~request_id query ->
   observe_fact_request t ~request_id
@@ -850,6 +781,13 @@ let observe_query_result
     | Worker.Favorites _ ->
       observe_favorites t ~first_page ~favorites_page:value.favorites_page value.items
     | Assets _ -> remember_assets t value.items
+    | Asset_descriptors _ -> remember_assets t value.items
+    | Children _ -> List.iter (fun value ->
+        let value=Worker.block_data value in
+        remember_block_value t ~issuance value.block.uuid (Some value.block)) value.items
+    | Journal _ -> Option.iter (fun page ->
+        let page=Worker.page_data page in
+        remember_page_value t ~issuance page.uuid (Some page)) value
     | _ -> ())
 ;;
 

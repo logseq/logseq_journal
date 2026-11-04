@@ -1,6 +1,5 @@
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Asset = Logseq_db_types.Asset_descriptor
-module Protocol = Logseq_db_worker.Protocol
 
 type ticket
 
@@ -89,11 +88,6 @@ val preview_visible
 
 val next : t -> root:string -> unit
 val retry : ?owner:string -> t -> root:string -> asset:string -> unit
-val observe_response : t -> Protocol.response -> unit
-
-(** Register a successfully admitted current-scope query before its response.
-    Observations retire their registration and cannot overwrite newer facts. *)
-val observe_request : t -> Protocol.request -> unit
 
 val forget_request : t -> Logseq_db_types.Graph_types.Uuid.t -> unit
 val changes : t -> Worker_pure_data.change_window list -> unit

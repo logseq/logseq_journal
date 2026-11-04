@@ -2025,7 +2025,7 @@ let test_host_durable_recovery_confirmation_ack () =
     (* Child business ordering against the actual Service and persisted intents.
        UI application here uses the production pure block projection; mounted
        application tests separately verify the rendered composer barrier. *)
-    let module Child=Journal_graph_mutation_confirmation.Pure_child in
+    let module Child=Journal_graph_mutation_confirmation.Pure_insertion in
     let parent_summary=value(call(W.Query(budget,W.Block_summary
       {block=Test_support.authoritative_block_uuid;after=None}))) in
     let parent_revision,page=match parent_summary.lookup,parent_summary.page with

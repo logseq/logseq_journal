@@ -2,7 +2,6 @@ module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Asset = Logseq_db_types.Asset_descriptor
 module P = Journal_media
 module G = Logseq_db_types.Graph_types
-module Protocol = Logseq_db_worker.Protocol
 module Owners = Set.Make (String)
 
 module Worker = Journal_worker_coordination.Worker_api
@@ -306,28 +305,7 @@ let observe_fact_request t ~request_id =
   then Hashtbl.replace t.sources request_id (tick t)
 ;;
 
-let observe_request t (request : Protocol.request) =
-  if Hashtbl.mem t.sources request.request_id || Hashtbl.length t.sources < 4096
-  then observe_fact_request t ~request_id:request.request_id
-  else (
-    let fail uuid =
-      dependency_failure
-        t
-        (G.Uuid.to_string uuid)
-        "Attachment dependency requests are full."
-    in
-    match request.command with
-    | Protocol.V2_get_outline_block { block; _ }
-    | V2_get_outline_block_summary { block; _ } -> fail block
-    | V2_get_children { parent; _ } -> fail parent
-    | V2_get_page { page; _ } ->
-      dependency_failure
-        t
-        ("page:" ^ G.Uuid.to_string page)
-        "Attachment page requests are full."
-    | V2_list_assets { roots; _ } -> List.iter fail roots
-    | _ -> ())
-;;
+
 
 let fact_needed t target =
   Hashtbl.to_seq_values t.groups
@@ -1014,30 +992,6 @@ let remember_block remember (record : Worker_pure_data.block_record) =
 let remember_block_lookup remember = function
   | Worker_pure_data.V2_present_block { value; _ } -> remember_block remember value
   | Worker_pure_data.V2_missing_block { uuid; _ } -> remember uuid None
-;;
-
-let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
-  observe_fact_result t ~request_id (fun remember remember_page ->
-    let page_lookup = remember_page_lookup remember_page in
-    let block = remember_block remember in
-    let lookup = remember_block_lookup remember in
-    (match outcome with
-     | Protocol.V2_block_outcome value -> lookup value
-     | V2_block_summary_outcome { lookup = value; page; items; _ } ->
-       lookup value;
-       Option.iter page_lookup page;
-       List.iter (fun (item : Worker_pure_data.child_member) -> block item.value) items
-     | V2_children_outcome { items; _ } ->
-       List.iter (fun (item : Worker_pure_data.child_member) -> block item.value) items
-     | V2_page_tree_outcome { items; _ } ->
-       List.iter (fun (item : Worker_pure_data.tree_member) -> block item.value) items
-     | V2_page_outcome value -> page_lookup value
-     | V2_journals_outcome { items; _ } ->
-       List.iter
-         (fun (item : Worker_pure_data.journal_item) ->
-            remember_page item.page.uuid (not item.page.recycled))
-         items
-     | _ -> ()))
 ;;
 
 let observe_query_result

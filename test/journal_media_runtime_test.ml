@@ -424,32 +424,16 @@ let raw_block ?(refs = []) ?(properties = []) n parent : G.block =
   }
 ;;
 
-let block_response block =
-  P.V2_response
-    { api_version = 2
-    ; request_id = uuid 999
-    ; outcome =
-        V2_block_outcome
-          (Worker_pure_data.V2_present_block
-             { value =
-                 { block
-                 ; task_status = None
-                 ; rendered_page_title = "Page"
-                 ; tag_titles = []
-                 }
-             ; revision = "r"
-             })
-    }
+let block_value block : Worker_pure_data.block_lookup =
+  Worker_pure_data.V2_present_block
+    { value = { block; task_status = None; rendered_page_title = "Page"; tag_titles = [] }
+    ; revision = "r" }
 ;;
 
 let observe runtime (block : G.block) =
-  R.observe_request
-    runtime
-    { api_version = 2
-    ; request_id = uuid 999
-    ; command = P.V2_get_outline_block { block = block.G.uuid; revision = None }
-    };
-  R.observe_response runtime (block_response block)
+  let query = W.Outline_block { uuid = block.uuid; revision = None } in
+  R.observe_query runtime ~request_id:(uuid 999) query;
+  R.observe_query_result runtime ~request_id:(uuid 999) query (block_value block)
 ;;
 
 let raw_page recycled : G.page =
@@ -476,8 +460,7 @@ let reply_page runtime sent recycled =
 let reply_block runtime sent (block : G.block) =
   match take_read sent with
   | (R.Read { query = W.Outline_block { uuid; _ }; _ } as request) when uuid = block.G.uuid ->
-    let P.V2_response { outcome; _ } = block_response block in
-    answer runtime request outcome
+    answer runtime request (P.V2_block_outcome (block_value block))
   | _ -> failwith "holder/liveness must use its owned bounded Outline_block query"
 ;;
 
@@ -735,21 +718,13 @@ let () =
       , fun () ->
           let r, q, _, _ = fixture () in
           seed r q 1 [];
-          R.observe_request
-            r
-            { P.api_version = 2
-            ; request_id = uuid 998
-            ; command = P.V2_get_outline_block { block = uuid 1; revision = None }
-            };
+          R.observe_query r ~request_id:(uuid 998) (W.Outline_block { uuid = uuid 1; revision = None });
           for n = 10000 to 14100 do
             change r [ n ]
           done;
-          let answer =
-            match block_response (raw_block ~refs:[ uuid 70 ] 1 900) with
-            | P.V2_response response ->
-              P.V2_response { response with request_id = uuid 998 }
-          in
-          R.observe_response r answer;
+          R.observe_query_result r ~request_id:(uuid 998)
+            (W.Outline_block { uuid = uuid 1; revision = None })
+            (block_value (raw_block ~refs:[ uuid 70 ] 1 900));
           change r [ 70 ];
           check
             (list_reads q = 1)
@@ -814,21 +789,13 @@ let () =
       , fun () ->
           let r, q, _, _ = fixture () in
           seed r q 1 [];
-          let request id =
-            { P.api_version = 2
-            ; request_id = uuid id
-            ; command = P.V2_get_outline_block { block = uuid 1; revision = None }
-            }
-          in
-          let answer id refs =
-            match block_response (raw_block ~refs 1 900) with
-            | P.V2_response response ->
-              P.V2_response { response with request_id = uuid id }
-          in
-          R.observe_request r (request 997);
-          R.observe_request r (request 998);
-          R.observe_response r (answer 998 [ uuid 71 ]);
-          R.observe_response r (answer 997 [ uuid 70 ]);
+          let query = W.Outline_block { uuid = uuid 1; revision = None } in
+          R.observe_query r ~request_id:(uuid 997) query;
+          R.observe_query r ~request_id:(uuid 998) query;
+          R.observe_query_result r ~request_id:(uuid 998) query
+            (block_value (raw_block ~refs:[ uuid 71 ] 1 900));
+          R.observe_query_result r ~request_id:(uuid 997) query
+            (block_value (raw_block ~refs:[ uuid 70 ] 1 900));
           change r [ 70 ];
           check (list_reads q = 0) "older owned response cannot restore removed ref";
           change r [ 71 ];
@@ -837,26 +804,20 @@ let () =
       , fun () ->
           let r, q, _, _ = fixture () in
           seed r q 1 [];
-          R.observe_response r (block_response (raw_block ~refs:[ uuid 70 ] 1 900));
+          R.observe_query_result r ~request_id:(uuid 999)
+            (W.Outline_block { uuid = uuid 1; revision = None })
+            (block_value (raw_block ~refs:[ uuid 70 ] 1 900));
           change r [ 70 ];
           check (list_reads q = 0) "only registered current-scope facts are accepted" )
     ; ( "unrelated change does not stale in-flight root facts"
       , fun () ->
           let r, q, _, _ = fixture () in
           seed r q 1 [];
-          R.observe_request
-            r
-            { P.api_version = 2
-            ; request_id = uuid 998
-            ; command = P.V2_get_outline_block { block = uuid 1; revision = None }
-            };
+          R.observe_query r ~request_id:(uuid 998) (W.Outline_block { uuid = uuid 1; revision = None });
           change r [ 80 ];
-          let answer =
-            match block_response (raw_block ~refs:[ uuid 70 ] 1 900) with
-            | P.V2_response response ->
-              P.V2_response { response with request_id = uuid 998 }
-          in
-          R.observe_response r answer;
+          R.observe_query_result r ~request_id:(uuid 998)
+            (W.Outline_block { uuid = uuid 1; revision = None })
+            (block_value (raw_block ~refs:[ uuid 70 ] 1 900));
           change r [ 70 ];
           check
             (list_reads q = 1)
@@ -941,8 +902,7 @@ let () =
             match take_read q with
             | (R.Read { query = W.Outline_block { uuid = block; _ }; _ } as request)
               when block = uuid 60 ->
-              let P.V2_response { outcome; _ } = block_response (raw_block 60 61) in
-              answer r request outcome
+              answer r request (P.V2_block_outcome (block_value (raw_block 60 61)))
             | _ -> failwith "unknown ancestor requires a bounded Outline_block query"
           in
           if Queue.is_empty q then change r [ 61 ];

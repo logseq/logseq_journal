@@ -44,10 +44,8 @@ val refresh
 
 (** Observe only accepted, currently owned requests/responses. Issuance fences
     late responses; facts are discarded on graph replacement. *)
-val observe_request : t -> Logseq_db_worker.Protocol.request -> unit
 
 val forget_request : t -> request_id:Logseq_db_types.Graph_types.Uuid.t -> unit
-val observe_response : t -> Logseq_db_worker.Protocol.response -> unit
 
 (** Reconcile only dependency-intersecting bounded recursive root batches.
     Unknown holders use bounded point reads instead of invalidating all scans. *)
@@ -77,15 +75,6 @@ val notice
 val pump : t -> unit
 val reject : t -> request_id:Logseq_db_types.Graph_types.Uuid.t -> unit
 val idle : t -> bool
-
-(** Owned business Favorites results preserve the explicit first-page boundary;
-    they never expose or reconstruct the sealed pagination cursor. *)
-val observe_favorites_result
-  :  t
-  -> request_id:Logseq_db_types.Graph_types.Uuid.t
-  -> first_page:bool
-  -> Journal_worker_coordination.Worker_api.favorites
-  -> unit
 
 val consumer_names : t -> string Seq.t
 

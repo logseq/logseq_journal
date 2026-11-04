@@ -532,5 +532,3 @@ module Pure_insertion = struct
     then recover t message else t,Ignore
 
 end
-
-module Pure_child = Pure_insertion

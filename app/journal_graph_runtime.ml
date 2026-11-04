@@ -6,7 +6,7 @@ module Reference = Journal_graph_reference_plan
 module Favorites = Journal_graph_favorites_plan
 module Feed = Journal_graph_feed_plan
 module Confirmation = Journal_graph_mutation_confirmation
-module Child = Journal_graph_mutation_confirmation.Pure_child
+module Child = Journal_graph_mutation_confirmation.Pure_insertion
 module Worker = Journal_worker_coordination.Worker_api
 module Coordination = Journal_worker_coordination.Worker_pure_coordinator
 

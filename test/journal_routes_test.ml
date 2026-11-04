@@ -4564,7 +4564,7 @@ let test_detail_observation_failure_and_pending_cancel () =
 ;;
 
 module Child_chain_fixture = struct
-  module C = Journal_graph_mutation_confirmation.Pure_child
+  module C = Journal_graph_mutation_confirmation.Pure_insertion
   module W = Journal_worker_coordination.Worker_api
   module P = Logseq_db_worker.Protocol
   module G = Logseq_db_types.Graph_types
