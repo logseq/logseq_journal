@@ -42,12 +42,16 @@
   logseq_overlay_db
   logseq_sync.pure_reducer
   logseq_db_types
+  melange-transit-core
   melange-transit-native
   mirage-crypto-rng
   mirage-crypto-rng.unix
+  rrbvec
+  tls
   tls-eio
   unix
   uri
+  x509
   ppx_deriving_yojson.runtime
   yojson)
  (preprocess

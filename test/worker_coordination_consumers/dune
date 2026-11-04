@@ -1,4 +1,5 @@
 (library
  (name worker_coordination_consumers)
  (modules consumer)
- (libraries rrbvec app logseq_journal.worker_coordination))
+ (libraries rrbvec app logseq_journal.worker_coordination
+  logseq_db_worker))

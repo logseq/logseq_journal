@@ -6,6 +6,7 @@
   datascript-ocaml-native
   datascript_ocaml
   logseq_db_types
+  melange-transit-core
   melange-transit-native
   persistent_sorted_set_ocaml
   sqlite3

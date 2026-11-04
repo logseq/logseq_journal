@@ -6,6 +6,8 @@
  (default_implementation logseq_db_worker_effect_runner_impl)
  (libraries
   eio
+  rrbvec
+  logseq_db_types
   logseq_db_worker.contract
   logseq_db_worker.pure_reducer
   logseq_overlay_db

@@ -14,6 +14,8 @@
   eio.unix
   eio_posix
   logseq_db_worker
+  logseq_db_worker.contract
+  logseq_db_worker.pure_reducer
   logseq_db_types
   logseq_overlay_db
   logseq_sync.effect_runner
@@ -21,7 +23,9 @@
   melange-transit-native
   mtime.clock
   mtime.clock.os
+  rrbvec
   threads
   unix
   uri
-  yojson))
+  yojson
+  logseq_db_worker.effect_runner))

@@ -11,9 +11,12 @@
  (libraries
   datascript_ocaml.types
   datascript-ocaml-native
+  logseq_db_types
   logseq_db_worker
+  logseq_db_worker.contract
   logseq_db_worker_test_support
   rrbvec
+  unix
   uri
   yojson))
 
@@ -24,9 +27,13 @@
   alcotest
   logseq_db_types
   logseq_db_worker
+  logseq_db_worker.contract
   logseq_db_worker.pure_reducer
+  logseq_overlay_db
   logseq_sync.pure_reducer
-  uri))
+  uri
+  yojson
+  rrbvec))
 
 (test
  (name test_lui_service)
@@ -38,7 +45,19 @@
   logseq_db_worker
   logseq_db_worker.lui
   logseq_db_worker_test_support
-  logseq_sync.effect_runner))
+  logseq_sync.effect_runner
+  digestif
+  eio
+  logseq_db_storage
+  logseq_db_types
+  logseq_db_worker.pure_reducer
+  logseq_sync.pure_reducer
+  rrbvec
+  sqlite3
+  threads
+  unix
+  uri
+  yojson))
 
 (test
  (name test_effect_runner)
@@ -48,18 +67,24 @@
   datascript-ocaml-native
   datascript_ocaml
   datascript_ocaml.types
+  eio
   eio_main
   eio.unix
   sqlite3
   logseq_db_storage
   logseq_db_types
   logseq_db_worker
+  logseq_db_worker.contract
   logseq_db_worker.effect_runner
   logseq_db_worker.pure_reducer
   logseq_db_worker_test_support
   logseq_sync.effect_runner
   logseq_sync.pure_reducer
-  uri))
+  rrbvec
+  unix
+  uri
+  logseq_overlay_db
+  yojson))
 
 (library
  (name managed_sync_e2e_support)
@@ -106,7 +131,11 @@
   sqlite3
   tls-eio
   uri
-  unix))
+  unix
+  eio
+  melange-transit-core
+  melange-transit-native
+  tls))
 
 (rule
  (alias managed-sync-online-e2e)

@@ -2,4 +2,11 @@
  (name journal_worker_coordination_impl)
  (implements journal_worker_coordination)
  (modules worker_api worker_pure_coordinator worker_effect_runner)
- (libraries uri yojson))
+ (libraries uri yojson
+  digestif
+  logseq_db_types
+  logseq_db_worker
+  logseq_db_worker.contract
+  logseq_db_worker.lui
+  logseq_db_worker.pure_reducer
+  rrbvec))

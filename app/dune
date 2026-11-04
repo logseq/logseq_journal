@@ -68,7 +68,11 @@
   threads
   unix
   ppx_deriving_yojson.runtime
-  yojson)
+  yojson
+  angstrom
+  logseq_db_worker.pure_reducer
+  mtime
+  uri)
  (preprocess
   (pps ppx_deriving_yojson))
  (foreign_stubs

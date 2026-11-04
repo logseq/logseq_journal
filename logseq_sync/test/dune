@@ -20,14 +20,20 @@
   sync_protocol_contract)
  (libraries
   alcotest
+  eio
   eio_main
   eio.unix
   logseq_db_types
+  logseq_overlay_db
   logseq_sync.effect_runner
   logseq_sync.pure_reducer
+  melange-transit-core
   melange-transit-native
+  mtime
+  ptime.clock.os
   unix
   uri
+  x509
   yojson))
 
 (test
@@ -38,7 +44,7 @@
 (test
  (name test_asset_codec)
  (modules test_asset_codec)
- (libraries alcotest logseq_sync.effect_runner melange-transit-native))
+ (libraries alcotest logseq_db_types logseq_sync.effect_runner melange-transit-core melange-transit-native unix))
 
 (test
  (name test_asset_cache)
@@ -53,9 +59,9 @@
 (executable
  (name asset_native_interop)
  (modules asset_native_interop)
- (libraries logseq_sync.effect_runner melange-transit-native yojson))
+ (libraries logseq_db_types logseq_sync.effect_runner melange-transit-core melange-transit-native yojson))
 
 (executable
  (name asset_adapter_memory)
  (modules asset_adapter_memory)
- (libraries logseq_sync.effect_runner logseq_sync.pure_reducer logseq_db_types eio_main uri melange-transit-native))
+ (libraries logseq_sync.effect_runner logseq_sync.pure_reducer logseq_db_types eio eio_main uri melange-transit-core melange-transit-native))
