@@ -1912,12 +1912,31 @@ let children_result items continuation : Projection.children_page =
   }
 ;;
 
-let receive_response t ~read_result ~origin (protocol_response : Protocol.response) =
-  let favorites : Worker.favorites option = match read_result with Some (Query_result (Worker.Favorites _, value))->Some value | _->None in
-  let catalog : Worker.task_status_catalog option = match read_result with Some (Query_result (Worker.Task_statuses _, value))->Some value | _->None in
-  let target_summary : Worker.block_summary option = match read_result with Some (Query_result (Worker.Block_summary _, value))->Some value | _->None in
-  let children : Worker.children option = match read_result with Some (Query_result (Worker.Child_members _, value))->Some value | _->None in
-  let (Protocol.V2_response { request_id; outcome; _ }) = protocol_response in
+let newer_target_point t pending =
+  match pending.failure_owner with
+  |Some(Mutation_owner{block_id;_})->
+    Option.exists(fun epoch->epoch>pending.source_epoch)
+      (Hashtbl.find_opt t.changed_point_epochs block_id)
+  |_->false
+;;
+
+let resample_confirmation t ~finished durable =
+  let key=Graph.Uuid.to_string finished in
+  let root_key=Graph.Uuid.to_string durable.root_request.request_id in
+  if key<>root_key then (
+    Option.iter(fun pending->Option.iter(fun token->
+      t.on_change(Coordination.Change_consumer_retired(token,finished)))pending.change_application)
+      (Hashtbl.find_opt t.pending key);
+    Hashtbl.remove t.pending key;
+    Hashtbl.remove t.hydration_active key);
+  match Hashtbl.find_opt t.pending root_key with
+  |None->empty
+  |Some pending->
+    Hashtbl.replace t.pending root_key {pending with delivery=Planned};
+    dispatch_output t (requests[durable.root_request])
+;;
+
+let receive_result t ~origin ~request_id result =
   let key = Graph.Uuid.to_string request_id in
   match Hashtbl.find_opt t.pending key with
   | None -> empty
@@ -1937,52 +1956,33 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
   | Some { operation; source_epoch; _ } ->
     let failure_output = failure_output ~source_epoch in
     Hashtbl.remove t.pending key;
-    (match (match operation,read_result with
-       | Feed_read operation,Some(Query_result(query,value)) ->
+    (match (match operation,result with
+       | Feed_read operation,Query_result(query,value) ->
          Feed.receive t.feed ~ports:(feed_ports t) ?origin operation query value
-       | Feed_read operation,Some(Read_failed{code;_}) ->
+       | Feed_read operation,Read_failed{code;_} ->
          Feed.failed t.feed ~ports:(feed_ports t) operation ~code
        | _ -> None) with
      | Some planned -> feed_output t planned
-     | _ -> (match outcome with
-     | Protocol.V2_assets_outcome _ ->
-       failure_output t operation request_id "Unexpected asset query response."
-     | V2_page_tree_outcome _ ->
-       failure_output t operation request_id "Unowned page-tree response."
-     | Protocol.V2_favorites_outcome _ ->
+     | _ -> (match result with
+     | Query_result (Worker.Favorites _, result) ->
        (match operation with
         | Favorite_read read when Favorites.accepts_list read ->
-          (match favorites with
-           | Some result -> Favorites.receive_list t.favorites ~ports:(favorites_ports t) read result
-             |> favorites_output |> background_demands t
-           | None -> failure_output t operation request_id
-               "An unsealed Favorites continuation cannot enter the business state.")
+          Favorites.receive_list t.favorites ~ports:(favorites_ports t) read result
+          |> favorites_output |> background_demands t
         | _ -> failure_output t operation request_id "Unexpected favorites response.")
-     | Protocol.V2_failed { code; message } ->
-       (match Error.code_of_string code with
-        | None ->
-          failure_output
-            ~code:Error.Invalid_request
-            t
-            operation
-            request_id
-            "The Worker returned an unknown failure code."
-        | Some failure_code ->
-          (match operation with
-           | Target_summary summary when failure_code = Error.Stale_read_cursor ->
-             (match Confirmation.retry_stale t.confirmations ~ports:(confirmation_ports t) summary with
-              | Some planned -> confirmation_planning planned
-              | None -> failure_output ~code:failure_code t operation request_id message)
-           | Delete_mutation command
-             when String.equal code (Error.code_string Error.Conflict) ->
-             request_delete_summary t command.block_id
-           | _ -> failure_output ~code:failure_code t operation request_id message))
-     | V2_resync_required { generation; reason } ->
+     | Read_failed { code; message } ->
        (match operation with
-        | Pull_changes { request_generation; _ } ->
-          rehydrate_current_interests t ~request_generation ~generation
-        | _ -> failure_output t operation request_id reason)
-     | V2_graph_info_outcome { generation; _ } ->
+        | Target_summary summary when code = Error.Stale_read_cursor ->
+          (match Confirmation.retry_stale t.confirmations ~ports:(confirmation_ports t) summary with
+           | Some planned -> confirmation_planning planned
+           | None -> failure_output ~code t operation request_id message)
+        | Delete_mutation command when code = Error.Conflict ->
+          request_delete_summary t command.block_id
+        | _ -> failure_output ~code t operation request_id message)
+     | Changes_resync reason -> failure_output t operation request_id reason
+     | Changes_retired -> empty
+     | Query_result (Worker.Graph_info, value) ->
+       let generation=value.Worker.generation in
        (match operation with
         | Graph_info ->
           if t.change_generation<>Some generation then t.change_cursor<-None;
@@ -1992,21 +1992,12 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
           in
           { requests = catalog; responses = [ response Graph_ready ] }
         | _ -> failure_output t operation request_id "Unexpected graph-info response.")
-     | V2_task_statuses_outcome { property_uuid; default_status; items; next_cursor } ->
+     | Query_result (Worker.Task_statuses _, catalog) ->
+       let property_uuid=catalog.Worker.property_uuid and default_status=catalog.default_status
+       and items=catalog.items and next_cursor=catalog.next in
        (match operation with
         | Task_catalog { epoch; _ } when epoch <> t.task_catalog_epoch -> empty
         | Task_catalog { epoch; seen; _ } ->
-          let values =
-            match catalog with
-            | Some value ->
-              Ok (value.Worker.property_uuid, value.default_status, value.items, value.next)
-            | None when next_cursor = None -> Ok (property_uuid, default_status, items, None)
-            | None ->
-              Error "An unsealed task catalog continuation cannot enter business state."
-          in
-          Result.fold
-            ~error:(fun message -> failure_output t operation request_id message)
-            ~ok:(fun (property_uuid, default_status, items, next_cursor) ->
               t.task_property <- property_uuid;
               t.default_task_status <- default_status;
               let seen =
@@ -2059,10 +2050,9 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
               in
               { requests
               ; responses = (if next_cursor = None then [ task_catalog_response t ] else [])
-              })
-            values
+              }
         | _ -> failure_output t operation request_id "Unexpected status catalog response.")
-     | V2_task_status_definitions_outcome definitions ->
+     | Query_result (Worker.Task_status_definitions _, definitions) ->
        (match operation with
         | Task_definitions ids
           when List.length ids = List.length definitions
@@ -2120,12 +2110,13 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
           let requests = if !restart_catalog then [ request_task_catalog t ] else [] in
           { requests; responses = (if !changed then [ task_catalog_response t ] else []) }
         | _ -> failure_output t operation request_id "Unexpected status lookup response.")
-     | V2_admission_outcome observation ->
+     | Query_result (Worker.Admission, observation) ->
        (match operation with
         | Admission_info request ->
           responses [ response (Admission_inspected { request; observation }) ]
         | _ -> failure_output t operation request_id "Unexpected admission response.")
-     | V2_journals_outcome { items; next_cursor = _ } ->
+     | Query_result (Worker.Journals _, journals) ->
+       let items=journals.Worker.items in
        List.iter
          (fun (item : Worker_pure_data.journal_item) ->
             Hashtbl.replace t.graph_pages (Graph.Uuid.to_string item.page.uuid) item.page;
@@ -2133,7 +2124,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
          items;
        (match operation with
         | _ -> failure_output t operation request_id "Unexpected journal response.")
-     | V2_page_outcome lookup ->
+     | Query_result (Worker.Page _, lookup) ->
        (match lookup, operation with
         |Worker_pure_data.V2_present_page{page;revision=page_revision},Changed_point_context{block_id;value;revision;child_count}
           when Graph.Uuid.equal page.uuid value.block.page && not page.recycled->
@@ -2239,26 +2230,17 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                    })
             ]
         | _ -> failure_output t operation request_id "Unexpected page response.")
-     | V2_block_summary_outcome
-         { lookup
-         ; page
-         ; items
-         ; next_cursor
-         ; scope_revision
-         ; generation
-         ; projection_revision
-         } ->
+     | Query_result (Worker.Block_summary _, target_summary) ->
+       let lookup=target_summary.Worker.lookup and page=target_summary.page
+       and items=target_summary.items and scope_revision=target_summary.scope_revision
+       and generation=target_summary.generation and projection_revision=target_summary.projection_revision in
        (match operation with
         | Child_canonical{root;round}->
-          (match read_result with
-           | Some(Query_result(Worker.Block_summary _,summary))->child_step t root(fun chain->Child.read_child chain ~round summary)
-           | _->child_step t root(fun chain->Child.read_failed chain ~round "The typed child snapshot is unavailable."))
+          child_step t root(fun chain->Child.read_child chain ~round target_summary)
         | Target_summary summary ->
-          (match (match target_summary,next_cursor with
-             | None,Some _ -> Confirmation.Failed "Unsealed target summary continuation"
-             | _ -> Confirmation.receive_summary t.confirmations ~ports:(confirmation_ports t) summary
-               ~lookup ~page ~items ~next_cursor:(Option.bind target_summary (fun (value:Worker.block_summary)->value.next))
-               ~scope_revision ~generation ~projection_revision) with
+          (match Confirmation.receive_summary t.confirmations ~ports:(confirmation_ports t) summary
+               ~lookup ~page ~items ~next_cursor:target_summary.next
+               ~scope_revision ~generation ~projection_revision with
            | Continue planned -> confirmation_planning planned
            | Failed message -> failure_output t operation request_id message
            | Absent {purpose=Delete_conflict_refresh _;block_id} ->
@@ -2347,7 +2329,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                            | Delete_conflict_refresh _ -> responses [response (Delete_conflict {block;timeline_entry_update=entry})]))))
           )
         | _ -> failure_output t operation request_id "Unexpected target summary response.")
-     | V2_block_outcome lookup ->
+     | Query_result (Worker.Outline_block _, lookup) ->
        (match lookup with
         | Worker_pure_data.V2_present_block { value; _ } ->
           Hashtbl.replace
@@ -2422,7 +2404,9 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
             | _->Block_removed{block_id} in
           responses [response payload]
         | _ -> failure_output t operation request_id "Unexpected block response.")
-     | V2_children_outcome { revision_scope; scope_revision; items; next_cursor; _ } ->
+     | Query_result (Worker.Child_members _, children) ->
+       let revision_scope=children.Worker.revision_scope and scope_revision=children.scope_revision
+       and items=children.items in
        remember_scope_revision t revision_scope scope_revision;
        List.iter
          (fun (item : Worker_pure_data.child_member) ->
@@ -2433,12 +2417,8 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
               item.value.tag_titles)
          items;
        (match operation with
-        | (Detail_children _ | Changed_children _)
-          when children=None && next_cursor<>None ->
-          failure_output t operation request_id "Unsealed child continuation"
         | Detail_children { generation; page; root; limit; _ } ->
-          let children = children_result items (Option.bind children (fun (value:Worker.children)->
-              Option.map (fun after -> ({Projection.after;maximum_items=limit}:Projection.child_cursor)) value.next)) in
+          let children = children_result items (Option.map (fun after -> ({Projection.after;maximum_items=limit}:Projection.child_cursor)) children.next) in
           remember_detail_members t ~page ~root children;
           Option.iter
             (fun journal_page ->
@@ -2478,16 +2458,12 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                          })
                   ]))
         | Favorite_read value when Favorites.accepts_memberships value ->
-          if children = None && next_cursor <> None
-          then failure_output t operation request_id "Unsealed Favorite membership continuation"
-          else (
-            let planned = Favorites.receive_memberships t.favorites ~ports:(favorites_ports t)
-                value items (Option.bind children (fun (value:Worker.children) -> value.next)) in
-            let output = favorites_output planned in
-            if planned.background then background_demands t output else output)
+          let planned = Favorites.receive_memberships t.favorites ~ports:(favorites_ports t)
+              value items children.next in
+          let output = favorites_output planned in
+          if planned.background then background_demands t output else output
         | Changed_children { page; root; limit } ->
-          let children = children_result items (Option.bind children (fun (value:Worker.children)->
-              Option.map (fun after -> ({Projection.after;maximum_items=limit}:Projection.child_cursor)) value.next)) in
+          let children = children_result items (Option.map (fun after -> ({Projection.after;maximum_items=limit}:Projection.child_cursor)) children.next) in
           let interest =
             Hashtbl.find_opt t.children_interests (Graph.Uuid.to_string root.block.uuid)
           in
@@ -2509,21 +2485,9 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
               | Ok detail -> responses [ response (Children_reconciled detail) ]
               | Error message -> reject message))
         | _ -> failure_output t operation request_id "Unexpected children response.")
-     | V2_mutation_committed _ ->
-       (match operation with
-        | Mutation_refresh { page; refresh } -> request_target_summary t page refresh
-        | Delete_mutation command ->
-          responses
-            [ response
-                (Subtree_deleted
-                   { block_id = command.block_id
-                   ; deleted_count = None
-                   ; parent = None
-                   ; timeline_entry_update = None
-                   })
-            ]
-        | _ -> failure_output t operation request_id "Unexpected mutation response.")
-     | V2_changes { generation; through; windows; next; _ } ->
+     | Query_result (Worker.Changes _, batch) ->
+       let generation=batch.Worker.generation and through=batch.through
+       and windows=batch.windows and next=batch.next in
        (match operation with
         | Pull_changes { request_generation; _ } ->
           report_timeline "runtime-change-window"
@@ -2538,10 +2502,9 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
             ; "truncated", `Bool (List.length windows > 16)
             ];
           t.change_generation <- Some generation;
-          let batch : Worker.change_batch option = match read_result with Some(Query_result(Worker.Changes _,batch))->Some batch|_->None in
-          t.latest_change_batch<-batch;
+          t.latest_change_batch<-Some batch;
           let acknowledgement =
-            read t (Acknowledge_changes {batch;continuation=Option.map(fun _->request_generation)next}) (Protocol.V2_ack_changes { generation; through })
+            read t (Acknowledge_changes {batch=Some batch;continuation=Option.map(fun _->request_generation)next}) (Protocol.V2_ack_changes { generation; through })
           in
           let hydration = hydration_for_changes t ~request_generation windows in
           let catalog_requests =
@@ -2577,7 +2540,8 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
           ; responses = response (Projection_changes windows) :: hydration.responses
           }
         | _ -> failure_output t operation request_id "Unexpected changes response.")
-     | V2_changes_acknowledged {generation;through} ->
+     | Changes_acknowledged ack ->
+       let generation=Worker.change_ack_generation ack and through=Worker.change_ack_through ack in
        (match operation with
         | Acknowledge_changes {continuation;_} ->
           t.change_generation<-Some generation;t.change_cursor<-Some through;
@@ -2585,11 +2549,11 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
             requests[read t (Pull_changes{request_generation;generation})
               (Protocol.V2_pull_changes{generation;after=Some through;limit=Worker_pure_data.maximum_page_size})])
         | _ ->
-          failure_output t operation request_id "Unexpected acknowledgement response.")))
+          failure_output t operation request_id "Unexpected acknowledgement response.")
+     | Query_result _ -> failure_output t operation request_id "The query has no graph business owner."))
 ;;
 
-let receive_delivery_body t ~read_result ~origin (protocol_response : Protocol.response) =
-  let (Protocol.V2_response { request_id; _ }) = protocol_response in
+let receive_delivery_body t ~origin ~request_id result =
   let key = Graph.Uuid.to_string request_id in
   let pending = Hashtbl.find_opt t.pending key in
   let owned = match pending with
@@ -2598,7 +2562,10 @@ let receive_delivery_body t ~read_result ~origin (protocol_response : Protocol.r
   if not owned then (
     report_timeline "runtime-response"
       ["request", `String (Graph.Uuid.to_string request_id); "reason", `String "discard-not-owned"];
-    empty) else (
+    empty) else match pending with
+  |Some({operation=Target_summary _;durable=Some durable;_}as pending)
+    when newer_target_point t pending->resample_confirmation t ~finished:request_id durable
+  |_->(
   let background = Hashtbl.mem t.hydration_active key in
   Hashtbl.remove t.hydration_active key;
   let root_current = match pending with
@@ -2609,25 +2576,25 @@ let receive_delivery_body t ~read_result ~origin (protocol_response : Protocol.r
     scope_output
       t
       (Option.bind pending (fun pending -> pending.failure_owner))
-      (receive_response t ~read_result ~origin protocol_response)
+      (receive_result t ~origin ~request_id result)
   in
   let references =
-    match pending, protocol_response with
+    match pending, result with
     | _ when not root_current -> empty
     | None, _ | Some { operation = Reference_read _; _ }, _ -> empty
     | Some pending, _ when not (favorite_request_current t pending) -> empty
     | Some { operation = Target_summary summary; _ }, _
       when not (Confirmation.current t.confirmations summary) ->
       empty
-    | Some { operation; source_epoch; _ }, Protocol.V2_response { outcome; _ } ->
+    | Some { operation; source_epoch; _ }, result ->
       let block (value : Worker_pure_data.block_record) = Reference.Block value.block in
       let sources =
-        match outcome with
-        | V2_block_outcome (Worker_pure_data.V2_present_block { value; _ }) -> Rrbvec.singleton (block value)
-        | V2_block_outcome (Worker_pure_data.V2_missing_block { uuid; _ }) ->
+        match result with
+        | Query_result (Worker.Outline_block _, Worker_pure_data.V2_present_block { value; _ }) -> Rrbvec.singleton (block value)
+        | Query_result (Worker.Outline_block _, Worker_pure_data.V2_missing_block { uuid; _ }) ->
           Rrbvec.singleton (Reference.Missing_outline uuid)
-        | V2_block_summary_outcome
-            { lookup = Worker_pure_data.V2_present_block { value; _ }; items; next_cursor = None; _ }
+        | Query_result (Worker.Block_summary _,
+            { lookup = Worker_pure_data.V2_present_block { value; _ }; items; next = None; _ })
           when List.exists
                  (fun response -> match response.payload with
                     | Block_captured _ | Block_updated _ | Update_conflict _ | Delete_conflict _ -> true | _ -> false)
@@ -2637,18 +2604,18 @@ let receive_delivery_body t ~read_result ~origin (protocol_response : Protocol.r
             | _ -> Rrbvec.push_front
                 (Rrbvec.of_list items |> Rrbvec.map (fun (item:Worker_pure_data.child_member)->item.value)) value in
           Rrbvec.map block fragment
-        | V2_page_outcome (Worker_pure_data.V2_present_page { page; _ }) ->
+        | Query_result (Worker.Page _, Worker_pure_data.V2_present_page { page; _ }) ->
           let detail_owner = match operation with
             | Detail_block { block_id; _ } -> block_id = Graph.Uuid.to_string page.uuid
             | Changed_detail_page _ ->
               Hashtbl.mem t.detail_pages (Graph.Uuid.to_string page.uuid)
             | _ -> false in
           Rrbvec.singleton (Reference.Page { page; detail_owner })
-        | V2_page_outcome (Worker_pure_data.V2_missing_page { uuid; _ }) ->
+        | Query_result (Worker.Page _, Worker_pure_data.V2_missing_page { uuid; _ }) ->
           Rrbvec.singleton (Reference.Missing_page uuid)
-        | V2_children_outcome { items; _ } ->
+        | Query_result (Worker.Child_members _, { items; _ }) ->
           Rrbvec.of_list items |> Rrbvec.map (fun (item : Worker_pure_data.child_member) -> block item.value)
-        | V2_page_tree_outcome { items; _ } ->
+        | Query_result (Worker.Tree _, { items; _ }) ->
           Rrbvec.of_list items |> Rrbvec.map (fun (item : Worker_pure_data.tree_member) -> block item.value)
         | _ -> Rrbvec.empty
       in
@@ -2672,17 +2639,17 @@ let receive_delivery_body t ~read_result ~origin (protocol_response : Protocol.r
          reading its bounded tree fragment without property hydration. All
          child titles enter the cache before discovery, avoiding duplicate reads. *)
       let property_blocks =
-        match operation, outcome with
+        match operation, result with
         | ( (Detail_children { root; _ } | Changed_children { root; _ })
-          , V2_children_outcome { items; _ } ) ->
+          , Query_result (Worker.Child_members _, { items; _ }) ) ->
           Seq.cons
             root.block
             (List.to_seq items
              |> Seq.map (fun (item : Worker_pure_data.child_member) -> item.value.block))
         | ( (Changed_detail_block { block_id; _ } | Changed_block { block_id; _ })
-          , V2_block_outcome (Worker_pure_data.V2_present_block { value; _ }) )
+          , Query_result (Worker.Outline_block _, Worker_pure_data.V2_present_block { value; _ }) )
           when Hashtbl.mem t.detail_pages block_id -> Seq.return value.block
-        | Changed_detail_page _, V2_page_outcome (Worker_pure_data.V2_present_page {page;revision})
+        | Changed_detail_page _, Query_result (Worker.Page _, Worker_pure_data.V2_present_page {page;revision})
             when (not page.recycled)
             && Hashtbl.mem t.detail_pages (Graph.Uuid.to_string page.uuid) ->
           Seq.return (page_root_member page revision).block
@@ -2697,7 +2664,12 @@ let receive_delivery_body t ~read_result ~origin (protocol_response : Protocol.r
     | Some durable ->
       List.iter (fun (request:Protocol.request) ->
         let key=Graph.Uuid.to_string request.request_id in
-        Option.iter (fun pending -> Hashtbl.replace t.pending key {pending with durable=Some durable})
+        Option.iter (fun next ->
+          let source_epoch=match pending,next.operation with
+            |Some{operation=Target_summary _;source_epoch;_},Target_summary summary
+              when (match Confirmation.worker_query summary with Worker.Block_summary{after=Some _;_}->true|_->false)->source_epoch
+            |_->next.source_epoch in
+          Hashtbl.replace t.pending key {next with durable=Some durable;source_epoch})
           (Hashtbl.find_opt t.pending key)) output.requests;
       let settled=List.exists(fun response->match response.payload with
         | Block_updated _ | Block_removed _ | Update_conflict _ | Delete_conflict _ | Subtree_deleted _ -> true
@@ -2853,32 +2825,27 @@ let notify_projection_changes t (output : output) =
     output.responses
 ;;
 
-let receive_delivery t ~read_result ~origin (Protocol.V2_response raw as protocol_response) =
-  let token=application_for_request t ~request_id:raw.request_id in
+let receive_delivery t ~origin ~request_id result =
+  let token=application_for_request t ~request_id:request_id in
   match token with
-  | None->let output=receive_delivery_body t ~read_result ~origin protocol_response in
+  | None->let output=receive_delivery_body t ~origin ~request_id result in
     notify_projection_changes t output;output
   | Some token ->
-    let external_children=match Hashtbl.find_opt t.pending(Graph.Uuid.to_string raw.request_id) with
+    let external_children=match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request_id) with
       | Some pending->pending.external_children|None->Rrbvec.empty in
     let previous=t.application_context and children=ref external_children in
-    t.application_context<-Some(token,raw.request_id,children);
+    t.application_context<-Some(token,request_id,children);
     let output=Fun.protect ~finally:(fun()->t.application_context<-previous)
-      (fun()->let output=receive_delivery_body t ~read_result ~origin protocol_response in
+      (fun()->let output=receive_delivery_body t ~origin ~request_id result in
         notify_projection_changes t output;output) in
-    t.on_change(Coordination.Change_consumer_expanded(token,raw.request_id,!children));
-    let error=match raw.outcome with
-      | Protocol.V2_failed{code;message}->Some(Worker.Service_failed(code^": "^message))
-      | V2_resync_required{reason;_}->Some(Worker.Resync_required reason)
+    t.on_change(Coordination.Change_consumer_expanded(token,request_id,!children));
+    let error=match result with
+      | Read_failed{code;message}->Some(Worker.Service_failed(Error.code_string code ^ ": " ^ message))
+      | Changes_resync reason->Some(Worker.Resync_required reason)
       | _->List.find_map response_application_error output.responses in
-    Option.iter(fun error->t.on_change(Coordination.Change_consumer_applied(token,raw.request_id,Error error))) error;
+    Option.iter(fun error->t.on_change(Coordination.Change_consumer_applied(token,request_id,Error error))) error;
     output
 ;;
-
-(* Route accepted Worker terminal failures through the same owner as protocol
-   failures. This removes pending/active markers and drains queued hydration;
-   a later completion for the request is then unowned and ignored. *)
-let receive t response = receive_delivery t ~read_result:None ~origin:None response
 
 let receive_worker_read ?resync_generation ?origin t ~request_id result =
   match result with
@@ -2895,48 +2862,7 @@ let receive_worker_read ?resync_generation ?origin t ~request_id result =
        let generation=Option.value t.change_generation ~default:"" in
        dispatch_output t (rehydrate_current_interests t ~request_generation ~generation)
      | _ -> responses[response(Rejected(Projection_failure reason))])
-  | _ ->
-  let outcome =
-    match result with
-    | Changes_resync _ | Changes_retired -> Protocol.V2_failed
-      {code="invalidRequest";message="The change continuation was retired"}
-    | Read_failed { code; message } -> Protocol.V2_failed { code = Error.code_string code; message }
-    | Changes_acknowledged ack -> Protocol.V2_changes_acknowledged
-        { generation=Worker.change_ack_generation ack; through=Worker.change_ack_through ack }
-    | Query_result (query, value) ->
-      (match query with
-       | Worker.Graph_info -> Protocol.V2_graph_info_outcome
-           { graph_uuid=value.graph_uuid;graph_name=value.graph_name;schema=value.schema;
-             admission_facts=value.admission_facts;journal_title_format=value.journal_title_format;
-             limits=value.limits;generation=value.generation;projection_revision=value.projection_revision }
-       | Admission -> Protocol.V2_admission_outcome value
-       | Page _ -> Protocol.V2_page_outcome value
-       | Outline_block _ -> Protocol.V2_block_outcome value
-       | Task_status_definitions _ -> Protocol.V2_task_status_definitions_outcome value
-       | Tree {page;maximum_depth;_} -> Protocol.V2_page_tree_outcome
-           {page;maximum_depth;items=value.items;next_cursor=None}
-       | Child_members _ -> Protocol.V2_children_outcome
-           {parent=value.parent;revision_scope=value.revision_scope;scope_revision=value.scope_revision;
-             items=value.items;next_cursor=None}
-       | Journals _ -> Protocol.V2_journals_outcome {items=value.items;next_cursor=None}
-       | Block_summary _ -> Protocol.V2_block_summary_outcome
-           {lookup=value.lookup;page=value.page;items=value.items;next_cursor=None;
-             scope_revision=value.scope_revision;generation=value.generation;projection_revision=value.projection_revision}
-       | Task_statuses _ -> Protocol.V2_task_statuses_outcome
-           {property_uuid=value.property_uuid;default_status=value.default_status;items=value.items;next_cursor=None}
-       | Favorites _ -> Protocol.V2_favorites_outcome
-           {favorites_page=value.favorites_page;generation=value.generation;
-             projection_revision=value.projection_revision;items=value.items;next_cursor=None}
-       | Changes _ -> Protocol.V2_changes {generation=value.generation;from_exclusive=value.from_exclusive;
-           through=value.through;windows=value.windows;next=value.next}
-       | Journal _ | Children _ | Assets _ | Asset_descriptors _ ->
-         Protocol.V2_failed {code="invalidRequest";message="The query has no graph business owner"})
-  in
-  receive_delivery
-    t
-    ~read_result:(Some result)
-    ~origin
-    (Protocol.V2_response { api_version = Protocol.api_version; request_id; outcome })
+  | _ -> receive_delivery t ~origin ~request_id result
 ;;
 
 let worker_append t (request:Protocol.request) =
@@ -3000,11 +2926,17 @@ let bind_mutation t request ~presentation ~intent =
        (match Child.bind chain ~index ~round ~intent ~presentation with
         | None->false|Some chain->update_child_root t root chain projection;true))
   | Some pending when pending.delivery=Dispatched ->
+    (match pending.operation with
+     |Mutation_refresh{page;_}->Hashtbl.replace t.page_tree_interests page.Projection.id
+        {page;limit=Worker_pure_data.maximum_page_size}
+     |_->());
     let durable=match pending.durable with
       | Some durable -> {durable with intent;presentation;confirm_readback=true}
       | None -> {intent;presentation;confirm_readback=true;root_request=request;
           submission_recovered=false;acknowledgement_recovered=None;acknowledgement_in_flight=false} in
-    Hashtbl.replace t.pending key {pending with durable=Some durable};true
+    let source_epoch=t.next_request in
+    t.next_request<-Int64.succ t.next_request;
+    Hashtbl.replace t.pending key {pending with durable=Some durable;source_epoch};true
   | _->false
 ;;
 
@@ -3084,7 +3016,9 @@ let receive_mutation t (request:Protocol.request) progress =
     Hashtbl.remove t.pending key;
     dispatch_output t (child_step t root (fun chain->Child.receive chain ~index ~round progress))
   | Some ({durable=Some durable;operation=(Mutation_refresh _ | Delete_mutation _);_} as pending) ->
-    (match progress with
+    if newer_target_point t pending && (match progress with Worker.Confirmed _->true|_->false)
+    then resample_confirmation t ~finished:request.request_id durable
+    else (match progress with
      | Worker.Confirmed confirmation when Worker.confirmation_presentation confirmation=durable.presentation ->
        (match Worker.confirmation_primary confirmation with
         | Worker.Confirmed_block summary ->
@@ -3099,7 +3033,8 @@ let receive_mutation t (request:Protocol.request) progress =
           (match planned.requests with
            | [first]->
              let child=Graph.Uuid.to_string first.request_id in
-             Option.iter(fun pending->Hashtbl.replace t.pending child {pending with durable=Some durable})
+             Option.iter(fun next->Hashtbl.replace t.pending child
+               {next with durable=Some durable;source_epoch=pending.source_epoch})
                (Hashtbl.find_opt t.pending child);
              let planned=dispatch_output t planned in
              let query=match Hashtbl.find_opt t.pending child with
@@ -3123,8 +3058,7 @@ let receive_mutation t (request:Protocol.request) progress =
        let code,message=match error with Worker.Db_error error->Error.code error,Error.message error
          | Service_failed message->Error.Invalid_request,message
          | _->Error.Invalid_request,"The change was rejected." in
-       let output=receive t (Protocol.V2_response{api_version=Protocol.api_version;request_id=request.request_id;
-         outcome=V2_failed{code=Error.code_string code;message}}) in
+       let output=receive_worker_read t ~request_id:request.request_id (Read_failed{code;message}) in
        Hashtbl.replace t.pending key {pending with durable=Some durable};
        List.iter(fun (request:Protocol.request)->let key=Graph.Uuid.to_string request.request_id in
          Option.iter(fun pending->Hashtbl.replace t.pending key {pending with durable=Some durable})
@@ -3173,14 +3107,7 @@ let fail_request t (request : Protocol.request) ~message =
     Hashtbl.remove t.pending(Graph.Uuid.to_string request.request_id);
     responses[response(Child_not_admitted{command;message})]
   | Some{operation=(Child_chain _|Capture_chain _|Child_write _|Child_ack _);_}->mutation_waiting t request message
-  | _->receive
-    t
-    (Protocol.V2_response
-       { api_version = Protocol.api_version
-       ; request_id = request.request_id
-       ; outcome =
-           Protocol.V2_failed { code = Error.code_string Error.Closed_session; message }
-       })
+  | _->receive_worker_read t ~request_id:request.request_id (Read_failed{code=Error.Closed_session;message})
 ;;
 
 let abandon t (request : Protocol.request) =
@@ -3229,7 +3156,7 @@ let reconcile_signal t ~request_generation push =
         [ read
             t
             (Pull_changes { request_generation; generation })
-            (Protocol.V2_pull_changes { generation; after; limit = 256 })
+            (Protocol.V2_pull_changes { generation; after; limit = Worker_pure_data.maximum_page_size })
         ]
     | Worker_pure_data.Resync_required { generation; _ } ->
       rehydrate_current_interests t ~request_generation ~generation

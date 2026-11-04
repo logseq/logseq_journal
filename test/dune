@@ -123,6 +123,7 @@
  (name application_view_test)
  (modules application_view_test)
  (libraries coordination_test_fixture alcotest app
+  logseq_journal.worker_coordination worker_effect_authority
   eio
   logseq_db_types
   logseq_db_worker
@@ -148,6 +149,7 @@
  (libraries coordination_test_fixture alcotest app
   logseq_db_types
   logseq_db_worker
+  logseq_db_worker.contract
   logseq_db_worker.lui
   logseq_journal.worker_coordination
   lui

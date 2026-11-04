@@ -5303,12 +5303,24 @@ let () =
   let only output=match output.R.requests with [request]->request|_->fail "expected one Runtime request" in
   let status_a=F.G.Uuid.of_string "00000002-1615-5853-7700-000000000000" |> Result.get_ok in
   let status_b=F.G.Uuid.of_string "00000002-1827-5820-8200-000000000000" |> Result.get_ok in
+  let issuer,_,_,catalog_session=Coordination_test_fixture.fixture 9901L in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let catalog status=
     let request=R.submit runtime Journal_graph_request.Load_task_statuses |> only in
     let item uuid:F.G.task_status_definition={uuid;title=F.G.Uuid.to_string uuid;ident=None;order="a";checkbox_state=None} in
-    ignore(R.receive runtime(F.P.V2_response{api_version=F.P.api_version;request_id=request.request_id;
-      outcome=V2_task_statuses_outcome{property_uuid=None;default_status=Some status;
-        items=[item status_a;item status_b];next_cursor=None}})) in
+    match R.worker_read runtime request with
+    |Some(R.Read read)->
+      let budget=F.W.read_budget catalog_session ~maximum_items:read.maximum_items ~maximum_bytes:65536 |> Result.get_ok in
+      let operation=F.W.Query(budget,read.query) in
+      ignore(I.request catalog_session ~request_id:(F.W.request_id request.F.P.request_id) operation |> Result.get_ok);
+      (match I.reply catalog_session ~request_id:(F.W.request_id request.F.P.request_id) operation
+        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response
+          (F.P.V2_response{api_version=F.P.api_version;request_id=request.request_id;
+            outcome=V2_task_statuses_outcome{property_uuid=None;default_status=Some status;
+              items=[item status_a;item status_b];next_cursor=None}})) with
+       |Ok(F.W.Answered(Ok value))->ignore(R.receive_worker_read runtime ~request_id:request.request_id (R.Query_result(read.query,value)))
+       |_->failwith "catalog fixture rejected its typed value")
+    |_->failwith "catalog fixture lost its typed query" in
   catalog status_a;
   let command:Journal_graph_projection.capture={mutation_id=fixture.command.mutation_id;
     block_id=fixture.command.block_id;sibling_order=fixture.command.sibling_order;

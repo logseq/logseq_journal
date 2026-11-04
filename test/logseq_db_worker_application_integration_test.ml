@@ -200,12 +200,10 @@ let seed_visible_block ?(record = record) runtime =
 
 let observe_graph_revision runtime projection_revision =
   let request = Runtime.start runtime in
-  Runtime.receive
-    runtime
-    (respond
-       request
+  Read_fixture.receive runtime request
+    (respond request
        (Protocol.V2_graph_info_outcome
-          { graph_uuid = page_uuid
+          { graph_uuid = Read_fixture.W.graph_id Read_fixture.session
           ; graph_name = "Journal"
           ; schema = { major = 1; minor = 0 }
           ; admission_facts = []
@@ -232,10 +230,8 @@ let refresh_private_block_revision runtime revision =
     |> fun output -> only "point block request" output.requests
   in
   ignore
-    (Runtime.receive
-       runtime
-       (respond
-          request
+    (Read_fixture.receive runtime request
+    (respond request
           (Protocol.V2_block_outcome (Worker_pure_data.V2_present_block { value = record; revision }))))
 ;;
 
@@ -274,10 +270,8 @@ let test_admission_inspection_preserves_graph_generation () =
    | V2_inspect_admission -> ()
    | _ -> Alcotest.fail "admission inspection did not use the Worker protocol command");
   let output =
-    Runtime.receive
-      runtime
-      (respond
-         request
+    Read_fixture.receive runtime request
+    (respond request
          (Protocol.V2_admission_outcome
             { active_records = 3
             ; active_bytes = 1536
@@ -356,13 +350,23 @@ let test_status_conflict_refreshes_authoritative_block () =
          })
     |> fun output -> only "status mutation request" output.requests
   in
-  let refresh =
-    Runtime.receive
-      runtime
-      (respond
-         mutation
-         (Protocol.V2_failed
-            { code = "conflict"; message = "The mutation precondition did not match." }))
+  let module W=Read_fixture.W in
+  let module I=Read_fixture.I in
+  let session=Read_fixture.session in
+  let presentation=Option.get(W.selected Read_fixture.projection) in
+  let mutation_id,command=Runtime.worker_mutation runtime mutation |> Option.get in
+  let intent=W.mutation_intent session ~mutation_id command |> Result.get_ok in
+  Alcotest.(check bool) "typed status conflict keeps original intent" true
+    (Runtime.bind_mutation runtime mutation ~presentation ~intent:(W.Mutation_intent intent));
+  let operation=W.Mutate intent in
+  let request_id=W.request_id mutation.Protocol.request_id in
+  ignore(I.request session ~request_id operation |> Result.get_ok);
+  let progress=match I.reply session ~request_id operation
+    (Read_fixture.S.Coordination_mutation_result{request_id=mutation.request_id;
+      outcome=Logseq_db_worker_contract.Mutation_pure_wire.Rejected
+        (respond mutation (Protocol.V2_failed{code="conflict";message="The mutation precondition did not match."}))}) with
+    |Ok(W.Answered(Ok progress))->progress|_->Alcotest.fail "known conflict proof was not decoded" in
+  let refresh = Runtime.receive_mutation runtime mutation progress
     |> fun output -> only "status conflict refresh" output.requests
   in
   let output =
@@ -374,7 +378,7 @@ let test_status_conflict_refreshes_authoritative_block () =
          generation="graph-1";projection_revision="projection-2"}))
   in
   match output.responses with
-  | [ { Runtime.payload = Update_conflict {block=latest;_} } ] ->
+  | [ { Runtime.payload = Mutation_settled(_,_,Update_conflict {block=latest;_}) } ] ->
     Alcotest.(check string)
       "authoritative conflict revision"
       "block-2"
@@ -430,10 +434,8 @@ let seed_parent_children_interest runtime =
     |> fun output -> only "detail block request" output.requests
   in
   let children_request =
-    Runtime.receive
-      runtime
-      (respond
-         block_request
+    Read_fixture.receive runtime block_request
+    (respond block_request
          (Protocol.V2_block_outcome
             (Worker_pure_data.V2_present_block { value = record; revision = "block-detail-1" })))
     |> fun output -> only "detail children request" output.requests
@@ -550,16 +552,14 @@ let test_uninterested_change_is_acknowledged_without_hydration () =
   in
   let unrelated = uuid "a2000000-0000-4000-9000-000000000099" in
   let output =
-    Runtime.receive
-      runtime
-      (respond
-         pull
+    Read_fixture.receive runtime pull
+    (respond pull
          (Protocol.V2_changes
             { generation = "generation-1"
             ; from_exclusive = None
             ; through = "revision-2"
             ; windows =
-                [ { id = "change-1"
+                [ { id = "revision-2"
                   ; predecessor = "revision-1"
                   ; successor = "revision-2"
                   ; block_uuids = [ unrelated ]
@@ -711,16 +711,14 @@ let test_point_read_tag_metadata () =
          |> fun output -> only "change request" output.requests
        in
        let hydrated =
-         Runtime.receive
-           runtime
-           (respond
-              pull
+         Read_fixture.receive runtime pull
+    (respond pull
               (V2_changes
                  { generation = "generation-1"
                  ; from_exclusive = None
                  ; through = "revision-2"
                  ; windows =
-                     [ { id = "change-1"
+                     [ { id = "revision-2"
                        ; predecessor = "revision-1"
                        ; successor = "revision-2"
                        ; block_uuids = [ block_uuid ]
@@ -750,10 +748,8 @@ let test_point_read_tag_metadata () =
          }
        in
        let output =
-         Runtime.receive
-           runtime
-           (respond
-              point
+         Read_fixture.receive runtime point
+    (respond point
               (V2_block_outcome
                  (Worker_pure_data.V2_present_block { value = updated; revision = "block-2" })))
        in

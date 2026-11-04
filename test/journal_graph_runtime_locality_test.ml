@@ -70,12 +70,11 @@ module Worker_producer = struct
     match Production_runtime.worker_read runtime request with
     | Some (Production_runtime.Read read) ->
       let operation = W.Query (budget read.maximum_items, read.query) in
-      ignore
-        (I.request
-           session
-           ~request_id:(W.request_id request.Protocol.request_id)
-           operation
-         |> Result.get_ok);
+      (match I.request session ~request_id:(W.request_id request.Protocol.request_id) operation with
+       |Ok _->()
+       |Error(W.Invalid_input message|Protocol_mismatch message|Service_failed message)->failwith message
+       |Error(W.Db_error error)->failwith(Logseq_db_worker.Error.message error)
+       |Error _->failwith "Fixture query admission was rejected");
       (match
          I.reply
            session
@@ -104,7 +103,24 @@ module Worker_producer = struct
            runtime
            request
            ~message:"Typed fixture response rejected")
-    | _ -> Production_runtime.receive runtime raw
+    |Some(Production_runtime.Acknowledge{batch})->
+      let operation=W.Acknowledge_changes batch in
+      ignore(I.request session ~request_id:(W.request_id request.Protocol.request_id) operation |> Result.get_ok);
+      (match I.reply session ~request_id:(W.request_id request.request_id) operation (S.Graph_response raw) with
+       |Ok(W.Answered(Ok ack))->Production_runtime.receive_worker_read runtime ~request_id:request.request_id
+           (Production_runtime.Changes_acknowledged ack)
+       |_->failwith "Typed change ACK fixture rejected its original batch")
+    |Some(Production_runtime.Unowned_read _)->
+      Production_runtime.fail_request runtime request ~message:"Unowned fixture completion"
+    | _ ->
+      (match raw with
+       | Protocol.V2_response{outcome=V2_failed{code;message};_}->
+         Production_runtime.receive_worker_read runtime ~request_id:request.request_id
+           (Production_runtime.Read_failed{code=Option.value(Logseq_db_worker.Error.code_of_string code)
+             ~default:Logseq_db_worker.Error.Invalid_request;message})
+       | _ when Protocol.is_snapshot_read request.command ->
+         Production_runtime.fail_request runtime request ~message:"Retired fixture completion"
+       | _->failwith "A raw mutation fixture must use its typed mutation lifecycle")
   ;;
 end
 
@@ -161,7 +177,10 @@ module Runtime = struct
     | Some command, Protocol.V2_failed _ ->
       Worker_producer.receive runtime
         {Protocol.api_version=Protocol.api_version;request_id=envelope.request_id;command} raw
-    | _ -> Production_runtime.receive runtime raw)
+    | Some command,_ -> Worker_producer.receive runtime
+        {Protocol.api_version=Protocol.api_version;request_id=envelope.request_id;command} raw
+    | None,_ -> Production_runtime.receive_worker_read runtime ~request_id:envelope.request_id
+        (Production_runtime.Read_failed{code=Logseq_db_worker.Error.Invalid_request;message="Unowned fixture completion"}))
     |> Worker_producer.wire_output runtime
 
   let submit runtime request =
@@ -289,21 +308,22 @@ let pull runtime =
 
 let changed runtime window =
   let request = pull runtime in
+  let after=match request.command with Protocol.V2_pull_changes{after;_}->after|_->assert false in
   Runtime.receive
     runtime
     (response
        request
        (Protocol.V2_changes
           { generation = "generation-1"
-          ; from_exclusive = Some "revision-1"
-          ; through = "revision-2"
+          ; from_exclusive = after
+          ; through = window.Worker_pure_data.id
           ; windows = [ window ]
           ; next = None
           }))
 ;;
 
 let window ?(blocks = []) ?(pages = []) ?(scopes = []) () : Worker_pure_data.change_window =
-  { id = "change-1"
+  { id = "revision-2"
   ; predecessor = "revision-1"
   ; successor = "revision-2"
   ; block_uuids = blocks
@@ -443,7 +463,7 @@ let test_large_changes_are_bounded fail_one =
             ; next = None
             ; windows =
                 [ { (window ~blocks:(ids later) ()) with
-                    id = "change-2"
+                    id = "revision-3"
                   ; predecessor = "revision-2"
                   ; successor = "revision-3"
                   }
@@ -1323,7 +1343,7 @@ type refresh_result =
   | Missing
   | Cursor_failed
 
-let prepare_paged_refresh ?(ordinary=false) ?(defer=false) kind =
+let prepare_unbound_mutation ?(ordinary=false) kind =
   let page=if ordinary then {page with kind=Ordinary_page;name="ordinary";title="Ordinary"} else page in
   let runtime = Runtime.create ~localtime:Unix.gmtime () in
   let sampler =
@@ -1395,49 +1415,133 @@ let prepare_paged_refresh ?(ordinary=false) ?(defer=false) kind =
       in
       page, Runtime.submit runtime command |> next "target mutation"
   in
-  let refresh = if defer then mutation else
-    receive
-      mutation
-      (match kind with
-       | Task_change ->
-         V2_mutation_committed
-           { mutation_id
-           ; status = Worker_pure_data.V2_applied
-           ; generation = "graph-1"
-           ; before_projection_revision = "projection-1"
-           ; after_projection_revision = "projection-2"
-           }
-       | Task_conflict | Delete_conflict ->
-         V2_failed
-           { code = Logseq_db_worker.Error.code_string Conflict
-           ; message = "Concurrent target change"
-           })
-    |> next "post-mutation refresh"
-  in
-  runtime, page, refresh
+  runtime, page, mutation
 ;;
 
-let summary_response request page lookup children next_cursor revision =
-  response
-    request
-    (Protocol.V2_block_summary_outcome
-       { lookup
-       ; page = Some (Worker_pure_data.V2_present_page { page; revision = "page-1" })
-       ; items = children
-       ; next_cursor
-       ; scope_revision = "target-children-1"
-       ; generation = "graph-1"
-       ; projection_revision = revision
-       })
+module Target_fixture = struct
+  module W=Worker_producer.W
+  module I=Worker_producer.I
+  module S=Worker_producer.S
+  let session=Worker_producer.session
+  let presentation=Option.get(W.selected Worker_producer.projection)
+  type t=Pending :
+    { original:Protocol.request
+    ; operation:'a W.request
+    ; proof:(W.presentation * W.receipt) option
+    ; deliver:'a W.reply -> Production_runtime.output
+    } -> t
+
+  let failure = function
+    |W.Db_error error->Logseq_db_worker.Error.code error,Logseq_db_worker.Error.message error
+    |Stale_read message->Logseq_db_worker.Error.Stale_read_cursor,message
+    |Service_failed message|Invalid_input message|Protocol_mismatch message->Logseq_db_worker.Error.Invalid_request,message
+    |_->Logseq_db_worker.Error.Closed_session,"The typed target read was interrupted."
+
+  let query ?proof runtime original = match Production_runtime.worker_read runtime original with
+    |Some(Production_runtime.Read read)->
+      let budget=Worker_producer.budget read.maximum_items in
+      Pending{original;operation=W.Query(budget,read.query);proof;deliver=(function
+        |W.Answered(Ok value)->Production_runtime.receive_worker_read ~origin:(session,budget)
+            runtime ~request_id:original.request_id (Production_runtime.Query_result(read.query,value))
+        |Answered(Error error)->let code,message=failure error in
+          Production_runtime.receive_worker_read runtime ~request_id:original.request_id (Production_runtime.Read_failed{code;message})
+        |_->Production_runtime.fail_request runtime original ~message:"Typed target query did not complete")}
+    |Some(Production_runtime.Confirm_readback read)->
+      (* A fresh snapshot retry is still a Confirm of the original intent. *)
+      let presentation,receipt=Option.get proof in
+      Alcotest.(check bool) "snapshot retry retains original typed intent" true
+        (W.encode_durable_intent(W.receipt_intent receipt)=W.encode_durable_intent read.intent
+         && presentation=read.presentation);
+      let complete result=Production_runtime.receive_worker_read runtime ~request_id:original.request_id result in
+      Pending{original;operation=W.Confirm(read.presentation,receipt);proof;deliver=(function
+        |W.Answered(Ok(W.Confirmed confirmation))->
+          (match W.confirmation_primary confirmation with
+           |Confirmed_block value->complete(Production_runtime.Query_result(read.query,value))
+           |_->complete(Production_runtime.Read_failed{code=Logseq_db_worker.Error.Invalid_request;message="The canonical mutation target is unavailable."}))
+        |Answered(Error error)->let code,message=failure error in complete(Production_runtime.Read_failed{code;message})
+        |_->Production_runtime.fail_request runtime original ~message:"The original confirmation is still pending.")}
+    |_->failwith "Target continuation must be an original typed read"
+
+  let send (Pending pending) outcome =
+    let request_id=W.request_id pending.original.request_id in
+    ignore(I.request session ~request_id pending.operation |> Result.get_ok);
+    let response=S.Graph_response(Protocol.V2_response{api_version=Protocol.api_version;
+      request_id=pending.original.request_id;outcome}) in
+    let reply=match I.reply session ~request_id pending.operation response with
+      |Ok reply->reply|Error error->W.Answered(Error error) in
+    pending.deliver reply
+
+  let mutation runtime original outcome =
+    let mutation_id,command=Production_runtime.worker_mutation runtime original |> Option.get in
+    let intent=W.mutation_intent session ~mutation_id command |> Result.get_ok in
+    Alcotest.(check bool) "original typed target intent binds before execution" true
+      (Production_runtime.bind_mutation runtime original ~presentation ~intent:(W.Mutation_intent intent));
+    let request_id=W.request_id original.Protocol.request_id in
+    let operation=W.Mutate intent in
+    ignore(I.request session ~request_id operation |> Result.get_ok);
+    match I.reply session ~request_id operation
+      (S.Coordination_mutation_result{request_id=original.request_id;outcome}) with
+    |Ok(W.Answered(Ok progress))->intent,progress
+    |_->failwith "Original typed mutation proof was rejected"
+
+  let committed runtime original =
+    let mutation_id,_=Production_runtime.worker_mutation runtime original |> Option.get in
+    let _,progress=mutation runtime original
+      (Logseq_db_worker_contract.Mutation_pure_wire.Committed
+        (Protocol.V2_response{api_version=Protocol.api_version;request_id=original.request_id;
+          outcome=V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;
+            generation="generation:v1:1:1";before_projection_revision="projection:v1:1";
+            after_projection_revision="projection:v1:2"}})) in
+    let receipt=match progress with W.Committed_pending_presentation receipt->receipt|_->assert false in
+    Pending{original;operation=W.Confirm(presentation,receipt);proof=Some(presentation,receipt);deliver=(function
+      |W.Answered(Ok progress)->Production_runtime.receive_mutation runtime original progress
+      |Answered(Error error)->let _,message=failure error in Production_runtime.mutation_waiting runtime original message
+      |_->Production_runtime.mutation_waiting runtime original "Original confirmation is pending.")}
+
+  let rejected runtime original =
+    let _,progress=mutation runtime original
+      (Logseq_db_worker_contract.Mutation_pure_wire.Rejected
+        (Protocol.V2_response{api_version=Protocol.api_version;request_id=original.request_id;
+          outcome=V2_failed{code="conflict";message="Concurrent target change"}})) in
+    let output=Production_runtime.receive_mutation runtime original progress in
+    query runtime (only "post-rejection typed target read" output.requests)
+
+  let summary pending page lookup children next_cursor revision =
+    send pending (Protocol.V2_block_summary_outcome
+      {lookup;page=Some(Worker_pure_data.V2_present_page{page;revision="page-1"});items=children;
+       next_cursor;scope_revision="target-children-1";generation="graph-1";projection_revision=revision})
+
+  let next runtime (Pending previous) label output=query ?proof:previous.proof runtime (only label output.Production_runtime.requests)
+  let original(Pending pending)=pending.original
+  (* Inspect the actual UI projection while leaving the durable settlement and
+     its original proof intact in the output consumed by the application. *)
+  let payload (response:Production_runtime.response)=match response.payload with
+    |Mutation_settled(_,_,payload)->payload
+    |payload->payload
+end
+
+let prepare_paged_refresh kind =
+  let runtime,page,mutation=prepare_unbound_mutation kind in
+  let target=match kind with
+    |Task_change->Target_fixture.committed runtime mutation
+    |Task_conflict|Delete_conflict->Target_fixture.rejected runtime mutation in
+  runtime,page,target
 ;;
 
-let check_target_summary (request : Protocol.request) cursor =
-  match request.command with
-  | V2_get_outline_block_summary { block; limit; cursor = actual_cursor } ->
-    Alcotest.(check bool) "target identity" true (Graph.Uuid.equal block block_uuid);
-    Alcotest.(check int) "bounded target children" Worker_pure_data.default_page_size limit;
-    Alcotest.(check bool) "target children cursor" true (actual_cursor = cursor)
-  | _ -> Alcotest.fail "confirmation must issue one canonical target read"
+
+let check_target_summary (Target_fixture.Pending pending) cursor =
+  let module W=Target_fixture.W in
+  match pending.operation with
+  |W.Confirm _->Alcotest.(check bool) "first target uses its original typed Confirm" true (cursor=None)
+  |W.Query _->
+    (match Target_fixture.I.request Target_fixture.session
+      ~request_id:(W.request_id pending.original.request_id) pending.operation with
+     |Ok(Target_fixture.S.Coordination_query{request={command=V2_get_outline_block_summary{block;limit;cursor=actual};_};_})->
+       Alcotest.(check bool) "target identity" true(Graph.Uuid.equal block block_uuid);
+       Alcotest.(check int) "bounded target children" Worker_pure_data.default_page_size limit;
+       Alcotest.(check bool) "target children cursor" true(actual=cursor)
+     |_->Alcotest.fail "target must use the original typed summary query")
+  |_->Alcotest.fail "target confirmation used another operation"
 ;;
 
 let test_paged_mutation_refresh kind result =
@@ -1454,48 +1558,36 @@ let test_paged_mutation_refresh kind result =
     let completed =
       match result with
       | Found ->
-        Runtime.receive
-          runtime
-          (summary_response refresh page lookup [] None "projection-2")
+        Target_fixture.summary refresh page lookup [] None "projection-2"
       | Missing ->
-        Runtime.receive
-          runtime
-          (summary_response
+        Target_fixture.summary
              refresh
              page
              (Worker_pure_data.V2_missing_block { uuid = block_uuid; revision = "missing-2" })
              []
              None
-             "projection-2")
+             "projection-2"
+      | Cursor_failed when kind=Task_change ->
+        Target_fixture.send refresh (Protocol.V2_failed{code="staleReadCursor";message="Concurrent target change"})
       | Cursor_failed ->
         let current = ref refresh in
         for _ = 1 to 2 do
-          current
-          := Runtime.receive
-               runtime
-               (response
-                  !current
-                  (V2_failed
-                     { code = Logseq_db_worker.Error.code_string Stale_read_cursor
-                     ; message = "Concurrent target change"
-                     }))
-             |> fun output -> only "bounded canonical retry" output.requests
+          current := Target_fixture.send !current
+            (Protocol.V2_failed{code="staleReadCursor";message="Concurrent target change"})
+            |> Target_fixture.next runtime !current "bounded canonical retry"
         done;
-        Runtime.receive
-          runtime
-          (response
-             !current
-             (V2_failed
-                { code = Logseq_db_worker.Error.code_string Stale_read_cursor
-                ; message = "Concurrent target change"
-                }))
+        Target_fixture.send !current
+          (Protocol.V2_failed{code="staleReadCursor";message="Concurrent target change"})
     in
-    Alcotest.(check int)
-      "target terminal confirmation stops reading"
-      0
-      (List.length completed.requests);
-    match
-      result, kind, (only "owned canonical target terminal" completed.responses).payload
+    if kind=Task_change && result=Cursor_failed then (
+      Alcotest.(check bool) "failed confirmation retains original intent" true
+        (Runtime.pending_mutation runtime ~mutation_id:"a1000000-0000-4000-a000-000000000021"<>None);
+      Alcotest.(check bool) "failed confirmation does not settle or ACK" false
+        (List.exists(fun response->match response.Runtime.payload with Mutation_settled _->true|_->false)completed.responses))
+    else Alcotest.(check int) "target terminal confirmation stops reading" 0(List.length completed.requests);
+    if kind=Task_change && result=Cursor_failed then () else match
+      result, kind, (match (only "owned canonical target terminal" completed.responses).payload with
+       |Mutation_settled(_,_,payload)->payload|payload->payload)
     with
     | Found, Task_change, Block_updated { block; _ } ->
       Alcotest.(check string)
@@ -1512,6 +1604,8 @@ let test_paged_mutation_refresh kind result =
       Alcotest.(check string) "canonical conflicted target"
         "Committed target" (Journal_model.source actual)
     | Missing, Delete_conflict, Subtree_deleted {deleted_count=Some 0;_} -> ()
+    | Missing, Task_change, Block_removed _ -> ()
+    | Cursor_failed, Task_change, _ -> ()
     | Missing, _, Mutation_failed _ -> ()
     | _ -> Alcotest.fail "unexpected canonical mutation completion")
 ;;
@@ -1523,7 +1617,8 @@ let test_paged_mutation_refresh kind result =
 let test_ordinary_delete_readback committed paged () =
   let module W=Worker_producer.W in
   let module I=Worker_producer.I in
-  let runtime,page,request=prepare_paged_refresh ~ordinary:true ~defer:committed Delete_conflict in
+  let runtime,page,request=prepare_unbound_mutation ~ordinary:true Delete_conflict in
+  let request=if committed then request else Target_fixture.original(Target_fixture.rejected runtime request) in
   let target={record with block={block with page=page.uuid;parent=page.uuid;title="Ordinary canonical target"}} in
   let lookup=Worker_pure_data.V2_present_block{value=target;revision="canonical-current"} in
   let summary request_id cursor=Protocol.V2_response{api_version=Protocol.api_version;request_id;
@@ -1558,10 +1653,10 @@ let test_ordinary_delete_readback committed paged () =
         (List.exists(fun r->match r.Production_runtime.payload with Mutation_settled _->true|_->false)output.responses);
       let more=only "ordinary canonical More remains typed" output.requests in
       Worker_producer.receive runtime more(summary more.request_id None)) else output)
-    else Runtime.receive runtime(summary request.request_id None) in
+    else Worker_producer.receive runtime request(summary request.request_id None) in
   let current=List.find_map(fun response->match response.Runtime.payload with
     | Mutation_settled(_,_,Delete_reappeared{block;timeline_entry_update=None}) when committed->Some block
-    | Delete_conflict{block;timeline_entry_update=None} when not committed->Some block
+    | Mutation_settled(_,_,Delete_conflict{block;timeline_entry_update=None}) when not committed->Some block
     | _->None)output.responses in
   match current with
   | Some block->
@@ -1573,27 +1668,25 @@ let test_ordinary_delete_readback committed paged () =
 let test_conflict_missing_after_empty_more changed_version () =
   let runtime, page, first = prepare_paged_refresh Delete_conflict in
   let cursor = Graph.Cursor.of_string "empty-present-prefix" |> Result.get_ok in
-  let prefix = Runtime.receive runtime
-    (summary_response first page (Worker_pure_data.V2_present_block {value=record;revision="target-2"})
-      [] (Some cursor) "projection-2") in
-  let next = only "empty More target continuation" prefix.requests in
-  let missing request revision = summary_response request page
+  let prefix = Target_fixture.summary first page (Worker_pure_data.V2_present_block {value=record;revision="target-2"})
+      [] (Some cursor) "projection-2" in
+  let next = Target_fixture.next runtime first "empty More target continuation" prefix in
+  let missing request revision = Target_fixture.summary request page
     (Worker_pure_data.V2_missing_block {uuid=block_uuid;revision="missing-2"}) [] None revision in
-  let output = Runtime.receive runtime
-    (missing next (if changed_version then "projection-3" else "projection-2")) in
+  let output = missing next (if changed_version then "projection-3" else "projection-2") in
   if changed_version then (
     Alcotest.(check int) "version change cannot confirm continuation absence" 0
       (List.length output.responses);
-    let fresh = only "fresh target read after version change" output.requests in
+    let fresh = Target_fixture.next runtime next "fresh target read after version change" output in
     check_target_summary fresh None;
-    let final = Runtime.receive runtime (missing fresh "projection-3") in
-    match (only "fresh complete absence" final.responses).payload with
+    let final = missing fresh "projection-3" in
+    match (Target_fixture.payload (only "fresh complete absence" final.responses)) with
     | Subtree_deleted {deleted_count=Some 0;_} -> ()
     | _ -> Alcotest.fail "fresh authoritative absence was not accepted")
   else (
     Alcotest.(check int) "contradictory chain does not continue" 0
       (List.length output.requests);
-    match (only "contradictory target response" output.responses).payload with
+    match (Target_fixture.payload (only "contradictory target response" output.responses)) with
     | Mutation_failed _ -> ()
     | _ -> Alcotest.fail "same-version present prefix became successful absence")
 ;;
@@ -1608,23 +1701,21 @@ let target_refresh = function
 ;;
 
 let test_target_summary_uses_owned_worker_query () =
-  let runtime, _, request = target_refresh `Status in
+  let runtime,page,confirmation=target_refresh `Status in
+  check_target_summary confirmation None;
+  let value={record with block={block with parent=page.uuid;page=page.uuid}} in
+  let output=Target_fixture.summary confirmation page
+    (Worker_pure_data.V2_present_block{value;revision="canonical-2"}) []
+    (Some(Graph.Cursor.of_string "owned-summary-next" |> Result.get_ok)) "projection-2" in
+  let request=only "actual confirmed More" output.requests in
   (match Production_runtime.worker_read runtime request with
-   | Some
-       (Production_runtime.Read
-          { query = Journal_worker_coordination.Worker_api.Block_summary _
-          ; maximum_items
-          ; _
-          }) ->
-     Alcotest.(check int)
-       "retained summary budget"
-       Worker_pure_data.default_page_size
-       maximum_items
-   | _ -> Alcotest.fail "canonical summary bypasses typed coordinator");
-  ignore (Production_runtime.abandon runtime request);
+   |Some(Production_runtime.Read{query=Journal_worker_coordination.Worker_api.Block_summary{after=Some _;_};maximum_items})->
+     Alcotest.(check int) "retained summary budget" Worker_pure_data.default_page_size maximum_items
+   |_->Alcotest.fail "canonical More bypasses typed coordinator");
+  Production_runtime.abandon runtime request;
   match Production_runtime.worker_read runtime request with
-  | Some (Production_runtime.Unowned_read _) -> ()
-  | _ -> Alcotest.fail "retired summary falls back to legacy transport"
+  |Some(Production_runtime.Unowned_read _)->()
+  |_->Alcotest.fail "retired summary falls back to legacy transport"
 ;;
 
 let summary_children ?(page = page_uuid) count =
@@ -1642,7 +1733,7 @@ let summary_children ?(page = page_uuid) count =
 ;;
 
 let test_target_confirmation kind title count =
-  let runtime, page, refresh = target_refresh kind in
+  let _runtime, page, refresh = target_refresh kind in
   check_target_summary refresh None;
   let canonical =
     { record with
@@ -1651,21 +1742,19 @@ let test_target_confirmation kind title count =
   in
   let children = summary_children ~page:page.uuid count in
   let complete =
-    Runtime.receive
-      runtime
-      (summary_response
+    Target_fixture.summary
          refresh
          page
          (Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" })
          children
          None
-         "projection-2")
+         "projection-2"
   in
   Alcotest.(check int)
     "target completion does not read siblings"
     0
     (List.length complete.requests);
-  let payload = (only "target completion" complete.responses).payload in
+  let payload = (Target_fixture.payload (only "target completion" complete.responses)) in
   let actual, entry =
     match kind, payload with
     | `Status, Runtime.Block_updated { block; timeline_entry_update } ->
@@ -1685,18 +1774,7 @@ let test_target_confirmation kind title count =
        (min 3 count)
        (List.length entry.child_summaries)
    | None -> Alcotest.(check string) "blank root is not fabricated as visible" "" title);
-  let duplicate =
-    Runtime.receive
-      runtime
-      (summary_response
-         refresh
-         page
-         (Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" })
-         children
-         None
-         "projection-2")
-  in
-  Alcotest.(check int) "completion is consumed once" 0 (List.length duplicate.responses)
+
 ;;
 
 let test_target_children_continue () =
@@ -1732,9 +1810,7 @@ let test_target_children_continue () =
            |> Result.get_ok)
     in
     let output =
-      Runtime.receive
-        runtime
-        (summary_response !current page lookup items cursor "projection-2")
+      Target_fixture.summary !current page lookup items cursor "projection-2"
     in
     if batch < 4
     then (
@@ -1742,11 +1818,11 @@ let test_target_children_continue () =
         "partial target children do not complete Status"
         0
         (List.length output.responses);
-      current := only "target child continuation" output.requests;
+      current := Target_fixture.next runtime !current "target child continuation" output;
       previous_cursor := cursor)
     else completion := output
   done;
-  match (only "all canonical children" !completion.responses).payload with
+  match (Target_fixture.payload (only "all canonical children" !completion.responses)) with
   | Block_updated { block; timeline_entry_update = Some entry } ->
     Alcotest.(check int)
       "child count is not truncated"
@@ -1770,64 +1846,45 @@ let test_target_repeated_cursor_settles () =
   in
   let cursor = Some (Graph.Cursor.of_string "nonadvancing-summary" |> Result.get_ok) in
   let page request =
-    Runtime.receive
-      runtime
-      (summary_response request page lookup [] cursor "projection-2")
+    Target_fixture.summary request page lookup [] cursor "projection-2"
   in
-  let next = page first |> fun o -> only "summary continuation" o.requests in
+  let next = page first |> Target_fixture.next runtime first "summary continuation" in
   let output = page next in
   Alcotest.(check int)
     "nonadvancing summary cannot continue"
     0
     (List.length output.requests);
-  match (only "summary failure remains owned" output.responses).payload with
-  | Runtime.Mutation_failed { kind = Status_mutation; _ } -> ()
+  match (Target_fixture.payload (only "summary failure remains owned" output.responses)) with
+  | Runtime.Mutation_waiting _ ->
+    Alcotest.(check bool) "nonadvancing More preserves original intent" true
+      (Runtime.pending_mutation runtime ~mutation_id:"a1000000-0000-4000-a000-000000000021"<>None)
   | _ -> Alcotest.fail "nonadvancing summary lost mutation owner"
 ;;
 
 let test_target_terminal kind terminal =
-  let runtime, page, refresh = target_refresh kind in
-  check_target_summary refresh None;
-  let completion =
-    match terminal with
-    | `Missing ->
-      summary_response
-        refresh
-        page
-        (Worker_pure_data.V2_missing_block { uuid = block_uuid; revision = "missing" })
-        []
-        None
-        "projection-2"
-    | `Failure ->
-      response
-        refresh
-        (Protocol.V2_failed { code = "ClosedSession"; message = "read unavailable" })
-    | `Reset ->
-      Runtime.reset runtime;
-      summary_response
-        refresh
-        page
-        (Worker_pure_data.V2_missing_block { uuid = block_uuid; revision = "missing" })
-        []
-        None
-        "projection-2"
-  in
-  let output = Runtime.receive runtime completion in
-  if terminal = `Reset
-  then
-    Alcotest.(check int) "old graph completion ignored" 0 (List.length output.responses)
-  else (
-    match (only "owned target failure" output.responses).payload with
-    | Runtime.Mutation_failed { kind = actual; block_id; _ } ->
-      Alcotest.(check bool)
-        "mutation kind preserved"
-        true
-        (actual=Status_mutation);
-      Alcotest.(check string)
-        "mutation block identity"
-        (Graph.Uuid.to_string block_uuid)
-        block_id
-    | _ -> Alcotest.fail "target failure lost admitted mutation identity")
+  let runtime,page,target=target_refresh kind in
+  check_target_summary target None;
+  let original=Target_fixture.original target in
+  let output=match terminal with
+    |`Missing->Target_fixture.summary target page
+      (Worker_pure_data.V2_missing_block{uuid=block_uuid;revision="missing"}) [] None "projection-2"
+    |`Failure->Target_fixture.send target (Protocol.V2_failed{code="closedSession";message="read unavailable"})
+    |`Reset->Runtime.reset runtime;Target_fixture.summary target page
+      (Worker_pure_data.V2_missing_block{uuid=block_uuid;revision="missing"}) [] None "projection-2" in
+  match terminal with
+  |`Reset->Alcotest.(check int) "old graph completion ignored" 0(List.length output.responses)
+  |`Missing->
+    (match (only "canonical absence is settled" output.responses).payload with
+     |Mutation_settled(_,_,Block_removed{block_id})->
+       Alcotest.(check string) "canonical absence retains target identity" (Graph.Uuid.to_string block_uuid) block_id
+     |_->Alcotest.fail "canonical absence lost original durable ownership")
+  |`Failure->
+    Alcotest.(check bool) "confirmation failure preserves the original intent" true
+      (Runtime.pending_mutation runtime ~mutation_id:"a1000000-0000-4000-a000-000000000021"<>None);
+    Alcotest.(check bool) "confirmation failure does not pretend to settle or ACK" false
+      (List.exists(fun response->match response.Runtime.payload with Mutation_settled _->true|_->false)output.responses);
+    List.iter(fun (request:Protocol.request)->Alcotest.(check bool) "safe recovery retains original immutable payload" true
+      (request=original))output.requests
 ;;
 
 let test_target_version_fence () =
@@ -1841,32 +1898,28 @@ let test_target_version_fence () =
   in
   let cursor = Graph.Cursor.of_string "target-children-next" |> Result.get_ok in
   let first =
-    Runtime.receive
-      runtime
-      (summary_response
+    Target_fixture.summary
          refresh
          page
          lookup
          (summary_children ~page:page.uuid Worker_pure_data.default_page_size)
          (Some cursor)
-         "projection-2")
+         "projection-2"
   in
-  let continuation = only "target child continuation" first.requests in
+  let continuation = Target_fixture.next runtime refresh "target child continuation" first in
   let result =
-    Runtime.receive
-      runtime
-      (summary_response continuation page lookup [] None "projection-3")
+    Target_fixture.summary continuation page lookup [] None "projection-3"
   in
   Alcotest.(check bool)
     "different snapshots cannot complete mixed Status"
     false
     (List.exists
        (fun value ->
-          match value.Runtime.payload with
+          match Target_fixture.payload value with
           | Block_updated _ -> true
           | _ -> false)
        result.responses);
-  let retry = only "fresh canonical target retry" result.requests in
+  let retry = Target_fixture.next runtime continuation "fresh canonical target retry" result in
   check_target_summary retry None
 ;;
 
@@ -1874,9 +1927,7 @@ let test_target_rejects_wrong_identity () =
   let runtime, page, refresh = target_refresh `Status in
   check_target_summary refresh None;
   let output =
-    Runtime.receive
-      runtime
-      (summary_response
+    Target_fixture.summary
          refresh
          page
          (Worker_pure_data.V2_present_block
@@ -1885,11 +1936,13 @@ let test_target_rejects_wrong_identity () =
             })
          []
          None
-         "projection-2")
+         "projection-2"
   in
-  match (only "foreign target failure" output.responses).payload with
-  | Runtime.Mutation_failed _ -> ()
-  | _ -> Alcotest.fail "foreign canonical block cannot confirm admitted target"
+  Alcotest.(check bool) "foreign canonical data never becomes an applied projection" false
+    (List.exists(fun response->match response.Runtime.payload with Block_updated _|Mutation_settled _->true|_->false)output.responses);
+  Alcotest.(check bool) "rejected canonical identity preserves original durable intent" true
+    (Runtime.pending_mutation runtime ~mutation_id:"a1000000-0000-4000-a000-000000000021"<>None)
+
 ;;
 
 let asset_type_property : Graph.property_summary =
@@ -1905,7 +1958,7 @@ let asset_type_property : Graph.property_summary =
 let test_target_blank_image_and_deep_child () =
   List.iter
     (fun child_target ->
-       let runtime, page, refresh = target_refresh `Status in
+       let _runtime, page, refresh = target_refresh `Status in
        check_target_summary refresh None;
        let canonical =
          { record with
@@ -1927,18 +1980,16 @@ let test_target_blank_image_and_deep_child () =
          }
        in
        let output =
-         Runtime.receive
-           runtime
-           (summary_response
+         Target_fixture.summary
               refresh
               page
               (Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" })
               [ image ]
               None
-              "projection-2")
+              "projection-2"
        in
        match
-         (only "canonical blank/image or deep child completion" output.responses).payload
+         (Target_fixture.payload (only "canonical blank/image or deep child completion" output.responses))
        with
        | Runtime.Block_updated { block; timeline_entry_update } ->
          Alcotest.(check int)
@@ -1954,89 +2005,81 @@ let test_target_blank_image_and_deep_child () =
 ;;
 
 let test_target_stale_recovery_is_bounded () =
-  let runtime, _, refresh = target_refresh `Status in
-  check_target_summary refresh None;
-  let stale request =
-    response
-      request
-      (Protocol.V2_failed { code = "staleReadCursor"; message = "Concurrent projection" })
-  in
-  let current = ref refresh in
-  for _ = 1 to 2 do
-    let output = Runtime.receive runtime (stale !current) in
-    Alcotest.(check int)
-      "retry does not prematurely complete Status"
-      0
-      (List.length output.responses);
-    current := only "bounded fresh target retry" output.requests;
+  let runtime,page,confirmation=target_refresh `Status in
+  let value={record with block={block with page=page.uuid;parent=page.uuid}} in
+  let prefix=Target_fixture.summary confirmation page
+    (Worker_pure_data.V2_present_block{value;revision="canonical-2"}) []
+    (Some(Graph.Cursor.of_string "stale-target-more" |> Result.get_ok)) "projection-2" in
+  let current=ref(Target_fixture.next runtime confirmation "first typed canonical More" prefix) in
+  let stale request=Target_fixture.send request
+    (Protocol.V2_failed{code="staleReadCursor";message="Concurrent projection"}) in
+  for _=1 to 2 do
+    let output=stale !current in
+    Alcotest.(check int) "retry does not prematurely complete Status" 0(List.length output.responses);
+    current:=Target_fixture.next runtime !current "bounded fresh target retry" output;
     check_target_summary !current None
   done;
-  let exhausted = Runtime.receive runtime (stale !current) in
-  Alcotest.(check int) "stale retries stop" 0 (List.length exhausted.requests);
-  match (only "owned retry exhaustion" exhausted.responses).payload with
-  | Runtime.Mutation_failed { kind = Status_mutation; _ } -> ()
-  | _ -> Alcotest.fail "stale retry exhaustion lost Status owner"
+  let exhausted=stale !current in
+  Alcotest.(check int) "stale retries stop" 0(List.length exhausted.requests);
+  (match (only "owned retry exhaustion" exhausted.responses).payload with
+   |Mutation_waiting{block_id;_}->Alcotest.(check string) "unknown confirmation retains target" (Graph.Uuid.to_string block_uuid) block_id
+   |_->Alcotest.fail "stale retry exhaustion lost original pending intent");
+  Alcotest.(check bool) "failed More never ACKs original intent" true
+    (Runtime.pending_mutation runtime ~mutation_id:"a1000000-0000-4000-a000-000000000021"<>None)
 ;;
 
 let test_target_newer_confirmation_fences_old () =
-  let runtime, page, old_read = target_refresh `Status in
-  check_target_summary old_read None;
-  let mutation =
-    Runtime.submit
-      runtime
-      (Journal_graph_request.Set_task_state
-         { mutation_id = "a1000000-0000-4000-a000-000000000073"
-         ; block_id = Graph.Uuid.to_string block_uuid
-         ; expected_revision = "block-1"
-         ; task_state = Journal_model.No_status
-         })
-    |> fun output -> only "newer admitted update" output.requests
-  in
-  let newer_read =
-    Runtime.receive
-      runtime
-      (response
-         mutation
-         (Protocol.V2_mutation_committed
-            { mutation_id = uuid "a1000000-0000-4000-a000-000000000073"
-            ; status = Worker_pure_data.V2_applied
-            ; generation = "graph-1"
-            ; before_projection_revision = "projection-2"
-            ; after_projection_revision = "projection-3"
-            }))
-    |> fun output -> only "newer confirmation" output.requests
-  in
-  check_target_summary newer_read None;
-  let canonical title revision request =
-    summary_response
-      request
-      page
-      (Worker_pure_data.V2_present_block
-         { value =
-             { record with
-               block = { block with title; page = page.uuid; parent = page.uuid }
-             }
-         ; revision
-         })
-      []
-      None
-      "projection-3"
-  in
-  ignore (Runtime.receive runtime (canonical "Newer stored" "canonical-3" newer_read));
-  let late = Runtime.receive runtime (canonical "Older stored" "canonical-2" old_read) in
-  Alcotest.(check bool)
-    "superseded read cannot overwrite newer canonical state"
-    false
-    (List.exists
-       (fun value ->
-          match value.Runtime.payload with
-          | Block_updated _ -> true
-          | _ -> false)
-       late.responses)
+  List.iter(fun paged->
+  let runtime,page,original_confirm=target_refresh `Status in
+  let original=Target_fixture.original original_confirm in
+  let older={record with block={block with title="Older local snapshot";page=page.uuid;parent=page.uuid}} in
+  let old_confirm=if not paged then original_confirm else (
+    let prefix=Target_fixture.summary original_confirm page
+      (Worker_pure_data.V2_present_block{value=older;revision="canonical-2"}) []
+      (Some(Graph.Cursor.of_string "old-canonical-more" |> Result.get_ok)) "projection-2" in
+    Alcotest.(check int) "empty Partial cannot settle the admitted write" 0(List.length prefix.responses);
+    Target_fixture.next runtime original_confirm "actual typed More snapshot" prefix) in
+  let updates=changed runtime(window ~blocks:[block_uuid]()) in
+  let point=only "remote change owns its point read" (hydration_requests updates) in
+  let newer={record with block={block with title="Newer remote value";page=page.uuid;parent=page.uuid}} in
+  let applied=Worker_producer.receive runtime point
+    (response point(Protocol.V2_block_outcome(Worker_pure_data.V2_present_block{value=newer;revision="canonical-3"}))) in
+  let applied=match applied.requests with
+    |[]->applied
+    |[context]->Worker_producer.receive runtime context
+      (response context(Protocol.V2_page_outcome(Worker_pure_data.V2_present_page{page;revision="page-3"})))
+    |_->Alcotest.fail "remote confirmation fence requested unrelated context" in
+  Alcotest.(check bool) "newer remote point is actually applied first" true
+    (List.exists(fun response->match Target_fixture.payload response with
+      |Block_updated{block;_}->Journal_model.source block="Newer remote value"|_->false)applied.responses);
+  let late=Target_fixture.summary old_confirm page
+    (Worker_pure_data.V2_present_block{value=older;revision="canonical-2"}) [] None "projection-2" in
+  Alcotest.(check bool) "old Confirm cannot overwrite an already applied remote point" false
+    (List.exists(fun response->match Target_fixture.payload response with Block_updated _->true|_->false)late.responses);
+  Alcotest.(check bool) "stale Confirm retains the original durable obligation" true
+    (Runtime.pending_mutation runtime ~mutation_id:"a1000000-0000-4000-a000-000000000021"<>None);
+  let retry=only "same intent is confirmed again rather than ACKed" late.requests in
+  Alcotest.(check bool) "recovery keeps original immutable payload" true (retry=original);
+  Alcotest.(check int) "a superseded sample adds no transient UI" 0(List.length late.responses);
+  let Target_fixture.Pending pending=original_confirm in
+  (match pending.operation with
+   |Target_fixture.W.Confirm(presentation,receipt)->
+     Alcotest.(check bool) "new confirmation attempt rebinds the original durable intent" true
+       (Runtime.bind_mutation runtime retry ~presentation ~intent:(Target_fixture.W.receipt_intent receipt));
+     let recovered=Target_fixture.summary original_confirm page
+       (Worker_pure_data.V2_present_block{value=newer;revision="canonical-3"}) [] None "projection-3" in
+     (match (only "fresh confirmation applies before original intent settlement" recovered.responses).payload with
+      |Mutation_settled(intent,_,Block_updated{block;_})->
+        Alcotest.(check bool) "fresh confirmation retains original durable identity" true
+          (Target_fixture.W.encode_durable_intent intent=Target_fixture.W.encode_durable_intent(Target_fixture.W.receipt_intent receipt));
+        Alcotest.(check string) "fresh canonical DTO agrees with the newer visible source" "Newer remote value"(Journal_model.source block)
+      |_->Alcotest.fail "fresh confirmation lost its canonical DTO or original proof")
+   |_->assert false)
+) [false;true]
 ;;
 
 let test_target_invisible_root_has_timeline_only_removal () =
-  let runtime, page, refresh = target_refresh `Status in
+  let _runtime, page, refresh = target_refresh `Status in
   check_target_summary refresh None;
   let canonical =
     { record with
@@ -2044,15 +2087,13 @@ let test_target_invisible_root_has_timeline_only_removal () =
     }
   in
   let output =
-    Runtime.receive
-      runtime
-      (summary_response
+    Target_fixture.summary
          refresh
          page
          (Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" })
          []
          None
-         "projection-2")
+         "projection-2"
   in
   Alcotest.(check int)
     "canonical blank title confirms using existing presentation semantics"
@@ -2063,7 +2104,7 @@ let test_target_invisible_root_has_timeline_only_removal () =
     false
     (List.exists
        (fun value ->
-          match value.Runtime.payload with
+          match Target_fixture.payload value with
           | Block_removed _ -> true
           | _ -> false)
        output.responses)
@@ -2078,15 +2119,13 @@ let test_target_confirmation_retains_page_interest completed =
   if completed
   then
     ignore
-      (Runtime.receive
-         runtime
-         (summary_response
+      (Target_fixture.summary
             refresh
             page
             (Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" })
             []
             None
-            "projection-2"));
+            "projection-2");
   let output =
     changed runtime (window ~scopes:[ Worker_pure_data.V2_page_tree_interest page.uuid ] ())
   in
@@ -2115,15 +2154,13 @@ let test_target_confirmation_retains_child_mutation_context () =
   let children = summary_children ~page:page.uuid 1 in
   let child = (List.hd children).Worker_pure_data.value.block.uuid in
   ignore
-    (Runtime.receive
-       runtime
-       (summary_response
+    (Target_fixture.summary
           refresh
           page
           (Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" })
           children
           None
-          "projection-2"));
+          "projection-2");
   let status =
     Runtime.submit
       runtime
@@ -2323,7 +2360,7 @@ let test_feed_with_blank_root_continues () =
 
 let graph_info_outcome ~journal_title_format =
   Protocol.V2_graph_info_outcome
-    { graph_uuid = uuid "a1000000-0000-4000-8000-0000000000ff"
+    { graph_uuid = Worker_producer.W.graph_id Worker_producer.session
     ; graph_name = "Journal"
     ; schema = { major = 65; minor = 33 }
     ; admission_facts = []
@@ -3016,7 +3053,7 @@ type copy_query = Query : 'a Copy_worker.query -> copy_query
 
 module Copy_issuer = struct
   let issuer, _, _, session = Coordination_test_fixture.fixture
-    ~graph:(uuid "a1000000-0000-4000-8000-0000000000ff")
+    ~graph:(Worker_producer.W.graph_id Worker_producer.session)
     ~limits:{Coordination_test_fixture.limits with
       response_budget_bytes=Worker_pure_data.maximum_response_bytes} 2840L
   module I = (val issuer : Worker_effect_authority.ISSUER)
@@ -3702,7 +3739,7 @@ let test_favorite_changes_locality () =
          request
          (Protocol.V2_changes
             { generation = "generation-1"
-            ; from_exclusive = Some "revision-1"
+            ; from_exclusive = None
             ; through = "revision-2"
             ; windows = [ window ~blocks:[ unrelated_uuid ] () ]
             ; next = None
@@ -3902,7 +3939,7 @@ let test_changes_more_continues_after_ack () =
   let first=pull runtime in
   let output=Runtime.receive runtime(response first(Protocol.V2_changes
     {generation="generation-1";from_exclusive=None;through="w1";
-     windows=[window ~blocks:[unrelated_uuid]()];next=Some "w1"})) in
+     windows=[{(window ~blocks:[unrelated_uuid]()) with id="w1"}];next=Some "w1"})) in
   let ack=only "first page waits for ACK" output.requests in
   (match ack.command with Protocol.V2_ack_changes _->()|_->Alcotest.fail "More bypassed first page application ACK");
   let output=Runtime.receive runtime(response ack(Protocol.V2_changes_acknowledged
@@ -3912,7 +3949,7 @@ let test_changes_more_continues_after_ack () =
    | _->Alcotest.fail "More lost its actual acknowledged cursor");
   let output=Runtime.receive runtime(response next(Protocol.V2_changes
     {generation="generation-1";from_exclusive=Some "w1";through="w2";
-     windows=[window ~blocks:[unrelated_uuid]()];next=None})) in
+     windows=[{(window ~blocks:[unrelated_uuid]()) with id="w2"}];next=None})) in
   let ack=only "last page ACK" output.requests in
   let output=Runtime.receive runtime(response ack(Protocol.V2_changes_acknowledged
     {generation="generation-1";through="w2"})) in
@@ -4366,9 +4403,7 @@ let test_bounded_preview_target_pages kind count () =
   let children = summary_children ~page:page.uuid count in
   let rec complete request cursor batch = function
     | [] ->
-      Runtime.receive
-        runtime
-        (summary_response request page lookup [] None "projection-2")
+      Target_fixture.summary request page lookup [] None "projection-2"
     | remaining ->
       check_target_summary request cursor;
       let items = List.take Worker_pure_data.default_page_size remaining in
@@ -4382,9 +4417,7 @@ let test_bounded_preview_target_pages kind count () =
              |> Result.get_ok)
       in
       let output =
-        Runtime.receive
-          runtime
-          (summary_response request page lookup items next "projection-2")
+        Target_fixture.summary request page lookup items next "projection-2"
       in
       (match next with
        | None -> output
@@ -4394,7 +4427,7 @@ let test_bounded_preview_target_pages kind count () =
            0
            (List.length output.responses);
          complete
-           (only "unchanged target child continuation" output.requests)
+           (Target_fixture.next runtime request "unchanged target child continuation" output)
            next
            (batch + 1)
            tail)
@@ -4403,7 +4436,7 @@ let test_bounded_preview_target_pages kind count () =
   let entry =
     List.find_map
       (fun r ->
-         match r.Runtime.payload with
+         match Target_fixture.payload r with
          | Block_captured { timeline_entry_update = Some entry; _ }
          | Block_updated { timeline_entry_update = Some entry; _ }
          | Update_conflict {timeline_entry_update=Some entry;_}
@@ -4767,27 +4800,25 @@ let test_parent_visibility_confirmations () =
     (fun kind ->
        List.iter
          (fun (visible, index) ->
-            let runtime, page, refresh = target_refresh kind in
+            let _runtime, page, refresh = target_refresh kind in
             let roots, children, _ = parent_visibility_fixture page in
             let _, canonical = List.nth roots index in
             let canonical =
               { canonical with block = { canonical.block with uuid = block_uuid } }
             in
             let output =
-              Runtime.receive
-                runtime
-                (summary_response
+              Target_fixture.summary
                    refresh
                    page
                    (Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" })
                    (children (index + 1) block_uuid)
                    None
-                   "projection-2")
+                   "projection-2"
             in
             let actual, entry =
               List.find_map
                 (fun r ->
-                   match r.Runtime.payload with
+                   match Target_fixture.payload r with
                    | Block_captured { block; timeline_entry_update }
                    | Block_updated { block; timeline_entry_update }
                    | Update_conflict {block;timeline_entry_update}
@@ -6203,7 +6234,7 @@ let child_identity_insert runtime =
    Use its public transition, with the same typed intent as a real bound write. *)
 let test_unknown_mutation_recovery_issues_original () =
   let module W=Worker_producer.W in
-    let runtime,_,request=prepare_paged_refresh ~ordinary:true ~defer:true Delete_conflict in
+    let runtime,_,request=prepare_unbound_mutation ~ordinary:true Delete_conflict in
     let mutation_id,command=Runtime.worker_mutation runtime request |> Option.get in
     let presentation=Option.get(W.selected Worker_producer.projection) in
     let intent=W.mutation_intent Worker_producer.session ~mutation_id command |> Result.get_ok in
@@ -6255,7 +6286,7 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
       | _ -> failwith "Production confirmation was rejected") in
       let parent=Production_runtime.receive_mutation runtime insert(W.Confirmed proof)
         |> fun output->only "canonical Child parent" output.Runtime.requests in
-      let output=Production_runtime.receive runtime(response parent(V2_block_outcome(Worker_pure_data.V2_present_block{value=record;revision="new-parent-state"}))) in
+      let output=Worker_producer.receive runtime parent (response parent(V2_block_outcome(Worker_pure_data.V2_present_block{value=record;revision="new-parent-state"}))) in
       let root,round=List.find_map(fun response->match response.Runtime.payload with
         | Child_projection_ready{root;round;_}->Some(root,round)|_->None)output.responses |> Option.get in
       let ack=Production_runtime.child_projection_applied runtime ~root ~round ~presentation
@@ -6369,7 +6400,7 @@ let test_task_catalog_generation_and_deltas () =
   let initial = Runtime.start runtime in
   let raw =
     Yojson.Safe.from_string
-      {|["V2_response",{"api_version":2,"request_id":"00000000-0000-4000-8000-000000000001","outcome":["V2_graph_info_outcome",{"graph_uuid":"a1000000-0000-4000-8000-000000000001","graph_name":"Synthetic","schema":{"major":65,"minor":33},"admission_facts":[],"journal_title_format":null,"generation":"generation-1","projection_revision":"revision-1","limits":{"response_budget_bytes":1048576,"outbox_max_records":100,"outbox_max_bytes":1048576,"change_max_items":256,"change_max_bytes":1048576,"dispatcher_capacity":100,"wire_batch_max_bytes":1048576}}]}]|}
+      {|["V2_response",{"api_version":2,"request_id":"00000000-0000-4000-8000-000000000001","outcome":["V2_graph_info_outcome",{"graph_uuid":"98000000-0000-4000-8000-000000000001","graph_name":"Synthetic","schema":{"major":65,"minor":33},"admission_facts":[],"journal_title_format":null,"generation":"generation-1","projection_revision":"revision-1","limits":{"response_budget_bytes":1048576,"outbox_max_records":100,"outbox_max_bytes":1048576,"change_max_items":256,"change_max_bytes":1048576,"dispatcher_capacity":100,"wire_batch_max_bytes":1048576}}]}]|}
   in
   let (Protocol.V2_response { outcome; _ }) =
     Protocol.response_of_yojson raw |> Result.get_ok
@@ -7554,7 +7585,7 @@ let test_resync_retires_changed_points () =
            (only "point change pull" pull.requests)
            (Protocol.V2_changes
               { generation
-              ; from_exclusive = Some "revision-1"
+              ; from_exclusive = None
               ; through = "revision-2"
               ; windows = [ window ~blocks:[ block_id ] () ]
               ; next = None
@@ -7626,12 +7657,22 @@ let test_resync_retires_changed_points () =
                 ; reason = "retention overflow"
                 })
          | `Pull ->
-           Runtime.receive
-             runtime
-             (response
-                (pull runtime)
-                (Protocol.V2_resync_required
-                   { generation = "generation-2"; reason = "retention overflow" }))
+           let request=pull runtime in
+           let module W=Worker_producer.W in
+           let module I=Worker_producer.I in
+           (match Production_runtime.worker_read runtime request with
+            |Some(Production_runtime.Read read)->
+              let operation=W.Query(Worker_producer.budget read.maximum_items,read.query) in
+              let request_id=W.request_id request.Protocol.request_id in
+              ignore(I.request Worker_producer.session ~request_id operation |> Result.get_ok);
+              (match I.reply Worker_producer.session ~request_id operation
+                (Worker_producer.S.Graph_response(response request
+                  (Protocol.V2_resync_required{generation="generation-2";reason="retention overflow"}))) with
+               |Ok(W.Answered(Error(W.Resync_required reason)))->
+                 Production_runtime.receive_worker_read ~resync_generation:802L runtime
+                   ~request_id:request.request_id (Production_runtime.Changes_resync reason)
+               |_->Alcotest.fail "actual typed Changes resync was not decoded")
+            |_->Alcotest.fail "resync boundary did not retain its typed query")
        in
        (* Hold unrelated graph-info work; complete the real Feed and retained
           page requests before the previously issued point/context response. *)
