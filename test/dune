@@ -218,7 +218,8 @@
 (test
  (name journal_asset_policy_test)
  (modules journal_asset_policy_test)
- (libraries app
+ (libraries app coordination_test_fixture logseq_journal.worker_coordination
+  journal_worker_coordination_impl worker_effect_authority
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.lui

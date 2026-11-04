@@ -5,7 +5,6 @@ module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Worker = Journal_worker_coordination.Worker_api
 
 type scan_cursor =
-  | Wire_cursor of Graph.Cursor.t
   | Journals_cursor of Worker_pure_data.journal_item Worker.continuation
   | Favorites_cursor of Worker_pure_data.favorite_item Worker.continuation
   | Assets_cursor of Logseq_db_types.Asset_descriptor.t Worker.continuation
@@ -59,7 +58,7 @@ type dependency =
   | Page of Graph.Uuid.t
 
 type t =
-  { read_port : (read_request -> bool) option
+  { read_port : read_request -> bool
   ; release_consumer : (Worker.asset_consumer -> bool) option
   ; bound_consumers : (string,Worker.asset_consumer)Hashtbl.t
   ; mutable resource_binding : Worker.binding option
@@ -123,11 +122,8 @@ let create_state ~release_consumer ~read_port ~read_planned ~read_retired ~send 
   }
 ;;
 
-let create ~send ~changed =
-  create_state ~release_consumer:None ~read_port:None ~read_planned:(fun _ -> ()) ~read_retired:(fun _ -> ()) ~send ~changed
-
-let create_coordinated ?release_consumer ?(read_planned=fun _->()) ?(read_retired=fun _->()) ~read ~send ~changed () =
-  create_state ~release_consumer ~read_port:(Some read) ~read_planned ~read_retired ~send ~changed
+let create ?release_consumer ?(read_planned=fun _->()) ?(read_retired=fun _->()) ~read ~send ~changed () =
+  create_state ~release_consumer ~read_port:read ~read_planned ~read_retired ~send ~changed
 ;;
 
 let scan_request_id id =
@@ -168,29 +164,6 @@ let notice_reads t (scope:Service.asset_scope) notice =
     | _ -> None in
   match event with None->[]|Some event->
     Policy.completed_deferred_reads t.policy event |> List.map dependency_id
-;;
-
-let wire_cursor = function
-  | None -> None
-  | Some (Wire_cursor cursor) -> Some cursor
-  | Some _ -> invalid_arg "A sealed continuation cannot enter the legacy reader"
-;;
-
-let command (ticket : scan_cursor Policy.ticket) =
-  match ticket.query with
-  | Recent_roots { from_day; through_day; cursor } ->
-    Protocol.V2_list_journals
-      { from_day
-      ; through_day
-      ; cursor = wire_cursor cursor
-      ; limit = Policy.page_size
-      ; revision = None
-      }
-  | Favorite_roots cursor ->
-    V2_list_favorites { cursor = wire_cursor cursor; limit = Policy.page_size }
-  | Assets { roots; cursor } ->
-    V2_list_assets
-      { recursive = true; roots; cursor = wire_cursor cursor; limit = Policy.page_size }
 ;;
 
 let degrade t =
@@ -244,18 +217,8 @@ let execute t = function
   | Policy.Read ticket ->
     let request_id = scan_request_id ticket.id in
     let accepted =
-      match t.read_port with
-      | None ->
-        let command = command ticket in
-        let accepted =
-          t.send (Service.Graph_request { api_version = 2; request_id; command })
-        in
-        if accepted
-        then observe_request t Protocol.{ api_version = 2; request_id; command };
-        accepted
-      | Some read ->
         let submit query =
-          read
+          t.read_port
             (Read
                { request_id
                ; maximum_items = Policy.page_size
@@ -297,8 +260,7 @@ let execute t = function
     if accepted
     then (
       (* The logical scan identity is independent of the physical mailbox ID. *)
-      if Option.is_some t.read_port then
-        observe_fact_request t ~request_id
+      observe_fact_request t ~request_id
           ~first_page:(match ticket.query with Favorite_roots None -> true | _ -> false);
       Hashtbl.replace t.pending (Graph.Uuid.to_string request_id) ticket;
       true)
@@ -364,14 +326,8 @@ let rec pump_dependencies t =
     if not (Queue.is_empty t.dependency_queue)
     then (
       let dependency,request_id = Queue.peek t.dependency_queue in
-      let accepted = match t.read_port with
-        | None ->
-          let command = match dependency with
-            | Block block -> Protocol.V2_get_outline_block { block; revision = None }
-            | Page page -> V2_get_page { page; revision = None } in
-          t.send (Service.Graph_request Protocol.{ api_version = 2; request_id; command })
-        | Some read ->
-          let submit query = read (Read
+      let accepted =
+          let submit query = t.read_port (Read
             { request_id; maximum_items = 1; query
             ; outcome = (fun value -> Read_result { read_id = request_id; query; value })
             }) in
@@ -1068,54 +1024,6 @@ let receive_read t ~request_id (Read_result { read_id; query; value }) =
       observe_query_result t ~request_id query value;
       dispatch t event;
       true
-;;
-
-let receive t (Protocol.V2_response { request_id; outcome; _ } as response) =
-  let key = Graph.Uuid.to_string request_id in
-  match Hashtbl.find_opt t.pending key with
-  | None ->
-    (match Hashtbl.find_opt t.dependencies key with
-     | None -> false
-     | Some (dependency, issuance) ->
-       complete_dependency t ~request_id dependency issuance (fun () ->
-       let expected =
-         match dependency, outcome with
-         | Block _, Protocol.V2_block_outcome _ | Page _, V2_page_outcome _ -> true
-         | _ -> false
-       in
-       if not expected
-       then (
-         Hashtbl.clear t.dirty;
-         Hashtbl.clear t.page_dirty;
-         clear_dependency_queue t;
-         degrade t);
-       observe_response t response))
-  | Some _ when Option.is_some t.read_port -> false
-  | Some ticket ->
-    Hashtbl.remove t.pending key;
-    observe_response t response;
-    let event =
-      match ticket.query, outcome with
-      | Policy.Recent_roots _, Protocol.V2_journals_outcome { items; next_cursor } ->
-        Policy.Roots_loaded
-          ( ticket
-          , List.map (fun (item : Worker_pure_data.journal_item) -> item.page.uuid) items
-          , Option.map (fun c -> Wire_cursor c) next_cursor )
-      | Favorite_roots _, V2_favorites_outcome { items; next_cursor; _ } ->
-        Roots_loaded
-          ( ticket
-          , List.map
-              (fun (item : Worker_pure_data.favorite_item) ->
-                 match item.target with
-                 | Worker_pure_data.V2_favorite_page { uuid; _ } | Worker_pure_data.V2_favorite_block { uuid; _ } -> uuid)
-              items
-          , Option.map (fun c -> Wire_cursor c) next_cursor )
-      | Assets _, V2_assets_outcome { items; next_cursor; _ } ->
-        Assets_loaded (ticket, items, Option.map (fun c -> Wire_cursor c) next_cursor)
-      | _ -> Read_failed ticket
-    in
-    dispatch t event;
-    true
 ;;
 
 let reject t ~request_id =

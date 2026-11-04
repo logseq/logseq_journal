@@ -3826,7 +3826,7 @@ let start
   let coordinated_asset_read = ref(fun (_:Journal_asset_runtime.read_request)->false) in
   let asset_changes_cell = graph_ref (fun () -> None) in
   let asset_runtime_cell = graph_ref (fun () ->
-    Journal_asset_runtime.create_coordinated
+    Journal_asset_runtime.create
       ~release_consumer:release_coordinated_consumer
       ~read_planned:(fun request_id->Journal_graph_runtime.register_external_read (!graph_runtime_cell) ~request_id)
       ~read_retired:(fun request_id->Journal_graph_runtime.retire_external_read (!graph_runtime_cell) ~request_id)

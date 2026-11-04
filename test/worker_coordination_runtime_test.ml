@@ -2320,7 +2320,7 @@ let test_offline_asset_scans_use_typed_reads () =
           require(not(Assets.receive_read(Option.get !runtime)~request_id:request.request_id result))
             "typed scan consumed the same result twice"
         | _->failwith "real typed offline asset read failed");true in
-    let assets=Assets.create_coordinated ~read
+    let assets=Assets.create ~read
       ~send:(function Service.Graph_request _->incr legacy_reads;false|_->true)
       ~changed:(fun _ recent favorites->status:=Some(recent,favorites)) () in
     runtime:=Some assets;

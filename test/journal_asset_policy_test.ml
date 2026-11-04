@@ -351,39 +351,55 @@ let config_and_disabled () =
   check (ins = []) "old graph owner cannot escape scope replacement"
 ;;
 
+module Runtime = Journal_asset_runtime
+module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
+module Wire = Logseq_db_worker.Protocol
+module W = Journal_worker_coordination.Worker_api
+
+type outgoing = Read of Runtime.read_request | Command of Service.request
+
+let request_id (Runtime.Read request) = request.request_id
+let producer = lazy (Coordination_test_fixture.fixture ~graph:(uuid 3) ~graph_generation:1 8200L)
+
+let respond r (Runtime.Read request) outcome =
+  check (Runtime.owns_read r request.request_id) "runtime must retain the terminal owner";
+  let issuer, _, _, session = Lazy.force producer in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
+  let budget = W.read_budget session ~maximum_items:request.maximum_items
+    ~maximum_bytes:65536 |> Result.get_ok in
+  let operation = W.Query (budget, request.query) in
+  let id = W.request_id request.request_id in
+  ignore (I.request session ~request_id:id operation |> Result.get_ok);
+  let response = Wire.V2_response { api_version = 2; request_id = request.request_id; outcome } in
+  match I.reply session ~request_id:id operation (Service.Graph_response response) with
+  | Ok (W.Answered (Ok value)) ->
+    check (Runtime.receive_read r ~request_id:request.request_id (request.outcome value))
+      "runtime must retain the typed terminal owner"
+  | Ok (W.Answered (Error _)) -> Runtime.reject r ~request_id:request.request_id
+  | _ -> failwith "invalid typed fixture completion"
+;;
+
 (* Runtime, unlike Policy, owns accepted Worker request IDs and queued IO. *)
 let runtime_same_configuration () =
   let module R = Journal_asset_runtime in
-  let module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service in
   let module Wire = Logseq_db_worker.Protocol in
   let sent = Queue.create () in
   let r =
     R.create
+      ~read:(fun request -> Queue.add (Read request) sent; true)
       ~send:(fun q ->
-        Queue.add q sent;
+        Queue.add (Command q) sent;
         true)
-      ~changed:(fun _ _ _ -> ())
+      ~changed:(fun _ _ _ -> ()) ()
   in
   R.refresh r ~graph_generation:1 ~today:20260301 ~settings:P.default_settings;
   let first = Queue.take sent in
   Queue.clear sent;
   R.refresh r ~graph_generation:1 ~today:20260301 ~settings:P.default_settings;
   check (Queue.is_empty sent) "adapter must retain tickets on unchanged lifecycle refresh";
-  let request_id =
-    match first with
-    | S.Graph_request q -> q.request_id
-    | _ -> assert false
-  in
-  let accepted =
-    R.receive
-      r
-      (Wire.V2_response
-         { api_version = 2
-         ; request_id
-         ; outcome = V2_journals_outcome { items = []; next_cursor = None }
-         })
-  in
-  check accepted "adapter must not swallow still-owned response on same configuration"
+  let request = match first with Read request -> request | _ -> assert false in
+  respond r request (Wire.V2_journals_outcome { items = []; next_cursor = None })
+
 ;;
 
 let completed_favorites () =
@@ -508,9 +524,6 @@ let selected_burst () =
   check (ins = []) "followup settles without recursive restarts"
 ;;
 
-module Runtime = Journal_asset_runtime
-module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
-module Wire = Logseq_db_worker.Protocol
 
 let block n parent page refs =
   G.
@@ -534,11 +547,6 @@ let present (block : G.block) =
            { block; task_status = None; rendered_page_title = "page"; tag_titles = [] }
        ; revision = "r"
        })
-;;
-
-let respond r request_id outcome =
-  let response = Wire.V2_response { api_version = 2; request_id; outcome } in
-  check (Runtime.receive r response) "runtime must retain the terminal owner"
 ;;
 
 let raw r n (block : G.block) =
@@ -580,10 +588,11 @@ let runtime_fixture
   let sent = Queue.create () in
   let r =
     Runtime.create
+      ~read:(fun request -> Queue.add (Read request) sent; true)
       ~send:(fun request ->
-        Queue.add request sent;
+        Queue.add (Command request) sent;
         true)
-      ~changed
+      ~changed ()
   in
   Runtime.refresh
     r
@@ -592,13 +601,13 @@ let runtime_fixture
     ~settings:(P.settings ~recent_days:0 |> Result.get_ok);
   let take () =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> failwith "expected graph read"
   in
   let roots = take () in
   respond
     r
-    roots.request_id
+    roots
     (Wire.V2_favorites_outcome
        { favorites_page = Some (uuid 9)
        ; generation = "g"
@@ -623,25 +632,25 @@ let runtime_fixture
        });
   while not (Queue.is_empty sent) do
     match Queue.take sent with
-    | Service.Asset_command { command = Replace_asset_demand { consumer; _ }; _ } ->
+    | Command (Service.Asset_command { command = Replace_asset_demand { consumer; _ }; _ }) ->
       initial_demand consumer;
       Runtime.notice r runtime_scope (Asset_demand_accepted consumer)
-    | Service.Graph_request request ->
-      (match request.command with
-       | Wire.V2_list_assets _ ->
+    | Read request ->
+      (match request with
+       | Runtime.Read { query = W.Assets _; _ } ->
          respond
            r
-           request.request_id
+           request
            (V2_assets_outcome
               { generation = "g"
               ; projection_revision = "r"
               ; items = initial_assets
               ; next_cursor = None
               })
-       | V2_get_page { page; _ } ->
+       | Runtime.Read { query = W.Page { uuid = page; _ }; _ } ->
          respond
            r
-           request.request_id
+           request
            (V2_page_outcome
               (Worker_pure_data.V2_present_page
                  { page =
@@ -658,10 +667,10 @@ let runtime_fixture
                        }
                  ; revision = "r"
                  }))
-       | V2_get_outline_block { block = target; _ } ->
+       | Runtime.Read { query = W.Outline_block { uuid = target; _ }; _ } ->
          respond
            r
-           request.request_id
+           request
            (if G.Uuid.equal target (uuid 2)
             then present (block 2 root_parent 1 [])
             else if G.Uuid.equal target (uuid 3)
@@ -687,10 +696,11 @@ let runtime_unconfigured_changes after_shutdown () =
   let sent = Queue.create () in
   let r =
     Runtime.create
+      ~read:(fun request -> Queue.add (Read request) sent; true)
       ~send:(fun request ->
-        Queue.add request sent;
+        Queue.add (Command request) sent;
         true)
-      ~changed:(fun _ _ _ -> ())
+      ~changed:(fun _ _ _ -> ()) ()
   in
   if after_shutdown
   then (
@@ -739,10 +749,10 @@ let runtime_title_only () =
   Runtime.changes r [ window 1 [ 2 ] [] ];
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
-  respond r request.request_id (present { original with title = "edited" });
+  respond r request (present { original with title = "edited" });
   check (Queue.is_empty sent) "title-only raw delta must not issue an offline asset query"
 ;;
 
@@ -755,11 +765,10 @@ let runtime_unknown_unrelated () =
       incr rounds;
       check (!rounds <= 4) "unknown unrelated holder lookup must terminate";
       match Queue.take sent with
-      | Service.Graph_request
-          ({ command = Wire.V2_get_outline_block { block = target; _ }; _ } as request) ->
+      | Read (Runtime.Read { query = W.Outline_block { uuid = target; _ }; _ } as request) ->
         respond
           r
-          request.request_id
+          request
           (if G.Uuid.equal target (uuid 99)
            then present (block 99 98 98 [])
            else V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = target; revision = "r" }))
@@ -774,23 +783,23 @@ let runtime_refs_delta () =
   Runtime.changes r [ window 1 [ 2 ] [] ];
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
-  respond r request.request_id (present (block 2 1 1 [ 50 ]));
+  respond r request (present (block 2 1 1 [ 50 ]));
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
   check
-    (match request.command with
-     | V2_list_assets { roots; recursive = true; cursor = None; _ } -> roots = [ uuid 1 ]
+    (match request with
+     | Runtime.Read { query = W.Assets { roots; recursive = true; after = None }; _ } -> roots = [ uuid 1 ]
      | _ -> false)
     "raw ref insertion reads only the matching offline batch";
   respond
     r
-    request.request_id
+    request
     (V2_assets_outcome
        { generation = "g"; projection_revision = "r"; items = []; next_cursor = None });
   check (Queue.is_empty sent) "raw ref replacement settles"
@@ -802,12 +811,12 @@ let runtime_sibling_structure () =
   Runtime.changes r [ window 1 [] [ Worker_pure_data.V2_children_interest (uuid 98) ] ];
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
   respond
     r
-    request.request_id
+    request
     (V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = uuid 98; revision = "r" }));
   check
     (Queue.is_empty sent)
@@ -821,30 +830,30 @@ let runtime_unknown_ancestor () =
   Runtime.changes r [ window 1 [ 4 ] [] ];
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
   respond
     r
-    request.request_id
+    request
     (V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = uuid 4; revision = "r" }));
   let fresh =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> failwith "changed ancestor must follow its pre-change query"
   in
   respond
     r
-    fresh.request_id
+    fresh
     (V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = uuid 4; revision = "r" }));
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> failwith "unknown ancestor deletion must replace its dependent root batch"
   in
   check
-    (match request.command with
-     | V2_list_assets { roots; cursor = None; _ } -> roots = [ uuid 2 ]
+    (match request with
+     | Runtime.Read { query = W.Assets { roots; after = None; _ }; _ } -> roots = [ uuid 2 ]
      | _ -> false)
     "ancestor liveness has a precise favorite-root dependency"
 ;;
@@ -868,18 +877,18 @@ let runtime_late_fact () =
        { api_version = 2; request_id = late_request.request_id; outcome = present old });
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
-  respond r request.request_id (present (block 2 1 1 [ 50 ]));
+  respond r request (present (block 2 1 1 [ 50 ]));
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> failwith "late pre-change fact must not consume the dirty owner"
   in
   check
-    (match request.command with
-     | V2_list_assets _ -> true
+    (match request with
+     | Runtime.Read { query = W.Assets _; _ } -> true
      | _ -> false)
     "new membership survives a late old raw completion"
 ;;
@@ -932,12 +941,12 @@ let runtime_real_capture_sibling () =
       incr rounds;
       check (!rounds <= 2) "Capture dependency point reads remain bounded";
       match Queue.take sent with
-      | Service.Graph_request ({ command = V2_get_outline_block _; _ } as request) ->
-        respond r request.request_id (present (block 7 1 1 []))
-      | Service.Graph_request ({ command = V2_get_page { page; _ }; _ } as request) ->
+      | Read (Runtime.Read { query = W.Outline_block _; _ } as request) ->
+        respond r request (present (block 7 1 1 []))
+      | Read (Runtime.Read { query = W.Page { uuid = page; _ }; _ } as request) ->
         respond
           r
-          request.request_id
+          request
           (V2_page_outcome
              (Worker_pure_data.V2_present_page
                 { page =
@@ -985,12 +994,12 @@ let runtime_registry_capacity () =
   Runtime.resync r;
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
   respond
     r
-    request.request_id
+    request
     (V2_favorites_outcome
        { favorites_page = Some (uuid 9)
        ; generation = "g"
@@ -1002,7 +1011,7 @@ let runtime_registry_capacity () =
 ;;
 
 let runtime_unconfigured_shared_capacity () =
-  let runtime=Runtime.create ~send:(fun _->true) ~changed:(fun _ _ _->()) in
+  let runtime=Runtime.create ~read:(fun _->true) ~send:(fun _->true) ~changed:(fun _ _ _->()) () in
   for n=1 to 4200 do raw runtime (10000+n) (block n 9999 9999 []) done;
   check(Runtime.projection_read_error runtime=None)
     "unconfigured shared DTO cache overflow invented an offline ACK consumer"
@@ -1059,10 +1068,10 @@ let runtime_reference_order () =
   Runtime.changes r [ window 1 [ 2 ] [] ];
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
-  respond r request.request_id (present (block 2 1 1 [ 51; 50 ]));
+  respond r request (present (block 2 1 1 [ 51; 50 ]));
   check (Queue.is_empty sent) "reference membership order cannot renew offline demand"
 ;;
 
@@ -1074,28 +1083,27 @@ let runtime_hidden_holder_fanout () =
   let queried = ref false in
   while not (Queue.is_empty sent) do
     match Queue.take sent with
-    | Service.Graph_request
-        ({ command = V2_get_outline_block { block = target; _ }; _ } as request) ->
+    | Read (Runtime.Read { query = W.Outline_block { uuid = target; _ }; _ } as request) ->
       respond
         r
-        request.request_id
+        request
         (if G.Uuid.equal target (uuid 50)
          then present (block 50 99 99 [])
          else if G.Uuid.equal target (uuid 2)
          then present (block 2 1 1 [ 50 ])
          else V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = target; revision = "r" }))
-    | Service.Graph_request ({ command = V2_list_assets { roots; _ }; _ } as request) ->
+    | Read (Runtime.Read { query = W.Assets { roots; _ }; _ } as request) ->
       queried := roots = [ uuid 1 ];
       respond
         r
-        request.request_id
+        request
         (V2_assets_outcome
            { generation = "g"
            ; projection_revision = "r"
            ; items = [ asset 50 ]
            ; next_cursor = None
            })
-    | Service.Asset_command { command = Replace_asset_demand { consumer; _ }; _ } ->
+    | Command (Service.Asset_command { command = Replace_asset_demand { consumer; _ }; _ }) ->
       Runtime.notice
         r
         { account =
@@ -1141,18 +1149,18 @@ let runtime_truncated_membership () =
   Runtime.changes r [ window 1 [ 2 ] [] ];
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
-  respond r request.request_id (present holder);
+  respond r request (present holder);
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> failwith "truncated membership cannot prove unchanged hidden references"
   in
   check
-    (match request.command with
-     | V2_list_assets { roots; cursor = None; _ } -> roots = [ uuid 1 ]
+    (match request with
+     | Runtime.Read { query = W.Assets { roots; after = None; _ }; _ } -> roots = [ uuid 1 ]
      | _ -> false)
     "truncated owned holder refresh selects only its offline batch"
 ;;
@@ -1201,24 +1209,23 @@ let runtime_unknown_old_parent () =
   let queried = ref false in
   while not (Queue.is_empty sent) do
     match Queue.take sent with
-    | Service.Graph_request
-        ({ command = V2_get_outline_block { block = target; _ }; _ } as request) ->
+    | Read (Runtime.Read { query = W.Outline_block { uuid = target; _ }; _ } as request) ->
       respond
         r
-        request.request_id
+        request
         (if G.Uuid.equal target (uuid 4)
          then present (block 4 7 1 [])
          else if G.Uuid.equal target (uuid 3)
          then present (block 3 2 1 [])
          else V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = target; revision = "r" }))
-    | Service.Graph_request ({ command = V2_list_assets { roots; _ }; _ } as request) ->
+    | Read (Runtime.Read { query = W.Assets { roots; _ }; _ } as request) ->
       queried := roots = [ uuid 2 ];
       respond
         r
-        request.request_id
+        request
         (V2_assets_outcome
            { generation = "g"; projection_revision = "r"; items = []; next_cursor = None })
-    | Service.Asset_command { command = Release_asset_demand consumer; _ } ->
+    | Command (Service.Asset_command { command = Release_asset_demand consumer; _ }) ->
       released := Some consumer = !old
     | _ -> ()
   done;
@@ -1236,13 +1243,13 @@ let runtime_dependency_failure rejected () =
   Runtime.changes r [ window 1 [ 99 ] [] ];
   let request =
     match Queue.take sent with
-    | Service.Graph_request request -> request
+    | Read request -> request
     | _ -> assert false
   in
   if rejected
-  then Runtime.reject r ~request_id:request.request_id
+  then Runtime.reject r ~request_id:(request_id request)
   else
-    respond r request.request_id (V2_failed { code = "storage"; message = "unavailable" });
+    respond r request (V2_failed { code = "storage"; message = "unavailable" });
   check
     (!status = P.Failed && Queue.is_empty sent)
     "owned dependency failure must expose Failed without retrying or preserving false \

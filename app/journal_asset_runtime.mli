@@ -13,7 +13,7 @@ type read_request = private
 
 type t
 
-val create_coordinated
+val create
   :  ?release_consumer:(Worker.asset_consumer -> bool)
   -> ?read_planned:(Logseq_db_types.Graph_types.Uuid.t -> unit)
   -> ?read_retired:(Logseq_db_types.Graph_types.Uuid.t -> unit)
@@ -32,15 +32,6 @@ val receive_read
   -> request_id:Logseq_db_types.Graph_types.Uuid.t
   -> read_result
   -> bool
-
-val create
-  :  send:(Logseq_db_worker_lui.Logseq_db_worker_lui_service.request -> bool)
-  -> changed:
-       (int option
-        -> Journal_asset_policy.offline
-        -> Journal_asset_policy.offline
-        -> unit)
-  -> t
 
 (** Configure graph scope, day and offline settings. Repeating the same
     configuration preserves pending requests and completed enumerations. *)
@@ -76,7 +67,6 @@ val notice_reads : t -> Logseq_db_worker_lui.Logseq_db_worker_lui_service.asset_
 val resync : t -> unit
 
 val shutdown : t -> unit
-val receive : t -> Logseq_db_worker.Protocol.response -> bool
 
 val notice
   :  t
