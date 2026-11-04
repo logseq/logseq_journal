@@ -1537,7 +1537,7 @@ let test_ordinary_delete_readback committed paged () =
     let presentation=Option.get(W.selected Worker_producer.projection) in
     let intent=W.mutation_intent session ~mutation_id(W.Delete_blocks{root;preconditions}) |> Result.get_ok in
     Alcotest.(check bool) "ordinary mutation business owner bound" true
-      (Production_runtime.bind_mutation runtime request ~presentation ~intent);
+      (Production_runtime.bind_mutation runtime request ~presentation ~intent:(W.Mutation_intent intent));
     let receipt=(let (Protocol.V2_response receipt_packet as packet) = (response request(V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
         before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"})) in
       match I.reply session ~request_id:(W.request_id request.request_id) (W.Mutate intent)
@@ -5664,7 +5664,7 @@ let test_page_detail_root_and_append () =
     let mutation_id,mutation=Runtime.worker_mutation runtime request |> Option.get in
     let intent=W.mutation_intent Worker_producer.session ~mutation_id mutation |> Result.get_ok in
     Alcotest.(check bool) "page insertion bound to typed owner" true
-      (Runtime.bind_mutation runtime request ~presentation ~intent);
+      (Runtime.bind_mutation runtime request ~presentation ~intent:(W.Mutation_intent intent));
     let receipt=(let (Protocol.V2_response receipt_packet as packet) = (response request (V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
         before_projection_revision="projection:v1:1";after_projection_revision="projection:v1:2"})) in
       match I.reply Worker_producer.session ~request_id:(W.request_id request.request_id) (W.Mutate intent)
@@ -6208,14 +6208,14 @@ let test_unknown_mutation_recovery_issues_original () =
     let presentation=Option.get(W.selected Worker_producer.projection) in
     let intent=W.mutation_intent Worker_producer.session ~mutation_id command |> Result.get_ok in
     Alcotest.(check bool) "original mutation bound before Unknown" true
-      (Runtime.bind_mutation runtime request ~presentation ~intent);
+      (Runtime.bind_mutation runtime request ~presentation ~intent:(W.Mutation_intent intent));
     let output=Runtime.receive_mutation runtime request W.Outcome_unknown in
     let resumed=only "one automatic original-intent continuation" output.requests in
     Alcotest.(check bool) "continuation preserves original wire" true (resumed=request);
     Alcotest.(check bool) "public transition issues continuation before returning" true
       (Runtime.worker_mutation runtime resumed=Some(mutation_id,command));
     Alcotest.(check bool) "same-intent continuation can bind its next receipt" true
-      (Runtime.bind_mutation runtime resumed ~presentation ~intent)
+      (Runtime.bind_mutation runtime resumed ~presentation ~intent:(W.Mutation_intent intent))
 ;;
 
 let child_identity_runtime () =
@@ -6230,7 +6230,7 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
   let presentation=Option.get(W.selected projection) in
   let mutation_id,command=Runtime.worker_mutation runtime insert |> Option.get in
   let original=W.mutation_intent session ~mutation_id command |> Result.get_ok in
-  Alcotest.(check bool) "original Child binds" true(Runtime.bind_mutation runtime insert ~presentation ~intent:original);
+  Alcotest.(check bool) "original Child binds" true(Runtime.bind_mutation runtime insert ~presentation ~intent:(W.Mutation_intent original));
   let original=if not status then (
     ignore(Runtime.receive_mutation runtime insert W.Outcome_unknown); original)
     else (
@@ -6267,7 +6267,7 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
         |> fun output->only "original status attempt" output.Runtime.requests in
       let mutation_id,command=Runtime.worker_mutation runtime pending |> Option.get in
       let intent=W.mutation_intent session ~mutation_id command |> Result.get_ok in
-      Alcotest.(check bool) "original status binds" true(Runtime.bind_mutation runtime pending ~presentation ~intent);
+      Alcotest.(check bool) "original status binds" true(Runtime.bind_mutation runtime pending ~presentation ~intent:(W.Mutation_intent intent));
       ignore(Runtime.receive_mutation runtime pending W.Outcome_unknown);intent) in
   let business_command,chain=Production_runtime.retained_child_chains runtime |> fun values->Rrbvec.nth values 0 in
   Runtime.reset runtime;set_calendar runtime;
@@ -6277,7 +6277,7 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
   let mutation_id,command=Runtime.worker_mutation runtime retry |> Option.get in
   let retried=W.mutation_intent session ~mutation_id command |> Result.get_ok in
   Alcotest.(check string) "unknown Child keeps the complete original intent across reset"
-    (Bytes.to_string(W.encode_mutation_intent original))(Bytes.to_string(W.encode_mutation_intent retried))
+    (Bytes.to_string(W.encode_durable_intent(W.Mutation_intent original)))(Bytes.to_string(W.encode_durable_intent(W.Mutation_intent retried)))
 ;;
 
 let test_child_typed_insert_admission () =
@@ -6302,7 +6302,7 @@ let test_typed_child_planning_refusal_retains_transport () =
     let id,command=Runtime.worker_mutation runtime insert |> Option.get in
     let intent=W.mutation_intent session ~mutation_id:id command |> Result.get_ok in
     Alcotest.(check bool) "typed child bound before admission" true
-      (Runtime.bind_mutation runtime insert ~presentation ~intent);
+      (Runtime.bind_mutation runtime insert ~presentation ~intent:(W.Mutation_intent intent));
     let delivery=Journal_graph_transport.deliver ~runtime ~send:(fun _->refusal)
       {Runtime.requests=[insert];responses=[]} in
     Alcotest.(check (option string)) "retryable Child admission does not retire the graph" None delivery.error;
@@ -6345,7 +6345,7 @@ let test_child_error_continuations_retire () =
     let id,command=Runtime.worker_mutation runtime !request |> Option.get in
     let intent=W.mutation_intent session ~mutation_id:id command |> Result.get_ok in
     Alcotest.(check bool) "actual continuation binds before its completion"true
-      (Runtime.bind_mutation runtime !request ~presentation ~intent);
+      (Runtime.bind_mutation runtime !request ~presentation ~intent:(W.Mutation_intent intent));
     let previous= !request in
     let output=Runtime.mutation_waiting runtime previous "Transient confirmation failure"in
     if previous.request_id<>original.request_id then

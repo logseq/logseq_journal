@@ -14,7 +14,7 @@ let read session budget day =
     "atomic_capture_and_durable_retry": """
 let submit session intent = request (session, W.Append intent)
 let restore_and_retry session bytes =
-  Result.map (fun intent -> submit session intent) (W.restore_append_intent session bytes)
+  Result.map (function W.Append_intent intent -> submit session intent | Mutation_intent intent -> request(session,W.Mutate intent)) (W.restore_durable_intent session bytes)
 """,
     "typed_completion": """
 let complete (ticket : W.page option C.ticket) (reply : W.page option W.reply) =
@@ -208,8 +208,8 @@ let operations session id uuid preconditions title status =
   in List.map (fun command ->
     Result.map (fun intent -> request(session,W.Mutate intent))
       (W.mutation_intent session ~mutation_id:id command)) commands
-let recover session bytes = Result.map (fun intent -> request(session,W.Mutate intent))
-    (W.restore_mutation_intent session bytes)
+let recover session bytes = Result.map (function W.Append_intent intent -> request(session,W.Append intent) | Mutation_intent intent -> request(session,W.Mutate intent))
+    (W.restore_durable_intent session bytes)
 let confirm session presentation receipt = request(session,W.Confirm(presentation,receipt))
 let receipt value = W.receipt_mutation_id value,W.receipt_revisions value
 let capture session id uuid day =

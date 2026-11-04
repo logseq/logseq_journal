@@ -4576,7 +4576,7 @@ module Child_chain_fixture = struct
     ; presentation : W.presentation
     ; projection : W.projection
     ; binding : W.binding
-    ; confirm : int -> W.mutation_intent -> W.presentation -> W.mutation_progress
+    ; confirm : int -> W.durable_intent -> W.presentation -> W.mutation_progress
     }
   let make ?(append=false) ?(task_state=Journal_model.No_status) () =
     let issuer,_,projection,session=Coordination_test_fixture.fixture
@@ -4600,14 +4600,14 @@ module Child_chain_fixture = struct
       journal_day=20260809;root={block_id=child;title=command.source;task_status=resolved_status;children=Rrbvec.empty}} in
     let initial,action=C.start ~command ~page ~resolved_status ~insert |> Result.get_ok in
     let confirm index intent presentation =
-      let id=W.mutation_intent_id intent in
+      let id=W.durable_intent_id intent in
       let request_id=W.request_id id in
       let after=Printf.sprintf "projection:v1:%d" (index+1) in
       let receipt=(let (P.V2_response receipt_packet as packet) = (P.V2_response
         {api_version=P.api_version;request_id=id;outcome=V2_mutation_committed
           {mutation_id=id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
            before_projection_revision=Printf.sprintf "projection:v1:%d" index;after_projection_revision=after}}) in
-        match I.reply session ~request_id (W.Mutate intent)
+        match I.reply session ~request_id (match intent with W.Append_intent intent->W.Append intent|Mutation_intent intent->W.Mutate intent)
           (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
             {request_id=receipt_packet.request_id;
              outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
@@ -4720,7 +4720,7 @@ let test_capture_retained_attempt_survives_runtime_reset () =
   let status=R.receive_worker_read runtime ~request_id:canonical.request_id (R.Query_result(F.W.Block_summary{block=root;after=None},summary)) |> only in
   let mutation_id,command=R.worker_mutation runtime status |> Option.get in
   let status_intent=F.W.mutation_intent fixture.session ~mutation_id command |> Result.get_ok in
-  require(R.bind_mutation runtime status ~presentation:fixture.presentation ~intent:status_intent)
+  require(R.bind_mutation runtime status ~presentation:fixture.presentation ~intent:(F.W.Mutation_intent status_intent))
     "status continuation did not bind";
   ignore(R.receive_mutation runtime status F.W.Outcome_unknown);
   let command=Journal_capture.pending_command capture |> Option.get in
@@ -4964,7 +4964,7 @@ let test_child_chain_sdk_capacity_progress () =
   let state=ref fixture.initial and action=ref fixture.action in
   for n=1 to 70 do
     let bound,index,round,intent=F.bind fixture !state !action in
-    run(F.W.Mutate intent)F.W.Outcome_unknown;
+    run(match intent with F.W.Append_intent intent->F.W.Append intent|Mutation_intent intent->F.W.Mutate intent)F.W.Outcome_unknown;
     let unknown,_=B.receive bound ~index ~round F.W.Outcome_unknown in
     let selected=if n mod 2=0 then child_status_a else child_status_b in
     let resolved=match selected with Journal_model.Status id->Some(F.G.Uuid.of_string id |> Result.get_ok)|_->None in
@@ -4976,7 +4976,7 @@ let test_child_chain_sdk_capacity_progress () =
     let progress=fixture.confirm index intent fixture.presentation in
     let confirmation=match progress with F.W.Confirmed value->value|_->assert false in
     let receipt=F.W.confirmation_receipt confirmation in
-    run(F.W.Mutate intent)(F.W.Committed_pending_presentation receipt);
+    run(match intent with F.W.Append_intent intent->F.W.Append intent|Mutation_intent intent->F.W.Mutate intent)(F.W.Committed_pending_presentation receipt);
     run(F.W.Confirm(fixture.presentation,receipt))progress;
     let next,out=B.receive bound ~index ~round progress in
     let rec drain fuel state action =

@@ -172,7 +172,7 @@ let advance t =
        (match W.append_intent session ~mutation_id:t.mutation_id ~block_id:t.block_id
            ~day:t.day ~title:"synthetic" ~task_status:None ~children:Rrbvec.empty with
         | Error _ -> release t session
-        | Ok intent -> t.save(W.encode_append_intent intent);
+        | Ok intent -> t.save(W.encode_durable_intent(W.Append_intent intent));
           plan t session (W.Append intent) (fun ticket -> Write ticket))
      | Some _ -> forget t ticket; release t session
      | None -> ())

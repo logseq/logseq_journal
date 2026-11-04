@@ -69,7 +69,7 @@ type payload =
   | Capture_projection_settled of
       {command:Journal_graph_projection.capture;presentation:Journal_worker_coordination.Worker_api.presentation option;
        result:payload;failure:Journal_worker_coordination.Worker_api.error option;insert_rejected:bool}
-  | Mutation_settled of Journal_worker_coordination.Worker_api.mutation_intent * Journal_worker_coordination.Worker_api.presentation * payload
+  | Mutation_settled of Journal_worker_coordination.Worker_api.durable_intent * Journal_worker_coordination.Worker_api.presentation * payload
   | Mutation_waiting of { mutation_id:string; block_id:string; message:string }
   | Projection_changes of Worker_pure_data.change_window list
   | Projection_resync
@@ -216,7 +216,7 @@ type operation =
   | Child_canonical of { root : Graph.Uuid.t; round : int64 }
   | Child_chain_parent of { root : Graph.Uuid.t; round : int64; summary : Worker.block_summary }
   | Child_ack of { root : Graph.Uuid.t; index : int; round : int64;
-      intent : Worker.mutation_intent; presentation : Worker.presentation }
+      intent : Worker.durable_intent; presentation : Worker.presentation }
   | Child_insert of Projection.create_child * Graph.page
   | Changed_block of { block_id : string }
   | Changed_detail_block of { block_id : string; observed : bool }
@@ -261,7 +261,7 @@ type request_delivery =
   | Dispatched
 
 type durable_operation =
-  { intent : Worker.mutation_intent
+  { intent : Worker.durable_intent
   ; presentation : Worker.presentation
   ; confirm_readback : bool
   ; root_request : Protocol.request
@@ -3016,19 +3016,19 @@ let mutation_presentation t (request:Protocol.request) =
 let pending_mutation t ~mutation_id =
   Hashtbl.to_seq_values t.pending |> Seq.find_map(fun pending->
     match pending.durable with
-    | Some durable when Graph.Uuid.to_string(Worker.mutation_intent_id durable.intent)=mutation_id
+    | Some durable when Graph.Uuid.to_string(Worker.durable_intent_id durable.intent)=mutation_id
         && Graph.Uuid.equal pending.original.request_id durable.root_request.request_id -> Some durable.root_request
     | _->None)
 ;;
 
 let acknowledge_mutation t intent =
-  match pending_mutation t ~mutation_id:(Graph.Uuid.to_string(Worker.mutation_intent_id intent)) with
+  match pending_mutation t ~mutation_id:(Graph.Uuid.to_string(Worker.durable_intent_id intent)) with
   | Some request->Hashtbl.remove t.pending(Graph.Uuid.to_string request.request_id)
   | None->()
 ;;
 
 let update_mutation_acknowledgement t intent f =
-  match pending_mutation t ~mutation_id:(Graph.Uuid.to_string(Worker.mutation_intent_id intent)) with
+  match pending_mutation t ~mutation_id:(Graph.Uuid.to_string(Worker.durable_intent_id intent)) with
   |None->false
   |Some request->let key=Graph.Uuid.to_string request.Protocol.request_id in
     match Hashtbl.find_opt t.pending key with
@@ -3045,7 +3045,7 @@ let finish_mutation_acknowledgement t intent =
   ignore(update_mutation_acknowledgement t intent(fun durable->Some{durable with acknowledgement_in_flight=false}))
 ;;
 let claim_mutation_ack_recovery t intent ~presentation =
-  match pending_mutation t ~mutation_id:(Graph.Uuid.to_string(Worker.mutation_intent_id intent)) with
+  match pending_mutation t ~mutation_id:(Graph.Uuid.to_string(Worker.durable_intent_id intent)) with
   | None->false
   | Some request->let key=Graph.Uuid.to_string request.Protocol.request_id in
     (match Hashtbl.find_opt t.pending key with
@@ -3239,7 +3239,7 @@ let reconcile_signal t ~request_generation push =
 
 
 type worker_read =
-  | Confirm_readback of {intent:Worker.mutation_intent;presentation:Worker.presentation;query:Worker.block_summary Worker.query}
+  | Confirm_readback of {intent:Worker.durable_intent;presentation:Worker.presentation;query:Worker.block_summary Worker.query}
   | Read :
       { query : 'a Worker.query
       ; maximum_items : int

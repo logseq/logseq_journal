@@ -285,8 +285,6 @@ val append_intent
   -> (append_intent, error) result
 
 val append_intent_id : append_intent -> Uuid.t
-val encode_append_intent : append_intent -> bytes
-val restore_append_intent : session -> bytes -> (append_intent, error) result
 
 type mutation_command = Worker_effect_authority.mutation_command =
   | Save_block of
@@ -334,8 +332,17 @@ val mutation_intent
   -> (mutation_intent, error) result
 
 val mutation_intent_id : mutation_intent -> Uuid.t
-val encode_mutation_intent : mutation_intent -> bytes
-val restore_mutation_intent : session -> bytes -> (mutation_intent, error) result
+
+type durable_intent = Worker_effect_authority.durable_intent =
+  | Append_intent of append_intent
+  | Mutation_intent of mutation_intent
+
+(** One lifecycle identity preserves the original family and canonical stored
+    bytes. Restoring is read-only; it never submits or replays a mutation. *)
+val durable_intent_id : durable_intent -> Uuid.t
+val encode_durable_intent : durable_intent -> bytes
+val restore_durable_intent : session -> bytes -> (durable_intent, error) result
+
 
 (** General mutations preserve today's exact preconditions and mutation IDs.
     Restores validate logical origin/account/graph and all bytes, allowing fresh
@@ -348,7 +355,7 @@ val restore_mutation_intent : session -> bytes -> (mutation_intent, error) resul
 type receipt = Worker_effect_authority.receipt
 type confirmation = Worker_effect_authority.confirmation
 
-val receipt_intent : receipt -> mutation_intent
+val receipt_intent : receipt -> durable_intent
 val receipt_mutation_id : receipt -> Uuid.t
 val receipt_revisions : receipt -> string * string * string
 
@@ -407,7 +414,7 @@ type admission_error = Worker_effect_authority.admission_error =
     artifact byte ceiling accommodates a full legal intent and proof; ordinary
     query read_budget limits do not apply. Cursors bind session and both budgets. *)
 type mutation_recovery_cursor = Worker_effect_authority.mutation_recovery_cursor
-type recovered_mutation = Worker_effect_authority.recovered_mutation = private { intent : mutation_intent; progress : mutation_progress }
+type recovered_mutation = Worker_effect_authority.recovered_mutation = private { intent : durable_intent; progress : mutation_progress }
 type mutation_recovery = Worker_effect_authority.mutation_recovery = private
   { items : recovered_mutation Rrbvec.t; next : mutation_recovery_cursor option }
 
@@ -595,7 +602,7 @@ type 'a request = 'a Worker_effect_authority.request =
   | Recover_mutations :
       { after : mutation_recovery_cursor option; maximum_items : int; maximum_bytes : int }
       -> mutation_recovery request
-  | Acknowledge_intent : mutation_intent -> unit request
+  | Acknowledge_intent : durable_intent -> unit request
   | Acknowledge_changes : change_batch -> change_ack request
   | Import : asset_import_intent -> import_progress request
   | Recover_import_inputs : {after:import_input_recovery_cursor option;maximum_items:int;maximum_bytes:int} -> import_input_recovery request

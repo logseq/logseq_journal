@@ -339,9 +339,7 @@ let changefeed_updates ~previous view =
     Rrbvec.empty
 ;;
 let shutdown_state v = v.shutdown
-let mutation_progress view intent =
-  Intents.find_opt (Bytes.to_string(Worker.encode_append_intent intent)) view.intents
-let intent_key intent = Bytes.to_string (Worker.encode_mutation_intent intent)
+let intent_key intent = Bytes.to_string (Worker.encode_durable_intent intent)
 let intent_progress view intent = Intents.find_opt (intent_key intent) view.intents
 let adopt_import_source facts proof =
   let id=Worker.import_source_proof_id proof in
@@ -1437,7 +1435,7 @@ let intent_capacity intents =
 let recovered_intents facts session (page:Worker.mutation_recovery) =
   let merged=Rrbvec.fold_left(fun result (item:Worker.recovered_mutation)->
     Result.bind result(fun intents->
-      Result.bind(Worker.validate_request session(Worker.Mutate item.intent))(fun()->
+      Result.bind(Worker.validate_request session(match item.intent with Worker.Append_intent intent->Worker.Append intent|Mutation_intent intent->Worker.Mutate intent))(fun()->
         let key=intent_key item.intent in
         let old=Intents.find_opt key intents in
         let valid=match old,item.progress with
@@ -1458,15 +1456,12 @@ let recovered_intents facts session (page:Worker.mutation_recovery) =
 
 let retire_intent_attempts entries intent =
   let key=intent_key intent in
-  let matches actual=actual==intent ||
-    (Worker.Uuid.equal(Worker.mutation_intent_id actual)(Worker.mutation_intent_id intent)
-     && intent_key actual=key) in
+  let matches actual=intent_key actual=key in
   Slots.map(fun (Entry slot as entry)->
     let same_intent=match slot.ticket.query with
-      | Operation(Worker.Mutate actual|Acknowledge_intent actual)->matches actual
-      | Operation(Worker.Append actual)->
-        Worker.Uuid.equal(Worker.append_intent_id actual)(Worker.mutation_intent_id intent)
-        && Bytes.to_string(Worker.encode_append_intent actual)=key
+      | Operation(Worker.Mutate actual)->matches(Worker.Mutation_intent actual)
+      | Operation(Worker.Append actual)->matches(Worker.Append_intent actual)
+      | Operation(Worker.Acknowledge_intent actual)->matches actual
       | Operation(Worker.Confirm(_,receipt))->matches(Worker.receipt_intent receipt)
       | _->false in
     if slot.result=None && same_intent then Entry{slot with retired_by_ack=true} else entry)entries
@@ -1596,10 +1591,10 @@ let checked_result : type a. view -> a ticket -> a Worker.reply -> a Worker.repl
             (Worker.Protocol_mismatch "Refreshed value does not match its owned interest")))
   | ( Operation (Worker.Mutate intent)
     , Worker.Answered (Ok (Worker.Committed_pending_presentation receipt)) ) ->
-    if receipt_agrees facts (intent_key intent) receipt then result else mismatch ()
+    if receipt_agrees facts (intent_key(Worker.Mutation_intent intent)) receipt then result else mismatch ()
   | Operation (Worker.Mutate _), Worker.Answered (Ok (Worker.Confirmed _)) -> mismatch ()
   | Operation (Worker.Append intent), Worker.Answered (Ok (Worker.Committed_pending_presentation receipt)) ->
-    if receipt_agrees facts (Bytes.to_string(Worker.encode_append_intent intent)) receipt then result else mismatch ()
+    if receipt_agrees facts (intent_key(Worker.Append_intent intent)) receipt then result else mismatch ()
   | Operation (Worker.Append _), Worker.Answered (Ok (Worker.Confirmed _)) -> mismatch ()
   | ( Operation (Worker.Confirm (presentation, receipt))
     , Worker.Answered (Ok (Worker.Confirmed confirmation)) ) ->
@@ -2056,11 +2051,11 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
          let intents : Worker.mutation_progress Intents.t =
            if slot.retired_by_ack then state.facts.intents else match ticket.query with
            | Operation (Worker.Mutate intent) ->
-             retain_submission_result state.facts.intents ~key:(intent_key intent)
+             retain_submission_result state.facts.intents ~key:(intent_key(Worker.Mutation_intent intent))
                ~admitted:(slot.admitted<>None) result
            | Operation (Worker.Append intent) ->
              retain_submission_result state.facts.intents
-               ~key:(Bytes.to_string(Worker.encode_append_intent intent))
+               ~key:(intent_key(Worker.Append_intent intent))
                ~admitted:(slot.admitted<>None) result
            | Operation (Worker.Confirm (presentation, receipt)) ->
              let key = intent_key (Worker.receipt_intent receipt) in
@@ -3772,9 +3767,9 @@ let request
                        )))
             | Worker.Append intent ->
               plan_mutation state session operation
-                (Bytes.to_string(Worker.encode_append_intent intent)) (Direct session)
+                (intent_key(Worker.Append_intent intent)) (Direct session)
             | Worker.Mutate intent ->
-              plan_mutation state session operation (intent_key intent) (Direct session)
+              plan_mutation state session operation (intent_key(Worker.Mutation_intent intent)) (Direct session)
             | Worker.Confirm (presentation, receipt) ->
               plan_mutation
                 state
@@ -3798,7 +3793,7 @@ let reconcile_mutation state ~presentation intent =
       | Some (Worker.Committed_pending_presentation receipt) -> Worker.Confirm (presentation, receipt)
       | Some (Worker.Confirmed confirmation) ->
         Worker.Confirm (presentation, Worker.confirmation_receipt confirmation)
-      | None | Some (Worker.Outcome_unknown | Worker.Rejected _) -> Worker.Mutate intent in
+      | None | Some (Worker.Outcome_unknown | Worker.Rejected _) -> (match intent with Worker.Append_intent intent->Worker.Append intent|Mutation_intent intent->Worker.Mutate intent) in
     request state session operation
   | _ -> Error Worker.Revoked_session
 ;;

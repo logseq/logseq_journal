@@ -17,8 +17,7 @@ val projection : view -> Worker.projection option
     the previous view. Stale/foreign notices never reach this outlet; it retains
     no delivery history. Queued consumers still validate the notice session. *)
 val changefeed_updates : previous:view option -> view -> Worker.changefeed_notice Rrbvec.t
-val mutation_progress : view -> Worker.append_intent -> Worker.mutation_progress option
-val intent_progress : view -> Worker.mutation_intent -> Worker.mutation_progress option
+val intent_progress : view -> Worker.durable_intent -> Worker.mutation_progress option
 
 (** A queued business callback rechecks presentation after ticket Forget. It
     cannot use a captured success to settle a later focus generation. *)
@@ -241,7 +240,7 @@ val request
     reads its original proof; Unknown reconciles using the same intent. The
     supplied current presentation is checked before either request is planned. *)
 val reconcile_mutation
-  : t -> presentation:Worker.presentation -> Worker.mutation_intent
+  : t -> presentation:Worker.presentation -> Worker.durable_intent
   -> (Worker.mutation_progress ticket * transition, Worker.error) result
 
 type mutation_settlement =
@@ -252,7 +251,7 @@ type mutation_settlement =
     needs ACK only after that exact presentation consumed its canonical DTOs;
     an older applied presentation first requires canonical readback. *)
 val settle_applied_mutation
-  : t -> presentation:Worker.presentation -> applied_presentation:Worker.presentation -> Worker.mutation_intent
+  : t -> presentation:Worker.presentation -> applied_presentation:Worker.presentation -> Worker.durable_intent
   -> (mutation_settlement * transition, Worker.error) result
 
 (** Start application of an actually delivered batch. An active successful

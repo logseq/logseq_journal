@@ -1399,10 +1399,10 @@ let test_client_to_typed_read () =
       | Error (W.Invalid_input message) -> failwith message
       | Error _ -> failwith "durable intent rejected"
     in
-    let wire = W.encode_mutation_intent intent in
-    let restored = W.restore_mutation_intent session wire |> Result.get_ok in
+    let wire = W.encode_durable_intent(W.Mutation_intent intent) in
+    let restored = W.restore_durable_intent session wire |> Result.get_ok in
     require
-      (W.encode_mutation_intent restored = wire)
+      (W.encode_durable_intent restored = wire)
       "complete mutation changed on restore";
     let observed_block_ticket,observed_block_reply=request(W.Observe(budget,
       W.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None})) in
@@ -1457,9 +1457,9 @@ let test_client_to_typed_read () =
       "durable receipt lost canonical target";
     apply (C.step !state (C.Forget mutation_ticket));
     require
-      (Option.is_some (C.intent_progress (C.view !state) intent))
+      (Option.is_some (C.intent_progress (C.view !state)(W.Mutation_intent intent)))
       "forgetting ticket erased durable outcome";
-    let _, again = request (W.Mutate restored) in
+    let _, again = request (match restored with W.Mutation_intent intent->W.Mutate intent|Append_intent intent->W.Append intent) in
     (match again with
      | W.Answered (Ok (W.Committed_pending_presentation repeated)) ->
        require
@@ -1554,7 +1554,7 @@ let test_client_to_typed_read () =
          ~some:(fun p -> W.equal_session (W.presentation_session p) session)
          (selected ()))
       "focus roundtrip revoked resident execution instead of presentation";
-    (match C.intent_progress (C.view !state) intent with
+    (match C.intent_progress (C.view !state)(W.Mutation_intent intent) with
      | Some (W.Committed_pending_presentation preserved) ->
        require
          (W.receipt_revisions preserved = original)
@@ -1957,7 +1957,7 @@ let test_host_durable_recovery_confirmation_ack () =
       (W.Save_block{block=Test_support.authoritative_block_uuid;title="Typed applied readback";
         preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}) |> Result.get_ok in
     let receipt=match value(call(W.Mutate intent)) with W.Committed_pending_presentation receipt->receipt|_->failwith "typed write lost proof" in
-    require(Result.is_error(Host.request host session(W.Acknowledge_intent intent))) "typed unconfirmed commit admitted ACK";
+    require(Result.is_error(Host.request host session(W.Acknowledge_intent(W.Mutation_intent intent)))) "typed unconfirmed commit admitted ACK";
     let recover()=value(call(W.Recover_mutations{after=None;maximum_items=8;maximum_bytes=W.maximum_mutation_recovery_bytes})) in
     let page=recover() in
     require(Rrbvec.length page.items=1) "typed recovery lost the persisted intent";
@@ -1968,8 +1968,8 @@ let test_host_durable_recovery_confirmation_ack () =
       | W.Confirmed_block{lookup=Worker_pure_data.V2_present_block{value;_};_}->value.block.title="Typed applied readback"
       | _->false in
     require ui_applied "canonical DTO was not applied to the consuming projection";
-    ignore(value(call(W.Acknowledge_intent intent)));
-    require(C.intent_progress(Host.view host)intent=None) "actual typed ACK did not retire pure ownership";
+    ignore(value(call(W.Acknowledge_intent(W.Mutation_intent intent))));
+    require(C.intent_progress(Host.view host)(W.Mutation_intent intent)=None) "actual typed ACK did not retire pure ownership";
     require(Rrbvec.is_empty(recover()).items) "actual typed ACK did not settle database recovery entry";
     let before=read() in
     require(match value(call(W.Mutate intent)) with W.Committed_pending_presentation original->
@@ -1987,7 +1987,7 @@ let test_host_durable_recovery_confirmation_ack () =
     require(match W.confirmation_primary status_confirmation with
       | W.Confirmed_block{lookup=Worker_pure_data.V2_present_block{value;_};_}->value.task_status=Some status
       | _->false) "real canonical DTO lost committed status UUID";
-    ignore(value(call(W.Acknowledge_intent status_intent)));
+    ignore(value(call(W.Acknowledge_intent(W.Mutation_intent status_intent))));
     require(Rrbvec.is_empty(recover()).items) "real status ACK retained pending recovery entry";
     let completed_appends=ref Rrbvec.empty in
     List.iteri(fun index day->
@@ -2016,12 +2016,25 @@ let test_host_durable_recovery_confirmation_ack () =
         "Append separated or lost its child status write";
       ignore(value(call(W.Acknowledge_intent(W.receipt_intent receipt))));
       require(Rrbvec.is_empty(recover()).items) "actual Append ACK did not settle its durable recovery item";
-      require(match value(call(W.Append(W.restore_append_intent session(W.encode_append_intent append) |> Result.get_ok))) with
+      require(match value(call((match W.restore_durable_intent session(W.encode_durable_intent(W.Append_intent append)) |> Result.get_ok with W.Append_intent intent->W.Append intent|Mutation_intent _->failwith "stored Append lost its family"))) with
         | W.Committed_pending_presentation again->W.receipt_revisions again=W.receipt_revisions receipt
         |_->false) "Append retry lost the original commit proof";
       require(value(call(W.Query(budget,W.Block_summary{block=root_id;after=None})))=summary)
         "Append retry duplicated or changed the complete canonical tree";
-      completed_appends:=Rrbvec.push_back !completed_appends(W.encode_append_intent append,receipt,root_id,summary)) [20261102;20261103];
+      completed_appends:=Rrbvec.push_back !completed_appends(W.encode_durable_intent(W.Append_intent append),receipt,root_id,summary)) [20261102;20261103];
+    let rejected_append=W.append_intent session
+      ~mutation_id:(uuid "9f000000-0000-4000-8000-000000002199")
+      ~block_id:Test_support.authoritative_block_uuid
+      ~day:(W.journal_day 20261102 |> Result.get_ok) ~title:"Conflicting existing block"
+      ~task_status:None ~children:Rrbvec.empty |> Result.get_ok in
+    require(match value(call(W.Append rejected_append)) with W.Rejected _->true|_->false)
+      "existing block Append conflict was not a known non-commit";
+    require(match C.intent_progress(Host.view host)(W.Append_intent rejected_append) with
+      |Some(W.Rejected _)->true|_->false) "Rejected Append lost its original lifecycle family";
+    ignore(value(call(W.Acknowledge_intent(W.Append_intent rejected_append))));
+    require(C.intent_progress(Host.view host)(W.Append_intent rejected_append)=None
+      && Rrbvec.is_empty(recover()).items)
+      "Rejected Append without a receipt could not settle its original proof";
     (* Child business ordering against the actual Service and persisted intents.
        UI application here uses the production pure block projection; mounted
        application tests separately verify the rendered composer barrier. *)
@@ -2053,7 +2066,7 @@ let test_host_durable_recovery_confirmation_ack () =
           incr writes;
           let stage=Child.stage state index in
           let intent=W.mutation_intent session ~mutation_id:(Child.stage_id stage)(Child.stage_mutation stage) |> Result.get_ok in
-          let state=Child.bind state ~index ~round ~intent ~presentation |> Option.get in
+          let state=Child.bind state ~index ~round ~intent:(W.Mutation_intent intent) ~presentation |> Option.get in
           let receipt=match value(call(W.Mutate intent)) with
             | W.Committed_pending_presentation receipt->receipt|_->failwith "real Child lost durable commit" in
           proofs:=(intent,receipt):: !proofs;
@@ -2104,7 +2117,7 @@ let test_host_durable_recovery_confirmation_ack () =
     require(match W.confirmation_primary deleted_confirmation with
       | W.Confirmed_absence{uuid;_}->W.Uuid.equal uuid Test_support.authoritative_block_uuid
       | _->false) "typed deletion did not deliver exact canonical absence";
-    ignore(value(call(W.Acknowledge_intent deletion)));
+    ignore(value(call(W.Acknowledge_intent(W.Mutation_intent deletion))));
     require(Rrbvec.is_empty(recover()).items) "real deletion ACK retained pending recovery entry";
     require(match value(call(W.Mutate deletion)) with
       | W.Committed_pending_presentation original->W.receipt_revisions original=W.receipt_revisions deleted_receipt
@@ -2125,7 +2138,7 @@ let test_host_durable_recovery_confirmation_ack () =
     let current=Option.get(Option.bind(C.projection(Host.view host))W.selected) in
     let fresh=W.presentation_session current in
     Rrbvec.iter(fun(bytes,original,root_id,summary)->
-      let append=W.restore_append_intent fresh bytes |> Result.get_ok in
+      let append=match W.restore_durable_intent fresh bytes |> Result.get_ok with W.Append_intent intent->intent|Mutation_intent _->failwith "recovered Append lost its family" in
       let receipt=match value(call_in fresh(W.Append append)) with
         | W.Committed_pending_presentation receipt->receipt|_->failwith "reopened Append did not reconcile" in
       require(W.receipt_revisions receipt=W.receipt_revisions original)

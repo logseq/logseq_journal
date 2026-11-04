@@ -180,7 +180,7 @@ module Pure_insertion = struct
   type stage =
     { wire : Protocol.command
     ; choice : choice option
-    ; binding : (Worker.mutation_intent * Worker.presentation) option
+    ; binding : (Worker.durable_intent * Worker.presentation) option
     ; outcome : Worker.mutation_progress option
     ; acknowledged : bool
     ; submission_recovered : bool
@@ -212,7 +212,7 @@ module Pure_insertion = struct
     | Read_child of int64
     | Read_parent of int64 * Worker.block_summary
     | Present of int64
-    | Acknowledge of int * int64 * Worker.mutation_intent * Worker.presentation
+    | Acknowledge of int * int64 * Worker.durable_intent * Worker.presentation
     | Complete
     | Ignore
     | Wait of string
@@ -240,9 +240,9 @@ module Pure_insertion = struct
        | Ok day->match Worker.append_intent session ~mutation_id ~block_id:root.block_id
            ~day ~title:root.title ~task_status:root.task_status ~children:root.children with
          | Error error->Error error
-         | Ok intent->Worker.restore_mutation_intent session (Worker.encode_append_intent intent))
+         | Ok intent->Ok(Worker.Append_intent intent))
     | (Protocol.V2_insert_blocks _|V2_set_task_status _|V2_clear_task_status _) as wire->
-      Worker.mutation_intent session ~mutation_id:(wire_id wire)(mutation wire)
+      Worker.mutation_intent session ~mutation_id:(wire_id wire)(mutation wire) |> Result.map(fun intent->Worker.Mutation_intent intent)
     | _->Error(Worker.Invalid_input "Unsupported durable insertion wire.")
   let stage_intent session stage = wire_intent session stage.wire
   let replace_stage t index value =
@@ -352,7 +352,7 @@ module Pure_insertion = struct
         previous (Worker.presentation_session presentation)) t.origin in
       if not same_origin then None else
       (match stage_intent (Worker.presentation_session presentation) current with
-       | Ok expected when Worker.encode_mutation_intent expected=Worker.encode_mutation_intent intent ->
+       | Ok expected when Worker.encode_durable_intent expected=Worker.encode_durable_intent intent ->
          Some{(replace_stage t index {current with binding=Some(intent,presentation);acknowledged=false}) with current=Some presentation;origin=Some(Worker.presentation_session presentation)}
        | _ -> None)
     | _ -> None
@@ -433,8 +433,8 @@ module Pure_insertion = struct
       (match current.binding,progress with
        | Some(intent,presentation),Worker.Confirmed confirmation
          when Worker.confirmation_presentation confirmation=presentation
-           && Worker.encode_mutation_intent(Worker.receipt_intent(Worker.confirmation_receipt confirmation))
-              =Worker.encode_mutation_intent intent ->
+           && Worker.encode_durable_intent(Worker.receipt_intent(Worker.confirmation_receipt confirmation))
+              =Worker.encode_durable_intent intent ->
          let original=match current.outcome with
            | Some(Worker.Confirmed value)->Some(Worker.confirmation_receipt value)
            | Some(Committed_pending_presentation receipt)->Some receipt

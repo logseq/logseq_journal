@@ -110,7 +110,7 @@ module Admission_refresh = Journal_admission_refresh
 type pending_delete =
   { mutation_id:string
   ; block_id:string
-  ; settled_intent:(Journal_worker_coordination.Worker_api.mutation_intent * Journal_worker_coordination.Worker_api.presentation) option
+  ; settled_intent:(Journal_worker_coordination.Worker_api.durable_intent * Journal_worker_coordination.Worker_api.presentation) option
   }
 
 type pending_status =
@@ -118,7 +118,7 @@ type pending_status =
   ; block_id : string
   ; expected_revision : string
   ; task_state : Journal_model.task_state
-  ; settled_intent : (Journal_worker_coordination.Worker_api.mutation_intent * Journal_worker_coordination.Worker_api.presentation) option
+  ; settled_intent : (Journal_worker_coordination.Worker_api.durable_intent * Journal_worker_coordination.Worker_api.presentation) option
   }
 
 type timeline_notice =
@@ -1257,11 +1257,11 @@ let rec apply_worker_response ?(settling=false) ~discard state (response : Journ
     let next=apply_worker_response ~settling:true ~discard state {payload} in
     (match state.pending_status with
      | Some pending when pending.mutation_id=Logseq_db_types.Graph_types.Uuid.to_string
-         (Journal_worker_coordination.Worker_api.mutation_intent_id intent)->
+         (Journal_worker_coordination.Worker_api.durable_intent_id intent)->
        {next with pending_status=Some{pending with settled_intent=Some(intent,presentation)}}
      | _->(match state.pending_delete with
        | Some pending when pending.mutation_id=Logseq_db_types.Graph_types.Uuid.to_string
-           (Journal_worker_coordination.Worker_api.mutation_intent_id intent)->
+           (Journal_worker_coordination.Worker_api.durable_intent_id intent)->
          {next with pending_delete=Some{pending with settled_intent=Some(intent,presentation)}}
        | _->next))
   | Mutation_waiting{mutation_id;block_id;message}->
@@ -4342,7 +4342,7 @@ let start
        | _->Journal_graph_transport.Not_ready)
     | _->Journal_graph_transport.Not_ready in
   let send_coordinated_mutation request (mutation_id,command) =
-    send_coordinated_intent request(fun session->Wc.mutation_intent session ~mutation_id command) in
+    send_coordinated_intent request(fun session->Wc.mutation_intent session ~mutation_id command |> Result.map(fun intent->Wc.Mutation_intent intent)) in
   let send_coordinated_append request wire =
     send_coordinated_intent request(fun session->
       Journal_graph_mutation_confirmation.Pure_insertion.wire_intent session wire) in
@@ -4418,7 +4418,7 @@ let start
         Journal_graph_runtime.finish_mutation_acknowledgement (!graph_runtime_cell)intent;
         set_state_and_effect(fun state->
       match state.pending_status with
-      | Some pending when pending.mutation_id=Logseq_db_types.Graph_types.Uuid.to_string(Wc.mutation_intent_id intent)
+      | Some pending when pending.mutation_id=Logseq_db_types.Graph_types.Uuid.to_string(Wc.durable_intent_id intent)
           && pending.settled_intent=Some(intent,applied_presentation) ->
         let current=match presentation,timeline_scope state,!coordination_host with
           | Some presentation,Some owner,Some(_,host)->
@@ -4430,7 +4430,7 @@ let start
         else {state with timeline_notice=Some(Status_pending
           "The status result is applied, but its acknowledgement could not finish.")},Effect.ignore
       | _->(match state.pending_delete with
-        | Some pending when pending.mutation_id=Logseq_db_types.Graph_types.Uuid.to_string(Wc.mutation_intent_id intent)
+        | Some pending when pending.mutation_id=Logseq_db_types.Graph_types.Uuid.to_string(Wc.durable_intent_id intent)
             && pending.settled_intent=Some(intent,applied_presentation)->
           let current=match presentation,timeline_scope state,!coordination_host with
             | Some presentation,Some owner,Some(_,host)->Coordination.current_presentation ~owner
@@ -4468,7 +4468,7 @@ let start
           | Ok(Coordination.Reconciliation ticket)->
             Journal_graph_runtime.finish_mutation_acknowledgement (!graph_runtime_cell)intent;
             (match Journal_graph_runtime.pending_mutation (!graph_runtime_cell)
-                ~mutation_id:(Logseq_db_types.Graph_types.Uuid.to_string(Wc.mutation_intent_id intent)) with
+                ~mutation_id:(Logseq_db_types.Graph_types.Uuid.to_string(Wc.durable_intent_id intent)) with
              | None->Coordination_host.watch host ticket ~f:(fun _->failed ())
              | Some request->
                Effect.run(set_state(fun state->match state.pending_status with
@@ -4534,11 +4534,11 @@ let start
               | Some owner,Some(_,host)->Coordination.current_presentation ~owner (Coordination_host.view host)presentation
               | _->false)->
             (match state.pending_status with
-             | Some pending when pending.mutation_id=Logseq_db_types.Graph_types.Uuid.to_string(Wc.mutation_intent_id intent)->
+             | Some pending when pending.mutation_id=Logseq_db_types.Graph_types.Uuid.to_string(Wc.durable_intent_id intent)->
                Journal_graph_runtime.{payload=Mutation_waiting{mutation_id=pending.mutation_id;block_id=pending.block_id;
                  message="The confirmation belongs to an earlier presentation."}}
              | _->(match state.pending_delete with
-               | Some pending when pending.mutation_id=Logseq_db_types.Graph_types.Uuid.to_string(Wc.mutation_intent_id intent)->
+               | Some pending when pending.mutation_id=Logseq_db_types.Graph_types.Uuid.to_string(Wc.durable_intent_id intent)->
                  Journal_graph_runtime.{payload=Mutation_waiting{mutation_id=pending.mutation_id;block_id=pending.block_id;
                    message="The deletion confirmation belongs to an earlier presentation."}}
                | _->Journal_graph_runtime.{payload=Reference_sources_changed []}))

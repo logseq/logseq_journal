@@ -262,8 +262,14 @@ type mutation_command =
 
 type mutation_intent = Wire.t
 
+type durable_intent =
+  | Append_intent of append_intent
+  | Mutation_intent of mutation_intent
+
+let durable_wire = function Append_intent intent | Mutation_intent intent -> intent
+
 type receipt =
-  { intent : mutation_intent
+  { intent : durable_intent
   ; generation : string
   ; before : string
   ; after : string
@@ -295,7 +301,7 @@ type mutation_progress =
 
 type mutation_recovery_cursor =
   { recovery_owner : session; after : int64; maximum_items : int; maximum_bytes : int }
-type recovered_mutation = { intent : mutation_intent; progress : mutation_progress }
+type recovered_mutation = { intent : durable_intent; progress : mutation_progress }
 type mutation_recovery = { items : recovered_mutation Rrbvec.t; next : mutation_recovery_cursor option }
 
 let maximum_mutation_recovery_bytes = Wire.maximum_recovery_bytes
@@ -387,7 +393,7 @@ type _ request =
   | Recover_mutations :
       { after : mutation_recovery_cursor option; maximum_items : int; maximum_bytes : int }
       -> mutation_recovery request
-  | Acknowledge_intent : mutation_intent -> unit request
+  | Acknowledge_intent : durable_intent -> unit request
   | Acknowledge_changes : change_batch -> change_ack request
   | Import : asset_import_intent -> import_progress request
   | Recover_import_inputs : {after:import_input_recovery_cursor option;maximum_items:int;maximum_bytes:int} -> import_input_recovery request
@@ -611,14 +617,6 @@ let append_intent (session:session) ~mutation_id ~block_id ~day ~title ~task_sta
 ;;
 
 let append_intent_id = Wire.mutation_id
-let encode_append_intent intent = Bytes.of_string(Wire.encode intent)
-let restore_append_intent (session:session) bytes =
-  Result.bind(Wire.restore ~origin:(Uri.of_string session.binding.origin) ~user:session.binding.user
-    ~graph:session.graph(Bytes.to_string bytes) |> Result.map_error(fun message->Invalid_input message))
-    (fun intent->match Wire.command intent with
-      | Protocol.V2_append_journal _->Ok intent
-      | _->Error(Invalid_input "Stored intent is not an atomic Append"))
-;;
 
 let wire_command ~mutation_id = function
   | Save_block { block; title; preconditions } ->
@@ -648,33 +646,38 @@ let mutation_intent (session : session) ~mutation_id command =
 ;;
 
 let mutation_intent_id = Wire.mutation_id
-let encode_mutation_intent intent = Bytes.of_string (Wire.encode intent)
-
-let restore_mutation_intent (session : session) bytes =
+let durable_intent_id intent = Wire.mutation_id (durable_wire intent)
+let encode_durable_intent intent = Bytes.of_string (Wire.encode (durable_wire intent))
+let restore_durable_intent (session : session) bytes =
   Wire.restore
     ~origin:(Uri.of_string session.binding.origin)
     ~user:session.binding.user
     ~graph:session.graph
     (Bytes.to_string bytes)
+  |> Result.map (fun intent -> match Wire.command intent with
+    | Protocol.V2_append_journal _ -> Append_intent intent
+    | _ -> Mutation_intent intent)
   |> Result.map_error (fun message -> Invalid_input message)
 ;;
 
-let validate_intent session intent =
-  restore_mutation_intent session (encode_mutation_intent intent)
-  |> Result.map (fun _ -> ())
+let validate_intent (session:session) intent =
+  let namespace=Wire.namespace_for_owner ~origin:(Uri.of_string session.binding.origin)
+    ~user:session.binding.user ~graph:session.graph in
+  if String.equal namespace (Wire.namespace(durable_wire intent)) then Ok ()
+  else Error(Invalid_input "Durable intent belongs to another logical graph")
 ;;
 
 let receipt_intent (receipt:receipt) = receipt.intent
-let receipt_mutation_id (receipt:receipt) = Wire.mutation_id receipt.intent
+let receipt_mutation_id (receipt:receipt) = durable_intent_id receipt.intent
 let receipt_revisions receipt = receipt.generation, receipt.before, receipt.after
-let receipt_targets (receipt:receipt) = Wire.targets receipt.intent
+let receipt_targets (receipt:receipt) = Wire.targets (durable_wire receipt.intent)
 
 let decode_mutation_receipt session ~request_id ~intent response =
   Result.bind (validate_intent session intent) (fun () ->
     if Protocol.encoded_response_bytes response > session.limits.response_budget_bytes
     then Error Response_budget_exceeded
     else
-      Wire.committed_point intent ~request_id response
+      Wire.committed_point (durable_wire intent) ~request_id response
       |> Result.map (fun point ->
         { intent
         ; generation = point.Wire.generation
@@ -737,8 +740,8 @@ let decode_recovery session ~request_id ~after ~maximum_items ~maximum_bytes (pa
     else
       let decoded=Rrbvec.fold_left(fun result (item:Wire.recovery_item)->
         Result.bind result (fun(items,seen)->
-          Result.bind(restore_mutation_intent session(Bytes.of_string item.intent))(fun intent->
-            let id=Wire.mutation_id intent in
+          Result.bind(restore_durable_intent session(Bytes.of_string item.intent))(fun intent->
+            let id=durable_intent_id intent in
             if Mutation_ids.mem id seen then Error(Protocol_mismatch "Duplicate recovered intent identity") else
             Result.map(fun progress->Rrbvec.push_back items {intent;progress},Mutation_ids.add id seen)
               (decode_mutation_progress session ~request_id ~intent item.outcome))))
@@ -1110,7 +1113,7 @@ let rec validate_request : type a. session -> a request -> (unit, error) result 
   fun session -> function
   | Append intent ->
     if not(capabilities session).atomic_append then unavailable "Atomic Append"
-    else Result.map(fun _->())(restore_append_intent session(encode_append_intent intent))
+    else validate_intent session (Append_intent intent)
   | Import intent|Confirm_import_source intent->Result.map(fun _->())(restore_asset_import_intent session(encode_asset_import_intent intent))
   | Recover_import_inputs{after;maximum_items;maximum_bytes}->validate_import_recovery session ~after ~maximum_items ~maximum_bytes
   | Acknowledge_import_source proof->if equal_session session proof.prepared_owner
@@ -1118,7 +1121,7 @@ let rec validate_request : type a. session -> a request -> (unit, error) result 
       else Error Revoked_session
   | Acquire_imported_file imported->if equal_session session imported.import_owner then Ok() else Error Revoked_session
   | Release_file lease->if equal_session session lease.lease_owner then Ok() else Error Revoked_session
-  | Mutate intent -> validate_intent session intent
+  | Mutate intent -> validate_intent session (Mutation_intent intent)
   | Confirm (presentation, receipt) -> validate_confirmation session presentation receipt
   | Recover_mutations {after;maximum_items;maximum_bytes}->validate_recovery session ~after ~maximum_items ~maximum_bytes
   | Acknowledge_intent intent->validate_intent session intent
@@ -1362,7 +1365,7 @@ let decode_confirmation session ~presentation receipt response =
       | Protocol.V2_response { api_version; outcome; _ }
         when api_version = Protocol.api_version ->
         let target =
-          match Wire.command receipt.intent with
+          match Wire.command (durable_wire receipt.intent) with
           | Protocol.V2_create_journal_page { page; _ } ->
             decode session budget (Page { uuid = page; revision = None }) outcome
             |> Result.map (fun page -> Confirmed_page page)

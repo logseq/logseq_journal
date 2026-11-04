@@ -72,7 +72,7 @@ module Pure_insertion : sig
     | Read_child of int64
     | Read_parent of int64 * Worker.block_summary
     | Present of int64
-    | Acknowledge of int * int64 * Worker.mutation_intent * Worker.presentation
+    | Acknowledge of int * int64 * Worker.durable_intent * Worker.presentation
     | Complete
     | Ignore
     | Wait of string
@@ -81,8 +81,8 @@ module Pure_insertion : sig
   val start_capture : command:Journal_graph_projection.capture -> resolved_status:Graph.Uuid.t option
     -> insert:Protocol.command -> (t * action,string) result
   val capture_command : Journal_graph_projection.capture -> Journal_graph_projection.create_child
-  val wire_intent : Worker.session -> Protocol.command -> (Worker.mutation_intent,Worker.error) result
-  val stage_intent : Worker.session -> stage -> (Worker.mutation_intent,Worker.error) result
+  val wire_intent : Worker.session -> Protocol.command -> (Worker.durable_intent,Worker.error) result
+  val stage_intent : Worker.session -> stage -> (Worker.durable_intent,Worker.error) result
   val command : t -> Journal_graph_projection.create_child
   val page : t -> Graph.page
   val failure : t -> Worker.error option
@@ -103,7 +103,7 @@ module Pure_insertion : sig
   val matches_child : t -> Journal_graph_projection.create_child -> bool
   val matches_capture : t -> Journal_graph_projection.capture -> bool
   val retarget_capture : t -> command:Journal_graph_projection.capture -> resolved_status:Graph.Uuid.t option -> (t,string) result
-  val bind : t -> index:int -> round:int64 -> intent:Worker.mutation_intent
+  val bind : t -> index:int -> round:int64 -> intent:Worker.durable_intent
     -> presentation:Worker.presentation -> t option
   val receive : t -> index:int -> round:int64 -> Worker.mutation_progress -> t * action
   val read_child : t -> round:int64 -> Worker.block_summary -> t * action
@@ -116,6 +116,6 @@ module Pure_insertion : sig
   val retry : t -> t * action
   val applied : t -> round:int64 -> Worker.presentation -> t * action
   val acknowledged : t -> index:int -> round:int64 -> (unit,string) result -> t * action
-  val rebind_ack : t -> index:int -> round:int64 -> intent:Worker.mutation_intent
+  val rebind_ack : t -> index:int -> round:int64 -> intent:Worker.durable_intent
     -> presentation:Worker.presentation -> t option
 end

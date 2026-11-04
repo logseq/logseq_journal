@@ -33,7 +33,7 @@ type payload =
   | Capture_projection_settled of
       {command:Journal_graph_projection.capture;presentation:Journal_worker_coordination.Worker_api.presentation option;
        result:payload;failure:Journal_worker_coordination.Worker_api.error option;insert_rejected:bool}
-  | Mutation_settled of Journal_worker_coordination.Worker_api.mutation_intent * Journal_worker_coordination.Worker_api.presentation * payload
+  | Mutation_settled of Journal_worker_coordination.Worker_api.durable_intent * Journal_worker_coordination.Worker_api.presentation * payload
   | Mutation_waiting of { mutation_id:string; block_id:string; message:string }
   | Projection_changes of Worker_pure_data.change_window list
   | Projection_resync
@@ -165,7 +165,7 @@ type worker_read_result =
   | Changes_acknowledged of Worker.change_ack
 
 type worker_read =
-  | Confirm_readback of {intent:Worker.mutation_intent;presentation:Worker.presentation;query:Worker.block_summary Worker.query}
+  | Confirm_readback of {intent:Worker.durable_intent;presentation:Worker.presentation;query:Worker.block_summary Worker.query}
   | Read :
       { query : 'a Worker.query
       ; maximum_items : int
@@ -219,7 +219,7 @@ val worker_mutation : t -> Logseq_db_worker.Protocol.request ->
   (Logseq_db_types.Graph_types.Uuid.t * Journal_worker_coordination.Worker_api.mutation_command) option
 val bind_mutation : t -> Logseq_db_worker.Protocol.request ->
   presentation:Journal_worker_coordination.Worker_api.presentation ->
-  intent:Journal_worker_coordination.Worker_api.mutation_intent -> bool
+  intent:Journal_worker_coordination.Worker_api.durable_intent -> bool
 val pending_mutation : t -> mutation_id:string -> Logseq_db_worker.Protocol.request option
 val mutation_waiting : t -> Logseq_db_worker.Protocol.request -> string -> output
 val receive_mutation : t -> Logseq_db_worker.Protocol.request ->
@@ -228,14 +228,14 @@ val receive_mutation : t -> Logseq_db_worker.Protocol.request ->
 val mutation_presentation : t -> Logseq_db_worker.Protocol.request ->
   Journal_worker_coordination.Worker_api.presentation option
 
-val acknowledge_mutation : t -> Journal_worker_coordination.Worker_api.mutation_intent -> unit
-val begin_mutation_acknowledgement : t -> Journal_worker_coordination.Worker_api.mutation_intent -> bool
-val finish_mutation_acknowledgement : t -> Journal_worker_coordination.Worker_api.mutation_intent -> unit
-val claim_mutation_ack_recovery : t -> Journal_worker_coordination.Worker_api.mutation_intent
+val acknowledge_mutation : t -> Journal_worker_coordination.Worker_api.durable_intent -> unit
+val begin_mutation_acknowledgement : t -> Journal_worker_coordination.Worker_api.durable_intent -> bool
+val finish_mutation_acknowledgement : t -> Journal_worker_coordination.Worker_api.durable_intent -> unit
+val claim_mutation_ack_recovery : t -> Journal_worker_coordination.Worker_api.durable_intent
   -> presentation:Journal_worker_coordination.Worker_api.presentation -> bool
 
 val worker_child_ack : t -> Logseq_db_worker.Protocol.request ->
-  (Journal_worker_coordination.Worker_api.mutation_intent * Journal_worker_coordination.Worker_api.presentation) option
+  (Journal_worker_coordination.Worker_api.durable_intent * Journal_worker_coordination.Worker_api.presentation) option
 val rebind_child_ack : t -> Logseq_db_worker.Protocol.request ->
   presentation:Journal_worker_coordination.Worker_api.presentation -> bool
 val receive_child_ack : t -> Logseq_db_worker.Protocol.request -> (unit,string) result -> output
