@@ -21,7 +21,7 @@ module Worker_producer = struct
       2800L
   ;;
 
-  module I = (val issuer : W.ISSUER)
+  module I = (val issuer : Worker_effect_authority.ISSUER)
   module C = Journal_worker_coordination.Worker_pure_coordinator
 
   let state =
@@ -3035,7 +3035,7 @@ module Copy_issuer = struct
     ~graph:(uuid "a1000000-0000-4000-8000-0000000000ff")
     ~limits:{Coordination_test_fixture.limits with
       response_budget_bytes=Worker_pure_data.maximum_response_bytes} 2840L
-  module I = (val issuer : Copy_worker.ISSUER)
+  module I = (val issuer : Worker_effect_authority.ISSUER)
   let serial = ref 0
   let next_id () =
     incr serial;
@@ -6244,7 +6244,7 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
   let runtime=child_identity_runtime() in
   let insert=child_identity_insert runtime in
   let issuer,_,projection,session=Coordination_test_fixture.fixture 5530L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let presentation=Option.get(W.selected projection) in
   let mutation_id,command=Runtime.worker_mutation runtime insert |> Option.get in
   let original=W.mutation_intent session ~mutation_id command |> Result.get_ok in

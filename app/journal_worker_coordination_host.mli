@@ -48,7 +48,7 @@ val post : t -> Core.event -> unit
 
 val plan_query
   :  t
-  -> owner:Runner.Service.timeline_scope
+  -> owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
   -> maximum_items:int
   -> maximum_bytes:int
   -> 'a Worker.query
@@ -58,7 +58,7 @@ val plan_query
     capacity. Session replacement still revokes its original send authority. *)
 val plan_query_when_available
   :  t
-  -> owner:Runner.Service.timeline_scope
+  -> owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
   -> maximum_items:int
   -> maximum_bytes:int
   -> 'a Worker.query
@@ -86,7 +86,7 @@ val validate_session
 
 val on_event
   :  t
-  -> (Runner.Service.response, Runner.Service.push) Runner.Mailbox.event
+  -> (Logseq_db_worker_lui.Logseq_db_worker_lui_service.response, Logseq_db_worker_lui.Logseq_db_worker_lui_service.push) Logseq_db_worker_lui.Journal_worker.event
   -> Runner.delivery
 
 val shutdown : t -> Runner.shutdown_state
@@ -96,7 +96,7 @@ val shutdown : t -> Runner.shutdown_state
     family; callbacks retain the actual Send origin and carry only checked DTOs. *)
 val query_point
   :  t
-  -> owner:Runner.Service.timeline_scope
+  -> owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
   -> maximum_bytes:int
   -> Logseq_db_worker.Protocol.command
   -> f:
@@ -111,7 +111,7 @@ val prepare_host_change : ?legacy_pending:bool -> t -> Worker.host_change -> (Wo
 val authorize_host_change : t -> Worker.handoff_receipt -> (unit,Worker.error)result
 val watch_handoff : t -> Worker.handoff_id -> f:(Worker.handoff_state -> unit) -> unit
 
-val host_change_blocks : t -> owner:Runner.Service.timeline_scope -> bool
+val host_change_blocks : t -> owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope -> bool
 
 (** Read only the original source evidence of actually pending imports; no replay or review ACK. *)
 val recover_import_sources : t -> Worker.asset_import_intent Rrbvec.t

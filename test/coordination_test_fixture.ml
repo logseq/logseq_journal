@@ -21,14 +21,14 @@ let limits : Worker_pure_data.capability_limits =
 
 let fixture ?(graph = graph) ?(graph_generation = 7) ?(limits = limits) epoch =
   let issuer =
-    W.issuer
+    Worker_effect_authority.issuer
       ~managed_origin:"https://example.invalid"
       ~user_id:"synthetic"
       ~runtime_epoch:(Id.Runtime.Epoch.of_int64 epoch)
       ~worker_generation:Id.Worker.Generation.one
     |> Result.get_ok
   in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let registration =
     match I.bootstrap_request () with
     | Ok (S.Register_coordination id) -> id
@@ -115,7 +115,7 @@ let child_cursor_fixture = lazy (fixture 6100L)
 
 let child_continuation token =
   let issuer, _, _, session = Lazy.force child_cursor_fixture in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let budget =
     W.read_budget session ~maximum_items:Worker_pure_data.default_page_size ~maximum_bytes:65536
     |> Result.get_ok

@@ -1,10 +1,8 @@
 (** Direct interpreter against the existing dbworker Service/client. No adapter,
     second Worker client is introduced; the host selects its implementation explicitly. *)
 module Worker = Worker_api
-module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
-module Mailbox = Logseq_db_worker_lui.Journal_worker
 
-type client = (Service.request, Service.response, Service.push) Mailbox.client
+type client = (Logseq_db_worker_lui.Logseq_db_worker_lui_service.request, Logseq_db_worker_lui.Logseq_db_worker_lui_service.response, Logseq_db_worker_lui.Logseq_db_worker_lui_service.push) Logseq_db_worker_lui.Journal_worker.client
 type t
 val create
   : client:client -> managed_origin:string -> user_id:string
@@ -27,7 +25,7 @@ val create
 
 type disposition = Consumed | Unowned_response | Broadcast | Dropped_envelope
 type delivery = private { disposition : disposition; error : Worker.error option }
-val on_event : t -> (Service.response, Service.push) Mailbox.event -> delivery
+val on_event : t -> (Logseq_db_worker_lui.Logseq_db_worker_lui_service.response, Logseq_db_worker_lui.Logseq_db_worker_lui_service.push) Logseq_db_worker_lui.Journal_worker.event -> delivery
 
 (** One shared host router calls this BEFORE legacy response dispatch. Ownership
     is decided by the actual Accepted mailbox ID in the checked epoch/generation,

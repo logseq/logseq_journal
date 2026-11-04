@@ -20,7 +20,7 @@ let ready binding projection =
 (* Only a deterministic codec fixture. Real physical settlement is separately
    exercised through Service/DB/Sync; this helper cannot supply that evidence. *)
 let pure_host_receipt_fixture issuer plan =
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let request=match I.handoff_request plan |> Result.get_ok with
     |S.Coordination_prepare_host_change request->request|_->assert false in
   let module H=Logseq_db_worker_pure_reducer.Core.Host_handoff in
@@ -37,7 +37,7 @@ let pure_host_receipt_fixture issuer plan =
 ;;
 
 let checked_import_reply issuer session ticket intent receipt =
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let response=match I.request session ~request_id:(C.ticket_id ticket)(W.Import intent) |> Result.get_ok with
     |S.Coordination_import{registration;owner;request_id;_}->S.Coordination_imported{registration;owner;request_id;result=Ok receipt}
     |_->failwith "Import bypassed its registration-owned Service entry" in
@@ -46,7 +46,7 @@ let checked_import_reply issuer session ticket intent receipt =
 
 let test_asset_demand_notice_has_one_registered_owner () =
   let issuer,raw,projection,session=fixture 881L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let state=ready I.binding projection in
   let consumer=W.asset_consumer session ~name:"media:synthetic-owner" |> Result.get_ok in
   let asset=Logseq_db_types.Asset_descriptor.create ~uuid:(uuid "98000000-0000-4000-8000-000000000881")
@@ -113,7 +113,7 @@ let test_asset_demand_notice_has_one_registered_owner () =
   let late=(C.step releasing.next(C.Asset_received(notice,Id.Worker.Push_sequence.of_int64 1L))).next in
   check(C.asset_notices(C.view late)consumer=[]) "late demand notice revived a retired consumer";
   let foreign,_,_,foreign_session=fixture 882L in
-  let module F=(val foreign:W.ISSUER) in
+  let module F=(val foreign:Worker_effect_authority.ISSUER) in
   check(Result.is_error(F.asset_notice foreign_session(S.Asset_demand_accepted wire_name)))
     "old binding consumer namespace crossed into a new issuer"
 ;;
@@ -136,7 +136,7 @@ let complete_demand state ticket =
 
 let test_asset_cleanup_ack_and_shutdown_retry () =
   let issuer,_,projection,session=fixture 883L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let initial=ready I.binding projection in
   let consumer=W.asset_consumer session ~name:"cleanup-owner" |> Result.get_ok in
   let asset=Logseq_db_types.Asset_descriptor.create ~uuid:graph ~source:(Managed None)
@@ -180,7 +180,7 @@ let test_asset_cleanup_ack_and_shutdown_retry () =
 let test_asset_cleanup_round_properties () =
   let run actions =
     let issuer,_,projection,session=fixture 884L in
-    let module I=(val issuer:W.ISSUER) in
+    let module I=(val issuer:Worker_effect_authority.ISSUER) in
     let consumer=W.asset_consumer session ~name:"round-properties" |> Result.get_ok in
     let first,one=C.request(ready I.binding projection)session(W.Replace_asset_demand(consumer,W.Foreground,[])) |> Result.get_ok in
     let second,two=C.request (complete_demand one.next first) session(W.Replace_asset_demand(consumer,W.Foreground,[])) |> Result.get_ok in
@@ -226,7 +226,7 @@ let test_asset_cleanup_round_properties () =
 
 let test_import_source_recovery_owner_cursor_and_ack () =
   let issuer,raw,projection,session=fixture 9888L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let module U=Logseq_db_types.Asset_upload_intent in
   let module R=Logseq_db_types.Asset_import.Recovery in
   let scope,_=List.hd raw.baseline.state.residents in
@@ -385,7 +385,7 @@ let test_import_intent_preserves_complete_source () =
 
 let test_import_preview_late_result_is_cleanup_owned () =
   let issuer,raw,projection,session=fixture 888L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let source:Logseq_db_types.Asset_import.t=
     {operation=uuid "98000000-0000-4000-8000-000000000885";
      asset=uuid "98000000-0000-4000-8000-000000000886";target=graph;replace_reference=None;
@@ -435,7 +435,7 @@ let test_import_preview_late_result_is_cleanup_owned () =
 let test_import_cancelled_preview_properties () =
   let run actions =
     let issuer,raw,projection,session=fixture 889L in
-    let module I=(val issuer:W.ISSUER) in
+    let module I=(val issuer:Worker_effect_authority.ISSUER) in
     let source:Logseq_db_types.Asset_import.t={operation=uuid "98000000-0000-4000-8000-000000000891";
       asset=uuid "98000000-0000-4000-8000-000000000892";target=graph;replace_reference=None;
       local_mutation=uuid "98000000-0000-4000-8000-000000000893";
@@ -489,7 +489,7 @@ let test_import_cancelled_preview_properties () =
 
 let test_completed_imports_release_active_recovery_capacity () =
   let issuer,raw,projection,session=fixture 890L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let state=ref(ready I.binding projection) in
   let id n=uuid(Printf.sprintf "98000000-0000-4000-8000-%012d" n) in
   let source n:Logseq_db_types.Asset_import.t={operation=id(9000+4*n);asset=id(9001+4*n);target=graph;replace_reference=None;
@@ -518,7 +518,7 @@ let test_completed_imports_release_active_recovery_capacity () =
 
 let test_new_host_source_proof_retires_only_identical_unknown () =
   let first,_,projection,session=fixture 891L in
-  let module I=(val first:W.ISSUER) in
+  let module I=(val first:Worker_effect_authority.ISSUER) in
   let source:Logseq_db_types.Asset_import.t={operation=uuid "98000000-0000-4000-8000-000000001891";
     asset=uuid "98000000-0000-4000-8000-000000001892";target=graph;replace_reference=None;
     local_mutation=uuid "98000000-0000-4000-8000-000000001893";metadata_mutation=uuid "98000000-0000-4000-8000-000000001894";
@@ -533,7 +533,7 @@ let test_new_host_source_proof_retires_only_identical_unknown () =
   check(C.shutdown_state(C.view old)=C.Stopped && C.import_sources_pending(C.view old) ~owner:None)
     "old stopped host did not preserve original Unknown source";
   let second,raw,next_projection,next_session=fixture ~graph_generation:99 892L in
-  let module N=(val second:W.ISSUER) in
+  let module N=(val second:Worker_effect_authority.ISSUER) in
   let next_intent=W.restore_asset_import_intent next_session(W.encode_asset_import_intent intent) |> Result.get_ok in
   let make_proof intent target=
     let ticket,plan=C.request(ready N.binding next_projection)next_session(W.Import intent) |> Result.get_ok in
@@ -565,7 +565,7 @@ let test_new_host_source_proof_retires_only_identical_unknown () =
 let test_import_proof_consumption_properties () =
   let run actions =
     let issuer,raw,projection,session=fixture 893L in
-    let module I=(val issuer:W.ISSUER) in
+    let module I=(val issuer:Worker_effect_authority.ISSUER) in
     let id n=uuid(Printf.sprintf "98000000-0000-4000-8000-%012d" n) in
     let source:Logseq_db_types.Asset_import.t={operation=id 18931;asset=id 18932;target=graph;replace_reference=None;
       local_mutation=id 18933;metadata_mutation=id 18934;source_file="/tmp/synthetic-cross-host-input.png";
@@ -626,7 +626,7 @@ let test_import_proof_consumption_properties () =
    proved by the real Service tests, not by this validation fixture. *)
 let test_host_prepare_waits_for_exact_legacy_owner () =
   let issuer,raw,projection,session=fixture 9881L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let initial=ready I.binding projection in
   let id,waiting=C.prepare_host_change ~legacy_pending:true initial
       (W.Graph_will_close(W.graph_id session)) |> Result.get_ok in
@@ -671,7 +671,7 @@ let test_host_prepare_waits_for_exact_legacy_owner () =
 
 let test_host_consumption_keeps_old_execution_retired () =
   let issuer,raw,projection,session=fixture 9873L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let initial=ready I.binding projection in
   let id,prepared=C.prepare_host_change initial(W.Graph_will_close(W.graph_id session)) |> Result.get_ok in
   let plan=List.find_map(function C.Quiesce plan->Some plan|_->None)prepared.instructions |> Option.get in
@@ -742,7 +742,7 @@ let test_host_consumption_keeps_old_execution_retired () =
    public pure boundary owns the admission history, so no I/O duplicate test. *)
 let test_repeated_graph_close_reopen_does_not_exhaust_handoff_history () =
   let issuer,raw,projection,session=fixture 9875L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let state=ref(ready I.binding projection) in
   let old_receipts=ref [] in
   for round=0 to 95 do
@@ -779,7 +779,7 @@ let test_repeated_graph_close_reopen_does_not_exhaust_handoff_history () =
 
 let test_determined_failed_handoff_retires_when_user_retries () =
   let issuer,_,projection,session=fixture 9876L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   List.iter(fun legacy->
     let state=ref(ready I.binding projection) and previous=ref None in
     for _round=0 to 95 do
@@ -798,7 +798,7 @@ let test_determined_failed_handoff_retires_when_user_retries () =
 
 let test_account_host_unknown_requires_original_consumption_readback () =
   let issuer,_,projection,_=fixture 9878L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let module H=Logseq_db_worker_pure_reducer.Core.Host_handoff in
   List.iter(fun change->
     let id,prepared=C.prepare_host_change(ready I.binding projection)change |> Result.get_ok in
@@ -859,7 +859,7 @@ let test_account_host_unknown_requires_original_consumption_readback () =
 
 let test_host_plan_pins_original_authoritative_frame () =
   let issuer,raw,projection,session=fixture 9871L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let id=W.handoff_id(uuid "98000000-0000-4000-8000-000000009871") in
   let plan=W.host_change_plan projection ~handoff_id:id
     ~change:(W.Graph_will_close(W.graph_id session)) ~sessions:(Rrbvec.singleton session) |> Result.get_ok in
@@ -891,7 +891,7 @@ let test_host_plan_pins_original_authoritative_frame () =
 
 let test_query_origin_boundary () =
   let issuer, raw, projection, session = fixture 310L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let state = (C.step (C.initial ~client_id:client) (C.Worker_bound I.binding)).next in
   let owner = Option.get raw.baseline.state.sync.selected in
   let ticket, waiting =
@@ -937,7 +937,7 @@ let test_query_origin_boundary () =
 
 let test_bootstrap_validation () =
   let issuer, raw, projection, _ = fixture 101L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let empty =
     { raw with
       baseline =
@@ -1019,7 +1019,7 @@ let test_bootstrap_validation () =
   List.iteri
     (fun n corrupt ->
        let issuer, raw, _, _ = fixture (Int64.of_int (200 + n)) in
-       let module I = (val issuer : W.ISSUER) in
+       let module I = (val issuer : Worker_effect_authority.ISSUER) in
        let bad = corrupt { raw with baseline = { raw.baseline with version = 2L } } in
        match I.bootstrap (S.Coordination_registered bad) with
        | Error (W.Protocol_mismatch _) -> ()
@@ -1075,7 +1075,7 @@ let shrink fails trace =
 
 let test_pure_properties () =
   let issuer, _, projection, session = fixture 400L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let budget =
     W.read_budget session ~maximum_items:10 ~maximum_bytes:65536 |> Result.get_ok
   in
@@ -1200,7 +1200,7 @@ let test_pure_properties () =
 
 let test_cleanup_admission_edges () =
   let issuer, _, projection, session = fixture 500L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let bound = (C.step (C.initial ~client_id:client) (C.Worker_bound I.binding)).next in
   let admitted =
     (C.step bound (C.Bootstrap_admitted (I.binding, Id.Worker.Request_id.one))).next
@@ -1247,7 +1247,7 @@ let test_cleanup_admission_edges () =
 
 let test_reads_wait_for_verified_baseline () =
   let issuer, raw, projection, _ = fixture 301L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let owner = Option.get raw.baseline.state.sync.selected in
   let bound = (C.step (C.initial ~client_id:client) (C.Worker_bound I.binding)).next in
   let ticket, waiting =
@@ -1369,7 +1369,7 @@ let test_reads_wait_for_verified_baseline () =
 
 let test_opening_query_retires_on_removal () =
   let issuer, raw, _, _ = fixture 303L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let owner = Option.get raw.baseline.state.sync.selected in
   let opening =
     { raw with
@@ -1436,7 +1436,7 @@ let test_opening_query_retires_on_removal () =
 
 let test_queued_query_properties () =
   let issuer, raw, first, _ = fixture 302L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let owner = Option.get raw.baseline.state.sync.selected in
   let later_owner = { owner with graph_generation = owner.graph_generation + 1 } in
   let later_scope (scope : S.asset_scope) =
@@ -1620,7 +1620,7 @@ let test_queued_query_properties () =
 
 let test_durable_mutation_properties ?(append=false) () =
   let issuer, _, projection, session = fixture 1901L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let append_intent=if not append then None else Some(
     W.append_intent session ~mutation_id:(uuid "98000000-0000-4000-8000-000000000091")
       ~block_id:graph ~day:(W.journal_day 20261102 |> Result.get_ok) ~title:"stable durable Append"
@@ -1805,7 +1805,7 @@ let test_durable_mutation_properties ?(append=false) () =
 
 let test_durable_readback_reservation () =
   let issuer, _, projection, session = fixture 1902L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let state = ref (ready I.binding projection)
   and admitted = ref 0 in
   for n = 1 to 128 do
@@ -1836,7 +1836,7 @@ let test_durable_readback_reservation () =
 let test_recovery_cursor_and_capacity_bounds () =
   let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
   let issuer,_,projection,session=fixture 1906L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let make n=W.mutation_intent session ~mutation_id:(uuid(Printf.sprintf "98000000-0000-4000-8000-%012d" (2000+n)))
     (W.Save_block{block=graph;title="bounded recovered item";
       preconditions={blocks=[graph,"block-state:v1:synthetic"];pages=[];scopes=[]}}) |> Result.get_ok in
@@ -1881,7 +1881,7 @@ let test_recovery_cursor_and_capacity_bounds () =
 let test_durable_recovery_and_ack_purity () =
   let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
   let issuer,_,projection,session=fixture 1903L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let intent=W.mutation_intent session ~mutation_id:(uuid "98000000-0000-4000-8000-000000001903")
     (W.Save_block{block=graph;title="recovered choice";
       preconditions={blocks=[graph,"block-state:v1:synthetic"];pages=[];scopes=[]}}) |> Result.get_ok in
@@ -1937,13 +1937,13 @@ let test_durable_recovery_and_ack_purity () =
 
 let test_committed_ack_requires_current_confirmation () =
   let issuer,raw,projection,session=fixture 1905L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let presentation=Option.get(W.selected projection) in
   let owner=Option.get raw.baseline.state.sync.selected in
   check(C.current_presentation ~owner (C.view(ready I.binding projection))presentation)
     "current UI presentation was rejected";
   let independent,independent_raw,_,_=fixture 1915L in
-  let module J=(val independent:W.ISSUER) in
+  let module J=(val independent:Worker_effect_authority.ISSUER) in
   let divergent=match J.bootstrap(S.Coordination_registered{independent_raw with
       baseline={independent_raw.baseline with version=2L;presentation=17L}}) with
     | Ok(W.Ready value)->value|_->failwith "independent presentation counter fixture" in
@@ -2182,7 +2182,7 @@ let test_committed_ack_requires_current_confirmation () =
 let test_durable_recovery_ack_properties () =
   let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
   let issuer,_,projection,session=fixture 1904L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let intent=W.mutation_intent session ~mutation_id:(uuid "98000000-0000-4000-8000-000000001904")
     (W.Save_block{block=graph;title="property choice";
       preconditions={blocks=[graph,"block-state:v1:synthetic"];pages=[];scopes=[]}}) |> Result.get_ok in
@@ -2236,7 +2236,7 @@ let test_durable_recovery_ack_properties () =
 
 let test_observation_planning_is_pure () =
   let issuer, _, projection, session = fixture 720L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let state = ready I.binding projection in
   let budget =
     W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
@@ -2263,7 +2263,7 @@ let test_observation_planning_is_pure () =
 ;;
 
 let pure_observation_response issuer raw session ticket operation epoch revision =
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let registration, owner, observation_id, request_id =
     match
       I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok
@@ -2300,7 +2300,7 @@ let pure_observation_response issuer raw session ticket operation epoch revision
 
 let test_host_candidate_waits_for_own_observation_ack () =
   let issuer,raw,projection,session=fixture 9876L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let initial=ready I.binding projection in
   let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
   let operation=W.Observe(budget,W.Graph_info) in
@@ -2324,7 +2324,7 @@ let test_host_candidate_waits_for_own_observation_ack () =
 
 let test_observation_retains_typed_value () =
   let issuer, raw, projection, session = fixture 721L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let state = ready I.binding projection in
   let budget =
     W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
@@ -2357,7 +2357,7 @@ let test_observation_retains_typed_value () =
 
 let test_observation_cancel_requires_ack () =
   let issuer, raw, projection, session = fixture 722L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let state = ready I.binding projection in
   let budget =
     W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
@@ -2414,7 +2414,7 @@ let test_observation_cancel_requires_ack () =
 
 let test_observation_read_failure_and_refresh () =
   let issuer, raw, projection, session = fixture 723L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let state = ready I.binding projection in
   let budget =
     W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
@@ -2504,7 +2504,7 @@ let test_observation_read_failure_and_refresh () =
 
 let test_observation_notice_plans_one_refresh () =
   let issuer, raw, projection, session = fixture 724L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let operation =
     W.Observe
       ( W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
@@ -2601,7 +2601,7 @@ let test_observation_notice_plans_one_refresh () =
 
 let test_observation_cleanup_failure_waits_for_explicit_retry () =
   let issuer, _, projection, session = fixture 725L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let operation =
     W.Observe
       ( W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
@@ -2665,7 +2665,7 @@ let test_observation_cleanup_failure_waits_for_explicit_retry () =
 
 let test_observation_full_batch_does_not_self_wake () =
   let issuer, _, projection, session = fixture 727L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let budget =
     W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
   in
@@ -2721,7 +2721,7 @@ let test_observation_full_batch_does_not_self_wake () =
 
 let test_observation_focus_and_reopen_fences () =
   let issuer, raw, projection, session = fixture 728L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let project raw =
     match I.bootstrap (S.Coordination_registered raw) with
     | Ok (W.Ready p) -> p
@@ -2845,7 +2845,7 @@ let test_observation_focus_and_reopen_fences () =
 
 let test_observation_retirement_capacity_resets_only_after_binding_ack () =
   let issuer, raw, projection, session = fixture 729L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let budget =
     W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
   in
@@ -2880,7 +2880,7 @@ let test_observation_retirement_capacity_resets_only_after_binding_ack () =
   step C.Retry_bootstrap;
   step (C.Binding_release_completed (I.binding, Ok ()));
   let next_issuer, _, next_projection, next_session = fixture 730L in
-  let module Next = (val next_issuer : W.ISSUER) in
+  let module Next = (val next_issuer : Worker_effect_authority.ISSUER) in
   step (C.Worker_bound Next.binding);
   step (C.Bootstrap_received (Next.binding, W.Ready next_projection));
   let budget =
@@ -2913,7 +2913,7 @@ let test_observation_retirement_capacity_resets_only_after_binding_ack () =
    pure boundary. No implementation tables or private handle constructors. *)
 let test_observation_properties () =
   let issuer, raw, projection, session = fixture 726L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let budget =
     W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok
   in
@@ -3190,7 +3190,7 @@ let test_observation_properties () =
 
 let test_dependency_read_waits_for_capacity () =
   let issuer, raw, projection, session = fixture 745L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let owner = Option.get raw.baseline.state.sync.selected in
   let state = ready I.binding projection in
   let ticket, planned =
@@ -3335,8 +3335,8 @@ let test_dependency_read_waits_for_capacity () =
 let test_live_binding_invalidation_is_pure () =
   let old_issuer, _, old_projection, old_session = fixture 741L in
   let new_issuer, _, new_projection, new_session = fixture 742L in
-  let module Old = (val old_issuer : W.ISSUER) in
-  let module New = (val new_issuer : W.ISSUER) in
+  let module Old = (val old_issuer : Worker_effect_authority.ISSUER) in
+  let module New = (val new_issuer : Worker_effect_authority.ISSUER) in
   let initial = ready Old.binding old_projection in
   let invalidated = C.step initial (C.Binding_invalidated Old.binding) in
   check
@@ -3442,7 +3442,7 @@ let test_live_binding_invalidation_is_pure () =
 
 let test_changefeed_planning_owns_its_typed_ticket () =
   let issuer, _, projection, session = fixture 731L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let state = ready I.binding projection in
   let budget =
     W.read_budget session ~maximum_items:32 ~maximum_bytes:65536 |> Result.get_ok
@@ -3472,7 +3472,7 @@ let test_changefeed_planning_owns_its_typed_ticket () =
 
 let test_changes_serial_and_ack_capacity () =
   let issuer, _, projection, session = fixture 736L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let state = ref (ready I.binding projection) in
   let budget =
     W.read_budget session ~maximum_items:32 ~maximum_bytes:65536 |> Result.get_ok
@@ -3595,7 +3595,7 @@ let test_changes_serial_and_ack_capacity () =
 
 let test_changefeed_ack_requires_owned_delivered_batch () =
   let issuer, _, projection, session = fixture 732L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let state = ready I.binding projection in
   let budget =
     W.read_budget session ~maximum_items:32 ~maximum_bytes:65536 |> Result.get_ok
@@ -3805,7 +3805,7 @@ let test_changefeed_ack_requires_owned_delivered_batch () =
 
 let test_empty_change_batch_ack_retires_old_reads () =
   let issuer, _, projection, session = fixture 733L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let state = ref (ready I.binding projection) in
   let budget =
     W.read_budget session ~maximum_items:32 ~maximum_bytes:65536 |> Result.get_ok
@@ -3944,7 +3944,7 @@ let test_empty_change_batch_ack_retires_old_reads () =
 
 let test_scoped_change_notices_and_lifecycle () =
   let issuer, raw, projection, session = fixture 735L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let scope = fst (List.hd raw.baseline.state.residents) in
   let available =
     P.V2_changes_available
@@ -4055,7 +4055,7 @@ let test_scoped_change_notices_and_lifecycle () =
 
 let test_change_application_properties () =
   let issuer, raw, projection, session = fixture 734L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let budget =
     W.read_budget session ~maximum_items:32 ~maximum_bytes:65536 |> Result.get_ok
   in
@@ -4320,7 +4320,7 @@ let test_change_application_properties () =
 
 let test_atomic_append_intent_and_admission () =
   let issuer,_,projection,session=fixture 6050L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let intent=match W.append_intent session ~mutation_id:(uuid "98000000-0000-4000-8000-000000006051")
     ~block_id:(uuid "98000000-0000-4000-8000-000000006052")
     ~day:(W.journal_day 20261102 |> Result.get_ok) ~title:"Atomic typed source"
@@ -4349,7 +4349,7 @@ let test_atomic_append_intent_and_admission () =
 
 let test_host_handoff_properties () =
   let issuer,raw,projection,session=fixture 9879L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let scope,physical=List.hd raw.baseline.state.residents in
   let projections=Array.init 16(fun n->
     let scope={scope with graph_generation=scope.graph_generation+n+1} in
@@ -4438,7 +4438,7 @@ let test_host_handoff_properties () =
    Backend Service tests separately prove the resource/finalization acknowledgements. *)
 let test_returned_observations_reuse_capacity () =
   let issuer,raw,projection,session=fixture 731L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
   let operation=W.Observe(budget,W.Graph_info) in
   let state=ref(ready I.binding projection) in
@@ -4475,7 +4475,7 @@ let test_returned_observations_reuse_capacity () =
 let test_resource_return_finalization_properties () =
   let run scenarios =
     let issuer,raw,projection,session=fixture 733L in
-    let module I=(val issuer:W.ISSUER) in
+    let module I=(val issuer:Worker_effect_authority.ISSUER) in
     let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
     let operation=W.Observe(budget,W.Graph_info) in
     let state=ref(ready I.binding projection) in
@@ -4548,7 +4548,7 @@ let test_resource_return_finalization_properties () =
 
 let test_returned_files_reuse_capacity () =
   let issuer,_,projection,session=fixture 732L in
-  let module I=(val issuer:W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let state=ref(ready I.binding projection) in
   let step event=let t=C.step !state event in state:=t.next;t.instructions in
   let consumer=W.asset_consumer session ~name:"ordinary-visible-image" |> Result.get_ok in

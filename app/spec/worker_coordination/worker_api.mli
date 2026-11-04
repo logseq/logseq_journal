@@ -6,19 +6,18 @@ module Graph = Logseq_db_types.Graph_types
 
 module Uuid = Graph.Uuid
 module Data = Worker_pure_data
-module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 
-type account_generation
-type graph_generation
-type presentation_generation
-type worker_incarnation
-type binding
+type account_generation = Worker_effect_authority.account_generation
+type graph_generation = Worker_effect_authority.graph_generation
+type presentation_generation = Worker_effect_authority.presentation_generation
+type worker_incarnation = Worker_effect_authority.worker_incarnation
+type binding = Worker_effect_authority.binding
 
 val binding_incarnation : binding -> worker_incarnation
 val equal_binding : binding -> binding -> bool
 
-type session
-type presentation
+type session = Worker_effect_authority.session
+type presentation = Worker_effect_authority.presentation
 
 val account_generation : session -> account_generation
 val graph_generation : session -> graph_generation
@@ -28,9 +27,9 @@ val graph_id : session -> Uuid.t
 val equal_session : session -> session -> bool
 val compare_session : session -> session -> int
 val same_logical_graph : session -> session -> bool
-val matches_scope : session -> Service.timeline_scope -> bool
-val matches_asset_scope : session -> Service.asset_scope -> bool
-val presentation_matches_scope : presentation -> Service.timeline_scope -> bool
+val matches_scope : session -> Worker_effect_authority.Service.timeline_scope -> bool
+val matches_asset_scope : session -> Worker_effect_authority.Service.asset_scope -> bool
+val presentation_matches_scope : presentation -> Worker_effect_authority.Service.timeline_scope -> bool
 
 val worker_incarnation
   :  runtime_epoch:Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch
@@ -40,7 +39,7 @@ val worker_incarnation
 (** Sessions survive focus changes while resident. Close/reopen, account changes,
     removal and rebinding revoke execution authority. Presentation has a separate
     lifetime. Admission and completion recheck all identities, not just UUID. *)
-type error =
+type error = Worker_effect_authority.error =
   | Revoked_session
   | Invalid_input of string
   | Response_budget_exceeded
@@ -52,13 +51,13 @@ type error =
   | Service_failed of string
   | Unsupported_operation of string
 
-type request_id
+type request_id = Worker_effect_authority.request_id
 
 val request_id : Uuid.t -> request_id
 val equal_request_id : request_id -> request_id -> bool
 val compare_request_id : request_id -> request_id -> int
 
-type capabilities = private
+type capabilities = Worker_effect_authority.capabilities = private
   { limits : Worker_pure_data.capability_limits
   ; atomic_append : bool
   ; durable_mutations : bool
@@ -68,7 +67,7 @@ type capabilities = private
 
 val capabilities : session -> capabilities
 
-type read_budget
+type read_budget = Worker_effect_authority.read_budget
 
 (** Validate positive item/encoded-byte bounds against this session's advertised
     limits. Every final enriched result, including summary/refs/properties, fits
@@ -80,12 +79,12 @@ val read_budget
   -> maximum_bytes:int
   -> (read_budget, error) result
 
-type journal_day
+type journal_day = Worker_effect_authority.journal_day
 
 val journal_day : int -> (journal_day, error) result
 
-type page
-type block
+type page = Worker_effect_authority.page
+type block = Worker_effect_authority.block
 
 val page_uuid : page -> Uuid.t
 val page_title : page -> string
@@ -103,9 +102,9 @@ val page_revision : page -> string
 val block_data : block -> Worker_pure_data.block_record
 val block_revision : block -> string
 
-type 'a continuation
+type 'a continuation = 'a Worker_effect_authority.continuation
 
-type 'a slice = private
+type 'a slice = 'a Worker_effect_authority.slice = private
   { items : 'a list
   ; next : 'a continuation option
   }
@@ -115,7 +114,7 @@ type 'a slice = private
     static guarantee; runtime rejects a different parent/range/depth/filter or
     stale snapshot. Ordinary reads do not change an observation epoch. *)
 
-type graph_info = private
+type graph_info = Worker_effect_authority.graph_info = private
   { graph_uuid : Uuid.t
   ; graph_name : string
   ; schema : Graph.schema_version
@@ -126,7 +125,7 @@ type graph_info = private
   ; projection_revision : string
   }
 
-type block_summary = private
+type block_summary = Worker_effect_authority.block_summary = private
   { lookup : Worker_pure_data.block_lookup
   ; page : Worker_pure_data.page_lookup option
   ; items : Worker_pure_data.child_member list
@@ -139,7 +138,7 @@ type block_summary = private
 (** Canonical target, owning page and direct children share one DB snapshot,
     as in today's V2_get_outline_block_summary. Count is exact only at next=None.
     No sequential page/children calls may masquerade as this atomic summary. *)
-type favorites = private
+type favorites = Worker_effect_authority.favorites = private
   { favorites_page : Uuid.t option
   ; generation : string
   ; projection_revision : string
@@ -147,21 +146,21 @@ type favorites = private
   ; next : Worker_pure_data.favorite_item continuation option
   }
 
-type task_status_catalog = private
+type task_status_catalog = Worker_effect_authority.task_status_catalog = private
   { property_uuid : Uuid.t option
   ; default_status : Uuid.t option
   ; items : Graph.task_status_definition list
   ; next : Graph.task_status_definition continuation option
   }
 
-type asset_listing = private
+type asset_listing = Worker_effect_authority.asset_listing = private
   { generation : string
   ; projection_revision : string
   ; items : Logseq_db_types.Asset_descriptor.t list
   ; next : Logseq_db_types.Asset_descriptor.t continuation option
   }
 
-type children = private
+type children = Worker_effect_authority.children = private
   { parent : Uuid.t
   ; revision_scope : Worker_pure_data.revision_scope
   ; scope_revision : string
@@ -169,7 +168,7 @@ type children = private
   ; next : Worker_pure_data.child_member continuation option
   }
 
-type change_batch = private
+type change_batch = Worker_effect_authority.change_batch = private
   { change_owner : session
   ; generation : string
   ; from_exclusive : string option
@@ -178,7 +177,7 @@ type change_batch = private
   ; next : string option
   }
 
-type change_ack
+type change_ack = Worker_effect_authority.change_ack
 
 (** Typed forms of the existing App query families, not an untyped command escape
     hatch. Journal is a bounded single-day convenience; it preserves page revision
@@ -186,7 +185,7 @@ type change_ack
     exposes the exact scope revision required by current planners/confirmation.
     Typed results preserve present/missing and full metadata without UI layout
     types. List/lookup result ordering matches input IDs, including missing slots. *)
-type _ query =
+type 'a query = 'a Worker_effect_authority.query =
   | Graph_info : graph_info query
   | Admission : Worker_pure_data.admission_inspection query
   | Journal : journal_day -> page option query
@@ -269,14 +268,14 @@ val change_ack_session : change_ack -> session
 val change_ack_generation : change_ack -> string
 val change_ack_through : change_ack -> string
 
-type capture_node =
+type capture_node = Worker_effect_authority.capture_node =
   { block_id : Uuid.t
   ; title : string
   ; task_status : Uuid.t option
   ; children : capture_node Rrbvec.t
   }
 
-type append_intent
+type append_intent = Worker_effect_authority.append_intent
 
 (** Persist the complete bounded root/child/status payload and normalized stable
     identity before first send. Retries reuse it; a changed choice creates a new
@@ -296,7 +295,7 @@ val append_intent_id : append_intent -> Uuid.t
 val encode_append_intent : append_intent -> bytes
 val restore_append_intent : session -> bytes -> (append_intent, error) result
 
-type mutation_command =
+type mutation_command = Worker_effect_authority.mutation_command =
   | Save_block of
       { block : Uuid.t
       ; title : string
@@ -333,7 +332,7 @@ type mutation_command =
       ; preconditions : Worker_pure_data.preconditions
       }
 
-type mutation_intent
+type mutation_intent = Worker_effect_authority.mutation_intent
 
 val mutation_intent
   :  session
@@ -353,14 +352,14 @@ val restore_mutation_intent : session -> bytes -> (mutation_intent, error) resul
     replays a destructive operation under a fresh ID. The business reducer owns
     ordering/choice changes; this layer owns identity, admission and receipts. *)
 
-type receipt
-type confirmation
+type receipt = Worker_effect_authority.receipt
+type confirmation = Worker_effect_authority.confirmation
 
 val receipt_intent : receipt -> mutation_intent
 val receipt_mutation_id : receipt -> Uuid.t
 val receipt_revisions : receipt -> string * string * string
 
-type confirmed_target = private
+type confirmed_target = Worker_effect_authority.confirmed_target = private
   | Confirmed_block of block_summary
   | Confirmed_page of Worker_pure_data.page_lookup
   | Confirmed_absence of
@@ -388,7 +387,7 @@ val confirmation_receipt : confirmation -> receipt
 
 val confirmation_presentation : confirmation -> presentation
 
-type mutation_progress =
+type mutation_progress = Worker_effect_authority.mutation_progress =
   | Rejected of error
   | Outcome_unknown
   | Committed_pending_presentation of receipt
@@ -405,7 +404,7 @@ type mutation_progress =
     admission and completion. Focus away/back creates a different presentation
     even if the execution session survives; its old in-flight confirmation cannot
     confirm the new view. An explicit new Confirm may use the new presentation. *)
-type admission_error =
+type admission_error = Worker_effect_authority.admission_error =
   | Full
   | Not_ready
   | Stopping
@@ -414,19 +413,19 @@ type admission_error =
 (** Recovery is read-only and returns complete immutable payloads. Its independent
     artifact byte ceiling accommodates a full legal intent and proof; ordinary
     query read_budget limits do not apply. Cursors bind session and both budgets. *)
-type mutation_recovery_cursor
-type recovered_mutation = private { intent : mutation_intent; progress : mutation_progress }
-type mutation_recovery = private
+type mutation_recovery_cursor = Worker_effect_authority.mutation_recovery_cursor
+type recovered_mutation = Worker_effect_authority.recovered_mutation = private { intent : mutation_intent; progress : mutation_progress }
+type mutation_recovery = Worker_effect_authority.mutation_recovery = private
   { items : recovered_mutation Rrbvec.t; next : mutation_recovery_cursor option }
 
 val maximum_mutation_recovery_bytes : int
 
-type interruption =
+type interruption = Worker_effect_authority.interruption =
   | Cancelled
   | Transport_lost
   | Worker_stopped
 
-type 'a reply =
+type 'a reply = 'a Worker_effect_authority.reply =
   | Not_admitted of admission_error
   | Answered of ('a, error) result
   | Interrupted of interruption
@@ -437,17 +436,17 @@ type 'a reply =
     non-commit evidence cannot become Rejected. Replay must be durable/idempotent
     across restart, not merely a process-local duplicate cache. *)
 
-type changefeed_notice = private
+type changefeed_notice = Worker_effect_authority.changefeed_notice = private
   { notice_session : session
   ; notice : Worker_pure_data.changefeed_signal
   }
 
-type observation_epoch
+type observation_epoch = Worker_effect_authority.observation_epoch
 
 val compare_observation_epoch : observation_epoch -> observation_epoch -> int
 
-type 'a observation
-type (_, _) equality = Refl : ('a, 'a) equality
+type 'a observation = 'a Worker_effect_authority.observation
+type ('a, 'b) equality = ('a, 'b) Worker_effect_authority.equality = Refl : ('a, 'a) equality
 
 val observation_session : 'a observation -> session
 val observation_id : 'a observation -> request_id
@@ -458,7 +457,7 @@ val same_observation : 'a observation -> 'b observation -> ('a, 'b) equality opt
 (** Equality requires the exact owner/registration identity, not only compatible
     query result types. Refl permits typed existential storage without casts;
     runtime still checks registration, scope, query and epoch. *)
-type 'a observed = private
+type 'a observed = 'a Worker_effect_authority.observed = private
   { observation : 'a observation
   ; epoch : observation_epoch
   ; value : 'a
@@ -476,20 +475,20 @@ type 'a observed = private
 (** Authenticated invalidation facts carry the exact binding and logical owner.
     They do not grant ownership or create a session; Core matches an existing
     planned registration before deciding whether to refresh. *)
-type observation_notice = private
+type observation_notice = Worker_effect_authority.observation_notice = private
   | Observation_invalidated of
       { binding : binding
-      ; owner : Service.timeline_scope
+      ; owner : Worker_effect_authority.Service.timeline_scope
       ; id : request_id
       ; epoch : observation_epoch
       }
   | Observations_resync of binding
 
-type asset_consumer
-type asset_file
-type file_lease
-type upload_operation
-type imported
+type asset_consumer = Worker_effect_authority.asset_consumer
+type asset_file = Worker_effect_authority.asset_file
+type file_lease = Worker_effect_authority.file_lease
+type upload_operation = Worker_effect_authority.upload_operation
+type imported = Worker_effect_authority.imported
 
 val asset_consumer : session -> name:string -> (asset_consumer, error) result
 val asset_consumer_session : asset_consumer -> session
@@ -513,11 +512,11 @@ val without_import_preview : imported -> imported
 (** Checked durable source adoption, bound to the complete logical intent bytes.
     It grants no lease, data-session or destructive authority. It may retire an
     old host's identical Unknown picker-source obligation after reconciliation. *)
-type import_source_proof
+type import_source_proof = Worker_effect_authority.import_source_proof
 val import_source_proof : imported -> import_source_proof
 val import_source_proof_id : import_source_proof -> Uuid.t
 
-type asset_import_intent
+type asset_import_intent = Worker_effect_authority.asset_import_intent
 
 val asset_import_intent
   :  session
@@ -532,10 +531,10 @@ val restore_asset_import_intent : session -> bytes -> (asset_import_intent, erro
 
 (** Read-only complete source recovery preserves immutable IDs and source bytes.
     Original Prepared proof is logical adoption evidence, never a preview lease. *)
-type prepared_import_source
-type recovered_import_input=private {intent:asset_import_intent;prepared:prepared_import_source option;acknowledged:bool}
-type import_input_recovery_cursor
-type import_input_recovery=private {inputs:recovered_import_input Rrbvec.t;continuation:import_input_recovery_cursor option}
+type prepared_import_source = Worker_effect_authority.prepared_import_source
+type recovered_import_input = Worker_effect_authority.recovered_import_input =private {intent:asset_import_intent;prepared:prepared_import_source option;acknowledged:bool}
+type import_input_recovery_cursor = Worker_effect_authority.import_input_recovery_cursor
+type import_input_recovery = Worker_effect_authority.import_input_recovery =private {inputs:recovered_import_input Rrbvec.t;continuation:import_input_recovery_cursor option}
 val equal_prepared_import_source:prepared_import_source -> prepared_import_source -> bool
 val prepared_import_intent:prepared_import_source -> asset_import_intent
 val prepared_import_source_session:prepared_import_source -> session
@@ -546,22 +545,22 @@ val prepared_import_adoption:prepared_import_source -> import_source_proof
     backend must reconcile the same operation and source ownership; a missing
     source fails explicitly. It must not import a duplicate asset or patch a new
     target. Imported preview handles are adopted as owned leases, never leaked. *)
-type import_progress =
+type import_progress = Worker_effect_authority.import_progress =
   | Import_rejected of error
   | Import_unknown
   | Imported of imported
 
-type asset_priority =
+type asset_priority = Worker_effect_authority.asset_priority =
   | Foreground
   | Background
 
-type asset_notice
+type asset_notice = Worker_effect_authority.asset_notice
 
 val asset_notice_session : asset_notice -> session
 
 (** Read-only owner data from the checked notice; it grants no new authority. *)
-val asset_notice_scope : asset_notice -> Service.asset_scope
-val asset_notice_data : asset_notice -> Service.asset_notice
+val asset_notice_scope : asset_notice -> Worker_effect_authority.Service.asset_scope
+val asset_notice_data : asset_notice -> Worker_effect_authority.Service.asset_notice
 val asset_notice_consumer : asset_notice -> asset_consumer option
 
 (** Availability/demand-accepted/backpressure notices identify the exact registered
@@ -589,7 +588,7 @@ val upload_operation : asset_notice -> upload_operation option
     replaces an underlying successful resource result and App never receives the
     handle. App-only late-reply cleanup cannot prove this; backend acquisition/
     import ledger or atomic rollback must settle every Accepted operation. *)
-type _ request =
+type 'a request = 'a Worker_effect_authority.request =
   | Query : read_budget * 'a query -> 'a request
   | Observe : read_budget * 'a query -> 'a observed request
   | Refresh : 'a observation -> 'a observed request
@@ -628,43 +627,43 @@ type _ request =
     fail before enqueue, without a fabricated receipt/registration/lease ACK. *)
 val validate_request : session -> 'a request -> (unit, error) result
 
-type observation_update = Update : 'a observed -> observation_update
-type projection_version
+type observation_update = Worker_effect_authority.observation_update = Update : 'a observed -> observation_update
+type projection_version = Worker_effect_authority.projection_version
 
 val compare_projection_version : projection_version -> projection_version -> int
 
-type resident_phase =
+type resident_phase = Worker_effect_authority.resident_phase =
   | Opening
   | Open
   | Closing
   | Failed of error
 
-type network_phase =
+type network_phase = Worker_effect_authority.network_phase =
   | Offline
   | Connecting
   | Current
   | Network_failed of error
 
-type resident = private
+type resident = Worker_effect_authority.resident = private
   { session : session
   ; phase : resident_phase
   ; network : network_phase
   }
 
-type removal_mode =
+type removal_mode = Worker_effect_authority.removal_mode =
   | Ordinary
   | Force
 
-type removal_stage =
+type removal_stage = Worker_effect_authority.removal_stage =
   | Closing_graph
   | Deleting_local
   | Clearing_selection
 
-type local_deletion = private
+type local_deletion = Worker_effect_authority.local_deletion = private
   | Removing of Uuid.t * removal_mode * removal_stage
   | Removal_failed of Uuid.t * removal_mode * removal_stage * error
 
-type projection
+type projection = Worker_effect_authority.projection
 
 val projection_incarnation : projection -> worker_incarnation
 val projection_binding : projection -> binding
@@ -682,7 +681,7 @@ val equal_projection : projection -> projection -> bool
 val scope_is_superseded
   :  ?previous:projection
   -> projection
-  -> Service.timeline_scope
+  -> Worker_effect_authority.Service.timeline_scope
   -> bool
 
 val removal_target : local_deletion -> Uuid.t
@@ -694,7 +693,7 @@ val removal_target : local_deletion -> Uuid.t
     observable transition, including local_deletion Some -> None, failure detail,
     and removal of the final graph with no readable DB or selected graph.
     Local availability, network progress and account state remain orthogonal. *)
-type bootstrap_state =
+type bootstrap_state = Worker_effect_authority.bootstrap_state =
   | Awaiting_baseline
   | Bootstrap_not_ready of string
   | Ready of projection
@@ -718,25 +717,25 @@ type bootstrap_state =
     state. The host must perform a handoff before retiring a graph/account/client;
     focus alone revokes presentation, not resident execution. The authoritative
     projection, not optimistic UI flags, admits the next session. *)
-type host_change =
+type host_change = Worker_effect_authority.host_change =
   | Account_will_change
   | Graph_will_close of Uuid.t
   | Graph_will_remove of Uuid.t * removal_mode
   | Connection_will_stop
 
-type cleanup_resource =
+type cleanup_resource = Worker_effect_authority.cleanup_resource =
   | Observation
   | Asset_demand
   | File_lease
   | Pending_request
   | Durable_intent
 
-type handoff_id
+type handoff_id = Worker_effect_authority.handoff_id
 
 val handoff_id : Uuid.t -> handoff_id
 val equal_handoff_id : handoff_id -> handoff_id -> bool
 
-type handoff_plan
+type handoff_plan = Worker_effect_authority.handoff_plan
 
 (** Deterministic snapshot of the exact authoritative frame. The effect runner
     forwards it without choosing another account/version from a later callback. *)
@@ -747,7 +746,7 @@ val handoff_plan_change : handoff_plan -> host_change
 val handoff_plan_binding : handoff_plan -> binding
 val handoff_plan_sessions : handoff_plan -> session Rrbvec.t
 
-type handoff_receipt
+type handoff_receipt = Worker_effect_authority.handoff_receipt
 val valid_handoff_receipt : handoff_plan -> handoff_receipt -> bool
 val valid_handoff_projection : handoff_plan -> projection -> bool
 
@@ -757,7 +756,7 @@ val handoff_sessions : handoff_receipt -> session Rrbvec.t
 val handoff_change : handoff_receipt -> host_change
 val handoff_pending : handoff_receipt -> cleanup_resource list
 
-type handoff_state =
+type handoff_state = Worker_effect_authority.handoff_state =
   | Quiescing of host_change
   | Safe_to_proceed of handoff_receipt
   | Applying_host_change of handoff_receipt
@@ -789,133 +788,3 @@ type handoff_state =
 (** Connection-bound validation used inside the direct effect runner. Methods below
     map concrete Service messages, not fictional bytes or a separate adapter. The
     factory is trusted integration, not proof of an honest backend. *)
-module type ISSUER = sig
-  val binding : binding
-
-  (** Fresh issuer/registration lifetime within the real mailbox incarnation.
-      Rebinding the same client/account still yields a distinct binding; this is
-      not a second invented Worker incarnation. Every delayed bootstrap failure,
-      not-ready update and baseline is tagged with it, as are sealed sessions. *)
-
-  val revoke : unit -> unit
-  val release_binding_request : unit -> (Service.request, error) result
-  val binding_released : Service.response -> (unit, error) result
-
-  (** Revocation immediately removes data authority; the baseline subscription
-      remains tracked until its exact unregister/fence ACK. Repeated cleanup is
-      idempotent. Do not abandon an old registration on retry/rebind/shutdown. *)
-
-  val handoff_request
-    :  handoff_plan
-    -> (Service.request, error) result
-
-  val handoff_receipt
-    :  handoff_plan
-    -> Service.response
-    -> (handoff_receipt, error) result
-
-  (** Match the tracked host transition and actual writer/resource fence. This
-      is not Client_command_completed interpreted as proof of quiescence. The
-      actual Service frame binds backend lifetime, original version, captured
-      resources and held local-copy preparation. No readback callback may choose
-      another target or reconstruct an absent receipt. *)
-
-  (** The actual Service owner registers and samples one lifecycle version.
-      Baselines carry caller-known registration IDs, effective limits and exact
-      resident/account identities. Ordinary query families map to Protocol V2;
-      unsupported durability/resource capabilities fail before enqueue. *)
-  val consume_handoff_request : handoff_receipt -> (Service.request,error)result
-  val handoff_consumed : handoff_receipt -> Service.response -> (unit,error)result
-
-  (** Read-only original receipt confirmation, including after local revocation.
-      No initial prepare, consumption, graph deletion or account change occurs. *)
-  val confirm_handoff_request : handoff_receipt -> (Service.request,error)result
-  val handoff_confirmed : handoff_receipt -> Service.response -> (bool,error)result
-  val bootstrap_request : unit -> (Service.request, error) result
-
-  val bootstrap : Service.response -> (bootstrap_state, error) result
-
-  (** Includes correlated ongoing baseline updates; rejects account/incarnation/
-      version regressions, duplicate residents, invalid limits and selection.
-      previous must be the latest accepted projection for this binding. Current
-      unversioned Service.state/Graph_states alone cannot establish this obligation. *)
-  val projection
-    :  previous:projection option
-    -> Service.push
-    -> (projection, error) result
-
-  val request
-    :  session
-    -> request_id:request_id
-    -> 'a request
-    -> (Service.request, error) result
-
-  (** Pure coordinator supplies the captured current presentation and original
-      proof. None denotes a known rejection, never Unknown. The runner only
-      encodes this decision; it does not infer acknowledgement from UI callbacks. *)
-  val acknowledge_mutation_request
-    : session -> request_id:request_id -> presentation:presentation
-    -> intent:mutation_intent -> original:receipt option -> (Service.request,error) result
-
-  val reply
-    :  session
-    -> request_id:request_id
-    -> 'a request
-    -> Service.response
-    -> ('a reply, error) result
-
-  val observation
-    :  session
-    -> request_id:request_id
-    -> 'a observation
-    -> Service.response
-    -> ('a observed, error) result
-
-  (** Checked registration metadata is separate from sampled data: a V2_failed
-      still owns an observation. Metadata accepts the exact retired binding for
-      cleanup tracking; it grants no current read authority. *)
-  val observation_registration
-    :  session
-    -> request_id:request_id
-    -> 'a observed request
-    -> Service.response
-    -> ('a observation * observation_epoch, error) result
-
-  val changefeed_notices : Service.push -> (changefeed_notice Rrbvec.t, error) result
-  val observation_notices : Service.push -> (observation_notice Rrbvec.t, error) result
-
-  (** Settle a caller-known pending logical registration even when cancellation
-      hid its successful handle. Only the exact backend cleanup ACK is success;
-      this is not a fabricated active observation. *)
-  val finalize_observation_registration : session -> observation_id:request_id -> (Service.request,error)result
-  val observation_registration_finalized : session -> observation_id:request_id -> Service.response -> (unit,error)result
-  val finalize_asset_demand : session -> request_id:request_id -> asset_consumer -> (Service.request,error)result
-  val asset_demand_finalized : session -> request_id:request_id -> asset_consumer -> Service.response -> (unit,error)result
-
-  val release_observation_registration
-    :  session
-    -> observation_id:request_id
-    -> (Service.request, error) result
-
-  val observation_registration_released
-    :  session
-    -> observation_id:request_id
-    -> Service.response
-    -> (unit, error) result
-
-  val asset_notice : session -> Service.asset_notice -> (asset_notice, error) result
-end
-
-val issuer
-  :  managed_origin:string
-  -> user_id:string
-  -> runtime_epoch:Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch
-  -> worker_generation:Logseq_db_worker_lui.Journal_worker_ids.Worker.generation
-  -> ((module ISSUER), error) result
-
-(** Factory binds verified logical origin/account and real mailbox identities.
-    The runner validates response kind, protocol and mailbox IDs, exact intent/
-    graph/revision, continuation and handle, before issuing authority. Retired
-    bindings accept tracked cleanup ACKs only, never new sessions/data operations.
-    Protocol.V2_failed preserves its code/message but cannot reconstruct Error.t
-    causal evidence it never transported. Existing Error.t values remain intact. *)

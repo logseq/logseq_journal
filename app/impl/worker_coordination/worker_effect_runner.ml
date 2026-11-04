@@ -7,17 +7,17 @@ module Core = Worker_pure_coordinator
 type client = (Service.request, Service.response, Service.push) Mailbox.client
 
 type flight =
-  | Baseline of (module Worker.ISSUER)
+  | Baseline of (module Worker_effect_authority.ISSUER)
   | Query :
-      (module Worker.ISSUER) * 'a Core.ticket * Worker.session * 'a Worker.request
+      (module Worker_effect_authority.ISSUER) * 'a Core.ticket * Worker.session * 'a Worker.request
       -> flight
-  | Unobserve of (module Worker.ISSUER) * Worker.session * Worker.request_id
-  | Finalize_observation of (module Worker.ISSUER) * Worker.session * Worker.request_id
-  | Finalize_demand of (module Worker.ISSUER) * unit Core.ticket * Worker.session * Worker.asset_consumer
-  | Unregister of (module Worker.ISSUER)
-  | Handoff of (module Worker.ISSUER) * Worker.handoff_plan
-  | Consume of (module Worker.ISSUER) * Worker.handoff_receipt * Worker.request_id
-  | Confirm of (module Worker.ISSUER) * Worker.handoff_receipt * Worker.request_id
+  | Unobserve of (module Worker_effect_authority.ISSUER) * Worker.session * Worker.request_id
+  | Finalize_observation of (module Worker_effect_authority.ISSUER) * Worker.session * Worker.request_id
+  | Finalize_demand of (module Worker_effect_authority.ISSUER) * unit Core.ticket * Worker.session * Worker.asset_consumer
+  | Unregister of (module Worker_effect_authority.ISSUER)
+  | Handoff of (module Worker_effect_authority.ISSUER) * Worker.handoff_plan
+  | Consume of (module Worker_effect_authority.ISSUER) * Worker.handoff_receipt * Worker.request_id
+  | Confirm of (module Worker_effect_authority.ISSUER) * Worker.handoff_receipt * Worker.request_id
 
 type t =
   { client : client
@@ -25,7 +25,7 @@ type t =
   ; user : string
   ; post : Core.event -> unit
   ; publish : Core.view -> unit
-  ; mutable issuer : (module Worker.ISSUER)
+  ; mutable issuer : (module Worker_effect_authority.ISSUER)
   ; mutable registration : int64 option
   ; pending : (Id.Worker.request_id, flight) Hashtbl.t
   ; mutable latest : Core.view option
@@ -33,13 +33,13 @@ type t =
   }
 
 let create ~client ~managed_origin ~user_id ~post ~publish =
-  Worker.issuer
+  Worker_effect_authority.issuer
     ~managed_origin
     ~user_id
     ~runtime_epoch:(Mailbox.runtime_epoch client)
     ~worker_generation:(Mailbox.worker_generation client)
   |> Result.map (fun issuer ->
-    let module I = (val issuer : Worker.ISSUER) in
+    let module I = (val issuer : Worker_effect_authority.ISSUER) in
     let t =
       { client
       ; origin = managed_origin
@@ -83,7 +83,7 @@ let refused = function
 
 let submit t = function
   | Core.Bootstrap ->
-    let module I = (val t.issuer : Worker.ISSUER) in
+    let module I = (val t.issuer : Worker_effect_authority.ISSUER) in
     (match I.bootstrap_request () with
      | Error e -> t.post (Core.Bootstrap_received (I.binding, Worker.Bootstrap_failed e))
      | Ok request ->
@@ -94,7 +94,7 @@ let submit t = function
         | Accepted id -> t.post (Core.Bootstrap_admitted (I.binding, id))
         | result -> t.post (Core.Bootstrap_not_admitted (I.binding, refused result))))
   | Release_observation_registration (session, id) ->
-    let module I = (val t.issuer : Worker.ISSUER) in
+    let module I = (val t.issuer : Worker_effect_authority.ISSUER) in
     (match I.release_observation_registration session ~observation_id:id with
      | Error error ->
        t.post (Core.Observation_release_completed (session, id, Error error))
@@ -104,21 +104,21 @@ let submit t = function
         | result ->
           t.post (Core.Observation_release_not_admitted (session, id, refused result))))
   | Finalize_observation_registration(session,id)->
-    let module I=(val t.issuer:Worker.ISSUER) in
+    let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
     (match I.finalize_observation_registration session ~observation_id:id with
      |Error error->t.post(Core.Observation_finalize_completed(session,id,Error error))
      |Ok request->match admit t request(Finalize_observation(t.issuer,session,id)) with
        |Accepted _->()
        |result->t.post(Core.Observation_finalize_not_admitted(session,id,refused result)))
   | Finalize_asset_demand(ticket,session,consumer)->
-    let module I=(val t.issuer:Worker.ISSUER) in
+    let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
     (match I.finalize_asset_demand session ~request_id:(Core.ticket_id ticket) consumer with
      |Error error->t.post(Core.Admission_failed(ticket,error))
      |Ok request->match admit t request(Finalize_demand(t.issuer,ticket,session,consumer)) with
        |Accepted id->t.post(Core.Admitted(ticket,id))
        |result->t.post(Core.Admission_refused(ticket,refused result)))
   | Release_binding binding ->
-    let module I = (val t.issuer : Worker.ISSUER) in
+    let module I = (val t.issuer : Worker_effect_authority.ISSUER) in
     if not (Worker.equal_binding binding I.binding)
     then t.post (Core.Binding_release_completed (binding, Error Worker.Revoked_session))
     else (
@@ -131,22 +131,22 @@ let submit t = function
          | result -> t.post (Core.Binding_release_not_admitted (binding, refused result))))
   | Bind_replacement ->
     (match
-       Worker.issuer
+       Worker_effect_authority.issuer
          ~managed_origin:t.origin
          ~user_id:t.user
          ~runtime_epoch:(Mailbox.runtime_epoch t.client)
          ~worker_generation:(Mailbox.worker_generation t.client)
      with
      | Error e ->
-       let module I = (val t.issuer : Worker.ISSUER) in
+       let module I = (val t.issuer : Worker_effect_authority.ISSUER) in
        t.post (Core.Bootstrap_received (I.binding, Worker.Bootstrap_failed e))
      | Ok issuer ->
        t.issuer <- issuer;
        t.registration <- None;
-       let module I = (val issuer : Worker.ISSUER) in
+       let module I = (val issuer : Worker_effect_authority.ISSUER) in
        t.post (Core.Worker_bound I.binding))
   | Send (ticket, session, operation) ->
-    let module I = (val t.issuer : Worker.ISSUER) in
+    let module I = (val t.issuer : Worker_effect_authority.ISSUER) in
     let request=match operation with
       | Worker.Acknowledge_intent intent->
         (match Core.ticket_acknowledgement ticket with
@@ -169,7 +169,7 @@ let submit t = function
          | _ -> ())
       t.pending
   |Quiesce plan->
-    let module I=(val t.issuer:Worker.ISSUER) in
+    let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
     let id=Worker.handoff_plan_id plan and change=Worker.handoff_plan_change plan in
     let fail error=t.post(Core.Handoff_completed(id,Worker.Handoff_failed(change,error))) in
     (match I.handoff_request plan with
@@ -179,7 +179,7 @@ let submit t = function
        |Full->fail(Worker.Service_failed "Host preparation was not admitted: queue full")
        |Not_ready|Stopping->fail(Worker.Service_failed "Host preparation was not admitted: Worker unavailable"))
   |Consume_handoff(receipt,attempt)->
-    let module I=(val t.issuer:Worker.ISSUER) in
+    let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
     let id=Worker.handoff_receipt_id receipt in
     (match I.consume_handoff_request receipt with
      |Error error->t.post(Core.Handoff_apply_rejected(id,attempt,error))
@@ -187,7 +187,7 @@ let submit t = function
        |Accepted mailbox->t.post(Core.Handoff_apply_admitted(id,attempt,mailbox))
        |result->t.post(Core.Handoff_apply_not_admitted(id,attempt,refused result)))
   |Confirm_handoff(receipt,attempt)->
-    let module I=(val t.issuer:Worker.ISSUER) in
+    let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
     let id=Worker.handoff_receipt_id receipt in
     (match I.confirm_handoff_request receipt with
      |Error error->t.post(Core.Handoff_confirmed(id,attempt,None,Error error))
@@ -222,7 +222,7 @@ let on_event t event =
            Hashtbl.remove t.pending request_id;
            (match flight with
             | Baseline issuer ->
-              let module I = (val issuer : Worker.ISSUER) in
+              let module I = (val issuer : Worker_effect_authority.ISSUER) in
               let state =
                 match outcome with
                 | Completed response ->
@@ -239,7 +239,7 @@ let on_event t event =
               in
               t.post (Core.Bootstrap_received (I.binding, state))
             | Query (issuer, ticket, session, request) ->
-              let module I = (val issuer : Worker.ISSUER) in
+              let module I = (val issuer : Worker_effect_authority.ISSUER) in
               let result =
                 match outcome with
                 | Completed response ->
@@ -283,7 +283,7 @@ let on_event t event =
               in
               t.post (Core.Completed (ticket, result))
             | Unobserve (issuer, session, id) ->
-              let module I = (val issuer : Worker.ISSUER) in
+              let module I = (val issuer : Worker_effect_authority.ISSUER) in
               let result =
                 match outcome with
                 | Completed response ->
@@ -295,32 +295,32 @@ let on_event t event =
               in
               t.post (Core.Observation_release_completed (session, id, result))
             |Finalize_observation(issuer,session,id)->
-              let module I=(val issuer:Worker.ISSUER) in
+              let module I=(val issuer:Worker_effect_authority.ISSUER) in
               let result=match outcome with Completed response->I.observation_registration_finalized session ~observation_id:id response
                 |_->Error(Worker.Service_failed "Observation finalization was not acknowledged") in
               t.post(Core.Observation_finalize_completed(session,id,result))
             |Finalize_demand(issuer,ticket,session,consumer)->
-              let module I=(val issuer:Worker.ISSUER) in
+              let module I=(val issuer:Worker_effect_authority.ISSUER) in
               let result=match outcome with
                 |Completed response->Worker.Answered(I.asset_demand_finalized session ~request_id:(Core.ticket_id ticket) consumer response)
                 |Failed message->Worker.Answered(Error(Worker.Service_failed message))
                 |Cancelled->Worker.Interrupted Worker.Cancelled|Shutdown->Worker.Interrupted Worker.Worker_stopped in
               t.post(Core.Completed(ticket,result))
             |Consume(issuer,receipt,attempt)->
-              let module I=(val issuer:Worker.ISSUER) in
+              let module I=(val issuer:Worker_effect_authority.ISSUER) in
               let result=match outcome with
                 |Completed response->I.handoff_consumed receipt response
                 |Failed message->Error(Worker.Service_failed message)
                 |Cancelled|Shutdown->Error(Worker.Service_failed "Host action outcome is unknown; original permission cannot be replayed") in
               t.post(Core.Handoff_applied(Worker.handoff_receipt_id receipt,attempt,request_id,result))
             |Confirm(issuer,receipt,attempt)->
-              let module I=(val issuer:Worker.ISSUER) in
+              let module I=(val issuer:Worker_effect_authority.ISSUER) in
               let result=match outcome with Completed response->I.handoff_confirmed receipt response
                 |Failed message->Error(Worker.Service_failed message)
                 |Cancelled|Shutdown->Error(Worker.Service_failed "Original host consumption readback is unavailable; outcome remains unknown") in
               t.post(Core.Handoff_confirmed(Worker.handoff_receipt_id receipt,attempt,Some request_id,result))
             |Handoff(issuer,plan)->
-              let module I=(val issuer:Worker.ISSUER) in
+              let module I=(val issuer:Worker_effect_authority.ISSUER) in
               let id=Worker.handoff_plan_id plan and change=Worker.handoff_plan_change plan in
               let result=match outcome with
                 |Completed response->I.handoff_receipt plan response
@@ -329,7 +329,7 @@ let on_event t event =
               t.post(Core.Handoff_completed(id,match result with
                 |Ok receipt->Worker.Safe_to_proceed receipt|Error error->Worker.Handoff_failed(change,error)))
             | Unregister issuer ->
-              let module I = (val issuer : Worker.ISSUER) in
+              let module I = (val issuer : Worker_effect_authority.ISSUER) in
               let result =
                 match outcome with
                 | Completed response -> I.binding_released response
@@ -341,7 +341,7 @@ let on_event t event =
               t.post (Core.Binding_release_completed (I.binding, result)));
            Consumed)
       | Push { payload = Service.Graph_pushes _ as payload; push_sequence; _ } ->
-        let module I = (val t.issuer : Worker.ISSUER) in
+        let module I = (val t.issuer : Worker_effect_authority.ISSUER) in
         (match I.changefeed_notices payload with
          | Ok notices ->
            Rrbvec.iter
@@ -350,7 +350,7 @@ let on_event t event =
          | Error e -> error := Some e);
         Broadcast
       | Push { payload = Service.Coordination_updates updates; _ } ->
-        let module I = (val t.issuer : Worker.ISSUER) in
+        let module I = (val t.issuer : Worker_effect_authority.ISSUER) in
         List.iter
           (function
             | Service.Coordination_snapshot b when t.registration = Some b.registration ->
@@ -366,7 +366,7 @@ let on_event t event =
           updates;
         Broadcast
       | Push { payload = Service.Coordination_observations _ as payload; _ } ->
-        let module I = (val t.issuer : Worker.ISSUER) in
+        let module I = (val t.issuer : Worker_effect_authority.ISSUER) in
         (match I.observation_notices payload with
          | Ok notices ->
            Rrbvec.iter (fun notice -> t.post (Core.Observation_notice notice)) notices
@@ -375,7 +375,7 @@ let on_event t event =
            t.post (Core.Observation_notices_failed (I.binding, e)));
         Broadcast
       | Push {payload=(Service.Asset_notice _|Asset_notices _) as payload;push_sequence;_}->
-        let module I=(val t.issuer:Worker.ISSUER) in
+        let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
         Option.iter(fun view->Option.iter(fun projection->
           List.iter(fun(scope,data)->
             match List.find_opt(fun resident->resident.Worker.phase=Worker.Open
@@ -388,7 +388,7 @@ let on_event t event =
         Broadcast
       | Push _ -> Broadcast
       | Terminal { error = message; _ } ->
-        let module I = (val t.issuer : Worker.ISSUER) in
+        let module I = (val t.issuer : Worker_effect_authority.ISSUER) in
         I.revoke ();
         t.post
           (Core.Bootstrap_received
@@ -403,7 +403,7 @@ let on_event t event =
 ;;
 
 let authorize_host_change t receipt ~attempt =
-  let module I=(val t.issuer:Worker.ISSUER) in
+  let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
   Result.bind(I.consume_handoff_request receipt)(fun request->
     match admit t request(Consume(t.issuer,receipt,attempt))with
     |Accepted id->Ok id

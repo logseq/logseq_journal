@@ -18,7 +18,7 @@ module Read_fixture = struct
       2900L
   ;;
 
-  module I = (val issuer : W.ISSUER)
+  module I = (val issuer : Worker_effect_authority.ISSUER)
 
   let state =
     let bound =

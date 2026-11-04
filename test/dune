@@ -6,7 +6,8 @@
   logseq_db_worker
   logseq_db_worker.lui
   logseq_sync.pure_reducer
-  logseq_db_worker.typed_data))
+  logseq_db_worker.typed_data
+  worker_effect_authority))
 
 (test
  (name startup_test)
@@ -115,7 +116,8 @@
   unix
   yojson
   logseq_db_worker.typed_data
-  journal_app_business))
+  journal_app_business
+  worker_effect_authority))
 
 (test
  (name application_view_test)
@@ -151,7 +153,8 @@
   lui
   unix
   logseq_db_worker.typed_data
-  journal_app_business))
+  journal_app_business
+  worker_effect_authority))
 
 (test
  (name journal_timeline_state_test)
@@ -189,7 +192,8 @@
   unix
   yojson
   logseq_db_worker.typed_data
-  journal_app_business))
+  journal_app_business
+  worker_effect_authority))
 
 (rule
  (alias runtest)
@@ -269,6 +273,7 @@
   (run
    python3 -B %{dep:worker_coordination_contract_test.py}
    --ocamlc %{ocamlc}
+   --cmi %{cmi:../app/impl/worker_coordination/worker_effect_authority}
    --cmi %{lib:rrbvec:rrbvec.cmi}
    --cmi %{lib:logseq_db_worker.typed_data:worker_pure_data.cmi}
    --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination.cmi}
@@ -312,7 +317,8 @@
   unix
   uri
   logseq_db_worker.typed_data
-  journal_app_business))
+  journal_app_business
+  worker_effect_authority))
 
 (test
  (name worker_coordination_pure_test)
@@ -324,4 +330,5 @@
   logseq_db_worker.lui
   logseq_db_worker.pure_reducer
   rrbvec
-  logseq_db_worker.typed_data))
+  logseq_db_worker.typed_data
+  worker_effect_authority))

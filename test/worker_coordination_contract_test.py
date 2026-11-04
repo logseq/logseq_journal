@@ -38,7 +38,7 @@ let reply = function
   | W.Answered (Ok progress) -> phase progress
 """,
     "receipt_validation": """
-let checked (module Issuer : W.ISSUER) session request_id intent response =
+let checked (module Issuer : Worker_effect_authority.ISSUER) session request_id intent response =
   Issuer.reply session ~request_id (W.Append intent) response
 """,
     "observe_empty_page_and_release": """
@@ -61,7 +61,7 @@ let incoming runner event = Journal_worker_coordination.Worker_effect_runner.on_
 """,
     "binding_consumes_concrete_worker_values": """
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
-module Validate (Issuer : W.ISSUER) = struct
+module Validate (Issuer : Worker_effect_authority.ISSUER) = struct
   let projection previous (push : Service.push) = Issuer.projection ~previous push
   let answer session request_id request (response : Service.response) =
     Issuer.reply session ~request_id request response
@@ -76,10 +76,10 @@ let acknowledged (ticket : unit C.ticket) = C.Completed (ticket, W.Answered (Ok 
 """,
     "trusted_issuer_has_a_construction_boundary": """
 let issue managed_origin user_id runtime_epoch worker_generation =
-  W.issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation
+  Worker_effect_authority.issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation
 """,
     "binding_encodes_scoped_service_requests": """
-let send (module Issuer : W.ISSUER) session request_id request
+let send (module Issuer : Worker_effect_authority.ISSUER) session request_id request
     : (Logseq_db_worker_lui.Logseq_db_worker_lui_service.request, W.error) result =
   Issuer.request session ~request_id request
 let cancel client mailbox_id =
@@ -144,7 +144,7 @@ let registration view (ticket : W.block W.slice W.observed C.ticket) =
 
 NEGATIVE = {
     "observation_requires_registered_service_envelope": (
-        """let wrong (module Issuer : W.ISSUER) session request_id observation
+        """let wrong (module Issuer : Worker_effect_authority.ISSUER) session request_id observation
           (response:Logseq_db_worker.Protocol.response) =
           Issuer.observation session ~request_id observation response""",
         ("Protocol.response", "Service.response")),
@@ -176,7 +176,7 @@ NEGATIVE = {
     "mailbox_generations_are_not_runtime_epochs": (
         """let wrong (runtime_epoch : Logseq_db_worker_lui.Journal_worker_ids.Runtime.epoch)
     (worker_generation : Logseq_db_worker_lui.Journal_worker_ids.Worker.generation) =
-  W.issuer ~managed_origin:"https://example.invalid" ~user_id:"fixture"
+  Worker_effect_authority.issuer ~managed_origin:"https://example.invalid" ~user_id:"fixture"
     ~runtime_epoch:worker_generation ~worker_generation:runtime_epoch""",
         ("Worker.generation", "Runtime.epoch")),
 }
@@ -263,16 +263,16 @@ let stop runner =
   | R.Shutdown_failed error -> `Error error
 """,
     "changefeed_observation_and_snapshot_registration": """
-let bootstrap (module Issuer : W.ISSUER) response = Issuer.bootstrap response
-let sample (module Issuer : W.ISSUER) = Issuer.bootstrap_request ()
+let bootstrap (module Issuer : Worker_effect_authority.ISSUER) response = Issuer.bootstrap response
+let sample (module Issuer : Worker_effect_authority.ISSUER) = Issuer.bootstrap_request ()
 let observed (value : W.block_summary W.observed) =
   W.compare_observation_epoch value.epoch value.epoch,value.value.W.lookup
 let changes (batch : W.change_batch) = batch.generation,batch.through,batch.windows,batch.next
 let capability session = W.capabilities session
 let can_observe session query = W.supports_observation session query
-let release_baseline (module Issuer : W.ISSUER) response =
+let release_baseline (module Issuer : Worker_effect_authority.ISSUER) response =
   Issuer.revoke (); Issuer.release_binding_request (),Issuer.binding_released response
-let handoff (module Issuer : W.ISSUER) plan response =
+let handoff (module Issuer : Worker_effect_authority.ISSUER) plan response =
   Issuer.handoff_request plan,Issuer.handoff_receipt plan response
 """,
 })
@@ -297,9 +297,9 @@ NEGATIVE.update({
 
 POSITIVE.update({
     "presentation_and_registration_identity_are_explicit": """
-let confirm (module Issuer:W.ISSUER) session request_id presentation receipt response =
+let confirm (module Issuer:Worker_effect_authority.ISSUER) session request_id presentation receipt response =
   Issuer.reply session ~request_id (W.Confirm(presentation, receipt)) response
-let bound (module Issuer:W.ISSUER) state =
+let bound (module Issuer:Worker_effect_authority.ISSUER) state =
   C.Worker_bound Issuer.binding,C.Bootstrap_received(Issuer.binding,state)
 let cleanup handle =
   W.observation_session handle,W.observation_id handle
@@ -313,7 +313,7 @@ NEGATIVE.update({
       ("W.session", "W.presentation")),
     "binding_is_not_worker_incarnation": (
       "let wrong (worker:W.worker_incarnation) = C.Worker_bound worker",
-      ("W.worker_incarnation", "Worker_api.binding")),
+      ("W.worker_incarnation", "Worker_effect_authority.binding")),
     "observation_value_cannot_cross_without_equality": (
       "let wrong (type a b) (left:a W.observation) (right:b W.observation) (value:b) : a = value",
       ("b", "a")),
@@ -329,7 +329,7 @@ NEGATIVE.update({
       ("W.page", "W.block")),
     "handoff_id_is_not_request_id": (
       "let wrong view (id:W.request_id) = C.handoff view id",
-      ("W.request_id", "Worker_api.handoff_id")),
+      ("W.request_id", "Worker_effect_authority.handoff_id")),
 })
 
 def main():

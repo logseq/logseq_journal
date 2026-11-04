@@ -2992,9 +2992,9 @@ let test_service_import_rejects_retired_registration () =
     let call request=let id=match Mailbox.send client request with Accepted id->id|_->failwith "typed Import fixture admission" in
       wait(fun()->Hashtbl.mem replies id);Hashtbl.find replies id in
     ignore(call(Service.Client_command(Restore_local_account{user_id="user-1"})));
-    let issuer=W.issuer ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
+    let issuer=Worker_effect_authority.issuer ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
       ~runtime_epoch:(Mailbox.runtime_epoch client) ~worker_generation:(Mailbox.worker_generation client) |> Result.get_ok in
-    let module I=(val issuer:W.ISSUER) in
+    let module I=(val issuer:Worker_effect_authority.ISSUER) in
     (match call(I.bootstrap_request() |> Result.get_ok)with
       |Completed(Service.Coordination_registered value)->baseline:=Some value|_->failwith "typed Import baseline request failed");
     wait(fun()->Option.exists(fun value->List.exists(fun(_,graph)->graph.Logseq_db_worker.phase=Graph_open)value.Service.baseline.state.residents)!baseline);
@@ -3098,9 +3098,9 @@ let test_prepared_import_survives_worker_lifetime () =
           let id=match Mailbox.send client request with Accepted id->id|_->failwith "restarted Import admission" in
           wait(fun()->Hashtbl.mem replies id);Hashtbl.find replies id in
         ignore(call(Service.Client_command(Restore_local_account{user_id="user-1"})));
-        let issuer=W.issuer ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
+        let issuer=Worker_effect_authority.issuer ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
           ~runtime_epoch:(Mailbox.runtime_epoch client) ~worker_generation:(Mailbox.worker_generation client) |> Result.get_ok in
-        let module I=(val issuer:W.ISSUER) in
+        let module I=(val issuer:Worker_effect_authority.ISSUER) in
         (match call(I.bootstrap_request() |> Result.get_ok)with
          |Completed(Service.Coordination_registered value)->baseline:=Some value
          |_->failwith "restarted Import bootstrap failed");

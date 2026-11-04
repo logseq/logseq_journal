@@ -1104,7 +1104,7 @@ let favorites_cursor_factory ?(graph_generation = 7) () =
   let module P = Logseq_db_worker.Protocol in
   let module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service in
   let issuer, _, _, session = Coordination_test_fixture.fixture ~graph_generation 2700L in
-  let module I = (val issuer : W.ISSUER) in
+  let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let budget =
     W.read_budget session ~maximum_items:50 ~maximum_bytes:65536 |> Result.get_ok
   in
@@ -4425,7 +4425,7 @@ module Detail_observation_fixture = struct
   let root=W.Uuid.of_string "70000000-0000-4000-a000-000000005540" |> Result.get_ok
   let make ?(failed=false) () =
     let issuer,raw,projection,session=Coordination_test_fixture.fixture 5540L in
-    let module I=(val issuer:W.ISSUER) in
+    let module I=(val issuer:Worker_effect_authority.ISSUER) in
     let ready=(C.step(C.initial ~client_id:root)(C.Worker_bound I.binding)).next
       |> fun state->(C.step state(C.Bootstrap_received(I.binding,W.Ready projection))).next in
     let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
@@ -4446,7 +4446,7 @@ module Detail_observation_fixture = struct
     let context:M.context={entry_id="detail-observation-fixture";request_generation=1L;root;owner;original=request;maximum_children=128} in
     context,ticket,handle,planned.next,completed,issuer,session,raw
   let refresh issuer session handle state =
-    let module I=(val issuer:W.ISSUER) in
+    let module I=(val issuer:Worker_effect_authority.ISSUER) in
     let operation=W.Refresh handle in
     let ticket,planned=C.request state session operation |> Result.get_ok in
     let registration,owner,observation_id,request_id=match I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok with
@@ -4517,7 +4517,7 @@ let test_observed_absence_does_not_commit_user_deletion () =
 let test_detail_observation_binding_revocation_is_visible () =
   let module F=Detail_observation_fixture in let module M=F.M in let module C=F.C in
   let context,ticket,_,_,ready,issuer,_,_=F.make() in
-  let module I=(val issuer:F.W.ISSUER) in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let model,_=M.planned M.empty context ticket in
   let model,_=M.inspect model(C.view ready) in
   let forgotten=(C.step ready(C.Forget ticket)).next in
@@ -4633,7 +4633,7 @@ module Child_chain_fixture = struct
   let make ?(append=false) ?(task_state=Journal_model.No_status) () =
     let issuer,_,projection,session=Coordination_test_fixture.fixture
       ~limits:{Coordination_test_fixture.limits with response_budget_bytes=Worker_pure_data.maximum_response_bytes} 5514L in
-    let module I=(val issuer:W.ISSUER) in
+    let module I=(val issuer:Worker_effect_authority.ISSUER) in
     let presentation=Option.get(W.selected projection) in
     let uuid s=G.Uuid.of_string s |> Result.get_ok in
     let _,request=child_identity_detail() |> fun t->Journal_detail.update_child_source t "Frozen child source"
