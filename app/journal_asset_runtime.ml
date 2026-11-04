@@ -80,7 +80,7 @@ type t =
   ; pages : (string, Graph.page option * int) Hashtbl.t
   ; page_dirty : (string, Graph.page option * Uuids.t * int * bool) Hashtbl.t
   ; assets : (string, unit) Hashtbl.t
-  ; requests : (string, int * Protocol.command) Hashtbl.t
+  ; requests : (string, int * bool) Hashtbl.t
   ; dependencies : (string, dependency * int) Hashtbl.t
   ; dependency_queue : (dependency * Graph.Uuid.t) Queue.t
   ; dependency_waiting : (string, Graph.Uuid.t) Hashtbl.t
@@ -208,8 +208,8 @@ let degrade t =
     t.changed t.generation recent favorites)
 ;;
 
-let observe_request t (request : Protocol.request) =
-  let key = Graph.Uuid.to_string request.request_id in
+let observe_fact_request t ~request_id ~first_page =
+  let key = Graph.Uuid.to_string request_id in
   if not (Hashtbl.mem t.requests key)
   then (
     if Hashtbl.length t.requests >= maximum_accepted_fact_requests
@@ -232,7 +232,14 @@ let observe_request t (request : Protocol.request) =
     if Hashtbl.length t.requests < maximum_accepted_fact_requests
     then (
       t.serial <- t.serial + 1;
-      Hashtbl.replace t.requests key (t.serial, request.command)))
+      Hashtbl.replace t.requests key (t.serial, first_page)))
+;;
+
+let observe_request t (request : Protocol.request) =
+  let first_page = match request.command with
+    | Protocol.V2_list_favorites { cursor; _ } -> cursor = None
+    | _ -> false in
+  observe_fact_request t ~request_id:request.request_id ~first_page
 ;;
 
 let execute t = function
@@ -294,28 +301,9 @@ let execute t = function
     if accepted
     then (
       (* The logical scan identity is independent of the physical mailbox ID. *)
-      if Option.is_some t.read_port
-      then (
-        (* Metadata is observed locally, never sent as a transport query. *)
-        let metadata =
-          match ticket.query with
-          | Recent_roots { from_day; through_day; _ } ->
-            Protocol.V2_list_journals
-              { from_day
-              ; through_day
-              ; cursor = None
-              ; limit = Policy.page_size
-              ; revision = None
-              }
-          | Favorite_roots _ ->
-            V2_list_favorites { cursor = None; limit = Policy.page_size }
-          | Assets { roots; _ } ->
-            V2_list_assets
-              { recursive = true; roots; cursor = None; limit = Policy.page_size }
-        in
-        observe_request
-          t
-          Protocol.{ api_version = Protocol.api_version; request_id; command = metadata });
+      if Option.is_some t.read_port then
+        observe_fact_request t ~request_id
+          ~first_page:(match ticket.query with Favorite_roots None -> true | _ -> false);
       Hashtbl.replace t.pending (Graph.Uuid.to_string request_id) ticket;
       true)
     else false
@@ -692,6 +680,50 @@ let settle_dirty t =
   pump t
 ;;
 
+let remember_page_value t ~issuance uuid page =
+  let key = Graph.Uuid.to_string uuid in
+  let prior = Hashtbl.find_opt t.pages key in
+  if Hashtbl.length t.pages < maximum_dependency_facts || Option.is_some prior
+  then (
+    if
+      match prior with
+      | None -> true
+      | Some (_, stamp) -> issuance >= stamp
+    then (
+      Hashtbl.replace t.pages key (page, issuance);
+      match Hashtbl.find_opt t.page_dirty key with
+      | Some (before, roots, barrier, observed) when issuance > barrier ->
+        let direct =
+          Seq.exists (Graph.Uuid.equal uuid) (all_roots t)
+          || Hashtbl.fold
+               (fun _ fact found -> found || Uuids.mem uuid fact.references)
+               t.facts
+               false
+        in
+        let changed =
+          if direct
+          then (
+            let membership =
+              Option.map (fun (page : Graph.page) ->
+                ( page.recycled
+                , uuid_set page.tags
+                , property_membership page.properties ))
+            in
+            (not (page_membership_equal (membership before) (membership page)))
+            || not observed)
+          else (
+            let live = function
+              | Some (page : Graph.page) -> not page.recycled
+              | None -> false
+            in
+            (if observed then live before else true) <> live page)
+        in
+        if changed then dispatch t (Roots_changed (Uuids.elements roots));
+        Hashtbl.remove t.page_dirty key
+      | _ -> ()))
+  else degrade t
+;;
+
 let observe_favorites t ~first_page ~favorites_page items =
   t.favorites_page <- favorites_page;
   if first_page then t.favorite_members <- Uuids.empty;
@@ -706,17 +738,29 @@ let observe_favorites t ~first_page ~favorites_page items =
     items
 ;;
 
-let observe_response_internal
-      ?favorites_first_page
-      t
-      (Protocol.V2_response { request_id; outcome; _ })
-  =
-  match Hashtbl.find_opt t.requests (Graph.Uuid.to_string request_id) with
+let remember_assets t items =
+  List.iter
+    (fun (asset : Logseq_db_types.Asset_descriptor.t) ->
+       if Hashtbl.length t.assets < maximum_dependency_facts
+          || Hashtbl.mem t.assets (Graph.Uuid.to_string asset.uuid)
+       then Hashtbl.replace t.assets (Graph.Uuid.to_string asset.uuid) ()
+       else degrade t)
+    items
+;;
+
+let observe_fact_result t ~request_id apply =
+  let key = Graph.Uuid.to_string request_id in
+  match Hashtbl.find_opt t.requests key with
   | None -> ()
-  | Some (issuance, command) ->
-    Hashtbl.remove t.requests (Graph.Uuid.to_string request_id);
-    if issuance > t.barrier
-    then (
+  | Some (issuance, first_page) ->
+    Hashtbl.remove t.requests key;
+    if issuance > t.barrier then (
+      apply issuance first_page;
+      settle_dirty t)
+;;
+
+let observe_response_internal t (Protocol.V2_response { request_id; outcome; _ }) =
+  observe_fact_result t ~request_id (fun issuance first_page ->
       let remember_block uuid block =
         let key = Graph.Uuid.to_string uuid in
         let prior = Hashtbl.find_opt t.facts key in
@@ -747,49 +791,7 @@ let observe_response_internal
           remember_block value.block.uuid (Some value.block)
         | Worker_pure_data.V2_missing_block { uuid; _ } -> remember_block uuid None
       in
-      let remember_page_value uuid page =
-        let key = Graph.Uuid.to_string uuid in
-        let prior = Hashtbl.find_opt t.pages key in
-        if Hashtbl.length t.pages < maximum_dependency_facts || Option.is_some prior
-        then (
-          if
-            match prior with
-            | None -> true
-            | Some (_, stamp) -> issuance >= stamp
-          then (
-            Hashtbl.replace t.pages key (page, issuance);
-            match Hashtbl.find_opt t.page_dirty key with
-            | Some (before, roots, barrier, observed) when issuance > barrier ->
-              let direct =
-                Seq.exists (Graph.Uuid.equal uuid) (all_roots t)
-                || Hashtbl.fold
-                     (fun _ fact found -> found || Uuids.mem uuid fact.references)
-                     t.facts
-                     false
-              in
-              let changed =
-                if direct
-                then (
-                  let membership =
-                    Option.map (fun (page : Graph.page) ->
-                      ( page.recycled
-                      , uuid_set page.tags
-                      , property_membership page.properties ))
-                  in
-                  (not (page_membership_equal (membership before) (membership page)))
-                  || not observed)
-                else (
-                  let live = function
-                    | Some (page : Graph.page) -> not page.recycled
-                    | None -> false
-                  in
-                  (if observed then live before else true) <> live page)
-              in
-              if changed then dispatch t (Roots_changed (Uuids.elements roots));
-              Hashtbl.remove t.page_dirty key
-            | _ -> ()))
-        else degrade t
-      in
+      let remember_page_value = remember_page_value t ~issuance in
       let remember_page = function
         | Worker_pure_data.V2_present_page { page; _ } ->
           remember_page_value page.uuid (Some page)
@@ -827,22 +829,9 @@ let observe_response_internal
               remember_page_value item.page.uuid (Some item.page))
            items
        | V2_favorites_outcome { favorites_page; items; _ } ->
-         let first_page = match command with
-           | V2_list_favorites { cursor; _ } ->
-             Option.value favorites_first_page ~default:(cursor = None)
-           | _ -> false in
          observe_favorites t ~first_page ~favorites_page items
-       | V2_assets_outcome { items; _ } ->
-         List.iter
-           (fun (asset : Logseq_db_types.Asset_descriptor.t) ->
-              if
-                Hashtbl.length t.assets < maximum_dependency_facts
-                || Hashtbl.mem t.assets (Graph.Uuid.to_string asset.uuid)
-              then Hashtbl.replace t.assets (Graph.Uuid.to_string asset.uuid) ()
-              else degrade t)
-           items
-       | _ -> ());
-      settle_dirty t)
+       | V2_assets_outcome { items; _ } -> remember_assets t items
+       | _ -> ()))
 ;;
 
 let observe_response t response = observe_response_internal t response
@@ -853,14 +842,18 @@ let observe_favorites_result
       ~first_page
       (value : Journal_worker_coordination.Worker_api.favorites)
   =
-  let key = Graph.Uuid.to_string request_id in
-  match Hashtbl.find_opt t.requests key with
-  | None -> ()
-  | Some (issuance, _) ->
-    Hashtbl.remove t.requests key;
-    if issuance > t.barrier then (
-      observe_favorites t ~first_page ~favorites_page:value.favorites_page value.items;
-      settle_dirty t)
+  observe_fact_result t ~request_id (fun _ _ ->
+    observe_favorites t ~first_page ~favorites_page:value.favorites_page value.items)
+;;
+
+let observe_journals_result t ~request_id (value : Worker_pure_data.journal_item Worker.slice) =
+  observe_fact_result t ~request_id (fun issuance _ ->
+    List.iter (fun (item : Worker_pure_data.journal_item) ->
+      remember_page_value t ~issuance item.page.uuid (Some item.page)) value.items)
+;;
+
+let observe_assets_result t ~request_id (value : Worker.asset_listing) =
+  observe_fact_result t ~request_id (fun _ _ -> remember_assets t value.items)
 ;;
 
 let changes t windows =
@@ -1018,8 +1011,7 @@ let receive_read t ~request_id result =
                     (fun (item : Worker_pure_data.journal_item) -> item.page.uuid)
                     value.items
                 , Option.map (fun c -> Journals_cursor c) value.next )
-            , Protocol.V2_journals_outcome { items = value.items; next_cursor = None }
-            , None )
+            , (fun () -> observe_journals_result t ~request_id value) )
         | Favorite_roots cursor, Favorites_packet value ->
           Some
             ( Policy.Roots_loaded
@@ -1031,36 +1023,19 @@ let receive_read t ~request_id result =
                          uuid)
                     value.items
                 , Option.map (fun c -> Favorites_cursor c) value.next )
-            , Protocol.V2_favorites_outcome
-                { favorites_page = value.favorites_page
-                ; generation = value.generation
-                ; projection_revision = value.projection_revision
-                ; items = value.items
-                ; next_cursor = None
-                }
-            , Some (cursor = None) )
+            , (fun () -> observe_favorites_result t ~request_id ~first_page:(cursor = None) value) )
         | Assets _, Assets_packet value ->
           Some
             ( Policy.Assets_loaded
                 (ticket, value.items, Option.map (fun c -> Assets_cursor c) value.next)
-            , Protocol.V2_assets_outcome
-                { generation = value.generation
-                ; projection_revision = value.projection_revision
-                ; items = value.items
-                ; next_cursor = None
-                }
-            , None )
+            , (fun () -> observe_assets_result t ~request_id value) )
         | _ -> None
       in
       (match delivery with
        | None -> false
-       | Some (event, outcome, favorites_first_page) ->
+       | Some (event, observe) ->
          Hashtbl.remove t.pending key;
-         observe_response_internal
-           ?favorites_first_page
-           t
-           (Protocol.V2_response
-              { api_version = Protocol.api_version; request_id; outcome });
+         observe ();
          dispatch t event;
          true))
 ;;
