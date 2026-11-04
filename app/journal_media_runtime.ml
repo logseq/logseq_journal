@@ -318,14 +318,14 @@ let dependency_received t node =
         if not g.listing_failed then g.error<-None)))t.groups
 ;;
 
-let observe_journals_request t ~request_id =
+let observe_fact_request t ~request_id =
   if Hashtbl.mem t.sources request_id || Hashtbl.length t.sources < 4096
   then Hashtbl.replace t.sources request_id (tick t)
 ;;
 
 let observe_request t (request : Protocol.request) =
   if Hashtbl.mem t.sources request.request_id || Hashtbl.length t.sources < 4096
-  then observe_journals_request t ~request_id:request.request_id
+  then observe_fact_request t ~request_id:request.request_id
   else (
     let fail uuid =
       dependency_failure
@@ -350,6 +350,24 @@ let fact_needed t target =
   Hashtbl.to_seq_values t.groups
   |> Seq.exists (fun g ->
     g.visible && (not g.dependency_failed) && group_reaches t g target)
+;;
+
+let observe_query : type a. t -> request_id:G.Uuid.t -> a Worker.query -> unit =
+  fun t ~request_id query ->
+  if Hashtbl.mem t.sources request_id || Hashtbl.length t.sources < 4096
+  then observe_fact_request t ~request_id
+  else
+    let fail uuid = dependency_failure t (G.Uuid.to_string uuid)
+      "Attachment dependency requests are full." in
+    match query with
+    | Worker.Outline_block { uuid; _ } -> fail uuid
+    | Block_summary { block; _ } -> fail block
+    | Children { parent; _ } -> fail parent
+    | Child_members { parent; _ } -> fail parent
+    | Page { uuid; _ } -> dependency_failure t ("page:" ^ G.Uuid.to_string uuid)
+        "Attachment page requests are full."
+    | Assets { roots; _ } -> List.iter fail roots
+    | _ -> ()
 ;;
 
 let rec pump t =
@@ -962,7 +980,7 @@ let reconcile_dependencies t =
   request_pending_pages t
 ;;
 
-let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
+let observe_fact_result t ~request_id apply =
   match Hashtbl.find_opt t.sources request_id with
   | None -> ()
   | Some issued ->
@@ -1026,18 +1044,33 @@ let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
               t.groups)
         else dependency_failure t ("page:" ^ page) "Attachment page cache is full."
     in
-    let page_lookup = function
-      | Worker_pure_data.V2_present_page { page; _ } ->
-        remember_page page.uuid (not page.recycled)
-      | Worker_pure_data.V2_missing_page { uuid; _ } -> remember_page uuid false
-    in
-    let block (record : Worker_pure_data.block_record) =
-      remember record.block.uuid (Some record.block)
-    in
-    let lookup = function
-      | Worker_pure_data.V2_present_block { value; _ } -> block value
-      | Worker_pure_data.V2_missing_block { uuid; _ } -> remember uuid None
-    in
+    apply remember remember_page;
+    if !changed
+    then (
+      reconcile_dependencies t;
+      pump t)
+;;
+
+let remember_page_lookup remember_page = function
+  | Worker_pure_data.V2_present_page { page; _ } ->
+    remember_page page.uuid (not page.recycled)
+  | Worker_pure_data.V2_missing_page { uuid; _ } -> remember_page uuid false
+;;
+
+let remember_block remember (record : Worker_pure_data.block_record) =
+  remember record.block.uuid (Some record.block)
+;;
+
+let remember_block_lookup remember = function
+  | Worker_pure_data.V2_present_block { value; _ } -> remember_block remember value
+  | Worker_pure_data.V2_missing_block { uuid; _ } -> remember uuid None
+;;
+
+let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
+  observe_fact_result t ~request_id (fun remember remember_page ->
+    let page_lookup = remember_page_lookup remember_page in
+    let block = remember_block remember in
+    let lookup = remember_block_lookup remember in
     (match outcome with
      | Protocol.V2_block_outcome value -> lookup value
      | V2_block_summary_outcome { lookup = value; page; items; _ } ->
@@ -1054,27 +1087,32 @@ let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
          (fun (item : Worker_pure_data.journal_item) ->
             remember_page item.page.uuid (not item.page.recycled))
          items
-     | _ -> ());
-    if !changed
-    then (
-      reconcile_dependencies t;
-      pump t)
+     | _ -> ()))
 ;;
 
-let observe_journals_result
-      t
-      ~request_id
-      (value : Worker_pure_data.journal_item Journal_worker_coordination.Worker_api.slice)
-  =
-  (* This outlet records page facts only; it does not publish enumeration or a
-     transport continuation. The scan owner retains the actual sealed next. *)
-  observe_response
-    t
-    (Protocol.V2_response
-       { api_version = Protocol.api_version
-       ; request_id
-       ; outcome = V2_journals_outcome { items = value.items; next_cursor = None }
-       })
+let observe_query_result
+    : type a. t -> request_id:G.Uuid.t -> a Worker.query -> a -> unit
+  = fun t ~request_id query value ->
+  observe_fact_result t ~request_id (fun remember remember_page ->
+    let page_lookup = remember_page_lookup remember_page in
+    let block = remember_block remember in
+    let lookup = remember_block_lookup remember in
+    match query with
+    | Worker.Outline_block _ -> lookup value
+    | Page _ -> page_lookup value
+    | Journal _ -> Option.iter (fun page ->
+        let page = Worker.page_data page in remember_page page.uuid (not page.recycled)) value
+    | Block_summary _ ->
+      lookup value.lookup;
+      Option.iter page_lookup value.page;
+      List.iter (fun (item : Worker_pure_data.child_member) -> block item.value) value.items
+    | Child_members _ ->
+      List.iter (fun (item : Worker_pure_data.child_member) -> block item.value) value.items
+    | Children _ -> List.iter (fun value -> block (Worker.block_data value)) value.items
+    | Tree _ -> List.iter (fun (item : Worker_pure_data.tree_member) -> block item.value) value.items
+    | Journals _ -> List.iter (fun (item : Worker_pure_data.journal_item) ->
+        remember_page item.page.uuid (not item.page.recycled)) value.items
+    | _ -> ())
 ;;
 
 (* Observation registers facts only. The changes owner determines which

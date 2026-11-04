@@ -106,14 +106,12 @@ val pump : t -> unit
 val imported : t -> current:bool -> Logseq_db_worker.import_receipt -> unit
 val idle : t -> bool
 
-(** Page-fact observation only. No enumeration or pagination state is consumed. *)
-val observe_journals_request : t -> request_id:Logseq_db_types.Graph_types.Uuid.t -> unit
-
-val observe_journals_result
-  :  t
-  -> request_id:Logseq_db_types.Graph_types.Uuid.t
-  -> Worker_pure_data.journal_item Journal_worker_coordination.Worker_api.slice
-  -> unit
+(** Observe the original accepted spec query and value without a transport envelope.
+    Facts do not consume enumeration or its sealed continuation. *)
+val observe_query
+  : t -> request_id:Logseq_db_types.Graph_types.Uuid.t -> 'a Worker.query -> unit
+val observe_query_result
+  : t -> request_id:Logseq_db_types.Graph_types.Uuid.t -> 'a Worker.query -> 'a -> unit
 
 (** Exact business correlation, independent of Worker transport IDs. *)
 val read_request_id : read_request -> Logseq_db_types.Graph_types.Uuid.t

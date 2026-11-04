@@ -4044,8 +4044,8 @@ let start
        | Error _->false
        | Ok ticket ->
          (match request.query with
-          | Wc.Journals _->Journal_media_runtime.observe_journals_request (!media_runtime_cell)
-              ~request_id:request.request_id
+          | Wc.Journals _->Journal_media_runtime.observe_query (!media_runtime_cell)
+              ~request_id:request.request_id request.query
           | _->());
          Coordination_host.watch_read host ticket ~f:(fun origin reply->
            if runtime_owner_is_live !state_ref owner then run_owned (Some owner) (fun()->
@@ -4062,8 +4062,8 @@ let start
                      ~request_id:request.request_id (request.outcome value) in
                  if consumed then (
                    match request.query with
-                   | Wc.Journals _->Journal_media_runtime.observe_journals_result (!media_runtime_cell)
-                       ~request_id:request.request_id value
+                   | Wc.Journals _->Journal_media_runtime.observe_query_result (!media_runtime_cell)
+                       ~request_id:request.request_id request.query value
                    | _->())
                  else forget_projection_request request.request_id;
                  consumed
