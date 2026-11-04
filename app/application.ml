@@ -4224,7 +4224,8 @@ let start
             | Answered(Error(Wc.Resync_required message)) when is_changes ->Ok(Journal_graph_runtime.Changes_resync message)
             | Answered(Error(Wc.Stale_read message))->Ok(Journal_graph_runtime.Read_failed{code=Logseq_db_worker.Error.Stale_read_cursor;message})
             | Answered(Error Wc.Response_budget_exceeded)->Ok(Journal_graph_runtime.Read_failed{code=Logseq_db_worker.Error.Response_too_large;message="The read exceeded its response budget."})
-            | Answered(Error(Wc.Db_error error))->Error(Logseq_db_worker.Error.message error)
+            | Answered(Error(Wc.Db_error error))->Ok(Journal_graph_runtime.Read_failed
+                {code=Logseq_db_worker.Error.code error;message=Logseq_db_worker.Error.message error})
             | Answered(Error(Wc.Service_failed message|Resync_required message))->Error message
             | Answered(Error Revoked_session)->Error "The graph execution changed before the read completed."
             | Answered(Error _)->Error "The typed graph read could not be validated."

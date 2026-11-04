@@ -935,16 +935,6 @@ let is_current t = function Root_dates (scan, _) | Root_today (scan, _) -> root_
 let superseded t ~ports = function Root_dates _ | Root_today _ -> empty
   | Root_tree batch -> superseded_root_batch t ~ports batch
   | Root_preview preview -> superseded_root_batch t ~ports preview.preview_batch
-let handles operation outcome = match operation,outcome with
-  | (Root_dates _ | Root_today _), Protocol.V2_journals_outcome _
-  | Root_tree _, Protocol.V2_page_tree_outcome _
-  | Root_preview _, Protocol.V2_children_outcome _ -> true
-  | Root_dates (scan, _), Protocol.V2_failed {code="responseTooLarge";_} -> scan.root_list_size > 1
-  | Root_dates (scan, _), Protocol.V2_failed {code="staleReadCursor";_} ->
-    Option.is_some scan.root_journal_cursor && scan.root_date_retries < 2
-  | Root_tree batch, Protocol.V2_failed {code="responseTooLarge";_} -> batch.root_limit > 1 && batch.root_cursor=None
-  | Root_preview preview, Protocol.V2_failed {code="responseTooLarge";_} -> preview.preview_limit > 1
-  | _ -> false
 let journal_request = function
   | Root_dates (_, request) | Root_today (_, request) -> Some request
   | Root_tree _ | Root_preview _ -> None
@@ -982,16 +972,17 @@ let child_request = function
   | Root_dates _ | Root_today _ | Root_tree _ -> None
 ;;
 
-let receive t ~ports ?journals ?children ?roots ?origin operation outcome =
-  let unsealed = match operation, journals, outcome with
-    | (Root_dates _ | Root_today _), None, Protocol.V2_journals_outcome {next_cursor=Some _;_} -> true
+let receive : type a. t -> ports:ports -> ?origin:(Worker.session * Worker.read_budget)
+  -> operation -> a Worker.query -> a -> output option =
+  fun t ~ports ?origin operation query value ->
+  let handles = match operation, query with
+    | (Root_dates _ | Root_today _), Worker.Journals _ -> true
+    | Root_tree _, Worker.Tree _ -> true
+    | Root_preview _, Worker.Child_members _ -> true
     | _ -> false in
-  if unsealed then Some (match operation with
-    | Root_dates (scan,_) | Root_today (scan,_) -> scan_failure scan "Unsealed journal continuation"
-    | _ -> empty)
-  else if not (handles operation outcome) then None else Some (match operation,outcome with
-      | Root_dates (scan, _), Protocol.V2_journals_outcome { items; _ } ->
-        let next_cursor = Option.bind journals (fun (value:Worker_pure_data.journal_item Worker.slice)->value.next) in
+  if not handles then None else Some (match operation,query with
+      | Root_dates (scan, _), Worker.Journals _ ->
+        let items=value.items and next_cursor=value.next in
         ports.observe_packet (Dates (List.to_seq items));
         let boundary_page (i : Worker_pure_data.journal_item) =
           scan.root_journal_boundary = Some i.journal_day
@@ -1057,7 +1048,8 @@ let receive t ~ports ?journals ?children ?roots ?origin operation outcome =
                         pages -> requests [ read_priority_today ~ports scan ]
             | None -> next_feed_batch t ~ports scan)
           else next_feed_batch t ~ports scan)
-      | Root_today (scan, _), Protocol.V2_journals_outcome { items; _ } ->
+      | Root_today (scan, _), Worker.Journals _ ->
+        let items=value.items in
         ports.observe_packet (Dates (List.to_seq items));
         let items = Rrbvec.of_list items in
         let today =
@@ -1067,36 +1059,45 @@ let receive t ~ports ?journals ?children ?roots ?origin operation outcome =
         in
         scan.root_queued <- Rrbvec.append today scan.root_queued;
         next_feed_batch t ~ports scan
-     | Root_tree batch, V2_page_tree_outcome {items;_} ->
-       (match roots,origin with
-        | Some (value:Worker_pure_data.tree_member Worker.slice),Some origin ->
-          ports.observe_packet (Roots (List.to_seq items));
-          receive_root_tree t ~ports ~origin ~cached:false batch items value.next
-        | _ -> root_failure batch "The root read lost its typed execution provenance.")
-     | Root_preview preview, V2_children_outcome {parent;scope_revision;items;next_cursor;_} ->
-       if children=None && next_cursor<>None then root_failure preview.preview_batch "Unsealed preview continuation"
-       else (
-         ports.observe_packet (Preview (List.to_seq items));
-         receive_root_preview t ~ports preview parent scope_revision items
-           (Option.bind children (fun (value:Worker.children)->value.next)))
-     | Root_dates (scan, _), V2_failed {code="staleReadCursor";_} ->
+     | Root_tree batch, Worker.Tree _ ->
+       (match origin with
+        | Some origin ->
+          ports.observe_packet (Roots (List.to_seq value.items));
+          receive_root_tree t ~ports ~origin ~cached:false batch value.items value.next
+        | None -> root_failure batch "The root read lost its typed execution provenance.")
+     | Root_preview preview, Worker.Child_members _ ->
+       ports.observe_packet (Preview (List.to_seq value.items));
+       receive_root_preview t ~ports preview value.parent value.scope_revision value.items value.next
+     | _ -> empty)
+;;
+
+let failed t ~ports operation ~code =
+  let handles = match operation,code with
+    | Root_dates (scan,_),Logseq_db_worker.Error.Response_too_large -> scan.root_list_size>1
+    | Root_dates (scan,_),Logseq_db_worker.Error.Stale_read_cursor ->
+      Option.is_some scan.root_journal_cursor && scan.root_date_retries<2
+    | Root_tree batch,Logseq_db_worker.Error.Response_too_large -> batch.root_limit>1 && batch.root_cursor=None
+    | Root_preview preview,Logseq_db_worker.Error.Response_too_large -> preview.preview_limit>1
+    | _ -> false in
+  if not handles then None else Some (match operation,code with
+     | Root_dates (scan, _), Logseq_db_worker.Error.Stale_read_cursor ->
        if not (root_owner_current t (Feed_roots scan)) then empty else (
          scan.root_date_retries <- scan.root_date_retries + 1;
          Option.iter (fun day -> scan.root_journal_through <- day) scan.root_journal_boundary;
          scan.root_journal_cursor <- None;
          requests [read_root_dates ~ports scan])
-     | Root_dates (scan, _), V2_failed {code="responseTooLarge";_} when scan.root_list_size>1 ->
+     | Root_dates (scan, _), Logseq_db_worker.Error.Response_too_large when scan.root_list_size>1 ->
        scan.root_list_size <- max 1 (scan.root_list_size/2);
        (* Continuations seal the original item budget. Restart at the inclusive
           boundary and deduplicate already observed identities after resizing. *)
        Option.iter (fun day -> scan.root_journal_through <- day) scan.root_journal_boundary;
        scan.root_journal_cursor <- None;
        requests [read_root_dates ~ports scan]
-     | Root_tree batch, V2_failed {code="responseTooLarge";_} when batch.root_limit>1 && batch.root_cursor=None ->
+     | Root_tree batch, Logseq_db_worker.Error.Response_too_large when batch.root_limit>1 && batch.root_cursor=None ->
        let limit=max 1 (batch.root_limit/2) in
        (match batch.root_owner with Feed_roots scan->scan.root_page_size<-limit | _->());
        requests [read_root_batch t ~ports batch.root_owner batch.root_page batch.root_cursor limit]
-     | Root_preview preview, V2_failed {code="responseTooLarge";_} when preview.preview_limit>1 ->
+     | Root_preview preview, Logseq_db_worker.Error.Response_too_large when preview.preview_limit>1 ->
        requests [read_root_preview ~ports {preview with preview_limit=max 1 (preview.preview_limit/2);
          preview_members=Rrbvec.empty;preview_cursor=None;preview_revision=None}]
   | _ -> empty)

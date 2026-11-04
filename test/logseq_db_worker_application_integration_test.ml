@@ -172,9 +172,7 @@ let seed_visible_block ?(record = record) runtime =
     |> fun output -> only "journal request" output.requests
   in
   let tree =
-    Runtime.receive
-      runtime
-      (respond
+    Read_fixture.receive runtime journals (respond
          journals
          (Protocol.V2_journals_outcome
             { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
@@ -195,7 +193,7 @@ let seed_visible_block ?(record = record) runtime =
           ; next_cursor = None
           })) in
   let child=only "bounded preview query" output.requests in
-  Runtime.receive runtime (respond child (Protocol.V2_children_outcome
+  Read_fixture.receive runtime child (respond child (Protocol.V2_children_outcome
       {parent=record.block.uuid;revision_scope=Worker_pure_data.V2_children_revision record.block.uuid;
        scope_revision="children-1";items=[];next_cursor=None}))
 ;;
@@ -441,9 +439,7 @@ let seed_parent_children_interest runtime =
     |> fun output -> only "detail children request" output.requests
   in
   ignore
-    (Runtime.receive
-       runtime
-       (respond
+    (Read_fixture.receive runtime children_request (respond
           children_request
           (Protocol.V2_children_outcome
              { parent = block_uuid
@@ -598,9 +594,7 @@ let test_named_tags_reach_timeline_row () =
     |> fun out -> only "journals" out.requests
   in
   let tree =
-    Runtime.receive
-      runtime
-      (respond
+    Read_fixture.receive runtime journals (respond
          journals
          (Protocol.V2_journals_outcome
             { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
@@ -644,7 +638,7 @@ let test_named_tags_reach_timeline_row () =
   in
   let output = Read_fixture.receive runtime tree response in
   let child=only "tagged root preview" output.requests in
-  let output=Runtime.receive runtime (respond child (Protocol.V2_children_outcome
+  let output=Read_fixture.receive runtime child (respond child (Protocol.V2_children_outcome
       {parent=block_uuid;revision_scope=Worker_pure_data.V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None})) in
   let entry =
     List.find_map

@@ -1915,9 +1915,7 @@ let children_result items continuation : Projection.children_page =
 let receive_response t ~read_result ~origin (protocol_response : Protocol.response) =
   let favorites : Worker.favorites option = match read_result with Some (Query_result (Worker.Favorites _, value))->Some value | _->None in
   let catalog : Worker.task_status_catalog option = match read_result with Some (Query_result (Worker.Task_statuses _, value))->Some value | _->None in
-  let journals : Worker_pure_data.journal_item Worker.slice option = match read_result with Some (Query_result (Worker.Journals _, value))->Some value | _->None in
   let target_summary : Worker.block_summary option = match read_result with Some (Query_result (Worker.Block_summary _, value))->Some value | _->None in
-  let roots : Worker_pure_data.tree_member Worker.slice option = match read_result with Some (Query_result (Worker.Tree _, value))->Some value | _->None in
   let children : Worker.children option = match read_result with Some (Query_result (Worker.Child_members _, value))->Some value | _->None in
   let (Protocol.V2_response { request_id; outcome; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
@@ -1939,7 +1937,12 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
   | Some { operation; source_epoch; _ } ->
     let failure_output = failure_output ~source_epoch in
     Hashtbl.remove t.pending key;
-    (match (match operation with Feed_read value -> Feed.receive t.feed ~ports:(feed_ports t) ?journals ?children ?roots ?origin value outcome | _ -> None) with
+    (match (match operation,read_result with
+       | Feed_read operation,Some(Query_result(query,value)) ->
+         Feed.receive t.feed ~ports:(feed_ports t) ?origin operation query value
+       | Feed_read operation,Some(Read_failed{code;_}) ->
+         Feed.failed t.feed ~ports:(feed_ports t) operation ~code
+       | _ -> None) with
      | Some planned -> feed_output t planned
      | _ -> (match outcome with
      | Protocol.V2_assets_outcome _ ->

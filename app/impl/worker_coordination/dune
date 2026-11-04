@@ -22,4 +22,5 @@
  (implements journal_worker_coordination)
  (modules worker_api worker_pure_coordinator worker_effect_runner)
  (libraries worker_effect_authority logseq_db_types logseq_db_worker.lui
+  logseq_db_worker.contract
   rrbvec logseq_db_worker.typed_data))

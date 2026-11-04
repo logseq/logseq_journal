@@ -2577,7 +2577,9 @@ let test_observation_notice_plans_one_refresh () =
         check
           (count (C.step failed.next C.Capacity_available) = 0)
           "sample failure busy-retried without a newer invalidation";
-        let transient=C.step admitted.next(C.Completed(refresh,W.Answered(Error(W.Service_failed "local refresh interrupted"))))in
+        let busy=Logseq_db_worker.Error.create ~code:Storage_busy
+          ~message:"local refresh busy" ~details:[] |> Result.get_ok in
+        let transient=C.step admitted.next(C.Completed(refresh,W.Answered(Error(W.Db_error busy))))in
         check(count transient=1) "transient observation failure did not recover in the same epoch";
         List.iter(function
           |C.Send(again,_,W.Refresh same)->

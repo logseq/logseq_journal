@@ -48,13 +48,13 @@ val journal_request : operation -> journal_request option
 val receive
   :  t
   -> ports:ports
-  -> ?journals:Worker_pure_data.journal_item Worker.slice
-  -> ?children:Worker.children
-  -> ?roots:Worker_pure_data.tree_member Worker.slice
   -> ?origin:(Worker.session * Worker.read_budget)
   -> operation
-  -> Protocol.v2_outcome
+  -> 'a Worker.query
+  -> 'a
   -> output option
+
+val failed : t -> ports:ports -> operation -> code:Logseq_db_worker.Error.code -> output option
 
 val load_feed : t -> ports:ports -> cursor:Projection.feed_cursor option -> root_limit:int -> day_limit:int -> request_generation:int64 -> output
 val load_day : t -> ports:ports -> page:Projection.page -> after:Projection.block_cursor option -> limit:int -> request_generation:int64 -> output

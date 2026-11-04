@@ -1525,7 +1525,7 @@ let run_favorites_native_visibility
               V2_changes_acknowledged {generation;through}
             | V2_get_outline_block { block; _ } ->
               if block=uuid 1 && Atomic.exchange detail_observed_failure false then V2_failed{
-                code=Logseq_db_worker.Error.code_string Invalid_request;message="Observation sample failed"}
+                code=Logseq_db_worker.Error.code_string Storage_busy;message="Observation sample failed"}
               else if Atomic.get detail_observed_missing && block=uuid 1 then
                 V2_block_outcome(Worker_pure_data.V2_missing_block{uuid=block;revision="observed-missing"})
               else if !fail_this_media_read then V2_failed {code="FixtureReadFailure";message="Synthetic Media dependency read failed"}
@@ -2869,7 +2869,7 @@ let run_favorites_native_visibility
                  Atomic.set detail_observed_title true;
                  Atomic.set detail_observed_failure true;invalidate 1L;
                  dispatch(Lui_protocol.Press(Option.get(find "text" "Diagnostics")));
-                 wait "observation read failure uses existing Diagnostics" (fun()->Option.is_some(find "text" "invalidRequest: Observation sample failed"));
+                 wait "observation read failure uses existing Diagnostics" (fun()->Option.is_some(find "text" "Observation sample failed"));
                  dispatch(Lui_protocol.Press(Option.get(find "accessibility-identifier" "journal-diagnostics-close")));
                  Alcotest.(check bool) "refactor adds no observation retry control" true
                    (Option.is_none(find "text" "Retry observation"));

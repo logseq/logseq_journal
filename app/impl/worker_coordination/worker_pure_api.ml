@@ -1198,10 +1198,13 @@ let decode
   | Protocol.V2_failed { code; message } ->
     Error
       (if code = "staleReadCursor"
-       then Stale_read (code ^ ": " ^ message)
-       else if code = "responseTooLarge"
-       then Response_budget_exceeded
-       else Service_failed (code ^ ": " ^ message))
+       then Stale_read message
+       else match Logseq_db_worker.Error.code_of_string code with
+         | Some code ->
+           (match Logseq_db_worker.Error.create ~code ~message ~details:[] with
+            | Ok error -> Db_error error
+            | Error _ -> Invalid_input "The query failure was not a valid database error.")
+         | None -> Service_failed (code ^ ": " ^ message))
   | V2_resync_required { reason; _ } -> Error (Resync_required reason)
   | _ ->
     (match query, outcome with

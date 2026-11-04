@@ -90,22 +90,15 @@ module Worker_producer = struct
            ~request_id:request.request_id
            (Journal_graph_runtime.Query_result(read.query,value))
        | Ok (W.Answered (Error (W.Stale_read message))) ->
-         Production_runtime.receive
-           runtime
-           (Protocol.V2_response
-              { api_version = Protocol.api_version
-              ; request_id = request.request_id
-              ; outcome = V2_failed { code = "staleReadCursor"; message }
-              })
+         Production_runtime.receive_worker_read runtime ~request_id:request.request_id
+           (Journal_graph_runtime.Read_failed {code=Logseq_db_worker.Error.Stale_read_cursor;message})
        | Ok (W.Answered (Error W.Response_budget_exceeded)) ->
-         Production_runtime.receive
-           runtime
-           (Protocol.V2_response
-              { api_version = Protocol.api_version
-              ; request_id = request.request_id
-              ; outcome =
-                  V2_failed { code = "responseTooLarge"; message = "oversized fixture" }
-              })
+         Production_runtime.receive_worker_read runtime ~request_id:request.request_id
+           (Journal_graph_runtime.Read_failed {code=Logseq_db_worker.Error.Response_too_large;message="oversized fixture"})
+       | Ok (W.Answered (Error (W.Db_error error))) ->
+         Production_runtime.receive_worker_read runtime ~request_id:request.request_id
+           (Journal_graph_runtime.Read_failed
+             {code=Logseq_db_worker.Error.code error;message=Logseq_db_worker.Error.message error})
        | _ ->
          Production_runtime.fail_request
            runtime
@@ -165,6 +158,9 @@ module Runtime = struct
       in serve result
     | Some (Protocol.V2_get_page_tree _ as command), Protocol.V2_page_tree_outcome _ ->
       Worker_producer.receive runtime {Protocol.api_version=Protocol.api_version;request_id=envelope.request_id;command} raw
+    | Some command, Protocol.V2_failed _ ->
+      Worker_producer.receive runtime
+        {Protocol.api_version=Protocol.api_version;request_id=envelope.request_id;command} raw
     | _ -> Production_runtime.receive runtime raw)
     |> Worker_producer.wire_output runtime
 
@@ -4138,7 +4134,11 @@ let test_typed_date_budget_failure_preserves_classification () =
          operation
          (F.S.Graph_response failure)
      with
-     | Ok (F.W.Answered (Error F.W.Response_budget_exceeded)) -> ()
+     | Ok (F.W.Answered (Error (F.W.Db_error error))) ->
+       Alcotest.(check bool) "recoverable database budget code" true
+         (Logseq_db_worker.Error.code error=Logseq_db_worker.Error.Response_too_large);
+       Alcotest.(check string) "original database budget message" "oversize"
+         (Logseq_db_worker.Error.message error)
      | _ -> Alcotest.fail "typed response discarded recoverable budget failure")
   | _ -> Alcotest.fail "missing typed date request"
 ;;

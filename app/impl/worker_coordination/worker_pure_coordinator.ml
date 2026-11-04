@@ -1625,6 +1625,7 @@ let retain_observed_value state value ~admitted ~cancelled =
 let failed_observation_sample owned error =
   let recover=not owned.obs_error_recovered && match error with
     |Worker.Service_failed _->true
+    |Worker.Db_error error->Logseq_db_worker_contract.Error.code error=Logseq_db_worker_contract.Error.Storage_busy
     |_->false in
   {owned with obs_error=Some error;obs_dirty=owned.obs_dirty || recover;
     obs_error_recovered=owned.obs_error_recovered || recover}
