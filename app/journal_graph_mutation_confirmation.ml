@@ -233,15 +233,12 @@ module Pure_insertion = struct
     | V2_set_task_status {block;status;preconditions;_} -> Set_task_status {block;status;preconditions}
     | V2_clear_task_status {block;preconditions;_} -> Clear_task_status {block;preconditions}
     | _ -> invalid_arg "Unsupported child mutation"
-  let rec capture_node (node:Worker_pure_data.append_node) : Worker.capture_node =
-    {block_id=node.block_id;title=node.title;task_status=node.task_status;
-      children=Rrbvec.map capture_node node.children}
   let wire_intent session wire = match wire with
     | Protocol.V2_append_journal{mutation_id;journal_day;root;_}->
       (match Worker.journal_day journal_day with
        | Error error->Error error
        | Ok day->match Worker.append_intent session ~mutation_id ~block_id:root.block_id
-           ~day ~title:root.title ~task_status:root.task_status ~children:(Rrbvec.map capture_node root.children) with
+           ~day ~title:root.title ~task_status:root.task_status ~children:root.children with
          | Error error->Error error
          | Ok intent->Worker.restore_mutation_intent session (Worker.encode_append_intent intent))
     | (Protocol.V2_insert_blocks _|V2_set_task_status _|V2_clear_task_status _) as wire->

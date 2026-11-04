@@ -1995,7 +1995,7 @@ let test_host_durable_recovery_confirmation_ack () =
       let child_id=uuid(Printf.sprintf "9f000000-0000-4000-8000-%012d" (2001+index*10)) in
       let append=W.append_intent session ~mutation_id:(uuid(Printf.sprintf "9f000000-0000-4000-8000-%012d" (2002+index*10)))
         ~block_id:root_id ~day:(W.journal_day day |> Result.get_ok) ~title:"Atomic Service root 中文"
-        ~task_status:(Some status) ~children:(Rrbvec.singleton W.{block_id=child_id;title="Atomic Service child";
+        ~task_status:(Some status) ~children:(Rrbvec.singleton Worker_pure_data.{block_id=child_id;title="Atomic Service child";
           task_status=Some(Test_support.status_uuid 3);children=Rrbvec.empty}) |> Result.get_ok in
       let receipt=match value(call(W.Append append)) with
         | W.Committed_pending_presentation receipt->receipt|_->failwith "actual Append did not commit atomically" in

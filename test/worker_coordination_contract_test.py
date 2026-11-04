@@ -214,7 +214,7 @@ let confirm session presentation receipt = request(session,W.Confirm(presentatio
 let receipt value = W.receipt_mutation_id value,W.receipt_revisions value
 let capture session id uuid day =
   W.append_intent session ~mutation_id:id ~block_id:uuid ~day ~title:"root"
-    ~task_status:None ~children:(Rrbvec.singleton {W.block_id=uuid;title="child";task_status=None;children=Rrbvec.empty})
+    ~task_status:None ~children:(Rrbvec.singleton {Worker_pure_data.block_id=uuid;title="child";task_status=None;children=Rrbvec.empty})
 """,
     "asset_import_notices_leases_and_ack": """
 let import session source = Result.map (fun intent -> request(session,W.Import intent))

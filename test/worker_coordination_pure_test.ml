@@ -1625,7 +1625,7 @@ let test_durable_mutation_properties ?(append=false) () =
     W.append_intent session ~mutation_id:(uuid "98000000-0000-4000-8000-000000000091")
       ~block_id:graph ~day:(W.journal_day 20261102 |> Result.get_ok) ~title:"stable durable Append"
       ~task_status:(Some(uuid "98000000-0000-4000-8000-000000000096"))
-      ~children:(Rrbvec.singleton W.{block_id=uuid "98000000-0000-4000-8000-000000000095";
+      ~children:(Rrbvec.singleton Worker_pure_data.{block_id=uuid "98000000-0000-4000-8000-000000000095";
         title="complete child";task_status=None;children=Rrbvec.empty}) |> Result.get_ok) in
   let intent = match append_intent with
   | Some intent->W.restore_mutation_intent session(W.encode_append_intent intent) |> Result.get_ok
@@ -4327,7 +4327,7 @@ let test_atomic_append_intent_and_admission () =
     ~block_id:(uuid "98000000-0000-4000-8000-000000006052")
     ~day:(W.journal_day 20261102 |> Result.get_ok) ~title:"Atomic typed source"
     ~task_status:(Some(uuid "98000000-0000-4000-8000-000000006053"))
-    ~children:(Rrbvec.singleton W.{block_id=uuid "98000000-0000-4000-8000-000000006054";
+    ~children:(Rrbvec.singleton Worker_pure_data.{block_id=uuid "98000000-0000-4000-8000-000000006054";
       title="Nested status";task_status=Some(uuid "98000000-0000-4000-8000-000000006055");children=Rrbvec.empty}) with
     | Ok intent->intent|Error _->failwith "atomic Append constructor is unavailable after the real backend contract" in
   let bytes=W.encode_append_intent intent in

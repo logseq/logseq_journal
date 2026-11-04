@@ -269,13 +269,6 @@ val change_ack_session : change_ack -> session
 val change_ack_generation : change_ack -> string
 val change_ack_through : change_ack -> string
 
-type capture_node =
-  { block_id : Uuid.t
-  ; title : string
-  ; task_status : Uuid.t option
-  ; children : capture_node Rrbvec.t
-  }
-
 type append_intent
 
 (** Persist the complete bounded root/child/status payload and normalized stable
@@ -289,7 +282,7 @@ val append_intent
   -> day:journal_day
   -> title:string
   -> task_status:Uuid.t option
-  -> children:capture_node Rrbvec.t
+  -> children:Worker_pure_data.append_node Rrbvec.t
   -> (append_intent, error) result
 
 val append_intent_id : append_intent -> Uuid.t

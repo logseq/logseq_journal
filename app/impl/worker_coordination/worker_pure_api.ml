@@ -221,13 +221,6 @@ type _ query =
       }
       -> change_batch query
 
-type capture_node = Worker_pure_data.append_node =
-  { block_id : Uuid.t
-  ; title : string
-  ; task_status : Uuid.t option
-  ; children : capture_node Rrbvec.t
-  }
-
 type append_intent = Wire.t
 
 type mutation_command =
