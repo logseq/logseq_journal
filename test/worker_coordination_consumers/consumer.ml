@@ -6,7 +6,6 @@ let request (session,operation) state = Result.map snd (C.request state session 
 module Client_bootstrap_query_projection_and_release = struct
 
 module R = Journal_worker_coordination.Worker_effect_runner
-module P = Logseq_db_worker.Protocol
 module Projection = Journal_graph_projection
 let start client managed_origin user_id publish enqueue =
   let post event = enqueue event in
@@ -40,7 +39,6 @@ end
 
 module All_read_families_and_current_projection_consumers = struct
 
-module P = Logseq_db_worker.Protocol
 module Projection = Journal_graph_projection
 let queries session budget uuid day = [
   request(session,W.Query(budget,W.Graph_info));
@@ -83,7 +81,6 @@ end
 module Client_to_projection_observation_write_and_cleanup = struct
 
 module R = Journal_worker_coordination.Worker_effect_runner
-module P = Logseq_db_worker.Protocol
 module Projection = Journal_graph_projection
 type pending =
   | Idle

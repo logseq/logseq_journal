@@ -24,7 +24,8 @@
  (libraries app
   logseq_db_worker.lui
   logseq_sync.pure_reducer
-  yojson))
+  yojson
+  journal_app_business))
 
 (test
  (name source_boundary_test)
@@ -80,7 +81,8 @@
  (name journal_adaptive_test)
  (modules journal_adaptive_test)
  (libraries app
-  lui))
+  lui
+  journal_app_business))
 
 (test
  (name journal_semantics_test)
@@ -91,7 +93,8 @@
   ocaml-signal
   rrbvec
   unix
-  yojson))
+  yojson
+  journal_app_business))
 
 (test
  (name journal_graph_runtime_locality_test)
@@ -111,7 +114,8 @@
   rrbvec
   unix
   yojson
-  logseq_db_worker.typed_data))
+  logseq_db_worker.typed_data
+  journal_app_business))
 
 (test
  (name application_view_test)
@@ -133,7 +137,8 @@
   unix
   uri
   yojson
-  logseq_db_worker.typed_data))
+  logseq_db_worker.typed_data
+  journal_app_business))
 
 (test
  (name logseq_db_worker_application_integration_test)
@@ -145,26 +150,30 @@
   logseq_journal.worker_coordination
   lui
   unix
-  logseq_db_worker.typed_data))
+  logseq_db_worker.typed_data
+  journal_app_business))
 
 (test
  (name journal_timeline_state_test)
  (modules journal_timeline_state_test)
  (libraries app datascript-ocaml-native unix
-  logseq_db_types))
+  logseq_db_types
+  journal_app_business))
 
 (test
  (name journal_time_test)
  (modules journal_time_test)
  (libraries app
-  unix))
+  unix
+  journal_app_business))
 
 (test
  (name journal_model_test)
  (modules journal_model_test)
  (libraries app
   logseq_db_types
-  unix))
+  unix
+  journal_app_business))
 
 (test
  (name journal_routes_test)
@@ -179,7 +188,8 @@
   rrbvec
   unix
   yojson
-  logseq_db_worker.typed_data))
+  logseq_db_worker.typed_data
+  journal_app_business))
 
 (rule
  (alias runtest)
@@ -301,7 +311,8 @@
   threads
   unix
   uri
-  logseq_db_worker.typed_data))
+  logseq_db_worker.typed_data
+  journal_app_business))
 
 (test
  (name worker_coordination_pure_test)

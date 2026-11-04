@@ -485,7 +485,6 @@ let detail_on_page ~page ~time_context ~root children =
 ;;
 
 let favorite (item : Worker_pure_data.favorite_item) =
-  let module P = Logseq_db_worker.Protocol in
   let id = Logseq_db_types.Graph_types.Uuid.to_string in
   let target, title, task_state =
     match item.target with

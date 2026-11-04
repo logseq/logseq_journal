@@ -1,4 +1,24 @@
 (library
+ (name journal_app_business)
+ (wrapped false)
+ (modules
+  journal_validation
+  journal_calendar
+  journal_time
+  journal_model
+  journal_environment)
+ (libraries
+  logseq_db_types
+  mldoc
+  ppx_deriving_yojson.runtime
+  threads
+  unix
+  uri
+  yojson)
+ (preprocess
+  (pps ppx_deriving_yojson)))
+
+(library
  (name app)
  (wrapped false)
  (modules
@@ -11,7 +31,6 @@
   journal_manager_view
   journal_page_layout
   journal_bridge
-  journal_environment
   journal_ids
   journal_lui_native
   journal_pump
@@ -21,20 +40,18 @@
   journal_asset_settings
   journal_asset_runtime
   journal_asset_policy
-  journal_calendar
   journal_capture
   journal_copy
   journal_detail
+  journal_graph_runtime
   journal_graph_projection
   journal_graph_request
-  journal_graph_runtime
   journal_graph_reference_plan
   journal_graph_favorites_plan
   journal_graph_feed_plan
   journal_graph_mutation_confirmation
   journal_graph_transport
   journal_header
-  journal_model
   journal_media
   journal_media_runtime
   journal_media_view
@@ -46,17 +63,15 @@
   journal_routes
   journal_row
   journal_startup
-  journal_time
   journal_title
   journal_timeline
   journal_timeline_state
-  journal_validation
   journal_visual_tokens
   journal_symbols)
  (libraries
+  journal_app_business
   rrbvec
   mtime.clock
-  mldoc
   lui
   ocaml-signal
   datascript-ocaml-native
