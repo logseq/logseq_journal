@@ -97,7 +97,7 @@ copying the full Service command set or introducing App UI models into Worker.
 | Current consumers / source | Target contract |
 | --- | --- |
 | journal_graph_feed_plan: list journals, root tree, child preview, cursor/revision scan | Journals (including initial revision), Tree, Children/Child_members, typed continuations and bounded budgets |
-| journal_graph_reference_plan, journal_copy, detail/confirmation | Graph_info, Page/Outline_block UUID lookup, atomic Block_summary, full page/block DTO and per-target revision |
+| journal_graph_reference_plan, journal_pure_copy, detail/confirmation | Graph_info, Page/Outline_block UUID lookup, atomic Block_summary, full page/block DTO and per-target revision |
 | journal_graph_favorites_plan and status load in journal_graph_runtime | Favorites, Task_statuses, Task_status_definitions, membership/order/revision/missing result slots |
 | journal_graph_runtime admission/Capture/create child/source/status/delete | Admission; complete Append child/status payload; typed durable Save/Insert/Delete/Create_journal/Set/Clear/Set_asset_reference intents; receipt and Confirm |
 | journal_media_runtime and Application imports/uploads | asset descriptors/list, scoped consumer demand/release, Import identity/outcome, Retry_asset/Retry_upload, imported/available file Acquire and tracked lease Release ACK |

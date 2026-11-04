@@ -3025,7 +3025,7 @@ let test_child_failure_retains_admitted_child () =
     (List.length duplicate.responses)
 ;;
 
-module Copy = Journal_copy.Pure
+module Copy = Journal_pure_copy
 module Copy_worker = Journal_worker_coordination.Worker_api
 
 type copy_query = Query : 'a Copy_worker.query -> copy_query

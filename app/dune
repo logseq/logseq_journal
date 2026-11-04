@@ -8,7 +8,8 @@
   journal_model
   journal_environment
   journal_graph_projection
-  journal_graph_request)
+  journal_graph_request
+  journal_pure_copy)
  (libraries
   logseq_db_types
   mldoc
@@ -46,7 +47,6 @@
   journal_asset_runtime
   journal_asset_policy
   journal_capture
-  journal_copy
   journal_detail
   journal_graph_runtime
   journal_graph_reference_plan

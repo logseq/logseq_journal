@@ -3368,7 +3368,7 @@ let start
   let module Wc = Journal_worker_coordination.Worker_api in
   let module Coordination = Journal_worker_coordination.Worker_pure_coordinator in
   let module Coordination_host = Journal_worker_coordination_host in
-  let module Copy = Journal_copy.Pure in
+  let module Copy = Journal_pure_copy in
   let copy_state : Copy.t ref = ref Copy.initial in
   let copy_owner = ref None in
   let copy_sequence = ref 0L in
