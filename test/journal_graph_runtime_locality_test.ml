@@ -278,12 +278,10 @@ let seed_feed runtime =
 ;;
 
 let pull runtime =
-  Runtime.reconcile_push
+  Runtime.reconcile_signal
     runtime
     ~request_generation:11L
-    (Protocol.V2_changes_available
-       { api_version = Protocol.api_version
-       ; generation = "generation-1"
+    (Worker_pure_data.Changes_available { generation = "generation-1"
        ; through = "revision-2"
        })
   |> fun output -> only "change pull" output.requests
@@ -609,12 +607,10 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
                   }))))
     records;
   let output =
-    Runtime.reconcile_push
+    Runtime.reconcile_signal
       runtime
       ~request_generation:3L
-      (Protocol.V2_resync_required_push
-         { api_version = Protocol.api_version
-         ; generation = "generation-2"
+      (Worker_pure_data.Resync_required { generation = "generation-2"
          ; reason = "overflow"
          })
   in
@@ -702,12 +698,10 @@ let test_queued_resync_announces_feed_refresh () =
           ~blocks:(List.map (fun (r : Worker_pure_data.block_record) -> r.block.uuid) records)
           ()));
   let output =
-    Runtime.reconcile_push
+    Runtime.reconcile_signal
       runtime
       ~request_generation:20L
-      (Protocol.V2_resync_required_push
-         { api_version = Protocol.api_version
-         ; generation = "generation-2"
+      (Worker_pure_data.Resync_required { generation = "generation-2"
          ; reason = "overflow"
          })
   in
@@ -746,12 +740,10 @@ let test_worker_generation_change_restarts_pull_without_cursor () =
              ; next = None
              })));
   let restarted =
-    Runtime.reconcile_push
+    Runtime.reconcile_signal
       runtime
       ~request_generation:12L
-      (Protocol.V2_changes_available
-         { api_version = Protocol.api_version
-         ; generation = "generation-2"
+      (Worker_pure_data.Changes_available { generation = "generation-2"
          ; through = "revision-3"
          })
     |> fun output -> only "generation-change pull" output.requests
@@ -917,12 +909,10 @@ let test_resync_rehydrates_graph_and_registered_journal_interest () =
   let runtime = Runtime.create () in
   ignore (load_feed runtime);
   let output =
-    Runtime.reconcile_push
+    Runtime.reconcile_signal
       runtime
       ~request_generation:12L
-      (Protocol.V2_resync_required_push
-         { api_version = Protocol.api_version
-         ; generation = "generation-2"
+      (Worker_pure_data.Resync_required { generation = "generation-2"
          ; reason = "retention overflow"
          })
   in
@@ -944,12 +934,10 @@ let test_resync_rehydrates_all_registered_structure_interests () =
   let runtime = Runtime.create () in
   seed_children_interest runtime;
   let output =
-    Runtime.reconcile_push
+    Runtime.reconcile_signal
       runtime
       ~request_generation:13L
-      (Protocol.V2_resync_required_push
-         { api_version = Protocol.api_version
-         ; generation = "generation-3"
+      (Worker_pure_data.Resync_required { generation = "generation-3"
          ; reason = "retention overflow"
          })
   in
@@ -2530,12 +2518,10 @@ let test_reference_hydration_and_changes () =
   in
   ignore (Runtime.receive runtime (target_response recreated_request "Recreated"));
   let resync =
-    Runtime.reconcile_push
+    Runtime.reconcile_signal
       runtime
       ~request_generation:12L
-      (Protocol.V2_resync_required_push
-         { api_version = Protocol.api_version
-         ; generation = "generation-2"
+      (Worker_pure_data.Resync_required { generation = "generation-2"
          ; reason = "consumer lagged"
          })
   in
@@ -3522,12 +3508,10 @@ let test_detail_resync_reads_latest_root () =
   let runtime = Runtime.create () in
   ignore (seed_ordinary_detail runtime);
   let output =
-    Runtime.reconcile_push
+    Runtime.reconcile_signal
       runtime
       ~request_generation:12L
-      (Protocol.V2_resync_required_push
-         { api_version = Protocol.api_version
-         ; generation = "generation-2"
+      (Worker_pure_data.Resync_required { generation = "generation-2"
          ; reason = "overflow"
          })
   in
@@ -3938,12 +3922,10 @@ let test_changes_more_continues_after_ack () =
 let test_projection_changes_are_owned () =
   let runtime = Runtime.create () in
   let output =
-    Runtime.reconcile_push
+    Runtime.reconcile_signal
       runtime
       ~request_generation:11L
-      (Protocol.V2_changes_available
-         { api_version = Protocol.api_version
-         ; generation = "generation-1"
+      (Worker_pure_data.Changes_available { generation = "generation-1"
          ; through = "revision-2"
          })
   in
@@ -3980,12 +3962,10 @@ let test_projection_changes_are_owned () =
     0
     (List.length (Runtime.receive runtime completion).responses);
   let output =
-    Runtime.reconcile_push
+    Runtime.reconcile_signal
       runtime
       ~request_generation:12L
-      (Protocol.V2_resync_required_push
-         { api_version = Protocol.api_version
-         ; generation = "generation-2"
+      (Worker_pure_data.Resync_required { generation = "generation-2"
          ; reason = "overflow"
          })
   in
@@ -5749,8 +5729,8 @@ let test_page_root_refresh_and_resync () =
     | Children_reconciled detail -> Some detail | _->None) |> Option.get in
   Alcotest.(check string) "renamed page root reconciles" "Renamed page" (Journal_model.source detail.root);
   Alcotest.(check string) "page revision reconciles" "page-2" (Journal_model.revision detail.root);
-  let out=Runtime.reconcile_push runtime ~request_generation:12L
-    (Protocol.V2_resync_required_push {api_version=Protocol.api_version;generation="generation-2";reason="overflow"}) in
+  let out=Runtime.reconcile_signal runtime ~request_generation:12L
+    (Worker_pure_data.Resync_required {generation="generation-2";reason="overflow"}) in
   Alcotest.(check bool) "page root is never rehydrated as outline" false
     (List.exists (fun (r:Protocol.request)->r.command=V2_get_outline_block {block=page_uuid;revision=None}) out.requests)
 ;;
@@ -6522,12 +6502,10 @@ let test_task_catalog_generation_and_deltas () =
     0
     (List.length old_failure.responses);
   let resync =
-    Runtime.reconcile_push
+    Runtime.reconcile_signal
       runtime
       ~request_generation:99L
-      (Protocol.V2_resync_required_push
-         { api_version = Protocol.api_version
-         ; generation = "generation-2"
+      (Worker_pure_data.Resync_required { generation = "generation-2"
          ; reason = "overflow"
          })
   in
@@ -7564,11 +7542,10 @@ let test_resync_retires_changed_points () =
   in
   let point ?(generation = "generation-1") runtime block_id =
     let pull =
-      Runtime.reconcile_push
+      Runtime.reconcile_signal
         runtime
         ~request_generation:803L
-        (Protocol.V2_changes_available
-           { api_version = Protocol.api_version; generation; through = "revision-2" })
+        (Worker_pure_data.Changes_available { generation; through = "revision-2" })
     in
     let output =
       Runtime.receive
@@ -7642,12 +7619,10 @@ let test_resync_retires_changed_points () =
        let start =
          match boundary with
          | `Push ->
-           Runtime.reconcile_push
+           Runtime.reconcile_signal
              runtime
              ~request_generation:802L
-             (Protocol.V2_resync_required_push
-                { api_version = Protocol.api_version
-                ; generation = "generation-2"
+             (Worker_pure_data.Resync_required { generation = "generation-2"
                 ; reason = "retention overflow"
                 })
          | `Pull ->
@@ -8280,9 +8255,8 @@ let test_prefix_preserves_reconciliation ~resync stage () =
         Some { r with block = { r.block with title = "Remote suffix edit" } }
       else Some r) fixture.roots } in
   let refresh =
-    if resync then Runtime.reconcile_push runtime ~request_generation:90L
-        (Protocol.V2_resync_required_push
-           { api_version = Protocol.api_version; generation = "generation-2"
+    if resync then Runtime.reconcile_signal runtime ~request_generation:90L
+        (Worker_pure_data.Resync_required { generation = "generation-2"
            ; reason = "overflow" })
     else changed runtime (window ~scopes:
         [ Worker_pure_data.V2_page_tree_interest fixture.owner.uuid

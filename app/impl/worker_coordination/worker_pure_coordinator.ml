@@ -218,7 +218,7 @@ type view =
   ; intent_epoch : int64
   ; import_input_epoch : int64
   ; applications : application_state Graphs.t
-  ; change_notices : (Worker.session * Id.push_sequence) Graphs.t
+  ; change_notices : (Worker.changefeed_notice * Id.push_sequence) Graphs.t
   ; change_projections : string Graphs.t
   ; change_versions : int64 Graphs.t
   ; change_batches : (Worker.change_batch * Worker.read_budget) Graphs.t
@@ -324,6 +324,20 @@ let change_version facts session =
 let view t = t.facts
 let bootstrap v = v.bootstrap_state
 let projection v = v.current
+let changefeed_updates ~previous view =
+  Graphs.fold
+    (fun graph (notice, sequence) updates ->
+       let unchanged =
+         match Option.bind previous (fun view -> Graphs.find_opt graph view.change_notices) with
+         | Some (old, seen) ->
+           Worker.equal_session old.Worker.notice_session notice.Worker.notice_session
+           && Id.Push_sequence.compare seen sequence = 0
+         | None -> false
+       in
+       if unchanged then updates else Rrbvec.push_back updates notice)
+    view.change_notices
+    Rrbvec.empty
+;;
 let shutdown_state v = v.shutdown
 let mutation_progress view intent =
   Intents.find_opt (Bytes.to_string(Worker.encode_append_intent intent)) view.intents
@@ -1314,7 +1328,7 @@ let apply_baseline state binding incoming =
         { facts with
           change_notices =
             Graphs.filter
-              (fun _ (session, _) -> current_session facts session)
+              (fun _ (notice, _) -> current_session facts notice.Worker.notice_session)
               facts.change_notices
         ; change_projections =
             Graphs.filter
@@ -2754,7 +2768,7 @@ let step_base state event =
     let graph = Worker.graph_id session in
     let fresh =
       match Graphs.find_opt graph state.facts.change_notices with
-      | Some (previous, seen) when Worker.equal_session previous session ->
+      | Some (previous, seen) when Worker.equal_session previous.Worker.notice_session session ->
         Id.Push_sequence.compare sequence seen > 0
       | _ -> true
     in
@@ -2766,7 +2780,7 @@ let step_base state event =
           facts =
             { state.facts with
               change_notices =
-                Graphs.add graph (session, sequence) state.facts.change_notices
+                Graphs.add graph (notice, sequence) state.facts.change_notices
             }
         }
       in

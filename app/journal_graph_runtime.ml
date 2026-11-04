@@ -3204,22 +3204,22 @@ let abandon t (request : Protocol.request) =
   Hashtbl.remove t.hydration_active key
 ;;
 
-let reconcile_push t ~request_generation push =
+let reconcile_signal t ~request_generation push =
   (match push with
-   | Protocol.V2_changes_available { generation; through; _ } ->
+   | Worker_pure_data.Changes_available { generation; through; _ } ->
      report_timeline "runtime-change-window"
        [ "phase", `String "push"; "generation", timeline_version generation
        ; "through", timeline_version through
        ; "requestGeneration", `String (Int64.to_string request_generation)
        ]
-   | V2_resync_required_push { generation; _ } ->
+   | Worker_pure_data.Resync_required { generation; _ } ->
      report_timeline "runtime-change-window"
        [ "phase", `String "resync"; "generation", timeline_version generation
        ; "requestGeneration", `String (Int64.to_string request_generation)
        ]);
   let output =
     match push with
-    | Protocol.V2_changes_available { generation; _ } ->
+    | Worker_pure_data.Changes_available { generation; _ } ->
       let after =
         match t.change_generation with
         | Some current when String.equal current generation -> t.change_cursor
@@ -3231,7 +3231,7 @@ let reconcile_push t ~request_generation push =
             (Pull_changes { request_generation; generation })
             (Protocol.V2_pull_changes { generation; after; limit = 256 })
         ]
-    | V2_resync_required_push { generation; _ } ->
+    | Worker_pure_data.Resync_required { generation; _ } ->
       rehydrate_current_interests t ~request_generation ~generation
   in
   dispatch_output t output

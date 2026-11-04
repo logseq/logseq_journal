@@ -849,6 +849,7 @@ let restore_asset_import_intent session bytes=Import_wire.restore ~namespace:(im
 ;;
 
 let asset_notice_session (x:asset_notice)=x.notice_owner
+let changefeed_notice_scope (x:changefeed_notice)=x.notice_session.asset_scope
 let asset_notice_scope (x:asset_notice)=x.notice_owner.asset_scope
 
 let asset_notice_data (x:asset_notice)=x.notice_data

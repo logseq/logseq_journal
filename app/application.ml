@@ -3293,7 +3293,7 @@ let start
   let preview_owner = ref None in
   let landed_owner = ref None in
   let presentation_enabled = ref true in
-  let pending_graph_pushes = Hashtbl.create 3 in
+  let pending_change_notices = Hashtbl.create 3 in
   let graph_cells : ((unit -> unit -> unit) * (unit -> unit)) list ref = ref [] in
   let graph_ref make =
     let cell=ref(make ()) in
@@ -3387,6 +3387,7 @@ let start
   let account_lifecycle_changed=ref(fun()->()) in
   let detail_observations_changed = ref(fun()->()) in
   let coordination_assets_changed=ref(fun()->()) in
+  let coordinated_changefeed_notice=ref(fun (_:Wc.changefeed_notice)->()) in
   let mutation_acknowledgements_changed=ref(fun()->()) in
   let retained_insertions_changed=ref(fun()->())in
   let detail_observations_cell=graph_ref(fun()->Detail_observation.empty) in
@@ -3481,12 +3482,16 @@ let start
            ignore(Coordination_host.shutdown host);
            retired_coordination_hosts:=Rrbvec.push_back !retired_coordination_hosts host)previous;
          let id=fresh_identity () in
+         let previous_notice_view=ref None in
          match Coordination_host.create ~client
            ~client_id:(Wc.Uuid.of_string id |> Result.get_ok) ~managed_origin:origin ~user_id:user
            ~enqueue:(Journal_pump.enqueue pump)
            ~changed:(fun view->
+             let notices=Coordination.changefeed_updates ~previous:!previous_notice_view view in
+             previous_notice_view:=Some view;
              reconcile_import_sources();
              if !coordination_host_id=Some id then (
+               Rrbvec.iter (fun notice-> !coordinated_changefeed_notice notice) notices;
                Option.iter(fun poll->poll view)!copy_poll;
                !detail_observations_changed();
                !coordination_assets_changed();
@@ -5015,7 +5020,7 @@ let start
       Journal_asset_runtime.shutdown (!asset_runtime_cell);
       Hashtbl.replace retired_runtimes key (owner,snapshot_cells ());
       Hashtbl.remove runtime_sessions key;Hashtbl.remove runtime_owners key;
-      Hashtbl.remove pending_graph_pushes key) retired;
+      Hashtbl.remove pending_change_notices key) retired;
     List.iter(fun restore->restore ()) restore;active_runtime:=active;processing_owner:=previous
   in
   let retired_runtime_io=ref Rrbvec.empty in
@@ -5362,6 +5367,52 @@ let start
              Ok())))
     |_->Error "The destination is not ready for imports."
   in
+  let process_change_signal signal =
+      let snapshot = !state_ref in
+      let admission_refresh =
+        trigger_admission
+          set_state_and_effect
+          ~graph_generation:snapshot.graph_state.generation
+          ~graph_open:(snapshot.graph_state.phase = Graph_open)
+      in
+      if not snapshot.graph_ready
+      then admission_refresh
+      else (
+        let generation = snapshot.next_request_generation in
+        let output =
+          Journal_graph_runtime.reconcile_signal
+            (!graph_runtime_cell)
+            ~request_generation:generation
+            signal
+        in
+        if output.requests = [] && output.responses = []
+        then Effect.ignore
+        else (
+          let prepare =
+            if output.requests <> []
+            then
+              set_state (fun state ->
+                { state with
+                  next_request_generation =
+                    Int64.max state.next_request_generation (Int64.succ generation)
+                })
+            else Effect.ignore
+          in
+          Effect.many
+            [ admission_refresh
+            ; Effect.bind prepare ~f:(fun () ->
+                Effect.bind
+                  (Effect.of_thunk (fun () -> deliver_output output))
+                  ~f:(fun delivery ->
+                    set_state (fun state ->
+                      let state =
+                        List.fold_left worker_response_transition state delivery.responses
+                      in
+                      match delivery.error with
+                      | Some message -> fail_feed_transport state message
+                      | None -> state)))
+            ]))
+  in
   let handle_worker_event event =
     Journal_asset_runtime.pump (!asset_runtime_cell);
     sync_media !state_ref;
@@ -5369,7 +5420,7 @@ let start
     match event with
     | Worker.Push {payload=Graph_service.Coordination_updates _ | Coordination_observations _;_}
     | Worker.Response {outcome=Completed(Graph_service.Coordination_asset_demand_finalized _ | Coordination_observation_finalized _ | Graph_response _ | Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _ | Coordination_imported _ | Coordination_writers_quiesced _ | Coordination_host_prepared _ | Coordination_host_applied _ | Coordination_host_confirmed _ | Coordination_import_inputs_recovered _ | Coordination_import_input_confirmed _ | Coordination_import_input_acknowledged _);_}->Effect.ignore
-    | Worker.Push {payload=Graph_service.Graph_pushes _ | Graph_states _ | Session_states _;_} -> Effect.ignore
+    | Worker.Push {payload=Graph_service.Graph_push _ | Graph_pushes _ | Graph_states _ | Session_states _;_} -> Effect.ignore
     | Worker.Response { request_id; outcome; _ }
       when Hashtbl.mem local_copy_requests request_id ->
       let request, confirm = Hashtbl.find local_copy_requests request_id in
@@ -5401,51 +5452,6 @@ let start
             | Ok Not_downloaded -> { state with local_copy_message = Some "No local copy on this device." }
                | Error message -> { state with local_copy_message = Some message }))))
         ~f:(fun () -> !drain_visible_copies ())
-    | Worker.Push { payload = Graph_service.Graph_push push; _ } ->
-      let snapshot = !state_ref in
-      let admission_refresh =
-        trigger_admission
-          set_state_and_effect
-          ~graph_generation:snapshot.graph_state.generation
-          ~graph_open:(snapshot.graph_state.phase = Graph_open)
-      in
-      if not snapshot.graph_ready
-      then admission_refresh
-      else (
-        let generation = snapshot.next_request_generation in
-        let output =
-          Journal_graph_runtime.reconcile_push
-            (!graph_runtime_cell)
-            ~request_generation:generation
-            push
-        in
-        if output.requests = [] && output.responses = []
-        then Effect.ignore
-        else (
-          let prepare =
-            if output.requests <> []
-            then
-              set_state (fun state ->
-                { state with
-                  next_request_generation =
-                    Int64.max state.next_request_generation (Int64.succ generation)
-                })
-            else Effect.ignore
-          in
-          Effect.many
-            [ admission_refresh
-            ; Effect.bind prepare ~f:(fun () ->
-                Effect.bind
-                  (Effect.of_thunk (fun () -> deliver_output output))
-                  ~f:(fun delivery ->
-                    set_state (fun state ->
-                      let state =
-                        List.fold_left worker_response_transition state delivery.responses
-                      in
-                      match delivery.error with
-                      | Some message -> fail_feed_transport state message
-                      | None -> state)))
-            ]))
     | Worker.Push { payload = (Asset_notice _ | Asset_notices _) as payload; _ } ->
       let notices = Graph_service.asset_notices payload in
       let apply_notice (scope,notice) =
@@ -7248,8 +7254,8 @@ let start
     state_ref:=model;
     if visible then Option.iter (fun owner ->
       let key=owner_key owner in
-      match Hashtbl.find_opt pending_graph_pushes key with
-      | None->() | Some(_,push,build)->Hashtbl.remove pending_graph_pushes key;Effect.run(build push)) (timeline_scope model);
+      match Hashtbl.find_opt pending_change_notices key with
+      | None->() | Some(notice,build)->Hashtbl.remove pending_change_notices key;Effect.run(build notice)) (timeline_scope model);
     let model=sync_startup_presentation model |> run_edge_callbacks |> prune_resident_models in
     let model=if visible then prepare_presentation model else model in
     state_ref:=model;save_runtime ();processing_owner:=previous;
@@ -8185,6 +8191,29 @@ let start
   let owner_of_scope (scope:Graph_service.asset_scope) : Graph_service.timeline_scope =
     {startup={account_generation=scope.account.account_generation;presentation_generation=scope.account.presentation_generation};
      graph_id=scope.graph_id;graph_generation=scope.graph_generation} in
+  coordinated_changefeed_notice:=(fun notice->
+      let owner=timeline_owner_of_scope(Wc.changefeed_notice_scope notice) in
+      let current notice=runtime_owner_is_live !state_ref owner
+        && match !coordination_host with
+           |None->false
+           |Some(_,host)->Result.is_ok(Coordination_host.validate_session host ~owner notice.Wc.notice_session) in
+      let deliver notice=
+        if not(current notice) then Effect.ignore
+        else Effect.bind
+          (Effect.bind (process_change_signal notice.Wc.notice) ~f:drain_startup_commands)
+          ~f:(fun()->Effect.bind(flush_media set_state) ~f:(fun()->
+            Effect.bind(drain_focus_refresh()) ~f:finish_termination)) in
+      if current notice then (
+        let key=owner_key owner in
+        if model_key !state_ref=Some key then run_owned(Some owner)(fun()->deliver notice)
+        else (
+          let notice=match Hashtbl.find_opt pending_change_notices key with
+            |Some(old,_) when Wc.equal_session old.Wc.notice_session notice.Wc.notice_session->
+              (match old.notice,notice.notice with
+               |Worker_pure_data.Resync_required _,Worker_pure_data.Changes_available _->old
+               |_->notice)
+            |_->notice in
+          Hashtbl.replace pending_change_notices key (notice,deliver))));
   Worker.on_event client (fun event ->
     Journal_pump.enqueue pump (fun () ->
       let coordination_consumed=route_coordination_event event in
@@ -8234,21 +8263,6 @@ let start
           run_owned (Some(owner_of_scope scope)) (fun () ->
             deliver (Worker.Push {envelope with payload=Graph_service.Asset_notice(scope,notice)})))
           (Graph_service.asset_notices payload)
-      | Worker.Push ({payload=Graph_service.Graph_pushes pushes;_} as envelope) ->
-        List.iter (fun (scope,push) -> let owner=owner_of_scope scope in
-          if model_key !state_ref=Some(owner_key owner) then
-            run_owned (Some owner) (fun () -> deliver (Worker.Push {envelope with payload=Graph_service.Graph_push push}))
-          else (
-            let key=owner_key owner in
-            let push=match Hashtbl.find_opt pending_graph_pushes key with
-              | Some(previous,old,_) when previous=scope ->
-                (match Graph_service.coalesce_push ~topic:envelope.topic
-                  (Graph_service.Graph_pushes[scope,old]) (Graph_service.Graph_pushes[scope,push]) with
-                 | Graph_service.Graph_pushes[_,merged]->merged
-                 | _->push)
-              | _->push in
-            Hashtbl.replace pending_graph_pushes key (scope,push,
-              fun push->deliver(Worker.Push{envelope with payload=Graph_service.Graph_push push})))) pushes
       | _ -> Effect.run (deliver event));
       progress_legacy_host_joins();!account_lifecycle_changed());
 

@@ -148,10 +148,10 @@ val receive : t -> Logseq_db_worker.Protocol.response -> output
 val fail_request : t -> Logseq_db_worker.Protocol.request -> message:string -> output
 val abandon : t -> Logseq_db_worker.Protocol.request -> unit
 
-val reconcile_push
+val reconcile_signal
   :  t
   -> request_generation:int64
-  -> Logseq_db_worker.Protocol.push
+  -> Worker_pure_data.changefeed_signal
   -> output
 
 

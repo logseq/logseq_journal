@@ -434,6 +434,9 @@ type changefeed_notice = Worker_effect_authority.changefeed_notice = private
   ; notice : Worker_pure_data.changefeed_signal
   }
 
+(** Read-only owner of an already validated notice, with no new authority. *)
+val changefeed_notice_scope : changefeed_notice -> Worker_effect_authority.Service.asset_scope
+
 type observation_epoch = Worker_effect_authority.observation_epoch
 
 val compare_observation_epoch : observation_epoch -> observation_epoch -> int

@@ -2523,6 +2523,8 @@ let test_changefeed_business_waits_for_ui_application () =
   let module Business = Journal_graph_runtime in
   with_client (fun client ->
     let jobs = Queue.create () in
+    let process_notice=ref(fun (_:W.changefeed_notice)->()) in
+    let previous_notice_view=ref None in
     let host =
       Host.create
         ~client
@@ -2530,11 +2532,13 @@ let test_changefeed_business_waits_for_ui_application () =
         ~managed_origin:"https://api.logseq.io"
         ~user_id:"user-1"
         ~enqueue:(fun f -> Queue.add f jobs)
-        ~changed:(fun _ -> ())
+        ~changed:(fun view ->
+          let notices=C.changefeed_updates ~previous:!previous_notice_view view in
+          previous_notice_view:=Some view;
+          Rrbvec.iter (fun notice-> !process_notice notice) notices)
       |> Result.get_ok
     in
-    let process_push = ref (fun (_ : P.push) -> ())
-    and acks = ref 0 in
+    let acks = ref 0 in
     Mailbox.on_event client (fun event ->
       let delivery = Host.on_event host event in
       match event, delivery.R.disposition with
@@ -2546,14 +2550,6 @@ let test_changefeed_business_waits_for_ui_application () =
             ; _
             }
         , R.Consumed ) -> incr acks
-      | Mailbox.Push { payload = Service.Graph_push push; _ }, R.Broadcast ->
-        Queue.add (fun () -> !process_push push) jobs
-      | Mailbox.Push { payload = Service.Graph_pushes values; _ }, R.Broadcast ->
-        List.iter
-          (fun ((scope : Service.asset_scope), push) ->
-             if scope.graph_id = Test_support.graph_uuid
-             then Queue.add (fun () -> !process_push push) jobs)
-          values
       | _ -> ());
     let pump () =
       Mailbox.Private.deliver client ~max_events:64;
@@ -2758,11 +2754,12 @@ let test_changefeed_business_waits_for_ui_application () =
             }));
     wait (fun () -> !detail_loaded);
     active := true;
-    (process_push
-     := fun push ->
-          incr notices;
-          generation := Int64.succ !generation;
-          deliver (Business.reconcile_push business ~request_generation:!generation push));
+    (process_notice
+     := fun notice ->
+          if Result.is_ok(Host.validate_session host ~owner notice.W.notice_session) then (
+            incr notices;
+            generation := Int64.succ !generation;
+            deliver (Business.reconcile_signal business ~request_generation:!generation notice.notice)));
     let write n title =
       let revision = ref None in
       let budget =

@@ -540,12 +540,10 @@ let test_uninterested_change_is_acknowledged_without_hydration () =
   let runtime = Runtime.create () in
   ignore (seed_visible_block runtime);
   let pull =
-    Runtime.reconcile_push
+    Runtime.reconcile_signal
       runtime
       ~request_generation:11L
-      (Protocol.V2_changes_available
-         { api_version = Protocol.api_version
-         ; generation = "generation-1"
+      (Worker_pure_data.Changes_available { generation = "generation-1"
          ; through = "revision-2"
          })
     |> fun output -> only "pull request" output.requests
@@ -706,11 +704,10 @@ let test_point_read_tag_metadata () =
        in
        ignore (seed_visible_block ~record:tagged runtime);
        let pull =
-         Runtime.reconcile_push
+         Runtime.reconcile_signal
            runtime
            ~request_generation:11L
-           (Protocol.V2_changes_available
-              { api_version = 2; generation = "generation-1"; through = "revision-2" })
+           (Worker_pure_data.Changes_available { generation = "generation-1"; through = "revision-2" })
          |> fun output -> only "change request" output.requests
        in
        let hydrated =

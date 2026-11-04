@@ -656,7 +656,10 @@ let test_reconciled_capture_status () =
     let captured = capture worker runtime 930 Journal_model.No_status in
     let sync () =
       let push = last_push worker in
-      Runtime.reconcile_push runtime ~request_generation:11L push
+      let signal=match push with
+        |P.V2_changes_available{generation;through;_}->Worker_pure_data.Changes_available{generation;through}
+        |V2_resync_required_push{generation;reason;_}->Worker_pure_data.Resync_required{generation;reason} in
+      Runtime.reconcile_signal runtime ~request_generation:11L signal
       |> deliver worker runtime
     in
     ignore (sync ());

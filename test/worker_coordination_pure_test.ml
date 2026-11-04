@@ -3967,6 +3967,11 @@ let test_scoped_change_notices_and_lifecycle () =
   in
   let old = C.step seen.next (C.Changefeed_notice (reset, Id.Worker.Push_sequence.one)) in
   check
+    (W.changefeed_notice_scope fact = scope
+     && Rrbvec.to_list (C.changefeed_updates ~previous:(Some (C.view state)) (C.view seen.next)) = [fact]
+     && Rrbvec.is_empty (C.changefeed_updates ~previous:(Some (C.view seen.next)) (C.view old.next)))
+    "business changefeed outlet lost its checked notice or repeated a stale notice";
+  check
     (C.equal_view (C.view seen.next) (C.view old.next))
     "stale scoped resync reset a newer producer sequence";
   let bad = { scope with account = { scope.account with user_id = "another-user" } } in

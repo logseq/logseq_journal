@@ -435,6 +435,8 @@ type changefeed_notice = private
   ; notice : Worker_pure_data.changefeed_signal
   }
 
+val changefeed_notice_scope : changefeed_notice -> Service.asset_scope
+
 type observation_epoch
 
 val compare_observation_epoch : observation_epoch -> observation_epoch -> int

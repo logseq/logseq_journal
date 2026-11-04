@@ -12,6 +12,11 @@ val initial : client_id:Worker.Uuid.t -> t
 val view : t -> view
 val bootstrap : view -> Worker.bootstrap_state
 val projection : view -> Worker.projection option
+
+(** Latest original notifications accepted by Core for current residents since
+    the previous view. Stale/foreign notices never reach this outlet; it retains
+    no delivery history. Queued consumers still validate the notice session. *)
+val changefeed_updates : previous:view option -> view -> Worker.changefeed_notice Rrbvec.t
 val mutation_progress : view -> Worker.append_intent -> Worker.mutation_progress option
 val intent_progress : view -> Worker.mutation_intent -> Worker.mutation_progress option
 

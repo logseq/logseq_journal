@@ -1239,9 +1239,7 @@ let run_favorites_native_visibility
             W.Request_context.emit
               context
               ~topic:Service.invalidation_topic
-              (Service.Graph_push
-                 (P.V2_changes_available
-                    { api_version = 2; generation = "g"; through = "p2" })));
+              (Service.Graph_pushes [scope, P.V2_changes_available { api_version = 2; generation = "g"; through = "p2" }]));
           List.iter
             (fun notice ->
                Atomic.incr media_delivered;
@@ -4294,9 +4292,7 @@ let run_favorites_native_visibility
                  W.Session_context.emit
                    (Option.get !worker_context)
                    ~topic:Service.invalidation_topic
-                   (Service.Graph_push
-                      (P.V2_changes_available
-                         { api_version = 2; generation = "g"; through = "p2" }));
+                   (Service.Graph_pushes [scope, P.V2_changes_available { api_version = 2; generation = "g"; through = "p2" }]);
                  wait "metadata changes acknowledged" (fun () ->
                    Atomic.get changes_acknowledged);
                  settle ();
@@ -5270,6 +5266,7 @@ let test_reference_outer_terminals cancel =
     }
   in
   let manager=fixture_with_scope manager in
+  let scope=fixture_scope manager (uuid 900) in
   let graph_state : Logseq_db_worker.graph_state =
     { generation = 1; graph_id = Some (uuid 900); phase = Graph_open; error = None }
   in
@@ -5309,9 +5306,7 @@ let test_reference_outer_terminals cancel =
             W.Request_context.emit
               context
               ~topic:Service.invalidation_topic
-              (Service.Graph_push
-                 (P.V2_changes_available
-                    { api_version = P.api_version; generation = "g"; through = "r2" }));
+              (Service.Graph_pushes [scope, P.V2_changes_available { api_version = P.api_version; generation = "g"; through = "r2" }]);
           Ok (Service.Graph_state graph_state)
         | Client_command _ | Asset_command _ | Release_asset_file _ ->
           Ok Service.Client_command_completed
@@ -8302,8 +8297,8 @@ let test_detail_reconciliation_diagnostics mode =
     |> fun o -> one "children read" o.requests in
   ignore(step read (P.V2_children_outcome {parent=block_id;
     revision_scope=Worker_pure_data.V2_children_revision block_id; scope_revision="c1"; items=[]; next_cursor=None}));
-  let pull = R.reconcile_push runtime ~request_generation:10L
-    (P.V2_changes_available {api_version=P.api_version; generation="g"; through="p2"})
+  let pull = R.reconcile_signal runtime ~request_generation:10L
+    (Worker_pure_data.Changes_available { generation="g"; through="p2"})
     |> fun o -> one "changes read" o.requests in
   let output = step pull (P.V2_changes {generation="g"; from_exclusive=None; through="p2";
     next=None; windows=[{id="w"; predecessor="p1"; successor="p2"; block_uuids=[];
