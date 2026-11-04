@@ -6,7 +6,9 @@
   journal_calendar
   journal_time
   journal_model
-  journal_environment)
+  journal_environment
+  journal_graph_projection
+  journal_graph_request)
  (libraries
   logseq_db_types
   mldoc
@@ -14,7 +16,10 @@
   threads
   unix
   uri
-  yojson)
+  yojson
+  logseq_db_worker.typed_data
+  logseq_journal.worker_coordination
+  rrbvec)
  (preprocess
   (pps ppx_deriving_yojson)))
 
@@ -44,8 +49,6 @@
   journal_copy
   journal_detail
   journal_graph_runtime
-  journal_graph_projection
-  journal_graph_request
   journal_graph_reference_plan
   journal_graph_favorites_plan
   journal_graph_feed_plan
@@ -69,12 +72,12 @@
   journal_visual_tokens
   journal_symbols)
  (libraries
+  datascript-ocaml-native
   journal_app_business
   rrbvec
   mtime.clock
   lui
   ocaml-signal
-  datascript-ocaml-native
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.lui
