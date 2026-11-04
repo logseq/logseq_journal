@@ -4454,8 +4454,8 @@ let test_observed_absence_does_not_commit_user_deletion () =
   let runtime=Journal_graph_runtime.create() in
   let request=Journal_graph_runtime.plan_observed_block runtime ~root:F.root in
   let output=Journal_graph_runtime.receive_worker_read runtime ~request_id:request.request_id
-    (Journal_graph_runtime.Ordinary_read(F.P.V2_block_outcome
-      (Worker_pure_data.V2_missing_block{uuid=F.root;revision="missing-observed"}))) in
+    (Journal_graph_runtime.Query_result(F.W.Outline_block{uuid=F.root;revision=None},
+      Worker_pure_data.V2_missing_block{uuid=F.root;revision="missing-observed"})) in
   require(not(List.exists(fun response->match response.Journal_graph_runtime.payload with
     | Block_removed _|Subtree_deleted _->true|_->false)output.responses))
     "an observed absence committed deletion of retained Detail drafts";
@@ -4717,7 +4717,7 @@ let test_capture_retained_attempt_survives_runtime_reset () =
   let canonical=R.receive_child_ack runtime ack (Ok()) |> only in
   let summary=match progress with F.W.Confirmed proof->(match F.W.confirmation_primary proof with
     | Confirmed_block summary->summary|_->assert false)|_->assert false in
-  let status=R.receive_worker_read runtime ~request_id:canonical.request_id (R.Child_chain_summary summary) |> only in
+  let status=R.receive_worker_read runtime ~request_id:canonical.request_id (R.Query_result(F.W.Block_summary{block=root;after=None},summary)) |> only in
   let mutation_id,command=R.worker_mutation runtime status |> Option.get in
   let status_intent=F.W.mutation_intent fixture.session ~mutation_id command |> Result.get_ok in
   require(R.bind_mutation runtime status ~presentation:fixture.presentation ~intent:status_intent)

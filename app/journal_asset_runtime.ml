@@ -808,6 +808,12 @@ let observe_favorites_result
     observe_favorites t ~first_page ~favorites_page:value.favorites_page value.items)
 ;;
 
+let observe_query : type a. t -> request_id:Graph.Uuid.t -> a Worker.query -> unit =
+  fun t ~request_id query ->
+  observe_fact_request t ~request_id
+    ~first_page:(match query with Worker.Favorites None -> true | _ -> false)
+;;
+
 let observe_query_result
     : type a. t -> request_id:Graph.Uuid.t -> a Worker.query -> a -> unit
   = fun t ~request_id query value ->
@@ -825,6 +831,20 @@ let observe_query_result
          if page.name = "$$$favorites" && t.favorites_page <> Some page.uuid
          then dispatch t (Index_changed Favorites)
        | Worker_pure_data.V2_missing_page { uuid; _ } -> remember_page_value t ~issuance uuid None)
+    | Block_summary _ ->
+      (match value.lookup with
+       | Worker_pure_data.V2_present_block { value; _ } ->
+         remember_block_value t ~issuance value.block.uuid (Some value.block)
+       | Worker_pure_data.V2_missing_block { uuid; _ } -> remember_block_value t ~issuance uuid None);
+      Option.iter (function
+        | Worker_pure_data.V2_present_page { page; _ } -> remember_page_value t ~issuance page.uuid (Some page)
+        | Worker_pure_data.V2_missing_page { uuid; _ } -> remember_page_value t ~issuance uuid None) value.page;
+      List.iter (fun (item : Worker_pure_data.child_member) ->
+        remember_block_value t ~issuance item.value.block.uuid (Some item.value.block)) value.items
+    | Child_members _ -> List.iter (fun (item : Worker_pure_data.child_member) ->
+        remember_block_value t ~issuance item.value.block.uuid (Some item.value.block)) value.items
+    | Tree _ -> List.iter (fun (item : Worker_pure_data.tree_member) ->
+        remember_block_value t ~issuance item.value.block.uuid (Some item.value.block)) value.items
     | Journals _ -> List.iter (fun (item : Worker_pure_data.journal_item) ->
         remember_page_value t ~issuance item.page.uuid (Some item.page)) value.items
     | Worker.Favorites _ ->

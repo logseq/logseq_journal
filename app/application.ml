@@ -3851,18 +3851,15 @@ let start
     Journal_asset_runtime.changes (!asset_runtime_cell) windows;
     Option.iter(fun message->Journal_graph_runtime.report_projection_failure (!graph_runtime_cell)
       (Wc.Service_failed message))(Journal_asset_runtime.change_application_error (!asset_runtime_cell) windows));
-  let observe_projection_request request =
+  let observe_projection_query : type a. request_id:Wc.Uuid.t -> a Wc.query -> unit =
+    fun ~request_id query ->
     sync_media !state_ref;
-    Journal_media_runtime.observe_request (!media_runtime_cell) request;
-    Journal_asset_runtime.observe_request (!asset_runtime_cell) request
+    Journal_media_runtime.observe_query (!media_runtime_cell) ~request_id query;
+    Journal_asset_runtime.observe_query (!asset_runtime_cell) ~request_id query
   in
   let forget_projection_request request_id =
     Journal_media_runtime.forget_request (!media_runtime_cell) request_id;
     Journal_asset_runtime.forget_request (!asset_runtime_cell) ~request_id
-  in
-  let observe_projection_response response =
-    Journal_media_runtime.observe_response (!media_runtime_cell) response;
-    Journal_asset_runtime.observe_response (!asset_runtime_cell) response
   in
   let resume_media_change_application=ref(fun()->Effect.ignore) in
   let apply_media_read ~request_id ~result ~f =
@@ -4215,7 +4212,6 @@ let start
       let application=Journal_graph_runtime.application_for_request (!graph_runtime_cell) ~request_id:request.Logseq_db_worker.Protocol.request_id in
       let watch : type a. Wc.session option -> a Coordination.ticket -> (a -> Journal_graph_runtime.worker_read_result) -> unit =
         fun expected_session ticket outcome ->
-        observe_projection_request request;
         Coordination_host.watch_read host ticket ~f:(fun origin reply ->
           let is_changes=match request.command with Logseq_db_worker.Protocol.V2_pull_changes _|V2_ack_changes _->true|_->false in
           let result=match reply with
@@ -4226,8 +4222,8 @@ let start
                | _->Error "The graph execution changed before the read was delivered.")
             | Answered(Error(Wc.Stale_read _)) when is_changes ->Ok Journal_graph_runtime.Changes_retired
             | Answered(Error(Wc.Resync_required message)) when is_changes ->Ok(Journal_graph_runtime.Changes_resync message)
-            | Answered(Error(Wc.Stale_read message))->Ok(Journal_graph_runtime.Ordinary_read(V2_failed{code="staleReadCursor";message}))
-            | Answered(Error Wc.Response_budget_exceeded)->Ok(Journal_graph_runtime.Ordinary_read(V2_failed{code="responseTooLarge";message="The read exceeded its response budget."}))
+            | Answered(Error(Wc.Stale_read message))->Ok(Journal_graph_runtime.Read_failed{code=Logseq_db_worker.Error.Stale_read_cursor;message})
+            | Answered(Error Wc.Response_budget_exceeded)->Ok(Journal_graph_runtime.Read_failed{code=Logseq_db_worker.Error.Response_too_large;message="The read exceeded its response budget."})
             | Answered(Error(Wc.Db_error error))->Error(Logseq_db_worker.Error.message error)
             | Answered(Error(Wc.Service_failed message|Resync_required message))->Error message
             | Answered(Error Revoked_session)->Error "The graph execution changed before the read completed."
@@ -4252,7 +4248,7 @@ let start
                   match Wc.read_budget session ~maximum_items:read.maximum_items ~maximum_bytes:Worker_pure_data.maximum_response_bytes with
                   | Error _->Some Journal_graph_transport.Not_ready
                   | Ok budget->
-                    observe_projection_request request;
+                    observe_projection_query ~request_id:request.request_id read.query;
                     match Coordination_host.request host session(Wc.Observe(budget,read.query)) with
                     | Error _->Some Journal_graph_transport.Not_ready
                     | Ok ticket->
@@ -4272,22 +4268,26 @@ let start
          (match observed with Some result->result|None->
          match Coordination_host.plan_query host ~owner ~maximum_items:read.maximum_items
            ~maximum_bytes:Worker_pure_data.maximum_response_bytes read.query with
-          | Ok ticket->watch None ticket read.outcome;Journal_graph_transport.Accepted
+          | Ok ticket->
+            observe_projection_query ~request_id:request.request_id read.query;
+            watch None ticket (fun value->Journal_graph_runtime.Query_result(read.query,value));
+            Journal_graph_transport.Accepted
           | Error _->Journal_graph_transport.Not_ready)
        | Confirm_readback read ->
          (match Coordination_host.reconcile_mutation host ~presentation:read.presentation read.intent with
           | Ok ticket->
+            observe_projection_query ~request_id:request.request_id read.query;
             watch (Some(Wc.presentation_session read.presentation)) ticket (function
               | Wc.Confirmed confirmation ->
                 (match Wc.confirmation_primary confirmation with
-                 | Confirmed_block value->Journal_graph_runtime.Target_summary_read value
-                 | _->Ordinary_read(V2_failed{code="invalidRequest";message="The canonical mutation target is unavailable."}))
-              | _->Ordinary_read(V2_failed{code="invalidRequest";message="The change is awaiting confirmation."}));
+                 | Confirmed_block value->Journal_graph_runtime.Query_result(read.query,value)
+                 | _->Read_failed{code=Logseq_db_worker.Error.Invalid_request;message="The canonical mutation target is unavailable."})
+              | _->Read_failed{code=Logseq_db_worker.Error.Invalid_request;message="The change is awaiting confirmation."});
             Journal_graph_transport.Accepted
           | Error _->Journal_graph_transport.Not_ready)
        | Acknowledge read ->
          (match Coordination_host.request host (Wc.change_batch_session read.batch)(Wc.Acknowledge_changes read.batch) with
-          | Ok ticket->watch(Some(Wc.change_batch_session read.batch))ticket read.outcome;Journal_graph_transport.Accepted
+          | Ok ticket->watch(Some(Wc.change_batch_session read.batch))ticket (fun ack->Journal_graph_runtime.Changes_acknowledged ack);Journal_graph_transport.Accepted
           | Error _->Journal_graph_transport.Not_ready)
        | Unowned_read _->Journal_graph_transport.Not_ready)
     | _->Journal_graph_transport.Not_ready in
@@ -4693,7 +4693,7 @@ let start
         | Some _,None->Error "The confirmation lost its Worker binding."
         | _->result in
       let application,result=match result,!coordination_host with
-        | Ok(Journal_graph_runtime.Changes_read batch),Some(_,host) ->
+        | Ok(Journal_graph_runtime.Query_result(Wc.Changes _,batch)),Some(_,host) ->
           let view=Coordination_host.view host in
           if not(Coordination.owns_change_batch view batch)
              || (Coordination.change_application_started view batch && Coordination.change_application_error view batch=None)
@@ -4712,33 +4712,13 @@ let start
           Journal_graph_runtime.with_read_projection (!graph_runtime_cell) ~request_id:request.request_id ~f:(fun()->
           let asset_error_before=Journal_asset_runtime.projection_read_error (!asset_runtime_cell) in
           (match result with
-           | Journal_graph_runtime.Ordinary_read outcome -> observe_projection_response
-             (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
-               request_id=request.request_id;outcome})
-           | Journals_read value -> observe_projection_response
-             (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
-               request_id=request.request_id;outcome=V2_journals_outcome {items=value.items;next_cursor=None}})
-           | Root_tree_read {page;value} -> observe_projection_response
-             (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
-               request_id=request.request_id;outcome=V2_page_tree_outcome
-                 {page;maximum_depth=0;items=value.items;next_cursor=None}})
-           | Child_members_read value -> observe_projection_response
-             (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
-               request_id=request.request_id;outcome=V2_children_outcome
-                 {parent=value.parent;revision_scope=value.revision_scope;scope_revision=value.scope_revision;
-                  items=value.items;next_cursor=None}})
-           | Child_chain_summary value | Target_summary_read value -> observe_projection_response
-             (Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
-               request_id=request.request_id;outcome=V2_block_summary_outcome
-                 {lookup=value.lookup;page=value.page;items=value.items;next_cursor=None;
-                  scope_revision=value.scope_revision;generation=value.generation;
-                  projection_revision=value.projection_revision}})
-           | Changes_read _|Changes_acknowledged _|Changes_resync _|Changes_retired
-           | Task_catalog_read _ -> forget_projection_request request.request_id
-           | Favorites_read{first_page;value}->
-             Journal_media_runtime.forget_request (!media_runtime_cell) request.request_id;
-             Journal_asset_runtime.observe_favorites_result (!asset_runtime_cell)
-               ~request_id:request.request_id ~first_page value);
+           | Journal_graph_runtime.Query_result (query,value) ->
+             Journal_media_runtime.observe_query_result (!media_runtime_cell)
+               ~request_id:request.request_id query value;
+             Journal_asset_runtime.observe_query_result (!asset_runtime_cell)
+               ~request_id:request.request_id query value
+           | Read_failed _ | Changes_acknowledged _ | Changes_resync _ | Changes_retired ->
+             forget_projection_request request.request_id);
           asset_projection_error :=
             (if asset_error_before=None then Journal_asset_runtime.projection_read_error (!asset_runtime_cell)
              else None));
@@ -4800,11 +4780,12 @@ let start
             && Journal_routes.detail_block_id route=Some(Wc.Uuid.to_string context.root)
             && runtime_owner_is_live !state_ref context.owner
           | None->false in
-        let forward context sample request=
-          observe_projection_request request;
+        let forward context sample (request:Logseq_db_worker.Protocol.request)=
+          observe_projection_query ~request_id:request.request_id
+            (Wc.Outline_block{uuid=context.Detail_observation.root;revision=None});
           !coordinated_read_finished context.Detail_observation.owner request None
             (Some(Wc.observation_session sample.Wc.observation,Wc.observation_budget sample.observation))
-            (Ok(Journal_graph_runtime.Ordinary_read(V2_block_outcome sample.value))) in
+            (Ok(Journal_graph_runtime.Query_result(Wc.Outline_block{uuid=context.Detail_observation.root;revision=None},sample.value))) in
         Rrbvec.iter(function
           | Detail_observation.Cancel_initial ticket->Coordination_host.post host(Coordination.Cancel ticket)
           | Forget_initial ticket->Coordination_host.post host(Coordination.Forget ticket)
@@ -4816,7 +4797,7 @@ let start
              | Ok()->
                !coordinated_read_finished context.owner context.original None
                (Some(session,Wc.observation_budget sample.observation))
-               (Ok(Journal_graph_runtime.Ordinary_read(V2_block_outcome sample.value))))
+               (Ok(Journal_graph_runtime.Query_result(Wc.Outline_block{uuid=context.Detail_observation.root;revision=None},sample.value))))
           | Updated(context,sample) when live context ->
             let session=Wc.observation_session sample.observation in
             (match Coordination_host.validate_session ~owner:context.owner host session with

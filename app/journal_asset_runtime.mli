@@ -95,3 +95,7 @@ val retire_coordinated_resources : t -> unit
 val bind_coordinated_resources : t -> Worker.binding -> unit
 
 val demand_backpressured : t -> string -> unit
+
+(** The original accepted query and value retain fact issuance and ownership. *)
+val observe_query : t -> request_id:Worker.Uuid.t -> 'a Worker.query -> unit
+val observe_query_result : t -> request_id:Worker.Uuid.t -> 'a Worker.query -> 'a -> unit

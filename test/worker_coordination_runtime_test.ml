@@ -567,7 +567,7 @@ let test_client_to_typed_read () =
             Journal_graph_runtime.receive_worker_read
               business
               ~request_id:original.request_id
-              (read.outcome value)
+              (Journal_graph_runtime.Query_result(read.query,value))
           in
           require
             (List.exists
@@ -769,10 +769,10 @@ let test_client_to_typed_read () =
         let _, reply = request (W.Query (budget, read.query)) in
         (match reply with
          | W.Answered (Ok value) ->
-           let result = read.outcome value in
+           let result = Journal_graph_runtime.Query_result(read.query,value) in
            let more =
              match result with
-             | Journal_graph_runtime.Task_catalog_read value -> Option.is_some value.next
+             | Journal_graph_runtime.Query_result(W.Task_statuses _,value) -> Option.is_some value.next
              | _ -> failwith "catalog result lost typed correspondence"
            in
            let output =
@@ -861,10 +861,10 @@ let test_client_to_typed_read () =
         let ticket, reply = request (W.Query (budget, read.query)) in
         (match reply with
          | W.Answered (Ok value) ->
-           let result = read.outcome value in
+           let result = Journal_graph_runtime.Query_result(read.query,value) in
            let items, next =
              match result with
-             | Journal_graph_runtime.Root_tree_read { value; _ } -> value.items, value.next
+             | Journal_graph_runtime.Query_result(W.Tree _,value) -> value.items, value.next
              | _ -> failwith "root lost typed result"
            in
            ( items
@@ -886,10 +886,10 @@ let test_client_to_typed_read () =
         let _, reply = request (W.Query (budget, read.query)) in
         (match reply with
          | W.Answered (Ok value) ->
-           let result = read.outcome value in
+           let result = Journal_graph_runtime.Query_result(read.query,value) in
            let items, more =
              match result with
-             | Journal_graph_runtime.Journals_read value ->
+             | Journal_graph_runtime.Query_result(W.Journals _,value) ->
                value.items, Option.is_some value.next
              | _ -> failwith "date result lost typed family"
            in
@@ -970,10 +970,10 @@ let test_client_to_typed_read () =
         let _, reply = request (W.Query (budget, read.query)) in
         (match reply with
          | W.Answered (Ok value) ->
-           let result = read.outcome value in
+           let result = Journal_graph_runtime.Query_result(read.query,value) in
            let more =
              match result with
-             | Journal_graph_runtime.Child_members_read value -> Option.is_some value.next
+             | Journal_graph_runtime.Query_result(W.Child_members _,value) -> Option.is_some value.next
              | _ -> failwith "preview lost typed child result"
            in
            let output =
@@ -1040,7 +1040,7 @@ let test_client_to_typed_read () =
                   ?origin:(C.query_origin (C.view !state) ticket)
                   business
                   ~request_id:original.request_id
-                  (read.outcome value))
+                  (Journal_graph_runtime.Query_result(read.query,value)))
            | _ -> failwith "actual root quota typed query failed")
         | _ -> failwith "actual root quota path bypassed coordinator"
       done;
@@ -1168,7 +1168,7 @@ let test_client_to_typed_read () =
              Journal_graph_runtime.receive_worker_read
                business
                ~request_id:original.request_id
-               (read.outcome value)
+               (Journal_graph_runtime.Query_result(read.query,value))
            in
            List.iter (fun (r:P.request) -> match r.command with
              | V2_get_children {parent;_} when W.Uuid.equal parent favorite_page_id -> membership:=Some r
@@ -1211,10 +1211,10 @@ let test_client_to_typed_read () =
         let _, reply = request_query (W.Query (budget, read.query)) in
         (match reply with
          | W.Answered (Ok value) ->
-           let result = read.outcome value in
+           let result = Journal_graph_runtime.Query_result(read.query,value) in
            let items, more =
              match result with
-             | Journal_graph_runtime.Child_members_read value ->
+             | Journal_graph_runtime.Query_result(W.Child_members _,value) ->
                value.items, Option.is_some value.next
              | _ -> failwith "Favorite membership lost typed result"
            in
@@ -1280,7 +1280,7 @@ let test_client_to_typed_read () =
                   (Journal_graph_runtime.receive_worker_read
                      business
                      ~request_id:original.request_id
-                     (read.outcome value))
+                     (Journal_graph_runtime.Query_result(read.query,value)))
               | _ -> failwith "actual Detail typed query failed")
            | _ -> failwith "actual Detail query bypassed coordinator")
       in
@@ -1437,7 +1437,7 @@ let test_client_to_typed_read () =
     let business_request=Journal_graph_runtime.plan_observed_block business ~root:context.root in
     let applied=Journal_graph_runtime.receive_worker_read business ~request_id:business_request.request_id
       ~origin:(W.observation_session sample.observation,W.observation_budget sample.observation)
-      (Journal_graph_runtime.Ordinary_read(P.V2_block_outcome sample.value)) in
+      (Journal_graph_runtime.Query_result(W.Outline_block{uuid=context.root;revision=None},sample.value)) in
     require(List.exists(fun response->match response.Journal_graph_runtime.payload with
       | Block_updated{block;_}->Journal_model.id block=W.Uuid.to_string context.root
         && Journal_model.source block="Durable coordinated edit"
@@ -2616,7 +2616,7 @@ let test_changefeed_business_waits_for_ui_application () =
     let active = ref false
     and notices = ref 0
     and generation = ref 1000L
-    and batch = ref None in
+    and batch : W.change_batch option ref = ref None in
     let ui responses =
       List.iter
         (fun (response : Business.response) ->
@@ -2663,7 +2663,7 @@ let test_changefeed_business_waits_for_ui_application () =
         Host.watch_read host ticket ~f:(fun origin reply ->
           match reply with
           | W.Answered (Ok value) ->
-            finished request application origin (read.outcome value)
+            finished request application origin (Journal_graph_runtime.Query_result(read.query,value))
           | W.Answered (Error (W.Stale_read _)) ->
             finished request application origin Business.Changes_retired
           | W.Answered (Error W.Response_budget_exceeded) when !expected_failure ->
@@ -2671,11 +2671,9 @@ let test_changefeed_business_waits_for_ui_application () =
               request
               application
               origin
-              (Business.Ordinary_read
-                 (P.V2_failed
-                    { code = "responseTooLarge"
-                    ; message = "Actual encoded read budget failure"
-                    }))
+              (Business.Read_failed
+                 { code = Logseq_db_worker.Error.Response_too_large
+                 ; message = "Actual encoded read budget failure" })
           | _ -> failwith "real typed Changes business query failed")
       | Some (Business.Acknowledge read) ->
         let ticket =
@@ -2687,7 +2685,7 @@ let test_changefeed_business_waits_for_ui_application () =
         in
         Host.watch_read host ticket ~f:(fun origin reply ->
           match reply with
-          | W.Answered (Ok value) -> finished request None origin (read.outcome value)
+          | W.Answered (Ok value) -> finished request None origin (Business.Changes_acknowledged value)
           | _ -> failwith "real typed Changes business ACK failed")
       | Some (Business.Confirm_readback _) -> failwith "Changes dispatch became mutation confirmation"
       | Some (Business.Unowned_read message) -> failwith message
@@ -2695,7 +2693,7 @@ let test_changefeed_business_waits_for_ui_application () =
     and finished request application origin result =
       let application, discard =
         match result with
-        | Business.Changes_read value ->
+        | Business.Query_result(W.Changes _,value) ->
           if value.next <> None then more_seen := true;
           let view = Host.view host in
           if

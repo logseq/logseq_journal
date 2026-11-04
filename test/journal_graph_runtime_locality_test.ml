@@ -88,7 +88,7 @@ module Worker_producer = struct
            ~origin:(session, budget read.maximum_items)
            runtime
            ~request_id:request.request_id
-           (read.outcome value)
+           (Journal_graph_runtime.Query_result(read.query,value))
        | Ok (W.Answered (Error (W.Stale_read message))) ->
          Production_runtime.receive
            runtime
@@ -6283,7 +6283,7 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
       let canonical=Production_runtime.receive_child_ack runtime ack (Ok())
         |> fun output->only "fresh child before status" output.Runtime.requests in
       let value=match W.confirmation_primary proof with Confirmed_block value->value|_->assert false in
-      let pending=Production_runtime.receive_worker_read runtime ~request_id:canonical.request_id (Runtime.Child_chain_summary value)
+      let pending=Production_runtime.receive_worker_read runtime ~request_id:canonical.request_id (Journal_graph_runtime.Query_result(W.Block_summary{block=root;after=None},value))
         |> fun output->only "original status attempt" output.Runtime.requests in
       let mutation_id,command=Runtime.worker_mutation runtime pending |> Option.get in
       let intent=W.mutation_intent session ~mutation_id command |> Result.get_ok in

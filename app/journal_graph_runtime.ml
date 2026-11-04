@@ -11,18 +11,11 @@ module Worker = Journal_worker_coordination.Worker_api
 module Coordination = Journal_worker_coordination.Worker_pure_coordinator
 
 type worker_read_result =
-  | Child_chain_summary of Worker.block_summary
+  | Query_result : 'a Worker.query * 'a -> worker_read_result
+  | Read_failed of { code : Logseq_db_worker.Error.code; message : string }
   | Changes_resync of string
   | Changes_retired
-  | Changes_read of Worker.change_batch
   | Changes_acknowledged of Worker.change_ack
-  | Root_tree_read of {page:Graph.Uuid.t;value:Worker_pure_data.tree_member Worker.slice}
-  | Child_members_read of Worker.children
-  | Target_summary_read of Worker.block_summary
-  | Journals_read of Worker_pure_data.journal_item Worker.slice
-  | Task_catalog_read of Worker.task_status_catalog
-  | Ordinary_read of Protocol.v2_outcome
-  | Favorites_read of { first_page:bool; value:Journal_worker_coordination.Worker_api.favorites }
 
 let timeline_version value =
   let digits s = s <> "" && String.length s <= 19
@@ -1920,12 +1913,12 @@ let children_result items continuation : Projection.children_page =
 ;;
 
 let receive_response t ~read_result ~origin (protocol_response : Protocol.response) =
-  let favorites = match read_result with Some (Favorites_read {value;_})->Some value | _->None in
-  let catalog = match read_result with Some (Task_catalog_read value)->Some value | _->None in
-  let journals = match read_result with Some (Journals_read value)->Some value | _->None in
-  let target_summary = match read_result with Some (Target_summary_read value)->Some value | _->None in
-  let roots = match read_result with Some (Root_tree_read {value;_})->Some value | _->None in
-  let children = match read_result with Some (Child_members_read value)->Some value | _->None in
+  let favorites : Worker.favorites option = match read_result with Some (Query_result (Worker.Favorites _, value))->Some value | _->None in
+  let catalog : Worker.task_status_catalog option = match read_result with Some (Query_result (Worker.Task_statuses _, value))->Some value | _->None in
+  let journals : Worker_pure_data.journal_item Worker.slice option = match read_result with Some (Query_result (Worker.Journals _, value))->Some value | _->None in
+  let target_summary : Worker.block_summary option = match read_result with Some (Query_result (Worker.Block_summary _, value))->Some value | _->None in
+  let roots : Worker_pure_data.tree_member Worker.slice option = match read_result with Some (Query_result (Worker.Tree _, value))->Some value | _->None in
+  let children : Worker.children option = match read_result with Some (Query_result (Worker.Child_members _, value))->Some value | _->None in
   let (Protocol.V2_response { request_id; outcome; _ }) = protocol_response in
   let key = Graph.Uuid.to_string request_id in
   match Hashtbl.find_opt t.pending key with
@@ -2255,7 +2248,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
        (match operation with
         | Child_canonical{root;round}->
           (match read_result with
-           | Some(Child_chain_summary summary)->child_step t root(fun chain->Child.read_child chain ~round summary)
+           | Some(Query_result(Worker.Block_summary _,summary))->child_step t root(fun chain->Child.read_child chain ~round summary)
            | _->child_step t root(fun chain->Child.read_failed chain ~round "The typed child snapshot is unavailable."))
         | Target_summary summary ->
           (match (match target_summary,next_cursor with
@@ -2542,7 +2535,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
             ; "truncated", `Bool (List.length windows > 16)
             ];
           t.change_generation <- Some generation;
-          let batch=match read_result with Some(Changes_read batch)->Some batch|_->None in
+          let batch : Worker.change_batch option = match read_result with Some(Query_result(Worker.Changes _,batch))->Some batch|_->None in
           t.latest_change_batch<-batch;
           let acknowledgement =
             read t (Acknowledge_changes {batch;continuation=Option.map(fun _->request_generation)next}) (Protocol.V2_ack_changes { generation; through })
@@ -2904,48 +2897,37 @@ let receive_worker_read ?resync_generation ?origin t ~request_id result =
     match result with
     | Changes_resync _ | Changes_retired -> Protocol.V2_failed
       {code="invalidRequest";message="The change continuation was retired"}
-    | Changes_read batch -> Protocol.V2_changes{generation=batch.generation;from_exclusive=batch.from_exclusive;
-      through=batch.through;windows=batch.windows;next=batch.next}
+    | Read_failed { code; message } -> Protocol.V2_failed { code = Error.code_string code; message }
     | Changes_acknowledged ack -> Protocol.V2_changes_acknowledged
-      {generation=Worker.change_ack_generation ack;through=Worker.change_ack_through ack}
-    | Ordinary_read outcome -> outcome
-    | Root_tree_read {page;value} -> Protocol.V2_page_tree_outcome
-        {page;maximum_depth=0;items=value.items;next_cursor=None}
-    | Child_members_read value ->
-      Protocol.V2_children_outcome
-        { parent = value.parent
-        ; revision_scope = value.revision_scope
-        ; scope_revision = value.scope_revision
-        ; items = value.items
-        ; next_cursor = None
-        }
-    | Journals_read value ->
-      Protocol.V2_journals_outcome { items = value.items; next_cursor = None }
-    | Child_chain_summary value | Target_summary_read value ->
-      Protocol.V2_block_summary_outcome
-        { lookup = value.lookup
-        ; page = value.page
-        ; items = value.items
-        ; next_cursor = None
-        ; scope_revision = value.scope_revision
-        ; generation = value.generation
-        ; projection_revision = value.projection_revision
-        }
-    | Task_catalog_read value ->
-      Protocol.V2_task_statuses_outcome
-        { property_uuid = value.property_uuid
-        ; default_status = value.default_status
-        ; items = value.items
-        ; next_cursor = None
-        }
-    | Favorites_read { value; _ } ->
-      Protocol.V2_favorites_outcome
-        { favorites_page = value.favorites_page
-        ; generation = value.generation
-        ; projection_revision = value.projection_revision
-        ; items = value.items
-        ; next_cursor = None
-        }
+        { generation=Worker.change_ack_generation ack; through=Worker.change_ack_through ack }
+    | Query_result (query, value) ->
+      (match query with
+       | Worker.Graph_info -> Protocol.V2_graph_info_outcome
+           { graph_uuid=value.graph_uuid;graph_name=value.graph_name;schema=value.schema;
+             admission_facts=value.admission_facts;journal_title_format=value.journal_title_format;
+             limits=value.limits;generation=value.generation;projection_revision=value.projection_revision }
+       | Admission -> Protocol.V2_admission_outcome value
+       | Page _ -> Protocol.V2_page_outcome value
+       | Outline_block _ -> Protocol.V2_block_outcome value
+       | Task_status_definitions _ -> Protocol.V2_task_status_definitions_outcome value
+       | Tree {page;maximum_depth;_} -> Protocol.V2_page_tree_outcome
+           {page;maximum_depth;items=value.items;next_cursor=None}
+       | Child_members _ -> Protocol.V2_children_outcome
+           {parent=value.parent;revision_scope=value.revision_scope;scope_revision=value.scope_revision;
+             items=value.items;next_cursor=None}
+       | Journals _ -> Protocol.V2_journals_outcome {items=value.items;next_cursor=None}
+       | Block_summary _ -> Protocol.V2_block_summary_outcome
+           {lookup=value.lookup;page=value.page;items=value.items;next_cursor=None;
+             scope_revision=value.scope_revision;generation=value.generation;projection_revision=value.projection_revision}
+       | Task_statuses _ -> Protocol.V2_task_statuses_outcome
+           {property_uuid=value.property_uuid;default_status=value.default_status;items=value.items;next_cursor=None}
+       | Favorites _ -> Protocol.V2_favorites_outcome
+           {favorites_page=value.favorites_page;generation=value.generation;
+             projection_revision=value.projection_revision;items=value.items;next_cursor=None}
+       | Changes _ -> Protocol.V2_changes {generation=value.generation;from_exclusive=value.from_exclusive;
+           through=value.through;windows=value.windows;next=value.next}
+       | Journal _ | Children _ | Assets _ | Asset_descriptors _ ->
+         Protocol.V2_failed {code="invalidRequest";message="The query has no graph business owner"})
   in
   receive_delivery
     t
@@ -3117,7 +3099,10 @@ let receive_mutation t (request:Protocol.request) progress =
              Option.iter(fun pending->Hashtbl.replace t.pending child {pending with durable=Some durable})
                (Hashtbl.find_opt t.pending child);
              let planned=dispatch_output t planned in
-             let output=receive_worker_read t ~request_id:first.request_id(Target_summary_read summary) in
+             let query=match Hashtbl.find_opt t.pending child with
+               | Some {operation=Target_summary read;_}->Confirmation.worker_query read
+               | _->assert false in
+             let output=receive_worker_read t ~request_id:first.request_id(Query_result(query,summary)) in
              {output with requests=List.filter(fun (value:Protocol.request)->value.request_id<>first.request_id)planned.requests @ output.requests}
            | _->mutation_waiting t request "The canonical mutation read could not be planned."))
         | Confirmed_absence{uuid;_}->
@@ -3251,33 +3236,32 @@ let reconcile_push t ~request_generation push =
 
 
 type worker_read =
-  | Confirm_readback of {intent:Worker.mutation_intent;presentation:Worker.presentation}
+  | Confirm_readback of {intent:Worker.mutation_intent;presentation:Worker.presentation;query:Worker.block_summary Worker.query}
   | Read :
       { query : 'a Worker.query
       ; maximum_items : int
-      ; outcome : 'a -> worker_read_result
       }
       -> worker_read
-  | Acknowledge : {batch:Worker.change_batch;outcome:Worker.change_ack -> worker_read_result} -> worker_read
+  | Acknowledge of {batch:Worker.change_batch}
   | Unowned_read of string
 
 let worker_read t (request : Protocol.request) =
   let confirmation=match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
     | Some {operation=Target_summary summary;durable=Some durable;_}
       when durable.confirm_readback && (match Confirmation.worker_query summary with Worker.Block_summary{after=None;_}->true|_->false) ->
-      Some(Confirm_readback{intent=durable.intent;presentation=durable.presentation})
+      Some(Confirm_readback{intent=durable.intent;presentation=durable.presentation;query=Confirmation.worker_query summary})
     | _->None in
   match confirmation with Some _->confirmation|None->
   match request.command with
   | V2_pull_changes {generation;after;limit} ->
     (match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
      | Some{operation=Pull_changes _;delivery=Dispatched;_}->Some(Read
-       {query=Worker.Changes{generation;after};maximum_items=limit;outcome=(fun batch->Changes_read batch)})
+       {query=Worker.Changes{generation;after};maximum_items=limit})
      | _->Some(Unowned_read "Changefeed pull is no longer owned by its business request"))
   | V2_ack_changes _ ->
     (match Hashtbl.find_opt t.pending(Graph.Uuid.to_string request.request_id) with
      | Some{operation=Acknowledge_changes{batch=Some batch;_};delivery=Dispatched;_}->
-       Some(Acknowledge{batch;outcome=(fun ack->Changes_acknowledged ack)})
+       Some(Acknowledge{batch})
      | Some{operation=Acknowledge_changes{batch=None;_};delivery=Dispatched;_}->None
      | _->Some(Unowned_read "Changefeed ACK is no longer owned by its delivered batch"))
   | V2_graph_info ->
@@ -3285,49 +3269,35 @@ let worker_read t (request : Protocol.request) =
       (Read
          { query = Worker.Graph_info
          ; maximum_items = 1
-         ; outcome =
-             (fun (i : Worker.graph_info) ->
-               Ordinary_read
-                 (Protocol.V2_graph_info_outcome
-                    { graph_uuid = i.graph_uuid
-                    ; graph_name = i.graph_name
-                    ; schema = i.schema
-                    ; admission_facts = i.admission_facts
-                    ; journal_title_format = i.journal_title_format
-                    ; limits = i.limits
-                    ; generation = i.generation
-                    ; projection_revision = i.projection_revision
-                    }))
+
          })
   | V2_inspect_admission ->
     Some
       (Read
          { query = Worker.Admission
          ; maximum_items = 1
-         ; outcome = (fun value -> Ordinary_read (Protocol.V2_admission_outcome value))
+
          })
   | V2_get_page { page; revision } ->
     Some
       (Read
          { query = Worker.Page { uuid = page; revision }
          ; maximum_items = 1
-         ; outcome = (fun value -> Ordinary_read (Protocol.V2_page_outcome value))
+
          })
   | V2_get_outline_block { block; revision } ->
     Some
       (Read
          { query = Worker.Outline_block { uuid = block; revision }
          ; maximum_items = 1
-         ; outcome = (fun value -> Ordinary_read (Protocol.V2_block_outcome value))
+
          })
   | V2_get_task_status_definitions { statuses } ->
     Some
       (Read
          { query = Worker.Task_status_definitions statuses
          ; maximum_items = max 1 (List.length statuses)
-         ; outcome =
-             (fun value ->
-               Ordinary_read (Protocol.V2_task_status_definitions_outcome value))
+
          })
   | V2_get_page_tree _ ->
     (match Hashtbl.find_opt t.pending (Graph.Uuid.to_string request.request_id) with
@@ -3344,7 +3314,7 @@ let worker_read t (request : Protocol.request) =
                      ; after = business.after
                      }
                ; maximum_items = business.maximum_items
-               ; outcome = (fun value -> Root_tree_read { page = business.page; value })
+
                })
         | None -> Some (Unowned_read "Root tree business operation mismatch"))
      | _ -> Some (Unowned_read "Root tree business request is no longer owned"))
@@ -3359,7 +3329,7 @@ let worker_read t (request : Protocol.request) =
                    Worker.Child_members
                      { parent = business.parent; revision = None; after = business.after }
                ; maximum_items = business.limit
-               ; outcome = (fun value -> Child_members_read value)
+
                })
         | None -> Some (Unowned_read "Child business operation mismatch"))
      | Some { operation = Favorite_read read; delivery = Dispatched; _ } ->
@@ -3369,7 +3339,7 @@ let worker_read t (request : Protocol.request) =
             (Read
                { query
                ; maximum_items = 200
-               ; outcome = (fun value -> Child_members_read value)
+
                })
         | None -> Some (Unowned_read "Favorite child business operation mismatch"))
      | Some
@@ -3389,7 +3359,7 @@ let worker_read t (request : Protocol.request) =
                         after
                   }
             ; maximum_items = limit
-            ; outcome = (fun value -> Child_members_read value)
+
             })
      | Some { operation = Changed_children interest; delivery = Dispatched; _ } ->
        Some
@@ -3398,7 +3368,7 @@ let worker_read t (request : Protocol.request) =
                 Worker.Child_members
                   { parent = interest.root.block.uuid; revision = None; after = None }
             ; maximum_items = interest.limit
-            ; outcome = (fun value -> Child_members_read value)
+
             })
      | Some _ | None -> Some (Unowned_read "Child business request is no longer owned"))
   | V2_get_outline_block_summary _ ->
@@ -3406,15 +3376,14 @@ let worker_read t (request : Protocol.request) =
      | Some {operation=Child_canonical _;delivery=Dispatched;_}->
        (match request.command with
         | V2_get_outline_block_summary{block;limit;_}->Some(Read
-            {query=Worker.Block_summary{block;after=None};maximum_items=limit;
-             outcome=(fun value->Child_chain_summary value)})
+            {query=Worker.Block_summary{block;after=None};maximum_items=limit})
         | _->Some(Unowned_read "The child snapshot command changed"))
      | Some { operation = Target_summary read; delivery = Dispatched; _ } ->
        Some
          (Read
             { query = Confirmation.worker_query read
             ; maximum_items = Worker_pure_data.default_page_size
-            ; outcome = (fun value -> Target_summary_read value)
+
             })
      | _ -> Some (Unowned_read "Target summary business request is no longer owned"))
   | V2_list_journals _ ->
@@ -3432,7 +3401,7 @@ let worker_read t (request : Protocol.request) =
                      ; after = business.after
                      }
                ; maximum_items = business.limit
-               ; outcome = (fun value -> Journals_read value)
+
                })
         | None -> Some (Unowned_read "Journal business operation mismatch"))
      | _ -> Some (Unowned_read "Journal business request is no longer owned"))
@@ -3443,7 +3412,7 @@ let worker_read t (request : Protocol.request) =
          (Read
             { query = Worker.Task_statuses after
             ; maximum_items = Worker_pure_data.maximum_page_size
-            ; outcome = (fun value -> Task_catalog_read value)
+
             })
      | _ -> Some (Unowned_read "Task catalog business request is no longer owned"))
   | V2_list_favorites _ ->
@@ -3456,9 +3425,7 @@ let worker_read t (request : Protocol.request) =
             (Read
                { query = Worker.Favorites business.cursor
                ; maximum_items = business.limit
-               ; outcome =
-                   (fun (value : Worker.favorites) ->
-                     Favorites_read { first_page = business.cursor = None; value })
+
                }))
      | _ -> Some (Unowned_read "Favorites business request is no longer owned"))
   | _ -> None

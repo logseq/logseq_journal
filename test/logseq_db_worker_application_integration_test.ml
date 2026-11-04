@@ -64,7 +64,7 @@ module Read_fixture = struct
            ~origin:(session, budget)
            runtime
            ~request_id:request.request_id
-           (read.outcome value)
+           (Journal_graph_runtime.Query_result(read.query,value))
        | _ -> Alcotest.fail "typed domain fixture response rejected")
     | _ -> Alcotest.fail "expected a typed domain read"
   ;;

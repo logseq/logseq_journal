@@ -158,31 +158,20 @@ val reconcile_push
 module Worker = Journal_worker_coordination.Worker_api
 
 type worker_read_result =
-  | Child_chain_summary of Journal_worker_coordination.Worker_api.block_summary
+  | Query_result : 'a Worker.query * 'a -> worker_read_result
+  | Read_failed of { code : Logseq_db_worker.Error.code; message : string }
   | Changes_resync of string
   | Changes_retired
-  | Changes_read of Worker.change_batch
   | Changes_acknowledged of Worker.change_ack
-  | Root_tree_read of {page:Logseq_db_types.Graph_types.Uuid.t;value:Worker_pure_data.tree_member Worker.slice}
-  | Child_members_read of Worker.children
-  | Target_summary_read of Worker.block_summary
-  | Journals_read of Worker_pure_data.journal_item Worker.slice
-  | Task_catalog_read of Worker.task_status_catalog
-  | Ordinary_read of Logseq_db_worker.Protocol.v2_outcome
-  | Favorites_read of
-      { first_page : bool
-      ; value : Journal_worker_coordination.Worker_api.favorites
-      }
 
 type worker_read =
-  | Confirm_readback of {intent:Journal_worker_coordination.Worker_api.mutation_intent;presentation:Journal_worker_coordination.Worker_api.presentation}
+  | Confirm_readback of {intent:Worker.mutation_intent;presentation:Worker.presentation;query:Worker.block_summary Worker.query}
   | Read :
       { query : 'a Worker.query
       ; maximum_items : int
-      ; outcome : 'a -> worker_read_result
       }
       -> worker_read
-  | Acknowledge : {batch:Worker.change_batch;outcome:Worker.change_ack -> worker_read_result} -> worker_read
+  | Acknowledge of {batch:Worker.change_batch}
   | Unowned_read of string
 
 (** Business DTO interoperability. Favorites keeps its sealed continuation in
