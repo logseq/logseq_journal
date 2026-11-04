@@ -2238,15 +2238,18 @@ let test_visible_media_listing_uses_typed_reads () =
     let owner:Service.timeline_scope={startup={account_generation=1;presentation_generation=1};graph_id=Test_support.graph_uuid;graph_generation=1} in
     let runtime=ref None and legacy_reads=ref 0 and typed_reads=ref 0 and seen=ref [] and finished=ref false and last=ref None and held=ref None and retiring=ref false and late_returned=ref false in
     let root=W.Uuid.to_string(journal_page 1) in
-    let read(request:Media.read_request)=
+    let read(Media.Read request)=
       let ticket=Host.plan_query_when_available host ~owner ~maximum_items:(min 1 request.maximum_items) ~maximum_bytes:65536 request.query |> Result.get_ok in
-      incr typed_reads;
+      (match request.query with W.Assets _ -> incr typed_reads | _ -> ());
       let number= !typed_reads in
       Host.watch_read host ticket ~f:(fun origin reply->
         require(Option.exists(fun(session,_)->Host.validate_session ~owner host session=Ok())origin) "media listing borrowed its response origin";
         match reply with
         | W.Answered(Ok value)->
-          let result=request.outcome value in last:=Some result;
+          let result=request.outcome value in
+          (match request.query with
+          | W.Assets _ ->
+          last:=Some result;
           if !retiring then (
             require(not(Media.receive_read(Option.get !runtime)result)) "in-flight result revived reset scope";
             late_returned:=true)
@@ -2255,6 +2258,7 @@ let test_visible_media_listing_uses_typed_reads () =
           require(not(Media.receive_read(Option.get !runtime) result)) "media page consumed twice";
           if Option.is_some value.next then Queue.add(fun()->Media.next(Option.get !runtime) ~root)jobs
           else finished:=true)
+          | _ -> ignore (Media.receive_read (Option.get !runtime) result))
         | _->failwith "real typed media listing failed");true in
     let media=Media.create_coordinated ~read
       ~send:(fun _->function Service.Graph_request _->incr legacy_reads;false|_->true)
@@ -2377,45 +2381,42 @@ let test_dependency_point_reads_use_typed_owner () =
       ; graph_generation = 1
       }
     in
-    let query maximum_bytes command =
+    let query : type a. int -> a W.query -> (a, W.error) result =
+      fun maximum_bytes query ->
       let result = ref None in
       let before = !consumed in
-      require
-        (Host.query_point host ~owner ~maximum_bytes command ~f:(fun origin outcome ->
-           result := Some (origin, outcome))
-         = Ok true)
-        "resource dependency point read still bypasses typed owner";
-      require
-        (!result = None)
-        "point callback ran synchronously before business admission";
+      let ticket = Host.plan_query_when_available host ~owner ~maximum_items:1
+        ~maximum_bytes query |> Result.get_ok in
+      Host.watch_read host ticket ~f:(fun origin reply -> result := Some (origin, reply));
+      require (!result = None) "point callback ran synchronously before business admission";
       wait (fun () -> !result <> None);
-      require
-        (!consumed = before + 1)
+      require (!consumed = before + 1)
         "dependency point response was not consumed exactly once";
-      let origin, outcome = Option.get !result in
+      let origin, reply = Option.get !result in
       require
         (Option.exists
-           (fun (session, _) -> Host.validate_session ~owner host session = Ok ())
-           origin)
+           (fun (session, _) -> Host.validate_session ~owner host session = Ok ()) origin)
         "point dependency inferred its origin after delivery";
-      outcome
+      match reply with
+      | W.Answered result -> result
+      | _ -> failwith "dependency read was not answered"
     in
     require
       (match
          query
            65536
-           (P.V2_get_outline_block
-              { block = Test_support.authoritative_block_uuid; revision = None })
+           (W.Outline_block
+              { uuid = Test_support.authoritative_block_uuid; revision = None })
        with
-       | Ok (P.V2_block_outcome (Worker_pure_data.V2_present_block { value; revision })) ->
+       | Ok (Worker_pure_data.V2_present_block { value; revision }) ->
          value.block.uuid = Test_support.authoritative_block_uuid && revision <> ""
        | _ -> false)
       "typed dependency lost full block identity or revision";
     require
       (match
-         query 65536 (P.V2_get_page { page = Test_support.page_uuid; revision = None })
+         query 65536 (W.Page { uuid = Test_support.page_uuid; revision = None })
        with
-       | Ok (P.V2_page_outcome (Worker_pure_data.V2_present_page { page; revision })) ->
+       | Ok (Worker_pure_data.V2_present_page { page; revision }) ->
          page.uuid = Test_support.page_uuid && revision <> ""
        | _ -> false)
       "typed dependency lost its full page DTO";
@@ -2423,19 +2424,12 @@ let test_dependency_point_reads_use_typed_owner () =
       (match
          query
            64
-           (P.V2_get_outline_block
-              { block = Test_support.authoritative_block_uuid; revision = None })
+           (W.Outline_block
+              { uuid = Test_support.authoritative_block_uuid; revision = None })
        with
        | Error W.Response_budget_exceeded -> true
        | _ -> false)
       "point read bypassed encoded budget validation";
-    let called = ref false in
-    require
-      (Host.query_point host ~owner ~maximum_bytes:65536 P.V2_graph_info ~f:(fun _ _ ->
-         called := true)
-       = Ok false)
-      "point bridge claimed another read family";
-    require (not !called) "unowned family invoked a point callback";
     ignore (Host.shutdown host);
     wait (fun () -> C.shutdown_state (Host.view host) = C.Stopped))
 ;;

@@ -3496,27 +3496,6 @@ let start
          | Error _->Error "Unable to bind the graph reader. Try Copy again."
          | Ok host->coordination_host_id:=Some id;coordination_host:=Some(identity,host);Ok host)
   in
-  let send_coordinated_point request ~finish =
-    match request with
-    | Graph_service.Graph_request request when (match request.command with
-        Logseq_db_worker.Protocol.V2_get_outline_block _ | V2_get_page _->true|_->false) ->
-      (match current_owner(),ensure_coordination() with
-       | Some owner,Ok host when request.api_version=Logseq_db_worker.Protocol.api_version ->
-         let accepted=Coordination_host.query_point host ~owner
-           ~maximum_bytes:Worker_pure_data.maximum_response_bytes request.command
-           ~f:(fun origin result->
-             if runtime_owner_is_live !state_ref owner then run_owned (Some owner) (fun()->
-               let result=match result,origin with
-                 | Ok outcome,Some(session,_) when Coordination_host.validate_session ~owner host session=Ok()->
-                   Ok(Logseq_db_worker.Protocol.V2_response{api_version=Logseq_db_worker.Protocol.api_version;
-                     request_id=request.request_id;outcome})
-                 | Ok _,_->Error Wc.Revoked_session
-                 | Error error,_->Error error in
-               finish result)) in
-         Some(match accepted with Ok true->true|Ok false|Error _->false)
-       | _->Some false)
-    | _->None
-  in
   let route_coordination_event event =
     let module Runner=Journal_worker_coordination.Worker_effect_runner in
     let active=Option.map snd !coordination_host in
@@ -3945,15 +3924,6 @@ let start
     |_->None in
   coordinated_media_point := (fun ticket request ->
     match ticket,request with
-    | Some ticket,Graph_service.Graph_request original->
-      send_coordinated_point request ~finish:(fun result->
-        apply_media_read ~request_id:original.request_id ~result:(Result.map(fun _->())result)
-          ~f:(fun()->
-            let owned=Journal_media_runtime.owns_read (!media_runtime_cell) original.request_id in
-            (match result with
-             | Ok response->Journal_media_runtime.receive (!media_runtime_cell) ticket (Graph_service.Graph_response response)
-             | Error _->Journal_media_runtime.reject (!media_runtime_cell) ticket);
-            owned))
     |Some ticket,Graph_service.Acquire_asset_file{scope;handle}->
       Some(match coordinated_asset_context(),Journal_media_runtime.acquisition_consumer ticket with
       |Some(owner,host,session),Some name when Wc.matches_asset_scope session scope->
@@ -3979,7 +3949,7 @@ let start
       |_->false)
     |_,Graph_service.Release_asset_file _->Some false
     |_->coordinated_asset_command ~bind:(Journal_media_runtime.bind_consumer (!media_runtime_cell)) request);
-  coordinated_media_read := (fun (request:Journal_media_runtime.read_request)->
+  coordinated_media_read := (fun ((Journal_media_runtime.Read request) as original)->
     match current_owner(),ensure_coordination() with
     | Some owner,Ok host->
       (match Coordination_host.plan_query_when_available host ~owner
@@ -3995,12 +3965,12 @@ let start
                | _,Wc.Answered(Error error)->Error error
                | _->Error(Wc.Service_failed "The media listing was interrupted or retired") in
              (* The business ID is carried by its private request ticket. *)
-             let request_id=Journal_media_runtime.read_request_id request in
+             let request_id=Journal_media_runtime.read_request_id original in
              apply_media_read ~request_id ~result:(Result.map(fun _->())value) ~f:(fun()->
                let owned=Journal_media_runtime.owns_read (!media_runtime_cell) request_id in
                match value with
                | Ok value->Journal_media_runtime.receive_read (!media_runtime_cell)(request.outcome value)
-               | Error _->Journal_media_runtime.reject (!media_runtime_cell) request.ticket;owned)));
+               | Error _->Journal_media_runtime.reject_read (!media_runtime_cell) request.ticket;owned)));
          true)
     | _->false);
   let apply_asset_read ~request_id ~result ~f =

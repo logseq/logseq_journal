@@ -163,43 +163,6 @@ let watch_read host ticket ~f =
 
 let watch host ticket ~f = watch_read host ticket ~f:(fun _ result -> f result)
 
-let query_point host ~owner ~maximum_bytes command ~f =
-  let module P = Logseq_db_worker.Protocol in
-  let submit
-    : type a. a Worker.query -> (a -> P.v2_outcome) -> (bool, Worker.error) result
-    =
-    fun query outcome ->
-    Core.plan_query_when_available
-      !(host.state)
-      ~owner
-      ~maximum_items:1
-      ~maximum_bytes
-      query
-    |> Result.map (fun (ticket, transition) ->
-      apply host.state host.runner transition;
-      watch_read host ticket ~f:(fun origin reply ->
-        let result =
-          match reply with
-          | Worker.Answered (Ok value) -> Ok (outcome value)
-          | Answered (Error error) -> Error error
-          | Not_admitted _ ->
-            Error (Worker.Service_failed "The dependency read was not admitted")
-          | Interrupted _ ->
-            Error (Worker.Service_failed "The dependency read was interrupted")
-        in
-        f origin result);
-      true)
-  in
-  match command with
-  | P.V2_get_outline_block { block; revision } ->
-    submit
-      (Worker.Outline_block { uuid = block; revision })
-      (fun value -> P.V2_block_outcome value)
-  | V2_get_page { page; revision } ->
-    submit (Worker.Page { uuid = page; revision }) (fun value -> P.V2_page_outcome value)
-  | _ -> Ok false
-;;
-
 let prepare_host_change ?(legacy_pending=false) host change =
   Core.prepare_host_change ~legacy_pending !(host.state) change
   |> Result.map(fun(id,transition)->apply host.state host.runner transition;id)

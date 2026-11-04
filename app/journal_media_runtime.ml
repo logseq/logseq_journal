@@ -5,17 +5,22 @@ module G = Logseq_db_types.Graph_types
 module Protocol = Logseq_db_worker.Protocol
 module Owners = Set.Make (String)
 
+module Worker = Journal_worker_coordination.Worker_api
+
+type fact_ticket =
+  { block : string
+  ; request_id : G.Uuid.t
+  ; generation : int option
+  }
+
+type _ read_ticket =
+  | Listing : { root : string; epoch : int; request_id : G.Uuid.t }
+      -> Worker.asset_listing read_ticket
+  | Block_fact : fact_ticket -> Worker_pure_data.block_lookup read_ticket
+  | Page_fact : fact_ticket -> Worker_pure_data.page_lookup read_ticket
+
 type ticket =
-  | Query of
-      { root : string
-      ; epoch : int
-      ; request_id : G.Uuid.t
-      }
-  | Facts of
-      { block : string
-      ; request_id : G.Uuid.t
-      ; generation : int option
-      }
+  | Read_ticket : 'a read_ticket -> ticket
   | Lease of
       { root : string
       ; epoch : int
@@ -23,19 +28,19 @@ type ticket =
       ; ticket : P.ticket
       }
 
-module Worker = Journal_worker_coordination.Worker_api
-
 type read_result =
-  { ticket : ticket
-  ; value : Worker.asset_listing
-  }
+  | Read_result :
+      { ticket : 'a read_ticket; query : 'a Worker.query; value : 'a }
+      -> read_result
 
 type read_request =
-  { ticket : ticket
-  ; maximum_items : int
-  ; query : Worker.asset_listing Worker.query
-  ; outcome : Worker.asset_listing -> read_result
-  }
+  | Read :
+      { ticket : 'a read_ticket
+      ; maximum_items : int
+      ; query : 'a Worker.query
+      ; outcome : 'a -> read_result
+      }
+      -> read_request
 
 type item =
   { token : string
@@ -58,10 +63,12 @@ type controller =
   ; mutable owners : Owners.t
   }
 
-let read_request_id (request : read_request) =
-  match request.ticket with
-  | Query { request_id; _ } | Facts { request_id; _ } -> request_id
-  | Lease _ -> assert false
+let read_ticket_id : type a. a read_ticket -> G.Uuid.t = function
+  | Listing { request_id; _ } -> request_id
+  | Block_fact { request_id; _ } | Page_fact { request_id; _ } -> request_id
+;;
+
+let read_request_id (Read request) = read_ticket_id request.ticket
 ;;
 
 type scan_cursor =
@@ -92,7 +99,7 @@ type group =
 
 type outgoing_request =
   | Command of Service.request
-  | Listing of read_request
+  | Perform_read of read_request
   | Release_preview of Worker.file_lease
   | Release_consumer of Worker.asset_consumer
 
@@ -200,11 +207,12 @@ let owns_read t request_id =
 
 let retire_outgoing t outgoing =
   match outgoing.ticket with
-  | Some (Facts { block; request_id; _ }) ->
+  | Some (Read_ticket (Block_fact { block; request_id; _ }))
+  | Some (Read_ticket (Page_fact { block; request_id; _ })) ->
     if Hashtbl.find_opt t.fact_requests block = Some request_id
     then Hashtbl.remove t.fact_requests block;
     t.read_retired request_id
-  | Some (Query { root; epoch; request_id }) ->
+  | Some (Read_ticket (Listing { root; epoch; request_id })) ->
     (match Hashtbl.find_opt t.groups root with
      | Some g when g.epoch = epoch && g.pending = Some request_id ->
        g.pending <- None;
@@ -382,13 +390,18 @@ let rec pump t =
     else if
       match next.request with
       | Command request -> t.send next.ticket request
-      | Listing request ->
+      | Perform_read request ->
         Option.fold t.read_port ~none:false ~some:(fun read -> read request)
       | Release_preview lease->Option.fold t.release_file ~none:false ~some:(fun release->release lease)
       | Release_consumer consumer->Option.fold t.release_consumer ~none:false ~some:(fun release->release consumer)
     then (
       (match next.request with
        | Command (Service.Graph_request request) -> observe_request t request
+       | Perform_read (Read request) ->
+         (match request.ticket with
+          | Block_fact _ -> observe_query t ~request_id:(read_ticket_id request.ticket) request.query
+          | Page_fact _ -> observe_query t ~request_id:(read_ticket_id request.ticket) request.query
+          | Listing _ -> ())
        | _ -> ());
       t.queued <- rest;
       pump t)
@@ -536,7 +549,7 @@ let read t g cursor =
     g.pending <- Some request_id;
     g.membership_changed <- false;
     g.error <- None;
-    let ticket = Query { root = g.root; epoch = g.epoch; request_id } in
+    let ticket = Listing { root = g.root; epoch = g.epoch; request_id } in
     t.read_planned request_id;
     let current () = current_group t g && g.pending = Some request_id in
     match t.read_port with
@@ -550,7 +563,7 @@ let read t g cursor =
       in
       enqueue
         t
-        ~ticket
+        ~ticket:(Read_ticket ticket)
         ~current
         (Service.Graph_request
            { api_version = 2
@@ -565,11 +578,12 @@ let read t g cursor =
         | Some (Sealed_cursor c) -> Some c
         | Some _ -> invalid_arg "A wire cursor cannot enter typed media reads"
       in
-      let request =
+      let query = Worker.Assets { recursive = false; roots = [ root ]; after } in
+      let request = Read
         { ticket
         ; maximum_items = 16
-        ; query = Worker.Assets { recursive = false; roots = [ root ]; after }
-        ; outcome = (fun value -> { ticket; value })
+        ; query
+        ; outcome = (fun value -> Read_result { ticket; query; value })
         }
       in
       t.queued
@@ -581,7 +595,7 @@ let read t g cursor =
                 retire_outgoing t item;
                 false))
            t.queued
-         @ [ { ticket = Some ticket; request = Listing request; current } ])
+         @ [ { ticket = Some (Read_ticket ticket); request = Perform_read request; current } ])
   else if g.pending = None
   then g.error <- Some "Attachment requests are busy."
 ;;
@@ -628,7 +642,7 @@ let root_visible ?(owner = "default") t ~root visible =
         List.exists
           (fun queued ->
              match queued.ticket with
-             | Some (Query { request_id; _ }) -> g.pending = Some request_id
+             | Some (Read_ticket (Listing { request_id; _ })) -> g.pending = Some request_id
              | _ -> false)
           t.queued
       in
@@ -856,21 +870,28 @@ let request_fact t block =
       Hashtbl.add t.fact_requests block request_id;
       t.read_planned request_id;
       let generation = t.generation in
-      enqueue
-        t
-        ~ticket:(Facts { block; request_id; generation })
-        ~current:(fun () ->
-          t.generation = generation
-          && fact_needed t block
-          && Hashtbl.find_opt t.fact_requests block = Some request_id)
-        (Service.Graph_request
-           { api_version = 2
-           ; request_id
-           ; command =
-               (if page
-                then V2_get_page { page = uuid; revision = None }
-                else V2_get_outline_block { block = uuid; revision = None })
-           }))
+      let fact = { block; request_id; generation } in
+      let current () =
+        t.generation = generation
+        && fact_needed t block
+        && Hashtbl.find_opt t.fact_requests block = Some request_id
+      in
+      let submit : type a. a read_ticket -> a Worker.query -> Protocol.command -> unit =
+        fun ticket query command ->
+        match t.read_port with
+        | None -> enqueue t ~ticket:(Read_ticket ticket) ~current
+            (Service.Graph_request { api_version = 2; request_id; command })
+        | Some _ ->
+          let request = Read { ticket; maximum_items = 1; query;
+            outcome = (fun value -> Read_result { ticket; query; value }) } in
+          t.queued <- t.queued @
+            [{ ticket = Some (Read_ticket ticket); request = Perform_read request; current }]
+      in
+      if page
+      then submit (Page_fact fact) (Worker.Page { uuid; revision = None })
+        (V2_get_page { page = uuid; revision = None })
+      else submit (Block_fact fact) (Worker.Outline_block { uuid; revision = None })
+        (V2_get_outline_block { block = uuid; revision = None }))
 ;;
 
 let request_pending_pages t =
@@ -1421,62 +1442,88 @@ let receive_listing t ~root ~epoch ~request_id listing =
   | _ -> false
 ;;
 
-let receive_read t (result : read_result) =
-  let consumed =
-    match t.read_port, result.ticket with
-    | Some _, Query { root; epoch; request_id } ->
-      receive_listing
-        t
-        ~root
-        ~epoch
-        ~request_id
+let owns_fact t (fact : fact_ticket) =
+  t.generation = fact.generation
+  && Hashtbl.find_opt t.fact_requests fact.block = Some fact.request_id
+;;
+
+let complete_fact t (fact : fact_ticket) ~apply ~accepted ~refresh_superseded =
+  let { block; request_id; _ } = fact in
+  if not (owns_fact t fact) then false
+  else (
+    Hashtbl.remove t.fact_requests block;
+    let barrier =
+      if String.starts_with ~prefix:"page:" block
+      then Hashtbl.find_opt t.page_barriers (String.sub block 5 (String.length block - 5))
+      else Hashtbl.find_opt t.barriers block
+    in
+    let superseded = match Hashtbl.find_opt t.sources request_id, barrier with
+      | Some issued, Some at -> issued <= at
+      | _ -> false
+    in
+    apply ();
+    if not (accepted superseded) then
+      dependency_failure t block "Unable to load attachment dependencies.";
+    reconcile_dependencies t;
+    if refresh_superseded && superseded && fact_needed t block then request_fact t block;
+    true)
+;;
+
+let reject_fact t (fact : fact_ticket) =
+  if not (owns_fact t fact) then false
+  else (
+    Hashtbl.remove t.fact_requests fact.block;
+    Hashtbl.remove t.sources fact.request_id;
+    dependency_failure t fact.block "Unable to load attachment dependencies.";
+    true)
+;;
+
+let receive_read t (Read_result result) =
+  let consumed = match result.ticket with
+    | Listing { root; epoch; request_id } ->
+      receive_listing t ~root ~epoch ~request_id
         (Some (result.value.items, Option.map (fun c -> Sealed_cursor c) result.value.next))
-    | _ -> false
+    | Block_fact fact ->
+      complete_fact t fact
+        ~apply:(fun () -> observe_query_result t ~request_id:fact.request_id result.query result.value)
+        ~accepted:(fun superseded -> superseded || Hashtbl.mem t.facts fact.block)
+        ~refresh_superseded:true
+    | Page_fact fact ->
+      complete_fact t fact
+        ~apply:(fun () -> observe_query_result t ~request_id:fact.request_id result.query result.value)
+        ~accepted:(fun _ -> true) ~refresh_superseded:false
   in
-  if consumed then pump t;
+  if consumed then (
+    (match result.ticket with Listing _ -> () | Block_fact _ | Page_fact _ -> recover_failed_reads t);
+    pump t);
   consumed
+;;
+
+let reject_read : type a. t -> a read_ticket -> unit = fun t ticket ->
+  (match ticket with
+   | Listing { root; epoch; request_id } ->
+     ignore (receive_listing t ~root ~epoch ~request_id None : bool)
+   | Block_fact fact -> ignore (reject_fact t fact : bool)
+   | Page_fact fact -> ignore (reject_fact t fact : bool));
+  recover_failed_reads t;
+  pump t
 ;;
 
 let receive t ticket response =
   (match ticket with
-   | Facts { block; request_id; generation } ->
-     if
-       t.generation = generation
-       && Hashtbl.find_opt t.fact_requests block = Some request_id
-     then (
-       Hashtbl.remove t.fact_requests block;
-       match response with
-       | Service.Graph_response
-           (Protocol.V2_response { request_id = actual; outcome; _ } as raw)
-         when actual = request_id ->
-         let barrier =
-           if String.starts_with ~prefix:"page:" block
-           then
-             Hashtbl.find_opt
-               t.page_barriers
-               (String.sub block 5 (String.length block - 5))
-           else Hashtbl.find_opt t.barriers block
-         in
-         let superseded =
-           match Hashtbl.find_opt t.sources request_id, barrier with
-           | Some issued, Some at -> issued <= at
-           | _ -> false
-         in
-         observe_response t raw;
-         (match outcome with
-          | V2_block_outcome _ when superseded || Hashtbl.mem t.facts block -> ()
-          | V2_page_outcome _ when String.starts_with ~prefix:"page:" block -> ()
-          | _ ->
-            dependency_failure t block "Unable to load attachment dependencies.");
-         reconcile_dependencies t;
-         (match outcome with
-          | V2_block_outcome _ when superseded && fact_needed t block ->
-            request_fact t block
-          | _ -> ())
-       | _ ->
-         Hashtbl.remove t.sources request_id;
-         dependency_failure t block "Unable to load attachment dependencies.")
-   | Query { root; epoch; request_id } ->
+   | Read_ticket (Block_fact fact) | Read_ticket (Page_fact fact) ->
+     (match response with
+      | Service.Graph_response
+          (Protocol.V2_response { request_id = actual; outcome; _ } as raw)
+        when actual = fact.request_id ->
+        ignore (complete_fact t fact ~apply:(fun () -> observe_response t raw)
+          ~accepted:(fun superseded -> match outcome with
+            | V2_block_outcome _ -> superseded || Hashtbl.mem t.facts fact.block
+            | V2_page_outcome _ -> String.starts_with ~prefix:"page:" fact.block
+            | _ -> false)
+          ~refresh_superseded:(match outcome with V2_block_outcome _ -> true | _ -> false) : bool)
+      | _ -> ignore (reject_fact t fact : bool))
+   | Read_ticket (Listing { root; epoch; request_id }) ->
      (match response with
       | Service.Graph_response _ when Option.is_some t.read_port -> ()
       | _ ->
@@ -1512,7 +1559,7 @@ let receive t ticket response =
   pump t
 ;;
 
-let acquisition_consumer = function Lease{consumer;_}->Some consumer|Query _|Facts _->None
+let acquisition_consumer = function Lease{consumer;_}->Some consumer|Read_ticket _->None
 let consumer_names t=Hashtbl.to_seq_keys t.consumers
 let receive_file t ticket lease =
   let result=Option.map(fun lease->
@@ -1639,7 +1686,7 @@ let retire_coordinated_resources t =
     t.resource_binding<-None;
     t.queued<-List.filter(fun outgoing->match outgoing.request with
       |Release_preview _|Release_consumer _->true
-      |Command _|Listing _->retire_outgoing t outgoing;false)t.queued;
+      |Command _|Perform_read _->retire_outgoing t outgoing;false)t.queued;
     Hashtbl.iter(fun _ id->t.read_retired id)t.fact_requests;
     Hashtbl.clear t.fact_requests;Hashtbl.clear t.facts;Hashtbl.clear t.pages;
     Hashtbl.clear t.page_barriers;Hashtbl.clear t.sources;Hashtbl.clear t.barriers;

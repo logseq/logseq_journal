@@ -8,12 +8,16 @@ module Worker = Journal_worker_coordination.Worker_api
 
 type read_result
 
+type 'a read_ticket
+
 type read_request = private
-  { ticket : ticket
-  ; maximum_items : int
-  ; query : Worker.asset_listing Worker.query
-  ; outcome : Worker.asset_listing -> read_result
-  }
+  | Read :
+      { ticket : 'a read_ticket
+      ; maximum_items : int
+      ; query : 'a Worker.query
+      ; outcome : 'a -> read_result
+      }
+      -> read_request
 
 type item =
   { token : string
@@ -35,7 +39,7 @@ val create
   -> changed:(string -> view -> unit)
   -> t
 
-(** A fixed typed listing port. It returns admission synchronously and delivers
+(** A fixed typed read port. It returns admission synchronously and delivers
     the read result on a later turn of the existing serial App event entrance.
     Transport IDs and continuation construction stay with the coordinator SDK. *)
 val create_coordinated
@@ -60,6 +64,7 @@ val consumer_names:t -> string Seq.t
 val receive_file:t -> ticket -> Worker.file_lease option -> unit
 
 val receive_read : t -> read_result -> bool
+val reject_read : t -> 'a read_ticket -> unit
 (** Retire only imported preview leases owned by a replaced coordinator binding.
     Keep ordinary display owners and rediscover visible roots after real rebind. *)
 val retire_coordinated_previews:t -> unit

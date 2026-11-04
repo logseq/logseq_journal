@@ -91,20 +91,6 @@ val on_event
 
 val shutdown : t -> Runner.shutdown_state
 
-(** Route existing business Block/Page dependency point reads through the same
-    typed admission and exclusive response owner. False means another request
-    family; callbacks retain the actual Send origin and carry only checked DTOs. *)
-val query_point
-  :  t
-  -> owner:Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
-  -> maximum_bytes:int
-  -> Logseq_db_worker.Protocol.command
-  -> f:
-       ((Worker.session * Worker.read_budget) option
-        -> (Logseq_db_worker.Protocol.v2_outcome, Worker.error) result
-        -> unit)
-  -> (bool, Worker.error) result
-
 (** Queued business outlets only. Exact plan/admission/cleanup/one-use decisions
     remain in Core; the host supplies real legacy retirement facts through post. *)
 val prepare_host_change : ?legacy_pending:bool -> t -> Worker.host_change -> (Worker.handoff_id,Worker.error)result
