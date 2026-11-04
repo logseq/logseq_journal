@@ -1,6 +1,5 @@
 module Config = Logseq_db_worker_contract.Config
 module Error = Logseq_db_worker_contract.Error
-module Protocol = Logseq_db_worker_contract.Protocol
 module Pure_reducer = Logseq_db_worker_pure_reducer.Core
 module Effect_runner = Logseq_db_worker_effect_runner.Effect_runner
 
@@ -695,13 +694,13 @@ let release_unallocated_observation t ~registration ~id ~owner =
   Effect_runner.release_unallocated_observation t.runner ~registration ~id ~owner
 ;;
 
-let durable_mutation_for_scope t ~scope ~request_id ~intent ~current =
+let durable_mutation_for_scope t ~scope ~intent ~current =
   let current () = not t.stopped && current () &&
     (match Pure_reducer.graph_state_for_scope !(t.state) scope with
      | Some {phase=Graph_open;graph_id=Some id;generation;_} ->
        id=scope.Sync.graph_id && generation=scope.graph_generation
      | _ -> false) in
-  Effect_runner.durable_mutation t.runner ~scope ~request_id ~intent ~current
+  Effect_runner.durable_mutation t.runner ~scope ~intent ~current
 ;;
 let graph_scopes t = Pure_reducer.graph_scopes !(t.state)
 let graph_state_for_scope t ~scope = Pure_reducer.graph_state_for_scope !(t.state) scope
@@ -722,12 +721,12 @@ let confirm_mutation_for_scope t ~scope ~read ~intent ~original ~current =
   Effect_runner.confirm_mutation t.runner ~scope ~read ~intent ~original ~current
 ;;
 
-let recover_mutations_for_scope t ~scope ~request_id ~after ~maximum_items ~maximum_bytes ~current =
+let recover_mutations_for_scope t ~scope ~after ~maximum_items ~maximum_bytes ~current =
   let current ()=not t.stopped && current() &&
     (match Pure_reducer.graph_state_for_scope !(t.state) scope with
      | Some{phase=Graph_open;graph_id=Some id;generation;_}->id=scope.Sync.graph_id && generation=scope.graph_generation
      | _->false) in
-  Effect_runner.recover_mutations t.runner ~scope ~request_id ~after ~maximum_items ~maximum_bytes ~current
+  Effect_runner.recover_mutations t.runner ~scope ~after ~maximum_items ~maximum_bytes ~current
 ;;
 
 let acknowledge_mutation_for_scope t ~scope ~intent ~original ~current =

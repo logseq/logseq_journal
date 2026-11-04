@@ -133,34 +133,34 @@ val retain_imported_file
   -> operation:Logseq_db_types.Graph_types.Uuid.t
   -> (string * string) option
 
-(** Durable complete mutation bytes use the existing scoped database attachment.
+(** Original typed durable intents use the existing scoped database attachment.
     Rechecks authority before committing; accepted interruption remains unknown. *)
 val durable_mutation : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> request_id:Logseq_db_types.Graph_types.Uuid.t -> intent:string
-  -> current:(unit -> bool) -> Logseq_db_worker_contract.Mutation_pure_wire.outcome
+  -> intent:Logseq_db_worker_contract.Worker_pure_mutation.durable_intent
+  -> current:(unit -> bool) -> Logseq_db_worker_contract.Worker_pure_mutation.outcome
 
 (** Read-only original-proof lookup and one bounded canonical snapshot read. *)
 val confirm_mutation : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> read:Worker_pure_read.packed_query -> intent:string
+  -> read:Worker_pure_read.packed_query -> intent:Logseq_db_worker_contract.Worker_pure_mutation.durable_intent
   -> original:(string * string * string) -> current:(unit -> bool)
   -> Worker_pure_read.answer
 
 (** Read-only item/byte bounded recovery. Complete immutable intent bytes and
     original proofs are returned; pending work remains Unknown and is not run. *)
 val recover_mutations : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> request_id:Logseq_db_types.Graph_types.Uuid.t -> after:int64 option
+  -> after:int64 option
   -> maximum_items:int -> maximum_bytes:int -> current:(unit -> bool)
-  -> (Logseq_db_worker_contract.Mutation_pure_wire.recovery_page,string) result
+  -> (Logseq_db_worker_contract.Worker_pure_mutation.recovery_page,string) result
 
 (** Acknowledges only a stored rejection or the exact immutable commit proof.
     The caller admits committed ACK only after applying a confirmation in the
     current presentation. Proof and outbox contents are retained. *)
 val acknowledge_mutation : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> intent:string -> original:(string * string * string) option
+  -> intent:Logseq_db_worker_contract.Worker_pure_mutation.durable_intent -> original:(string * string * string) option
   -> current:(unit -> bool) -> (unit,string) result
 
 (** Actual paused-listener/predecessor-snapshot registration on the existing DB.
-    A sampled V2_failed remains registered and can recover on the next
+    A sampled typed error remains registered and can recover on the next
     invalidation/Refresh; only allocation or activation failure aborts registration.
     A repeated logical ID retains its original sample/epoch and rebinds only the
     response envelope to this RPC request_id. Refresh does not replace the

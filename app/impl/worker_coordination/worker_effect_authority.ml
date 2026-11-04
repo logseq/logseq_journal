@@ -537,12 +537,12 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
         else Result.bind(validate_intent session intent)(fun()->
           let proof=match original with
             | None->Ok None
-            | Some (receipt:receipt) when Bytes.to_string(encode_durable_intent receipt.intent)=Bytes.to_string(encode_durable_intent intent)->
+            | Some (receipt:receipt) when Mutation.encode receipt.intent=Mutation.encode intent->
               Result.map(fun()->Some(receipt_revisions receipt))(validate_confirmation session presentation receipt)
             | Some _->Error(Protocol_mismatch "Acknowledgement replaced the immutable intent") in
           Result.map(fun original->Service.Coordination_acknowledge_mutation
             {registration=(For_worker.binding_serial binding);owner=(For_worker.session_scope session);presentation=presentation.generation;
-             request_id;intent=Bytes.to_string(encode_durable_intent intent);original})proof)
+             request_id;intent=intent;original})proof)
       ;;
 
       let request
@@ -604,7 +604,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                        ; owner = (For_worker.session_scope session)
                        ; presentation = presentation.generation
                        ; request_id
-                       ; intent = Bytes.to_string(encode_durable_intent receipt.intent)
+                       ; intent = receipt.intent
                        ; original = receipt_revisions receipt
                        ; read = confirmation_read session receipt
                        })
@@ -613,13 +613,13 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
               Result.map
                 (fun () -> Service.Coordination_mutation
                   { registration=(For_worker.binding_serial binding);owner=(For_worker.session_scope session);request_id;
-                    intent=Bytes.to_string(encode_durable_intent(Mutation_intent intent)) })
+                    intent=Mutation_intent intent })
                 (validate_intent session (Mutation_intent intent))
             | Append intent ->
               Result.map
                 (fun () -> Service.Coordination_mutation
                   { registration=(For_worker.binding_serial binding);owner=(For_worker.session_scope session);request_id;
-                    intent=Bytes.to_string(encode_durable_intent(Append_intent intent)) })
+                    intent=Append_intent intent })
                 (validate_request session operation)
             | Import intent->Result.map(fun()->Service.Coordination_import{registration=(For_worker.binding_serial binding);owner=(For_worker.session_asset_scope session);request_id;source=(Import_wire.source intent)})(validate_request session operation)
             | Acquire_asset_file file->Result.map(fun()->Service.Acquire_asset_file{scope=(For_worker.session_asset_scope session);handle=file.source_handle})(validate_request session operation)
@@ -785,19 +785,19 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
             | (Recover_mutations {after;maximum_items;maximum_bytes},
                Service.Coordination_mutations_recovered{request_id=actual;page})
               when Uuid.equal actual request_id->
-              decode_recovery session ~request_id ~after ~maximum_items ~maximum_bytes page
+              decode_recovery session ~after ~maximum_items ~maximum_bytes page
               |> Result.map(fun page->Answered(Ok page))
             | Acknowledge_intent _,Service.Coordination_mutation_acknowledged{request_id=actual}
               when Uuid.equal actual request_id->Ok(Answered(Ok()))
             | ( Mutate intent
               , Service.Coordination_mutation_result { request_id = actual; outcome } )
               when Uuid.equal request_id actual ->
-              decode_mutation_progress session ~request_id ~intent:(Mutation_intent intent) outcome
+              decode_mutation_progress session ~intent:(Mutation_intent intent) outcome
               |> Result.map(fun progress->Answered(Ok progress))
             | ( Append intent
               , Service.Coordination_mutation_result { request_id = actual; outcome } )
               when Uuid.equal request_id actual ->
-              decode_mutation_progress session ~request_id ~intent:(Append_intent intent) outcome
+              decode_mutation_progress session ~intent:(Append_intent intent) outcome
               |> Result.map(fun progress->Answered(Ok progress))
             | _ -> Error (Protocol_mismatch "Unexpected owned query receipt"))
       ;;

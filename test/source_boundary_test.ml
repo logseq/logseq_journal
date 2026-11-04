@@ -721,7 +721,7 @@ let test_worker_owned_overlay_orchestration root =
   forbid_text
     root
     "logseq_db_worker/lib/effect_runner/effect_runner.ml"
-    [ "Logseq_db_worker_engine"; "Engine."; "Mutation."; "Datascript." ];
+    [ "Logseq_db_worker_engine"; "Engine."; "Logseq_db_types.Mutation"; "Datascript." ];
   forbid_worker_storage_access root "logseq_db_worker/lib/effect_runner/effect_runner.ml";
   require_text
     root

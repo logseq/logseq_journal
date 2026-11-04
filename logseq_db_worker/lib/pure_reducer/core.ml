@@ -1,5 +1,4 @@
 module Read = Worker_pure_read
-module Protocol = Logseq_db_worker_contract.Protocol
 
 type graph_phase =
   | Graph_closed

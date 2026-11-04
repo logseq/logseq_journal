@@ -53,14 +53,14 @@ type read_budget
 (** Validate positive item/encoded-byte bounds against this session's advertised
     limits. Every final enriched result, including summary/refs/properties, fits
     both bounds. An oversized singleton fails explicitly; no silent truncation.
-    Requests also validate Protocol limits on IDs, roots, depth, payload and lists. *)
+    Requests also validate effective limits on IDs, roots, depth, payload and lists. *)
 val read_budget
   :  session
   -> maximum_items:int
   -> maximum_bytes:int
   -> (read_budget, error) result
 
-type journal_day
+type journal_day = Logseq_db_worker_contract.Worker_pure_day.t
 
 val journal_day : int -> (journal_day, error) result
 
@@ -291,7 +291,7 @@ module For_worker : sig
 end
 
 (** Pure validation and ephemeral continuation identity for the original query.
-    No Protocol command, response or transport envelope is constructed. *)
+    No transport envelope is constructed. *)
 val query_key : read_budget -> 'a query -> string
 val query_cursor : session -> read_budget -> 'a query -> (Graph.Cursor.t option,error) result
 val checked_query : session -> read_budget -> 'a query -> (Graph.Cursor.t option,error) result
@@ -304,3 +304,7 @@ val encoded_value_bytes : 'a query -> 'a -> int
 val validate_value : session -> read_budget -> 'a query -> 'a -> (unit,error) result
 
 val equal_packed_query : packed_query -> packed_query -> bool
+
+(** Pure next fetch bound for the same original query. No new query, session,
+    budget or cursor is minted. A singleton fails rather than losing data. *)
+val smaller_page_size : 'a query -> int -> int option

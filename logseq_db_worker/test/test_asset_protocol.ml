@@ -1,43 +1,40 @@
-module P = Logseq_db_worker.Protocol
+module A = Logseq_db_types.Asset_descriptor
+module M = Logseq_db_worker_contract.Worker_pure_mutation
+module Read = Worker_pure_read
+module Sync = Logseq_sync_pure_reducer.Core
+module Id = Journal_worker_ids
 
-let id = "78000000-0000-4000-8000-000000000001"
+let id="78000000-0000-4000-8000-000000000001"
+let target=Logseq_db_types.Graph_types.Uuid.of_string id |> Result.get_ok
+let origin=Uri.of_string "https://example.invalid"
+let command name fields=`List[`String name;`Assoc fields]
+let stored_bytes command=Yojson.Safe.to_string(Yojson.Safe.sort(`Assoc[
+  "version",`Int 1;"owner",`Assoc["origin",`String(Uri.to_string origin);"user",`String "synthetic";"graph",`String id];
+  "request",`Assoc["api_version",`Int 2;"request_id",`String id;"command",command]]))
 
-let request command =
-  `Assoc
-    [ "api_version", `Int P.api_version; "request_id", `String id; "command", command ]
+let owner =
+  let module F=Read.For_worker in
+  let account:Sync.account_scope={managed_sync_origin=origin;user_id="synthetic";
+    account_generation=1;presentation_generation=1;lifecycle_generation=1L}in
+  let asset_scope:Sync.graph_scope={account;graph_id=target;graph_generation=1}in
+  let scope:Sync.timeline_scope={startup={account_generation=1;presentation_generation=1};
+    graph_id=target;graph_generation=1}in
+  let limits:Worker_pure_data.capability_limits={response_budget_bytes=Worker_pure_data.maximum_response_bytes;
+    outbox_max_records=100;outbox_max_bytes=1048576;change_max_items=256;change_max_bytes=1048576;
+    dispatcher_capacity=100;wire_batch_max_bytes=1048576}in
+  let binding=F.binding ~serial:1L ~incarnation:(Read.worker_incarnation
+    ~runtime_epoch:(Id.Runtime.Epoch.of_int64 1L) ~worker_generation:Id.Worker.Generation.one)
+    ~origin:(Uri.to_string origin) ~user:"synthetic"in
+  F.session ~binding ~graph:target ~account:1 ~lifecycle:1L ~generation:1 ~scope ~asset_scope ~limits
 ;;
 
-let command name fields = `List [ `String name; `Assoc fields ]
-
 let roundtrip () =
-  List.iter
-    (fun cmd ->
-       let json = request cmd in
-       match P.request_of_yojson json with
-       | Error _ -> Alcotest.fail "asset query command rejected"
-       | Ok value ->
-         Alcotest.(check bool)
-           "query roundtrip"
-           true
-           (Yojson.Safe.equal
-              (Yojson.Safe.sort json)
-              (Yojson.Safe.sort (P.request_to_yojson value))))
-    [ command
-        "V2_list_assets"
-        [ "recursive", `Bool false
-        ; "roots", `List [ `String id ]
-        ; "limit", `Int 1
-        ; "cursor", `Null
-        ]
-    ; command "V2_get_asset_descriptors" [ "assets", `List [ `String id ] ]
-    ; command
-        "V2_list_assets"
-        [ "recursive", `Bool true
-        ; "roots", `List [ `String id ]
-        ; "limit", `Int 5
-        ; "cursor", `Null
-        ]
-    ]
+  let check :type a. int -> a Read.query -> unit=fun maximum_items query->
+    let budget=Read.read_budget owner ~maximum_items ~maximum_bytes:4096 |> Result.get_ok in
+    Alcotest.(check bool) "original typed query admitted"true(Result.is_ok(Read.validate_query owner budget query))in
+  check 1(Read.Assets{recursive=false;roots=[target];after=None});
+  check 1(Read.Asset_descriptors[target]);
+  check 5(Read.Assets{recursive=true;roots=[target];after=None})
 ;;
 
 let reference_command previous =
@@ -59,23 +56,18 @@ let reference_command previous =
 let references () =
   List.iter
     (fun previous ->
-       let json = request (reference_command previous) in
-       match P.request_of_yojson json with
+       let json = stored_bytes (reference_command previous) in
+       match M.restore ~origin ~user:"synthetic" ~graph:target json with
        | Error _ -> Alcotest.fail "asset reference command rejected"
        | Ok decoded ->
-         Alcotest.(check bool)
-           "reference command roundtrip"
-           true
-           (Yojson.Safe.equal
-              (Yojson.Safe.sort json)
-              (Yojson.Safe.sort (P.request_to_yojson decoded))))
+         Alcotest.(check string) "reference stored bytes roundtrip" json(M.encode decoded))
     [ `Null; `String id ];
   List.iter
     (fun previous ->
        Alcotest.(check bool)
          "malformed previous reference rejected"
          true
-         (Result.is_error (P.request_of_yojson (request (reference_command previous)))))
+         (Result.is_error (M.restore ~origin ~user:"synthetic" ~graph:target (stored_bytes (reference_command previous)))))
     [ `String "not-a-uuid"; `Int 1; `Bool false ]
 ;;
 
@@ -95,24 +87,8 @@ let response () =
       ; "dimensions", `List [ `Int 10; `Int 20 ]
       ]
   in
-  let json =
-    `List
-      [ `String "V2_response"
-      ; `Assoc
-          [ "api_version", `Int P.api_version
-          ; "request_id", `String id
-          ; ( "outcome"
-            , command
-                "V2_assets_outcome"
-                [ "generation", `String "generation"
-                ; "projection_revision", `String "projection"
-                ; "items", `List [ item ]
-                ; "next_cursor", `Null
-                ] )
-          ]
-      ]
-  in
-  match P.response_of_yojson json with
+  let json=item in
+  match A.of_yojson json with
   | Error e -> Alcotest.fail e
   | Ok value ->
     Alcotest.(check bool)
@@ -120,30 +96,17 @@ let response () =
       true
       (Yojson.Safe.equal
          (Yojson.Safe.sort json)
-         (Yojson.Safe.sort (P.response_to_yojson value)))
+         (Yojson.Safe.sort (A.to_yojson value)))
 ;;
 
 let limits () =
-  List.iter
-    (fun cmd ->
-       Alcotest.(check bool)
-         "bounded asset command"
-         true
-         (Result.is_error (P.request_of_yojson (request cmd))))
-    [ command
-        "V2_get_asset_descriptors"
-        [ "assets", `List (List.init 201 (fun _ -> `String id)) ]
-    ; command
-        "V2_list_assets"
-        [ "recursive", `Bool true
-        ; "roots", `List (List.init 65 (fun _ -> `String id))
-        ; "limit", `Int 1
-        ; "cursor", `Null
-        ]
-    ; command
-        "V2_list_assets"
-        [ "recursive", `Bool true; "roots", `List []; "limit", `Int 0; "cursor", `Null ]
-    ]
+  let budget=Read.read_budget owner ~maximum_items:1 ~maximum_bytes:4096 |> Result.get_ok in
+  let reject :type a. a Read.query->unit=fun query->
+    Alcotest.(check bool) "bounded asset query"true(Result.is_error(Read.validate_query owner budget query))in
+  reject(Read.Asset_descriptors(List.init 201(fun _->target)));
+  reject(Read.Assets{recursive=true;roots=List.init 65(fun _->target);after=None});
+  Alcotest.(check bool) "invalid budget cannot be constructed"true
+    (Result.is_error(Read.read_budget owner ~maximum_items:0 ~maximum_bytes:4096))
 ;;
 
 let descriptor_validation () =
@@ -162,25 +125,9 @@ let descriptor_validation () =
       "Managed"
       (`Assoc [ "checksum", `String (String.make 64 'a'); "file_type", `String "png" ])
   in
-  let envelope item =
-    variant
-      "V2_response"
-      (`Assoc
-          [ "api_version", `Int 2
-          ; "request_id", `String id
-          ; ( "outcome"
-            , command
-                "V2_assets_outcome"
-                [ "generation", `String "g"
-                ; "projection_revision", `String "p"
-                ; "items", `List [ item ]
-                ; "next_cursor", `Null
-                ] )
-          ])
-  in
   let check_roundtrip item =
-    let json = envelope item in
-    match P.response_of_yojson json with
+    let json = item in
+    match A.of_yojson json with
     | Error message -> Alcotest.failf "descriptor rejected: %s" message
     | Ok response ->
       Alcotest.(check bool)
@@ -190,7 +137,7 @@ let descriptor_validation () =
            (Yojson.Safe.sort (Yojson.Safe.from_string (Yojson.Safe.to_string json)))
            (Yojson.Safe.sort
               (Yojson.Safe.from_string
-                 (Yojson.Safe.to_string (P.response_to_yojson response)))))
+                 (Yojson.Safe.to_string (A.to_yojson response)))))
   in
   List.iter
     check_roundtrip
@@ -210,7 +157,7 @@ let descriptor_validation () =
     Alcotest.(check bool)
       "invalid descriptor rejected"
       true
-      (Result.is_error (P.response_of_yojson (envelope item)))
+      (Result.is_error (A.of_yojson item))
   in
   List.iter
     reject

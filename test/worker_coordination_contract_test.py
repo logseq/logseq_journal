@@ -145,9 +145,9 @@ let registration view (ticket : W.block W.slice W.observed C.ticket) =
 NEGATIVE = {
     "observation_requires_registered_service_envelope": (
         """let wrong (module Issuer : Worker_effect_authority.ISSUER) session request_id observation
-          (response:Logseq_db_worker.Protocol.response) =
+          (response:Worker_pure_read.answer) =
           Issuer.observation session ~request_id observation response""",
-        ("Protocol.response", "Service.response")),
+        ("Worker_pure_read.answer", "Service.response")),
     "account_generation_is_not_graph_generation": (
         "let wrong (x : W.account_generation) : W.graph_generation = x",
         ("W.account_generation", "W.graph_generation")),

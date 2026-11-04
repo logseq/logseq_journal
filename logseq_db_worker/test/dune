@@ -5,10 +5,10 @@
   logseq_db_worker.typed_data))
 
 (tests
- (names test_protocol test_overlay_integration)
- (modules test_protocol test_overlay_integration)
+ (names test_protocol)
+ (modules test_protocol)
  (deps
-  (source_tree fixtures/protocol))
+  (source_tree fixtures/worker-data))
  (libraries
   datascript_ocaml.types
   datascript-ocaml-native
@@ -81,6 +81,7 @@
   logseq_db_worker.effect_runner
   logseq_db_worker.pure_reducer
   logseq_db_worker_test_support
+  logseq_overlay_db_test_support
   logseq_sync.effect_runner
   logseq_sync.pure_reducer
   rrbvec
@@ -159,4 +160,4 @@
 (test
  (name test_asset_protocol)
  (modules test_asset_protocol)
- (libraries alcotest logseq_db_worker yojson))
+ (libraries alcotest logseq_db_worker logseq_db_worker.contract logseq_db_worker.typed_read logseq_db_worker.typed_data logseq_db_worker.identity logseq_db_types logseq_sync.pure_reducer uri yojson))

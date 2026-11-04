@@ -292,7 +292,8 @@
    --cmi %{lib:logseq_db_worker:logseq_db_worker.cmi}
    --cmi %{lib:logseq_db_worker.contract:logseq_db_worker_contract.cmi}
    --cmi %{lib:logseq_db_worker.contract:logseq_db_worker_contract__Error.cmi}
-   --cmi %{lib:logseq_db_worker.contract:logseq_db_worker_contract__Protocol.cmi}
+   --cmi %{lib:logseq_db_worker.contract:logseq_db_worker_contract__Worker_pure_mutation.cmi}
+   --cmi %{lib:logseq_db_worker.contract:logseq_db_worker_contract__Worker_pure_day.cmi}
    --cmi %{lib:logseq_db_worker.lui:logseq_db_worker_lui.cmi}
    --cmi %{lib:logseq_db_worker.lui:logseq_db_worker_lui__Journal_worker.cmi}
    --cmi %{lib:logseq_db_worker.identity:journal_worker_ids.cmi}
@@ -338,3 +339,8 @@
   rrbvec
   logseq_db_worker.typed_data
   worker_effect_authority))
+
+(test
+ (name macos_mutation_input_diagnostics_pure_reducer_test)
+ (modules macos_mutation_input_diagnostics_pure_reducer_test)
+ (libraries app journal_app_business lui logseq_db_worker.identity logseq_db_worker.typed_data))

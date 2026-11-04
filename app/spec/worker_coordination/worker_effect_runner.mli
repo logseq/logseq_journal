@@ -51,13 +51,13 @@ val on_event : t -> (Logseq_db_worker_lui.Logseq_db_worker_lui_service.response,
 
 val submit : t -> Worker_pure_coordinator.instruction -> unit
 
-(** Directly encode scoped Service/Protocol requests; never implicit-current
+(** Directly submit scoped typed Service requests; never implicit-current
     Graph_request/Asset_command fallbacks. Track Accepted mailbox ID against typed
-    ticket, protocol ID, owner, immutable intent and any acquired resource. Full/
+    ticket, request ID, owner, immutable intent and any acquired resource. Full/
     Not_ready/Stopping are Not_admitted; unsupported capabilities fail BEFORE send.
     Recheck session liveness and all nested scopes at admission and completion.
 
-    Existing V2 query families retain actual DTOs/budgets/cursors; their availability
+    Existing query families retain actual DTOs/budgets/cursors; their availability
     depends on a valid bootstrap, not a fabricated session. Existing non-atomic
     create/insert/status calls cannot implement atomic Append. Durable mutation/
     import replay requires persistent outcome evidence, not just process caches.

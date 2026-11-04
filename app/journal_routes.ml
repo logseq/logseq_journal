@@ -804,7 +804,6 @@ let commit_delete t ~block_id =
 
 module Favorites = struct
   module Hidden = Set.Make (String)
-  module P = Logseq_db_worker.Protocol
   module G = Logseq_db_types.Graph_types
 
   type event =

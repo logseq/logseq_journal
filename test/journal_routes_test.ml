@@ -1109,7 +1109,6 @@ let favorites_cursor_factory ?(graph_generation = 7) () =
 
 let test_favorites_state_isolates_requests_and_refreshes () =
   let module F = Journal_routes.Favorites in
-  let module P = Logseq_db_worker.Protocol in
   let module G = Logseq_db_types.Graph_types in
   let uuid n =
     G.Uuid.of_string (Printf.sprintf "75000000-0000-4000-8000-%012d" n) |> Result.get_ok
@@ -1195,7 +1194,6 @@ let test_favorites_state_isolates_requests_and_refreshes () =
 
 let test_favorites_retains_large_typed_pages () =
   let module F = Journal_routes.Favorites in
-  let module P = Logseq_db_worker.Protocol in
   let module U = Logseq_db_types.Graph_types.Uuid in
   let uuid n =
     U.of_string (Printf.sprintf "76000000-0000-4000-8000-%012d" n) |> Result.get_ok
@@ -1247,7 +1245,6 @@ let test_favorites_retains_large_typed_pages () =
 ;;
 
 let test_favorite_target_origin_and_delete () =
-  let module P = Logseq_db_worker.Protocol in
   let module G = Logseq_db_types.Graph_types in
   let module F = Journal_routes.Favorites in
   let uuid suffix =
@@ -2001,7 +1998,6 @@ let test_automatic_outline_reads_are_bounded_and_idempotent () =
 
 let test_favorites_hidden_rows_do_not_block_pagination () =
   let module F = Journal_routes.Favorites in
-  let module P = Logseq_db_worker.Protocol in
   let module G = Logseq_db_types.Graph_types in
   let uuid n =
     G.Uuid.of_string (Printf.sprintf "76000000-0000-4000-8000-%012d" n) |> Result.get_ok
@@ -4572,7 +4568,6 @@ let test_detail_observation_failure_and_pending_cancel () =
 module Child_chain_fixture = struct
   module C = Journal_graph_mutation_confirmation.Pure_insertion
   module W = Journal_worker_coordination.Worker_api
-  module P = Logseq_db_worker.Protocol
   module G = Logseq_db_types.Graph_types
   type t =
     { initial : C.t
@@ -4612,14 +4607,11 @@ module Child_chain_fixture = struct
       let id=W.durable_intent_id intent in
       let request_id=W.request_id id in
       let after=Printf.sprintf "projection:v1:%d" (index+1) in
-      let receipt=(let (P.V2_response receipt_packet as packet) = (P.V2_response
-        {api_version=P.api_version;request_id=id;outcome=V2_mutation_committed
-          {mutation_id=id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
-           before_projection_revision=Printf.sprintf "projection:v1:%d" index;after_projection_revision=after}}) in
+      let receipt=(let packet = ((Logseq_db_worker_contract.Worker_pure_mutation.For_worker.commit ~mutation_id:(id) ~status:(Worker_pure_data.V2_applied) ~generation:("generation:v1:1:1") ~before:(Printf.sprintf "projection:v1:%d" index) ~after:(after))) in
         match I.reply session ~request_id (match intent with W.Append_intent intent->W.Append intent|Mutation_intent intent->W.Mutate intent)
           (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
-            {request_id=receipt_packet.request_id;
-             outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
+            {request_id=id;
+             outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed packet}) with
         | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
         | _ -> failwith "Production mutation receipt was rejected") in
       let block:G.block={uuid=child;title=command.source;parent;page=page.uuid;order="a";
@@ -4742,7 +4734,7 @@ let test_capture_retained_attempt_survives_runtime_reset () =
 ;;
 
 let test_capture_chain_freezes_complete_payload () =
-  let module F=Child_chain_fixture in let module C=F.C in let module P=F.P in
+  let module F=Child_chain_fixture in let module C=F.C in
   let fixture=F.make() in
   let uuid value=F.G.Uuid.of_string value |> Result.get_ok in
   let child:Journal_graph_projection.capture_child={

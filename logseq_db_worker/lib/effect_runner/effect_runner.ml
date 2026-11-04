@@ -8,7 +8,6 @@ module Upload = Logseq_db_worker_pure_reducer.Asset_upload
 module Core = Logseq_db_worker_pure_reducer.Core
 module Database = Logseq_overlay_db.Database
 module Overlay = Logseq_overlay_db.Types
-module Protocol = Logseq_db_worker_contract.Protocol
 module Graph = Logseq_db_types.Graph_types
 module Sync = Logseq_sync_pure_reducer.Core
 module Transit = Transit_core.Json
@@ -964,17 +963,6 @@ let effect_error message =
     |> Result.get_ok
 ;;
 
-let failure request code message =
-  Protocol.failed ~request_id:request.Protocol.request_id (worker_error ~code message)
-;;
-
-let response request outcome =
-  Protocol.V2_response
-    { api_version = Protocol.api_version
-    ; request_id = request.Protocol.request_id
-    ; outcome
-    }
-;;
 
 let task_status_to_protocol = function
   | Overlay.Status_uuid uuid -> uuid
@@ -1343,50 +1331,29 @@ let journal_append_title format day =
   Option.get(Logseq_db_types.Journal_title.for_journal_day ~pattern:format day)
 ;;
 
-let local_mutation ?append_title = function
-  | Protocol.V2_append_journal{mutation_id;page;journal_day;root}->
-    let title=Option.value append_title ~default:(journal_append_title None journal_day) in
-    Ok(Worker_pure_data.{blocks=[];pages=[];scopes=[]},Overlay.Append_journal
-      {mutation_id;page;journal_day;title;root=append_node root})
-  | Protocol.V2_set_asset_reference { mutation_id; block; previous; asset; preconditions }
-    ->
-    Ok (preconditions, Overlay.Set_asset_reference { mutation_id; block; previous; asset })
-  | Protocol.V2_save_block { mutation_id; block; title; preconditions } ->
-    Ok (preconditions, Overlay.Save_block { mutation_id; block; title })
-  | V2_insert_blocks { mutation_id; parent; roots = [ root ]; preconditions } ->
-    Ok
-      ( preconditions
-      , Overlay.Insert_blocks
-          { mutation_id; parent; tree = block_tree root; asset = None } )
-  | V2_insert_blocks _ -> Error "insertBlocks requires exactly one root"
-  | V2_delete_blocks { mutation_id; root; preconditions } ->
-    Ok (preconditions, Overlay.Delete_blocks { mutation_id; root })
-  | V2_create_journal_page { mutation_id; page; journal_day; title; preconditions } ->
-    Ok
-      ( preconditions
-      , Overlay.Create_journal_page { mutation_id; page; journal_day; title } )
-  | V2_set_task_status { mutation_id; block; status; preconditions } ->
-    Ok
-      ( preconditions
-      , Overlay.Set_task_status
-          { mutation_id; block; status = task_status_of_protocol status } )
-  | V2_clear_task_status { mutation_id; block; preconditions } ->
-    Ok (preconditions, Overlay.Clear_task_status { mutation_id; block })
-  | V2_graph_info
-  | V2_inspect_admission
-  | V2_get_asset_descriptors _
-  | V2_list_assets _
-  | V2_list_task_statuses _
-  | V2_get_task_status_definitions _
-  | V2_list_favorites _
-  | V2_list_journals _
-  | V2_get_page _
-  | V2_get_outline_block _
-  | V2_get_outline_block_summary _
-  | V2_get_children _
-  | V2_get_page_tree _
-  | V2_pull_changes _
-  | V2_ack_changes _ -> Error "not a local mutation"
+let local_mutation ?append_title intent =
+  let module Mutation=Logseq_db_worker_contract.Worker_pure_mutation in
+  let mutation_id=Mutation.mutation_id intent in
+  match intent with
+  |Mutation.Append_intent append->
+    let value=Mutation.append_parameters append in
+    let journal_day=Logseq_db_worker_contract.Worker_pure_day.value value.day in
+    let title=Option.value append_title ~default:(journal_append_title None journal_day)in
+    Worker_pure_data.{blocks=[];pages=[];scopes=[]},Overlay.Append_journal
+      {mutation_id;page=value.page;journal_day;title;root=append_node value.root}
+  |Mutation.Mutation_intent mutation->match Mutation.mutation_command mutation with
+    |Mutation.Save_block{block;title;preconditions}->preconditions,Overlay.Save_block{mutation_id;block;title}
+    |Insert_blocks{parent;roots;preconditions}->
+      (* The sealed intent admits exactly one bounded root. *)
+      preconditions,Overlay.Insert_blocks{mutation_id;parent;tree=block_tree(List.hd roots);asset=None}
+    |Delete_blocks{root;preconditions}->preconditions,Overlay.Delete_blocks{mutation_id;root}
+    |Create_journal{page;day;title;preconditions}->preconditions,Overlay.Create_journal_page
+      {mutation_id;page;journal_day=Logseq_db_worker_contract.Worker_pure_day.value day;title}
+    |Set_task_status{block;status;preconditions}->preconditions,Overlay.Set_task_status
+      {mutation_id;block;status=task_status_of_protocol status}
+    |Clear_task_status{block;preconditions}->preconditions,Overlay.Clear_task_status{mutation_id;block}
+    |Set_asset_reference{block;previous;asset;preconditions}->preconditions,Overlay.Set_asset_reference
+      {mutation_id;block;previous;asset}
 ;;
 
 let local_status = function
@@ -1395,16 +1362,18 @@ let local_status = function
   | Already_applied -> Worker_pure_data.V2_already_applied
 ;;
 
-let committed_outcome (commit : Overlay.local_commit) =
-  Protocol.V2_mutation_committed
-    { mutation_id = commit.mutation_id
-    ; status = local_status commit.status
-    ; generation = Overlay.Generation.to_string commit.generation
-    ; before_projection_revision =
-        Overlay.Projection_revision.to_string commit.before_projection_revision
-    ; after_projection_revision =
-        Overlay.Projection_revision.to_string commit.after_projection_revision
-    }
+let commit_proof (commit:Overlay.local_commit)=
+  Logseq_db_worker_contract.Worker_pure_mutation.For_worker.commit
+    ~mutation_id:commit.mutation_id ~status:(local_status commit.status)
+    ~generation:(Overlay.Generation.to_string commit.generation)
+    ~before:(Overlay.Projection_revision.to_string commit.before_projection_revision)
+    ~after:(Overlay.Projection_revision.to_string commit.after_projection_revision)
+;;
+
+let mutation_owner_matches (scope:Sync.graph_scope) intent =
+  let module Mutation=Logseq_db_worker_contract.Worker_pure_mutation in
+  Mutation.namespace intent=Mutation.namespace_for_owner ~origin:scope.account.managed_sync_origin
+    ~user:scope.account.user_id ~graph:scope.graph_id
 ;;
 
 let typed_read_error ?code error =
@@ -1434,14 +1403,14 @@ let read_typed
   let next cursor=Option.map(fun cursor->F.continuation ~owner ~budget ~key:(Read.query_key budget query) ~cursor)cursor in
   let fail code message=Error(Read.Db_error(Logseq_db_worker_contract.Error.create ~code ~message ~details:[] |> Result.get_ok)) in
   let checked value=Result.bind value(fun value->Result.map(fun()->value)(Read.validate_value owner budget query value)) in
-  let fit ~paged read =
+  let fit read =
     let rec loop limit=match read limit with
       |Ok value when Read.encoded_value_bytes query value>min maximum_bytes(F.read_budget_maximum_bytes budget)->
-        if paged && limit>1 then loop(max 1(limit/2))
-        else Error Read.Response_budget_exceeded
+        (match Read.smaller_page_size query limit with
+         |Some next->loop next|None->Error Read.Response_budget_exceeded)
       |value->checked value in
     loop limit in
-  let with_snapshot ~paged read =
+  let with_snapshot read =
     match (match snapshot with Some value->Ok value|None->Database.current_snapshot database) with
     |Error _->fail Closed_session "The graph snapshot is unavailable."
     |Ok snapshot->Fun.protect ~finally:(fun()->if release_snapshot then Database.release_snapshot snapshot)(fun()->
@@ -1456,7 +1425,7 @@ let read_typed
             |Missing_page{uuid;_}->Hashtbl.replace titles(Graph.Uuid.to_string uuid)None)pages);
         let tag_titles=List.filter_map(fun uuid->Option.join(Hashtbl.find_opt titles(Graph.Uuid.to_string uuid)))value.block.tags in
         block_record ~tag_titles value in
-      try fit ~paged (read snapshot record) with Enrichment_failed error->Error error) in
+      try fit (read snapshot record) with Enrichment_failed error->Error error) in
   Result.bind(Read.checked_query owner budget query)(fun cursor->(
     let page_lookup = function
       |Overlay.Present_page{value;revision}->Worker_pure_data.V2_present_page{page=value.page;revision=Overlay.Page_state_revision.to_string revision}
@@ -1465,13 +1434,13 @@ let read_typed
       |Overlay.Present_block{value;revision}->Worker_pure_data.V2_present_block{value=record value;revision=Overlay.Block_state_revision.to_string revision}
       |Missing_block{uuid;revision}->V2_missing_block{uuid;revision=Overlay.Block_state_revision.to_string revision} in
     match query with
-    |Read.Changes{generation;after}->fit ~paged:true (fun limit->changes ~generation ~after ~limit)
+    |Read.Changes{generation;after}->fit (fun limit->changes ~generation ~after ~limit)
     |Admission->checked(match Database.inspect_admission database with
       |Error _->fail Closed_session "Admission information is unavailable."
       |Ok value->Ok Worker_pure_data.{active_records=value.active_records;active_bytes=value.active_bytes;
         protected_wire_bytes=value.protected_wire_bytes;retained_origin_evidence_bytes=value.retained_origin_evidence_bytes;
         maximum_records=value.maximum_records;maximum_bytes=value.maximum_bytes})
-    |Graph_info->with_snapshot ~paged:false (fun snapshot _ _->match Database.graph_info snapshot with
+    |Graph_info->with_snapshot (fun snapshot _ _->match Database.graph_info snapshot with
       |Error error->Error(typed_read_error ~code:Corrupt_storage error)
       |Ok info->let limits=info.Overlay.limits in Ok(F.graph_info ~graph_uuid:info.graph_uuid ~graph_name:info.graph_name
         ~schema:info.schema ~admission_facts:info.admission_facts ~journal_title_format:info.journal_title_format
@@ -1480,26 +1449,26 @@ let read_typed
           dispatcher_capacity=limits.dispatcher_capacity;wire_batch_max_bytes=limits.wire_batch_max_bytes}
         ~generation:(Overlay.Generation.to_string info.version.generation)
         ~projection_revision:(Overlay.Projection_revision.to_string info.version.projection_revision)))
-    |Journal day->with_snapshot ~paged:false (fun snapshot _ _->
+    |Journal day->with_snapshot (fun snapshot _ _->
       let day=F.journal_day_value day in match Database.get_journals snapshot ~from_day:day ~through_day:day ~limit:1 ~cursor:None with
       |Error error->Error(typed_read_error error)
       |Ok{items=[];next_cursor=None}->Ok None
       |Ok{items=[item];next_cursor=None} when item.journal_day=day->Ok(Some(F.page ~data:item.page.page ~revision:(Overlay.Page_state_revision.to_string item.revision)))
       |Ok _->Error(Read.Protocol_mismatch "Response does not match the typed query"))
-    |Journals{from_day;through_day;_}->with_snapshot ~paged:true (fun snapshot _ limit->
+    |Journals{from_day;through_day;_}->with_snapshot (fun snapshot _ limit->
       Database.get_journals snapshot ~from_day:(F.journal_day_value from_day) ~through_day:(F.journal_day_value through_day) ~limit ~cursor
       |> Result.map_error typed_read_error
       |> Result.map(fun (result:Overlay.journal_list_result)->F.slice ~items:(List.map(fun(item:Overlay.journal_item)->Worker_pure_data.{page=item.page.page;
         journal_day=item.journal_day;revision=Overlay.Page_state_revision.to_string item.revision})result.items) ~next:(next result.next_cursor)))
-    |Page{uuid;_}->with_snapshot ~paged:false (fun snapshot _ _->match Database.get_pages snapshot[uuid]with
+    |Page{uuid;_}->with_snapshot (fun snapshot _ _->match Database.get_pages snapshot[uuid]with
       |Error error->Error(typed_read_error ~code:Corrupt_storage error)
       |Ok[value]->Ok(page_lookup value)
       |Ok _->fail Corrupt_storage "The page lookup failed.")
-    |Outline_block{uuid;_}->with_snapshot ~paged:false (fun snapshot record _->match Database.get_outline_blocks snapshot[uuid]with
+    |Outline_block{uuid;_}->with_snapshot (fun snapshot record _->match Database.get_outline_blocks snapshot[uuid]with
       |Error error->Error(typed_read_error ~code:Corrupt_storage error)
       |Ok[value]->Ok(block_lookup record value)
       |Ok _->fail Corrupt_storage "The block lookup failed.")
-    |Block_summary{block;_}->with_snapshot ~paged:true(fun snapshot record limit->
+    |Block_summary{block;_}->with_snapshot(fun snapshot record limit->
       let version=Database.snapshot_version snapshot in
       let summary lookup page scope_revision items next_cursor=Ok(F.block_summary ~lookup ~page ~scope_revision ~items ~next:(next next_cursor)
         ~generation:(Overlay.Generation.to_string version.generation) ~projection_revision:(Overlay.Projection_revision.to_string version.projection_revision))in
@@ -1520,14 +1489,14 @@ let read_typed
               (List.map(fun(item:Overlay.child_member)->Worker_pure_data.{value=record item.block;revision=Overlay.Block_state_revision.to_string item.revision})items)next_cursor)
          |Ok _->fail Corrupt_storage "The target page lookup failed.")
       |Ok _->fail Corrupt_storage "The target block lookup failed.")
-    |Children{parent;_}->with_snapshot ~paged:true(fun snapshot record limit->
+    |Children{parent;_}->with_snapshot(fun snapshot record limit->
       match Database.get_structure snapshot(Overlay.Children{parent;limit;cursor})with
       |Error error->Error(typed_read_error error)
       |Ok(Page_tree_result _)->fail Invalid_request "The children query returned a page tree."
       |Ok(Children_result{items;next_cursor;_})->Ok(F.slice
         ~items:(List.map(fun(item:Overlay.child_member)->F.block ~data:(record item.block) ~revision:(Overlay.Block_state_revision.to_string item.revision))items)
         ~next:(next next_cursor)))
-    |Child_members{parent;_}->with_snapshot ~paged:true(fun snapshot record limit->
+    |Child_members{parent;_}->with_snapshot(fun snapshot record limit->
       match Database.get_structure snapshot(Overlay.Children{parent;limit;cursor})with
       |Error error->Error(typed_read_error error)
       |Ok(Page_tree_result _)->fail Invalid_request "The children query returned a page tree."
@@ -1535,14 +1504,14 @@ let read_typed
         ~revision_scope:(revision_scope_to_protocol revision_scope) ~scope_revision:(Overlay.Scope_revision.to_string scope_revision)
         ~items:(List.map(fun(item:Overlay.child_member)->Worker_pure_data.{value=record item.block;revision=Overlay.Block_state_revision.to_string item.revision})items)
         ~next:(next next_cursor)))
-    |Tree{page;maximum_depth;_}->with_snapshot ~paged:true(fun snapshot record limit->
+    |Tree{page;maximum_depth;_}->with_snapshot(fun snapshot record limit->
       match Database.get_structure snapshot(Overlay.Page_tree{page;maximum_depth;limit;cursor})with
       |Error error->Error(typed_read_error error)
       |Ok(Children_result _)->fail Invalid_request "The page-tree query returned children."
       |Ok(Page_tree_result{items;next_cursor;_})->Ok(F.slice
         ~items:(List.map(fun(item:Overlay.tree_member)->Worker_pure_data.{value=record item.block;revision=Overlay.Block_state_revision.to_string item.revision;
           depth=item.depth;parent=item.parent})items) ~next:(next next_cursor)))
-    |Favorites _->with_snapshot ~paged:true(fun snapshot _ limit->
+    |Favorites _->with_snapshot(fun snapshot _ limit->
       Database.get_favorites snapshot ~limit ~cursor |>Result.map_error typed_read_error |>Result.map(fun (result:Overlay.favorites_result)->
         let items=List.map(fun(item:Overlay.favorite_item)->
           let target=match item.target with
@@ -1553,15 +1522,15 @@ let read_typed
             membership_revision=Overlay.Block_state_revision.to_string item.membership_revision;target})result.items in
         F.favorites ~favorites_page:result.favorites_page ~items ~next:(next result.next_cursor)
           ~generation:(Overlay.Generation.to_string result.version.generation) ~projection_revision:(Overlay.Projection_revision.to_string result.version.projection_revision)))
-    |Task_statuses _->with_snapshot ~paged:true(fun snapshot _ limit->
+    |Task_statuses _->with_snapshot(fun snapshot _ limit->
       Database.get_task_statuses snapshot ~limit ~cursor |>Result.map_error typed_read_error |>Result.map(fun (result:Overlay.task_status_catalog_result)->
         F.task_status_catalog ~property_uuid:result.property_uuid ~default_status:result.default_status ~items:result.items ~next:(next result.next_cursor)))
-    |Task_status_definitions ids->with_snapshot ~paged:false(fun snapshot _ _->Database.get_task_status_definitions snapshot ids |>Result.map_error typed_read_error)
-    |Asset_descriptors ids->with_snapshot ~paged:false(fun snapshot _ _->
+    |Task_status_definitions ids->with_snapshot(fun snapshot _ _->Database.get_task_status_definitions snapshot ids |>Result.map_error typed_read_error)
+    |Asset_descriptors ids->with_snapshot(fun snapshot _ _->
       Database.get_asset_descriptors snapshot ids |>Result.map_error typed_read_error |>Result.map(fun items->
         let version=Database.snapshot_version snapshot in F.asset_listing ~items ~next:None
           ~generation:(Overlay.Generation.to_string version.generation) ~projection_revision:(Overlay.Projection_revision.to_string version.projection_revision)))
-    |Assets{recursive;roots;_}->with_snapshot ~paged:true(fun snapshot _ limit->
+    |Assets{recursive;roots;_}->with_snapshot(fun snapshot _ limit->
       Database.get_assets_under_roots snapshot ~recursive ~roots ~limit ~cursor |>Result.map_error typed_read_error |>Result.map(fun (result:Database.asset_page)->
         let version=Database.snapshot_version snapshot in F.asset_listing ~items:result.assets ~next:(next result.next_cursor)
           ~generation:(Overlay.Generation.to_string version.generation) ~projection_revision:(Overlay.Projection_revision.to_string version.projection_revision))) : (a,Read.error)result))
@@ -1840,67 +1809,58 @@ let acknowledge_change_batch t ~registration ~scope ~(batch:Read.change_batch) ~
         Ok(Read.For_worker.change_ack ~ack_owner:owner ~generation:batch.generation ~through:batch.through))
 ;;
 
-let run_durable_mutation t ~(scope:Sync.graph_scope) ~request_id ~intent ~current =
-  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
-  let fail error=Protocol.failed ~request_id error in
-  match Wire.restore ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id intent with
-  | Error message->Wire.Rejected(failure {Protocol.api_version=Protocol.api_version;request_id;command=Protocol.V2_graph_info}
-      Invalid_request message)
-  | Ok wire->
-    let request=Protocol.{api_version;request_id;command=Wire.command wire} in
-    if t.stopped || not(current()) then Wire.Unknown else
-    match attached_session t scope with
-    | None->Wire.Unknown
-    | Some session->
-      let existing ()=Database.find_local_intent session.database ~namespace:(Wire.namespace wire)
-        ~mutation_id:(Wire.mutation_id wire) in
-      let matching prepared=Database.local_intent_payload prepared=intent in
-      let reject error=Wire.Rejected(fail(local_commit_error error)) in
-      let prepare ()=match existing() with
-        | Error _->Error Wire.Unknown
-        | Ok(Some prepared) when matching prepared->Ok prepared
-        | Ok(Some _)->Error(reject Overlay.Mutation_identity_conflict)
-        | Ok None->
-          let append_title=match request.command with
-            | Protocol.V2_append_journal{journal_day;_}->
-              (match Database.current_snapshot session.database with
-               | Error _->Error Wire.Unknown
-               | Ok snapshot->Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
-                 match Database.graph_info snapshot with
-                 | Error _->Error Wire.Unknown
-                 | Ok info->Ok(Some(journal_append_title info.journal_title_format journal_day))))
-            | _->Ok None in
-          Result.bind append_title(fun append_title->
-            match local_mutation ?append_title request.command with
-            | Error message->Error(Wire.Rejected(failure request Unsupported_semantics message))
-            | Ok(raw,mutation)->
-              match parse_preconditions raw with
-              | Error message->Error(Wire.Rejected(failure request Conflict message))
-              | Ok expected->
-                match Database.persist_local_intent session.database ~namespace:(Wire.namespace wire)
-                  ~payload:intent ~expected mutation with
-                | Ok prepared->Ok prepared
-                | Error(Overlay.Invalid_local_mutation _ as error)
-                | Error(Overlay.Mutation_identity_conflict as error)->
-                  (* Concurrent first preparations may sample different formats;
-                     only the one exact stored wire wins, never a new intent. *)
-                  (match existing() with
-                   | Ok(Some prepared) when matching prepared->Ok prepared
-                   | _->Error(reject error))
-                | Error _->Error Wire.Unknown) in
-      match prepare() with
-      | Error outcome->outcome
-      | Ok prepared->
-        if t.stopped || not(current()) then Wire.Unknown else
-        match Database.commit_local_intent session.database prepared with
-        | Error _->
-          (match Database.inspect_local_intent session.database prepared with
-           | Ok(Database.Intent_rejected error)->reject error|_->Wire.Unknown)
-        | Ok proof->Wire.Committed(response request(committed_outcome(Database.intent_commit_outcome proof)))
+let run_durable_mutation t ~(scope:Sync.graph_scope) ~intent ~current =
+  let module Mutation=Logseq_db_worker_contract.Worker_pure_mutation in
+  if not(mutation_owner_matches scope intent)then
+    Mutation.Rejected(worker_error ~code:Invalid_request "Durable intent logical owner does not match")
+  else if t.stopped || not(current())then Mutation.Unknown else
+  match attached_session t scope with
+  |None->Mutation.Unknown
+  |Some session->
+    let payload=Mutation.encode intent in
+    let existing()=Database.find_local_intent session.database ~namespace:(Mutation.namespace intent)
+      ~mutation_id:(Mutation.mutation_id intent)in
+    let matching prepared=Database.local_intent_payload prepared=payload in
+    let reject error=Mutation.Rejected(local_commit_error error)in
+    let prepare()=match existing()with
+      |Error _->Error Mutation.Unknown
+      |Ok(Some prepared)when matching prepared->Ok prepared
+      |Ok(Some _)->Error(reject Overlay.Mutation_identity_conflict)
+      |Ok None->
+        let append_title=match intent with
+          |Mutation.Append_intent append->
+            (match Database.current_snapshot session.database with
+             |Error _->Error Mutation.Unknown
+             |Ok snapshot->Fun.protect ~finally:(fun()->Database.release_snapshot snapshot)(fun()->
+               match Database.graph_info snapshot with
+               |Error _->Error Mutation.Unknown
+               |Ok info->Ok(Some(journal_append_title info.journal_title_format
+                  (Logseq_db_worker_contract.Worker_pure_day.value(Mutation.append_parameters append).day)))))
+          |Mutation.Mutation_intent _->Ok None in
+        Result.bind append_title(fun append_title->
+          let raw,mutation=local_mutation ?append_title intent in
+          match parse_preconditions raw with
+          |Error message->Error(Mutation.Rejected(worker_error ~code:Conflict message))
+          |Ok expected->
+            match Database.persist_local_intent session.database ~namespace:(Mutation.namespace intent)
+              ~payload ~expected mutation with
+            |Ok prepared->Ok prepared
+            |Error(Overlay.Invalid_local_mutation _ as error)
+            |Error(Overlay.Mutation_identity_conflict as error)->
+              (match existing()with Ok(Some prepared)when matching prepared->Ok prepared|_->Error(reject error))
+            |Error _->Error Mutation.Unknown)in
+    match prepare()with
+    |Error outcome->outcome
+    |Ok prepared->
+      if t.stopped || not(current())then Mutation.Unknown else
+      match Database.commit_local_intent session.database prepared with
+      |Error _->(match Database.inspect_local_intent session.database prepared with
+        |Ok(Database.Intent_rejected error)->reject error|_->Mutation.Unknown)
+      |Ok proof->Mutation.Committed(commit_proof(Database.intent_commit_outcome proof))
 ;;
 
-let durable_mutation t ~scope ~request_id ~intent ~current =
-  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+let durable_mutation t ~scope ~intent ~current =
+  let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
   match reserve_writer t scope with
   |Error _->Wire.Unknown
   |Ok job->
@@ -1919,19 +1879,21 @@ let durable_mutation t ~scope ~request_id ~intent ~current =
             Fun.protect ~finally:(fun()->
               Eio.Semaphore.release t.durable_slots;finish_writer t job)
               (fun()->
-                let outcome=try run_durable_mutation t ~scope ~request_id ~intent ~current with _->Wire.Unknown in
+                let outcome=try run_durable_mutation t ~scope ~intent ~current with _->Wire.Unknown in
                 ignore(Eio.Promise.try_resolve resolve outcome:bool)));
           submitted:=true);
         Eio.Promise.await promise)
 ;;
 
 let confirm_mutation_unfenced t ~(scope:Sync.graph_scope) ~read:(Read.Read_query(budget,query) as read) ~intent ~original ~current =
-  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
   let fail message=Read.For_worker.answer budget query(Error(Read.Db_error
     (Logseq_db_worker_contract.Error.create ~code:Conflict ~message ~details:[]|>Result.get_ok)))in
-  match Wire.restore ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id intent with
-  |Error message->fail message
-  |Ok wire->
+  match mutation_owner_matches scope intent with
+  |false->fail "Durable intent logical owner does not match"
+  |true->
+    let wire=intent in
+    let payload=Wire.encode intent in
     if t.stopped || not(current())then fail "The confirmation presentation retired."else
     match attached_session t scope with
     |None->fail "The scoped database is no longer attached."
@@ -1944,7 +1906,7 @@ let confirm_mutation_unfenced t ~(scope:Sync.graph_scope) ~read:(Read.Read_query
       let checked=Result.bind(Database.find_local_intent session.database ~namespace:(Wire.namespace wire)
         ~mutation_id:(Wire.mutation_id wire))(function
         |None->Error Overlay.Mutation_identity_conflict
-        |Some prepared when Database.local_intent_payload prepared<>intent->Error Overlay.Mutation_identity_conflict
+        |Some prepared when Database.local_intent_payload prepared<>payload->Error Overlay.Mutation_identity_conflict
         |Some prepared->Database.inspect_local_intent session.database prepared)in
       match checked with
       |Ok(Database.Intent_committed proof)->
@@ -1964,8 +1926,8 @@ let confirm_mutation t ~scope ~read:(Read.Read_query(budget,query) as read) ~int
     (fun()->confirm_mutation_unfenced t ~scope ~read ~intent ~original ~current)
 ;;
 
-let recover_mutations_unfenced t ~(scope:Sync.graph_scope) ~request_id ~after ~maximum_items ~maximum_bytes ~current =
-  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+let recover_mutations_unfenced t ~(scope:Sync.graph_scope) ~after ~maximum_items ~maximum_bytes ~current =
+  let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
   let fail error=Error(Logseq_db_worker_contract.Error.message(local_commit_error error)) in
   if maximum_items<=0 || maximum_items>256 || maximum_bytes<=0
      || maximum_bytes>Wire.maximum_recovery_bytes || Option.exists(fun after->after<=0L)after
@@ -1996,11 +1958,9 @@ let recover_mutations_unfenced t ~(scope:Sync.graph_scope) ~request_id ~after ~m
                | Ok resolution->
                  let outcome=match resolution with
                    | Database.Intent_pending->Wire.Unknown
-                   | Intent_rejected error->Wire.Rejected(Protocol.failed ~request_id (local_commit_error error))
-                   | Intent_committed proof->Wire.Committed(response
-                       {Protocol.api_version=Protocol.api_version;request_id;command=Wire.command wire}
-                       (committed_outcome(Database.intent_commit_outcome proof))) in
-                 let candidate=Wire.{items=Rrbvec.push_back items {intent;outcome};next=page.next} in
+                   | Intent_rejected error->Wire.Rejected(local_commit_error error)
+                   | Intent_committed proof->Wire.Committed(commit_proof(Database.intent_commit_outcome proof)) in
+                 let candidate=Wire.{items=Rrbvec.push_back items {intent=wire;outcome};next=page.next} in
                  if Wire.recovery_page_bytes candidate>maximum_bytes then
                    if Rrbvec.is_empty items then Error "A complete durable recovery item exceeds the byte budget"
                    else Ok Wire.{items;next=cursor}
@@ -2013,16 +1973,18 @@ let recover_mutations_unfenced t ~(scope:Sync.graph_scope) ~request_id ~after ~m
       else Ok page)
 ;;
 
-let recover_mutations t ~scope ~request_id ~after ~maximum_items ~maximum_bytes ~current =
-  with_writer t scope(fun()->recover_mutations_unfenced t ~scope ~request_id ~after ~maximum_items ~maximum_bytes ~current)
+let recover_mutations t ~scope ~after ~maximum_items ~maximum_bytes ~current =
+  with_writer t scope(fun()->recover_mutations_unfenced t ~scope ~after ~maximum_items ~maximum_bytes ~current)
 ;;
 
 let acknowledge_mutation_unfenced t ~(scope:Sync.graph_scope) ~intent ~original ~current =
-  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
   let fail error=Error(Logseq_db_worker_contract.Error.message(local_commit_error error)) in
-  match Wire.restore ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id intent with
-  | Error _->Error "Durable intent owner or payload is invalid"
-  | Ok wire->
+  match mutation_owner_matches scope intent with
+  | false->Error "Durable intent owner or payload is invalid"
+  | true->
+    let wire=intent in
+    let payload=Wire.encode intent in
     if t.stopped || not(current()) then Error "Durable acknowledgement authority retired" else
     match attached_session t scope with
     | None->Error "The scoped database is no longer attached."
@@ -2030,7 +1992,7 @@ let acknowledge_mutation_unfenced t ~(scope:Sync.graph_scope) ~intent ~original 
       (match Database.find_local_intent session.database ~namespace:(Wire.namespace wire) ~mutation_id:(Wire.mutation_id wire) with
        | Error error->fail error
        | Ok None->Error "No durable intent evidence is available"
-       | Ok(Some prepared) when Database.local_intent_payload prepared<>intent->Error "Durable intent identity does not match"
+       | Ok(Some prepared) when Database.local_intent_payload prepared<>payload->Error "Durable intent identity does not match"
        | Ok(Some prepared)->
          match Database.inspect_local_intent session.database prepared with
          | Error error->fail error
@@ -2353,7 +2315,7 @@ let recover_local_retirements ?on_diagnostic t (scope : Sync.graph_scope) =
       let expected = json |> member "expected" |> to_string |> Overlay.Mirror_generation.of_string |> Result.get_ok in
       let captured = json |> member "uploads" |> Logseq_db_storage.Asset_upload_store.captured_graph_of_yojson |> Result.get_ok in
       if not (Logseq_db_storage.Asset_upload_store.captured_graph_matches captured
-        ~namespace:(Logseq_db_worker_contract.Mutation_pure_wire.namespace_for_owner ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id)
+        ~namespace:(Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id)
         ~origin:(Uri.to_string scope.account.managed_sync_origin) ~account:scope.account.user_id ~graph:scope.graph_id)
       then failwith "Retirement journal account mismatch";
       let* prepared, generation = Database.prepare_mirror_deletion
@@ -2560,7 +2522,7 @@ let handle_sync_worker_effect t = function
         with_staging_lock t (fun () ->
           let* () = if current () then Ok () else Error "The graph account is no longer current." in
           let* captured = with_upload_store t (fun db -> Logseq_db_storage.Asset_upload_store.capture_graph db
-            ~namespace:(Logseq_db_worker_contract.Mutation_pure_wire.namespace_for_owner ~origin:request.account.managed_sync_origin ~user:request.account.user_id ~graph:request.graph_id)
+            ~namespace:(Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner ~origin:request.account.managed_sync_origin ~user:request.account.user_id ~graph:request.graph_id)
             ~origin:(Uri.to_string request.account.managed_sync_origin) ~account:request.account.user_id ~graph:request.graph_id)
             |> Result.map_error (fun source ->
               report (failure_detail ~source ~operation:"deleteMirror" ~reason:"persistenceFailed" ()); source) in
@@ -3625,7 +3587,7 @@ let prepare_import_unlocked
   in
   let* version = source_error "invalidRequest" (A.version ~checksum:(String.make 64 '0') ~file_type:request.file_type) in
   let* _ = source_error "invalidRequest" (prepare version 0L "validation.bin") in
-  let namespace=Logseq_db_worker_contract.Mutation_pure_wire.namespace_for_owner
+  let namespace=Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner
     ~origin:context.scope.account.managed_sync_origin ~user:context.scope.account.user_id ~graph:context.scope.graph_id in
   let input_owner:Logseq_db_storage.Asset_upload_store.Inputs.owner={namespace;
     origin=Uri.to_string context.scope.account.managed_sync_origin;account=context.scope.account.user_id;graph=context.scope.graph_id} in
@@ -3762,7 +3724,7 @@ let retain_imported_file t ~(scope : Sync.graph_scope) ~operation =
 ;;
 
 let import_input_owner (scope:Sync.graph_scope) : Logseq_db_storage.Asset_upload_store.Inputs.owner =
-  {namespace=Logseq_db_worker_contract.Mutation_pure_wire.namespace_for_owner
+  {namespace=Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner
      ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id;
    origin=Uri.to_string scope.account.managed_sync_origin;account=scope.account.user_id;graph=scope.graph_id}
 ;;

@@ -1,6 +1,5 @@
 module Read = Worker_pure_read
 module Graph = Logseq_db_types.Graph_types
-module Protocol = Logseq_db_worker.Protocol
 module Production_runtime = Journal_graph_runtime
 module W = Journal_worker_coordination.Worker_api
 
@@ -302,9 +301,9 @@ let test_status_conflict_refreshes_authoritative_block () =
   ignore(I.request session ~request_id operation |> Result.get_ok);
   let progress=match I.reply session ~request_id operation
     (Read_fixture.S.Coordination_mutation_result{request_id=mutation;
-      outcome=Logseq_db_worker_contract.Mutation_pure_wire.Rejected
-        (Protocol.failed ~request_id:mutation(Logseq_db_worker.Error.create ~code:Conflict
-          ~message:"The mutation precondition did not match." ~details:[]|>Result.get_ok))}) with
+      outcome=Logseq_db_worker_contract.Worker_pure_mutation.Rejected
+        (Logseq_db_worker.Error.create ~code:Conflict
+          ~message:"The mutation precondition did not match." ~details:[]|>Result.get_ok)}) with
     |Ok(W.Answered(Ok progress))->progress|_->Alcotest.fail "known conflict proof was not decoded" in
   let refresh = Runtime.receive_mutation runtime mutation progress
     |> fun output -> only "status conflict refresh" output.requests

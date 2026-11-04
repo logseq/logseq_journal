@@ -5,7 +5,6 @@ module Worker_runner = Logseq_db_worker_effect_runner.Effect_runner
 module Sync = Logseq_sync_pure_reducer.Core
 module Unlock = Sync
 module Sync_runner = Logseq_sync_effect_runner.Effect_runner
-module Protocol = Db.Protocol
 module Overlay = Logseq_overlay_db.Database
 module ID = Journal_worker_ids
 module Authorized_graphs = Set.Make (String)
@@ -370,17 +369,17 @@ type request =
       { registration : int64; owner : timeline_scope; request_id : Logseq_db_types.Graph_types.Uuid.t; batch : Worker_pure_read.change_batch }
   | Coordination_mutation of
       { registration : int64; owner : timeline_scope;
-        request_id : Logseq_db_types.Graph_types.Uuid.t; intent : string }
+        request_id : Logseq_db_types.Graph_types.Uuid.t; intent : Logseq_db_worker_contract.Worker_pure_mutation.durable_intent }
   | Coordination_confirm of
       { registration : int64; owner : timeline_scope; presentation : int64;
-        request_id : Logseq_db_types.Graph_types.Uuid.t; intent : string;
+        request_id : Logseq_db_types.Graph_types.Uuid.t; intent : Logseq_db_worker_contract.Worker_pure_mutation.durable_intent;
         original : string * string * string; read : Worker_pure_read.packed_query }
   | Coordination_recover_mutations of
       { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
         after:int64 option; maximum_items:int; maximum_bytes:int }
   | Coordination_acknowledge_mutation of
       { registration:int64; owner:timeline_scope; presentation:int64;
-        request_id:Logseq_db_types.Graph_types.Uuid.t; intent:string;
+        request_id:Logseq_db_types.Graph_types.Uuid.t; intent:Logseq_db_worker_contract.Worker_pure_mutation.durable_intent;
         original:(string * string * string) option }
   | Get_graph_state_at of timeline_scope
   | Asset_command_at of timeline_scope * asset_command
@@ -436,7 +435,7 @@ type response =
       {registration:int64;owner:asset_scope;request_id:Logseq_db_types.Graph_types.Uuid.t;consumer:string}
   | Coordination_mutations_recovered of
       { request_id:Logseq_db_types.Graph_types.Uuid.t;
-        page:Logseq_db_worker_contract.Mutation_pure_wire.recovery_page }
+        page:Logseq_db_worker_contract.Worker_pure_mutation.recovery_page }
   | Coordination_mutation_acknowledged of {request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_confirmed of
       {registration:int64;owner:timeline_scope;presentation:int64;request_id:Logseq_db_types.Graph_types.Uuid.t;
@@ -462,7 +461,7 @@ type response =
       }
   | Coordination_mutation_result of
       { request_id : Logseq_db_types.Graph_types.Uuid.t;
-        outcome : Logseq_db_worker_contract.Mutation_pure_wire.outcome }
+        outcome : Logseq_db_worker_contract.Worker_pure_mutation.outcome }
   | Coordination_registered of coordination_baseline
   | Coordination_released of int64
   | Local_copy_inspected of local_copy_request * (local_copy_presence, string) result
@@ -1407,7 +1406,7 @@ let create ~(dependencies : dependencies) =
                  id=scope.graph_id && generation=scope.graph_generation
                | _ -> false) in
             if not(authorized ()) then Error "Coordination account authority changed" else
-            let response=Db.durable_mutation_for_scope session.worker ~scope ~request_id ~intent
+            let response=Db.durable_mutation_for_scope session.worker ~scope ~intent
               ~current:authorized in
             if authorized () then Ok(Coordination_mutation_result{request_id;outcome=response}) else Error "Coordination binding retired")
       | Coordination_confirm {registration;owner;presentation;request_id;intent;original;read} ->
@@ -1430,9 +1429,9 @@ let create ~(dependencies : dependencies) =
            let current ()=Db.coordination_current session.worker ~registration && resolve owner=Some scope &&
              (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
            if not(current()) then Error "Durable recovery authority retired"
-           else if maximum_bytes>Logseq_db_worker_contract.Mutation_pure_wire.maximum_recovery_bytes
+           else if maximum_bytes>Logseq_db_worker_contract.Worker_pure_mutation.maximum_recovery_bytes
            then Error "Invalid durable recovery byte budget"
-           else Result.bind(Db.recover_mutations_for_scope session.worker ~scope ~request_id ~after
+           else Result.bind(Db.recover_mutations_for_scope session.worker ~scope ~after
              ~maximum_items ~maximum_bytes ~current)(fun page->
              if current() then Ok(Coordination_mutations_recovered{request_id;page})
              else Error "Durable recovery authority retired"))

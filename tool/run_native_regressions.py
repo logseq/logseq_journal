@@ -1,63 +1,20 @@
 #!/usr/bin/env python3
-"""Run the registered worker/mutation fixtures through compiled public APIs."""
+"""Run the Worker Service and effect-runner regressions through their public APIs."""
 
-import json
 from pathlib import Path
-import shutil
 import subprocess
-import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TARGETS = (
+    "test/worker_coordination_runtime_test.exe",
+    "logseq_db_worker/test/test_effect_runner.exe",
+)
 
 
 def main():
-    subprocess.run(
-        ["dune", "build", "app/app.cmxa",
-         "logseq_overlay_db/test/logseq_overlay_db_test_support.cmxa"],
-        cwd=ROOT, check=True,
-    )
-    lines = []
-    for target in ("app", "logseq_overlay_db/test"):
-        lines.extend(subprocess.check_output(
-            ["dune", "ocaml", "top", target], cwd=ROOT, text=True,
-        ).splitlines())
-    includes = []
-    libraries = []
-    for line in dict.fromkeys(lines):
-        if line.startswith("#directory "):
-            path = Path(json.loads(line[len("#directory "):-2]))
-            if not path.is_absolute():
-                path = ROOT / path
-            includes.extend(["-I", str(path)])
-            if path.name == "byte":
-                includes.extend(["-I", str(path.with_name("native"))])
-        elif line.startswith("#load "):
-            path = Path(json.loads(line[len("#load "):-2]))
-            if not path.is_absolute():
-                path = ROOT / path
-            if "/native_backend/" not in str(path):
-                libraries.append(str(path.with_suffix(".cmxa")))
-    # `dune ocaml top` may refresh byte interfaces after the first native build.
-    # Rebuild the native libraries that will actually be linked against them.
-    native_targets = []
-    build_root = ROOT / "_build" / "default"
-    for library in libraries:
-        path = Path(library)
-        if path.is_relative_to(build_root):
-            native_targets.append(str(path.relative_to(build_root)))
-    subprocess.run(["dune", "build", *native_targets], cwd=ROOT, check=True)
-    with tempfile.TemporaryDirectory(prefix="journal-native-regression-") as directory:
-        directory = Path(directory)
-        source = ROOT / "test/macos_mutation_runtime_test.ml"
-        shutil.copyfile(source, directory / source.name)
-        executable = directory / "regression.exe"
-        subprocess.run(
-            ["ocamlopt", "-thread", "-w", "-58", *includes, *libraries,
-             source.name, "-o", str(executable)],
-            cwd=directory, check=True,
-        )
-        subprocess.run([str(executable)], cwd=ROOT, check=True)
+    for target in TARGETS:
+        subprocess.run(["dune", "exec", target], cwd=ROOT, check=True)
 
 
 if __name__ == "__main__":

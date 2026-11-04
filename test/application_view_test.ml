@@ -74,7 +74,6 @@ let fixture_with_scope (manager:Service.state) =
 
 let fixture_coordination ?account ?(version=1L) ?(phase=Logseq_db_worker.Graph_open) (manager:Service.state) registration =
   let module C=Logseq_sync_pure_reducer.Core in
-  let module P=Logseq_db_worker.Protocol in
   let manager=fixture_with_scope manager in
   let scopes=manager.snapshot.resident_scopes in
   let limits=C.limits ~maximum_response_bytes:Worker_pure_data.maximum_response_bytes
@@ -636,7 +635,6 @@ let run_favorites_native_visibility
       ()
   =
   let module W = Logseq_db_worker_lui.Journal_worker in
-  let module P = Logseq_db_worker.Protocol in
   let module G = Logseq_db_types.Graph_types in
   let uuid n =
     G.Uuid.of_string (Printf.sprintf "82000000-0000-4000-8000-%012d" n) |> Result.get_ok
@@ -663,7 +661,7 @@ let run_favorites_native_visibility
       local_mutation=uuid(ordinal+200);metadata_mutation=uuid(ordinal+300);replace_reference=None;
       source_file="/isolated-picker/recorded-source.bin";
       title=(if prepared then "Prepared attachment input" else "Unknown attachment input");file_type="bin"} in
-    let namespace=Logseq_db_worker_contract.Mutation_pure_wire.namespace_for_owner
+    let namespace=Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner
       ~origin:owner.account.managed_sync_origin ~user:owner.account.user_id ~graph:owner.graph_id in
     let input=A.Pure_intent.create ~namespace source |> Result.get_ok |> A.Pure_intent.encode in
     let proof=if not prepared then None else Some(U.prepare ~operation_id:source.operation
@@ -1011,8 +1009,6 @@ let run_favorites_native_visibility
           (Atomic.get coordination_registration);Ok()
       |_->Error "Unsupported host change in this UI fixture") in
   let durable_outcomes = Hashtbl.create 8 in
-  let durable_intent intent = Logseq_db_worker_contract.Mutation_pure_wire.restore
-    ~origin:(Uri.of_string "https://example.invalid") ~user:"fixture" ~graph:(uuid 900) intent |> Result.get_ok in
   let latest_error_manager = Atomic.make manager in
   let service =
     W.Service.create
@@ -1072,21 +1068,17 @@ let run_favorites_native_visibility
               (Service.Coordination_updates[Service.Coordination_snapshot
                 (coordination_baseline(Option.get(Atomic.get coordination_registration)))]));
           Error "Fixture acknowledgement failed after UI application") else
-        let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+        let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
         let cached=match request with
           | Service.Coordination_mutation{request_id;intent;_} ->
-            Option.map(fun outcome->
-              let rebind=function P.V2_response value->P.V2_response{value with request_id} in
-              Service.Coordination_mutation_result{request_id;outcome=(match outcome with
-                | Wire.Committed response->Wire.Committed(rebind response)
-                | Rejected response->Rejected(rebind response)|Unknown->Unknown)})
-              (Hashtbl.find_opt durable_outcomes intent)
+            Option.map(fun outcome->Service.Coordination_mutation_result{request_id;outcome})
+              (Hashtbl.find_opt durable_outcomes (Wire.encode intent))
           | Coordination_acknowledge_mutation{request_id;intent;original;_}->
-            (match Hashtbl.find_opt durable_outcomes intent,original with
+            (match Hashtbl.find_opt durable_outcomes (Wire.encode intent),original with
              | Some(Wire.Rejected _),None->()
-             | Some(Committed(P.V2_response{outcome=V2_mutation_committed point;_})),Some(g,b,a)->
+             | Some(Committed point),Some(g,b,a)->
                Alcotest.(check bool) "ACK uses original proof" true
-                 ((g,b,a)=(point.generation,point.before_projection_revision,point.after_projection_revision))
+                 ((g,b,a)=(point.generation,point.before,point.after))
              | _->failwith "ACK without known settled proof");
             Some(Service.Coordination_mutation_acknowledged{request_id})
           | _->None in
@@ -1526,12 +1518,12 @@ let run_favorites_native_visibility
           let count=min maximum_items (21-offset) in
           let items=Rrbvec.init count (fun index ->
             let mutation_id=uuid (20000+offset+index) in
-            let intent=Wire.create ~origin:(Uri.of_string "https://example.invalid")
+            let intent=Wire.create_mutation ~mutation_id ~origin:(Uri.of_string "https://example.invalid")
               ~user:"fixture" ~graph:(uuid 900)
-              (P.V2_save_block {mutation_id;block=uuid 1;title="Never replay recovery";
+              (Wire.Save_block {block=uuid 1;title="Never replay recovery";
                 preconditions={blocks=[uuid 1,"block-detail-1"];pages=[];scopes=[]}})
               |> Result.get_ok in
-            Wire.{intent=Wire.encode intent;outcome=Unknown}) in
+            Wire.{intent=Wire.Mutation_intent intent;outcome=Unknown}) in
           let page=Wire.{items;next=(if offset+count<21 then Some(Int64.of_int(offset+count)) else None)} in
           if Wire.recovery_page_bytes page>maximum_bytes then Error "Fixture recovery byte budget"
           else Ok(Service.Coordination_mutations_recovered{request_id;page})
@@ -1714,12 +1706,17 @@ let run_favorites_native_visibility
           Ok(Service.Coordination_confirmed{registration=source.registration;owner=source.owner;
             presentation=source.presentation;request_id=source.request_id;answer=Read.For_worker.answer budget query result})
         |Coordination_mutation source->
+          let committed mutation_id=Wire.Committed(Wire.For_worker.commit ~mutation_id
+            ~status:Worker_pure_data.V2_applied ~generation:"generation:v1:1:1"
+            ~before:"projection:v1:0" ~after:"projection:v1:1")in
+          let rejected code message=Wire.Rejected(Logseq_db_worker.Error.create
+            ~code ~message ~details:[] |> Result.get_ok)in
           let commit_status mutation_id block value =
             if detail_capture=Some "status-rejected" then (
               Alcotest.(check bool) "status failure belongs to the already inserted child"true
                 (List.exists(fun(_,root)->root.Worker_pure_data.uuid=block)(Atomic.get detail_captures));
               Atomic.set status_writes(Atomic.get status_writes @ [value]);
-              P.V2_failed{code="invalidRequest";message="Fixture child status rejected"})else (
+              rejected (Invalid_request) ("Fixture child status rejected"))else (
             Alcotest.(check string) "status mutation keeps target UUID"
               (G.Uuid.to_string (uuid 1)) (G.Uuid.to_string block);
             Atomic.set status_writes (Atomic.get status_writes @ [ value ]);
@@ -1727,14 +1724,29 @@ let run_favorites_native_visibility
               Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
             done;
             if status_scenario = Some "failure"
-            then P.V2_failed { code = (if durable_status=Some `Conflict then "conflict" else "invalid-request"); message = "Fixture status write failed" }
+            then rejected ((if durable_status=Some `Conflict then Conflict else Invalid_request)) ("Fixture status write failed")
             else (
               Atomic.set status_value value;
-              P.V2_mutation_committed { mutation_id; status = Worker_pure_data.V2_applied; generation = "g"
-                ; before_projection_revision = "p"; after_projection_revision = "p2" }))
+              committed (mutation_id)))
           in
-          let outcome=match Wire.command(durable_intent source.intent)with
-            | P.V2_delete_blocks { root; mutation_id; preconditions }
+          let mutation_id=Wire.mutation_id source.intent in
+          let outcome=match source.intent with
+            |Wire.Append_intent append when check_capture_imports->
+              let value=Wire.append_parameters append in
+              let candidate=value.page and root=value.root in
+              let journal_day=Logseq_db_worker_contract.Worker_pure_day.value value.day in
+
+              Atomic.incr capture_append_writes;
+              Alcotest.(check int) "the full attachment-only capture has one root" 0(Rrbvec.length root.children);
+              let captured={page with uuid=uuid 94321;name=string_of_int journal_day;
+                title="Web-created journal page";kind=Journal_page{journal_day}} in
+              Alcotest.(check bool) "canonical Web page differs from candidate" true (candidate<>captured.uuid);
+              Atomic.set capture_page(Some captured);
+              Atomic.set capture_root(Some{uuid=root.block_id;title=root.title;children=[]});
+              committed (mutation_id)
+
+            |Wire.Mutation_intent intent->(match Wire.mutation_command intent with
+            | Wire.Delete_blocks { root; preconditions }
               when Option.is_some delete_scenario ->
               Alcotest.(check string) "delete keeps target UUID"
                 (G.Uuid.to_string (uuid 1)) (G.Uuid.to_string root);
@@ -1747,11 +1759,9 @@ let run_favorites_native_visibility
                 Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
               done;
               if delete_scenario = Some "failure" then
-                P.V2_failed { code = Logseq_db_worker.Error.code_string
-                  (if durable_delete=Some `Conflict then Conflict else Invalid_request); message = "Fixture delete failed" }
-              else P.V2_mutation_committed { mutation_id; status = Worker_pure_data.V2_applied; generation = "g"
-                ; before_projection_revision = "p"; after_projection_revision = "p2" }
-            | V2_set_task_status { mutation_id; block; status; _ }
+                rejected ((if durable_delete=Some `Conflict then Conflict else Invalid_request)) ("Fixture delete failed")
+              else committed (mutation_id)
+            | Wire.Set_task_status { block; status; _ }
               when Option.is_some status_scenario || detail_capture=Some "status-rejected" ->
               let value =
                 List.find_map
@@ -1761,10 +1771,10 @@ let run_favorites_native_visibility
                 |> Option.value ~default:(G.Uuid.to_string status)
               in
               commit_status mutation_id block (Some value)
-            | V2_clear_task_status { mutation_id; block; _ }
+            | Wire.Clear_task_status { block; _ }
               when Option.is_some status_scenario || detail_capture=Some "status-rejected" ->
               commit_status mutation_id block None
-            | V2_insert_blocks { mutation_id; parent; roots = [ root ]; _ }
+            | Wire.Insert_blocks { parent; roots = [ root ]; _ }
               when Option.is_some detail_capture ->
 
               Atomic.incr child_attempts;
@@ -1773,30 +1783,11 @@ let run_favorites_native_visibility
               done;
               if detail_capture = Some "failure" && Atomic.get child_attempts = 1
               then
-                V2_failed
-                  { code = Logseq_db_worker.Error.code_string Invalid_request
-                  ; message = "Fixture child write failed" }
+                rejected (Invalid_request) ("Fixture child write failed")
               else (
                 Atomic.set detail_captures (Atomic.get detail_captures @ [ parent, root ]);
-                V2_mutation_committed
-                  { mutation_id
-                  ; status = Worker_pure_data.V2_applied
-                  ; generation = "g"
-                  ; before_projection_revision = "p"
-                  ; after_projection_revision = "p2"
-                  })
-            | V2_append_journal{mutation_id;page=candidate;journal_day;root} when check_capture_imports ->
-
-              Atomic.incr capture_append_writes;
-              Alcotest.(check int) "the full attachment-only capture has one root" 0(Rrbvec.length root.children);
-              let captured={page with uuid=uuid 94321;name=string_of_int journal_day;
-                title="Web-created journal page";kind=Journal_page{journal_day}} in
-              Alcotest.(check bool) "canonical Web page differs from candidate" true (candidate<>captured.uuid);
-              Atomic.set capture_page(Some captured);
-              Atomic.set capture_root(Some{uuid=root.block_id;title=root.title;children=[]});
-              V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="g";
-                before_projection_revision="p";after_projection_revision="p2"}
-            | V2_insert_blocks { mutation_id; parent; roots = [ root ]; _ }
+                committed (mutation_id))
+            | Wire.Insert_blocks { parent; roots = [ root ]; _ }
               when check_capture_imports ->
               let page = Atomic.get capture_page |> Option.get in
               Alcotest.(check string)
@@ -1804,22 +1795,11 @@ let run_favorites_native_visibility
                 (G.Uuid.to_string page.uuid)
                 (G.Uuid.to_string parent);
               Atomic.set capture_root (Some root);
-              V2_mutation_committed
-                { mutation_id
-                ; status = Worker_pure_data.V2_applied
-                ; generation = "g"
-                ; before_projection_revision = "p"
-                ; after_projection_revision = "p2"
-                }
-            | _ -> V2_failed { code = "unsupported"; message = "Unused fixture command" }
+              committed (mutation_id)
+            | _ -> rejected Unsupported_semantics "Unused fixture command")
+            |Wire.Append_intent _->rejected Unsupported_semantics "Unused fixture Append"
           in
-          let response=P.V2_response{api_version=2;request_id=source.request_id;outcome}in
-          let outcome=match outcome with
-            |P.V2_mutation_committed point->Wire.Committed(P.V2_response{api_version=2;request_id=source.request_id;
-              outcome=V2_mutation_committed{point with generation="generation:v1:1:1";
-                before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"}})
-            |_->Wire.Rejected response in
-          Hashtbl.replace durable_outcomes source.intent outcome;
+          Hashtbl.replace durable_outcomes (Wire.encode source.intent) outcome;
           Ok(Service.Coordination_mutation_result{request_id=source.request_id;
             outcome=(if (durable_case=Some `Unknown||capture_case=Some `Unknown||edit_pending)
               && Atomic.get typed_status_mutations=1 then Wire.Unknown else outcome)})))
@@ -4623,8 +4603,9 @@ let run_favorites_native_visibility
              wait "late original ACK preserves the edited native draft"(fun()->
                Option.is_some(find "text" "New draft while original settles"));
              Alcotest.(check bool) "original durable payload never uses the newer buffer" true
-               (List.for_all(fun encoded->match Logseq_db_worker_contract.Mutation_pure_wire.command(durable_intent encoded)with
-                 |P.V2_append_journal{root;_}->root.title="First attachment"|_->false)(Atomic.get typed_status_intents)));
+               (List.for_all(fun intent->match intent with
+                 |Logseq_db_worker_contract.Worker_pure_mutation.Append_intent append->
+                   (Logseq_db_worker_contract.Worker_pure_mutation.append_parameters append).root.title="First attachment"|_->false)(Atomic.get typed_status_intents)));
            Alcotest.(check int) "canonical Capture was ACKed before imports" (if capture_case=Some `Ack_failed then 2 else 1)
              (Atomic.get typed_status_acks);
            if List.mem capture_case [Some `Closed_import;Some `Closed_failed_import] then (
@@ -5071,7 +5052,6 @@ let run_favorites_native_visibility
    controlled service, without a database, native host, or cloud peer. *)
 let test_reference_outer_terminals cancel =
   let module W = Logseq_db_worker_lui.Journal_worker in
-  let module P = Logseq_db_worker.Protocol in
   let module G = Logseq_db_types.Graph_types in
   let uuid n =
     G.Uuid.of_string (Printf.sprintf "83000000-0000-4000-8000-%012d" n) |> Result.get_ok
@@ -5688,7 +5668,6 @@ let test_detail_page_property_value_presentation () =
    data; Runtime discovery itself is covered by its pure owner regressions. *)
 let test_favorite_page_uses_shared_reference_lookup () =
   let module W = Logseq_db_worker_lui.Journal_worker in
-  let module P = Logseq_db_worker.Protocol in
   let module G = Logseq_db_types.Graph_types in
   let uuid n = G.Uuid.of_string
     (Printf.sprintf "86000000-0000-4000-8000-%012d" n) |> Result.get_ok in
@@ -5809,7 +5788,6 @@ let test_favorite_page_uses_shared_reference_lookup () =
 
 let test_favorites_compact_shared_titles () =
   let module G=Logseq_db_types.Graph_types in
-  let module P=Logseq_db_worker.Protocol in
   let id n=G.Uuid.of_string (Printf.sprintf "85000000-0000-4000-8000-%012d" n) |> Result.get_ok in
   let items=List.init 2 (fun n ->
     {Worker_pure_data.membership_uuid=id (n+1);membership_order=string_of_int n;membership_revision="m";
@@ -7336,7 +7314,6 @@ let test_graph_picker_controls scenario () =
   let held_close=List.mem scenario[`Remove_reopen;`Remove_select;`Remove_cancel;`Remove_failure;`Remove_sign_out] in
   let resident_scenario=List.mem scenario [`Current;`Remove;`Remove_current;`Remove_reopen;`Remove_select;`Remove_cancel;`Remove_failure;`Remove_sign_out;`Replace;`Sign_out;`Terminate;`Automatic_auth;`Automatic_direct;`Automatic_stop] in
   let module W = Logseq_db_worker_lui.Journal_worker in
-  let module P = Logseq_db_worker.Protocol in
   let uuid n = Logseq_db_types.Graph_types.Uuid.of_string
       (Printf.sprintf "94000000-0000-4000-8000-%012d" n) |> Result.get_ok in
   let first = uuid 1 and second = uuid 2 in
@@ -8231,7 +8208,6 @@ let test_retired_feed_failure_does_not_publish_diagnostics projection =
 module Admission_fixture = struct
   module Worker=Logseq_db_worker_lui.Journal_worker
   module Id=Journal_worker_ids.Worker.Request_id
-  module Protocol=Logseq_db_worker.Protocol
   type t={owner:Journal_worker_admission.t;sent:Service.request list ref;
     refused:(Service.request*Worker.send_result)list ref;results:Worker.send_result list ref}
   let create () =

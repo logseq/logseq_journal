@@ -1,6 +1,5 @@
 module Config = Logseq_db_worker_contract.Config
 module Error = Logseq_db_worker_contract.Error
-module Protocol = Logseq_db_worker_contract.Protocol
 module Pure_reducer = Logseq_db_worker_pure_reducer.Core
 module Effect_runner = Logseq_db_worker_effect_runner.Effect_runner
 
@@ -112,8 +111,8 @@ val retain_imported_file
 val read_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
   -> Worker_pure_read.packed_query -> Worker_pure_read.answer
 val durable_mutation_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> request_id:Logseq_db_types.Graph_types.Uuid.t -> intent:string
-  -> current:(unit -> bool) -> Logseq_db_worker_contract.Mutation_pure_wire.outcome
+  -> intent:Logseq_db_worker_contract.Worker_pure_mutation.durable_intent
+  -> current:(unit -> bool) -> Logseq_db_worker_contract.Worker_pure_mutation.outcome
 val graph_scopes : t -> Logseq_sync_pure_reducer.Core.graph_scope list
 val graph_state_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> graph_state option
 
@@ -137,15 +136,15 @@ val revoke_coordination : t -> unit
 val coordination_presentation_current : t -> registration:int64 -> presentation:int64
   -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> bool
 val confirm_mutation_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> read:Worker_pure_read.packed_query -> intent:string
+  -> read:Worker_pure_read.packed_query -> intent:Logseq_db_worker_contract.Worker_pure_mutation.durable_intent
   -> original:(string * string * string) -> current:(unit -> bool) -> Worker_pure_read.answer
 
 val recover_mutations_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> request_id:Logseq_db_types.Graph_types.Uuid.t -> after:int64 option
+  -> after:int64 option
   -> maximum_items:int -> maximum_bytes:int -> current:(unit -> bool)
-  -> (Logseq_db_worker_contract.Mutation_pure_wire.recovery_page,string) result
+  -> (Logseq_db_worker_contract.Worker_pure_mutation.recovery_page,string) result
 val acknowledge_mutation_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> intent:string -> original:(string * string * string) option
+  -> intent:Logseq_db_worker_contract.Worker_pure_mutation.durable_intent -> original:(string * string * string) option
   -> current:(unit -> bool) -> (unit,string) result
 
 (** Query registrations share the real scoped DB owner. Initial sampling uses

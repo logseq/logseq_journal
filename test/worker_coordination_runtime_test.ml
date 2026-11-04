@@ -5,7 +5,6 @@ module Mailbox = Logseq_db_worker_lui.Journal_worker
 module Runtime = Logseq_db_worker_lui.Journal_worker_runtime
 module Id = Journal_worker_ids
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
-module P = Logseq_db_worker.Protocol
 module T = Logseq_db_worker_test_support.Test_support
 module Sync = Logseq_sync_pure_reducer.Core
 module SR = Logseq_sync_effect_runner.Effect_runner
@@ -41,7 +40,7 @@ let mutation_request client baseline owner registration ~request_id ~mutation_id
   let session=Read.For_worker.read_budget_owner budget in
   let intent=W.mutation_intent session ~mutation_id command |> Result.get_ok in
   Service.Coordination_mutation{registration;owner;request_id;
-    intent=Bytes.to_string(W.encode_durable_intent(W.Mutation_intent intent))}
+    intent=W.Mutation_intent intent}
 
 let second_graph = uuid "9c000000-0000-4000-8000-000000000003"
 let client_id = uuid "9c000000-0000-4000-8000-000000000001"
@@ -288,6 +287,7 @@ let with_client_sessions
       ?(favorites = false)
       ?(assets = false)
       ?(statuses = false)
+      ?change_max_items
       ?(prepare = fun _ -> ())
       f
   =
@@ -333,7 +333,8 @@ let with_client_sessions
           (Logseq_overlay_db.Database.dependencies
              ~epoch_ms
              ~monotonic_ns:(fun () -> 1L)
-             ~limits:(Logseq_overlay_db.Database.dependency_limits fixture.overlay)
+             ~limits:(let limits=Logseq_overlay_db.Database.dependency_limits fixture.overlay in
+               match change_max_items with None->limits|Some change_max_items->{limits with change_max_items})
            |> Result.get_ok)
         ~crypto
         ~secrets
@@ -352,8 +353,8 @@ let with_client_sessions
     Fun.protect ~finally:stop (fun () -> f start))
 ;;
 
-let with_client ?epoch_ms ?favorites ?assets ?statuses ?prepare f =
-  with_client_sessions ?epoch_ms ?favorites ?assets ?statuses ?prepare
+let with_client ?epoch_ms ?favorites ?assets ?statuses ?change_max_items ?prepare f =
+  with_client_sessions ?epoch_ms ?favorites ?assets ?statuses ?change_max_items ?prepare
     (fun start -> f (start ()))
 ;;
 
@@ -1756,13 +1757,6 @@ let test_read_completion_rechecks_graph_owner () =
                value.baseline.state.residents
            | _ -> false);
          let owner = Option.get (Option.get !baseline).baseline.state.sync.selected in
-         let req suffix command =
-           { P.api_version = P.api_version
-           ; request_id =
-               W.Uuid.of_string ("99000000-0000-4000-8000-" ^ suffix) |> Result.get_ok
-           ; command
-           }
-         in
          let read=send(query_request client !baseline owner registration
            (uuid "99000000-0000-4000-8000-000000000001") ~maximum_bytes:Worker_pure_data.maximum_response_bytes
            (Read.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None})) in
@@ -1774,31 +1768,15 @@ let test_read_completion_rechecks_graph_owner () =
            | _ -> failwith "race fixture block missing"
          in
          Atomic.set armed true;
-         let mutation_request =
-           req
-             "000000000002"
-             (P.V2_save_block
-                { mutation_id = uuid "99000000-0000-4000-8000-000000000003"
-                ; block = Test_support.authoritative_block_uuid
-                ; title = "Synthetic held writer"
-                ; preconditions =
-                    { blocks = [ Test_support.authoritative_block_uuid, revision ]
-                    ; pages = []
-                    ; scopes = []
-                    }
-                })
-         in
-         let module Wire = Logseq_db_worker_contract.Mutation_pure_wire in
-         let wire =
-           Wire.create
-             ~origin:(Uri.of_string "https://api.logseq.io")
-             ~user:"user-1"
-             ~graph:Test_support.graph_uuid
-             mutation_request.command
-           |> Result.get_ok
-         in
+         let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
+         let wire=Wire.create_mutation ~origin:(Uri.of_string "https://api.logseq.io")
+           ~user:"user-1" ~graph:Test_support.graph_uuid
+           ~mutation_id:(uuid "99000000-0000-4000-8000-000000000003")
+           (Wire.Save_block{block=Test_support.authoritative_block_uuid;title="Synthetic held writer";
+             preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}})
+           |>Result.get_ok |>fun intent->Wire.Mutation_intent intent in
          let writer=send(Service.Coordination_mutation{registration;owner;
-           request_id=mutation_request.request_id;intent=Wire.encode wire})in
+           request_id=uuid "99000000-0000-4000-8000-000000000002";intent=wire})in
          wait (fun () -> Atomic.get entered);
          let read=send(query_request client !baseline owner registration
            (uuid "99000000-0000-4000-8000-000000000004") Read.Graph_info)in
@@ -1852,8 +1830,8 @@ let test_read_completion_rechecks_graph_owner () =
                (Service.Coordination_mutation
                   { registration
                   ; owner = next_owner
-                  ; request_id = (req "000000000004" P.V2_graph_info).request_id
-                  ; intent = Wire.encode wire
+                  ; request_id = uuid "99000000-0000-4000-8000-000000000004"
+                  ; intent = wire
                   })
            in
            wait (fun () -> Hashtbl.mem responses retry);
@@ -1861,16 +1839,15 @@ let test_read_completion_rechecks_graph_owner () =
            | Completed
                (Service.Coordination_mutation_result
                   { outcome =
-                      Wire.Committed
-                        (P.V2_response { outcome = P.V2_mutation_committed committed; _ })
+                      Wire.Committed committed
                   ; _
                   }) ->
              require
                (committed.status = Worker_pure_data.V2_applied)
                "unknown write replay invented Already_applied/current revision";
              require
-               (committed.before_projection_revision
-                <> committed.after_projection_revision)
+               (committed.before
+                <> committed.after)
                "unknown accepted write lost original commit evidence"
            | _ -> failwith "durable unknown did not reconcile across close/reopen")))
 ;;
@@ -2494,7 +2471,7 @@ let test_live_authority_invalidation_rebinds () =
 let test_changefeed_business_waits_for_ui_application () =
   let module Host = Journal_worker_coordination_host in
   let module Business = Journal_graph_runtime in
-  with_client (fun client ->
+  with_client ~statuses:true (fun client ->
     let jobs = Queue.create () in
     let process_notice=ref(fun (_:W.changefeed_notice)->()) in
     let previous_notice_view=ref None in
@@ -2511,17 +2488,17 @@ let test_changefeed_business_waits_for_ui_application () =
           Rrbvec.iter (fun notice-> !process_notice notice) notices)
       |> Result.get_ok
     in
-    let acks = ref 0 in
+    let acks = ref 0 and acknowledged_batches=Hashtbl.create 16 in
     Mailbox.on_event client (fun event ->
       let delivery = Host.on_event host event in
       match event, delivery.R.disposition with
       | ( Mailbox.Response
             { outcome =
                 Completed
-                  (Service.Coordination_changes_acknowledged{result=Ok _;_})
+                  (Service.Coordination_changes_acknowledged{result=Ok value;_})
             ; _
             }
-        , R.Consumed ) -> incr acks
+        , R.Consumed ) -> incr acks;Hashtbl.replace acknowledged_batches (W.change_ack_through value) ()
       | _ -> ());
     let pump () =
       Mailbox.Private.deliver client ~max_events:64;
@@ -2585,16 +2562,29 @@ let test_changefeed_business_waits_for_ui_application () =
     and notices = ref 0
     and generation = ref 1000L
     and batch : W.change_batch option ref = ref None in
-    let ui responses =
+    let latest_blocks=Hashtbl.create 4 and delete_conflict=ref None and deleted=ref false in
+    let rec ui responses =
       List.iter
         (fun (response : Business.response) ->
            match response.payload with
+           | Business.Mutation_settled(intent,_,payload) ->
+             ui [{Business.payload}];
+             let ticket=Host.request host session(W.Acknowledge_intent intent) |> Result.get_ok in
+             Host.watch host ticket ~f:(function
+               | W.Answered(Ok())->Business.acknowledge_mutation business intent
+               | _->failwith "actual business mutation ACK failed")
            | Business.Detail_loaded { detail; _ } ->
+             Hashtbl.replace latest_blocks (Journal_model.id detail.root) detail.root;
              detail_loaded := true;
              ui_title := Some (Journal_model.source detail.root)
            | Children_reconciled detail ->
+             Hashtbl.replace latest_blocks (Journal_model.id detail.root) detail.root;
              ui_title := Some (Journal_model.source detail.root)
-           | Block_updated { block; _ } -> ui_title := Some (Journal_model.source block)
+           | Block_updated { block; _ } ->
+             Hashtbl.replace latest_blocks (Journal_model.id block) block;
+             ui_title := Some (Journal_model.source block)
+           | Delete_conflict{block;_}->delete_conflict:=Some block
+           | Subtree_deleted _->deleted:=true
            | Rejected _ | Feed_failed _ | Open_failed _
            | Task_statuses_changed { error = Some _; _ } ->
              if !expected_failure
@@ -2655,8 +2645,24 @@ let test_changefeed_business_waits_for_ui_application () =
           match reply with
           | W.Answered (Ok value) -> finished request None origin (Business.Changes_acknowledged value)
           | _ -> failwith "real typed Changes business ACK failed")
-      | Some (Business.Confirm_readback _) -> failwith "Changes dispatch became mutation confirmation"
-      | None -> failwith "Changes business flow fell back to legacy transport"
+      | Some (Business.Confirm_readback read) ->
+        let ticket=Host.reconcile_mutation host ~presentation:read.presentation read.intent |> Result.get_ok in
+        Host.watch_read host ticket ~f:(fun origin->function
+          | W.Answered(Ok(W.Confirmed confirmation))->
+            (match W.confirmation_primary confirmation with
+             | W.Confirmed_block summary->finished request application origin(Business.Query_result(read.query,summary))
+             | _->failwith "business confirmation target missing")
+          | _->failwith "business canonical read failed")
+      | None ->
+        let presentation=Option.get(Option.bind(C.projection(Host.view host))W.selected) in
+        let intent=Business.worker_intent business request session |> Result.get_ok in
+        require(Business.bind_mutation business request ~presentation ~intent) "business intent did not bind";
+        let rec watch ticket=Host.watch host ticket ~f:(function
+          | W.Answered(Ok(W.Committed_pending_presentation _))->
+            watch(Host.reconcile_mutation host ~presentation intent |> Result.get_ok)
+          | W.Answered(Ok progress)->deliver(Business.receive_mutation business request progress)
+          | _->failwith "actual business mutation did not settle") in
+        watch(Host.reconcile_mutation host ~presentation intent |> Result.get_ok)
     and finished request application origin result =
       let application, discard =
         match result with
@@ -2792,18 +2798,69 @@ let test_changefeed_business_waits_for_ui_application () =
     require
       (C.change_application_error (Host.view host) (Option.get !batch) = None)
       "real applied consumers retained a failure";
-    let before = !acks in
+    (* Original Capture/reconcile/status and stale-delete combinations, using
+       the production business reducer and the actual typed Service throughout. *)
+    let operation : type a. a W.request -> a = fun request->
+      let ticket=Host.request host session request |> Result.get_ok in
+      let result=ref None in Host.watch host ticket ~f:(fun reply->result:=Some reply);
+      wait(fun()-> !result<>None);
+      match Option.get !result with W.Answered(Ok value)->value|_->failwith "combination fixture failed" in
+    let target=uuid "9d000000-0000-4000-8000-000000008000" in
+    let target_id=W.Uuid.to_string target in
+    let append=W.append_intent session ~mutation_id:(uuid "9d000000-0000-4000-8000-000000008001")
+      ~block_id:target ~day:(W.journal_day 20260902 |> Result.get_ok) ~title:"Captured regression block"
+      ~task_status:None ~children:Rrbvec.empty |> Result.get_ok in
+    let receipt=match operation(W.Append append)with W.Committed_pending_presentation value->value|_->failwith "capture seed failed" in
+    let presentation=Option.get(Option.bind(C.projection(Host.view host))W.selected)in
+    ignore(operation(W.Confirm(presentation,receipt)));
+    ignore(operation(W.Acknowledge_intent(W.Append_intent append)));
+    deliver(Business.submit business(Load_detail{block_id=target_id;after=None;limit=32;request_generation=910L}));
+    wait(fun()->Hashtbl.mem latest_blocks target_id);
+    let save_target n title=
+      let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
+      let revision=match operation(W.Query(budget,W.Outline_block{uuid=target;revision=None}))with
+        |Worker_pure_data.V2_present_block value->value.revision|_->failwith "captured target missing" in
+      let intent=W.mutation_intent session ~mutation_id:(uuid(Printf.sprintf "9d000000-0000-4000-8000-%012d" n))
+        (W.Save_block{block=target;title;preconditions={blocks=[target,revision];pages=[];scopes=[]}}) |> Result.get_ok in
+      match operation(W.Mutate intent)with W.Committed_pending_presentation _->()|_->failwith "concurrent target save failed" in
+    save_target 8002 "Reconciled capture";
+    wait(fun()->Journal_model.source(Hashtbl.find latest_blocks target_id)="Reconciled capture");
+    let reconciled=Hashtbl.find latest_blocks target_id in
+    let actual=operation(W.Query((W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok),
+      W.Outline_block{uuid=target;revision=None}))in
+    require(match actual with Worker_pure_data.V2_present_block value->value.revision=Journal_model.revision reconciled|_->false)
+      "changefeed reconciliation emitted an obsolete target revision";
+    write 5 "Unrelated target change";
+    let status=Test_support.status_uuid 3 in
+    deliver(Business.submit business(Set_task_state{mutation_id="9d000000-0000-4000-8000-000000008003";
+      block_id=target_id;expected_revision=Journal_model.revision reconciled;task_state=Journal_model.Status(W.Uuid.to_string status)}));
+    wait(fun()->Journal_model.task_state(Hashtbl.find latest_blocks target_id)=Journal_model.Status(W.Uuid.to_string status));
+    let stale=Hashtbl.find latest_blocks target_id in
+    save_target 8004 "Concurrent edit before delete deadline";
+    let deletion revision id=Business.submit business(Delete_subtree{mutation_id=id;block_id=target_id;expected_revision=revision})in
+    deliver(deletion(Journal_model.revision stale)"9d000000-0000-4000-8000-000000008005");
+    wait(fun()-> !delete_conflict<>None);
+    let refreshed=Option.get !delete_conflict in
+    require(Journal_model.source refreshed="Concurrent edit before delete deadline")
+      "delete conflict retained stale canonical source";
+    deliver(deletion(Journal_model.revision refreshed)"9d000000-0000-4000-8000-000000008006");
+    wait(fun()-> !deleted);
+    deliver(Business.submit business(Load_detail{block_id=W.Uuid.to_string Test_support.authoritative_block_uuid;
+      after=None;limit=1;request_generation=911L}));
+    wait(fun()-> !ui_title=Some "Unrelated target change");
     expected_failure := true;
     fail_budget_once := true;
     write 4 "Business change D";
     wait (fun () ->
       !saw_failure && Option.exists(fun value->C.change_application_error(Host.view host)value<>None)!batch);
-    require (!acks = before) "an actual failed read acknowledged its unapplied window";
+    let failed_batch=Option.get !batch in
+    require(not(Hashtbl.mem acknowledged_batches failed_batch.through))
+      "an actual failed read acknowledged its unapplied window";
     active := false;
     ui_title := None;
     detail_loaded := false;
     Business.reset business;
-    wait (fun () -> !acks = before + 1);
+    wait (fun () -> Hashtbl.mem acknowledged_batches failed_batch.through);
     require
       (!ui_title = None)
       "retired consumer callbacks revived the discarded business scope";
@@ -2811,8 +2868,8 @@ let test_changefeed_business_waits_for_ui_application () =
     wait (fun () -> C.shutdown_state (Host.view host) = C.Stopped))
 ;;
 
-let with_observation_service ?epoch_ms ?prepare ?(observe_push=fun _->()) f =
-  with_client ?epoch_ms ?prepare (fun client ->
+let with_observation_service ?epoch_ms ?prepare ?change_max_items ?(observe_push=fun _->()) f =
+  with_client ?epoch_ms ?prepare ?change_max_items (fun client ->
     let replies = Hashtbl.create 16
     and baseline = ref None
     and notices = ref Rrbvec.empty in
@@ -2863,6 +2920,236 @@ let with_observation_service ?epoch_ms ?prepare ?(observe_push=fun _->()) f =
     f client ~call ~send ~wait ~replies ~notices ~baseline ~owner ~registration)
 ;;
 
+let prepare_enriched_read_data ~count ~title support =
+  let module Storage = Logseq_db_storage.Logseq_sqlite_storage in
+  let module Session = Logseq_db_storage.Storage_session in
+  let path =
+    Filename.concat
+      support
+      ("logseq-db-worker/synced-graphs/"
+       ^ W.Uuid.to_string Test_support.graph_uuid
+       ^ "/db.sqlite")
+  in
+  let connection = Storage.open_database path |> Result.get_ok in
+  let storage = Storage.datascript_storage connection in
+  let database = Storage.restore_database connection |> Result.get_ok in
+  let session =
+    Session.create
+      ~tail:(Datascript.Storage.restore_tail_groups storage)
+      ~callbacks:(Storage.connection_callbacks connection)
+  in
+  Fun.protect
+    ~finally:(fun () -> ignore (Session.close session))
+    (fun () ->
+       let open Datascript in
+       let tag = Temp_id "budget-tag" in
+       let page =
+         Lookup_ref ("block/uuid", Uuid (W.Uuid.to_string Test_support.page_uuid))
+       in
+       let changes =
+         Rrbvec.init count (fun n ->
+           let block = Temp_id ("budget-block-" ^ string_of_int n) in
+           [ Add
+               ( block
+               , "block/uuid"
+               , Uuid (W.Uuid.to_string (Test_support.mutation_uuid (10000 + n))) )
+           ; Add (block, "block/title", String "Small fixture body")
+           ; Add (block, "block/parent", Ref_to page)
+           ; Add (block, "block/page", Ref_to page)
+           ; Add (block, "block/order", String (Printf.sprintf "b%08d" n))
+           ; Add (block, "block/created-at", Int64 1704067200000L)
+           ; Add (block, "block/updated-at", Int64 1704067200000L)
+           ; Add (block, "block/tags", Ref_to tag)
+           ]
+           |> Rrbvec.of_list)
+         |> Rrbvec.concat_map Fun.id
+         |> Rrbvec.to_list
+       in
+       let staged =
+         Session.stage_transact
+           session
+           ~authoritative_before:database
+           (Add
+              (tag, "block/uuid", Uuid (W.Uuid.to_string (Test_support.mutation_uuid 9999)))
+            :: Add (tag, "block/name", String "budget-fixture-tag")
+            :: Add (tag, "block/title", String title)
+            :: changes)
+         |> Result.get_ok
+       in
+       Session.commit_staged session staged |> Result.get_ok)
+;;
+
+let service_read : type a.
+  (Service.request,Service.response,Service.push)Mailbox.client -> Service.coordination_baseline option -> Service.timeline_scope -> int64
+  -> call:(Service.request -> Service.response Mailbox.outcome)
+  -> request_id:W.Uuid.t -> maximum_items:int -> maximum_bytes:int -> a Read.query
+  -> (a,Read.error)result =
+  fun client baseline owner registration ~call ~request_id ~maximum_items ~maximum_bytes query->
+  let source=observation_read client baseline owner registration
+    ~maximum_items ~maximum_bytes query in
+  match call(Service.Coordination_query{registration;owner;request_id;read=source})with
+  |Mailbox.Completed(Service.Coordination_queried response)
+    when response.request_id=request_id && response.registration=registration && response.owner=owner->
+    let Read.Query_answer(actual_budget,actual_query,result)=response.answer in
+    (match Read.query_result_equality query actual_query with
+     |Some Read.Refl when Read.equal_packed_query source(Read.For_worker.pack_query actual_budget actual_query)->result
+     |_->failwith "Actual Service returned another query or budget")
+  |_->failwith "Actual typed Service read did not complete"
+;;
+
+let test_enriched_response_budget ()=
+  let title=String.make 4096 't'in
+  with_observation_service ~prepare:(prepare_enriched_read_data ~count:195 ~title)
+    (fun client ~call ~send:_ ~wait:_ ~replies:_ ~notices:_ ~baseline ~owner ~registration->
+      let module Ids=Set.Make(W.Uuid)in
+      let expected=List.init 195(fun n->Test_support.mutation_uuid(10000+n))
+        |>List.fold_left(fun set id->Ids.add id set)Ids.empty in
+      let serial=ref 41000 in
+      let read :type a. a Read.query->a=fun query->incr serial;
+        service_read client !baseline owner registration ~call
+          ~request_id:(Test_support.mutation_uuid !serial) ~maximum_items:200
+          ~maximum_bytes:Worker_pure_data.maximum_response_bytes query |> Result.get_ok in
+      let check_record seen (value:Worker_pure_data.block_record)=
+        if not(Ids.mem value.block.uuid expected)then seen else(
+          require(value.tag_titles=[title]) "adaptive page truncated enriched tag DTO";
+          require(not(Ids.mem value.block.uuid seen)) "adaptive structural pages repeated a member";
+          Ids.add value.block.uuid seen)in
+      let rec children after pages seen=
+        require(pages<16) "enriched children pagination did not terminate";
+        let query=Read.Child_members{parent=Test_support.page_uuid;after;revision=None}in
+        let value=read query in
+        require(Read.encoded_value_bytes query value<=Worker_pure_data.maximum_response_bytes)
+          "enriched children exceeded final DTO budget";
+        let seen=List.fold_left(fun seen(item:Worker_pure_data.child_member)->check_record seen item.value)seen value.items in
+        match value.next with
+        |None->require(pages>0 && Ids.equal seen expected) "adaptive children lost tagged members"
+        |Some _->require(value.next<>after) "child cursor did not advance";children value.next(pages+1)seen in
+      let rec tree after pages seen=
+        require(pages<16) "enriched Tree pagination did not terminate";
+        let query=Read.Tree{page=Test_support.page_uuid;maximum_depth=1;after;revision=None}in
+        let value=read query in
+        require(Read.encoded_value_bytes query value<=Worker_pure_data.maximum_response_bytes)
+          "enriched Tree exceeded final DTO budget";
+        let seen=List.fold_left(fun seen(item:Worker_pure_data.tree_member)->check_record seen item.value)seen value.items in
+        match value.next with
+        |None->require(pages>0 && Ids.equal seen expected) "adaptive Tree lost tagged members"
+        |Some _->require(value.next<>after) "Tree cursor did not advance";tree value.next(pages+1)seen in
+      children None 0 Ids.empty;tree None 0 Ids.empty)
+;;
+
+let test_encoded_utf8_budget_boundary ()=
+  let title=String.concat ""(List.init 300(fun _->"日\"\n"))in
+  with_observation_service ~prepare:(prepare_enriched_read_data ~count:1 ~title)
+    (fun client ~call ~send:_ ~wait:_ ~replies:_ ~notices:_ ~baseline ~owner ~registration->
+      let query=Read.Outline_block{uuid=Test_support.mutation_uuid 10000;revision=None}in
+      let read n maximum_bytes=service_read client !baseline owner registration ~call
+        ~request_id:(Test_support.mutation_uuid(42000+n)) ~maximum_items:1 ~maximum_bytes query in
+      let value=read 0 Worker_pure_data.maximum_response_bytes |> Result.get_ok in
+      (match value with Worker_pure_data.V2_present_block{value;_}->
+        require(value.tag_titles=[title]) "actual UTF-8 tag title was not resolved"|_->failwith "UTF-8 block missing");
+      let size=Read.encoded_value_bytes query value in
+      let exact=read 1 size |> Result.get_ok in
+      require(Read.encoded_value_bytes query exact=size) "exact final byte budget was not preserved";
+      require(match read 2(size-1)with Error Read.Response_budget_exceeded->true|_->false)
+        "UTF-8 plus escaped JSON N-1 did not fail explicitly")
+;;
+
+let test_canonical_target_summary_query ()=
+  let target = Test_support.mutation_uuid 16000 in
+  let prepare support=Eio_main.run(fun _->Eio.Switch.run(fun sw->
+    prepare_enriched_read_data ~count:1000 ~title:"Unrelated sibling tag" support;
+    let module D = Logseq_overlay_db.Database in
+    let module O = Logseq_overlay_db.Types in
+    let inspection =
+      D.inspect_mirror ~application_support_directory:support ~graph_id:Test_support.graph_uuid
+      |> Result.get_ok
+    in
+    let db =
+      D.open_
+        ~sw
+        (Test_support.dependencies ~behavior:"canonical target summary")
+        inspection
+        ~graph_name:"Target summary"
+      |> Result.get_ok
+    in
+    Fun.protect
+      ~finally:(fun () -> D.close db |> Result.get_ok)
+      (fun () ->
+         let children =
+           List.init 201 (fun n ->
+             O.
+               { uuid = Test_support.mutation_uuid (17000 + n)
+               ; title = Printf.sprintf "Canonical child %d" n
+               ; children = []
+               })
+         in
+         let expected =
+           Test_support.insert_precondition
+             db
+             ~parent:Test_support.page_uuid
+             ~behavior:"canonical target summary"
+         in
+         D.commit_local
+           db
+           ~expected
+           (O.Insert_blocks
+              { mutation_id = Test_support.mutation_uuid 15999
+              ; parent = Test_support.page_uuid
+              ; tree = { uuid = target; title = "Canonical target"; children }
+              ; asset = None
+              })
+         |> Result.get_ok
+         |> ignore)
+)) in
+  with_observation_service ~prepare
+    (fun client ~call ~send:_ ~wait:_ ~replies:_ ~notices:_ ~baseline ~owner ~registration->
+      let serial=ref 43000 in
+      let inspect ?(maximum_items=Worker_pure_data.default_page_size) ?(maximum_bytes=Worker_pure_data.maximum_response_bytes) after=
+        incr serial;let query=Read.Block_summary{block=target;after}in
+        let result=service_read client !baseline owner registration ~call
+          ~request_id:(Test_support.mutation_uuid !serial) ~maximum_items ~maximum_bytes query in
+        query,result in
+      let query,result=inspect ~maximum_items:200 ~maximum_bytes:16384 None in
+      let adapted=result |> Result.get_ok in
+      require(Read.encoded_value_bytes query adapted<=16384 && adapted.items<>[]
+        && List.length adapted.items<200 && Option.is_some adapted.next)
+        "metadata-heavy summary did not shrink complete DTOs with a real continuation";
+      List.iteri(fun index(item:Worker_pure_data.child_member)->
+        require(item.value.block.uuid=Test_support.mutation_uuid(17000+index)
+          && item.value.block.title=Printf.sprintf "Canonical child %d" index)
+          "adaptive target page truncated or skipped canonical DTO")adapted.items;
+      let _,first=inspect None in let first=Result.get_ok first in
+      require(List.length first.items=Worker_pure_data.default_page_size) "bounded direct summary children";
+      let revision=match first.lookup with
+        |Worker_pure_data.V2_present_block{value;revision}->
+          require(value.block.title="Canonical target") "canonical target title";revision
+        |_->failwith "canonical target missing"in
+      (match first.page with Some(Worker_pure_data.V2_present_page{page;_})->
+        require(page.uuid=Test_support.page_uuid) "owning page is canonical"|_->failwith "owning page missing");
+      let old_cursor=first.next in require(Option.is_some old_cursor) "target child continuation missing";
+      let rec collect count items (value:Read.block_summary)=
+        require(count<8 && List.length value.items<=Worker_pure_data.default_page_size) "summary pages lost their bound";
+        require(value.generation=first.generation && value.projection_revision=first.projection_revision)
+          "summary pages mixed snapshot versions";
+        let items=Rrbvec.append items(Rrbvec.of_list value.items)in
+        match value.next with
+        |None->count,items
+        |Some _->let _,next=inspect value.next in collect(count+1)items(Result.get_ok next)in
+      let pages,items=collect 1 Rrbvec.empty first in
+      require(pages=5 && Rrbvec.length items=201) "canonical summary did not return all 201 children";
+      Rrbvec.iteri(fun index(item:Worker_pure_data.child_member)->
+        require(item.value.block.uuid=Test_support.mutation_uuid(17000+index)) "canonical child order changed")items;
+      let request_id=Test_support.mutation_uuid 43999 in
+      require(match call(mutation_request client !baseline owner registration ~request_id ~mutation_id:request_id
+        (W.Save_block{block=target;title="Changed canonical title";
+          preconditions={blocks=[target,revision];pages=[];scopes=[]}}))with
+        |Mailbox.Completed(Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed _;_})->true
+        |_->false) "actual canonical target update failed";
+      let _,stale=inspect old_cursor in
+      require(match stale with Error(Read.Stale_read _)->true|_->false)
+        "old canonical continuation admitted a mixed projection")
+;;
+
 (* Pure registry retirement already passes; the defect is the absent production
    Db -> runner -> registry call after the actual unregister joins. Exercise that
    public Service boundary without injecting cleanup ACKs or registry state. *)
@@ -2892,25 +3179,27 @@ let test_service_writer_fence_waits_for_canceled_protected_commit () =
     1_700_000_000_000L in
   Fun.protect ~finally:(fun()->Atomic.set released true)(fun()->
     with_observation_service ~epoch_ms(fun client ~call ~send ~wait ~replies ~notices:_ ~baseline ~owner ~registration->
-      let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+      let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
       let id n=uuid(Printf.sprintf "9f000000-0000-4000-8000-%012d" (9000+n)) in
       let read owner n=call(query_request client !baseline owner registration(id n)
         (Read.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None}))in
       let revision=match read owner 1 with
         |Mailbox.Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_present_block{revision;_}));_})->revision
         |_->failwith "writer fence source read failed"in
-      let intent n title=Wire.create ~origin:(Uri.of_string "https://api.logseq.io") ~user:"user-1" ~graph:owner.graph_id
-        (P.V2_save_block{mutation_id=id n;block=Test_support.authoritative_block_uuid;title;
-          preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}) |> Result.get_ok in
+      let intent n title=Wire.create_mutation ~origin:(Uri.of_string "https://api.logseq.io")
+        ~user:"user-1" ~graph:owner.graph_id ~mutation_id:(id n)
+        (Wire.Save_block{block=Test_support.authoritative_block_uuid;title;
+          preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}})
+        |>Result.get_ok |>fun intent->Wire.Mutation_intent intent in
       let original=intent 2 "Protected writer actually committed" in
       Atomic.set armed true;
-      let writer=send(Service.Coordination_mutation{registration;owner;request_id=id 3;intent=Wire.encode original}) in
+      let writer=send(Service.Coordination_mutation{registration;owner;request_id=id 3;intent=original}) in
       wait(fun()->Atomic.get entered);
       Mailbox.cancel client ~request_id:writer;
       let scope=fst(List.find(fun((scope:Service.asset_scope),_)->scope.graph_id=owner.graph_id)
         (Option.get !baseline).baseline.state.residents) in
       let fence=send(Service.Coordination_quiesce_writers{registration;owner=scope;request_id=id 4}) in
-      let rejected=call(Service.Coordination_mutation{registration;owner;request_id=id 5;intent=Wire.encode(intent 6 "Must not enter held DB")}) in
+      let rejected=call(Service.Coordination_mutation{registration;owner;request_id=id 5;intent=intent 6 "Must not enter held DB"}) in
       require(match rejected with Mailbox.Completed(Service.Coordination_mutation_result{outcome=Wire.Unknown;_})->true|_->false)
         "writer fence admitted another durable operation into the held database";
       require(not(Hashtbl.mem replies fence)) "writer fence ACK preceded actual canceled protected commit";
@@ -3195,7 +3484,7 @@ let test_service_observation_lifecycle () =
        require
          (match write 3 revision "Observed write" with
           | Completed
-              (Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed _;_}) -> true
+              (Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed _;_}) -> true
           | _ -> false)
          "observation synthetic mutation failed";
        wait (fun () ->
@@ -3261,7 +3550,7 @@ let test_service_observation_lifecycle () =
        require
          (match write 5 current_revision "After observation release" with
           | Completed
-              (Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed _;_}) -> true
+              (Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed _;_}) -> true
           | _ -> false)
          "post-release synthetic write did not commit";
        for _ = 1 to 12 do
@@ -3346,7 +3635,7 @@ let test_service_empty_observation_is_retained () =
            roots=[{uuid=target;title="First observed block";children=[]}];
            preconditions={blocks=[];pages=[Test_support.page_uuid,page_revision];
              scopes=[Worker_pure_data.V2_children_scope Test_support.page_uuid,scope_revision]}})) with
-         |Completed(Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed _;_})->true
+         |Completed(Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed _;_})->true
          |_->false) "synthetic first insertion did not commit";
        wait (fun () ->
          Rrbvec.exists
@@ -3404,7 +3693,7 @@ let test_service_observation_read_failure_retains_interest () =
          require(match call(mutation_request _client !baseline owner registration ~request_id:(rid n) ~mutation_id:(rid(n+200))
            (W.Save_block{block=Test_support.authoritative_block_uuid;title;
              preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}))with
-           |Completed(Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed _;_})->true
+           |Completed(Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed _;_})->true
            |_->false) "synthetic observation recovery write failed" in
        let too_large = String.make (budget + 1024) 'L' in
        write 3 too_large;
@@ -3501,9 +3790,9 @@ let test_service_unallocated_observation_cleanup_after_close () =
 let test_service_unknown_recovery_is_read_only ?(large=false) () =
   let module D=Logseq_overlay_db.Database in
   let module Types=Logseq_overlay_db.Types in
-  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
   let mutation_id=uuid "9f000000-0000-4000-8000-000000000900" in
-  let encoded=ref "" in
+  let encoded=ref "" and pending=ref None in
   let prepare support=Eio_main.run(fun _->Eio.Switch.run(fun sw->
     let inspection=D.inspect_mirror ~application_support_directory:support ~graph_id:Test_support.graph_uuid |> Result.get_ok in
     let database=D.open_ ~sw (Test_support.dependencies ~behavior:"pending recovery fixture") inspection ~graph_name:"pending recovery" |> Result.get_ok in
@@ -3519,13 +3808,13 @@ let test_service_unknown_recovery_is_read_only ?(large=false) () =
         let root=Worker_pure_data.{uuid=uuid "9f000000-0000-4000-8000-000000000909";title="Never automatically replay";children} in
         let tree=Types.{uuid=root.uuid;title=root.title;children=List.map(fun (child:Worker_pure_data.block_tree)->
           {uuid=child.uuid;title=child.title;children=[]})children} in
-        P.V2_insert_blocks{mutation_id;parent=Test_support.authoritative_block_uuid;roots=[root];preconditions},
+        Wire.Insert_blocks{parent=Test_support.authoritative_block_uuid;roots=[root];preconditions},
         Types.Insert_blocks{mutation_id;parent=Test_support.authoritative_block_uuid;tree;asset=None})
-      else P.V2_save_block{mutation_id;block=Test_support.authoritative_block_uuid;title="Never automatically replay";preconditions},
+      else Wire.Save_block{block=Test_support.authoritative_block_uuid;title="Never automatically replay";preconditions},
         Types.Save_block{mutation_id;block=Test_support.authoritative_block_uuid;title="Never automatically replay"} in
-      let wire=Wire.create ~origin:(Uri.of_string "https://api.logseq.io") ~user:"user-1" ~graph:Test_support.graph_uuid command
-        |> Result.get_ok in
-      encoded:=Wire.encode wire;
+      let wire=Wire.create_mutation ~mutation_id ~origin:(Uri.of_string "https://api.logseq.io") ~user:"user-1" ~graph:Test_support.graph_uuid command
+        |> Result.get_ok |>fun intent->Wire.Mutation_intent intent in
+      pending:=Some wire;encoded:=Wire.encode wire;
       if large then require(String.length !encoded>Worker_pure_data.maximum_response_bytes && String.length !encoded<=Worker_pure_data.maximum_request_bytes)
         "large recovery fixture must be a valid intent exceeding the ordinary read cap";
       let expected=D.write_precondition ~blocks:[Test_support.authoritative_block_uuid,revision] ~pages:[] ~scopes:[] |> Result.get_ok in
@@ -3537,10 +3826,10 @@ let test_service_unknown_recovery_is_read_only ?(large=false) () =
       | Mailbox.Completed(Service.Coordination_mutations_recovered{page;_})->page
       | _->failwith "pending recovery failed" in
     let page=recover() in
-    require(Rrbvec.length page.items=1 && (Rrbvec.nth page.items 0).intent= !encoded
+    require(Rrbvec.length page.items=1 && Wire.encode(Rrbvec.nth page.items 0).intent= !encoded
       && (Rrbvec.nth page.items 0).outcome=Wire.Unknown) "recovery inferred a pending write outcome";
     require(match call(Service.Coordination_acknowledge_mutation{registration;owner;request_id;
-      presentation=(Option.get !baseline).baseline.presentation;intent= !encoded;original=None}) with
+      presentation=(Option.get !baseline).baseline.presentation;intent=Option.get !pending;original=None}) with
       | Mailbox.Failed _->true|_->false) "Unknown intent could be acknowledged away";
     require(Rrbvec.length(recover()).items=1) "Unknown ACK or recovery dropped pending identity";
     require(match call(query_request client !baseline owner registration request_id
@@ -3550,9 +3839,29 @@ let test_service_unknown_recovery_is_read_only ?(large=false) () =
       |_->false) "recovery automatically executed Unknown intent")
 ;;
 
+let prepare_reusable_asset support =
+  let module D=Logseq_overlay_db.Database in
+  let module O=Logseq_overlay_db.Types in
+  Eio_main.run(fun _->Eio.Switch.run(fun sw->
+    let inspection=D.inspect_mirror ~application_support_directory:support ~graph_id:Test_support.graph_uuid |> Result.get_ok in
+    let database=D.open_ ~sw (Test_support.dependencies ~behavior:"reusable asset") inspection ~graph_name:"reusable asset" |> Result.get_ok in
+    Fun.protect ~finally:(fun()->ignore(D.close database))(fun()->
+      let version=Logseq_db_types.Asset_descriptor.version ~checksum:(String.make 64 'a') ~file_type:"png" |> Result.get_ok in
+      let parent=Test_support.page_uuid in
+      let expected=Test_support.insert_precondition database ~parent ~behavior:"reusable asset" in
+      ignore(D.commit_local database ~expected(O.Insert_blocks{
+        mutation_id=Test_support.mutation_uuid 981;parent;
+        tree={uuid=Test_support.mutation_uuid 980;title="Reusable attachment";children=[]};
+        asset=Some{replace_reference=None;version;size=4L}}) |> Result.get_ok))))
+;;
+
 let test_service_durable_recovery_and_ack () =
-  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
-  with_observation_service(fun client ~call ~send:_ ~wait ~replies:_ ~notices:_ ~baseline ~owner ~registration->
+  let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
+  let changes=ref 0 in
+  let observe_push=function Service.Graph_push(Worker_pure_data.Changes_available _)->incr changes
+    |Graph_pushes values->List.iter(function _,Worker_pure_data.Changes_available _->incr changes|_->())values
+    |_->() in
+  with_observation_service ~prepare:prepare_reusable_asset ~observe_push(fun client ~call ~send:_ ~wait ~replies:_ ~notices:_ ~baseline ~owner ~registration->
     let id n=uuid(Printf.sprintf "9f000000-0000-4000-8000-%012d" n) in
     let owner=ref owner in
     let presentation ()=(Option.get !baseline).Service.baseline.presentation in
@@ -3568,17 +3877,18 @@ let test_service_durable_recovery_and_ack () =
       | _->failwith "real durable recovery did not return its bounded page" in
     require(Rrbvec.is_empty(page 1 None).items) "new fixture has unexpected pending intents";
     let rev,_=read 2 in
-    let intent n revision title=Wire.create ~origin:(Uri.of_string "https://api.logseq.io") ~user:"user-1"
-      ~graph:(!owner).graph_id (P.V2_save_block{mutation_id=id n;block=Test_support.authoritative_block_uuid;
-        title;preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}})
-      |> Result.get_ok in
+    let intent n revision title=Wire.create_mutation ~origin:(Uri.of_string "https://api.logseq.io")
+      ~user:"user-1" ~graph:(!owner).graph_id ~mutation_id:(id n)
+      (Wire.Save_block{block=Test_support.authoritative_block_uuid;title;
+        preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}})
+      |>Result.get_ok |>fun intent->Wire.Mutation_intent intent in
     let first=intent 10 rev "Durable first" in
     let mutate n intent=match call(Service.Coordination_mutation
-      {registration;owner= !owner;request_id=id n;intent=Wire.encode intent}) with
+      {registration;owner= !owner;request_id=id n;intent}) with
       | Mailbox.Completed(Service.Coordination_mutation_result{outcome;_})->outcome
       | _->failwith "durable lifecycle mutation did not settle" in
     let original=match mutate 11 first with
-      | Wire.Committed response->Wire.committed_point first ~request_id:(id 11) response |> Result.get_ok
+      | Wire.Committed response->Wire.committed_point first response |> Result.get_ok
       | _->failwith "first durable fixture write failed" in
     let rejected=intent 20 rev "Stale rejected" in
     require(match mutate 21 rejected with Wire.Rejected _->true|_->false) "stale durable write was not rejected";
@@ -3617,14 +3927,13 @@ let test_service_durable_recovery_and_ack () =
     let restored=collect 50 in
     require(Rrbvec.length restored=3) "reopening lost unsettled durable intents";
     let item=Rrbvec.fold_left(fun found (item:Wire.recovery_item)->
-      if item.intent=Wire.encode first then Some item else found)None restored |> Option.get in
+      if item.intent=first then Some item else found)None restored |> Option.get in
     let restored_point=match item.outcome with
-      | Wire.Committed response->(match response with P.V2_response{request_id;_}->
-        Wire.committed_point first ~request_id response |> Result.get_ok)
+      | Wire.Committed proof->Wire.committed_point first proof |> Result.get_ok
       | _->failwith "recovered commit lost original proof" in
     require(restored_point=original) "recovery rewrote original commit generation or revisions";
     let ack n presentation intent original=call(Service.Coordination_acknowledge_mutation
-      {registration;owner= !owner;presentation;request_id=id n;intent=Wire.encode intent;original}) in
+      {registration;owner= !owner;presentation;request_id=id n;intent;original}) in
     let proof=original.generation,original.before,original.after in
     require(match ack 60 old_presentation first(Some proof) with Mailbox.Failed _->true|_->false)
       "old presentation acknowledged a committed intent";
@@ -3634,7 +3943,7 @@ let test_service_durable_recovery_and_ack () =
       "wrong immutable proof acknowledged intent";
     require(Rrbvec.length(collect 70)=3) "invalid ACK removed recovery ownership";
     require(match call(Service.Coordination_confirm{registration;owner= !owner;presentation=presentation();
-      request_id=id 80;intent=Wire.encode first;original=proof;
+      request_id=id 80;intent=first;original=proof;
       read=observation_read client !baseline !owner registration ~maximum_items:Worker_pure_data.default_page_size
         ~maximum_bytes:(Option.get !baseline).limits.response_budget_bytes
         (Read.Block_summary{block=Test_support.authoritative_block_uuid;after=None})}) with
@@ -3650,9 +3959,29 @@ let test_service_durable_recovery_and_ack () =
     require(Rrbvec.length(collect 90)=1) "ACK removed the wrong intent or retained settled rows";
     let revision_before=read 7 in
     require(match mutate 100 first with Wire.Committed response->
-      Wire.committed_point first ~request_id:(id 100) response=Ok original|_->false)
+      Wire.committed_point first response=Ok original|_->false)
       "ACK deleted immutable original commit proof";
-    require(read 8=revision_before) "same-intent reconciliation after ACK replayed the write")
+    require(read 8=revision_before) "same-intent reconciliation after ACK replayed the write";
+    let block=Test_support.reference_source_uuid in
+    let revision=match call(query_request client !baseline !owner registration(id 110)
+      (Read.Outline_block{uuid=block;revision=None})) with
+      |Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_present_block{revision;_}));_})->revision
+      |_->failwith "asset reference source missing" in
+    let asset=Test_support.mutation_uuid 980 in
+    let linked=Wire.create_mutation ~origin:(Uri.of_string "https://api.logseq.io") ~user:"user-1"
+      ~graph:(!owner).graph_id ~mutation_id:(id 111)
+      (Wire.Set_asset_reference{block;previous=None;asset;
+        preconditions={blocks=[block,revision];pages=[];scopes=[]}}) |> Result.get_ok
+      |> fun value->Wire.Mutation_intent value in
+    let before= !changes in
+    require(match mutate 112 linked with Wire.Committed _->true|_->false)
+      "real Service did not execute asset reference mutation";
+    wait(fun()-> !changes>before);
+    require(match call(query_request client !baseline !owner registration(id 113)
+      (Read.Assets{roots=[block];recursive=false;after=None})) with
+      |Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Assets _,Ok page);_})->
+        List.exists(fun(value:Logseq_db_types.Asset_descriptor.t)->value.uuid=asset)page.items
+      |_->false) "real typed Assets read missed committed reference")
 ;;
 
 let test_service_changefeed_has_one_owner () =
@@ -3664,7 +3993,7 @@ let test_service_changefeed_has_one_owner () =
       |_,Worker_pure_data.Changes_available _->incr pulses
       |_,Worker_pure_data.Resync_required _->incr pulses;incr resyncs)values
     |_->() in
-  with_observation_service ~observe_push
+  with_observation_service ~change_max_items:16 ~observe_push
     (fun client ~call ~send:_ ~wait ~replies:_ ~notices:_ ~baseline ~owner ~registration ->
       let id n=uuid(Printf.sprintf "9d000000-0000-4000-8000-%012d" (6000+n)) in
       let active=ref registration in
@@ -3680,7 +4009,7 @@ let test_service_changefeed_has_one_owner () =
         require(match call(mutation_request client !baseline owner !active ~request_id:(id n) ~mutation_id:(id n)
           (W.Save_block{block=Test_support.authoritative_block_uuid;title;
             preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}))with
-          |Completed(Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed _;_})->true
+          |Completed(Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed _;_})->true
           |_->false) "real changefeed write failed";
         wait(fun()-> !pulses>before)in
       let pull registration n after : Read.change_batch = match query registration n(Read.Changes{generation;after})with
@@ -3693,6 +4022,9 @@ let test_service_changefeed_has_one_owner () =
           request_id=id n && Read.change_ack_generation value=batch.W.generation && Read.change_ack_through value=batch.through
         |_->false) "owned applied window did not receive its actual ACK"in
       let data(batch:W.change_batch)=batch.through,batch.windows,batch.next in
+      let empty=pull registration 12 None in
+      require(empty.windows=[] && empty.next=None) "fresh physical changefeed was not empty";
+      acknowledged registration 13 empty;
       write 20 "Owned change window A";
       let first=pull registration 1 None in
       require(first.windows<>[]) "actual write produced no retained change window";
@@ -3722,7 +4054,46 @@ let test_service_changefeed_has_one_owner () =
         |Completed(Service.Coordination_changes_acknowledged{result=Error(Read.Resync_required _);_})->true
         |_->false) "retention overflow fabricated ACK of discarded physical history";
       let recovered=pull replacement 3261 None in
+      require(List.for_all(fun(window:Worker_pure_data.change_window)->
+        not(List.exists(fun(old:Worker_pure_data.change_window)->old.id=window.id)held.windows))recovered.windows)
+        "overflow retained the discarded owned window";
       acknowledged replacement 3262 recovered;
+      require(match query replacement 3263(Read.Changes{generation;after=Some held.through})with
+        |Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Changes _,Error(Read.Resync_required _));_})->true
+        |_->false) "overflow admitted an obsolete physical cursor";
+      write 3264 "After retention reset";
+      let after_reset=pull replacement 3265 None in
+      require(List.length after_reset.windows=1) "retention reset swallowed or mixed the later publication";
+      acknowledged replacement 3266 after_reset;
+      (* The original oversized-publication case, through the actual Service. *)
+      for n=3300 to 3363 do write n(Printf.sprintf "Before explicit reset %d" n)done;
+      let old=pull replacement 3364 None in
+      let parent=Test_support.page_uuid in
+      let page_revision=match query replacement 3365(Read.Page{uuid=parent;revision=None})with
+        |Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Page _,Ok(Worker_pure_data.V2_present_page{revision;_}));_})->revision
+        |_->failwith "resync page missing" in
+      let scope_revision=match query replacement 3366(Read.Child_members{parent;after=None;revision=None})with
+        |Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Child_members _,Ok page);_})->page.scope_revision
+        |_->failwith "resync children scope missing" in
+      let before= !resyncs in
+      let roots=[Worker_pure_data.{uuid=id 3400;title="Resync tree";
+        children=List.init 32(fun n->{uuid=id(3401+n);title="Child";children=[]})}] in
+      require(match call(mutation_request client !baseline owner replacement ~request_id:(id 3440) ~mutation_id:(id 3440)
+        (W.Insert_blocks{parent;roots;preconditions={blocks=[];pages=[parent,page_revision];
+          scopes=[Worker_pure_data.V2_children_scope parent,scope_revision]}}))with
+        |Completed(Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed _;_})->true
+        |_->false) "oversized publication insertion failed";
+      wait(fun()-> !resyncs>before);
+      let cleared=pull replacement 3441 None in
+      require(cleared.windows=[] && cleared.next=None) "explicit resync retained obsolete windows";
+      acknowledged replacement 3443 cleared;
+      require(match query replacement 3442(Read.Changes{generation;after=Some old.through})with
+        |Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Changes _,Error(Read.Resync_required _));_})->true
+        |_->false) "explicit resync admitted a discarded cursor";
+      write 3444 "After explicit reset";
+      let later=pull replacement 3445 None in
+      require(List.length later.windows=1) "explicit resync swallowed the next publication";
+      acknowledged replacement 3446 later;
       ignore(call(Service.Release_coordination replacement)))
 ;;
 
@@ -3840,6 +4211,11 @@ let test_host_recovers_only_pending_import_sources () =
 ;;
 
 let () =
+  if Array.mem "--change-owner-only" Sys.argv then (
+    test_service_changefeed_has_one_owner();print_endline "Real Service changefeed owner cases passed";exit 0);
+  if Array.mem "--read-boundaries-only" Sys.argv then (
+    test_enriched_response_budget();test_encoded_utf8_budget_boundary();test_canonical_target_summary_query();
+    print_endline "Migrated real typed read boundary cases passed";exit 0);
   if Array.mem "--changes-application-only" Sys.argv then (
     test_changefeed_business_waits_for_ui_application(); print_endline "Real typed Changes application barrier passed"; exit 0);
   if Array.mem "--source-recovery-only" Sys.argv then (
@@ -3862,6 +4238,9 @@ let () =
   test_host_durable_recovery_confirmation_ack ();
   test_service_unknown_recovery_is_read_only ~large:true ();
   test_service_unknown_recovery_is_read_only ();
+  test_enriched_response_budget ();
+  test_encoded_utf8_budget_boundary ();
+  test_canonical_target_summary_query ();
   test_service_durable_recovery_and_ack ();
   test_visible_media_listing_uses_typed_reads ();
   test_offline_asset_scans_use_typed_reads ();

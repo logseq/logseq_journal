@@ -1,5 +1,4 @@
-module Protocol = Logseq_db_worker.Protocol
-module Wire = Logseq_db_worker_contract.Mutation_pure_wire
+module Mutation = Logseq_db_worker_contract.Worker_pure_mutation
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Import_wire=Logseq_db_types.Asset_import.Pure_intent
 
@@ -26,9 +25,9 @@ type capabilities =
   ; observations : bool
   }
 
-type append_intent = Wire.t
+type append_intent = Mutation.append_intent
 
-type mutation_command =
+type mutation_command = Mutation.mutation_command =
   | Save_block of
       { block : Uuid.t
       ; title : string
@@ -65,13 +64,11 @@ type mutation_command =
       ; preconditions : Worker_pure_data.preconditions
       }
 
-type mutation_intent = Wire.t
+type mutation_intent = Mutation.mutation_intent
 
-type durable_intent =
+type durable_intent = Mutation.durable_intent =
   | Append_intent of append_intent
   | Mutation_intent of mutation_intent
-
-let durable_wire = function Append_intent intent | Mutation_intent intent -> intent
 
 type receipt =
   { intent : durable_intent
@@ -109,7 +106,7 @@ type mutation_recovery_cursor =
 type recovered_mutation = { intent : durable_intent; progress : mutation_progress }
 type mutation_recovery = { items : recovered_mutation Rrbvec.t; next : mutation_recovery_cursor option }
 
-let maximum_mutation_recovery_bytes = Wire.maximum_recovery_bytes
+let maximum_mutation_recovery_bytes = Mutation.maximum_recovery_bytes
 
 type admission_error =
   | Full
@@ -314,80 +311,58 @@ let append_intent (session:session) ~mutation_id ~block_id ~day ~title ~task_sta
   let root:Worker_pure_data.append_node={block_id;title;task_status;children} in
   if not(Worker_pure_data.valid_append_node root) then Error(Invalid_input "Invalid bounded Append tree")
   else
-    let day=For_worker.journal_day_value day in
-    let digits=Printf.sprintf "%08d" day in
+    let digits=Printf.sprintf "%08d" (For_worker.journal_day_value day) in
     let page=Uuid.of_string(Printf.sprintf "00000001-%s-%s-0000-000000000000"
       (String.sub digits 0 4)(String.sub digits 4 4)) |> Result.get_ok in
-    Wire.create ~origin:(Uri.of_string (For_worker.binding_origin (For_worker.session_binding session))) ~user:(For_worker.binding_user (For_worker.session_binding session)) ~graph:(graph_id session)
-      (Protocol.V2_append_journal{mutation_id;page;journal_day=day;root})
+    Mutation.create_append ~mutation_id ~page ~day ~root ~origin:(Uri.of_string (For_worker.binding_origin (For_worker.session_binding session))) ~user:(For_worker.binding_user (For_worker.session_binding session)) ~graph:(graph_id session)
+
     |> Result.map_error(fun message->Invalid_input message)
 ;;
 
-let append_intent_id = Wire.mutation_id
-
-let wire_command ~mutation_id = function
-  | Save_block { block; title; preconditions } ->
-    Protocol.V2_save_block { mutation_id; block; title; preconditions }
-  | Insert_blocks { parent; roots; preconditions } ->
-    Protocol.V2_insert_blocks { mutation_id; parent; roots; preconditions }
-  | Delete_blocks { root; preconditions } ->
-    Protocol.V2_delete_blocks { mutation_id; root; preconditions }
-  | Create_journal { page; day; title; preconditions } ->
-    Protocol.V2_create_journal_page
-      { mutation_id; page; journal_day = For_worker.journal_day_value day; title; preconditions }
-  | Set_task_status { block; status; preconditions } ->
-    Protocol.V2_set_task_status { mutation_id; block; status; preconditions }
-  | Clear_task_status { block; preconditions } ->
-    Protocol.V2_clear_task_status { mutation_id; block; preconditions }
-  | Set_asset_reference { block; previous; asset; preconditions } ->
-    Protocol.V2_set_asset_reference { mutation_id; block; previous; asset; preconditions }
-;;
+let append_intent_id = Mutation.append_intent_id
 
 let mutation_intent (session : session) ~mutation_id command =
-  Wire.create
+  Mutation.create_mutation ~mutation_id
     ~origin:(Uri.of_string (For_worker.binding_origin (For_worker.session_binding session)))
     ~user:(For_worker.binding_user (For_worker.session_binding session))
     ~graph:(graph_id session)
-    (wire_command ~mutation_id command)
+    command
   |> Result.map_error (fun message -> Invalid_input message)
 ;;
 
-let mutation_intent_id = Wire.mutation_id
-let durable_intent_id intent = Wire.mutation_id (durable_wire intent)
-let encode_durable_intent intent = Bytes.of_string (Wire.encode (durable_wire intent))
+let mutation_intent_id = Mutation.mutation_intent_id
+let durable_intent_id intent = Mutation.mutation_id intent
+let encode_durable_intent intent = Bytes.of_string (Mutation.encode intent)
 let restore_durable_intent (session : session) bytes =
-  Wire.restore
+  Mutation.restore
     ~origin:(Uri.of_string (For_worker.binding_origin (For_worker.session_binding session)))
     ~user:(For_worker.binding_user (For_worker.session_binding session))
     ~graph:(graph_id session)
     (Bytes.to_string bytes)
-  |> Result.map (fun intent -> match Wire.command intent with
-    | Protocol.V2_append_journal _ -> Append_intent intent
-    | _ -> Mutation_intent intent)
   |> Result.map_error (fun message -> Invalid_input message)
 ;;
 
 let validate_intent (session:session) intent =
-  let namespace=Wire.namespace_for_owner ~origin:(Uri.of_string (For_worker.binding_origin (For_worker.session_binding session)))
+  let namespace=Mutation.namespace_for_owner ~origin:(Uri.of_string (For_worker.binding_origin (For_worker.session_binding session)))
     ~user:(For_worker.binding_user (For_worker.session_binding session)) ~graph:(graph_id session) in
-  if String.equal namespace (Wire.namespace(durable_wire intent)) then Ok ()
+  if String.equal namespace (Mutation.namespace intent) then Ok ()
   else Error(Invalid_input "Durable intent belongs to another logical graph")
 ;;
 
 let receipt_intent (receipt:receipt) = receipt.intent
 let receipt_mutation_id (receipt:receipt) = durable_intent_id receipt.intent
 let receipt_revisions receipt = receipt.generation, receipt.before, receipt.after
-let receipt_targets (receipt:receipt) = Wire.targets (durable_wire receipt.intent)
+let receipt_targets (receipt:receipt) = Mutation.targets receipt.intent
 
-let decode_mutation_receipt session ~request_id ~intent response =
+let decode_mutation_receipt session ~intent proof =
   Result.bind (validate_intent session intent) (fun () ->
-    if Protocol.encoded_response_bytes response > (For_worker.session_limits session).response_budget_bytes
+    if Mutation.commit_bytes proof > (For_worker.session_limits session).response_budget_bytes
     then Error Response_budget_exceeded
     else
-      Wire.committed_point (durable_wire intent) ~request_id response
+      Mutation.committed_point intent proof
       |> Result.map (fun point ->
         { intent
-        ; generation = point.Wire.generation
+        ; generation = point.Mutation.generation
         ; before = point.before
         ; after = point.after
         })
@@ -417,41 +392,34 @@ let validate_recovery session ~after ~maximum_items ~maximum_bytes =
   | Some _->Ok()
 ;;
 
-let decode_mutation_progress session ~request_id ~intent outcome =
+let decode_mutation_progress session ~intent outcome =
   Result.bind(validate_intent session intent)(fun()->match outcome with
-    | Wire.Unknown->Ok Outcome_unknown
-    | Wire.Committed response->decode_mutation_receipt session ~request_id ~intent response
-      |> Result.map(fun receipt->Committed_pending_presentation receipt)
-    | Wire.Rejected(Protocol.V2_response{api_version;request_id=actual;outcome=V2_failed{code;message}} as response)
-      when api_version=Protocol.api_version && Uuid.equal actual request_id->
-      if Protocol.encoded_response_bytes response>(For_worker.session_limits session).response_budget_bytes
-      then Error Response_budget_exceeded
-      else (match Logseq_db_worker.Error.code_of_string code with
-        | Some code ->
-          (match Logseq_db_worker.Error.create ~code ~message ~details:[] with
-           | Ok error->Ok(Rejected(Db_error error))
-           | Error _->Error(Protocol_mismatch "Invalid known mutation error"))
-        | None->Ok(Rejected(Service_failed(code^": "^message))))
-    | _->Error(Protocol_mismatch "Invalid known mutation rejection"))
+    |Mutation.Unknown->Ok Outcome_unknown
+    |Mutation.Committed proof->decode_mutation_receipt session ~intent proof
+      |>Result.map(fun receipt->Committed_pending_presentation receipt)
+    |Mutation.Rejected error->
+      if String.length(Yojson.Safe.to_string(Logseq_db_worker.Error.to_yojson error))
+        >(For_worker.session_limits session).response_budget_bytes
+      then Error Response_budget_exceeded else Ok(Rejected(Db_error error)))
 ;;
 
 module Mutation_ids=Set.Make(Uuid)
 
-let decode_recovery session ~request_id ~after ~maximum_items ~maximum_bytes (page:Wire.recovery_page) : (mutation_recovery,error)result =
+let decode_recovery session ~after ~maximum_items ~maximum_bytes (page:Mutation.recovery_page) : (mutation_recovery,error)result =
   Result.bind(validate_recovery session ~after ~maximum_items ~maximum_bytes)(fun()->
-    if Rrbvec.length page.items>maximum_items || Wire.recovery_page_bytes page>maximum_bytes
+    if Rrbvec.length page.items>maximum_items || Mutation.recovery_page_bytes page>maximum_bytes
     then Error Response_budget_exceeded
     else if Option.exists(fun next->next<=0L || Rrbvec.is_empty page.items
       || Option.exists(fun previous->next<=previous.after)after)page.next
     then Error(Protocol_mismatch "Durable recovery continuation did not advance")
     else
-      let decoded=Rrbvec.fold_left(fun result (item:Wire.recovery_item)->
+      let decoded=Rrbvec.fold_left(fun result (item:Mutation.recovery_item)->
         Result.bind result (fun(items,seen)->
-          Result.bind(restore_durable_intent session(Bytes.of_string item.intent))(fun intent->
+          Result.bind(validate_intent session item.intent)(fun()->let intent=item.intent in
             let id=durable_intent_id intent in
             if Mutation_ids.mem id seen then Error(Protocol_mismatch "Duplicate recovered intent identity") else
             Result.map(fun progress->Rrbvec.push_back items {intent;progress},Mutation_ids.add id seen)
-              (decode_mutation_progress session ~request_id ~intent item.outcome))))
+              (decode_mutation_progress session ~intent item.outcome))))
         (Ok(Rrbvec.empty,Mutation_ids.empty))page.items in
       Result.map(fun(items,_)->{items;next=Option.map(fun after->
         {recovery_owner=session;after;maximum_items;maximum_bytes})page.next})decoded)
@@ -523,7 +491,7 @@ let import_source_proof imported=imported.source_proof
 let import_source_proof_id proof=proof.source_operation
 let without_import_preview imported={imported with import_preview=None;import_receipt={imported.import_receipt with preview=None}}
 
-let import_namespace (session:session)=Wire.namespace_for_owner
+let import_namespace (session:session)=Mutation.namespace_for_owner
   ~origin:(Uri.of_string (For_worker.binding_origin (For_worker.session_binding session))) ~user:(For_worker.binding_user (For_worker.session_binding session)) ~graph:(graph_id session)
 let import_wire_error=function Import_wire.Invalid message->Invalid_input message|Wrong_namespace->Revoked_session
 let asset_import_intent session source=Import_wire.create ~namespace:(import_namespace session) source |> Result.map_error import_wire_error
@@ -763,7 +731,7 @@ let rec validate_request : type a. session -> a request -> (unit, error) result 
 let confirmation_read session (receipt:receipt) =
   let budget=For_worker.read_budget ~owner:session ~maximum_items:Worker_pure_data.default_page_size
     ~maximum_bytes:(For_worker.session_limits session).response_budget_bytes in
-  match Wire.readback_target(durable_wire receipt.intent) with
+  match Mutation.readback_target receipt.intent with
   |`Page uuid->For_worker.pack_query budget (Page{uuid;revision=None})
   |`Block block->For_worker.pack_query budget (Block_summary{block;after=None})
 ;;

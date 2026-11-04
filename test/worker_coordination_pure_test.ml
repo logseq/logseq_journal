@@ -1,6 +1,5 @@
 module W = Journal_worker_coordination.Worker_api
 module C = Journal_worker_coordination.Worker_pure_coordinator
-module P = Logseq_db_worker.Protocol
 module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Id = Journal_worker_ids
 module Sync = Logseq_sync_pure_reducer.Core
@@ -1782,26 +1781,14 @@ let test_durable_mutation_properties ?(append=false) () =
                | _ -> assert false
              in
              let response =
-               P.V2_response
-                 { api_version = P.api_version
-                 ; request_id
-                 ; outcome =
-                     P.V2_mutation_committed
-                       { mutation_id = W.durable_intent_id receipt_intent
-                       ; status = Worker_pure_data.V2_applied
-                       ; generation = "generation:v1:1:1"
-                       ; before_projection_revision = "projection:v1:0"
-                       ; after_projection_revision =
-                           (if action = 10 then "projection:v1:2" else "projection:v1:1")
-                       }
-                 }
+               (Logseq_db_worker_contract.Worker_pure_mutation.For_worker.commit ~mutation_id:(W.durable_intent_id receipt_intent) ~status:(Worker_pure_data.V2_applied) ~generation:("generation:v1:1:1") ~before:("projection:v1:0") ~after:((if action = 10 then "projection:v1:2" else "projection:v1:1")))
              in
              let receipt =
-               (let (P.V2_response receipt_packet as packet) = response in
+               (let packet = response in
       match I.reply session ~request_id:(C.ticket_id ticket) (match receipt_intent with W.Append_intent intent->W.Append intent|Mutation_intent intent->W.Mutate intent)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
-          {request_id=receipt_packet.request_id;
-           outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
+          {request_id=request_id;
+           outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed packet}) with
       | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected")
              in
@@ -1887,13 +1874,13 @@ let test_durable_readback_reservation () =
 ;;
 
 let test_recovery_cursor_and_capacity_bounds () =
-  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
   let issuer,_,projection,session=fixture 1906L in
   let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let make n=W.mutation_intent session ~mutation_id:(uuid(Printf.sprintf "98000000-0000-4000-8000-%012d" (2000+n)))
     (W.Save_block{block=graph;title="bounded recovered item";
       preconditions={blocks=[graph,"block-state:v1:synthetic"];pages=[];scopes=[]}}) |> Result.get_ok in
-  let item n=Wire.{intent=Bytes.to_string(W.encode_durable_intent(W.Mutation_intent(make n)));outcome=Unknown} in
+  let item n=Wire.{intent=((W.Mutation_intent(make n)));outcome=Unknown} in
   let id=W.request_id(uuid "98000000-0000-4000-8000-000000001906") in
   let request_id=uuid "98000000-0000-4000-8000-000000001906" in
   let operation=W.Recover_mutations{after=None;maximum_items=1;maximum_bytes=W.maximum_mutation_recovery_bytes} in
@@ -1914,9 +1901,8 @@ let test_recovery_cursor_and_capacity_bounds () =
   let many=W.Recover_mutations{after=None;maximum_items=70;maximum_bytes=W.maximum_mutation_recovery_bytes} in
   check(Result.is_error(I.reply session ~request_id:id many(raw(Rrbvec.of_list[item 1;item 1])None)))
     "duplicate recovered mutation identity was accepted";
-  let oversized=Wire.{intent=(item 1).intent;outcome=Rejected(P.V2_response{api_version=P.api_version;
-    request_id;outcome=V2_failed{code="conflict";message=String.make Worker_pure_data.maximum_response_bytes 'x'}})} in
-  check(Result.is_error(I.reply session ~request_id:id operation(raw(Rrbvec.singleton oversized)None)))
+  let oversized=Wire.{intent=(item 1).intent;outcome=Rejected((Logseq_db_worker.Error.create ~code:Conflict ~message:("Known not applied") ~details:[] |> Result.get_ok))} in
+  check(Result.is_error(I.reply session ~request_id:id (W.Recover_mutations{after=None;maximum_items=1;maximum_bytes=1})(raw(Rrbvec.singleton oversized)None)))
     "recovered rejection bypassed its reserved protocol-result budget";
   let ticket,planned=C.request(ready I.binding projection)session many |> Result.get_ok in
   let request_id=match I.request session ~request_id:(C.ticket_id ticket)many with
@@ -1932,7 +1918,7 @@ let test_recovery_cursor_and_capacity_bounds () =
 ;;
 
 let test_durable_recovery_and_ack_purity () =
-  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
   let issuer,_,projection,session=fixture 1903L in
   let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let intent=W.mutation_intent session ~mutation_id:(uuid "98000000-0000-4000-8000-000000001903")
@@ -1948,11 +1934,10 @@ let test_durable_recovery_and_ack_purity () =
   let answer ticket progress =
     let request_id=match I.request session ~request_id:(C.ticket_id ticket) operation with
       | Ok(S.Coordination_recover_mutations{request_id;_})->request_id|_->failwith "recovery codec request" in
-    let outcome=if progress then Wire.Rejected(P.V2_response{api_version=P.api_version;request_id;
-      outcome=V2_failed{code="conflict";message="known not applied"}}) else Wire.Unknown in
+    let outcome=if progress then Wire.Rejected((Logseq_db_worker.Error.create ~code:Conflict ~message:("known not applied") ~details:[] |> Result.get_ok)) else Wire.Unknown in
     match I.reply session ~request_id:(C.ticket_id ticket) operation
       (S.Coordination_mutations_recovered{request_id;page=Wire.{items=Rrbvec.singleton
-        {intent=Bytes.to_string(W.encode_durable_intent intent);outcome};next=None}}) with
+        {intent=(intent);outcome};next=None}}) with
     | Ok(W.Answered(Ok page))->page|_->failwith "recovery codec response" in
   let state=ref(ready I.binding projection) in
   check(Result.is_error(C.request !state session(W.Acknowledge_intent intent))) "unknown intent admitted ACK";
@@ -2019,13 +2004,11 @@ let test_committed_ack_requires_current_confirmation () =
   let ticket,planned=C.request(ready I.binding projection)session(W.Mutate intent) |> Result.get_ok in
   let request_id=match I.request session ~request_id:(C.ticket_id ticket)(W.Mutate intent) with
     | Ok(S.Coordination_mutation{request_id;_})->request_id|_->assert false in
-  let receipt=(let (P.V2_response receipt_packet as packet) = (P.V2_response{api_version=P.api_version;request_id;outcome=V2_mutation_committed
-      {mutation_id=W.mutation_intent_id intent;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
-       before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"}}) in
+  let receipt=(let packet = ((Logseq_db_worker_contract.Worker_pure_mutation.For_worker.commit ~mutation_id:(W.mutation_intent_id intent) ~status:(Worker_pure_data.V2_applied) ~generation:("generation:v1:1:1") ~before:("projection:v1:0") ~after:("projection:v1:1"))) in
       match I.reply session ~request_id:(C.ticket_id ticket) (W.Mutate intent)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
-          {request_id=receipt_packet.request_id;
-           outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
+          {request_id=request_id;
+           outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed packet}) with
       | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected") in
   let state=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.of_int64 20L))).next in
@@ -2173,13 +2156,11 @@ let test_committed_ack_requires_current_confirmation () =
   check(C.intent_progress(C.view late)(W.Mutation_intent intent)=None) "pre-ACK confirmation resurrected settled intent";
   let request_id=match I.request session ~request_id:(C.ticket_id independent)(W.Mutate other) with
     | Ok(S.Coordination_mutation{request_id;_})->request_id|_->assert false in
-  let other_receipt=(let (P.V2_response receipt_packet as packet) = (P.V2_response{api_version=P.api_version;request_id;outcome=V2_mutation_committed
-      {mutation_id=W.mutation_intent_id other;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
-       before_projection_revision="projection:v1:1";after_projection_revision="projection:v1:2"}}) in
+  let other_receipt=(let packet = ((Logseq_db_worker_contract.Worker_pure_mutation.For_worker.commit ~mutation_id:(W.mutation_intent_id other) ~status:(Worker_pure_data.V2_applied) ~generation:("generation:v1:1:1") ~before:("projection:v1:1") ~after:("projection:v1:2"))) in
       match I.reply session ~request_id:(C.ticket_id independent) (W.Mutate other)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
-          {request_id=receipt_packet.request_id;
-           outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
+          {request_id=request_id;
+           outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed packet}) with
       | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected") in
   let other_done=(C.step acknowledged(C.Completed(independent,W.Answered(Ok(W.Committed_pending_presentation other_receipt))))).next in
@@ -2230,7 +2211,7 @@ let test_committed_ack_requires_current_confirmation () =
 ;;
 
 let test_durable_recovery_ack_properties () =
-  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  let module Wire=Logseq_db_worker_contract.Worker_pure_mutation in
   let issuer,_,projection,session=fixture 1904L in
   let module I=(val issuer:Worker_effect_authority.ISSUER) in
   let intent=W.mutation_intent session ~mutation_id:(uuid "98000000-0000-4000-8000-000000001904")
@@ -2256,9 +2237,8 @@ let test_durable_recovery_ack_properties () =
       | 2 | 3->read n(fun(ticket,after_ack)->
           let request_id=match I.request session ~request_id:(C.ticket_id ticket)operation with
             | Ok(S.Coordination_recover_mutations{request_id;_})->request_id|_->assert false in
-          let items=if after_ack then Rrbvec.empty else Rrbvec.singleton Wire.{intent=Bytes.to_string(W.encode_durable_intent(W.Mutation_intent intent));
-            outcome=(if op=2 then Unknown else Rejected(P.V2_response{api_version=P.api_version;request_id;
-              outcome=V2_failed{code="conflict";message="known rejection"}}))} in
+          let items=if after_ack then Rrbvec.empty else Rrbvec.singleton Wire.{intent=((W.Mutation_intent intent));
+            outcome=(if op=2 then Unknown else Rejected((Logseq_db_worker.Error.create ~code:Conflict ~message:("known rejection") ~details:[] |> Result.get_ok)))} in
           let reply=I.reply session ~request_id:(C.ticket_id ticket)operation
             (S.Coordination_mutations_recovered{request_id;page=Wire.{items;next=None}}) |> Result.get_ok in
           step(C.Completed(ticket,reply)))
@@ -4301,7 +4281,7 @@ let test_atomic_append_intent_and_admission () =
   check(List.exists(function C.Send(sent,owner,operation)->
     W.equal_request_id(C.ticket_id sent)(C.ticket_id ticket) && W.equal_session owner session
     && (match I.request owner ~request_id:(C.ticket_id sent)operation with
-      |Ok(S.Coordination_mutation{intent=encoded;_})->encoded=Bytes.to_string bytes
+      |Ok(S.Coordination_mutation{intent=encoded;_})->W.encode_durable_intent encoded=bytes
       |_->false)|_->false)planned.instructions)
     "Append bypassed the existing durable Service channel"
 ;;

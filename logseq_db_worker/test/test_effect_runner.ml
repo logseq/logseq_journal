@@ -819,7 +819,7 @@ let cancelled_stage_output deliver_first () =
       Logseq_db_storage.Asset_upload_store.read db ~operation:source.operation
       |> Result.get_ok
     in
-    let namespace=Logseq_db_worker_contract.Mutation_pure_wire.namespace_for_owner
+    let namespace=Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner
       ~origin:fixture.context.scope.account.managed_sync_origin ~user:fixture.context.scope.account.user_id
       ~graph:fixture.context.scope.graph_id in
     let reserved=Logseq_db_storage.Asset_upload_store.Inputs.read db
@@ -840,7 +840,7 @@ let cancelled_stage_output deliver_first () =
 let test_import_input_readonly_recovery_and_proof_ack () =
   with_asset_bridge(fun fixture->
     let module P=Logseq_db_types.Asset_import.Pure_intent in
-    let module W=Logseq_db_worker_contract.Mutation_pure_wire in
+    let module W=Logseq_db_worker_contract.Worker_pure_mutation in
     let scope=fixture.context.scope in
     let store=Filename.concat fixture.support "asset-upload-intents.sqlite" in
     let recover()=Runner.recover_import_inputs fixture.runner ~scope ~after:None ~maximum_items:2
@@ -977,6 +977,141 @@ let test_host_scope_settlement_preserves_live_lease () =
 (* The bounded actor queue is outside Core.step. Fill it inside the registered
    snapshot callback before automatic host follow-up; the consumer must not wait
    for itself to make room. All data and account identities are isolated. *)
+(* Migrated existing physical after-listen initial-snapshot race. The public Db
+   owner executes the real read/cleanup; only unrelated Sync transport is absent. *)
+let test_observation_release_waits_for_initial_snapshot () =
+  let module Db=Logseq_db_worker in
+  let module Fixture=Test_support in
+  let module Read=Worker_pure_read in
+  let module F=Read.For_worker in
+  let require condition message=Alcotest.(check bool)message true condition in
+  T.with_managed(fun fixture->
+    ignore(Fixture.seed_mirror fixture.config.application_support_directory);
+    Eio_main.run(fun env->Eio.Switch.run(fun sw->
+      let worker=ref None in
+      let post event=Option.iter(fun db->Db.post db(Core.Sync_event event))!worker in
+      let graph:Sync.graph={graph_id=Fixture.graph_uuid;name="Observation snapshot fixture";
+        schema={major=65;minor=33;exact=true};encrypted=false}in
+      let sync_runner=Runner.sync_runner ~retire_account:(fun ~account:_->Ok()) ~shutdown:(fun()->())
+        ~submit:(function
+          |Sync.Request(ticket,Sync.Load_catalog _)->post(Sync.Runner_completed(Sync.Completion(ticket,Ok(Some
+             (Sync.catalog_cache ~user_id:"fixture-user" ~graphs:[graph] ~selected_graph:(Some graph.graph_id))))))
+          |Sync.Request(ticket,Sync.Save_catalog _)->post(Sync.Runner_completed(Sync.Completion(ticket,Ok())))
+          |Sync.Asset_io(ticket,request)->let value=match request.Sync.action with
+            |Sync.Prune_asset_staging _->Sync.Asset_pruned 0
+            |Close_asset_scope|Release_asset_file _|Release_staged_file _|Cancel_asset_operation _->Sync.Asset_unit
+            |_->failwith "Unexpected asset operation in observation fixture"in
+            post(Sync.Runner_completed(Sync.Asset_completion(ticket,Ok value)))
+          |_->())()in
+      let dependencies=Runner.dependencies ~config:fixture.config ~overlay:fixture.overlay ~sync_runner
+        ~runtime:(Runner.runtime ~fork:(fun ~sw task->Eio.Fiber.fork ~sw task)
+          ~sleep:(Eio.Time.sleep(Eio.Stdenv.clock env)) |> Result.get_ok) ~publish:(fun _->()) |> Result.get_ok in
+      let db=Db.create ~sw ~config:(Core.config ~worker:fixture.config ~sync:(asset_sync_config()))
+        ~runner_dependencies:dependencies |> Result.get_ok in
+      worker:=Some db;
+      Fun.protect ~finally:(fun()->Db.shutdown db)(fun()->
+        let latest=ref None in
+        ignore(Db.register_coordination db ~registration:801L ~notify:(fun value->latest:=Some value) |> Result.get_ok);
+        post(Sync.Restore_local_account{user_id="fixture-user"});
+        Eio.Time.with_timeout_exn(Eio.Stdenv.clock env)3.(fun()->
+          while not(Option.exists(fun(snapshot:Db.coordination_snapshot)->
+            List.exists(fun(_,state)->state.Db.phase=Db.Graph_open)snapshot.state.residents)!latest)
+          do Eio.Fiber.yield()done);
+        let snapshot=Option.get !latest in
+        let scope,_=List.find(fun(_,state)->state.Db.phase=Db.Graph_open)snapshot.state.residents in
+        let owner=Option.get snapshot.state.sync.selected in
+        let binding=F.binding ~serial:801L ~incarnation:(Read.worker_incarnation
+          ~runtime_epoch:(Journal_worker_ids.Runtime.Epoch.of_int64 29000L)
+          ~worker_generation:Journal_worker_ids.Worker.Generation.one)
+          ~origin:(Uri.to_string scope.Sync.account.managed_sync_origin) ~user:scope.account.user_id in
+        let limits:Worker_pure_data.capability_limits={response_budget_bytes=fixture.config.response_budget_bytes;
+          outbox_max_records=4096;outbox_max_bytes=8388608;change_max_items=256;change_max_bytes=65536;
+          dispatcher_capacity=256;wire_batch_max_bytes=262144}in
+        let session=F.session ~binding ~graph:scope.graph_id ~account:scope.account.account_generation
+          ~lifecycle:scope.account.lifecycle_generation ~generation:scope.graph_generation ~scope:owner ~asset_scope:scope ~limits in
+        let read=F.pack_query(Read.read_budget session ~maximum_items:1 ~maximum_bytes:16384 |> Result.get_ok)Read.Graph_info in
+    let entered, enter = Eio.Promise.create ()
+    and gate, release_gate = Eio.Promise.create () in
+    let result, resolve_result = Eio.Promise.create ()
+    and released, resolve_released = Eio.Promise.create () in
+    let calls = ref 0
+    and notifications = ref 0 in
+    let current () =
+      incr calls;
+      if !calls = 2
+      then (
+        Eio.Promise.resolve enter ();
+        Eio.Promise.await gate);
+      true
+    in
+    let id=Fixture.mutation_uuid 29000 in
+    let await promise =
+      let deadline = Unix.gettimeofday () +. 3. in
+      while Eio.Promise.peek promise = None && Unix.gettimeofday () < deadline do
+        Eio.Fiber.yield ()
+      done;
+      match Eio.Promise.peek promise with
+      | Some value -> value
+      | None -> failwith "physical observation race timed out"
+    in
+    Fun.protect
+      ~finally:(fun () -> ignore (Eio.Promise.try_resolve release_gate () : bool))
+      (fun () ->
+         Eio.Fiber.fork ~sw (fun () ->
+           let value =
+             Db.register_observation
+               db
+               ~registration:801L
+               ~id
+               ~scope
+               ~read
+               ~current
+               ~notify:(fun ~epoch:_ -> incr notifications)
+           in
+           Eio.Promise.resolve resolve_result value);
+         await entered;
+         Eio.Fiber.fork ~sw (fun () ->
+           let value =
+             Db.release_observation
+               db
+               ~registration:801L
+               ~id
+               ~scope
+           in
+           Eio.Promise.resolve resolve_released value);
+         for _ = 1 to 8 do
+           Eio.Fiber.yield ()
+         done;
+         require
+           (Eio.Promise.peek released = None)
+           "release ACK preceded initial snapshot settlement";
+         Eio.Promise.resolve release_gate ();
+         require
+           (match await result with
+            | Error _ -> true
+            | _ -> false)
+           "cancelled registration returned a readable observation";
+         require (await released = Ok ()) "physical release did not acknowledge cleanup";
+         require
+           (!notifications = 0)
+           "initial registration resurrected a retired callback";
+         require
+           (match
+              Db.register_observation
+                db
+                ~registration:801L
+                ~id
+                ~scope
+                ~read
+                ~current:(fun () -> true)
+                ~notify:(fun ~epoch:_ -> incr notifications)
+            with
+            | Error _ -> true
+            | _ -> false)
+           "retired registration ID was physically allocated again")
+      ))))
+;;
+
 let test_host_followup_survives_full_actor_queue () =
   T.with_managed(fun fixture->Eio_main.run(fun env->Eio.Switch.run(fun sw->
     let module Db=Logseq_db_worker in
@@ -2956,6 +3091,7 @@ let () =
     ; ( "unlock diagnostics", [Alcotest.test_case "typed finite runner observations" `Quick test_unlock_runner_logging] )
     ; ( "contract"
       , [ Alcotest.test_case "readonly import input recovery and exact proof ACK" `Quick test_import_input_readonly_recovery_and_proof_ack
+        ; Alcotest.test_case "initial observation snapshot joins real release" `Quick test_observation_release_waits_for_initial_snapshot
         ; Alcotest.test_case "host internal followup survives full actor queue" `Quick test_host_followup_survives_full_actor_queue
         ; Alcotest.test_case "host scope settlement preserves real lease" `Quick test_host_scope_settlement_preserves_live_lease
         ; Alcotest.test_case "Worker Sync IO fence correlates actual child" `Quick test_worker_sync_io_fence_correlates_real_child

@@ -1,7 +1,6 @@
 module Read = Worker_pure_read
 module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Graph = Logseq_db_types.Graph_types
-module Protocol = Logseq_db_worker.Protocol
 module Production_runtime = Journal_graph_runtime
 module W = Journal_worker_coordination.Worker_api
 
@@ -116,9 +115,6 @@ let only description = function
 
 let sample request produce = request,produce
 let deliver_sample runtime (request,produce) = Worker_producer.deliver runtime request produce
-let durable_response request outcome =
-  Protocol.V2_response{api_version=Protocol.api_version;request_id=request;outcome}
-;;
 
 let sample_bytes runtime (request,produce) =
   let source=Worker_producer.transport runtime request |> Result.get_ok in
@@ -1345,11 +1341,8 @@ module Target_fixture = struct
   let committed runtime original =
     let mutation_id=W.durable_intent_id(Production_runtime.worker_intent runtime original session |> Result.get_ok) in
     let _,progress=mutation runtime original
-      (Logseq_db_worker_contract.Mutation_pure_wire.Committed
-        (Protocol.V2_response{api_version=Protocol.api_version;request_id=original;
-          outcome=V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;
-            generation="generation:v1:1:1";before_projection_revision="projection:v1:1";
-            after_projection_revision="projection:v1:2"}})) in
+      (Logseq_db_worker_contract.Worker_pure_mutation.Committed
+        ((Logseq_db_worker_contract.Worker_pure_mutation.For_worker.commit ~mutation_id:(mutation_id) ~status:(Worker_pure_data.V2_applied) ~generation:("generation:v1:1:1") ~before:("projection:v1:1") ~after:("projection:v1:2")))) in
     let receipt=match progress with W.Committed_pending_presentation receipt->receipt|_->assert false in
     Pending{original;operation=W.Confirm(presentation,receipt);proof=Some(presentation,receipt);deliver=(function
       |W.Answered(Ok progress)->Production_runtime.receive_mutation runtime original progress
@@ -1358,9 +1351,8 @@ module Target_fixture = struct
 
   let rejected runtime original =
     let _,progress=mutation runtime original
-      (Logseq_db_worker_contract.Mutation_pure_wire.Rejected
-        (Protocol.V2_response{api_version=Protocol.api_version;request_id=original;
-          outcome=V2_failed{code="conflict";message="Concurrent target change"}})) in
+      (Logseq_db_worker_contract.Worker_pure_mutation.Rejected
+        ((Logseq_db_worker.Error.create ~code:Conflict ~message:("Concurrent target change") ~details:[] |> Result.get_ok))) in
     let output=Production_runtime.receive_mutation runtime original progress in
     query runtime (only "post-rejection typed target read" output.requests)
 
@@ -1487,12 +1479,11 @@ let test_ordinary_delete_readback committed paged () =
     let mutation_id=W.mutation_intent_id intent in
     Alcotest.(check bool) "ordinary mutation business owner bound" true
       (Production_runtime.bind_mutation runtime request ~presentation ~intent:(W.Mutation_intent intent));
-    let receipt=(let (Protocol.V2_response receipt_packet as packet) = (durable_response request (V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
-        before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"})) in
+    let receipt=(let receipt_request_id=request in let packet=((Logseq_db_worker_contract.Worker_pure_mutation.For_worker.commit ~mutation_id:(mutation_id) ~status:(Worker_pure_data.V2_applied) ~generation:("generation:v1:1:1") ~before:("projection:v1:0") ~after:("projection:v1:1"))) in
       match I.reply session ~request_id:(W.request_id request) (W.Mutate intent)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
-          {request_id=receipt_packet.request_id;
-           outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
+          {request_id=receipt_request_id;
+           outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed packet}) with
       | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected") in
     let confirmation=confirmed_sample Worker_producer.issuer session presentation receipt request
@@ -5358,12 +5349,11 @@ let test_page_detail_root_and_append () =
     let mutation_id=W.mutation_intent_id intent in
     Alcotest.(check bool) "page insertion bound to typed owner" true
       (Runtime.bind_mutation runtime request ~presentation ~intent:(W.Mutation_intent intent));
-    let receipt=(let (Protocol.V2_response receipt_packet as packet) = (durable_response request (V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
-        before_projection_revision="projection:v1:1";after_projection_revision="projection:v1:2"})) in
+    let receipt=(let receipt_request_id=request in let packet=((Logseq_db_worker_contract.Worker_pure_mutation.For_worker.commit ~mutation_id:(mutation_id) ~status:(Worker_pure_data.V2_applied) ~generation:("generation:v1:1:1") ~before:("projection:v1:1") ~after:("projection:v1:2"))) in
       match I.reply Worker_producer.session ~request_id:(W.request_id request) (W.Mutate intent)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
-          {request_id=receipt_packet.request_id;
-           outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
+          {request_id=receipt_request_id;
+           outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed packet}) with
       | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected") in
     let child=copy_child unrelated_uuid page_uuid command.source in
@@ -5903,12 +5893,11 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
     else (
       let child=uuid "a1000000-0000-4000-9000-000000000081" in
       let target={record with block={block with uuid=child;title="Stable child";parent=block_uuid};task_status=None} in
-      let receipt=(let (Protocol.V2_response receipt_packet as packet) = (durable_response insert (V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
-          before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"})) in
+      let receipt=(let receipt_request_id=insert in let packet=((Logseq_db_worker_contract.Worker_pure_mutation.For_worker.commit ~mutation_id:(mutation_id) ~status:(Worker_pure_data.V2_applied) ~generation:("generation:v1:1:1") ~before:("projection:v1:0") ~after:("projection:v1:1"))) in
       match I.reply session ~request_id:(W.request_id insert) (W.Mutate original)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
-          {request_id=receipt_packet.request_id;
-           outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
+          {request_id=receipt_request_id;
+           outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed packet}) with
       | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected") in
       let summary=(query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.block_summary ~lookup:(Worker_pure_data.V2_present_block{value=target;revision="original-child-precondition"}) ~page:(Some(Worker_pure_data.V2_present_page{page;revision="page-original"})) ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None)) ~scope_revision:("original-child-scope") ~generation:("generation:v1:1:1") ~projection_revision:("projection:v1:1")) in match query with |Read.Block_summary _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")) in

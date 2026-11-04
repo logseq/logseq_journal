@@ -109,8 +109,11 @@ let test_capture_pipeline () =
    | Some (Journal_graph_request.Capture { command; _ }) ->
      equal final_source command.source "save uses last complete editing value"
    | _ -> failwith "capture did not emit save");
-  let ignored = Journal_capture.apply_text_edit saving (edit session 4L 0L "late") in
-  equal final_source (Journal_capture.source ignored) "saving rejects text edits"
+  let editing = Journal_capture.apply_text_edit saving (edit session 4L 0L "late") in
+  equal "late" (Journal_capture.source editing) "next draft remains editable";
+  equal (Journal_capture.pending_command saving) (Journal_capture.pending_command editing)
+    "next draft cannot change the admitted source or identity";
+  require (not (Journal_capture.can_save editing)) "unsettled capture cannot submit a second identity"
 ;;
 
 let detail_source detail =
@@ -142,15 +145,15 @@ let test_detail_pipeline () =
      equal final_source command.source "append uses last complete value";
      equal "block-1" command.expected_parent_revision "append retains parent precondition"
    | _ -> failwith "detail did not emit append");
-  equal
-    saving
-    (Journal_detail.update_child_source saving "late")
-    "saving detail rejects edits";
+  let editing=Journal_detail.update_child_source saving "late" in
+  equal "late" (detail_source editing) "next child draft remains editable";
+  let _,duplicate=append_child editing in
+  equal None duplicate "unsettled child cannot submit a second identity";
   let failed, effects =
-    Journal_detail.step saving (Append_failed (child_id, "offline"))
+    Journal_detail.step editing (Append_failed (child_id, "offline"))
   in
   equal [] effects "failure does not resubmit";
-  equal final_source (detail_source failed) "failure preserves submitted text";
+  equal "late" (detail_source failed) "failure preserves the newer editable draft";
   let _, retried = Journal_detail.retry failed in
   equal request retried "retry preserves admitted append identity and precondition"
 ;;

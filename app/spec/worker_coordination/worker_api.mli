@@ -72,7 +72,7 @@ type read_budget = Worker_effect_authority.read_budget
 (** Validate positive item/encoded-byte bounds against this session's advertised
     limits. Every final enriched result, including summary/refs/properties, fits
     both bounds. An oversized singleton fails explicitly; no silent truncation.
-    Requests also validate Protocol limits on IDs, roots, depth, payload and lists. *)
+    Requests also validate effective limits on IDs, roots, depth, payload and lists. *)
 val read_budget
   :  session
   -> maximum_items:int

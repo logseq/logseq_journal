@@ -73,7 +73,7 @@ type read_budget = Worker_pure_read.read_budget
 (** Validate positive item/encoded-byte bounds against this session's advertised
     limits. Every final enriched result, including summary/refs/properties, fits
     both bounds. An oversized singleton fails explicitly; no silent truncation.
-    Requests also validate Protocol limits on IDs, roots, depth, payload and lists. *)
+    Requests also validate effective limits on IDs, roots, depth, payload and lists. *)
 val read_budget
   :  session
   -> maximum_items:int
@@ -269,7 +269,7 @@ val change_ack_session : change_ack -> session
 val change_ack_generation : change_ack -> string
 val change_ack_through : change_ack -> string
 
-type append_intent
+type append_intent = Logseq_db_worker_contract.Worker_pure_mutation.append_intent
 
 (** Persist the complete bounded root/child/status payload and normalized stable
     identity before first send. Retries reuse it; a changed choice creates a new
@@ -287,7 +287,7 @@ val append_intent
 
 val append_intent_id : append_intent -> Uuid.t
 
-type mutation_command =
+type mutation_command = Logseq_db_worker_contract.Worker_pure_mutation.mutation_command =
   | Save_block of
       { block : Uuid.t
       ; title : string
@@ -324,7 +324,7 @@ type mutation_command =
       ; preconditions : Worker_pure_data.preconditions
       }
 
-type mutation_intent
+type mutation_intent = Logseq_db_worker_contract.Worker_pure_mutation.mutation_intent
 
 val mutation_intent
   :  session
@@ -334,7 +334,7 @@ val mutation_intent
 
 val mutation_intent_id : mutation_intent -> Uuid.t
 
-type durable_intent =
+type durable_intent = Logseq_db_worker_contract.Worker_pure_mutation.durable_intent =
   | Append_intent of append_intent
   | Mutation_intent of mutation_intent
 
@@ -824,7 +824,7 @@ module type ISSUER = sig
 
   (** The actual Service owner registers and samples one lifecycle version.
       Baselines carry caller-known registration IDs, effective limits and exact
-      resident/account identities. Ordinary query families map to Protocol V2;
+      resident/account identities. Ordinary query families retain their original typed values;
       unsupported durability/resource capabilities fail before enqueue. *)
   val consume_handoff_request : handoff_receipt -> (Service.request,error)result
   val handoff_consumed : handoff_receipt -> Service.response -> (unit,error)result
@@ -919,5 +919,4 @@ val issuer
     The runner validates response kind, protocol and mailbox IDs, exact intent/
     graph/revision, continuation and handle, before issuing authority. Retired
     bindings accept tracked cleanup ACKs only, never new sessions/data operations.
-    Protocol.V2_failed preserves its code/message but cannot reconstruct Error.t
-    causal evidence it never transported. Existing Error.t values remain intact. *)
+    Typed results retain the original Error.t causal evidence. *)

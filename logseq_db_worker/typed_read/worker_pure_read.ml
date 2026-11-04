@@ -46,7 +46,7 @@ type read_budget =
   ; maximum_bytes : int
   }
 
-type journal_day = int
+type journal_day = Logseq_db_worker_contract.Worker_pure_day.t
 
 type page =
   { data : Graph.page
@@ -294,20 +294,8 @@ let read_budget (owner : session) ~maximum_items ~maximum_bytes =
   else Ok { owner; maximum_items; maximum_bytes }
 ;;
 
-let journal_day day =
-  let year = day / 10000
-  and month = day / 100 mod 100
-  and date = day mod 100 in
-  let leap = year mod 400 = 0 || (year mod 4 = 0 && year mod 100 <> 0) in
-  let days =
-    match month with
-    | 2 -> if leap then 29 else 28
-    | 4 | 6 | 9 | 11 -> 30
-    | _ -> 31
-  in
-  if year < 1 || year > 9999 || month < 1 || month > 12 || date < 1 || date > days
-  then Error (Invalid_input "Invalid journal day")
-  else Ok day
+let journal_day day = Logseq_db_worker_contract.Worker_pure_day.create day
+  |> Result.map_error(fun message->Invalid_input message)
 ;;
 
 let page_uuid (p : page) = p.data.uuid
@@ -360,11 +348,18 @@ module For_worker = struct
   let children ~parent ~revision_scope ~scope_revision ~items ~next : children = { parent; revision_scope; scope_revision; items; next }
   let change_batch ~change_owner ~generation ~from_exclusive ~through ~windows ~next : change_batch = { change_owner; generation; from_exclusive; through; windows; next }
   let change_ack ~ack_owner ~generation ~through : change_ack = { ack_owner; generation; through }
-  let journal_day_value (day:journal_day) = day
+  let journal_day_value = Logseq_db_worker_contract.Worker_pure_day.value
 end
 
 (* These are encoded query identities and byte accounting, never another
    business command representation. The original typed query reaches its owner. *)
+let smaller_page_size : type a. a query -> int -> int option = fun query count ->
+  match query with
+  |Journals _|Block_summary _|Children _|Child_members _|Tree _|Favorites _
+  |Task_statuses _|Assets _|Changes _->if count>1 then Some(max 1(count/2))else None
+  |Graph_info|Admission|Journal _|Page _|Outline_block _|Task_status_definitions _|Asset_descriptors _->None
+;;
+
 let query_json : type a. read_budget -> a query -> Graph.Cursor.t option -> Yojson.Safe.t =
   fun budget query cursor ->
   let optional encode = function None->`Null|Some value->encode value in
@@ -376,8 +371,8 @@ let query_json : type a. read_budget -> a query -> Graph.Cursor.t option -> Yojs
   let kind,fields=match query with
     |Graph_info->"Graph_info",[]
     |Admission->"Admission",[]
-    |Journal day->"Journal",["day",integer day]
-    |Journals{from_day;through_day;revision=version;_}->"Journals",page["from_day",integer from_day;"through_day",integer through_day;"revision",revision version]
+    |Journal day->"Journal",["day",integer (For_worker.journal_day_value day)]
+    |Journals{from_day;through_day;revision=version;_}->"Journals",page["from_day",integer (For_worker.journal_day_value from_day);"through_day",integer (For_worker.journal_day_value through_day);"revision",revision version]
     |Page{uuid;revision=version}->"Page",["uuid",Uuid.to_yojson uuid;"revision",revision version]
     |Outline_block{uuid;revision=version}->"Outline_block",["uuid",Uuid.to_yojson uuid;"revision",revision version]
     |Block_summary{block;_}->"Block_summary",page["block",Uuid.to_yojson block]

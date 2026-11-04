@@ -1,7 +1,7 @@
 (library
  (name logseq_db_worker_contract)
  (public_name logseq_db_worker.contract)
- (modules config error protocol mutation_pure_wire)
+ (modules config error worker_pure_day worker_pure_mutation)
  (libraries digestif rrbvec logseq_db_types ppx_deriving_yojson.runtime uri yojson
   logseq_db_worker.typed_data)
  (preprocess

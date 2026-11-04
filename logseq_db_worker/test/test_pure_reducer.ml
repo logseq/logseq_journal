@@ -1,7 +1,6 @@
 module Core = Logseq_db_worker_pure_reducer.Core
 module Sync = Logseq_sync_pure_reducer.Core
 module Config = Logseq_db_worker.Config
-module Protocol = Logseq_db_worker.Protocol
 
 let uuid value = Logseq_db_types.Graph_types.Uuid.of_string value |> Result.get_ok
 
@@ -58,13 +57,6 @@ let timeline_scope state : Sync.timeline_scope =
 ;;
 let initial () = let s=raw_initial () in
   (Core.step s (Sync_event (Sync.Sign_in_requested (startup_scope s)))).next
-;;
-let graph_info_request () =
-  Protocol.
-    { api_version
-    ; request_id = uuid "10000000-0000-4000-8000-000000000001"
-    ; command = V2_graph_info
-    }
 ;;
 
 let test_managed_worker_starts_without_local_open () =
@@ -1366,98 +1358,34 @@ let test_scoped_read_byte_budget () =
 ;;
 
 let test_pure_read_page_bounds () =
-  let cursor =
-    Some
-      (Logseq_db_types.Graph_types.Cursor.of_string "synthetic-continuation"
-       |> Result.get_ok)
-  in
-  let target = uuid "60000000-0000-4000-8000-000000000001" in
-  let requests limit : Protocol.command list =
-    Protocol.
-      [ V2_list_journals
-          { from_day = 20260801
-          ; through_day = 20260901
-          ; limit
-          ; cursor
-          ; revision = Some "source-revision"
-          }
-      ; V2_get_outline_block_summary { block = target; limit; cursor }
-      ; V2_get_children
-          { parent = target; limit; cursor; revision = Some "source-revision" }
-      ; V2_get_page_tree
-          { page = target
-          ; maximum_depth = 2
-          ; limit
-          ; cursor
-          ; revision = Some "source-revision"
-          }
-      ; V2_list_favorites { limit; cursor }
-      ; V2_list_task_statuses { limit; cursor }
-      ; V2_list_assets { roots = [ target ]; recursive = true; limit; cursor }
-      ]
-  in
-  let limit = function
-    | Protocol.V2_list_journals { limit; _ }
-    | V2_get_outline_block_summary { limit; _ }
-    | V2_get_children { limit; _ }
-    | V2_get_page_tree { limit; _ }
-    | V2_list_favorites { limit; _ }
-    | V2_list_task_statuses { limit; _ }
-    | V2_list_assets { limit; _ } -> limit
-    | _ -> Alcotest.fail "read page planner changed query family"
-  in
-  let rec erase_limit = function
-    | `Assoc fields ->
-      `Assoc
-        (List.filter_map
-           (fun (key, value) ->
-              if key = "limit" then None else Some (key, erase_limit value))
-           fields)
-    | `List values -> `List (List.map erase_limit values)
-    | value -> value
-  in
-  let metadata command =
-    Protocol.request_to_yojson { (graph_info_request ()) with command } |> erase_limit
-  in
-  for count = 1 to Worker_pure_data.maximum_page_size do
-    List.iter
-      (fun command ->
-         let rec drain steps current =
-           if steps > 10 then Alcotest.fail "pure page planner did not terminate";
-           match Protocol.smaller_read_page current with
-           | None ->
-             Alcotest.(check int) "only a singleton is irreducible" 1 (limit current)
-           | Some next ->
-             Alcotest.(check bool)
-               "ordinary read bound strictly decreases"
-               true
-               (limit next > 0 && limit next < limit current);
-             Alcotest.(check bool)
-               "scope, revision, cursor and family stay exact"
-               true
-               (metadata next = metadata command);
-             drain (steps + 1) next
-         in
-         drain 0 command)
-      (requests count)
+  let target=uuid "60000000-0000-4000-8000-000000000001" in
+  let day=Read.journal_day 20260901 |> Result.get_ok in
+  for count=1 to Worker_pure_data.maximum_page_size do
+    let check : type a. a Read.query -> unit = fun query->
+      let rec drain steps current=
+        if steps>10 then Alcotest.fail "pure page policy did not terminate";
+        match Read.smaller_page_size query current with
+        |None->Alcotest.(check int) "only a singleton is irreducible" 1 current
+        |Some next->
+          Alcotest.(check bool) "ordinary fetch bound strictly decreases" true(next>0 && next<current);
+          drain(steps+1)next
+      in drain 0 count in
+    check(Read.Journals{from_day=day;through_day=day;after=None;revision=Some "source-revision"});
+    check(Read.Block_summary{block=target;after=None});
+    check(Read.Children{parent=target;after=None});
+    check(Read.Child_members{parent=target;revision=Some "source-revision";after=None});
+    check(Read.Tree{page=target;maximum_depth=2;after=None;revision=Some "source-revision"});
+    check(Read.Favorites None);
+    check(Read.Task_statuses None);
+    check(Read.Assets{roots=[target];recursive=true;after=None});
+    check(Read.Changes{generation="source";after=None})
   done;
-  List.iter
-    (fun command ->
-       Alcotest.(check bool)
-         "unpaged/effect command cannot be shortened"
-         true
-         (Protocol.smaller_read_page command = None))
-    Protocol.
-      [ V2_graph_info
-      ; V2_get_page { page = target; revision = None }
-      ; V2_ack_changes { generation = "source"; through = "point" }
-      ; V2_save_block
-          { mutation_id = target
-          ; block = target
-          ; title = "kept"
-          ; preconditions = { blocks = []; pages = []; scopes = [] }
-          }
-      ]
+  let unpaged : type a. a Read.query -> unit=fun query->
+    Alcotest.(check bool) "unpaged query cannot be shortened" true(Read.smaller_page_size query 32=None)in
+  unpaged Read.Graph_info;unpaged Read.Admission;unpaged(Read.Journal day);
+  unpaged(Read.Page{uuid=target;revision=None});unpaged(Read.Outline_block{uuid=target;revision=None});
+  unpaged(Read.Asset_descriptors[target]);unpaged(Read.Task_status_definitions[target])
+
 ;;
 
 let test_observation_registry () =
