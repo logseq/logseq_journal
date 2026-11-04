@@ -8285,20 +8285,21 @@ let test_detail_reconciliation_diagnostics mode =
     updated_at_ms=1_788_192_000_000L; refs=[]; tags=[]; properties=[]} in
   let one label = function [x] -> x | _ -> Alcotest.fail label in
   let reply request outcome = P.V2_response {api_version=P.api_version;
-    request_id=request.P.request_id; outcome} in
+    request_id=request; outcome} in
   let module W=Journal_worker_coordination.Worker_api in
   let issuer,_,_,session=Coordination_test_fixture.fixture 9900L in
   let module I=(val issuer:Worker_effect_authority.ISSUER) in
-  let step request outcome =
+  let prepare_step request outcome =
     match R.worker_read runtime request with
     |Some(R.Read read)->
       let budget=W.read_budget session ~maximum_items:read.maximum_items ~maximum_bytes:65536 |> Result.get_ok in
       let operation=W.Query(budget,read.query) in
-      ignore(I.request session ~request_id:(W.request_id request.P.request_id) operation |> Result.get_ok);
-      (match I.reply session ~request_id:(W.request_id request.request_id) operation (Service.Graph_response(reply request outcome)) with
-       |Ok(W.Answered(Ok value))->R.receive_worker_read runtime ~request_id:request.request_id (R.Query_result(read.query,value))
+      ignore(I.request session ~request_id:(W.request_id request) operation |> Result.get_ok);
+      (match I.reply session ~request_id:(W.request_id request) operation (Service.Graph_response(reply request outcome)) with
+       |Ok(W.Answered(Ok value))->fun()->R.receive_worker_read runtime ~request_id:request (R.Query_result(read.query,value))
        |_->failwith "diagnostics fixture rejected its typed query")
     |_->failwith "diagnostics fixture did not plan a typed read" in
+  let step request outcome=(prepare_step request outcome)() in
   let read = R.submit runtime (Journal_graph_request.Load_detail
     {block_id=G.Uuid.to_string block_id; after=None; limit=32; request_generation=9L})
     |> fun o -> one "root read" o.requests in
@@ -8315,11 +8316,12 @@ let test_detail_reconciliation_diagnostics mode =
   let output = step pull (P.V2_changes {generation="g"; from_exclusive=None; through="p2";
     next=None; windows=[{id="p2"; predecessor="p1"; successor="p2"; block_uuids=[];
       page_uuids=[page_id]; structure_interests=[]}]}) in
-  let read = List.find (fun (r:P.request) -> match r.command with
-    | V2_get_page _ -> true | _ -> false) output.requests in
+  let read = List.find (fun r -> match R.worker_read runtime r with
+    | Some(R.Read{query=W.Page _;_}) -> true | _ -> false) output.requests in
+  let complete=prepare_step read (P.V2_page_outcome (Worker_pure_data.V2_present_page {page;revision="p2"})) in
   if mode=`Projection then fail_clock:=true;
   if mode=`Retired then R.reset runtime;
-  let completed = step read (P.V2_page_outcome (Worker_pure_data.V2_present_page {page; revision="p2"})) in
+  let completed=complete() in
   let state = A.create ~graph_generation:7 |> fun s -> A.step s (Capture_edited "retained draft") in
   let apply state = List.fold_left (fun s response -> A.step s (Completed response)) state completed.responses in
   let state = apply state in
@@ -8347,7 +8349,7 @@ let test_detail_reconciliation_diagnostics mode =
   Alcotest.(check string) "nonfatal completion retains draft" "retained draft"
     (A.capture state |> Option.get |> Journal_capture.source);
   Alcotest.(check int) "duplicate completion remains retired" 0
-    (List.length (step read (P.V2_page_outcome (Worker_pure_data.V2_present_page {page; revision="p2"}))).responses)
+    (List.length (complete()).responses)
 ;;
 
 (* Root_navigation owns acceptance of feed completions and its issue ledger.

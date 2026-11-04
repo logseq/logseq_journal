@@ -131,7 +131,7 @@ type response = { payload : payload }
 type t
 
 type output =
-  { requests : Logseq_db_worker.Protocol.request list
+  { requests : Logseq_db_types.Graph_types.Uuid.t list
   ; responses : response list
   }
 
@@ -141,11 +141,11 @@ type output =
 val create : ?on_change:(Journal_worker_coordination.Worker_pure_coordinator.event -> unit) -> ?on_projection_changes:(Worker_pure_data.change_window list -> unit) -> ?localtime:(float -> Unix.tm) -> ?validate_session:(Journal_worker_coordination.Worker_api.session -> (unit, Journal_worker_coordination.Worker_api.error) result) -> unit -> t
 val reset : t -> unit
 val set_calendar : t -> Journal_calendar.t -> unit
-val start : t -> Logseq_db_worker.Protocol.request
+val start : t -> Logseq_db_types.Graph_types.Uuid.t
 val submit : ?capture_chain:Journal_graph_mutation_confirmation.Pure_insertion.t ->
   ?child_chain:Journal_graph_mutation_confirmation.Pure_insertion.t -> t -> Journal_graph_request.t -> output
-val fail_request : t -> Logseq_db_worker.Protocol.request -> message:string -> output
-val abandon : t -> Logseq_db_worker.Protocol.request -> unit
+val fail_request : t -> Logseq_db_types.Graph_types.Uuid.t -> message:string -> output
+val abandon : t -> Logseq_db_types.Graph_types.Uuid.t -> unit
 
 val reconcile_signal
   :  t
@@ -171,12 +171,11 @@ type worker_read =
       }
       -> worker_read
   | Acknowledge of {batch:Worker.change_batch}
-  | Unowned_read of string
 
 (** Business DTO interoperability. Favorites keeps its sealed continuation in
     the business operation/result; ordinary Worker transport IDs remain solely
     with the coordinator. No raw continuation extraction or cursor registry. *)
-val worker_read : t -> Logseq_db_worker.Protocol.request -> worker_read option
+val worker_read : t -> Logseq_db_types.Graph_types.Uuid.t -> worker_read option
 
 (** The token only associates a business request with its pure application
     ledger. It never grants a new session or advances the ACK chain. *)
@@ -212,19 +211,17 @@ val retry_failed_change_application : t
   -> view:Journal_worker_coordination.Worker_pure_coordinator.view
   -> request_generation:int64 -> output
 
-val worker_append : t -> Logseq_db_worker.Protocol.request ->
-  (Logseq_db_worker.Protocol.command,string) result option
-val worker_mutation : t -> Logseq_db_worker.Protocol.request ->
-  (Logseq_db_types.Graph_types.Uuid.t * Journal_worker_coordination.Worker_api.mutation_command) option
-val bind_mutation : t -> Logseq_db_worker.Protocol.request ->
+val worker_intent : t -> Worker.Uuid.t -> Worker.session ->
+  (Worker.durable_intent, Worker.error) result
+val bind_mutation : t -> Logseq_db_types.Graph_types.Uuid.t ->
   presentation:Journal_worker_coordination.Worker_api.presentation ->
   intent:Journal_worker_coordination.Worker_api.durable_intent -> bool
-val pending_mutation : t -> mutation_id:string -> Logseq_db_worker.Protocol.request option
-val mutation_waiting : t -> Logseq_db_worker.Protocol.request -> string -> output
-val receive_mutation : t -> Logseq_db_worker.Protocol.request ->
+val pending_mutation : t -> mutation_id:string -> Logseq_db_types.Graph_types.Uuid.t option
+val mutation_waiting : t -> Logseq_db_types.Graph_types.Uuid.t -> string -> output
+val receive_mutation : t -> Logseq_db_types.Graph_types.Uuid.t ->
   Journal_worker_coordination.Worker_api.mutation_progress -> output
 
-val mutation_presentation : t -> Logseq_db_worker.Protocol.request ->
+val mutation_presentation : t -> Logseq_db_types.Graph_types.Uuid.t ->
   Journal_worker_coordination.Worker_api.presentation option
 
 val acknowledge_mutation : t -> Journal_worker_coordination.Worker_api.durable_intent -> unit
@@ -233,21 +230,21 @@ val finish_mutation_acknowledgement : t -> Journal_worker_coordination.Worker_ap
 val claim_mutation_ack_recovery : t -> Journal_worker_coordination.Worker_api.durable_intent
   -> presentation:Journal_worker_coordination.Worker_api.presentation -> bool
 
-val worker_child_ack : t -> Logseq_db_worker.Protocol.request ->
+val worker_child_ack : t -> Logseq_db_types.Graph_types.Uuid.t ->
   (Journal_worker_coordination.Worker_api.durable_intent * Journal_worker_coordination.Worker_api.presentation) option
-val rebind_child_ack : t -> Logseq_db_worker.Protocol.request ->
+val rebind_child_ack : t -> Logseq_db_types.Graph_types.Uuid.t ->
   presentation:Journal_worker_coordination.Worker_api.presentation -> bool
-val receive_child_ack : t -> Logseq_db_worker.Protocol.request -> (unit,string) result -> output
+val receive_child_ack : t -> Logseq_db_types.Graph_types.Uuid.t -> (unit,string) result -> output
 val child_projection_applied : t -> root:Logseq_db_types.Graph_types.Uuid.t -> round:int64
   -> presentation:Journal_worker_coordination.Worker_api.presentation -> output
 
 val capture_chain : t -> command:Journal_graph_projection.capture ->
   Journal_graph_mutation_confirmation.Pure_insertion.t option
 
-val capture_snapshot : t -> Logseq_db_worker.Protocol.request ->
+val capture_snapshot : t -> Logseq_db_types.Graph_types.Uuid.t ->
   (Journal_graph_projection.capture * Journal_graph_mutation_confirmation.Pure_insertion.t) option
 
-val child_snapshot : t -> Logseq_db_worker.Protocol.request ->
+val child_snapshot : t -> Logseq_db_types.Graph_types.Uuid.t ->
   (Journal_graph_projection.create_child * Journal_graph_mutation_confirmation.Pure_insertion.t) option
 val retained_child_chains : t ->
   (Journal_graph_projection.create_child * Journal_graph_mutation_confirmation.Pure_insertion.t) Rrbvec.t
@@ -255,12 +252,12 @@ val retained_child_chains : t ->
 val changed_child_chains : t -> output ->
   (Journal_graph_projection.create_child * Journal_graph_mutation_confirmation.Pure_insertion.t) Rrbvec.t
 
-val detail_observation_input : t -> Logseq_db_worker.Protocol.request -> (int64 * int) option
-val plan_observed_block : t -> root:Logseq_db_types.Graph_types.Uuid.t -> Logseq_db_worker.Protocol.request
+val detail_observation_input : t -> Logseq_db_types.Graph_types.Uuid.t -> (int64 * int) option
+val plan_observed_block : t -> root:Logseq_db_types.Graph_types.Uuid.t -> Logseq_db_types.Graph_types.Uuid.t
 val plan_observed_detail : t -> generation:int64 -> limit:int -> root:Logseq_db_types.Graph_types.Uuid.t ->
-  Logseq_db_worker.Protocol.request
+  Logseq_db_types.Graph_types.Uuid.t
 
-val owns_read : t -> Logseq_db_worker.Protocol.request -> bool
+val owns_read : t -> Logseq_db_types.Graph_types.Uuid.t -> bool
 
 val take_insertion_recoveries : t -> (Logseq_db_types.Graph_types.Uuid.t * Journal_graph_mutation_confirmation.Pure_insertion.recovery) Rrbvec.t
 val resume_insertion_recovery : t -> root:Logseq_db_types.Graph_types.Uuid.t

@@ -1,6 +1,7 @@
 module Graph = Logseq_db_types.Graph_types
 module Protocol = Logseq_db_worker.Protocol
 module Production_runtime = Journal_graph_runtime
+module W = Journal_worker_coordination.Worker_api
 
 (* Domain fixtures use the public typed read boundary. The database Service is
    exercised separately by worker_coordination_runtime_test. *)
@@ -49,13 +50,13 @@ module Read_fixture = struct
       ignore
         (I.request
            session
-           ~request_id:(W.request_id request.Protocol.request_id)
+           ~request_id:(W.request_id request)
            operation
          |> Result.get_ok);
       (match
          I.reply
            session
-           ~request_id:(W.request_id request.request_id)
+           ~request_id:(W.request_id request)
            operation
            (S.Graph_response raw)
        with
@@ -63,7 +64,7 @@ module Read_fixture = struct
          Production_runtime.receive_worker_read
            ~origin:(session, budget)
            runtime
-           ~request_id:request.request_id
+           ~request_id:request
            (Journal_graph_runtime.Query_result(read.query,value))
        | _ -> Alcotest.fail "typed domain fixture response rejected")
     | _ -> Alcotest.fail "expected a typed domain read"
@@ -88,9 +89,9 @@ let only label = function
   | values -> Alcotest.failf "%s: expected one value, got %d" label (List.length values)
 ;;
 
-let respond (request : Protocol.request) outcome =
+let respond (request : Graph.Uuid.t) outcome =
   Protocol.V2_response
-    { api_version = Protocol.api_version; request_id = request.request_id; outcome }
+    { api_version = Protocol.api_version; request_id = request; outcome }
 ;;
 
 let page_uuid = uuid "a2000000-0000-4000-8000-000000000001"
@@ -266,8 +267,8 @@ let test_admission_inspection_preserves_graph_generation () =
          { graph_generation = 9; request_generation = 1L })
     |> fun output -> only "admission inspection request" output.requests
   in
-  (match request.command with
-   | V2_inspect_admission -> ()
+  (match Runtime.worker_read runtime request with
+   | Some(Runtime.Read{query=W.Admission;_})-> ()
    | _ -> Alcotest.fail "admission inspection did not use the Worker protocol command");
   let output =
     Read_fixture.receive runtime request
@@ -308,32 +309,12 @@ let test_unrelated_projection_revision_does_not_reject_status_mutation () =
          ; task_state = Journal_model.Status "00000002-1827-5820-8200-000000000000"
          })
   in
-  match output.requests with
-  | [ { Protocol.command =
-          V2_set_task_status
-            { block = target
-            ; status
-            ; preconditions = { blocks = [ (precondition_block, revision) ]; _ }
-            ; _
-            }
-      ; _
-      }
-    ] ->
-    Alcotest.(check string)
-      "exact selected status UUID"
-      "00000002-1827-5820-8200-000000000000"
-      (Graph.Uuid.to_string status);
-    Alcotest.(check string)
-      "status target"
-      (Graph.Uuid.to_string block_uuid)
-      (Graph.Uuid.to_string target);
-    Alcotest.(check string)
-      "status precondition target"
-      (Graph.Uuid.to_string block_uuid)
-      (Graph.Uuid.to_string precondition_block);
-    Alcotest.(check string) "caller-observed status revision" "block-1" revision
-  | _ ->
-    Alcotest.fail "unrelated projection revision prevented the status Worker mutation"
+  let original=only "typed mutation" output.requests in
+  let actual=Runtime.worker_intent runtime original Read_fixture.session |> Result.get_ok in
+  let expected=W.mutation_intent Read_fixture.session ~mutation_id:(uuid "a2000000-0000-4000-a000-000000000003")
+    (W.Set_task_status{block=block_uuid;status=uuid "00000002-1827-5820-8200-000000000000";preconditions={blocks=[block_uuid,"block-1"];pages=[];scopes=[]}}) |> Result.get_ok in
+  Alcotest.(check bytes) "caller-observed status revision"
+    (W.encode_durable_intent(W.Mutation_intent expected)) (W.encode_durable_intent actual)
 ;;
 
 let test_status_conflict_refreshes_authoritative_block () =
@@ -354,15 +335,14 @@ let test_status_conflict_refreshes_authoritative_block () =
   let module I=Read_fixture.I in
   let session=Read_fixture.session in
   let presentation=Option.get(W.selected Read_fixture.projection) in
-  let mutation_id,command=Runtime.worker_mutation runtime mutation |> Option.get in
-  let intent=W.mutation_intent session ~mutation_id command |> Result.get_ok in
+  let intent=match Runtime.worker_intent runtime mutation session |> Result.get_ok with W.Mutation_intent intent->intent|_->assert false in
   Alcotest.(check bool) "typed status conflict keeps original intent" true
     (Runtime.bind_mutation runtime mutation ~presentation ~intent:(W.Mutation_intent intent));
   let operation=W.Mutate intent in
-  let request_id=W.request_id mutation.Protocol.request_id in
+  let request_id=W.request_id mutation in
   ignore(I.request session ~request_id operation |> Result.get_ok);
   let progress=match I.reply session ~request_id operation
-    (Read_fixture.S.Coordination_mutation_result{request_id=mutation.request_id;
+    (Read_fixture.S.Coordination_mutation_result{request_id=mutation;
       outcome=Logseq_db_worker_contract.Mutation_pure_wire.Rejected
         (respond mutation (Protocol.V2_failed{code="conflict";message="The mutation precondition did not match."}))}) with
     |Ok(W.Answered(Ok progress))->progress|_->Alcotest.fail "known conflict proof was not decoded" in
@@ -403,22 +383,12 @@ let test_delete_uses_caller_observed_block_revision () =
          ; expected_revision = "block-1"
          })
   in
-  match output.requests with
-  | [ { Protocol.command =
-          V2_delete_blocks
-            { preconditions =
-                { blocks = [ (precondition_block, block_revision) ]; scopes = []; _ }
-            ; _
-            }
-      ; _
-      }
-    ] ->
-    Alcotest.(check string)
-      "delete precondition target"
-      (Graph.Uuid.to_string block_uuid)
-      (Graph.Uuid.to_string precondition_block);
-    Alcotest.(check string) "caller-observed delete revision" "block-1" block_revision
-  | _ -> Alcotest.fail "delete did not use only its caller-observed block revision"
+  let original=only "typed mutation" output.requests in
+  let actual=Runtime.worker_intent runtime original Read_fixture.session |> Result.get_ok in
+  let expected=W.mutation_intent Read_fixture.session ~mutation_id:(uuid "a2000000-0000-4000-a000-000000000004")
+    (W.Delete_blocks{root=block_uuid;preconditions={blocks=[block_uuid,"block-1"];pages=[];scopes=[]}}) |> Result.get_ok in
+  Alcotest.(check bytes) "caller-observed delete revision"
+    (W.encode_durable_intent(W.Mutation_intent expected)) (W.encode_durable_intent actual)
 ;;
 
 let seed_parent_children_interest runtime =
@@ -474,33 +444,12 @@ let test_create_child_uses_caller_observed_parent_revision () =
          ; status_confirmation = false
 })
   in
-  match output.requests with
-  | [ { Protocol.command =
-          V2_insert_blocks
-            { parent
-            ; preconditions =
-                { blocks = [ (precondition_parent, parent_revision) ]
-                ; scopes = [ (Worker_pure_data.V2_children_scope scope_parent, scope_revision) ]
-                ; _
-                }
-            ; _
-            }
-      ; _
-      }
-    ] ->
-    List.iter
-      (fun actual ->
-         Alcotest.(check string)
-           "child parent"
-           (Graph.Uuid.to_string block_uuid)
-           (Graph.Uuid.to_string actual))
-      [ parent; precondition_parent; scope_parent ];
-    Alcotest.(check string)
-      "caller-observed parent revision"
-      "block-detail-1"
-      parent_revision;
-    Alcotest.(check string) "retained children scope" "children-scope-1" scope_revision
-  | _ -> Alcotest.fail "child creation did not preserve parent and scope preconditions"
+  let original=only "typed mutation" output.requests in
+  let actual=Runtime.worker_intent runtime original Read_fixture.session |> Result.get_ok in
+  let expected=W.mutation_intent Read_fixture.session ~mutation_id:(uuid "a2000000-0000-4000-a000-000000000005")
+    (W.Insert_blocks{parent=block_uuid;roots=[{uuid=uuid "a2000000-0000-4000-9000-000000000005";title="Child";children=[]}];preconditions={blocks=[block_uuid,"block-detail-1"];pages=[];scopes=[Worker_pure_data.V2_children_scope block_uuid,"children-scope-1"]}}) |> Result.get_ok in
+  Alcotest.(check bytes) "caller-observed parent and children scope"
+    (W.encode_durable_intent(W.Mutation_intent expected)) (W.encode_durable_intent actual)
 ;;
 
 let test_stale_calendar_generation_rejects_capture_before_worker_io () =
@@ -570,8 +519,8 @@ let test_uninterested_change_is_acknowledged_without_hydration () =
             ; next = None
             }))
   in
-  match output.requests with
-  | [ { Protocol.command = V2_ack_changes { through = "revision-2"; _ }; _ } ] -> ()
+  match List.map(Runtime.worker_read runtime) output.requests with
+  | [ Some(Runtime.Acknowledge{batch={through="revision-2";_}}) ] -> ()
   | _ -> Alcotest.fail "uninterested change must only produce an acknowledgement"
 ;;
 
@@ -731,9 +680,9 @@ let test_point_read_tag_metadata () =
        in
        let point =
          List.find
-           (fun (request : Protocol.request) ->
-              match request.command with
-              | V2_get_outline_block _ -> true
+           (fun (request : Graph.Uuid.t) ->
+              match Runtime.worker_read runtime request with
+              | Some(Runtime.Read{query=W.Outline_block _;_}) -> true
               | _ -> false)
            hydrated.requests
        in

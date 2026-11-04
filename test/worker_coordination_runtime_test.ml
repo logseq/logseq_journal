@@ -553,11 +553,8 @@ let test_client_to_typed_read () =
     let business = Journal_graph_runtime.create ~validate_session:(fun session -> C.validate_session ~owner !state session) () in
     let original = Journal_graph_runtime.start business in
     require
-      (Option.is_some
-         (Journal_graph_runtime.worker_read
-            business
-            { original with command = P.V2_list_favorites { limit = 50; cursor = None } }))
-      "a migrated Favorites request without business ownership fell back to legacy send";
+      (Journal_graph_runtime.worker_read business (W.Uuid.of_string "98000000-0000-4000-8000-000000009999" |> Result.get_ok)=None)
+      "an unplanned business request acquired a typed query";
     (match Journal_graph_runtime.worker_read business original with
      | Some (Journal_graph_runtime.Read read) ->
        let _, reply = request (W.Query (budget, read.query)) in
@@ -566,7 +563,7 @@ let test_client_to_typed_read () =
           let output =
             Journal_graph_runtime.receive_worker_read
               business
-              ~request_id:original.request_id
+              ~request_id:original
               (Journal_graph_runtime.Query_result(read.query,value))
           in
           require
@@ -577,7 +574,6 @@ let test_client_to_typed_read () =
                output.responses)
             "typed graph info did not reach actual business projection"
         | _ -> failwith "typed business graph-info read failed")
-     | Some (Journal_graph_runtime.Unowned_read message) -> failwith message
      | Some (Journal_graph_runtime.Acknowledge _ | Confirm_readback _) -> failwith "graph-info dispatch became a non-query"
      | None -> failwith "business graph-info path was not migrated");
     let _, page =
@@ -673,14 +669,9 @@ let test_client_to_typed_read () =
             clock := Int64.succ !clock;
             !clock)
       ; plan_read =
-          (fun ~source_epoch:_ read command ->
-            let original : P.request =
-              { api_version = P.api_version
-              ; request_id = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012Ld" !clock)
-              ; command
-              }
-            in
-            planned := Some (read, original);
+          (fun ~source_epoch:_ read query ->
+            let original=uuid (Printf.sprintf "9c000000-0000-4000-8000-%012Ld" !clock) in
+            planned := Some (read,query);
             original)
       }
     in
@@ -693,8 +684,8 @@ let test_client_to_typed_read () =
        |> Result.get_ok);
     let rec summary_page count =
       require (count < 10) "real summary cursor did not terminate";
-      let read, _ = Option.get !planned in
-      let _, reply = request (W.Query (budget, Confirmation.worker_query read)) in
+      let read, query = Option.get !planned in
+      let _, reply = request (W.Query (budget, query)) in
       match reply with
       | W.Answered (Ok value) ->
         let more = Option.is_some value.next in
@@ -753,9 +744,9 @@ let test_client_to_typed_read () =
       Journal_graph_runtime.submit business Journal_graph_request.Load_task_statuses
       |> fun output ->
       List.find
-        (fun (request : P.request) ->
-           match request.command with
-           | V2_list_task_statuses _ -> true
+        (fun request ->
+           match Journal_graph_runtime.worker_read business request with
+           | Some(Journal_graph_runtime.Read{query=W.Task_statuses _;_}) -> true
            | _ -> false)
         output.requests
     in
@@ -778,7 +769,7 @@ let test_client_to_typed_read () =
            let output =
              Journal_graph_runtime.receive_worker_read
                business
-               ~request_id:original.request_id
+               ~request_id:original
                result
            in
            if more
@@ -794,9 +785,9 @@ let test_client_to_typed_read () =
                "partial catalog was published as Complete";
              let next =
                List.find
-                 (fun (request : P.request) ->
-                    match request.command with
-                    | V2_list_task_statuses _ -> true
+                 (fun request ->
+                    match Journal_graph_runtime.worker_read business request with
+                    | Some(Journal_graph_runtime.Read{query=W.Task_statuses _;_}) -> true
                     | _ -> false)
                  output.requests
              in
@@ -849,13 +840,13 @@ let test_client_to_typed_read () =
            })
       |> fun o ->
       List.find
-        (fun (r : P.request) ->
-           match r.command with
-           | V2_list_journals _ -> true
+        (fun r ->
+           match Journal_graph_runtime.worker_read business r with
+           | Some(Journal_graph_runtime.Read{query=W.Journals _;_}) -> true
            | _ -> false)
         o.requests
     in
-    let deliver_root (original : P.request) =
+    let deliver_root original =
       match Journal_graph_runtime.worker_read business original with
       | Some (Journal_graph_runtime.Read read) ->
         let ticket, reply = request (W.Query (budget, read.query)) in
@@ -872,7 +863,7 @@ let test_client_to_typed_read () =
            , Journal_graph_runtime.receive_worker_read
                ?origin:(C.query_origin (C.view !state) ticket)
                business
-               ~request_id:original.request_id
+               ~request_id:original
                result )
          | _ -> failwith "actual root query failed")
       | _ -> failwith "production root dispatch bypassed coordinator"
@@ -903,7 +894,7 @@ let test_client_to_typed_read () =
            let output =
              Journal_graph_runtime.receive_worker_read
                business
-               ~request_id:original.request_id
+               ~request_id:original
                result
            in
            require
@@ -917,9 +908,9 @@ let test_client_to_typed_read () =
              "date Partial masqueraded as complete feed";
            let root =
              List.find
-               (fun (r : P.request) ->
-                  match r.command with
-                  | V2_get_page_tree _ -> true
+               (fun r ->
+                  match Journal_graph_runtime.worker_read business r with
+                  | Some(Journal_graph_runtime.Read{query=W.Tree _;_}) -> true
                   | _ -> false)
                output.requests
            in
@@ -933,9 +924,9 @@ let test_client_to_typed_read () =
                "synthetic first journal unexpectedly has roots";
              let next =
                List.find
-                 (fun (r : P.request) ->
-                    match r.command with
-                    | V2_list_journals _ -> true
+                 (fun r ->
+                    match Journal_graph_runtime.worker_read business r with
+                    | Some(Journal_graph_runtime.Read{query=W.Journals _;_}) -> true
                     | _ -> false)
                  output.requests
              in
@@ -957,9 +948,9 @@ let test_client_to_typed_read () =
       "synthetic preview root cardinality changed";
     let child_request output =
       List.find
-        (fun (r : P.request) ->
-           match r.command with
-           | V2_get_children _ -> true
+        (fun r ->
+           match Journal_graph_runtime.worker_read business r with
+           | Some(Journal_graph_runtime.Read{query=W.Child_members _;_}) -> true
            | _ -> false)
         output.Journal_graph_runtime.requests
     in
@@ -979,7 +970,7 @@ let test_client_to_typed_read () =
            let output =
              Journal_graph_runtime.receive_worker_read
                business
-               ~request_id:original.request_id
+               ~request_id:original
                result
            in
            if more
@@ -1022,9 +1013,9 @@ let test_client_to_typed_read () =
       while not (Queue.is_empty queue) do
         incr turns;
         require (!turns < 1000) "actual root quota read did not converge";
-        let original : P.request = Queue.take queue in
-        (match original.command with
-         | V2_get_page_tree { limit; _ } -> root_reads := limit :: !root_reads
+        let original = Queue.take queue in
+        (match Journal_graph_runtime.worker_read business original with
+         | Some(Journal_graph_runtime.Read{query=W.Tree _;maximum_items=limit}) -> root_reads := limit :: !root_reads
          | _ -> ());
         match Journal_graph_runtime.worker_read business original with
         | Some (Journal_graph_runtime.Read read) ->
@@ -1039,7 +1030,7 @@ let test_client_to_typed_read () =
                (Journal_graph_runtime.receive_worker_read
                   ?origin:(C.query_origin (C.view !state) ticket)
                   business
-                  ~request_id:original.request_id
+                  ~request_id:original
                   (Journal_graph_runtime.Query_result(read.query,value)))
            | _ -> failwith "actual root quota typed query failed")
         | _ -> failwith "actual root quota path bypassed coordinator"
@@ -1152,9 +1143,9 @@ let test_client_to_typed_read () =
       let planned = Journal_graph_runtime.submit business (Load_favorites request) in
       let original =
         List.find
-          (fun (r : P.request) ->
-             match r.command with
-             | V2_list_favorites _ -> true
+          (fun r ->
+             match Journal_graph_runtime.worker_read business r with
+             | Some(Journal_graph_runtime.Read{query=W.Favorites _;_}) -> true
              | _ -> false)
           planned.requests
       in
@@ -1167,11 +1158,11 @@ let test_client_to_typed_read () =
            let output =
              Journal_graph_runtime.receive_worker_read
                business
-               ~request_id:original.request_id
+               ~request_id:original
                (Journal_graph_runtime.Query_result(read.query,value))
            in
-           List.iter (fun (r:P.request) -> match r.command with
-             | V2_get_children {parent;_} when W.Uuid.equal parent favorite_page_id -> membership:=Some r
+           List.iter (fun r -> match Journal_graph_runtime.worker_read business r with
+             | Some(Journal_graph_runtime.Read{query=W.Child_members{parent;_};_}) when W.Uuid.equal parent favorite_page_id -> membership:=Some r
              | _ -> ()) output.requests;
            List.find_map
              (fun response ->
@@ -1224,7 +1215,7 @@ let test_client_to_typed_read () =
            let output =
              Journal_graph_runtime.receive_worker_read
                business
-               ~request_id:original.request_id
+               ~request_id:original
                result
            in
            if more
@@ -1260,9 +1251,9 @@ let test_client_to_typed_read () =
         | None ->
           let original =
             List.find
-              (fun (r : P.request) ->
-                 match r.command with
-                 | V2_get_outline_block _ | V2_get_page _ | V2_get_children _ -> true
+              (fun r ->
+                 match Journal_graph_runtime.worker_read business r with
+                 | Some(Journal_graph_runtime.Read{query=W.Outline_block _;_}) | Some(Journal_graph_runtime.Read{query=W.Page _;_}) | Some(Journal_graph_runtime.Read{query=W.Child_members _;_}) -> true
                  | _ -> false)
               output.requests
           in
@@ -1279,7 +1270,7 @@ let test_client_to_typed_read () =
                   (remaining - 1)
                   (Journal_graph_runtime.receive_worker_read
                      business
-                     ~request_id:original.request_id
+                     ~request_id:original
                      (Journal_graph_runtime.Query_result(read.query,value)))
               | _ -> failwith "actual Detail typed query failed")
            | _ -> failwith "actual Detail query bypassed coordinator")
@@ -1411,8 +1402,7 @@ let test_client_to_typed_read () =
     let module Detail_observation=Journal_detail.Pure_observation in
     let context:Detail_observation.context={entry_id="actual-service-detail";
       request_generation=350L;root=Test_support.authoritative_block_uuid;owner;maximum_children=128;
-      original={P.api_version=P.api_version;request_id=uuid "9c000000-0000-4000-8000-0000000000d0";
-        command=V2_get_outline_block{block=Test_support.authoritative_block_uuid;revision=None}}} in
+      original=uuid "9c000000-0000-4000-8000-0000000000d0"} in
     let presentation_model,_=Detail_observation.planned Detail_observation.empty context observed_block_ticket in
     let presentation_model,initial_effects=Detail_observation.inspect presentation_model(C.view !state) in
     require(Rrbvec.exists(function Detail_observation.Initial(_,sample)->
@@ -1435,7 +1425,7 @@ let test_client_to_typed_read () =
     let actual=Rrbvec.find_opt(function Detail_observation.Updated _->true|_->false)update_effects |> Option.get in
     let sample=match actual with Detail_observation.Updated(_,sample)->sample|_->assert false in
     let business_request=Journal_graph_runtime.plan_observed_block business ~root:context.root in
-    let applied=Journal_graph_runtime.receive_worker_read business ~request_id:business_request.request_id
+    let applied=Journal_graph_runtime.receive_worker_read business ~request_id:business_request
       ~origin:(W.observation_session sample.observation,W.observation_budget sample.observation)
       (Journal_graph_runtime.Query_result(W.Outline_block{uuid=context.root;revision=None},sample.value)) in
     require(List.exists(fun response->match response.Journal_graph_runtime.payload with
@@ -2053,7 +2043,7 @@ let test_host_durable_recovery_confirmation_ack () =
        task_state=Journal_model.Status(W.Uuid.to_string status);status_confirmation=true;status_intent_revision=0L;
        creation_time=Journal_time.create ~instant_unix_ms:1_788_192_000_000L ~local_day:20260901
          ~local_minute_of_day:0 |> Result.get_ok} in
-    let insert=P.V2_insert_blocks{mutation_id;parent=Test_support.authoritative_block_uuid;
+    let insert=W.Insert_blocks{parent=Test_support.authoritative_block_uuid;
       roots=[{uuid=child;title=command.source;children=[]}];
       preconditions={blocks=[Test_support.authoritative_block_uuid,parent_revision];pages=[];
         scopes=[Worker_pure_data.V2_children_scope Test_support.authoritative_block_uuid,parent_summary.scope_revision]}} in
@@ -2062,10 +2052,11 @@ let test_host_durable_recovery_confirmation_ack () =
     let rec drive fuel state action =
       require(fuel>0) "actual Child lifecycle failed to settle";
       let next,action=match action with
-        | Child.Write(index,round,_) ->
+        | Child.Write(index,round) ->
           incr writes;
           let stage=Child.stage state index in
-          let intent=W.mutation_intent session ~mutation_id:(Child.stage_id stage)(Child.stage_mutation stage) |> Result.get_ok in
+          let durable=Child.stage_intent session stage |> Result.get_ok in
+          let intent=match durable with W.Mutation_intent intent->intent|_->assert false in
           let state=Child.bind state ~index ~round ~intent:(W.Mutation_intent intent) ~presentation |> Option.get in
           let receipt=match value(call(W.Mutate intent)) with
             | W.Committed_pending_presentation receipt->receipt|_->failwith "real Child lost durable commit" in
@@ -2649,7 +2640,7 @@ let test_changefeed_business_waits_for_ui_application () =
       ui output.responses
     and send request =
       let application =
-        Business.application_for_request business ~request_id:request.P.request_id
+        Business.application_for_request business ~request_id:request
       in
       match Business.worker_read business request with
       | Some (Business.Read read) ->
@@ -2697,7 +2688,6 @@ let test_changefeed_business_waits_for_ui_application () =
           | W.Answered (Ok value) -> finished request None origin (Business.Changes_acknowledged value)
           | _ -> failwith "real typed Changes business ACK failed")
       | Some (Business.Confirm_readback _) -> failwith "Changes dispatch became mutation confirmation"
-      | Some (Business.Unowned_read message) -> failwith message
       | None -> failwith "Changes business flow fell back to legacy transport"
     and finished request application origin result =
       let application, discard =
@@ -2711,13 +2701,13 @@ let test_changefeed_business_waits_for_ui_application () =
           then None, true
           else (
             let token =
-              Host.begin_change_application host value ~root:request.P.request_id
+              Host.begin_change_application host value ~root:request
               |> Result.get_ok
             in
             require
               (Business.set_change_application
                  business
-                 ~request_id:request.request_id
+                 ~request_id:request
                  token)
               "business application root was not owned";
             batch := Some value;
@@ -2727,11 +2717,16 @@ let test_changefeed_business_waits_for_ui_application () =
       if discard
       then Business.abandon business request
       else (
+        let child =
+          match Business.worker_read business request with
+          | Some(Business.Read{query=W.Changes _;_}) | Some(Business.Acknowledge _) -> false
+          | _ -> true
+        in
         let output =
           Business.receive_worker_read
             ?origin
             business
-            ~request_id:request.request_id
+            ~request_id:request
             result
         in
         List.iter send output.requests;
@@ -2741,14 +2736,10 @@ let test_changefeed_business_waits_for_ui_application () =
             (fun token ->
                Host.post
                  host
-                 (C.Change_consumer_applied (token, request.request_id, Ok ())))
+                 (C.Change_consumer_applied (token, request, Ok ())))
             application
         in
-        let child =
-          match request.command with
-          | P.V2_pull_changes _ | V2_ack_changes _ -> false
-          | _ -> true
-        in
+
         if !active && !hold_once && child && application <> None
         then (
           hold_once := false;

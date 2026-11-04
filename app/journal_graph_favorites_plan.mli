@@ -1,5 +1,4 @@
 module Graph = Logseq_db_types.Graph_types
-module Protocol = Logseq_db_worker.Protocol
 module Error = Logseq_db_worker.Error
 module Worker = Journal_worker_coordination.Worker_api
 
@@ -14,12 +13,12 @@ type event =
   | Favorites_invalidated
   | Rejected of rejection
 type output =
-  { requests : Protocol.request Rrbvec.t
+  { requests : Graph.Uuid.t Rrbvec.t
   ; responses : event Rrbvec.t
   ; background : bool
   }
 type ports =
-  { plan_read : read -> Protocol.command -> Protocol.request
+  { plan_read : 'a. maximum_items:int -> read -> 'a Worker.query -> Graph.Uuid.t
   ; remember_page : Graph.page -> unit
   }
 type t
@@ -28,7 +27,7 @@ val reset : t -> unit
 val current : t -> read -> bool
 val is_page_target : t -> string -> bool
 val operation_name : read -> string
-val load : ports:ports -> Journal_graph_request.favorites_request -> Protocol.request
+val load : ports:ports -> Journal_graph_request.favorites_request -> Graph.Uuid.t
 val changes : t -> ports:ports -> blocks:Graph.Uuid.t Rrbvec.t -> pages:Graph.Uuid.t Rrbvec.t
   -> structures:Worker_pure_data.structure_interest Rrbvec.t -> output
 val accepts_list : read -> bool
@@ -40,8 +39,3 @@ val receive_page : t -> ports:ports -> read -> Worker_pure_data.page_lookup -> o
 val receive_block : t -> ports:ports -> read -> Worker_pure_data.block_lookup -> output
 val receive_memberships : t -> ports:ports -> read -> Worker_pure_data.child_member list -> Worker_pure_data.child_member Worker.continuation option -> output
 val fail : t -> read -> request_id:Graph.Uuid.t -> code:Error.code -> message:string -> error:Error.t -> output
-
-(** The business owner retains the sealed continuation; the transport DTO is not its cursor store. *)
-val list_request : read -> Journal_graph_request.favorites_request option
-
-val membership_query : read -> Worker.children Worker.query option

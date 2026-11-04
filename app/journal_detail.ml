@@ -963,7 +963,6 @@ let retain_retained_child_chain draft ~command chain =
 module Pure_observation = struct
   module Worker = Journal_worker_coordination.Worker_api
   module Core = Journal_worker_coordination.Worker_pure_coordinator
-  module Protocol = Logseq_db_worker.Protocol
   module Entries = Map.Make (String)
 
   type context =
@@ -971,7 +970,7 @@ module Pure_observation = struct
     ; request_generation : int64
     ; root : Worker.Uuid.t
     ; owner : Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
-    ; original : Protocol.request
+    ; original : Worker.Uuid.t
     ; maximum_children : int
     }
 
@@ -1014,11 +1013,7 @@ module Pure_observation = struct
     let claimed=Entries.exists(fun _ old->old.ticket=ticket && old.context<>context)t in
     if claimed then t,Rrbvec.singleton(Rejected(context,Worker.Invalid_input
       "This observation ticket already belongs to another Detail context.")) else
-    match context.original.command with
-    | Protocol.V2_get_outline_block { block; _ }
-      when block=context.root && context.original.api_version=Protocol.api_version
-        && context.request_generation>=0L && context.maximum_children>0
-        && context.maximum_children<=Worker_pure_data.maximum_page_size ->
+    if context.maximum_children>0 && context.maximum_children<=Worker_pure_data.maximum_page_size then
       (match Entries.find_opt context.entry_id t with
        | Some old when old.context = context && Core.ticket_id old.ticket = Core.ticket_id ticket ->
          t, Rrbvec.empty
@@ -1027,9 +1022,8 @@ module Pure_observation = struct
          let entry = { context; ticket; handle=None; forwarded_epoch=None;
            reported=false; forgotten=false; error=None } in
          Entries.add context.entry_id entry t, effects)
-    | _ ->
-      t, Rrbvec.of_list [Cancel_initial ticket; Forget_initial ticket;
-        Rejected (context, Worker.Invalid_input "Detail observation does not match its root request.")]
+    else t, Rrbvec.of_list [Cancel_initial ticket; Forget_initial ticket;
+        Rejected (context, Worker.Invalid_input "Detail observation has an invalid child budget.")]
   ;;
 
   let retain t wanted =
@@ -1065,9 +1059,8 @@ module Pure_observation = struct
     let entry = {entry with handle;forgotten} in
     let result = Option.map (fun handle ->
       let session = Worker.observation_session handle in
-      let Worker.Outline_block {uuid;revision}=Worker.observation_query handle in
-      let query_matches=uuid=entry.context.root && entry.context.original.command=
-        Protocol.V2_get_outline_block{block=uuid;revision} in
+      let Worker.Outline_block {uuid;_}=Worker.observation_query handle in
+      let query_matches=uuid=entry.context.root in
       if not query_matches then Error (Worker.Protocol_mismatch "Detail observation root changed.")
       else if Core.observation_handle view entry.ticket=None
            || not(Worker.matches_scope session entry.context.owner) then Error Worker.Revoked_session

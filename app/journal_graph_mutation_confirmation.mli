@@ -1,5 +1,4 @@
 module Graph = Logseq_db_types.Graph_types
-module Protocol = Logseq_db_worker.Protocol
 module Worker = Journal_worker_coordination.Worker_api
 
 type purpose =
@@ -20,7 +19,7 @@ type confirmation =
   ; children : Worker_pure_data.child_member Rrbvec.t
   }
 
-type planning = (Protocol.request, string) result
+type planning = (Graph.Uuid.t, string) result
 
 type step =
   | Continue of planning
@@ -30,7 +29,7 @@ type step =
 
 type ports =
   { now : unit -> int64
-  ; plan_read : source_epoch:int64 -> read -> Protocol.command -> Protocol.request
+  ; plan_read : source_epoch:int64 -> read -> Worker.block_summary Worker.query -> Graph.Uuid.t
   }
 
 type t
@@ -68,7 +67,7 @@ module Pure_insertion : sig
   type stage
   type t
   type action =
-    | Write of int * int64 * Protocol.command
+    | Write of int * int64
     | Read_child of int64
     | Read_parent of int64 * Worker.block_summary
     | Present of int64
@@ -77,11 +76,10 @@ module Pure_insertion : sig
     | Ignore
     | Wait of string
   val start : command:Journal_graph_projection.create_child -> page:Graph.page
-    -> resolved_status:Graph.Uuid.t option -> insert:Protocol.command -> (t * action,string) result
+    -> resolved_status:Graph.Uuid.t option -> insert:Worker.mutation_command -> (t * action,string) result
   val start_capture : command:Journal_graph_projection.capture -> resolved_status:Graph.Uuid.t option
-    -> insert:Protocol.command -> (t * action,string) result
+    -> root:Worker_pure_data.append_node -> (t * action,string) result
   val capture_command : Journal_graph_projection.capture -> Journal_graph_projection.create_child
-  val wire_intent : Worker.session -> Protocol.command -> (Worker.durable_intent,Worker.error) result
   val stage_intent : Worker.session -> stage -> (Worker.durable_intent,Worker.error) result
   val command : t -> Journal_graph_projection.create_child
   val page : t -> Graph.page
@@ -91,8 +89,6 @@ module Pure_insertion : sig
   val presentation : t -> Worker.presentation option
   val stage : t -> int -> stage
   val stage_id : stage -> Graph.Uuid.t
-  val stage_wire : stage -> Protocol.command
-  val stage_mutation : stage -> Worker.mutation_command
   val interrupted : t -> index:int -> round:int64 -> string -> t * action
   val read_failed : t -> round:int64 -> string -> t * action
   val insert_rejected : t -> bool

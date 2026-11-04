@@ -4208,17 +4208,16 @@ let start
     terminal_graph_state state (Transport_graph_error message)
   in
   let coordinated_read_finished = ref (fun (_:Graph_service.timeline_scope)
-      (_:Logseq_db_worker.Protocol.request) (_:Coordination.change_application option) (_: (Wc.session * Wc.read_budget) option) (_:(Journal_graph_runtime.worker_read_result,string) result) -> ()) in
+      (_:Wc.Uuid.t) (_:Coordination.change_application option) (_: (Wc.session * Wc.read_budget) option) (_:(Journal_graph_runtime.worker_read_result,string) result) -> ()) in
   let send_coordinated_read request read =
-    match read with
-    | Journal_graph_runtime.Unowned_read _ -> Journal_graph_transport.Not_ready
-    | _ -> match current_owner(),ensure_coordination() with
+    match current_owner(),ensure_coordination() with
     | Some owner,Ok host ->
-      let application=Journal_graph_runtime.application_for_request (!graph_runtime_cell) ~request_id:request.Logseq_db_worker.Protocol.request_id in
+      let application=Journal_graph_runtime.application_for_request (!graph_runtime_cell) ~request_id:request in
       let watch : type a. Wc.session option -> a Coordination.ticket -> (a -> Journal_graph_runtime.worker_read_result) -> unit =
         fun expected_session ticket outcome ->
         Coordination_host.watch_read host ticket ~f:(fun origin reply ->
-          let is_changes=match request.command with Logseq_db_worker.Protocol.V2_pull_changes _|V2_ack_changes _->true|_->false in
+          let is_changes=match read with
+            |Journal_graph_runtime.Read{query=Wc.Changes _;_}|Acknowledge _->true|_->false in
           let result=match reply with
             | Wc.Answered(Ok value) ->
               let session=match expected_session,origin with Some session,_->Some session|None,Some(session,_)->Some session|_->None in
@@ -4254,7 +4253,7 @@ let start
                   match Wc.read_budget session ~maximum_items:read.maximum_items ~maximum_bytes:Worker_pure_data.maximum_response_bytes with
                   | Error _->Some Journal_graph_transport.Not_ready
                   | Ok budget->
-                    observe_projection_query ~request_id:request.request_id read.query;
+                    observe_projection_query ~request_id:request read.query;
                     match Coordination_host.request host session(Wc.Observe(budget,read.query)) with
                     | Error _->Some Journal_graph_transport.Not_ready
                     | Ok ticket->
@@ -4275,14 +4274,14 @@ let start
          match Coordination_host.plan_query host ~owner ~maximum_items:read.maximum_items
            ~maximum_bytes:Worker_pure_data.maximum_response_bytes read.query with
           | Ok ticket->
-            observe_projection_query ~request_id:request.request_id read.query;
+            observe_projection_query ~request_id:request read.query;
             watch None ticket (fun value->Journal_graph_runtime.Query_result(read.query,value));
             Journal_graph_transport.Accepted
           | Error _->Journal_graph_transport.Not_ready)
        | Confirm_readback read ->
          (match Coordination_host.reconcile_mutation host ~presentation:read.presentation read.intent with
           | Ok ticket->
-            observe_projection_query ~request_id:request.request_id read.query;
+            observe_projection_query ~request_id:request read.query;
             watch (Some(Wc.presentation_session read.presentation)) ticket (function
               | Wc.Confirmed confirmation ->
                 (match Wc.confirmation_primary confirmation with
@@ -4295,19 +4294,19 @@ let start
          (match Coordination_host.request host (Wc.change_batch_session read.batch)(Wc.Acknowledge_changes read.batch) with
           | Ok ticket->watch(Some(Wc.change_batch_session read.batch))ticket (fun ack->Journal_graph_runtime.Changes_acknowledged ack);Journal_graph_transport.Accepted
           | Error _->Journal_graph_transport.Not_ready)
-       | Unowned_read _->Journal_graph_transport.Not_ready)
+       )
     | _->Journal_graph_transport.Not_ready in
   let coordinated_mutation_finished=ref(fun (_:Graph_service.timeline_scope)
-    (_:Logseq_db_worker.Protocol.request) (_:(Wc.mutation_progress,string)result)->()) in
+    (_:Wc.Uuid.t) (_:(Wc.mutation_progress,string)result)->()) in
   let coordinated_child_ack_finished=ref(fun (_:Graph_service.timeline_scope)
-    (_:Logseq_db_worker.Protocol.request) (_:Wc.presentation) (_:(unit,string)result)->()) in
-  let send_coordinated_intent request make_intent =
+    (_:Wc.Uuid.t) (_:Wc.presentation) (_:(unit,string)result)->()) in
+  let send_coordinated_intent request =
     match current_owner(),ensure_coordination() with
     | Some owner,Ok host ->
       (match Option.bind(Coordination.projection(Coordination_host.view host))Wc.selected with
        | Some presentation when Wc.matches_scope(Wc.presentation_session presentation)owner ->
          let session=Wc.presentation_session presentation in
-         (match make_intent session with
+         (match Journal_graph_runtime.worker_intent (!graph_runtime_cell) request session with
           | Ok intent when Journal_graph_runtime.bind_mutation (!graph_runtime_cell)request ~presentation ~intent ->
             let rec watch ticket =
               Coordination_host.watch host ticket ~f:(fun reply->
@@ -4341,11 +4340,6 @@ let start
           | _->Journal_graph_transport.Not_ready)
        | _->Journal_graph_transport.Not_ready)
     | _->Journal_graph_transport.Not_ready in
-  let send_coordinated_mutation request (mutation_id,command) =
-    send_coordinated_intent request(fun session->Wc.mutation_intent session ~mutation_id command |> Result.map(fun intent->Wc.Mutation_intent intent)) in
-  let send_coordinated_append request wire =
-    send_coordinated_intent request(fun session->
-      Journal_graph_mutation_confirmation.Pure_insertion.wire_intent session wire) in
   let send_coordinated_child_ack request (intent,applied_presentation) =
     match current_owner(),!coordination_host with
     | Some owner,Some(_,host)->
@@ -4388,20 +4382,12 @@ let start
     let delivery=Journal_graph_transport.deliver
       ~runtime:(!graph_runtime_cell)
       ~send:(fun request ->
-        match Journal_graph_runtime.worker_append (!graph_runtime_cell) request with
-        | Some(Ok wire)->send_coordinated_append request wire
-        | Some(Error _)->Journal_graph_transport.Not_ready
-        | None->
         match Journal_graph_runtime.worker_read (!graph_runtime_cell) request with
         | Some read -> send_coordinated_read request read
         | None ->
         match Journal_graph_runtime.worker_child_ack (!graph_runtime_cell) request with
         | Some ack->send_coordinated_child_ack request ack
-        | None ->
-        match Journal_graph_runtime.worker_mutation (!graph_runtime_cell) request with
-        | Some mutation->send_coordinated_mutation request mutation
-        | None->
-        Journal_graph_transport.Not_ready)
+        | None -> send_coordinated_intent request)
       output in
     Rrbvec.iter(fun(root,recovery)-> !schedule_insertion_recovery root recovery)
       (Journal_graph_runtime.take_insertion_recoveries (!graph_runtime_cell));
@@ -4704,8 +4690,8 @@ let start
           if not(Coordination.owns_change_batch view batch)
              || (Coordination.change_application_started view batch && Coordination.change_application_error view batch=None)
           then None,Ok Journal_graph_runtime.Changes_retired
-          else (match Coordination_host.begin_change_application host batch ~root:request.request_id with
-            | Ok token when Journal_graph_runtime.set_change_application (!graph_runtime_cell) ~request_id:request.request_id token ->Some token,result
+          else (match Coordination_host.begin_change_application host batch ~root:request with
+            | Ok token when Journal_graph_runtime.set_change_application (!graph_runtime_cell) ~request_id:request token ->Some token,result
             | _->None,Error "The graph change application could not be started.")
         | _->application,result in
       let resync_generation= !state_ref.next_request_generation in
@@ -4715,21 +4701,21 @@ let start
       let asset_projection_error=ref None in
       let output=match result with
         | Ok result ->
-          Journal_graph_runtime.with_read_projection (!graph_runtime_cell) ~request_id:request.request_id ~f:(fun()->
+          Journal_graph_runtime.with_read_projection (!graph_runtime_cell) ~request_id:request ~f:(fun()->
           let asset_error_before=Journal_asset_runtime.projection_read_error (!asset_runtime_cell) in
           (match result with
            | Journal_graph_runtime.Query_result (query,value) ->
              Journal_media_runtime.observe_query_result (!media_runtime_cell)
-               ~request_id:request.request_id query value;
+               ~request_id:request query value;
              Journal_asset_runtime.observe_query_result (!asset_runtime_cell)
-               ~request_id:request.request_id query value
+               ~request_id:request query value
            | Read_failed _ | Changes_acknowledged _ | Changes_resync _ | Changes_retired ->
-             forget_projection_request request.request_id);
+             forget_projection_request request);
           asset_projection_error :=
             (if asset_error_before=None then Journal_asset_runtime.projection_read_error (!asset_runtime_cell)
              else None));
-          Journal_graph_runtime.receive_worker_read ~resync_generation ?origin (!graph_runtime_cell) ~request_id:request.request_id result
-        | Error message -> forget_projection_request request.request_id;
+          Journal_graph_runtime.receive_worker_read ~resync_generation ?origin (!graph_runtime_cell) ~request_id:request result
+        | Error message -> forget_projection_request request;
           Journal_graph_runtime.fail_request (!graph_runtime_cell) request ~message in
       Effect.bind prepare ~f:(fun()->
       Effect.bind (Effect.of_thunk(fun()->deliver_output output)) ~f:(fun delivery ->
@@ -4741,7 +4727,7 @@ let start
             | None-> !asset_projection_error in
           Effect.bind(flush_media set_state) ~f:(fun()->
           Option.iter(fun token->Option.iter(fun(_,host)->Coordination_host.post host
-            (Coordination.Change_consumer_applied(token,request.request_id,
+            (Coordination.Change_consumer_applied(token,request,
               match result,delivery.error,projection_error with
               | Error message,_,_|_,Some message,_|_,_,Some message->Error(Wc.Service_failed message)
               | _->Ok())))!coordination_host) application;
@@ -4786,8 +4772,8 @@ let start
             && Journal_routes.detail_block_id route=Some(Wc.Uuid.to_string context.root)
             && runtime_owner_is_live !state_ref context.owner
           | None->false in
-        let forward context sample (request:Logseq_db_worker.Protocol.request)=
-          observe_projection_query ~request_id:request.request_id
+        let forward context sample (request:Wc.Uuid.t)=
+          observe_projection_query ~request_id:request
             (Wc.Outline_block{uuid=context.Detail_observation.root;revision=None});
           !coordinated_read_finished context.Detail_observation.owner request None
             (Some(Wc.observation_session sample.Wc.observation,Wc.observation_budget sample.observation))

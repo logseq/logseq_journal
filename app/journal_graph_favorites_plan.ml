@@ -1,5 +1,4 @@
 module Graph = Logseq_db_types.Graph_types
-module Protocol = Logseq_db_worker.Protocol
 module Error = Logseq_db_worker.Error
 module Worker = Journal_worker_coordination.Worker_api
 
@@ -30,12 +29,12 @@ type event =
   | Favorites_invalidated
   | Rejected of rejection
 type output =
-  { requests : Protocol.request Rrbvec.t
+  { requests : Graph.Uuid.t Rrbvec.t
   ; responses : event Rrbvec.t
   ; background : bool
   }
 type ports =
-  { plan_read : read -> Protocol.command -> Protocol.request
+  { plan_read : 'a. maximum_items:int -> read -> 'a Worker.query -> Graph.Uuid.t
   ; remember_page : Graph.page -> unit
   }
 type t =
@@ -103,8 +102,8 @@ let operation_name = function
   | Favorite_memberships _ -> "readFavoriteMemberships"
 ;;
 let load ~ports (request : Journal_graph_request.favorites_request) =
-  ports.plan_read (List_favorites request)
-    (Protocol.V2_list_favorites { limit = request.limit; cursor = None })
+  ports.plan_read ~maximum_items:request.limit (List_favorites request)
+    (Worker.Favorites request.cursor)
 ;;
 let maximum_reference_targets = 4096
 let register_favorite_dependency t uuid =
@@ -130,11 +129,9 @@ let favorite_dependency_read ?(refresh = false) t ~ports ~page ~seen uuid =
     then invalid_arg "Favorite pending reads exceed the bounded read limit.";
     Hashtbl.replace t.favorite_pending key ();
     Some
-      (ports.plan_read
-         (Favorite_dependency { epoch = t.favorite_epoch; uuid; seen; page })
-         (if page
-          then Protocol.V2_get_page { page = uuid; revision = None }
-          else Protocol.V2_get_outline_block { block = uuid; revision = None })))
+      (let operation=Favorite_dependency { epoch = t.favorite_epoch; uuid; seen; page } in
+       if page then ports.plan_read ~maximum_items:1 operation (Worker.Page {uuid;revision=None})
+       else ports.plan_read ~maximum_items:1 operation (Worker.Outline_block {uuid;revision=None})))
 ;;
 
 let recheck_dirty_favorite_dependency t ~ports ~uuid ~seen ~page =
@@ -240,9 +237,9 @@ let changes t ~ports ~blocks ~pages ~structures =
     then
       Rrbvec.map
         (fun page ->
-           ports.plan_read
+           ports.plan_read ~maximum_items:1
          (Favorite_page_candidate page)
-             (Protocol.V2_get_page { page; revision = None }))
+             (Worker.Page { uuid=page; revision = None }))
         pages
     else Rrbvec.empty
   in
@@ -311,11 +308,10 @@ let receive_list t ~ports (request : Journal_graph_request.favorites_request) (r
                match request.cursor, result.favorites_page with
                | None, Some page ->
                  Hashtbl.replace t.favorite_pending (favorite_membership_key page) ();
-                 Rrbvec.singleton (ports.plan_read
+                 Rrbvec.singleton (ports.plan_read ~maximum_items:200
                     (Favorite_memberships
                         { epoch = t.favorite_epoch; page; consumed = 0; seen = []; after=None })
-                     (Protocol.V2_get_children
-                        { parent = page; limit = 200; cursor = None; revision = None })
+                     (Worker.Child_members {parent=page;revision=None;after=None})
                  )
                | _ -> Rrbvec.empty
              in
@@ -486,7 +482,7 @@ let receive_memberships t ~ports operation items next_cursor =
                   background_demands
                 { output with
                       requests =
-                        Rrbvec.singleton (ports.plan_read
+                        Rrbvec.singleton (ports.plan_read ~maximum_items:200
                     (Favorite_memberships
                                { epoch
                                ; page
@@ -494,12 +490,7 @@ let receive_memberships t ~ports operation items next_cursor =
                                ; seen = key :: seen
                                ; after = Some cursor
                                })
-                            (Protocol.V2_get_children
-                               { parent = page
-                               ; limit = 200
-                               ; cursor = None
-                               ; revision = None
-                               })
+                            (Worker.Child_members {parent=page;revision=None;after=Some cursor})
                         )
                     }
             with
@@ -525,12 +516,4 @@ let fail t operation ~request_id ~code ~message ~error =
     if epoch <> t.favorite_epoch then empty else
       complete_favorite_dependency_key t (favorite_membership_key page) (rejected ())
   | Favorite_page_candidate _ -> rejected ()
-;;
-
-let list_request = function List_favorites request -> Some request | _ -> None
-
-let membership_query = function
-  | Favorite_memberships { page; after; _ } ->
-    Some (Worker.Child_members { parent = page; revision = None; after })
-  | _ -> None
 ;;

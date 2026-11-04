@@ -1,5 +1,4 @@
 module Graph = Logseq_db_types.Graph_types
-module Protocol = Logseq_db_worker.Protocol
 module Projection = Journal_graph_projection
 module Worker = Journal_worker_coordination.Worker_api
 
@@ -88,7 +87,7 @@ type publication =
   | Reconciled of { page : Projection.page; value : Projection.timeline_entry_page }
   | Failed of { scope : failure_scope; stale_cursor : bool; message : string }
 type cached = root_batch
-type output = { requests : Protocol.request Rrbvec.t; publications : publication Rrbvec.t; cached : cached option }
+type output = { requests : Graph.Uuid.t Rrbvec.t; publications : publication Rrbvec.t; cached : cached option }
 type packet = Dates of Worker_pure_data.journal_item Seq.t | Roots of Worker_pure_data.tree_member Seq.t
   | Preview of Worker_pure_data.child_member Seq.t
 type fragment = { page : Projection.page; members : Projection.tree_member Rrbvec.t
@@ -97,7 +96,7 @@ type context = { today : int option; time_context : (Projection.time_context, st
 type ports =
   { now : unit -> int64
   ; validate_session : Worker.session -> (unit, Worker.error) result
-  ; plan_read : operation -> Protocol.command -> Protocol.request
+  ; plan_read : 'a. maximum_items:int -> operation -> 'a Worker.query -> Graph.Uuid.t
   ; context : unit -> context
   ; tag_titles : Graph.Uuid.t -> string list
   ; project_journal_page : Graph.page -> Projection.page option
@@ -213,19 +212,17 @@ let plan_root_batch ~ports batch =
   let request =
     ports.plan_read
       (Root_tree batch)
-      (Protocol.V2_get_page_tree
+      ~maximum_items:limit
+      (Worker.Tree
          { page = Graph.Uuid.of_string batch.root_page.id |> Result.get_ok
-         ; maximum_depth = 0
-         ; limit
-         ; cursor = None
-         ; revision = None
-         })
+         ; maximum_depth = 0; revision = None
+         ; after = Option.bind batch.root_cursor (fun cursor -> cursor.Projection.after) })
   in
   (match batch.root_owner with
    | Feed_roots scan ->
      ports.report
        "runtime-feed-tree-request"
-       [ "request", `String (Graph.Uuid.to_string request.request_id)
+       [ "request", `String (Graph.Uuid.to_string request)
        ; "requestGeneration", `String (Int64.to_string scan.root_generation)
        ; "target", timeline_uuid batch.root_page.id
        ; "day", `Int batch.root_page.day
@@ -325,17 +322,14 @@ let read_root_dates ~ports scan =
   let request =
     ports.plan_read
       (Root_dates (scan, params))
-      (Protocol.V2_list_journals
-         { from_day = 10101
-         ; through_day = min 99991231 scan.root_journal_through
-         ; limit = scan.root_list_size
-         ; cursor = None
-         ; revision = None
-         })
+      ~maximum_items:params.limit
+      (Worker.Journals
+         { from_day = params.from_day; through_day = params.through_day
+         ; revision = None; after = params.after })
   in
   ports.report
     "runtime-feed-request"
-    [ "request", `String (Graph.Uuid.to_string request.request_id)
+    [ "request", `String (Graph.Uuid.to_string request)
     ; "requestGeneration", `String (Int64.to_string scan.root_generation)
     ; "beforeDay", Option.fold ~none:`Null ~some:(fun d -> `Int d) scan.root_before_day
     ; "dayLimit", `Int scan.root_list_size
@@ -363,17 +357,14 @@ let read_priority_today ~ports scan =
   let request =
     ports.plan_read
       (Root_today (scan, params))
-      (Protocol.V2_list_journals
-         { from_day = today
-         ; through_day = today
-         ; limit = 1
-         ; cursor = None
-         ; revision = None
-         })
+      ~maximum_items:params.limit
+      (Worker.Journals
+         { from_day = params.from_day; through_day = params.through_day
+         ; revision = None; after = params.after })
   in
   ports.report
     "runtime-feed-request"
-    [ "request", `String (Graph.Uuid.to_string request.request_id)
+    [ "request", `String (Graph.Uuid.to_string request)
     ; "requestGeneration", `String (Int64.to_string scan.root_generation)
     ; "day", `Int today
     ; "dayLimit", `Int 1
@@ -593,18 +584,16 @@ let read_root_preview ~ports preview =
   let request =
     ports.plan_read
       (Root_preview preview)
-      (Protocol.V2_get_children
-         { parent = preview.preview_root.block.uuid
-         ; limit = preview.preview_limit
-         ; cursor = None
-         ; revision = None
-         })
+      ~maximum_items:preview.preview_limit
+      (Worker.Child_members
+         { parent = preview.preview_root.block.uuid; revision = None
+         ; after = preview.preview_cursor })
   in
   (match preview.preview_batch.root_owner with
    | Feed_roots scan ->
      ports.report
        "runtime-feed-tree-request"
-       [ "request", `String (Graph.Uuid.to_string request.request_id)
+       [ "request", `String (Graph.Uuid.to_string request)
        ; "requestGeneration", `String (Int64.to_string scan.root_generation)
        ; "target", `String (Graph.Uuid.to_string preview.preview_root.block.uuid)
        ; "day", `Int preview.preview_batch.root_page.day
@@ -935,43 +924,6 @@ let is_current t = function Root_dates (scan, _) | Root_today (scan, _) -> root_
 let superseded t ~ports = function Root_dates _ | Root_today _ -> empty
   | Root_tree batch -> superseded_root_batch t ~ports batch
   | Root_preview preview -> superseded_root_batch t ~ports preview.preview_batch
-let journal_request = function
-  | Root_dates (_, request) | Root_today (_, request) -> Some request
-  | Root_tree _ | Root_preview _ -> None
-;;
-
-type tree_request =
-  { page : Graph.Uuid.t
-  ; maximum_items : int
-  ; after : Worker_pure_data.tree_member Worker.continuation option
-  }
-
-let tree_request = function
-  | Root_tree batch ->
-    Some
-      { page = Graph.Uuid.of_string batch.root_page.id |> Result.get_ok
-      ; maximum_items = root_read_size batch
-      ; after = Option.bind batch.root_cursor (fun cursor -> cursor.Projection.after)
-      }
-  | _ -> None
-;;
-
-type child_request =
-  { parent : Graph.Uuid.t
-  ; limit : int
-  ; after : Worker_pure_data.child_member Worker.continuation option
-  }
-
-let child_request = function
-  | Root_preview preview ->
-    Some
-      { parent = preview.preview_root.block.uuid
-      ; limit = preview.preview_limit
-      ; after = preview.preview_cursor
-      }
-  | Root_dates _ | Root_today _ | Root_tree _ -> None
-;;
-
 let receive : type a. t -> ports:ports -> ?origin:(Worker.session * Worker.read_budget)
   -> operation -> a Worker.query -> a -> output option =
   fun t ~ports ?origin operation query value ->

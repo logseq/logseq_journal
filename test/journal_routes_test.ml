@@ -4391,7 +4391,7 @@ module Detail_observation_fixture = struct
     let reply=if failed then W.Answered(Error W.Response_budget_exceeded) else I.reply session
       ~request_id:(C.ticket_id ticket) operation response |> Result.get_ok in
     let completed=(C.step registered(C.Completed(ticket,reply))).next in
-    let context:M.context={entry_id="detail-observation-fixture";request_generation=1L;root;owner;original=request;maximum_children=128} in
+    let context:M.context={entry_id="detail-observation-fixture";request_generation=1L;root;owner;original=request.request_id;maximum_children=128} in
     context,ticket,handle,planned.next,completed,issuer,session,raw
   let refresh issuer session handle state =
     let module I=(val issuer:Worker_effect_authority.ISSUER) in
@@ -4453,7 +4453,7 @@ let test_observed_absence_does_not_commit_user_deletion () =
   let module F=Detail_observation_fixture in
   let runtime=Journal_graph_runtime.create() in
   let request=Journal_graph_runtime.plan_observed_block runtime ~root:F.root in
-  let output=Journal_graph_runtime.receive_worker_read runtime ~request_id:request.request_id
+  let output=Journal_graph_runtime.receive_worker_read runtime ~request_id:request
     (Journal_graph_runtime.Query_result(F.W.Outline_block{uuid=F.root;revision=None},
       Worker_pure_data.V2_missing_block{uuid=F.root;revision="missing-observed"})) in
   require(not(List.exists(fun response->match response.Journal_graph_runtime.payload with
@@ -4590,15 +4590,18 @@ module Child_chain_fixture = struct
     let page:G.page={uuid=uuid "70000000-0000-4000-b000-000020260809";name="Child fixture";title="Child fixture";
       kind=(if append then Journal_page{journal_day=20260809} else Ordinary_page);created_at_ms=1L;updated_at_ms=1L;tags=[];properties=[];recycled=false} in
     let parent=(if append then page.uuid else uuid command.parent_block_id) and child=uuid command.block_id in
-    let insert=P.V2_insert_blocks {mutation_id=uuid command.mutation_id;parent;
+    let insert=W.Insert_blocks {parent;
       roots=[{uuid=child;title=command.source;children=[]}];
       preconditions={blocks=[parent,command.expected_parent_revision];pages=[];
         scopes=[Worker_pure_data.V2_children_scope parent,"children-state:v1:frozen"]}} in
     let resolved_status=match task_state with Journal_model.Status id->Some(uuid id)|_->None in
-    let insert=if not append then insert else P.V2_append_journal{
-      mutation_id=uuid command.mutation_id;page=uuid "70000000-0000-4000-b000-000020260810";
-      journal_day=20260809;root={block_id=child;title=command.source;task_status=resolved_status;children=Rrbvec.empty}} in
-    let initial,action=C.start ~command ~page ~resolved_status ~insert |> Result.get_ok in
+    let initial,action=if not append then C.start ~command ~page ~resolved_status ~insert |> Result.get_ok
+      else let capture:Journal_graph_projection.capture={mutation_id=command.mutation_id;block_id=command.block_id;
+        source=command.source;sibling_order=command.sibling_order;creation_time=command.creation_time;children=[];
+        task_state=command.task_state;status_confirmation=command.status_confirmation;status_intent_revision=command.status_intent_revision} in
+      C.start_capture ~command:capture ~resolved_status
+        ~root:Worker_pure_data.{block_id=child;title=command.source;task_status=resolved_status;children=Rrbvec.empty}
+      |> Result.get_ok in
     let confirm index intent presentation =
       let id=W.durable_intent_id intent in
       let request_id=W.request_id id in
@@ -4629,9 +4632,11 @@ module Child_chain_fixture = struct
       | _ -> failwith "Production confirmation was rejected") in
       W.Confirmed confirmation in
     {initial;action;command;session;presentation;projection;binding=I.binding;confirm}
-  let write = function C.Write(index,round,wire)->index,round,wire|_->fail "expected a child write"
+  let write fixture state = function
+    | C.Write(index,round)->index,round,W.encode_durable_intent(C.stage_intent fixture.session(C.stage state index) |> Result.get_ok)
+    | _->fail "expected a child write"
   let bind fixture state action =
-    let index,round,_=write action in
+    let index,round,_=write fixture state action in
     let stage=C.stage state index in
     let intent=C.stage_intent fixture.session stage |> Result.get_ok in
     let state=C.bind state ~index ~round ~intent ~presentation:fixture.presentation |> Option.get in
@@ -4694,8 +4699,8 @@ let test_capture_retained_attempt_survives_runtime_reset () =
       (List.map(fun response->match response.R.payload with
         | Capture_waiting{message;_}->message|_->"other")output.responses |> String.concat ";") in
   let initial=R.submit runtime (Option.get request) |> only in
-  let wire=R.worker_append runtime initial |> Option.get |> Result.get_ok in
-  let intent=C.wire_intent fixture.session wire |> Result.get_ok in
+  let intent=R.worker_intent runtime initial fixture.session |> Result.get_ok in
+  let wire=F.W.encode_durable_intent intent in
   require(R.bind_mutation runtime initial ~presentation:fixture.presentation ~intent) "Capture did not bind original Append";
   ignore(R.receive_mutation runtime initial F.W.Outcome_unknown);
   let command=Journal_capture.pending_command capture |> Option.get in
@@ -4705,7 +4710,7 @@ let test_capture_retained_attempt_survives_runtime_reset () =
   R.reset runtime;R.set_calendar runtime calendar;
   let capture,request=Journal_capture.retry capture in
   let resumed=R.submit ?capture_chain:(Journal_capture.retained_chain capture) runtime (Option.get request) |> only in
-  let resumed_wire=R.worker_append runtime resumed |> Option.get |> Result.get_ok in
+  let resumed_wire=R.worker_intent runtime resumed fixture.session |> Result.get_ok |> F.W.encode_durable_intent in
   require(resumed_wire=wire) "Runtime reset reconstructed the accepted Append with a new status payload";
   require(Journal_capture.source capture=fixture.command.source) "Runtime reset lost frozen source";
   require(R.bind_mutation runtime resumed ~presentation:fixture.presentation ~intent) "restored Append did not bind";
@@ -4717,10 +4722,9 @@ let test_capture_retained_attempt_survives_runtime_reset () =
   let canonical=R.receive_child_ack runtime ack (Ok()) |> only in
   let summary=match progress with F.W.Confirmed proof->(match F.W.confirmation_primary proof with
     | Confirmed_block summary->summary|_->assert false)|_->assert false in
-  let status=R.receive_worker_read runtime ~request_id:canonical.request_id (R.Query_result(F.W.Block_summary{block=root;after=None},summary)) |> only in
-  let mutation_id,command=R.worker_mutation runtime status |> Option.get in
-  let status_intent=F.W.mutation_intent fixture.session ~mutation_id command |> Result.get_ok in
-  require(R.bind_mutation runtime status ~presentation:fixture.presentation ~intent:(F.W.Mutation_intent status_intent))
+  let status=R.receive_worker_read runtime ~request_id:canonical (R.Query_result(F.W.Block_summary{block=root;after=None},summary)) |> only in
+  let status_intent=R.worker_intent runtime status fixture.session |> Result.get_ok in
+  require(R.bind_mutation runtime status ~presentation:fixture.presentation ~intent:status_intent)
     "status continuation did not bind";
   ignore(R.receive_mutation runtime status F.W.Outcome_unknown);
   let command=Journal_capture.pending_command capture |> Option.get in
@@ -4729,10 +4733,10 @@ let test_capture_retained_attempt_survives_runtime_reset () =
   R.reset runtime;R.set_calendar runtime calendar;
   let capture,request=Journal_capture.retry capture in
   let resumed=R.submit ?capture_chain:(Journal_capture.retained_chain capture) runtime (Option.get request) |> only in
-  require(resumed.command=status.command) "Runtime reset rebuilt an accepted status with new preconditions";
+  require(F.W.encode_durable_intent(R.worker_intent runtime resumed fixture.session |> Result.get_ok)=F.W.encode_durable_intent status_intent) "Runtime reset rebuilt an accepted status with new preconditions";
   let _,_,projection,session=Coordination_test_fixture.fixture 5520L in
   let presentation=Option.get(F.W.selected projection) in
-  let intent=C.wire_intent session resumed.command |> Result.get_ok in
+  let intent=R.worker_intent runtime resumed session |> Result.get_ok in
   require(R.bind_mutation runtime resumed ~presentation ~intent)
     "fresh execution did not adopt its original logical operation"
 ;;
@@ -4753,41 +4757,34 @@ let test_capture_chain_freezes_complete_payload () =
   let root:Worker_pure_data.append_node={block_id=uuid command.block_id;title=command.source;task_status=None;
     children=Rrbvec.singleton Worker_pure_data.{block_id=uuid child.block_id;title=child.source;
       task_status=(match child_status_a with Status id->Some(uuid id)|_->assert false);children=Rrbvec.empty}} in
-  let insert=P.V2_append_journal{mutation_id=uuid command.mutation_id;page=(C.page fixture.initial).uuid;
-    journal_day=Journal_time.local_day command.creation_time;root} in
-  let state,_=C.start_capture ~command ~resolved_status:None ~insert |> Result.get_ok in
+  let state,_=C.start_capture ~command ~resolved_status:None ~root |> Result.get_ok in
+  let original=F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage state 0) |> Result.get_ok) in
   require(Result.is_error(C.retarget_capture state ~command:{command with source="Changed"} ~resolved_status:None))
     "Capture retry changed its root source";
   require(Result.is_error(C.retarget_capture state ~command:{command with children=[{child with source="Changed"}]} ~resolved_status:None))
     "Capture retry changed its original child payload";
-  require(Result.is_error(C.start_capture ~command:{command with children=[]} ~resolved_status:None ~insert))
+  require(Result.is_error(C.start_capture ~command:{command with children=[]} ~resolved_status:None ~root))
     "Capture admitted children different from the atomic wire";
   let selected={command with task_state=child_status_a;status_intent_revision=1L;status_confirmation=true} in
   let state=C.retarget_capture state ~command:selected
     ~resolved_status:(match child_status_a with Status id->Some(uuid id)|_->assert false) |> Result.get_ok in
-  let _,action=C.retry state in
-  let _,_,wire=F.write action in
-  require(wire=insert) "Capture changed an unknown Append when a later status was selected"
+  let state,action=C.retry state in
+  let _,_,wire=F.write fixture state action in
+  require(wire=original) "Capture changed an unknown Append when a later status was selected"
 ;;
 
 let test_append_chain_uses_canonical_journal_owner () =
-  let module F=Child_chain_fixture in let module C=F.C in let module P=F.P in let module G=F.G in
-  let fixture=F.make () in
-  let uuid value=G.Uuid.of_string value |> Result.get_ok in
-  let wire=P.V2_append_journal{mutation_id=uuid fixture.command.mutation_id;
-    page=(C.page fixture.initial).uuid;journal_day=20260809;
-    root={block_id=uuid fixture.command.block_id;title=fixture.command.source;
-      task_status=None;children=Rrbvec.empty}} in
-  let result=C.start ~command:fixture.command ~page:(C.page fixture.initial)
-    ~resolved_status:None ~insert:wire in
-  require (Result.is_ok result) "pure insertion owner rejected atomic Append";
-  let state,action=Result.get_ok result in
-  let _,_,actual=F.write action in
-  require (actual=wire) "atomic Append changed its frozen payload";
+  let module F=Child_chain_fixture in let module C=F.C in
+  let fixture=F.make ~append:true () in
+  let state=fixture.initial in
+  let _,_,original=F.write fixture state fixture.action in
   let state,action=C.retry state in
-  let _,_,actual=F.write action in
-  require (actual=wire) "atomic Append retry changed its frozen payload";
-  ignore state
+  let _,_,actual=F.write fixture state action in
+  require(actual=original) "atomic Append retry changed its frozen intent";
+  let state,index,round,intent=F.bind fixture state action in
+  let state,action=C.receive state ~index ~round (fixture.confirm index intent fixture.presentation) in
+  require(match action with C.Present _->true|_->false) "atomic Append lost its canonical journal owner";
+  require((C.page state).kind=F.G.Journal_page{journal_day=20260809}) "atomic Append adopted a different day"
 ;;
 
 let child_unknown_stages fixture =
@@ -4804,6 +4801,7 @@ let test_child_retained_chain_survives_projection_reopen () =
   let module F=Child_chain_fixture in let module C=F.C in let module D=Journal_detail in
   let fixture=F.make ~task_state:child_status_a () in
   List.iter(fun(chain,index)->
+    let expected=F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage chain index) |> Result.get_ok) in
     let saving,_=child_identity_detail() |> fun detail->D.update_child_source detail fixture.command.source
       |> fun detail->D.set_child_task detail child_status_a |> child_identity_append in
     let saving=D.retain_child_chain saving ~command:fixture.command chain in
@@ -4819,9 +4817,9 @@ let test_child_retained_chain_survives_projection_reopen () =
     let chain=C.retarget chain ~command
       ~resolved_status:(match child_status_b with Status value->Some(F.G.Uuid.of_string value |> Result.get_ok)|_->assert false)
       |> Result.get_ok in
-    let _,action=C.retry chain in
-    let _,_,wire=F.write action in
-    require(wire=C.stage_wire(C.stage chain index))
+    let chain,action=C.retry chain in
+    let _,_,wire=F.write fixture chain action in
+    require(wire=expected)
       "Child reopening replaced an accepted wire/precondition before reconciling it")
     (child_unknown_stages fixture)
 ;;
@@ -4831,7 +4829,7 @@ let test_child_retained_chain_generated_roundtrips () =
   let run stage actions =
     let fixture=F.make ~task_state:child_status_a () in
     let chain,index=List.nth(child_unknown_stages fixture)stage in
-    let expected=C.stage_wire(C.stage chain index) in
+    let expected=(F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage chain index) |> Result.get_ok)) in
     let saving,_=child_identity_detail() |> fun detail->D.update_child_source detail fixture.command.source
       |> fun detail->D.set_child_task detail child_status_a |> child_identity_append in
     let current=ref(D.retain_child_chain saving ~command:fixture.command chain
@@ -4854,7 +4852,7 @@ let test_child_retained_chain_generated_roundtrips () =
       let _,request=D.retry(D.fail !current ~message:"Read pending") in
       let command=Option.get request |> child_command in
       let retained=D.child_chain !current ~command |> Option.get in
-      require(C.stage_wire(C.stage retained index)=expected) "retained Child acquired a new payload";
+      require((F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage retained index) |> Result.get_ok))=expected) "retained Child acquired a new payload";
       require(command.source=fixture.command.source) "retained Child admitted source changed";
       require(command.mutation_id=fixture.command.mutation_id && command.block_id=fixture.command.block_id)
         "retained Child replaced an original identity";
@@ -4880,15 +4878,15 @@ let test_child_chain_frozen_unknown_choice () =
   let fixture=F.make ~task_state:child_status_a () in
   let insertion,insert_index,insert_round,_=F.bind fixture fixture.initial fixture.action in
   let unknown,action=C.receive insertion ~index:insert_index ~round:insert_round F.W.Outcome_unknown in
-  require(match action with C.Write(0,_,wire)->wire=C.stage_wire(C.stage insertion 0)|_->false) "unknown insertion did not recover its original wire";
+  require(match action with C.Write(0,_)->F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage unknown 0) |> Result.get_ok)=F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage insertion 0) |> Result.get_ok)|_->false) "unknown insertion did not recover its original wire";
   let retried,retry=C.retry unknown in
-  child_equal (let _,_,wire=F.write fixture.action in wire) (let _,_,wire=F.write retry in wire)
+  child_equal (let _,_,wire=F.write fixture fixture.initial fixture.action in wire) (let _,_,wire=F.write fixture retried retry in wire)
     "unknown retry rebuilt frozen parent/scope preconditions";
   let old,action=C.receive retried ~index:insert_index ~round:insert_round F.W.Outcome_unknown in
   require(old==retried && action=C.Ignore) "old insertion callback changed the retried phase";
   let inserted,parent=F.confirm fixture retried retry in
   let inserted,status_a=F.flush_prefix fixture inserted parent in
-  require(match status_a with C.Write(1,_,_)->true|_->false)
+  require(match status_a with C.Write(1,_)->true|_->false)
     "equal status skipped its own mutation proof";
   let active,index,round,_=F.bind fixture inserted status_a in
   let active,_=C.receive active ~index ~round F.W.Outcome_unknown in
@@ -4896,11 +4894,11 @@ let test_child_chain_frozen_unknown_choice () =
   let status_b=match child_status_b with Journal_model.Status id->Some(F.G.Uuid.of_string id |> Result.get_ok)|_->None in
   let selected=C.retarget active ~command:command_b ~resolved_status:status_b |> Result.get_ok in
   let selected,retry_a=C.retry selected in
-  child_equal (let _,_,wire=F.write status_a in wire) (let _,_,wire=F.write retry_a in wire)
+  child_equal (let _,_,wire=F.write fixture inserted status_a in wire) (let _,_,wire=F.write fixture selected retry_a in wire)
     "new choice replaced an unresolved status payload";
   let after_a,parent=F.confirm fixture selected retry_a in
   let after_a,write_b=F.flush_prefix fixture after_a parent in
-  require(match write_b with C.Write(1,_,_)->true|_->false) "old status did not settle before the new choice";
+  require(match write_b with C.Write(1,_)->true|_->false) "old status did not settle before the new choice";
   let active,index,round,_=F.bind fixture after_a write_b in
   let active,_=C.receive active ~index ~round F.W.Outcome_unknown in
   let command_a2={fixture.command with status_intent_revision=2L} in
@@ -4909,7 +4907,7 @@ let test_child_chain_frozen_unknown_choice () =
   let selected,retry_b=C.retry selected in
   let after_b,parent=F.confirm fixture selected retry_b in
   let after_b,write_a2=F.flush_prefix fixture after_b parent in
-  let _,_,first_wire=F.write status_a and _,_,second_wire=F.write write_a2 in
+  let _,_,first_wire=F.write fixture inserted status_a and _,_,second_wire=F.write fixture after_b write_a2 in
   require(first_wire<>second_wire) "A to B to A reused the original status intent";
   require(Result.is_error(C.retarget after_b ~command:{command_a2 with source="Replace accepted body"}
     ~resolved_status:status_a_uuid)) "child retarget replaced the frozen insertion body"
@@ -4926,7 +4924,7 @@ let test_child_chain_ack_failure_keeps_proofs () =
   child_equal 1 index "a successful insertion ACK was sent again";
   let failed,_=C.acknowledged applied ~index ~round (Error "Synthetic release/ACK failure") in
   let retried,write=C.retry failed in
-  child_equal (let _,_,wire=F.write status in wire) (let _,_,wire=F.write write in wire)
+  child_equal (let _,_,wire=F.write fixture inserted status in wire) (let _,_,wire=F.write fixture retried write in wire)
     "ACK failure replay changed the original status preconditions";
   let stale,action=C.acknowledged retried ~index ~round (Ok()) in
   require(stale==retried && action=C.Ignore) "old ACK completed a new retry round";
@@ -5053,7 +5051,8 @@ let test_child_chain_generated_traces ?(append=false) () =
         let same,out=C.applied before ~round:0L fixture.presentation in
         require(same==before && out=C.Ignore) "obsolete UI application changed lifecycle"
       | _ -> match !action with
-        | C.Write(index,round,wire) ->
+        | C.Write(index,round) ->
+          let wire=F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage !state index) |> Result.get_ok) in
           let id=C.stage_id(C.stage !state index) |> F.G.Uuid.to_string in
           (match Hashtbl.find_opt frozen id with None->Hashtbl.add frozen id wire
            |Some previous->require(previous=wire) "one child intent acquired a different payload");
@@ -5312,13 +5311,13 @@ let () =
     |Some(R.Read read)->
       let budget=F.W.read_budget catalog_session ~maximum_items:read.maximum_items ~maximum_bytes:65536 |> Result.get_ok in
       let operation=F.W.Query(budget,read.query) in
-      ignore(I.request catalog_session ~request_id:(F.W.request_id request.F.P.request_id) operation |> Result.get_ok);
-      (match I.reply catalog_session ~request_id:(F.W.request_id request.F.P.request_id) operation
+      ignore(I.request catalog_session ~request_id:(F.W.request_id request) operation |> Result.get_ok);
+      (match I.reply catalog_session ~request_id:(F.W.request_id request) operation
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response
-          (F.P.V2_response{api_version=F.P.api_version;request_id=request.request_id;
+          (F.P.V2_response{api_version=F.P.api_version;request_id=request;
             outcome=V2_task_statuses_outcome{property_uuid=None;default_status=Some status;
               items=[item status_a;item status_b];next_cursor=None}})) with
-       |Ok(F.W.Answered(Ok value))->ignore(R.receive_worker_read runtime ~request_id:request.request_id (R.Query_result(read.query,value)))
+       |Ok(F.W.Answered(Ok value))->ignore(R.receive_worker_read runtime ~request_id:request (R.Query_result(read.query,value)))
        |_->failwith "catalog fixture rejected its typed value")
     |_->failwith "catalog fixture lost its typed query" in
   catalog status_a;
@@ -5327,12 +5326,15 @@ let () =
     source=fixture.command.source;task_state=Journal_model.Default_status;creation_time=fixture.command.creation_time;
     children=[];status_confirmation=false;status_intent_revision=0L} in
   let request=R.submit runtime(Capture{calendar_generation=Journal_calendar.generation calendar;command}) |> only in
-  let wire=R.worker_append runtime request |> Option.get |> Result.get_ok in
-  require(match wire with F.P.V2_append_journal{root;_}->root.task_status=Some status_a|_->false)
-    "initial Append did not freeze the resolved default";
+  let intent=R.worker_intent runtime request fixture.session |> Result.get_ok in
+  let wire=F.W.encode_durable_intent intent in
+  let expected=F.W.append_intent fixture.session ~mutation_id:(F.G.Uuid.of_string command.mutation_id |> Result.get_ok)
+    ~block_id:(F.G.Uuid.of_string command.block_id |> Result.get_ok)
+    ~day:(F.W.journal_day(Journal_time.local_day command.creation_time) |> Result.get_ok)
+    ~title:command.source ~task_status:(Some status_a) ~children:Rrbvec.empty |> Result.get_ok in
+  require(wire=F.W.encode_durable_intent(F.W.Append_intent expected)) "initial Append did not freeze the resolved default";
   catalog status_b;
-  require(R.worker_append runtime request=Some(Ok wire)) "catalog update replaced the planned atomic payload";
-  let intent=Journal_graph_mutation_confirmation.Pure_insertion.wire_intent fixture.session wire |> Result.get_ok in
+  require(F.W.encode_durable_intent(R.worker_intent runtime request fixture.session |> Result.get_ok)=wire) "catalog update replaced the planned atomic payload";
   require(R.bind_mutation runtime request ~presentation:fixture.presentation ~intent)
     "catalog update re-resolved and rejected the already frozen default"
 ;;
@@ -5346,19 +5348,20 @@ let () =
     status_confirmation=true;status_intent_revision=1L} in
   let selected=C.retarget unknown ~command ~resolved_status:None |> Result.get_ok in
   let selected,retry=C.retry selected in
-  require(let _,_,wire=F.write retry and _,_,original=F.write fixture.action in wire=original)
+  require(let _,_,wire=F.write fixture selected retry and _,_,original=F.write fixture fixture.initial fixture.action in wire=original)
     "explicit Clear replaced the unknown original insertion";
   let confirmed,parent=F.confirm fixture selected retry in
   let cleared,action=F.flush_prefix fixture confirmed parent in
-  let _,_,wire=F.write action in
-  require(match wire with F.P.V2_clear_task_status{block;preconditions;_}->
-      block=(F.G.Uuid.of_string command.block_id |> Result.get_ok)
-      && preconditions.blocks=[block,"child-state:v1:0"] |_->false)
+  let _,_,wire=F.write fixture cleared action in
+  let block=F.G.Uuid.of_string command.block_id |> Result.get_ok in
+  let expected=F.W.mutation_intent fixture.session ~mutation_id:(C.stage_id(C.stage cleared 1))
+    (F.W.Clear_task_status{block;preconditions={blocks=[block,"child-state:v1:0"];pages=[];scopes=[]}}) |> Result.get_ok in
+  require(wire=F.W.encode_durable_intent(F.W.Mutation_intent expected))
     "No status after an uncertain insert skipped the real explicit Clear stage";
   let bound,index,round,_=F.bind fixture cleared action in
   let unknown,_=C.receive bound ~index ~round F.W.Outcome_unknown in
-  let _,retry=C.retry unknown in
-  require(let _,_,actual=F.write retry in actual=wire)
+  let unknown,retry=C.retry unknown in
+  require(let _,_,actual=F.write fixture unknown retry in actual=wire)
     "unknown Clear retry replaced its original immutable payload"
 ;;
 
@@ -5372,8 +5375,8 @@ let test_insertion_recovers_without_user_retry () =
     let snapshot=Marshal.to_string state [] in
     let next,action=if interrupted then C.interrupted state ~index ~round "Local reply unavailable"
       else C.receive state ~index ~round F.W.Outcome_unknown in
-    let i,r,wire=F.write action in
-    require(wire=C.stage_wire(C.stage state index) && i=index && r>round)
+    let i,r,wire=F.write fixture next action in
+    require(wire=(F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage state index) |> Result.get_ok)) && i=index && r>round)
       "background recovery changed the original insertion";
     require(snapshot=Marshal.to_string state []) "background recovery mutated its input";
     let same,late=C.receive next ~index ~round F.W.Outcome_unknown in
@@ -5396,12 +5399,12 @@ let test_insertion_recovery_budgets_follow_stages () =
   let applied,ack=F.applied fixture confirmed parent in
   let index,round=match ack with C.Acknowledge(index,round,_,_)->index,round|_->fail "missing insertion ACK" in
   let recovering,wire=C.acknowledged applied ~index ~round (Error "Transient local ACK failure") in
-  ignore(F.write wire);
+  ignore(F.write fixture recovering wire);
   let confirmed,parent=F.confirm fixture recovering wire in
   let progressed,status=F.flush_prefix fixture confirmed parent in
   let bound,index,round,_=F.bind fixture progressed status in
   let _,wire=C.receive bound ~index ~round F.W.Outcome_unknown in
-  require(match wire with C.Write(1,_,_)->true|_->false) "prior insertion recovery exhausted a distinct status stage"
+  require(match wire with C.Write(1,_)->true|_->false) "prior insertion recovery exhausted a distinct status stage"
 ;;
 let () = test_insertion_recovery_budgets_follow_stages ()
 
@@ -5531,8 +5534,8 @@ let test_insertion_delayed_recovery_tokens () =
     Option.iter(fun old->let same,ignored=C.resume_recovery armed old in
       require(same==armed && ignored=C.Ignore) "obsolete timer restarted a later attempt")!previous;
     let retrying,action=C.resume_recovery armed recovery in
-    let _,_,wire=F.write action in
-    require(wire=C.stage_wire(C.stage state 0)) "timer replaced the original durable payload";
+    let _,_,wire=F.write fixture retrying action in
+    require(wire=(F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage state 0) |> Result.get_ok))) "timer replaced the original durable payload";
     let duplicate,ignored=C.resume_recovery retrying recovery in
     require(duplicate==retrying && ignored=C.Ignore) "timer fired the same attempt twice";
     let bound,index,round,_=F.bind fixture retrying action in
@@ -5611,18 +5614,18 @@ let test_delayed_recovery_cannot_borrow_another_submission () =
   let _,old=arm fixture.initial fixture.action in
   let command={fixture.command with mutation_id="70000000-0000-4000-9000-000000005604";
     block_id="70000000-0000-4000-a000-000000005604"}in
-  let wire=match C.stage_wire(C.stage fixture.initial 0)with
-    |F.P.V2_insert_blocks({roots=[root];_}as value)->F.P.V2_insert_blocks{value with
-      mutation_id=F.G.Uuid.of_string command.mutation_id |> Result.get_ok;
-      roots=[{root with uuid=F.G.Uuid.of_string command.block_id |> Result.get_ok}]}
-    |_->assert false in
-  let initial,action=C.start ~command ~page:(C.page fixture.initial) ~resolved_status:None ~insert:wire |> Result.get_ok in
+  let parent=F.G.Uuid.of_string command.parent_block_id |> Result.get_ok in
+  let insert=F.W.Insert_blocks{parent;roots=[{uuid=F.G.Uuid.of_string command.block_id |> Result.get_ok;title=command.source;children=[]}];
+    preconditions={blocks=[parent,command.expected_parent_revision];pages=[];
+      scopes=[Worker_pure_data.V2_children_scope parent,"children-state:v1:frozen"]}} in
+  let initial,action=C.start ~command ~page:(C.page fixture.initial) ~resolved_status:None ~insert |> Result.get_ok in
+  let wire=F.W.encode_durable_intent(C.stage_intent fixture.session(C.stage initial 0) |> Result.get_ok) in
   let current,token=arm initial action in
   require(old.round=token.round && old.delay=token.delay) "foreign timer test did not reproduce reused local counters";
   let same,out=C.resume_recovery current old in
   require(same==current && out=C.Ignore) "old submission timer borrowed a different immutable intent";
-  let _,out=C.resume_recovery current token in
-  let _,_,actual=F.write out in
+  let current,out=C.resume_recovery current token in
+  let _,_,actual=F.write fixture current out in
   require(actual=wire) "current submission timer did not retain its own payload"
 ;;
 let ()=test_delayed_recovery_cannot_borrow_another_submission()

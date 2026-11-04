@@ -184,14 +184,13 @@ val retain_retained_child_chain : retained_composer -> command:Journal_graph_pro
 module Pure_observation : sig
   module Worker = Journal_worker_coordination.Worker_api
   module Core = Journal_worker_coordination.Worker_pure_coordinator
-  module Protocol = Logseq_db_worker.Protocol
 
   type context =
     { entry_id : string
     ; request_generation : int64
     ; root : Worker.Uuid.t
     ; owner : Logseq_db_worker_lui.Logseq_db_worker_lui_service.timeline_scope
-    ; original : Protocol.request
+    ; original : Worker.Uuid.t
     ; maximum_children : int
     }
 

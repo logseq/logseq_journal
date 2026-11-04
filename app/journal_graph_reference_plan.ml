@@ -1,5 +1,4 @@
 module Graph = Logseq_db_types.Graph_types
-module Protocol = Logseq_db_worker.Protocol
 
 type lookup = Page_lookup | Outline_lookup
 type read = { block_id : string; depth : int; lookup : lookup }
@@ -14,11 +13,11 @@ type change =
   | Page_changed of { id : string; detail_page_owned : unit -> bool }
 type ports =
   { now : unit -> int64
-  ; plan_read : source_epoch:int64 option -> read -> Protocol.command -> Protocol.request
+  ; plan_read : 'a. source_epoch:int64 option -> read -> 'a Journal_worker_coordination.Worker_api.query -> Graph.Uuid.t
   ; known_page : string -> Graph.page option
   }
 type output =
-  { requests : Protocol.request Rrbvec.t
+  { requests : Graph.Uuid.t Rrbvec.t
   ; updates : (string * string option) Rrbvec.t
   }
 type reference_source = Source_text of string | Source_missing | Source_retryable
@@ -57,11 +56,11 @@ let reference_read ?(lookup = Page_lookup) ?source_epoch t ~ports block_id depth
     Hashtbl.replace t.reference_pending block_id ();
     let uuid = Graph.Uuid.of_string block_id |> Result.get_ok in
     Some
-      (ports.plan_read ~source_epoch { block_id; depth; lookup }
-         (match lookup with
-          | Page_lookup -> Protocol.V2_get_page { page = uuid; revision = None }
-          | Outline_lookup ->
-            Protocol.V2_get_outline_block { block = uuid; revision = None })))
+      (let read={block_id;depth;lookup} in match lookup with
+       | Page_lookup -> ports.plan_read ~source_epoch read
+           (Journal_worker_coordination.Worker_api.Page {uuid;revision=None})
+       | Outline_lookup -> ports.plan_read ~source_epoch read
+           (Journal_worker_coordination.Worker_api.Outline_block {uuid;revision=None})))
 ;;
 
 let fence t ~now block_id =

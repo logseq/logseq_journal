@@ -1,5 +1,4 @@
 module Graph = Logseq_db_types.Graph_types
-module Protocol = Logseq_db_worker.Protocol
 module Worker = Journal_worker_coordination.Worker_api
 
 type purpose =
@@ -28,7 +27,7 @@ type confirmation =
   ; children : Worker_pure_data.child_member Rrbvec.t
   }
 
-type planning = (Protocol.request, string) result
+type planning = (Graph.Uuid.t, string) result
 
 type step =
   | Continue of planning
@@ -38,7 +37,7 @@ type step =
 
 type ports =
   { now : unit -> int64
-  ; plan_read : source_epoch:int64 -> read -> Protocol.command -> Protocol.request
+  ; plan_read : source_epoch:int64 -> read -> Worker.block_summary Worker.query -> Graph.Uuid.t
   }
 
 type t = { latest : (string, int64) Hashtbl.t }
@@ -57,8 +56,7 @@ let plan t ~ports (value : read) cursor =
       (ports.plan_read
          ~source_epoch:stamp
          { value with stamp; after = cursor }
-         (Protocol.V2_get_outline_block_summary
-            { block; limit = Worker_pure_data.default_page_size; cursor = None }))
+         (Worker.Block_summary {block;after=cursor}))
 ;;
 
 let start t ~ports purpose =
@@ -177,10 +175,16 @@ module Pure_insertion = struct
     ; resolved : Graph.Uuid.t option
     ; required : bool
     }
+  type plan =
+    | Mutation of {mutation_id:Graph.Uuid.t;command:Worker.mutation_command}
+    | Append of {mutation_id:Graph.Uuid.t;day:Worker.journal_day;root:Worker_pure_data.append_node}
+  type payload =
+    | Unbound of plan
+    | Bound of Worker.durable_intent * Worker.presentation
   type stage =
-    { wire : Protocol.command
+    { payload : payload
+    ; creation : bool
     ; choice : choice option
-    ; binding : (Worker.durable_intent * Worker.presentation) option
     ; outcome : Worker.mutation_progress option
     ; acknowledged : bool
     ; submission_recovered : bool
@@ -208,7 +212,7 @@ module Pure_insertion = struct
     ; backoff : int
     }
   type action =
-    | Write of int * int64 * Protocol.command
+    | Write of int * int64
     | Read_child of int64
     | Read_parent of int64 * Worker.block_summary
     | Present of int64
@@ -221,30 +225,22 @@ module Pure_insertion = struct
   let page t = Option.get t.page
   let failure t = t.failure
   let stage t index = Rrbvec.nth t.stages index
-  let wire_id = function
-    | Protocol.V2_insert_blocks {mutation_id;_}
-    | V2_append_journal {mutation_id;_}
-    | V2_set_task_status {mutation_id;_}
-    | V2_clear_task_status {mutation_id;_} -> mutation_id
-    | _ -> assert false
-  let stage_id stage = wire_id stage.wire
-  let mutation = function
-    | Protocol.V2_insert_blocks {parent;roots;preconditions;_} -> Worker.Insert_blocks {parent;roots;preconditions}
-    | V2_set_task_status {block;status;preconditions;_} -> Set_task_status {block;status;preconditions}
-    | V2_clear_task_status {block;preconditions;_} -> Clear_task_status {block;preconditions}
-    | _ -> invalid_arg "Unsupported child mutation"
-  let wire_intent session wire = match wire with
-    | Protocol.V2_append_journal{mutation_id;journal_day;root;_}->
-      (match Worker.journal_day journal_day with
-       | Error error->Error error
-       | Ok day->match Worker.append_intent session ~mutation_id ~block_id:root.block_id
-           ~day ~title:root.title ~task_status:root.task_status ~children:root.children with
-         | Error error->Error error
-         | Ok intent->Ok(Worker.Append_intent intent))
-    | (Protocol.V2_insert_blocks _|V2_set_task_status _|V2_clear_task_status _) as wire->
-      Worker.mutation_intent session ~mutation_id:(wire_id wire)(mutation wire) |> Result.map(fun intent->Worker.Mutation_intent intent)
-    | _->Error(Worker.Invalid_input "Unsupported durable insertion wire.")
-  let stage_intent session stage = wire_intent session stage.wire
+  let stage_id stage = match stage.payload with
+    |Unbound(Mutation{mutation_id;_}|Append{mutation_id;_})->mutation_id
+    |Bound(intent,_)->Worker.durable_intent_id intent
+  let stage_binding stage=match stage.payload with Bound(intent,presentation)->Some(intent,presentation)|Unbound _->None
+  let stage_intent session stage = match stage.payload with
+    |Unbound(Mutation{mutation_id;command})->
+      Worker.mutation_intent session ~mutation_id command
+      |> Result.map(fun intent->Worker.Mutation_intent intent)
+    |Unbound(Append{mutation_id;day;root})->
+      Worker.append_intent session ~mutation_id ~block_id:root.block_id ~day ~title:root.title
+        ~task_status:root.task_status ~children:root.children
+      |> Result.map(fun intent->Worker.Append_intent intent)
+    |Bound(intent,_)->
+      Worker.validate_request session (match intent with
+        |Worker.Append_intent intent->Worker.Append intent|Mutation_intent intent->Worker.Mutate intent)
+      |> Result.map(fun()->intent)
   let replace_stage t index value =
     {t with stages=Rrbvec.mapi (fun i old -> if i=index then value else old) t.stages}
   let status_mutation_id ~domain ~mutation_id ~revision ~block status =
@@ -261,56 +257,55 @@ module Pure_insertion = struct
   let writing t index =
     if t.round=Int64.max_int then t,Wait "Child attempt counter exhausted."
     else let round=Int64.succ t.round in
-      {t with phase=Writing index;round;recovery=None;recovery_armed=false},Write(index,round,(stage t index).wire)
+      {t with phase=Writing index;round;recovery=None;recovery_armed=false},Write(index,round)
   let choice_matches task_state resolved = match task_state,resolved with
     | Journal_model.No_status,None | Default_status,Some _ -> true
     | Status value,Some id -> String.lowercase_ascii value=Graph.Uuid.to_string id
     | _ -> false
-  let fresh wire choice = {wire;choice;binding=None;outcome=None;acknowledged=false;submission_recovered=false;acknowledgement_recovered=false}
-  let start_value ~(command:Journal_graph_projection.create_child) ~page ~resolved_status ~insert =
+  let fresh ~creation plan choice = {payload=Unbound plan;creation;choice;outcome=None;acknowledged=false;submission_recovered=false;acknowledgement_recovered=false}
+  let start_value ~(command:Journal_graph_projection.create_child) ~page ~resolved_status ~append_day plan =
     let desired={revision=command.status_intent_revision;task_state=command.task_state;
       resolved=resolved_status;required=command.status_confirmation} in
-    let append_day=match insert with Protocol.V2_append_journal{journal_day;_}->Some journal_day|_->None in
-    let value=fresh insert (Option.map (fun _->desired) append_day) in
-    let valid=match insert with
-      | Protocol.V2_insert_blocks {mutation_id;parent;roots=[root];_}->
-        Graph.Uuid.to_string mutation_id=String.lowercase_ascii command.mutation_id
-        && Graph.Uuid.to_string parent=String.lowercase_ascii command.parent_block_id
-        && Graph.Uuid.to_string root.uuid=String.lowercase_ascii command.block_id
-        && root.title=command.source && root.children=[]
-      | V2_append_journal{mutation_id;root;_}->
-        Graph.Uuid.to_string mutation_id=String.lowercase_ascii command.mutation_id
-        && Graph.Uuid.to_string root.block_id=String.lowercase_ascii command.block_id
-        && root.title=command.source && root.task_status=resolved_status
-        && Worker_pure_data.valid_append_node root
-      | _->false in
-    if not valid || command.status_intent_revision<0L || not(choice_matches command.task_state resolved_status)
+    let value=fresh ~creation:true plan (Option.map(fun _->desired)append_day) in
+    if command.status_intent_revision<0L || not(choice_matches command.task_state resolved_status)
     then Error "The initial child payload does not match its admitted business command."
     else Ok({command;page;append_day;capture=None;desired;stages=Rrbvec.singleton value;phase=Writing 0;round=1L;
-      canonical=None;failure=None;current=None;applied=None;origin=None;read_recovered=false;recovery=None;recovery_armed=false;backoff=0}, Write(0,1L,insert))
-  let start ~command ~page ~resolved_status ~insert =
-    start_value ~command ~page:(Some page) ~resolved_status ~insert
+      canonical=None;failure=None;current=None;applied=None;origin=None;read_recovered=false;recovery=None;recovery_armed=false;backoff=0},Write(0,1L))
+  let start ~(command:Journal_graph_projection.create_child) ~page ~resolved_status ~(insert:Worker.mutation_command) =
+    let valid=match insert with
+      |Worker.Insert_blocks{parent;roots=[root];_}->
+        Graph.Uuid.to_string parent=String.lowercase_ascii command.parent_block_id
+        && Graph.Uuid.to_string root.uuid=String.lowercase_ascii command.block_id
+        && root.title=command.source && root.children=[]
+      |_->false in
+    if not valid then Error "The initial child payload does not match its admitted business command."
+    else Result.bind(Graph.Uuid.of_string command.mutation_id)(fun mutation_id->
+      start_value ~command ~page:(Some page) ~resolved_status ~append_day:None
+        (Mutation{mutation_id;command=insert}))
   let capture_command (capture:Journal_graph_projection.capture) : Journal_graph_projection.create_child =
     {mutation_id=capture.mutation_id;calendar_generation=0L;block_id=capture.block_id;
       parent_block_id="";expected_parent_revision="";sibling_order=capture.sibling_order;
       source=capture.source;task_state=capture.task_state;status_confirmation=capture.status_confirmation;
       status_intent_revision=capture.status_intent_revision;creation_time=capture.creation_time}
-  let start_capture ~(command:Journal_graph_projection.capture) ~resolved_status ~insert = match insert with
-    | Protocol.V2_append_journal{journal_day;_}
-      when journal_day=Journal_time.local_day command.Journal_graph_projection.creation_time ->
-      (match insert with
-       | V2_append_journal{root;_} when Rrbvec.length root.children=List.length command.children
-         && Seq.for_all2 (fun (node:Worker_pure_data.append_node) (child:Journal_graph_projection.capture_child)->
+  let start_capture ~(command:Journal_graph_projection.capture) ~resolved_status ~(root:Worker_pure_data.append_node) =
+    let day=Journal_time.local_day command.creation_time in
+    if Graph.Uuid.to_string root.block_id<>String.lowercase_ascii command.block_id
+       || root.title<>command.source || root.task_status<>resolved_status
+       || not(Worker_pure_data.valid_append_node root)
+       || Rrbvec.length root.children<>List.length command.children
+       || not(Seq.for_all2 (fun (node:Worker_pure_data.append_node) (child:Journal_graph_projection.capture_child)->
            Graph.Uuid.to_string node.block_id=String.lowercase_ascii child.block_id
            && node.title=child.source && Rrbvec.is_empty node.children
            && choice_matches child.task_state node.task_status)
-           (Rrbvec.to_seq root.children)(List.to_seq command.children)->
-         Result.map(fun(t,action)->{t with capture=Some command},action)
-           (start_value ~command:(capture_command command) ~page:None ~resolved_status ~insert)
-       | _->Error "The atomic Capture children do not match the admitted payload.")
-    | _->Error "Capture requires its admitted day and atomic Append payload."
-  let insert_rejected t = Rrbvec.exists (fun stage ->
-    (match stage.wire with Protocol.V2_insert_blocks _|V2_append_journal _->true|_->false) &&
+           (Rrbvec.to_seq root.children)(List.to_seq command.children))
+    then Error "The atomic Capture children do not match the admitted payload."
+    else Result.bind(Graph.Uuid.of_string command.mutation_id)(fun mutation_id->
+      match Worker.journal_day day with
+      |Error _->Error "Capture requires its admitted day and atomic Append payload."
+      |Ok journal_day->Result.map(fun(t,action)->{t with capture=Some command},action)
+        (start_value ~command:(capture_command command) ~page:None ~resolved_status ~append_day:(Some day)
+          (Append{mutation_id;day=journal_day;root})))
+  let insert_rejected t = Rrbvec.exists (fun stage -> stage.creation &&
     match stage.outcome with Some(Worker.Rejected _)->true|_->false) t.stages
   let terminal t = t.phase=Finished
   let retarget t ~(command:Journal_graph_projection.create_child) ~resolved_status =
@@ -353,7 +348,7 @@ module Pure_insertion = struct
       if not same_origin then None else
       (match stage_intent (Worker.presentation_session presentation) current with
        | Ok expected when Worker.encode_durable_intent expected=Worker.encode_durable_intent intent ->
-         Some{(replace_stage t index {current with binding=Some(intent,presentation);acknowledged=false}) with current=Some presentation;origin=Some(Worker.presentation_session presentation)}
+         Some{(replace_stage t index {current with payload=Bound(intent,presentation);acknowledged=false}) with current=Some presentation;origin=Some(Worker.presentation_session presentation)}
        | _ -> None)
     | _ -> None
   let exact_child t (summary:Worker.block_summary) =
@@ -366,16 +361,17 @@ module Pure_insertion = struct
         | None->Graph.Uuid.to_string value.block.parent=t.command.parent_block_id
           && Option.exists(fun (original:Graph.page)->page.uuid=original.uuid)t.page)
     | _ -> false
-  let status_wire t (summary:Worker.block_summary) =
+  let status_plan t (summary:Worker.block_summary) =
     match summary.lookup with
     | Worker_pure_data.V2_present_block {value;revision} ->
       let block=value.block.uuid in
       let mutation_id=status_mutation_id ~domain:(if t.append_day=None then "child" else "capture") ~mutation_id:t.command.mutation_id
         ~revision:t.desired.revision ~block t.desired.resolved in
       let preconditions:Worker_pure_data.preconditions={blocks=[block,revision];pages=[];scopes=[]} in
-      (match t.desired.resolved with
-       | None->Protocol.V2_clear_task_status{mutation_id;block;preconditions}
-       | Some status->V2_set_task_status{mutation_id;block;status;preconditions})
+      let command=match t.desired.resolved with
+        |None->Worker.Clear_task_status{block;preconditions}
+        |Some status->Worker.Set_task_status{block;status;preconditions} in
+      Mutation{mutation_id;command}
     | _ -> assert false
   let canonical_state t (summary:Worker.block_summary) =
     let page=match summary.page with Some(Worker_pure_data.V2_present_page{page;_})->Some page|_->t.page in
@@ -388,7 +384,7 @@ module Pure_insertion = struct
     if not(exact_child t summary) then t,Wait "The saved child is no longer available in its parent."
     else
       let previous=stage t (Rrbvec.length t.stages-1) in
-      let next=fresh(status_wire t summary)(Some t.desired) in
+      let next=fresh ~creation:false (status_plan t summary)(Some t.desired) in
       (* Only acknowledged history may be compacted. Rounds reject callbacks
          from earlier indices, while each wire retains its original intent. *)
       writing {(canonical_state t summary) with stages=Rrbvec.of_list [previous;next];
@@ -430,7 +426,7 @@ module Pure_insertion = struct
     match t.phase with
     | Writing expected when expected=index && round=t.round ->
       let current=stage t index in
-      (match current.binding,progress with
+      (match stage_binding current,progress with
        | Some(intent,presentation),Worker.Confirmed confirmation
          when Worker.confirmation_presentation confirmation=presentation
            && Worker.encode_durable_intent(Worker.receipt_intent(Worker.confirmation_receipt confirmation))
@@ -454,7 +450,7 @@ module Pure_insertion = struct
          t,Wait "A committed child operation cannot become a rejection."
        | Some _,Worker.Rejected error ->
          let next=replace_stage t index {current with outcome=Some progress} in
-         if (match current.wire with Protocol.V2_insert_blocks _|V2_append_journal _->true|_->false)
+         if current.creation
          then {next with failure=Some error;phase=Applying},Present t.round
          else {next with failure=Some error;phase=Canonical(index,false)},Read_child t.round
        | Some _,(Worker.Outcome_unknown|Committed_pending_presentation _) ->
@@ -488,7 +484,7 @@ module Pure_insertion = struct
     else
       let current=stage t index in
       if current.acknowledged then settle_from t presentation (index+1)
-      else match current.binding,current.outcome with
+      else match stage_binding current,current.outcome with
         | Some(intent,initiator),Some(Worker.Rejected _) when initiator=presentation ->
           if t.round=Int64.max_int then t,Wait "Child attempt counter exhausted."
           else let round=Int64.succ t.round in
@@ -512,8 +508,6 @@ module Pure_insertion = struct
        | Ok ()->settle_from (replace_stage t index {(stage t index)with acknowledged=true}) presentation (index+1))
     | _->t,Ignore
 
-  let stage_wire stage = stage.wire
-  let stage_mutation stage = mutation stage.wire
   let rebind_ack t ~index ~round ~intent ~presentation =
     match t.phase with
     | Acknowledging expected when expected=index && round=t.round ->
