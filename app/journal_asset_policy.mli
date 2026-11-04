@@ -1,6 +1,7 @@
 module Asset = Logseq_db_types.Asset_descriptor
 module Graph = Logseq_db_types.Graph_types
 module Transfer = Logseq_db_worker_lui.Logseq_db_worker_lui_service.Asset
+module Worker = Journal_worker_coordination.Worker_api
 
 type reason =
   | Recent
@@ -38,7 +39,7 @@ type 'cursor instruction =
   | Read of 'cursor ticket
   | Demand of
       { consumer : string
-      ; priority : Transfer.priority
+      ; priority : Worker.asset_priority
       ; assets : Asset.t list
       }
   | Release of string
@@ -107,5 +108,3 @@ type offline =
   }
 
 val offline : 'cursor t -> reason -> offline
-
-val consumer_names : 'cursor t -> string Seq.t

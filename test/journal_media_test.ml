@@ -22,25 +22,24 @@ let asset c =
   |> Result.get_ok
 ;;
 
-let scope : S.asset_scope =
-  { account =
-      { managed_sync_origin = Uri.of_string "https://sync.example"
-      ; user_id = "user"
-      ; account_generation = 1
-      ; presentation_generation = 1
-      ; lifecycle_generation = 1L
-      }
-  ; graph_id = uuid 2
-  ; graph_generation = 1
-  }
-;;
+module W=Journal_worker_coordination.Worker_api
+module Resources=Coordination_test_fixture.Resources
+let resources=Resources.create ~graph:(uuid 2) ~graph_generation:1 8200L
+let foreign_resources=Resources.create ~graph:(uuid 2) ~graph_generation:2 8201L
 
 let show a = P.Show { graph_generation = 1; consumer = "visible"; asset = a }
 
-let ready state handle =
-  P.step
-    state
-    (Availability { scope; consumer = "visible"; availability = S.Asset.Ready handle })
+let notice ?(graph_generation=1) state availability =
+  let source=if graph_generation=1 then resources else foreign_resources in
+  let asset=Option.get(P.descriptor state) in
+  (match Hashtbl.find_opt source.Resources.demands "visible" with
+   |Some(_,_,[previous]) when previous=asset->()
+   |_->ignore(Resources.demand source ~graph_generation ~name:"visible" W.Foreground [asset] |> Option.get));
+  P.Availability(Resources.availability source ~consumer:"visible" ~asset availability)
+
+let ready state handle = P.step state (notice state (S.Asset.Ready handle))
+let acquired ticket handle path =
+  P.Acquired(ticket,Some(Resources.lease resources ticket.P.file ~handle ~path))
 ;;
 
 let acquire effects =
@@ -138,7 +137,7 @@ let () =
       (effects = [] && P.presentation duplicate = Placeholder "Loading")
       "duplicate Ready preserves acquisition";
     let visible, effects =
-      P.step duplicate (Acquired (ticket, Some ("lease", "/cache/local")))
+      P.step duplicate (acquired (ticket) "lease" "/cache/local")
     in
     check
       (effects = [] && P.presentation visible = File "/cache/local")
@@ -148,7 +147,7 @@ let () =
     let downloading, effects =
       P.step
         waiting
-        (Availability { scope; consumer = "visible"; availability = Downloading })
+        (notice waiting S.Asset.Downloading)
     in
     check
       (effects = [] && P.presentation downloading = Placeholder "Downloading")
@@ -158,7 +157,7 @@ let () =
       (P.presentation pending = Placeholder "Loading")
       "remote completion starts local Loading";
     let visible, effects =
-      P.step pending (Acquired (acquire effects, Some ("lease", "/cache/downloaded")))
+      P.step pending (acquired (acquire effects) "lease" "/cache/downloaded")
     in
     check
       (effects = [] && P.presentation visible = File "/cache/downloaded")
@@ -168,7 +167,7 @@ let () =
     List.iter
       (fun (availability, label) ->
          let state, effects =
-           P.step waiting (Availability { scope; consumer = "visible"; availability })
+           P.step waiting (notice waiting availability)
          in
          check
            (effects = [] && P.presentation state = Placeholder label)
@@ -189,8 +188,7 @@ let () =
   run "non-network availability failures have no user retry" (fun () ->
     List.iter(fun failure ->
       let waiting,_=P.step P.empty (show(asset 'a')) in
-      let failed,_=P.step waiting(Availability{scope;consumer="visible";
-        availability=Failed{failure;attempts=1;retry_scheduled=false}}) in
+      let failed,_=P.step waiting(notice waiting(S.Asset.Failed{failure;attempts=1;retry_scheduled=false})) in
       let same,effects=P.step failed Retry_requested in
       check(same=failed && effects=[]) "non-network failure admitted manual retry")
       [S.Asset.Not_found;Checksum_mismatch;Authentication;Locked;Storage_full;Invalid_content "Synthetic"]);
@@ -200,45 +198,46 @@ let () =
     check (effects = []) "loading ignores Retry instead of starting another download");
   run "same UUID content version retires successful File" (fun () ->
     let loading, _ = P.step P.empty (show (asset 'a')) in
-    let pending, effects = ready loading "cached" in
+    let old_ready=notice loading (S.Asset.Ready "cached") in
+    let pending, effects = P.step loading old_ready in
     let visible, _ =
-      P.step pending (Acquired (acquire effects, Some ("held", "/cache/held")))
+      P.step pending (acquired (acquire effects) "held" "/cache/held")
     in
     let updated, effects = P.step visible (show (asset 'b')) in
     check(List.length(releases effects)=1) "version replacement retires the old renderer lease once";
     check(List.exists(function P.Demand{asset=descriptor;_}->descriptor=asset 'b'|_->false)effects)
       "version replacement demands the new content";
     check(match P.presentation updated with Placeholder _->true|_->false)
-      "old rendered bytes cannot represent the new descriptor");
+      "old rendered bytes cannot represent the new descriptor";
+    let delayed, effects=P.step updated old_ready in
+    check(effects=[] && P.presentation delayed=P.presentation updated)
+      "old Ready notification reacquired bytes while the new demand was waiting");
   run "preview pins retain their selected version" (fun () ->
     let loading,_=P.step P.empty(show(asset 'a')) in
     let pending,effects=ready loading "cached-a" in
-    let visible,_=P.step pending(Acquired(acquire effects,Some("held-a","/cache/a"))) in
+    let file_a=Resources.lease resources (acquire effects).file ~handle:"held-a" ~path:"/cache/a" in
+    let visible,_=P.step pending(P.Acquired(acquire effects,Some file_a)) in
     let pinned,_=P.step visible(Pin_preview "preview-one") in
     let pinned,_=P.step pinned(Pin_preview "preview-two") in
     let replaced,effects=P.step pinned(show(asset 'b')) in
     check(releases effects=[]) "changing row content must retain the open previews' original file";
     let loading,effects=ready replaced "cached-b" in
-    let current,_=P.step loading(Acquired(acquire effects,Some("held-b","/cache/b"))) in
+    let file_b=Resources.lease resources (acquire effects).file ~handle:"held-b" ~path:"/cache/b" in
+    let current,_=P.step loading(P.Acquired(acquire effects,Some file_b)) in
     let current,_=P.step current(Pin_preview "preview-one") in
     let current,effects=P.step current(Unpin_preview "preview-one") in
     check(effects=[]) "another preview still holds the original version";
     let current,effects=P.step current(Unpin_preview "preview-two") in
-    check(releases effects=[P.Release_file{scope;lease="held-a"}]) "last old preview releases only its original file";
+    check(releases effects=[P.Release_file file_a]) "last old preview releases only its original file";
     check(P.presentation current=File "/cache/b") "closing an old preview leaves the new row file";
     let _,effects=P.step current Hide in
-    check(releases effects=[P.Release_file{scope;lease="held-b"}]) "last current row releases the new version");
+    check(releases effects=[P.Release_file file_b]) "last current row releases the new version");
   run "failed Retry is one explicit attempt" (fun () ->
     let loading, _ = P.step P.empty (show (asset 'a')) in
     let failed, _ =
       P.step
         loading
-        (Availability
-           { scope
-           ; consumer = "visible"
-           ; availability =
-               Failed { failure = Network; attempts = 1; retry_scheduled = false }
-           })
+        (notice loading (S.Asset.Failed{failure=Network;attempts=1;retry_scheduled=false}))
     in
     let retrying, effects = P.step failed Retry_requested in
     check (List.length effects = 1) "failed Retry starts one attempt";
@@ -248,12 +247,12 @@ let () =
     let loading, _ = P.step P.empty (show (asset 'a')) in
     let pending, effects = ready loading "cached" in
     let visible, _ =
-      P.step pending (Acquired (acquire effects, Some ("held", "/cache/held")))
+      P.step pending (acquired (acquire effects) "held" "/cache/held")
     in
     List.iter
       (fun availability ->
          let stable, effects =
-           P.step visible (Availability { scope; consumer = "visible"; availability })
+           P.step visible (notice visible availability)
          in
          check
            (effects = [] && P.presentation stable = File "/cache/held")
@@ -269,7 +268,7 @@ let () =
     let loading, _ = P.step P.empty (show (asset 'a')) in
     let pending, effects = ready loading "cached" in
     let visible, _ =
-      P.step pending (Acquired (acquire effects, Some ("held", "/cache/held")))
+      P.step pending (acquired (acquire effects) "held" "/cache/held")
     in
     let hidden, effects = P.step visible Hide in
     check (List.length (releases effects) = 1) "Hide releases exactly one lease";
@@ -312,14 +311,14 @@ let () =
   let duplicate, effects = ready pending "cache-a" in
   check (effects = []) "duplicate readiness does not acquire twice";
   let visible, _ =
-    P.step duplicate (Acquired (ticket, Some ("lease-a", "/cache/a.png")))
+    P.step duplicate (acquired (ticket) "lease-a" "/cache/a.png")
   in
   check (P.presentation visible = File "/cache/a.png") "retained file is displayed";
   let _, effects = P.step visible Hide in
   check (List.length (releases effects) = 1) "hidden media releases its lease";
   let hidden, _ = P.step pending Hide in
   let hidden, effects =
-    P.step hidden (Acquired (ticket, Some ("late", "/cache/a.png")))
+    P.step hidden (acquired (ticket) "late" "/cache/a.png")
   in
   check
     (P.presentation hidden = Hidden && List.length (releases effects) = 1)
@@ -328,11 +327,7 @@ let () =
   let unchanged, effects =
     P.step
       replacement
-      (Availability
-         { scope = { scope with graph_generation = 2 }
-         ; consumer = "visible"
-         ; availability = Ready "wrong"
-         })
+      (notice ~graph_generation:2 replacement (S.Asset.Ready "wrong"))
   in
   check
     (effects = [] && P.presentation unchanged = P.presentation replacement)
@@ -367,7 +362,8 @@ let test_preview_pin_traces () =
       let next,effects=P.step !state event in state:=next;
       List.iter(function
         |P.Acquire ticket->jobs:= !jobs@[ticket]
-        |Release_file{lease;_}->
+        |Release_file file->
+          let lease=W.file_path file in
           check(Hashtbl.mem allocated lease) "release must name a real acquired lease";
           check(not(Hashtbl.mem released lease)) "a lease is released at most once";
           Hashtbl.add released lease ()
@@ -383,13 +379,13 @@ let test_preview_pin_traces () =
         incr serial;
         let lease=Printf.sprintf "lease-%d" !serial in
         if success then Hashtbl.add allocated lease ();
-        apply(Acquired(ticket,if success then Some(lease,lease) else None)) in
+        apply(if success then acquired ticket lease lease else P.Acquired(ticket,None)) in
     List.iter(fun choice->match choice mod 7 with
       |0->apply(show(asset 'a'))
       |1->apply(show(asset 'b'))
       |2->(match P.presentation !state,P.descriptor !state with
           |(Placeholder _|Failed _),Some{source=Managed(Some version);_}->
-            apply(Availability{scope;consumer="visible";availability=Ready("cache:"^version.checksum)})
+            apply(notice !state(S.Asset.Ready("cache:"^version.checksum)))
           |_->())
       |3->complete(choice/7)(choice mod 3<>0)
       |4->(match P.presentation !state with

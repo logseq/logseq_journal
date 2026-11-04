@@ -1,4 +1,3 @@
-module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Asset = Logseq_db_types.Asset_descriptor
 
 type ticket
@@ -37,12 +36,14 @@ type t
     the read result on a later turn of the existing serial App event entrance.
     Transport IDs and continuation construction stay with the coordinator SDK. *)
 val create
-  :  ?release_file:(Worker.file_lease -> bool)
-  -> ?release_consumer:(Worker.asset_consumer -> bool)
+  :  release_file:(Worker.file_lease -> bool)
+  -> release_consumer:(Worker.asset_consumer -> bool)
   -> ?read_planned:(Logseq_db_types.Graph_types.Uuid.t -> unit)
   -> ?read_retired:(Logseq_db_types.Graph_types.Uuid.t -> unit)
   -> read:(read_request -> bool)
-  -> send:(ticket option -> Service.request -> bool)
+  -> demand:(graph_generation:int -> name:string -> Worker.asset_priority -> Asset.t list -> Worker.asset_consumer option)
+  -> acquire:(ticket -> Worker.asset_file -> bool)
+  -> retry_asset:(graph_generation:int -> Worker.Uuid.t -> bool)
   -> changed:(string -> view -> unit)
   -> unit
   -> t
@@ -52,9 +53,6 @@ val create
 val owns_read : t -> Logseq_db_types.Graph_types.Uuid.t -> bool
 
 (** Logical presentation association only; physical ownership stays in Core. *)
-val bind_consumer:t -> name:string -> Worker.asset_consumer -> unit
-val acquisition_consumer:ticket -> string
-val consumer_names:t -> string Seq.t
 val receive_file:t -> ticket -> Worker.file_lease option -> unit
 
 val receive_read : t -> read_result -> bool
@@ -68,7 +66,7 @@ val resume_coordinated_previews:t -> unit
 val reset : t -> graph_generation:int option -> unit
 
 (** Visibility belongs to a retained presentation. Shared roots and assets are
-    released after their last owner leaves; omitting [owner] uses one legacy owner. *)
+    released after their last owner leaves; omitting [owner] uses one default owner. *)
 val root_visible : ?owner:string -> t -> root:string -> bool -> unit
 
 val retain_visible_roots : ?owner:string -> t -> string list -> unit
@@ -92,11 +90,10 @@ val retry : ?owner:string -> t -> root:string -> asset:string -> unit
 val forget_request : t -> Logseq_db_types.Graph_types.Uuid.t -> unit
 val changes : t -> Worker_pure_data.change_window list -> unit
 val resync : t -> unit
-val receive : t -> ticket -> Service.response -> unit
-val notice : t -> Service.asset_scope -> Service.asset_notice -> unit
+val notice : t -> Worker.asset_notice -> unit
 val demand_backpressured : t -> string -> unit
 val pump : t -> unit
-val imported : t -> current:bool -> Logseq_db_worker.import_receipt -> unit
+val imported : t -> current:bool -> Worker.imported -> unit
 val idle : t -> bool
 
 (** Observe the original accepted spec query and value without a transport envelope.
@@ -116,7 +113,3 @@ val change_application_error : t -> Worker_pure_data.change_window list -> strin
 (** Only failed DTO/dependency reads, excluding download/lease/import status. An
     actual queued listing retry remains an obligation rather than a final error. *)
 val projection_read_error : t -> root:string -> string option
-
-(** Retains the actual typed import preview until its business consumers leave.
-    Cleanup uses the fixed sealed-lease port and remains owned by the coordinator. *)
-val imported_coordinated : t -> current:bool -> Worker.imported -> unit

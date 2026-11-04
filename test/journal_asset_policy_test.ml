@@ -356,14 +356,22 @@ module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Wire = Logseq_db_worker.Protocol
 module W = Journal_worker_coordination.Worker_api
 
-type outgoing = Read of Runtime.read_request | Command of Service.request
+type outgoing = Read of Runtime.read_request | Command of unit W.request
 
 let request_id (Runtime.Read request) = request.request_id
-let producer = lazy (Coordination_test_fixture.fixture ~graph:(uuid 3) ~graph_generation:1 8200L)
+module Resources=Coordination_test_fixture.Resources
+let resources=Resources.create ~graph:(uuid 3) ~graph_generation:1 8200L
+let producer=lazy(resources.Resources.issuer,resources.session)
+let demand_port sent ~graph_generation ~name priority assets =
+  Option.map(fun consumer->Queue.add(Command(W.Replace_asset_demand(consumer,priority,assets)))sent;consumer)
+    (Resources.demand resources ~graph_generation ~name priority assets)
+let release_port sent consumer=Queue.add(Command(W.Release_asset_demand consumer))sent;true
+let consumer_name consumer=Hashtbl.to_seq resources.Resources.demands |>Seq.find_map(fun(name,(actual,_,_))->
+  if W.equal_asset_consumer consumer actual then Some name else None) |>Option.get
 
 let respond r (Runtime.Read request) outcome =
   check (Runtime.owns_read r request.request_id) "runtime must retain the terminal owner";
-  let issuer, _, _, session = Lazy.force producer in
+  let issuer, session = Lazy.force producer in
   let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let budget = W.read_budget session ~maximum_items:request.maximum_items
     ~maximum_bytes:65536 |> Result.get_ok in
@@ -387,9 +395,8 @@ let runtime_same_configuration () =
   let r =
     R.create
       ~read:(fun request -> Queue.add (Read request) sent; true)
-      ~send:(fun q ->
-        Queue.add (Command q) sent;
-        true)
+      ~demand:(demand_port sent)
+      ~release_consumer:(release_port sent)
       ~changed:(fun _ _ _ -> ()) ()
   in
   R.refresh r ~graph_generation:1 ~today:20260301 ~settings:P.default_settings;
@@ -553,18 +560,6 @@ let raw r n (block : G.block) =
   Runtime.observe_query_result r ~request_id:(uuid n) query (block_value block)
 ;;
 
-let runtime_scope : Service.asset_scope =
-  { account =
-      { managed_sync_origin = Uri.of_string "https://sync.example"
-      ; user_id = "u"
-      ; account_generation = 1
-      ; presentation_generation = 1
-      ; lifecycle_generation = 1L
-      }
-  ; graph_id = uuid 3
-  ; graph_generation = 1
-  }
-;;
 
 let runtime_fixture
       ?(favorite_block = false)
@@ -578,9 +573,8 @@ let runtime_fixture
   let r =
     Runtime.create
       ~read:(fun request -> Queue.add (Read request) sent; true)
-      ~send:(fun request ->
-        Queue.add (Command request) sent;
-        true)
+      ~demand:(demand_port sent)
+      ~release_consumer:(release_port sent)
       ~changed ()
   in
   Runtime.refresh
@@ -621,9 +615,10 @@ let runtime_fixture
        });
   while not (Queue.is_empty sent) do
     match Queue.take sent with
-    | Command (Service.Asset_command { command = Replace_asset_demand { consumer; _ }; _ }) ->
+    | Command(W.Replace_asset_demand(bound,_,_)) ->
+      let consumer=consumer_name bound in
       initial_demand consumer;
-      Runtime.notice r runtime_scope (Asset_demand_accepted consumer)
+      Runtime.notice r (Resources.notice resources(Service.Asset_demand_accepted consumer))
     | Read request ->
       (match request with
        | Runtime.Read { query = W.Assets _; _ } ->
@@ -686,9 +681,8 @@ let runtime_unconfigured_changes after_shutdown () =
   let r =
     Runtime.create
       ~read:(fun request -> Queue.add (Read request) sent; true)
-      ~send:(fun request ->
-        Queue.add (Command request) sent;
-        true)
+      ~demand:(demand_port sent)
+      ~release_consumer:(release_port sent)
       ~changed:(fun _ _ _ -> ()) ()
   in
   if after_shutdown
@@ -872,7 +866,7 @@ let runtime_known_asset_immutable () =
   let query = W.Asset_descriptors [ uuid 50 ] in
   let id = uuid 600 in
   Runtime.observe_query r ~request_id:id query;
-  let issuer,_,_,session=Lazy.force producer in
+  let issuer,session=Lazy.force producer in
   let module I=(val issuer : Worker_effect_authority.ISSUER) in
   let budget=W.read_budget session ~maximum_items:32 ~maximum_bytes:65536 |> Result.get_ok in
   let operation=W.Query(budget,query) in
@@ -972,7 +966,7 @@ let runtime_registry_capacity () =
 ;;
 
 let runtime_unconfigured_shared_capacity () =
-  let runtime=Runtime.create ~read:(fun _->true) ~send:(fun _->true) ~changed:(fun _ _ _->()) () in
+  let runtime=Runtime.create ~read:(fun _->true) ~demand:(fun ~graph_generation:_ ~name:_ _ _->failwith "unconfigured fixture emitted a demand") ~release_consumer:(fun _->failwith "unconfigured fixture released a consumer") ~changed:(fun _ _ _->()) () in
   for n=1 to 4200 do raw runtime (10000+n) (block n 9999 9999 []) done;
   check(Runtime.projection_read_error runtime=None)
     "unconfigured shared DTO cache overflow invented an offline ACK consumer"
@@ -1064,20 +1058,8 @@ let runtime_hidden_holder_fanout () =
            ; items = [ asset 50 ]
            ; next_cursor = None
            })
-    | Command (Service.Asset_command { command = Replace_asset_demand { consumer; _ }; _ }) ->
-      Runtime.notice
-        r
-        { account =
-            { managed_sync_origin = Uri.of_string "https://sync.example"
-            ; user_id = "u"
-            ; account_generation = 1
-            ; presentation_generation = 1
-            ; lifecycle_generation = 1L
-            }
-        ; graph_id = uuid 3
-        ; graph_generation = 1
-        }
-        (Asset_demand_accepted consumer)
+    | Command(W.Replace_asset_demand(bound,_,_)) ->
+      Runtime.notice r (Resources.notice resources(Service.Asset_demand_accepted(consumer_name bound)))
     | _ -> ()
   done;
   check
@@ -1186,8 +1168,8 @@ let runtime_unknown_old_parent () =
         request
         (V2_assets_outcome
            { generation = "g"; projection_revision = "r"; items = []; next_cursor = None })
-    | Command (Service.Asset_command { command = Release_asset_demand consumer; _ }) ->
-      released := Some consumer = !old
+    | Command(W.Release_asset_demand bound) ->
+      released := Some(consumer_name bound) = !old
     | _ -> ()
   done;
   check

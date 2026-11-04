@@ -69,7 +69,7 @@ let read_ticket_id : type a. a read_ticket -> G.Uuid.t = function
 let read_request_id (Read request) = read_ticket_id request.ticket
 ;;
 
-type local_import={data:Logseq_db_worker.import_receipt;authority:Worker.imported option}
+type local_import=Worker.imported
 
 type group =
   { root : string
@@ -92,14 +92,15 @@ type group =
   }
 
 type outgoing_request =
-  | Command of Service.request
+  | Demand of {graph_generation:int;consumer:string;priority:Worker.asset_priority;assets:Asset.t list}
+  | Acquire of ticket * Worker.asset_file
+  | Retry_asset of {graph_generation:int;asset:G.Uuid.t}
   | Perform_read of read_request
   | Release_preview of Worker.file_lease
   | Release_consumer of Worker.asset_consumer
 
 type outgoing =
-  { ticket : ticket option
-  ; request : outgoing_request
+  { request : outgoing_request
   ; current : unit -> bool
   }
 
@@ -115,19 +116,20 @@ type page_fact =
   }
 
 type t =
-  { release_file : (Worker.file_lease -> bool) option
-  ; release_consumer : (Worker.asset_consumer -> bool) option
+  { release_file : Worker.file_lease -> bool
+  ; release_consumer : Worker.asset_consumer -> bool
   ; bound_consumers : (string,Worker.asset_consumer)Hashtbl.t
   ; mutable resource_binding : Worker.binding option
   ; read_port : read_request -> bool
   ; read_planned : G.Uuid.t -> unit
   ; read_retired : G.Uuid.t -> unit
-  ; send : ticket option -> Service.request -> bool
+  ; demand : graph_generation:int -> name:string -> Worker.asset_priority -> Asset.t list -> Worker.asset_consumer option
+  ; acquire : ticket -> Worker.asset_file -> bool
+  ; retry_asset : graph_generation:int -> G.Uuid.t -> bool
   ; changed : string -> view -> unit
   ; groups : (string, group) Hashtbl.t
   ; consumers : (string, group * controller) Hashtbl.t
   ; previews : (string, string * string * string) Hashtbl.t
-  ; coordinated_leases : (string, Worker.file_lease) Hashtbl.t
   ; facts : (string, fact) Hashtbl.t
   ; pages : (string, page_fact) Hashtbl.t
   ; page_barriers : (string, int) Hashtbl.t
@@ -140,7 +142,7 @@ type t =
   ; mutable queued : outgoing list
   }
 
-let create_state ~release_file ~release_consumer ~read_port ~read_planned ~read_retired ~send ~changed =
+let create_state ~release_file ~release_consumer ~read_port ~read_planned ~read_retired ~demand ~acquire ~retry_asset ~changed =
   { release_file
   ; release_consumer
   ; bound_consumers=Hashtbl.create 32
@@ -148,12 +150,11 @@ let create_state ~release_file ~release_consumer ~read_port ~read_planned ~read_
   ; read_port
   ; read_planned
   ; read_retired
-  ; send
+  ; demand;acquire;retry_asset
   ; changed
   ; groups = Hashtbl.create 16
   ; consumers = Hashtbl.create 32
   ; previews = Hashtbl.create 4
-  ; coordinated_leases=Hashtbl.create 16
   ; facts = Hashtbl.create 64
   ; pages = Hashtbl.create 16
   ; page_barriers = Hashtbl.create 16
@@ -167,9 +168,9 @@ let create_state ~release_file ~release_consumer ~read_port ~read_planned ~read_
   }
 ;;
 
-let create ?release_file ?release_consumer ?(read_planned=fun _->())
-      ?(read_retired=fun _->()) ~read ~send ~changed () =
-  create_state ~release_file ~release_consumer ~read_port:read ~read_planned ~read_retired ~send ~changed
+let create ~release_file ~release_consumer ?(read_planned=fun _->())
+      ?(read_retired=fun _->()) ~read ~demand ~acquire ~retry_asset ~changed () =
+  create_state ~release_file ~release_consumer ~read_port:read ~read_planned ~read_retired ~demand ~acquire ~retry_asset ~changed
 ;;
 
 let owns_read t request_id =
@@ -193,7 +194,7 @@ let retire_outgoing t outgoing =
           g.pending <- None; g.membership_changed <- true
         | _ -> ()));
     t.read_retired (read_request_id (Read request))
-  | Command _ | Release_preview _ | Release_consumer _ -> ()
+  | Demand _ | Acquire _ | Retry_asset _ | Release_preview _ | Release_consumer _ -> ()
 ;;
 
 let empty_view = { items = []; more = false; error = None }
@@ -203,15 +204,15 @@ let notify t g =
     { items =
         List.filter_map
           (fun (local:local_import) ->
-         let receipt=local.data in
+         let receipt=Worker.import_data local in
              Option.map
-               (fun (_, path) ->
+               (fun lease ->
                   { token = "import:" ^ G.Uuid.to_string receipt.operation
                   ; asset = receipt.asset
                   ; file_type = receipt.file_type
-                  ; presentation = P.File path
+                  ; presentation = P.File (Worker.file_path lease)
                   })
-               receipt.preview)
+               (Worker.import_preview local))
           g.local
         @ List.map
             (fun c ->
@@ -233,7 +234,7 @@ let notify t g =
                   not
                     (List.exists
                        (fun (local:local_import) ->
-                          local.data.asset.uuid = c.asset.uuid)
+                          (Worker.import_data local).asset.uuid = c.asset.uuid)
                        g.local))
                g.controllers)
     ; more = Option.is_some g.cursor
@@ -342,10 +343,14 @@ let rec pump t =
       pump t)
     else if
       match next.request with
-      | Command request -> t.send next.ticket request
+      | Demand {graph_generation;consumer;priority;assets}->
+        (match t.demand ~graph_generation ~name:consumer priority assets with
+         |None->false|Some bound->Hashtbl.replace t.bound_consumers consumer bound;true)
+      | Acquire(ticket,file)->t.acquire ticket file
+      | Retry_asset{graph_generation;asset}->t.retry_asset ~graph_generation asset
       | Perform_read request -> t.read_port request
-      | Release_preview lease->Option.fold t.release_file ~none:false ~some:(fun release->release lease)
-      | Release_consumer consumer->Option.fold t.release_consumer ~none:false ~some:(fun release->release consumer)
+      | Release_preview lease->t.release_file lease
+      | Release_consumer consumer->t.release_consumer consumer
     then (
       (match next.request with
        | Perform_read (Read request) ->
@@ -358,7 +363,7 @@ let rec pump t =
       pump t)
 ;;
 
-let enqueue t ?ticket ?(current = fun () -> true) request =
+let enqueue t ?(current = fun () -> true) request =
   t.queued
   <- List.filter
        (fun item ->
@@ -368,7 +373,7 @@ let enqueue t ?ticket ?(current = fun () -> true) request =
             retire_outgoing t item;
             false))
        t.queued
-     @ [ { ticket; request = Command request; current } ]
+     @ [ { request; current } ]
 ;;
 
 let current_group t g =
@@ -379,54 +384,29 @@ let current_group t g =
 
 let current_controller t g c = current_group t g && Hashtbl.mem t.consumers c.consumer
 
-let release_retained_file t scope handle =
-  match Hashtbl.find_opt t.coordinated_leases handle with
-  |Some lease->
-    Hashtbl.remove t.coordinated_leases handle;
-    t.queued<-t.queued @ [{ticket=None;request=Release_preview lease;current=(fun()->true)}]
-  |None->enqueue t(Service.Release_asset_file{scope;handle})
+let release_retained_file t lease =
+  enqueue t (Release_preview lease)
 ;;
 
-let release_bound_consumer t graph_generation consumer =
+let release_bound_consumer t consumer =
   match Hashtbl.find_opt t.bound_consumers consumer with
-  |Some bound->
-    Hashtbl.remove t.bound_consumers consumer;
-    t.queued<-t.queued @ [{ticket=None;request=Release_consumer bound;current=(fun()->true)}]
-  |None when t.release_consumer<>None->()
-  |None->enqueue t(Service.Asset_command{graph_generation;command=Release_asset_demand consumer})
+  | Some bound->Hashtbl.remove t.bound_consumers consumer;enqueue t(Release_consumer bound)
+  | None->()
 ;;
-
-let bind_consumer t ~name consumer=Hashtbl.replace t.bound_consumers name consumer
 
 let instructions t g c effects =
   List.iter
     (function
-      | P.Demand { graph_generation; consumer; asset } ->
-        enqueue
-          t
-          ~current:(fun () ->
-            current_controller t g c && c.shown && P.descriptor c.state = Some asset)
-          (Service.Asset_command
-             { graph_generation
-             ; command =
-                 Replace_asset_demand
-                   { consumer; priority = Foreground; assets = [ asset ] }
-             })
-      | Release { graph_generation; consumer } -> release_bound_consumer t graph_generation consumer
-      | Retry { graph_generation; asset } ->
-        enqueue
-          t
-          ~current:(fun () -> current_controller t g c && c.shown)
-          (Service.Asset_command { graph_generation; command = Retry_asset asset })
-      | Acquire ticket ->
-        enqueue
-          t
-          ~ticket:
-            (Lease { root = g.root; epoch = g.epoch; consumer = c.consumer; ticket })
-          ~current:(fun () -> current_controller t g c && P.ticket_current c.state ticket)
-          (Service.Acquire_asset_file { scope = ticket.scope; handle = ticket.handle })
-      | Release_file { scope; lease } ->
-        release_retained_file t scope lease)
+      | P.Demand {graph_generation;consumer;asset}->
+        enqueue t ~current:(fun()->current_controller t g c && c.shown && P.descriptor c.state=Some asset)
+          (Demand{graph_generation;consumer;priority=Worker.Foreground;assets=[asset]})
+      | Release{consumer;_}->release_bound_consumer t consumer
+      | Retry{graph_generation;asset}->
+        enqueue t ~current:(fun()->current_controller t g c && c.shown)(Retry_asset{graph_generation;asset})
+      | Acquire ticket->
+        enqueue t ~current:(fun()->current_controller t g c && P.ticket_current c.state ticket)
+          (Acquire(Lease{root=g.root;epoch=g.epoch;consumer=c.consumer;ticket},ticket.file))
+      | Release_file lease->release_retained_file t lease)
     effects
 ;;
 
@@ -437,19 +417,14 @@ let dispatch t g c event =
 ;;
 
 let release_import t local =
-  match local.authority with
-  | Some imported->Option.iter(fun lease->
-      t.queued<-t.queued @ [{ticket=None;request=Release_preview lease;current=(fun()->true)}])
-      (Worker.import_preview imported)
-  | None->let receipt=local.data in
-    Option.iter(fun(handle,_)->enqueue t(Service.Release_asset_file{scope=receipt.scope;handle}))receipt.preview
+  Option.iter(release_retained_file t)(Worker.import_preview local)
 ;;
 
 let handoff_imports t g =
   let completed, pending =
     List.partition
       (fun (local:local_import) ->
-         let receipt=local.data in
+         let receipt=Worker.import_data local in
          let token = "import:" ^ G.Uuid.to_string receipt.operation in
          (not
             (Hashtbl.to_seq_values t.previews
@@ -511,7 +486,7 @@ let read t g cursor =
     t.queued <- List.filter
       (fun item -> if item.current () then true else (retire_outgoing t item; false))
       t.queued
-      @ [{ ticket = None; request = Perform_read request; current }])
+      @ [{ request = Perform_read request; current }])
   else if g.pending = None
   then g.error <- Some "Attachment requests are busy."
 ;;
@@ -716,9 +691,9 @@ let preview_visible t ~owner ~slot ~root ~asset visible =
              g.controllers
            || List.exists
                 (fun (local:local_import) ->
-         let receipt=local.data in
+         let receipt=Worker.import_data local in
                    asset = "import:" ^ G.Uuid.to_string receipt.operation
-                   && Option.is_some receipt.preview)
+                   && Option.is_some(Worker.import_preview local))
                 g.local ->
       Hashtbl.replace t.previews preview selected;
       root_visible ~owner:preview t ~root true;
@@ -795,7 +770,7 @@ let request_fact t block =
       let submit : type a. a read_ticket -> a Worker.query -> unit = fun ticket query ->
         let request = Read { ticket; maximum_items = 1; query;
           outcome = (fun value -> Read_result { ticket; query; value }) } in
-        t.queued <- t.queued @ [{ ticket = None; request = Perform_read request; current }]
+        t.queued <- t.queued @ [{ request = Perform_read request; current }]
       in
       if page then submit (Page_fact fact) (Worker.Page { uuid; revision = None })
       else submit (Block_fact fact) (Worker.Outline_block { uuid; revision = None }))
@@ -1234,11 +1209,7 @@ let recover_failed_reads t =
         retry t ~root:g.root ~asset:""))) t.groups
 ;;
 
-let release_stale t ticket result =
-  match result with
-  | None -> ()
-  | Some (lease, _) ->
-    release_retained_file t ticket.P.scope lease
+let release_stale t result = Option.iter(release_retained_file t)result
 ;;
 
 let receive_listing t ~root ~epoch ~request_id listing =
@@ -1301,7 +1272,7 @@ let receive_listing t ~root ~epoch ~request_id listing =
                && (not c.shown)
                && List.exists
                     (fun (local:local_import) ->
-         let receipt=local.data in
+         let receipt=Worker.import_data local in
                        receipt.asset.uuid = c.asset.uuid)
                     g.local
              then (
@@ -1392,48 +1363,27 @@ let reject_read : type a. t -> a read_ticket -> unit = fun t ticket ->
   pump t
 ;;
 
-let receive t ticket response =
-  (match ticket with
-   | Lease { root; epoch; consumer; ticket } ->
-     let result =
-       match response with
-       | Service.Asset_file result -> result
-       | _ -> None
-     in
-     (match Hashtbl.find_opt t.groups root with
-      | Some g when g.epoch = epoch ->
-        (match List.find_opt (fun c -> c.consumer = consumer) g.controllers with
-         | Some c ->
-           dispatch t g c (Acquired (ticket, result));
-           handoff_imports t g;
-           notify t g
-         | None -> release_stale t ticket result)
-      | _ -> release_stale t ticket result));
-  recover_failed_reads t;
-  pump t
+let receive_file t (Lease{root;epoch;consumer;ticket}) result =
+  (match Hashtbl.find_opt t.groups root with
+   |Some g when g.epoch=epoch->
+     (match List.find_opt(fun c->c.consumer=consumer)g.controllers with
+      |Some c->dispatch t g c(Acquired(ticket,result));handoff_imports t g;notify t g
+      |None->release_stale t result)
+   |_->release_stale t result);
+  recover_failed_reads t;pump t
 ;;
-
-let acquisition_consumer = function Lease { consumer; _ } -> consumer
-let consumer_names t=Hashtbl.to_seq_keys t.consumers
-let receive_file t ticket lease =
-  let result=Option.map(fun lease->
-    let handle=Printf.sprintf "coordinated-display-lease:%d" t.serial in
-    t.serial<-t.serial+1;
-    Hashtbl.replace t.coordinated_leases handle lease;
-    handle,Worker.file_path lease)lease in
-  receive t ticket(Service.Asset_file result)
-;;
-
 let demand_backpressured t consumer =
   Option.iter(fun(g,c)->dispatch t g c P.Demand_backpressured)
     (Hashtbl.find_opt t.consumers consumer)
 ;;
 
-let notice t scope = function
-  | Service.Asset_availability { consumer; asset; availability; _ } ->
+let notice t notice =
+  let scope=Worker.asset_notice_scope notice in
+  match Worker.asset_notice_data notice with
+  | Service.Asset_availability { consumer; asset; _ } ->
     (match Hashtbl.find_opt t.consumers consumer with
      | Some (g, c) when c.asset.uuid = asset ->
-       dispatch t g c (Availability { scope; consumer; availability });
+       dispatch t g c (Availability notice);
        notify t g;
        pump t
      | _ -> ())
@@ -1443,7 +1393,7 @@ let notice t scope = function
          let cancelled, pending =
            List.partition
              (fun (local:local_import) ->
-         let receipt=local.data in
+         let receipt=Worker.import_data local in
                 receipt.operation = operation && receipt.scope = scope)
              g.local
          in
@@ -1464,7 +1414,7 @@ let notice t scope = function
 ;;
 
 let imported_local t ~current local =
-  let receipt=local.data in
+  let receipt=Worker.import_data local in
   if (not current) || t.generation <> Some receipt.graph_generation
   then release_import t local
   else (
@@ -1504,13 +1454,13 @@ let imported_local t ~current local =
       let duplicate, retained =
         List.partition
           (fun (old:local_import) ->
-             old.data.operation = receipt.operation)
+             (Worker.import_data old).operation = receipt.operation)
           g.local
       in
       List.iter
         (fun old ->
            if
-             old.data.preview <> receipt.preview || old.data.scope <> receipt.scope
+             Worker.import_preview old <> Worker.import_preview local
            then release_import t old)
         duplicate;
       if List.length retained >= 16
@@ -1518,8 +1468,8 @@ let imported_local t ~current local =
         release_import t local;
         g.error <- Some "Too many open attachment previews")
       else (
-        g.local <- (retained @ if receipt.preview = None then [] else [ local ]);
-        if receipt.preview = None
+        g.local <- (retained @ if Worker.import_preview local = None then [] else [ local ]);
+        if Worker.import_preview local = None
         then g.error <- Some "Local attachment preview unavailable";
         if g.visible && g.pending = None then read t g None);
       notify t g);
@@ -1528,9 +1478,9 @@ let imported_local t ~current local =
 
 let retire_coordinated_previews t =
   Hashtbl.iter(fun _ g->
-    let retiring,retained=List.partition(fun(local:local_import)->local.authority<>None)g.local in
+    let retiring=g.local in
     if retiring<>[] then (
-      List.iter(release_import t)retiring;g.local<-retained;g.membership_changed<-true;notify t g))t.groups;
+      List.iter(release_import t)retiring;g.local<-[];g.membership_changed<-true;notify t g))t.groups;
   pump t
 ;;
 let retire_coordinated_resources t =
@@ -1538,7 +1488,7 @@ let retire_coordinated_resources t =
     t.resource_binding<-None;
     t.queued<-List.filter(fun outgoing->match outgoing.request with
       |Release_preview _|Release_consumer _->true
-      |Command _|Perform_read _->retire_outgoing t outgoing;false)t.queued;
+      |Demand _|Acquire _|Retry_asset _|Perform_read _->retire_outgoing t outgoing;false)t.queued;
     Hashtbl.iter(fun _ id->t.read_retired id)t.fact_requests;
     Hashtbl.clear t.fact_requests;Hashtbl.clear t.facts;Hashtbl.clear t.pages;
     Hashtbl.clear t.page_barriers;Hashtbl.clear t.sources;Hashtbl.clear t.barriers;
@@ -1561,8 +1511,6 @@ let bind_coordinated_resources t binding =
   resume_coordinated_previews t
 ;;
 
-let imported t ~current data=imported_local t ~current {data;authority=None}
-let imported_coordinated t ~current imported=
-  imported_local t ~current {data=Worker.import_data imported;authority=Some imported}
+let imported t ~current imported=imported_local t ~current imported
 
 let idle t = t.queued = []

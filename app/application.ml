@@ -3386,7 +3386,7 @@ let start
   let account_lifecycle=ref Account_pure_lifecycle.initial in
   let account_lifecycle_changed=ref(fun()->()) in
   let detail_observations_changed = ref(fun()->()) in
-  let coordination_assets_changed=ref(fun()->()) in
+  let coordination_assets_changed=ref(fun (_:Wc.asset_notice Rrbvec.t)->()) in
   let coordinated_changefeed_notice=ref(fun (_:Wc.changefeed_notice)->()) in
   let mutation_acknowledgements_changed=ref(fun()->()) in
   let retained_insertions_changed=ref(fun()->())in
@@ -3488,13 +3488,14 @@ let start
            ~enqueue:(Journal_pump.enqueue pump)
            ~changed:(fun view->
              let notices=Coordination.changefeed_updates ~previous:!previous_notice_view view in
+             let assets=Coordination.asset_updates ~previous:!previous_notice_view view in
              previous_notice_view:=Some view;
              reconcile_import_sources();
              if !coordination_host_id=Some id then (
                Rrbvec.iter (fun notice-> !coordinated_changefeed_notice notice) notices;
                Option.iter(fun poll->poll view)!copy_poll;
                !detail_observations_changed();
-               !coordination_assets_changed();
+               !coordination_assets_changed assets;
                !mutation_acknowledgements_changed();
                !retained_insertions_changed());
              !coordination_lifecycle_changed()) with
@@ -3753,12 +3754,13 @@ let start
       { state with timeline_structure_revision })
   in
   ignore (Journal_timeline.Store.synchronize (!timeline_store_cell) initial_state.timeline : int);
-  let coordinated_asset_projection_cell=graph_ref(fun()->Hashtbl.create 32) in
   let media_context = graph_ref (fun () -> None) in
   let prev_media_owners = graph_ref (fun () -> (media_presentation_scopes initial_state)) in
   let prev_detail_media_roots = graph_ref (fun () -> (media_detail_roots initial_state)) in
   let prev_detail_media_routes = graph_ref (fun () -> initial_state.routes) in
-  let coordinated_media_point = ref(fun (_:Journal_media_runtime.ticket option) (_:Graph_service.request)->None) in
+  let asset_demand = ref(fun ~graph_generation:_ ~name:_ (_:Wc.asset_priority) (_:Logseq_db_types.Asset_descriptor.t list)->None) in
+  let media_acquire = ref(fun (_:Journal_media_runtime.ticket) (_:Wc.asset_file)->false) in
+  let asset_retry = ref(fun ~graph_generation:_ (_:Wc.Uuid.t)->false) in
   let coordinated_media_read = ref(fun (_:Journal_media_runtime.read_request)->false) in
   let release_coordinated_resource ?returned session operation =
     let retry=ref false in
@@ -3782,7 +3784,9 @@ let start
       ~read_planned:(fun request_id->Journal_graph_runtime.register_external_read graph ~request_id)
       ~read_retired:(fun request_id->Journal_graph_runtime.retire_external_read graph ~request_id)
       ~read:(fun request-> !coordinated_media_read request)
-      ~send:(fun ticket request ->Option.value(!coordinated_media_point ticket request) ~default:false)
+      ~demand:(fun ~graph_generation ~name priority assets -> !asset_demand ~graph_generation ~name priority assets)
+      ~acquire:(fun ticket file -> !media_acquire ticket file)
+      ~retry_asset:(fun ~graph_generation asset -> !asset_retry ~graph_generation asset)
       ~changed:(fun root view -> Hashtbl.replace changes root view) ()) in
   media_projection_changes:=(fun windows->
     Journal_media_runtime.changes (!media_runtime_cell) windows;
@@ -3827,7 +3831,6 @@ let start
   let capture_import_queue_cell = graph_ref (fun () ->
     Queue.create ()) in
   let drain_capture_imports = ref (fun () -> Effect.ignore) in
-  let coordinated_asset_point = ref(fun (_:Graph_service.request)->None) in
   let coordinated_asset_read = ref(fun (_:Journal_asset_runtime.read_request)->false) in
   let asset_changes_cell = graph_ref (fun () -> None) in
   let asset_runtime_cell = graph_ref (fun () ->
@@ -3838,7 +3841,7 @@ let start
       ~read:(fun request-> !coordinated_asset_read request)
       ~changed:(fun generation recent favorites ->
         asset_changes_cell := Some(generation,recent,favorites))
-      ~send:(fun request->Option.value(!coordinated_asset_point request) ~default:false) ()) in
+      ~demand:(fun ~graph_generation ~name priority assets -> !asset_demand ~graph_generation ~name priority assets) ()) in
   let flush_media set_state =
     Effect.bind (flush_media_only set_state) ~f:(fun()->
       match !asset_changes_cell with
@@ -3895,62 +3898,47 @@ let start
         List.find_map(fun resident->if resident.Wc.phase=Wc.Open && Wc.matches_scope resident.session owner
           then Some(owner,host,resident.session) else None)(Wc.residents projection))
     |_->None in
-  let coordinated_asset_command ~bind request =
-    let send graph_generation make_operation =
-      Some(match coordinated_asset_context() with
-      |Some(owner,host,session) when owner.graph_generation=graph_generation->
-        (match make_operation session with
-         |Error _->false
-         |Ok(operation,consumer)->
-           match Coordination_host.request host session operation with
-           |Error _->false
-           |Ok ticket->
-             Option.iter(fun(name,consumer)->bind ~name
-               (Wc.bind_asset_consumer consumer ~round:(Coordination.ticket_id ticket)))consumer;
-             Coordination_host.watch host ticket ~f:(function
-               |Wc.Answered(Ok())|Answered(Error Revoked_session)|Interrupted Cancelled|Interrupted Worker_stopped->()
-               |_->Option.iter(fun(name,_)->if runtime_owner_is_live !state_ref owner then
-                 run_owned(Some owner)(fun()->Effect.of_thunk(fun()->
-                   Journal_media_runtime.demand_backpressured (!media_runtime_cell) name;
-                   Journal_asset_runtime.demand_backpressured (!asset_runtime_cell) name)))consumer);
-             true)
-      |_->false) in
-    match request with
-    |Graph_service.Asset_command{graph_generation;command=Replace_asset_demand{consumer=name;priority;assets}}->
-      send graph_generation(fun session->Result.map(fun consumer->
-        Wc.Replace_asset_demand(consumer,(match priority with Foreground->Wc.Foreground|Background->Background),assets),
-        Some(name,consumer))(Wc.asset_consumer session ~name))
-    |Asset_command{graph_generation;command=Retry_asset asset}->
-      send graph_generation(fun _->Ok(Wc.Retry_asset asset,None))
-    |Asset_command{command=Release_asset_demand _;_}->Some false
-    |_->None in
-  coordinated_media_point := (fun ticket request ->
-    match ticket,request with
-    |Some ticket,Graph_service.Acquire_asset_file{scope;handle}->
-      Some(match coordinated_asset_context(),Journal_media_runtime.acquisition_consumer ticket with
-      |Some(owner,host,session),name when Wc.matches_asset_scope session scope->
-        (match Wc.asset_consumer session ~name with
-         |Error _->false
-         |Ok consumer->
-           let file=List.find_map(fun notice->match Wc.asset_notice_data notice with
-             |Graph_service.Asset_availability{availability=Ready actual;_} when actual=handle->Wc.ready_asset_file notice
-             |_->None)(Coordination.asset_notices(Coordination_host.view host)consumer) in
-           match Option.bind file(fun file->Result.to_option(Coordination_host.request host session(Wc.Acquire_asset_file file))) with
-           |None->false
-           |Some acquire->
-             let runtime= !media_runtime_cell in
-             Coordination_host.watch host acquire ~f:(fun reply->
-               let lease=match reply with Wc.Answered(Ok lease)->lease|_->None in
-               if runtime_owner_is_live !state_ref owner then run_owned(Some owner)(fun()->
-                 Effect.bind(Effect.of_thunk(fun()->Journal_media_runtime.receive_file runtime ticket lease))
-                   ~f:(fun()->flush_media set_state))
-               else (
-                 Journal_media_runtime.reset runtime ~graph_generation:None;
-                 Journal_media_runtime.receive_file runtime ticket lease));
-             true)
-      |_->false)
-    |_,Graph_service.Release_asset_file _->Some false
-    |_->coordinated_asset_command ~bind:(Journal_media_runtime.bind_consumer (!media_runtime_cell)) request);
+  asset_demand := (fun ~graph_generation ~name priority assets ->
+    match coordinated_asset_context() with
+    |Some(owner,host,session) when owner.graph_generation=graph_generation->
+      (match Wc.asset_consumer session ~name with
+       |Error _->None
+       |Ok consumer->
+         match Coordination_host.request host session(Wc.Replace_asset_demand(consumer,priority,assets)) with
+         |Error _->None
+         |Ok ticket->
+           let bound=Wc.bind_asset_consumer consumer ~round:(Coordination.ticket_id ticket) in
+           Coordination_host.watch host ticket ~f:(function
+             |Wc.Answered(Ok())|Answered(Error Revoked_session)|Interrupted Cancelled|Interrupted Worker_stopped->()
+             |_->if runtime_owner_is_live !state_ref owner then
+               run_owned(Some owner)(fun()->Effect.of_thunk(fun()->
+                 Journal_media_runtime.demand_backpressured (!media_runtime_cell) name;
+                 Journal_asset_runtime.demand_backpressured (!asset_runtime_cell) name)));
+           Some bound)
+    |_->None);
+  asset_retry := (fun ~graph_generation asset ->
+    match coordinated_asset_context() with
+    |Some(owner,host,session) when owner.graph_generation=graph_generation->
+      (match Coordination_host.request host session(Wc.Retry_asset asset) with
+       |Error _->false|Ok ticket->Coordination_host.watch host ticket ~f:(fun _->());true)
+    |_->false);
+  media_acquire := (fun ticket file ->
+    match coordinated_asset_context() with
+    |Some(owner,host,session)->
+      (match Coordination_host.request host session(Wc.Acquire_asset_file file) with
+       |Error _->false
+       |Ok acquire->
+         let runtime= !media_runtime_cell in
+         Coordination_host.watch host acquire ~f:(fun reply->
+           let lease=match reply with Wc.Answered(Ok lease)->lease|_->None in
+           if runtime_owner_is_live !state_ref owner then run_owned(Some owner)(fun()->
+             Effect.bind(Effect.of_thunk(fun()->Journal_media_runtime.receive_file runtime ticket lease))
+               ~f:(fun()->flush_media set_state))
+           else (
+             Journal_media_runtime.reset runtime ~graph_generation:None;
+             Journal_media_runtime.receive_file runtime ticket lease));
+         true)
+    |_->false);
   coordinated_media_read := (fun ((Journal_media_runtime.Read request) as original)->
     match current_owner(),ensure_coordination() with
     | Some owner,Ok host->
@@ -3990,8 +3978,6 @@ let start
           (if consumed then Coordination.Change_consumer_applied(token,request_id,result)
            else Coordination.Change_consumer_retired(token,request_id)))!coordination_host)application;
         Effect.ignore)) in
-  coordinated_asset_point := (fun request ->
-    coordinated_asset_command ~bind:(Journal_asset_runtime.bind_consumer (!asset_runtime_cell)) request);
   coordinated_asset_read := (fun (Journal_asset_runtime.Read request) ->
     match current_owner(),ensure_coordination() with
     | Some owner,Ok host ->
@@ -5034,7 +5020,7 @@ let start
         active_runtime:=Some key;processing_owner:=Some owner;action();save_runtime())
         (Hashtbl.find_opt runtime_sessions key));
     List.iter(fun restore->restore())restore;active_runtime:=active;processing_owner:=previous in
-  coordination_assets_changed:=(fun()->with_live_runtime_resources(fun()->
+  coordination_assets_changed:=(fun updates->with_live_runtime_resources(fun()->
     match current_owner(),!coordination_host with
     |Some owner,Some(_,host)->
       let view=Coordination_host.view host in
@@ -5043,37 +5029,32 @@ let start
         if resident.Wc.phase=Wc.Open && Wc.matches_scope resident.session owner then Some resident.session else None)
         (Wc.residents projection)) in
       (match projection,session with
-       |Some projection,Some session->
+       |Some projection,Some _->
          let binding=Wc.projection_binding projection in
          Journal_media_runtime.bind_coordinated_resources (!media_runtime_cell) binding;
          Journal_asset_runtime.bind_coordinated_resources (!asset_runtime_cell) binding;
-         let module Names=Set.Make(String) in
-            let names=Seq.append(Journal_media_runtime.consumer_names (!media_runtime_cell))
-              (Journal_asset_runtime.consumer_names (!asset_runtime_cell))
-              |> Seq.fold_left(fun names name->Names.add name names)Names.empty in
-            Hashtbl.filter_map_inplace(fun name values->if Names.mem name names then Some values else None)
-              (!coordinated_asset_projection_cell);
-            Names.iter(fun name->match Wc.asset_consumer session ~name with
-              |Error _->()
-              |Ok consumer->let notices=Coordination.asset_notices view consumer in
-                if Hashtbl.find_opt (!coordinated_asset_projection_cell) name<>Some notices then (
-                  Hashtbl.replace (!coordinated_asset_projection_cell) name notices;
-                  List.iter(fun notice->let data=Wc.asset_notice_data notice in
-                    let scope=Wc.asset_notice_scope notice in
-                    let apply()=
-                      Journal_media_runtime.notice (!media_runtime_cell) scope data;
-                      Journal_asset_runtime.notice (!asset_runtime_cell) scope data;true in
-                    let delivery=match Journal_asset_runtime.notice_reads (!asset_runtime_cell) scope data with
-                      |[request_id]->apply_asset_read ~request_id ~result:(Ok()) ~f:apply
-                      |[]->Effect.of_thunk(fun()->ignore(apply():bool))
-                      |_->assert false in
-                    Effect.run delivery)notices))names;
+         Rrbvec.iter(fun notice->
+           let current()=match !coordination_host with
+             |Some(_,actual) when actual==host->
+               Coordination_host.validate_session ~owner actual (Wc.asset_notice_session notice)=Ok()
+               && (match Wc.asset_notice_consumer notice with
+                 |None->true
+                 |Some consumer->List.mem notice (Coordination.asset_notices (Coordination_host.view actual) consumer))
+             |_->false in
+           let apply()=if not(current()) then false else (
+             Journal_media_runtime.notice (!media_runtime_cell) notice;
+             Journal_asset_runtime.notice (!asset_runtime_cell) notice;true) in
+           if current() then (
+             let delivery=match Journal_asset_runtime.notice_reads (!asset_runtime_cell) notice with
+               |[request_id]->apply_asset_read ~request_id ~result:(Ok()) ~f:apply
+               |[]->Effect.of_thunk(fun()->ignore(apply():bool))
+               |_->assert false in
+             Effect.run delivery))updates;
             Journal_asset_runtime.pump (!asset_runtime_cell);
             Journal_media_runtime.pump (!media_runtime_cell);
             Effect.run(flush_media set_state)
        |_->Journal_media_runtime.retire_coordinated_resources (!media_runtime_cell);
          Journal_asset_runtime.retire_coordinated_resources (!asset_runtime_cell);
-         Hashtbl.clear (!coordinated_asset_projection_cell);
          Effect.run(flush_media set_state))
     |_->()));
   let retry_failed_graph_handoff host =
@@ -5287,7 +5268,7 @@ let start
         Effect.bind
           (Effect.of_thunk (fun () ->
              sync_media !state_ref;
-             Result.iter (Journal_media_runtime.imported_coordinated (!media_runtime_cell) ~current) typed_result))
+             Result.iter (Journal_media_runtime.imported (!media_runtime_cell) ~current) typed_result))
           ~f:(fun () ->
             Effect.many
               [ flush_media set_state
@@ -5440,20 +5421,7 @@ let start
         ~f:(fun () -> !drain_visible_copies ())
     | Worker.Push { payload = (Asset_notice _ | Asset_notices _) as payload; _ } ->
       let notices = Graph_service.asset_notices payload in
-      let apply_notice (scope,notice) =
-        let apply () =
-          (match notice with
-           |Graph_service.Upload_status _|Asset_capacity_available->
-             Journal_asset_runtime.notice (!asset_runtime_cell) scope notice;
-             Journal_media_runtime.notice (!media_runtime_cell) scope notice
-           |Asset_availability _|Asset_backpressure _|Asset_demand_accepted _->());
-          true in
-        match Journal_asset_runtime.notice_reads (!asset_runtime_cell) scope notice with
-        | [request_id] -> apply_asset_read ~request_id ~result:(Ok()) ~f:apply
-        | [] -> Effect.of_thunk(fun()->ignore(apply():bool))
-        | _ -> assert false in
-      let applied=List.fold_left(fun pending notice->Effect.bind pending ~f:(fun()->apply_notice notice))
-        Effect.ignore notices in
+      let applied=Effect.ignore in
       Effect.bind applied ~f:(fun()->Effect.many
         [ flush_media set_state
         ; set_state (fun state ->

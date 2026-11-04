@@ -58,13 +58,13 @@ type dependency =
 
 type t =
   { read_port : read_request -> bool
-  ; release_consumer : (Worker.asset_consumer -> bool) option
+  ; release_consumer : Worker.asset_consumer -> bool
   ; bound_consumers : (string,Worker.asset_consumer)Hashtbl.t
   ; mutable resource_binding : Worker.binding option
   ; mutable resume_configuration : (int*int*Policy.settings)option
   ; read_planned : Graph.Uuid.t -> unit
   ; read_retired : Graph.Uuid.t -> unit
-  ; send : Service.request -> bool
+  ; demand : graph_generation:int -> name:string -> Worker.asset_priority -> Logseq_db_types.Asset_descriptor.t list -> Worker.asset_consumer option
   ; changed : int option -> Policy.offline -> Policy.offline -> unit
   ; mutable published : (int option * Policy.offline * Policy.offline) option
   ; mutable policy : scan_cursor Policy.t
@@ -88,7 +88,7 @@ type t =
   ; mutable favorite_members : Uuids.t
   }
 
-let create_state ~release_consumer ~read_port ~read_planned ~read_retired ~send ~changed =
+let create_state ~release_consumer ~read_port ~read_planned ~read_retired ~demand ~changed =
   { read_port
   ; release_consumer
   ; bound_consumers=Hashtbl.create 32
@@ -96,7 +96,7 @@ let create_state ~release_consumer ~read_port ~read_planned ~read_retired ~send 
   ; resume_configuration=None
   ; read_planned
   ; read_retired
-  ; send
+  ; demand
   ; changed
   ; published = None
   ; policy = Policy.empty
@@ -121,8 +121,8 @@ let create_state ~release_consumer ~read_port ~read_planned ~read_retired ~send 
   }
 ;;
 
-let create ?release_consumer ?(read_planned=fun _->()) ?(read_retired=fun _->()) ~read ~send ~changed () =
-  create_state ~release_consumer ~read_port:read ~read_planned ~read_retired ~send ~changed
+let create ~release_consumer ?(read_planned=fun _->()) ?(read_retired=fun _->()) ~read ~demand ~changed () =
+  create_state ~release_consumer ~read_port:read ~read_planned ~read_retired ~demand ~changed
 ;;
 
 let scan_request_id id =
@@ -155,7 +155,8 @@ let projection_read_error t =
   if t.configuration<>None && t.degraded
   then Some "Offline attachment dependencies could not be read" else None
 
-let notice_reads t (scope:Service.asset_scope) notice =
+let notice_reads t notice =
+  let scope=Worker.asset_notice_scope notice and notice=Worker.asset_notice_data notice in
   if t.generation <> Some scope.graph_generation then [] else
   let event=match notice with
     | Service.Asset_demand_accepted consumer -> Some(Policy.Demand_accepted consumer)
@@ -259,22 +260,15 @@ let execute t = function
       Hashtbl.replace t.pending (Graph.Uuid.to_string request_id) ticket;
       true)
     else false
-  | Demand { consumer; priority; assets } ->
-    (match t.generation with
-     | None -> true
-     | Some graph_generation ->
-       t.send
-         (Service.Asset_command
-            { graph_generation
-            ; command = Replace_asset_demand { consumer; priority; assets }
-            }))
-  | Release consumer ->
-    (match Hashtbl.find_opt t.bound_consumers consumer,t.release_consumer with
-     |Some bound,Some release->
-       if release bound then (Hashtbl.remove t.bound_consumers consumer;true)else false
-     |None,Some _->true
-     |_,None->match t.generation with None->true|Some graph_generation->
-       t.send(Service.Asset_command{graph_generation;command=Release_asset_demand consumer}))
+  | Demand {consumer;priority;assets}->
+    (match t.generation with None->true|Some graph_generation->
+      match t.demand ~graph_generation ~name:consumer priority assets with
+      |None->false|Some bound->Hashtbl.replace t.bound_consumers consumer bound;true)
+  | Release consumer->
+    (match Hashtbl.find_opt t.bound_consumers consumer with
+     |None->true|Some bound->
+       if t.release_consumer bound then (Hashtbl.remove t.bound_consumers consumer;true)else false)
+
 ;;
 
 let forget_request t ~request_id =
@@ -1005,11 +999,8 @@ let reject t ~request_id =
 
 let demand_backpressured t consumer=dispatch t(Policy.Backpressure consumer)
 
-let notice
-      t
-      (scope : Logseq_db_worker_lui.Logseq_db_worker_lui_service.asset_scope)
-      notice
-  =
+let notice t notice =
+  let scope=Worker.asset_notice_scope notice and notice=Worker.asset_notice_data notice in
   if t.generation = Some scope.graph_generation
   then (
     match notice with
@@ -1022,7 +1013,3 @@ let notice
 ;;
 
 let idle t = Queue.is_empty t.queued
-
-let consumer_names t=Policy.consumer_names t.policy
-
-let bind_consumer t ~name consumer=Hashtbl.replace t.bound_consumers name consumer

@@ -2334,11 +2334,42 @@ let change_consumer state token operation =
   | _ -> unchanged state
 ;;
 
+type asset_fact_key = Asset_fact of Worker.Uuid.t | Demand_fact | Capacity_fact | Upload_fact of Worker.Uuid.t
+module Asset_facts = Map.Make(struct type t=asset_fact_key let compare=Stdlib.compare end)
 let asset_fact_key notice=match Worker.asset_notice_data notice with
-  | Logseq_db_worker_lui.Logseq_db_worker_lui_service.Asset_availability{asset;_}->"asset:"^Worker.Uuid.to_string asset
-  | Asset_demand_accepted _|Asset_backpressure _->"admission"
-  | Asset_capacity_available->"capacity"
-  | Upload_status{operation;_}->"upload:"^Worker.Uuid.to_string operation
+  | Logseq_db_worker_lui.Logseq_db_worker_lui_service.Asset_availability{asset;_}->Asset_fact asset
+  | Asset_demand_accepted _|Asset_backpressure _->Demand_fact
+  | Asset_capacity_available->Capacity_fact
+  | Upload_status{operation;_}->Upload_fact operation
+let asset_updates ~previous facts =
+  if Option.exists(fun previous->previous.asset_consumers == facts.asset_consumers
+    && previous.session_assets == facts.session_assets) previous then Rrbvec.empty else
+  let changed previous values updates =
+    if previous == values then updates else
+    let seen = List.fold_left(fun seen (notice,sequence)->
+      Asset_facts.add (asset_fact_key notice) (notice,sequence) seen) Asset_facts.empty previous in
+    List.fold_left(fun updates ((notice,sequence) as value)->
+      if not(current_session facts (Worker.asset_notice_session notice)) then updates else
+      let unchanged=match Asset_facts.find_opt (asset_fact_key notice) seen with
+        |Some(old,seen)->Worker.equal_session (Worker.asset_notice_session old) (Worker.asset_notice_session notice)
+          && Id.Push_sequence.compare seen sequence >= 0
+        |None->false in
+      if unchanged then updates else Rrbvec.push_back updates value) updates values
+  in
+  let updates = Asset_consumers.fold (fun consumer entry updates ->
+    if not entry.active then updates else
+    let previous = match Option.bind previous (fun view -> Asset_consumers.find_opt consumer view.asset_consumers) with
+      | Some old when old.active && Worker.asset_consumer_round old.consumer = Worker.asset_consumer_round entry.consumer -> old.notices
+      | _ -> [] in
+    changed previous entry.notices updates) facts.asset_consumers Rrbvec.empty in
+  let updates = Graphs.fold (fun graph values updates ->
+    let previous = Option.bind previous (fun view -> Graphs.find_opt graph view.session_assets)
+      |> Option.value ~default:[] in
+    changed previous values updates) facts.session_assets updates in
+  Rrbvec.sort (fun (_, a) (_, b) -> Id.Push_sequence.compare a b) updates
+  |> Rrbvec.map fst
+;;
+
 let retain_asset_notice state notice sequence =
   let session=Worker.asset_notice_session notice in
   if validate_session state session<>Ok() then unchanged state else

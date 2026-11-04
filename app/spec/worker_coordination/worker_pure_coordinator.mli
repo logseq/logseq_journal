@@ -17,6 +17,13 @@ val projection : view -> Worker.projection option
     the previous view. Stale/foreign notices never reach this outlet; it retains
     no delivery history. Queued consumers still validate the notice session. *)
 val changefeed_updates : previous:view option -> view -> Worker.changefeed_notice Rrbvec.t
+
+(** Original accepted asset facts changed since the previous view, for current
+    sessions and active demand rounds. A newer sequence is an update even when
+    its content is identical. This retains no delivery history; queued consumers
+    still check current ownership before applying a notification. *)
+val asset_updates : previous:view option -> view -> Worker.asset_notice Rrbvec.t
+
 val intent_progress : view -> Worker.durable_intent -> Worker.mutation_progress option
 
 (** A queued business callback rechecks presentation after ticket Forget. It

@@ -40,6 +40,22 @@ let secrets =
   |> Result.get_ok
 ;;
 
+let host_asset_demand host ~(owner:Service.timeline_scope) ~graph_generation ~name priority assets =
+  let module H=Journal_worker_coordination_host in
+  match Option.bind(C.projection(H.view host))(fun projection->List.find_map(fun resident->
+    if resident.W.phase=W.Open && W.matches_scope resident.session owner then Some resident.session else None)(W.residents projection)) with
+  |Some session when owner.graph_generation=graph_generation->
+    (match W.asset_consumer session ~name with Error _->None|Ok consumer->
+      match H.request host session(W.Replace_asset_demand(consumer,priority,assets)) with
+      |Error _->None|Ok ticket->H.watch host ticket ~f:(fun _->());
+        Some(W.bind_asset_consumer consumer ~round:(C.ticket_id ticket)))
+  |_->None
+
+let host_asset_release host consumer =
+  let module H=Journal_worker_coordination_host in
+  match H.request host (W.asset_consumer_session consumer)(W.Release_asset_demand consumer) with
+  |Error _->false|Ok ticket->H.watch host ticket ~f:(fun _->());true
+
 let favorite_page_id = uuid "9c000000-0000-4000-8000-000000000100"
 let favorite_member n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (100 + n))
 
@@ -474,6 +490,7 @@ let test_client_to_typed_read () =
     let asset=Logseq_db_types.Asset_descriptor.create
       ~uuid:(uuid "9c000000-0000-4000-8000-000000000881") ~source:(Managed None)
       ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
+    let before_demand=C.view !state in
     let demand_ticket,demand_reply=request(W.Replace_asset_demand(asset_consumer,W.Foreground,[asset])) in
     require(demand_reply=W.Answered(Ok())) "actual Service rejected typed scoped asset demand";
     wait(fun()->List.exists(fun notice->match W.asset_notice_data notice with
@@ -481,6 +498,10 @@ let test_client_to_typed_read () =
       | _->false)(C.asset_notices(C.view !state)asset_consumer));
     require(List.for_all(fun notice->Option.exists(W.equal_asset_consumer asset_consumer)(W.asset_notice_consumer notice))
       (C.asset_notices(C.view !state)asset_consumer)) "actual asset push crossed consumer identity";
+    require(Rrbvec.exists(fun notice->match W.asset_notice_data notice with
+      |Service.Asset_demand_accepted name->name="runtime-synthetic-demand"|_->false)
+      (C.asset_updates ~previous:(Some before_demand)(C.view !state)))
+      "actual Service acceptance did not reach the typed asset outlet";
     let release_demand,released_demand=request(W.Release_asset_demand asset_consumer) in
     require(released_demand=W.Answered(Ok())) "actual scoped asset demand retirement failed";
     require(C.asset_notices(C.view !state)asset_consumer=[]) "retired actual asset demand retained data authority";
@@ -1611,18 +1632,21 @@ let test_client_to_typed_read () =
       require(W.file_lease_id retained<>W.file_lease_id preview) "two real acquisitions shared one lease identity";
       let release,reply=request(W.Release_file retained) in
       require(reply=W.Answered(Ok())) "actual retained lease release did not ACK";
-      let released_previews=ref [] and raw_release=ref 0 in
+      let released_previews=ref [] in
       let media=Journal_media_runtime.create ~read:(fun _->false)
         ~release_file:(fun lease->released_previews:=lease::!released_previews;true)
-        ~send:(fun _ request->(match request with Service.Release_asset_file _->incr raw_release|_->());false)
+        ~release_consumer:(fun _->failwith "preview-only fixture emitted a display release")
+        ~demand:(fun ~graph_generation:_ ~name:_ _ _->failwith "preview-only fixture emitted a display demand")
+        ~acquire:(fun _ _->failwith "preview-only fixture acquired a display file")
+        ~retry_asset:(fun ~graph_generation:_ _->failwith "preview-only fixture retried a network asset")
         ~changed:(fun _ _->())() in
       Journal_media_runtime.reset media ~graph_generation:(Some(W.import_data imported).graph_generation);
-      Journal_media_runtime.imported_coordinated media ~current:true imported;
+      Journal_media_runtime.imported media ~current:true imported;
       Journal_media_runtime.retire_coordinated_previews media;
       Journal_media_runtime.reset media ~graph_generation:None;
       require(List.length !released_previews=1)"binding cleanup and later reset released the same preview twice";
-      require(!raw_release=0 && List.exists(fun lease->W.file_lease_id lease=W.file_lease_id preview)!released_previews)
-        "typed Media preview cleanup fell back to raw handle ownership";
+      require(List.exists(fun lease->W.file_lease_id lease=W.file_lease_id preview)!released_previews)
+        "typed Media preview cleanup lost its original lease";
       let release_preview,reply=request(W.Release_file preview) in
       require(reply=W.Answered(Ok())) "actual preview lease release did not ACK";
       apply(C.step !state(C.Forget imported_ticket));apply(C.step !state(C.Forget acquire));
@@ -2240,7 +2264,7 @@ let test_visible_media_listing_uses_typed_reads () =
     ignore(Mailbox.send client(Service.Client_command(Restore_local_account{user_id="user-1"})));
     wait(fun()->Option.exists(fun p->List.exists(fun r->r.W.phase=W.Open)(W.residents p))(C.projection(Host.view host)));
     let owner:Service.timeline_scope={startup={account_generation=1;presentation_generation=1};graph_id=Test_support.graph_uuid;graph_generation=1} in
-    let runtime=ref None and legacy_reads=ref 0 and typed_reads=ref 0 and seen=ref [] and finished=ref false and last=ref None and held=ref None and retiring=ref false and late_returned=ref false in
+    let runtime=ref None and typed_reads=ref 0 and seen=ref [] and finished=ref false and last=ref None and held=ref None and retiring=ref false and late_returned=ref false in
     let root=W.Uuid.to_string(journal_page 1) in
     let read(Media.Read request)=
       let ticket=Host.plan_query_when_available host ~owner ~maximum_items:(min 1 request.maximum_items) ~maximum_bytes:65536 request.query |> Result.get_ok in
@@ -2265,14 +2289,17 @@ let test_visible_media_listing_uses_typed_reads () =
           | _ -> ignore (Media.receive_read (Option.get !runtime) result))
         | _->failwith "real typed media listing failed");true in
     let media=Media.create ~read
-      ~send:(fun _->function Service.Graph_request _->incr legacy_reads;false|_->true)
+      ~demand:(host_asset_demand host ~owner)
+      ~release_consumer:(host_asset_release host)
+      ~acquire:(fun _ _->failwith "metadata listing unexpectedly acquired a rendered file")
+      ~release_file:(fun _->failwith "metadata listing unexpectedly released a rendered file")
+      ~retry_asset:(fun ~graph_generation:_ _->failwith "metadata listing unexpectedly retried a network asset")
       ~changed:(fun _ (view:Media.view)->
         require(view.error=None) "typed media projection failed";
         seen:=List.rev_append(List.map(fun(item:Media.item)->item.asset.uuid)view.items)!seen) () in
     runtime:=Some media;
     Media.reset media ~graph_generation:(Some 1);
     Media.root_visible media ~root true;
-    require(!legacy_reads=0) "visible media listing still sent a legacy graph query";
     wait(fun()->Option.is_some !held);
     Media.resync media;
     require(Media.receive_read media(Option.get !held)) "superseded media read lost its owning terminal";
@@ -2306,7 +2333,7 @@ let test_offline_asset_scans_use_typed_reads () =
     ignore(Mailbox.send client(Service.Client_command(Restore_local_account{user_id="user-1"})));
     wait(fun()->Option.exists(fun p->List.exists(fun r->r.W.phase=W.Open)(W.residents p))(C.projection(Host.view host)));
     let owner:Service.timeline_scope={startup={account_generation=1;presentation_generation=1};graph_id=Test_support.graph_uuid;graph_generation=1} in
-    let runtime=ref None and legacy_reads=ref 0 and typed_reads=ref 0 and status=ref None and asset_continuations=ref 0 and asset_rows=ref [] in
+    let runtime=ref None and typed_reads=ref 0 and status=ref None and asset_continuations=ref 0 and asset_rows=ref [] in
     let read(Assets.Read request)=
       (match request.query with W.Assets {after=Some _;_}->incr asset_continuations|_->());
       let ticket=Host.plan_query_when_available host ~owner ~maximum_items:(min 1 request.maximum_items) ~maximum_bytes:65536 request.query |> Result.get_ok in
@@ -2325,11 +2352,11 @@ let test_offline_asset_scans_use_typed_reads () =
             "typed scan consumed the same result twice"
         | _->failwith "real typed offline asset read failed");true in
     let assets=Assets.create ~read
-      ~send:(function Service.Graph_request _->incr legacy_reads;false|_->true)
+      ~demand:(host_asset_demand host ~owner)
+      ~release_consumer:(host_asset_release host)
       ~changed:(fun _ recent favorites->status:=Some(recent,favorites)) () in
     runtime:=Some assets;
     Assets.refresh assets ~graph_generation:1 ~today:20260901 ~settings:Journal_asset_policy.default_settings;
-    require(!legacy_reads=0) "offline asset scan still sent a legacy graph query";
     wait(fun()->match !status with Some(recent,favorites)->
       recent.Journal_asset_policy.enumeration=Complete && favorites.enumeration=Complete|_->false);
     require(!typed_reads>=3) "offline scan did not execute real catalog and asset query families";

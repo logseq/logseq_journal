@@ -68,17 +68,33 @@ let test_asset_demand_notice_has_one_registered_owner () =
   let notice=I.asset_notice session(S.Asset_demand_accepted wire_name) |> Result.get_ok in
   let announced=(C.step planned.next(C.Asset_received(notice,Id.Worker.Push_sequence.of_int64 1L))).next in
   let values=C.asset_notices(C.view announced)consumer in
+  check(Rrbvec.to_list(C.asset_updates ~previous:(Some(C.view planned.next))(C.view announced))=[notice])
+    "accepted asset notice did not leave the original typed outlet";
   check(not(C.equal_view(C.view announced)(C.view planned.next))) "asset fact update was hidden by view equality";
   check(List.length values=1) "registered consumer did not own its exact acceptance notice";
   check(Option.exists(W.equal_asset_consumer consumer)(W.asset_notice_consumer(List.hd values))) "notice guessed a different consumer association";
   let duplicate=(C.step announced(C.Asset_received(notice,Id.Worker.Push_sequence.of_int64 1L))).next in
   check(C.asset_notices(C.view duplicate)consumer=values) "duplicate acceptance accumulated an event log";
+  check(Rrbvec.length(C.asset_updates ~previous:(Some(C.view announced))(C.view duplicate))=0)
+    "duplicate sequence escaped the typed outlet";
+  let capacity=I.asset_notice session S.Asset_capacity_available |> Result.get_ok in
+  let capacity_one=(C.step duplicate(C.Asset_received(capacity,Id.Worker.Push_sequence.of_int64 6L))).next in
+  let capacity_two=(C.step capacity_one(C.Asset_received(capacity,Id.Worker.Push_sequence.of_int64 7L))).next in
+  check(C.session_asset_notices(C.view capacity_one)session=C.session_asset_notices(C.view capacity_two)session)
+    "same-content capacity fixture changed payload";
+  check(Rrbvec.to_list(C.asset_updates ~previous:(Some(C.view capacity_one))(C.view capacity_two))=[capacity])
+    "a second real capacity notification could not wake backpressured consumers";
+  let capacity_old=(C.step capacity_two(C.Asset_received(capacity,Id.Worker.Push_sequence.of_int64 6L))).next in
+  check(Rrbvec.length(C.asset_updates ~previous:(Some(C.view capacity_two))(C.view capacity_old))=0)
+    "out-of-order capacity notification escaped the typed outlet";
   let asset_notice=I.asset_notice session(S.Asset_availability{consumer=wire_name;asset=asset.uuid;descriptor=asset;availability=Ready "real-ready-capability"}) |> Result.get_ok in
   let latest=(C.step duplicate(C.Asset_received(asset_notice,Id.Worker.Push_sequence.of_int64 3L))).next in
   let old=I.asset_notice session(S.Asset_availability{consumer=wire_name;asset=asset.uuid;descriptor=asset;availability=Downloading}) |> Result.get_ok in
   let older=(C.step latest(C.Asset_received(old,Id.Worker.Push_sequence.of_int64 2L))).next in
   check(List.exists(fun notice->Option.is_some(W.ready_asset_file notice))(C.asset_notices(C.view older)consumer))
     "out-of-order notice rolled a Ready capability backwards";
+  check(Rrbvec.length(C.asset_updates ~previous:(Some(C.view latest))(C.view older))=0)
+    "stale Ready replacement escaped the typed outlet";
   let ready_file=W.ready_asset_file asset_notice |> Option.get in
   let acquire,_=C.request older session(W.Acquire_asset_file ready_file) |> Result.get_ok in
   check(match I.request session ~request_id:(C.ticket_id acquire)(W.Acquire_asset_file ready_file) with
@@ -112,6 +128,8 @@ let test_asset_demand_notice_has_one_registered_owner () =
   let _,releasing=C.request focused_state focused_session(W.Release_asset_demand focused_consumer) |> Result.get_ok in
   let late=(C.step releasing.next(C.Asset_received(notice,Id.Worker.Push_sequence.of_int64 1L))).next in
   check(C.asset_notices(C.view late)consumer=[]) "late demand notice revived a retired consumer";
+  check(Rrbvec.length(C.asset_updates ~previous:(Some(C.view releasing.next))(C.view late))=0)
+    "retired consumer notice escaped the typed outlet";
   let foreign,_,_,foreign_session=fixture 882L in
   let module F=(val foreign:Worker_effect_authority.ISSUER) in
   check(Result.is_error(F.asset_notice foreign_session(S.Asset_demand_accepted wire_name)))

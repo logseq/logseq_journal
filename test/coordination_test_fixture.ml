@@ -191,3 +191,75 @@ let favorites
   in
   produce after next wire_next favorites_page generation projection_revision items
 ;;
+
+(* Private resource capabilities for the existing business reducers are issued
+   through the actual Service request/reply boundary, never record construction. *)
+module Resources = struct
+  type t =
+    { issuer : (module Worker_effect_authority.ISSUER)
+    ; session : W.session
+    ; scope : S.asset_scope
+    ; mutable next : int
+    ; demands : (string, W.asset_consumer * string * Logseq_db_types.Asset_descriptor.t list) Hashtbl.t
+    }
+
+  let create ?graph ?graph_generation epoch =
+    let issuer,raw,_,session=fixture ?graph ?graph_generation epoch in
+    let scope=fst(List.hd raw.baseline.state.residents) in
+    {issuer;session;scope;next=1;demands=Hashtbl.create 8}
+
+  let id t =
+    let id=uuid(Printf.sprintf "97000000-0000-4000-8000-%012d" t.next) in
+    t.next<-t.next+1;id
+
+  let demand t ~graph_generation ~name priority assets =
+    if graph_generation<>t.scope.graph_generation then None else
+    let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
+    let consumer=W.asset_consumer t.session ~name |> Result.get_ok in
+    let request_id=id t in
+    match I.request t.session ~request_id:(W.request_id request_id)
+      (W.Replace_asset_demand(consumer,priority,assets)) with
+    |Ok(S.Coordination_asset_demand{consumer=wire;_})->
+      let consumer=W.bind_asset_consumer consumer ~round:(W.request_id request_id) in
+      Hashtbl.replace t.demands name(consumer,wire,assets);Some consumer
+    |_->failwith "resource fixture rejected its original typed demand"
+
+  let notice t notice =
+    let wire name=let _,wire,_=Hashtbl.find t.demands name in wire in
+    let notice=match notice with
+      |S.Asset_availability value->S.Asset_availability{value with consumer=wire value.consumer}
+      |Asset_demand_accepted name->S.Asset_demand_accepted(wire name)
+      |Asset_backpressure name->S.Asset_backpressure(wire name)
+      |Asset_capacity_available|Upload_status _->notice in
+    let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
+    I.asset_notice t.session notice |> Result.get_ok
+
+  let availability t ~consumer ~asset availability =
+    notice t (S.Asset_availability{consumer;asset=asset.Logseq_db_types.Asset_descriptor.uuid;
+      descriptor=asset;availability})
+
+  let lease t file ~handle ~path =
+    let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
+    let request_id=W.request_id(id t) in
+    let operation=W.Acquire_asset_file file in
+    ignore(I.request t.session ~request_id operation |> Result.get_ok);
+    match I.reply t.session ~request_id operation(S.Asset_file(Some(handle,path))) with
+    |Ok(W.Answered(Ok(Some lease)))->lease
+    |_->failwith "resource fixture rejected its acquired lease"
+
+  let imported t (receipt:Logseq_db_worker.import_receipt) =
+    let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
+    let source:Logseq_db_types.Asset_import.t=
+      {operation=receipt.operation;asset=receipt.asset.uuid;replace_reference=None;target=receipt.target;
+       local_mutation=id t;metadata_mutation=id t;source_file="/synthetic/picker-source";
+       title="Synthetic attachment";file_type=receipt.file_type} in
+    let intent=W.asset_import_intent t.session source |> Result.get_ok in
+    let request_id=id t in
+    let operation=W.Import intent in
+    let registration=match I.request t.session ~request_id:(W.request_id request_id) operation |> Result.get_ok with
+      |S.Coordination_import{registration;_}->registration|_->assert false in
+    match I.reply t.session ~request_id:(W.request_id request_id) operation
+      (S.Coordination_imported{registration;owner=t.scope;request_id;result=Ok receipt}) with
+    |Ok(W.Answered(Ok(W.Imported imported)))->imported
+    |_->failwith "resource fixture rejected its actual import proof"
+end

@@ -14,11 +14,11 @@ type read_request = private
 type t
 
 val create
-  :  ?release_consumer:(Worker.asset_consumer -> bool)
+  :  release_consumer:(Worker.asset_consumer -> bool)
   -> ?read_planned:(Logseq_db_types.Graph_types.Uuid.t -> unit)
   -> ?read_retired:(Logseq_db_types.Graph_types.Uuid.t -> unit)
   -> read:(read_request -> bool)
-  -> send:(Logseq_db_worker_lui.Logseq_db_worker_lui_service.request -> bool)
+  -> demand:(graph_generation:int -> name:string -> Worker.asset_priority -> Logseq_db_types.Asset_descriptor.t list -> Worker.asset_consumer option)
   -> changed:
        (int option
         -> Journal_asset_policy.offline
@@ -57,8 +57,7 @@ val change_application_error : t -> Worker_pure_data.change_window list -> strin
 
 (** Only demand notices which may plan a deferred read carry these bounded
     business obligations. Availability/download completion is not a read ACK. *)
-val notice_reads : t -> Logseq_db_worker_lui.Logseq_db_worker_lui_service.asset_scope
-  -> Logseq_db_worker_lui.Logseq_db_worker_lui_service.asset_notice
+val notice_reads : t -> Worker.asset_notice
   -> Logseq_db_types.Graph_types.Uuid.t list
 
 (** Explicit projection resync restarts the configured index enumerations. *)
@@ -66,19 +65,13 @@ val resync : t -> unit
 
 val shutdown : t -> unit
 
-val notice
-  :  t
-  -> Logseq_db_worker_lui.Logseq_db_worker_lui_service.asset_scope
-  -> Logseq_db_worker_lui.Logseq_db_worker_lui_service.asset_notice
-  -> unit
+val notice : t -> Worker.asset_notice -> unit
 
 val pump : t -> unit
 val reject : t -> request_id:Logseq_db_types.Graph_types.Uuid.t -> unit
 val idle : t -> bool
 
-val consumer_names : t -> string Seq.t
 
-val bind_consumer : t -> name:string -> Worker.asset_consumer -> unit
 
 val retire_coordinated_resources : t -> unit
 val bind_coordinated_resources : t -> Worker.binding -> unit

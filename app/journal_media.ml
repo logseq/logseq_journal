@@ -1,10 +1,10 @@
+module Worker = Journal_worker_coordination.Worker_api
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Asset = Logseq_db_types.Asset_descriptor
 
 type ticket =
   { id : int
-  ; scope : Service.asset_scope
-  ; handle : string
+  ; file : Worker.asset_file
   }
 
 type presentation =
@@ -26,10 +26,7 @@ type instruction =
       ; consumer : string
       }
   | Acquire of ticket
-  | Release_file of
-      { scope : Service.asset_scope
-      ; lease : string
-      }
+  | Release_file of Worker.file_lease
   | Retry of
       { graph_generation : int
       ; asset : Logseq_db_types.Graph_types.Uuid.t
@@ -44,12 +41,8 @@ type event =
   | Hide
   | Pin_preview of string
   | Unpin_preview of string
-  | Availability of
-      { scope : Service.asset_scope
-      ; consumer : string
-      ; availability : Service.Asset.availability
-      }
-  | Acquired of ticket * (string * string) option
+  | Availability of Worker.asset_notice
+  | Acquired of ticket * Worker.file_lease option
   | Retry_requested
   | Demand_backpressured
   | Demand_accepted
@@ -63,7 +56,7 @@ type selection =
 
 type lease =
   { ticket : ticket
-  ; lease : string
+  ; lease : Worker.file_lease
   }
 
 module Pins=Map.Make(String)
@@ -71,7 +64,7 @@ module Pins=Map.Make(String)
 type t =
   { selection : selection option
   ; pending : ticket option
-  ; available : (Service.asset_scope * string) option
+  ; available : Worker.asset_file option
   ; lease : lease option
   ; pins : lease Pins.t
   ; pressured : bool
@@ -94,7 +87,7 @@ let empty =
 let presentation t = t.status
 let descriptor t = Option.map (fun selected -> selected.asset) t.selection
 
-let release_lease item=Release_file{scope=item.ticket.scope;lease=item.lease}
+let release_lease (item:lease)=Release_file item.lease
 let pinned t item=Pins.exists(fun _ held->held=item)t.pins
 let release_file t =
   match t.lease with
@@ -286,55 +279,35 @@ let step t = function
      |None->t,[]
      |Some held->let next={t with pins=Pins.remove owner t.pins} in
        next,(if next.lease=Some held || pinned next held then []else[release_lease held]))
-  | Availability { scope; consumer; availability } ->
-    (match t.selection with
-     | Some selected
-       when selected.graph_generation = scope.graph_generation
-            && selected.consumer = consumer
-            && managed selected.asset ->
-       (match t.status, availability with
-        | File _, _ -> t, []
-        | _, Service.Asset.Ready handle ->
-          if
-            (match t.lease with
-             | Some l -> l.ticket.scope = scope && l.ticket.handle = handle
-             | None -> false)
-            ||
-            match t.pending with
-            | Some p -> p.scope = scope && p.handle = handle
-            | None -> false
-          then t, []
-          else (
-            let ticket = { id = t.serial + 1; scope; handle } in
-            ( { t with
-                pending = Some ticket
-              ; available = Some (scope, handle)
-              ; lease = None
-              ; serial = ticket.id
-              ; status = Placeholder "Loading"
-              }
-            , release_file t @ [ Acquire ticket ] ))
-        | _, _ ->
-          ( { t with
-              pending = None
-            ; available = None
-            ; lease = None
-            ; pressured = false
-            ; status = status availability
-            }
-          , release_file t ))
-     | _ -> t, [])
+  | Availability notice ->
+    (match Worker.asset_notice_data notice,t.selection with
+     | Service.Asset_availability{consumer;asset;descriptor;availability;_},Some selected
+       when selected.graph_generation=(Worker.asset_notice_scope notice).graph_generation
+         && selected.consumer=consumer && selected.asset.uuid=asset && managed selected.asset
+         && selected.asset.source=descriptor.source && selected.asset.current_checksum=descriptor.current_checksum ->
+       (match t.status,availability,Worker.ready_asset_file notice with
+        | File _,_,_->t,[]
+        | _,Service.Asset.Ready _,Some file ->
+          if (match t.lease with Some held->held.ticket.file=file|None->false)
+             || (match t.pending with Some pending->pending.file=file|None->false)
+          then t,[]
+          else let ticket={id=t.serial+1;file} in
+            {t with pending=Some ticket;available=Some file;lease=None;serial=ticket.id;status=Placeholder "Loading"},
+            release_file t@[Acquire ticket]
+        | _,_,_ ->
+          {t with pending=None;available=None;lease=None;pressured=false;status=status availability},release_file t)
+     |_->t,[])
   | Acquired (ticket, result) ->
     if t.pending = Some ticket
     then (
       match result with
-      | Some (lease, path) ->
-        { t with pending = None; lease = Some { ticket; lease }; status = File path }, []
+      | Some lease ->
+        { t with pending = None; lease = Some { ticket; lease }; status = File (Worker.file_path lease) }, []
       | None -> { t with pending = None; status = Failed "Unable to open file" }, [])
     else
       ( t
       , (match result with
-         | Some (lease, _) -> [ Release_file { scope = ticket.scope; lease } ]
+         | Some lease -> [ Release_file lease ]
          | None -> []) )
   | Retry_requested ->
     (match t.selection with
@@ -345,8 +318,8 @@ let step t = function
             | Network_failed _ -> true
             | _ -> false ->
        (match t.available with
-        | Some (scope, handle) ->
-          let ticket = { id = t.serial + 1; scope; handle } in
+        | Some file ->
+          let ticket = { id = t.serial + 1; file } in
           ( { t with
               pending = Some ticket
             ; lease = None

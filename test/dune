@@ -231,7 +231,7 @@
 (test
  (name journal_media_test)
  (modules journal_media_test)
- (libraries app uri
+ (libraries app uri coordination_test_fixture logseq_journal.worker_coordination
   logseq_db_types
   logseq_db_worker.lui))
 

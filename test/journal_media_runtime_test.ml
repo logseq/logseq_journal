@@ -12,14 +12,14 @@ let uuid n =
 
 module W = Journal_worker_coordination.Worker_api
 
-type outgoing = Read of R.read_request | Command of R.ticket option * S.request
+type outgoing = Read of R.read_request | Command : R.ticket option * 'a W.request -> outgoing
 
 let commands queue = Queue.to_seq queue |> Seq.filter_map (function
-  | Command (ticket, request) -> Some (ticket, request) | Read _ -> None)
+  | Command _ as command -> Some command | Read _ -> None)
 ;;
 
 let take_command queue = match Queue.take queue with
-  | Command (ticket, request) -> ticket, request
+  | Command _ as command -> command
   | Read _ -> failwith "expected a resource command"
 ;;
 
@@ -28,10 +28,53 @@ let take_read queue = match Queue.take queue with
   | Command _ -> failwith "expected a typed read"
 ;;
 
-let producer = lazy (Coordination_test_fixture.fixture ~graph:(uuid 3) ~graph_generation:1 8100L)
+module Resources=Coordination_test_fixture.Resources
+let resource_source=Resources.create ~graph:(uuid 3) ~graph_generation:1 8100L
+let producer=lazy(resource_source.Resources.issuer,resource_source.session)
+
+type resource_ports =
+  { demand : graph_generation:int -> name:string -> W.asset_priority -> A.t list -> W.asset_consumer option
+  ; acquire : R.ticket -> W.asset_file -> bool
+  ; release_file : W.file_lease -> bool
+  ; release_consumer : W.asset_consumer -> bool
+  ; retry_asset : graph_generation:int -> W.Uuid.t -> bool }
+
+let resource_ports sent accepted =
+  let submit request=if accepted() then (Queue.add request sent;true)else false in
+  {demand=(fun ~graph_generation ~name priority assets -> if not(accepted())then None else
+     Option.map(fun consumer->Queue.add(Command(None,W.Replace_asset_demand(consumer,priority,assets)))sent;consumer)
+       (Resources.demand resource_source ~graph_generation ~name priority assets));
+   acquire=(fun ticket file->submit(Command(Some ticket,W.Acquire_asset_file file)));
+   release_file=(fun file->submit(Command(None,W.Release_file file)));
+   release_consumer=(fun consumer->submit(Command(None,W.Release_asset_demand consumer)));
+   retry_asset=(fun ~graph_generation asset->graph_generation=resource_source.scope.graph_generation && submit(Command(None,W.Retry_asset asset)))}
+
+let consumer_name consumer =
+  Hashtbl.to_seq resource_source.Resources.demands |> Seq.find_map(fun(name,(actual,_,_))->
+    if W.equal_asset_consumer consumer actual then Some name else None) |> Option.get
+
+let take_acquire sent = match take_command sent with
+  |Command(Some ticket,W.Acquire_asset_file file)->ticket,file
+  |_->failwith "expected an original typed file acquisition"
+
+let file_reply runtime (ticket,file) handle path =
+  R.receive_file runtime ticket (Some(Resources.lease resource_source file ~handle ~path))
+
+let acquisition_handle (_,file) =
+  let module I=(val resource_source.issuer:Worker_effect_authority.ISSUER) in
+  match I.request resource_source.session ~request_id:(W.request_id(Resources.id resource_source))(W.Acquire_asset_file file) with
+  |Ok(S.Acquire_asset_file{handle;_})->handle
+  |_->failwith "actual acquire factory rejected its original capability"
+
+let released_handle = function
+  |Command(_,W.Release_file lease)->
+    let module I=(val resource_source.issuer:Worker_effect_authority.ISSUER) in
+    (match I.request (W.file_lease_session lease) ~request_id:(W.request_id(Resources.id resource_source))(W.Release_file lease) with
+     |Ok(S.Release_asset_file{handle;_})->Some handle|_->failwith "actual release factory rejected its original lease")
+  |_->None
 
 let answer runtime (R.Read request as original) outcome =
-  let issuer, _, _, session = Lazy.force producer in
+  let issuer, session = Lazy.force producer in
   let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let budget = W.read_budget session ~maximum_items:request.maximum_items
     ~maximum_bytes:65536 |> Result.get_ok in
@@ -57,9 +100,11 @@ let test_equal_media_notices_keep_effects () =
   let runtime =
     R.create
       ~read:(fun request -> Queue.add (Read request) sent; true)
-      ~send:(fun ticket request ->
-        Queue.add (Command (ticket, request)) sent;
-        true)
+      ~demand:(resource_ports sent (fun()->true)).demand
+      ~acquire:(resource_ports sent (fun()->true)).acquire
+      ~release_file:(resource_ports sent (fun()->true)).release_file
+      ~release_consumer:(resource_ports sent (fun()->true)).release_consumer
+      ~retry_asset:(resource_ports sent (fun()->true)).retry_asset
       ~changed:(fun root view -> changes := (root, view) :: !changes) ()
   in
   R.reset runtime ~graph_generation:(Some 1);
@@ -94,7 +139,11 @@ let coordinated_read_retirement accepted () =
           (List.mem (R.read_request_id request) !planned)
           "read callback ran before causal planning";
         accepted)
-      ~send:(fun _ _ -> true)
+      ~demand:(resource_ports (Queue.create()) (fun()->true)).demand
+      ~acquire:(resource_ports (Queue.create()) (fun()->true)).acquire
+      ~release_file:(resource_ports (Queue.create()) (fun()->true)).release_file
+      ~release_consumer:(resource_ports (Queue.create()) (fun()->true)).release_consumer
+      ~retry_asset:(resource_ports (Queue.create()) (fun()->true)).retry_asset
       ~changed:(fun _ _ -> ())
       ()
   in
@@ -124,9 +173,11 @@ let () =
   let runtime =
     R.create
       ~read:(fun request -> Queue.add (Read request) sent; true)
-      ~send:(fun ticket request ->
-        Queue.add (Command (ticket, request)) sent;
-        true)
+      ~demand:(resource_ports sent (fun()->true)).demand
+      ~acquire:(resource_ports sent (fun()->true)).acquire
+      ~release_file:(resource_ports sent (fun()->true)).release_file
+      ~release_consumer:(resource_ports sent (fun()->true)).release_consumer
+      ~retry_asset:(resource_ports sent (fun()->true)).retry_asset
       ~changed:(fun root view ->
         incr changes;
         Hashtbl.replace views root view) ()
@@ -161,70 +212,35 @@ let () =
     ~root
     ~asset:(List.hd (Hashtbl.find views root).items).token
     true;
-  let _, request = take_command sent in
-  let consumer =
-    match request with
-    | S.Asset_command
-        { command =
-            Replace_asset_demand { consumer; priority = Foreground; assets = [ _ ] }
-        ; _
-        } -> consumer
-    | _ -> failwith "visible media demand must be foreground"
-  in
-  let scope : S.asset_scope =
-    { account =
-        { managed_sync_origin = Uri.of_string "https://sync.example"
-        ; user_id = "u"
-        ; account_generation = 1
-        ; presentation_generation = 1
-        ; lifecycle_generation = 1L
-        }
-    ; graph_id = uuid 3
-    ; graph_generation = 1
-    }
-  in
+  let consumer=match take_command sent with
+    |Command(_,W.Replace_asset_demand(consumer,W.Foreground,[_]))->consumer_name consumer
+    |_->failwith "visible media demand must be foreground" in
+  let scope=resource_source.Resources.scope in
   let before_waiting = !changes in
-  R.notice
-    runtime
-    scope
-    (Asset_availability { consumer; asset = asset.uuid; descriptor=asset; availability = Queued });
+  R.notice runtime (Resources.notice resource_source (S.Asset_availability { consumer; asset = asset.uuid; descriptor=asset; availability = Queued }));
   check
     (!changes = before_waiting)
     "equal waiting availability must not republish the pending presentation";
-  R.notice
-    runtime
-    scope
-    (Asset_availability { consumer; asset = asset.uuid; descriptor=asset; availability = Ready "cached" });
-  let token, request = take_command sent in
-  check
-    (match request with
-     | S.Acquire_asset_file { handle = "cached"; _ } -> true
-     | _ -> false)
+  R.notice runtime (Resources.notice resource_source (S.Asset_availability { consumer; asset = asset.uuid; descriptor=asset; availability = Ready "cached" }));
+  let acquisition=take_acquire sent in
+  check(acquisition_handle acquisition="cached")
     "readiness retains the file";
-  R.receive
-    runtime
-    (Option.get token)
-    (Asset_file (Some ("retained", "/cache/image.png")));
+  file_reply runtime acquisition "retained" "/cache/image.png";
   check
     ((List.hd (Hashtbl.find views root).items).presentation
      = Journal_media.File "/cache/image.png")
     "native view receives retained path";
   let before_ready_duplicate = !changes in
-  R.notice
-    runtime
-    scope
-    (Asset_availability { consumer; asset = asset.uuid; descriptor=asset; availability = Ready "cached" });
+  R.notice runtime (Resources.notice resource_source (S.Asset_availability { consumer; asset = asset.uuid; descriptor=asset; availability = Ready "cached" }));
   check
     (!changes = before_ready_duplicate)
     "duplicate readiness must not republish a retained file";
   check (Queue.is_empty sent) "duplicate readiness must not reacquire the retained file";
   R.reset runtime ~graph_generation:None;
-  let requests = commands sent |> List.of_seq |> List.map snd in
+  let requests = commands sent |> List.of_seq in
   check
     (List.exists
-       (function
-         | S.Release_asset_file { handle = "retained"; _ } -> true
-         | _ -> false)
+       (fun command->released_handle command=Some "retained")
        requests)
     "navigation reset releases file";
   Queue.clear sent;
@@ -234,12 +250,14 @@ let () =
     ; graph_generation = 1
     ; scope
     ; target = uuid 1
-    ; asset
+    ; asset=(A.create ~uuid:asset.uuid ~source:asset.source
+        ~current_checksum:(Some(String.make 64 'a')) ~size:asset.size ~dimensions:asset.dimensions |> Result.get_ok)
     ; file_type = "png"
     ; preview = Some ("local-lease", "/staged/import.bin")
     }
   in
-  R.imported runtime ~current:true receipt;
+  let imported=Resources.imported resource_source receipt in
+  R.imported runtime ~current:true imported;
   check (Queue.is_empty sent) "explicit import must not query or download";
   check
     (List.exists
@@ -248,7 +266,7 @@ let () =
        (Hashtbl.find views root).items)
     "imported file appears immediately";
   let before_duplicate = !changes in
-  R.imported runtime ~current:true receipt;
+  R.imported runtime ~current:true imported;
   check
     (!changes = before_duplicate)
     "duplicate import must not republish the same file presentation";
@@ -256,21 +274,17 @@ let () =
   R.reset runtime ~graph_generation:None;
   check
     (List.exists
-       (function
-         | _, S.Release_asset_file { handle = "local-lease"; _ } -> true
-         | _ -> false)
+       (fun command->released_handle command=Some "local-lease")
        (commands sent |> List.of_seq))
     "reset releases staged preview";
   Queue.clear sent;
   R.imported
     runtime
     ~current:false
-    { receipt with preview = Some ("late-lease", "/staged/late.bin") };
+    (Resources.imported resource_source {receipt with preview=Some("late-lease","/staged/late.bin")});
   check
     (List.exists
-       (function
-         | _, S.Release_asset_file { handle = "late-lease"; _ } -> true
-         | _ -> false)
+       (fun command->released_handle command=Some "late-lease")
        (commands sent |> List.of_seq))
     "late import receipt releases its lease"
 ;;
@@ -284,12 +298,11 @@ let test_preview_reference_when_requests_are_full () =
   let runtime =
     R.create
       ~read:(fun request -> if !full then false else (Queue.add (Read request) sent; true))
-      ~send:(fun ticket request ->
-        if !full
-        then false
-        else (
-          Queue.add (Command (ticket, request)) sent;
-          true))
+      ~demand:(resource_ports sent (fun()->not !full)).demand
+      ~acquire:(resource_ports sent (fun()->not !full)).acquire
+      ~release_file:(resource_ports sent (fun()->not !full)).release_file
+      ~release_consumer:(resource_ports sent (fun()->not !full)).release_consumer
+      ~retry_asset:(resource_ports sent (fun()->not !full)).retry_asset
       ~changed:(fun root view -> Hashtbl.replace views root view) ()
   in
   let asset =
@@ -304,18 +317,6 @@ let test_preview_reference_when_requests_are_full () =
       ~dimensions:None
     |> Result.get_ok
   in
-  let scope : S.asset_scope =
-    { account =
-        { managed_sync_origin = Uri.of_string "https://sync.example"
-        ; user_id = "u"
-        ; account_generation = 1
-        ; presentation_generation = 1
-        ; lifecycle_generation = 1L
-        }
-    ; graph_id = uuid 3
-    ; graph_generation = 1
-    }
-  in
   R.reset runtime ~graph_generation:(Some 1);
   let metadata root =
     R.root_visible ~owner:"row" runtime ~root true;
@@ -326,16 +327,10 @@ let test_preview_reference_when_requests_are_full () =
   let token = metadata root in
   R.asset_visible ~owner:"row" runtime ~root ~asset:token true;
   Queue.clear sent;
-  R.notice
-    runtime
-    scope
-    (Asset_availability
-       { consumer = token; asset = asset.uuid; descriptor=asset; availability = Ready "cached" });
-  let ticket, _ = take_command sent in
-  R.receive
-    runtime
-    (Option.get ticket)
-    (Asset_file (Some ("preview-file", "/cache/image.png")));
+  R.notice runtime (Resources.notice resource_source (S.Asset_availability
+       { consumer = token; asset = asset.uuid; descriptor=asset; availability = Ready "cached" }));
+  let acquisition=take_acquire sent in
+  file_reply runtime acquisition "preview-file" "/cache/image.png";
   let pressure_root = G.Uuid.to_string (uuid 4) in
   let pressure_token = metadata pressure_root in
   full := true;
@@ -353,9 +348,7 @@ let test_preview_reference_when_requests_are_full () =
   R.pump runtime;
   let release_count () =
     commands sent
-    |> Seq.filter (function
-      | _, S.Release_asset_file { handle = "preview-file"; _ } -> true
-      | _ -> false)
+    |> Seq.filter (fun command->released_handle command=Some "preview-file")
     |> Seq.length
   in
   check (release_count () = 0) "draining pressure must keep the preview file";
@@ -376,12 +369,11 @@ let fixture () =
   let runtime =
     R.create
       ~read:(fun request -> if !admitted then (Queue.add (Read request) sent; true) else false)
-      ~send:(fun ticket request ->
-        if !admitted
-        then (
-          Queue.add (Command (ticket, request)) sent;
-          true)
-        else false)
+      ~demand:(resource_ports sent (fun()-> !admitted)).demand
+      ~acquire:(resource_ports sent (fun()-> !admitted)).acquire
+      ~release_file:(resource_ports sent (fun()-> !admitted)).release_file
+      ~release_consumer:(resource_ports sent (fun()-> !admitted)).release_consumer
+      ~retry_asset:(resource_ports sent (fun()-> !admitted)).retry_asset
       ~changed:(fun root view -> Hashtbl.replace views root view) ()
   in
   R.reset runtime ~graph_generation:(Some 1);
@@ -500,11 +492,7 @@ let list_reads sent =
 ;;
 
 let file_commands sent =
-  commands sent
-  |> Seq.filter (function
-    | _, (S.Asset_command _ | Acquire_asset_file _ | Release_asset_file _) -> true
-    | _ -> false)
-  |> Seq.length
+  commands sent |> Seq.length
 ;;
 
 let run_cases cases =
@@ -642,25 +630,10 @@ let () =
           let token = (List.hd (Hashtbl.find v root).items).token in
           R.asset_visible r ~root ~asset:token true;
           Queue.clear q;
-          let scope : S.asset_scope =
-            { account =
-                { managed_sync_origin = Uri.of_string "https://sync.example"
-                ; user_id = "u"
-                ; account_generation = 1
-                ; presentation_generation = 1
-                ; lifecycle_generation = 1L
-                }
-            ; graph_id = uuid 900
-            ; graph_generation = 1
-            }
-          in
-          R.notice
-            r
-            scope
-            (Asset_availability
-               { consumer = token; asset = asset.uuid; descriptor=asset; availability = Ready "cached" });
-          let ticket, _ = take_command q in
-          R.receive r (Option.get ticket) (Asset_file (Some ("held", "/cache/held")));
+          R.notice r (Resources.notice resource_source (S.Asset_availability
+               { consumer = token; asset = asset.uuid; descriptor=asset; availability = Ready "cached" }));
+          let acquisition=take_acquire q in
+          file_reply r acquisition "held" "/cache/held";
           change r [ 1 ];
           check
             (Queue.is_empty q)
@@ -995,25 +968,10 @@ let () =
           let token = (List.hd (Hashtbl.find v root).items).token in
           R.asset_visible r ~root ~asset:token true;
           Queue.clear q;
-          let scope : S.asset_scope =
-            { account =
-                { managed_sync_origin = Uri.of_string "https://sync.example"
-                ; user_id = "u"
-                ; account_generation = 1
-                ; presentation_generation = 1
-                ; lifecycle_generation = 1L
-                }
-            ; graph_id = uuid 900
-            ; graph_generation = 1
-            }
-          in
-          R.notice
-            r
-            scope
-            (Asset_availability
-               { consumer = token; asset = asset.uuid; descriptor=asset; availability = Ready "cached" });
-          let ticket, _ = take_command q in
-          R.receive r (Option.get ticket) (Asset_file (Some ("held", "/cache/held")));
+          R.notice r (Resources.notice resource_source (S.Asset_availability
+               { consumer = token; asset = asset.uuid; descriptor=asset; availability = Ready "cached" }));
+          let acquisition=take_acquire q in
+          file_reply r acquisition "held" "/cache/held";
           observe r (raw_block ~refs:[ asset.uuid ] 1 900);
           change r [ 2 ];
           check
@@ -1044,10 +1002,7 @@ let () =
             "holder ref removal removes successful membership";
           check
             (commands q
-             |> Seq.exists (fun (_, request) ->
-               match request with
-               | S.Release_asset_file { handle = "held"; _ } -> true
-               | _ -> false))
+             |> Seq.exists (fun command->released_handle command=Some "held"))
             "real membership removal releases the retained File lease" )
     ]
 ;;
@@ -1060,25 +1015,16 @@ let test_import_handoff preview =
   let runtime =
     R.create
       ~read:(fun request -> Queue.add (Read request) sent; true)
-      ~send:(fun ticket request ->
-        Queue.add (Command (ticket, request)) sent;
-        true)
+      ~demand:(resource_ports sent (fun()->true)).demand
+      ~acquire:(resource_ports sent (fun()->true)).acquire
+      ~release_file:(resource_ports sent (fun()->true)).release_file
+      ~release_consumer:(resource_ports sent (fun()->true)).release_consumer
+      ~retry_asset:(resource_ports sent (fun()->true)).retry_asset
       ~changed:(fun root view -> Hashtbl.replace views root view) ()
   in
   R.reset runtime ~graph_generation:(Some 1);
   let root = G.Uuid.to_string (uuid 1) in
-  let scope : S.asset_scope =
-    { account =
-        { managed_sync_origin = Uri.of_string "https://fixture.invalid"
-        ; user_id = "fixture"
-        ; account_generation = 1
-        ; presentation_generation = 1
-        ; lifecycle_generation = 1L
-        }
-    ; graph_id = uuid 3
-    ; graph_generation = 1
-    }
-  in
+  let scope=resource_source.Resources.scope in
   let asset =
     A.create
       ~uuid:(uuid 2)
@@ -1098,15 +1044,15 @@ let test_import_handoff preview =
     ; preview = Some ("staged-lease", "/staged/original.png")
     }
   in
-  R.imported runtime ~current:true receipt;
+  let imported=Resources.imported resource_source receipt in
+  R.imported runtime ~current:true imported;
   R.root_visible runtime ~root true;
   reply runtime (take_read sent) [ asset ];
   let requests = commands sent |> List.of_seq in
   let consumer =
     List.find_map
       (function
-        | _, S.Asset_command { command = S.Replace_asset_demand { consumer; _ }; _ } ->
-          Some consumer
+        | Command(_,W.Replace_asset_demand(consumer,_,_))->Some(consumer_name consumer)
         | _ -> None)
       requests
   in
@@ -1127,26 +1073,15 @@ let test_import_handoff preview =
   if preview = `Multiple then show "detail";
   Queue.clear sent;
   let consumer = Option.get consumer in
-  R.notice
-    runtime
-    scope
-    (Asset_availability
-       { consumer; asset = asset.uuid; descriptor=asset; availability = Ready "normal-cache" });
-  let ticket, request = take_command sent in
-  check
-    (match request with
-     | S.Acquire_asset_file _ -> true
-     | _ -> false)
+  R.notice runtime (Resources.notice resource_source (S.Asset_availability
+       { consumer; asset = asset.uuid; descriptor=asset; availability = Ready "normal-cache" }));
+  let acquisition=take_acquire sent in
+  check (W.asset_file_asset(snd acquisition)=asset.uuid)
     "normal file is acquired";
-  R.receive
-    runtime
-    (Option.get ticket)
-    (Asset_file (Some ("normal-lease", "/cache/original.png")));
+  file_reply runtime acquisition "normal-lease" "/cache/original.png";
   let release_count () =
     commands sent
-    |> Seq.filter (function
-      | _, S.Release_asset_file { handle = "staged-lease"; _ } -> true
-      | _ -> false)
+    |> Seq.filter (fun command->released_handle command=Some "staged-lease")
     |> Seq.length
   in
   let preview_is_retained () =
@@ -1191,9 +1126,7 @@ let test_import_handoff preview =
       "pending local image keeps its type after handoff");
   check
     (List.exists
-       (function
-         | _, S.Release_asset_file { handle = "staged-lease"; _ } -> true
-         | _ -> false)
+       (fun command->released_handle command=Some "staged-lease")
        (commands sent |> List.of_seq))
     "normal acquisition releases staged preview";
   check (release_count () = 1) "handoff or final preview close releases its lease once";
@@ -1202,9 +1135,7 @@ let test_import_handoff preview =
   check
     (not
        (List.exists
-          (function
-            | _, S.Release_asset_file { handle = "staged-lease"; _ } -> true
-            | _ -> false)
+          (fun command->released_handle command=Some "staged-lease")
           (commands sent |> List.of_seq)))
     "handoff releases staged preview only once"
 ;;
@@ -1226,24 +1157,15 @@ let () =
   let runtime =
     R.create
       ~read:(fun request -> Queue.add (Read request) sent; true)
-      ~send:(fun ticket request ->
-        Queue.add (Command (ticket, request)) sent;
-        true)
+      ~demand:(resource_ports sent (fun()->true)).demand
+      ~acquire:(resource_ports sent (fun()->true)).acquire
+      ~release_file:(resource_ports sent (fun()->true)).release_file
+      ~release_consumer:(resource_ports sent (fun()->true)).release_consumer
+      ~retry_asset:(resource_ports sent (fun()->true)).retry_asset
       ~changed:(fun root view -> Hashtbl.replace views root view) ()
   in
   R.reset runtime ~graph_generation:(Some 1);
-  let scope : S.asset_scope =
-    { account =
-        { managed_sync_origin = Uri.of_string "https://fixture.invalid"
-        ; user_id = "fixture"
-        ; account_generation = 1
-        ; presentation_generation = 1
-        ; lifecycle_generation = 1L
-        }
-    ; graph_id = uuid 3
-    ; graph_generation = 1
-    }
-  in
+  let scope=resource_source.Resources.scope in
   let asset =
     A.create
       ~uuid:(uuid 2)
@@ -1263,6 +1185,7 @@ let () =
     ; preview = Some ("cancelled-preview", "/staged/original.png")
     }
   in
+  let imported=Resources.imported resource_source receipt in
   let root = G.Uuid.to_string receipt.target in
   let notice =
     S.Upload_status
@@ -1273,21 +1196,19 @@ let () =
       ; status = Cancelled
       }
   in
-  R.imported runtime ~current:true receipt;
-  R.notice runtime { scope with graph_id = uuid 90 } notice;
+  R.imported runtime ~current:true imported;
+  R.notice runtime (Resources.notice (Resources.create ~graph:(uuid 90) ~graph_generation:1 8190L) notice);
   check
     (List.length (Hashtbl.find views root).items = 1 && Queue.is_empty sent)
     "foreign scope cannot cancel imported preview";
-  R.notice runtime scope notice;
+  R.notice runtime (Resources.notice resource_source notice);
   check ((Hashtbl.find views root).items = []) "cancelled unpublished preview disappears";
   check
     (List.exists
-       (function
-         | _, S.Release_asset_file { handle = "cancelled-preview"; _ } -> true
-         | _ -> false)
+       (fun command->released_handle command=Some "cancelled-preview")
        (commands sent |> List.of_seq))
     "cancellation releases its staged preview";
   Queue.clear sent;
-  R.notice runtime scope notice;
+  R.notice runtime (Resources.notice resource_source notice);
   check (Queue.is_empty sent) "duplicate cancellation releases no second lease"
 ;;
