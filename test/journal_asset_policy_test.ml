@@ -529,7 +529,7 @@ let block n parent page refs =
 
 let present (block : G.block) =
   Wire.V2_block_outcome
-    (V2_present_block
+    (Worker_pure_data.V2_present_block
        { value =
            { block; task_status = None; rendered_page_title = "page"; tag_titles = [] }
        ; revision = "r"
@@ -611,13 +611,13 @@ let runtime_fixture
              ; target =
                  (if favorite_block
                   then
-                    V2_favorite_block
+                    Worker_pure_data.V2_favorite_block
                       { uuid = uuid 2
                       ; title = "block"
                       ; task_status = None
                       ; revision = "r"
                       }
-                  else V2_favorite_page { uuid = uuid 1; title = "page"; revision = "r" })
+                  else Worker_pure_data.V2_favorite_page { uuid = uuid 1; title = "page"; revision = "r" })
              }
            ]
        });
@@ -643,7 +643,7 @@ let runtime_fixture
            r
            request.request_id
            (V2_page_outcome
-              (V2_present_page
+              (Worker_pure_data.V2_present_page
                  { page =
                      G.
                        { uuid = page
@@ -666,7 +666,7 @@ let runtime_fixture
             then present (block 2 root_parent 1 [])
             else if G.Uuid.equal target (uuid 3)
             then present (block 3 1 1 [])
-            else V2_block_outcome (V2_missing_block { uuid = target; revision = "r" }))
+            else V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = target; revision = "r" }))
        | _ -> failwith "unexpected initial dependency")
     | _ -> ()
   done;
@@ -674,8 +674,7 @@ let runtime_fixture
 ;;
 
 let window n uuids interests =
-  Wire.
-    { id = string_of_int n
+  Worker_pure_data.{ id = string_of_int n
     ; predecessor = "r"
     ; successor = "next"
     ; block_uuids = List.map uuid uuids
@@ -723,7 +722,7 @@ let runtime_unconfigured_changes after_shutdown () =
     "unconfigured offline owner must not duplicate Graph reference target reads";
   Runtime.changes
     r
-    [ { (window 2 [] [ Wire.V2_children_interest (uuid 99) ]) with
+    [ { (window 2 [] [ Worker_pure_data.V2_children_interest (uuid 99) ]) with
         page_uuids = [ uuid 98 ]
       }
     ];
@@ -763,7 +762,7 @@ let runtime_unknown_unrelated () =
           request.request_id
           (if G.Uuid.equal target (uuid 99)
            then present (block 99 98 98 [])
-           else V2_block_outcome (V2_missing_block { uuid = target; revision = "r" }))
+           else V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = target; revision = "r" }))
       | _ -> failwith "55 unknown unrelated deltas must not issue an asset/index read"
     done
   done
@@ -800,7 +799,7 @@ let runtime_refs_delta () =
 let runtime_sibling_structure () =
   let r, sent = runtime_fixture () in
   raw r 600 (block 2 1 1 []);
-  Runtime.changes r [ window 1 [] [ Wire.V2_children_interest (uuid 98) ] ];
+  Runtime.changes r [ window 1 [] [ Worker_pure_data.V2_children_interest (uuid 98) ] ];
   let request =
     match Queue.take sent with
     | Service.Graph_request request -> request
@@ -809,7 +808,7 @@ let runtime_sibling_structure () =
   respond
     r
     request.request_id
-    (V2_block_outcome (V2_missing_block { uuid = uuid 98; revision = "r" }));
+    (V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = uuid 98; revision = "r" }));
   check
     (Queue.is_empty sent)
     "unrelated unknown children scope point read never becomes an offline assets/index \
@@ -828,7 +827,7 @@ let runtime_unknown_ancestor () =
   respond
     r
     request.request_id
-    (V2_block_outcome (V2_missing_block { uuid = uuid 4; revision = "r" }));
+    (V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = uuid 4; revision = "r" }));
   let fresh =
     match Queue.take sent with
     | Service.Graph_request request -> request
@@ -837,7 +836,7 @@ let runtime_unknown_ancestor () =
   respond
     r
     fresh.request_id
-    (V2_block_outcome (V2_missing_block { uuid = uuid 4; revision = "r" }));
+    (V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = uuid 4; revision = "r" }));
   let request =
     match Queue.take sent with
     | Service.Graph_request request -> request
@@ -919,14 +918,13 @@ let runtime_real_capture_sibling () =
   for n = 1 to 55 do
     Runtime.changes
       r
-      [ Wire.
-          { id = string_of_int n
+      [ Worker_pure_data.{ id = string_of_int n
           ; predecessor = "r"
           ; successor = "next"
           ; block_uuids = [ uuid 7 ]
           ; page_uuids = [ uuid 1 ]
           ; structure_interests =
-              [ V2_children_interest (uuid 1); V2_page_tree_interest (uuid 1) ]
+              [ Worker_pure_data.V2_children_interest (uuid 1); Worker_pure_data.V2_page_tree_interest (uuid 1) ]
           }
       ];
     let rounds = ref 0 in
@@ -941,7 +939,7 @@ let runtime_real_capture_sibling () =
           r
           request.request_id
           (V2_page_outcome
-             (V2_present_page
+             (Worker_pure_data.V2_present_page
                 { page =
                     G.
                       { uuid = page
@@ -1085,7 +1083,7 @@ let runtime_hidden_holder_fanout () =
          then present (block 50 99 99 [])
          else if G.Uuid.equal target (uuid 2)
          then present (block 2 1 1 [ 50 ])
-         else V2_block_outcome (V2_missing_block { uuid = target; revision = "r" }))
+         else V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = target; revision = "r" }))
     | Service.Graph_request ({ command = V2_list_assets { roots; _ }; _ } as request) ->
       queried := roots = [ uuid 1 ];
       respond
@@ -1195,9 +1193,9 @@ let runtime_unknown_old_parent () =
     [ window
         1
         [ 4 ]
-        [ V2_children_interest (uuid 3)
-        ; V2_children_interest (uuid 7)
-        ; V2_page_tree_interest (uuid 1)
+        [ Worker_pure_data.V2_children_interest (uuid 3)
+        ; Worker_pure_data.V2_children_interest (uuid 7)
+        ; Worker_pure_data.V2_page_tree_interest (uuid 1)
         ]
     ];
   let queried = ref false in
@@ -1212,7 +1210,7 @@ let runtime_unknown_old_parent () =
          then present (block 4 7 1 [])
          else if G.Uuid.equal target (uuid 3)
          then present (block 3 2 1 [])
-         else V2_block_outcome (V2_missing_block { uuid = target; revision = "r" }))
+         else V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = target; revision = "r" }))
     | Service.Graph_request ({ command = V2_list_assets { roots; _ }; _ } as request) ->
       queried := roots = [ uuid 2 ];
       respond

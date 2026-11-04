@@ -560,7 +560,7 @@ let step state event =
       then { next = state; effects = [ Publish (Graph_push push) ] }
       else no_effects state
     | Graph_request { id; request; response_budget_bytes } ->
-      if Option.exists (fun value->value<=0 || value>Protocol.maximum_response_bytes || not (Protocol.is_snapshot_read request.command)) response_budget_bytes
+      if Option.exists (fun value->value<=0 || value>Worker_pure_data.maximum_response_bytes || not (Protocol.is_snapshot_read request.command)) response_budget_bytes
       then {next=state;effects=[Publish (Reply (id,Protocol.V2_response
         {api_version=Protocol.api_version;request_id=request.request_id;
          outcome=V2_failed {code="invalidRequest";message="Invalid read response byte budget"}}))]}
@@ -1348,7 +1348,7 @@ module Observation_registry = struct
     if
       registration <= 0L
       || maximum_bytes <= 0
-      || maximum_bytes > Protocol.maximum_response_bytes
+      || maximum_bytes > Worker_pure_data.maximum_response_bytes
       || not (Protocol.is_observable_read command)
     then state, Invalid
     else if registration<=state.closed then state,Retired else (
@@ -1566,7 +1566,7 @@ module Changefeed_owner = struct
     if
       (not (owns state registration))
       || maximum_bytes <= 0
-      || maximum_bytes > Protocol.maximum_response_bytes
+      || maximum_bytes > Worker_pure_data.maximum_response_bytes
     then Refused
     else (
       match request.command, state.pending with
@@ -1652,7 +1652,7 @@ module Changefeed_owner = struct
     if
       encoded_bytes <= 0
       || state.windows >= 256
-      || encoded_bytes > Protocol.maximum_response_bytes - state.bytes
+      || encoded_bytes > Worker_pure_data.maximum_response_bytes - state.bytes
     then invalidate state, false
     else
       ( { state with windows = state.windows + 1; bytes = state.bytes + encoded_bytes }
@@ -1737,10 +1737,10 @@ module Demand_registry = struct
   let reserve t owner ~priority ~assets : t * reservation =
     if owner.registration<=t.closed then t,Retired
     else if owner.registration<=0L || owner.consumer="" || String.length owner.consumer>512
-         || List.length assets>Protocol.maximum_page_size then t,Invalid else
-    let bytes=List.fold_left(fun bytes asset->if bytes>Protocol.maximum_response_bytes then bytes else
+         || List.length assets>Worker_pure_data.maximum_page_size then t,Invalid else
+    let bytes=List.fold_left(fun bytes asset->if bytes>Worker_pure_data.maximum_response_bytes then bytes else
       bytes+1+String.length(Yojson.Safe.to_string(Logseq_db_types.Asset_descriptor.to_yojson asset)))2 assets in
-    if bytes>Protocol.maximum_response_bytes then t,Invalid else
+    if bytes>Worker_pure_data.maximum_response_bytes then t,Invalid else
     match Keys.find_opt(key owner)t.entries with
     | Some entry when not(same_scope entry.owner.scope owner.scope)->t,Mismatch
     | Some{retired=true;_}->t,Retired

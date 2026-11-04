@@ -15,8 +15,8 @@ let sample : Journal_startup.t =
     ~application_support_directory:"/tmp/support"
     ~target:(Managed_sync { base_url = "https://api.logseq.io" })
     ~compatibility_profile:Logseq_65_33_or_newer
-    ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
-    ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+    ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+    ~default_page_size:Worker_pure_data.default_page_size
   |> Result.get_ok
 ;;
 

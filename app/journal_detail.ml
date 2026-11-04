@@ -975,21 +975,21 @@ module Pure_observation = struct
     ; maximum_children : int
     }
 
-  type ticket = Protocol.v2_block_lookup Worker.observed Core.ticket
+  type ticket = Worker_pure_data.block_lookup Worker.observed Core.ticket
 
   type instruction =
     | Cancel_initial of ticket
     | Forget_initial of ticket
-    | Release of Protocol.v2_block_lookup Worker.observation
-    | Initial of context * Protocol.v2_block_lookup Worker.observed
-    | Updated of context * Protocol.v2_block_lookup Worker.observed
+    | Release of Worker_pure_data.block_lookup Worker.observation
+    | Initial of context * Worker_pure_data.block_lookup Worker.observed
+    | Updated of context * Worker_pure_data.block_lookup Worker.observed
     | Failed of context * Worker.error
     | Rejected of context * Worker.error
 
   type entry =
     { context : context
     ; ticket : ticket
-    ; handle : Protocol.v2_block_lookup Worker.observation option
+    ; handle : Worker_pure_data.block_lookup Worker.observation option
     ; forwarded_epoch : Worker.observation_epoch option
     ; reported : bool
     ; forgotten : bool
@@ -1018,7 +1018,7 @@ module Pure_observation = struct
     | Protocol.V2_get_outline_block { block; _ }
       when block=context.root && context.original.api_version=Protocol.api_version
         && context.request_generation>=0L && context.maximum_children>0
-        && context.maximum_children<=Protocol.maximum_page_size ->
+        && context.maximum_children<=Worker_pure_data.maximum_page_size ->
       (match Entries.find_opt context.entry_id t with
        | Some old when old.context = context && Core.ticket_id old.ticket = Core.ticket_id ticket ->
          t, Rrbvec.empty

@@ -16,7 +16,7 @@ val create : unit -> t
 val open_favorite
   :  t
   -> request_generation:int64
-  -> Logseq_db_worker.Protocol.v2_favorite_item
+  -> Worker_pure_data.favorite_item
   -> t * Journal_graph_request.t option
 
 val destination : t -> destination
@@ -136,7 +136,7 @@ module Favorites : sig
   val create : graph_generation:int -> t
   val step : t -> event -> t * Journal_graph_request.favorites_request list
   val revision : t -> int
-  val items : t -> Logseq_db_worker.Protocol.v2_favorite_item Rrbvec.t
+  val items : t -> Worker_pure_data.favorite_item Rrbvec.t
   val loading : t -> bool
   val error : t -> string option
   val initialized : t -> bool

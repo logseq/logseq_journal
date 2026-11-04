@@ -432,7 +432,7 @@ let test_client_to_typed_read () =
         !state
         ~owner
         ~maximum_items:1
-        ~maximum_bytes:P.maximum_response_bytes
+        ~maximum_bytes:Worker_pure_data.maximum_response_bytes
         W.Graph_info
       |> Result.get_ok
     in
@@ -585,7 +585,7 @@ let test_client_to_typed_read () =
         (W.Query (budget, W.Page { uuid = Test_support.page_uuid; revision = None }))
     in
     (match page with
-     | W.Answered (Ok (P.V2_present_page { page; _ })) ->
+     | W.Answered (Ok (Worker_pure_data.V2_present_page { page; _ })) ->
        require (page.uuid = Test_support.page_uuid) "page DTO lost identity"
      | _ -> failwith "page lookup failed");
     let _, children =
@@ -629,7 +629,7 @@ let test_client_to_typed_read () =
      with
      | Error (W.Invalid_input _) -> ()
      | _ -> failwith "foreign parent accepted continuation");
-    let summary_budget = W.read_budget session ~maximum_items:P.maximum_page_size ~maximum_bytes:65536 |> Result.get_ok in
+    let summary_budget = W.read_budget session ~maximum_items:Worker_pure_data.maximum_page_size ~maximum_bytes:65536 |> Result.get_ok in
     let _, summary =
       request
         (W.Query
@@ -642,7 +642,7 @@ let test_client_to_typed_read () =
        require (summary.next=None) "test projection cannot infer exact child count from Partial";
        require (Option.is_some summary.page) "atomic summary lost owning page";
        (match summary.lookup, summary.page with
-        | P.V2_present_block { value; revision }, Some (P.V2_present_page { page; _ }) ->
+        | Worker_pure_data.V2_present_block { value; revision }, Some (Worker_pure_data.V2_present_page { page; _ }) ->
           require
             (revision <> "" && value.block.title = "Authoritative block")
             "full DTO lost source/revision";
@@ -721,7 +721,7 @@ let test_client_to_typed_read () =
              (fun n ->
                 require
                   (Rrbvec.exists
-                     (fun (item : P.v2_child_member) ->
+                     (fun (item : Worker_pure_data.child_member) ->
                         W.Uuid.equal item.value.block.uuid (summary_child n))
                      value.children)
                   "summary lost actual child identity")
@@ -1219,7 +1219,7 @@ let test_client_to_typed_read () =
              | _ -> failwith "Favorite membership lost typed result"
            in
            let seen =
-             seen @ List.map (fun (item : P.v2_child_member) -> item.value.block.uuid) items
+             seen @ List.map (fun (item : Worker_pure_data.child_member) -> item.value.block.uuid) items
            in
            let output =
              Journal_graph_runtime.receive_worker_read
@@ -1322,7 +1322,7 @@ let test_client_to_typed_read () =
       [ 1; 2 ];
     let revision =
       match summary with
-      | W.Answered (Ok { lookup = P.V2_present_block { revision; _ }; _ }) -> revision
+      | W.Answered (Ok { lookup = Worker_pure_data.V2_present_block { revision; _ }; _ }) -> revision
       | _ -> assert false
     in
     let mutation_request : P.request =
@@ -1346,7 +1346,7 @@ let test_client_to_typed_read () =
         Mailbox.send
           client
           (Service.Coordination_query
-             { response_budget_bytes=P.maximum_response_bytes; registration = baseline.registration
+             { response_budget_bytes=Worker_pure_data.maximum_response_bytes; registration = baseline.registration
              ; owner = Option.get baseline.baseline.state.sync.selected
              ; request = mutation_request
              })
@@ -1376,7 +1376,7 @@ let test_client_to_typed_read () =
                { uuid = Test_support.authoritative_block_uuid; revision = None } ))
     in
     (match unchanged with
-     | W.Answered (Ok (P.V2_present_block { value; _ })) ->
+     | W.Answered (Ok (Worker_pure_data.V2_present_block { value; _ })) ->
        require
          (value.block.title = "Authoritative block")
          "rejected read capability altered storage"
@@ -1416,7 +1416,7 @@ let test_client_to_typed_read () =
     let presentation_model,_=Detail_observation.planned Detail_observation.empty context observed_block_ticket in
     let presentation_model,initial_effects=Detail_observation.inspect presentation_model(C.view !state) in
     require(Rrbvec.exists(function Detail_observation.Initial(_,sample)->
-      (match sample.value with P.V2_present_block{value;_}->value.block.title="Authoritative block"|_->false)
+      (match sample.value with Worker_pure_data.V2_present_block{value;_}->value.block.title="Authoritative block"|_->false)
       | _->false)initial_effects) "actual Service sample did not reach the pure Detail outlet";
     apply(C.step !state(C.Forget observed_block_ticket));
     let mutation_ticket, mutation_reply = request (W.Mutate intent) in
@@ -1426,7 +1426,7 @@ let test_client_to_typed_read () =
       | _ -> failwith "real durable mutation did not return commit evidence"
     in
     wait(fun ()->match C.observed(C.view !state) observed_block.observation with
-      | Some {value=P.V2_present_block {value;_};_}->value.block.title="Durable coordinated edit"
+      | Some {value=Worker_pure_data.V2_present_block {value;_};_}->value.block.title="Durable coordinated edit"
       | _->false);
     let observed_after=Option.get(C.observed(C.view !state) observed_block.observation) in
     require(W.compare_observation_epoch observed_after.epoch observed_block.epoch>0)
@@ -1474,7 +1474,7 @@ let test_client_to_typed_read () =
                { uuid = Test_support.authoritative_block_uuid; revision = None } ))
     in
     (match readback with
-     | W.Answered (Ok (P.V2_present_block { value; _ })) ->
+     | W.Answered (Ok (Worker_pure_data.V2_present_block { value; _ })) ->
        require
          (value.block.title = "Durable coordinated edit")
          "durable mutation did not reach real projection"
@@ -1494,7 +1494,7 @@ let test_client_to_typed_read () =
         | W.Confirmed_block summary ->
           require (Option.is_some summary.page) "confirmation lost atomic owning page";
           (match summary.lookup with
-           | P.V2_present_block { value; _ } ->
+           | Worker_pure_data.V2_present_block { value; _ } ->
              require
                (value.block.title = "Durable coordinated edit")
                "confirmation did not expose canonical readback"
@@ -1777,7 +1777,7 @@ let test_read_completion_rechecks_graph_owner ?(durable = false) () =
          let read =
            send
              (Service.Coordination_query
-                { response_budget_bytes=P.maximum_response_bytes; registration
+                { response_budget_bytes=Worker_pure_data.maximum_response_bytes; registration
                 ; owner
                 ; request =
                     req
@@ -1794,7 +1794,7 @@ let test_read_completion_rechecks_graph_owner ?(durable = false) () =
            | Completed
                (Service.Graph_response
                   (P.V2_response
-                     { outcome = V2_block_outcome (V2_present_block { revision; _ }); _ }))
+                     { outcome = V2_block_outcome (Worker_pure_data.V2_present_block { revision; _ }); _ }))
              -> revision
            | _ -> failwith "race fixture block missing"
          in
@@ -1838,7 +1838,7 @@ let test_read_completion_rechecks_graph_owner ?(durable = false) () =
          let read =
            send
              (Service.Coordination_query
-                { response_budget_bytes=P.maximum_response_bytes; registration; owner; request = req "000000000004" P.V2_graph_info })
+                { response_budget_bytes=Worker_pure_data.maximum_response_bytes; registration; owner; request = req "000000000004" P.V2_graph_info })
          in
          (* Cancelling the outer writer releases its Service lane, not its
             accepted durable DB operation. Keep that operation held while the
@@ -1910,7 +1910,7 @@ let test_read_completion_rechecks_graph_owner ?(durable = false) () =
                   ; _
                   }) ->
              require
-               (committed.status = P.V2_applied)
+               (committed.status = Worker_pure_data.V2_applied)
                "unknown write replay invented Already_applied/current revision";
              require
                (committed.before_projection_revision
@@ -1952,7 +1952,7 @@ let test_host_durable_recovery_confirmation_ack () =
     let value : type a. a W.reply -> a = function W.Answered(Ok value)->value|_->failwith "typed lifecycle operation failed" in
     let budget=W.read_budget session ~maximum_items:8 ~maximum_bytes:16384 |> Result.get_ok in
     let read()=value(call(W.Query(budget,W.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None}))) in
-    let revision=match read() with P.V2_present_block{revision;_}->revision|_->assert false in
+    let revision=match read() with Worker_pure_data.V2_present_block{revision;_}->revision|_->assert false in
     let intent=W.mutation_intent session ~mutation_id:(uuid "9f000000-0000-4000-8000-000000001000")
       (W.Save_block{block=Test_support.authoritative_block_uuid;title="Typed applied readback";
         preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}) |> Result.get_ok in
@@ -1965,7 +1965,7 @@ let test_host_durable_recovery_confirmation_ack () =
       W.receipt_revisions actual=W.receipt_revisions receipt|_->false) "typed recovery replaced original proof";
     let confirmation=match value(call(W.Confirm(presentation,receipt))) with W.Confirmed value->value|_->failwith "typed confirmation failed" in
     let ui_applied=match W.confirmation_primary confirmation with
-      | W.Confirmed_block{lookup=V2_present_block{value;_};_}->value.block.title="Typed applied readback"
+      | W.Confirmed_block{lookup=Worker_pure_data.V2_present_block{value;_};_}->value.block.title="Typed applied readback"
       | _->false in
     require ui_applied "canonical DTO was not applied to the consuming projection";
     ignore(value(call(W.Acknowledge_intent intent)));
@@ -1975,7 +1975,7 @@ let test_host_durable_recovery_confirmation_ack () =
     require(match value(call(W.Mutate intent)) with W.Committed_pending_presentation original->
       W.receipt_revisions original=W.receipt_revisions receipt|_->false) "typed ACK removed original idempotency proof";
     require(read()=before) "typed same-intent reconciliation executed a second write";
-    let revision=match read() with P.V2_present_block{revision;_}->revision|_->assert false in
+    let revision=match read() with Worker_pure_data.V2_present_block{revision;_}->revision|_->assert false in
     let status=Test_support.status_uuid 2 in
     let status_intent=W.mutation_intent session ~mutation_id:(uuid "9f000000-0000-4000-8000-000000001001")
       (W.Set_task_status{block=Test_support.authoritative_block_uuid;status;
@@ -1985,7 +1985,7 @@ let test_host_durable_recovery_confirmation_ack () =
     let status_confirmation=match value(call(W.Confirm(presentation,status_receipt))) with
       | W.Confirmed value->value|_->failwith "real typed status canonical readback failed" in
     require(match W.confirmation_primary status_confirmation with
-      | W.Confirmed_block{lookup=P.V2_present_block{value;_};_}->value.task_status=Some status
+      | W.Confirmed_block{lookup=Worker_pure_data.V2_present_block{value;_};_}->value.task_status=Some status
       | _->false) "real canonical DTO lost committed status UUID";
     ignore(value(call(W.Acknowledge_intent status_intent)));
     require(Rrbvec.is_empty(recover()).items) "real status ACK retained pending recovery entry";
@@ -2005,13 +2005,13 @@ let test_host_durable_recovery_confirmation_ack () =
       let summary=match W.confirmation_primary confirmation with W.Confirmed_block summary->summary
         |_->failwith "Append canonical primary was not the admitted root" in
       require(match summary.lookup,summary.page with
-        | P.V2_present_block{value;_},Some(P.V2_present_page{page;_})->
+        | Worker_pure_data.V2_present_block{value;_},Some(Worker_pure_data.V2_present_page{page;_})->
           value.block.uuid=root_id && value.block.title="Atomic Service root 中文" && value.task_status=Some status
           && value.block.parent=page.uuid && value.block.page=page.uuid
           && (if index=0 then page.title="2026-11-02" else
             page.uuid=uuid "9f000000-0000-4000-8000-000000002100" && page.title="Existing Web day title")
         |_->false) "Append lost settings format or adopted the candidate instead of the existing Web page";
-      require(List.exists(fun(item:P.v2_child_member)->item.value.block.uuid=child_id
+      require(List.exists(fun(item:Worker_pure_data.child_member)->item.value.block.uuid=child_id
         && item.value.task_status=Some(Test_support.status_uuid 3))summary.items)
         "Append separated or lost its child status write";
       ignore(value(call(W.Acknowledge_intent(W.receipt_intent receipt))));
@@ -2029,7 +2029,7 @@ let test_host_durable_recovery_confirmation_ack () =
     let parent_summary=value(call(W.Query(budget,W.Block_summary
       {block=Test_support.authoritative_block_uuid;after=None}))) in
     let parent_revision,page=match parent_summary.lookup,parent_summary.page with
-      | P.V2_present_block{revision;_},Some(P.V2_present_page{page;_})->revision,page
+      | Worker_pure_data.V2_present_block{revision;_},Some(Worker_pure_data.V2_present_page{page;_})->revision,page
       | _->failwith "real Child parent unavailable" in
     let child=uuid "9f000000-0000-4000-8000-000000001003" in
     let mutation_id=uuid "9f000000-0000-4000-8000-000000001004" in
@@ -2043,7 +2043,7 @@ let test_host_durable_recovery_confirmation_ack () =
     let insert=P.V2_insert_blocks{mutation_id;parent=Test_support.authoritative_block_uuid;
       roots=[{uuid=child;title=command.source;children=[]}];
       preconditions={blocks=[Test_support.authoritative_block_uuid,parent_revision];pages=[];
-        scopes=[P.V2_children_scope Test_support.authoritative_block_uuid,parent_summary.scope_revision]}} in
+        scopes=[Worker_pure_data.V2_children_scope Test_support.authoritative_block_uuid,parent_summary.scope_revision]}} in
     let initial,action=Child.start ~command ~page ~resolved_status:(Some status) ~insert |> Result.get_ok in
     let writes=ref 0 and acks=ref 0 and applied=ref None and proofs=ref [] in
     let rec drive fuel state action =
@@ -2063,7 +2063,7 @@ let test_host_durable_recovery_confirmation_ack () =
         | Read_parent(round,summary) ->
           ignore(value(call(W.Query(budget,W.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None}))));
           let block,revision,page=match summary.lookup,summary.page with
-            | P.V2_present_block{value;revision},Some(P.V2_present_page{page;_})->value.block,revision,page
+            | Worker_pure_data.V2_present_block{value;revision},Some(Worker_pure_data.V2_present_page{page;_})->value.block,revision,page
             | _->failwith "real Child canonical DTO absent" in
           applied:=Some(Journal_graph_projection.block_on_page ~page ~revision
             ~child_count:(List.length summary.items) ~time_context:{localtime=Unix.gmtime} block |> Result.get_ok);
@@ -2084,7 +2084,7 @@ let test_host_durable_recovery_confirmation_ack () =
     ignore(drive 24 initial action);
     require(!writes=2 && !acks=2) "real Child bypassed Insert/Status or per-stage ACK";
     let final=value(call(W.Query(budget,W.Outline_block{uuid=child;revision=None}))) in
-    require(match final with P.V2_present_block{value;_}->value.block.title=command.source && value.task_status=Some status|_->false)
+    require(match final with Worker_pure_data.V2_present_block{value;_}->value.block.title=command.source && value.task_status=Some status|_->false)
       "real Child chain did not preserve source/status";
     List.iter(fun(intent,receipt)->
       require(match value(call(W.Mutate intent)) with
@@ -2093,7 +2093,7 @@ let test_host_durable_recovery_confirmation_ack () =
     require(value(call(W.Query(budget,W.Outline_block{uuid=child;revision=None})))=final)
       "Child original-intent reconciliation wrote a duplicate";
 
-    let revision=match read() with P.V2_present_block{revision;_}->revision|_->assert false in
+    let revision=match read() with Worker_pure_data.V2_present_block{revision;_}->revision|_->assert false in
     let deletion=W.mutation_intent session ~mutation_id:(uuid "9f000000-0000-4000-8000-000000001002")
       (W.Delete_blocks{root=Test_support.authoritative_block_uuid;
         preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}) |> Result.get_ok in
@@ -2109,7 +2109,7 @@ let test_host_durable_recovery_confirmation_ack () =
     require(match value(call(W.Mutate deletion)) with
       | W.Committed_pending_presentation original->W.receipt_revisions original=W.receipt_revisions deleted_receipt
       | _->false) "deletion reconciliation lost its original idempotent proof";
-    require(match read() with P.V2_missing_block{uuid;_}->W.Uuid.equal uuid Test_support.authoritative_block_uuid|_->false)
+    require(match read() with Worker_pure_data.V2_missing_block{uuid;_}->W.Uuid.equal uuid Test_support.authoritative_block_uuid|_->false)
       "same-intent deletion reconciliation changed canonical absence";
 
 
@@ -2407,7 +2407,7 @@ let test_dependency_point_reads_use_typed_owner () =
            (P.V2_get_outline_block
               { block = Test_support.authoritative_block_uuid; revision = None })
        with
-       | Ok (P.V2_block_outcome (P.V2_present_block { value; revision })) ->
+       | Ok (P.V2_block_outcome (Worker_pure_data.V2_present_block { value; revision })) ->
          value.block.uuid = Test_support.authoritative_block_uuid && revision <> ""
        | _ -> false)
       "typed dependency lost full block identity or revision";
@@ -2415,7 +2415,7 @@ let test_dependency_point_reads_use_typed_owner () =
       (match
          query 65536 (P.V2_get_page { page = Test_support.page_uuid; revision = None })
        with
-       | Ok (P.V2_page_outcome (P.V2_present_page { page; revision })) ->
+       | Ok (P.V2_page_outcome (Worker_pure_data.V2_present_page { page; revision })) ->
          page.uuid = Test_support.page_uuid && revision <> ""
        | _ -> false)
       "typed dependency lost its full page DTO";
@@ -2787,7 +2787,7 @@ let test_changefeed_business_waits_for_ui_application () =
         |> Result.get_ok
       in
       Host.watch host ticket ~f:(function
-        | W.Answered (Ok (P.V2_present_block value)) -> revision := Some value.revision
+        | W.Answered (Ok (Worker_pure_data.V2_present_block value)) -> revision := Some value.revision
         | _ -> failwith "write revision query failed");
       wait (fun () -> !revision <> None);
       let intent =
@@ -2940,7 +2940,7 @@ let test_service_writer_fence_waits_for_canceled_protected_commit () =
         request={P.api_version=P.api_version;request_id=id n;command=V2_get_outline_block
           {block=Test_support.authoritative_block_uuid;revision=None}}}) in
       let revision=match read owner 1 with
-        |Mailbox.Completed(Service.Graph_response(P.V2_response{outcome=V2_block_outcome(V2_present_block{revision;_});_}))->revision
+        |Mailbox.Completed(Service.Graph_response(P.V2_response{outcome=V2_block_outcome(Worker_pure_data.V2_present_block{revision;_});_}))->revision
         |_->failwith "writer fence source read failed" in
       let intent n title=Wire.create ~origin:(Uri.of_string "https://api.logseq.io") ~user:"user-1" ~graph:owner.graph_id
         (P.V2_save_block{mutation_id=id n;block=Test_support.authoritative_block_uuid;title;
@@ -2973,7 +2973,7 @@ let test_service_writer_fence_waits_for_canceled_protected_commit () =
         (Option.get !baseline).baseline.state.residents);
       let fresh=Option.get(Option.get !baseline).baseline.state.sync.selected in
       require(match read fresh 8 with
-        |Mailbox.Completed(Service.Graph_response(P.V2_response{outcome=V2_block_outcome(V2_present_block{value;_});_}))->
+        |Mailbox.Completed(Service.Graph_response(P.V2_response{outcome=V2_block_outcome(Worker_pure_data.V2_present_block{value;_});_}))->
           value.block.title="Protected writer actually committed"
         |_->false) "new incarnation lost actual canceled commit or inherited the old admission fence"))
 ;;
@@ -3183,7 +3183,7 @@ let test_service_observation_lifecycle () =
                 { epoch = 0L
                 ; response =
                     V2_response
-                      { outcome = V2_block_outcome (V2_present_block { revision; _ }); _ }
+                      { outcome = V2_block_outcome (Worker_pure_data.V2_present_block { revision; _ }); _ }
                 ; _
                 }) -> revision
          | _ -> failwith "real initial observation did not sample its predecessor"
@@ -3242,7 +3242,7 @@ let test_service_observation_lifecycle () =
                  { response =
                      V2_response
                        { outcome =
-                           V2_block_outcome (V2_present_block { revision = actual; _ })
+                           V2_block_outcome (Worker_pure_data.V2_present_block { revision = actual; _ })
                        ; _
                        }
                  ; _
@@ -3298,7 +3298,7 @@ let test_service_observation_lifecycle () =
                 { epoch
                 ; response =
                     V2_response
-                      { outcome = V2_block_outcome (V2_present_block { value; revision })
+                      { outcome = V2_block_outcome (Worker_pure_data.V2_present_block { value; revision })
                       ; _
                       }
                 ; _
@@ -3418,7 +3418,7 @@ let test_service_empty_observation_is_retained () =
               (Service.Coordination_observed
                  { response =
                      V2_response
-                       { outcome = V2_block_outcome (V2_missing_block { uuid; _ }); _ }
+                       { outcome = V2_block_outcome (Worker_pure_data.V2_missing_block { uuid; _ }); _ }
                  ; _
                  }) -> uuid = target
           | _ -> false)
@@ -3431,7 +3431,7 @@ let test_service_empty_observation_is_retained () =
          | Completed
              (Service.Graph_response
                 (V2_response
-                   { outcome = V2_page_outcome (V2_present_page { revision; _ }); _ })) ->
+                   { outcome = V2_page_outcome (Worker_pure_data.V2_present_page { revision; _ }); _ })) ->
            revision
          | _ -> failwith "observation insert page revision unavailable"
        in
@@ -3465,7 +3465,7 @@ let test_service_empty_observation_is_retained () =
                      { blocks = []
                      ; pages = [ Test_support.page_uuid, page_revision ]
                      ; scopes =
-                         [ V2_children_scope Test_support.page_uuid, scope_revision ]
+                         [ Worker_pure_data.V2_children_scope Test_support.page_uuid, scope_revision ]
                      }
                  })
           with
@@ -3494,7 +3494,7 @@ let test_service_empty_observation_is_retained () =
               (Service.Coordination_observed
                  { response =
                      V2_response
-                       { outcome = V2_block_outcome (V2_present_block { value; _ }); _ }
+                       { outcome = V2_block_outcome (Worker_pure_data.V2_present_block { value; _ }); _ }
                  ; _
                  }) ->
             value.block.uuid = target && value.block.title = "First observed block"
@@ -3537,13 +3537,13 @@ let test_service_observation_read_failure_retains_interest () =
                 { registration
                 ; owner
                 ; request = point n
-                ; response_budget_bytes = P.maximum_response_bytes
+                ; response_budget_bytes = Worker_pure_data.maximum_response_bytes
                 })
          with
          | Completed
              (Service.Graph_response
                 (P.V2_response
-                   { outcome = V2_block_outcome (V2_present_block { revision; _ }); _ } as
+                   { outcome = V2_block_outcome (Worker_pure_data.V2_present_block { revision; _ }); _ } as
                  raw)) -> revision, raw
          | _ -> failwith "observation recovery source read failed"
        in
@@ -3624,7 +3624,7 @@ let test_service_observation_read_failure_retains_interest () =
                 (Service.Coordination_observed
                    { response =
                        V2_response
-                         { outcome = V2_block_outcome (V2_present_block { value; _ }); _ }
+                         { outcome = V2_block_outcome (Worker_pure_data.V2_present_block { value; _ }); _ }
                    ; _
                    }) -> value.block.title = text
             | _ -> false)
@@ -3688,12 +3688,12 @@ let test_service_unknown_recovery_is_read_only ?(large=false) () =
       let revision=Fun.protect ~finally:(fun()->D.release_snapshot snapshot)(fun()->
         match D.get_outline_blocks snapshot [Test_support.authoritative_block_uuid] |> Result.get_ok with
         | [Types.Present_block{revision;_}]->revision|_->failwith "pending fixture block missing") in
-      let preconditions=P.{blocks=[Test_support.authoritative_block_uuid,Types.Block_state_revision.to_string revision];pages=[];scopes=[]} in
+      let preconditions=Worker_pure_data.{blocks=[Test_support.authoritative_block_uuid,Types.Block_state_revision.to_string revision];pages=[];scopes=[]} in
       let command,mutation=if large then (
-        let children=List.init 5(fun n->P.{uuid=uuid(Printf.sprintf "9f000000-0000-4000-8000-%012d" (910+n));
+        let children=List.init 5(fun n->Worker_pure_data.{uuid=uuid(Printf.sprintf "9f000000-0000-4000-8000-%012d" (910+n));
           title=String.make 60000 '"';children=[]}) in
-        let root=P.{uuid=uuid "9f000000-0000-4000-8000-000000000909";title="Never automatically replay";children} in
-        let tree=Types.{uuid=root.uuid;title=root.title;children=List.map(fun (child:P.v2_block_tree)->
+        let root=Worker_pure_data.{uuid=uuid "9f000000-0000-4000-8000-000000000909";title="Never automatically replay";children} in
+        let tree=Types.{uuid=root.uuid;title=root.title;children=List.map(fun (child:Worker_pure_data.block_tree)->
           {uuid=child.uuid;title=child.title;children=[]})children} in
         P.V2_insert_blocks{mutation_id;parent=Test_support.authoritative_block_uuid;roots=[root];preconditions},
         Types.Insert_blocks{mutation_id;parent=Test_support.authoritative_block_uuid;tree;asset=None})
@@ -3702,7 +3702,7 @@ let test_service_unknown_recovery_is_read_only ?(large=false) () =
       let wire=Wire.create ~origin:(Uri.of_string "https://api.logseq.io") ~user:"user-1" ~graph:Test_support.graph_uuid command
         |> Result.get_ok in
       encoded:=Wire.encode wire;
-      if large then require(String.length !encoded>P.maximum_response_bytes && String.length !encoded<=P.maximum_request_bytes)
+      if large then require(String.length !encoded>Worker_pure_data.maximum_response_bytes && String.length !encoded<=Worker_pure_data.maximum_request_bytes)
         "large recovery fixture must be a valid intent exceeding the ordinary read cap";
       let expected=D.write_precondition ~blocks:[Test_support.authoritative_block_uuid,revision] ~pages:[] ~scopes:[] |> Result.get_ok in
       ignore(D.persist_local_intent database ~namespace:(Wire.namespace wire) ~payload: !encoded ~expected mutation |> Result.get_ok)))) in
@@ -3722,7 +3722,7 @@ let test_service_unknown_recovery_is_read_only ?(large=false) () =
     require(match call(Service.Coordination_query{registration;owner;
       request={P.api_version=P.api_version;request_id;command=V2_get_outline_block{block=Test_support.authoritative_block_uuid;revision=None}};
       response_budget_bytes=16384}) with
-      | Mailbox.Completed(Service.Graph_response(V2_response{outcome=V2_block_outcome(V2_present_block{value;_});_}))->
+      | Mailbox.Completed(Service.Graph_response(V2_response{outcome=V2_block_outcome(Worker_pure_data.V2_present_block{value;_});_}))->
         value.block.title<>"Never automatically replay"
       | _->false) "recovery automatically executed Unknown intent")
 ;;
@@ -3736,7 +3736,7 @@ let test_service_durable_recovery_and_ack () =
     let read n=match call(Service.Coordination_query{registration;owner= !owner;
       request={P.api_version=P.api_version;request_id=id n;command=V2_get_outline_block
         {block=Test_support.authoritative_block_uuid;revision=None}};response_budget_bytes=16384}) with
-      | Mailbox.Completed(Service.Graph_response(V2_response{outcome=V2_block_outcome(V2_present_block{revision;value});_}))->revision,value.block.title
+      | Mailbox.Completed(Service.Graph_response(V2_response{outcome=V2_block_outcome(Worker_pure_data.V2_present_block{revision;value});_}))->revision,value.block.title
       | _->failwith "durable lifecycle source read failed" in
     let recover ?(maximum_bytes=16384) ?(maximum_items=1) n after=call(Service.Coordination_recover_mutations
       {registration;owner= !owner;request_id=id n;after;maximum_items;maximum_bytes}) in
@@ -3889,7 +3889,7 @@ let test_service_changefeed_has_one_owner () =
            | Completed
                (Service.Graph_response
                   (P.V2_response
-                     { outcome = P.V2_block_outcome (P.V2_present_block { revision; _ })
+                     { outcome = P.V2_block_outcome (Worker_pure_data.V2_present_block { revision; _ })
                      ; _
                      })) -> revision
            | _ -> failwith "changefeed write revision"

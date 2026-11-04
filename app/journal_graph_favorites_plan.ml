@@ -16,8 +16,8 @@ type read =
       { epoch : int64
       ; page : Graph.Uuid.t
       ; consumed : int
-      ; seen : Protocol.v2_child_member Worker.continuation list
-      ; after : Protocol.v2_child_member Worker.continuation option
+      ; seen : Worker_pure_data.child_member Worker.continuation list
+      ; after : Worker_pure_data.child_member Worker.continuation option
       }
 
 type rejection =
@@ -44,8 +44,8 @@ type t =
   ; mutable favorites_page : Graph.Uuid.t option
   ; favorite_dependencies : (string, unit) Hashtbl.t
   ; favorite_members : (string, unit) Hashtbl.t
-  ; favorite_targets : (string, Protocol.v2_favorite_target) Hashtbl.t
-  ; favorite_blocks : (string, Protocol.v2_block_record) Hashtbl.t
+  ; favorite_targets : (string, Worker_pure_data.favorite_target) Hashtbl.t
+  ; favorite_blocks : (string, Worker_pure_data.block_record) Hashtbl.t
   ; favorite_pages : (string, Graph.page) Hashtbl.t
   ; favorite_dirty : (string, unit) Hashtbl.t
   ; favorite_pending : (string, unit) Hashtbl.t
@@ -94,7 +94,7 @@ let current t = function
 ;;
 let is_page_target t id =
   match Hashtbl.find_opt t.favorite_targets id with
-  | Some (Protocol.V2_favorite_page _) -> true | _ -> false
+  | Some (Worker_pure_data.V2_favorite_page _) -> true | _ -> false
 ;;
 let operation_name = function
   | List_favorites _ -> "listFavorites"
@@ -162,8 +162,8 @@ let favorite_deleted (block : Graph.block) =
 let favorite_block_changed
       t
       key
-      (before : Protocol.v2_block_record)
-      (after : Protocol.v2_block_record)
+      (before : Worker_pure_data.block_record)
+      (after : Worker_pure_data.block_record)
   =
   before.block.parent <> after.block.parent
   || before.block.page <> after.block.page
@@ -209,9 +209,9 @@ let changes t ~ports ~blocks ~pages ~structures =
     || Rrbvec.exists favorites_scope pages
     || Rrbvec.exists
          (function
-           | Protocol.V2_children_interest parent | V2_page_tree_interest parent ->
+           | Worker_pure_data.V2_children_interest parent | Worker_pure_data.V2_page_tree_interest parent ->
              favorites_scope parent
-           | V2_journal_index_interest -> false)
+           | Worker_pure_data.V2_journal_index_interest -> false)
          structures
   in
   let rechecks =
@@ -276,29 +276,29 @@ let receive_list t ~ports (request : Journal_graph_request.favorites_request) (r
                 limit failure must not leave unscheduled request constructors. *)
              let items = result.items in
              Rrbvec.iter
-               (fun (item : Protocol.v2_favorite_item) ->
+               (fun (item : Worker_pure_data.favorite_item) ->
                   register_favorite_dependency t item.membership_uuid;
                   match item.target with
-                  | V2_favorite_page { uuid; _ } | V2_favorite_block { uuid; _ } ->
+                  | Worker_pure_data.V2_favorite_page { uuid; _ } | Worker_pure_data.V2_favorite_block { uuid; _ } ->
                     register_favorite_dependency t uuid)
                items;
              let dependencies =
                Rrbvec.filter_map
-                 (fun (item : Protocol.v2_favorite_item) ->
+                 (fun (item : Worker_pure_data.favorite_item) ->
                     register_favorite_dependency t item.membership_uuid;
                     Hashtbl.replace
                       t.favorite_members
                       (Graph.Uuid.to_string item.membership_uuid)
                       ();
                     match item.target with
-                    | V2_favorite_page { uuid; _ } ->
+                    | Worker_pure_data.V2_favorite_page { uuid; _ } ->
                       Hashtbl.replace
                         t.favorite_targets
                         (Graph.Uuid.to_string uuid)
                         item.target;
                       favorite_dependency_read t ~ports
                   ~page:true ~seen:[] uuid
-                    | V2_favorite_block { uuid; _ } ->
+                    | Worker_pure_data.V2_favorite_block { uuid; _ } ->
                       Hashtbl.replace
                         t.favorite_targets
                         (Graph.Uuid.to_string uuid)
@@ -328,13 +328,13 @@ let receive_list t ~ports (request : Journal_graph_request.favorites_request) (r
              responses [ response (Favorites_failed (request, false, message)) ])
 ;;
 
-let receive_page t ~ports operation (lookup : Protocol.v2_page_lookup) =
+let receive_page t ~ports operation (lookup : Worker_pure_data.page_lookup) =
   match lookup, operation with
         | _, Favorite_dependency { epoch; _ } when epoch <> t.favorite_epoch -> empty
         | _, Favorite_dependency { uuid; seen; page; _ }
           when Hashtbl.mem t.favorite_dirty (Graph.Uuid.to_string uuid) ->
           recheck_dirty_favorite_dependency t ~ports ~uuid ~seen ~page
-        | V2_present_page { page; _ }, Favorite_dependency { uuid; page = true; _ } ->
+        | Worker_pure_data.V2_present_page { page; _ }, Favorite_dependency { uuid; page = true; _ } ->
           let key = Graph.Uuid.to_string uuid in
           let changed =
             match Hashtbl.find_opt t.favorite_pages key with
@@ -345,7 +345,7 @@ let receive_page t ~ports operation (lookup : Protocol.v2_page_lookup) =
               page.recycled
               ||
                 (match Hashtbl.find_opt t.favorite_targets key with
-                | Some (V2_favorite_page target) -> target.title <> page.title
+                | Some (Worker_pure_data.V2_favorite_page target) -> target.title <> page.title
                 | _ -> false)
           in
           Hashtbl.replace t.favorite_pages key page;
@@ -354,16 +354,16 @@ let receive_page t ~ports operation (lookup : Protocol.v2_page_lookup) =
             t
             uuid
             (if changed then responses [ response Favorites_invalidated ] else empty)
-        | V2_missing_page _, Favorite_dependency { uuid; page = true; _ } ->
+        | Worker_pure_data.V2_missing_page _, Favorite_dependency { uuid; page = true; _ } ->
           complete_favorite_dependency
             t
             uuid
             (responses [ response Favorites_invalidated ])
-        | V2_present_page { page; _ }, Favorite_page_candidate _ ->
+        | Worker_pure_data.V2_present_page { page; _ }, Favorite_page_candidate _ ->
           if String.equal page.name "$$$favorites" && not page.recycled
           then responses [ response Favorites_invalidated ]
           else empty
-        | V2_missing_page _, Favorite_page_candidate _ -> empty
+        | Worker_pure_data.V2_missing_page _, Favorite_page_candidate _ -> empty
   | _ -> empty
 ;;
 let accepts_page t = function
@@ -373,13 +373,13 @@ let accepts_page t = function
   | _ -> false
 ;;
 
-let receive_block t ~ports operation (lookup : Protocol.v2_block_lookup) =
+let receive_block t ~ports operation (lookup : Worker_pure_data.block_lookup) =
   match lookup, operation with
         | _, Favorite_dependency { epoch; _ } when epoch <> t.favorite_epoch -> empty
         | _, Favorite_dependency { uuid; seen; page; _ }
           when Hashtbl.mem t.favorite_dirty (Graph.Uuid.to_string uuid) ->
           recheck_dirty_favorite_dependency t ~ports ~uuid ~seen ~page
-        | ( V2_present_block { value; _ }
+        | ( Worker_pure_data.V2_present_block { value; _ }
           , Favorite_dependency { uuid; seen; page = false; _ } ) ->
           let key = Graph.Uuid.to_string uuid in
           let parent = value.block.parent in
@@ -401,7 +401,7 @@ let receive_block t ~ports operation (lookup : Protocol.v2_block_lookup) =
                 not (Rrbvec.is_empty (favorite_deleted value.block))
                 ||
                   (match Hashtbl.find_opt t.favorite_targets key with
-                  | Some (V2_favorite_block target) ->
+                  | Some (Worker_pure_data.V2_favorite_block target) ->
                     target.title <> value.block.title
                     || target.task_status <> value.task_status
                   | _ -> false)
@@ -425,7 +425,7 @@ let receive_block t ~ports operation (lookup : Protocol.v2_block_lookup) =
             with
             | Invalid_argument message ->
               complete_favorite_dependency t uuid (reject message))
-        | V2_missing_block _, Favorite_dependency { uuid; page = false; _ } ->
+        | Worker_pure_data.V2_missing_block _, Favorite_dependency { uuid; page = false; _ } ->
           complete_favorite_dependency
             t
             uuid
@@ -452,7 +452,7 @@ let receive_memberships t ~ports operation items next_cursor =
           else (
             try
               Rrbvec.iter
-                (fun (item : Protocol.v2_child_member) ->
+                (fun (item : Worker_pure_data.child_member) ->
                    register_favorite_dependency t item.value.block.uuid;
                    Hashtbl.replace
                      t.favorite_members
@@ -461,7 +461,7 @@ let receive_memberships t ~ports operation items next_cursor =
                 items;
               let changed =
                 Rrbvec.exists
-                  (fun (item : Protocol.v2_child_member) ->
+                  (fun (item : Worker_pure_data.child_member) ->
                      favorite_dependency_changed t item.value.block.uuid)
                   items
               in

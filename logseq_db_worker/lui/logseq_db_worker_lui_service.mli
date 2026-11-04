@@ -222,7 +222,7 @@ type coordination_baseline =
   { registration : int64
   ; baseline : Logseq_db_worker.coordination_snapshot
   ; authority_user : string option option
-  ; limits : Logseq_db_worker.Protocol.v2_capability_limits
+  ; limits : Worker_pure_data.capability_limits
   }
 
 type coordination_update =

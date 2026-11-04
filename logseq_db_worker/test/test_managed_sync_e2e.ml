@@ -427,7 +427,7 @@ let journal_parent context =
   | V2_response { outcome = V2_journals_outcome { items; _ }; _ } ->
     (match
        List.find_opt
-         (fun (item : Protocol.v2_journal_item) -> not item.page.recycled)
+         (fun (item : Worker_pure_data.journal_item) -> not item.page.recycled)
          items
      with
      | Some item -> item.page.uuid
@@ -437,9 +437,9 @@ let journal_parent context =
 
 let read_block context block_uuid =
   match graph_request context (V2_get_outline_block { block = block_uuid; revision = None }) with
-  | V2_response { outcome = V2_block_outcome (V2_present_block { value; revision }); _ }
+  | V2_response { outcome = V2_block_outcome (Worker_pure_data.V2_present_block { value; revision }); _ }
     -> Ok (value, revision)
-  | V2_response { outcome = V2_block_outcome (V2_missing_block _); _ } -> Error ()
+  | V2_response { outcome = V2_block_outcome (Worker_pure_data.V2_missing_block _); _ } -> Error ()
   | V2_response _ -> fail_worker context "block-read" "unexpected-response"
 ;;
 
@@ -461,7 +461,7 @@ let run_mutation ?(on_applied = fun () -> ()) context ~after_server_t phase comm
   let request = Protocol.{ api_version; request_id = fresh_uuid (); command } in
   let worker_request_id = send context (Service.Graph_request request) in
   (match await_graph_response context ~phase worker_request_id with
-   | V2_response { outcome = V2_mutation_committed { status = V2_applied; _ }; _ } ->
+   | V2_response { outcome = V2_mutation_committed { status = Worker_pure_data.V2_applied; _ }; _ } ->
      report_phase (phase ^ "-local-commit");
      on_applied ()
    | V2_response { outcome = V2_failed { code; message }; _ } ->
@@ -475,7 +475,7 @@ let run_mutation ?(on_applied = fun () -> ()) context ~after_server_t phase comm
 let insert_preconditions context parent =
   let page_revision =
     match graph_request context (V2_get_page { page = parent; revision = None }) with
-    | V2_response { outcome = V2_page_outcome (V2_present_page { revision; _ }); _ } ->
+    | V2_response { outcome = V2_page_outcome (Worker_pure_data.V2_present_page { revision; _ }); _ } ->
       revision
     | V2_response _ -> fail_worker context "insert-precondition" "parent-page-missing"
   in
@@ -489,10 +489,9 @@ let insert_preconditions context parent =
       scope_revision
     | V2_response _ -> fail_worker context "insert-precondition" "children-missing"
   in
-  Protocol.
-    { blocks = []
+  Worker_pure_data.{ blocks = []
     ; pages = [ parent, page_revision ]
-    ; scopes = [ V2_children_scope parent, scope_revision ]
+    ; scopes = [ Worker_pure_data.V2_children_scope parent, scope_revision ]
     }
 ;;
 
@@ -982,8 +981,8 @@ let config support =
       ~application_support_directory:support
       ~target:(Managed_sync { base_url })
       ~compatibility_profile:Logseq_65_33_or_newer
-      ~response_budget_bytes:Protocol.maximum_response_bytes
-      ~default_page_size:Protocol.default_page_size
+      ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+      ~default_page_size:Worker_pure_data.default_page_size
   with
   | Ok config -> config
   | Error _ -> fail "worker configuration failed"
@@ -1327,7 +1326,7 @@ let run () =
                   then fail_worker receiver "recovery" "graph-mismatch";
                   ignore
                     (require_block receiver ~block_uuid ~parent_uuid ~title:marker_title
-                     : Protocol.v2_block_record * string);
+                     : Worker_pure_data.block_record * string);
                   let final_cursor =
                     cleanup_block
                       receiver

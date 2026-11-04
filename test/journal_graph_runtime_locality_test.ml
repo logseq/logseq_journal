@@ -16,7 +16,7 @@ module Worker_producer = struct
     Coordination_test_fixture.fixture
       ~limits:
         { Coordination_test_fixture.limits with
-          response_budget_bytes = Protocol.maximum_response_bytes
+          response_budget_bytes = Worker_pure_data.maximum_response_bytes
         }
       2800L
   ;;
@@ -39,7 +39,7 @@ module Worker_producer = struct
   ;;
 
   let budget maximum_items =
-    W.read_budget session ~maximum_items ~maximum_bytes:Protocol.maximum_response_bytes
+    W.read_budget session ~maximum_items ~maximum_bytes:Worker_pure_data.maximum_response_bytes
     |> Result.get_ok
   ;;
 
@@ -131,7 +131,7 @@ module Runtime = struct
     | Some ((Protocol.V2_get_page_tree {maximum_depth=0;_}) as command),
       Protocol.V2_page_tree_outcome ({maximum_depth=1;items;page;_} as source) ->
       Hashtbl.remove fixture_requests key;
-      let roots=List.filter (fun (m:Protocol.v2_tree_member)->m.depth=0) items in
+      let roots=List.filter (fun (m:Worker_pure_data.tree_member)->m.depth=0) items in
       let result=Worker_producer.receive runtime
           {Protocol.api_version=Protocol.api_version;request_id=envelope.request_id;
            command}
@@ -140,14 +140,14 @@ module Runtime = struct
         List.fold_left (fun (kept:Production_runtime.output) (request:Protocol.request) ->
           let outcome = match request.command with
             | V2_get_children {parent;limit;cursor;_}
-              when limit <= 3 && List.exists (fun (m:Protocol.v2_tree_member)->Graph.Uuid.equal m.value.block.uuid parent) roots ->
-              let children=List.filter (fun (m:Protocol.v2_tree_member)->m.depth=1 && Graph.Uuid.equal m.parent parent) items
-                |> List.sort (fun (a:Protocol.v2_tree_member) (b:Protocol.v2_tree_member) -> compare (a.value.block.order,Graph.Uuid.to_string a.value.block.uuid) (b.value.block.order,Graph.Uuid.to_string b.value.block.uuid)) in
+              when limit <= 3 && List.exists (fun (m:Worker_pure_data.tree_member)->Graph.Uuid.equal m.value.block.uuid parent) roots ->
+              let children=List.filter (fun (m:Worker_pure_data.tree_member)->m.depth=1 && Graph.Uuid.equal m.parent parent) items
+                |> List.sort (fun (a:Worker_pure_data.tree_member) (b:Worker_pure_data.tree_member) -> compare (a.value.block.order,Graph.Uuid.to_string a.value.block.uuid) (b.value.block.order,Graph.Uuid.to_string b.value.block.uuid)) in
               let offset=Option.fold ~none:0 ~some:(fun c->Scanf.sscanf (Graph.Cursor.to_string c) "preview:%d" Fun.id) cursor in
               let selected=List.take limit (List.drop offset children) in
               let next_cursor=if offset+List.length selected < List.length children then Some (Graph.Cursor.of_string (Printf.sprintf "preview:%d" (offset+List.length selected)) |> Result.get_ok) else None in
-              Some (Protocol.V2_children_outcome {parent;revision_scope=V2_children_revision parent;scope_revision="fixture-children";
-                items=List.map (fun (m:Protocol.v2_tree_member)->Protocol.{value=m.value;revision=m.revision}) selected;next_cursor})
+              Some (Protocol.V2_children_outcome {parent;revision_scope=Worker_pure_data.V2_children_revision parent;scope_revision="fixture-children";
+                items=List.map (fun (m:Worker_pure_data.tree_member)->Worker_pure_data.{value=m.value;revision=m.revision}) selected;next_cursor})
             | V2_list_journals {through_day;_}
               when Option.fold ~none:false ~some:(fun day->through_day<day) (Hashtbl.find_opt fixture_days (Graph.Uuid.to_string page)) ->
               Some (Protocol.V2_journals_outcome {items=[];next_cursor=None})
@@ -183,7 +183,7 @@ let request_id (request : Protocol.request) = request.request_id
 let response request outcome =
   Hashtbl.replace fixture_requests (Graph.Uuid.to_string request.Protocol.request_id) request.command;
   (match outcome with
-   | Protocol.V2_journals_outcome {items;_} -> List.iter (fun (i:Protocol.v2_journal_item)->Hashtbl.replace fixture_days (Graph.Uuid.to_string i.page.uuid) i.journal_day) items
+   | Protocol.V2_journals_outcome {items;_} -> List.iter (fun (i:Worker_pure_data.journal_item)->Hashtbl.replace fixture_days (Graph.Uuid.to_string i.page.uuid) i.journal_day) items
    | _ -> ());
   Protocol.V2_response
     { api_version = Protocol.api_version; request_id = request_id request; outcome }
@@ -232,7 +232,7 @@ let block : Graph.block =
   }
 ;;
 
-let record : Protocol.v2_block_record =
+let record : Worker_pure_data.block_record =
   { block; task_status = None; rendered_page_title = page.title; tag_titles = [] }
 ;;
 
@@ -306,7 +306,7 @@ let changed runtime window =
           }))
 ;;
 
-let window ?(blocks = []) ?(pages = []) ?(scopes = []) () : Protocol.v2_change_window =
+let window ?(blocks = []) ?(pages = []) ?(scopes = []) () : Worker_pure_data.change_window =
   { id = "change-1"
   ; predecessor = "revision-1"
   ; successor = "revision-2"
@@ -376,7 +376,7 @@ let seed_large_feed runtime =
   let items =
     List.map
       (fun value ->
-         Protocol.{ value; revision = "block-1"; depth = 0; parent = page_uuid })
+         Worker_pure_data.{ value; revision = "block-1"; depth = 0; parent = page_uuid })
       records
   in
   ignore
@@ -421,7 +421,7 @@ let test_large_changes_are_bounded fail_one =
   let records, _ = seed_large_feed runtime in
   let first, later =
     List.partition
-      (fun (r : Protocol.v2_block_record) ->
+      (fun (r : Worker_pure_data.block_record) ->
          String.compare
            (Graph.Uuid.to_string r.block.uuid)
            "a1000000-0000-4000-9000-000000000140"
@@ -429,7 +429,7 @@ let test_large_changes_are_bounded fail_one =
       records
   in
   let ids records =
-    List.map (fun (r : Protocol.v2_block_record) -> r.block.uuid) records
+    List.map (fun (r : Worker_pure_data.block_record) -> r.block.uuid) records
   in
   let first_output = changed runtime (window ~blocks:(ids first) ()) in
   let outstanding = consume_ack runtime first_output in
@@ -470,7 +470,7 @@ let test_large_changes_are_bounded fail_one =
       (response
          foreground
          (Protocol.V2_block_outcome
-            (V2_missing_block { uuid = unrelated_uuid; revision = "missing" })))
+            (Worker_pure_data.V2_missing_block { uuid = unrelated_uuid; revision = "missing" })))
   in
   Alcotest.(check int)
     "foreground completion does not expand background window"
@@ -497,7 +497,7 @@ let test_large_changes_are_bounded fail_one =
         if fail_one && List.length seen = 6
         then Protocol.V2_failed { code = "invalidRequest"; message = "Read unavailable" }
         else
-          Protocol.V2_block_outcome (V2_missing_block { uuid = id; revision = "removed" })
+          Protocol.V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = id; revision = "removed" })
       in
       let output = Runtime.receive runtime (response request outcome) in
       let duplicate = Runtime.receive runtime (response request outcome) in
@@ -543,7 +543,7 @@ let test_reset_discards_background_backlog () =
     changed
       runtime
       (window
-         ~blocks:(List.map (fun (r : Protocol.v2_block_record) -> r.block.uuid) records)
+         ~blocks:(List.map (fun (r : Worker_pure_data.block_record) -> r.block.uuid) records)
          ())
   in
   let issued = consume_ack runtime output in
@@ -576,7 +576,7 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
   let runtime = Runtime.create () in
   let records, items = seed_large_feed runtime in
   List.iter
-    (fun (value : Protocol.v2_block_record) ->
+    (fun (value : Worker_pure_data.block_record) ->
        let request =
          Runtime.submit
            runtime
@@ -594,7 +594,7 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
            (response
               request
               (Protocol.V2_block_outcome
-                 (V2_present_block { value; revision = "block-1" })))
+                 (Worker_pure_data.V2_present_block { value; revision = "block-1" })))
          |> fun output -> only "register children" output.requests
        in
        ignore
@@ -604,7 +604,7 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
                request
                (Protocol.V2_children_outcome
                   { parent = value.block.uuid
-                  ; revision_scope = V2_children_revision value.block.uuid
+                  ; revision_scope = Worker_pure_data.V2_children_revision value.block.uuid
                   ; scope_revision = "children-1"
                   ; items = []
                   ; next_cursor = None
@@ -641,12 +641,12 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
         | V2_get_page_tree {maximum_depth;_} ->
           ( "tree"
           , Protocol.V2_page_tree_outcome
-              { page = page_uuid; maximum_depth; items=List.filter (fun (m:Protocol.v2_tree_member)->m.depth<=maximum_depth) items; next_cursor = None } )
+              { page = page_uuid; maximum_depth; items=List.filter (fun (m:Worker_pure_data.tree_member)->m.depth<=maximum_depth) items; next_cursor = None } )
         | V2_get_children { parent; _ } ->
           ( "children"
           , Protocol.V2_children_outcome
               { parent
-              ; revision_scope = V2_children_revision parent
+              ; revision_scope = Worker_pure_data.V2_children_revision parent
               ; scope_revision = "children-2"
               ; items = []
               ; next_cursor = None
@@ -654,14 +654,14 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
         | V2_get_outline_block { block = id; _ } ->
           let value =
             List.find
-              (fun (value : Protocol.v2_block_record) ->
+              (fun (value : Worker_pure_data.block_record) ->
                  Graph.Uuid.equal value.block.uuid id)
               records
           in
           ( "block"
-          , Protocol.V2_block_outcome (V2_present_block { value; revision = "block-2" }) )
+          , Protocol.V2_block_outcome (Worker_pure_data.V2_present_block { value; revision = "block-2" }) )
         | V2_get_page _ ->
-          "page", Protocol.V2_page_outcome (V2_present_page { page; revision = "page-2" })
+          "page", Protocol.V2_page_outcome (Worker_pure_data.V2_present_page { page; revision = "page-2" })
         | _ -> Alcotest.fail "resync request outside retained interests"
       in
       Hashtbl.replace
@@ -701,7 +701,7 @@ let test_queued_resync_announces_feed_refresh () =
     (changed
        runtime
        (window
-          ~blocks:(List.map (fun (r : Protocol.v2_block_record) -> r.block.uuid) records)
+          ~blocks:(List.map (fun (r : Worker_pure_data.block_record) -> r.block.uuid) records)
           ()));
   let output =
     Runtime.reconcile_push
@@ -806,7 +806,7 @@ let test_one_block_hydration_emits_only_changed_fragment () =
       (response
          hydration
          (Protocol.V2_block_outcome
-            (V2_present_block { value = updated_record; revision = "block-2" })))
+            (Worker_pure_data.V2_present_block { value = updated_record; revision = "block-2" })))
   in
   Alcotest.(check int) "no follow-up hydration" 0 (List.length output.requests);
   match output.responses with
@@ -829,7 +829,7 @@ let test_journal_interest_refetches_only_journal_query () =
   let runtime = Runtime.create () in
   ignore (load_feed runtime);
   let output =
-    changed runtime (window ~scopes:[ Protocol.V2_journal_index_interest ] ())
+    changed runtime (window ~scopes:[ Worker_pure_data.V2_journal_index_interest ] ())
   in
   require_ack output;
   match hydration_requests output with
@@ -844,7 +844,7 @@ let test_page_tree_interest_refetches_only_matching_tree () =
   let runtime = Runtime.create () in
   seed_feed runtime;
   let output =
-    changed runtime (window ~scopes:[ Protocol.V2_page_tree_interest page_uuid ] ())
+    changed runtime (window ~scopes:[ Worker_pure_data.V2_page_tree_interest page_uuid ] ())
   in
   require_ack output;
   match hydration_requests output with
@@ -878,7 +878,7 @@ let seed_children_interest ?(scope_revision="scope-children-1") runtime =
       (response
          block_request
          (Protocol.V2_block_outcome
-            (V2_present_block { value = record; revision = "block-detail-1" })))
+            (Worker_pure_data.V2_present_block { value = record; revision = "block-detail-1" })))
     |> fun output -> only "detail children request" output.requests
   in
   ignore
@@ -888,7 +888,7 @@ let seed_children_interest ?(scope_revision="scope-children-1") runtime =
           children_request
           (Protocol.V2_children_outcome
              { parent = block_uuid
-             ; revision_scope = V2_children_revision block_uuid
+             ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
              ; scope_revision
              ; items = []
              ; next_cursor = None
@@ -900,7 +900,7 @@ let test_children_interest_refetches_only_matching_children () =
   let runtime = Runtime.create () in
   seed_children_interest runtime;
   let output =
-    changed runtime (window ~scopes:[ Protocol.V2_children_interest block_uuid ] ())
+    changed runtime (window ~scopes:[ Worker_pure_data.V2_children_interest block_uuid ] ())
   in
   require_ack output;
   match hydration_requests output with
@@ -1076,7 +1076,7 @@ let test_detail_resolves_unretained_page ?(tagged = false) () =
       (response
          read
          (Protocol.V2_block_outcome
-            (V2_present_block
+            (Worker_pure_data.V2_present_block
                { value = (if tagged then { record with tag_titles = [ "周末"; "旅行" ] } else record)
                ; revision = "block-1" })))
   in
@@ -1093,7 +1093,7 @@ let test_detail_resolves_unretained_page ?(tagged = false) () =
       (response
          read
          (Protocol.V2_page_outcome
-            (V2_present_page { page = ordinary_page; revision = "ordinary-page-1" })))
+            (Worker_pure_data.V2_present_page { page = ordinary_page; revision = "ordinary-page-1" })))
   in
   let children = only "ordinary page direct children" output.requests in
   let child_uuid = Graph.Uuid.of_string "a1000000-0000-4000-9000-000000000003" |> Result.get_ok in
@@ -1104,10 +1104,10 @@ let test_detail_resolves_unretained_page ?(tagged = false) () =
          children
          (Protocol.V2_children_outcome
             { parent = block_uuid
-            ; revision_scope = V2_children_revision block_uuid
+            ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
             ; scope_revision = "children-1"
             ; items = (if tagged then
-                [ { Protocol.value = { record with block =
+                [ { Worker_pure_data.value = { record with block =
                       { block with uuid = child_uuid; parent = block_uuid; title = "Child" }
                     ; tag_titles = [ "地图" ] }
                   ; revision = "child-1" } ] else [])
@@ -1144,7 +1144,7 @@ let initial_detail_children runtime =
     runtime
     (response
        first
-       (V2_block_outcome (V2_present_block { value = record; revision = "block-1" })))
+       (V2_block_outcome (Worker_pure_data.V2_present_block { value = record; revision = "block-1" })))
   |> fun output -> only "detail children" output.requests
 ;;
 
@@ -1178,7 +1178,7 @@ let test_detail_empty_more_preserves_cursor () =
          original
          (V2_children_outcome
             { parent = block_uuid
-            ; revision_scope = V2_children_revision block_uuid
+            ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
             ; scope_revision = "children-1"
             ; items = []
             ; next_cursor = Some cursor
@@ -1205,10 +1205,10 @@ let test_detail_forwards_child_cursor () =
          first
          (V2_children_outcome
             { parent = block_uuid
-            ; revision_scope = V2_children_revision block_uuid
+            ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
             ; scope_revision = "children-1"
             ; items =
-                [ { Protocol.value =
+                [ { Worker_pure_data.value =
                       { record with
                         block =
                           { block with
@@ -1257,7 +1257,7 @@ let test_detail_forwards_child_cursor () =
       runtime
       (response
          first
-         (V2_block_outcome (V2_present_block { value = record; revision = "block-1" })))
+         (V2_block_outcome (Worker_pure_data.V2_present_block { value = record; revision = "block-1" })))
     |> fun output -> only "continuation child read" output.requests
   in
   match child.command with
@@ -1369,7 +1369,7 @@ let prepare_paged_refresh ?(ordinary=false) ?(defer=false) kind =
         receive
           lookup
           (V2_block_outcome
-             (V2_present_block
+             (Worker_pure_data.V2_present_block
                 { value = { record with block = { block with order = "a1" } }
                 ; revision = "block-1"
                 }))
@@ -1378,7 +1378,7 @@ let prepare_paged_refresh ?(ordinary=false) ?(defer=false) kind =
       let children =
         receive
           page_lookup
-          (V2_page_outcome (V2_present_page { page; revision = "page-1" }))
+          (V2_page_outcome (Worker_pure_data.V2_present_page { page; revision = "page-1" }))
         |> next "target child lookup"
       in
       ignore
@@ -1386,7 +1386,7 @@ let prepare_paged_refresh ?(ordinary=false) ?(defer=false) kind =
            children
            (V2_children_outcome
               { parent = block_uuid
-              ; revision_scope = V2_children_revision block_uuid
+              ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
               ; scope_revision = "target-children-1"
               ; items = []
               ; next_cursor = None
@@ -1416,7 +1416,7 @@ let prepare_paged_refresh ?(ordinary=false) ?(defer=false) kind =
        | Task_change ->
          V2_mutation_committed
            { mutation_id
-           ; status = V2_applied
+           ; status = Worker_pure_data.V2_applied
            ; generation = "graph-1"
            ; before_projection_revision = "projection-1"
            ; after_projection_revision = "projection-2"
@@ -1436,7 +1436,7 @@ let summary_response request page lookup children next_cursor revision =
     request
     (Protocol.V2_block_summary_outcome
        { lookup
-       ; page = Some (V2_present_page { page; revision = "page-1" })
+       ; page = Some (Worker_pure_data.V2_present_page { page; revision = "page-1" })
        ; items = children
        ; next_cursor
        ; scope_revision = "target-children-1"
@@ -1449,7 +1449,7 @@ let check_target_summary (request : Protocol.request) cursor =
   match request.command with
   | V2_get_outline_block_summary { block; limit; cursor = actual_cursor } ->
     Alcotest.(check bool) "target identity" true (Graph.Uuid.equal block block_uuid);
-    Alcotest.(check int) "bounded target children" Protocol.default_page_size limit;
+    Alcotest.(check int) "bounded target children" Worker_pure_data.default_page_size limit;
     Alcotest.(check bool) "target children cursor" true (actual_cursor = cursor)
   | _ -> Alcotest.fail "confirmation must issue one canonical target read"
 ;;
@@ -1464,7 +1464,7 @@ let test_paged_mutation_refresh kind result =
           { block with page = page.uuid; parent = page.uuid; title = "Committed target" }
       }
     in
-    let lookup = Protocol.V2_present_block { value = target; revision = "target-2" } in
+    let lookup = Worker_pure_data.V2_present_block { value = target; revision = "target-2" } in
     let completed =
       match result with
       | Found ->
@@ -1477,7 +1477,7 @@ let test_paged_mutation_refresh kind result =
           (summary_response
              refresh
              page
-             (V2_missing_block { uuid = block_uuid; revision = "missing-2" })
+             (Worker_pure_data.V2_missing_block { uuid = block_uuid; revision = "missing-2" })
              []
              None
              "projection-2")
@@ -1539,9 +1539,9 @@ let test_ordinary_delete_readback committed paged () =
   let module I=Worker_producer.I in
   let runtime,page,request=prepare_paged_refresh ~ordinary:true ~defer:committed Delete_conflict in
   let target={record with block={block with page=page.uuid;parent=page.uuid;title="Ordinary canonical target"}} in
-  let lookup=Protocol.V2_present_block{value=target;revision="canonical-current"} in
+  let lookup=Worker_pure_data.V2_present_block{value=target;revision="canonical-current"} in
   let summary request_id cursor=Protocol.V2_response{api_version=Protocol.api_version;request_id;
-    outcome=V2_block_summary_outcome{lookup;page=Some(V2_present_page{page;revision="page-2"});items=[];
+    outcome=V2_block_summary_outcome{lookup;page=Some(Worker_pure_data.V2_present_page{page;revision="page-2"});items=[];
       next_cursor=cursor;scope_revision="ordinary-children";generation="generation:v1:1:1";projection_revision="projection:v1:2"}} in
   let output=if committed then (
     let mutation_id,root,preconditions=match request.command with
@@ -1552,7 +1552,7 @@ let test_ordinary_delete_readback committed paged () =
     let intent=W.mutation_intent session ~mutation_id(W.Delete_blocks{root;preconditions}) |> Result.get_ok in
     Alcotest.(check bool) "ordinary mutation business owner bound" true
       (Production_runtime.bind_mutation runtime request ~presentation ~intent);
-    let receipt=(let (Protocol.V2_response receipt_packet as packet) = (response request(V2_mutation_committed{mutation_id;status=V2_applied;generation="generation:v1:1:1";
+    let receipt=(let (Protocol.V2_response receipt_packet as packet) = (response request(V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
         before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"})) in
       match I.reply session ~request_id:(W.request_id request.request_id) (W.Mutate intent)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
@@ -1588,11 +1588,11 @@ let test_conflict_missing_after_empty_more changed_version () =
   let runtime, page, first = prepare_paged_refresh Delete_conflict in
   let cursor = Graph.Cursor.of_string "empty-present-prefix" |> Result.get_ok in
   let prefix = Runtime.receive runtime
-    (summary_response first page (V2_present_block {value=record;revision="target-2"})
+    (summary_response first page (Worker_pure_data.V2_present_block {value=record;revision="target-2"})
       [] (Some cursor) "projection-2") in
   let next = only "empty More target continuation" prefix.requests in
   let missing request revision = summary_response request page
-    (V2_missing_block {uuid=block_uuid;revision="missing-2"}) [] None revision in
+    (Worker_pure_data.V2_missing_block {uuid=block_uuid;revision="missing-2"}) [] None revision in
   let output = Runtime.receive runtime
     (missing next (if changed_version then "projection-3" else "projection-2")) in
   if changed_version then (
@@ -1632,7 +1632,7 @@ let test_target_summary_uses_owned_worker_query () =
           }) ->
      Alcotest.(check int)
        "retained summary budget"
-       Protocol.default_page_size
+       Worker_pure_data.default_page_size
        maximum_items
    | _ -> Alcotest.fail "canonical summary bypasses typed coordinator");
   ignore (Production_runtime.abandon runtime request);
@@ -1652,7 +1652,7 @@ let summary_children ?(page = page_uuid) count =
       ; title = Printf.sprintf "Canonical child %d" index
       }
     in
-    Protocol.{ value = { record with block = child }; revision = "child-2" })
+    Worker_pure_data.{ value = { record with block = child }; revision = "child-2" })
 ;;
 
 let test_target_confirmation kind title count =
@@ -1670,7 +1670,7 @@ let test_target_confirmation kind title count =
       (summary_response
          refresh
          page
-         (V2_present_block { value = canonical; revision = "canonical-2" })
+         (Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" })
          children
          None
          "projection-2")
@@ -1705,7 +1705,7 @@ let test_target_confirmation kind title count =
       (summary_response
          refresh
          page
-         (V2_present_block { value = canonical; revision = "canonical-2" })
+         (Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" })
          children
          None
          "projection-2")
@@ -1722,7 +1722,7 @@ let test_target_children_continue () =
     }
   in
   let lookup =
-    Protocol.V2_present_block { value = canonical; revision = "canonical-2" }
+    Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" }
   in
   let children = summary_children ~page:page.uuid 201 in
   let current = ref refresh in
@@ -1733,8 +1733,8 @@ let test_target_children_continue () =
     let items =
       List.filteri
         (fun index _ ->
-           index >= batch * Protocol.default_page_size
-           && index < (batch + 1) * Protocol.default_page_size)
+           index >= batch * Worker_pure_data.default_page_size
+           && index < (batch + 1) * Worker_pure_data.default_page_size)
         children
     in
     let cursor =
@@ -1776,7 +1776,7 @@ let test_target_children_continue () =
 let test_target_repeated_cursor_settles () =
   let runtime, page, first = target_refresh `Status in
   let lookup =
-    Protocol.V2_present_block
+    Worker_pure_data.V2_present_block
       { value =
           { record with block = { block with page = page.uuid; parent = page.uuid } }
       ; revision = "canonical-2"
@@ -1808,7 +1808,7 @@ let test_target_terminal kind terminal =
       summary_response
         refresh
         page
-        (V2_missing_block { uuid = block_uuid; revision = "missing" })
+        (Worker_pure_data.V2_missing_block { uuid = block_uuid; revision = "missing" })
         []
         None
         "projection-2"
@@ -1821,7 +1821,7 @@ let test_target_terminal kind terminal =
       summary_response
         refresh
         page
-        (V2_missing_block { uuid = block_uuid; revision = "missing" })
+        (Worker_pure_data.V2_missing_block { uuid = block_uuid; revision = "missing" })
         []
         None
         "projection-2"
@@ -1851,7 +1851,7 @@ let test_target_version_fence () =
     { record with block = { block with page = page.uuid; parent = page.uuid } }
   in
   let lookup =
-    Protocol.V2_present_block { value = canonical; revision = "canonical-2" }
+    Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" }
   in
   let cursor = Graph.Cursor.of_string "target-children-next" |> Result.get_ok in
   let first =
@@ -1861,7 +1861,7 @@ let test_target_version_fence () =
          refresh
          page
          lookup
-         (summary_children ~page:page.uuid Protocol.default_page_size)
+         (summary_children ~page:page.uuid Worker_pure_data.default_page_size)
          (Some cursor)
          "projection-2")
   in
@@ -1893,7 +1893,7 @@ let test_target_rejects_wrong_identity () =
       (summary_response
          refresh
          page
-         (V2_present_block
+         (Worker_pure_data.V2_present_block
             { value = { record with block = { block with uuid = unrelated_uuid } }
             ; revision = "foreign"
             })
@@ -1946,7 +1946,7 @@ let test_target_blank_image_and_deep_child () =
            (summary_response
               refresh
               page
-              (V2_present_block { value = canonical; revision = "canonical-2" })
+              (Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" })
               [ image ]
               None
               "projection-2")
@@ -2013,7 +2013,7 @@ let test_target_newer_confirmation_fences_old () =
          mutation
          (Protocol.V2_mutation_committed
             { mutation_id = uuid "a1000000-0000-4000-a000-000000000073"
-            ; status = V2_applied
+            ; status = Worker_pure_data.V2_applied
             ; generation = "graph-1"
             ; before_projection_revision = "projection-2"
             ; after_projection_revision = "projection-3"
@@ -2025,7 +2025,7 @@ let test_target_newer_confirmation_fences_old () =
     summary_response
       request
       page
-      (V2_present_block
+      (Worker_pure_data.V2_present_block
          { value =
              { record with
                block = { block with title; page = page.uuid; parent = page.uuid }
@@ -2063,7 +2063,7 @@ let test_target_invisible_root_has_timeline_only_removal () =
       (summary_response
          refresh
          page
-         (V2_present_block { value = canonical; revision = "canonical-2" })
+         (Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" })
          []
          None
          "projection-2")
@@ -2097,12 +2097,12 @@ let test_target_confirmation_retains_page_interest completed =
          (summary_response
             refresh
             page
-            (V2_present_block { value = canonical; revision = "canonical-2" })
+            (Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" })
             []
             None
             "projection-2"));
   let output =
-    changed runtime (window ~scopes:[ Protocol.V2_page_tree_interest page.uuid ] ())
+    changed runtime (window ~scopes:[ Worker_pure_data.V2_page_tree_interest page.uuid ] ())
   in
   require_ack output;
   match hydration_requests output with
@@ -2127,14 +2127,14 @@ let test_target_confirmation_retains_child_mutation_context () =
     { record with block = { block with page = page.uuid; parent = page.uuid } }
   in
   let children = summary_children ~page:page.uuid 1 in
-  let child = (List.hd children).Protocol.value.block.uuid in
+  let child = (List.hd children).Worker_pure_data.value.block.uuid in
   ignore
     (Runtime.receive
        runtime
        (summary_response
           refresh
           page
-          (V2_present_block { value = canonical; revision = "canonical-2" })
+          (Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" })
           children
           None
           "projection-2"));
@@ -2202,7 +2202,7 @@ let test_child_only_day_pages outcome =
   let runtime = Runtime.create () in
   let tree = initial_tree runtime in
   let cursor = Graph.Cursor.of_string "children-after-3" |> Result.get_ok in
-  let root : Protocol.v2_tree_member =
+  let root : Worker_pure_data.tree_member =
     { value = record; revision = "root-1"; depth = 0; parent = page_uuid }
   in
   let initial =
@@ -2292,7 +2292,7 @@ let test_child_only_day_pages outcome =
 let test_feed_with_blank_root_continues () =
   let runtime = Runtime.create () in
   let tree = initial_tree runtime in
-  let blank : Protocol.v2_tree_member =
+  let blank : Worker_pure_data.tree_member =
     { value = { record with block = { block with title = " " } }
     ; revision = "root-1"
     ; depth = 0
@@ -2451,7 +2451,7 @@ let target_response request title =
   response
     request
     (Protocol.V2_block_outcome
-       (V2_present_block
+       (Worker_pure_data.V2_present_block
           { value = { record with block = { block with uuid = target_uuid; title } }
           ; revision = title
           }))
@@ -2470,7 +2470,7 @@ let outline_after_page_miss runtime request =
   match request.Protocol.command with
   | V2_get_page {page;_} ->
     Runtime.receive runtime (response request (Protocol.V2_page_outcome
-      (V2_missing_page {uuid=page;revision="page-absent"})))
+      (Worker_pure_data.V2_missing_page {uuid=page;revision="page-absent"})))
     |> fun output -> only "outline lookup after page absence" output.requests
   | V2_get_outline_block _ -> request
   | _ -> Alcotest.fail "not a reference lookup"
@@ -2521,7 +2521,7 @@ let test_reference_hydration_and_changes () =
       (response
          deleted_request
          (Protocol.V2_block_outcome
-            (V2_missing_block { uuid = target_uuid; revision = "deleted" })))
+            (Worker_pure_data.V2_missing_block { uuid = target_uuid; revision = "deleted" })))
   in
   Alcotest.(check bool)
     "missing target clears cached source"
@@ -2673,7 +2673,7 @@ let test_shorter_reference_path_discovers_nested_targets () =
          (response
             request
             (Protocol.V2_block_outcome
-               (V2_present_block
+               (Worker_pure_data.V2_present_block
                   { value =
                       { record with
                         block = { block with uuid = uuid (id n); title = link (n + 1) }
@@ -2714,7 +2714,7 @@ let test_reference_burst_is_bounded () =
       (response
          request
          (Protocol.V2_page_outcome
-            (V2_missing_page
+            (Worker_pure_data.V2_missing_page
                { uuid =
                    (match request.command with
                     | V2_get_page { page; _ } -> page
@@ -2766,7 +2766,7 @@ let reference_tree_response request title =
        ; items =
            List.map
              (fun value ->
-                Protocol.{ value; revision = title; depth = 0; parent = page_uuid })
+                Worker_pure_data.{ value; revision = title; depth = 0; parent = page_uuid })
              [ root; target ]
        })
 ;;
@@ -3034,15 +3034,15 @@ module Copy_issuer = struct
   let issuer, _, _, session = Coordination_test_fixture.fixture
     ~graph:(uuid "a1000000-0000-4000-8000-0000000000ff")
     ~limits:{Coordination_test_fixture.limits with
-      response_budget_bytes=Protocol.maximum_response_bytes} 2840L
+      response_budget_bytes=Worker_pure_data.maximum_response_bytes} 2840L
   module I = (val issuer : Copy_worker.ISSUER)
   let serial = ref 0
   let next_id () =
     incr serial;
     uuid(Printf.sprintf "a1000000-0000-4000-9000-%012x" !serial)
   let request query =
-    let budget=Copy_worker.read_budget session ~maximum_items:Protocol.maximum_page_size
-      ~maximum_bytes:Protocol.maximum_response_bytes |> Result.get_ok in
+    let budget=Copy_worker.read_budget session ~maximum_items:Worker_pure_data.maximum_page_size
+      ~maximum_bytes:Worker_pure_data.maximum_response_bytes |> Result.get_ok in
     Copy_worker.Query(budget,query)
   let wire query = I.request session ~request_id:(Copy_worker.request_id(next_id()))
     (request query) |> Result.get_ok
@@ -3102,7 +3102,7 @@ let copy_start root =
 let copy_children ?cursor ?(revision = "children-1") parent items =
   Protocol.V2_children_outcome
     { parent
-    ; revision_scope = V2_children_revision parent
+    ; revision_scope = Worker_pure_data.V2_children_revision parent
     ; scope_revision = revision
     ; items
     ; next_cursor = cursor
@@ -3114,11 +3114,11 @@ let copy_root state effects title =
     state
     effects
     (Protocol.V2_block_outcome
-       (V2_present_block
+       (Worker_pure_data.V2_present_block
           { value = { record with block = { block with title } }; revision = "root-1" }))
 ;;
 
-let copy_child id parent title : Protocol.v2_child_member =
+let copy_child id parent title : Worker_pure_data.child_member =
   { value = { record with block = { block with uuid = id; parent; title } }
   ; revision = "child-1"
   }
@@ -3239,9 +3239,9 @@ let copy_expect_failure state effects outcome =
 let test_copy_rejects_missing_failed_or_changed_graph () =
   let state, effects = copy_start block_uuid in
   let missing_state, missing_effects = copy_reply state effects
-    (Protocol.V2_block_outcome (V2_missing_block {uuid=block_uuid;revision="missing"})) in
+    (Protocol.V2_block_outcome (Worker_pure_data.V2_missing_block {uuid=block_uuid;revision="missing"})) in
   copy_expect_failure missing_state missing_effects
-    (Protocol.V2_page_outcome (V2_missing_page {uuid=block_uuid;revision="missing"}));
+    (Protocol.V2_page_outcome (Worker_pure_data.V2_missing_page {uuid=block_uuid;revision="missing"}));
   let state, effects = copy_root state effects "Root" in
   copy_expect_failure
     state
@@ -3294,7 +3294,7 @@ let test_copy_rejects_oversized_text () =
     state
     effects
     (Protocol.V2_block_outcome
-       (V2_present_block
+       (Worker_pure_data.V2_present_block
           { value =
               { record with
                 block = { block with title = String.make ((256 * 1024) + 1) 'x' }
@@ -3326,9 +3326,9 @@ let test_copy_result_fits_serialized_clipboard () =
       let size=payload/count+(if index<payload mod count then 1 else 0) in
       copy_child (uuid(Printf.sprintf "a1000000-0000-4000-9100-%012x" index))
         block_uuid (String.make size character)) in
-    let source=prefix ^ String.concat "" (List.map (fun (child:Protocol.v2_child_member) ->
+    let source=prefix ^ String.concat "" (List.map (fun (child:Worker_pure_data.child_member) ->
       "\n  - " ^ String.concat "\n    "
-        (String.split_on_char '\n' child.Protocol.value.block.title)) children) in
+        (String.split_on_char '\n' child.Worker_pure_data.value.block.title)) children) in
     let state,effects=copy_start block_uuid in
     let state,effects=copy_root state effects prefix in
     let rec gather state effects page = function
@@ -3340,8 +3340,8 @@ let test_copy_result_fits_serialized_clipboard () =
           (copy_children ?cursor block_uuid [child]) in
         gather state effects (page+1) rest in
     let state,effects=gather state effects 0 children in
-    let state,effects=List.fold_left (fun (state,effects) (child:Protocol.v2_child_member) ->
-      copy_reply state effects (copy_children child.Protocol.value.block.uuid []))
+    let state,effects=List.fold_left (fun (state,effects) (child:Worker_pure_data.child_member) ->
+      copy_reply state effects (copy_children child.Worker_pure_data.value.block.uuid []))
       (state,effects) children in
     let effects=match effects with
       | [Copy.Read _] -> snd(copy_reply state effects
@@ -3378,7 +3378,7 @@ let seed_ordinary_detail runtime =
       (response
          request
          (Protocol.V2_block_outcome
-            (V2_present_block { value = record; revision = "root-1" })))
+            (Worker_pure_data.V2_present_block { value = record; revision = "root-1" })))
     |> fun output -> only "ordinary detail page" output.requests
   in
   let request =
@@ -3387,7 +3387,7 @@ let seed_ordinary_detail runtime =
       (response
          request
          (Protocol.V2_page_outcome
-            (V2_present_page { page = ordinary_page; revision = "page-1" })))
+            (Worker_pure_data.V2_present_page { page = ordinary_page; revision = "page-1" })))
     |> fun output -> only "ordinary detail children" output.requests
   in
   let child =
@@ -3402,7 +3402,7 @@ let seed_ordinary_detail runtime =
           request
           (Protocol.V2_children_outcome
              { parent = block_uuid
-             ; revision_scope = V2_children_revision block_uuid
+             ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
              ; scope_revision = "children-1"
              ; items = [ { value = child; revision = "child-1" } ]
              ; next_cursor = None
@@ -3429,7 +3429,7 @@ let test_ordinary_detail_point_change child_changed =
       (response
          request
          (Protocol.V2_block_outcome
-            (V2_present_block
+            (Worker_pure_data.V2_present_block
                { value =
                    { value with block = { value.block with title = "Updated detail" } }
                ; revision = "detail-2"
@@ -3460,7 +3460,7 @@ let test_detail_children_uses_latest_root () =
       runtime
       (window
          ~blocks:[ block_uuid ]
-         ~scopes:[ Protocol.V2_children_interest block_uuid ]
+         ~scopes:[ Worker_pure_data.V2_children_interest block_uuid ]
          ())
   in
   let point =
@@ -3485,7 +3485,7 @@ let test_detail_children_uses_latest_root () =
        (response
           point
           (Protocol.V2_block_outcome
-             (V2_present_block
+             (Worker_pure_data.V2_present_block
                 { value = { record with block = { block with title = "Fresh root" }; tag_titles = [ "Fresh tags" ] }
                 ; revision = "root-2"
                 }))));
@@ -3496,7 +3496,7 @@ let test_detail_children_uses_latest_root () =
          children
          (Protocol.V2_children_outcome
             { parent = block_uuid
-            ; revision_scope = V2_children_revision block_uuid
+            ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
             ; scope_revision = "children-2"
             ; items = []
             ; next_cursor = None
@@ -3580,7 +3580,7 @@ let seed_favorite_dependencies
                      ; membership_order = "a"
                      ; membership_revision = "membership-1"
                      ; target =
-                         V2_favorite_block
+                         Worker_pure_data.V2_favorite_block
                            { uuid = block_uuid
                            ; title = block.title
                            ; task_status = None
@@ -3606,7 +3606,7 @@ let seed_favorite_dependencies
            | _ -> Alcotest.fail "favorite memberships bypassed typed coordinator");
           Protocol.V2_children_outcome
             { parent
-            ; revision_scope = V2_children_revision parent
+            ; revision_scope = Worker_pure_data.V2_children_revision parent
             ; scope_revision = "favorites-memberships-1"
             ; items =
                 [ { value =
@@ -3641,9 +3641,9 @@ let seed_favorite_dependencies
             else Alcotest.fail "dependency read escaped favorite ancestry"
           in
           Protocol.V2_block_outcome
-            (V2_present_block { value; revision = "dependency-1" })
+            (Worker_pure_data.V2_present_block { value; revision = "dependency-1" })
         | V2_get_page { page = id; _ } when Graph.Uuid.equal id page_uuid ->
-          Protocol.V2_page_outcome (V2_present_page { page; revision = "page-1" })
+          Protocol.V2_page_outcome (Worker_pure_data.V2_present_page { page; revision = "page-1" })
         | _ -> Alcotest.fail "favorite dependency used an unbounded discovery request"
       in
       let output = Runtime.receive runtime (response request outcome) in
@@ -3737,7 +3737,7 @@ let test_favorite_changes_locality () =
          true
          (invalidates_favorites (changed runtime window)))
     [ window ~blocks:[ membership_uuid ] ()
-    ; window ~scopes:[ Protocol.V2_children_interest favorites_page_uuid ] ()
+    ; window ~scopes:[ Worker_pure_data.V2_children_interest favorites_page_uuid ] ()
     ];
   List.iter
     (fun (window, outcome) ->
@@ -3756,7 +3756,7 @@ let test_favorite_changes_locality () =
          (invalidates_favorites out))
     [ ( window ~blocks:[ block_uuid ] ()
       , Protocol.V2_block_outcome
-          (V2_present_block
+          (Worker_pure_data.V2_present_block
              { value =
                  { record with
                    block = { block with parent = ancestor_uuid; title = "Fresh favorite" }
@@ -3765,10 +3765,10 @@ let test_favorite_changes_locality () =
              }) )
     ; ( window ~blocks:[ ancestor_uuid ] ()
       , Protocol.V2_block_outcome
-          (V2_missing_block { uuid = ancestor_uuid; revision = "missing-2" }) )
+          (Worker_pure_data.V2_missing_block { uuid = ancestor_uuid; revision = "missing-2" }) )
     ; ( window ~pages:[ page_uuid ] ()
       , Protocol.V2_page_outcome
-          (V2_present_page { page = { page with recycled = true }; revision = "page-2" })
+          (Worker_pure_data.V2_present_page { page = { page with recycled = true }; revision = "page-2" })
       )
     ]
 ;;
@@ -3783,7 +3783,7 @@ let test_favorite_sibling_structure_is_local () =
          ~blocks:[ unrelated_uuid ]
          ~pages:[ page_uuid ]
          ~scopes:
-           [ Protocol.V2_children_interest page_uuid; V2_page_tree_interest page_uuid ]
+           [ Worker_pure_data.V2_children_interest page_uuid; Worker_pure_data.V2_page_tree_interest page_uuid ]
          ())
   in
   Alcotest.(check bool)
@@ -3799,7 +3799,7 @@ let test_favorite_sibling_structure_is_local () =
              runtime
              (response
                 request
-                (Protocol.V2_page_outcome (V2_present_page { page; revision = "page-2" })))
+                (Protocol.V2_page_outcome (Worker_pure_data.V2_present_page { page; revision = "page-2" })))
          in
          Alcotest.(check bool)
            "unchanged live ancestor preserves Favorites"
@@ -3824,7 +3824,7 @@ let test_favorite_ancestor_title_is_local () =
       (response
          read
          (Protocol.V2_block_outcome
-            (V2_present_block
+            (Worker_pure_data.V2_present_block
                { value =
                    { record with
                      block =
@@ -3874,8 +3874,7 @@ let test_favorite_dependency_limit () =
         let uuid =
           uuid (Printf.sprintf "a2000000-0000-4000-8000-%012d" ((batch * 200) + offset))
         in
-        Protocol.
-          { value =
+        Worker_pure_data.{ value =
               { record with
                 block =
                   { block with
@@ -3897,7 +3896,7 @@ let test_favorite_dependency_limit () =
            read
            (Protocol.V2_children_outcome
               { parent = favorites_page_uuid
-              ; revision_scope = V2_children_revision favorites_page_uuid
+              ; revision_scope = Worker_pure_data.V2_children_revision favorites_page_uuid
               ; scope_revision = "members-1"
               ; items
               ; next_cursor
@@ -4085,7 +4084,7 @@ let test_feed_date_budget_failure_restarts_bound_cursor () =
   let runtime = Runtime.create () in
   set_calendar ~clock:1_788_307_200. runtime;
   let first = feed_window_request runtime ~days:3 ~slots:16 in
-  let item : Protocol.v2_journal_item =
+  let item : Worker_pure_data.journal_item =
     { page; journal_day = 20260901; revision = "page-1" }
   in
   let more = Graph.Cursor.of_string "date-budget-after-one" |> Result.get_ok in
@@ -4155,7 +4154,7 @@ let test_feed_window_fits_encoded_response_budget () =
     ; values_truncated = false
     }
   in
-  let item n : Protocol.v2_journal_item =
+  let item n : Worker_pure_data.journal_item =
     let id = uuid (Printf.sprintf "a3000000-0000-4000-8000-%012d" n) in
     { page = { page with uuid = id; properties = [ property ] }
     ; journal_day = 20260901
@@ -4171,11 +4170,11 @@ let test_feed_window_fits_encoded_response_budget () =
   Alcotest.(check bool)
     "full 200-item metadata batch exceeds real byte budget"
     true
-    (encoded Protocol.maximum_page_size > Protocol.maximum_response_bytes);
+    (encoded Worker_pure_data.maximum_page_size > Worker_pure_data.maximum_response_bytes);
   Alcotest.(check bool)
     "requested feed metadata fits unchanged byte budget"
     true
-    (encoded (journal_request_limit request) <= Protocol.maximum_response_bytes);
+    (encoded (journal_request_limit request) <= Worker_pure_data.maximum_response_bytes);
   Alcotest.(check int)
     "read only the seven requested days"
     7
@@ -4187,7 +4186,7 @@ let test_feed_continuation_reads_only_missing_days () =
   set_calendar ~clock:1_788_278_400. runtime;
   let first = feed_window_request runtime ~days:3 ~slots:16 in
   let cursor = Graph.Cursor.of_string "journal-after-one" |> Result.get_ok in
-  let valid : Protocol.v2_journal_item = {page;journal_day=20260901;revision="journal-first"} in
+  let valid : Worker_pure_data.journal_item = {page;journal_day=20260901;revision="journal-first"} in
   let output = Runtime.receive runtime (response first (V2_journals_outcome
       {items=[valid;{valid with page={page with recycled=true}}];next_cursor=Some cursor})) in
   let tree=only "resolve available date before fetching more metadata" output.requests in
@@ -4216,7 +4215,7 @@ let test_feed_window_bounds_and_singleton_failure () =
          "day, slot and protocol bounds"
          expected
          (journal_request_limit request))
-    [ 1, 2, 1; 10, 6, 10; 500, 1000, Protocol.maximum_page_size ];
+    [ 1, 2, 1; 10, 6, 10; 500, 1000, Worker_pure_data.maximum_page_size ];
   let runtime = Runtime.create () in
   let request = feed_window_request runtime ~days:1 ~slots:2 in
   let oversized_page =
@@ -4225,7 +4224,7 @@ let test_feed_window_bounds_and_singleton_failure () =
         List.init 5 (fun n ->
           { Graph.ident = Printf.sprintf "fixture/large-property-%d" n
           ; uuid = uuid (Printf.sprintf "a4000000-0000-4000-8000-%012d" n)
-          ; title = String.make Protocol.maximum_title_bytes 'x'
+          ; title = String.make Worker_pure_data.maximum_title_bytes 'x'
           ; schema =
               { property_type = String; cardinality = One; hidden = false; public = true }
           ; values = []
@@ -4249,7 +4248,7 @@ let test_feed_window_bounds_and_singleton_failure () =
   Alcotest.(check bool)
     "one complete oversized item cannot fit"
     true
-    (Protocol.encoded_response_bytes oversized > Protocol.maximum_response_bytes);
+    (Protocol.encoded_response_bytes oversized > Worker_pure_data.maximum_response_bytes);
   let failed =
     Runtime.receive
       runtime
@@ -4293,15 +4292,14 @@ let check_preview count (entry : Journal_graph_projection.timeline_entry) =
 let test_bounded_preview_tree_paths () =
   let count = 199 in
   let children = summary_children count in
-  let root : Protocol.v2_tree_member =
+  let root : Worker_pure_data.tree_member =
     { value = record; revision = "root-1"; depth = 0; parent = page_uuid }
   in
   let items =
     root
     :: List.rev_map
-         (fun (child : Protocol.v2_child_member) ->
-            Protocol.
-              { value = child.value
+         (fun (child : Worker_pure_data.child_member) ->
+            Worker_pure_data.{ value = child.value
               ; revision = child.revision
               ; depth = 1
               ; parent = block_uuid
@@ -4365,7 +4363,7 @@ let test_bounded_preview_tree_paths () =
    | Feed_loaded {feed;complete=true;_} -> check_preview 3 (only "day entry" (List.hd feed.days).entries)
    | _ -> Alcotest.fail "preview day result lost owner");
   let changed_output =
-    changed runtime (window ~scopes:[ Protocol.V2_page_tree_interest page_uuid ] ())
+    changed runtime (window ~scopes:[ Worker_pure_data.V2_page_tree_interest page_uuid ] ())
   in
   let refresh = only "preview remote structure" (hydration_requests changed_output) in
   let remote = Runtime.receive runtime (tree_page refresh items None) in
@@ -4381,7 +4379,7 @@ let test_bounded_preview_target_pages kind count () =
     { record with block = { block with page = page.uuid; parent = page.uuid } }
   in
   let lookup =
-    Protocol.V2_present_block { value = canonical; revision = "canonical-2" }
+    Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" }
   in
   let children = summary_children ~page:page.uuid count in
   let rec complete request cursor batch = function
@@ -4391,8 +4389,8 @@ let test_bounded_preview_target_pages kind count () =
         (summary_response request page lookup [] None "projection-2")
     | remaining ->
       check_target_summary request cursor;
-      let items = List.take Protocol.default_page_size remaining in
-      let tail = List.drop Protocol.default_page_size remaining in
+      let items = List.take Worker_pure_data.default_page_size remaining in
+      let tail = List.drop Worker_pure_data.default_page_size remaining in
       let next =
         if tail = []
         then None
@@ -4439,11 +4437,11 @@ let test_preview_preserves_full_detail_and_copy () =
   let count = 199 in
   let children =
     summary_children count
-    |> List.mapi (fun index (child : Protocol.v2_child_member) ->
+    |> List.mapi (fun index (child : Worker_pure_data.child_member) ->
       if index = 0
       then
         { child with
-          Protocol.value =
+          Worker_pure_data.value =
             { child.value with
               block = { child.value.block with properties = [ asset_type_property ] }
             }
@@ -4477,11 +4475,10 @@ let test_preview_preserves_full_detail_and_copy () =
     |> fun output -> only "hidden parent tree" output.requests
   in
   let items =
-    { Protocol.value = root; revision = "root-1"; depth = 0; parent = page_uuid }
+    { Worker_pure_data.value = root; revision = "root-1"; depth = 0; parent = page_uuid }
     :: List.map
-         (fun (child : Protocol.v2_child_member) ->
-            Protocol.
-              { value = child.value
+         (fun (child : Worker_pure_data.child_member) ->
+            Worker_pure_data.{ value = child.value
               ; revision = child.revision
               ; depth = 1
               ; parent = block_uuid
@@ -4513,7 +4510,7 @@ let test_preview_preserves_full_detail_and_copy () =
       (response
          root_read
          (Protocol.V2_block_outcome
-            (V2_present_block { value = root; revision = "root-1" })))
+            (Worker_pure_data.V2_present_block { value = root; revision = "root-1" })))
     |> fun o -> only "complete Detail children" o.requests
   in
   let output =
@@ -4535,8 +4532,8 @@ let test_preview_preserves_full_detail_and_copy () =
   let state, effects = copy_reply state effects (copy_children block_uuid children) in
   let state, effects =
     List.fold_left
-      (fun (state, effects) (child : Protocol.v2_child_member) ->
-         copy_parent effects child.Protocol.value.block.uuid;
+      (fun (state, effects) (child : Worker_pure_data.child_member) ->
+         copy_parent effects child.Worker_pure_data.value.block.uuid;
          copy_reply state effects (copy_children child.value.block.uuid []))
       (state, effects)
       children
@@ -4553,7 +4550,7 @@ let test_preview_preserves_full_detail_and_copy () =
             ^ String.concat
                 ""
                 (List.map
-                   (fun (c : Protocol.v2_child_member) -> "\n  - " ^ c.value.block.title)
+                   (fun (c : Worker_pure_data.child_member) -> "\n  - " ^ c.value.block.title)
                    children))
        ])
 ;;
@@ -4634,7 +4631,7 @@ let parent_visibility_fixture (page : Graph.page) =
   let children n parent =
     List.init 4 (fun offset ->
       let j = offset + 1 in
-      { Protocol.value =
+      { Worker_pure_data.value =
           { record with
             block =
               { block with
@@ -4652,11 +4649,10 @@ let parent_visibility_fixture (page : Graph.page) =
   let items =
     List.mapi
       (fun index (_, root) ->
-         { Protocol.value = root; revision = "root-1"; depth = 0; parent = page.uuid }
+         { Worker_pure_data.value = root; revision = "root-1"; depth = 0; parent = page.uuid }
          :: List.map
-              (fun (child : Protocol.v2_child_member) ->
-                 Protocol.
-                   { value = child.value
+              (fun (child : Worker_pure_data.child_member) ->
+                 Worker_pure_data.{ value = child.value
                    ; revision = child.revision
                    ; depth = 1
                    ; parent = root.block.uuid
@@ -4672,7 +4668,7 @@ let check_parent_visibility roots entries =
   let expected =
     List.filter_map
       (fun (visible, r) ->
-         if visible then Some (Graph.Uuid.to_string r.Protocol.block.uuid) else None)
+         if visible then Some (Graph.Uuid.to_string r.Worker_pure_data.block.uuid) else None)
       roots
   in
   Alcotest.(check (list string))
@@ -4770,7 +4766,7 @@ let test_parent_visibility_tree_paths () =
    | Feed_loaded {feed;complete=true;_} -> check_parent_visibility roots (List.hd feed.days).entries
    | _ -> Alcotest.fail "visibility day owner lost");
   let refresh =
-    changed runtime (window ~scopes:[ V2_page_tree_interest page_uuid ] ())
+    changed runtime (window ~scopes:[ Worker_pure_data.V2_page_tree_interest page_uuid ] ())
     |> hydration_requests
     |> only "visibility remote"
   in
@@ -4801,7 +4797,7 @@ let test_parent_visibility_confirmations () =
                 (summary_response
                    refresh
                    page
-                   (V2_present_block { value = canonical; revision = "canonical-2" })
+                   (Worker_pure_data.V2_present_block { value = canonical; revision = "canonical-2" })
                    (children (index + 1) block_uuid)
                    None
                    "projection-2")
@@ -4854,10 +4850,10 @@ let test_detail_property_reference_reads_are_deduplicated () =
     {block_id=Graph.Uuid.to_string block_uuid;after=None;limit=128;request_generation=91L})
     |> fun o->only "property root read" o.requests in
   let child=Runtime.receive runtime (response read (Protocol.V2_block_outcome
-    (V2_present_block {value=root;revision="root-with-properties"})))
+    (Worker_pure_data.V2_present_block {value=root;revision="root-with-properties"})))
     |> fun o->only "property child read" o.requests in
   let children=Protocol.V2_children_outcome
-    {parent=block_uuid;revision_scope=V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None} in
+    {parent=block_uuid;revision_scope=Worker_pure_data.V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None} in
   let output=Runtime.receive runtime (response child children) in
   let reference=only "one deduplicated closed property reference" output.requests
     |> outline_after_page_miss runtime in
@@ -4867,7 +4863,7 @@ let test_detail_property_reference_reads_are_deduplicated () =
    |_ ->Alcotest.fail "property value must use the existing bounded block read");
   let closed={record with block={block with uuid=unrelated_uuid;title="Yes";properties=[]}} in
   let output=Runtime.receive runtime (response reference (Protocol.V2_block_outcome
-    (V2_present_block {value=closed;revision="closed-1"}))) in
+    (Worker_pure_data.V2_present_block {value=closed;revision="closed-1"}))) in
   Alcotest.(check int) "no repeated reference read" 0 (List.length output.requests);
   Alcotest.(check bool) "closed value enters reference presentation cache" true
     (List.exists (fun (r:Runtime.response)->match r.payload with
@@ -4888,7 +4884,7 @@ let test_changed_journal_detail_discovers_property_reference () =
   let output = changed runtime (window ~blocks:[block_uuid] ()) in
   let request = only "changed active journal detail" (hydration_requests output) in
   let output = Runtime.receive runtime (response request
-    (Protocol.V2_block_outcome (V2_present_block
+    (Protocol.V2_block_outcome (Worker_pure_data.V2_present_block
       {value={record with block={block with properties=[property]}}; revision="block-2"}))) in
   let reference = only "new property reference after sync" output.requests in
   match reference.command with
@@ -4924,7 +4920,7 @@ let test_materialized_detail_leaf_discovers_property_reference () =
       (response
          root
          (Protocol.V2_block_outcome
-            (V2_present_block { value = record; revision = "root-1" })))
+            (Worker_pure_data.V2_present_block { value = record; revision = "root-1" })))
     |> fun o -> only "materialized parent page" o.requests
   in
   ignore
@@ -4934,7 +4930,7 @@ let test_materialized_detail_leaf_discovers_property_reference () =
           children
           (Protocol.V2_children_outcome
              { parent = block_uuid
-             ; revision_scope = V2_children_revision block_uuid
+             ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
              ; scope_revision = "children-1"
              ; items = [ { value = leaf; revision = "leaf-1" } ]
              ; next_cursor = None
@@ -4961,7 +4957,7 @@ let test_materialized_detail_leaf_discovers_property_reference () =
       (response
          update
          (Protocol.V2_block_outcome
-            (V2_present_block
+            (Worker_pure_data.V2_present_block
                { value =
                    { leaf with block = { leaf.block with properties = [ property ] } }
                ; revision = "leaf-2"
@@ -5000,7 +4996,7 @@ let test_timeline_only_property_update_does_not_hydrate () =
       (response
          update
          (Protocol.V2_block_outcome
-            (V2_present_block
+            (Worker_pure_data.V2_present_block
                { value = { record with block = { block with properties = [ property ] } }
                ; revision = "root-2"
                })))
@@ -5051,7 +5047,7 @@ let test_detail_child_property_reference_without_child_load () =
       (response
          root
          (Protocol.V2_block_outcome
-            (V2_present_block { value = record; revision = "root-1" })))
+            (Worker_pure_data.V2_present_block { value = record; revision = "root-1" })))
     |> fun o -> only "child property page" o.requests
   in
   let output =
@@ -5061,7 +5057,7 @@ let test_detail_child_property_reference_without_child_load () =
          children
          (Protocol.V2_children_outcome
             { parent = block_uuid
-            ; revision_scope = V2_children_revision block_uuid
+            ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
             ; scope_revision = "children-1"
             ; items = [ { value = leaf; revision = "leaf-1" } ]
             ; next_cursor = None
@@ -5109,7 +5105,7 @@ let test_detail_page_and_class_property_uses_page_lookup () =
            (response
               read
               (Protocol.V2_block_outcome
-                 (V2_present_block
+                 (Worker_pure_data.V2_present_block
                     { value =
                         { record with block = { block with properties = [ property ] } }
                     ; revision = "root-1"
@@ -5123,7 +5119,7 @@ let test_detail_page_and_class_property_uses_page_lookup () =
               children
               (Protocol.V2_children_outcome
                  { parent = block_uuid
-                 ; revision_scope = V2_children_revision block_uuid
+                 ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
                  ; scope_revision = "children-1"
                  ; items = []
                  ; next_cursor = None
@@ -5143,7 +5139,7 @@ let test_detail_page_and_class_property_uses_page_lookup () =
            (response
               read
               (Protocol.V2_page_outcome
-                 (V2_present_page
+                 (Worker_pure_data.V2_present_page
                     { page =
                         { page with
                           uuid = unrelated_uuid
@@ -5179,7 +5175,7 @@ let test_detail_page_and_class_property_uses_page_lookup () =
            (response
               update
               (Protocol.V2_page_outcome
-                 (V2_present_page
+                 (Worker_pure_data.V2_present_page
                     { page =
                         { page with
                           uuid = unrelated_uuid
@@ -5211,7 +5207,7 @@ let test_page_property_promotes_prior_block_reference () =
     let runtime=Runtime.create () in
     let tree=initial_tree runtime in
     let title="See [[" ^ Graph.Uuid.to_string unrelated_uuid ^ "]]" in
-    let root : Protocol.v2_tree_member =
+    let root : Worker_pure_data.tree_member =
       {value={record with block={block with title}};revision="root-1";depth=0;parent=page_uuid} in
     let first=Runtime.receive runtime (tree_page tree [root] None)
       |> fun o -> only "initial generic page reference" o.requests
@@ -5220,7 +5216,7 @@ let test_page_property_promotes_prior_block_reference () =
         | Protocol.V2_get_outline_block _ -> ()
         | _ -> Alcotest.fail "expected generic block lookup");
     if not pending then ignore (Runtime.receive runtime (response first (Protocol.V2_block_outcome
-      (V2_missing_block {uuid=unrelated_uuid;revision="missing-1"}))));
+      (Worker_pure_data.V2_missing_block {uuid=unrelated_uuid;revision="missing-1"}))));
     let property : Graph.property_summary =
       {ident="user.property/page";uuid=block_uuid;title="Actual page"
       ;schema={property_type=Page;cardinality=One;hidden=false;public=false}
@@ -5229,20 +5225,20 @@ let test_page_property_promotes_prior_block_reference () =
       {block_id=Graph.Uuid.to_string block_uuid;after=None;limit=128;request_generation=91L})
       |> fun o -> only "promoted Detail root" o.requests in
     let children=Runtime.receive runtime (response read (Protocol.V2_block_outcome
-      (V2_present_block {value={record with block={block with properties=[property]}};revision="root-2"})))
+      (Worker_pure_data.V2_present_block {value={record with block={block with properties=[property]}};revision="root-2"})))
       |> fun o -> only "promoted Detail children" o.requests in
     let output=Runtime.receive runtime (response children (Protocol.V2_children_outcome
-      {parent=block_uuid;revision_scope=V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None})) in
+      {parent=block_uuid;revision_scope=Worker_pure_data.V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None})) in
     let output=if pending then (
       Alcotest.(check int) "retain one pending reference read" 0 (List.length output.requests);
       Runtime.receive runtime (response first (Protocol.V2_block_outcome
-        (V2_missing_block {uuid=unrelated_uuid;revision="missing-1"})))) else output in
+        (Worker_pure_data.V2_missing_block {uuid=unrelated_uuid;revision="missing-1"})))) else output in
     let page_read=only "page type supersedes old block missing/pending cache" output.requests in
     (match page_read.command with
      |Protocol.V2_get_page {page;_}->Alcotest.(check bool) "promoted UUID" true (Graph.Uuid.equal page unrelated_uuid)
      |_ -> Alcotest.fail "semantic page type did not supersede the generic block lookup");
     let output=Runtime.receive runtime (response page_read (Protocol.V2_page_outcome
-      (V2_present_page {page={page with uuid=unrelated_uuid;title="Actual page title";kind=Ordinary_page};revision="actual-page-1"}))) in
+      (Worker_pure_data.V2_present_page {page={page with uuid=unrelated_uuid;title="Actual page title";kind=Ordinary_page};revision="actual-page-1"}))) in
     Alcotest.(check bool) "promoted title published" true (List.exists (fun (r:Runtime.response)->match r.payload with
       |Reference_sources_changed values->List.mem (Graph.Uuid.to_string unrelated_uuid,Some "Actual page title") values
       |_ ->false) output.responses)) [false;true]
@@ -5252,7 +5248,7 @@ let test_changed_tree_all_property_slice_continues () =
   let runtime = Runtime.create () in
   seed_feed runtime;
   let read =
-    changed runtime (window ~scopes:[ Protocol.V2_page_tree_interest page_uuid ] ())
+    changed runtime (window ~scopes:[ Worker_pure_data.V2_page_tree_interest page_uuid ] ())
     |> fun o -> only "property-only changed tree" (hydration_requests o)
   in
   let marker : Graph.property_summary =
@@ -5266,7 +5262,7 @@ let test_changed_tree_all_property_slice_continues () =
     }
   in
   let cursor = Graph.Cursor.of_string "after-property-only-slice" |> Result.get_ok in
-  let root : Protocol.v2_tree_member =
+  let root : Worker_pure_data.tree_member =
     { value =
         { record with
           block = { block with title = "Property value"; properties = [ marker ] }
@@ -5289,7 +5285,7 @@ let test_changed_tree_all_property_slice_continues () =
        (Graph.Cursor.to_string cursor)
        (Graph.Cursor.to_string actual)
    | _ -> Alcotest.fail "lost property-only continuation");
-  let ordinary : Protocol.v2_tree_member =
+  let ordinary : Worker_pure_data.tree_member =
     { value = record; revision = "root-2"; depth = 0; parent = page_uuid }
   in
   let output = Runtime.receive runtime (tree_page next [ ordinary ] None) in
@@ -5317,7 +5313,7 @@ let expect_reference_page output id =
 let missing_reference_page runtime request id =
   Runtime.receive runtime
     (response request (Protocol.V2_page_outcome
-      (V2_missing_page { uuid = id; revision = "page-absent" })))
+      (Worker_pure_data.V2_missing_page { uuid = id; revision = "page-absent" })))
 ;;
 
 let expect_reference_outline output id =
@@ -5329,7 +5325,7 @@ let expect_reference_outline output id =
 
 let reference_page_response ?(recycled = false) request kind title =
   response request (Protocol.V2_page_outcome
-    (V2_present_page { page = { page with uuid = target_uuid; kind; title; recycled }
+    (Worker_pure_data.V2_present_page { page = { page with uuid = target_uuid; kind; title; recycled }
       ; revision = "resolved-page" }))
 ;;
 
@@ -5377,7 +5373,7 @@ let test_reference_negative_cache_requires_both_misses () =
   let fallback = missing_reference_page runtime page_read target_uuid in
   let outline = expect_reference_outline fallback target_uuid in
   let missing = Runtime.receive runtime (response outline (Protocol.V2_block_outcome
-    (V2_missing_block {uuid=target_uuid;revision="outline-absent"}))) in
+    (Worker_pure_data.V2_missing_block {uuid=target_uuid;revision="outline-absent"}))) in
   Alcotest.(check bool) "both misses publish unavailable source" true
     (List.mem (target_id,None) (reference_updates missing));
   Alcotest.(check int) "both misses are cached" 0
@@ -5438,7 +5434,7 @@ let test_reference_invalidation_restarts_page_phase () =
     let stale=Runtime.receive runtime
       (if outline_stage then target_response current "Stale"
        else response current (Protocol.V2_page_outcome
-         (V2_missing_page {uuid=target_uuid;revision="old-page-miss"}))) in
+         (Worker_pure_data.V2_missing_page {uuid=target_uuid;revision="old-page-miss"}))) in
     Alcotest.(check bool) "stale phase never publishes" false
       (List.mem (target_id,Some "Stale") (reference_updates stale));
     let refresh=expect_reference_page stale target_uuid in
@@ -5481,9 +5477,9 @@ let test_reference_two_stage_burst_stays_bounded () =
     let request : Protocol.request = Queue.pop pending in
     let outcome=match request.command with
       | V2_get_page {page;_}->incr pages;Protocol.V2_page_outcome
-          (V2_missing_page {uuid=page;revision="page-missing"})
+          (Worker_pure_data.V2_missing_page {uuid=page;revision="page-missing"})
       | V2_get_outline_block {block;_}->incr outlines;Protocol.V2_block_outcome
-          (V2_missing_block {uuid=block;revision="outline-missing"})
+          (Worker_pure_data.V2_missing_block {uuid=block;revision="outline-missing"})
       | _->Alcotest.fail "unexpected hydration request" in
     List.iter (fun request->Queue.push request pending)
       (Runtime.receive runtime (response request outcome)).requests;
@@ -5561,7 +5557,7 @@ let test_reference_page_survives_unrelated_outline_miss () =
   let wrong_projection=Runtime.submit runtime (Journal_graph_request.Find_block target_id)
     |> fun output->only "independent outline request" output.requests in
   let missing=Runtime.receive runtime (response wrong_projection (Protocol.V2_block_outcome
-    (V2_missing_block {uuid=target_uuid;revision="not-an-outline"}))) in
+    (Worker_pure_data.V2_missing_block {uuid=target_uuid;revision="not-an-outline"}))) in
   Alcotest.(check bool) "outline miss does not invalidate an existing page" false
     (List.mem (target_id,None) (reference_updates missing));
   Alcotest.(check int) "existing page stays positively cached" 0
@@ -5576,7 +5572,7 @@ let test_reference_shared_page_miss_is_not_negative_cache () =
     {block_id=Graph.Uuid.to_string block_uuid;after=None;limit=128;request_generation=22L})
     |> fun output->only "unretained owning page root" output.requests in
   let owning=Runtime.receive runtime (response root (Protocol.V2_block_outcome
-    (V2_present_block {value={record with block={block with page=target_uuid;parent=target_uuid}};revision="owning"})))
+    (Worker_pure_data.V2_present_block {value={record with block={block with page=target_uuid;parent=target_uuid}};revision="owning"})))
     |> fun output->only "owning page metadata read" output.requests in
   ignore (missing_reference_page runtime owning target_uuid);
   ignore (reference_feed runtime reference |> fun output->expect_reference_page output target_uuid)
@@ -5593,7 +5589,7 @@ let test_typed_metadata_preserves_newer_reference_fence () =
     {block_id=Graph.Uuid.to_string block_uuid;after=None;limit=128;request_generation=31L})
     |> fun output->only "old typed Detail root" output.requests in
   let children=Runtime.receive runtime (response root (Protocol.V2_block_outcome
-    (V2_present_block {value={record with block={block with properties=[property]}};revision="typed"})))
+    (Worker_pure_data.V2_present_block {value={record with block={block with properties=[property]}};revision="typed"})))
     |> fun output->only "old typed Detail children" output.requests in
   let middle=begin_reference_tree runtime 32L in
   ignore (changed runtime (window ~pages:[target_uuid] ()));
@@ -5601,7 +5597,7 @@ let test_typed_metadata_preserves_newer_reference_fence () =
     |> fun output->expect_reference_page output target_uuid in
   ignore (Runtime.fail_request runtime fresh ~message:"newer failure fence");
   ignore (Runtime.receive runtime (response children (Protocol.V2_children_outcome
-    {parent=block_uuid;revision_scope=V2_children_revision block_uuid;scope_revision="typed";items=[];next_cursor=None})));
+    {parent=block_uuid;revision_scope=Worker_pure_data.V2_children_revision block_uuid;scope_revision="typed";items=[];next_cursor=None})));
   let late=Runtime.receive runtime (reference_tree_response middle "Rollback") in
   Alcotest.(check bool) "old typed metadata cannot lower a newer fence" false
     (List.mem (target_id,Some "Rollback") (reference_updates late))
@@ -5616,7 +5612,7 @@ let test_dirty_abandon_keeps_reference_retryable () =
       let outline=missing_reference_page runtime first target_uuid
         |> fun output->expect_reference_outline output target_uuid in
       ignore (Runtime.receive runtime (response outline (Protocol.V2_block_outcome
-        (V2_missing_block {uuid=target_uuid;revision="missing"})))));
+        (Worker_pure_data.V2_missing_block {uuid=target_uuid;revision="missing"})))));
     let pending=changed runtime (window ~pages:[target_uuid] ())
       |> fun output->expect_reference_page output target_uuid in
     ignore (changed runtime (window ~pages:[target_uuid] ()));
@@ -5635,13 +5631,13 @@ let page_detail_seed runtime children =
     | V2_get_page {page=id;_} when Graph.Uuid.equal id page_uuid -> root
     | V2_get_outline_block _ ->
       Runtime.receive runtime (response root (Protocol.V2_block_outcome
-        (V2_missing_block {uuid=page_uuid; revision="absent-outline"})))
+        (Worker_pure_data.V2_missing_block {uuid=page_uuid; revision="absent-outline"})))
       |> fun out -> only "outline miss must resolve page" out.requests
     | _ -> Alcotest.fail "unexpected root lookup" in
   Alcotest.(check bool) "page root is resolved as a page" true
     (root.command = V2_get_page {page=page_uuid; revision=None});
   let child_read = Runtime.receive runtime (response root (Protocol.V2_page_outcome
-    (V2_present_page {page; revision="page-1"})))
+    (Worker_pure_data.V2_present_page {page; revision="page-1"})))
     |> fun out -> only "page root children" out.requests in
   (match child_read.command with
    | V2_get_children {parent;limit=128;_} when Graph.Uuid.equal parent page_uuid -> ()
@@ -5678,8 +5674,8 @@ let test_page_detail_root_and_append () =
      | V2_insert_blocks {parent;preconditions;_} ->
        Alcotest.(check bool) "exact page parent" true (Graph.Uuid.equal parent page_uuid);
        Alcotest.(check bool) "page revision, never outline revision" true
-         (preconditions = {Protocol.blocks=[];pages=[page_uuid,"page-1"];
-           scopes=[V2_children_scope page_uuid,"children-1"]})
+         (preconditions = {Worker_pure_data.blocks=[];pages=[page_uuid,"page-1"];
+           scopes=[Worker_pure_data.V2_children_scope page_uuid,"children-1"]})
      | _->Alcotest.fail "page append failed to issue scoped insert");
     let module W=Worker_producer.W in let module I=Worker_producer.I in
     let presentation=Option.get(W.selected Worker_producer.projection) in
@@ -5687,7 +5683,7 @@ let test_page_detail_root_and_append () =
     let intent=W.mutation_intent Worker_producer.session ~mutation_id mutation |> Result.get_ok in
     Alcotest.(check bool) "page insertion bound to typed owner" true
       (Runtime.bind_mutation runtime request ~presentation ~intent);
-    let receipt=(let (Protocol.V2_response receipt_packet as packet) = (response request (V2_mutation_committed{mutation_id;status=V2_applied;generation="generation:v1:1:1";
+    let receipt=(let (Protocol.V2_response receipt_packet as packet) = (response request (V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
         before_projection_revision="projection:v1:1";after_projection_revision="projection:v1:2"})) in
       match I.reply Worker_producer.session ~request_id:(W.request_id request.request_id) (W.Mutate intent)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
@@ -5696,8 +5692,8 @@ let test_page_detail_root_and_append () =
       | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected") in
     let child=copy_child unrelated_uuid page_uuid command.source in
-    let confirmation=(let (Protocol.V2_response confirmation_packet as packet) = (response request(V2_block_summary_outcome{lookup=V2_present_block{value=child.value;revision=child.revision};
-        page=Some(V2_present_page{page;revision="page-2"});items=[];next_cursor=None;
+    let confirmation=(let (Protocol.V2_response confirmation_packet as packet) = (response request(V2_block_summary_outcome{lookup=Worker_pure_data.V2_present_block{value=child.value;revision=child.revision};
+        page=Some(Worker_pure_data.V2_present_page{page;revision="page-2"});items=[];next_cursor=None;
         scope_revision="children-1";generation="generation:v1:1:1";projection_revision="projection:v1:2"})) in
       match I.reply Worker_producer.session ~request_id:(W.request_id confirmation_packet.request_id)
         (W.Confirm(presentation,receipt))
@@ -5709,7 +5705,7 @@ let test_page_detail_root_and_append () =
     Alcotest.(check bool) "confirm page through page API" true
       (parent_read.command=V2_get_page {page=page_uuid;revision=None});
     let done_=Runtime.receive runtime (response parent_read (Protocol.V2_page_outcome
-      (V2_present_page {page;revision="page-2"}))) in
+      (Worker_pure_data.V2_present_page {page;revision="page-2"}))) in
     let child,parent=done_.responses |> List.find_map (fun r -> match r.Runtime.payload with
       | Child_projection_ready {result=Child_created{child;parent;_};_}->Some(child,parent)
       | _->None) |> Option.get in
@@ -5724,7 +5720,7 @@ let test_recycled_page_root_is_removed () =
   let request=changed runtime (window ~pages:[page_uuid] ())
     |> fun out->only "page recycle refresh" (hydration_requests out) in
   let out=Runtime.receive runtime (response request (Protocol.V2_page_outcome
-    (V2_present_page {page={page with recycled=true};revision="recycled"}))) in
+    (Worker_pure_data.V2_present_page {page={page with recycled=true};revision="recycled"}))) in
   Alcotest.(check bool) "recycled page root becomes unavailable" true
     (List.exists (fun r->match r.Runtime.payload with
       | Block_removed {block_id}->block_id=Graph.Uuid.to_string page_uuid | _->false) out.responses)
@@ -5746,7 +5742,7 @@ let test_page_root_refresh_and_resync () =
   let fresh=changed runtime (window ~pages:[page_uuid] ())
     |> fun out->only "one owned page refresh" (hydration_requests out) in
   let result=Runtime.receive runtime (response fresh (Protocol.V2_page_outcome
-    (V2_present_page {page={page with title="Renamed page"};revision="page-2"}))) in
+    (Worker_pure_data.V2_present_page {page={page with title="Renamed page"};revision="page-2"}))) in
   let detail=result.responses |> List.find_map (fun r-> match r.Runtime.payload with
     | Children_reconciled detail -> Some detail | _->None) |> Option.get in
   Alcotest.(check string) "renamed page root reconciles" "Renamed page" (Journal_model.source detail.root);
@@ -5774,7 +5770,7 @@ let test_page_property_refresh_discovers_references () =
         request.command = V2_get_page {page=page_uuid;revision=None})
       |> only "one owning page refresh" in
     let complete request = Runtime.receive runtime (response request (Protocol.V2_page_outcome
-      (V2_present_page {page={page with properties=[property;hidden]};revision="page-2"}))) in
+      (Worker_pure_data.V2_present_page {page={page with properties=[property;hidden]};revision="page-2"}))) in
     let out=complete (refresh ()) in
     if page_root then (
       let reference=expect_reference_page out target_uuid in
@@ -5796,7 +5792,7 @@ let favorites_reference_source runtime title =
   Runtime.receive runtime (response read (Protocol.V2_favorites_outcome
     {favorites_page=None;generation="g";projection_revision="p";next_cursor=None;
      items=[{membership_uuid;membership_order="a";membership_revision="m";
-       target=V2_favorite_block {uuid=block_uuid;title;task_status=None;revision="b"}}]}))
+       target=Worker_pure_data.V2_favorite_block {uuid=block_uuid;title;task_status=None;revision="b"}}]}))
 ;;
 
 let test_favorites_share_reference_cache () =
@@ -5830,7 +5826,7 @@ let test_favorites_outline_and_missing_reference () =
     let fallback=missing_reference_page runtime page_read target_uuid in
     let outline=expect_reference_outline fallback target_uuid in
     let out=Runtime.receive runtime (if missing then response outline (Protocol.V2_block_outcome
-      (V2_missing_block {uuid=target_uuid;revision="absent"})) else target_response outline "Outline title") in
+      (Worker_pure_data.V2_missing_block {uuid=target_uuid;revision="absent"})) else target_response outline "Outline title") in
     Alcotest.(check (option string)) "Favorites shares outline and missing source results"
       (if missing then None else Some "Outline title")
       (List.assoc_opt target_id (reference_updates out) |> Option.join)) [false;true]
@@ -5842,7 +5838,7 @@ let scheduling_uuid family n =
   uuid (Printf.sprintf "a8000000-0000-4000-%04d-%012d" family n)
 ;;
 
-let scheduling_block n : Protocol.v2_block_record =
+let scheduling_block n : Worker_pure_data.block_record =
   let parent = scheduling_uuid 8000 n in
   { record with
     block =
@@ -5866,9 +5862,9 @@ let scheduling_favorites runtime count generation =
     ; next_cursor = None
     ; items = List.init count (fun n ->
         let value = scheduling_block n in
-        { Protocol.membership_uuid = scheduling_uuid 7000 n
+        { Worker_pure_data.membership_uuid = scheduling_uuid 7000 n
         ; membership_order = string_of_int n; membership_revision = "m"
-        ; target = V2_favorite_block
+        ; target = Worker_pure_data.V2_favorite_block
             { uuid = value.block.uuid; title = value.block.title
             ; task_status = None; revision = "b" } }) }))
 ;;
@@ -5879,9 +5875,9 @@ let scheduling_reply (request : Protocol.request) =
     let n = List.find (fun n -> Graph.Uuid.equal requested (scheduling_uuid 9000 n))
       (List.init 12 Fun.id) in
     response request (Protocol.V2_block_outcome
-      (V2_present_block { value = scheduling_block n; revision = "b" }))
+      (Worker_pure_data.V2_present_block { value = scheduling_block n; revision = "b" }))
   | V2_get_page { page = requested; _ } ->
-    response request (Protocol.V2_page_outcome (V2_present_page
+    response request (Protocol.V2_page_outcome (Worker_pure_data.V2_present_page
       { page = { page with uuid = requested; kind = Ordinary_page
                 ; title =
                     (if Graph.Uuid.equal requested target_uuid
@@ -6008,8 +6004,8 @@ let test_favorite_page_title_discovers_reference () =
   let out = Runtime.receive runtime (response read (Protocol.V2_favorites_outcome
     { favorites_page = None; generation = "g"; projection_revision = "p"
     ; next_cursor = None
-    ; items = [{ Protocol.membership_uuid; membership_order = "a"; membership_revision = "m"
-        ; target = V2_favorite_page { uuid = page_uuid; title = reference; revision = "p" } }] })) in
+    ; items = [{ Worker_pure_data.membership_uuid; membership_order = "a"; membership_revision = "m"
+        ; target = Worker_pure_data.V2_favorite_page { uuid = page_uuid; title = reference; revision = "p" } }] })) in
   let reference_read = out.requests |> List.filter (fun (r : Protocol.request) ->
     r.command = V2_get_page { page = target_uuid; revision = None })
     |> only "Favorite page title demands page-first reference" in
@@ -6027,10 +6023,10 @@ let test_page_detail_root_title_discovers_reference () =
     ; limit = 50; request_generation = 904L })
     |> fun out -> only "detail root" out.requests in
   let page_read = Runtime.receive runtime (response root (Protocol.V2_block_outcome
-    (V2_missing_block { uuid = page_uuid; revision = "no-outline" })))
+    (Worker_pure_data.V2_missing_block { uuid = page_uuid; revision = "no-outline" })))
     |> fun out -> only "detail page fallback" out.requests in
   let out = Runtime.receive runtime (response page_read (Protocol.V2_page_outcome
-    (V2_present_page { page = { page with kind = Ordinary_page; title = reference }
+    (Worker_pure_data.V2_present_page { page = { page with kind = Ordinary_page; title = reference }
     ; revision = "p" }))) in
   let children = out.requests |> List.find (fun (r : Protocol.request) ->
       match r.command with
@@ -6038,7 +6034,7 @@ let test_page_detail_root_title_discovers_reference () =
       | _ -> false)
   in
   let loaded = Runtime.receive runtime (response children (Protocol.V2_children_outcome
-    { parent = page_uuid; revision_scope = V2_children_revision page_uuid
+    { parent = page_uuid; revision_scope = Worker_pure_data.V2_children_revision page_uuid
     ; scope_revision = "c"; items = []; next_cursor = None })) in
   let refs = out.requests @ loaded.requests |> List.filter (fun (r : Protocol.request) ->
     r.command = V2_get_page { page = target_uuid; revision = None }) in
@@ -6057,13 +6053,13 @@ let test_copy_page_root () =
   List.iter (fun populated ->
     let state,effects=copy_start page_uuid in
     let state,effects=copy_reply state effects (Protocol.V2_block_outcome
-      (V2_missing_block {uuid=page_uuid;revision="no-outline"})) in
+      (Worker_pure_data.V2_missing_block {uuid=page_uuid;revision="no-outline"})) in
     Alcotest.(check bool) "copy resolves exact page" true
       (match snd(copy_read effects) with
        | Query(Copy_worker.Page {uuid;revision=None}) -> Graph.Uuid.equal uuid page_uuid
        | _ -> false);
     let state,effects=copy_reply state effects (Protocol.V2_page_outcome
-      (V2_present_page {page;revision="page-1"})) in
+      (Worker_pure_data.V2_present_page {page;revision="page-1"})) in
     copy_parent effects page_uuid;
     let state,effects=copy_reply state effects (copy_children page_uuid
       (if populated then [copy_child block_uuid page_uuid "Child"] else [])) in
@@ -6258,7 +6254,7 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
     else (
       let child=uuid "a1000000-0000-4000-9000-000000000081" in
       let target={record with block={block with uuid=child;title="Stable child";parent=block_uuid};task_status=None} in
-      let receipt=(let (Protocol.V2_response receipt_packet as packet) = (response insert(V2_mutation_committed{mutation_id;status=V2_applied;generation="generation:v1:1:1";
+      let receipt=(let (Protocol.V2_response receipt_packet as packet) = (response insert(V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
           before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"})) in
       match I.reply session ~request_id:(W.request_id insert.request_id) (W.Mutate original)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
@@ -6266,8 +6262,8 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
            outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
       | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected") in
-      let summary=Protocol.V2_block_summary_outcome{lookup=V2_present_block{value=target;revision="original-child-precondition"};
-        page=Some(V2_present_page{page;revision="page-original"});items=[];next_cursor=None;
+      let summary=Protocol.V2_block_summary_outcome{lookup=Worker_pure_data.V2_present_block{value=target;revision="original-child-precondition"};
+        page=Some(Worker_pure_data.V2_present_page{page;revision="page-original"});items=[];next_cursor=None;
         scope_revision="original-child-scope";generation="generation:v1:1:1";projection_revision="projection:v1:1"} in
       let proof=(let (Protocol.V2_response confirmation_packet as packet) = (response insert summary) in
       match I.reply session ~request_id:(W.request_id confirmation_packet.request_id)
@@ -6277,7 +6273,7 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
       | _ -> failwith "Production confirmation was rejected") in
       let parent=Production_runtime.receive_mutation runtime insert(W.Confirmed proof)
         |> fun output->only "canonical Child parent" output.Runtime.requests in
-      let output=Production_runtime.receive runtime(response parent(V2_block_outcome(V2_present_block{value=record;revision="new-parent-state"}))) in
+      let output=Production_runtime.receive runtime(response parent(V2_block_outcome(Worker_pure_data.V2_present_block{value=record;revision="new-parent-state"}))) in
       let root,round=List.find_map(fun response->match response.Runtime.payload with
         | Child_projection_ready{root;round;_}->Some(root,round)|_->None)output.responses |> Option.get in
       let ack=Production_runtime.child_projection_applied runtime ~root ~round ~presentation
@@ -6561,8 +6557,8 @@ let test_task_catalog_generation_and_deltas () =
    is ordered input, not a second implementation of Timeline projection. *)
 type root_fixture =
   { owner : Graph.page
-  ; roots : Protocol.v2_block_record list
-  ; descendants : (Graph.Uuid.t * Protocol.v2_block_record list) list
+  ; roots : Worker_pure_data.block_record list
+  ; descendants : (Graph.Uuid.t * Worker_pure_data.block_record list) list
   }
 
 let root_fixture index count child_count =
@@ -6589,7 +6585,7 @@ let root_fixture index count child_count =
   in
   let descendants =
     List.map
-      (fun (r : Protocol.v2_block_record) ->
+      (fun (r : Worker_pure_data.block_record) ->
          ( r.block.uuid
          , List.init child_count (fun n ->
              { record with
@@ -6665,7 +6661,7 @@ let drive_root_output ?(split_bytes = false) ?(filter_omitted = false) runtime f
                      | Journal_page { journal_day } -> journal_day
                      | _ -> assert false
                    in
-                   Protocol.{ page = f.owner; journal_day; revision = "page-1" })
+                   Worker_pure_data.{ page = f.owner; journal_day; revision = "page-1" })
                 selected
           ; next_cursor
           }
@@ -6688,8 +6684,8 @@ let drive_root_output ?(split_bytes = false) ?(filter_omitted = false) runtime f
             ; items =
                 List.map
                   (fun value ->
-                     Protocol.{ value; revision = "root-1"; depth = 0; parent = page })
-                  (if filter_omitted then List.filter (fun (value:Protocol.v2_block_record)->value.block.title<>"__pbt-omitted-root__") selected else selected)
+                     Worker_pure_data.{ value; revision = "root-1"; depth = 0; parent = page })
+                  (if filter_omitted then List.filter (fun (value:Worker_pure_data.block_record)->value.block.title<>"__pbt-omitted-root__") selected else selected)
             ; next_cursor
             })
       | V2_get_children { parent; limit; cursor; _ } ->
@@ -6705,10 +6701,10 @@ let drive_root_output ?(split_bytes = false) ?(filter_omitted = false) runtime f
           let selected, next_cursor = root_slice values limit cursor in
           V2_children_outcome
             { parent
-            ; revision_scope = V2_children_revision parent
+            ; revision_scope = Worker_pure_data.V2_children_revision parent
             ; scope_revision = "children-1"
             ; items =
-                List.map (fun value -> Protocol.{ value; revision = "child-1" }) selected
+                List.map (fun value -> Worker_pure_data.{ value; revision = "child-1" }) selected
             ; next_cursor
             })
       | V2_ack_changes _ ->
@@ -6759,7 +6755,7 @@ let normal_journal_fixture index count child_count =
   in
   let roots =
     List.map
-      (fun (r : Protocol.v2_block_record) ->
+      (fun (r : Worker_pure_data.block_record) ->
          { r with block = { r.block with parent = id; page = id } })
       fixture.roots
   in
@@ -6768,7 +6764,7 @@ let normal_journal_fixture index count child_count =
       (fun (root, values) ->
          ( root
          , List.map
-             (fun (r : Protocol.v2_block_record) ->
+             (fun (r : Worker_pure_data.block_record) ->
                 { r with block = { r.block with page = id } })
              values ))
       fixture.descendants
@@ -6813,7 +6809,7 @@ let test_empty_today_sync_retires_initial_feed () =
        let refresh =
          changed runtime
            (window ~pages:[ today.owner.uuid ]
-              ~scopes:[ Protocol.V2_page_tree_interest today.owner.uuid ] ())
+              ~scopes:[ Worker_pure_data.V2_page_tree_interest today.owner.uuid ] ())
        in
        let fixtures = [ synced_today; older ] in
        let finish_history () =
@@ -6849,7 +6845,7 @@ let test_empty_today_sync_retires_initial_feed () =
        in
        Alcotest.(check (list string))
          (Printf.sprintf "synced Today survives initial history (history_first=%b)" history_first)
-         (List.map (fun (r : Protocol.v2_block_record) -> Graph.Uuid.to_string r.block.uuid) synced_today.roots)
+         (List.map (fun (r : Worker_pure_data.block_record) -> Graph.Uuid.to_string r.block.uuid) synced_today.roots)
          today_ids)
     [ true; false ]
 ;;
@@ -6996,7 +6992,7 @@ let test_today_priority_continuations () =
                  in
                  let expected =
                    List.concat_map (fun f -> f.roots) fixtures
-                   |> List.map (fun (r : Protocol.v2_block_record) ->
+                   |> List.map (fun (r : Worker_pure_data.block_record) ->
                      Graph.Uuid.to_string r.block.uuid)
                    |> List.sort String.compare
                  in
@@ -7203,7 +7199,7 @@ let test_today_date_traversal_survives_recovery () =
                     (changed
                        runtime
                        (window
-                          ~scopes:[ Protocol.V2_page_tree_interest current.owner.uuid ]
+                          ~scopes:[ Worker_pure_data.V2_page_tree_interest current.owner.uuid ]
                           ()))
                 in
                 let page, value =
@@ -7317,7 +7313,7 @@ let test_today_date_traversal_survives_recovery () =
                 List.concat_map
                   (fun f ->
                      List.map
-                       (fun (r : Protocol.v2_block_record) ->
+                       (fun (r : Worker_pure_data.block_record) ->
                           Graph.Uuid.to_string r.block.uuid)
                        f.roots)
                   !fixtures
@@ -7373,7 +7369,7 @@ let test_changed_point_ownership () =
       runtime
       (response
          request
-         (V2_block_outcome (V2_present_block { value; revision = "changed-block" })))
+         (V2_block_outcome (Worker_pure_data.V2_present_block { value; revision = "changed-block" })))
   in
   let context_request output page =
     List.find_opt
@@ -7440,7 +7436,7 @@ let test_changed_point_ownership () =
                   (response
                      request
                      (V2_page_outcome
-                        (V2_present_page { page = target.owner; revision = "new-page" }))))
+                        (Worker_pure_data.V2_present_page { page = target.owner; revision = "new-page" }))))
             in
             let block = only "one correctly contextualized update" (updates output) in
             Alcotest.(check string)
@@ -7512,7 +7508,7 @@ let test_changed_point_ownership () =
         (response
            lookup
            (V2_page_outcome
-              (V2_present_page { page = target.owner; revision = "old-target-page" })))
+              (Worker_pure_data.V2_present_page { page = target.owner; revision = "old-target-page" })))
     in
     Alcotest.(check int)
       "late context cannot resurrect old move"
@@ -7534,7 +7530,7 @@ let test_changed_point_ownership () =
         (response
            lookup
            (V2_page_outcome
-              (V2_missing_page { uuid = target.owner.uuid; revision = "missing-page" })))
+              (Worker_pure_data.V2_missing_page { uuid = target.owner.uuid; revision = "missing-page" })))
     in
     Alcotest.(check int)
       "missing context never becomes a Timeline model"
@@ -7562,7 +7558,7 @@ let test_resync_retires_changed_points () =
       runtime
       (response
          request
-         (V2_block_outcome (V2_present_block { value; revision = "point-before-resync" })))
+         (V2_block_outcome (Worker_pure_data.V2_present_block { value; revision = "point-before-resync" })))
   in
   let point ?(generation = "generation-1") runtime block_id =
     let pull =
@@ -7708,7 +7704,7 @@ let test_resync_retires_changed_points () =
           (response
              held
              (V2_page_outcome
-                (V2_present_page
+                (Worker_pure_data.V2_present_page
                    { page = target.owner; revision = "valid-late-page-metadata" })))
       else complete runtime held moved
     in
@@ -7770,7 +7766,7 @@ let test_initial_thirty_roots () =
   Alcotest.(check (list string))
     "date and sibling order"
     (List.map
-       (fun (r : Protocol.v2_block_record) -> Graph.Uuid.to_string r.block.uuid)
+       (fun (r : Worker_pure_data.block_record) -> Graph.Uuid.to_string r.block.uuid)
        ((List.nth fixtures 0).roots @ List.take 10 (List.nth fixtures 1).roots))
     (List.map
        (fun (e : Journal_graph_projection.timeline_entry) -> Journal_model.id e.block)
@@ -7869,7 +7865,7 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
        let dates request fixtures next_cursor =
          Runtime.receive runtime (response request (V2_journals_outcome
              { items = List.map (fun f -> ({ page = f.owner; journal_day = day f
-                                            ; revision = "page-1" } : Protocol.v2_journal_item))
+                                            ; revision = "page-1" } : Worker_pure_data.journal_item))
                    fixtures
              ; next_cursor }))
        in
@@ -7904,7 +7900,7 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
          in
          let output = Runtime.receive runtime (response preview (V2_children_outcome
              { parent = root.block.uuid
-             ; revision_scope = V2_children_revision root.block.uuid
+             ; revision_scope = Worker_pure_data.V2_children_revision root.block.uuid
              ; scope_revision = "children-1"; items = []; next_cursor = None })) in
          listing ~quiet:false output next_cursor through
        in
@@ -8054,7 +8050,7 @@ let test_initial_wide_preview () =
   in
   let values =
     List.mapi
-      (fun i (r : Protocol.v2_block_record) ->
+      (fun i (r : Worker_pure_data.block_record) ->
          if i < 3 then { r with block = { r.block with properties = [ marker ] } } else r)
       values
   in
@@ -8168,7 +8164,7 @@ let test_initial_refresh_range split_bytes () =
   let refreshed =
     changed
       runtime
-      (window ~scopes:[ Protocol.V2_page_tree_interest (List.hd fixtures).owner.uuid ] ())
+      (window ~scopes:[ Worker_pure_data.V2_page_tree_interest (List.hd fixtures).owner.uuid ] ())
   in
   let results, _ = drive_root_output runtime fixtures refreshed in
   let page =
@@ -8223,7 +8219,7 @@ let test_initial_refresh_after_restarting_prefix () =
   let fresh =
     changed
       runtime
-      (window ~scopes:[ Protocol.V2_page_tree_interest fixture.owner.uuid ] ())
+      (window ~scopes:[ Worker_pure_data.V2_page_tree_interest fixture.owner.uuid ] ())
   in
   let outputs, _ = drive_root_output runtime [ newer ] fresh in
   let page =
@@ -8262,7 +8258,7 @@ let fixture_root_tree fixture (request : Protocol.request) =
     Protocol.V2_page_tree_outcome
       { page; maximum_depth
       ; items = List.map (fun value ->
-          Protocol.{ value; revision = "root-1"; depth = 0; parent = page }) selected
+          Worker_pure_data.{ value; revision = "root-1"; depth = 0; parent = page }) selected
       ; next_cursor }
   | _ -> Alcotest.fail "expected a retained root read"
 ;;
@@ -8276,7 +8272,7 @@ let test_prefix_preserves_reconciliation ~resync stage () =
   let edited = List.nth fixture.roots 70 in
   let deleted = List.nth fixture.roots 80 in
   let fresh = { fixture with roots =
-    List.filter_map (fun (r : Protocol.v2_block_record) ->
+    List.filter_map (fun (r : Worker_pure_data.block_record) ->
       if Graph.Uuid.equal r.block.uuid deleted.block.uuid then None
       else if Graph.Uuid.equal r.block.uuid edited.block.uuid then
         Some { r with block = { r.block with title = "Remote suffix edit" } }
@@ -8287,8 +8283,8 @@ let test_prefix_preserves_reconciliation ~resync stage () =
            { api_version = Protocol.api_version; generation = "generation-2"
            ; reason = "overflow" })
     else changed runtime (window ~scopes:
-        [ Protocol.V2_page_tree_interest fixture.owner.uuid
-        ; V2_journal_index_interest ] ())
+        [ Worker_pure_data.V2_page_tree_interest fixture.owner.uuid
+        ; Worker_pure_data.V2_journal_index_interest ] ())
   in
   let tree = List.find (fun (r : Protocol.request) -> match r.command with
       | V2_get_page_tree _ -> true | _ -> false) refresh.requests in
@@ -8309,7 +8305,7 @@ let test_prefix_preserves_reconciliation ~resync stage () =
         | V2_get_children { parent; _ } ->
           finish_previews (Runtime.receive runtime (response request
               (Protocol.V2_children_outcome
-                 { parent; revision_scope = V2_children_revision parent
+                 { parent; revision_scope = Worker_pure_data.V2_children_revision parent
                  ; scope_revision = "children-1"; items = []; next_cursor = None })))
         | _ -> Alcotest.fail "unexpected reconciliation request"
       in
@@ -8339,7 +8335,7 @@ let test_newer_reconciliation_fences_old_results () =
   let fixture = root_fixture 0 90 0 in
   load_ninety_roots runtime fixture;
   let refresh () = changed runtime
-      (window ~scopes:[Protocol.V2_page_tree_interest fixture.owner.uuid] ()) in
+      (window ~scopes:[Worker_pure_data.V2_page_tree_interest fixture.owner.uuid] ()) in
   let old = only "held old reconciliation" (hydration_requests (refresh ())) in
   let fresh, _ = drive_root_output runtime [fixture] (refresh ()) in
   Alcotest.(check int) "newer reconciliation publishes once" 1
@@ -8369,16 +8365,16 @@ let test_initial_reconciliation_restarts_prefix () =
     | Protocol.V2_get_page_tree _->request
     | V2_list_journals{from_day;through_day;_}->
       let items=if from_day<=day && day<=through_day then
-        [Protocol.{page=fixture.owner;journal_day=day;revision="page-1"}] else [] in
+        [Worker_pure_data.{page=fixture.owner;journal_day=day;revision="page-1"}] else [] in
       hold_roots(Runtime.receive runtime(response request(V2_journals_outcome{items;next_cursor=None})))
     | _->Alcotest.fail "unexpected initial query"
   in
   let old=hold_roots(initial_roots runtime 77L)in
-  let refreshed=changed runtime(window ~scopes:[Protocol.V2_page_tree_interest fixture.owner.uuid]())in
+  let refreshed=changed runtime(window ~scopes:[Worker_pure_data.V2_page_tree_interest fixture.owner.uuid]())in
   ignore(drive_root_output runtime[fixture]refreshed);
   let packet=response old(Protocol.V2_page_tree_outcome
     {page=fixture.owner.uuid;maximum_depth=0;
-     items=List.take 30 fixture.roots |> List.map(fun value->Protocol.{value;revision="old";depth=0;parent=fixture.owner.uuid});
+     items=List.take 30 fixture.roots |> List.map(fun value->Worker_pure_data.{value;revision="old";depth=0;parent=fixture.owner.uuid});
      next_cursor=Some(root_cursor 30)})in
   let restarted=Runtime.receive runtime packet in
   Alcotest.(check bool) "reconciliation restarts the initial prefix without user failure"true
@@ -8411,7 +8407,7 @@ let test_initial_later_read_superseded () =
   let fresh =
     changed
       runtime
-      (window ~scopes:[ Protocol.V2_page_tree_interest fixture.owner.uuid ] ())
+      (window ~scopes:[ Worker_pure_data.V2_page_tree_interest fixture.owner.uuid ] ())
   in
   ignore (drive_root_output runtime [ fixture ] fresh);
   let values = List.take 30 (List.drop 30 fixture.roots) in
@@ -8426,8 +8422,7 @@ let test_initial_later_read_superseded () =
             ; items =
                 List.map
                   (fun value ->
-                     Protocol.
-                       { value; revision = "old"; depth = 0; parent = fixture.owner.uuid })
+                     Worker_pure_data.{ value; revision = "old"; depth = 0; parent = fixture.owner.uuid })
                   values
             ; next_cursor = Some (root_cursor 60)
             }))
@@ -8498,7 +8493,7 @@ let test_root_sealed_budget_preserves_visible_quota_and_tail () =
     { fixture with
       roots =
         List.mapi
-          (fun index (value : Protocol.v2_block_record) ->
+          (fun index (value : Worker_pure_data.block_record) ->
              if index < 20
              then { value with block = { value.block with title = "" } }
              else value)
@@ -8572,7 +8567,7 @@ let test_root_quota_generated_traces () =
     let fixture = root_fixture 0 (List.length flags) 0 in
     let roots =
       List.map2
-        (fun kind (value : Protocol.v2_block_record) ->
+        (fun kind (value : Worker_pure_data.block_record) ->
            { value with
              block =
                { value.block with
@@ -8590,7 +8585,7 @@ let test_root_quota_generated_traces () =
     let fixture = { fixture with roots } in
     let expected =
       List.filter_map
-        (fun (value : Protocol.v2_block_record) ->
+        (fun (value : Worker_pure_data.block_record) ->
            if value.block.title = "__pbt-omitted-root__" || value.block.title = ""
            then None
            else Some (Graph.Uuid.to_string value.block.uuid))
@@ -8662,7 +8657,7 @@ let test_root_quota_generated_traces () =
                (changed
                   runtime
                   (window
-                     ~scopes:[ Protocol.V2_page_tree_interest fixture.owner.uuid ]
+                     ~scopes:[ Worker_pure_data.V2_page_tree_interest fixture.owner.uuid ]
                      ())));
           let output =
             Runtime.submit

@@ -1151,12 +1151,12 @@ let test_favorites_state_isolates_requests_and_refreshes () =
   let uuid n =
     G.Uuid.of_string (Printf.sprintf "75000000-0000-4000-8000-%012d" n) |> Result.get_ok
   in
-  let item n : P.v2_favorite_item =
+  let item n : Worker_pure_data.favorite_item =
     { membership_uuid = uuid n
     ; membership_order = string_of_int n
     ; membership_revision = "member"
     ; target =
-        V2_favorite_page
+        Worker_pure_data.V2_favorite_page
           { uuid = uuid (n + 100); title = string_of_int n; revision = "page" }
     }
   in
@@ -1249,12 +1249,11 @@ let test_favorites_retains_large_typed_pages () =
     let items =
       Rrbvec.init 50 (fun index ->
         let n = (page * 50) + index + 1 in
-        P.
-          { membership_uuid = uuid n
+        Worker_pure_data.{ membership_uuid = uuid n
           ; membership_order = string_of_int n
           ; membership_revision = "m"
           ; target =
-              V2_favorite_page
+              Worker_pure_data.V2_favorite_page
                 { uuid = uuid (20000 + n); title = string_of_int n; revision = "p" }
           })
     in
@@ -1301,12 +1300,12 @@ let test_favorite_target_origin_and_delete () =
   in
   let membership = uuid "000000000001"
   and target = uuid "000000000002" in
-  let item : P.v2_favorite_item =
+  let item : Worker_pure_data.favorite_item =
     { membership_uuid = membership
     ; membership_order = "a"
     ; membership_revision = "membership-1"
     ; target =
-        V2_favorite_block
+        Worker_pure_data.V2_favorite_block
           { uuid = target; title = "Target"; task_status = None; revision = "block-1" }
     }
   in
@@ -1328,7 +1327,7 @@ let test_favorite_target_origin_and_delete () =
    | _ -> fail "block favorite did not load detail");
   let page_item =
     { item with
-      target = V2_favorite_page { uuid = target; title = "Page"; revision = "page-1" }
+      target = Worker_pure_data.V2_favorite_page { uuid = target; title = "Page"; revision = "page-1" }
     }
   in
   let untouched, request =
@@ -2055,12 +2054,12 @@ let test_favorites_hidden_rows_do_not_block_pagination () =
   let uuid n =
     G.Uuid.of_string (Printf.sprintf "76000000-0000-4000-8000-%012d" n) |> Result.get_ok
   in
-  let item membership target : P.v2_favorite_item =
+  let item membership target : Worker_pure_data.favorite_item =
     { membership_uuid = uuid membership
     ; membership_order = string_of_int membership
     ; membership_revision = "member"
     ; target =
-        V2_favorite_block
+        Worker_pure_data.V2_favorite_block
           { uuid = uuid (100 + target)
           ; title = "Target"
           ; task_status = None
@@ -4259,7 +4258,7 @@ let child_identity_append detail =
     ~sibling_order:"a" ~creation_time:(creation_time 550)
 ;;
 let test_child_oversize_is_editable_before_admission () =
-  let source=String.make(Logseq_db_worker.Protocol.maximum_title_bytes+1)'x' in
+  let source=String.make(Worker_pure_data.maximum_title_bytes+1)'x' in
   let detail=child_identity_detail() |> fun detail->Journal_detail.update_child_source detail source in
   let next,request=child_identity_append detail in
   require(request<>None) "refactor changed the existing Child submission boundary";
@@ -4437,7 +4436,7 @@ module Detail_observation_fixture = struct
       value.registration,value.owner,value.observation_id,value.request|_->assert false in
     let response=S.Coordination_observed{registration;owner;observation_id;epoch=0L;
       response=P.V2_response{api_version=P.api_version;request_id=request.request_id;
-        outcome=V2_block_outcome(V2_missing_block{uuid=root;revision="missing-0"})}} in
+        outcome=V2_block_outcome(Worker_pure_data.V2_missing_block{uuid=root;revision="missing-0"})}} in
     let handle,epoch=I.observation_registration session ~request_id:(C.ticket_id ticket) operation response |> Result.get_ok in
     let admitted=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
     let registered=(C.step admitted(C.Observation_registered(ticket,handle,epoch))).next in
@@ -4455,7 +4454,7 @@ module Detail_observation_fixture = struct
       | _->assert false in
     let response=S.Coordination_observed{registration;owner;observation_id;epoch=1L;
       response=P.V2_response{api_version=P.api_version;request_id;
-        outcome=V2_block_outcome(V2_missing_block{uuid=root;revision="missing-1"})}} in
+        outcome=V2_block_outcome(Worker_pure_data.V2_missing_block{uuid=root;revision="missing-1"})}} in
     let value=match I.reply session ~request_id:(C.ticket_id ticket) operation response |> Result.get_ok with
       | W.Answered(Ok value)->value|_->assert false in
     let admitted=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.of_int64 2L))).next in
@@ -4472,7 +4471,7 @@ let test_detail_observation_context_retains_empty_and_releases () =
   let waiting,effects=M.inspect model(C.view pending) in
   require(Rrbvec.is_empty effects && M.context_count waiting=1) "pending Observe fabricated a sample";
   let current,effects=M.inspect waiting(C.view ready) in
-  require(Rrbvec.exists(function M.Initial(_,sample)->(match sample.value with V2_missing_block _->true|_->false)|_->false)effects)
+  require(Rrbvec.exists(function M.Initial(_,sample)->(match sample.value with Worker_pure_data.V2_missing_block _->true|_->false)|_->false)effects)
     "missing/empty Detail observation was discarded";
   require(not(Rrbvec.exists(function M.Release _->true|_->false)effects)) "empty Detail observation was released";
   let current,again=M.inspect current(C.view ready) in
@@ -4508,7 +4507,7 @@ let test_observed_absence_does_not_commit_user_deletion () =
   let request=Journal_graph_runtime.plan_observed_block runtime ~root:F.root in
   let output=Journal_graph_runtime.receive_worker_read runtime ~request_id:request.request_id
     (Journal_graph_runtime.Ordinary_read(F.P.V2_block_outcome
-      (F.P.V2_missing_block{uuid=F.root;revision="missing-observed"}))) in
+      (Worker_pure_data.V2_missing_block{uuid=F.root;revision="missing-observed"}))) in
   require(not(List.exists(fun response->match response.Journal_graph_runtime.payload with
     | Block_removed _|Subtree_deleted _->true|_->false)output.responses))
     "an observed absence committed deletion of retained Detail drafts";
@@ -4633,7 +4632,7 @@ module Child_chain_fixture = struct
     }
   let make ?(append=false) ?(task_state=Journal_model.No_status) () =
     let issuer,_,projection,session=Coordination_test_fixture.fixture
-      ~limits:{Coordination_test_fixture.limits with response_budget_bytes=P.maximum_response_bytes} 5514L in
+      ~limits:{Coordination_test_fixture.limits with response_budget_bytes=Worker_pure_data.maximum_response_bytes} 5514L in
     let module I=(val issuer:W.ISSUER) in
     let presentation=Option.get(W.selected projection) in
     let uuid s=G.Uuid.of_string s |> Result.get_ok in
@@ -4646,7 +4645,7 @@ module Child_chain_fixture = struct
     let insert=P.V2_insert_blocks {mutation_id=uuid command.mutation_id;parent;
       roots=[{uuid=child;title=command.source;children=[]}];
       preconditions={blocks=[parent,command.expected_parent_revision];pages=[];
-        scopes=[P.V2_children_scope parent,"children-state:v1:frozen"]}} in
+        scopes=[Worker_pure_data.V2_children_scope parent,"children-state:v1:frozen"]}} in
     let resolved_status=match task_state with Journal_model.Status id->Some(uuid id)|_->None in
     let insert=if not append then insert else P.V2_append_journal{
       mutation_id=uuid command.mutation_id;page=uuid "70000000-0000-4000-b000-000020260810";
@@ -4658,7 +4657,7 @@ module Child_chain_fixture = struct
       let after=Printf.sprintf "projection:v1:%d" (index+1) in
       let receipt=(let (P.V2_response receipt_packet as packet) = (P.V2_response
         {api_version=P.api_version;request_id=id;outcome=V2_mutation_committed
-          {mutation_id=id;status=V2_applied;generation="generation:v1:1:1";
+          {mutation_id=id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
            before_projection_revision=Printf.sprintf "projection:v1:%d" index;after_projection_revision=after}}) in
         match I.reply session ~request_id (W.Mutate intent)
           (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
@@ -4669,11 +4668,11 @@ module Child_chain_fixture = struct
       let block:G.block={uuid=child;title=command.source;parent;page=page.uuid;order="a";
         created_at_ms=1L;updated_at_ms=1L;refs=[];tags=[];properties=[]} in
       (* Equal visible status is deliberately insufficient to prove a status sub-operation. *)
-      let value:P.v2_block_record={block;task_status=resolved_status;rendered_page_title=page.title;tag_titles=[]} in
+      let value:Worker_pure_data.block_record={block;task_status=resolved_status;rendered_page_title=page.title;tag_titles=[]} in
       let confirmation=(let (P.V2_response confirmation_packet as packet) = (P.V2_response
         {api_version=P.api_version;request_id=id;outcome=V2_block_summary_outcome
-          {lookup=V2_present_block{value;revision=Printf.sprintf "child-state:v1:%d" index};
-           page=Some(V2_present_page{page;revision="page-state:v1:1"});items=[];next_cursor=None;
+          {lookup=Worker_pure_data.V2_present_block{value;revision=Printf.sprintf "child-state:v1:%d" index};
+           page=Some(Worker_pure_data.V2_present_page{page;revision="page-state:v1:1"});items=[];next_cursor=None;
            scope_revision="children-state:v1:1";generation="generation:v1:1:1";projection_revision=after}}) in
       match I.reply session ~request_id:(W.request_id confirmation_packet.request_id)
         (W.Confirm(presentation,receipt))
@@ -4712,7 +4711,7 @@ module Child_chain_fixture = struct
 end
 
 let test_capture_oversize_is_editable_before_admission () =
-  let source=String.make (Logseq_db_worker.Protocol.maximum_title_bytes+1) 'x' in
+  let source=String.make (Worker_pure_data.maximum_title_bytes+1) 'x' in
   let original=Journal_capture.create ~session_number:5518L ~source in
   let next,request=Journal_capture.admit_save original
     ~mutation_id:"70000000-0000-4000-9000-000000005518"
@@ -4803,8 +4802,8 @@ let test_capture_chain_freezes_complete_payload () =
     source=fixture.command.source;task_state=Journal_model.No_status;
     status_confirmation=false;status_intent_revision=0L;creation_time=fixture.command.creation_time;
     children=[child]} in
-  let root:P.v2_append_node={block_id=uuid command.block_id;title=command.source;task_status=None;
-    children=Rrbvec.singleton P.{block_id=uuid child.block_id;title=child.source;
+  let root:Worker_pure_data.append_node={block_id=uuid command.block_id;title=command.source;task_status=None;
+    children=Rrbvec.singleton Worker_pure_data.{block_id=uuid child.block_id;title=child.source;
       task_status=(match child_status_a with Status id->Some(uuid id)|_->assert false);children=Rrbvec.empty}} in
   let insert=P.V2_append_journal{mutation_id=uuid command.mutation_id;page=(C.page fixture.initial).uuid;
     journal_day=Journal_time.local_day command.creation_time;root} in

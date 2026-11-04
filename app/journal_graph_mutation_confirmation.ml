@@ -10,22 +10,22 @@ type purpose =
 type read =
   { purpose : purpose
   ; block_id : string
-  ; children : Protocol.v2_child_member Rrbvec.t
+  ; children : Worker_pure_data.child_member Rrbvec.t
   ; version : (string * string * string) option
   ; retries : int
   ; stamp : int64
-  ; after : Protocol.v2_child_member Worker.continuation option
+  ; after : Worker_pure_data.child_member Worker.continuation option
   }
 
 type confirmation =
   { purpose : purpose
   ; block_id : string
-  ; value : Protocol.v2_block_record
+  ; value : Worker_pure_data.block_record
   ; revision : string
   ; page : Graph.page
   ; page_revision : string
   ; scope_revision : string
-  ; children : Protocol.v2_child_member Rrbvec.t
+  ; children : Worker_pure_data.child_member Rrbvec.t
   }
 
 type planning = (Protocol.request, string) result
@@ -58,7 +58,7 @@ let plan t ~ports (value : read) cursor =
          ~source_epoch:stamp
          { value with stamp; after = cursor }
          (Protocol.V2_get_outline_block_summary
-            { block; limit = Protocol.default_page_size; cursor = None }))
+            { block; limit = Worker_pure_data.default_page_size; cursor = None }))
 ;;
 
 let start t ~ports purpose =
@@ -120,14 +120,14 @@ let receive_summary
     | None -> Failed "The target changed repeatedly during confirmation.")
   else (
     match
-      (lookup : Protocol.v2_block_lookup), (page : Protocol.v2_page_lookup option)
+      (lookup : Worker_pure_data.block_lookup), (page : Worker_pure_data.page_lookup option)
     with
-    | ( V2_present_block { value; revision }
-      , Some (V2_present_page { page; revision = page_revision }) )
+    | ( Worker_pure_data.V2_present_block { value; revision }
+      , Some (Worker_pure_data.V2_present_page { page; revision = page_revision }) )
       when String.equal (Graph.Uuid.to_string value.block.uuid) summary.block_id
            && Graph.Uuid.equal value.block.page page.uuid
            && List.to_seq items
-              |> Seq.for_all (fun (item : Protocol.v2_child_member) ->
+              |> Seq.for_all (fun (item : Worker_pure_data.child_member) ->
                 Graph.Uuid.equal item.value.block.parent value.block.uuid
                 && Graph.Uuid.equal item.value.block.page page.uuid) ->
       let children = Rrbvec.append_list summary.children items in
@@ -146,7 +146,7 @@ let receive_summary
            ; scope_revision
            ; children
            })
-    | V2_missing_block {uuid;_}, _
+    | Worker_pure_data.V2_missing_block {uuid;_}, _
       when Graph.Uuid.to_string uuid = summary.block_id
            && summary.after = None
            && items = [] && next_cursor = None && Rrbvec.is_empty summary.children ->
@@ -165,7 +165,7 @@ let worker_query (read : read) =
 let reference_fragment (summary : read) ~target ~final_children =
   Rrbvec.push_front
     (Rrbvec.map
-       (fun (item : Protocol.v2_child_member) -> item.value)
+       (fun (item : Worker_pure_data.child_member) -> item.value)
        (Rrbvec.append_list summary.children final_children))
     target
 ;;
@@ -233,7 +233,7 @@ module Pure_insertion = struct
     | V2_set_task_status {block;status;preconditions;_} -> Set_task_status {block;status;preconditions}
     | V2_clear_task_status {block;preconditions;_} -> Clear_task_status {block;preconditions}
     | _ -> invalid_arg "Unsupported child mutation"
-  let rec capture_node (node:Protocol.v2_append_node) : Worker.capture_node =
+  let rec capture_node (node:Worker_pure_data.append_node) : Worker.capture_node =
     {block_id=node.block_id;title=node.title;task_status=node.task_status;
       children=Rrbvec.map capture_node node.children}
   let wire_intent session wire = match wire with
@@ -285,7 +285,7 @@ module Pure_insertion = struct
         Graph.Uuid.to_string mutation_id=String.lowercase_ascii command.mutation_id
         && Graph.Uuid.to_string root.block_id=String.lowercase_ascii command.block_id
         && root.title=command.source && root.task_status=resolved_status
-        && Protocol.valid_append_node root
+        && Worker_pure_data.valid_append_node root
       | _->false in
     if not valid || command.status_intent_revision<0L || not(choice_matches command.task_state resolved_status)
     then Error "The initial child payload does not match its admitted business command."
@@ -303,7 +303,7 @@ module Pure_insertion = struct
       when journal_day=Journal_time.local_day command.Journal_graph_projection.creation_time ->
       (match insert with
        | V2_append_journal{root;_} when Rrbvec.length root.children=List.length command.children
-         && Seq.for_all2 (fun (node:Protocol.v2_append_node) (child:Journal_graph_projection.capture_child)->
+         && Seq.for_all2 (fun (node:Worker_pure_data.append_node) (child:Journal_graph_projection.capture_child)->
            Graph.Uuid.to_string node.block_id=String.lowercase_ascii child.block_id
            && node.title=child.source && Rrbvec.is_empty node.children
            && choice_matches child.task_state node.task_status)
@@ -361,7 +361,7 @@ module Pure_insertion = struct
     | _ -> None
   let exact_child t (summary:Worker.block_summary) =
     match summary.lookup,summary.page with
-    | Protocol.V2_present_block {value;_},Some(V2_present_page {page;_}) ->
+    | Worker_pure_data.V2_present_block {value;_},Some(Worker_pure_data.V2_present_page {page;_}) ->
       Graph.Uuid.to_string value.block.uuid=t.command.block_id
       && value.block.page=page.uuid && not page.recycled
       && (match t.append_day with
@@ -371,17 +371,17 @@ module Pure_insertion = struct
     | _ -> false
   let status_wire t (summary:Worker.block_summary) =
     match summary.lookup with
-    | Protocol.V2_present_block {value;revision} ->
+    | Worker_pure_data.V2_present_block {value;revision} ->
       let block=value.block.uuid in
       let mutation_id=status_mutation_id ~domain:(if t.append_day=None then "child" else "capture") ~mutation_id:t.command.mutation_id
         ~revision:t.desired.revision ~block t.desired.resolved in
-      let preconditions:Protocol.v2_preconditions={blocks=[block,revision];pages=[];scopes=[]} in
+      let preconditions:Worker_pure_data.preconditions={blocks=[block,revision];pages=[];scopes=[]} in
       (match t.desired.resolved with
        | None->Protocol.V2_clear_task_status{mutation_id;block;preconditions}
        | Some status->V2_set_task_status{mutation_id;block;status;preconditions})
     | _ -> assert false
   let canonical_state t (summary:Worker.block_summary) =
-    let page=match summary.page with Some(Protocol.V2_present_page{page;_})->Some page|_->t.page in
+    let page=match summary.page with Some(Worker_pure_data.V2_present_page{page;_})->Some page|_->t.page in
     {t with canonical=Some summary;page}
   let after_child t summary =
     if not(exact_child t summary) then t,Wait "The canonical child is absent or belongs to another parent."

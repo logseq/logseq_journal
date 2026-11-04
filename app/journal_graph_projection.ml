@@ -75,7 +75,7 @@ type feed_cursor =
 
 type child_cursor =
   { after :
-      Logseq_db_worker.Protocol.v2_child_member
+      Worker_pure_data.child_member
         Journal_worker_coordination.Worker_api.continuation
   ; maximum_items : int
   }
@@ -87,10 +87,10 @@ type root_cursor =
   ; page : Logseq_db_types.Graph_types.Uuid.t
   ; epoch : int64
   ; after :
-      Logseq_db_worker.Protocol.v2_tree_member
+      Worker_pure_data.tree_member
         Journal_worker_coordination.Worker_api.continuation
         option
-  ; remaining : Logseq_db_worker.Protocol.v2_tree_member Rrbvec.t
+  ; remaining : Worker_pure_data.tree_member Rrbvec.t
   }
 
 type block_continuation =
@@ -410,10 +410,10 @@ let timeline_entry_page
 let timeline_target_entry ~page ~time_context ~(root : tree_member) ~tag_titles children =
   let preview =
     Rrbvec.to_seq children
-    |> Seq.filter (fun (item : Logseq_db_worker.Protocol.v2_child_member) ->
+    |> Seq.filter (fun (item : Worker_pure_data.child_member) ->
       not (property_value_block item.value.block))
     |> Seq.take 3
-    |> Seq.map (fun (item : Logseq_db_worker.Protocol.v2_child_member) ->
+    |> Seq.map (fun (item : Worker_pure_data.child_member) ->
       { block = item.value.block; revision = item.revision; depth = 1 })
     |> List.of_seq
   in
@@ -484,14 +484,14 @@ let detail_on_page ~page ~time_context ~root children =
   project_detail ~project_block:(block_on_page ~page) ~time_context ~root children
 ;;
 
-let favorite (item : Logseq_db_worker.Protocol.v2_favorite_item) =
+let favorite (item : Worker_pure_data.favorite_item) =
   let module P = Logseq_db_worker.Protocol in
   let id = Logseq_db_types.Graph_types.Uuid.to_string in
   let target, title, task_state =
     match item.target with
-    | P.V2_favorite_page { uuid; title; _ } ->
+    | Worker_pure_data.V2_favorite_page { uuid; title; _ } ->
       Page (id uuid), title, Journal_model.No_status
-    | V2_favorite_block { uuid; title; task_status; _ } ->
+    | Worker_pure_data.V2_favorite_block { uuid; title; task_status; _ } ->
       let status =
         Option.fold
           ~none:Journal_model.No_status

@@ -30,8 +30,8 @@ val plan_change : t -> ports:ports -> change -> Protocol.request option
 val resync : t -> ports:ports -> Protocol.request Rrbvec.t
 val shared_read_failed : t -> ports:ports -> source_epoch:int64 -> block_id:string -> output
 val read_failed : t -> ports:ports -> source_epoch:int64 -> block_id:string -> depth:int -> output
-val receive_page : t -> ports:ports -> source_epoch:int64 -> read -> Protocol.v2_page_lookup -> output
-val receive_outline : t -> ports:ports -> source_epoch:int64 -> read -> Protocol.v2_block_lookup -> output
+val receive_page : t -> ports:ports -> source_epoch:int64 -> read -> Worker_pure_data.page_lookup -> output
+val receive_outline : t -> ports:ports -> source_epoch:int64 -> read -> Worker_pure_data.block_lookup -> output
 val observe_fragment
   : t -> ports:ports -> source_epoch:int64 -> sources:source Rrbvec.t
   -> changes:known Rrbvec.t -> property_blocks:Graph.block Seq.t -> output

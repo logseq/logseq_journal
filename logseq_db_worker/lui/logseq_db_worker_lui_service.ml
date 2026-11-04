@@ -293,7 +293,7 @@ type coordination_baseline =
   { registration : int64
   ; baseline : Logseq_db_worker.coordination_snapshot
   ; authority_user : string option option
-  ; limits : Logseq_db_worker.Protocol.v2_capability_limits
+  ; limits : Worker_pure_data.capability_limits
   }
 
 type coordination_update =
@@ -631,13 +631,13 @@ let dependencies ~overlay ~tls_authenticator ~secrets ~crypto =
 let production_dependencies () =
   let limits =
     Logseq_overlay_db.Types.
-      { response_budget_bytes = Protocol.maximum_response_bytes
+      { response_budget_bytes = Worker_pure_data.maximum_response_bytes
       ; outbox_max_records = 4_096
       ; outbox_max_bytes = 8 * 1024 * 1024
-      ; change_max_items = Protocol.maximum_changed_uuids
-      ; change_max_bytes = Protocol.maximum_push_bytes
+      ; change_max_items = Worker_pure_data.maximum_changed_uuids
+      ; change_max_bytes = Worker_pure_data.maximum_push_bytes
       ; dispatcher_capacity = 256
-      ; wire_batch_max_bytes = Protocol.maximum_response_bytes
+      ; wire_batch_max_bytes = Worker_pure_data.maximum_response_bytes
       }
   in
   let overlay =
@@ -1011,7 +1011,7 @@ let create ~(dependencies : dependencies) =
       ; auth_enqueued_sequence : int ref
       ; auth_wake : Eio.Condition.t
       ; mutable coordination_registration : int64 option
-      ; coordination_limits : Protocol.v2_capability_limits
+      ; coordination_limits : Worker_pure_data.capability_limits
       ; emit_observation : observation_signal -> unit
       ; emit_coordination : coordination_update -> unit
       }
@@ -1199,7 +1199,7 @@ let create ~(dependencies : dependencies) =
                      ; coordination_registration=None
                      ; coordination_limits=(let limits=Overlay.dependency_limits dependencies.overlay in
                          {response_budget_bytes=min limits.response_budget_bytes
-                           (min config.response_budget_bytes Protocol.maximum_response_bytes);
+                           (min config.response_budget_bytes Worker_pure_data.maximum_response_bytes);
                           outbox_max_records=limits.outbox_max_records;outbox_max_bytes=limits.outbox_max_bytes;
                           change_max_items=limits.change_max_items;change_max_bytes=limits.change_max_bytes;
                           dispatcher_capacity=limits.dispatcher_capacity;wire_batch_max_bytes=limits.wire_batch_max_bytes})
@@ -1364,7 +1364,7 @@ let create ~(dependencies : dependencies) =
         let changefeed=match request.command with Protocol.V2_pull_changes _|V2_ack_changes _->true|_->false in
         if not(coordination_read request.command || changefeed) then
           Error "This registration supports scoped reads and owned Changes/ACK, not mutation commands."
-        else if response_budget_bytes<=0 || response_budget_bytes>Protocol.maximum_response_bytes
+        else if response_budget_bytes<=0 || response_budget_bytes>Worker_pure_data.maximum_response_bytes
         then Error "Invalid coordination read byte budget"
         else if not(current ()) then Error "Coordination binding retired"
         else (match resolve owner with

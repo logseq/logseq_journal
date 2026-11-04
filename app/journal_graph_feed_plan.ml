@@ -28,7 +28,7 @@ type feed_scan =
   ; mutable root_list_size : int
   ; mutable root_days : day_feed Rrbvec.t
   ; mutable root_queued : Projection.page Rrbvec.t
-  ; mutable root_journal_cursor : Protocol.v2_journal_item Worker.continuation option
+  ; mutable root_journal_cursor : Worker_pure_data.journal_item Worker.continuation option
   ; mutable root_journal_through : int
   ; mutable root_journal_boundary : int option
   ; root_journal_boundary_pages : (string, unit) Hashtbl.t
@@ -63,7 +63,7 @@ type root_preview =
   { preview_batch : root_batch
   ; preview_root : Projection.tree_member
   ; preview_members : Projection.tree_member Rrbvec.t
-  ; preview_cursor : Protocol.v2_child_member Worker.continuation option
+  ; preview_cursor : Worker_pure_data.child_member Worker.continuation option
   ; preview_limit : int
   ; preview_revision : string option
   ; preview_retries : int
@@ -73,7 +73,7 @@ type journal_request =
   { from_day : Worker.journal_day
   ; through_day : Worker.journal_day
   ; limit : int
-  ; after : Protocol.v2_journal_item Worker.continuation option
+  ; after : Worker_pure_data.journal_item Worker.continuation option
   }
 
 type operation =
@@ -89,8 +89,8 @@ type publication =
   | Failed of { scope : failure_scope; stale_cursor : bool; message : string }
 type cached = root_batch
 type output = { requests : Protocol.request Rrbvec.t; publications : publication Rrbvec.t; cached : cached option }
-type packet = Dates of Protocol.v2_journal_item Seq.t | Roots of Protocol.v2_tree_member Seq.t
-  | Preview of Protocol.v2_child_member Seq.t
+type packet = Dates of Worker_pure_data.journal_item Seq.t | Roots of Worker_pure_data.tree_member Seq.t
+  | Preview of Worker_pure_data.child_member Seq.t
 type fragment = { page : Projection.page; members : Projection.tree_member Rrbvec.t
   ; entries : Projection.timeline_entry Rrbvec.t }
 type context = { today : int option; time_context : (Projection.time_context, string) result }
@@ -679,8 +679,8 @@ let start_feed_scan t ~ports ~cursor ~root_limit ~day_limit ~request_generation 
       ; root_publish_partial = cursor = None && after = None
       ; root_consumed_by_page = Hashtbl.create 32
       ; root_remaining = root_limit
-      ; root_page_size = min root_limit Protocol.maximum_page_size
-      ; root_list_size = min day_limit Protocol.maximum_page_size
+      ; root_page_size = min root_limit Worker_pure_data.maximum_page_size
+      ; root_list_size = min day_limit Worker_pure_data.maximum_page_size
       ; root_days = Rrbvec.empty
       ; root_queued = Rrbvec.empty
       ; root_journal_cursor = None
@@ -736,13 +736,13 @@ let receive_root_tree t ~ports ~origin ~cached batch items next_cursor =
   then cursor_failure batch "The root execution was revoked. Refresh Timeline."
   else if
     Rrbvec.exists
-      (fun (m : Protocol.v2_tree_member) ->
+      (fun (m : Worker_pure_data.tree_member) ->
          m.depth <> 0
          || Graph.Uuid.to_string m.value.block.page <> batch.root_page.id
          || Graph.Uuid.to_string m.value.block.parent <> batch.root_page.id)
       items
   then root_failure batch "The root query returned a foreign or nested block."
-  else if Rrbvec.length items > Protocol.maximum_page_size
+  else if Rrbvec.length items > Worker_pure_data.maximum_page_size
   then root_failure batch "The retained root packet exceeds its bound."
   else if
     (not cached)
@@ -752,7 +752,7 @@ let receive_root_tree t ~ports ~origin ~cached batch items next_cursor =
   else (
     let members =
       Rrbvec.map
-        (fun (m : Protocol.v2_tree_member) ->
+        (fun (m : Worker_pure_data.tree_member) ->
            Projection.{ block = m.value.block; revision = m.revision; depth = 0 })
         items
     in
@@ -781,7 +781,7 @@ let receive_root_tree t ~ports ~origin ~cached batch items next_cursor =
              let last = List.hd (List.rev ids) in
              let rec find index = function
                | [] -> index
-               | (item : Protocol.v2_tree_member) :: rest ->
+               | (item : Worker_pure_data.tree_member) :: rest ->
                  if Graph.Uuid.to_string item.value.block.uuid = last
                  then index + 1
                  else find (index + 1) rest
@@ -847,7 +847,7 @@ let receive_root_preview t ~ports preview parent revision items next_cursor =
   else if
     (not (Graph.Uuid.equal parent preview.preview_root.block.uuid))
     || Rrbvec.exists
-         (fun (m : Protocol.v2_child_member) ->
+         (fun (m : Worker_pure_data.child_member) ->
             (not (Graph.Uuid.equal m.value.block.parent parent))
             || Graph.Uuid.to_string m.value.block.page <> batch.root_page.id)
          items
@@ -871,7 +871,7 @@ let receive_root_preview t ~ports preview parent revision items next_cursor =
     let members =
       Rrbvec.append preview.preview_members
         (Rrbvec.map
-          (fun (m : Protocol.v2_child_member) ->
+          (fun (m : Worker_pure_data.child_member) ->
              Projection.{ block = m.value.block; revision = m.revision; depth = 1 })
           items)
     in
@@ -953,7 +953,7 @@ let journal_request = function
 type tree_request =
   { page : Graph.Uuid.t
   ; maximum_items : int
-  ; after : Protocol.v2_tree_member Worker.continuation option
+  ; after : Worker_pure_data.tree_member Worker.continuation option
   }
 
 let tree_request = function
@@ -969,7 +969,7 @@ let tree_request = function
 type child_request =
   { parent : Graph.Uuid.t
   ; limit : int
-  ; after : Protocol.v2_child_member Worker.continuation option
+  ; after : Worker_pure_data.child_member Worker.continuation option
   }
 
 let child_request = function
@@ -991,9 +991,9 @@ let receive t ~ports ?journals ?children ?roots ?origin operation outcome =
     | _ -> empty)
   else if not (handles operation outcome) then None else Some (match operation,outcome with
       | Root_dates (scan, _), Protocol.V2_journals_outcome { items; _ } ->
-        let next_cursor = Option.bind journals (fun (value:Protocol.v2_journal_item Worker.slice)->value.next) in
+        let next_cursor = Option.bind journals (fun (value:Worker_pure_data.journal_item Worker.slice)->value.next) in
         ports.observe_packet (Dates (List.to_seq items));
-        let boundary_page (i : Protocol.v2_journal_item) =
+        let boundary_page (i : Worker_pure_data.journal_item) =
           scan.root_journal_boundary = Some i.journal_day
           && Hashtbl.mem scan.root_journal_boundary_pages (Graph.Uuid.to_string i.page.uuid)
         in
@@ -1004,7 +1004,7 @@ let receive t ~ports ?journals ?children ?roots ?origin operation outcome =
         else (
           let pages =
             Rrbvec.filter_map
-              (fun (i : Protocol.v2_journal_item) -> ports.project_journal_page i.page)
+              (fun (i : Worker_pure_data.journal_item) -> ports.project_journal_page i.page)
               items
             |> Rrbvec.sort (fun a b -> Int.compare b.Projection.day a.Projection.day)
           in
@@ -1019,7 +1019,7 @@ let receive t ~ports ?journals ?children ?roots ?origin operation outcome =
           scan.root_queued <- pages;
           (* Catalog progress includes Today, even when the feed continuation skips it. *)
           Rrbvec.iter
-            (fun (i : Protocol.v2_journal_item) ->
+            (fun (i : Worker_pure_data.journal_item) ->
                if Option.fold ~none:true ~some:(fun day -> i.journal_day < day)
                     scan.root_journal_boundary
                then (
@@ -1062,14 +1062,14 @@ let receive t ~ports ?journals ?children ?roots ?origin operation outcome =
         let items = Rrbvec.of_list items in
         let today =
           Rrbvec.filter_map
-            (fun (i : Protocol.v2_journal_item) -> ports.project_journal_page i.page)
+            (fun (i : Worker_pure_data.journal_item) -> ports.project_journal_page i.page)
             items
         in
         scan.root_queued <- Rrbvec.append today scan.root_queued;
         next_feed_batch t ~ports scan
      | Root_tree batch, V2_page_tree_outcome {items;_} ->
        (match roots,origin with
-        | Some (value:Protocol.v2_tree_member Worker.slice),Some origin ->
+        | Some (value:Worker_pure_data.tree_member Worker.slice),Some origin ->
           ports.observe_packet (Roots (List.to_seq items));
           receive_root_tree t ~ports ~origin ~cached:false batch items value.next
         | _ -> root_failure batch "The root read lost its typed execution provenance.")

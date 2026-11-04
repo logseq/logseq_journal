@@ -8,7 +8,7 @@ let check condition message = if not condition then failwith message
 let uuid s = W.Uuid.of_string s |> Result.get_ok
 let graph = uuid "98000000-0000-4000-8000-000000000001"
 
-let limits : P.v2_capability_limits =
+let limits : Worker_pure_data.capability_limits =
   { response_budget_bytes = 65536
   ; outbox_max_records = 32
   ; outbox_max_bytes = 65536
@@ -117,7 +117,7 @@ let child_continuation token =
   let issuer, _, _, session = Lazy.force child_cursor_fixture in
   let module I = (val issuer : W.ISSUER) in
   let budget =
-    W.read_budget session ~maximum_items:P.default_page_size ~maximum_bytes:65536
+    W.read_budget session ~maximum_items:Worker_pure_data.default_page_size ~maximum_bytes:65536
     |> Result.get_ok
   in
   let operation =
@@ -134,7 +134,7 @@ let child_continuation token =
          ; outcome =
              V2_children_outcome
                { parent = graph
-               ; revision_scope = V2_children_revision graph
+               ; revision_scope = Worker_pure_data.V2_children_revision graph
                ; scope_revision = "fixture"
                ; items = []
                ; next_cursor =

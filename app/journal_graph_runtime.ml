@@ -16,10 +16,10 @@ type worker_read_result =
   | Changes_retired
   | Changes_read of Worker.change_batch
   | Changes_acknowledged of Worker.change_ack
-  | Root_tree_read of {page:Graph.Uuid.t;value:Protocol.v2_tree_member Worker.slice}
+  | Root_tree_read of {page:Graph.Uuid.t;value:Worker_pure_data.tree_member Worker.slice}
   | Child_members_read of Worker.children
   | Target_summary_read of Worker.block_summary
-  | Journals_read of Protocol.v2_journal_item Worker.slice
+  | Journals_read of Worker_pure_data.journal_item Worker.slice
   | Task_catalog_read of Worker.task_status_catalog
   | Ordinary_read of Protocol.v2_outcome
   | Favorites_read of { first_page:bool; value:Journal_graph_request.favorites_result }
@@ -78,7 +78,7 @@ type payload =
        result:payload;failure:Journal_worker_coordination.Worker_api.error option;insert_rejected:bool}
   | Mutation_settled of Journal_worker_coordination.Worker_api.mutation_intent * Journal_worker_coordination.Worker_api.presentation * payload
   | Mutation_waiting of { mutation_id:string; block_id:string; message:string }
-  | Projection_changes of Protocol.v2_change_window list
+  | Projection_changes of Worker_pure_data.change_window list
   | Projection_resync
   | Task_statuses_changed of
       { items : Graph.task_status_definition Rrbvec.t
@@ -95,7 +95,7 @@ type payload =
   | Graph_ready
   | Admission_inspected of
       { request : Journal_graph_request.admission_request
-      ; observation : Protocol.v2_admission_inspection
+      ; observation : Worker_pure_data.admission_inspection
       }
   | Admission_unavailable of Journal_graph_request.admission_request
   | Block_captured of
@@ -229,7 +229,7 @@ type operation =
   | Changed_detail_block of { block_id : string; observed : bool }
   | Changed_point_context of
       { block_id : string
-      ; value : Protocol.v2_block_record
+      ; value : Worker_pure_data.block_record
       ; revision : string
       ; child_count : int
       }
@@ -291,7 +291,7 @@ type pending_operation =
 
 type t =
   { on_change : Coordination.event -> unit
-  ; on_projection_changes : Protocol.v2_change_window list -> unit
+  ; on_projection_changes : Worker_pure_data.change_window list -> unit
   ; external_reads : (Graph.Uuid.t,Coordination.change_application) Hashtbl.t
   ; mutable application_context : (Coordination.change_application * Graph.Uuid.t * Graph.Uuid.t Rrbvec.t ref) option
   ; mutable latest_application : Coordination.change_application option
@@ -554,7 +554,7 @@ let request_task_catalog t =
   read
     t
     (Task_catalog { epoch; seen = Rrbvec.empty; after = None })
-    (Protocol.V2_list_task_statuses { limit = Protocol.maximum_page_size; cursor = None })
+    (Protocol.V2_list_task_statuses { limit = Worker_pure_data.maximum_page_size; cursor = None })
 ;;
 
 let start t = issue_request t (read t Graph_info Protocol.V2_graph_info)
@@ -597,11 +597,11 @@ let parse_uuid field value =
 let mutation_context (_t : t) mutation_id = parse_uuid "mutation ID" mutation_id
 
 let scope_key = function
-  | Protocol.V2_children_scope parent -> "children:" ^ Graph.Uuid.to_string parent
+  | Worker_pure_data.V2_children_scope parent -> "children:" ^ Graph.Uuid.to_string parent
 ;;
 
 let preconditions ?(blocks = []) ?(pages = []) ?(scopes = []) () =
-  Protocol.{ blocks; pages; scopes }
+  Worker_pure_data.{ blocks; pages; scopes }
 ;;
 
 let scope_precondition t scope =
@@ -707,13 +707,13 @@ let feed_ports t =
             Some (Option.fold ~none:key ~some:(fun old->max old key) anchor)
           else anchor) t.projected_blocks None)
     ; observe_packet = (function
-        | Dates items -> Seq.iter (fun (i:Protocol.v2_journal_item)->
+        | Dates items -> Seq.iter (fun (i:Worker_pure_data.journal_item)->
             Hashtbl.replace t.graph_pages (Graph.Uuid.to_string i.page.uuid) i.page;
             Hashtbl.replace t.page_revisions (Graph.Uuid.to_string i.page.uuid) i.revision) items
-        | Roots items -> Seq.iter (fun (i:Protocol.v2_tree_member)->
+        | Roots items -> Seq.iter (fun (i:Worker_pure_data.tree_member)->
             Hashtbl.replace t.block_revisions (Graph.Uuid.to_string i.value.block.uuid) i.revision;
             Hashtbl.replace t.tag_titles (Graph.Uuid.to_string i.value.block.uuid) i.value.tag_titles) items
-        | Preview items -> Seq.iter (fun (i:Protocol.v2_child_member)->
+        | Preview items -> Seq.iter (fun (i:Worker_pure_data.child_member)->
             Hashtbl.replace t.block_revisions (Graph.Uuid.to_string i.value.block.uuid) i.revision;
             Hashtbl.replace t.tag_titles (Graph.Uuid.to_string i.value.block.uuid) i.value.tag_titles) items)
     ; remember_fragment = (fun {page;members;entries}->
@@ -841,7 +841,7 @@ let capture_failure (command:Projection.capture) message =
 ;;
 let project_capture_summary t (summary:Worker.block_summary) =
   match summary.lookup,summary.page,projection_time_context t with
-  | Protocol.V2_present_block{value;revision},Some(V2_present_page{page;revision=page_revision}),Ok time_context ->
+  | Worker_pure_data.V2_present_block{value;revision},Some(Worker_pure_data.V2_present_page{page;revision=page_revision}),Ok time_context ->
     (match Projection.block_on_page ~page ~revision
       ~child_count:(List.length summary.items + if summary.next=None then 0 else 1)
       ~time_context value.block,page_of_graph_page page with
@@ -857,7 +857,7 @@ let project_capture_summary t (summary:Worker.block_summary) =
           Hashtbl.replace t.block_revisions (Graph.Uuid.to_string value.block.uuid) revision;
           Hashtbl.replace t.projected_blocks (Graph.Uuid.to_string value.block.uuid) block;
           Hashtbl.replace t.tag_titles (Graph.Uuid.to_string value.block.uuid) value.tag_titles;
-          Hashtbl.replace t.page_tree_interests journal.id {page=journal;limit=Protocol.maximum_page_size};
+          Hashtbl.replace t.page_tree_interests journal.id {page=journal;limit=Worker_pure_data.maximum_page_size};
           remember_block_page t journal (Graph.Uuid.to_string value.block.uuid);
           (* The summary is a bounded slice. Keep the same lower bound on
              both projections; Timeline owns a preview and opens a fresh Detail
@@ -879,11 +879,11 @@ let capture_append_wire t (command:Projection.capture) =
     let children=List.fold_left(fun result (child:Projection.capture_child)->
       bind result(fun nodes->bind(parse_uuid "child UUID" child.block_id)(fun block_id->
         bind(task_status_uuid t child.task_state)(fun task_status->
-          Ok(Rrbvec.push_back nodes Protocol.{block_id;title=child.source;task_status;children=Rrbvec.empty})))))
+          Ok(Rrbvec.push_back nodes Worker_pure_data.{block_id;title=child.source;task_status;children=Rrbvec.empty})))))
       (Ok Rrbvec.empty)command.children in
     bind children(fun children->
-      let root:Protocol.v2_append_node={block_id;title=command.source;task_status;children} in
-      if not(Protocol.valid_append_node root) then Error "Capture tree has invalid or duplicate identities."
+      let root:Worker_pure_data.append_node={block_id;title=command.source;task_status;children} in
+      if not(Worker_pure_data.valid_append_node root) then Error "Capture tree has invalid or duplicate identities."
       else Ok(Protocol.V2_append_journal{mutation_id;page;
         journal_day=Journal_time.local_day command.creation_time;root}))))))
 ;;
@@ -897,7 +897,7 @@ let child_action t root chain projection action =
   | Child.Write(index,round,wire) -> requests [mutate t (Child_write{root;index;round}) wire]
   | Read_child round -> requests [read t (Child_canonical{root;round})
       (Protocol.V2_get_outline_block_summary {block=Graph.Uuid.of_string command.block_id |> Result.get_ok;
-        limit=Protocol.default_page_size;cursor=None})]
+        limit=Worker_pure_data.default_page_size;cursor=None})]
   | Read_parent(round,summary) ->
     let parent=Graph.Uuid.of_string command.parent_block_id |> Result.get_ok in
     let page=Child.page chain in
@@ -939,7 +939,7 @@ let child_action t root chain projection action =
         else Some pending) t.pending;
     let refresh=if Child.canonical chain=None then [] else
       match page_of_graph_page(Child.page chain) with None->[]|Some page->
-        Option.to_list(Feed.reconcile_page t.feed ~ports:(feed_ports t) ~page ~limit:Protocol.maximum_page_size) in
+        Option.to_list(Feed.reconcile_page t.feed ~ports:(feed_ports t) ~page ~limit:Worker_pure_data.maximum_page_size) in
     {requests=refresh;responses=[response(match capture with
       | Some command->Capture_projection_settled
         {command;presentation=Child.presentation chain;result;failure=Child.failure chain;insert_rejected}
@@ -977,7 +977,7 @@ let submit_unowned t (request : Journal_graph_request.t) =
     let cursor = Option.bind after (fun cursor -> cursor.Projection.protocol_cursor) in
     let parsed = match cursor with
       | Some (Projection.Root_tree_cursor _) -> Error "A Timeline cursor cannot continue Detail children."
-      | Some (Projection.Child_cursor {maximum_items;_}) when maximum_items<=0 || maximum_items>Protocol.maximum_page_size ->
+      | Some (Projection.Child_cursor {maximum_items;_}) when maximum_items<=0 || maximum_items>Worker_pure_data.maximum_page_size ->
         Error "The Detail continuation budget is invalid."
       | Some (Projection.Child_cursor _) | None -> parse_uuid "block UUID" block_id in
     (match parsed with
@@ -1000,7 +1000,7 @@ let submit_unowned t (request : Journal_graph_request.t) =
                 { generation = request_generation
                 ; block_id
                 ; limit = (match cursor with Some (Projection.Child_cursor value)->value.maximum_items
-                    | _->max 1 (min Protocol.maximum_page_size limit))
+                    | _->max 1 (min Worker_pure_data.maximum_page_size limit))
                 ; after = (match cursor with Some (Projection.Child_cursor value)->Some value | _->None)
                 })
              (if Hashtbl.mem t.graph_pages block_id
@@ -1113,7 +1113,7 @@ let submit_unowned t (request : Journal_graph_request.t) =
         (match page with
          | None -> reject "The append parent is unavailable."
          | Some page ->
-           (match scope_precondition t (Protocol.V2_children_scope parent) with
+           (match scope_precondition t (Worker_pure_data.V2_children_scope parent) with
             | Error message -> reject message
             | Ok scope_revision ->
               requests
@@ -1201,7 +1201,7 @@ let request_target_summary_without_interest t refresh =
 let request_target_summary t page refresh =
   (* Journal interests are optional business subscriptions. The target summary
      itself supplies its real owning page, including ordinary pages. *)
-  Hashtbl.replace t.page_tree_interests page.Projection.id {page;limit=Protocol.maximum_page_size};
+  Hashtbl.replace t.page_tree_interests page.Projection.id {page;limit=Worker_pure_data.maximum_page_size};
   request_target_summary_without_interest t refresh
 ;;
 let request_delete_summary t block_id =
@@ -1217,7 +1217,7 @@ let append_unique equal value values =
 
 let changed_interests windows =
   List.fold_left
-    (fun (blocks, pages, structures) (window : Protocol.v2_change_window) ->
+    (fun (blocks, pages, structures) (window : Worker_pure_data.change_window) ->
        ( List.fold_left
            (fun values value -> append_unique Graph.Uuid.equal value values)
            blocks
@@ -1430,11 +1430,11 @@ let hydration_for_changes t ~request_generation windows =
   let tree_reads =
     List.filter_map
       (function
-        | Protocol.V2_page_tree_interest page ->
+        | Worker_pure_data.V2_page_tree_interest page ->
           Option.bind (registered_tree t page) (fun interest ->
             Feed.reconcile_page t.feed ~ports:(feed_ports t)
               ~page:interest.page ~limit:interest.limit)
-        | V2_children_interest _ | V2_journal_index_interest -> None)
+        | Worker_pure_data.V2_children_interest _ | Worker_pure_data.V2_journal_index_interest -> None)
       structures
   in
   let detail_page_reads =
@@ -1454,7 +1454,7 @@ let hydration_for_changes t ~request_generation windows =
   let children_reads =
     List.filter_map
       (function
-        | Protocol.V2_children_interest parent ->
+        | Worker_pure_data.V2_children_interest parent ->
           Option.map
             (fun interest ->
                read
@@ -1463,14 +1463,14 @@ let hydration_for_changes t ~request_generation windows =
                  (Protocol.V2_get_children
                     { parent; limit = interest.limit; cursor = None; revision = None }))
             (registered_children t parent)
-        | V2_page_tree_interest _ | V2_journal_index_interest -> None)
+        | Worker_pure_data.V2_page_tree_interest _ | Worker_pure_data.V2_journal_index_interest -> None)
       structures
   in
   let journal_changed =
     List.exists
       (function
-        | Protocol.V2_journal_index_interest -> true
-        | V2_children_interest _ | V2_page_tree_interest _ -> false)
+        | Worker_pure_data.V2_journal_index_interest -> true
+        | Worker_pure_data.V2_children_interest _ | Worker_pure_data.V2_page_tree_interest _ -> false)
       structures
     || List.exists (fun page -> Option.is_some (registered_page t page)) pages
   in
@@ -1485,9 +1485,9 @@ let hydration_for_changes t ~request_generation windows =
     ; "blocks", `List (List.take 16 blocks |> List.map (fun u -> `String (Graph.Uuid.to_string u)))
     ; "interestCount", `Int (List.length structures)
     ; "interests", `List (List.take 16 structures |> List.map (function
-        | Protocol.V2_journal_index_interest -> `Assoc ["kind", `String "journal-index"]
-        | V2_children_interest u -> `Assoc ["kind", `String "children"; "target", `String (Graph.Uuid.to_string u)]
-        | V2_page_tree_interest u -> `Assoc ["kind", `String "page-tree"; "target", `String (Graph.Uuid.to_string u)]))
+        | Worker_pure_data.V2_journal_index_interest -> `Assoc ["kind", `String "journal-index"]
+        | Worker_pure_data.V2_children_interest u -> `Assoc ["kind", `String "children"; "target", `String (Graph.Uuid.to_string u)]
+        | Worker_pure_data.V2_page_tree_interest u -> `Assoc ["kind", `String "page-tree"; "target", `String (Graph.Uuid.to_string u)]))
     ; "truncated", `Bool (List.length pages > 16 || List.length blocks > 16 || List.length structures > 16)
     ];
   let journal =
@@ -1605,7 +1605,7 @@ let remember_page_revision t uuid revision =
 let remember_scope_revision t scope revision =
   let scope =
     match scope with
-    | Protocol.V2_children_revision parent -> Protocol.V2_children_scope parent
+    | Worker_pure_data.V2_children_revision parent -> Worker_pure_data.V2_children_scope parent
   in
   Hashtbl.replace t.scope_revisions (scope_key scope) revision
 ;;
@@ -1673,7 +1673,7 @@ let finish_child_parent t ~root ~round ~(summary:Worker.block_summary) parent =
   | Some(_,chain,_) ->
     let next,action=Child.projection_ready chain ~round in
     (match action,summary.lookup with
-     | Child.Present _,Protocol.V2_present_block{value;revision} ->
+     | Child.Present _,Worker_pure_data.V2_present_block{value;revision} ->
        remember_block_revision t value.block.uuid revision;
        Hashtbl.replace t.tag_titles (Graph.Uuid.to_string value.block.uuid) value.tag_titles;
        let child=Projection.{block=value.block;revision} in
@@ -1694,7 +1694,7 @@ let finish_child_parent t ~root ~round ~(summary:Worker.block_summary) parent =
 let publish_changed_point
       t
       ~block_id
-      ~(value : Protocol.v2_block_record)
+      ~(value : Worker_pure_data.block_record)
       ~revision
       ~child_count
       ~(page : Graph.page)
@@ -1708,7 +1708,7 @@ let publish_changed_point
          ~revision
          ~child_count
          ~time_context
-         value.Protocol.block
+         value.Worker_pure_data.block
      with
      | Error message -> reject message
      | Ok projected ->
@@ -1739,7 +1739,7 @@ let resolve_changed_point
       t
       ~source_epoch
       ~block_id
-      ~(value : Protocol.v2_block_record)
+      ~(value : Worker_pure_data.block_record)
       ~revision
   =
   let child_count =
@@ -1912,7 +1912,7 @@ let failure_output
 let children_result items continuation : Projection.children_page =
   { items =
       List.map
-        (fun (item : Protocol.v2_child_member) ->
+        (fun (item : Worker_pure_data.child_member) ->
            Projection.{ block = item.value.block; revision = item.revision })
         items
   ; continuation
@@ -2040,7 +2040,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                       t
                       (Task_catalog { epoch; seen; after = Some cursor })
                       (Protocol.V2_list_task_statuses
-                         { limit = Protocol.maximum_page_size; cursor = None })
+                         { limit = Worker_pure_data.maximum_page_size; cursor = None })
                   ]
                 | None ->
                   let seen =
@@ -2136,7 +2136,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
         | _ -> failure_output t operation request_id "Unexpected admission response.")
      | V2_journals_outcome { items; next_cursor = _ } ->
        List.iter
-         (fun (item : Protocol.v2_journal_item) ->
+         (fun (item : Worker_pure_data.journal_item) ->
             Hashtbl.replace t.graph_pages (Graph.Uuid.to_string item.page.uuid) item.page;
             remember_page_revision t item.page.uuid item.revision)
          items;
@@ -2144,26 +2144,26 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
         | _ -> failure_output t operation request_id "Unexpected journal response.")
      | V2_page_outcome lookup ->
        (match lookup, operation with
-        |V2_present_page{page;revision=page_revision},Changed_point_context{block_id;value;revision;child_count}
+        |Worker_pure_data.V2_present_page{page;revision=page_revision},Changed_point_context{block_id;value;revision;child_count}
           when Graph.Uuid.equal page.uuid value.block.page && not page.recycled->
           remember_page_revision t page.uuid page_revision;
           publish_changed_point t ~block_id ~value ~revision ~child_count ~page
         |_,Changed_point_context _->reject "The changed block page is unavailable."
-        | ( (V2_present_page _ | V2_missing_page _)
+        | ( (Worker_pure_data.V2_present_page _ | Worker_pure_data.V2_missing_page _)
           , Reference_read ({ lookup = Reference.Page_lookup; _ } as value) ) ->
           Reference.receive_page t.references ~ports:(reference_ports t)
             ~source_epoch value lookup |> reference_output
-        | ( V2_present_page { page; revision }
+        | ( Worker_pure_data.V2_present_page { page; revision }
           , Detail_block { generation; block_id; limit; after } )
           when Graph.Uuid.to_string page.uuid = block_id && not page.recycled ->
           remember_page_revision t page.uuid revision;
           Hashtbl.replace t.graph_pages block_id page;
           detail_children t ~generation ~page ~root:(page_root_member page revision) ~limit ~after
-        | ( (V2_missing_page _ | V2_present_page _)
+        | ( (Worker_pure_data.V2_missing_page _ | Worker_pure_data.V2_present_page _)
           , Detail_block { generation; block_id; _ } ) ->
           responses [response (Detail_failed {request_generation=generation;block_id;
             missing=true;stale_cursor=false;failure=Projection_failure "This page is unavailable."})]
-        | V2_present_page {page;revision}, Child_chain_parent{root;round;summary}
+        | Worker_pure_data.V2_present_page {page;revision}, Child_chain_parent{root;round;summary}
           when not page.recycled ->
           remember_page_revision t page.uuid revision;
           Hashtbl.replace t.graph_pages (Graph.Uuid.to_string page.uuid) page;
@@ -2172,7 +2172,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
           let planned = Favorites.receive_page t.favorites ~ports:(favorites_ports t) value lookup in
           let output = favorites_output planned in
           if planned.background then background_demands t output else output
-        | V2_present_page { page; revision }, Changed_detail_page _ when not page.recycled ->
+        | Worker_pure_data.V2_present_page { page; revision }, Changed_detail_page _ when not page.recycled ->
           Hashtbl.replace t.graph_pages (Graph.Uuid.to_string page.uuid) page;
           remember_page_revision t page.uuid revision;
           let reconciled = ref [] in
@@ -2214,8 +2214,8 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                Some (if Graph.Uuid.equal old.Graph.uuid page.uuid then page else old))
             t.detail_pages;
           responses (List.rev !reconciled)
-        | ( ( V2_missing_page { uuid; _ }
-            | V2_present_page { page = { uuid; recycled = true; _ }; _ } )
+        | ( ( Worker_pure_data.V2_missing_page { uuid; _ }
+            | Worker_pure_data.V2_present_page { page = { uuid; recycled = true; _ }; _ } )
           , Changed_detail_page _ ) ->
           responses
             (Hashtbl.to_seq_values t.children_interests
@@ -2228,7 +2228,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                          { block_id = Graph.Uuid.to_string interest.root.block.uuid }))
                else None)
              |> List.of_seq)
-        | ( V2_present_page { page; revision }
+        | ( Worker_pure_data.V2_present_page { page; revision }
           , Detail_page { generation; root; limit; after } ) ->
           remember_page_revision t page.uuid revision;
           if page.recycled
@@ -2236,7 +2236,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
           else (
             Hashtbl.replace t.graph_pages (Graph.Uuid.to_string page.uuid) page;
             detail_children t ~generation ~page ~root ~limit ~after)
-        | V2_missing_page _, Detail_page { generation; root; _ } ->
+        | Worker_pure_data.V2_missing_page _, Detail_page { generation; root; _ } ->
           responses
             [ response
                 (Detail_failed
@@ -2316,7 +2316,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                           Hashtbl.replace t.block_revisions block_id revision;
                           Hashtbl.replace
                             t.scope_revisions
-                            (scope_key (Protocol.V2_children_scope value.block.uuid))
+                            (scope_key (Worker_pure_data.V2_children_scope value.block.uuid))
                             scope_revision;
                           Hashtbl.replace t.tag_titles block_id value.tag_titles;
                           Hashtbl.replace t.projected_blocks block_id block;
@@ -2325,10 +2325,10 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                                Hashtbl.replace
                                  t.page_tree_interests
                                  journal.Projection.id
-                                 { page = journal; limit = Protocol.maximum_page_size };
+                                 { page = journal; limit = Worker_pure_data.maximum_page_size };
                                remember_block_page t journal block_id;
                                Rrbvec.iter
-                                 (fun (item : Protocol.v2_child_member) ->
+                                 (fun (item : Worker_pure_data.child_member) ->
                                     remember_block_page
                                       t
                                       journal
@@ -2336,7 +2336,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                                  children)
                             (page_of_graph_page page);
                           Rrbvec.iter
-                            (fun (item : Protocol.v2_child_member) ->
+                            (fun (item : Worker_pure_data.child_member) ->
                                Hashtbl.replace
                                  t.block_revisions
                                  (Graph.Uuid.to_string item.value.block.uuid)
@@ -2358,18 +2358,18 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
         | _ -> failure_output t operation request_id "Unexpected target summary response.")
      | V2_block_outcome lookup ->
        (match lookup with
-        | V2_present_block { value; _ } ->
+        | Worker_pure_data.V2_present_block { value; _ } ->
           Hashtbl.replace
             t.tag_titles
             (Graph.Uuid.to_string value.block.uuid)
             value.tag_titles
-        | V2_missing_block _ -> ());
+        | Worker_pure_data.V2_missing_block _ -> ());
        (match lookup, operation with
         | _, Favorite_read value when Favorites.accepts_block t.favorites value ->
           let planned = Favorites.receive_block t.favorites ~ports:(favorites_ports t) value lookup in
           let output = favorites_output planned in
           if planned.background then background_demands t output else output
-        | ( V2_present_block { value; revision }
+        | ( Worker_pure_data.V2_present_block { value; revision }
           , Detail_block { generation; limit; after; _ } ) ->
           remember_block_revision t value.block.uuid revision;
           let root = Projection.{ block = value.block; revision } in
@@ -2384,19 +2384,19 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                    (Detail_page { generation; root; limit; after })
                    (Protocol.V2_get_page { page = value.block.page; revision = None })
                ])
-        | ( V2_missing_block { uuid; _ }
+        | ( Worker_pure_data.V2_missing_block { uuid; _ }
           , Detail_block { generation; block_id; limit; after } )
           when Graph.Uuid.to_string uuid = block_id ->
           requests [read t (Detail_block {generation;block_id;limit;after})
             (Protocol.V2_get_page {page=uuid;revision=None})]
-        | V2_present_block {value;revision},Child_chain_parent{root;round;summary}->
+        | Worker_pure_data.V2_present_block {value;revision},Child_chain_parent{root;round;summary}->
           remember_block_revision t value.block.uuid revision;
           finish_child_parent t ~root ~round ~summary Projection.{block=value.block;revision}
-        | ( (V2_present_block _ | V2_missing_block _)
+        | ( (Worker_pure_data.V2_present_block _ | Worker_pure_data.V2_missing_block _)
           , Reference_read ({ lookup = Reference.Outline_lookup; _ } as value) ) ->
           Reference.receive_outline t.references ~ports:(reference_ports t)
             ~source_epoch value lookup |> reference_output
-        | V2_present_block { value; revision }, Find_block_result ->
+        | Worker_pure_data.V2_present_block { value; revision }, Find_block_result ->
           remember_block_revision t value.block.uuid revision;
           (match page_by_uuid t value.block.page, projection_time_context t with
            | Some page, Ok time_context ->
@@ -2411,11 +2411,11 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
               | Error message -> reject message)
            | None, _ -> responses [ response (Block_found None) ]
            | _, Error message -> reject message)
-        | V2_missing_block _, Find_block_result ->
+        | Worker_pure_data.V2_missing_block _, Find_block_result ->
           responses [ response (Block_found None) ]
-        |V2_present_block{value;revision},(Changed_block{block_id;_}|Changed_detail_block{block_id;_})->
+        |Worker_pure_data.V2_present_block{value;revision},(Changed_block{block_id;_}|Changed_detail_block{block_id;_})->
           resolve_changed_point t ~source_epoch ~block_id ~value ~revision
-        | V2_missing_block { uuid; revision }, ((Changed_block { block_id; _ }
+        | Worker_pure_data.V2_missing_block { uuid; revision }, ((Changed_block { block_id; _ }
           | Changed_detail_block { block_id; _ }) as operation) ->
           remember_block_revision t uuid revision;
           t.block_pages
@@ -2434,7 +2434,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
      | V2_children_outcome { revision_scope; scope_revision; items; next_cursor; _ } ->
        remember_scope_revision t revision_scope scope_revision;
        List.iter
-         (fun (item : Protocol.v2_child_member) ->
+         (fun (item : Worker_pure_data.child_member) ->
             remember_block_revision t item.value.block.uuid item.revision;
             Hashtbl.replace
               t.tag_titles
@@ -2540,7 +2540,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
             ; "requestGeneration", `String (Int64.to_string request_generation)
             ; "generation", timeline_version generation; "through", timeline_version through
             ; "windowCount", `Int (List.length windows)
-            ; "windows", `List (List.take 16 windows |> List.map (fun (w : Protocol.v2_change_window) ->
+            ; "windows", `List (List.take 16 windows |> List.map (fun (w : Worker_pure_data.change_window) ->
                 `Assoc ["id", timeline_version w.id; "predecessor", timeline_version w.predecessor;
                   "successor", timeline_version w.successor; "blockCount", `Int (List.length w.block_uuids);
                   "pageCount", `Int (List.length w.page_uuids); "interestCount", `Int (List.length w.structure_interests)]))
@@ -2559,7 +2559,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
             else (
               let ids =
                 List.concat_map
-                  (fun (w : Protocol.v2_change_window) -> w.block_uuids @ w.page_uuids)
+                  (fun (w : Worker_pure_data.change_window) -> w.block_uuids @ w.page_uuids)
                   windows
                 |> List.sort_uniq Graph.Uuid.compare
               in
@@ -2573,7 +2573,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
                 let rec batches = function
                   | [] -> []
                   | ids ->
-                    let batch = List.take Protocol.maximum_page_size ids in
+                    let batch = List.take Worker_pure_data.maximum_page_size ids in
                     read
                       t
                       (Task_definitions batch)
@@ -2592,7 +2592,7 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
           t.change_generation<-Some generation;t.change_cursor<-Some through;
           (match continuation with None->empty|Some request_generation ->
             requests[read t (Pull_changes{request_generation;generation})
-              (Protocol.V2_pull_changes{generation;after=Some through;limit=Protocol.maximum_page_size})])
+              (Protocol.V2_pull_changes{generation;after=Some through;limit=Worker_pure_data.maximum_page_size})])
         | _ ->
           failure_output t operation request_id "Unexpected acknowledgement response.")))
 ;;
@@ -2629,14 +2629,14 @@ let receive_delivery_body t ~read_result ~origin (protocol_response : Protocol.r
       when not (Confirmation.current t.confirmations summary) ->
       empty
     | Some { operation; source_epoch; _ }, Protocol.V2_response { outcome; _ } ->
-      let block (value : Protocol.v2_block_record) = Reference.Block value.block in
+      let block (value : Worker_pure_data.block_record) = Reference.Block value.block in
       let sources =
         match outcome with
-        | V2_block_outcome (V2_present_block { value; _ }) -> Rrbvec.singleton (block value)
-        | V2_block_outcome (V2_missing_block { uuid; _ }) ->
+        | V2_block_outcome (Worker_pure_data.V2_present_block { value; _ }) -> Rrbvec.singleton (block value)
+        | V2_block_outcome (Worker_pure_data.V2_missing_block { uuid; _ }) ->
           Rrbvec.singleton (Reference.Missing_outline uuid)
         | V2_block_summary_outcome
-            { lookup = V2_present_block { value; _ }; items; next_cursor = None; _ }
+            { lookup = Worker_pure_data.V2_present_block { value; _ }; items; next_cursor = None; _ }
           when List.exists
                  (fun response -> match response.payload with
                     | Block_captured _ | Block_updated _ | Update_conflict _ | Delete_conflict _ -> true | _ -> false)
@@ -2644,21 +2644,21 @@ let receive_delivery_body t ~read_result ~origin (protocol_response : Protocol.r
           let fragment = match operation with
             | Target_summary summary -> Confirmation.reference_fragment summary ~target:value ~final_children:items
             | _ -> Rrbvec.push_front
-                (Rrbvec.of_list items |> Rrbvec.map (fun (item:Protocol.v2_child_member)->item.value)) value in
+                (Rrbvec.of_list items |> Rrbvec.map (fun (item:Worker_pure_data.child_member)->item.value)) value in
           Rrbvec.map block fragment
-        | V2_page_outcome (V2_present_page { page; _ }) ->
+        | V2_page_outcome (Worker_pure_data.V2_present_page { page; _ }) ->
           let detail_owner = match operation with
             | Detail_block { block_id; _ } -> block_id = Graph.Uuid.to_string page.uuid
             | Changed_detail_page _ ->
               Hashtbl.mem t.detail_pages (Graph.Uuid.to_string page.uuid)
             | _ -> false in
           Rrbvec.singleton (Reference.Page { page; detail_owner })
-        | V2_page_outcome (V2_missing_page { uuid; _ }) ->
+        | V2_page_outcome (Worker_pure_data.V2_missing_page { uuid; _ }) ->
           Rrbvec.singleton (Reference.Missing_page uuid)
         | V2_children_outcome { items; _ } ->
-          Rrbvec.of_list items |> Rrbvec.map (fun (item : Protocol.v2_child_member) -> block item.value)
+          Rrbvec.of_list items |> Rrbvec.map (fun (item : Worker_pure_data.child_member) -> block item.value)
         | V2_page_tree_outcome { items; _ } ->
-          Rrbvec.of_list items |> Rrbvec.map (fun (item : Protocol.v2_tree_member) -> block item.value)
+          Rrbvec.of_list items |> Rrbvec.map (fun (item : Worker_pure_data.tree_member) -> block item.value)
         | _ -> Rrbvec.empty
       in
       let changes =
@@ -2687,11 +2687,11 @@ let receive_delivery_body t ~read_result ~origin (protocol_response : Protocol.r
           Seq.cons
             root.block
             (List.to_seq items
-             |> Seq.map (fun (item : Protocol.v2_child_member) -> item.value.block))
+             |> Seq.map (fun (item : Worker_pure_data.child_member) -> item.value.block))
         | ( (Changed_detail_block { block_id; _ } | Changed_block { block_id; _ })
-          , V2_block_outcome (V2_present_block { value; _ }) )
+          , V2_block_outcome (Worker_pure_data.V2_present_block { value; _ }) )
           when Hashtbl.mem t.detail_pages block_id -> Seq.return value.block
-        | Changed_detail_page _, V2_page_outcome (V2_present_page {page;revision})
+        | Changed_detail_page _, V2_page_outcome (Worker_pure_data.V2_present_page {page;revision})
             when (not page.recycled)
             && Hashtbl.mem t.detail_pages (Graph.Uuid.to_string page.uuid) ->
           Seq.return (page_root_member page revision).block
@@ -2768,7 +2768,7 @@ let retry_failed_change_application t ~view ~request_generation =
              (Protocol.V2_pull_changes
                 { generation = batch.generation
                 ; after = batch.from_exclusive
-                ; limit = Protocol.maximum_page_size
+                ; limit = Worker_pure_data.maximum_page_size
                 })
          ])
   | _ -> empty
@@ -3418,7 +3418,7 @@ let worker_read t (request : Protocol.request) =
        Some
          (Read
             { query = Confirmation.worker_query read
-            ; maximum_items = Protocol.default_page_size
+            ; maximum_items = Worker_pure_data.default_page_size
             ; outcome = (fun value -> Target_summary_read value)
             })
      | _ -> Some (Unowned_read "Target summary business request is no longer owned"))
@@ -3447,7 +3447,7 @@ let worker_read t (request : Protocol.request) =
        Some
          (Read
             { query = Worker.Task_statuses after
-            ; maximum_items = Protocol.maximum_page_size
+            ; maximum_items = Worker_pure_data.maximum_page_size
             ; outcome = (fun value -> Task_catalog_read value)
             })
      | _ -> Some (Unowned_read "Task catalog business request is no longer owned"))

@@ -28,4 +28,5 @@
   unix
   uri
   yojson
-  logseq_db_worker.effect_runner))
+  logseq_db_worker.effect_runner
+  logseq_db_worker.typed_data))

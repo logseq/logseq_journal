@@ -1,6 +1,6 @@
 module Worker = Journal_worker_coordination.Worker_api
 
-type favorites_cursor = Worker.Protocol.v2_favorite_item Worker.continuation
+type favorites_cursor = Worker_pure_data.favorite_item Worker.continuation
 
 type favorites_request =
   { graph_generation : int
@@ -13,7 +13,7 @@ type favorites_result =
   { favorites_page : Worker.Uuid.t option
   ; generation : string
   ; projection_revision : string
-  ; items : Worker.Protocol.v2_favorite_item Rrbvec.t
+  ; items : Worker_pure_data.favorite_item Rrbvec.t
   ; next_cursor : favorites_cursor option
   }
 

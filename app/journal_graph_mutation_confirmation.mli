@@ -12,12 +12,12 @@ type read
 type confirmation =
   { purpose : purpose
   ; block_id : string
-  ; value : Protocol.v2_block_record
+  ; value : Worker_pure_data.block_record
   ; revision : string
   ; page : Graph.page
   ; page_revision : string
   ; scope_revision : string
-  ; children : Protocol.v2_child_member Rrbvec.t
+  ; children : Worker_pure_data.child_member Rrbvec.t
   }
 
 type planning = (Protocol.request, string) result
@@ -45,10 +45,10 @@ val receive_summary
   :  t
   -> ports:ports
   -> read
-  -> lookup:Protocol.v2_block_lookup
-  -> page:Protocol.v2_page_lookup option
-  -> items:Protocol.v2_child_member list
-  -> next_cursor:Protocol.v2_child_member Worker.continuation option
+  -> lookup:Worker_pure_data.block_lookup
+  -> page:Worker_pure_data.page_lookup option
+  -> items:Worker_pure_data.child_member list
+  -> next_cursor:Worker_pure_data.child_member Worker.continuation option
   -> scope_revision:string
   -> generation:string
   -> projection_revision:string
@@ -56,9 +56,9 @@ val receive_summary
 
 val reference_fragment
   :  read
-  -> target:Protocol.v2_block_record
-  -> final_children:Protocol.v2_child_member list
-  -> Protocol.v2_block_record Rrbvec.t
+  -> target:Worker_pure_data.block_record
+  -> final_children:Worker_pure_data.child_member list
+  -> Worker_pure_data.block_record Rrbvec.t
 
 val worker_query : read -> Worker.block_summary Worker.query
 

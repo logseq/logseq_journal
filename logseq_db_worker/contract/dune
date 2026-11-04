@@ -2,7 +2,8 @@
  (name logseq_db_worker_contract)
  (public_name logseq_db_worker.contract)
  (modules config error protocol mutation_pure_wire)
- (libraries digestif rrbvec logseq_db_types ppx_deriving_yojson.runtime uri yojson)
+ (libraries digestif rrbvec logseq_db_types ppx_deriving_yojson.runtime uri yojson
+  logseq_db_worker.typed_data)
  (preprocess
   (pps ppx_deriving_yojson))
  (flags

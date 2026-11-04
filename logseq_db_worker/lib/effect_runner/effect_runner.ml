@@ -360,7 +360,7 @@ type change_window =
   ; successor : string
   ; block_uuids : Graph.block_uuid list
   ; page_uuids : Graph.page_uuid list
-  ; structure_interests : Protocol.v2_structure_interest list
+  ; structure_interests : Worker_pure_data.structure_interest list
   }
 
 type database_session =
@@ -984,7 +984,7 @@ let task_status_to_protocol = function
 let task_status_of_protocol uuid = Overlay.Status_uuid uuid
 
 let block_record ?(tag_titles = []) (value : Overlay.block_record)
-  : Protocol.v2_block_record
+  : Worker_pure_data.block_record
   =
   { block = value.block
   ; task_status = Option.map task_status_to_protocol value.task_status
@@ -994,13 +994,13 @@ let block_record ?(tag_titles = []) (value : Overlay.block_record)
 ;;
 
 let revision_scope_to_protocol = function
-  | Overlay.Children_revision parent -> Protocol.V2_children_revision parent
+  | Overlay.Children_revision parent -> Worker_pure_data.V2_children_revision parent
 ;;
 
 let structure_interest_to_protocol = function
-  | Overlay.Children_interest parent -> Protocol.V2_children_interest parent
-  | Page_tree_interest page -> V2_page_tree_interest page
-  | Journal_index_interest -> V2_journal_index_interest
+  | Overlay.Children_interest parent -> Worker_pure_data.V2_children_interest parent
+  | Page_tree_interest page -> Worker_pure_data.V2_page_tree_interest page
+  | Journal_index_interest -> Worker_pure_data.V2_journal_index_interest
 ;;
 
 let resync_reason = function
@@ -1029,7 +1029,7 @@ let publish_projection_change t session = function
       session.acknowledged_through <- "change-window:v1:0");
     let id = Printf.sprintf "change-window:v1:%d" session.next_window in
     session.next_window <- session.next_window + 1;
-    let window:Protocol.v2_change_window=
+    let window:Worker_pure_data.change_window=
       {id;predecessor=Overlay.Projection_revision.to_string before_revision;
        successor=Overlay.Projection_revision.to_string after_revision;block_uuids;page_uuids;
        structure_interests=List.map structure_interest_to_protocol structure_interests} in
@@ -1300,10 +1300,10 @@ let close_attached t =
 ;;
 
 let overlay_scope_of_protocol = function
-  | Protocol.V2_children_scope parent -> Overlay.Children_revision parent
+  | Worker_pure_data.V2_children_scope parent -> Overlay.Children_revision parent
 ;;
 
-let parse_preconditions (value : Protocol.v2_preconditions) =
+let parse_preconditions (value : Worker_pure_data.preconditions) =
   let rec blocks reversed = function
     | [] -> Ok (List.rev reversed)
     | (uuid, revision) :: rest ->
@@ -1333,14 +1333,14 @@ let parse_preconditions (value : Protocol.v2_preconditions) =
         |> Result.map_error (fun _ -> "duplicate write precondition"))))
 ;;
 
-let rec block_tree (value : Protocol.v2_block_tree) : Overlay.block_tree =
+let rec block_tree (value : Worker_pure_data.block_tree) : Overlay.block_tree =
   { uuid = value.uuid
   ; title = value.title
   ; children = List.map block_tree value.children
   }
 ;;
 
-let rec append_node (node:Protocol.v2_append_node) : Overlay.append_node =
+let rec append_node (node:Worker_pure_data.append_node) : Overlay.append_node =
   {uuid=node.block_id;title=node.title;task_status=node.task_status;children=Rrbvec.map append_node node.children}
 ;;
 
@@ -1351,7 +1351,7 @@ let journal_append_title format day =
 let local_mutation ?append_title = function
   | Protocol.V2_append_journal{mutation_id;page;journal_day;root}->
     let title=Option.value append_title ~default:(journal_append_title None journal_day) in
-    Ok(Protocol.{blocks=[];pages=[];scopes=[]},Overlay.Append_journal
+    Ok(Worker_pure_data.{blocks=[];pages=[];scopes=[]},Overlay.Append_journal
       {mutation_id;page;journal_day;title;root=append_node root})
   | Protocol.V2_set_asset_reference { mutation_id; block; previous; asset; preconditions }
     ->
@@ -1395,9 +1395,9 @@ let local_mutation ?append_title = function
 ;;
 
 let local_status = function
-  | Overlay.Applied -> Protocol.V2_applied
-  | No_change -> V2_no_change
-  | Already_applied -> V2_already_applied
+  | Overlay.Applied -> Worker_pure_data.V2_applied
+  | No_change -> Worker_pure_data.V2_no_change
+  | Already_applied -> Worker_pure_data.V2_already_applied
 ;;
 
 let committed_outcome (commit : Overlay.local_commit) =
@@ -1591,21 +1591,20 @@ let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~respo
                      let target =
                        match item.target with
                        | Overlay.Favorite_page { uuid; title; revision } ->
-                         Protocol.V2_favorite_page
+                         Worker_pure_data.V2_favorite_page
                            { uuid
                            ; title
                            ; revision = Overlay.Page_state_revision.to_string revision
                            }
                        | Overlay.Favorite_block { uuid; title; task_status; revision } ->
-                         Protocol.V2_favorite_block
+                         Worker_pure_data.V2_favorite_block
                            { uuid
                            ; title
                            ; task_status = Option.map task_status_to_protocol task_status
                            ; revision = Overlay.Block_state_revision.to_string revision
                            }
                      in
-                     Protocol.
-                       { membership_uuid = item.membership_uuid
+                     Worker_pure_data.{ membership_uuid = item.membership_uuid
                        ; membership_order = item.membership_order
                        ; membership_revision =
                            Overlay.Block_state_revision.to_string item.membership_revision
@@ -1666,8 +1665,7 @@ let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~respo
               let items =
                 result.items
                 |> List.map (fun (item : Overlay.journal_item) ->
-                  Protocol.
-                    { page = item.page.page
+                  Worker_pure_data.{ page = item.page.page
                     ; journal_day = item.journal_day
                     ; revision = Overlay.Page_state_revision.to_string item.revision
                     })
@@ -1682,7 +1680,7 @@ let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~respo
               response
                 request
                 (Protocol.V2_page_outcome
-                   (V2_present_page
+                   (Worker_pure_data.V2_present_page
                       { page = value.page
                       ; revision = Overlay.Page_state_revision.to_string revision
                       }))
@@ -1691,7 +1689,7 @@ let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~respo
               response
                 request
                 (Protocol.V2_page_outcome
-                   (V2_missing_page
+                   (Worker_pure_data.V2_missing_page
                       { uuid; revision = Overlay.Page_state_revision.to_string revision }))
             | Error error -> read_failure ~code:Corrupt_storage request error
             | Ok _ -> failure request Corrupt_storage "The page lookup failed.")
@@ -1701,7 +1699,7 @@ let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~respo
               response
                 request
                 (Protocol.V2_block_outcome
-                   (V2_present_block
+                   (Worker_pure_data.V2_present_block
                       { value = block_record value
                       ; revision = Overlay.Block_state_revision.to_string revision
                       }))
@@ -1709,7 +1707,7 @@ let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~respo
               response
                 request
                 (Protocol.V2_block_outcome
-                   (V2_missing_block
+                   (Worker_pure_data.V2_missing_block
                       { uuid; revision = Overlay.Block_state_revision.to_string revision }))
             | Error error -> read_failure ~code:Corrupt_storage request error
             | Ok _ -> failure request Corrupt_storage "The block lookup failed.")
@@ -1729,13 +1727,13 @@ let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~respo
                       Overlay.Projection_revision.to_string version.projection_revision
                   })
            in
-           if limit < 1 || limit > Protocol.maximum_page_size
+           if limit < 1 || limit > Worker_pure_data.maximum_page_size
            then failure request Invalid_request "Invalid block summary limit."
            else (
              match Database.get_outline_blocks snapshot [ block ] with
              | Ok [ Overlay.Missing_block { uuid; revision } ] ->
                summary
-                 (V2_missing_block
+                 (Worker_pure_data.V2_missing_block
                     { uuid; revision = Overlay.Block_state_revision.to_string revision })
                  None
                  ""
@@ -1743,7 +1741,7 @@ let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~respo
                  None
              | Ok [ Overlay.Present_block { value; revision } ] ->
                let lookup =
-                 Protocol.V2_present_block
+                 Worker_pure_data.V2_present_block
                    { value = block_record value
                    ; revision = Overlay.Block_state_revision.to_string revision
                    }
@@ -1752,7 +1750,7 @@ let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~respo
                 | Ok [ Overlay.Present_page { value = page; revision } ] ->
                   let page =
                     Some
-                      (Protocol.V2_present_page
+                      (Worker_pure_data.V2_present_page
                          { page = page.page
                          ; revision = Overlay.Page_state_revision.to_string revision
                          })
@@ -1771,8 +1769,7 @@ let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~respo
                        (Overlay.Scope_revision.to_string scope_revision)
                        (List.map
                           (fun (item : Overlay.child_member) ->
-                             Protocol.
-                               { value = block_record item.block
+                             Worker_pure_data.{ value = block_record item.block
                                ; revision =
                                    Overlay.Block_state_revision.to_string item.revision
                                })
@@ -1788,7 +1785,7 @@ let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~respo
                   summary
                     lookup
                     (Some
-                       (V2_missing_page
+                       (Worker_pure_data.V2_missing_page
                           { uuid
                           ; revision = Overlay.Page_state_revision.to_string revision
                           }))
@@ -1819,8 +1816,7 @@ let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~respo
                    ; items =
                        List.map
                          (fun (item : Overlay.child_member) ->
-                            Protocol.
-                              { value = block_record item.Overlay.block
+                            Worker_pure_data.{ value = block_record item.Overlay.block
                               ; revision =
                                   Overlay.Block_state_revision.to_string item.revision
                               })
@@ -1848,8 +1844,7 @@ let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~respo
                    ; items =
                        List.map
                          (fun (item : Overlay.tree_member) ->
-                            Protocol.
-                              { value = block_record item.Overlay.block
+                            Worker_pure_data.{ value = block_record item.Overlay.block
                               ; revision =
                                   Overlay.Block_state_revision.to_string item.revision
                               ; depth = item.depth
@@ -1873,7 +1868,7 @@ let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~respo
          | V2_ack_changes _ ->
            failure request Invalid_request "The command is not a snapshot read."
          in
-         let budget=min response_budget_bytes Protocol.maximum_response_bytes in
+         let budget=min response_budget_bytes Worker_pure_data.maximum_response_bytes in
          (* Reuse this pinned snapshot and enrichment cache across bounded
             attempts. The client budget and query identity stay unchanged;
             storage returns a shorter complete page with its true next cursor. *)
@@ -1940,8 +1935,7 @@ let pull_changes session request generation after limit =
            ; windows =
                Rrbvec.fold_right
                  (fun (window : change_window) rest ->
-                    Protocol.
-                      { id = window.id
+                    Worker_pure_data.{ id = window.id
                       ; predecessor = window.predecessor
                       ; successor = window.successor
                       ; block_uuids = window.block_uuids
@@ -1982,7 +1976,7 @@ let execute_database ~on_enrichment_error session ~response_budget_bytes request
     failure request Unsupported_semantics "Atomic Append requires a registered durable intent."
   | V2_inspect_admission ->
     let result=inspect_admission session.database request in
-    if Protocol.encoded_response_bytes result<=min response_budget_bytes Protocol.maximum_response_bytes
+    if Protocol.encoded_response_bytes result<=min response_budget_bytes Worker_pure_data.maximum_response_bytes
     then result else failure request Response_too_large "The encoded admission result exceeded its byte limit."
   | ( V2_set_asset_reference _
     | V2_save_block _
@@ -2194,7 +2188,7 @@ let retire_changefeed t ~registration =
 ;;
 let coordinated_changefeed t ~registration ~scope ~request ~maximum_bytes ~current =
   if t.stopped || not(current ()) || request.Protocol.api_version<>Protocol.api_version
-      || maximum_bytes<=0 || maximum_bytes>Protocol.maximum_response_bytes
+      || maximum_bytes<=0 || maximum_bytes>Worker_pure_data.maximum_response_bytes
   then Error "The registered changefeed execution is unavailable"
   else match attached_session t scope with
   | None -> Error "The scoped changefeed database is no longer attached"
@@ -2369,13 +2363,13 @@ let confirm_mutation_unfenced t ~(scope : Sync.graph_scope) ~request_id ~intent 
              let command =
                match Wire.command wire with
                | Protocol.V2_append_journal{root;_}->
-                 Protocol.V2_get_outline_block_summary{block=root.block_id;limit=Protocol.default_page_size;cursor=None}
+                 Protocol.V2_get_outline_block_summary{block=root.block_id;limit=Worker_pure_data.default_page_size;cursor=None}
                | Protocol.V2_create_journal_page { page; _ } ->
                  Protocol.V2_get_page { page; revision = None }
                | V2_insert_blocks { roots = root :: _; _ } ->
                  V2_get_outline_block_summary
                    { block = root.uuid
-                   ; limit = Protocol.default_page_size
+                   ; limit = Worker_pure_data.default_page_size
                    ; cursor = None
                    }
                | V2_save_block { block; _ }
@@ -2383,10 +2377,10 @@ let confirm_mutation_unfenced t ~(scope : Sync.graph_scope) ~request_id ~intent 
                | V2_clear_task_status { block; _ }
                | V2_set_asset_reference { block; _ } ->
                  V2_get_outline_block_summary
-                   { block; limit = Protocol.default_page_size; cursor = None }
+                   { block; limit = Worker_pure_data.default_page_size; cursor = None }
                | V2_delete_blocks { root; _ } ->
                  V2_get_outline_block_summary
-                   { block = root; limit = Protocol.default_page_size; cursor = None }
+                   { block = root; limit = Worker_pure_data.default_page_size; cursor = None }
                | _ -> assert false
              in
              let result =

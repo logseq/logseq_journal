@@ -1027,31 +1027,31 @@ let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
         else dependency_failure t ("page:" ^ page) "Attachment page cache is full."
     in
     let page_lookup = function
-      | Protocol.V2_present_page { page; _ } ->
+      | Worker_pure_data.V2_present_page { page; _ } ->
         remember_page page.uuid (not page.recycled)
-      | V2_missing_page { uuid; _ } -> remember_page uuid false
+      | Worker_pure_data.V2_missing_page { uuid; _ } -> remember_page uuid false
     in
-    let block (record : Protocol.v2_block_record) =
+    let block (record : Worker_pure_data.block_record) =
       remember record.block.uuid (Some record.block)
     in
     let lookup = function
-      | Protocol.V2_present_block { value; _ } -> block value
-      | V2_missing_block { uuid; _ } -> remember uuid None
+      | Worker_pure_data.V2_present_block { value; _ } -> block value
+      | Worker_pure_data.V2_missing_block { uuid; _ } -> remember uuid None
     in
     (match outcome with
      | Protocol.V2_block_outcome value -> lookup value
      | V2_block_summary_outcome { lookup = value; page; items; _ } ->
        lookup value;
        Option.iter page_lookup page;
-       List.iter (fun (item : Protocol.v2_child_member) -> block item.value) items
+       List.iter (fun (item : Worker_pure_data.child_member) -> block item.value) items
      | V2_children_outcome { items; _ } ->
-       List.iter (fun (item : Protocol.v2_child_member) -> block item.value) items
+       List.iter (fun (item : Worker_pure_data.child_member) -> block item.value) items
      | V2_page_tree_outcome { items; _ } ->
-       List.iter (fun (item : Protocol.v2_tree_member) -> block item.value) items
+       List.iter (fun (item : Worker_pure_data.tree_member) -> block item.value) items
      | V2_page_outcome value -> page_lookup value
      | V2_journals_outcome { items; _ } ->
        List.iter
-         (fun (item : Protocol.v2_journal_item) ->
+         (fun (item : Worker_pure_data.journal_item) ->
             remember_page item.page.uuid (not item.page.recycled))
          items
      | _ -> ());
@@ -1064,7 +1064,7 @@ let observe_response t (Protocol.V2_response { request_id; outcome; _ }) =
 let observe_journals_result
       t
       ~request_id
-      (value : Protocol.v2_journal_item Journal_worker_coordination.Worker_api.slice)
+      (value : Worker_pure_data.journal_item Journal_worker_coordination.Worker_api.slice)
   =
   (* This outlet records page facts only; it does not publish enumeration or a
      transport continuation. The scan owner retains the actual sealed next. *)
@@ -1100,7 +1100,7 @@ let affected_by_changes t g windows =
   let deps = dependencies t g in
   (not (chain_complete t g))
   || List.exists
-       (fun (window : Protocol.v2_change_window) ->
+       (fun (window : Worker_pure_data.change_window) ->
           List.exists (fun id -> Owners.mem (G.Uuid.to_string id) deps) window.block_uuids
           || Option.exists
                (fun page ->
@@ -1155,10 +1155,10 @@ let changes t windows =
   (* Non-recursive membership does not depend on siblings or page-tree growth.
      The changed block identities carry holder/ancestor moves and deletion. *)
   List.iter
-    (fun (window : Protocol.v2_change_window) -> List.iter mark window.block_uuids)
+    (fun (window : Worker_pure_data.change_window) -> List.iter mark window.block_uuids)
     windows;
   List.iter
-    (fun (window : Protocol.v2_change_window) ->
+    (fun (window : Worker_pure_data.change_window) ->
        List.iter
          (fun uuid ->
             let page = G.Uuid.to_string uuid in

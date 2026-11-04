@@ -27,8 +27,8 @@ let closed_internal_config_fields () =
             ; `Assoc [ "base_url", `String "https://example.invalid" ]
             ] )
       ; "compatibility_profile", `List [ `String "Logseq_65_33_or_newer" ]
-      ; "response_budget_bytes", `Int P.maximum_response_bytes
-      ; "default_page_size", `Int P.default_page_size
+      ; "response_budget_bytes", `Int Worker_pure_data.maximum_response_bytes
+      ; "default_page_size", `Int Worker_pure_data.default_page_size
       ]
   in
   T.require
@@ -489,7 +489,7 @@ let request_domain_constraints () =
   in
   List.iter
     (fun limit -> reject "invalid page limit" (favorite (`Int limit) `Null))
-    [ 0; -1; P.maximum_page_size + 1 ];
+    [ 0; -1; Worker_pure_data.maximum_page_size + 1 ];
   List.iter
     (fun cursor -> reject "invalid cursor" (favorite (`Int 1) cursor))
     [ `String ""; `String (String.make 16385 'x'); `Bool false; `List []; `String "\255" ];
@@ -516,7 +516,7 @@ let request_domain_constraints () =
          ])
   in
   reject "invalid title UTF-8" (save "\255");
-  reject "oversized title" (save (String.make (P.maximum_title_bytes + 1) 'x'));
+  reject "oversized title" (save (String.make (Worker_pure_data.maximum_title_bytes + 1) 'x'));
   let duplicate =
     native_request
       (native_variant
@@ -564,7 +564,7 @@ let request_domain_constraints () =
   in
   List.iter
     (fun depth -> reject "invalid tree depth" (tree depth))
-    [ -1; P.maximum_tree_depth + 1 ]
+    [ -1; Worker_pure_data.maximum_tree_depth + 1 ]
 ;;
 
 let response_domain_constraints () =
@@ -591,7 +591,7 @@ let response_domain_constraints () =
     "oversized block title"
     (replace_field
        "title"
-       (`String (String.make (P.maximum_title_bytes + 1) 'x'))
+       (`String (String.make (Worker_pure_data.maximum_title_bytes + 1) 'x'))
        present_block);
   reject
     "missing required tag_titles"
@@ -731,7 +731,7 @@ let exact_wire_budgets () =
     let remaining = ref padding in
     let roots =
       List.init 17 (fun i ->
-        let length = min P.maximum_title_bytes !remaining in
+        let length = min Worker_pure_data.maximum_title_bytes !remaining in
         remaining := !remaining - length;
         `Assoc
           [ "uuid", `String (Printf.sprintf "10000000-0000-4000-8000-%012d" i)
@@ -755,10 +755,10 @@ let exact_wire_budgets () =
     | Error e ->
       T.fail "request at budget rejected: %s" (Logseq_db_worker.Error.message e)
   in
-  accept_request (padded P.maximum_request_bytes request_make);
+  accept_request (padded Worker_pure_data.maximum_request_bytes request_make);
   T.require
     (Result.is_error
-       (P.request_of_yojson (padded (P.maximum_request_bytes + 1) request_make)))
+       (P.request_of_yojson (padded (Worker_pure_data.maximum_request_bytes + 1) request_make)))
     "request over budget accepted";
   let response_make padding =
     `List
@@ -774,16 +774,16 @@ let exact_wire_budgets () =
           ]
       ]
   in
-  let at_limit = padded P.maximum_response_bytes response_make in
+  let at_limit = padded Worker_pure_data.maximum_response_bytes response_make in
   (match P.response_of_yojson at_limit with
    | Error message -> T.fail "response at budget rejected: %s" message
    | Ok response ->
      T.require
-       (P.encoded_response_bytes response = P.maximum_response_bytes)
+       (P.encoded_response_bytes response = Worker_pure_data.maximum_response_bytes)
        "actual generated response byte count differs");
   T.require
     (Result.is_error
-       (P.response_of_yojson (padded (P.maximum_response_bytes + 1) response_make)))
+       (P.response_of_yojson (padded (Worker_pure_data.maximum_response_bytes + 1) response_make)))
     "response over budget accepted";
   let push_make padding =
     native_variant
@@ -794,10 +794,10 @@ let exact_wire_budgets () =
       ]
   in
   T.require
-    (Result.is_ok (P.push_of_yojson (padded P.maximum_push_bytes push_make)))
+    (Result.is_ok (P.push_of_yojson (padded Worker_pure_data.maximum_push_bytes push_make)))
     "push at budget rejected";
   T.require
-    (Result.is_error (P.push_of_yojson (padded (P.maximum_push_bytes + 1) push_make)))
+    (Result.is_error (P.push_of_yojson (padded (Worker_pure_data.maximum_push_bytes + 1) push_make)))
     "push over budget accepted"
 ;;
 
@@ -890,8 +890,8 @@ let config_generated_golden_and_validation () =
       ; ( "target"
         , native_variant "Managed_sync" [ "base_url", `String "https://api.logseq.io" ] )
       ; "compatibility_profile", `List [ `String "Logseq_65_33_or_newer" ]
-      ; "response_budget_bytes", `Int P.maximum_response_bytes
-      ; "default_page_size", `Int P.default_page_size
+      ; "response_budget_bytes", `Int Worker_pure_data.maximum_response_bytes
+      ; "default_page_size", `Int Worker_pure_data.default_page_size
       ]
   in
   (match C.of_yojson valid with
@@ -926,14 +926,14 @@ let config_generated_golden_and_validation () =
          (Result.is_error
             (C.of_yojson (replace_field "response_budget_bytes" (`Int budget) valid)))
          "invalid config response budget accepted")
-    [ 0; P.maximum_response_bytes + 1 ];
+    [ 0; Worker_pure_data.maximum_response_bytes + 1 ];
   List.iter
     (fun size ->
        T.require
          (Result.is_error
             (C.of_yojson (replace_field "default_page_size" (`Int size) valid)))
          "invalid default page size accepted")
-    [ 0; P.maximum_page_size + 1 ];
+    [ 0; Worker_pure_data.maximum_page_size + 1 ];
   T.require
     (Result.is_error
        (C.of_yojson
@@ -976,24 +976,24 @@ let request_tree_boundaries () =
     | Ok _ -> ()
     | Error error -> T.fail "%s rejected: %s" label (Logseq_db_worker.Error.message error)
   in
-  accept "tree at maximum depth" (insert [ chain P.maximum_tree_depth ]);
+  accept "tree at maximum depth" (insert [ chain Worker_pure_data.maximum_tree_depth ]);
   T.require
-    (Result.is_error (P.request_of_yojson (insert [ chain (P.maximum_tree_depth + 1) ])))
+    (Result.is_error (P.request_of_yojson (insert [ chain (Worker_pure_data.maximum_tree_depth + 1) ])))
     "tree deeper than maximum accepted";
   let width nodes =
     insert [ node 0 (List.init (nodes - 1) (fun i -> node (i + 1) [])) ]
   in
-  accept "tree at maximum node count" (width P.maximum_tree_nodes);
+  accept "tree at maximum node count" (width Worker_pure_data.maximum_tree_nodes);
   T.require
-    (Result.is_error (P.request_of_yojson (width (P.maximum_tree_nodes + 1))))
+    (Result.is_error (P.request_of_yojson (width (Worker_pure_data.maximum_tree_nodes + 1))))
     "tree over node bound accepted";
   accept
     "tree at maximum root count"
-    (insert (List.init P.maximum_roots (fun i -> node i [])));
+    (insert (List.init Worker_pure_data.maximum_roots (fun i -> node i [])));
   T.require
     (Result.is_error
        (P.request_of_yojson
-          (insert (List.init (P.maximum_roots + 1) (fun i -> node i [])))))
+          (insert (List.init (Worker_pure_data.maximum_roots + 1) (fun i -> node i [])))))
     "tree over root bound accepted"
 ;;
 
@@ -1045,15 +1045,15 @@ let durable_wire_preserves_logical_identity () =
       outcome=P.V2_mutation_committed{mutation_id=id;status;generation;
         before_projection_revision;after_projection_revision}} in
   T.require (Result.is_ok(W.committed_point restored ~request_id:id
-    (response P.V2_applied "generation:v1:1:1" "projection:v1:0" "projection:v1:1")))
+    (response Worker_pure_data.V2_applied "generation:v1:1:1" "projection:v1:0" "projection:v1:1")))
     "valid original commit point rejected";
   List.iter(fun invalid ->
     T.require(Result.is_error(W.committed_point restored ~request_id:id invalid))
       "invalid original commit evidence accepted")
-    [response P.V2_already_applied "generation:v1:1:1" "projection:v1:0" "projection:v1:0";
-     response P.V2_applied "generation:v1:1:1" "projection:v1:1" "projection:v1:1";
-     response P.V2_no_change "generation:v1:1:1" "projection:v1:0" "projection:v1:1";
-     response P.V2_applied "futureGeneration:v2:1" "projection:v1:0" "projection:v1:1"]
+    [response Worker_pure_data.V2_already_applied "generation:v1:1:1" "projection:v1:0" "projection:v1:0";
+     response Worker_pure_data.V2_applied "generation:v1:1:1" "projection:v1:1" "projection:v1:1";
+     response Worker_pure_data.V2_no_change "generation:v1:1:1" "projection:v1:0" "projection:v1:1";
+     response Worker_pure_data.V2_applied "futureGeneration:v2:1" "projection:v1:0" "projection:v1:1"]
 ;;
 
 let () =
@@ -1078,13 +1078,13 @@ let () =
         page_tree_result_without_collection_revision
     ; T.case "frozen protocol budgets" (fun () ->
         T.require (P.api_version = 2) "api version is not v2";
-        T.require (P.maximum_request_bytes = 1_048_576) "request budget changed";
-        T.require (P.maximum_response_bytes = 262_144) "response budget changed";
-        T.require (P.maximum_push_bytes = 65_536) "push budget changed";
-        T.require (P.default_page_size = 50) "default page size changed";
-        T.require (P.maximum_page_size = 200) "maximum page size changed";
-        T.require (P.maximum_tree_nodes = 2_000) "tree node budget changed";
-        T.require (P.maximum_tree_depth = 64) "tree depth budget changed")
+        T.require (Worker_pure_data.maximum_request_bytes = 1_048_576) "request budget changed";
+        T.require (Worker_pure_data.maximum_response_bytes = 262_144) "response budget changed";
+        T.require (Worker_pure_data.maximum_push_bytes = 65_536) "push budget changed";
+        T.require (Worker_pure_data.default_page_size = 50) "default page size changed";
+        T.require (Worker_pure_data.maximum_page_size = 200) "maximum page size changed";
+        T.require (Worker_pure_data.maximum_tree_nodes = 2_000) "tree node budget changed";
+        T.require (Worker_pure_data.maximum_tree_depth = 64) "tree depth budget changed")
     ; T.case "versioned command fixture" (fun () ->
         fixture_has_version 2 "protocol/v2-command-catalog.json")
     ; T.case "versioned outcome fixture" (fun () ->
@@ -1142,7 +1142,7 @@ let () =
                "V2_save_block"
                [ "mutation_id", `String native_id
                ; "block", `String native_id
-               ; "title", `String (String.make P.maximum_request_bytes 'x')
+               ; "title", `String (String.make Worker_pure_data.maximum_request_bytes 'x')
                ; ( "preconditions"
                  , `Assoc [ "blocks", `List []; "pages", `List []; "scopes", `List [] ] )
                ])
@@ -1174,8 +1174,8 @@ let () =
               ~application_support_directory:directory
               ~target:(Managed_sync { base_url = "https://api.logseq.io" })
               ~compatibility_profile:Logseq_65_33_or_newer
-              ~response_budget_bytes:P.maximum_response_bytes
-              ~default_page_size:P.default_page_size
+              ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+              ~default_page_size:Worker_pure_data.default_page_size
           with
           | Ok config -> config
           | Error message -> T.fail "%s" message
@@ -1205,8 +1205,8 @@ let () =
                   ; `Assoc [ "base_url", `String "https://api.logseq.io" ]
                   ] )
             ; "compatibility_profile", `List [ `String "Logseq_65_33_or_newer" ]
-            ; "response_budget_bytes", `Int P.maximum_response_bytes
-            ; "default_page_size", `Int P.default_page_size
+            ; "response_budget_bytes", `Int Worker_pure_data.maximum_response_bytes
+            ; "default_page_size", `Int Worker_pure_data.default_page_size
             ]
         in
         match Logseq_db_worker.Config.of_yojson json with
@@ -1222,8 +1222,8 @@ let () =
             [ "application_support_directory", `String "/tmp/logseq-journal-support"
             ; "target", target
             ; "compatibility_profile", `List [ `String "Logseq_65_33_or_newer" ]
-            ; "response_budget_bytes", `Int P.maximum_response_bytes
-            ; "default_page_size", `Int P.default_page_size
+            ; "response_budget_bytes", `Int Worker_pure_data.maximum_response_bytes
+            ; "default_page_size", `Int Worker_pure_data.default_page_size
             ]
         in
         let reject kind fields =

@@ -6,12 +6,12 @@ module Worker = Journal_worker_coordination.Worker_api
 
 type scan_cursor =
   | Wire_cursor of Graph.Cursor.t
-  | Journals_cursor of Protocol.v2_journal_item Worker.continuation
-  | Favorites_cursor of Protocol.v2_favorite_item Worker.continuation
+  | Journals_cursor of Worker_pure_data.journal_item Worker.continuation
+  | Favorites_cursor of Worker_pure_data.favorite_item Worker.continuation
   | Assets_cursor of Logseq_db_types.Asset_descriptor.t Worker.continuation
 
 type read_packet =
-  | Journals_packet of Protocol.v2_journal_item Worker.slice
+  | Journals_packet of Worker_pure_data.journal_item Worker.slice
   | Favorites_packet of Worker.favorites
   | Assets_packet of Worker.asset_listing
 
@@ -600,10 +600,10 @@ let change_application_error t windows =
   let root uuid =
     Seq.exists(Graph.Uuid.equal uuid)(all_roots t)
     || not(Uuids.is_empty(roots_for_uuid t uuid)) in
-  let needed = List.exists(fun (window:Protocol.v2_change_window)->
+  let needed = List.exists(fun (window:Worker_pure_data.change_window)->
     List.exists(function
-      | Protocol.V2_journal_index_interest -> failed Recent
-      | V2_children_interest uuid | V2_page_tree_interest uuid -> root uuid
+      | Worker_pure_data.V2_journal_index_interest -> failed Recent
+      | Worker_pure_data.V2_children_interest uuid | Worker_pure_data.V2_page_tree_interest uuid -> root uuid
         || (t.degraded && not(Hashtbl.mem t.pages(Graph.Uuid.to_string uuid))))window.structure_interests
     || List.exists(fun uuid->not(Hashtbl.mem t.assets(Graph.Uuid.to_string uuid))
       && (root uuid || (t.degraded && not(Hashtbl.mem t.facts(Graph.Uuid.to_string uuid)))))window.block_uuids
@@ -729,9 +729,9 @@ let observe_response_internal
         then degrade t
       in
       let remember_lookup = function
-        | Protocol.V2_present_block { value; _ } ->
+        | Worker_pure_data.V2_present_block { value; _ } ->
           remember_block value.block.uuid (Some value.block)
-        | V2_missing_block { uuid; _ } -> remember_block uuid None
+        | Worker_pure_data.V2_missing_block { uuid; _ } -> remember_block uuid None
       in
       let remember_page_value uuid page =
         let key = Graph.Uuid.to_string uuid in
@@ -777,16 +777,16 @@ let observe_response_internal
         else degrade t
       in
       let remember_page = function
-        | Protocol.V2_present_page { page; _ } ->
+        | Worker_pure_data.V2_present_page { page; _ } ->
           remember_page_value page.uuid (Some page)
-        | V2_missing_page { uuid; _ } -> remember_page_value uuid None
+        | Worker_pure_data.V2_missing_page { uuid; _ } -> remember_page_value uuid None
       in
       (match outcome with
        | V2_block_outcome lookup -> remember_lookup lookup
        | V2_page_outcome lookup ->
          remember_page lookup;
          (match lookup with
-          | V2_present_page { page; _ }
+          | Worker_pure_data.V2_present_page { page; _ }
             when page.name = "$$$favorites" && t.favorites_page <> Some page.uuid ->
             dispatch t (Index_changed Favorites)
           | _ -> ())
@@ -794,22 +794,22 @@ let observe_response_internal
          remember_lookup lookup;
          Option.iter remember_page page;
          List.iter
-           (fun (item : Protocol.v2_child_member) ->
+           (fun (item : Worker_pure_data.child_member) ->
               remember_block item.value.block.uuid (Some item.value.block))
            items
        | V2_children_outcome { items; _ } ->
          List.iter
-           (fun (item : Protocol.v2_child_member) ->
+           (fun (item : Worker_pure_data.child_member) ->
               remember_block item.value.block.uuid (Some item.value.block))
            items
        | V2_page_tree_outcome { items; _ } ->
          List.iter
-           (fun (item : Protocol.v2_tree_member) ->
+           (fun (item : Worker_pure_data.tree_member) ->
               remember_block item.value.block.uuid (Some item.value.block))
            items
        | V2_journals_outcome { items; _ } ->
          List.iter
-           (fun (item : Protocol.v2_journal_item) ->
+           (fun (item : Worker_pure_data.journal_item) ->
               remember_page_value item.page.uuid (Some item.page))
            items
        | V2_favorites_outcome { favorites_page; items; _ } ->
@@ -820,11 +820,11 @@ let observe_response_internal
             t.favorite_members <- Uuids.empty
           | _ -> ());
          List.iter
-           (fun (item : Protocol.v2_favorite_item) ->
+           (fun (item : Worker_pure_data.favorite_item) ->
               t.favorite_members <- Uuids.add item.membership_uuid t.favorite_members;
               match item.target with
-              | V2_favorite_block { uuid; _ } -> enqueue t (Block uuid)
-              | V2_favorite_page { uuid; _ } ->
+              | Worker_pure_data.V2_favorite_block { uuid; _ } -> enqueue t (Block uuid)
+              | Worker_pure_data.V2_favorite_page { uuid; _ } ->
                 if not (Hashtbl.mem t.pages (Graph.Uuid.to_string uuid))
                 then enqueue t (Page uuid))
            items
@@ -871,11 +871,11 @@ let changes t windows =
   then (
     let affected = ref Uuids.empty in
     List.iter
-      (fun (window : Protocol.v2_change_window) ->
+      (fun (window : Worker_pure_data.change_window) ->
          List.iter
            (function
-             | Protocol.V2_journal_index_interest -> dispatch t (Index_changed Recent)
-             | V2_children_interest uuid | V2_page_tree_interest uuid ->
+             | Worker_pure_data.V2_journal_index_interest -> dispatch t (Index_changed Recent)
+             | Worker_pure_data.V2_children_interest uuid | Worker_pure_data.V2_page_tree_interest uuid ->
                let direct =
                  Seq.fold_left
                    (fun roots root ->
@@ -896,7 +896,7 @@ let changes t windows =
                  && (not
                        (List.exists
                           (function
-                            | Protocol.V2_page_tree_interest page ->
+                            | Worker_pure_data.V2_page_tree_interest page ->
                               Graph.Uuid.equal page uuid
                             | _ -> false)
                           window.structure_interests))
@@ -1018,7 +1018,7 @@ let receive_read t ~request_id result =
             ( Policy.Roots_loaded
                 ( ticket
                 , List.map
-                    (fun (item : Protocol.v2_journal_item) -> item.page.uuid)
+                    (fun (item : Worker_pure_data.journal_item) -> item.page.uuid)
                     value.items
                 , Option.map (fun c -> Journals_cursor c) value.next )
             , Protocol.V2_journals_outcome { items = value.items; next_cursor = None }
@@ -1028,9 +1028,9 @@ let receive_read t ~request_id result =
             ( Policy.Roots_loaded
                 ( ticket
                 , List.map
-                    (fun (item : Protocol.v2_favorite_item) ->
+                    (fun (item : Worker_pure_data.favorite_item) ->
                        match item.target with
-                       | V2_favorite_page { uuid; _ } | V2_favorite_block { uuid; _ } ->
+                       | Worker_pure_data.V2_favorite_page { uuid; _ } | Worker_pure_data.V2_favorite_block { uuid; _ } ->
                          uuid)
                     value.items
                 , Option.map (fun c -> Favorites_cursor c) value.next )
@@ -1108,15 +1108,15 @@ let receive t (Protocol.V2_response { request_id; outcome; _ } as response) =
       | Policy.Recent_roots _, Protocol.V2_journals_outcome { items; next_cursor } ->
         Policy.Roots_loaded
           ( ticket
-          , List.map (fun (item : Protocol.v2_journal_item) -> item.page.uuid) items
+          , List.map (fun (item : Worker_pure_data.journal_item) -> item.page.uuid) items
           , Option.map (fun c -> Wire_cursor c) next_cursor )
       | Favorite_roots _, V2_favorites_outcome { items; next_cursor; _ } ->
         Roots_loaded
           ( ticket
           , List.map
-              (fun (item : Protocol.v2_favorite_item) ->
+              (fun (item : Worker_pure_data.favorite_item) ->
                  match item.target with
-                 | V2_favorite_page { uuid; _ } | V2_favorite_block { uuid; _ } -> uuid)
+                 | Worker_pure_data.V2_favorite_page { uuid; _ } | Worker_pure_data.V2_favorite_block { uuid; _ } -> uuid)
               items
           , Option.map (fun c -> Wire_cursor c) next_cursor )
       | Assets _, V2_assets_outcome { items; next_cursor; _ } ->

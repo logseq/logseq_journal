@@ -10,15 +10,15 @@ let worker_config () =
     ~application_support_directory:"/tmp/logseq-db-worker-reducer-contract"
     ~target:(Managed_sync { base_url = "https://api.logseq.io" })
     ~compatibility_profile:Logseq_65_33_or_newer
-    ~response_budget_bytes:Protocol.maximum_response_bytes
-    ~default_page_size:Protocol.default_page_size
+    ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+    ~default_page_size:Worker_pure_data.default_page_size
   |> Result.get_ok
 ;;
 
 let sync_config () =
   let limits =
     Sync.limits
-      ~maximum_response_bytes:Protocol.maximum_response_bytes
+      ~maximum_response_bytes:Worker_pure_data.maximum_response_bytes
       ~maximum_artifact_bytes:(1024 * 1024 * 1024)
       ~submission_batch_size:32
     |> Result.get_ok
@@ -1390,7 +1390,7 @@ let test_scoped_read_byte_budget () =
                          } )) -> actual = id && request_id = request.request_id
               | _ -> false)
             invalid.effects))
-    [ 0; -1; Protocol.maximum_response_bytes + 1 ]
+    [ 0; -1; Worker_pure_data.maximum_response_bytes + 1 ]
 ;;
 
 let test_read_byte_budget_is_not_an_effect_capability () =
@@ -1474,7 +1474,7 @@ let test_pure_read_page_bounds () =
   let metadata command =
     Protocol.request_to_yojson { (graph_info_request ()) with command } |> erase_limit
   in
-  for count = 1 to Protocol.maximum_page_size do
+  for count = 1 to Worker_pure_data.maximum_page_size do
     List.iter
       (fun command ->
          let rec drain steps current =
@@ -1985,7 +1985,7 @@ let test_demand_registry_retirement_requires_physical_settlement () =
   let _,scope=worker_open_graph() in
   let owner:R.owner={registration=90L;scope;consumer="typed-synthetic-round"} in
   let oversized=Logseq_db_types.Asset_descriptor.create ~uuid:scope.graph_id
-    ~source:(External(String.make(Protocol.maximum_response_bytes+1)'x'))
+    ~source:(External(String.make(Worker_pure_data.maximum_response_bytes+1)'x'))
     ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
   let unchanged,invalid=R.reserve R.empty owner ~priority:Foreground ~assets:[oversized] in
   Alcotest.(check bool) "unbounded descriptor rejected before registry allocation" true

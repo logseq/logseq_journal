@@ -464,7 +464,7 @@ let block_response block =
     ; request_id = uuid 999
     ; outcome =
         V2_block_outcome
-          (V2_present_block
+          (Worker_pure_data.V2_present_block
              { value =
                  { block
                  ; task_status = None
@@ -513,7 +513,7 @@ let reply_page runtime sent recycled =
             ; request_id
             ; outcome =
                 V2_page_outcome
-                  (V2_present_page { page = raw_page recycled; revision = "p" })
+                  (Worker_pure_data.V2_present_page { page = raw_page recycled; revision = "p" })
             }))
   | _ -> failwith "page liveness must use one bounded owned get_page"
 ;;
@@ -535,7 +535,7 @@ let reply_block runtime sent (block : G.block) =
   | _ -> failwith "holder/liveness must use its owned bounded get_outline_block"
 ;;
 
-let window ?(structures = []) blocks : P.v2_change_window =
+let window ?(structures = []) blocks : Worker_pure_data.change_window =
   { id = "change"
   ; predecessor = "before"
   ; successor = "after"
@@ -570,7 +570,7 @@ let reply_missing runtime sent n =
             { api_version = 2
             ; request_id
             ; outcome =
-                V2_block_outcome (V2_missing_block { uuid = block; revision = "deleted" })
+                V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = block; revision = "deleted" })
             }))
   | _ -> failwith "deletion must complete its owned bounded block lookup"
 ;;
@@ -764,7 +764,7 @@ let () =
           let change =
             { (window
                  ~structures:
-                   [ P.V2_children_interest (uuid 900); V2_page_tree_interest (uuid 900) ]
+                   [ Worker_pure_data.V2_children_interest (uuid 900); Worker_pure_data.V2_page_tree_interest (uuid 900) ]
                  [ 80 ])
               with
               page_uuids = [ uuid 900 ]
@@ -1035,7 +1035,7 @@ let () =
             r
             [ window
                 ~structures:
-                  [ P.V2_children_interest (uuid 900); V2_children_interest (uuid 60) ]
+                  [ Worker_pure_data.V2_children_interest (uuid 900); Worker_pure_data.V2_children_interest (uuid 60) ]
                 [ 1 ]
             ];
           check (list_reads q = 1) "move rebuilds one matching root" )

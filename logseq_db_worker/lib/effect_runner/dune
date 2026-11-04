@@ -21,6 +21,7 @@
   melange-transit-native
   uri
   ppx_deriving_yojson.runtime
-  yojson)
+  yojson
+  logseq_db_worker.typed_data)
  (preprocess
   (pps ppx_deriving_yojson)))

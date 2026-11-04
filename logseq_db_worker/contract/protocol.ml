@@ -1,30 +1,9 @@
 open Graph_types
+open Worker_pure_data
 
 (* The wire codec uses Yojson's list envelope; the owned append tree stays a
    persistent vector while planning, validating and decoding. *)
-module Rrbvec = struct
-  include Rrbvec
-  let to_yojson encode values = `List(Rrbvec.to_seq values |> Seq.map encode |> List.of_seq)
-  let of_yojson decode = function
-    | `List values ->
-      List.fold_left(fun result value->Result.bind result(fun values->
-        Result.map(fun value->Rrbvec.push_back values value)(decode value)))(Ok Rrbvec.empty)values
-    | _->Error "Append children must be an array"
-end
-
 let api_version = 2
-let maximum_request_bytes = Limits.maximum_request_bytes
-let maximum_response_bytes = Limits.maximum_response_bytes
-let maximum_push_bytes = Limits.maximum_push_bytes
-let default_page_size = 50
-let maximum_page_size = 200
-let maximum_tree_nodes = 2_000
-let maximum_tree_depth = 64
-let maximum_title_bytes = 65_536
-let maximum_roots = 1_024
-let maximum_changed_uuids = Limits.maximum_changed_uuids
-let maximum_property_values = 1_024
-let maximum_filter_values = 64
 
 type request =
   { api_version : int
@@ -90,48 +69,48 @@ and command =
       ; block : block_uuid
       ; previous : Uuid.t option
       ; asset : Uuid.t
-      ; preconditions : v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | V2_save_block of
       { mutation_id : Uuid.t
       ; block : block_uuid
       ; title : string
-      ; preconditions : v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | V2_insert_blocks of
       { mutation_id : Uuid.t
       ; parent : Uuid.t
-      ; roots : v2_block_tree list
-      ; preconditions : v2_preconditions
+      ; roots : Worker_pure_data.block_tree list
+      ; preconditions : Worker_pure_data.preconditions
       }
   | V2_append_journal of
       { mutation_id : Uuid.t
       ; page : page_uuid
       ; journal_day : int
-      ; root : v2_append_node
+      ; root : Worker_pure_data.append_node
       }
   | V2_delete_blocks of
       { mutation_id : Uuid.t
       ; root : block_uuid
-      ; preconditions : v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | V2_create_journal_page of
       { mutation_id : Uuid.t
       ; page : page_uuid
       ; journal_day : int
       ; title : string
-      ; preconditions : v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | V2_set_task_status of
       { mutation_id : Uuid.t
       ; block : block_uuid
-      ; status : v2_task_status
-      ; preconditions : v2_preconditions
+      ; status : Worker_pure_data.task_status
+      ; preconditions : Worker_pure_data.preconditions
       }
   | V2_clear_task_status of
       { mutation_id : Uuid.t
       ; block : block_uuid
-      ; preconditions : v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | V2_pull_changes of
       { generation : string
@@ -143,28 +122,6 @@ and command =
       ; through : string
       }
 
-and v2_scope = V2_children_scope of Uuid.t
-
-and v2_task_status = Uuid.t
-
-and v2_preconditions =
-  { blocks : (block_uuid * string) list
-  ; pages : (page_uuid * string) list
-  ; scopes : (v2_scope * string) list
-  }
-
-and v2_block_tree =
-  { uuid : block_uuid
-  ; title : string
-  ; children : v2_block_tree list
-  }
-
-and v2_append_node =
-  { block_id : block_uuid
-  ; title : string
-  ; task_status : Uuid.t option
-  ; children : v2_append_node Rrbvec.t
-  }
 [@@deriving yojson]
 
 type response =
@@ -174,109 +131,13 @@ type response =
       ; outcome : v2_outcome
       }
 
-and v2_change_window =
-  { id : string
-  ; predecessor : string
-  ; successor : string
-  ; block_uuids : block_uuid list
-  ; page_uuids : page_uuid list
-  ; structure_interests : v2_structure_interest list
-  }
-
-and v2_structure_interest =
-  | V2_children_interest of Uuid.t
-  | V2_page_tree_interest of page_uuid
-  | V2_journal_index_interest
-
-and v2_capability_limits =
-  { response_budget_bytes : int
-  ; outbox_max_records : int
-  ; outbox_max_bytes : int
-  ; change_max_items : int
-  ; change_max_bytes : int
-  ; dispatcher_capacity : int
-  ; wire_batch_max_bytes : int
-  }
-
-and v2_page_lookup =
-  | V2_present_page of
-      { page : page
-      ; revision : string
-      }
-  | V2_missing_page of
-      { uuid : page_uuid
-      ; revision : string
-      }
-
-and v2_block_record =
-  { block : block
-  ; task_status : v2_task_status option
-  ; rendered_page_title : string
-  ; tag_titles : string list
-  }
-
-and v2_block_lookup =
-  | V2_present_block of
-      { value : v2_block_record
-      ; revision : string
-      }
-  | V2_missing_block of
-      { uuid : block_uuid
-      ; revision : string
-      }
-
-and v2_journal_item =
-  { page : page
-  ; journal_day : int
-  ; revision : string
-  }
-
-and v2_favorite_target =
-  | V2_favorite_page of
-      { uuid : page_uuid
-      ; title : string
-      ; revision : string
-      }
-  | V2_favorite_block of
-      { uuid : block_uuid
-      ; title : string
-      ; task_status : v2_task_status option
-      ; revision : string
-      }
-
-and v2_favorite_item =
-  { membership_uuid : block_uuid
-  ; membership_order : string
-  ; membership_revision : string
-  ; target : v2_favorite_target
-  }
-
 and v2_favorites_result =
   { favorites_page : page_uuid option
   ; generation : string
   ; projection_revision : string
-  ; items : v2_favorite_item list
+  ; items : Worker_pure_data.favorite_item list
   ; next_cursor : Cursor.t option
   }
-
-and v2_child_member =
-  { value : v2_block_record
-  ; revision : string
-  }
-
-and v2_tree_member =
-  { value : v2_block_record
-  ; revision : string
-  ; depth : int
-  ; parent : Uuid.t
-  }
-
-and v2_revision_scope = V2_children_revision of Uuid.t
-
-and v2_local_status =
-  | V2_applied
-  | V2_no_change
-  | V2_already_applied
 
 and v2_outcome =
   | V2_graph_info_outcome of
@@ -285,7 +146,7 @@ and v2_outcome =
       ; schema : schema_version
       ; admission_facts : admission_fact list
       ; journal_title_format : string option
-      ; limits : v2_capability_limits
+      ; limits : Worker_pure_data.capability_limits
       ; generation : string
       ; projection_revision : string
       }
@@ -303,17 +164,17 @@ and v2_outcome =
       ; items : Logseq_db_types.Asset_descriptor.t list
       ; next_cursor : Cursor.t option
       }
-  | V2_admission_outcome of v2_admission_inspection
+  | V2_admission_outcome of Worker_pure_data.admission_inspection
   | V2_journals_outcome of
-      { items : v2_journal_item list
+      { items : Worker_pure_data.journal_item list
       ; next_cursor : Cursor.t option
       }
-  | V2_page_outcome of v2_page_lookup
-  | V2_block_outcome of v2_block_lookup
+  | V2_page_outcome of Worker_pure_data.page_lookup
+  | V2_block_outcome of Worker_pure_data.block_lookup
   | V2_block_summary_outcome of
-      { lookup : v2_block_lookup
-      ; page : v2_page_lookup option
-      ; items : v2_child_member list
+      { lookup : Worker_pure_data.block_lookup
+      ; page : Worker_pure_data.page_lookup option
+      ; items : Worker_pure_data.child_member list
       ; next_cursor : Cursor.t option
       ; scope_revision : string
       ; generation : string
@@ -321,20 +182,20 @@ and v2_outcome =
       }
   | V2_children_outcome of
       { parent : Uuid.t
-      ; revision_scope : v2_revision_scope
+      ; revision_scope : Worker_pure_data.revision_scope
       ; scope_revision : string
-      ; items : v2_child_member list
+      ; items : Worker_pure_data.child_member list
       ; next_cursor : Cursor.t option
       }
   | V2_page_tree_outcome of
       { page : page_uuid
       ; maximum_depth : int
-      ; items : v2_tree_member list
+      ; items : Worker_pure_data.tree_member list
       ; next_cursor : Cursor.t option
       }
   | V2_mutation_committed of
       { mutation_id : Uuid.t
-      ; status : v2_local_status
+      ; status : Worker_pure_data.local_status
       ; generation : string
       ; before_projection_revision : string
       ; after_projection_revision : string
@@ -343,7 +204,7 @@ and v2_outcome =
       { generation : string
       ; from_exclusive : string option
       ; through : string
-      ; windows : v2_change_window list
+      ; windows : Worker_pure_data.change_window list
       ; next : string option
       }
   | V2_changes_acknowledged of
@@ -359,14 +220,6 @@ and v2_outcome =
       ; reason : string
       }
 
-and v2_admission_inspection =
-  { active_records : int
-  ; active_bytes : int
-  ; protected_wire_bytes : int
-  ; retained_origin_evidence_bytes : int
-  ; maximum_records : int
-  ; maximum_bytes : int
-  }
 [@@deriving yojson]
 
 type push =
@@ -404,7 +257,7 @@ let valid_limit limit = limit >= 1 && limit <= maximum_page_size
 let valid_tree roots =
   let rec visit nodes = function
     | [] -> true
-    | (depth, tree) :: remaining ->
+    | (depth, (tree : Worker_pure_data.block_tree)) :: remaining ->
       depth <= maximum_tree_depth
       && nodes < maximum_tree_nodes
       && valid_title tree.title
@@ -416,20 +269,6 @@ let valid_tree roots =
               tree.children)
   in
   List.length roots <= maximum_roots && visit 0 (List.map (fun tree -> 0, tree) roots)
-;;
-
-module Append_ids=Set.Make(String)
-let valid_append_node root =
-  let rec visit pending index seen =
-    if index=Rrbvec.length pending then true
-    else if index>=maximum_tree_nodes then false
-    else let node,depth=Rrbvec.nth pending index in
-      let id=Uuid.to_string node.block_id in
-      depth<=maximum_tree_depth && valid_title node.title
-      && Rrbvec.length node.children<maximum_tree_nodes && not(Append_ids.mem id seen)
-      && visit(Rrbvec.append pending(Rrbvec.map(fun child->child,depth+1)node.children))
-        (index+1)(Append_ids.add id seen) in
-  visit(Rrbvec.singleton(root,0))0 Append_ids.empty
 ;;
 
 let valid_append_day day =
@@ -486,13 +325,13 @@ let valid_page (page : page) = valid_title page.title
 let valid_record value = valid_title value.block.title
 
 let valid_page_lookup = function
-  | V2_present_page { page; _ } -> valid_page page
-  | V2_missing_page _ -> true
+  | Worker_pure_data.V2_present_page { page; _ } -> valid_page page
+  | Worker_pure_data.V2_missing_page _ -> true
 ;;
 
 let valid_block_lookup = function
-  | V2_present_block { value; _ } -> valid_record value
-  | V2_missing_block _ -> true
+  | Worker_pure_data.V2_present_block { value; _ } -> valid_record value
+  | Worker_pure_data.V2_missing_block _ -> true
 ;;
 
 let validate_outcome = function
@@ -510,22 +349,22 @@ let validate_outcome = function
     && List.for_all
          (fun item ->
             match item.target with
-            | V2_favorite_page { title; _ } | V2_favorite_block { title; _ } ->
+            | Worker_pure_data.V2_favorite_page { title; _ } | Worker_pure_data.V2_favorite_block { title; _ } ->
               valid_title title)
          items
   | V2_assets_outcome { items; _ } -> List.length items <= maximum_page_size
   | V2_journals_outcome { items; _ } ->
-    List.for_all (fun (item : v2_journal_item) -> valid_page item.page) items
+    List.for_all (fun (item : Worker_pure_data.journal_item) -> valid_page item.page) items
   | V2_page_outcome lookup -> valid_page_lookup lookup
   | V2_block_outcome lookup -> valid_block_lookup lookup
   | V2_block_summary_outcome { lookup; page; items; _ } ->
     valid_block_lookup lookup
     && Option.fold ~none:true ~some:valid_page_lookup page
-    && List.for_all (fun (item : v2_child_member) -> valid_record item.value) items
+    && List.for_all (fun (item : Worker_pure_data.child_member) -> valid_record item.value) items
   | V2_children_outcome { items; _ } ->
-    List.for_all (fun (item : v2_child_member) -> valid_record item.value) items
+    List.for_all (fun (item : Worker_pure_data.child_member) -> valid_record item.value) items
   | V2_page_tree_outcome { items; _ } ->
-    List.for_all (fun (item : v2_tree_member) -> valid_record item.value) items
+    List.for_all (fun (item : Worker_pure_data.tree_member) -> valid_record item.value) items
   | V2_graph_info_outcome _
   | V2_admission_outcome _
   | V2_mutation_committed _

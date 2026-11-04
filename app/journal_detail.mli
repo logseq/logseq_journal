@@ -195,14 +195,14 @@ module Pure_observation : sig
     ; maximum_children : int
     }
 
-  type ticket = Protocol.v2_block_lookup Worker.observed Core.ticket
+  type ticket = Worker_pure_data.block_lookup Worker.observed Core.ticket
 
   type instruction =
     | Cancel_initial of ticket
     | Forget_initial of ticket
-    | Release of Protocol.v2_block_lookup Worker.observation
-    | Initial of context * Protocol.v2_block_lookup Worker.observed
-    | Updated of context * Protocol.v2_block_lookup Worker.observed
+    | Release of Worker_pure_data.block_lookup Worker.observation
+    | Initial of context * Worker_pure_data.block_lookup Worker.observed
+    | Updated of context * Worker_pure_data.block_lookup Worker.observed
     | Failed of context * Worker.error
     | Rejected of context * Worker.error
 
@@ -224,7 +224,7 @@ module Pure_observation : sig
 
   val context_count : t -> int
   val handle : t -> entry_id:string -> request_generation:int64 -> root:Worker.Uuid.t ->
-    Protocol.v2_block_lookup Worker.observation option
+    Worker_pure_data.block_lookup Worker.observation option
 
 end
 

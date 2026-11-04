@@ -26,7 +26,7 @@ let first_request event day =
   | _ -> `Other
 let project time_context ~child_count page block =
   Projection.block_on_page ~page:(W.page_data page) ~revision:(W.block_revision block)
-    ~child_count ~time_context (W.block_data block).P.block
+    ~child_count ~time_context (W.block_data block).Worker_pure_data.block
 let observe session budget day = request(session,W.Observe(budget,W.Journal day))
 let end_observation (observed : W.page option W.observed) = C.Release observed.observation
 let start_typed state session budget day =
@@ -62,7 +62,7 @@ let summary time_context (result : W.block_summary) =
   | Some after -> `More after
   | None ->
     (match result.lookup,result.page with
-     | P.V2_present_block {value;revision},Some(P.V2_present_page {page;_}) ->
+     | Worker_pure_data.V2_present_block {value;revision},Some(Worker_pure_data.V2_present_page {page;_}) ->
        `Complete(Some(Projection.block_on_page ~page ~revision
          ~child_count:(List.length result.items) ~time_context value.block))
      | _ -> `Complete None)
@@ -72,11 +72,11 @@ let confirmed time_context confirmation =
   | W.Confirmed_page page -> `Page page
   | W.Confirmed_absence {uuid;revision;generation;projection_revision} ->
     `Deleted(uuid,revision,generation,projection_revision)
-let child (member : P.v2_child_member) : Projection.block_member =
+let child (member : Worker_pure_data.child_member) : Projection.block_member =
   {block=member.value.block;revision=member.revision}
-let tree (member : P.v2_tree_member) : Projection.tree_member =
+let tree (member : Worker_pure_data.tree_member) : Projection.tree_member =
   {block=member.value.block;revision=member.revision;depth=member.depth}
-let next (result : P.v2_tree_member W.slice) : P.v2_tree_member W.continuation option = result.W.next
+let next (result : Worker_pure_data.tree_member W.slice) : Worker_pure_data.tree_member W.continuation option = result.W.next
 let ack session batch = request(session,W.Acknowledge_changes batch)
 end
 
@@ -161,7 +161,7 @@ let advance t =
         | Some _ -> t.render(Partial summary)
         | None ->
           (match summary.lookup,summary.page with
-           | P.V2_present_block{value;revision},Some(P.V2_present_page{page;_}) ->
+           | Worker_pure_data.V2_present_block{value;revision},Some(Worker_pure_data.V2_present_page{page;_}) ->
              t.render(Rows[Projection.block_on_page ~page ~revision
                ~child_count:(List.length summary.items) ~time_context:t.time_context value.block])
            | _ -> t.render(Rows [])));

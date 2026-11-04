@@ -1,18 +1,6 @@
 open Graph_types
 
 val api_version : int
-val maximum_request_bytes : int
-val maximum_response_bytes : int
-val maximum_push_bytes : int
-val default_page_size : int
-val maximum_page_size : int
-val maximum_tree_nodes : int
-val maximum_tree_depth : int
-val maximum_title_bytes : int
-val maximum_roots : int
-val maximum_changed_uuids : int
-val maximum_property_values : int
-val maximum_filter_values : int
 
 type request =
   { api_version : int
@@ -81,19 +69,19 @@ and command =
       ; block : block_uuid
       ; previous : Uuid.t option
       ; asset : Uuid.t
-      ; preconditions : v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | V2_save_block of
       { mutation_id : Uuid.t
       ; block : block_uuid
       ; title : string
-      ; preconditions : v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | V2_insert_blocks of
       { mutation_id : Uuid.t
       ; parent : Uuid.t
-      ; roots : v2_block_tree list
-      ; preconditions : v2_preconditions
+      ; roots : Worker_pure_data.block_tree list
+      ; preconditions : Worker_pure_data.preconditions
       }
   (* Atomic Append executes only through the registered durable intent bridge;
      unregistered raw graph requests cannot bypass persistence/receipt ownership. *)
@@ -101,30 +89,30 @@ and command =
       { mutation_id : Uuid.t
       ; page : page_uuid
       ; journal_day : int
-      ; root : v2_append_node
+      ; root : Worker_pure_data.append_node
       }
   | V2_delete_blocks of
       { mutation_id : Uuid.t
       ; root : block_uuid
-      ; preconditions : v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | V2_create_journal_page of
       { mutation_id : Uuid.t
       ; page : page_uuid
       ; journal_day : int
       ; title : string
-      ; preconditions : v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | V2_set_task_status of
       { mutation_id : Uuid.t
       ; block : block_uuid
-      ; status : v2_task_status
-      ; preconditions : v2_preconditions
+      ; status : Worker_pure_data.task_status
+      ; preconditions : Worker_pure_data.preconditions
       }
   | V2_clear_task_status of
       { mutation_id : Uuid.t
       ; block : block_uuid
-      ; preconditions : v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | V2_pull_changes of
       { generation : string
@@ -136,29 +124,6 @@ and command =
       ; through : string
       }
 
-and v2_scope = V2_children_scope of Uuid.t
-
-and v2_task_status = Uuid.t
-
-and v2_preconditions =
-  { blocks : (block_uuid * string) list
-  ; pages : (page_uuid * string) list
-  ; scopes : (v2_scope * string) list
-  }
-
-and v2_block_tree =
-  { uuid : block_uuid
-  ; title : string
-  ; children : v2_block_tree list
-  }
-
-and v2_append_node =
-  { block_id : block_uuid
-  ; title : string
-  ; task_status : Uuid.t option
-  ; children : v2_append_node Rrbvec.t
-  }
-
 type response =
   | V2_response of
       { api_version : int
@@ -166,109 +131,13 @@ type response =
       ; outcome : v2_outcome
       }
 
-and v2_change_window =
-  { id : string
-  ; predecessor : string
-  ; successor : string
-  ; block_uuids : block_uuid list
-  ; page_uuids : page_uuid list
-  ; structure_interests : v2_structure_interest list
-  }
-
-and v2_structure_interest =
-  | V2_children_interest of Uuid.t
-  | V2_page_tree_interest of page_uuid
-  | V2_journal_index_interest
-
-and v2_capability_limits =
-  { response_budget_bytes : int
-  ; outbox_max_records : int
-  ; outbox_max_bytes : int
-  ; change_max_items : int
-  ; change_max_bytes : int
-  ; dispatcher_capacity : int
-  ; wire_batch_max_bytes : int
-  }
-
-and v2_page_lookup =
-  | V2_present_page of
-      { page : page
-      ; revision : string
-      }
-  | V2_missing_page of
-      { uuid : page_uuid
-      ; revision : string
-      }
-
-and v2_block_record =
-  { block : block
-  ; task_status : v2_task_status option
-  ; rendered_page_title : string
-  ; tag_titles : string list
-  }
-
-and v2_block_lookup =
-  | V2_present_block of
-      { value : v2_block_record
-      ; revision : string
-      }
-  | V2_missing_block of
-      { uuid : block_uuid
-      ; revision : string
-      }
-
-and v2_journal_item =
-  { page : page
-  ; journal_day : int
-  ; revision : string
-  }
-
-and v2_favorite_target =
-  | V2_favorite_page of
-      { uuid : page_uuid
-      ; title : string
-      ; revision : string
-      }
-  | V2_favorite_block of
-      { uuid : block_uuid
-      ; title : string
-      ; task_status : v2_task_status option
-      ; revision : string
-      }
-
-and v2_favorite_item =
-  { membership_uuid : block_uuid
-  ; membership_order : string
-  ; membership_revision : string
-  ; target : v2_favorite_target
-  }
-
 and v2_favorites_result =
   { favorites_page : page_uuid option
   ; generation : string
   ; projection_revision : string
-  ; items : v2_favorite_item list
+  ; items : Worker_pure_data.favorite_item list
   ; next_cursor : Cursor.t option
   }
-
-and v2_child_member =
-  { value : v2_block_record
-  ; revision : string
-  }
-
-and v2_tree_member =
-  { value : v2_block_record
-  ; revision : string
-  ; depth : int
-  ; parent : Uuid.t
-  }
-
-and v2_revision_scope = V2_children_revision of Uuid.t
-
-and v2_local_status =
-  | V2_applied
-  | V2_no_change
-  | V2_already_applied
 
 and v2_outcome =
   | V2_graph_info_outcome of
@@ -277,7 +146,7 @@ and v2_outcome =
       ; schema : schema_version
       ; admission_facts : admission_fact list
       ; journal_title_format : string option
-      ; limits : v2_capability_limits
+      ; limits : Worker_pure_data.capability_limits
       ; generation : string
       ; projection_revision : string
       }
@@ -295,19 +164,19 @@ and v2_outcome =
       ; items : Logseq_db_types.Asset_descriptor.t list
       ; next_cursor : Cursor.t option
       }
-  | V2_admission_outcome of v2_admission_inspection
+  | V2_admission_outcome of Worker_pure_data.admission_inspection
   | V2_journals_outcome of
-      { items : v2_journal_item list
+      { items : Worker_pure_data.journal_item list
       ; next_cursor : Cursor.t option
       }
-  | V2_page_outcome of v2_page_lookup
-  | V2_block_outcome of v2_block_lookup
+  | V2_page_outcome of Worker_pure_data.page_lookup
+  | V2_block_outcome of Worker_pure_data.block_lookup
   (* All fields belong to generation/projection_revision. Child count becomes
      exact only after consuming next_cursor; page=None denotes a missing target. *)
   | V2_block_summary_outcome of
-      { lookup : v2_block_lookup
-      ; page : v2_page_lookup option
-      ; items : v2_child_member list
+      { lookup : Worker_pure_data.block_lookup
+      ; page : Worker_pure_data.page_lookup option
+      ; items : Worker_pure_data.child_member list
       ; next_cursor : Cursor.t option
       ; scope_revision : string
       ; generation : string
@@ -315,20 +184,20 @@ and v2_outcome =
       }
   | V2_children_outcome of
       { parent : Uuid.t
-      ; revision_scope : v2_revision_scope
+      ; revision_scope : Worker_pure_data.revision_scope
       ; scope_revision : string
-      ; items : v2_child_member list
+      ; items : Worker_pure_data.child_member list
       ; next_cursor : Cursor.t option
       }
   | V2_page_tree_outcome of
       { page : page_uuid
       ; maximum_depth : int
-      ; items : v2_tree_member list
+      ; items : Worker_pure_data.tree_member list
       ; next_cursor : Cursor.t option
       }
   | V2_mutation_committed of
       { mutation_id : Uuid.t
-      ; status : v2_local_status
+      ; status : Worker_pure_data.local_status
       ; generation : string
       ; before_projection_revision : string
       ; after_projection_revision : string
@@ -337,7 +206,7 @@ and v2_outcome =
       { generation : string
       ; from_exclusive : string option
       ; through : string
-      ; windows : v2_change_window list
+      ; windows : Worker_pure_data.change_window list
       ; next : string option
       }
   | V2_changes_acknowledged of
@@ -352,15 +221,6 @@ and v2_outcome =
       { generation : string
       ; reason : string
       }
-
-and v2_admission_inspection =
-  { active_records : int
-  ; active_bytes : int
-  ; protected_wire_bytes : int
-  ; retained_origin_evidence_bytes : int
-  ; maximum_records : int
-  ; maximum_bytes : int
-  }
 
 type push =
   | V2_changes_available of
@@ -396,5 +256,3 @@ val is_observable_read : command -> bool
     can shrink; query family, cursor, revision and filters remain exact. Returning
     None requires an explicit oversized-singleton/error result, never truncation. *)
 val smaller_read_page : command -> command option
-
-val valid_append_node : v2_append_node -> bool

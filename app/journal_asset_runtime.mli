@@ -60,11 +60,11 @@ val observe_response : t -> Logseq_db_worker.Protocol.response -> unit
 
 (** Reconcile only dependency-intersecting bounded recursive root batches.
     Unknown holders use bounded point reads instead of invalidating all scans. *)
-val changes : t -> Logseq_db_worker.Protocol.v2_change_window list -> unit
+val changes : t -> Worker_pure_data.change_window list -> unit
 
 val owns_read : t -> Logseq_db_types.Graph_types.Uuid.t -> bool
 val projection_read_error : t -> string option
-val change_application_error : t -> Logseq_db_worker.Protocol.v2_change_window list -> string option
+val change_application_error : t -> Worker_pure_data.change_window list -> string option
 
 (** Only demand notices which may plan a deferred read carry these bounded
     business obligations. Availability/download completion is not a read ACK. *)

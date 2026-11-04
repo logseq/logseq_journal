@@ -1,16 +1,15 @@
 module Pure = struct
   module Graph = Logseq_db_types.Graph_types
   module Worker = Journal_worker_coordination.Worker_api
-  module Protocol = Worker.Protocol
   module Keys = Set.Make (String)
 
   type frame =
     { parent : Graph.Uuid.t
     ; depth : int
-    ; cursor : Protocol.v2_child_member Worker.continuation option
+    ; cursor : Worker_pure_data.child_member Worker.continuation option
     ; revision : string option
-    ; cursors : Protocol.v2_child_member Worker.continuation Rrbvec.t
-    ; gathered : Protocol.v2_child_member Rrbvec.t
+    ; cursors : Worker_pure_data.child_member Worker.continuation Rrbvec.t
+    ; gathered : Worker_pure_data.child_member Rrbvec.t
     ; gathered_bytes : int
     ; remaining : int option
     }
@@ -41,8 +40,8 @@ module Pure = struct
 
   type result =
     | Info_result of Worker.graph_info
-    | Block_result of Protocol.v2_block_lookup
-    | Page_result of Protocol.v2_page_lookup
+    | Block_result of Worker_pure_data.block_lookup
+    | Page_result of Worker_pure_data.page_lookup
     | Children_result of Worker.children
 
   type event =
@@ -115,7 +114,7 @@ module Pure = struct
          then fail t "The selected outline is too deep to copy."
          else (
            match
-             add_text job (child_text current.depth child.Protocol.value.block.title)
+             add_text job (child_text current.depth child.Worker_pure_data.value.block.title)
            with
            | Error message -> fail t message
            | Ok job ->
@@ -140,7 +139,7 @@ module Pure = struct
         }
         (Worker.Outline_block { uuid = job.root; revision = None })
         (fun block -> Block_result block)
-    | Root, Block_result (V2_present_block { value; _ })
+    | Root, Block_result (Worker_pure_data.V2_present_block { value; _ })
       when Graph.Uuid.equal value.block.uuid job.root ->
       (match add_text job value.block.title with
        | Error message -> fail t message
@@ -154,11 +153,11 @@ module Pure = struct
            ; frames = [ current ]
            }
            current)
-    | Root, Block_result (V2_missing_block { uuid; _ })
+    | Root, Block_result (Worker_pure_data.V2_missing_block { uuid; _ })
       when Graph.Uuid.equal uuid job.root ->
       read t { job with phase = Page_root }
         (Worker.Page { uuid = job.root; revision = None }) (fun page -> Page_result page)
-    | Page_root, Page_result (V2_present_page { page; _ })
+    | Page_root, Page_result (Worker_pure_data.V2_present_page { page; _ })
       when Graph.Uuid.equal page.uuid job.root && not page.recycled ->
       (match add_text job page.title with
        | Error message -> fail t message
@@ -173,12 +172,12 @@ module Pure = struct
       (match job.frames with
        | current :: parents
          when Graph.Uuid.equal current.parent result.parent
-              && result.revision_scope = Protocol.V2_children_revision current.parent
+              && result.revision_scope = Worker_pure_data.V2_children_revision current.parent
               && (current.revision = None || current.revision = Some result.scope_revision)
          ->
          let rec validate visited = function
            | [] -> Some visited
-           | (child : Protocol.v2_child_member) :: rest ->
+           | (child : Worker_pure_data.child_member) :: rest ->
              let id = Graph.Uuid.to_string child.value.block.uuid in
              if
                Keys.mem id visited
@@ -194,7 +193,7 @@ module Pure = struct
             let gathered_bytes =
               current.gathered_bytes
               + List.fold_left
-                  (fun n (child : Protocol.v2_child_member) ->
+                  (fun n (child : Worker_pure_data.child_member) ->
                      n + String.length (child_text current.depth child.value.block.title))
                   0
                   result.items
@@ -234,7 +233,7 @@ module Pure = struct
       (match Journal_platform.copy_text_request ~text with
        | Ok _ -> { t with awaiting = None; job = None }, [ Copied text ]
        | Error _ -> fail t "The selected block is too large to copy.")
-    | Root, Block_result (V2_missing_block _) ->
+    | Root, Block_result (Worker_pure_data.V2_missing_block _) ->
       fail t "The selected block no longer exists."
     | _ -> fail t "The graph changed or returned an unexpected copy result. Try again."
   ;;

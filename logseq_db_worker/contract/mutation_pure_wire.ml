@@ -23,7 +23,7 @@ let identity command =
     let rec collect nodes index found =
       if index=Rrbvec.length nodes then Ok(mutation_id,Rrbvec.sort_uniq U.compare found)
       else let node=Rrbvec.nth nodes index in
-        collect(Rrbvec.append nodes node.Protocol.children)(index+1)(Rrbvec.push_back found node.block_id) in
+        collect(Rrbvec.append nodes node.Worker_pure_data.children)(index+1)(Rrbvec.push_back found node.block_id) in
     collect(Rrbvec.singleton root)0 Rrbvec.empty
   | V2_insert_blocks { mutation_id; roots = [ root ]; _ } ->
     let nodes = ref (Rrbvec.singleton root)
@@ -31,7 +31,7 @@ let identity command =
     and index = ref 0 in
     while !index < Rrbvec.length !nodes do
       let node = Rrbvec.nth !nodes !index in
-      found := Rrbvec.push_back !found node.Protocol.uuid;
+      found := Rrbvec.push_back !found node.Worker_pure_data.uuid;
       nodes := List.fold_left Rrbvec.push_back !nodes node.children;
       incr index
     done;
@@ -82,14 +82,14 @@ let create ~origin ~user ~graph command =
     let encoded =
       canonical (`Assoc [ "version", `Int 1; "owner", owner; "request", request ])
     in
-    if String.length encoded > Protocol.maximum_request_bytes
+    if String.length encoded > Worker_pure_data.maximum_request_bytes
     then Error "Complete mutation exceeds wire budget"
     else Ok { namespace; mutation_id; command = checked.command; targets; encoded })
 ;;
 
 let restore ~origin ~user ~graph encoded =
   try
-    if String.length encoded > Protocol.maximum_request_bytes
+    if String.length encoded > Worker_pure_data.maximum_request_bytes
     then Error "Stored mutation exceeds wire budget"
     else (
       match Yojson.Safe.from_string encoded with
@@ -132,7 +132,7 @@ type recovery_page = { items : recovery_item Rrbvec.t; next : int64 option }
    string, alongside one bounded outcome and the fixed recovery envelope. This
    is a distinct artifact budget, not the smaller ordinary query response cap. *)
 let maximum_recovery_bytes =
-  (2 * Protocol.maximum_request_bytes) + Protocol.maximum_response_bytes + 4096
+  (2 * Worker_pure_data.maximum_request_bytes) + Worker_pure_data.maximum_response_bytes + 4096
 
 let recovery_page_bytes page =
   let outcome = function
@@ -156,7 +156,7 @@ let committed_point intent ~request_id response =
     let prefix = prefix ^ ":v1:" in
     String.length value > String.length prefix && String.starts_with ~prefix value
   in
-  if Protocol.encoded_response_bytes response > Protocol.maximum_response_bytes
+  if Protocol.encoded_response_bytes response > Worker_pure_data.maximum_response_bytes
   then Error "Original commit response exceeds wire budget"
   else (
     match response with
@@ -180,8 +180,8 @@ let committed_point intent ~request_id response =
            && token "projection" after
            &&
            match status with
-           | Protocol.V2_applied -> before <> after
-           | V2_no_change -> before = after
-           | V2_already_applied -> false -> Ok { generation; before; after }
+           | Worker_pure_data.V2_applied -> before <> after
+           | Worker_pure_data.V2_no_change -> before = after
+           | Worker_pure_data.V2_already_applied -> false -> Ok { generation; before; after }
     | _ -> Error "Response does not establish the exact original durable commit")
 ;;

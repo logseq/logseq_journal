@@ -13,7 +13,7 @@ module Read_fixture = struct
     Coordination_test_fixture.fixture
       ~limits:
         { Coordination_test_fixture.limits with
-          response_budget_bytes = Protocol.maximum_response_bytes
+          response_budget_bytes = Worker_pure_data.maximum_response_bytes
         }
       2900L
   ;;
@@ -42,7 +42,7 @@ module Read_fixture = struct
         W.read_budget
           session
           ~maximum_items:read.maximum_items
-          ~maximum_bytes:Protocol.maximum_response_bytes
+          ~maximum_bytes:Worker_pure_data.maximum_response_bytes
         |> Result.get_ok
       in
       let operation = W.Query (budget, read.query) in
@@ -123,7 +123,7 @@ let block : Graph.block =
   }
 ;;
 
-let record : Protocol.v2_block_record =
+let record : Worker_pure_data.block_record =
   { block; task_status = None; rendered_page_title = page.title; tag_titles = [] }
 ;;
 
@@ -196,7 +196,7 @@ let seed_visible_block ?(record = record) runtime =
           })) in
   let child=only "bounded preview query" output.requests in
   Runtime.receive runtime (respond child (Protocol.V2_children_outcome
-      {parent=record.block.uuid;revision_scope=V2_children_revision record.block.uuid;
+      {parent=record.block.uuid;revision_scope=Worker_pure_data.V2_children_revision record.block.uuid;
        scope_revision="children-1";items=[];next_cursor=None}))
 ;;
 
@@ -238,7 +238,7 @@ let refresh_private_block_revision runtime revision =
        runtime
        (respond
           request
-          (Protocol.V2_block_outcome (V2_present_block { value = record; revision }))))
+          (Protocol.V2_block_outcome (Worker_pure_data.V2_present_block { value = record; revision }))))
 ;;
 
 let test_worker_read_becomes_normalized_application_feed () =
@@ -370,8 +370,8 @@ let test_status_conflict_refreshes_authoritative_block () =
   let output =
     Read_fixture.receive runtime refresh
       (respond refresh (Protocol.V2_block_summary_outcome
-        {lookup=V2_present_block {value=record;revision="block-2"};
-         page=Some (V2_present_page {page;revision="page-1"});
+        {lookup=Worker_pure_data.V2_present_block {value=record;revision="block-2"};
+         page=Some (Worker_pure_data.V2_present_page {page;revision="page-1"});
          items=[];next_cursor=None;scope_revision="children-1";
          generation="graph-1";projection_revision="projection-2"}))
   in
@@ -437,7 +437,7 @@ let seed_parent_children_interest runtime =
       (respond
          block_request
          (Protocol.V2_block_outcome
-            (V2_present_block { value = record; revision = "block-detail-1" })))
+            (Worker_pure_data.V2_present_block { value = record; revision = "block-detail-1" })))
     |> fun output -> only "detail children request" output.requests
   in
   ignore
@@ -447,7 +447,7 @@ let seed_parent_children_interest runtime =
           children_request
           (Protocol.V2_children_outcome
              { parent = block_uuid
-             ; revision_scope = V2_children_revision block_uuid
+             ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
              ; scope_revision = "children-scope-1"
              ; items = []
              ; next_cursor = None
@@ -482,7 +482,7 @@ let test_create_child_uses_caller_observed_parent_revision () =
             { parent
             ; preconditions =
                 { blocks = [ (precondition_parent, parent_revision) ]
-                ; scopes = [ (V2_children_scope scope_parent, scope_revision) ]
+                ; scopes = [ (Worker_pure_data.V2_children_scope scope_parent, scope_revision) ]
                 ; _
                 }
             ; _
@@ -645,7 +645,7 @@ let test_named_tags_reach_timeline_row () =
   let output = Read_fixture.receive runtime tree response in
   let child=only "tagged root preview" output.requests in
   let output=Runtime.receive runtime (respond child (Protocol.V2_children_outcome
-      {parent=block_uuid;revision_scope=V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None})) in
+      {parent=block_uuid;revision_scope=Worker_pure_data.V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None})) in
   let entry =
     List.find_map
       (fun (r : Runtime.response) ->
@@ -764,7 +764,7 @@ let test_point_read_tag_metadata () =
            (respond
               point
               (V2_block_outcome
-                 (V2_present_block { value = updated; revision = "block-2" })))
+                 (Worker_pure_data.V2_present_block { value = updated; revision = "block-2" })))
        in
        let projected =
          List.find_map

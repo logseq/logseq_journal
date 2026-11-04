@@ -24,7 +24,7 @@ type worker =
   }
 
 let with_worker
-      ?(response_budget_bytes = P.maximum_response_bytes)
+      ?(response_budget_bytes = Worker_pure_data.maximum_response_bytes)
       ?limits:overlay_limits
       ?(prepare = fun ~sw:_ ~support:_ -> ())
       run
@@ -40,12 +40,12 @@ let with_worker
             ~target:(Managed_sync { base_url = "https://example.invalid" })
             ~compatibility_profile:Logseq_65_33_or_newer
             ~response_budget_bytes
-            ~default_page_size:P.default_page_size
+            ~default_page_size:Worker_pure_data.default_page_size
           |> Result.get_ok
         in
         let limits =
           Sync.limits
-            ~maximum_response_bytes:P.maximum_response_bytes
+            ~maximum_response_bytes:Worker_pure_data.maximum_response_bytes
             ~maximum_artifact_bytes:1048576
             ~submission_batch_size:32
           |> Result.get_ok
@@ -201,7 +201,7 @@ let outcome worker ordinal value =
 
 let block_revision worker block =
   match outcome worker 801 (P.V2_get_outline_block { block; revision = None }) with
-  | V2_block_outcome (V2_present_block { revision; _ }) -> revision
+  | V2_block_outcome (Worker_pure_data.V2_present_block { revision; _ }) -> revision
   | _ -> failwith "worker block missing"
 ;;
 
@@ -420,7 +420,7 @@ let test_retained_window_pagination () =
     in
     require (List.length all = 70) "publication lost a retained change";
     let rec ordered = function
-      | (left : P.v2_change_window) :: ((right : P.v2_change_window) :: _ as rest) ->
+      | (left : Worker_pure_data.change_window) :: ((right : Worker_pure_data.change_window) :: _ as rest) ->
         require
           (left.successor = right.predecessor)
           "projection revision chain was reordered";
@@ -487,7 +487,7 @@ let test_resync_clears_retained_windows () =
     let parent = Fixture.page_uuid in
     let page_revision =
       match outcome worker 3102 (P.V2_get_page { page = parent; revision = None }) with
-      | V2_page_outcome (V2_present_page { revision; _ }) -> revision
+      | V2_page_outcome (Worker_pure_data.V2_present_page { revision; _ }) -> revision
       | _ -> failwith "resync page missing"
     in
     let scope_revision =
@@ -501,13 +501,11 @@ let test_resync_clears_retained_windows () =
       | _ -> failwith "resync scope missing"
     in
     let roots =
-      [ P.
-          { uuid = Fixture.mutation_uuid 3200
+      [ Worker_pure_data.{ uuid = Fixture.mutation_uuid 3200
           ; title = "Resync tree"
           ; children =
               List.init 32 (fun n ->
-                P.
-                  { uuid = Fixture.mutation_uuid (3201 + n)
+                Worker_pure_data.{ uuid = Fixture.mutation_uuid (3201 + n)
                   ; title = "Child"
                   ; children = []
                   })
@@ -527,7 +525,7 @@ let test_resync_clears_retained_windows () =
             ; preconditions =
                 { blocks = []
                 ; pages = [ parent, page_revision ]
-                ; scopes = [ V2_children_scope parent, scope_revision ]
+                ; scopes = [ Worker_pure_data.V2_children_scope parent, scope_revision ]
                 }
             })
      with
@@ -813,21 +811,21 @@ let test_enriched_response_budget () =
              worker.request (command (1100 + (family * 20) + ordinal) query_command)
            in
            require
-             (P.encoded_response_bytes response <= P.maximum_response_bytes)
+             (P.encoded_response_bytes response <= Worker_pure_data.maximum_response_bytes)
              "adaptive full DTO page exceeds final byte budget";
            let values, next =
              match response with
              | P.V2_response
                  { outcome = V2_children_outcome { items; next_cursor; _ }; _ } ->
-               List.map (fun (item : P.v2_child_member) -> item.value) items, next_cursor
+               List.map (fun (item : Worker_pure_data.child_member) -> item.value) items, next_cursor
              | P.V2_response
                  { outcome = V2_page_tree_outcome { items; next_cursor; _ }; _ } ->
-               List.map (fun (item : P.v2_tree_member) -> item.value) items, next_cursor
+               List.map (fun (item : Worker_pure_data.tree_member) -> item.value) items, next_cursor
              | _ -> failwith "adaptive structural read did not return a real page"
            in
            let seen =
              List.fold_left
-               (fun seen (value : P.v2_block_record) ->
+               (fun seen (value : Worker_pure_data.block_record) ->
                   if Ids.mem value.block.uuid expected
                   then (
                     require
@@ -873,7 +871,7 @@ let test_encoded_utf8_budget_boundary () =
     let response = worker.request request in
     size := P.encoded_response_bytes response;
     match response with
-    | P.V2_response { outcome = V2_block_outcome (V2_present_block { value; _ }); _ } ->
+    | P.V2_response { outcome = V2_block_outcome (Worker_pure_data.V2_present_block { value; _ }); _ } ->
       require
         (value.tag_titles = [ title ])
         "actual read must resolve the UTF-8 tag title"
@@ -939,7 +937,7 @@ let test_canonical_target_summary_query () =
          |> Result.get_ok
          |> ignore)
   in
-  let query ?(limit = P.default_page_size) ordinal cursor =
+  let query ?(limit = Worker_pure_data.default_page_size) ordinal cursor =
     command ordinal (P.V2_get_outline_block_summary { block = target; limit; cursor })
     |> P.request_to_yojson
     |> P.request_of_yojson
@@ -956,14 +954,14 @@ let test_canonical_target_summary_query () =
            ~error:(fun message ->
              failwith ("target summary response rejected: " ^ message))
     in
-    let adapted = worker.request (query ~limit:P.maximum_page_size 17999 None) in
-    require (P.encoded_response_bytes adapted<=P.maximum_response_bytes)
+    let adapted = worker.request (query ~limit:Worker_pure_data.maximum_page_size 17999 None) in
+    require (P.encoded_response_bytes adapted<=Worker_pure_data.maximum_response_bytes)
       "full canonical target metadata obeys final bytes";
     (match adapted with
      | P.V2_response {outcome=V2_block_summary_outcome {items;next_cursor=Some _;_};_}->
-       require (items<>[] && List.length items<P.maximum_page_size)
+       require (items<>[] && List.length items<Worker_pure_data.maximum_page_size)
          "oversized target page must shrink and retain its real continuation";
-       List.iteri(fun index (item:P.v2_child_member)->
+       List.iteri(fun index (item:Worker_pure_data.child_member)->
          require (item.value.block.uuid=Fixture.mutation_uuid (17000+index)
            && item.value.block.title=Printf.sprintf "Canonical child %d" index)
            "adaptive target page truncated or skipped canonical DTO") items
@@ -971,15 +969,15 @@ let test_canonical_target_summary_query () =
     let first_outcome = inspect 18000 None in
     match first_outcome with
     | P.V2_block_summary_outcome first ->
-      require (List.length first.items = P.default_page_size) "bounded direct children";
+      require (List.length first.items = Worker_pure_data.default_page_size) "bounded direct children";
       (match first.lookup with
-       | P.V2_present_block { value; _ } ->
+       | Worker_pure_data.V2_present_block { value; _ } ->
          require (value.block.title = "Canonical target") "canonical target title"
-       | P.V2_missing_block _ -> failwith "canonical target is missing");
+       | Worker_pure_data.V2_missing_block _ -> failwith "canonical target is missing");
       (match first.page with
-       | Some (P.V2_present_page { page; _ }) ->
+       | Some (Worker_pure_data.V2_present_page { page; _ }) ->
          require (Graph.Uuid.equal page.uuid Fixture.page_uuid) "owning page is canonical"
-       | Some (P.V2_missing_page _) | None -> failwith "owning page is missing");
+       | Some (Worker_pure_data.V2_missing_page _) | None -> failwith "owning page is missing");
       let cursor = first.next_cursor in
       require (Option.is_some cursor) "target child continuation";
       let rec collect ordinal pages reversed = function
@@ -989,7 +987,7 @@ let test_canonical_target_summary_query () =
              && String.equal first.projection_revision output.projection_revision)
             "stable snapshot version across target pages";
           require
-            (List.length output.items <= P.default_page_size)
+            (List.length output.items <= Worker_pure_data.default_page_size)
             "every target page is bounded";
           let reversed = List.rev_append output.items reversed in
           (match output.next_cursor with
@@ -1004,7 +1002,7 @@ let test_canonical_target_summary_query () =
         (List.length items = 201)
         "target pages return all direct children, no unrelated siblings";
       List.iteri
-        (fun index (item : P.v2_child_member) ->
+        (fun index (item : Worker_pure_data.child_member) ->
            require
              (Graph.Uuid.equal
                 item.value.block.uuid

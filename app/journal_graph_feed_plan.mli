@@ -11,8 +11,8 @@ type publication =
   | Failed of { scope : failure_scope; stale_cursor : bool; message : string }
 type cached
 type output = { requests : Protocol.request Rrbvec.t; publications : publication Rrbvec.t; cached : cached option }
-type packet = Dates of Protocol.v2_journal_item Seq.t | Roots of Protocol.v2_tree_member Seq.t
-  | Preview of Protocol.v2_child_member Seq.t
+type packet = Dates of Worker_pure_data.journal_item Seq.t | Roots of Worker_pure_data.tree_member Seq.t
+  | Preview of Worker_pure_data.child_member Seq.t
 type fragment = { page : Projection.page; members : Projection.tree_member Rrbvec.t
   ; entries : Projection.timeline_entry Rrbvec.t }
 type context = { today : int option; time_context : (Projection.time_context, string) result }
@@ -40,7 +40,7 @@ type journal_request =
   { from_day : Worker.journal_day
   ; through_day : Worker.journal_day
   ; limit : int
-  ; after : Protocol.v2_journal_item Worker.continuation option
+  ; after : Worker_pure_data.journal_item Worker.continuation option
   }
 
 val journal_request : operation -> journal_request option
@@ -48,9 +48,9 @@ val journal_request : operation -> journal_request option
 val receive
   :  t
   -> ports:ports
-  -> ?journals:Protocol.v2_journal_item Worker.slice
+  -> ?journals:Worker_pure_data.journal_item Worker.slice
   -> ?children:Worker.children
-  -> ?roots:Protocol.v2_tree_member Worker.slice
+  -> ?roots:Worker_pure_data.tree_member Worker.slice
   -> ?origin:(Worker.session * Worker.read_budget)
   -> operation
   -> Protocol.v2_outcome
@@ -65,13 +65,13 @@ val reconcile_page : t -> ports:ports -> page:Projection.page -> limit:int -> Pr
 type child_request =
   { parent : Graph.Uuid.t
   ; limit : int
-  ; after : Protocol.v2_child_member Worker.continuation option
+  ; after : Worker_pure_data.child_member Worker.continuation option
   }
 val child_request : operation -> child_request option
 
 type tree_request =
   { page : Graph.Uuid.t; maximum_items : int
-  ; after : Protocol.v2_tree_member Worker.continuation option }
+  ; after : Worker_pure_data.tree_member Worker.continuation option }
 val tree_request : operation -> tree_request option
 (** Business replay of a bounded already-read packet. Eligibility and epoch are
     checked before projection; this does not synthesize a Worker completion. *)

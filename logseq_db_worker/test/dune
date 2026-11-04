@@ -1,7 +1,8 @@
 (library
  (name logseq_db_worker_test_support)
  (modules test_support)
- (libraries logseq_db_types logseq_db_worker logseq_overlay_db unix yojson))
+ (libraries logseq_db_types logseq_db_worker logseq_overlay_db unix yojson
+  logseq_db_worker.typed_data))
 
 (tests
  (names test_protocol test_overlay_integration)
@@ -18,7 +19,8 @@
   rrbvec
   unix
   uri
-  yojson))
+  yojson
+  logseq_db_worker.typed_data))
 
 (test
  (name test_pure_reducer)
@@ -33,7 +35,8 @@
   logseq_sync.pure_reducer
   uri
   yojson
-  rrbvec))
+  rrbvec
+  logseq_db_worker.typed_data))
 
 (test
  (name test_lui_service)
@@ -135,7 +138,8 @@
   eio
   melange-transit-core
   melange-transit-native
-  tls))
+  tls
+  logseq_db_worker.typed_data))
 
 (rule
  (alias managed-sync-online-e2e)

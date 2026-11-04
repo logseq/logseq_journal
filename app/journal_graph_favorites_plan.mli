@@ -30,15 +30,15 @@ val is_page_target : t -> string -> bool
 val operation_name : read -> string
 val load : ports:ports -> Journal_graph_request.favorites_request -> Protocol.request
 val changes : t -> ports:ports -> blocks:Graph.Uuid.t Rrbvec.t -> pages:Graph.Uuid.t Rrbvec.t
-  -> structures:Protocol.v2_structure_interest Rrbvec.t -> output
+  -> structures:Worker_pure_data.structure_interest Rrbvec.t -> output
 val accepts_list : read -> bool
 val accepts_page : t -> read -> bool
 val accepts_block : t -> read -> bool
 val accepts_memberships : read -> bool
 val receive_list : t -> ports:ports -> read -> Journal_graph_request.favorites_result -> output
-val receive_page : t -> ports:ports -> read -> Protocol.v2_page_lookup -> output
-val receive_block : t -> ports:ports -> read -> Protocol.v2_block_lookup -> output
-val receive_memberships : t -> ports:ports -> read -> Protocol.v2_child_member list -> Protocol.v2_child_member Worker.continuation option -> output
+val receive_page : t -> ports:ports -> read -> Worker_pure_data.page_lookup -> output
+val receive_block : t -> ports:ports -> read -> Worker_pure_data.block_lookup -> output
+val receive_memberships : t -> ports:ports -> read -> Worker_pure_data.child_member list -> Worker_pure_data.child_member Worker.continuation option -> output
 val fail : t -> read -> request_id:Graph.Uuid.t -> code:Error.code -> message:string -> error:Error.t -> output
 
 (** The business owner retains the sealed continuation; the transport DTO is not its cursor store. *)

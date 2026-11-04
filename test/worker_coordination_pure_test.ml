@@ -52,7 +52,7 @@ let test_asset_demand_notice_has_one_registered_owner () =
   let asset=Logseq_db_types.Asset_descriptor.create ~uuid:(uuid "98000000-0000-4000-8000-000000000881")
     ~source:(Managed None) ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
   let oversized=Logseq_db_types.Asset_descriptor.create ~uuid:asset.uuid
-    ~source:(External(String.make(P.maximum_response_bytes+1)'x'))
+    ~source:(External(String.make(Worker_pure_data.maximum_response_bytes+1)'x'))
     ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
   check(Result.is_error(W.validate_request session(W.Replace_asset_demand(consumer,W.Foreground,[oversized]))))
     "asset demand admitted an unbounded descriptor payload";
@@ -1255,7 +1255,7 @@ let test_reads_wait_for_verified_baseline () =
       bound
       ~owner
       ~maximum_items:64
-      ~maximum_bytes:P.maximum_response_bytes
+      ~maximum_bytes:Worker_pure_data.maximum_response_bytes
       W.Graph_info
     |> Result.get_ok
   in
@@ -1735,7 +1735,7 @@ let test_durable_mutation_properties ?(append=false) () =
                  ; outcome =
                      P.V2_mutation_committed
                        { mutation_id = W.mutation_intent_id receipt_intent
-                       ; status = P.V2_applied
+                       ; status = Worker_pure_data.V2_applied
                        ; generation = "generation:v1:1:1"
                        ; before_projection_revision = "projection:v1:0"
                        ; after_projection_revision =
@@ -1829,7 +1829,7 @@ let test_durable_readback_reservation () =
   done;
   check (!admitted > 0) "durable capacity admitted no legitimate operation";
   check
-    (!admitted * P.maximum_response_bytes <= 16777216)
+    (!admitted * Worker_pure_data.maximum_response_bytes <= 16777216)
     "bounded intent keys admitted unreserved confirmation snapshots"
 ;;
 
@@ -1862,7 +1862,7 @@ let test_recovery_cursor_and_capacity_bounds () =
   check(Result.is_error(I.reply session ~request_id:id many(raw(Rrbvec.of_list[item 1;item 1])None)))
     "duplicate recovered mutation identity was accepted";
   let oversized=Wire.{intent=(item 1).intent;outcome=Rejected(P.V2_response{api_version=P.api_version;
-    request_id;outcome=V2_failed{code="conflict";message=String.make P.maximum_response_bytes 'x'}})} in
+    request_id;outcome=V2_failed{code="conflict";message=String.make Worker_pure_data.maximum_response_bytes 'x'}})} in
   check(Result.is_error(I.reply session ~request_id:id operation(raw(Rrbvec.singleton oversized)None)))
     "recovered rejection bypassed its reserved protocol-result budget";
   let ticket,planned=C.request(ready I.binding projection)session many |> Result.get_ok in
@@ -1960,7 +1960,7 @@ let test_committed_ack_requires_current_confirmation () =
   let request_id=match I.request session ~request_id:(C.ticket_id ticket)(W.Mutate intent) with
     | Ok(S.Coordination_mutation{request_id;_})->request_id|_->assert false in
   let receipt=(let (P.V2_response receipt_packet as packet) = (P.V2_response{api_version=P.api_version;request_id;outcome=V2_mutation_committed
-      {mutation_id=W.mutation_intent_id intent;status=V2_applied;generation="generation:v1:1:1";
+      {mutation_id=W.mutation_intent_id intent;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
        before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"}}) in
       match I.reply session ~request_id:(C.ticket_id ticket) (W.Mutate intent)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
@@ -1979,7 +1979,7 @@ let test_committed_ack_requires_current_confirmation () =
     "reconciliation mutated its previous state";
   let confirmation=(let (P.V2_response confirmation_packet as packet) = (P.V2_response
     {api_version=P.api_version;request_id;outcome=V2_block_summary_outcome
-      {lookup=V2_missing_block{uuid=graph;revision="block-state:v1:missing"};page=None;items=[];next_cursor=None;
+      {lookup=Worker_pure_data.V2_missing_block{uuid=graph;revision="block-state:v1:missing"};page=None;items=[];next_cursor=None;
        scope_revision="scope-revision:v1:missing";generation="generation:v1:1:1";projection_revision="projection:v1:1"}}) in
       match I.reply session ~request_id:(W.request_id confirmation_packet.request_id)
         (W.Confirm(presentation,receipt))
@@ -2013,7 +2013,7 @@ let test_committed_ack_requires_current_confirmation () =
     "cleanup retry across focus did not re-confirm original proof";
   let next_confirmation=(let (P.V2_response confirmation_packet as packet) = (P.V2_response
     {api_version=P.api_version;request_id;outcome=V2_block_summary_outcome
-      {lookup=V2_missing_block{uuid=graph;revision="block-state:v1:missing"};page=None;items=[];next_cursor=None;
+      {lookup=Worker_pure_data.V2_missing_block{uuid=graph;revision="block-state:v1:missing"};page=None;items=[];next_cursor=None;
        scope_revision="scope-revision:v1:missing";generation="generation:v1:1:1";projection_revision="projection:v1:1"}}) in
       match I.reply session ~request_id:(W.request_id confirmation_packet.request_id)
         (W.Confirm(latest,receipt))
@@ -2124,7 +2124,7 @@ let test_committed_ack_requires_current_confirmation () =
   let request_id=match I.request session ~request_id:(C.ticket_id independent)(W.Mutate other) with
     | Ok(S.Coordination_mutation{request_id;_})->request_id|_->assert false in
   let other_receipt=(let (P.V2_response receipt_packet as packet) = (P.V2_response{api_version=P.api_version;request_id;outcome=V2_mutation_committed
-      {mutation_id=W.mutation_intent_id other;status=V2_applied;generation="generation:v1:1:1";
+      {mutation_id=W.mutation_intent_id other;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
        before_projection_revision="projection:v1:1";after_projection_revision="projection:v1:2"}}) in
       match I.reply session ~request_id:(C.ticket_id independent) (W.Mutate other)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
@@ -3604,7 +3604,7 @@ let test_changefeed_ack_requires_owned_delivered_batch () =
     W.Query (budget, W.Changes { generation = "generation:v1:synthetic"; after = None })
   in
   let ticket, planned = C.request state session operation |> Result.get_ok in
-  let window : P.v2_change_window =
+  let window : Worker_pure_data.change_window =
     { id = "window-1"
     ; predecessor = "projection-0"
     ; successor = "projection-1"
@@ -3891,7 +3891,7 @@ let test_empty_change_batch_ack_retires_old_reads () =
     step (C.Admitted (ticket, Id.Worker.Request_id.one));
     step (C.Completed (ticket, W.Answered (Ok receipt)))
   in
-  let window id before after : P.v2_change_window =
+  let window id before after : Worker_pure_data.change_window =
     { id
     ; predecessor = before
     ; successor = after

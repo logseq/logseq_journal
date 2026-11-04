@@ -72,7 +72,8 @@
   angstrom
   logseq_db_worker.pure_reducer
   mtime
-  uri)
+  uri
+  logseq_db_worker.typed_data)
  (preprocess
   (pps ppx_deriving_yojson))
  (foreign_stubs

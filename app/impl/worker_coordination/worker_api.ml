@@ -1,6 +1,7 @@
 module Graph = Logseq_db_types.Graph_types
 module Uuid = Graph.Uuid
 module Protocol = Logseq_db_worker.Protocol
+module Data = Worker_pure_data
 module Wire = Logseq_db_worker_contract.Mutation_pure_wire
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Import_wire=Logseq_db_types.Asset_import.Pure_intent
@@ -29,7 +30,7 @@ type session =
   ; generation : graph_generation
   ; scope : Service.timeline_scope
   ; asset_scope : Service.asset_scope
-  ; limits : Protocol.v2_capability_limits
+  ; limits : Worker_pure_data.capability_limits
   }
 
 type presentation =
@@ -53,7 +54,7 @@ type error =
 type request_id = Uuid.t
 
 type capabilities =
-  { limits : Protocol.v2_capability_limits
+  { limits : Worker_pure_data.capability_limits
   ; atomic_append : bool
   ; durable_mutations : bool
   ; durable_import : bool
@@ -74,7 +75,7 @@ type page =
   }
 
 type block =
-  { data : Protocol.v2_block_record
+  { data : Worker_pure_data.block_record
   ; revision : string
   }
 
@@ -96,16 +97,16 @@ type graph_info =
   ; schema : Graph.schema_version
   ; admission_facts : Graph.admission_fact list
   ; journal_title_format : string option
-  ; limits : Protocol.v2_capability_limits
+  ; limits : Worker_pure_data.capability_limits
   ; generation : string
   ; projection_revision : string
   }
 
 type block_summary =
-  { lookup : Protocol.v2_block_lookup
-  ; page : Protocol.v2_page_lookup option
-  ; items : Protocol.v2_child_member list
-  ; next : Protocol.v2_child_member continuation option
+  { lookup : Worker_pure_data.block_lookup
+  ; page : Worker_pure_data.page_lookup option
+  ; items : Worker_pure_data.child_member list
+  ; next : Worker_pure_data.child_member continuation option
   ; scope_revision : string
   ; generation : string
   ; projection_revision : string
@@ -115,8 +116,8 @@ type favorites =
   { favorites_page : Uuid.t option
   ; generation : string
   ; projection_revision : string
-  ; items : Protocol.v2_favorite_item list
-  ; next : Protocol.v2_favorite_item continuation option
+  ; items : Worker_pure_data.favorite_item list
+  ; next : Worker_pure_data.favorite_item continuation option
   }
 
 type task_status_catalog =
@@ -135,10 +136,10 @@ type asset_listing =
 
 type children =
   { parent : Uuid.t
-  ; revision_scope : Protocol.v2_revision_scope
+  ; revision_scope : Worker_pure_data.revision_scope
   ; scope_revision : string
-  ; items : Protocol.v2_child_member list
-  ; next : Protocol.v2_child_member continuation option
+  ; items : Worker_pure_data.child_member list
+  ; next : Worker_pure_data.child_member continuation option
   }
 
 type change_batch =
@@ -146,7 +147,7 @@ type change_batch =
   ; generation : string
   ; from_exclusive : string option
   ; through : string
-  ; windows : Protocol.v2_change_window list
+  ; windows : Worker_pure_data.change_window list
   ; next : string option
   }
 
@@ -158,28 +159,28 @@ type change_ack =
 
 type _ query =
   | Graph_info : graph_info query
-  | Admission : Protocol.v2_admission_inspection query
+  | Admission : Worker_pure_data.admission_inspection query
   | Journal : journal_day -> page option query
   | Journals :
       { from_day : journal_day
       ; through_day : journal_day
       ; revision : string option
-      ; after : Protocol.v2_journal_item continuation option
+      ; after : Worker_pure_data.journal_item continuation option
       }
-      -> Protocol.v2_journal_item slice query
+      -> Worker_pure_data.journal_item slice query
   | Page :
       { uuid : Uuid.t
       ; revision : string option
       }
-      -> Protocol.v2_page_lookup query
+      -> Worker_pure_data.page_lookup query
   | Outline_block :
       { uuid : Uuid.t
       ; revision : string option
       }
-      -> Protocol.v2_block_lookup query
+      -> Worker_pure_data.block_lookup query
   | Block_summary :
       { block : Uuid.t
-      ; after : Protocol.v2_child_member continuation option
+      ; after : Worker_pure_data.child_member continuation option
       }
       -> block_summary query
   | Children :
@@ -190,17 +191,17 @@ type _ query =
   | Child_members :
       { parent : Uuid.t
       ; revision : string option
-      ; after : Protocol.v2_child_member continuation option
+      ; after : Worker_pure_data.child_member continuation option
       }
       -> children query
   | Tree :
       { page : Uuid.t
       ; maximum_depth : int
       ; revision : string option
-      ; after : Protocol.v2_tree_member continuation option
+      ; after : Worker_pure_data.tree_member continuation option
       }
-      -> Protocol.v2_tree_member slice query
-  | Favorites : Protocol.v2_favorite_item continuation option -> favorites query
+      -> Worker_pure_data.tree_member slice query
+  | Favorites : Worker_pure_data.favorite_item continuation option -> favorites query
   | Task_statuses :
       Graph.task_status_definition continuation option
       -> task_status_catalog query
@@ -220,7 +221,7 @@ type _ query =
       }
       -> change_batch query
 
-type capture_node = Protocol.v2_append_node =
+type capture_node = Worker_pure_data.append_node =
   { block_id : Uuid.t
   ; title : string
   ; task_status : Uuid.t option
@@ -233,37 +234,37 @@ type mutation_command =
   | Save_block of
       { block : Uuid.t
       ; title : string
-      ; preconditions : Protocol.v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | Insert_blocks of
       { parent : Uuid.t
-      ; roots : Protocol.v2_block_tree list
-      ; preconditions : Protocol.v2_preconditions
+      ; roots : Worker_pure_data.block_tree list
+      ; preconditions : Worker_pure_data.preconditions
       }
   | Delete_blocks of
       { root : Uuid.t
-      ; preconditions : Protocol.v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | Create_journal of
       { page : Uuid.t
       ; day : journal_day
       ; title : string
-      ; preconditions : Protocol.v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | Set_task_status of
       { block : Uuid.t
       ; status : Uuid.t
-      ; preconditions : Protocol.v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | Clear_task_status of
       { block : Uuid.t
-      ; preconditions : Protocol.v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | Set_asset_reference of
       { block : Uuid.t
       ; previous : Uuid.t option
       ; asset : Uuid.t
-      ; preconditions : Protocol.v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
 
 type mutation_intent = Wire.t
@@ -277,7 +278,7 @@ type receipt =
 
 type confirmed_target =
   | Confirmed_block of block_summary
-  | Confirmed_page of Protocol.v2_page_lookup
+  | Confirmed_page of Worker_pure_data.page_lookup
   | Confirmed_absence of
       { uuid : Uuid.t
       ; revision : string
@@ -324,7 +325,7 @@ type 'a reply =
 
 type changefeed_notice =
   { notice_session : session
-  ; notice : Protocol.push
+  ; notice : Worker_pure_data.changefeed_signal
   }
 
 type observation_epoch = int64
@@ -644,7 +645,7 @@ let capabilities (s : session) =
 let read_budget (owner : session) ~maximum_items ~maximum_bytes =
   if
     maximum_items <= 0
-    || maximum_items > Protocol.maximum_page_size
+    || maximum_items > Worker_pure_data.maximum_page_size
     || maximum_bytes <= 0
     || maximum_bytes > owner.limits.response_budget_bytes
   then Error (Invalid_input "Read budget exceeds advertised limits")
@@ -685,8 +686,8 @@ let unavailable feature =
 ;;
 
 let append_intent (session:session) ~mutation_id ~block_id ~day ~title ~task_status ~children =
-  let root:Protocol.v2_append_node={block_id;title;task_status;children} in
-  if not(Protocol.valid_append_node root) then Error(Invalid_input "Invalid bounded Append tree")
+  let root:Worker_pure_data.append_node={block_id;title;task_status;children} in
+  if not(Worker_pure_data.valid_append_node root) then Error(Invalid_input "Invalid bounded Append tree")
   else Result.bind(journal_day day)(fun day->
     let digits=Printf.sprintf "%08d" day in
     let page=Uuid.of_string(Printf.sprintf "00000001-%s-%s-0000-000000000000"
@@ -1132,7 +1133,7 @@ let checked_command
 let supports_observation session query =
   let budget =
     { owner = session
-    ; maximum_items = Protocol.maximum_page_size
+    ; maximum_items = Worker_pure_data.maximum_page_size
     ; maximum_bytes = session.limits.response_budget_bytes
     }
   in
@@ -1226,10 +1227,10 @@ let rec validate_request : type a. session -> a request -> (unit, error) result 
     if equal_session session batch.change_owner then Ok () else Error Revoked_session
   | Replace_asset_demand(consumer,_,assets)->
     if not(equal_session session consumer.session) then Error Revoked_session
-    else if List.length assets>Protocol.maximum_page_size
+    else if List.length assets>Worker_pure_data.maximum_page_size
     then Error(Invalid_input "Asset demand exceeds the bounded member batch")
     else
-      let limit=min session.limits.response_budget_bytes Protocol.maximum_response_bytes in
+      let limit=min session.limits.response_budget_bytes Worker_pure_data.maximum_response_bytes in
       let bytes=List.fold_left(fun bytes asset->if bytes>limit then bytes else
         bytes+1+String.length(Yojson.Safe.to_string(Logseq_db_types.Asset_descriptor.to_yojson asset)))2 assets in
       if bytes>limit then Error(Invalid_input "Asset demand exceeds the encoded payload bound") else Ok()
@@ -1266,12 +1267,12 @@ let decode
   in
   let mismatch () = Error (Protocol_mismatch "Response does not match the typed query") in
   let page_matches uuid = function
-    | Protocol.V2_present_page { page; _ } -> Uuid.equal page.uuid uuid
-    | V2_missing_page { uuid = actual; _ } -> Uuid.equal actual uuid
+    | Worker_pure_data.V2_present_page { page; _ } -> Uuid.equal page.uuid uuid
+    | Worker_pure_data.V2_missing_page { uuid = actual; _ } -> Uuid.equal actual uuid
   in
   let block_matches uuid = function
-    | Protocol.V2_present_block { value; _ } -> Uuid.equal value.block.uuid uuid
-    | V2_missing_block { uuid = actual; _ } -> Uuid.equal actual uuid
+    | Worker_pure_data.V2_present_block { value; _ } -> Uuid.equal value.block.uuid uuid
+    | Worker_pure_data.V2_missing_block { uuid = actual; _ } -> Uuid.equal actual uuid
   in
   match outcome with
   | Protocol.V2_failed { code; message } ->
@@ -1322,20 +1323,20 @@ let decode
             })
          (bounded s.items)
      | Children { parent; _ }, V2_children_outcome c
-       when Uuid.equal parent c.parent && c.revision_scope = V2_children_revision parent
+       when Uuid.equal parent c.parent && c.revision_scope = Worker_pure_data.V2_children_revision parent
        ->
        Result.map
          (fun items ->
             ({ items =
                 List.map
-                  (fun (i : Protocol.v2_child_member) ->
+                  (fun (i : Worker_pure_data.child_member) ->
                      { data = i.value; revision = i.revision })
                   items
             ; next = next c.next_cursor
             } : block slice))
          (bounded c.items)
      | Child_members { parent; _ }, V2_children_outcome c
-       when Uuid.equal parent c.parent && c.revision_scope = V2_children_revision parent
+       when Uuid.equal parent c.parent && c.revision_scope = Worker_pure_data.V2_children_revision parent
        ->
        Result.map
          (fun items ->
@@ -1392,7 +1393,7 @@ let decode
        when generation = b.generation && after = b.from_exclusive ->
        let rec chain seen previous = function
          | [] -> true
-         | (window : Protocol.v2_change_window) :: rest ->
+         | (window : Worker_pure_data.change_window) :: rest ->
            window.id <> ""
            && window.predecessor <> ""
            && window.successor <> ""
@@ -1402,7 +1403,7 @@ let decode
        in
        let through_matches =
          match List.rev b.windows with
-         | last :: _ -> b.through = last.Protocol.id
+         | last :: _ -> b.through = last.Worker_pure_data.id
          | [] -> Option.fold ~none:(b.through <> "") ~some:(String.equal b.through) after
        in
        if
@@ -1432,7 +1433,7 @@ let decode_confirmation session ~presentation receipt response =
   Result.bind (validate_confirmation session presentation receipt) (fun () ->
     let budget =
       { owner = session
-      ; maximum_items = Protocol.default_page_size
+      ; maximum_items = Worker_pure_data.default_page_size
       ; maximum_bytes = session.limits.response_budget_bytes
       }
     in
@@ -1467,7 +1468,7 @@ let decode_confirmation session ~presentation receipt response =
               outcome
             |> Result.map (fun summary ->
               match summary.lookup with
-              | Protocol.V2_missing_block { uuid; revision } ->
+              | Worker_pure_data.V2_missing_block { uuid; revision } ->
                 Confirmed_absence
                   { uuid
                   ; revision
@@ -1505,7 +1506,7 @@ let validate_baseline (b : Service.coordination_baseline) =
   then invalid "Negative baseline version"
   else if
     List.exists (fun n -> n <= 0) all_limits
-    || limits.response_budget_bytes > Protocol.maximum_response_bytes
+    || limits.response_budget_bytes > Worker_pure_data.maximum_response_bytes
     || limits.wire_batch_max_bytes > limits.outbox_max_bytes
   then invalid "Invalid baseline capability limits"
   else if
@@ -1696,7 +1697,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                      then Error (Protocol_mismatch "Too many residents")
                      else if
                        b.limits.response_budget_bytes <= 0
-                       || b.limits.response_budget_bytes > Protocol.maximum_response_bytes
+                       || b.limits.response_budget_bytes > Worker_pure_data.maximum_response_bytes
                      then Error (Protocol_mismatch "Invalid baseline response limit")
                      else (
                        let residents =
@@ -2042,7 +2043,10 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                        Ok
                          (Rrbvec.push_back
                             notices
-                            { notice_session = resident.session; notice = push })))
+                            { notice_session = resident.session
+                            ; notice = (match push with
+                              | Protocol.V2_changes_available {generation;through;_}->Data.Changes_available {generation;through}
+                              | V2_resync_required_push {generation;reason;_}->Data.Resync_required {generation;reason}) })))
               (Ok Rrbvec.empty)
               notices)
         | _ -> Ok Rrbvec.empty

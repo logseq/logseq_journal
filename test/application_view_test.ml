@@ -107,7 +107,7 @@ let fixture_coordination ?account ?(version=1L) ?(phase=Logseq_db_worker.Graph_o
   let module P=Logseq_db_worker.Protocol in
   let manager=fixture_with_scope manager in
   let scopes=manager.snapshot.resident_scopes in
-  let limits=C.limits ~maximum_response_bytes:P.maximum_response_bytes
+  let limits=C.limits ~maximum_response_bytes:Worker_pure_data.maximum_response_bytes
     ~maximum_artifact_bytes:1048576 ~submission_batch_size:1 |> Result.get_ok in
   let config=C.config ~managed_sync_origin:(Uri.of_string "https://example.invalid") ~limits |> Result.get_ok in
   let initial=C.initial config |> Result.get_ok |> C.state in
@@ -125,7 +125,7 @@ let fixture_coordination ?account ?(version=1L) ?(phase=Logseq_db_worker.Graph_o
     desired_residents=List.map(fun(scope:Service.asset_scope)->scope.graph_id) scopes;
     residents;selected;deletion=None} in
   Service.{registration;authority_user=None;
-    limits={response_budget_bytes=P.maximum_response_bytes;outbox_max_records=4096;outbox_max_bytes=8388608;
+    limits={response_budget_bytes=Worker_pure_data.maximum_response_bytes;outbox_max_records=4096;outbox_max_bytes=8388608;
       change_max_items=4096;change_max_bytes=1048576;dispatcher_capacity=256;wire_batch_max_bytes=262144};
     baseline={version;presentation=Int64.of_int manager.snapshot.startup.presentation_generation;
       state={sync;residents=List.map(fun(scope:Service.asset_scope)->scope,
@@ -353,7 +353,7 @@ let test_diagnostic_identity_comes_from_worker () =
     (Some "Not available") (List.assoc_opt "Worker graph UUID" closed)
 ;;
 
-let admission_inspection : Logseq_db_worker.Protocol.v2_admission_inspection =
+let admission_inspection : Worker_pure_data.admission_inspection =
   { active_records = 3
   ; active_bytes = 1536
   ; protected_wire_bytes = 512
@@ -767,7 +767,7 @@ let run_favorites_native_visibility
   let discovery_reads = Atomic.make [] in
   let detail_wait_release = Atomic.make false in
   let released_demands = Atomic.make 0 in
-  let capture_root : P.v2_block_tree option Atomic.t = Atomic.make None in
+  let capture_root : Worker_pure_data.block_tree option Atomic.t = Atomic.make None in
   let capture_page : G.page option Atomic.t = Atomic.make None in
   let imports_entered = Atomic.make [] in
   let imports_finished = Atomic.make 0 in
@@ -847,7 +847,7 @@ let run_favorites_native_visibility
     | Some definition -> definition.G.uuid
     | None -> G.Uuid.of_string slug |> Result.get_ok
   in
-  let timeline_block n : P.v2_block_record =
+  let timeline_block n : Worker_pure_data.block_record =
     { block =
         { uuid = List.nth roots n
         ; title =
@@ -900,19 +900,19 @@ let run_favorites_native_visibility
   in
   let favorite_items () =
     List.init 65 (fun n ->
-      { P.membership_uuid = uuid (1000 + n)
+      { Worker_pure_data.membership_uuid = uuid (1000 + n)
       ; membership_order = Printf.sprintf "%03d" n
       ; membership_revision = "membership-1"
       ; target =
           (if n mod 2 = 0
            then
-             P.V2_favorite_page
+             Worker_pure_data.V2_favorite_page
                { uuid = favorite_target_uuid n
                ; title = favorite_label n
                ; revision = "page-1"
                }
            else
-             P.V2_favorite_block
+             Worker_pure_data.V2_favorite_block
                { uuid = favorite_target_uuid n
                ; title = favorite_label n
                ; task_status = None
@@ -922,7 +922,7 @@ let run_favorites_native_visibility
   in
   let favorite_membership n =
     let value = timeline_block n in
-    { P.value =
+    { Worker_pure_data.value =
         { value with
           block =
             { value.block with
@@ -999,7 +999,7 @@ let run_favorites_native_visibility
     let generation=Atomic.get graph_generation in
     let presentation=max generation(Atomic.get status_presentation) in
     let scope={scope with graph_generation=generation} in
-    let limits=C.limits ~maximum_response_bytes:P.maximum_response_bytes
+    let limits=C.limits ~maximum_response_bytes:Worker_pure_data.maximum_response_bytes
       ~maximum_artifact_bytes:1048576 ~submission_batch_size:1 |> Result.get_ok in
     let config=C.config ~managed_sync_origin:scope.account.managed_sync_origin ~limits |> Result.get_ok in
     let state=C.initial config |> Result.get_ok |> C.state in
@@ -1018,7 +1018,7 @@ let run_favorites_native_visibility
       selected=(if Atomic.get host_closed then None else Some owner);deletion=None} in
     let physical:Logseq_db_worker.graph_state={graph_id=Some scope.graph_id;generation;phase=Graph_open;error=None} in
     Service.{registration;authority_user=None;
-      limits={response_budget_bytes=P.maximum_response_bytes;outbox_max_records=4096;outbox_max_bytes=8388608;
+      limits={response_budget_bytes=Worker_pure_data.maximum_response_bytes;outbox_max_records=4096;outbox_max_bytes=8388608;
         change_max_items=4096;change_max_bytes=1048576;dispatcher_capacity=256;wire_batch_max_bytes=262144};
       baseline={version=Int64.of_int(presentation+(if Atomic.get host_closed then 1 else 0));
         presentation=Int64.of_int presentation;state={sync;residents=(if Atomic.get host_closed then []else if extra then
@@ -1123,7 +1123,7 @@ let run_favorites_native_visibility
           | Coordination_confirm{request_id;intent;_}->
             let block=Rrbvec.nth (Wire.targets(durable_intent intent)) 0 in
             Service.Graph_request P.{api_version;request_id;command=V2_get_outline_block_summary
-              {block;limit=P.default_page_size;cursor=None}}
+              {block;limit=Worker_pure_data.default_page_size;cursor=None}}
           | _->fixture_request request in
         let fail_this_media_read=ref false and fail_this_media_listing=ref false in
         (match normalized with
@@ -1390,7 +1390,7 @@ let run_favorites_native_visibility
           let commit_status mutation_id block value =
             if detail_capture=Some "status-rejected" then (
               Alcotest.(check bool) "status failure belongs to the already inserted child"true
-                (List.exists(fun(_,root)->root.P.uuid=block)(Atomic.get detail_captures));
+                (List.exists(fun(_,root)->root.Worker_pure_data.uuid=block)(Atomic.get detail_captures));
               Atomic.set status_writes(Atomic.get status_writes @ [value]);
               P.V2_failed{code="invalidRequest";message="Fixture child status rejected"})else (
             Alcotest.(check string) "status mutation keeps target UUID"
@@ -1403,7 +1403,7 @@ let run_favorites_native_visibility
             then P.V2_failed { code = (if durable_status=Some `Conflict then "conflict" else "invalid-request"); message = "Fixture status write failed" }
             else (
               Atomic.set status_value value;
-              P.V2_mutation_committed { mutation_id; status = V2_applied; generation = "g"
+              P.V2_mutation_committed { mutation_id; status = Worker_pure_data.V2_applied; generation = "g"
                 ; before_projection_revision = "p"; after_projection_revision = "p2" }))
           in
           let outcome =
@@ -1439,7 +1439,7 @@ let run_favorites_native_visibility
               if delete_scenario = Some "failure" then
                 P.V2_failed { code = Logseq_db_worker.Error.code_string
                   (if durable_delete=Some `Conflict then Conflict else Invalid_request); message = "Fixture delete failed" }
-              else P.V2_mutation_committed { mutation_id; status = V2_applied; generation = "g"
+              else P.V2_mutation_committed { mutation_id; status = Worker_pure_data.V2_applied; generation = "g"
                 ; before_projection_revision = "p"; after_projection_revision = "p2" }
             | V2_set_task_status { mutation_id; block; status; _ }
               when Option.is_some status_scenario || detail_capture=Some "status-rejected" ->
@@ -1462,7 +1462,7 @@ let run_favorites_native_visibility
                 ; admission_facts = []
                 ; journal_title_format = None
                 ; limits =
-                    { response_budget_bytes = P.maximum_response_bytes
+                    { response_budget_bytes = Worker_pure_data.maximum_response_bytes
                     ; outbox_max_records = 4096
                     ; outbox_max_bytes = 8388608
                     ; change_max_items = 4096
@@ -1491,7 +1491,7 @@ let run_favorites_native_visibility
                 { page = page.uuid
                 ; maximum_depth
                 ; items = List.init length (fun index ->
-                    { P.value = timeline_block (offset + index)
+                    { Worker_pure_data.value = timeline_block (offset + index)
                     ; revision = status_revision ()
                     ; depth = 0
                     ; parent = page.uuid })
@@ -1516,7 +1516,7 @@ let run_favorites_native_visibility
                            else [if check_point_read_owner then uuid 1 else uuid 2])
                       ; page_uuids = []
                       ; structure_interests = (if Option.is_some asset_change
-                          then [V2_page_tree_interest page.uuid] else [])
+                          then [Worker_pure_data.V2_page_tree_interest page.uuid] else [])
                       }
                     ]
                 }
@@ -1527,19 +1527,19 @@ let run_favorites_native_visibility
               if block=uuid 1 && Atomic.exchange detail_observed_failure false then V2_failed{
                 code=Logseq_db_worker.Error.code_string Invalid_request;message="Observation sample failed"}
               else if Atomic.get detail_observed_missing && block=uuid 1 then
-                V2_block_outcome(V2_missing_block{uuid=block;revision="observed-missing"})
+                V2_block_outcome(Worker_pure_data.V2_missing_block{uuid=block;revision="observed-missing"})
               else if !fail_this_media_read then V2_failed {code="FixtureReadFailure";message="Synthetic Media dependency read failed"}
               else V2_block_outcome
                 (match
                    List.find_opt
-                     (fun (parent, (root : P.v2_block_tree)) ->
+                     (fun (parent, (root : Worker_pure_data.block_tree)) ->
                         let _ = parent in
                         G.Uuid.equal root.uuid block)
                      (Atomic.get detail_captures)
                  with
                  | Some (parent, root) ->
                    let value = timeline_block 0 in
-                   V2_present_block
+                   Worker_pure_data.V2_present_block
                      { value =
                          { value with
                            block =
@@ -1555,16 +1555,16 @@ let run_favorites_native_visibility
                  | None ->
                    (match List.find_index (G.Uuid.equal block) roots with
                     | Some n ->
-                      V2_present_block { value = timeline_block n; revision =
+                      Worker_pure_data.V2_present_block { value = timeline_block n; revision =
                         (if n=0 && Atomic.get detail_observed_title then "observed-root-1" else status_revision ()) }
-                    | None -> V2_missing_block { uuid = block; revision = "p" }))
+                    | None -> Worker_pure_data.V2_missing_block { uuid = block; revision = "p" }))
             | V2_get_outline_block_summary{block;_} when
-                List.exists(fun(_, (root:P.v2_block_tree))->root.uuid=block)(Atomic.get detail_captures) ->
-              let parent,root=List.find(fun(_, (root:P.v2_block_tree))->root.uuid=block)(Atomic.get detail_captures) in
+                List.exists(fun(_, (root:Worker_pure_data.block_tree))->root.uuid=block)(Atomic.get detail_captures) ->
+              let parent,root=List.find(fun(_, (root:Worker_pure_data.block_tree))->root.uuid=block)(Atomic.get detail_captures) in
               let value=timeline_block 0 in
               let value={value with block={value.block with uuid=root.uuid;title=root.title;parent;order="999"}} in
-              V2_block_summary_outcome{lookup=V2_present_block{value;revision="appended"};
-                page=Some(V2_present_page{page;revision="p"});items=[];next_cursor=None;
+              V2_block_summary_outcome{lookup=Worker_pure_data.V2_present_block{value;revision="appended"};
+                page=Some(Worker_pure_data.V2_present_page{page;revision="p"});items=[];next_cursor=None;
                 scope_revision="child-children";generation="generation:v1:1:1";
                 projection_revision="projection:v1:1"}
             | V2_get_outline_block_summary{block;_} when Option.is_some delete_scenario ->
@@ -1572,9 +1572,9 @@ let run_favorites_native_visibility
               let value=timeline_block 0 in
               let value=if durable_delete=Some `Reappeared then
                 {value with block={value.block with title="Reappeared after deletion"}} else value in
-              V2_block_summary_outcome{lookup=(if present then V2_present_block{value;revision="canonical-current"}
-                else V2_missing_block{uuid=block;revision="deleted"});
-                page=(if present then Some(V2_present_page{page;revision="p"}) else None);items=[];
+              V2_block_summary_outcome{lookup=(if present then Worker_pure_data.V2_present_block{value;revision="canonical-current"}
+                else Worker_pure_data.V2_missing_block{uuid=block;revision="deleted"});
+                page=(if present then Some(Worker_pure_data.V2_present_page{page;revision="p"}) else None);items=[];
                 next_cursor=None;scope_revision="children";generation="generation:v1:1:1";
                 projection_revision=(if durable_delete=Some `Reappeared then "projection:v1:2" else "projection:v1:1")}
             | V2_get_outline_block_summary { block; cursor; _ } when Option.is_some status_scenario ->
@@ -1583,14 +1583,14 @@ let run_favorites_native_visibility
                 Atomic.set status_more_entered true;
                 while not(Atomic.get status_more_release) do
                   Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done);
-              let child n : P.v2_child_member =
+              let child n : Worker_pure_data.child_member =
                 let value=timeline_block n in
                 {value={value with block={value.block with uuid=uuid(9100+n);parent=block;title="Canonical child "^string_of_int n}};
                  revision="child"} in
               let n = List.find_index (G.Uuid.equal block) roots |> Option.get in
               V2_block_summary_outcome
-                { lookup = V2_present_block { value = timeline_block n; revision = status_revision () }
-                ; page = Some (V2_present_page { page; revision = "p" })
+                { lookup = Worker_pure_data.V2_present_block { value = timeline_block n; revision = status_revision () }
+                ; page = Some (Worker_pure_data.V2_present_page { page; revision = "p" })
                 ; items = (if paged then [child(if cursor=None then 0 else 1)] else [])
                 ; next_cursor = (if paged && cursor=None then Some(G.Cursor.of_string "status-confirmation-more" |> Result.get_ok) else None)
                 ; scope_revision = "children"
@@ -1606,7 +1606,7 @@ let run_favorites_native_visibility
               let value = timeline_block 0 in
               V2_block_summary_outcome
                 { lookup =
-                    V2_present_block
+                    Worker_pure_data.V2_present_block
                       { value =
                           { value with
                             block =
@@ -1620,9 +1620,9 @@ let run_favorites_native_visibility
                           }
                       ; revision = "captured"
                       }
-                ; page = Some (V2_present_page { page; revision = "p" })
+                ; page = Some (Worker_pure_data.V2_present_page { page; revision = "p" })
                 ; items = (if capture_case=Some `Paged then
-                    [{P.value={value with block={value.block with uuid=uuid 94322;
+                    [{Worker_pure_data.value={value with block={value.block with uuid=uuid 94322;
                         title="Canonical child";parent=root.uuid;page=page.uuid}};revision="child"}]
                     else [])
                 ; next_cursor = (if capture_case=Some `Paged
@@ -1699,14 +1699,14 @@ let run_favorites_native_visibility
               in
               V2_page_outcome
                 (match known with
-                 | Some page -> V2_present_page { page; revision = "p" }
-                 | None -> V2_missing_page { uuid = requested; revision = "p" })
+                 | Some page -> Worker_pure_data.V2_present_page { page; revision = "p" }
+                 | None -> Worker_pure_data.V2_missing_page { uuid = requested; revision = "p" })
             | V2_get_children { parent; _ } when Option.is_some detail_capture ->
               let existing =
                 if G.Uuid.equal parent (uuid 1)
                 then (
                   let value = timeline_block 1 in
-                  [ { P.value = { value with block = { value.block with parent } }
+                  [ { Worker_pure_data.value = { value with block = { value.block with parent } }
                     ; revision = "child"
                     }
                   ])
@@ -1714,18 +1714,18 @@ let run_favorites_native_visibility
               in
               V2_children_outcome
                 { parent
-                ; revision_scope = V2_children_revision parent
+                ; revision_scope = Worker_pure_data.V2_children_revision parent
                 ; scope_revision = "children"
                 ; items =
                     existing
                     @ List.filter_map
-                        (fun (owner, (root : P.v2_block_tree)) ->
+                        (fun (owner, (root : Worker_pure_data.block_tree)) ->
                            if not (G.Uuid.equal owner parent)
                            then None
                            else (
                              let value = timeline_block 0 in
                              Some
-                               { P.value =
+                               { Worker_pure_data.value =
                                    { value with
                                      block =
                                        { value.block with
@@ -1747,14 +1747,14 @@ let run_favorites_native_visibility
               let value = timeline_block 1 in
               V2_children_outcome
                 { parent
-                ; revision_scope = V2_children_revision parent
+                ; revision_scope = Worker_pure_data.V2_children_revision parent
                 ; scope_revision = "children"
                 ; items =
                     List.init
                       (if check_detail_wait then 2 else 1)
                       (fun i ->
                        let value = if i = 0 then value else timeline_block 2 in
-                       { P.value = { value with block = { value.block with parent } }
+                       { Worker_pure_data.value = { value with block = { value.block with parent } }
                        ; revision = "child"
                          })
                 ; next_cursor = None
@@ -1770,7 +1770,7 @@ let run_favorites_native_visibility
                 done;
               V2_children_outcome
                 { parent
-                ; revision_scope = V2_children_revision parent
+                ; revision_scope = Worker_pure_data.V2_children_revision parent
                 ; scope_revision = "children"
                 ; items =
                     (if G.Uuid.equal parent favorites_page.uuid
@@ -1779,7 +1779,7 @@ let run_favorites_native_visibility
                           && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
                      then (
                        let value = timeline_block (if G.Uuid.equal parent (uuid 2) then 63 else 64) in
-                       [ { P.value = { value with block = { value.block with parent } }
+                       [ { Worker_pure_data.value = { value with block = { value.block with parent } }
                          ; revision = "child-first-page"
                          }
                        ])
@@ -1880,7 +1880,7 @@ let run_favorites_native_visibility
                 Atomic.set detail_captures (Atomic.get detail_captures @ [ parent, root ]);
                 V2_mutation_committed
                   { mutation_id
-                  ; status = V2_applied
+                  ; status = Worker_pure_data.V2_applied
                   ; generation = "g"
                   ; before_projection_revision = "p"
                   ; after_projection_revision = "p2"
@@ -1894,7 +1894,7 @@ let run_favorites_native_visibility
               Alcotest.(check bool) "canonical Web page differs from candidate" true (candidate<>captured.uuid);
               Atomic.set capture_page(Some captured);
               Atomic.set capture_root(Some{uuid=root.block_id;title=root.title;children=[]});
-              V2_mutation_committed{mutation_id;status=V2_applied;generation="g";
+              V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="g";
                 before_projection_revision="p";after_projection_revision="p2"}
             | V2_insert_blocks { mutation_id; parent; roots = [ root ]; _ }
               when check_capture_imports ->
@@ -1906,7 +1906,7 @@ let run_favorites_native_visibility
               Atomic.set capture_root (Some root);
               V2_mutation_committed
                 { mutation_id
-                ; status = V2_applied
+                ; status = Worker_pure_data.V2_applied
                 ; generation = "g"
                 ; before_projection_revision = "p"
                 ; after_projection_revision = "p2"
@@ -1931,7 +1931,7 @@ let run_favorites_native_visibility
                 outcome=V2_failed{code="invalidRequest";message="Fixture canonical read failed"}})
             | Coordination_confirm _ when durable_status=Some `Absence ->
               Service.Graph_response(P.V2_response{api_version=2;request_id=request.request_id;
-                outcome=V2_block_summary_outcome{lookup=V2_missing_block{uuid=uuid 1;revision="missing"};
+                outcome=V2_block_summary_outcome{lookup=Worker_pure_data.V2_missing_block{uuid=uuid 1;revision="missing"};
                   page=None;items=[];next_cursor=None;scope_revision="children";
                   generation="generation:v1:1:1";projection_revision="projection:v1:1"}})
             | Coordination_confirm _ ->
@@ -2083,8 +2083,8 @@ let run_favorites_native_visibility
       ~application_support_directory:"/tmp/journal-favorites-synthetic"
       ~target:(Managed_sync { base_url = "https://example.invalid" })
       ~compatibility_profile:Logseq_65_33_or_newer
-      ~response_budget_bytes:P.maximum_response_bytes
-      ~default_page_size:P.default_page_size
+      ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+      ~default_page_size:Worker_pure_data.default_page_size
     |> Result.get_ok
     |> Journal_startup.encode
     |> Result.get_ok
@@ -5239,7 +5239,7 @@ let test_reference_outer_terminals cancel =
     ; properties = []
     }
   in
-  let record block : P.v2_block_record =
+  let record block : Worker_pure_data.block_record =
     { block; task_status = None; rendered_page_title = page.title; tag_titles = [] }
   in
   let manager : Service.state =
@@ -5325,8 +5325,8 @@ let test_reference_outer_terminals cancel =
                request
                (V2_block_outcome
                   (if G.Uuid.equal target block.uuid
-                   then V2_present_block { value = record block; revision = "root" }
-                   else V2_missing_block { uuid = target; revision = "p" }))
+                   then Worker_pure_data.V2_present_block { value = record block; revision = "root" }
+                   else Worker_pure_data.V2_missing_block { uuid = target; revision = "p" }))
            | P.V2_get_page { page = target; _ }
              when Array.exists (G.Uuid.equal target) targets ->
              let index =
@@ -5353,7 +5353,7 @@ let test_reference_outer_terminals cancel =
                  completed
                    request
                    (V2_page_outcome
-                      (V2_present_page
+                      (Worker_pure_data.V2_present_page
                          { page = { page with uuid = target; title = "Late cancelled target"; kind = Ordinary_page }
                          ; revision = "old"
                          })))
@@ -5364,7 +5364,7 @@ let test_reference_outer_terminals cancel =
                completed
                  request
                  (V2_page_outcome
-                    (V2_present_page
+                    (Worker_pure_data.V2_present_page
                        { page = { page with uuid = target; title = Printf.sprintf "Fresh target %d" index; kind = Ordinary_page }
                        ; revision = "fresh"
                        }))
@@ -5378,7 +5378,7 @@ let test_reference_outer_terminals cancel =
                   ; admission_facts = []
                   ; journal_title_format = None
                   ; limits =
-                      { response_budget_bytes = P.maximum_response_bytes
+                      { response_budget_bytes = Worker_pure_data.maximum_response_bytes
                       ; outbox_max_records = 4096
                       ; outbox_max_bytes = 8388608
                       ; change_max_items = 4096
@@ -5413,7 +5413,7 @@ let test_reference_outer_terminals cancel =
                   })
            | V2_get_children {parent;_} ->
              completed request (V2_children_outcome
-               {parent;revision_scope=V2_children_revision parent;scope_revision="children";items=[];next_cursor=None})
+               {parent;revision_scope=Worker_pure_data.V2_children_revision parent;scope_revision="children";items=[];next_cursor=None})
            | V2_pull_changes {generation;after;_} ->
              completed
                request
@@ -5516,8 +5516,8 @@ let test_reference_outer_terminals cancel =
       ~application_support_directory:"/tmp/journal-reference-terminal-fixture"
       ~target:(Managed_sync { base_url = "https://example.invalid" })
       ~compatibility_profile:Logseq_65_33_or_newer
-      ~response_budget_bytes:P.maximum_response_bytes
-      ~default_page_size:P.default_page_size
+      ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+      ~default_page_size:Worker_pure_data.default_page_size
     |> Result.get_ok
     |> Journal_startup.encode
     |> Result.get_ok
@@ -5892,7 +5892,7 @@ let test_favorite_page_uses_shared_reference_lookup () =
           | V2_graph_info -> V2_graph_info_outcome
               { graph_uuid = uuid 9; graph_name = "Fixture"; schema = { major = 65; minor = 33 }
               ; admission_facts = []; journal_title_format = None; generation = "g"; projection_revision = "p"
-              ; limits = { response_budget_bytes = maximum_response_bytes; outbox_max_records = 4096
+              ; limits = { response_budget_bytes = Worker_pure_data.maximum_response_bytes; outbox_max_records = 4096
                   ; outbox_max_bytes = 8388608; change_max_items = 4096; change_max_bytes = 1048576
                   ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 } }
           | V2_list_journals _ -> V2_journals_outcome { items = []; next_cursor = None }
@@ -5900,13 +5900,13 @@ let test_favorite_page_uses_shared_reference_lookup () =
               { favorites_page = None; generation = "g"; projection_revision = "p"; next_cursor = None
               ; items =
                   [{ membership_uuid = uuid 10; membership_order = "a"; membership_revision = "m"
-                   ; target = V2_favorite_page { uuid = page.uuid; title = page.title; revision = "p" } }
+                   ; target = Worker_pure_data.V2_favorite_page { uuid = page.uuid; title = page.title; revision = "p" } }
                   ;{ membership_uuid = uuid 11; membership_order = "b"; membership_revision = "m"
-                   ; target = V2_favorite_block
+                   ; target = Worker_pure_data.V2_favorite_block
                        { uuid = block.uuid; title = block.title; task_status = None; revision = "b" } }] }
           | V2_get_page { page = requested; _ } ->
             if G.Uuid.equal requested (uuid 3) then Atomic.incr target_reads;
-            V2_page_outcome (V2_present_page
+            V2_page_outcome (Worker_pure_data.V2_present_page
                     { page =
                         (if G.Uuid.equal requested page.uuid
                          then page
@@ -5918,7 +5918,7 @@ let test_favorite_page_uses_shared_reference_lookup () =
                            })
               ; revision = "p" })
           | V2_get_outline_block { block = requested; _ } when G.Uuid.equal requested block.uuid ->
-            V2_block_outcome (V2_present_block
+            V2_block_outcome (Worker_pure_data.V2_present_block
               { value = { block; task_status = None; rendered_page_title = page.title; tag_titles = [] }
               ; revision = "b" })
           | V2_list_assets _ -> V2_assets_outcome
@@ -5965,7 +5965,7 @@ let test_favorite_page_uses_shared_reference_lookup () =
         ~application_support_directory:"/tmp/journal-favorite-page-reference-fixture"
         ~target:(Managed_sync { base_url = "https://example.invalid" })
         ~compatibility_profile:Logseq_65_33_or_newer
-        ~response_budget_bytes:P.maximum_response_bytes ~default_page_size:P.default_page_size
+        ~response_budget_bytes:Worker_pure_data.maximum_response_bytes ~default_page_size:Worker_pure_data.default_page_size
         |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
       consume (hooks.init 2 2 startup);
       wait "Favorites navigation mounts" (fun () -> Option.is_some (find "accessibility-label" "Favorites"));
@@ -5980,10 +5980,10 @@ let test_favorites_compact_shared_titles () =
   let module P=Logseq_db_worker.Protocol in
   let id n=G.Uuid.of_string (Printf.sprintf "85000000-0000-4000-8000-%012d" n) |> Result.get_ok in
   let items=List.init 2 (fun n ->
-    {P.membership_uuid=id (n+1);membership_order=string_of_int n;membership_revision="m";
-     target=(if n=0 then V2_favorite_page {uuid=id 10;title="Page";revision="p"}
+    {Worker_pure_data.membership_uuid=id (n+1);membership_order=string_of_int n;membership_revision="m";
+     target=(if n=0 then Worker_pure_data.V2_favorite_page {uuid=id 10;title="Page";revision="p"}
            else
-             V2_favorite_block
+             Worker_pure_data.V2_favorite_block
                { uuid = id 11
                ; title = "**Favorite** [[Named page]]"
                ; revision = "b"
@@ -6643,7 +6643,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
                 { graph_uuid = graph_id; graph_name = "Synthetic"
                 ; schema = { major = 65; minor = 33 }; admission_facts = []
                 ; journal_title_format = None
-                ; limits = { response_budget_bytes = P.maximum_response_bytes
+                ; limits = { response_budget_bytes = Worker_pure_data.maximum_response_bytes
                   ; outbox_max_records = 4096; outbox_max_bytes = 8388608
                   ; change_max_items = 4096; change_max_bytes = 1048576
                   ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 }
@@ -6674,8 +6674,8 @@ let test_failed_init_disposes_context () =
       ~application_support_directory:"/tmp/journal-init-synthetic"
       ~target:(Managed_sync {base_url="https://example.invalid"})
       ~compatibility_profile:Logseq_65_33_or_newer
-      ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
-      ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+      ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+      ~default_page_size:Worker_pure_data.default_page_size
       |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
   Fun.protect ~finally:(fun () -> Atomic.set release true; ignore(hooks.dispose());
     Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client) (fun () ->
@@ -6707,8 +6707,8 @@ let test_repeated_native_sign_in_intent_receives_permission () =
       ~application_support_directory:"/tmp/journal-online-permission-synthetic"
       ~target:(Managed_sync { base_url = "https://example.invalid" })
       ~compatibility_profile:Logseq_65_33_or_newer
-      ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
-      ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+      ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+      ~default_page_size:Worker_pure_data.default_page_size
     |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string
   in
   let send_intent ?(tag = 34) account_generation presentation_generation =
@@ -6769,8 +6769,8 @@ let test_local_account_failure_retries_local_discovery ?(typed_reason=false) ?(r
     Alcotest.(check bool) label true (predicate ()) in
   let config=Logseq_db_worker.Config.create ~application_support_directory:"/tmp/journal-local-retry-synthetic"
       ~target:(Managed_sync {base_url="https://example.invalid"}) ~compatibility_profile:Logseq_65_33_or_newer
-      ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
-      ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+      ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+      ~default_page_size:Worker_pure_data.default_page_size
       |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
   Fun.protect ~finally:(fun () -> Atomic.set release true; ignore(hooks.dispose ());
       Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client) (fun () ->
@@ -6835,8 +6835,8 @@ let test_pending_auth_never_replays_older_identity ~newer_accepted () =
     ~application_support_directory:"/tmp/journal-auth-order-synthetic"
     ~target:(Managed_sync {base_url="https://example.invalid"})
     ~compatibility_profile:Logseq_65_33_or_newer
-    ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
-    ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+    ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+    ~default_page_size:Worker_pure_data.default_page_size
     |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
   Fun.protect ~finally:(fun () -> Atomic.set release true; ignore (hooks.dispose ());
     Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client) (fun () ->
@@ -6905,8 +6905,8 @@ let test_native_authority_precedes_delayed_local_binding () =
         ~application_support_directory:"/tmp/journal-auth-local-order-synthetic"
         ~target:(Managed_sync {base_url="https://example.invalid"})
         ~compatibility_profile:Logseq_65_33_or_newer
-        ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
-        ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+        ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+        ~default_page_size:Worker_pure_data.default_page_size
         |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
     Fun.protect ~finally:(fun () -> Atomic.set release true; ignore(hooks.dispose());
       Option.iter Logseq_db_worker_lui.Journal_worker_runtime.stop !client) (fun () ->
@@ -7007,8 +7007,8 @@ let run_unlock_application ?(worker_failure = false) ?(queue_full = false)
       ~application_support_directory:"/tmp/journal-unlock-synthetic"
       ~target:(Managed_sync { base_url = "https://example.invalid" })
       ~compatibility_profile:Logseq_65_33_or_newer
-      ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
-      ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+      ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+      ~default_page_size:Worker_pure_data.default_page_size
     |> Result.get_ok
     |> Journal_startup.encode
     |> Result.get_ok
@@ -7173,8 +7173,8 @@ let test_unlock_attached_mirror ~graph_first () =
       ~application_support_directory:"/tmp/journal-attached-unlock-synthetic"
       ~target:(Managed_sync {base_url="https://example.invalid"})
       ~compatibility_profile:Logseq_65_33_or_newer
-      ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
-      ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+      ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+      ~default_page_size:Worker_pure_data.default_page_size
       |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
   Fun.protect ~finally:(fun () ->
     Atomic.set release true; Atomic.set finish_attachment true;
@@ -7267,13 +7267,13 @@ let test_application_token_control ~saturated ~failure () =
       ~monotonic_ns:Mtime_clock.elapsed_ns
       ~limits:
         Logseq_overlay_db.Types.
-          { response_budget_bytes = Logseq_db_worker.Protocol.maximum_response_bytes
+          { response_budget_bytes = Worker_pure_data.maximum_response_bytes
           ; outbox_max_records = 4096
           ; outbox_max_bytes = 8388608
-          ; change_max_items = Logseq_db_worker.Protocol.maximum_changed_uuids
-          ; change_max_bytes = Logseq_db_worker.Protocol.maximum_push_bytes
+          ; change_max_items = Worker_pure_data.maximum_changed_uuids
+          ; change_max_bytes = Worker_pure_data.maximum_push_bytes
           ; dispatcher_capacity = 256
-          ; wire_batch_max_bytes = Logseq_db_worker.Protocol.maximum_response_bytes
+          ; wire_batch_max_bytes = Worker_pure_data.maximum_response_bytes
           }
     |> Result.get_ok
   in
@@ -7289,8 +7289,8 @@ let test_application_token_control ~saturated ~failure () =
       ~application_support_directory:support
       ~target:(Managed_sync { base_url = "https://invalid.example" })
       ~compatibility_profile:Logseq_65_33_or_newer
-      ~response_budget_bytes:Logseq_db_worker.Protocol.maximum_response_bytes
-      ~default_page_size:Logseq_db_worker.Protocol.default_page_size
+      ~response_budget_bytes:Worker_pure_data.maximum_response_bytes
+      ~default_page_size:Worker_pure_data.default_page_size
     |> Result.get_ok
   in
   let client_ref = ref None in
@@ -7759,7 +7759,7 @@ let test_graph_picker_controls scenario () =
                 { graph_uuid = (match query_owner with Some owner->owner.graph_id|None->Option.get (Atomic.get current).snapshot.selected_graph)
                 ; graph_name = "Synthetic"; schema = { major = 65; minor = 33 }
                 ; admission_facts = []; journal_title_format = None
-                ; limits = { response_budget_bytes = P.maximum_response_bytes
+                ; limits = { response_budget_bytes = Worker_pure_data.maximum_response_bytes
                   ; outbox_max_records = 4096; outbox_max_bytes = 8388608
                   ; change_max_items = 4096; change_max_bytes = 1048576
                   ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 }
@@ -7871,7 +7871,7 @@ let test_graph_picker_controls scenario () =
       ~application_support_directory:"/tmp/journal-graph-picker-synthetic"
       ~target:(Managed_sync { base_url = "https://example.invalid" })
       ~compatibility_profile:Logseq_65_33_or_newer
-      ~response_budget_bytes:P.maximum_response_bytes ~default_page_size:P.default_page_size
+      ~response_budget_bytes:Worker_pure_data.maximum_response_bytes ~default_page_size:Worker_pure_data.default_page_size
       |> Result.get_ok |> Journal_startup.encode |> Result.get_ok |> Bytes.to_string in
   Fun.protect ~finally:(fun () ->
     Atomic.set unregister_allowed true;
@@ -8295,13 +8295,13 @@ let test_detail_reconciliation_diagnostics mode =
   let read = R.submit runtime (Journal_graph_request.Load_detail
     {block_id=G.Uuid.to_string block_id; after=None; limit=32; request_generation=9L})
     |> fun o -> one "root read" o.requests in
-  let read = step read (P.V2_block_outcome (V2_present_block
+  let read = step read (P.V2_block_outcome (Worker_pure_data.V2_present_block
     {value={block; task_status=None; rendered_page_title=page.title; tag_titles=[]}; revision="r1"}))
     |> fun o -> one "page read" o.requests in
-  let read = step read (P.V2_page_outcome (V2_present_page {page; revision="p1"}))
+  let read = step read (P.V2_page_outcome (Worker_pure_data.V2_present_page {page; revision="p1"}))
     |> fun o -> one "children read" o.requests in
   ignore(step read (P.V2_children_outcome {parent=block_id;
-    revision_scope=V2_children_revision block_id; scope_revision="c1"; items=[]; next_cursor=None}));
+    revision_scope=Worker_pure_data.V2_children_revision block_id; scope_revision="c1"; items=[]; next_cursor=None}));
   let pull = R.reconcile_push runtime ~request_generation:10L
     (P.V2_changes_available {api_version=P.api_version; generation="g"; through="p2"})
     |> fun o -> one "changes read" o.requests in
@@ -8312,7 +8312,7 @@ let test_detail_reconciliation_diagnostics mode =
     | V2_get_page _ -> true | _ -> false) output.requests in
   if mode=`Projection then fail_clock:=true;
   if mode=`Retired then R.reset runtime;
-  let completed = step read (P.V2_page_outcome (V2_present_page {page; revision="p2"})) in
+  let completed = step read (P.V2_page_outcome (Worker_pure_data.V2_present_page {page; revision="p2"})) in
   let state = A.create ~graph_generation:7 |> fun s -> A.step s (Capture_edited "retained draft") in
   let apply state = List.fold_left (fun s response -> A.step s (Completed response)) state completed.responses in
   let state = apply state in
@@ -8340,7 +8340,7 @@ let test_detail_reconciliation_diagnostics mode =
   Alcotest.(check string) "nonfatal completion retains draft" "retained draft"
     (A.capture state |> Option.get |> Journal_capture.source);
   Alcotest.(check int) "duplicate completion remains retired" 0
-    (List.length (step read (P.V2_page_outcome (V2_present_page {page; revision="p2"}))).responses)
+    (List.length (step read (P.V2_page_outcome (Worker_pure_data.V2_present_page {page; revision="p2"}))).responses)
 ;;
 
 (* Root_navigation owns acceptance of feed completions and its issue ledger.

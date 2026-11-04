@@ -96,7 +96,7 @@ val observe_response : t -> Protocol.response -> unit
 val observe_request : t -> Protocol.request -> unit
 
 val forget_request : t -> Logseq_db_types.Graph_types.Uuid.t -> unit
-val changes : t -> Protocol.v2_change_window list -> unit
+val changes : t -> Worker_pure_data.change_window list -> unit
 val resync : t -> unit
 val receive : t -> ticket -> Service.response -> unit
 val reject : t -> ticket -> unit
@@ -112,7 +112,7 @@ val observe_journals_request : t -> request_id:Logseq_db_types.Graph_types.Uuid.
 val observe_journals_result
   :  t
   -> request_id:Logseq_db_types.Graph_types.Uuid.t
-  -> Protocol.v2_journal_item Journal_worker_coordination.Worker_api.slice
+  -> Worker_pure_data.journal_item Journal_worker_coordination.Worker_api.slice
   -> unit
 
 (** Exact business correlation, independent of Worker transport IDs. *)
@@ -120,7 +120,7 @@ val read_request_id : read_request -> Logseq_db_types.Graph_types.Uuid.t
 
 (** Failed visible interests remain obligations of a repeated Changes attempt,
     even when their error view did not change and no new read was planned. *)
-val change_application_error : t -> Protocol.v2_change_window list -> string option
+val change_application_error : t -> Worker_pure_data.change_window list -> string option
 
 (** Only failed DTO/dependency reads, excluding download/lease/import status. An
     actual queued listing retry remains an obligation rather than a final error. *)

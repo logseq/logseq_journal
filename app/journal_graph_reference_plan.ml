@@ -267,9 +267,9 @@ let shared_read_failed t ~ports ~source_epoch ~block_id =
 let receive_page t ~ports ~source_epoch (read : read) lookup =
   let { block_id; depth; _ } = read in
   match lookup with
-  | Protocol.V2_missing_page _ ->
+  | Worker_pure_data.V2_missing_page _ ->
     continue_reference_outline t ~ports ~source_epoch ~block_id ~depth
-  | V2_present_page { page; _ } ->
+  | Worker_pure_data.V2_present_page { page; _ } ->
     (* Own reads intentionally do not share the common observer's capacity gate. *)
     if reference_is_current t ~source_epoch block_id
        && not (Hashtbl.mem t.reference_dirty block_id)
@@ -279,8 +279,8 @@ let receive_page t ~ports ~source_epoch (read : read) lookup =
 ;;
 let receive_outline t ~ports ~source_epoch (read : read) lookup =
   let source = match lookup with
-    | Protocol.V2_present_block { value; _ } -> Some (reference_source t value.block)
-    | V2_missing_block _ -> None in
+    | Worker_pure_data.V2_present_block { value; _ } -> Some (reference_source t value.block)
+    | Worker_pure_data.V2_missing_block _ -> None in
   complete_reference_read t ~ports ~source_epoch ~block_id:read.block_id ~depth:read.depth source
 ;;
 

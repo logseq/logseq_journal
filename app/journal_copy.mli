@@ -5,8 +5,8 @@ module Pure : sig
 
   type result =
     | Info_result of Worker.graph_info
-    | Block_result of Worker.Protocol.v2_block_lookup
-    | Page_result of Worker.Protocol.v2_page_lookup
+    | Block_result of Worker_pure_data.block_lookup
+    | Page_result of Worker_pure_data.page_lookup
     | Children_result of Worker.children
 
   type event =

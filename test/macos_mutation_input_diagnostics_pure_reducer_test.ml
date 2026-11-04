@@ -251,7 +251,7 @@ let test_detail_commit_fence () =
 
 let test_admission_reopen_fence () =
   let open Application.Admission_refresh in
-  let inspection : Logseq_db_worker.Protocol.v2_admission_inspection =
+  let inspection : Worker_pure_data.admission_inspection =
     { active_records = 9
     ; active_bytes = 99
     ; protected_wire_bytes = 3

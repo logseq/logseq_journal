@@ -1,11 +1,11 @@
-(** Target App/Worker coordination boundary. No production implementation satisfies
-    it yet. DTOs reuse today's protocol; sealed authority is issued by the trusted
+(** App/Worker coordination boundary. Pure data belongs to [Worker_pure_data];
+    sealed authority is issued by the trusted
     Worker runner. Abstraction is not authentication: every message, continuation,
     receipt and resource is validated against its actual channel and owner. *)
 module Graph = Logseq_db_types.Graph_types
 
 module Uuid = Graph.Uuid
-module Protocol = Logseq_db_worker.Protocol
+module Data = Worker_pure_data
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 
 type account_generation
@@ -59,7 +59,7 @@ val equal_request_id : request_id -> request_id -> bool
 val compare_request_id : request_id -> request_id -> int
 
 type capabilities = private
-  { limits : Protocol.v2_capability_limits
+  { limits : Worker_pure_data.capability_limits
   ; atomic_append : bool
   ; durable_mutations : bool
   ; durable_import : bool
@@ -100,7 +100,7 @@ val block_title : block -> string
 val page_data : page -> Graph.page
 
 val page_revision : page -> string
-val block_data : block -> Protocol.v2_block_record
+val block_data : block -> Worker_pure_data.block_record
 val block_revision : block -> string
 
 type 'a continuation
@@ -110,7 +110,7 @@ type 'a slice = private
   ; next : 'a continuation option
   }
 
-(** At most Protocol.maximum_page_size items (<1000). A continuation is bound to
+(** At most Data.maximum_page_size items (<1000). A continuation is bound to
     session, query kind, parameters, budget and revision. Only its item type is a
     static guarantee; runtime rejects a different parent/range/depth/filter or
     stale snapshot. Ordinary reads do not change an observation epoch. *)
@@ -121,16 +121,16 @@ type graph_info = private
   ; schema : Graph.schema_version
   ; admission_facts : Graph.admission_fact list
   ; journal_title_format : string option
-  ; limits : Protocol.v2_capability_limits
+  ; limits : Worker_pure_data.capability_limits
   ; generation : string
   ; projection_revision : string
   }
 
 type block_summary = private
-  { lookup : Protocol.v2_block_lookup
-  ; page : Protocol.v2_page_lookup option
-  ; items : Protocol.v2_child_member list
-  ; next : Protocol.v2_child_member continuation option
+  { lookup : Worker_pure_data.block_lookup
+  ; page : Worker_pure_data.page_lookup option
+  ; items : Worker_pure_data.child_member list
+  ; next : Worker_pure_data.child_member continuation option
   ; scope_revision : string
   ; generation : string
   ; projection_revision : string
@@ -143,8 +143,8 @@ type favorites = private
   { favorites_page : Uuid.t option
   ; generation : string
   ; projection_revision : string
-  ; items : Protocol.v2_favorite_item list
-  ; next : Protocol.v2_favorite_item continuation option
+  ; items : Worker_pure_data.favorite_item list
+  ; next : Worker_pure_data.favorite_item continuation option
   }
 
 type task_status_catalog = private
@@ -163,10 +163,10 @@ type asset_listing = private
 
 type children = private
   { parent : Uuid.t
-  ; revision_scope : Protocol.v2_revision_scope
+  ; revision_scope : Worker_pure_data.revision_scope
   ; scope_revision : string
-  ; items : Protocol.v2_child_member list
-  ; next : Protocol.v2_child_member continuation option
+  ; items : Worker_pure_data.child_member list
+  ; next : Worker_pure_data.child_member continuation option
   }
 
 type change_batch = private
@@ -174,7 +174,7 @@ type change_batch = private
   ; generation : string
   ; from_exclusive : string option
   ; through : string
-  ; windows : Protocol.v2_change_window list
+  ; windows : Worker_pure_data.change_window list
   ; next : string option
   }
 
@@ -188,28 +188,28 @@ type change_ack
     types. List/lookup result ordering matches input IDs, including missing slots. *)
 type _ query =
   | Graph_info : graph_info query
-  | Admission : Protocol.v2_admission_inspection query
+  | Admission : Worker_pure_data.admission_inspection query
   | Journal : journal_day -> page option query
   | Journals :
       { from_day : journal_day
       ; through_day : journal_day
       ; revision : string option
-      ; after : Protocol.v2_journal_item continuation option
+      ; after : Worker_pure_data.journal_item continuation option
       }
-      -> Protocol.v2_journal_item slice query
+      -> Worker_pure_data.journal_item slice query
   | Page :
       { uuid : Uuid.t
       ; revision : string option
       }
-      -> Protocol.v2_page_lookup query
+      -> Worker_pure_data.page_lookup query
   | Outline_block :
       { uuid : Uuid.t
       ; revision : string option
       }
-      -> Protocol.v2_block_lookup query
+      -> Worker_pure_data.block_lookup query
   | Block_summary :
       { block : Uuid.t
-      ; after : Protocol.v2_child_member continuation option
+      ; after : Worker_pure_data.child_member continuation option
       }
       -> block_summary query
   | Children :
@@ -220,17 +220,17 @@ type _ query =
   | Child_members :
       { parent : Uuid.t
       ; revision : string option
-      ; after : Protocol.v2_child_member continuation option
+      ; after : Worker_pure_data.child_member continuation option
       }
       -> children query
   | Tree :
       { page : Uuid.t
       ; maximum_depth : int
       ; revision : string option
-      ; after : Protocol.v2_tree_member continuation option
+      ; after : Worker_pure_data.tree_member continuation option
       }
-      -> Protocol.v2_tree_member slice query
-  | Favorites : Protocol.v2_favorite_item continuation option -> favorites query
+      -> Worker_pure_data.tree_member slice query
+  | Favorites : Worker_pure_data.favorite_item continuation option -> favorites query
   | Task_statuses :
       Graph.task_status_definition continuation option
       -> task_status_catalog query
@@ -300,37 +300,37 @@ type mutation_command =
   | Save_block of
       { block : Uuid.t
       ; title : string
-      ; preconditions : Protocol.v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | Insert_blocks of
       { parent : Uuid.t
-      ; roots : Protocol.v2_block_tree list
-      ; preconditions : Protocol.v2_preconditions
+      ; roots : Worker_pure_data.block_tree list
+      ; preconditions : Worker_pure_data.preconditions
       }
   | Delete_blocks of
       { root : Uuid.t
-      ; preconditions : Protocol.v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | Create_journal of
       { page : Uuid.t
       ; day : journal_day
       ; title : string
-      ; preconditions : Protocol.v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | Set_task_status of
       { block : Uuid.t
       ; status : Uuid.t
-      ; preconditions : Protocol.v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | Clear_task_status of
       { block : Uuid.t
-      ; preconditions : Protocol.v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
   | Set_asset_reference of
       { block : Uuid.t
       ; previous : Uuid.t option
       ; asset : Uuid.t
-      ; preconditions : Protocol.v2_preconditions
+      ; preconditions : Worker_pure_data.preconditions
       }
 
 type mutation_intent
@@ -362,7 +362,7 @@ val receipt_revisions : receipt -> string * string * string
 
 type confirmed_target = private
   | Confirmed_block of block_summary
-  | Confirmed_page of Protocol.v2_page_lookup
+  | Confirmed_page of Worker_pure_data.page_lookup
   | Confirmed_absence of
       { uuid : Uuid.t
       ; revision : string
@@ -439,7 +439,7 @@ type 'a reply =
 
 type changefeed_notice = private
   { notice_session : session
-  ; notice : Protocol.push
+  ; notice : Worker_pure_data.changefeed_signal
   }
 
 type observation_epoch

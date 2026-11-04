@@ -196,11 +196,10 @@ let route runner event registered_owner broadcast drop =
   result.R.error
 """,
     "durable_all_mutations_and_confirmation": """
-module P = Logseq_db_worker.Protocol
 let operations session id uuid preconditions title status =
   let commands = [
     W.Save_block {block=uuid;title;preconditions};
-    W.Insert_blocks {parent=uuid;roots=[{P.uuid;title;children=[]}];preconditions};
+    W.Insert_blocks {parent=uuid;roots=[{W.Data.uuid;title;children=[]}];preconditions};
     W.Delete_blocks {root=uuid;preconditions};
     W.Create_journal {page=uuid;day=(Result.get_ok(W.journal_day 20261101));title;preconditions};
     W.Set_task_status {block=uuid;status;preconditions};
@@ -280,8 +279,8 @@ let handoff (module Issuer : W.ISSUER) plan response =
 
 NEGATIVE.update({
     "tree_continuation_cannot_resume_journals": (
-        """let wrong day (after : Logseq_db_worker.Protocol.v2_tree_member W.continuation option) =
- W.Journals {from_day=day;through_day=day;revision=None;after}""", ("v2_tree_member", "v2_journal_item")),
+        """let wrong day (after : Worker_pure_data.tree_member W.continuation option) =
+ W.Journals {from_day=day;through_day=day;revision=None;after}""", ("tree_member", "journal_item")),
     "import_cannot_complete_as_graph_mutation": (
         """let wrong (ticket : W.import_progress C.ticket) (reply : W.mutation_progress W.reply) =
  C.Completed(ticket,reply)""", ("W.import_progress", "W.mutation_progress")),

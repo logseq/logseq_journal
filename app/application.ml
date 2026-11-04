@@ -343,9 +343,9 @@ let favorites_event state event =
     then state.favorites_media_roots
     else
       Journal_routes.Favorites.items favorites
-      |> Rrbvec.map (fun (item : Logseq_db_worker.Protocol.v2_favorite_item) ->
+      |> Rrbvec.map (fun (item : Worker_pure_data.favorite_item) ->
         match item.target with
-        | V2_favorite_page { uuid; _ } | V2_favorite_block { uuid; _ } ->
+        | Worker_pure_data.V2_favorite_page { uuid; _ } | Worker_pure_data.V2_favorite_block { uuid; _ } ->
           Logseq_db_types.Graph_types.Uuid.to_string uuid)
 
   in
@@ -3503,7 +3503,7 @@ let start
       (match current_owner(),ensure_coordination() with
        | Some owner,Ok host when request.api_version=Logseq_db_worker.Protocol.api_version ->
          let accepted=Coordination_host.query_point host ~owner
-           ~maximum_bytes:Logseq_db_worker.Protocol.maximum_response_bytes request.command
+           ~maximum_bytes:Worker_pure_data.maximum_response_bytes request.command
            ~f:(fun origin result->
              if runtime_owner_is_live !state_ref owner then run_owned (Some owner) (fun()->
                let result=match result,origin with
@@ -3731,7 +3731,7 @@ let start
                   (Journal_routes.detail state.routes) })
         ; copy_transition owner (Start root) ]
   in
-  let media_projection_changes=ref(fun (_:Logseq_db_worker.Protocol.v2_change_window list)->()) in
+  let media_projection_changes=ref(fun (_:Worker_pure_data.change_window list)->()) in
   let graph_runtime_cell = graph_ref (fun () ->
     Journal_graph_runtime.create
       ~on_projection_changes:(fun windows-> !media_projection_changes windows)
@@ -3984,7 +3984,7 @@ let start
     | Some owner,Ok host->
       (match Coordination_host.plan_query_when_available host ~owner
          ~maximum_items:request.maximum_items
-         ~maximum_bytes:Logseq_db_worker.Protocol.maximum_response_bytes request.query with
+         ~maximum_bytes:Worker_pure_data.maximum_response_bytes request.query with
        | Error _->false
        | Ok ticket->
          Coordination_host.watch_read host ticket ~f:(fun origin reply->
@@ -4040,7 +4040,7 @@ let start
     | Some owner,Ok host ->
       (match Coordination_host.plan_query_when_available host ~owner
           ~maximum_items:request.maximum_items
-          ~maximum_bytes:Logseq_db_worker.Protocol.maximum_response_bytes request.query with
+          ~maximum_bytes:Worker_pure_data.maximum_response_bytes request.query with
        | Error _->false
        | Ok ticket ->
          (match request.query with
@@ -4293,7 +4293,7 @@ let start
                 let session=List.find_map(fun resident->if resident.Wc.phase=Wc.Open
                   && Wc.matches_scope resident.session owner then Some resident.session else None)(Wc.residents projection) in
                 (match session with None->Some Journal_graph_transport.Not_ready|Some session->
-                  match Wc.read_budget session ~maximum_items:read.maximum_items ~maximum_bytes:Logseq_db_worker.Protocol.maximum_response_bytes with
+                  match Wc.read_budget session ~maximum_items:read.maximum_items ~maximum_bytes:Worker_pure_data.maximum_response_bytes with
                   | Error _->Some Journal_graph_transport.Not_ready
                   | Ok budget->
                     observe_projection_request request;
@@ -4315,7 +4315,7 @@ let start
            | _->None in
          (match observed with Some result->result|None->
          match Coordination_host.plan_query host ~owner ~maximum_items:read.maximum_items
-           ~maximum_bytes:Logseq_db_worker.Protocol.maximum_response_bytes read.query with
+           ~maximum_bytes:Worker_pure_data.maximum_response_bytes read.query with
           | Ok ticket->watch None ticket read.outcome;Journal_graph_transport.Accepted
           | Error _->Journal_graph_transport.Not_ready)
        | Confirm_readback read ->
@@ -4868,13 +4868,13 @@ let start
              | Ok()->
                let block_id=Wc.Uuid.to_string context.root in
                (match sample.value with
-                | Logseq_db_worker.Protocol.V2_missing_block _->
+                | Worker_pure_data.V2_missing_block _->
                   Effect.run(set_state_and_effect(fun state->
                     {state with routes=Journal_routes.observation_missing state.routes
                       ~entry_id:context.entry_id ~request_generation:context.request_generation ~block_id},
                     Effect.of_thunk(fun()->forward context sample
                       (Journal_graph_runtime.plan_observed_block (!graph_runtime_cell) ~root:context.root))))
-                | V2_present_block _->
+                | Worker_pure_data.V2_present_block _->
                   let route=Journal_routes.at_entry (!state_ref).routes ~entry_id:context.entry_id |> Option.get in
                   (match Journal_routes.route route with
                    | Journal_routes.Detail->forward context sample
@@ -6153,7 +6153,7 @@ let start
     let open_favorite membership_id =
       match
         Rrbvec.find_opt
-          (fun (item : Logseq_db_worker.Protocol.v2_favorite_item) ->
+          (fun (item : Worker_pure_data.favorite_item) ->
              Logseq_db_types.Graph_types.Uuid.to_string item.membership_uuid
              = membership_id)
           (Journal_routes.Favorites.items snapshot.favorites)
@@ -7150,7 +7150,7 @@ let start
     | Favorite_copy membership_id ->
       (match
          Rrbvec.find_opt
-           (fun (item : Logseq_db_worker.Protocol.v2_favorite_item) ->
+           (fun (item : Worker_pure_data.favorite_item) ->
               Logseq_db_types.Graph_types.Uuid.to_string item.membership_uuid
               = membership_id)
            (Journal_routes.Favorites.items snapshot.favorites)

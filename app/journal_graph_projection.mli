@@ -76,7 +76,7 @@ type feed_cursor =
 
 type child_cursor =
   { after :
-      Logseq_db_worker.Protocol.v2_child_member
+      Worker_pure_data.child_member
         Journal_worker_coordination.Worker_api.continuation
   ; maximum_items : int
   }
@@ -91,10 +91,10 @@ type root_cursor =
   ; page : Logseq_db_types.Graph_types.Uuid.t
   ; epoch : int64
   ; after :
-      Logseq_db_worker.Protocol.v2_tree_member
+      Worker_pure_data.tree_member
         Journal_worker_coordination.Worker_api.continuation
         option
-  ; remaining : Logseq_db_worker.Protocol.v2_tree_member Rrbvec.t
+  ; remaining : Worker_pure_data.tree_member Rrbvec.t
   }
 
 type block_continuation =
@@ -204,12 +204,12 @@ val detail_on_page
   -> children_page
   -> (detail, string) result
 
-val favorite : Logseq_db_worker.Protocol.v2_favorite_item -> favorite
+val favorite : Worker_pure_data.favorite_item -> favorite
 
 (** Canonical target projection retains the full raw child count while only
     materializing the existing bounded preview. *)
 val timeline_target_entry
   : page:page -> time_context:time_context -> root:tree_member
   -> tag_titles:(Logseq_db_types.Graph_types.Uuid.t -> string list)
-  -> Logseq_db_worker.Protocol.v2_child_member Rrbvec.t
+  -> Worker_pure_data.child_member Rrbvec.t
   -> (timeline_entry option,string) result

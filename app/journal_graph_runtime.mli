@@ -35,7 +35,7 @@ type payload =
        result:payload;failure:Journal_worker_coordination.Worker_api.error option;insert_rejected:bool}
   | Mutation_settled of Journal_worker_coordination.Worker_api.mutation_intent * Journal_worker_coordination.Worker_api.presentation * payload
   | Mutation_waiting of { mutation_id:string; block_id:string; message:string }
-  | Projection_changes of Logseq_db_worker.Protocol.v2_change_window list
+  | Projection_changes of Worker_pure_data.change_window list
   | Projection_resync
   | Task_statuses_changed of
       { items : Logseq_db_types.Graph_types.task_status_definition Rrbvec.t
@@ -52,7 +52,7 @@ type payload =
   | Graph_ready
   | Admission_inspected of
       { request : Journal_graph_request.admission_request
-      ; observation : Logseq_db_worker.Protocol.v2_admission_inspection
+      ; observation : Worker_pure_data.admission_inspection
       }
   | Admission_unavailable of Journal_graph_request.admission_request
   | Block_captured of
@@ -138,7 +138,7 @@ type output =
 (** The host supplies the pure coordinator's current session/owner eligibility
     check for buffered Tree DTOs. Its default rejects execution provenance; tests
     can supply an explicit pure coordinator snapshot. *)
-val create : ?on_change:(Journal_worker_coordination.Worker_pure_coordinator.event -> unit) -> ?on_projection_changes:(Logseq_db_worker.Protocol.v2_change_window list -> unit) -> ?localtime:(float -> Unix.tm) -> ?validate_session:(Journal_worker_coordination.Worker_api.session -> (unit, Journal_worker_coordination.Worker_api.error) result) -> unit -> t
+val create : ?on_change:(Journal_worker_coordination.Worker_pure_coordinator.event -> unit) -> ?on_projection_changes:(Worker_pure_data.change_window list -> unit) -> ?localtime:(float -> Unix.tm) -> ?validate_session:(Journal_worker_coordination.Worker_api.session -> (unit, Journal_worker_coordination.Worker_api.error) result) -> unit -> t
 val reset : t -> unit
 val set_calendar : t -> Journal_calendar.t -> unit
 val start : t -> Logseq_db_worker.Protocol.request
@@ -163,10 +163,10 @@ type worker_read_result =
   | Changes_retired
   | Changes_read of Worker.change_batch
   | Changes_acknowledged of Worker.change_ack
-  | Root_tree_read of {page:Logseq_db_types.Graph_types.Uuid.t;value:Logseq_db_worker.Protocol.v2_tree_member Worker.slice}
+  | Root_tree_read of {page:Logseq_db_types.Graph_types.Uuid.t;value:Worker_pure_data.tree_member Worker.slice}
   | Child_members_read of Worker.children
   | Target_summary_read of Worker.block_summary
-  | Journals_read of Logseq_db_worker.Protocol.v2_journal_item Worker.slice
+  | Journals_read of Worker_pure_data.journal_item Worker.slice
   | Task_catalog_read of Worker.task_status_catalog
   | Ordinary_read of Logseq_db_worker.Protocol.v2_outcome
   | Favorites_read of

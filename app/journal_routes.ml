@@ -383,10 +383,10 @@ let open_detail t ~block_id ~request_generation =
 let open_favorite
       t
       ~request_generation
-      (item : Logseq_db_worker.Protocol.v2_favorite_item)
+      (item : Worker_pure_data.favorite_item)
   =
   match item.target with
-  | V2_favorite_page { uuid; _ } | V2_favorite_block { uuid; _ } ->
+  | Worker_pure_data.V2_favorite_page { uuid; _ } | Worker_pure_data.V2_favorite_block { uuid; _ } ->
     let block_id = Logseq_db_types.Graph_types.Uuid.to_string uuid in
     ( open_detail t ~block_id ~request_generation
     , Some
@@ -827,12 +827,12 @@ module Favorites = struct
     ; active : bool
     ; dirty : bool
     ; initialized : bool
-    ; items : P.v2_favorite_item Rrbvec.t
+    ; items : Worker_pure_data.favorite_item Rrbvec.t
     ; hidden_targets : Hidden.t
     ; cursor : Journal_graph_request.favorites_cursor option
     ; pending : Journal_graph_request.favorites_request option
     ; error : string option
-    ; staging : P.v2_favorite_item Rrbvec.t option
+    ; staging : Worker_pure_data.favorite_item Rrbvec.t option
     ; refresh_count : int
     }
 
@@ -857,10 +857,10 @@ module Favorites = struct
 
   let visible_items t =
     Rrbvec.filter
-      (fun (item : P.v2_favorite_item) ->
+      (fun (item : Worker_pure_data.favorite_item) ->
          match item.target with
-         | V2_favorite_page _ -> true
-         | V2_favorite_block { uuid; _ } ->
+         | Worker_pure_data.V2_favorite_page _ -> true
+         | Worker_pure_data.V2_favorite_block { uuid; _ } ->
            not (Hidden.mem (G.Uuid.to_string uuid) t.hidden_targets))
       t.items
   ;;

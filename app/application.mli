@@ -65,7 +65,7 @@ module For_testing : sig
     -> Journal_view.View.Body.t
 
   val favorites_page
-    :  Logseq_db_worker.Protocol.v2_favorite_item list
+    :  Worker_pure_data.favorite_item list
     -> Journal_view.View.t
 
   val read_block_entropy : unit -> bytes

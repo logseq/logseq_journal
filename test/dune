@@ -5,7 +5,8 @@
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.lui
-  logseq_sync.pure_reducer))
+  logseq_sync.pure_reducer
+  logseq_db_worker.typed_data))
 
 (test
  (name startup_test)
@@ -14,7 +15,8 @@
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.lui
-  logseq_sync.pure_reducer))
+  logseq_sync.pure_reducer
+  logseq_db_worker.typed_data))
 
 (test
  (name journal_platform_test)
@@ -108,7 +110,8 @@
   logseq_journal.worker_coordination
   rrbvec
   unix
-  yojson))
+  yojson
+  logseq_db_worker.typed_data))
 
 (test
  (name application_view_test)
@@ -129,7 +132,8 @@
   threads
   unix
   uri
-  yojson))
+  yojson
+  logseq_db_worker.typed_data))
 
 (test
  (name logseq_db_worker_application_integration_test)
@@ -140,7 +144,8 @@
   logseq_db_worker.lui
   logseq_journal.worker_coordination
   lui
-  unix))
+  unix
+  logseq_db_worker.typed_data))
 
 (test
  (name journal_timeline_state_test)
@@ -173,7 +178,8 @@
   lui
   rrbvec
   unix
-  yojson))
+  yojson
+  logseq_db_worker.typed_data))
 
 (rule
  (alias runtest)
@@ -202,7 +208,8 @@
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.lui
-  uri))
+  uri
+  logseq_db_worker.typed_data))
 
 (test
  (name journal_media_test)
@@ -217,7 +224,8 @@
  (libraries app uri
   logseq_db_types
   logseq_db_worker
-  logseq_db_worker.lui))
+  logseq_db_worker.lui
+  logseq_db_worker.typed_data))
 
 (test
  (name journal_asset_settings_test)
@@ -252,6 +260,7 @@
    python3 -B %{dep:worker_coordination_contract_test.py}
    --ocamlc %{ocamlc}
    --cmi %{lib:rrbvec:rrbvec.cmi}
+   --cmi %{lib:logseq_db_worker.typed_data:worker_pure_data.cmi}
    --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination.cmi}
    --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination__Worker_api.cmi}
    --cmi %{lib:logseq_journal.worker_coordination:journal_worker_coordination__Worker_pure_coordinator.cmi}
@@ -291,7 +300,8 @@
   rrbvec
   threads
   unix
-  uri))
+  uri
+  logseq_db_worker.typed_data))
 
 (test
  (name worker_coordination_pure_test)
@@ -302,4 +312,5 @@
   logseq_db_worker.contract
   logseq_db_worker.lui
   logseq_db_worker.pure_reducer
-  rrbvec))
+  rrbvec
+  logseq_db_worker.typed_data))

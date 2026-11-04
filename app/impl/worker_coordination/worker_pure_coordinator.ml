@@ -1,4 +1,5 @@
 module Worker = Worker_api
+module Data = Worker.Data
 module Id = Logseq_db_worker_lui.Journal_worker_ids.Worker
 module Intents = Map.Make (String)
 module Slots = Map.Make (Int64)
@@ -27,15 +28,15 @@ type _ kind =
   | Import : Worker.import_progress kind
   | Lease : Worker.file_lease option kind
   | Info : Worker.graph_info kind
-  | Admission : Worker.Protocol.v2_admission_inspection kind
+  | Admission : Worker_pure_data.admission_inspection kind
   | Journal : Worker.page option kind
-  | Journals : Worker.Protocol.v2_journal_item Worker.slice kind
-  | Page : Worker.Protocol.v2_page_lookup kind
-  | Block : Worker.Protocol.v2_block_lookup kind
+  | Journals : Worker_pure_data.journal_item Worker.slice kind
+  | Page : Worker_pure_data.page_lookup kind
+  | Block : Worker_pure_data.block_lookup kind
   | Summary : Worker.block_summary kind
   | Children : Worker.block Worker.slice kind
   | Members : Worker.children kind
-  | Tree : Worker.Protocol.v2_tree_member Worker.slice kind
+  | Tree : Worker_pure_data.tree_member Worker.slice kind
   | Favorites : Worker.favorites kind
   | Statuses : Worker.task_status_catalog kind
   | Definitions : Worker.Graph.task_status_definition option list kind
@@ -1075,7 +1076,7 @@ let dispatch_waiting ?(publish = false) ?(retry_full = false) state instructions
                          (Worker.read_budget
                             session
                             ~maximum_items:
-                              (min maximum_items Worker.Protocol.maximum_page_size)
+                              (min maximum_items Worker_pure_data.maximum_page_size)
                             ~maximum_bytes:
                               (min
                                  maximum_bytes
@@ -1394,7 +1395,7 @@ let receipt_agrees facts intent receipt =
 let intent_capacity intents =
   let bytes=Intents.fold(fun key _ total->total+String.length key)intents 0 in
   Intents.cardinal intents<=256 && bytes<=4194304
-  && bytes+(Intents.cardinal intents*Worker.Protocol.maximum_response_bytes)<=16777216
+  && bytes+(Intents.cardinal intents*Worker_pure_data.maximum_response_bytes)<=16777216
 ;;
 
 let recovered_intents facts session (page:Worker.mutation_recovery) =
@@ -1495,7 +1496,7 @@ let checked_result : type a. view -> a ticket -> a Worker.reply -> a Worker.repl
        let gap =
          match batch.windows, expected_projection with
          | first :: _, Some predecessor ->
-           first.Logseq_db_worker.Protocol.predecessor <> predecessor
+           first.Worker_pure_data.predecessor <> predecessor
          | [], _ ->
            (match Graphs.find_opt graph facts.change_acks with
             | Some ack when Worker.change_ack_generation ack = batch.generation ->
@@ -1804,7 +1805,7 @@ let retain_change_result : type a. t -> a ticket -> a Worker.reply -> t =
         | last :: _ ->
           Graphs.add
             graph
-            last.Logseq_db_worker.Protocol.successor
+            last.Worker_pure_data.successor
             facts.change_projections
         | [] ->
           (match Graphs.find_opt graph facts.change_acks with
@@ -2757,8 +2758,8 @@ let step_base state event =
       in
       let state =
         match notice.notice with
-        | Worker.Protocol.V2_resync_required_push _ -> retire_change_proof state session
-        | V2_changes_available _ -> state
+        | Data.Resync_required _ -> retire_change_proof state session
+        | Data.Changes_available _ -> state
       in
       dispatch_waiting ~publish:true state [])
   | Change_application_retired token ->
@@ -3265,7 +3266,7 @@ let plan_mutation
             || bytes
                + String.length key
                + ((Intents.cardinal state.facts.intents + 1)
-                  * Worker.Protocol.maximum_response_bytes)
+                  * Worker_pure_data.maximum_response_bytes)
                > 16777216))
   then Error (Worker.Invalid_input "Durable intent coordination capacity exhausted")
   else (
@@ -3854,7 +3855,7 @@ let plan_query_internal
   else if
     maximum_items <= 0
     || maximum_bytes <= 0
-    || maximum_bytes > Worker.Protocol.maximum_response_bytes
+    || maximum_bytes > Worker_pure_data.maximum_response_bytes
     || owner.graph_generation < 0
     || owner.startup.account_generation < 0
   then Error (Worker.Invalid_input "Invalid queued read bounds or owner")
