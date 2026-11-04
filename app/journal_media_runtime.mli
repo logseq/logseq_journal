@@ -34,15 +34,10 @@ type view =
 
 type t
 
-val create
-  :  send:(ticket option -> Service.request -> bool)
-  -> changed:(string -> view -> unit)
-  -> t
-
 (** A fixed typed read port. It returns admission synchronously and delivers
     the read result on a later turn of the existing serial App event entrance.
     Transport IDs and continuation construction stay with the coordinator SDK. *)
-val create_coordinated
+val create
   :  ?release_file:(Worker.file_lease -> bool)
   -> ?release_consumer:(Worker.asset_consumer -> bool)
   -> ?read_planned:(Logseq_db_types.Graph_types.Uuid.t -> unit)
@@ -59,7 +54,7 @@ val owns_read : t -> Logseq_db_types.Graph_types.Uuid.t -> bool
 
 (** Logical presentation association only; physical ownership stays in Core. *)
 val bind_consumer:t -> name:string -> Worker.asset_consumer -> unit
-val acquisition_consumer:ticket -> string option
+val acquisition_consumer:ticket -> string
 val consumer_names:t -> string Seq.t
 val receive_file:t -> ticket -> Worker.file_lease option -> unit
 
@@ -104,7 +99,6 @@ val forget_request : t -> Logseq_db_types.Graph_types.Uuid.t -> unit
 val changes : t -> Worker_pure_data.change_window list -> unit
 val resync : t -> unit
 val receive : t -> ticket -> Service.response -> unit
-val reject : t -> ticket -> unit
 val notice : t -> Service.asset_scope -> Service.asset_notice -> unit
 val demand_backpressured : t -> string -> unit
 val pump : t -> unit

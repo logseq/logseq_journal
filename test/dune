@@ -235,7 +235,8 @@
 (test
  (name journal_media_runtime_test)
  (modules journal_media_runtime_test)
- (libraries app uri
+ (libraries app uri coordination_test_fixture logseq_journal.worker_coordination
+  journal_worker_coordination_impl worker_effect_authority
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.lui

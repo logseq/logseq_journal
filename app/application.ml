@@ -3771,7 +3771,7 @@ let start
   let release_coordinated_consumer consumer=release_coordinated_resource(Wc.asset_consumer_session consumer)(Wc.Release_asset_demand consumer) in
   let media_runtime_cell = graph_ref (fun () ->
     let graph= !graph_runtime_cell and changes= !media_changes_cell in
-    Journal_media_runtime.create_coordinated
+    Journal_media_runtime.create
       ~release_file:release_coordinated_file
       ~release_consumer:release_coordinated_consumer
       ~read_planned:(fun request_id->Journal_graph_runtime.register_external_read graph ~request_id)
@@ -3926,7 +3926,7 @@ let start
     match ticket,request with
     |Some ticket,Graph_service.Acquire_asset_file{scope;handle}->
       Some(match coordinated_asset_context(),Journal_media_runtime.acquisition_consumer ticket with
-      |Some(owner,host,session),Some name when Wc.matches_asset_scope session scope->
+      |Some(owner,host,session),name when Wc.matches_asset_scope session scope->
         (match Wc.asset_consumer session ~name with
          |Error _->false
          |Ok consumer->

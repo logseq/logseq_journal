@@ -1622,7 +1622,7 @@ let test_client_to_typed_read () =
       let release,reply=request(W.Release_file retained) in
       require(reply=W.Answered(Ok())) "actual retained lease release did not ACK";
       let released_previews=ref [] and raw_release=ref 0 in
-      let media=Journal_media_runtime.create_coordinated ~read:(fun _->false)
+      let media=Journal_media_runtime.create ~read:(fun _->false)
         ~release_file:(fun lease->released_previews:=lease::!released_previews;true)
         ~send:(fun _ request->(match request with Service.Release_asset_file _->incr raw_release|_->());false)
         ~changed:(fun _ _->())() in
@@ -2260,7 +2260,7 @@ let test_visible_media_listing_uses_typed_reads () =
           else finished:=true)
           | _ -> ignore (Media.receive_read (Option.get !runtime) result))
         | _->failwith "real typed media listing failed");true in
-    let media=Media.create_coordinated ~read
+    let media=Media.create ~read
       ~send:(fun _->function Service.Graph_request _->incr legacy_reads;false|_->true)
       ~changed:(fun _ (view:Media.view)->
         require(view.error=None) "typed media projection failed";

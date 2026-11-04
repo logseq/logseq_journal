@@ -20,7 +20,6 @@ type _ read_ticket =
   | Page_fact : fact_ticket -> Worker_pure_data.page_lookup read_ticket
 
 type ticket =
-  | Read_ticket : 'a read_ticket -> ticket
   | Lease of
       { root : string
       ; epoch : int
@@ -71,10 +70,6 @@ let read_ticket_id : type a. a read_ticket -> G.Uuid.t = function
 let read_request_id (Read request) = read_ticket_id request.ticket
 ;;
 
-type scan_cursor =
-  | Wire_cursor of G.Cursor.t
-  | Sealed_cursor of Asset.t Worker.continuation
-
 type local_import={data:Logseq_db_worker.import_receipt;authority:Worker.imported option}
 
 type group =
@@ -90,7 +85,7 @@ type group =
   ; mutable dependency_recovered : bool
   ; mutable failed_dependencies : Owners.t
   ; mutable pending : G.Uuid.t option
-  ; mutable cursor : scan_cursor option
+  ; mutable cursor : Asset.t Worker.continuation option
   ; mutable error : string option
   ; mutable local : local_import list
   ; mutable controllers : controller list
@@ -125,7 +120,7 @@ type t =
   ; release_consumer : (Worker.asset_consumer -> bool) option
   ; bound_consumers : (string,Worker.asset_consumer)Hashtbl.t
   ; mutable resource_binding : Worker.binding option
-  ; read_port : (read_request -> bool) option
+  ; read_port : read_request -> bool
   ; read_planned : G.Uuid.t -> unit
   ; read_retired : G.Uuid.t -> unit
   ; send : ticket option -> Service.request -> bool
@@ -173,28 +168,9 @@ let create_state ~release_file ~release_consumer ~read_port ~read_planned ~read_
   }
 ;;
 
-let create ~send ~changed =
-  create_state
-    ~release_file:None
-    ~release_consumer:None
-    ~read_port:None
-    ~read_planned:(fun _ -> ())
-    ~read_retired:(fun _ -> ())
-    ~send
-    ~changed
-;;
-
-let create_coordinated
-      ?release_file
-      ?release_consumer
-      ?(read_planned = fun _ -> ())
-      ?(read_retired = fun _ -> ())
-      ~read
-      ~send
-      ~changed
-      ()
-  =
-  create_state ~release_file ~release_consumer ~read_port:(Some read) ~read_planned ~read_retired ~send ~changed
+let create ?release_file ?release_consumer ?(read_planned=fun _->())
+      ?(read_retired=fun _->()) ~read ~send ~changed () =
+  create_state ~release_file ~release_consumer ~read_port:read ~read_planned ~read_retired ~send ~changed
 ;;
 
 let owns_read t request_id =
@@ -206,20 +182,19 @@ let owns_read t request_id =
 ;;
 
 let retire_outgoing t outgoing =
-  match outgoing.ticket with
-  | Some (Read_ticket (Block_fact { block; request_id; _ }))
-  | Some (Read_ticket (Page_fact { block; request_id; _ })) ->
-    if Hashtbl.find_opt t.fact_requests block = Some request_id
-    then Hashtbl.remove t.fact_requests block;
-    t.read_retired request_id
-  | Some (Read_ticket (Listing { root; epoch; request_id })) ->
-    (match Hashtbl.find_opt t.groups root with
-     | Some g when g.epoch = epoch && g.pending = Some request_id ->
-       g.pending <- None;
-       g.membership_changed <- true
-     | _ -> ());
-    t.read_retired request_id
-  | None | Some (Lease _) -> ()
+  match outgoing.request with
+  | Perform_read (Read request) ->
+    (match request.ticket with
+     | Block_fact { block; request_id; _ } | Page_fact { block; request_id; _ } ->
+       if Hashtbl.find_opt t.fact_requests block = Some request_id
+       then Hashtbl.remove t.fact_requests block
+     | Listing { root; epoch; request_id } ->
+       (match Hashtbl.find_opt t.groups root with
+        | Some g when g.epoch = epoch && g.pending = Some request_id ->
+          g.pending <- None; g.membership_changed <- true
+        | _ -> ()));
+    t.read_retired (read_request_id (Read request))
+  | Command _ | Release_preview _ | Release_consumer _ -> ()
 ;;
 
 let empty_view = { items = []; more = false; error = None }
@@ -390,13 +365,11 @@ let rec pump t =
     else if
       match next.request with
       | Command request -> t.send next.ticket request
-      | Perform_read request ->
-        Option.fold t.read_port ~none:false ~some:(fun read -> read request)
+      | Perform_read request -> t.read_port request
       | Release_preview lease->Option.fold t.release_file ~none:false ~some:(fun release->release lease)
       | Release_consumer consumer->Option.fold t.release_consumer ~none:false ~some:(fun release->release consumer)
     then (
       (match next.request with
-       | Command (Service.Graph_request request) -> observe_request t request
        | Perform_read (Read request) ->
          (match request.ticket with
           | Block_fact _ -> observe_query t ~request_id:(read_ticket_id request.ticket) request.query
@@ -552,50 +525,15 @@ let read t g cursor =
     let ticket = Listing { root = g.root; epoch = g.epoch; request_id } in
     t.read_planned request_id;
     let current () = current_group t g && g.pending = Some request_id in
-    match t.read_port with
-    | None ->
-      let cursor =
-        match cursor with
-        | None -> None
-        | Some (Wire_cursor c) -> Some c
-        | Some _ ->
-          invalid_arg "A sealed media continuation cannot enter legacy transport"
-      in
-      enqueue
-        t
-        ~ticket:(Read_ticket ticket)
-        ~current
-        (Service.Graph_request
-           { api_version = 2
-           ; request_id
-           ; command =
-               V2_list_assets { recursive = false; roots = [ root ]; limit = 16; cursor }
-           })
-    | Some _ ->
-      let after =
-        match cursor with
-        | None -> None
-        | Some (Sealed_cursor c) -> Some c
-        | Some _ -> invalid_arg "A wire cursor cannot enter typed media reads"
-      in
-      let query = Worker.Assets { recursive = false; roots = [ root ]; after } in
-      let request = Read
-        { ticket
-        ; maximum_items = 16
-        ; query
-        ; outcome = (fun value -> Read_result { ticket; query; value })
-        }
-      in
+    let query = Worker.Assets { recursive = false; roots = [ root ]; after = cursor } in
+    let request = Read
+      { ticket; maximum_items = 16; query
+      ; outcome = (fun value -> Read_result { ticket; query; value }) }
+    in
+    t.queued <- List.filter
+      (fun item -> if item.current () then true else (retire_outgoing t item; false))
       t.queued
-      <- List.filter
-           (fun item ->
-              if item.current ()
-              then true
-              else (
-                retire_outgoing t item;
-                false))
-           t.queued
-         @ [ { ticket = Some (Read_ticket ticket); request = Perform_read request; current } ])
+      @ [{ ticket = None; request = Perform_read request; current }])
   else if g.pending = None
   then g.error <- Some "Attachment requests are busy."
 ;;
@@ -641,8 +579,8 @@ let root_visible ?(owner = "default") t ~root visible =
       let removed =
         List.exists
           (fun queued ->
-             match queued.ticket with
-             | Some (Read_ticket (Listing { request_id; _ })) -> g.pending = Some request_id
+             match queued.request with
+             | Perform_read (Read { ticket = Listing { request_id; _ }; _ }) -> g.pending = Some request_id
              | _ -> false)
           t.queued
       in
@@ -876,22 +814,13 @@ let request_fact t block =
         && fact_needed t block
         && Hashtbl.find_opt t.fact_requests block = Some request_id
       in
-      let submit : type a. a read_ticket -> a Worker.query -> Protocol.command -> unit =
-        fun ticket query command ->
-        match t.read_port with
-        | None -> enqueue t ~ticket:(Read_ticket ticket) ~current
-            (Service.Graph_request { api_version = 2; request_id; command })
-        | Some _ ->
-          let request = Read { ticket; maximum_items = 1; query;
-            outcome = (fun value -> Read_result { ticket; query; value }) } in
-          t.queued <- t.queued @
-            [{ ticket = Some (Read_ticket ticket); request = Perform_read request; current }]
+      let submit : type a. a read_ticket -> a Worker.query -> unit = fun ticket query ->
+        let request = Read { ticket; maximum_items = 1; query;
+          outcome = (fun value -> Read_result { ticket; query; value }) } in
+        t.queued <- t.queued @ [{ ticket = None; request = Perform_read request; current }]
       in
-      if page
-      then submit (Page_fact fact) (Worker.Page { uuid; revision = None })
-        (V2_get_page { page = uuid; revision = None })
-      else submit (Block_fact fact) (Worker.Outline_block { uuid; revision = None })
-        (V2_get_outline_block { block = uuid; revision = None }))
+      if page then submit (Page_fact fact) (Worker.Page { uuid; revision = None })
+      else submit (Block_fact fact) (Worker.Outline_block { uuid; revision = None }))
 ;;
 
 let request_pending_pages t =
@@ -1367,7 +1296,7 @@ let receive_listing t ~root ~epoch ~request_id listing =
     then (if g.visible && not g.dependency_failed then ensure_fresh t g)
     else (
       match listing with
-      | Some (items, next_cursor) when List.length items <= 16 ->
+      | Some (items, next_cursor) ->
         g.listing_failed <- false;
         g.listing_recovered <- false;
         let old = g.controllers in
@@ -1482,7 +1411,7 @@ let receive_read t (Read_result result) =
   let consumed = match result.ticket with
     | Listing { root; epoch; request_id } ->
       receive_listing t ~root ~epoch ~request_id
-        (Some (result.value.items, Option.map (fun c -> Sealed_cursor c) result.value.next))
+        (Some (result.value.items, result.value.next))
     | Block_fact fact ->
       complete_fact t fact
         ~apply:(fun () -> observe_query_result t ~request_id:fact.request_id result.query result.value)
@@ -1511,35 +1440,6 @@ let reject_read : type a. t -> a read_ticket -> unit = fun t ticket ->
 
 let receive t ticket response =
   (match ticket with
-   | Read_ticket (Block_fact fact) | Read_ticket (Page_fact fact) ->
-     (match response with
-      | Service.Graph_response
-          (Protocol.V2_response { request_id = actual; outcome; _ } as raw)
-        when actual = fact.request_id ->
-        ignore (complete_fact t fact ~apply:(fun () -> observe_response t raw)
-          ~accepted:(fun superseded -> match outcome with
-            | V2_block_outcome _ -> superseded || Hashtbl.mem t.facts fact.block
-            | V2_page_outcome _ -> String.starts_with ~prefix:"page:" fact.block
-            | _ -> false)
-          ~refresh_superseded:(match outcome with V2_block_outcome _ -> true | _ -> false) : bool)
-      | _ -> ignore (reject_fact t fact : bool))
-   | Read_ticket (Listing { root; epoch; request_id }) ->
-     (match response with
-      | Service.Graph_response _ when Option.is_some t.read_port -> ()
-      | _ ->
-        let listing =
-          match response with
-          | Service.Graph_response
-              (Protocol.V2_response
-                 { request_id = actual
-                 ; outcome = V2_assets_outcome { items; next_cursor; _ }
-                 ; _
-                 })
-            when actual = request_id ->
-            Some (items, Option.map (fun c -> Wire_cursor c) next_cursor)
-          | _ -> None
-        in
-        ignore (receive_listing t ~root ~epoch ~request_id listing : bool))
    | Lease { root; epoch; consumer; ticket } ->
      let result =
        match response with
@@ -1559,7 +1459,7 @@ let receive t ticket response =
   pump t
 ;;
 
-let acquisition_consumer = function Lease{consumer;_}->Some consumer|Read_ticket _->None
+let acquisition_consumer = function Lease { consumer; _ } -> consumer
 let consumer_names t=Hashtbl.to_seq_keys t.consumers
 let receive_file t ticket lease =
   let result=Option.map(fun lease->
@@ -1569,8 +1469,6 @@ let receive_file t ticket lease =
     handle,Worker.file_path lease)lease in
   receive t ticket(Service.Asset_file result)
 ;;
-
-let reject t ticket = receive t ticket Service.Client_command_completed
 
 let demand_backpressured t consumer =
   Option.iter(fun(g,c)->dispatch t g c P.Demand_backpressured)
