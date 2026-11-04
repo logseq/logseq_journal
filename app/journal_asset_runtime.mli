@@ -94,7 +94,7 @@ val observe_favorites_result
   :  t
   -> request_id:Logseq_db_types.Graph_types.Uuid.t
   -> first_page:bool
-  -> Journal_graph_request.favorites_result
+  -> Journal_worker_coordination.Worker_api.favorites
   -> unit
 
 val consumer_names : t -> string Seq.t

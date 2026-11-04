@@ -130,7 +130,7 @@ module Favorites : sig
         }
     | Loaded of
         Journal_graph_request.favorites_request
-        * Journal_graph_request.favorites_result
+        * Journal_worker_coordination.Worker_api.favorites
     | Failed of Journal_graph_request.favorites_request * bool * string
 
   val create : graph_generation:int -> t

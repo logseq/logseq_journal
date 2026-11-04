@@ -9,14 +9,6 @@ type favorites_request =
   ; cursor : favorites_cursor option
   }
 
-type favorites_result =
-  { favorites_page : Worker.Uuid.t option
-  ; generation : string
-  ; projection_revision : string
-  ; items : Worker_pure_data.favorite_item Rrbvec.t
-  ; next_cursor : favorites_cursor option
-  }
-
 type admission_request =
   { graph_generation : int
   ; request_generation : int64

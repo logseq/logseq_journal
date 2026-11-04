@@ -8567,7 +8567,7 @@ module For_testing = struct
   let read_block_entropy = read_block_entropy
   let with_block_identity = with_block_identity
 
-  let favorites_page items =
+  let favorites_page result =
     let favorites, requests =
       Journal_routes.Favorites.step
         (Journal_routes.Favorites.create ~graph_generation:1)
@@ -8578,12 +8578,7 @@ module For_testing = struct
         favorites
         (Loaded
            ( List.hd requests
-           , { favorites_page = None
-             ; generation = "fixture"
-             ; projection_revision = "fixture"
-             ; items = Rrbvec.of_list items
-             ; next_cursor = None
-             } ))
+           , result ))
     in
     let handler = Ui.Event.Handler.create ~name:"root-visual-fixture" (fun _ -> ()) in
     timeline_page

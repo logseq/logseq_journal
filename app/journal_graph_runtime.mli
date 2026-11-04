@@ -46,7 +46,7 @@ type payload =
   | Reference_sources_changed of (string * string option) list
   | Favorites_loaded of
       Journal_graph_request.favorites_request
-      * Journal_graph_request.favorites_result
+      * Journal_worker_coordination.Worker_api.favorites
   | Favorites_failed of Journal_graph_request.favorites_request * bool * string
   | Favorites_invalidated
   | Graph_ready
@@ -171,7 +171,7 @@ type worker_read_result =
   | Ordinary_read of Logseq_db_worker.Protocol.v2_outcome
   | Favorites_read of
       { first_page : bool
-      ; value : Journal_graph_request.favorites_result
+      ; value : Journal_worker_coordination.Worker_api.favorites
       }
 
 type worker_read =

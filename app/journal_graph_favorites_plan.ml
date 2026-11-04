@@ -25,7 +25,7 @@ type rejection =
   | Worker_rejection of
       { operation : string; request_id : Graph.Uuid.t; error : Error.t }
 type event =
-  | Favorites_loaded of Journal_graph_request.favorites_request * Journal_graph_request.favorites_result
+  | Favorites_loaded of Journal_graph_request.favorites_request * Journal_worker_coordination.Worker_api.favorites
   | Favorites_failed of Journal_graph_request.favorites_request * bool * string
   | Favorites_invalidated
   | Rejected of rejection
@@ -252,7 +252,7 @@ let changes t ~ports ~blocks ~pages ~structures =
 ;;
 
 
-let receive_list t ~ports (request : Journal_graph_request.favorites_request) (result : Journal_graph_request.favorites_result) =
+let receive_list t ~ports (request : Journal_graph_request.favorites_request) (result : Journal_worker_coordination.Worker_api.favorites) =
           (try
              if request.cursor = None
              then (
@@ -274,7 +274,7 @@ let receive_list t ~ports (request : Journal_graph_request.favorites_request) (r
                result.favorites_page;
              (* Register the complete page before creating any pending reads. A
                 limit failure must not leave unscheduled request constructors. *)
-             let items = result.items in
+             let items = Rrbvec.of_list result.items in
              Rrbvec.iter
                (fun (item : Worker_pure_data.favorite_item) ->
                   register_favorite_dependency t item.membership_uuid;

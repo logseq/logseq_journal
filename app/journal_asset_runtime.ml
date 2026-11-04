@@ -692,6 +692,20 @@ let settle_dirty t =
   pump t
 ;;
 
+let observe_favorites t ~first_page ~favorites_page items =
+  t.favorites_page <- favorites_page;
+  if first_page then t.favorite_members <- Uuids.empty;
+  List.iter
+    (fun (item : Worker_pure_data.favorite_item) ->
+       t.favorite_members <- Uuids.add item.membership_uuid t.favorite_members;
+       match item.target with
+       | Worker_pure_data.V2_favorite_block { uuid; _ } -> enqueue t (Block uuid)
+       | Worker_pure_data.V2_favorite_page { uuid; _ } ->
+         if not (Hashtbl.mem t.pages (Graph.Uuid.to_string uuid))
+         then enqueue t (Page uuid))
+    items
+;;
+
 let observe_response_internal
       ?favorites_first_page
       t
@@ -813,21 +827,11 @@ let observe_response_internal
               remember_page_value item.page.uuid (Some item.page))
            items
        | V2_favorites_outcome { favorites_page; items; _ } ->
-         t.favorites_page <- favorites_page;
-         (match command with
-          | V2_list_favorites { cursor; _ }
-            when Option.value favorites_first_page ~default:(cursor = None) ->
-            t.favorite_members <- Uuids.empty
-          | _ -> ());
-         List.iter
-           (fun (item : Worker_pure_data.favorite_item) ->
-              t.favorite_members <- Uuids.add item.membership_uuid t.favorite_members;
-              match item.target with
-              | Worker_pure_data.V2_favorite_block { uuid; _ } -> enqueue t (Block uuid)
-              | Worker_pure_data.V2_favorite_page { uuid; _ } ->
-                if not (Hashtbl.mem t.pages (Graph.Uuid.to_string uuid))
-                then enqueue t (Page uuid))
-           items
+         let first_page = match command with
+           | V2_list_favorites { cursor; _ } ->
+             Option.value favorites_first_page ~default:(cursor = None)
+           | _ -> false in
+         observe_favorites t ~first_page ~favorites_page items
        | V2_assets_outcome { items; _ } ->
          List.iter
            (fun (asset : Logseq_db_types.Asset_descriptor.t) ->
@@ -847,23 +851,16 @@ let observe_favorites_result
       t
       ~request_id
       ~first_page
-      (value : Journal_graph_request.favorites_result)
+      (value : Journal_worker_coordination.Worker_api.favorites)
   =
-  observe_response_internal
-    ~favorites_first_page:first_page
-    t
-    (Protocol.V2_response
-       { api_version = Protocol.api_version
-       ; request_id
-       ; outcome =
-           V2_favorites_outcome
-             { favorites_page = value.favorites_page
-             ; generation = value.generation
-             ; projection_revision = value.projection_revision
-             ; items = Rrbvec.to_list value.items
-             ; next_cursor = None
-             }
-       })
+  let key = Graph.Uuid.to_string request_id in
+  match Hashtbl.find_opt t.requests key with
+  | None -> ()
+  | Some (issuance, _) ->
+    Hashtbl.remove t.requests key;
+    if issuance > t.barrier then (
+      observe_favorites t ~first_page ~favorites_page:value.favorites_page value.items;
+      settle_dirty t)
 ;;
 
 let changes t windows =

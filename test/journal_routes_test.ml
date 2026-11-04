@@ -1100,48 +1100,11 @@ let test_route_generation_background_and_runtime_replacement () =
 ;;
 
 let favorites_cursor_factory ?(graph_generation = 7) () =
-  let module W = Journal_worker_coordination.Worker_api in
-  let module P = Logseq_db_worker.Protocol in
-  let module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service in
-  let issuer, _, _, session = Coordination_test_fixture.fixture ~graph_generation 2700L in
-  let module I = (val issuer : Worker_effect_authority.ISSUER) in
-  let budget =
-    W.read_budget session ~maximum_items:50 ~maximum_bytes:65536 |> Result.get_ok
-  in
   fun after n ->
-    let request_id =
-      W.Uuid.of_string (Printf.sprintf "75000000-0000-4000-8000-%012d" (9000 + n))
-      |> Result.get_ok
-    in
-    let query = W.Query (budget, W.Favorites after) in
-    ignore (I.request session ~request_id:(W.request_id request_id) query |> Result.get_ok);
-    let next_cursor =
-      Logseq_db_types.Graph_types.Cursor.of_string ("favorites-fixture:" ^ string_of_int n)
-      |> Result.get_ok
-    in
-    let response =
-      P.V2_response
-        { api_version = P.api_version
-        ; request_id
-        ; outcome =
-            V2_favorites_outcome
-              { favorites_page = None
-              ; generation = "generation:v1:1:1"
-              ; projection_revision = "projection:v1:0"
-              ; items = []
-              ; next_cursor = Some next_cursor
-              }
-        }
-    in
-    match
-      I.reply
-        session
-        ~request_id:(W.request_id request_id)
-        query
-        (S.Graph_response response)
-    with
-    | Ok (W.Answered (Ok { next = Some cursor; _ })) -> cursor
-    | _ -> failwith "producer fixture did not issue a sealed Favorites continuation"
+    let wire_next = Some (Logseq_db_types.Graph_types.Cursor.of_string
+      ("favorites-fixture:" ^ string_of_int n) |> Result.get_ok) in
+    (Coordination_test_fixture.favorites ~graph_generation ~after ~wire_next []).next
+    |> Option.get
 ;;
 
 let test_favorites_state_isolates_requests_and_refreshes () =
@@ -1160,13 +1123,10 @@ let test_favorites_state_isolates_requests_and_refreshes () =
           { uuid = uuid (n + 100); title = string_of_int n; revision = "page" }
     }
   in
-  let result ?(cursor = None) items : Journal_graph_request.favorites_result =
-    { favorites_page = Some (uuid 99)
-    ; generation = "generation:v1:1"
-    ; projection_revision = "projection:v1:1"
-    ; items = Rrbvec.of_list items
-    ; next_cursor = cursor
-    }
+  let result ?(cursor = None) items =
+    Coordination_test_fixture.favorites ~graph_generation:7
+      ~favorites_page:(Some (uuid 99)) ~generation:"generation:v1:1"
+      ~projection_revision:"projection:v1:1" ~next:cursor items
   in
   let request = function
     | [ r ] -> r
@@ -1257,13 +1217,8 @@ let test_favorites_retains_large_typed_pages () =
                 { uuid = uuid (20000 + n); title = string_of_int n; revision = "p" }
           })
     in
-    let result : Journal_graph_request.favorites_result =
-      { favorites_page = Some (uuid 99999)
-      ; generation = "generation:v1:1:1"
-      ; projection_revision = "projection:v1:0"
-      ; items
-      ; next_cursor = after
-      }
+    let result = Coordination_test_fixture.favorites ~graph_generation:7
+      ~favorites_page:(Some (uuid 99999)) ~next:after (Rrbvec.to_list items)
     in
     let loaded, commands = F.step !state (Loaded (!request, result)) in
     require (commands = []) "nonempty page unexpectedly restarted the scan";
@@ -1348,12 +1303,9 @@ let test_favorite_target_origin_and_delete () =
       selected
       (Loaded
          ( request
-         , { favorites_page = Some membership
-           ; generation = "generation-1"
-           ; projection_revision = "projection-1"
-           ; items = Rrbvec.of_list [ item; { page_item with membership_uuid = uuid "000000000003" } ]
-           ; next_cursor = None
-           } ))
+         , Coordination_test_fixture.favorites ~favorites_page:(Some membership)
+             ~generation:"generation-1" ~projection_revision:"projection-1"
+             [ item; { page_item with membership_uuid = uuid "000000000003" } ] ))
   in
   let hidden, _ = F.step loaded (Hide_target (G.Uuid.to_string target)) in
   require
@@ -2069,13 +2021,9 @@ let test_favorites_hidden_rows_do_not_block_pagination () =
   in
   let make_cursor=favorites_cursor_factory ~graph_generation:1 () in
   let cursor n = make_cursor None n in
-  let result items next : Journal_graph_request.favorites_result =
-    { favorites_page = Some (uuid 99)
-    ; generation = "generation:v1:1"
-    ; projection_revision = "projection:v1:1"
-    ; items = Rrbvec.of_list items
-    ; next_cursor = next
-    }
+  let result items next =
+    Coordination_test_fixture.favorites ~favorites_page:(Some (uuid 99))
+      ~generation:"generation:v1:1" ~projection_revision:"projection:v1:1" ~next items
   in
   let one = function
     | [ request ] -> request

@@ -6000,7 +6000,7 @@ let test_favorites_compact_shared_titles () =
     {backend_profile=Lui_protocol.profile IOS SwiftUIHost;
      apply_batch=(fun batch->ops:=List.rev_append batch.Lui_protocol.ops !ops;true)} in
   let app=Lui_app.create_with_extensions backend Journal_lui_native.registry () (fun () ()->())
-    (fun _ _ _ -> Journal_view.mount (Application.For_testing.favorites_page items)) in
+    (fun _ _ _ -> Journal_view.mount (Application.For_testing.favorites_page (Coordination_test_fixture.favorites items))) in
   Fun.protect ~finally:(fun ()->ignore(Lui_app.dispose app)) (fun () ->
     Alcotest.(check bool) "Favorites mounts" true (Lui_app.start app);
     ignore(Lui_app.flush app);

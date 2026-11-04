@@ -9,7 +9,7 @@ type rejection =
   | Worker_rejection of
       { operation : string; request_id : Graph.Uuid.t; error : Error.t }
 type event =
-  | Favorites_loaded of Journal_graph_request.favorites_request * Journal_graph_request.favorites_result
+  | Favorites_loaded of Journal_graph_request.favorites_request * Journal_worker_coordination.Worker_api.favorites
   | Favorites_failed of Journal_graph_request.favorites_request * bool * string
   | Favorites_invalidated
   | Rejected of rejection
@@ -35,7 +35,7 @@ val accepts_list : read -> bool
 val accepts_page : t -> read -> bool
 val accepts_block : t -> read -> bool
 val accepts_memberships : read -> bool
-val receive_list : t -> ports:ports -> read -> Journal_graph_request.favorites_result -> output
+val receive_list : t -> ports:ports -> read -> Journal_worker_coordination.Worker_api.favorites -> output
 val receive_page : t -> ports:ports -> read -> Worker_pure_data.page_lookup -> output
 val receive_block : t -> ports:ports -> read -> Worker_pure_data.block_lookup -> output
 val receive_memberships : t -> ports:ports -> read -> Worker_pure_data.child_member list -> Worker_pure_data.child_member Worker.continuation option -> output

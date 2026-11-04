@@ -65,7 +65,7 @@ module For_testing : sig
     -> Journal_view.View.Body.t
 
   val favorites_page
-    :  Worker_pure_data.favorite_item list
+    :  Journal_worker_coordination.Worker_api.favorites
     -> Journal_view.View.t
 
   val read_block_entropy : unit -> bytes

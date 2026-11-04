@@ -147,3 +147,47 @@ let child_continuation token =
   | Ok (W.Answered (Ok children)) -> Option.get children.next
   | _ -> failwith "valid route continuation rejected"
 ;;
+
+let favorites_sources = Hashtbl.create 2
+
+let favorites
+      ?(graph_generation = 1)
+      ?(after = None)
+      ?(next = None)
+      ?(wire_next = None)
+      ?(favorites_page = None)
+      ?(generation = "generation:v1:1:1")
+      ?(projection_revision = "projection:v1:0")
+      items
+  =
+  let produce = match Hashtbl.find_opt favorites_sources graph_generation with
+    | Some produce -> produce
+    | None ->
+      let issuer, _, _, session = fixture ~graph_generation
+        (Int64.add 0x1100_0000L (Int64.of_int graph_generation)) in
+      let module I = (val issuer : Worker_effect_authority.ISSUER) in
+      let budget = W.read_budget session ~maximum_items:50 ~maximum_bytes:65536 |> Result.get_ok in
+      let request_id = W.request_id graph in
+      let produce after next wire_next favorites_page generation projection_revision items =
+        let next_cursor = match wire_next with
+          | Some _ -> wire_next
+          | None -> Option.bind next (fun cursor ->
+            match I.request session ~request_id (W.Query (budget, W.Favorites (Some cursor))) with
+            | Ok (S.Coordination_query { request = { command = P.V2_list_favorites { cursor; _ }; _ }; _ }) -> cursor
+            | _ -> failwith "Favorites fixture continuation is not owned by its producer") in
+        let query = W.Query (budget, W.Favorites after) in
+        ignore (I.request session ~request_id query |> Result.get_ok);
+        let response = P.V2_response
+          { api_version = P.api_version; request_id = graph
+          ; outcome = V2_favorites_outcome
+              { favorites_page; generation; projection_revision; items; next_cursor }
+          } in
+        match I.reply session ~request_id query (S.Graph_response response) with
+        | Ok (W.Answered (Ok result)) -> result
+        | _ -> failwith "Favorites fixture did not produce a checked spec value"
+      in
+      Hashtbl.add favorites_sources graph_generation produce;
+      produce
+  in
+  produce after next wire_next favorites_page generation projection_revision items
+;;

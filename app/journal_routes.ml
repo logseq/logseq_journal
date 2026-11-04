@@ -817,7 +817,7 @@ module Favorites = struct
         ; last_exclusive : int
         }
     | Loaded of
-        Journal_graph_request.favorites_request * Journal_graph_request.favorites_result
+        Journal_graph_request.favorites_request * Journal_worker_coordination.Worker_api.favorites
     | Failed of Journal_graph_request.favorites_request * bool * string
 
   type t =
@@ -940,15 +940,15 @@ module Favorites = struct
       else t, []
     | Loaded (completed, result) when current t completed ->
       let pending = None in
-      let staged = Rrbvec.append (Option.value t.staging ~default:t.items) result.items in
+      let staged = Rrbvec.append_list (Option.value t.staging ~default:t.items) result.items in
       let needs_continuation =
         match t.staging with
         | Some _ -> Rrbvec.length staged < max 1 t.refresh_count
-        | None -> Rrbvec.is_empty result.items
+        | None -> result.items = []
       in
-      let t = { t with pending; cursor = result.next_cursor } in
-      if needs_continuation && result.next_cursor <> None
-      then request { t with staging = Some staged } result.next_cursor
+      let t = { t with pending; cursor = result.next } in
+      if needs_continuation && result.next <> None
+      then request { t with staging = Some staged } result.next
       else (
         let t =
           { t with

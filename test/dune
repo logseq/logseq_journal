@@ -122,7 +122,7 @@
 (test
  (name application_view_test)
  (modules application_view_test)
- (libraries alcotest app
+ (libraries coordination_test_fixture alcotest app
   eio
   logseq_db_types
   logseq_db_worker

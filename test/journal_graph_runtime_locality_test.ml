@@ -48,7 +48,8 @@ module Worker_producer = struct
     | ( ( Protocol.V2_list_journals _
         | V2_get_outline_block_summary _
         | V2_get_children _
-        | V2_get_page_tree _ )
+        | V2_get_page_tree _
+        | V2_list_favorites _ )
       , Some (Production_runtime.Read read) ) ->
       (match
          I.request
@@ -125,7 +126,8 @@ module Runtime = struct
     | Some (Protocol.V2_get_children _ as command), Protocol.V2_children_outcome _
     | Some (Protocol.V2_get_outline_block_summary _ as command), Protocol.V2_block_summary_outcome _
     | Some (Protocol.V2_list_journals _ as command), Protocol.V2_journals_outcome _
-    | Some (Protocol.V2_list_task_statuses _ as command), Protocol.V2_task_statuses_outcome _ ->
+    | Some (Protocol.V2_list_task_statuses _ as command), Protocol.V2_task_statuses_outcome _
+    | Some (Protocol.V2_list_favorites _ as command), Protocol.V2_favorites_outcome _ ->
       Worker_producer.receive runtime
         {Protocol.api_version=Protocol.api_version;request_id=envelope.request_id;command} raw
     | Some ((Protocol.V2_get_page_tree {maximum_depth=0;_}) as command),

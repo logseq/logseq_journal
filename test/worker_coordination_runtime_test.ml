@@ -1185,24 +1185,24 @@ let test_client_to_typed_read () =
     in
     let first = read_favorites favorites_request in
     require
-      (Rrbvec.length first.items = 1 && Option.is_some first.next_cursor)
+      (List.length first.items = 1 && Option.is_some first.next)
       (Printf.sprintf
          "first Favorites page lost Partial continuation: items=%d more=%b page=%s"
-         (Rrbvec.length first.items)
-         (Option.is_some first.next_cursor)
+         (List.length first.items)
+         (Option.is_some first.next)
          (Option.fold ~none:"none" ~some:W.Uuid.to_string first.favorites_page));
     require
-      ((Rrbvec.nth first.items 0).membership_uuid = favorite_member 1)
+      ((List.nth first.items 0).membership_uuid = favorite_member 1)
       "first real Favorites membership changed";
     let second =
       read_favorites
-        { favorites_request with request_generation = 311L; cursor = first.next_cursor }
+        { favorites_request with request_generation = 311L; cursor = first.next }
     in
     require
-      (Rrbvec.length second.items = 1 && second.next_cursor = None)
+      (List.length second.items = 1 && second.next = None)
       "second Favorites page inferred completeness incorrectly";
     require
-      ((Rrbvec.nth second.items 0).membership_uuid = favorite_member 2)
+      ((List.nth second.items 0).membership_uuid = favorite_member 2)
       "actual second wire request did not retain the sealed backend continuation";
     let rec membership_page page seen original =
       require (page < 10) "actual Favorite memberships did not terminate";

@@ -22,7 +22,7 @@ type worker_read_result =
   | Journals_read of Worker_pure_data.journal_item Worker.slice
   | Task_catalog_read of Worker.task_status_catalog
   | Ordinary_read of Protocol.v2_outcome
-  | Favorites_read of { first_page:bool; value:Journal_graph_request.favorites_result }
+  | Favorites_read of { first_page:bool; value:Journal_worker_coordination.Worker_api.favorites }
 
 let timeline_version value =
   let digits s = s <> "" && String.length s <= 19
@@ -89,7 +89,7 @@ type payload =
   | Reference_sources_changed of (string * string option) list
   | Favorites_loaded of
       Journal_graph_request.favorites_request
-      * Journal_graph_request.favorites_result
+      * Journal_worker_coordination.Worker_api.favorites
   | Favorites_failed of Journal_graph_request.favorites_request * bool * string
   | Favorites_invalidated
   | Graph_ready
@@ -1953,19 +1953,14 @@ let receive_response t ~read_result ~origin (protocol_response : Protocol.respon
        failure_output t operation request_id "Unexpected asset query response."
      | V2_page_tree_outcome _ ->
        failure_output t operation request_id "Unowned page-tree response."
-     | Protocol.V2_favorites_outcome result ->
+     | Protocol.V2_favorites_outcome _ ->
        (match operation with
         | Favorite_read read when Favorites.accepts_list read ->
-          let result=match favorites with
-            | Some result->Ok result
-            | None when result.next_cursor=None->Ok Journal_graph_request.
-                {favorites_page=result.favorites_page;generation=result.generation;
-                 projection_revision=result.projection_revision;items=Rrbvec.of_list result.items;next_cursor=None}
-            | None->Error "An unsealed Favorites continuation cannot enter the business state." in
-          (match result with
-           | Ok result->Favorites.receive_list t.favorites ~ports:(favorites_ports t) read result
+          (match favorites with
+           | Some result -> Favorites.receive_list t.favorites ~ports:(favorites_ports t) read result
              |> favorites_output |> background_demands t
-           | Error message->failure_output t operation request_id message)
+           | None -> failure_output t operation request_id
+               "An unsealed Favorites continuation cannot enter the business state.")
         | _ -> failure_output t operation request_id "Unexpected favorites response.")
      | Protocol.V2_failed { code; message } ->
        (match Error.code_of_string code with
@@ -2673,7 +2668,7 @@ let receive_delivery_body t ~read_result ~origin (protocol_response : Protocol.r
                   let id, page_kind = match favorite.target with
                     | Page id -> id, true | Block id -> id, false in
                   Rrbvec.push_back changes Reference.{ id; text = Some favorite.title; page_kind })
-                changes result.items
+                changes (Rrbvec.of_list result.items)
             | _ -> changes)
           Rrbvec.empty output.responses
       in
@@ -2948,7 +2943,7 @@ let receive_worker_read ?resync_generation ?origin t ~request_id result =
         { favorites_page = value.favorites_page
         ; generation = value.generation
         ; projection_revision = value.projection_revision
-        ; items = Rrbvec.to_list value.items
+        ; items = value.items
         ; next_cursor = None
         }
   in
@@ -3463,16 +3458,7 @@ let worker_read t (request : Protocol.request) =
                ; maximum_items = business.limit
                ; outcome =
                    (fun (value : Worker.favorites) ->
-                     Favorites_read
-                       { first_page = business.cursor = None
-                       ; value =
-                           { favorites_page = value.favorites_page
-                           ; generation = value.generation
-                           ; projection_revision = value.projection_revision
-                           ; items = Rrbvec.of_list value.items
-                           ; next_cursor = value.next
-                           }
-                       })
+                     Favorites_read { first_page = business.cursor = None; value })
                }))
      | _ -> Some (Unowned_read "Favorites business request is no longer owned"))
   | _ -> None
