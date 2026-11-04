@@ -25,7 +25,7 @@
 (test
  (name test_pure_reducer)
  (modules test_pure_reducer)
- (libraries
+ (libraries logseq_db_worker.typed_read logseq_db_worker.identity
   alcotest
   logseq_db_types
   logseq_db_worker
@@ -65,9 +65,8 @@
 (test
  (name test_effect_runner)
  (modules test_effect_runner)
- (libraries
+ (libraries datascript-ocaml-native logseq_db_worker.typed_data logseq_db_worker.typed_read logseq_db_worker.identity
   alcotest
-  datascript-ocaml-native
   datascript_ocaml
   datascript_ocaml.types
   eio
@@ -108,11 +107,10 @@
 (executable
  (name test_managed_sync_e2e)
  (modules test_managed_sync_e2e managed_sync_protocol_probe)
- (libraries logseq_db_worker.identity
+ (libraries datascript-ocaml-native worker_effect_authority journal_worker_coordination_impl logseq_journal.worker_coordination logseq_db_worker.identity
   bigstringaf
   ca-certs-nss
   cstruct
-  datascript-ocaml-native
   datascript_ocaml
   datascript_ocaml.types
   digestif

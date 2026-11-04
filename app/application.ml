@@ -3527,7 +3527,6 @@ let start
         | Client_command (Set_foreground _) -> "setForeground"
         | Client_command Return_to_graph_picker -> "returnToGraphPicker"
         | Client_command _ -> "clientCommand"
-        | Graph_request _ | Graph_request_at _ -> "graphRequest"
         | Import_asset _ | Import_asset_at _ -> "importAsset"
         | Inspect_local_copy _ -> "inspectLocalCopy"
         | Delete_local_copy _ -> "deleteLocalCopy"
@@ -3537,6 +3536,7 @@ let start
         | Get_graph_state | Get_graph_state_at _ -> "getGraphState"
         | Register_coordination _ -> "registerCoordination"
         | Release_coordination _ -> "releaseCoordination"
+        | Coordination_acknowledge_changes _ -> "acknowledgeChanges"
         | Coordination_query _ -> "coordinationQuery"
         | Coordination_mutation _ -> "coordinationMutation"
         | Coordination_confirm _ -> "coordinationConfirm"
@@ -5074,8 +5074,11 @@ let start
       let pending=(Hashtbl.to_seq_values runtime_owners |> Seq.exists blocked)
         || Rrbvec.exists blocked !retired_runtime_io
         || (Hashtbl.to_seq_values worker_owners |> Seq.exists blocked) in
-      if pending || Coordination.projection(Coordination_host.view host)=None then true
-      else (Coordination_host.post host(Coordination.Legacy_handoff_completed(id,Ok()));false))!legacy_host_joins in
+      match Coordination.handoff(Coordination_host.view host)id with
+      |Some(Wc.Quiescing _)->
+        if pending || Coordination.projection(Coordination_host.view host)=None then true
+        else (Coordination_host.post host(Coordination.Legacy_handoff_completed(id,Ok()));false)
+      |_->false)!legacy_host_joins in
   let set_root_state_and_effect transition : unit Effect.t = fun()->send_action(Update transition) in
   let set_root_state transition : unit Effect.t =
     set_root_state_and_effect(fun state->transition state,Effect.ignore) in
@@ -5386,7 +5389,7 @@ let start
     Journal_media_runtime.pump (!media_runtime_cell);
     match event with
     | Worker.Push {payload=Graph_service.Coordination_updates _ | Coordination_observations _;_}
-    | Worker.Response {outcome=Completed(Graph_service.Coordination_asset_demand_finalized _ | Coordination_observation_finalized _ | Graph_response _ | Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _ | Coordination_imported _ | Coordination_writers_quiesced _ | Coordination_host_prepared _ | Coordination_host_applied _ | Coordination_host_confirmed _ | Coordination_import_inputs_recovered _ | Coordination_import_input_confirmed _ | Coordination_import_input_acknowledged _);_}->Effect.ignore
+    | Worker.Response {outcome=Completed(Graph_service.Coordination_asset_demand_finalized _ | Coordination_observation_finalized _ | Coordination_queried _ | Coordination_confirmed _ | Coordination_changes_acknowledged _ | Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _ | Coordination_imported _ | Coordination_writers_quiesced _ | Coordination_host_prepared _ | Coordination_host_applied _ | Coordination_host_confirmed _ | Coordination_import_inputs_recovered _ | Coordination_import_input_confirmed _ | Coordination_import_input_acknowledged _);_}->Effect.ignore
     | Worker.Push {payload=Graph_service.Graph_push _ | Graph_pushes _ | Graph_states _ | Session_states _;_} -> Effect.ignore
     | Worker.Response { request_id; outcome; _ }
       when Hashtbl.mem local_copy_requests request_id ->

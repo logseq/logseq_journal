@@ -5,6 +5,21 @@ module Protocol = Logseq_db_worker.Protocol
 
 let uuid value = Logseq_db_types.Graph_types.Uuid.of_string value |> Result.get_ok
 
+module Read=Worker_pure_read
+let observation_read (scope:Logseq_sync_pure_reducer.Core.graph_scope) registration query maximum_bytes =
+  let module F=Read.For_worker in
+  let limits:Worker_pure_data.capability_limits={response_budget_bytes=Worker_pure_data.maximum_response_bytes;
+    outbox_max_records=10000;outbox_max_bytes=10485760;change_max_items=256;change_max_bytes=1048576;dispatcher_capacity=256;wire_batch_max_bytes=1048576}in
+  let binding=F.binding ~serial:registration ~incarnation:(Read.worker_incarnation
+    ~runtime_epoch:(Journal_worker_ids.Runtime.Epoch.of_int64 1L) ~worker_generation:(Journal_worker_ids.Worker.Generation.of_int64 1L))
+    ~origin:(Uri.to_string scope.account.managed_sync_origin) ~user:scope.account.user_id in
+  let owner:Logseq_sync_pure_reducer.Core.timeline_scope={startup={account_generation=scope.account.account_generation;
+    presentation_generation=scope.account.presentation_generation};graph_id=scope.graph_id;graph_generation=scope.graph_generation}in
+  let session=F.session ~binding ~graph:scope.graph_id ~account:scope.account.account_generation ~lifecycle:scope.account.lifecycle_generation
+    ~generation:scope.graph_generation ~scope:owner ~asset_scope:scope ~limits in
+  F.pack_query(F.read_budget ~owner:session ~maximum_items:1 ~maximum_bytes)query
+;;
+
 let worker_config () =
   Config.create
     ~application_support_directory:"/tmp/logseq-db-worker-reducer-contract"
@@ -65,7 +80,9 @@ let test_managed_worker_starts_without_local_open () =
 let test_closed_graph_request_replies_once () =
   let id = Core.request_id_of_int64 1L in
   let transition =
-    Core.step (initial ()) (Core.Graph_request { id; request = graph_info_request (); response_budget_bytes=None })
+    Core.step (initial ()) (Core.Graph_request { id; read=observation_read ({Sync.account={managed_sync_origin=Uri.of_string "https://api.logseq.io";user_id="user-1";
+      account_generation=1;presentation_generation=1;lifecycle_generation=1L};
+      graph_id=uuid "10000000-0000-4000-8000-000000000001";graph_generation=1}) 71L Read.Graph_info 16384 })
   in
   let replies =
     List.filter
@@ -217,9 +234,9 @@ let worker_open_graph () =
 
 let test_current_deletion_preserves_work_until_retirement () =
   let ready, scope = worker_open_graph () in
-  let request = graph_info_request () in
+  let read=observation_read scope 71L Read.Graph_info 16384 in
   let executing =
-    Core.step ready (Core.Graph_request { id = Core.request_id_of_int64 11L; request; response_budget_bytes=None })
+    Core.step ready (Core.Graph_request { id = Core.request_id_of_int64 11L; read })
   in
   let completion =
     List.find_map
@@ -289,24 +306,13 @@ let test_current_deletion_preserves_work_until_retirement () =
     "close waits for executing work"
     false
     (has_close retiring.effects);
-  let edit =
-    { request with
-      Protocol.command =
-        Protocol.V2_save_block
-          { mutation_id = uuid "20000000-0000-4000-8000-000000000001"
-          ; block = uuid "30000000-0000-4000-8000-000000000001"
-          ; title = "Must not be saved after graph retirement admission"
-          ; preconditions = { blocks = []; pages = []; scopes = [] }
-          }
-    }
-  in
   let rejected =
     Core.step
       retiring.next
-      (Core.Graph_request { id = Core.request_id_of_int64 12L; request = edit; response_budget_bytes=None })
+      (Core.Graph_request { id = Core.request_id_of_int64 12L; read })
   in
   Alcotest.(check bool)
-    "new editing receives a terminal reply and no execution"
+    "new reading receives a terminal reply and no execution"
     true
     (List.exists
        (function
@@ -1231,15 +1237,15 @@ let test_resident_worker_routes_by_scope () =
   let opened,first_scope,second_id=resident_worker_fixture () in
   Alcotest.(check int) "two independent DB scopes remain open" 2 (List.length (Core.graph_scopes opened));
   let second_scope=List.find (fun (scope:Sync.graph_scope)->scope.graph_id=second_id) (Core.graph_scopes opened) in
-  let request=graph_info_request () in
-  let started=Core.step opened (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 101L;request;response_budget_bytes=None}) in
+  let read scope=observation_read scope 71L Read.Graph_info 16384 in
+  let started=Core.step opened (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 101L;read=read first_scope}) in
   let execution=List.find_map (function Core.Run_worker ((Core.Request (_,Execute_request _)) as instruction)->Some instruction | _->None) started.effects |> Option.get in
   let focused=Core.step started.next (Sync_event (Sync.Visible_graph_changed second_id)) in
-  let hidden=Core.step focused.next (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 102L;request;response_budget_bytes=None}) in
+  let hidden=Core.step focused.next (Graph_request_for_scope {scope=first_scope;id=Core.request_id_of_int64 102L;read=read first_scope}) in
   Alcotest.(check bool) "hidden request still targets first database" true
     (List.exists (function Core.Run_worker (Core.Request (_,Execute_request {database;_}))->
       Core.database_handle_id database="db-delete" | _->false) hidden.effects);
-  let second=Core.step hidden.next (Graph_request_for_scope {scope=second_scope;id=Core.request_id_of_int64 103L;request;response_budget_bytes=None}) in
+  let second=Core.step hidden.next (Graph_request_for_scope {scope=second_scope;id=Core.request_id_of_int64 103L;read=read second_scope}) in
   Alcotest.(check bool) "visible request targets its own database" true
     (List.exists (function Core.Run_worker (Core.Request (_,Execute_request {database;_}))->
       Core.database_handle_id database="resident-" ^ Logseq_db_types.Graph_types.Uuid.to_string second_id | _->false) second.effects);
@@ -1307,7 +1313,7 @@ let test_resident_worker_cold_restore_keeps_open_tickets () =
   List.iter(fun scope->
     Alcotest.(check bool) "each restored graph really opens" true
       (Option.fold ~none:false ~some:(fun(g:Core.graph_state)->g.phase=Core.Graph_open) (Core.graph_state_for_scope opened scope));
-    let read=Core.step opened (Graph_request_for_scope{scope;id=Core.request_id_of_int64 901L;request=graph_info_request();response_budget_bytes=None}) in
+    let read=Core.step opened (Graph_request_for_scope{scope;id=Core.request_id_of_int64 901L;read=observation_read scope 71L Read.Graph_info 16384}) in
     Alcotest.(check bool) "restored scope executes against its own DB" true
       (List.exists(function Core.Run_worker(Core.Request(_,Execute_request{database;_}))->
         Core.database_handle_id database="cached-" ^ Logseq_db_types.Graph_types.Uuid.to_string scope.graph_id|_->false) read.effects)) (Core.graph_scopes opened)) [1;2;3]
@@ -1343,81 +1349,20 @@ let test_coordination_owner_snapshot () =
 ;;
 
 let test_scoped_read_byte_budget () =
-  let opened, scope = worker_open_graph () in
-  let request = graph_info_request () in
-  let id = Core.request_id_of_int64 730L in
-  let run response_budget_bytes =
-    Core.step
-      opened
-      (Core.Graph_request_for_scope
-         { scope; id; request; response_budget_bytes = Some response_budget_bytes })
-  in
-  let valid = run 16384 in
-  Alcotest.(check bool)
-    "scoped read preserves its byte bound"
-    true
-    (List.exists
-       (function
-         | Core.Run_worker
-             (Core.Request
-                (_, Core.Execute_request { response_budget_bytes = Some 16384; _ })) ->
-           true
-         | _ -> false)
-       valid.effects);
-  List.iter
-    (fun budget ->
-       let invalid = run budget in
-       Alcotest.(check bool)
-         "invalid byte bound sends no DB IO"
-         false
-         (List.exists
-            (function
-              | Core.Run_worker _ -> true
-              | _ -> false)
-            invalid.effects);
-       Alcotest.(check bool)
-         "invalid byte bound keeps request identity"
-         true
-         (List.exists
-            (function
-              | Core.Publish
-                  (Core.Reply
-                     ( actual
-                     , Protocol.V2_response
-                         { request_id
-                         ; outcome = V2_failed { code = "invalidRequest"; _ }
-                         ; _
-                         } )) -> actual = id && request_id = request.request_id
-              | _ -> false)
-            invalid.effects))
-    [ 0; -1; Worker_pure_data.maximum_response_bytes + 1 ]
-;;
+  let opened,scope=worker_open_graph() in
+  let id=Core.request_id_of_int64 730L in
+  let run maximum_bytes=Core.step opened(Core.Graph_request_for_scope{
+    scope;id;read=observation_read scope 71L Read.Graph_info maximum_bytes})in
+  let valid=run 16384 in
+  Alcotest.(check bool) "scoped read preserves its byte bound" true
+    (List.exists(function Core.Run_worker(Core.Request(_,Core.Execute_request{read=Read.Read_query(budget,_);_}))->
+      Read.For_worker.read_budget_maximum_bytes budget=16384|_->false)valid.effects);
+  let Read.Read_query(source,_) = observation_read scope 71L Read.Graph_info 16384 in
+  List.iter(fun maximum_bytes->
+    Alcotest.(check bool) "public abstract budget rejects invalid byte bounds" true
+      (Result.is_error(Read.read_budget(Read.For_worker.read_budget_owner source)
+        ~maximum_items:1 ~maximum_bytes))) [0;-1;Worker_pure_data.maximum_response_bytes+1]
 
-let test_read_byte_budget_is_not_an_effect_capability () =
-  let opened, scope = worker_open_graph () in
-  let request =
-    { (graph_info_request ()) with
-      Protocol.command = V2_ack_changes { generation = "source"; through = "point" }
-    }
-  in
-  let transition =
-    Core.step
-      opened
-      (Core.Graph_request_for_scope
-         { scope
-         ; id = Core.request_id_of_int64 731L
-         ; request
-         ; response_budget_bytes = Some 16384
-         })
-  in
-  Alcotest.(check bool)
-    "read byte override cannot dispatch changefeed ACK"
-    false
-    (List.exists
-       (function
-         | Core.Run_worker _ -> true
-         | _ -> false)
-       transition.effects)
 ;;
 
 let test_pure_read_page_bounds () =
@@ -1519,22 +1464,22 @@ let test_observation_registry () =
   let module O = Core.Observation_registry in
   let _, scope = worker_open_graph () in
   let id = uuid "10000000-0000-4000-8000-000000007001" in
-  let reserve state scope command maximum_bytes =
-    O.reserve state ~registration:71L ~id ~scope ~command ~maximum_bytes
+  let reserve state scope query maximum_bytes =
+    O.reserve state ~registration:71L ~id ~scope ~read:(observation_read scope 71L query maximum_bytes)
   in
-  let live, decision = reserve O.empty scope Protocol.V2_graph_info 16384 in
+  let live, decision = reserve O.empty scope Read.Graph_info 16384 in
   Alcotest.(check bool) "first query registration is admitted" true (decision = O.Start);
   Alcotest.(check bool)
     "initial observation epoch is live"
     true
     (O.current live ~registration:71L ~id ~epoch:0L);
-  let again, decision = reserve live scope Protocol.V2_graph_info 16384 in
+  let again, decision = reserve live scope Read.Graph_info 16384 in
   Alcotest.(check bool)
     "duplicate registration does not allocate"
     true
     (decision = O.Existing);
   Alcotest.(check int) "only one active listener" 1 (O.active again);
-  let _, decision = reserve live scope Protocol.V2_inspect_admission 16384 in
+  let _, decision = reserve live scope Read.Admission 16384 in
   Alcotest.(check bool)
     "same ID cannot change query"
     true
@@ -1548,7 +1493,7 @@ let test_observation_registry () =
   let focused =
     { scope with account = { scope.account with presentation_generation = 99 } }
   in
-  let _, decision = reserve live focused Protocol.V2_graph_info 16384 in
+  let _, decision = reserve live focused Read.Graph_info 16384 in
   Alcotest.(check bool)
     "presentation focus does not replace execution"
     true
@@ -1567,14 +1512,14 @@ let test_observation_registry () =
     (O.active retired);
   let settled = O.released retired ~registration:71L ~id ~scope in
   Alcotest.(check int) "only physical ACK makes capacity reusable" 0 (O.active settled);
-  let _, decision = reserve retired scope Protocol.V2_graph_info 16384 in
+  let _, decision = reserve retired scope Read.Graph_info 16384 in
   Alcotest.(check bool) "retired request cannot resurrect" true (decision = O.Retired);
   let early, release = O.release O.empty ~registration:71L ~id ~scope in
   Alcotest.(check bool)
     "cancel before registration creates a fence"
     true
     (release = O.Unknown);
-  let _, decision = reserve early scope Protocol.V2_graph_info 16384 in
+  let _, decision = reserve early scope Read.Graph_info 16384 in
   Alcotest.(check bool)
     "registration after cancel cannot allocate"
     true
@@ -1648,8 +1593,7 @@ let test_observation_registry_traces () =
             ~registration:71L
             ~id
             ~scope:owner
-            ~command:Protocol.V2_graph_info
-            ~maximum_bytes:16384
+            ~read:(observation_read owner 71L Read.Graph_info 16384)
         in
         let expected =
           match model with
@@ -1699,8 +1643,7 @@ let test_observation_registry_traces () =
             ~registration:71L
             ~id
             ~scope:owner
-            ~command:Protocol.V2_inspect_admission
-            ~maximum_bytes:0
+            ~read:(observation_read owner 71L Read.Admission 0)
         in
         check trace (decision = O.Invalid) "invalid request allocated a listener";
         next, model
@@ -1738,19 +1681,20 @@ let test_single_graph_change_broadcast_keeps_scope () =
 
 let test_changefeed_owner_properties () =
   let module O=Core.Changefeed_owner in
-  let request_id=uuid "10000000-0000-4000-8000-000000007004" in
-  let pull:Protocol.request={api_version=Protocol.api_version;request_id;command=V2_pull_changes{generation="g";after=None;limit=32}} in
-  let packet request_id outcome=Protocol.V2_response{api_version=Protocol.api_version;request_id;outcome} in
-  let response=packet request_id(Protocol.V2_changes{generation="g";from_exclusive=None;through="w1";next=None;
-    windows=[{id="w1";predecessor="p0";successor="p1";block_uuids=[];page_uuids=[];structure_interests=[]}]}) in
+  let _,scope=worker_open_graph() in
+  let pull n=observation_read scope (Int64.of_int n) (Read.Changes{generation="g";after=None}) 16384 in
+  let response n=let Read.Read_query(budget,_)=pull n in
+    Read.For_worker.change_batch ~change_owner:(Read.For_worker.read_budget_owner budget) ~generation:"g"
+      ~from_exclusive:None ~through:"w1" ~next:None ~windows:[{Worker_pure_data.id="w1";
+        predecessor="p0";successor="p1";block_uuids=[];page_uuids=[];structure_interests=[]}] in
   let run trace =
     let state=ref O.empty and owner=ref 0 and pending=ref false and acked=ref false and resync=ref false in
     let same n= !owner=n in
     let verify ()=
-      if O.legacy !state<>(!owner=0) || O.needs_resync !state<> !resync then failwith "ownership/resync state mismatch";
+      if O.unclaimed !state<>(!owner=0) || O.needs_resync !state<> !resync then failwith "ownership/resync state mismatch";
       List.iter(fun n->if O.may_ack !state ~registration:(Int64.of_int n) ~generation:"g" ~through:"w1"
         <>(same n && (!pending || !acked)) then failwith "unknown or retired ACK was admitted") [71;72] in
-    List.iteri(fun index op->
+    List.iter(fun op->
       let n=if op mod 2=0 then 71 else 72 in
       let registration=Int64.of_int n in
       (match op with
@@ -1766,30 +1710,28 @@ let test_changefeed_owner_properties () =
          state:=O.retire !state ~registration;
          if same n then(owner:= -n;pending:=false;acked:=false;resync:=false)
        | 4|5 ->
-         let actual=O.remember !state ~registration ~request:pull ~maximum_bytes:16384 response in
+         let actual=O.remember !state ~registration ~read:(pull n) (response n) in
          let expected=same n && not !pending in
          if Result.is_ok actual<>expected then failwith "read allocation bypassed ownership or replaced unapplied data";
          (match actual with Ok next->state:=next;pending:=true;resync:=false|_->())
        | 6|7 ->
-         let request={pull with command=Protocol.V2_ack_changes{generation="g";through="w1"}} in
-         state:=O.acknowledged !state ~registration ~request
-           (packet request_id(Protocol.V2_changes_acknowledged{generation="g";through="w1"}));
+         state:=O.acknowledged !state ~registration ~generation:"g" ~through:"w1";
          if same n && (!pending || !acked) then(pending:=false;acked:=true)
        | 8 -> state:=O.invalidate !state;pending:=false;acked:=false;resync:=true
        | 9|10 ->
          let n=if op=9 then 71 else 72 in
-         let actual_id=uuid(Printf.sprintf "10000000-0000-4000-8000-%012d"(20000+index)) in
-         (match O.pull !state ~registration:(Int64.of_int n) ~request:{pull with request_id=actual_id} ~maximum_bytes:16384 with
-          | O.Read when same n && not !pending -> ()
-          | Cached(Protocol.V2_response value) when same n && !pending && value.request_id=actual_id -> ()
-          | Refused when not(same n)->()
-          | _->failwith "cached batch or duplicate RPC correlation changed")
+         (match O.pull !state ~registration:(Int64.of_int n) ~read:(pull n) with
+          |O.Read when same n && not !pending->()
+          |Cached batch when same n && !pending && batch=response n->()
+          |Refused when not(same n)->()
+          |_->failwith "cached batch or original query identity changed")
        | 11 -> if O.may_ack !state ~registration:71L ~generation:"g" ~through:"future" then failwith "future ACK invented proof"
        | _ ->
-         let bad=packet (uuid "10000000-0000-4000-8000-000000007099")
-           (Protocol.V2_changes{generation="g";from_exclusive=None;through="w1";windows=[];next=None}) in
-         if Result.is_ok(O.remember !state ~registration:71L ~request:pull ~maximum_bytes:16384 bad)
-         then failwith "foreign request ID became retained change evidence");verify()) trace in
+         let Read.Read_query(budget,_)=pull 72 in
+         let bad=Read.For_worker.change_batch ~change_owner:(Read.For_worker.read_budget_owner budget)
+           ~generation:"g" ~from_exclusive:None ~through:"w1" ~windows:[] ~next:None in
+         if Result.is_ok(O.remember !state ~registration:71L ~read:(pull 71) bad)
+         then failwith "foreign session became retained change evidence");verify()) trace in
   let prefixes=[[0;4;9;6;6;2;1;5;10];[0;4;8;6;4;6];[1;5;2;0;3;0;4];[0;1;5;4;7;6;11;12]] in
   for seed=0 to 199 do
     let random=Random.State.make[|0xc4a6e;seed|] in
@@ -1844,8 +1786,7 @@ let test_unallocated_observation_fence () =
            ~registration:71L
            ~id
            ~scope
-           ~command:Protocol.V2_graph_info
-           ~maximum_bytes:16384
+           ~read:(observation_read scope 71L Read.Graph_info 16384)
        in
        Alcotest.(check bool)
          "canceled ID never allocates in old or new generation"
@@ -1858,8 +1799,7 @@ let test_unallocated_observation_fence () =
       ~registration:71L
       ~id
       ~scope
-      ~command:Protocol.V2_graph_info
-      ~maximum_bytes:16384
+      ~read:(observation_read scope 71L Read.Graph_info 16384)
   in
   let unchanged, result = O.release_unallocated live ~registration:71L ~id ~owner in
   Alcotest.(check bool)
@@ -1877,8 +1817,7 @@ let test_observation_registry_capacity () =
       ~registration:71L
       ~id:(id n)
       ~scope
-      ~command:Protocol.V2_graph_info
-      ~maximum_bytes:16384
+      ~read:(observation_read scope 71L Read.Graph_info 16384)
   in
   let state = ref O.empty in
   for n = 1 to 256 do
@@ -2025,7 +1964,7 @@ let test_resource_registry_finalization () =
   for n=1 to 8200 do
     let id=uuid(Printf.sprintf "10000000-0000-4000-a000-%012d" n) in
     let owner:D.owner={registration=92L;scope;consumer=Printf.sprintf "actual-round-%d" n} in
-    let next,decision=O.reserve !observation ~registration:92L ~id ~scope ~command:Protocol.V2_graph_info ~maximum_bytes:16384 in
+    let next,decision=O.reserve !observation ~registration:92L ~id ~scope ~read:(observation_read scope 92L Read.Graph_info 16384) in
     Alcotest.(check bool) "ordinary Detail never consumes a lifetime quota" true(decision=O.Start);
     observation:=next;
     let next,decision=D.reserve !demand owner ~priority:Foreground ~assets:[] in
@@ -2061,7 +2000,7 @@ let test_resource_registry_finalization () =
     if creator_first then obs:=O.creator_finished !obs ~registration:92L ~id;
     let next,_=O.release_unallocated !obs ~registration:92L ~id ~owner:timeline in obs:=next;
     if not creator_first then (
-      let _,decision=O.reserve !obs ~registration:92L ~id ~scope ~command:Protocol.V2_graph_info ~maximum_bytes:16384 in
+      let _,decision=O.reserve !obs ~registration:92L ~id ~scope ~read:(observation_read scope 92L Read.Graph_info 16384) in
       Alcotest.(check bool) "release overtaking a queued creator fences its allocation" true(decision=O.Retired);
       obs:=O.creator_finished !obs ~registration:92L ~id);
     let next,result=O.finalize !obs ~registration:92L ~id ~owner:timeline in
@@ -2537,7 +2476,6 @@ let () =
           Alcotest.test_case "exhaustive shortest lifecycle traces" `Quick test_observation_registry_traces;
           Alcotest.test_case "active ACK and tombstone capacities" `Quick test_observation_registry_capacity] )
     ; ( "read budget", [Alcotest.test_case "scoped byte budget" `Quick test_scoped_read_byte_budget;
-          Alcotest.test_case "read budget excludes effects" `Quick test_read_byte_budget_is_not_an_effect_capability;
           Alcotest.test_case "pure bounded page planning" `Quick test_pure_read_page_bounds])
     ; ( "managed lifecycle"
       , [ Alcotest.test_case "local restore IO failures terminate loading" `Quick test_local_restore_worker_failures_are_terminal

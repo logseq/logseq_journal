@@ -6,6 +6,7 @@
  (default_implementation logseq_db_worker_pure_reducer_impl)
  (libraries
   rrbvec
+  logseq_db_worker.typed_read
   logseq_db_worker.contract
   logseq_db_types
   logseq_overlay_db

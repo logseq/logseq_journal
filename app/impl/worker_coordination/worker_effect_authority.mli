@@ -449,7 +449,7 @@ type observation_epoch
 val compare_observation_epoch : observation_epoch -> observation_epoch -> int
 
 type 'a observation
-type (_, _) equality = Refl : ('a, 'a) equality
+type ('a, 'b) equality = ('a, 'b) Worker_pure_read.equality = Refl : ('a, 'a) equality
 
 val observation_session : 'a observation -> session
 val observation_id : 'a observation -> request_id

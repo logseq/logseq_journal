@@ -1,17 +1,5 @@
+module Read = Worker_pure_read
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
-
-(* Existing single-graph service fixtures retain their behavior while accepting
-   the production caller's explicit graph owner. Multi-graph routing is tested
-   through the public Worker reducer and real service. *)
-let fixture_request = function
-  | Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_request_at (_,request) -> Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_request request
-  | Get_graph_state_at _ -> Get_graph_state
-  | Asset_command_at (owner,command) -> Asset_command {graph_generation=owner.graph_generation;command}
-  | Import_asset_at (owner,source) -> Import_asset {graph_generation=owner.graph_generation;source}
-  | Coordination_query {request;_}->Graph_request request
-  | Client_command (Focus_resident_graph id) -> Client_command (Select_graph id)
-  | request -> request
-;;
 
 (* Synthetic observation registration uses the same query handler, while
    preserving the real Service envelopes, identity, epochs and release ACK. *)
@@ -19,33 +7,24 @@ let fixture_observations ?(observed=(fun _->())) ?(released=(fun _->()))
     ?(asset_scope=(fun (_:Service.timeline_scope)->None)) ?(asset_request=(fun _->())) handle =
   let registrations=Hashtbl.create 16 in
   fun context state request ->
-    let read registration owner observation_id epoch query maximum_bytes =
-      match handle context state (Service.Coordination_query{registration;owner;request=query;
-        response_budget_bytes=maximum_bytes}) with
-      | Ok(Service.Graph_response response)->
-        Hashtbl.replace registrations (registration,observation_id)(owner,query,maximum_bytes,epoch);
-        Ok(Service.Coordination_observed{registration;owner;observation_id;epoch;response})
-      | Error error->Error error
-      | Ok _->Error "Observation fixture expected a query response" in
+    let read registration owner observation_id request_id epoch source =
+      match handle context state(Service.Coordination_query{registration;owner;request_id;read=source})with
+      |Ok(Service.Coordination_queried{answer;_})->
+        Hashtbl.replace registrations(registration,observation_id)(owner,source,epoch);
+        Ok(Service.Coordination_observed{registration;owner;observation_id;request_id;epoch;answer})
+      |Error error->Error error
+      |Ok _->Error "Observation fixture expected the original typed answer"in
     match request with
     |Service.Coordination_asset_demand value->
       asset_request request;
-      (match handle context state(Service.Asset_command_at(value.owner,Replace_asset_demand
-        {consumer=value.consumer;priority=value.priority;assets=value.assets})) with
-       |Ok Service.Client_command_completed->
-         Option.iter(fun scope->Logseq_db_worker_lui.Journal_worker.Request_context.emit context
-           ~topic:Service.asset_topic(Service.Asset_notice(scope,Asset_demand_accepted value.consumer)))
-           (asset_scope value.owner);
-         Ok(Service.Coordination_asset_demand_accepted{request_id=value.request_id})
-       |Error error->Error error|Ok _->Error "Asset demand fixture expected a command acknowledgement")
+      Option.iter(fun scope->Logseq_db_worker_lui.Journal_worker.Request_context.emit context
+        ~topic:Service.asset_topic(Service.Asset_notice(scope,Asset_demand_accepted value.consumer)))
+        (asset_scope value.owner);
+      Ok(Service.Coordination_asset_demand_accepted{request_id=value.request_id})
     |Service.Coordination_release_asset_demand value->
       asset_request request;
-      let owner:Service.timeline_scope={startup={account_generation=value.owner.account.account_generation;
-        presentation_generation=value.owner.account.presentation_generation};graph_id=value.owner.graph_id;graph_generation=value.owner.graph_generation} in
-      (match handle context state(Service.Asset_command_at(owner,Release_asset_demand value.consumer)) with
-       |Ok Service.Client_command_completed->Ok(Service.Coordination_asset_demand_released{
-         registration=value.registration;owner=value.owner;request_id=value.request_id;consumer=value.consumer})
-       |Error error->Error error|Ok _->Error "Asset release fixture expected a checked acknowledgement")
+      Ok(Service.Coordination_asset_demand_released{registration=value.registration;owner=value.owner;
+        request_id=value.request_id;consumer=value.consumer})
     |Service.Coordination_finalize_asset_demand value->
       Ok(Service.Coordination_asset_demand_finalized{registration=value.registration;owner=value.owner;
         request_id=value.request_id;consumer=value.consumer})
@@ -54,26 +33,17 @@ let fixture_observations ?(observed=(fun _->())) ?(released=(fun _->()))
       then Error "Observation fixture finalized before release"
       else Ok(Service.Coordination_observation_finalized{registration=value.registration;owner=value.owner;
         observation_id=value.observation_id})
-    | Service.Coordination_import value->
-      let owner:Service.timeline_scope={startup={account_generation=value.owner.account.account_generation;
-        presentation_generation=value.owner.account.presentation_generation};graph_id=value.owner.graph_id;graph_generation=value.owner.graph_generation} in
-      (match handle context state(Service.Import_asset_at(owner,value.source)) with
-       |Ok(Service.Asset_imported result)->Ok(Service.Coordination_imported{registration=value.registration;
-         owner=value.owner;request_id=value.request_id;result})
-       |Error message->Error message
-       |_->Error "Typed Import fixture expected its source receipt")
     | Service.Coordination_observe value->
       observed request;
-      read value.registration value.owner value.observation_id 0L value.request value.maximum_bytes
+      read value.registration value.owner value.observation_id value.request_id 0L value.read
     | Coordination_refresh_observation value->
       (match Hashtbl.find_opt registrations(value.registration,value.observation_id) with
-       | Some(owner,query,maximum_bytes,epoch) when owner=value.owner ->
-         read value.registration owner value.observation_id (Int64.succ epoch)
-           {query with request_id=value.request_id} maximum_bytes
+       | Some(owner,source,epoch) when owner=value.owner ->
+         read value.registration owner value.observation_id value.request_id (Int64.succ epoch) source
        | _->Error "Observation fixture rejected an unknown owner")
     | Coordination_release_observation value->
       (match Hashtbl.find_opt registrations(value.registration,value.observation_id) with
-       | Some(owner,_,_,_) when owner<>value.owner->Error "Observation fixture rejected a foreign release"
+       | Some(owner,_,_) when owner<>value.owner->Error "Observation fixture rejected a foreign release"
        | _->Hashtbl.remove registrations(value.registration,value.observation_id);
          released request;Ok(Service.Coordination_observation_released{
            registration=value.registration;owner=value.owner;observation_id=value.observation_id}))
@@ -706,8 +676,7 @@ let run_favorites_native_visibility
   let detail_observation_notice : Service.observation_invalidation option Atomic.t=Atomic.make None in
   let detail_observed_title=Atomic.make false and detail_observed_missing=Atomic.make false
   and detail_observed_failure=Atomic.make false in
-  let legacy_child_writes = Atomic.make 0 in
-  let capture_append_writes=Atomic.make 0 and legacy_capture_writes=Atomic.make 0 in
+  let capture_append_writes=Atomic.make 0 in
   let typed_status_intents=Atomic.make [] in
   let status_summary_queries=Atomic.make 0 in
   let status_more_entered=Atomic.make false and status_more_release=Atomic.make(durable_status<>Some `Paged) in
@@ -750,7 +719,7 @@ let run_favorites_native_visibility
   let media_notices = Atomic.make [] in
   let media_delivered = Atomic.make 0 in
   let demands = Atomic.make [] in
-  let typed_asset_demands=Atomic.make 0 and legacy_asset_demands=Atomic.make 0 in
+  let typed_asset_demands=Atomic.make 0 in
   let retries = Atomic.make 0 in
   let acquire_entered = Atomic.make 0 in
   let acquire_release = Atomic.make false in
@@ -972,15 +941,15 @@ let run_favorites_native_visibility
   (* Copy specifically exercises ordinary single-graph/native authority. Other
      UI fixtures declare their synthetic manager owner directly. *)
   let manager=if check_copy || single_graph_shape then manager else fixture_with_scope manager in
-  let point_reads=Atomic.make 0 and legacy_point_reads=Atomic.make 0 in
-  let offline_scans=Atomic.make 0 and legacy_offline_scans=Atomic.make 0 in
+  let point_reads=Atomic.make 0 in
+  let offline_scans=Atomic.make 0 in
   let asset_change_armed = Atomic.make false in
   let asset_change_entered = Atomic.make false in
   let asset_change_release = Atomic.make false in
   let asset_more_entered = Atomic.make false in
   let asset_more_release = Atomic.make false in
   let offline_demand = Atomic.make None in
-  let media_listings=Atomic.make 0 and legacy_media_listings=Atomic.make 0 in
+  let media_listings=Atomic.make 0 in
   let coordination_registration=Atomic.make None in
   let coordination_release_entered = Atomic.make false in
   let coordination_release_allowed = Atomic.make true in
@@ -1062,13 +1031,19 @@ let run_favorites_native_visibility
         Ok ())
       ~handle:(fixture_observations
         ~asset_scope:(fun owner->if asset_change=Some `More then None else Some(fixture_scope manager owner.graph_id))
-        ~asset_request:(function Service.Coordination_asset_demand _->Atomic.incr typed_asset_demands|_->())
+        ~asset_request:(function
+          |Service.Coordination_asset_demand value->
+            Atomic.incr typed_asset_demands;
+            if asset_change=Some `More then Atomic.set offline_demand(Some value.consumer);
+            if Option.is_some media_rows then List.iter(fun asset->Atomic.set demands
+              ((value.consumer,asset.Logseq_db_types.Asset_descriptor.uuid)::Atomic.get demands))value.assets
+          |Coordination_release_asset_demand _->Atomic.incr released_demands
+          |_->())
         ~observed:(fun request->Atomic.incr detail_observes;
         match request with Service.Coordination_observe value->
           Atomic.set detail_observation_notice(Some{registration_id=value.registration;owner=value.owner;
             observation_id=value.observation_id;epoch=0L})|_->()) ~released:(fun _->Atomic.incr detail_releases) (fun context () request ->
         (match request with
-         |Service.Asset_command{command=Replace_asset_demand _;_}->Atomic.incr legacy_asset_demands
          | Service.Coordination_mutation{intent;_}->
            Atomic.incr typed_status_mutations;
            Atomic.set typed_status_intents(intent::Atomic.get typed_status_intents)
@@ -1078,7 +1053,7 @@ let run_favorites_native_visibility
            while not(Atomic.get status_confirm_release) do
              Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done
          | Coordination_acknowledge_mutation _->Atomic.incr typed_status_acks
-         | Coordination_query{request={command=P.V2_get_outline_block_summary _;_};_}->Atomic.incr status_summary_queries
+         | Coordination_query{read=Read.Read_query(_,Read.Block_summary _);_}->Atomic.incr status_summary_queries
          | _->());
         if (match request with Service.Coordination_acknowledge_mutation _->
           (durable_case=Some `Ack_failed || durable_case=Some `Reconfirm_failed || durable_case=Some `Background_ack || capture_case=Some `Ack_failed) && Atomic.get typed_status_acks=1|_->false)
@@ -1115,35 +1090,23 @@ let run_favorites_native_visibility
              | _->failwith "ACK without known settled proof");
             Some(Service.Coordination_mutation_acknowledged{request_id})
           | _->None in
-        let original_request=request in
         match cached with Some response->Ok response|None->
-        let normalized=match request with
-          | Service.Coordination_mutation{request_id;intent;_}->
-            Service.Graph_request P.{api_version;request_id;command=Wire.command(durable_intent intent)}
-          | Coordination_confirm{request_id;intent;_}->
-            let block=Rrbvec.nth (Wire.targets(durable_intent intent)) 0 in
-            Service.Graph_request P.{api_version;request_id;command=V2_get_outline_block_summary
-              {block;limit=Worker_pure_data.default_page_size;cursor=None}}
-          | _->fixture_request request in
         let fail_this_media_read=ref false and fail_this_media_listing=ref false in
-        (match normalized with
-         | Service.Graph_request{command=(P.V2_get_outline_block _|V2_get_page _);_}->
-           Atomic.incr point_reads;
-           (match request with Service.Coordination_query _->()|_->Atomic.incr legacy_point_reads)
+        (match request with
+         | Service.Coordination_query{read=Read.Read_query(_,(Read.Outline_block _|Read.Page _));_}->
+           Atomic.incr point_reads
          | _->());
-        (match normalized with
-         | Service.Graph_request {command=P.V2_list_assets {recursive=false;_};_}->
-           Atomic.incr media_listings;
-           (match request with Service.Coordination_query _->()|_->Atomic.incr legacy_media_listings)
-         | Service.Graph_request {command=P.V2_list_assets {recursive=true;_};_}->
-           Atomic.incr offline_scans;
-           (match request with Service.Coordination_query _->()|_->Atomic.incr legacy_offline_scans)
+        (match request with
+         | Service.Coordination_query{read=Read.Read_query(_,Read.Assets{recursive=false;_});_}->
+           Atomic.incr media_listings
+         | Service.Coordination_query{read=Read.Read_query(_,Read.Assets{recursive=true;_});_}->
+           Atomic.incr offline_scans
          | _->());
         (* Only the mounted App adapter knows these Media reads are descendants
            of this Changes delivery. Feeding an incomplete expansion to Core is
            not a reproduction of that missing production ownership boundary. *)
-        (match normalized with
-         | Service.Graph_request {command=P.V2_get_outline_block {block;_};_}
+        (match request with
+         | Service.Coordination_query{read=Read.Read_query(_,Read.Outline_block{uuid=block;_});_}
            when check_media_change_ack && G.Uuid.equal block (uuid 1) ->
            if Atomic.compare_and_set hold_changed_media_fact true false then (
              Atomic.set changed_media_fact_entered true;
@@ -1156,7 +1119,7 @@ let run_favorites_native_visibility
              while not(Atomic.get failed_media_recovery_release) do
                Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done)
            else if Atomic.get changed_media_fact_entered then Atomic.incr changed_other_fact_completed
-         | Service.Graph_request {command=P.V2_list_assets {recursive=false;roots=[root];_};_}
+         | Service.Coordination_query{read=Read.Read_query(_,Read.Assets{recursive=false;roots=[root];_});_}
            when media_change_descendant && G.Uuid.equal root(uuid 1)
              && Atomic.compare_and_set hold_media_descendant true false ->
            Atomic.set media_descendant_entered true;
@@ -1164,8 +1127,8 @@ let run_favorites_native_visibility
            while not(Atomic.get media_descendant_release) do
              Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done
          | _->());
-        (match normalized with
-         | Service.Graph_request {command=P.V2_list_assets {recursive=true;cursor;_};_}
+        (match request with
+         | Service.Coordination_query{read=Read.Read_query(_,Read.Assets{recursive=true;after=cursor;_});_}
            when Atomic.get asset_change_armed ->
            (match cursor with
             | None ->
@@ -1177,8 +1140,356 @@ let run_favorites_native_visibility
               while not(Atomic.get asset_more_release) do
                 Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done)
          | _ -> ());
-        match normalized with
-        | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
+        let fixture_error code message=match Logseq_db_worker.Error.code_of_string code with
+          |Some code->Read.Db_error(Logseq_db_worker.Error.create ~code ~message ~details:[]|>Result.get_ok)
+          |None->Read.Service_failed(code^": "^message)in
+        let sample : type a. confirmation:bool -> Read.read_budget -> a Read.query -> (a,Read.error)result =
+          fun ~confirmation budget query->
+          let module F=Read.For_worker in
+          let owner=F.read_budget_owner budget in
+          let limit=F.read_budget_maximum_items budget in
+          let cursor=Read.query_cursor owner budget query|>Result.get_ok in
+          let next cursor=Option.map(fun cursor->F.continuation ~owner ~budget ~key:(Read.query_key budget query) ~cursor)cursor in
+          match query with
+          |Read.Block_summary{block;_} when confirmation && durable_status=Some `Absence->
+            Ok(F.block_summary ~lookup:(Worker_pure_data.V2_missing_block{uuid=block;revision="missing"})
+              ~page:None ~items:[] ~next:None ~scope_revision:"children"
+              ~generation:"generation:v1:1:1" ~projection_revision:"projection:v1:1")
+            | Read.Task_statuses _ ->
+              (Ok(F.task_status_catalog ~property_uuid:(Some (uuid 90001)) ~default_status:(Some (status_uuid "todo")) ~items:(List.map snd status_definitions) ~next:(next (None))))
+            | Read.Task_status_definitions statuses ->
+              Ok
+                (List.map
+                   (fun uuid ->
+                      List.find_map
+                        (fun (_, (d : G.task_status_definition)) ->
+                           if G.Uuid.equal uuid d.uuid then Some d else None)
+                        status_definitions)
+                   statuses)
+            | Read.Graph_info ->
+              (Ok(F.graph_info ~graph_uuid:(uuid 900) ~graph_name:("Fixture") ~schema:({ major = 65; minor = 33 }) ~admission_facts:([]) ~journal_title_format:(None) ~limits:({ response_budget_bytes = Worker_pure_data.maximum_response_bytes
+                    ; outbox_max_records = 4096
+                    ; outbox_max_bytes = 8388608
+                    ; change_max_items = 4096
+                    ; change_max_bytes = 1048576
+                    ; dispatcher_capacity = 256
+                    ; wire_batch_max_bytes = 262144
+                    }) ~generation:("g") ~projection_revision:("p")))
+            | Read.Journals _ ->
+              Atomic.set feed_queried true;
+              let _ = Atomic.fetch_and_add calendar_feed_reads 1 in
+              if Atomic.get calendar_refresh_pending then (
+                while not (Atomic.get calendar_feed_release) do Unix.sleepf 0.001 done;
+                (Error(fixture_error ("FixtureCalendarRefresh") ("Calendar refresh fixture failed"))))
+              else (Ok(F.slice ~items:([ Worker_pure_data.{ page; journal_day = 20260901; revision = "p" } ]) ~next:(next (None))))
+            | Read.Tree _ ->
+              let count = Option.value media_rows ~default:timeline_rows in
+              let offset = match cursor with None -> 0 | Some value -> int_of_string (G.Cursor.to_string value) in
+              let length = max 0 (min limit (count - offset)) in
+              (Ok(F.slice ~items:(List.init length (fun index ->
+                    { Worker_pure_data.value = timeline_block (offset + index)
+                    ; revision = status_revision ()
+                    ; depth = 0
+                    ; parent = page.uuid })) ~next:(next ((if offset + length < count
+                     then Some (G.Cursor.of_string (string_of_int (offset + length)) |> Result.get_ok) else None)))))
+            | Read.Changes {generation;after} ->
+              Atomic.incr change_pull_reads;
+              (Ok(F.change_batch ~change_owner:owner ~generation:(generation) ~from_exclusive:(after) ~through:("p2") ~next:(None) ~windows:([ { id = "p2"
+                      ; predecessor = "p"
+                      ; successor = "p2"
+                      ; block_uuids =
+                          (if Option.is_some asset_change then [] else if Atomic.get media_metadata_changed
+                           then [ uuid 20000 ]
+                           else [if check_point_read_owner then uuid 1 else uuid 2])
+                      ; page_uuids = []
+                      ; structure_interests = (if Option.is_some asset_change
+                          then [Worker_pure_data.V2_page_tree_interest page.uuid] else [])
+                      }
+                    ])))
+            | Read.Outline_block { uuid=block; _ } ->
+              if block=uuid 1 && Atomic.exchange detail_observed_failure false then (Error(fixture_error (Logseq_db_worker.Error.code_string Storage_busy) ("Observation sample failed")))
+              else if Atomic.get detail_observed_missing && block=uuid 1 then
+                Ok(Worker_pure_data.V2_missing_block{uuid=block;revision="observed-missing"})
+              else if !fail_this_media_read then (Error(fixture_error ("FixtureReadFailure") ("Synthetic Media dependency read failed")))
+              else Ok
+                (match
+                   List.find_opt
+                     (fun (parent, (root : Worker_pure_data.block_tree)) ->
+                        let _ = parent in
+                        G.Uuid.equal root.uuid block)
+                     (Atomic.get detail_captures)
+                 with
+                 | Some (parent, root) ->
+                   let value = timeline_block 0 in
+                   Worker_pure_data.V2_present_block
+                     { value =
+                         { value with
+                           block =
+                             { value.block with
+                               uuid = root.uuid
+                             ; title = root.title
+                             ; parent
+                             ; order = "999"
+                             }
+                         }
+                     ; revision = "appended"
+                     }
+                 | None ->
+                   (match List.find_index (G.Uuid.equal block) roots with
+                    | Some n ->
+                      Worker_pure_data.V2_present_block { value = timeline_block n; revision =
+                        (if n=0 && Atomic.get detail_observed_title then "observed-root-1" else status_revision ()) }
+                    | None -> Worker_pure_data.V2_missing_block { uuid = block; revision = "p" }))
+            | Read.Block_summary{block;_} when
+                List.exists(fun(_, (root:Worker_pure_data.block_tree))->root.uuid=block)(Atomic.get detail_captures) ->
+              let parent,root=List.find(fun(_, (root:Worker_pure_data.block_tree))->root.uuid=block)(Atomic.get detail_captures) in
+              let value=timeline_block 0 in
+              let value={value with block={value.block with uuid=root.uuid;title=root.title;parent;order="999"}} in
+              (Ok(F.block_summary ~lookup:(Worker_pure_data.V2_present_block{value;revision="appended"}) ~page:(Some(Worker_pure_data.V2_present_page{page;revision="p"})) ~items:([]) ~next:(next (None)) ~scope_revision:("child-children") ~generation:(if confirmation then Printf.sprintf "generation:v1:1:%d"(Atomic.get graph_generation) else ("generation:v1:1:1")) ~projection_revision:(if confirmation then "projection:v1:1" else ("projection:v1:1"))))
+            | Read.Block_summary{block;_} when Option.is_some delete_scenario ->
+              let present=durable_delete=Some `Conflict || durable_delete=Some `Reappeared in
+              let value=timeline_block 0 in
+              let value=if durable_delete=Some `Reappeared then
+                {value with block={value.block with title="Reappeared after deletion"}} else value in
+              (Ok(F.block_summary ~lookup:((if present then Worker_pure_data.V2_present_block{value;revision="canonical-current"}
+                else Worker_pure_data.V2_missing_block{uuid=block;revision="deleted"})) ~page:((if present then Some(Worker_pure_data.V2_present_page{page;revision="p"}) else None)) ~items:([]) ~next:(next (None)) ~scope_revision:("children") ~generation:(if confirmation then Printf.sprintf "generation:v1:1:%d"(Atomic.get graph_generation) else ("generation:v1:1:1")) ~projection_revision:(if confirmation then "projection:v1:1" else ((if durable_delete=Some `Reappeared then "projection:v1:2" else "projection:v1:1")))))
+            | Read.Block_summary { block; _ } when Option.is_some status_scenario ->
+              let paged=durable_status=Some `Paged in
+              if paged && Option.is_some cursor then (
+                Atomic.set status_more_entered true;
+                while not(Atomic.get status_more_release) do
+                  Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done);
+              let child n : Worker_pure_data.child_member =
+                let value=timeline_block n in
+                {value={value with block={value.block with uuid=uuid(9100+n);parent=block;title="Canonical child "^string_of_int n}};
+                 revision="child"} in
+              let n = List.find_index (G.Uuid.equal block) roots |> Option.get in
+              (Ok(F.block_summary ~lookup:(Worker_pure_data.V2_present_block { value = timeline_block n; revision = status_revision () }) ~page:(Some (Worker_pure_data.V2_present_page { page; revision = "p" })) ~items:((if paged then [child(if cursor=None then 0 else 1)] else [])) ~next:(next ((if paged && cursor=None then Some(G.Cursor.of_string "status-confirmation-more" |> Result.get_ok) else None))) ~scope_revision:("children") ~generation:(if confirmation then Printf.sprintf "generation:v1:1:%d"(Atomic.get graph_generation) else ((if paged then "generation:v1:1:1" else "g"))) ~projection_revision:(if confirmation then "projection:v1:1" else ((if paged then "projection:v1:1" else "p2")))))
+            | Read.Block_summary { block; _ } when check_capture_imports ->
+              let root = Atomic.get capture_root |> Option.get in
+              let page = Atomic.get capture_page |> Option.get in
+              Alcotest.(check string)
+                "capture summary queries committed UUID"
+                (G.Uuid.to_string root.uuid)
+                (G.Uuid.to_string block);
+              let value = timeline_block 0 in
+              (Ok(F.block_summary ~lookup:(Worker_pure_data.V2_present_block
+                      { value =
+                          { value with
+                            block =
+                              { value.block with
+                                uuid = root.uuid
+                              ; title = root.title
+                              ; parent = page.uuid
+                              ; page = page.uuid
+                              }
+                          ; rendered_page_title = page.title
+                          }
+                      ; revision = "captured"
+                      }) ~page:(Some (Worker_pure_data.V2_present_page { page; revision = "p" })) ~items:((if capture_case=Some `Paged then
+                    [{Worker_pure_data.value={value with block={value.block with uuid=uuid 94322;
+                        title="Canonical child";parent=root.uuid;page=page.uuid}};revision="child"}]
+                    else [])) ~next:(next ((if capture_case=Some `Paged
+                    then Some(G.Cursor.of_string "capture-more" |> Result.get_ok) else None))) ~scope_revision:("children") ~generation:(if confirmation then Printf.sprintf "generation:v1:1:%d"(Atomic.get graph_generation) else ("g")) ~projection_revision:(if confirmation then "projection:v1:1" else ("p2"))))
+            | Read.Page { uuid = requested; _ } ->
+              let known =
+                if G.Uuid.equal requested page.uuid
+                then Some page
+                else if G.Uuid.equal requested favorites_page.uuid
+                then Some favorites_page
+                else
+                  List.find_map
+                    (fun n ->
+                       if n mod 2 = 0 && G.Uuid.equal requested (favorite_target_uuid n)
+                       then Some (favorite_page n)
+                       else None)
+                    (List.init 65 Fun.id)
+              in
+              let capture_day =
+                if not check_capture_imports
+                then None
+                else (
+                  try
+                    Scanf.sscanf
+                      (G.Uuid.to_string requested)
+                      "00000001-%4d-%4d-0000-000000000000%!"
+                      (fun year month_day ->
+                         let month = month_day / 100
+                         and day = month_day mod 100 in
+                         let leap =
+                           year mod 4 = 0 && (year mod 100 <> 0 || year mod 400 = 0)
+                         in
+                         let maximum_day =
+                           match month with
+                           | 2 -> if leap then 29 else 28
+                           | 4 | 6 | 9 | 11 -> 30
+                           | 1 | 3 | 5 | 7 | 8 | 10 | 12 -> 31
+                           | _ -> 0
+                         in
+                         if
+                           year > 0
+                           && day >= 1
+                           && day <= maximum_day
+                           && G.Uuid.to_string requested
+                              = Printf.sprintf
+                                  "00000001-%04d-%04d-0000-000000000000"
+                                  year
+                                  month_day
+                         then Some ((year * 10000) + month_day)
+                         else None)
+                  with
+                  | Scanf.Scan_failure _ | End_of_file | Failure _ -> None)
+              in
+              let known =
+                match known, capture_day with
+                | Some _, _ -> known
+                | None, Some journal_day ->
+                  let name = Printf.sprintf "%08d" journal_day in
+                  let captured =
+                    { page with
+                      uuid = requested
+                    ; name
+                    ; title = name
+                    ; kind = Journal_page { journal_day }
+                    }
+                  in
+                  Atomic.set capture_page (Some captured);
+                  Some captured
+                | None, None -> None
+              in
+              Ok
+                (match known with
+                 | Some page -> Worker_pure_data.V2_present_page { page; revision = "p" }
+                 | None -> Worker_pure_data.V2_missing_page { uuid = requested; revision = "p" })
+            | Read.Child_members { parent; _ } when Option.is_some detail_capture ->
+              let existing =
+                if G.Uuid.equal parent (uuid 1)
+                then (
+                  let value = timeline_block 1 in
+                  [ { Worker_pure_data.value = { value with block = { value.block with parent } }
+                    ; revision = "child"
+                    }
+                  ])
+                else []
+              in
+              (Ok(F.children ~parent:(parent) ~revision_scope:(Worker_pure_data.V2_children_revision parent) ~scope_revision:("children") ~items:(existing
+                    @ List.filter_map
+                        (fun (owner, (root : Worker_pure_data.block_tree)) ->
+                           if not (G.Uuid.equal owner parent)
+                           then None
+                           else (
+                             let value = timeline_block 0 in
+                             Some
+                               { Worker_pure_data.value =
+                                   { value with
+                                     block =
+                                       { value.block with
+                                         uuid = root.uuid
+                                       ; title = root.title
+                                       ; parent
+                                       ; order = "999"
+                                       }
+                                   }
+                               ; revision = "appended"
+                               }))
+                        (Atomic.get detail_captures)) ~next:(next (None))))
+            | Read.Child_members { parent; _ }
+              when Atomic.get detail_fixture && G.Uuid.equal parent (uuid 1) ->
+              if check_copy && Atomic.get detail_initial_limit = None
+              then Atomic.set detail_initial_limit (Some limit);
+              let value = timeline_block 1 in
+              (Ok(F.children ~parent:(parent) ~revision_scope:(Worker_pure_data.V2_children_revision parent) ~scope_revision:("children") ~items:(List.init
+                      (if check_detail_wait then 2 else 1)
+                      (fun i ->
+                       let value = if i = 0 then value else timeline_block 2 in
+                       { Worker_pure_data.value = { value with block = { value.block with parent } }
+                       ; revision = "child"
+                         })) ~next:(next (None))))
+            | Read.Child_members { parent; _ } ->
+              if Atomic.get detail_fixture && (check_detail_discovery || check_detail_wait) && G.Uuid.equal parent (uuid 2)
+              then Atomic.set discovery_reads (limit :: Atomic.get discovery_reads);
+              (* Initial first pages complete before publication. The wait
+                 scenario delays only a later explicit continuation read. *)
+              if Atomic.get detail_fixture && check_detail_wait && G.Uuid.equal parent (uuid 2) && cursor <> None then
+                while not (Atomic.get detail_wait_release) do
+                  Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
+                done;
+              (Ok(F.children ~parent:(parent) ~revision_scope:(Worker_pure_data.V2_children_revision parent) ~scope_revision:("children") ~items:((if G.Uuid.equal parent favorites_page.uuid
+                     then List.init 65 favorite_membership
+                     else if Atomic.get detail_fixture && check_detail_wait && cursor = None
+                          && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
+                     then (
+                       let value = timeline_block (if G.Uuid.equal parent (uuid 2) then 63 else 64) in
+                       [ { Worker_pure_data.value = { value with block = { value.block with parent } }
+                         ; revision = "child-first-page"
+                         }
+                       ])
+                     else [])) ~next:(next ((if Atomic.get detail_fixture && check_detail_wait && cursor = None
+                        && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
+                     then Some (G.Cursor.of_string "later-child-page" |> Result.get_ok)
+                     else None)))))
+            | Read.Favorites _ ->
+              let offset =
+                match cursor with
+                | None -> 0
+                | Some cursor -> int_of_string (G.Cursor.to_string cursor)
+              in
+              let items =
+                favorite_items ()
+                |> List.filteri (fun n _ -> n >= offset && n < offset + limit)
+              in
+              let through = offset + List.length items in
+              (Ok(F.favorites ~favorites_page:(Some favorites_page.uuid) ~generation:("g") ~projection_revision:("p") ~items:(items) ~next:(next ((if through < 65
+                     then
+                       Some (G.Cursor.of_string (string_of_int through) |> Result.get_ok)
+                     else None)))))
+            | Read.Assets { roots; recursive; _ }
+              when recursive && Atomic.get asset_change_armed && asset_change = Some `Failure ->
+              let _ = roots,cursor in
+              (Error(fixture_error ("FixtureReadFailure") ("Synthetic offline listing failed")))
+            | Read.Assets { recursive=true;after=None;_ }
+              when Atomic.get asset_change_armed && asset_change=Some `More ->
+              let module A=Logseq_db_types.Asset_descriptor in
+              (Ok(F.asset_listing ~generation:("g") ~projection_revision:("p") ~items:([A.create ~uuid:(uuid 99000) ~source:(Managed None)
+                  ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok]) ~next:(next (Some(G.Cursor.of_string "offline-next" |> Result.get_ok)))))
+            | Read.Assets { roots; _ } ->
+              if !fail_this_media_listing || (Atomic.get fail_media_listings && List.exists(G.Uuid.equal(uuid 1))roots) then (
+                Atomic.set fail_media_listings false;
+                (Error(fixture_error ("FixtureReadFailure") ("Synthetic Media listing failed"))))
+              else (
+              Atomic.set queried (List.rev_append roots (Atomic.get queried));
+              (Ok(F.asset_listing ~generation:("g") ~projection_revision:("p") ~items:((if check_ios_capture || Option.is_some media_rows
+                     then
+                       let module A = Logseq_db_types.Asset_descriptor in
+                       [ A.create
+                           ~uuid:
+                             (uuid
+                                (if shared_media
+                                 then 20000
+                                 else
+                                   20000
+                                   + Option.value
+                                       (List.find_index
+                                          (G.Uuid.equal (List.hd roots))
+                                          (List.init 65 (fun n -> uuid (n + 1))))
+                                       ~default:0))
+                           ~source:
+                             (Managed
+                                (Some
+                                   (A.version
+                                      ~checksum:
+                                        (String.make 64 (Atomic.get media_checksum))
+                                      ~file_type:"png"
+                                    |> Result.get_ok)))
+                           ~current_checksum:None
+                           ~size:None
+                           ~dimensions:(Some (120, 80))
+                         |> Result.get_ok
+                       ]
+                     else [])) ~next:(next (None)))))
+            |_->Error(Read.Service_failed "Unused fixture query")
+        in
+        match request with
         | Coordination_recover_import_inputs{registration;owner;request_id;after;maximum_items;maximum_bytes} when check_import_recovery->
           Atomic.incr source_reads;
           let module R=Logseq_db_types.Asset_import.Recovery in
@@ -1193,8 +1504,8 @@ let run_favorites_native_visibility
           if original.input<>input || original.prepared<>Some prepared then Error "Source fixture rejected changed original proof" else (
             Atomic.incr source_acks;Atomic.set source_reviewed true;
             Ok(Service.Coordination_import_input_acknowledged{registration;owner;request_id}))
-        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ ->host_fixture context normalized
-        | Coordination_finalize_asset_demand _ | Coordination_finalize_observation _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
+        | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ ->host_fixture context request
+        | Coordination_finalize_asset_demand _ | Coordination_finalize_observation _ | Coordination_quiesce_writers _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration ->
           Atomic.set coordination_registration(Some registration);
           Ok(Service.Coordination_registered(coordination_baseline registration))
@@ -1206,7 +1517,6 @@ let run_favorites_native_visibility
           (match Atomic.get coordination_registration with Some id when id<=registration->
             Atomic.set coordination_registration None|_->());
           Ok(Service.Coordination_released registration)
-        | Coordination_query _ -> Error "Fixture normalization failed"
         | Coordination_observe _ | Coordination_refresh_observation _ | Coordination_release_observation _ ->
           Error "Observation is not used by this fixture"
         | Coordination_recover_mutations {request_id;after;maximum_items;maximum_bytes;_}
@@ -1225,9 +1535,9 @@ let run_favorites_native_visibility
           let page=Wire.{items;next=(if offset+count<21 then Some(Int64.of_int(offset+count)) else None)} in
           if Wire.recovery_page_bytes page>maximum_bytes then Error "Fixture recovery byte budget"
           else Ok(Service.Coordination_mutations_recovered{request_id;page})
-        | Coordination_mutation _ | Coordination_confirm _ | Coordination_recover_mutations _ | Coordination_acknowledge_mutation _ -> Error "Unused durable coordination fixture"
+        | Coordination_recover_mutations _ | Coordination_acknowledge_mutation _ -> Error "Unused durable coordination fixture"
         | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
-        | Service.Get_graph_state ->
+        | Service.Get_graph_state | Get_graph_state_at _ ->
           Option.iter(fun registration->W.Request_context.emit context
             ~topic:(Journal_worker_ids.Worker.Push_topic.of_int 7)
             (Service.Coordination_updates[Service.Coordination_snapshot(coordination_baseline registration)]))
@@ -1311,7 +1621,7 @@ let run_favorites_native_visibility
         | Asset_command { command = Release_asset_demand _; _ } ->
           Atomic.incr released_demands;
           Ok Service.Client_command_completed
-        | Asset_command { command = Retry_asset _; _ } when Option.is_some media_rows ->
+        | Asset_command { command = Retry_asset _; _ } | Asset_command_at(_,Retry_asset _) when Option.is_some media_rows ->
           Atomic.incr retries;
           Ok Service.Client_command_completed
         | Acquire_asset_file _ when Option.is_some media_rows ->
@@ -1334,10 +1644,11 @@ let run_favorites_native_visibility
                      resident_graphs = []; resident_scopes = [];
                      startup = { manager.snapshot.startup with awaiting_selection = true } } });
           Ok Service.Client_command_completed
-        | Client_command _ | Asset_command _ -> Ok Service.Client_command_completed
+        | Client_command _ | Asset_command _ | Asset_command_at _ -> Ok Service.Client_command_completed
         | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
-        | Import_asset { graph_generation; source }
+        | Coordination_import input
           when check_capture_imports || Option.is_some detail_capture ->
+          let graph_generation=input.owner.graph_generation and source=input.source in
           Atomic.set import_targets (Atomic.get import_targets @ [ source.target ]);
           Atomic.set imports_entered (Atomic.get imports_entered @ [ source.title ]);
           if source.title = "First attachment" then
@@ -1358,7 +1669,7 @@ let run_favorites_native_visibility
             Atomic.incr imports_finished;
             if List.mem detail_capture [Some "interrupted-imports"; Some "legacy-interrupted"]
             then Error "Fixture interrupted import"
-            else Ok (Service.Asset_imported (Error "Fixture first attachment failed")))
+            else Ok (Service.Coordination_imported{registration=input.registration;owner=input.owner;request_id=input.request_id;result=Error "Fixture first attachment failed"}))
           else
             let module A = Logseq_db_types.Asset_descriptor in
             let durable_path = source.source_file ^ ".durable" in
@@ -1373,8 +1684,7 @@ let run_favorites_native_visibility
             in
             Atomic.incr imports_finished;
             Ok
-              (Service.Asset_imported
-                 (Ok
+              (Service.Coordination_imported{registration=input.registration;owner=input.owner;request_id=input.request_id;result=Ok
                     { operation = source.operation
                     ; graph_generation
                     ; scope={scope with graph_generation}
@@ -1382,9 +1692,28 @@ let run_favorites_native_visibility
                     ; asset
                     ; file_type = source.file_type
                     ; preview = Some ("synthetic-capture-local-lease", durable_path)
-                    }))
-        | Import_asset _ -> Error "unexpected import"
-        | Graph_request request ->
+                    }})
+        | Import_asset _ | Import_asset_at _ | Coordination_import _ -> Error "unexpected import"
+        |Coordination_query source->
+          let Read.Read_query(budget,query)=source.read in
+          Ok(Service.Coordination_queried{registration=source.registration;owner=source.owner;
+            request_id=source.request_id;answer=Read.For_worker.answer budget query(sample ~confirmation:false budget query)})
+        |Coordination_acknowledge_changes source->
+          Atomic.set changes_acknowledged true;
+          let batch=source.batch in
+          Ok(Service.Coordination_changes_acknowledged{registration=source.registration;owner=source.owner;
+            request_id=source.request_id;result=Ok(Read.For_worker.change_ack
+              ~ack_owner:(Read.change_batch_session batch) ~generation:batch.generation ~through:batch.through)})
+        |Coordination_confirm source->
+          let Read.Read_query(budget,query)=source.read in
+          let result=if (durable_case=Some `Confirm_failed && Atomic.get typed_status_confirms=1)
+            ||(edit_pending && Atomic.get typed_status_confirms=1)
+            ||(durable_status=Some `Reconfirm_failed && Atomic.get typed_status_confirms=2)
+            then Error(fixture_error "invalidRequest" "Fixture canonical read failed")
+            else sample ~confirmation:true budget query in
+          Ok(Service.Coordination_confirmed{registration=source.registration;owner=source.owner;
+            presentation=source.presentation;request_id=source.request_id;answer=Read.For_worker.answer budget query result})
+        |Coordination_mutation source->
           let commit_status mutation_id block value =
             if detail_capture=Some "status-rejected" then (
               Alcotest.(check bool) "status failure belongs to the already inserted child"true
@@ -1404,24 +1733,7 @@ let run_favorites_native_visibility
               P.V2_mutation_committed { mutation_id; status = Worker_pure_data.V2_applied; generation = "g"
                 ; before_projection_revision = "p"; after_projection_revision = "p2" }))
           in
-          let outcome =
-            match request.command with
-            | P.V2_list_task_statuses _ ->
-              P.V2_task_statuses_outcome
-                { property_uuid = Some (uuid 90001)
-                ; default_status = Some (status_uuid "todo")
-                ; items = List.map snd status_definitions
-                ; next_cursor = None
-                }
-            | V2_get_task_status_definitions { statuses } ->
-              V2_task_status_definitions_outcome
-                (List.map
-                   (fun uuid ->
-                      List.find_map
-                        (fun (_, (d : G.task_status_definition)) ->
-                           if G.Uuid.equal uuid d.uuid then Some d else None)
-                        status_definitions)
-                   statuses)
+          let outcome=match Wire.command(durable_intent source.intent)with
             | P.V2_delete_blocks { root; mutation_id; preconditions }
               when Option.is_some delete_scenario ->
               Alcotest.(check string) "delete keeps target UUID"
@@ -1452,419 +1764,9 @@ let run_favorites_native_visibility
             | V2_clear_task_status { mutation_id; block; _ }
               when Option.is_some status_scenario || detail_capture=Some "status-rejected" ->
               commit_status mutation_id block None
-            | P.V2_graph_info ->
-              P.V2_graph_info_outcome
-                { graph_uuid = uuid 900
-                ; graph_name = "Fixture"
-                ; schema = { major = 65; minor = 33 }
-                ; admission_facts = []
-                ; journal_title_format = None
-                ; limits =
-                    { response_budget_bytes = Worker_pure_data.maximum_response_bytes
-                    ; outbox_max_records = 4096
-                    ; outbox_max_bytes = 8388608
-                    ; change_max_items = 4096
-                    ; change_max_bytes = 1048576
-                    ; dispatcher_capacity = 256
-                    ; wire_batch_max_bytes = 262144
-                    }
-                ; generation = "g"
-                ; projection_revision = "p"
-                }
-            | V2_list_journals _ ->
-              Atomic.set feed_queried true;
-              let _ = Atomic.fetch_and_add calendar_feed_reads 1 in
-              if Atomic.get calendar_refresh_pending then (
-                while not (Atomic.get calendar_feed_release) do Unix.sleepf 0.001 done;
-                V2_failed {code="FixtureCalendarRefresh"; message="Calendar refresh fixture failed"})
-              else V2_journals_outcome
-                { items = [ { page; journal_day = 20260901; revision = "p" } ]
-                ; next_cursor = None
-                }
-            | V2_get_page_tree { maximum_depth; limit; cursor; _ } ->
-              let count = Option.value media_rows ~default:timeline_rows in
-              let offset = match cursor with None -> 0 | Some value -> int_of_string (G.Cursor.to_string value) in
-              let length = max 0 (min limit (count - offset)) in
-              V2_page_tree_outcome
-                { page = page.uuid
-                ; maximum_depth
-                ; items = List.init length (fun index ->
-                    { Worker_pure_data.value = timeline_block (offset + index)
-                    ; revision = status_revision ()
-                    ; depth = 0
-                    ; parent = page.uuid })
-                ; next_cursor =
-                    (if offset + length < count
-                     then Some (G.Cursor.of_string (string_of_int (offset + length)) |> Result.get_ok) else None)
-                }
-            | V2_pull_changes {generation;after;_} ->
-              Atomic.incr change_pull_reads;
-              V2_changes
-                { generation
-                ; from_exclusive = after
-                ; through = "p2"
-                ; next = None
-                ; windows =
-                    [ { id = "p2"
-                      ; predecessor = "p"
-                      ; successor = "p2"
-                      ; block_uuids =
-                          (if Option.is_some asset_change then [] else if Atomic.get media_metadata_changed
-                           then [ uuid 20000 ]
-                           else [if check_point_read_owner then uuid 1 else uuid 2])
-                      ; page_uuids = []
-                      ; structure_interests = (if Option.is_some asset_change
-                          then [Worker_pure_data.V2_page_tree_interest page.uuid] else [])
-                      }
-                    ]
-                }
-            | V2_ack_changes {generation;through} ->
-              Atomic.set changes_acknowledged true;
-              V2_changes_acknowledged {generation;through}
-            | V2_get_outline_block { block; _ } ->
-              if block=uuid 1 && Atomic.exchange detail_observed_failure false then V2_failed{
-                code=Logseq_db_worker.Error.code_string Storage_busy;message="Observation sample failed"}
-              else if Atomic.get detail_observed_missing && block=uuid 1 then
-                V2_block_outcome(Worker_pure_data.V2_missing_block{uuid=block;revision="observed-missing"})
-              else if !fail_this_media_read then V2_failed {code="FixtureReadFailure";message="Synthetic Media dependency read failed"}
-              else V2_block_outcome
-                (match
-                   List.find_opt
-                     (fun (parent, (root : Worker_pure_data.block_tree)) ->
-                        let _ = parent in
-                        G.Uuid.equal root.uuid block)
-                     (Atomic.get detail_captures)
-                 with
-                 | Some (parent, root) ->
-                   let value = timeline_block 0 in
-                   Worker_pure_data.V2_present_block
-                     { value =
-                         { value with
-                           block =
-                             { value.block with
-                               uuid = root.uuid
-                             ; title = root.title
-                             ; parent
-                             ; order = "999"
-                             }
-                         }
-                     ; revision = "appended"
-                     }
-                 | None ->
-                   (match List.find_index (G.Uuid.equal block) roots with
-                    | Some n ->
-                      Worker_pure_data.V2_present_block { value = timeline_block n; revision =
-                        (if n=0 && Atomic.get detail_observed_title then "observed-root-1" else status_revision ()) }
-                    | None -> Worker_pure_data.V2_missing_block { uuid = block; revision = "p" }))
-            | V2_get_outline_block_summary{block;_} when
-                List.exists(fun(_, (root:Worker_pure_data.block_tree))->root.uuid=block)(Atomic.get detail_captures) ->
-              let parent,root=List.find(fun(_, (root:Worker_pure_data.block_tree))->root.uuid=block)(Atomic.get detail_captures) in
-              let value=timeline_block 0 in
-              let value={value with block={value.block with uuid=root.uuid;title=root.title;parent;order="999"}} in
-              V2_block_summary_outcome{lookup=Worker_pure_data.V2_present_block{value;revision="appended"};
-                page=Some(Worker_pure_data.V2_present_page{page;revision="p"});items=[];next_cursor=None;
-                scope_revision="child-children";generation="generation:v1:1:1";
-                projection_revision="projection:v1:1"}
-            | V2_get_outline_block_summary{block;_} when Option.is_some delete_scenario ->
-              let present=durable_delete=Some `Conflict || durable_delete=Some `Reappeared in
-              let value=timeline_block 0 in
-              let value=if durable_delete=Some `Reappeared then
-                {value with block={value.block with title="Reappeared after deletion"}} else value in
-              V2_block_summary_outcome{lookup=(if present then Worker_pure_data.V2_present_block{value;revision="canonical-current"}
-                else Worker_pure_data.V2_missing_block{uuid=block;revision="deleted"});
-                page=(if present then Some(Worker_pure_data.V2_present_page{page;revision="p"}) else None);items=[];
-                next_cursor=None;scope_revision="children";generation="generation:v1:1:1";
-                projection_revision=(if durable_delete=Some `Reappeared then "projection:v1:2" else "projection:v1:1")}
-            | V2_get_outline_block_summary { block; cursor; _ } when Option.is_some status_scenario ->
-              let paged=durable_status=Some `Paged in
-              if paged && Option.is_some cursor then (
-                Atomic.set status_more_entered true;
-                while not(Atomic.get status_more_release) do
-                  Eio.Time.Mono.sleep(W.Request_context.clock context)0.001 done);
-              let child n : Worker_pure_data.child_member =
-                let value=timeline_block n in
-                {value={value with block={value.block with uuid=uuid(9100+n);parent=block;title="Canonical child "^string_of_int n}};
-                 revision="child"} in
-              let n = List.find_index (G.Uuid.equal block) roots |> Option.get in
-              V2_block_summary_outcome
-                { lookup = Worker_pure_data.V2_present_block { value = timeline_block n; revision = status_revision () }
-                ; page = Some (Worker_pure_data.V2_present_page { page; revision = "p" })
-                ; items = (if paged then [child(if cursor=None then 0 else 1)] else [])
-                ; next_cursor = (if paged && cursor=None then Some(G.Cursor.of_string "status-confirmation-more" |> Result.get_ok) else None)
-                ; scope_revision = "children"
-                ; generation = (if paged then "generation:v1:1:1" else "g")
-                ; projection_revision = (if paged then "projection:v1:1" else "p2") }
-            | V2_get_outline_block_summary { block; _ } when check_capture_imports ->
-              let root = Atomic.get capture_root |> Option.get in
-              let page = Atomic.get capture_page |> Option.get in
-              Alcotest.(check string)
-                "capture summary queries committed UUID"
-                (G.Uuid.to_string root.uuid)
-                (G.Uuid.to_string block);
-              let value = timeline_block 0 in
-              V2_block_summary_outcome
-                { lookup =
-                    Worker_pure_data.V2_present_block
-                      { value =
-                          { value with
-                            block =
-                              { value.block with
-                                uuid = root.uuid
-                              ; title = root.title
-                              ; parent = page.uuid
-                              ; page = page.uuid
-                              }
-                          ; rendered_page_title = page.title
-                          }
-                      ; revision = "captured"
-                      }
-                ; page = Some (Worker_pure_data.V2_present_page { page; revision = "p" })
-                ; items = (if capture_case=Some `Paged then
-                    [{Worker_pure_data.value={value with block={value.block with uuid=uuid 94322;
-                        title="Canonical child";parent=root.uuid;page=page.uuid}};revision="child"}]
-                    else [])
-                ; next_cursor = (if capture_case=Some `Paged
-                    then Some(G.Cursor.of_string "capture-more" |> Result.get_ok) else None)
-                ; scope_revision = "children"
-                ; generation = "g"
-                ; projection_revision = "p2"
-                }
-            | V2_get_page { page = requested; _ } ->
-              let known =
-                if G.Uuid.equal requested page.uuid
-                then Some page
-                else if G.Uuid.equal requested favorites_page.uuid
-                then Some favorites_page
-                else
-                  List.find_map
-                    (fun n ->
-                       if n mod 2 = 0 && G.Uuid.equal requested (favorite_target_uuid n)
-                       then Some (favorite_page n)
-                       else None)
-                    (List.init 65 Fun.id)
-              in
-              let capture_day =
-                if not check_capture_imports
-                then None
-                else (
-                  try
-                    Scanf.sscanf
-                      (G.Uuid.to_string requested)
-                      "00000001-%4d-%4d-0000-000000000000%!"
-                      (fun year month_day ->
-                         let month = month_day / 100
-                         and day = month_day mod 100 in
-                         let leap =
-                           year mod 4 = 0 && (year mod 100 <> 0 || year mod 400 = 0)
-                         in
-                         let maximum_day =
-                           match month with
-                           | 2 -> if leap then 29 else 28
-                           | 4 | 6 | 9 | 11 -> 30
-                           | 1 | 3 | 5 | 7 | 8 | 10 | 12 -> 31
-                           | _ -> 0
-                         in
-                         if
-                           year > 0
-                           && day >= 1
-                           && day <= maximum_day
-                           && G.Uuid.to_string requested
-                              = Printf.sprintf
-                                  "00000001-%04d-%04d-0000-000000000000"
-                                  year
-                                  month_day
-                         then Some ((year * 10000) + month_day)
-                         else None)
-                  with
-                  | Scanf.Scan_failure _ | End_of_file | Failure _ -> None)
-              in
-              let known =
-                match known, capture_day with
-                | Some _, _ -> known
-                | None, Some journal_day ->
-                  let name = Printf.sprintf "%08d" journal_day in
-                  let captured =
-                    { page with
-                      uuid = requested
-                    ; name
-                    ; title = name
-                    ; kind = Journal_page { journal_day }
-                    }
-                  in
-                  Atomic.set capture_page (Some captured);
-                  Some captured
-                | None, None -> None
-              in
-              V2_page_outcome
-                (match known with
-                 | Some page -> Worker_pure_data.V2_present_page { page; revision = "p" }
-                 | None -> Worker_pure_data.V2_missing_page { uuid = requested; revision = "p" })
-            | V2_get_children { parent; _ } when Option.is_some detail_capture ->
-              let existing =
-                if G.Uuid.equal parent (uuid 1)
-                then (
-                  let value = timeline_block 1 in
-                  [ { Worker_pure_data.value = { value with block = { value.block with parent } }
-                    ; revision = "child"
-                    }
-                  ])
-                else []
-              in
-              V2_children_outcome
-                { parent
-                ; revision_scope = Worker_pure_data.V2_children_revision parent
-                ; scope_revision = "children"
-                ; items =
-                    existing
-                    @ List.filter_map
-                        (fun (owner, (root : Worker_pure_data.block_tree)) ->
-                           if not (G.Uuid.equal owner parent)
-                           then None
-                           else (
-                             let value = timeline_block 0 in
-                             Some
-                               { Worker_pure_data.value =
-                                   { value with
-                                     block =
-                                       { value.block with
-                                         uuid = root.uuid
-                                       ; title = root.title
-                                       ; parent
-                                       ; order = "999"
-                                       }
-                                   }
-                               ; revision = "appended"
-                               }))
-                        (Atomic.get detail_captures)
-                ; next_cursor = None
-                }
-            | V2_get_children { parent; limit; _ }
-              when Atomic.get detail_fixture && G.Uuid.equal parent (uuid 1) ->
-              if check_copy && Atomic.get detail_initial_limit = None
-              then Atomic.set detail_initial_limit (Some limit);
-              let value = timeline_block 1 in
-              V2_children_outcome
-                { parent
-                ; revision_scope = Worker_pure_data.V2_children_revision parent
-                ; scope_revision = "children"
-                ; items =
-                    List.init
-                      (if check_detail_wait then 2 else 1)
-                      (fun i ->
-                       let value = if i = 0 then value else timeline_block 2 in
-                       { Worker_pure_data.value = { value with block = { value.block with parent } }
-                       ; revision = "child"
-                         })
-                ; next_cursor = None
-                }
-            | V2_get_children { parent; limit; cursor; _ } ->
-              if Atomic.get detail_fixture && (check_detail_discovery || check_detail_wait) && G.Uuid.equal parent (uuid 2)
-              then Atomic.set discovery_reads (limit :: Atomic.get discovery_reads);
-              (* Initial first pages complete before publication. The wait
-                 scenario delays only a later explicit continuation read. *)
-              if Atomic.get detail_fixture && check_detail_wait && G.Uuid.equal parent (uuid 2) && cursor <> None then
-                while not (Atomic.get detail_wait_release) do
-                  Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
-                done;
-              V2_children_outcome
-                { parent
-                ; revision_scope = Worker_pure_data.V2_children_revision parent
-                ; scope_revision = "children"
-                ; items =
-                    (if G.Uuid.equal parent favorites_page.uuid
-                     then List.init 65 favorite_membership
-                     else if Atomic.get detail_fixture && check_detail_wait && cursor = None
-                          && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
-                     then (
-                       let value = timeline_block (if G.Uuid.equal parent (uuid 2) then 63 else 64) in
-                       [ { Worker_pure_data.value = { value with block = { value.block with parent } }
-                         ; revision = "child-first-page"
-                         }
-                       ])
-                     else [])
-                ; next_cursor =
-                    (if Atomic.get detail_fixture && check_detail_wait && cursor = None
-                        && (G.Uuid.equal parent (uuid 2) || G.Uuid.equal parent (uuid 3))
-                     then Some (G.Cursor.of_string "later-child-page" |> Result.get_ok)
-                     else None)
-                }
-            | V2_list_favorites { limit; cursor } ->
-              let offset =
-                match cursor with
-                | None -> 0
-                | Some cursor -> int_of_string (G.Cursor.to_string cursor)
-              in
-              let items =
-                favorite_items ()
-                |> List.filteri (fun n _ -> n >= offset && n < offset + limit)
-              in
-              let through = offset + List.length items in
-              V2_favorites_outcome
-                { favorites_page = Some favorites_page.uuid
-                ; generation = "g"
-                ; projection_revision = "p"
-                ; items
-                ; next_cursor =
-                    (if through < 65
-                     then
-                       Some (G.Cursor.of_string (string_of_int through) |> Result.get_ok)
-                     else None)
-                }
-            | V2_list_assets { roots; recursive; cursor; _ }
-              when recursive && Atomic.get asset_change_armed && asset_change = Some `Failure ->
-              let _ = roots,cursor in
-              V2_failed {code="FixtureReadFailure";message="Synthetic offline listing failed"}
-            | V2_list_assets { recursive=true;cursor=None;_ }
-              when Atomic.get asset_change_armed && asset_change=Some `More ->
-              let module A=Logseq_db_types.Asset_descriptor in
-              V2_assets_outcome {generation="g";projection_revision="p";
-                items=[A.create ~uuid:(uuid 99000) ~source:(Managed None)
-                  ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok];
-                next_cursor=Some(G.Cursor.of_string "offline-next" |> Result.get_ok)}
-            | V2_list_assets { roots; _ } ->
-              if !fail_this_media_listing || (Atomic.get fail_media_listings && List.exists(G.Uuid.equal(uuid 1))roots) then (
-                Atomic.set fail_media_listings false;
-                V2_failed {code="FixtureReadFailure";message="Synthetic Media listing failed"})
-              else (
-              Atomic.set queried (List.rev_append roots (Atomic.get queried));
-              V2_assets_outcome
-                { generation = "g"
-                ; projection_revision = "p"
-                ; items =
-                    (if check_ios_capture || Option.is_some media_rows
-                     then
-                       let module A = Logseq_db_types.Asset_descriptor in
-                       [ A.create
-                           ~uuid:
-                             (uuid
-                                (if shared_media
-                                 then 20000
-                                 else
-                                   20000
-                                   + Option.value
-                                       (List.find_index
-                                          (G.Uuid.equal (List.hd roots))
-                                          (List.init 65 (fun n -> uuid (n + 1))))
-                                       ~default:0))
-                           ~source:
-                             (Managed
-                                (Some
-                                   (A.version
-                                      ~checksum:
-                                        (String.make 64 (Atomic.get media_checksum))
-                                      ~file_type:"png"
-                                    |> Result.get_ok)))
-                           ~current_checksum:None
-                           ~size:None
-                           ~dimensions:(Some (120, 80))
-                         |> Result.get_ok
-                       ]
-                     else [])
-                ; next_cursor = None
-                })
             | V2_insert_blocks { mutation_id; parent; roots = [ root ]; _ }
               when Option.is_some detail_capture ->
-              (match original_request with Service.Coordination_mutation _->()|_->Atomic.incr legacy_child_writes);
+
               Atomic.incr child_attempts;
               while not (Atomic.get child_release) do
                 Eio.Time.Mono.sleep (W.Request_context.clock context) 0.001
@@ -1884,7 +1786,7 @@ let run_favorites_native_visibility
                   ; after_projection_revision = "p2"
                   })
             | V2_append_journal{mutation_id;page=candidate;journal_day;root} when check_capture_imports ->
-              (match original_request with Service.Coordination_mutation _->()|_->Atomic.incr legacy_capture_writes);
+
               Atomic.incr capture_append_writes;
               Alcotest.(check int) "the full attachment-only capture has one root" 0(Rrbvec.length root.children);
               let captured={page with uuid=uuid 94321;name=string_of_int journal_day;
@@ -1911,33 +1813,16 @@ let run_favorites_native_visibility
                 }
             | _ -> V2_failed { code = "unsupported"; message = "Unused fixture command" }
           in
-          let response=P.V2_response{api_version=2;request_id=request.request_id;outcome} in
-          Ok (match original_request with
-            | Service.Coordination_mutation{request_id;intent;_}->
-              let outcome=match outcome with
-                | P.V2_mutation_committed point->Wire.Committed(P.V2_response{api_version=2;request_id;
-                    outcome=V2_mutation_committed{point with generation="generation:v1:1:1";
-                      before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"}})
-                | _->Wire.Rejected response in
-              Hashtbl.replace durable_outcomes intent outcome;
-              Service.Coordination_mutation_result{request_id;outcome=(if (durable_case=Some `Unknown || capture_case=Some `Unknown || edit_pending)
-                && Atomic.get typed_status_mutations=1 then Wire.Unknown else outcome)}
-            | Coordination_confirm _ when (durable_case=Some `Confirm_failed && Atomic.get typed_status_confirms=1)
-              || (edit_pending && Atomic.get typed_status_confirms=1)
-              || (durable_status=Some `Reconfirm_failed && Atomic.get typed_status_confirms=2) ->
-              Service.Graph_response(P.V2_response{api_version=2;request_id=request.request_id;
-                outcome=V2_failed{code="invalidRequest";message="Fixture canonical read failed"}})
-            | Coordination_confirm _ when durable_status=Some `Absence ->
-              Service.Graph_response(P.V2_response{api_version=2;request_id=request.request_id;
-                outcome=V2_block_summary_outcome{lookup=Worker_pure_data.V2_missing_block{uuid=uuid 1;revision="missing"};
-                  page=None;items=[];next_cursor=None;scope_revision="children";
-                  generation="generation:v1:1:1";projection_revision="projection:v1:1"}})
-            | Coordination_confirm _ ->
-              Service.Graph_response(match response with P.V2_response({outcome=V2_block_summary_outcome value;_}as response)->
-                P.V2_response{response with outcome=V2_block_summary_outcome{value with
-                  generation=Printf.sprintf "generation:v1:1:%d"(Atomic.get graph_generation);
-                  projection_revision="projection:v1:1"}}|_->response)
-            | _->Service.Graph_response response)))
+          let response=P.V2_response{api_version=2;request_id=source.request_id;outcome}in
+          let outcome=match outcome with
+            |P.V2_mutation_committed point->Wire.Committed(P.V2_response{api_version=2;request_id=source.request_id;
+              outcome=V2_mutation_committed{point with generation="generation:v1:1:1";
+                before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"}})
+            |_->Wire.Rejected response in
+          Hashtbl.replace durable_outcomes source.intent outcome;
+          Ok(Service.Coordination_mutation_result{request_id=source.request_id;
+            outcome=(if (durable_case=Some `Unknown||capture_case=Some `Unknown||edit_pending)
+              && Atomic.get typed_status_mutations=1 then Wire.Unknown else outcome)})))
       ~shutdown:(fun () -> Atomic.set shutdown_called true)
       ()
   in
@@ -2158,8 +2043,7 @@ let run_favorites_native_visibility
                && Yojson.Safe.Util.member "favorites" json=`String "No managed attachments in this scope"
              | _->false)
            | None->false);
-         Alcotest.(check int) "offline scans have one typed response owner" 0
-           (Atomic.get legacy_offline_scans));
+         ());
        if Option.is_some asset_change then (
          Atomic.set changes_acknowledged false;
          Atomic.set asset_change_armed true;
@@ -3253,7 +3137,6 @@ let run_favorites_native_visibility
               Alcotest.(check int) "child writes use the typed channel" (if scenario="failure" || scenario="status-rejected" then 2 else 1)
                 (Atomic.get typed_status_mutations);
               Alcotest.(check bool) "child completion used canonical confirmation" true (Atomic.get typed_status_confirms>=1);
-              Alcotest.(check int) "child writes have no legacy second consumer" 0 (Atomic.get legacy_child_writes);
               if scenario="status-rejected"then (
                 dispatch(Lui_protocol.Press(Option.get(find "text" "Diagnostics")));
                 wait "known failed status remains in existing Diagnostics" (fun () ->
@@ -3685,7 +3568,6 @@ let run_favorites_native_visibility
          done;
          settle ();
          Alcotest.(check bool) "visible media uses typed demand admission" true(Atomic.get typed_asset_demands>=shown_count);
-         Alcotest.(check int) "visible media emits no legacy demand" 0(Atomic.get legacy_asset_demands);
          let title_ids =
            List.init count (fun n ->
              let title = Printf.sprintf "Timeline fixture %d" n in
@@ -3763,7 +3645,6 @@ let run_favorites_native_visibility
            Atomic.set publish_block true;
            ignore(W.send(Option.get !client)Service.Get_graph_state);
            wait "resource dependency point read reaches actual Worker" (fun()->Atomic.get point_reads>0);
-           Alcotest.(check int) "resource dependency points have one typed response owner" 0(Atomic.get legacy_point_reads);
            if check_media_change_ack then (
              wait "actual Media Facts reply is held" (fun()->Atomic.get changed_media_fact_entered);
              wait "other actual graph consumers remain live" (fun()->Atomic.get changed_other_fact_completed>0);
@@ -4744,7 +4625,6 @@ let run_favorites_native_visibility
              Alcotest.(check bool) "original durable payload never uses the newer buffer" true
                (List.for_all(fun encoded->match Logseq_db_worker_contract.Mutation_pure_wire.command(durable_intent encoded)with
                  |P.V2_append_journal{root;_}->root.title="First attachment"|_->false)(Atomic.get typed_status_intents)));
-           Alcotest.(check int) "Capture has no legacy write consumer" 0(Atomic.get legacy_capture_writes);
            Alcotest.(check int) "canonical Capture was ACKed before imports" (if capture_case=Some `Ack_failed then 2 else 1)
              (Atomic.get typed_status_acks);
            if List.mem capture_case [Some `Closed_import;Some `Closed_failed_import] then (
@@ -5181,9 +5061,8 @@ let run_favorites_native_visibility
              (Atomic.get queried=before)))))));
   if check_point_read_owner then (
     Alcotest.(check bool) "media fixture actually exercised listing reads" true(Atomic.get media_listings>0);
-    Alcotest.(check int) "media listings have one typed response owner" 0(Atomic.get legacy_media_listings);
     Alcotest.(check bool) "resource fixture actually exercised dependency point reads" true (Atomic.get point_reads>0);
-    Alcotest.(check int) "resource dependency points have one typed response owner" 0 (Atomic.get legacy_point_reads))
+    ())
 
 ;;
 
@@ -5281,26 +5160,15 @@ let test_reference_outer_terminals cancel =
           (Service.Client_state_changed manager);
         Ok ())
       ~handle:(fixture_observations (fun context () request ->
-        let completed request outcome =
-          Ok
-            (Service.Graph_response
-               (P.V2_response
-                  { api_version = P.api_version
-                  ; request_id = request.P.request_id
-                  ; outcome
-                  }))
-        in
-        match fixture_request request with
-        | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
+        match request with
         | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ | Coordination_finalize_asset_demand _ | Coordination_finalize_observation _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration -> Ok(Service.Coordination_registered(fixture_coordination manager registration))
         | Release_coordination registration -> Ok(Service.Coordination_released registration)
-        | Coordination_query _ -> Error "Fixture normalization failed"
         | Coordination_observe _ | Coordination_refresh_observation _ | Coordination_release_observation _ ->
           Error "Observation is not used by this fixture"
         | Coordination_mutation _ | Coordination_confirm _ | Coordination_recover_mutations _ | Coordination_acknowledge_mutation _ -> Error "Unused durable coordination fixture"
         | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
-        | Service.Get_graph_state ->
+        | Service.Get_graph_state | Get_graph_state_at _ ->
           if Atomic.exchange refresh false
           then
             W.Request_context.emit
@@ -5308,21 +5176,34 @@ let test_reference_outer_terminals cancel =
               ~topic:Service.invalidation_topic
               (Service.Graph_pushes [scope, P.V2_changes_available { api_version = P.api_version; generation = "g"; through = "r2" }]);
           Ok (Service.Graph_state graph_state)
-        | Client_command _ | Asset_command _ | Release_asset_file _ ->
+        | Client_command _ | Asset_command _ | Asset_command_at _ | Release_asset_file _ ->
           Ok Service.Client_command_completed
         | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
-        | Import_asset _ -> Error "unused import"
-        | Graph_request request ->
-          (match request.command with
-           | P.V2_get_outline_block { block = target; _ }
+        | Import_asset _ | Import_asset_at _ -> Error "unused import"
+        |Coordination_acknowledge_changes source->
+          let batch=source.batch in
+          Ok(Service.Coordination_changes_acknowledged{registration=source.registration;owner=source.owner;
+            request_id=source.request_id;result=Ok(Read.For_worker.change_ack
+              ~ack_owner:(Read.change_batch_session batch) ~generation:batch.generation ~through:batch.through)})
+        |Coordination_query source->
+          let Read.Read_query(budget,query)=source.read in
+          let module F=Read.For_worker in
+          let owner=F.read_budget_owner budget in
+          let next cursor=Option.map(fun cursor->F.continuation ~owner ~budget ~key:(Read.query_key budget query) ~cursor)cursor in
+          let fixture_error code message=Read.Service_failed(code^": "^message)in
+          let completed :type a. a Read.query -> (a,Read.error)result -> (Service.response,string)result=
+            fun query result->Ok(Service.Coordination_queried{registration=source.registration;owner=source.owner;
+              request_id=source.request_id;answer=F.answer budget query result})in
+          (match query with
+
+           | Read.Outline_block {uuid=target;_}
              when not (Array.exists (G.Uuid.equal target) targets) ->
-             completed
-               request
-               (V2_block_outcome
+             completed query
+               (Ok
                   (if G.Uuid.equal target block.uuid
                    then Worker_pure_data.V2_present_block { value = record block; revision = "root" }
                    else Worker_pure_data.V2_missing_block { uuid = target; revision = "p" }))
-           | P.V2_get_page { page = target; _ }
+           | Read.Page {uuid=target;_}
              when Array.exists (G.Uuid.equal target) targets ->
              let index =
                Array.to_list targets
@@ -5345,9 +5226,8 @@ let test_reference_outer_terminals cancel =
                    Worker must emit Cancelled and suppress this late completion. *)
                  Eio.Cancel.protect wait;
                  Atomic.incr late_returns;
-                 completed
-                   request
-                   (V2_page_outcome
+                 completed query
+                   (Ok
                       (Worker_pure_data.V2_present_page
                          { page = { page with uuid = target; title = "Late cancelled target"; kind = Ordinary_page }
                          ; revision = "old"
@@ -5356,92 +5236,52 @@ let test_reference_outer_terminals cancel =
                  wait ();
                  Error "Injected outer Worker failure"))
              else
-               completed
-                 request
-                 (V2_page_outcome
+               completed query
+                 (Ok
                     (Worker_pure_data.V2_present_page
                        { page = { page with uuid = target; title = Printf.sprintf "Fresh target %d" index; kind = Ordinary_page }
                        ; revision = "fresh"
                        }))
-           | V2_graph_info ->
-             completed
-               request
-               (V2_graph_info_outcome
-                  { graph_uuid = uuid 900
-                  ; graph_name = "Fixture"
-                  ; schema = { major = 65; minor = 33 }
-                  ; admission_facts = []
-                  ; journal_title_format = None
-                  ; limits =
-                      { response_budget_bytes = Worker_pure_data.maximum_response_bytes
+           | Read.Graph_info ->
+             completed query
+               ((Ok(F.graph_info ~graph_uuid:(uuid 900) ~graph_name:("Fixture") ~schema:({ major = 65; minor = 33 }) ~admission_facts:([]) ~journal_title_format:(None) ~limits:({ response_budget_bytes = Worker_pure_data.maximum_response_bytes
                       ; outbox_max_records = 4096
                       ; outbox_max_bytes = 8388608
                       ; change_max_items = 4096
                       ; change_max_bytes = 1048576
                       ; dispatcher_capacity = 256
                       ; wire_batch_max_bytes = 262144
-                      }
-                  ; generation = "g"
-                  ; projection_revision = "p"
-                  })
-           | V2_list_journals _ ->
-             completed
-               request
-               (V2_journals_outcome
-                  { items = [ { page; journal_day = 20260901; revision = "p" } ]
-                  ; next_cursor = None
-                  })
-           | V2_get_page_tree { maximum_depth; _ } ->
-             completed
-               request
-               (V2_page_tree_outcome
-                  { page = page.uuid
-                  ; maximum_depth
-                  ; items =
-                      [ { value = record block
+                      }) ~generation:("g") ~projection_revision:("p"))))
+           | Read.Journals _ ->
+             completed query
+               ((Ok(F.slice ~items:([ Worker_pure_data.{ page; journal_day = 20260901; revision = "p" } ]) ~next:(next (None)))))
+           | Read.Tree _ ->
+             completed query
+               ((Ok(F.slice ~items:([ { Worker_pure_data.value = record block
                         ; revision = "root"
                         ; depth = 0
                         ; parent = page.uuid
                         }
-                      ]
-                  ; next_cursor = None
-                  })
-           | V2_get_children {parent;_} ->
-             completed request (V2_children_outcome
-               {parent;revision_scope=Worker_pure_data.V2_children_revision parent;scope_revision="children";items=[];next_cursor=None})
-           | V2_pull_changes {generation;after;_} ->
-             completed
-               request
-               (V2_changes
-                  { generation
-                  ; from_exclusive = after
-                  ; through = "r2"
-                  ; next = None
-                  ; windows =
-                      [ { id = "r2"
+                      ]) ~next:(next (None)))))
+           | Read.Child_members{parent;_} ->
+             completed query ((Ok(F.children ~parent:(parent) ~revision_scope:(Worker_pure_data.V2_children_revision parent) ~scope_revision:("children") ~items:([]) ~next:(next (None)))))
+           | Read.Changes{generation;after} ->
+             completed query
+               ((Ok(F.change_batch ~change_owner:owner ~generation:(generation) ~from_exclusive:(after) ~through:("r2") ~next:(None) ~windows:([ { id = "r2"
                         ; predecessor = "p"
                         ; successor = "r2"
                         ; block_uuids = Array.to_list (Array.sub targets 0 4)
                         ; page_uuids = []
                         ; structure_interests = []
                         }
-                      ]
-                  })
-           | V2_ack_changes { generation; through } ->
-             completed request (V2_changes_acknowledged { generation; through })
-           | V2_list_assets _ ->
-             completed
-               request
-               (V2_assets_outcome
-                  { generation = "g"
-                  ; projection_revision = "p"
-                  ; items = []
-                  ; next_cursor = None
-                  })
+                      ]))))
+           | Read.Assets _ ->
+             completed query
+               ((Ok(F.asset_listing ~generation:("g") ~projection_revision:("p") ~items:([]) ~next:(next (None)))))
            | _ ->
-             completed
-               request
-               (V2_failed { code = "InvalidRequest"; message = "unused fixture query" }))))
+             completed query
+               ((Error(fixture_error ("InvalidRequest") ("unused fixture query"))))
+)))
       ~shutdown:(fun () -> ())
       ()
   in
@@ -5875,33 +5715,31 @@ let test_favorite_page_uses_shared_reference_lookup () =
     ~init:(fun context _ ->
       W.Session_context.emit context ~topic:Service.manager_topic (Service.Client_state_changed manager);
       Ok ())
-    ~handle:(fixture_observations (fun _ () request -> match fixture_request request with
-      | Service.Get_graph_state -> Ok (Service.Graph_state
+    ~handle:(fixture_observations (fun _ () request -> match request with
+      | Service.Get_graph_state | Get_graph_state_at _ -> Ok (Service.Graph_state
           { generation = 1; graph_id = Some (uuid 9); phase = Graph_open; error = None })
       | Register_coordination registration -> Ok(Service.Coordination_registered(fixture_coordination manager registration))
       | Release_coordination registration -> Ok(Service.Coordination_released registration)
       | Client_command _ -> Ok Service.Client_command_completed
-      | Graph_request request ->
-        let open P in
-        let outcome = match request.command with
-          | V2_graph_info -> V2_graph_info_outcome
-              { graph_uuid = uuid 9; graph_name = "Fixture"; schema = { major = 65; minor = 33 }
-              ; admission_facts = []; journal_title_format = None; generation = "g"; projection_revision = "p"
-              ; limits = { response_budget_bytes = Worker_pure_data.maximum_response_bytes; outbox_max_records = 4096
+      | Coordination_query source ->
+          let Read.Read_query(budget,query)=source.read in
+          let module F=Read.For_worker in
+          let owner=F.read_budget_owner budget in
+          let next cursor=Option.map(fun cursor->F.continuation ~owner ~budget ~key:(Read.query_key budget query) ~cursor)cursor in
+          let sample :type a. a Read.query -> (a,Read.error)result=fun query->match query with
+
+          | Read.Graph_info -> (Ok(F.graph_info ~graph_uuid:(uuid 9) ~graph_name:("Fixture") ~schema:({ major = 65; minor = 33 }) ~admission_facts:([]) ~journal_title_format:(None) ~generation:("g") ~projection_revision:("p") ~limits:({ response_budget_bytes = Worker_pure_data.maximum_response_bytes; outbox_max_records = 4096
                   ; outbox_max_bytes = 8388608; change_max_items = 4096; change_max_bytes = 1048576
-                  ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 } }
-          | V2_list_journals _ -> V2_journals_outcome { items = []; next_cursor = None }
-          | V2_list_favorites _ -> V2_favorites_outcome
-              { favorites_page = None; generation = "g"; projection_revision = "p"; next_cursor = None
-              ; items =
-                  [{ membership_uuid = uuid 10; membership_order = "a"; membership_revision = "m"
+                  ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 })))
+          | Read.Journals _ -> (Ok(F.slice ~items:([]) ~next:(next (None))))
+          | Read.Favorites _ -> (Ok(F.favorites ~favorites_page:(None) ~generation:("g") ~projection_revision:("p") ~next:(next (None)) ~items:([{ membership_uuid = uuid 10; membership_order = "a"; membership_revision = "m"
                    ; target = Worker_pure_data.V2_favorite_page { uuid = page.uuid; title = page.title; revision = "p" } }
                   ;{ membership_uuid = uuid 11; membership_order = "b"; membership_revision = "m"
                    ; target = Worker_pure_data.V2_favorite_block
-                       { uuid = block.uuid; title = block.title; task_status = None; revision = "b" } }] }
-          | V2_get_page { page = requested; _ } ->
+                       { uuid = block.uuid; title = block.title; task_status = None; revision = "b" } }])))
+          | Read.Page {uuid=requested;_} ->
             if G.Uuid.equal requested (uuid 3) then Atomic.incr target_reads;
-            V2_page_outcome (Worker_pure_data.V2_present_page
+            Ok (Worker_pure_data.V2_present_page
                     { page =
                         (if G.Uuid.equal requested page.uuid
                          then page
@@ -5912,16 +5750,15 @@ let test_favorite_page_uses_shared_reference_lookup () =
                            ; name = "resolved"
                            })
               ; revision = "p" })
-          | V2_get_outline_block { block = requested; _ } when G.Uuid.equal requested block.uuid ->
-            V2_block_outcome (Worker_pure_data.V2_present_block
+          | Read.Outline_block {uuid=requested;_} when G.Uuid.equal requested block.uuid ->
+            Ok (Worker_pure_data.V2_present_block
               { value = { block; task_status = None; rendered_page_title = page.title; tag_titles = [] }
               ; revision = "b" })
-          | V2_list_assets _ -> V2_assets_outcome
-              { generation = "g"; projection_revision = "p"; items = []; next_cursor = None }
-          | _ -> V2_failed { code = "InvalidRequest"; message = "Unused fixture operation" }
-        in
-        Ok (Service.Graph_response (V2_response
-          { api_version; request_id = request.request_id; outcome }))
+          | Read.Assets _ -> (Ok(F.asset_listing ~generation:("g") ~projection_revision:("p") ~items:([]) ~next:(next (None))))
+          | _ -> (Error((fun code message->Read.Service_failed(code^": "^message)) ("InvalidRequest") ("Unused fixture operation")))
+
+          in Ok(Service.Coordination_queried{registration=source.registration;owner=source.owner;
+            request_id=source.request_id;answer=F.answer budget query(sample query)})
       | _ -> Error "Unused fixture service operation"))
     ~shutdown:(fun () -> ()) () in
   let client = ref None in
@@ -6479,18 +6316,16 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
             ~topic:Service.manager_topic
             (Service.Client_state_changed value)
         in
-        match fixture_request request with
-        | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
+        match request with
         | Coordination_prepare_host_change _ | Coordination_apply_host_change _ | Coordination_confirm_host_change _ | Coordination_finalize_asset_demand _ | Coordination_finalize_observation _ | Coordination_quiesce_writers _ | Coordination_import _ | Coordination_recover_import_inputs _ | Coordination_confirm_import_input _ | Coordination_acknowledge_import_input _ | Coordination_asset_demand _ | Coordination_release_asset_demand _ -> Error "Unused typed asset fixture command"
         | Register_coordination registration -> Ok(Service.Coordination_registered(
             fixture_coordination ~phase:(Atomic.get graph_phase) (Atomic.get current) registration))
         | Release_coordination registration -> Ok(Service.Coordination_released registration)
-        | Coordination_query _ -> Error "Fixture normalization failed"
         | Coordination_observe _ | Coordination_refresh_observation _ | Coordination_release_observation _ ->
           Error "Observation is not used by this fixture"
-        | Coordination_mutation _ | Coordination_confirm _ | Coordination_recover_mutations _ | Coordination_acknowledge_mutation _ -> Error "Unused durable coordination fixture"
+        | Coordination_mutation _ | Coordination_confirm _ | Coordination_acknowledge_changes _ | Coordination_recover_mutations _ | Coordination_acknowledge_mutation _ -> Error "Unused durable coordination fixture"
         | Service.Inspect_local_copy _ | Service.Delete_local_copy _ -> Error "Unused fixture local-copy query"
-        | Service.Get_graph_state ->
+        | Service.Get_graph_state | Get_graph_state_at _ ->
           if queue_full && Atomic.fetch_and_add graph_reads 1 > 1
           then
             while not (Atomic.get release) do
@@ -6619,7 +6454,7 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
              && scope.presentation_generation = startup.presentation_generation
           then publish value;
           Ok Service.Client_command_completed
-        | Client_command (Select_graph _) ->
+        | Client_command (Select_graph _) | Client_command(Focus_resident_graph _) ->
           publish manager;
           Ok Service.Client_command_completed
         | Client_command (Reconcile_authenticated_user { user_id }) ->
@@ -6628,27 +6463,26 @@ let unlock_fixture ?(worker_failure = false) ?(queue_full = false) ?(fail_init =
         | Client_command ((Restore_local_account _ | Local_account_unavailable _) as command) ->
           on_local_account_command command;
           Ok Service.Client_command_completed
-        | Client_command _ | Asset_command _ | Release_asset_file _ ->
+        | Client_command _ | Asset_command _ | Asset_command_at _ | Release_asset_file _ ->
           Ok Service.Client_command_completed
         | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
-        | Graph_request request when attach_mirror ->
-          let module P = Logseq_db_worker.Protocol in
-          let outcome = match request.command with
-            | P.V2_graph_info -> P.V2_graph_info_outcome
-                { graph_uuid = graph_id; graph_name = "Synthetic"
-                ; schema = { major = 65; minor = 33 }; admission_facts = []
-                ; journal_title_format = None
-                ; limits = { response_budget_bytes = Worker_pure_data.maximum_response_bytes
+        | Coordination_query source when attach_mirror ->
+          let Read.Read_query(budget,query)=source.read in
+          let module F=Read.For_worker in
+          let owner=F.read_budget_owner budget in
+          let next cursor=Option.map(fun cursor->F.continuation ~owner ~budget ~key:(Read.query_key budget query) ~cursor)cursor in
+          let sample :type a. a Read.query -> (a,Read.error)result=fun query->match query with
+
+            | Read.Graph_info -> (Ok(F.graph_info ~graph_uuid:(graph_id) ~graph_name:("Synthetic") ~schema:({ major = 65; minor = 33 }) ~admission_facts:([]) ~journal_title_format:(None) ~limits:({ response_budget_bytes = Worker_pure_data.maximum_response_bytes
                   ; outbox_max_records = 4096; outbox_max_bytes = 8388608
                   ; change_max_items = 4096; change_max_bytes = 1048576
-                  ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 }
-                ; generation = "g"; projection_revision = "p" }
-            | V2_list_journals _ -> P.V2_journals_outcome { items = []; next_cursor = None }
-            | _ -> P.V2_failed { code = "UnusedFixtureRead"; message = "Unused unlock fixture read" }
-          in
-          Ok (Service.Graph_response (P.V2_response
-            { api_version = P.api_version; request_id = request.request_id; outcome }))
-        | Import_asset _ | Graph_request _ ->
+                  ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 }) ~generation:("g") ~projection_revision:("p")))
+            | Read.Journals _ -> (Ok(F.slice ~items:([]) ~next:(next (None))))
+            | _ -> (Error((fun code message->Read.Service_failed(code^": "^message)) ("UnusedFixtureRead") ("Unused unlock fixture read")))
+
+          in Ok(Service.Coordination_queried{registration=source.registration;owner=source.owner;
+            request_id=source.request_id;answer=F.answer budget query(sample query)})
+        | Import_asset _ | Import_asset_at _ | Coordination_query _ ->
           Error "Unused isolated password fixture command"))
       ~shutdown:(fun () -> ())
       ()
@@ -7590,10 +7424,9 @@ let test_graph_picker_controls scenario () =
           then (Atomic.set failed_registration(Atomic.get coordination_registration);
             Error "Synthetic delete failed. Try again.") else Ok() in
         let query_owner=match request with
-          | Service.Coordination_query{owner;_}|Graph_request_at(owner,_)->Some owner
+          | Service.Coordination_query{owner;_}->Some owner
           | _->None in
-        match (match request with Service.Client_command _ when scenario=`Retry_local || scenario=`Retry_graph_phase -> request | _ -> fixture_request request) with
-        | Graph_request_at _ | Get_graph_state_at _ | Asset_command_at _ | Import_asset_at _ -> Error "Fixture normalization failed"
+        match request with
         | Coordination_prepare_host_change plan ->
           if held_close then (
             Atomic.set prepare_held true;
@@ -7670,10 +7503,9 @@ let test_graph_picker_controls scenario () =
           while not(Atomic.get unregister_allowed)do Eio.Fiber.yield()done;
           if Atomic.get coordination_registration=Some registration then Atomic.set coordination_registration None;
           Ok(Service.Coordination_released registration)
-        | Coordination_query _ -> Error "Fixture normalization failed"
         | Coordination_observe _ | Coordination_refresh_observation _ | Coordination_release_observation _ ->
           Error "Observation is not used by this fixture"
-        | Coordination_mutation _ | Coordination_confirm _ | Coordination_recover_mutations _ | Coordination_acknowledge_mutation _ -> Error "Unused durable coordination fixture"
+        | Coordination_mutation _ | Coordination_confirm _ | Coordination_acknowledge_changes _ | Coordination_recover_mutations _ | Coordination_acknowledge_mutation _ -> Error "Unused durable coordination fixture"
         | Service.Inspect_local_copy request ->
           let index = Atomic.fetch_and_add inspections 1 in
           if scenario = `Late_presence && index = 0
@@ -7690,7 +7522,7 @@ let test_graph_picker_controls scenario () =
         | Service.Delete_local_copy request ->
           Atomic.incr legacy_deletions;
           Ok(Service.Local_copy_deleted(request,delete_copy request))
-        | Service.Get_graph_state ->
+        | Service.Get_graph_state | Get_graph_state_at _ ->
           let value = Atomic.get current in
           Ok (Service.Graph_state { generation = value.snapshot.startup.graph_generation
             ; graph_id = value.snapshot.selected_graph; phase = (if scenario=`Retry_local || scenario=`Retry_graph_phase then Graph_failed else Graph_open); error = None })
@@ -7735,7 +7567,7 @@ let test_graph_picker_controls scenario () =
              if Atomic.get host_applied<>1 then failwith "Replacement bypassed its old owner's permission";
              publish{previous with snapshot={previous.snapshot with resident_graphs=ids;
                resident_scopes=List.mapi(fun index id->resident_scope id (index+1))ids}}
-           | Select_graph id ->
+           | Select_graph id | Focus_resident_graph id ->
              let generation = if held_close then
                (List.find(fun(s:Service.asset_scope)->s.graph_id=id)previous.snapshot.resident_scopes).graph_generation
                else previous.snapshot.startup.graph_generation + 1 in
@@ -7746,21 +7578,21 @@ let test_graph_picker_controls scenario () =
                (Service.Graph_state_changed { generation; graph_id = Some id; phase = Graph_open; error = None })
            | _ -> ());
           Ok Service.Client_command_completed
-        | Asset_command _ | Release_asset_file _ -> Ok Service.Client_command_completed
+        | Asset_command _ | Asset_command_at _ | Release_asset_file _ -> Ok Service.Client_command_completed
         | Acquire_asset_file _ | Acquire_imported_file _ -> Ok (Service.Asset_file None)
-        | Graph_request request ->
-          let outcome = match request.P.command with
-            | V2_graph_info -> Atomic.incr graph_opens; P.V2_graph_info_outcome
-                { graph_uuid = (match query_owner with Some owner->owner.graph_id|None->Option.get (Atomic.get current).snapshot.selected_graph)
-                ; graph_name = "Synthetic"; schema = { major = 65; minor = 33 }
-                ; admission_facts = []; journal_title_format = None
-                ; limits = { response_budget_bytes = Worker_pure_data.maximum_response_bytes
+        | Coordination_query source ->
+          let Read.Read_query(budget,query)=source.read in
+          let module F=Read.For_worker in
+          let owner=F.read_budget_owner budget in
+          let next cursor=Option.map(fun cursor->F.continuation ~owner ~budget ~key:(Read.query_key budget query) ~cursor)cursor in
+          let sample :type a. a Read.query -> (a,Read.error)result=fun query->match query with
+
+            | Read.Graph_info -> Atomic.incr graph_opens; (Ok(F.graph_info ~graph_uuid:((match query_owner with Some owner->owner.graph_id|None->Option.get (Atomic.get current).snapshot.selected_graph)) ~graph_name:("Synthetic") ~schema:({ major = 65; minor = 33 }) ~admission_facts:([]) ~journal_title_format:(None) ~limits:({ response_budget_bytes = Worker_pure_data.maximum_response_bytes
                   ; outbox_max_records = 4096; outbox_max_bytes = 8388608
                   ; change_max_items = 4096; change_max_bytes = 1048576
-                  ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 }
-                ; generation = "g"; projection_revision = "p" }
-            | V2_list_journals _ -> P.V2_journals_outcome { items = []; next_cursor = None }
-            | V2_list_favorites _ when scenario = `Late_graph_cancel
+                  ; dispatcher_capacity = 256; wire_batch_max_bytes = 262144 }) ~generation:("g") ~projection_revision:("p")))
+            | Read.Journals _ -> (Ok(F.slice ~items:([]) ~next:(next (None))))
+            | Read.Favorites _ when scenario = `Late_graph_cancel
                 && (Atomic.get current).snapshot.selected_graph = Some first ->
               Fun.protect ~finally:(fun () ->
                 Atomic.set graph_read_cancelling true;
@@ -7770,17 +7602,14 @@ let test_graph_picker_controls scenario () =
                 Atomic.set graph_read_worker (Some (W.Request_context.request_id context));
                 Atomic.set graph_read_started true;
                 while not (Atomic.get release_graph_read) do Eio.Fiber.yield () done;
-                P.V2_favorites_outcome { favorites_page = None; generation = "g"
-                  ; projection_revision = "p"; items = []; next_cursor = None })
-            | V2_list_favorites _ when scenario = `Late_graph_cancel -> P.V2_favorites_outcome
-                { favorites_page = None; generation = "g"
-                ; projection_revision = "p"; items = []; next_cursor = None }
-            | V2_get_asset_descriptors _ | V2_list_assets _ ->
-              P.V2_assets_outcome { generation = "g"; projection_revision = "p"; items = []; next_cursor = None }
-            | _ -> P.V2_failed { code = "UnusedFixtureRead"; message = "Unused graph-picker fixture read" } in
-          Ok (Service.Graph_response (P.V2_response
-            { api_version = P.api_version; request_id = request.request_id; outcome }))
-        | Import_asset _ -> Error "Unused graph-picker fixture import"))
+                (Ok(F.favorites ~favorites_page:(None) ~generation:("g") ~projection_revision:("p") ~items:([]) ~next:(next (None)))))
+            | Read.Favorites _ when scenario = `Late_graph_cancel -> (Ok(F.favorites ~favorites_page:(None) ~generation:("g") ~projection_revision:("p") ~items:([]) ~next:(next (None))))
+            | Read.Asset_descriptors _ -> Ok(F.asset_listing ~generation:"g" ~projection_revision:"p" ~items:[] ~next:None)
+            | Read.Assets _ -> Ok(F.asset_listing ~generation:"g" ~projection_revision:"p" ~items:[] ~next:None)
+            | _ -> (Error((fun code message->Read.Service_failed(code^": "^message)) ("UnusedFixtureRead") ("Unused graph-picker fixture read")))
+          in Ok(Service.Coordination_queried{registration=source.registration;owner=source.owner;
+            request_id=source.request_id;answer=F.answer budget query(sample query)})
+        | Import_asset _ | Import_asset_at _ -> Error "Unused graph-picker fixture import"))
       ~shutdown:(fun () -> ()) () in
   let hooks = Application.For_testing.app_with_service
     ~on_platform_request:(fun packet->if Bytes.length packet>=32 then (
@@ -8106,7 +7935,7 @@ let test_graph_picker_controls scenario () =
         wait "name selection reaches worker" (fun () ->
            List.exists
              (function
-               | Service.Select_graph id -> id = second
+               | Service.Focus_resident_graph id -> id = second
                | _ -> false)
              (Atomic.get commands))
       | `Late_graph_cancel ->
@@ -8230,7 +8059,7 @@ let test_graph_picker_controls scenario () =
             wait "existing row callback retains its graph after failure" (fun () ->
                  List.exists
                    (function
-                     | Service.Select_graph id -> id = second
+                     | Service.Focus_resident_graph id -> id = second
                      | _ -> false)
                    (Atomic.get commands)))
           else wait "deleted graph stays available to download" (fun () -> Option.is_some (find "text" "Download and open"));
@@ -8264,7 +8093,6 @@ let test_graph_picker_controls scenario () =
    reducer. The injected clock is a host capability, not an injected issue. *)
 let test_detail_reconciliation_diagnostics mode =
   let module G = Logseq_db_types.Graph_types in
-  let module P = Logseq_db_worker.Protocol in
   let module R = Journal_graph_runtime in
   let module A = Root_state in
   let uuid s = G.Uuid.of_string s |> Result.get_ok in
@@ -8284,41 +8112,46 @@ let test_detail_reconciliation_diagnostics mode =
     page=page_id; order="a"; created_at_ms=1_788_192_000_000L;
     updated_at_ms=1_788_192_000_000L; refs=[]; tags=[]; properties=[]} in
   let one label = function [x] -> x | _ -> Alcotest.fail label in
-  let reply request outcome = P.V2_response {api_version=P.api_version;
-    request_id=request; outcome} in
   let module W=Journal_worker_coordination.Worker_api in
   let issuer,_,_,session=Coordination_test_fixture.fixture 9900L in
-  let module I=(val issuer:Worker_effect_authority.ISSUER) in
-  let prepare_step request outcome =
+  let module I=(val issuer:Worker_effect_authority.ISSUER)in
+  let prepare_step :type a. G.Uuid.t -> a W.query -> a -> unit -> R.output = fun request query value->
     match R.worker_read runtime request with
     |Some(R.Read read)->
-      let budget=W.read_budget session ~maximum_items:read.maximum_items ~maximum_bytes:65536 |> Result.get_ok in
-      let operation=W.Query(budget,read.query) in
-      ignore(I.request session ~request_id:(W.request_id request) operation |> Result.get_ok);
-      (match I.reply session ~request_id:(W.request_id request) operation (Service.Graph_response(reply request outcome)) with
-       |Ok(W.Answered(Ok value))->fun()->R.receive_worker_read runtime ~request_id:request (R.Query_result(read.query,value))
-       |_->failwith "diagnostics fixture rejected its typed query")
-    |_->failwith "diagnostics fixture did not plan a typed read" in
-  let step request outcome=(prepare_step request outcome)() in
+      (match Read.query_result_equality query read.query with
+       |None->failwith "diagnostics fixture changed query family"
+       |Some Read.Refl->
+         let budget=W.read_budget session ~maximum_items:read.maximum_items ~maximum_bytes:65536 |>Result.get_ok in
+         let operation=W.Query(budget,read.query)in
+         let response=match I.request session ~request_id:(W.request_id request)operation|>Result.get_ok with
+           |Service.Coordination_query source->Service.Coordination_queried{registration=source.registration;
+             owner=source.owner;request_id=source.request_id;answer=Read.For_worker.answer budget read.query(Ok value)}
+           |_->assert false in
+         match I.reply session ~request_id:(W.request_id request)operation response with
+         |Ok(W.Answered(Ok value))->fun()->R.receive_worker_read runtime ~request_id:request(R.Query_result(read.query,value))
+         |_->failwith "diagnostics fixture rejected its typed value")
+    |_->failwith "diagnostics fixture did not plan a typed read"in
+  let step request query value=(prepare_step request query value)()in
   let read = R.submit runtime (Journal_graph_request.Load_detail
     {block_id=G.Uuid.to_string block_id; after=None; limit=32; request_generation=9L})
     |> fun o -> one "root read" o.requests in
-  let read = step read (P.V2_block_outcome (Worker_pure_data.V2_present_block
-    {value={block; task_status=None; rendered_page_title=page.title; tag_titles=[]}; revision="r1"}))
+  let read = step read (W.Outline_block{uuid=block_id;revision=None})(Worker_pure_data.V2_present_block
+    {value={block; task_status=None; rendered_page_title=page.title; tag_titles=[]}; revision="r1"})
     |> fun o -> one "page read" o.requests in
-  let read = step read (P.V2_page_outcome (Worker_pure_data.V2_present_page {page; revision="p1"}))
+  let read = step read (W.Page{uuid=page_id;revision=None})(Worker_pure_data.V2_present_page{page;revision="p1"})
     |> fun o -> one "children read" o.requests in
-  ignore(step read (P.V2_children_outcome {parent=block_id;
-    revision_scope=Worker_pure_data.V2_children_revision block_id; scope_revision="c1"; items=[]; next_cursor=None}));
+  ignore(step read (W.Child_members{parent=block_id;revision=None;after=None})
+    (Read.For_worker.children ~parent:block_id ~revision_scope:(Worker_pure_data.V2_children_revision block_id)
+      ~scope_revision:"c1" ~items:[] ~next:None));
   let pull = R.reconcile_signal runtime ~request_generation:10L
     (Worker_pure_data.Changes_available { generation="g"; through="p2"})
     |> fun o -> one "changes read" o.requests in
-  let output = step pull (P.V2_changes {generation="g"; from_exclusive=None; through="p2";
-    next=None; windows=[{id="p2"; predecessor="p1"; successor="p2"; block_uuids=[];
-      page_uuids=[page_id]; structure_interests=[]}]}) in
+  let output = step pull (W.Changes{generation="g";after=None})
+    (Read.For_worker.change_batch ~change_owner:session ~generation:"g" ~from_exclusive:None ~through:"p2" ~next:None
+      ~windows:[{id="p2";predecessor="p1";successor="p2";block_uuids=[];page_uuids=[page_id];structure_interests=[]}]) in
   let read = List.find (fun r -> match R.worker_read runtime r with
     | Some(R.Read{query=W.Page _;_}) -> true | _ -> false) output.requests in
-  let complete=prepare_step read (P.V2_page_outcome (Worker_pure_data.V2_present_page {page;revision="p2"})) in
+  let complete=prepare_step read (W.Page{uuid=page_id;revision=None})(Worker_pure_data.V2_present_page{page;revision="p2"}) in
   if mode=`Projection then fail_clock:=true;
   if mode=`Retired then R.reset runtime;
   let completed=complete() in

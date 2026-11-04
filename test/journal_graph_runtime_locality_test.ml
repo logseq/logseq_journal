@@ -1,7 +1,30 @@
+module Read = Worker_pure_read
+module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Graph = Logseq_db_types.Graph_types
 module Protocol = Logseq_db_worker.Protocol
 module Production_runtime = Journal_graph_runtime
 module W = Journal_worker_coordination.Worker_api
+
+let query_sample produce = function
+  | S.Coordination_query r -> S.Coordination_queried
+      {registration=r.registration;owner=r.owner;request_id=r.request_id;answer=produce r.read}
+  | S.Coordination_confirm r -> S.Coordination_confirmed
+      {registration=r.registration;owner=r.owner;presentation=r.presentation;request_id=r.request_id;answer=produce r.read}
+  | _ -> failwith "Expected the original typed read request"
+;;
+
+let failed_sample error request = match request with
+  | S.Coordination_acknowledge_changes r -> S.Coordination_changes_acknowledged
+      {registration=r.registration;owner=r.owner;request_id=r.request_id;result=Error error}
+  | request -> query_sample (fun (Read.Read_query(budget,query))->Read.For_worker.answer budget query(Error error)) request
+;;
+
+let ack_sample generation through = function
+  | S.Coordination_acknowledge_changes r -> S.Coordination_changes_acknowledged
+      {registration=r.registration;owner=r.owner;request_id=r.request_id;
+       result=Ok(Read.For_worker.change_ack ~ack_owner:r.batch.change_owner ~generation ~through)}
+  | _ -> failwith "Expected the original typed Changes acknowledgement"
+;;
 
 module Worker_producer = struct
   module W = Journal_worker_coordination.Worker_api
@@ -46,59 +69,33 @@ module Worker_producer = struct
     |Some(Production_runtime.Acknowledge{batch})->I.request session ~request_id:(W.request_id id)(W.Acknowledge_changes batch)
     |_->Error(W.Invalid_input "No current typed fixture operation")
 
-  let receive runtime request raw =
+  let deliver runtime request produce =
     match Production_runtime.worker_read runtime request with
     | Some (Production_runtime.Read read) ->
-      let operation = W.Query (budget read.maximum_items, read.query) in
-      (match I.request session ~request_id:(W.request_id request) operation with
-       |Ok _->()
-       |Error(W.Invalid_input message|Protocol_mismatch message|Service_failed message)->failwith message
-       |Error(W.Db_error error)->failwith(Logseq_db_worker.Error.message error)
-       |Error _->failwith "Fixture query admission was rejected");
-      (match
-         I.reply
-           session
-           ~request_id:(W.request_id request)
-           operation
-           (S.Graph_response raw)
-       with
-       | Ok (W.Answered (Ok value)) ->
-         Production_runtime.receive_worker_read
-           ~origin:(session, budget read.maximum_items)
-           runtime
-           ~request_id:request
-           (Journal_graph_runtime.Query_result(read.query,value))
-       | Ok (W.Answered (Error (W.Stale_read message))) ->
-         Production_runtime.receive_worker_read runtime ~request_id:request
-           (Journal_graph_runtime.Read_failed {code=Logseq_db_worker.Error.Stale_read_cursor;message})
-       | Ok (W.Answered (Error W.Response_budget_exceeded)) ->
-         Production_runtime.receive_worker_read runtime ~request_id:request
-           (Journal_graph_runtime.Read_failed {code=Logseq_db_worker.Error.Response_too_large;message="oversized fixture"})
-       | Ok (W.Answered (Error (W.Db_error error))) ->
-         Production_runtime.receive_worker_read runtime ~request_id:request
-           (Journal_graph_runtime.Read_failed
-             {code=Logseq_db_worker.Error.code error;message=Logseq_db_worker.Error.message error})
-       | _ ->
-         Production_runtime.fail_request
-           runtime
-           request
-           ~message:"Typed fixture response rejected")
+      let budget=budget read.maximum_items in
+      let operation=W.Query(budget,read.query) in
+      let source=I.request session ~request_id:(W.request_id request) operation |> Result.get_ok in
+      (match I.reply session ~request_id:(W.request_id request) operation (produce source) with
+       | Ok(W.Answered(Ok value))->Production_runtime.receive_worker_read ~origin:(session,budget)
+           runtime ~request_id:request (Production_runtime.Query_result(read.query,value))
+       | Ok(W.Answered(Error(W.Stale_read message)))->Production_runtime.receive_worker_read runtime ~request_id:request
+           (Production_runtime.Read_failed{code=Logseq_db_worker.Error.Stale_read_cursor;message})
+       | Ok(W.Answered(Error W.Response_budget_exceeded))->Production_runtime.receive_worker_read runtime ~request_id:request
+           (Production_runtime.Read_failed{code=Logseq_db_worker.Error.Response_too_large;message="oversized fixture"})
+       | Ok(W.Answered(Error(W.Db_error error)))->Production_runtime.receive_worker_read runtime ~request_id:request
+           (Production_runtime.Read_failed{code=Logseq_db_worker.Error.code error;message=Logseq_db_worker.Error.message error})
+       | _->Production_runtime.fail_request runtime request ~message:"Typed fixture response rejected")
     |Some(Production_runtime.Acknowledge{batch})->
       let operation=W.Acknowledge_changes batch in
-      ignore(I.request session ~request_id:(W.request_id request) operation |> Result.get_ok);
-      (match I.reply session ~request_id:(W.request_id request) operation (S.Graph_response raw) with
+      let source=I.request session ~request_id:(W.request_id request) operation |> Result.get_ok in
+      (match I.reply session ~request_id:(W.request_id request) operation (produce source) with
        |Ok(W.Answered(Ok ack))->Production_runtime.receive_worker_read runtime ~request_id:request
            (Production_runtime.Changes_acknowledged ack)
        |_->failwith "Typed change ACK fixture rejected its original batch")
-    | _ ->
-      (match raw with
-       | Protocol.V2_response{outcome=V2_failed{code;message};_}->
-         Production_runtime.receive_worker_read runtime ~request_id:request
-           (Production_runtime.Read_failed{code=Option.value(Logseq_db_worker.Error.code_of_string code)
-             ~default:Logseq_db_worker.Error.Invalid_request;message})
-       | _->Production_runtime.receive_worker_read runtime ~request_id:request
-           (Production_runtime.Read_failed{code=Logseq_db_worker.Error.Invalid_request;message="Retired fixture completion"}))
+    |_->Production_runtime.receive_worker_read runtime ~request_id:request
+        (Production_runtime.Read_failed{code=Logseq_db_worker.Error.Invalid_request;message="Retired fixture completion"})
   ;;
+
 end
 
 module Runtime = struct
@@ -106,8 +103,6 @@ module Runtime = struct
   let create ?localtime ?(validate_session=Worker_producer.validate_session) () =
     Production_runtime.create ?localtime ~validate_session ()
 
-  let receive runtime (Protocol.V2_response envelope as raw) =
-    Worker_producer.receive runtime envelope.request_id raw
 
 end
 
@@ -119,8 +114,26 @@ let only description = function
     Alcotest.failf "%s: expected one value, got %d" description (List.length values)
 ;;
 
-let response request outcome =
-  Protocol.V2_response {api_version=Protocol.api_version;request_id=request;outcome}
+let sample request produce = request,produce
+let deliver_sample runtime (request,produce) = Worker_producer.deliver runtime request produce
+let durable_response request outcome =
+  Protocol.V2_response{api_version=Protocol.api_version;request_id=request;outcome}
+;;
+
+let sample_bytes runtime (request,produce) =
+  let source=Worker_producer.transport runtime request |> Result.get_ok in
+  match produce source with
+  |S.Coordination_queried{answer=Read.Query_answer(_,query,Ok value);_}->Read.encoded_value_bytes query value
+  |_->failwith "Expected a typed value when measuring a synthetic response"
+;;
+
+let confirmed_sample issuer session presentation receipt request_id produce =
+  let module I=(val issuer:Worker_effect_authority.ISSUER)in
+  let operation=W.Confirm(presentation,receipt)in
+  let source=I.request session ~request_id:(W.request_id request_id)operation |> Result.get_ok in
+  match I.reply session ~request_id:(W.request_id request_id)operation (produce source)with
+  |Ok(W.Answered(Ok(W.Confirmed proof)))->proof
+  |_->failwith "Production confirmation was rejected"
 ;;
 
 let set_calendar ?(clock=1_788_192_000.) runtime =
@@ -184,20 +197,20 @@ let load_feed runtime =
 ;;
 
 (* Drive the actual child requests of a declared synthetic source. This is
-   explicit fixture I/O; Runtime.receive never splits or answers a packet. *)
+   explicit fixture I/O; deliver_sample never splits or answers a packet. *)
 let rec finish_previews runtime ~children (output:Runtime.output) : Runtime.output =
   List.fold_left (fun (kept:Runtime.output) id ->
     match Worker_producer.transport runtime id with
-    |Ok(Worker_producer.S.Coordination_query{request={command=V2_get_children{parent;cursor;limit;_};_};_})->
+    |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Child_members{parent=parent;after=_;_} as query));_})->
+      let cursor=Read.query_cursor (Read.For_worker.read_budget_owner budget) budget query |> Result.get_ok in
+      let limit=Read.For_worker.read_budget_maximum_items budget in
       let items=List.filter(fun (item:Worker_pure_data.child_member)->item.value.block.parent=parent)children
         |>List.sort(fun (a:Worker_pure_data.child_member) (b:Worker_pure_data.child_member)->compare(a.value.block.order,a.value.block.uuid)(b.value.block.order,b.value.block.uuid)) in
       let offset=Option.fold ~none:0 ~some:(fun cursor->Scanf.sscanf(Graph.Cursor.to_string cursor)"declared-preview:%d" Fun.id)cursor in
       let selected=List.take limit(List.drop offset items) in
       let consumed=offset+List.length selected in
       let next_cursor=if consumed<List.length items then Some(Graph.Cursor.of_string(Printf.sprintf "declared-preview:%d" consumed) |> Result.get_ok)else None in
-      let next=Runtime.receive runtime(response id(V2_children_outcome{parent;
-        revision_scope=Worker_pure_data.V2_children_revision parent;scope_revision="fixture-children";
-        items=selected;next_cursor})) |> finish_previews runtime ~children in
+      let next=deliver_sample runtime(sample id((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(parent) ~revision_scope:(Worker_pure_data.V2_children_revision parent) ~scope_revision:("fixture-children") ~items:(selected) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(next_cursor))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) |> finish_previews runtime ~children in
       {Runtime.requests=kept.requests@next.requests;responses=kept.responses@next.responses}
     |_-> {kept with requests=kept.requests@[id]})
     {Runtime.requests=[];responses=output.responses} output.requests
@@ -207,29 +220,20 @@ let seed_feed runtime =
   set_calendar runtime;
   let journals = load_feed runtime in
   let tree =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          journals
-         (Protocol.V2_journals_outcome
-            { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
-            ; next_cursor = None
-            }))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([ { page; journal_day = 20260901; revision = "page-1" } ] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun output -> only "initial page-tree request" output.requests
   in
   ignore
-    (Runtime.receive
+    (deliver_sample
        runtime
-       (response
+       (sample
           tree
-          (Protocol.V2_page_tree_outcome
-             { page = page_uuid
-             ; maximum_depth = 0
-             ; items =
-                 [ { value = record; revision = "block-1"; depth = 0; parent = page_uuid }
-                 ]
-             ; next_cursor = None
-             })) |> finish_previews runtime ~children:[]);
+          ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([ { value = record; revision = "block-1"; depth = 0; parent = page_uuid }
+                 ] : Worker_pure_data.tree_member list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Tree _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) |> finish_previews runtime ~children:[]);
   ()
 ;;
 
@@ -246,17 +250,11 @@ let pull runtime =
 let changed runtime window =
   let request = pull runtime in
   let after=match Runtime.worker_read runtime request with Some(Runtime.Read{query=W.Changes{after;_};_})->after|_->assert false in
-  Runtime.receive
+  deliver_sample
     runtime
-    (response
+    (sample
        request
-       (Protocol.V2_changes
-          { generation = "generation-1"
-          ; from_exclusive = after
-          ; through = window.Worker_pure_data.id
-          ; windows = [ window ]
-          ; next = None
-          }))
+       ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.change_batch ~change_owner:(F.read_budget_owner budget) ~generation:("generation-1") ~from_exclusive:(after) ~through:(window.Worker_pure_data.id) ~windows:([ window ]) ~next:(None)) in match query with |Read.Changes _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
 ;;
 
 let window ?(blocks = []) ?(pages = []) ?(scopes = []) () : Worker_pure_data.change_window =
@@ -316,14 +314,11 @@ let seed_large_feed runtime =
     |> fun output -> only "large feed" output.requests
   in
   let tree =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          request
-         (Protocol.V2_journals_outcome
-            { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
-            ; next_cursor = None
-            }))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([ { page; journal_day = 20260901; revision = "page-1" } ] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun output -> only "large feed tree" output.requests
   in
   let items =
@@ -333,12 +328,11 @@ let seed_large_feed runtime =
       records
   in
   ignore
-    (Runtime.receive
+    (deliver_sample
        runtime
-       (response
+       (sample
           tree
-          (Protocol.V2_page_tree_outcome
-             { page = page_uuid; maximum_depth = 0; items; next_cursor = None })) |> finish_previews runtime ~children:[]);
+          ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:((items : Worker_pure_data.tree_member list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Tree _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) |> finish_previews runtime ~children:[]);
   records, items
 ;;
 
@@ -348,9 +342,9 @@ let consume_ack runtime output =
        match Runtime.worker_read runtime request with
        | Some (Runtime.Acknowledge {batch={generation; through; _}}) ->
          let ack =
-           Runtime.receive
+           deliver_sample
              runtime
-             (response request (Protocol.V2_changes_acknowledged { generation; through }))
+             (sample request ((ack_sample (generation) (through))))
          in
          Alcotest.(check int)
            "ack does not exceed the full hydration window"
@@ -389,23 +383,16 @@ let test_large_changes_are_bounded fail_one =
   check_hydration_bound outstanding;
   let next_pull = pull runtime in
   let later_output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          next_pull
-         (Protocol.V2_changes
-            { generation = "generation-1"
-            ; from_exclusive = Some "revision-2"
-            ; through = "revision-3"
-            ; next = None
-            ; windows =
-                [ { (window ~blocks:(ids later) ()) with
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.change_batch ~change_owner:(F.read_budget_owner budget) ~generation:("generation-1") ~from_exclusive:(Some "revision-2") ~through:("revision-3") ~next:(None) ~windows:([ { (window ~blocks:(ids later) ()) with
                     id = "revision-3"
                   ; predecessor = "revision-2"
                   ; successor = "revision-3"
                   }
-                ]
-            }))
+                ])) in match query with |Read.Changes _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   let outstanding = outstanding @ consume_ack runtime later_output in
   check_hydration_bound outstanding;
@@ -418,12 +405,11 @@ let test_large_changes_are_bounded fail_one =
     only "foreground read bypasses background backlog" foreground.requests
   in
   let foreground_output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          foreground
-         (Protocol.V2_block_outcome
-            (Worker_pure_data.V2_missing_block { uuid = unrelated_uuid; revision = "missing" })))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = unrelated_uuid; revision = "missing" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   Alcotest.(check int)
     "foreground completion does not expand background window"
@@ -448,12 +434,12 @@ let test_large_changes_are_bounded fail_one =
       in
       let outcome =
         if fail_one && List.length seen = 6
-        then Protocol.V2_failed { code = "invalidRequest"; message = "Read unavailable" }
+        then (failed_sample (Read.Db_error(Logseq_db_worker.Error.create ~code:Invalid_request ~message:("Read unavailable") ~details:[]|>Result.get_ok)))
         else
-          Protocol.V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = id; revision = "removed" })
+          (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = id; revision = "removed" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
       in
-      let output = Runtime.receive runtime (response request outcome) in
-      let duplicate = Runtime.receive runtime (response request outcome) in
+      let output = deliver_sample runtime (sample request outcome) in
+      let duplicate = deliver_sample runtime (sample request outcome) in
       Alcotest.(check int)
         "duplicate completion does not dispatch"
         0
@@ -505,11 +491,11 @@ let test_reset_discards_background_backlog () =
   List.iter
     (fun (request : Graph.Uuid.t) ->
        let output =
-         Runtime.receive
+         deliver_sample
            runtime
-           (response
+           (sample
               request
-              (Protocol.V2_failed { code = "invalidRequest"; message = "Old graph" }))
+              ((failed_sample (Read.Db_error(Logseq_db_worker.Error.create ~code:Invalid_request ~message:("Old graph") ~details:[]|>Result.get_ok)))))
        in
        Alcotest.(check int)
          "old graph does not dispatch backlog"
@@ -542,26 +528,19 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
          |> fun output -> only "register detail" output.requests
        in
        let request =
-         Runtime.receive
+         deliver_sample
            runtime
-           (response
+           (sample
               request
-              (Protocol.V2_block_outcome
-                 (Worker_pure_data.V2_present_block { value; revision = "block-1" })))
+              ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block { value; revision = "block-1" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
          |> fun output -> only "register children" output.requests
        in
        ignore
-         (Runtime.receive
+         (deliver_sample
             runtime
-            (response
+            (sample
                request
-               (Protocol.V2_children_outcome
-                  { parent = value.block.uuid
-                  ; revision_scope = Worker_pure_data.V2_children_revision value.block.uuid
-                  ; scope_revision = "children-1"
-                  ; items = []
-                  ; next_cursor = None
-                  }))))
+               ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(value.block.uuid) ~revision_scope:(Worker_pure_data.V2_children_revision value.block.uuid) ~scope_revision:("children-1") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))))
     records;
   let output =
     Runtime.reconcile_signal
@@ -581,27 +560,16 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
         match Runtime.worker_read runtime request with
         | Some(Runtime.Read{query=W.Graph_info;_})->
           ( "graph"
-          , Protocol.V2_failed
-              { code = "invalidRequest"; message = "Inspection unavailable" } )
+          , (failed_sample (Read.Db_error(Logseq_db_worker.Error.create ~code:Invalid_request ~message:("Inspection unavailable") ~details:[]|>Result.get_ok))) )
         | Some(Runtime.Read{query=W.Journals _;_}) ->
           ( "journal"
-          , Protocol.V2_journals_outcome
-              { items = [ { page; journal_day = 20260901; revision = "page-2" } ]
-              ; next_cursor = None
-              } )
+          , (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([ { page; journal_day = 20260901; revision = "page-2" } ] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")) )
         | Some(Runtime.Read{query=W.Tree {maximum_depth;_};_}) ->
           ( "tree"
-          , Protocol.V2_page_tree_outcome
-              { page = page_uuid; maximum_depth; items=List.filter (fun (m:Worker_pure_data.tree_member)->m.depth<=maximum_depth) items; next_cursor = None } )
+          , (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:((List.filter (fun (m:Worker_pure_data.tree_member)->m.depth<=maximum_depth) items : Worker_pure_data.tree_member list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Tree _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")) )
         | Some(Runtime.Read{query=W.Child_members {parent;_};_}) ->
           ( "children"
-          , Protocol.V2_children_outcome
-              { parent
-              ; revision_scope = Worker_pure_data.V2_children_revision parent
-              ; scope_revision = "children-2"
-              ; items = []
-              ; next_cursor = None
-              } )
+          , (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(parent) ~revision_scope:(Worker_pure_data.V2_children_revision parent) ~scope_revision:("children-2") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")) )
         | Some(Runtime.Read{query=W.Outline_block {uuid=id;_};_}) ->
           let value =
             List.find
@@ -610,16 +578,16 @@ let test_resync_and_dependent_reads_share_hydration_bound () =
               records
           in
           ( "block"
-          , Protocol.V2_block_outcome (Worker_pure_data.V2_present_block { value; revision = "block-2" }) )
+          , (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block { value; revision = "block-2" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")) )
         | Some(Runtime.Read{query=W.Page _;_}) ->
-          "page", Protocol.V2_page_outcome (Worker_pure_data.V2_present_page { page; revision = "page-2" })
+          "page", (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page { page; revision = "page-2" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
         | _ -> Alcotest.fail "resync request outside retained interests"
       in
       Hashtbl.replace
         counts
         kind
         (1 + Option.value ~default:0 (Hashtbl.find_opt counts kind));
-      let result = Runtime.receive runtime (response request outcome) in
+      let result = deliver_sample runtime (sample request outcome) in
       List.iter (fun (r : Runtime.response) -> match r.payload with
         | Feed_loaded { complete = true; _ } -> incr complete_feeds
         | Page_tree_reconciled { value; _ } ->
@@ -685,17 +653,11 @@ let test_worker_generation_change_restarts_pull_without_cursor () =
   let runtime = Runtime.create () in
   let first_pull = pull runtime in
   ignore
-    (Runtime.receive
+    (deliver_sample
        runtime
-       (response
+       (sample
           first_pull
-          (Protocol.V2_changes
-             { generation = "generation-1"
-             ; from_exclusive = None
-             ; through = "revision-2"
-             ; windows = []
-             ; next = None
-             })));
+          ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.change_batch ~change_owner:(F.read_budget_owner budget) ~generation:("generation-1") ~from_exclusive:(None) ~through:("revision-2") ~windows:([]) ~next:(None)) in match query with |Read.Changes _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))));
   let restarted =
     Runtime.reconcile_signal
       runtime
@@ -748,12 +710,11 @@ let test_one_block_hydration_emits_only_changed_fragment () =
     { record with block = { block with title = "Changed remotely" } }
   in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          hydration
-         (Protocol.V2_block_outcome
-            (Worker_pure_data.V2_present_block { value = updated_record; revision = "block-2" })))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block { value = updated_record; revision = "block-2" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   Alcotest.(check int) "no follow-up hydration" 0 (List.length output.requests);
   match output.responses with
@@ -820,26 +781,19 @@ let seed_children_interest ?(scope_revision="scope-children-1") runtime =
     |> fun output -> only "detail block request" output.requests
   in
   let children_request =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          block_request
-         (Protocol.V2_block_outcome
-            (Worker_pure_data.V2_present_block { value = record; revision = "block-detail-1" })))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block { value = record; revision = "block-detail-1" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun output -> only "detail children request" output.requests
   in
   ignore
-    (Runtime.receive
+    (deliver_sample
        runtime
-       (response
+       (sample
           children_request
-          (Protocol.V2_children_outcome
-             { parent = block_uuid
-             ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
-             ; scope_revision
-             ; items = []
-             ; next_cursor = None
-             })));
+          ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(block_uuid) ~revision_scope:(Worker_pure_data.V2_children_revision block_uuid) ~scope_revision:(scope_revision) ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))));
   ()
 ;;
 
@@ -929,8 +883,8 @@ let test_read_failure_conversion_preserves_category_and_ownership () =
          |> fun output -> only "day read" output.requests
        in
        let rec reject request =
-         let output = Runtime.receive runtime (response request
-             (Protocol.V2_failed {code=Logseq_db_worker.Error.code_string code;message="Read diagnostic"})) in
+         let output = deliver_sample runtime (sample request
+             ((failed_sample (Read.Db_error(Logseq_db_worker.Error.create ~code:code ~message:"Read diagnostic" ~details:[] |> Result.get_ok))))) in
          match output.requests with
          | [retry] when code=Logseq_db_worker.Error.Response_too_large -> reject retry
          | _ -> output
@@ -1014,14 +968,13 @@ let test_detail_resolves_unretained_page ?(tagged = false) () =
     |> fun output -> only "detail root read" output.requests
   in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          read
-         (Protocol.V2_block_outcome
-            (Worker_pure_data.V2_present_block
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block
                { value = (if tagged then { record with tag_titles = [ "周末"; "旅行" ] } else record)
-               ; revision = "block-1" })))
+               ; revision = "block-1" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   let read = only "unretained owning-page read" output.requests in
   (match Runtime.worker_read runtime read with
@@ -1031,31 +984,24 @@ let test_detail_resolves_unretained_page ?(tagged = false) () =
     { page with kind = Ordinary_page; name = "reference"; title = "Reference" }
   in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          read
-         (Protocol.V2_page_outcome
-            (Worker_pure_data.V2_present_page { page = ordinary_page; revision = "ordinary-page-1" })))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page { page = ordinary_page; revision = "ordinary-page-1" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   let children = only "ordinary page direct children" output.requests in
   let child_uuid = Graph.Uuid.of_string "a1000000-0000-4000-9000-000000000003" |> Result.get_ok in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          children
-         (Protocol.V2_children_outcome
-            { parent = block_uuid
-            ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
-            ; scope_revision = "children-1"
-            ; items = (if tagged then
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(block_uuid) ~revision_scope:(Worker_pure_data.V2_children_revision block_uuid) ~scope_revision:("children-1") ~items:((if tagged then
                 [ { Worker_pure_data.value = { record with block =
                       { block with uuid = child_uuid; parent = block_uuid; title = "Child" }
                     ; tag_titles = [ "地图" ] }
-                  ; revision = "child-1" } ] else [])
-            ; next_cursor = None
-            }))
+                  ; revision = "child-1" } ] else [])) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   match (only "ordinary detail completion" output.responses).payload with
   | Runtime.Detail_loaded { request_generation = 91L; detail } ->
@@ -1083,11 +1029,11 @@ let initial_detail_children runtime =
          })
     |> fun output -> only "detail root" output.requests
   in
-  Runtime.receive
+  deliver_sample
     runtime
-    (response
+    (sample
        first
-       (V2_block_outcome (Worker_pure_data.V2_present_block { value = record; revision = "block-1" })))
+       ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block { value = record; revision = "block-1" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   |> fun output -> only "detail children" output.requests
 ;;
 
@@ -1115,17 +1061,11 @@ let test_detail_empty_more_preserves_cursor () =
   let original = initial_detail_children runtime in
   let cursor = Graph.Cursor.of_string "empty-detail-more" |> Result.get_ok in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          original
-         (V2_children_outcome
-            { parent = block_uuid
-            ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
-            ; scope_revision = "children-1"
-            ; items = []
-            ; next_cursor = Some cursor
-            }))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(block_uuid) ~revision_scope:(Worker_pure_data.V2_children_revision block_uuid) ~scope_revision:("children-1") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(Some cursor))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   match (only "empty More Detail still publishes" output.responses).payload with
   | Detail_loaded { detail; _ } ->
@@ -1142,16 +1082,11 @@ let test_detail_forwards_child_cursor () =
   let first = initial_detail_children runtime in
   let cursor = Graph.Cursor.of_string "detail-next-page" |> Result.get_ok in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          first
-         (V2_children_outcome
-            { parent = block_uuid
-            ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
-            ; scope_revision = "children-1"
-            ; items =
-                [ { Worker_pure_data.value =
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(block_uuid) ~revision_scope:(Worker_pure_data.V2_children_revision block_uuid) ~scope_revision:("children-1") ~items:([ { Worker_pure_data.value =
                       { record with
                         block =
                           { block with
@@ -1162,9 +1097,7 @@ let test_detail_forwards_child_cursor () =
                       }
                   ; revision = "child-1"
                   }
-                ]
-            ; next_cursor = Some cursor
-            }))
+                ]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(Some cursor))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   let after =
     match (only "Detail initial page" output.responses).payload with
@@ -1196,15 +1129,18 @@ let test_detail_forwards_child_cursor () =
     |> fun output -> only "continuation root read" output.requests
   in
   let child =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          first
-         (V2_block_outcome (Worker_pure_data.V2_present_block { value = record; revision = "block-1" })))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block { value = record; revision = "block-1" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun output -> only "continuation child read" output.requests
   in
   match Worker_producer.transport runtime child with
-  | Ok(Worker_producer.S.Coordination_query{request={command=Protocol.V2_get_children{cursor=Some actual;limit=32;_};_};_}) when actual=cursor->()
+  | Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Child_members{after=_;_} as query));_}) ->
+      assert (Read.For_worker.read_budget_maximum_items budget=32);
+      let actual=Read.query_cursor (Read.For_worker.read_budget_owner budget) budget query |> Result.get_ok |> Option.get in
+      assert (actual=cursor);()
   | _ -> Alcotest.fail "Detail lost sealed continuation or its original budget"
 ;;
 
@@ -1225,14 +1161,8 @@ let test_status_failure_conversion () =
          |> fun output -> only "status mutation" output.requests
        in
        let output =
-         Runtime.receive
-           runtime
-           (response
-              request
-              (Protocol.V2_failed
-                 { code = Logseq_db_worker.Error.code_string code
-                 ; message = "Status write diagnostic"
-                 }))
+         Production_runtime.receive_worker_read runtime ~request_id:request
+             (Production_runtime.Read_failed{code=code;message="Status write diagnostic"})
        in
        if code = Logseq_db_worker.Error.Conflict
        then (
@@ -1292,7 +1222,7 @@ let prepare_unbound_mutation ?(ordinary=false) kind =
   let calendar = Journal_calendar.Sampler.sample sampler |> Result.get_ok in
   Runtime.set_calendar runtime calendar;
   let mutation_id = uuid "a1000000-0000-4000-a000-000000000021" in
-  let receive request outcome = Runtime.receive runtime (response request outcome) in
+  let receive request outcome = deliver_sample runtime (sample request outcome) in
   let next description output = only description output.Runtime.requests in
   let page, mutation =
     match kind with
@@ -1311,29 +1241,22 @@ let prepare_unbound_mutation ?(ordinary=false) kind =
       let page_lookup =
         receive
           lookup
-          (V2_block_outcome
-             (Worker_pure_data.V2_present_block
+          ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block
                 { value = { record with block = { block with order = "a1" } }
                 ; revision = "block-1"
-                }))
+                })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
         |> next "target page lookup"
       in
       let children =
         receive
           page_lookup
-          (V2_page_outcome (Worker_pure_data.V2_present_page { page; revision = "page-1" }))
+          ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page { page; revision = "page-1" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
         |> next "target child lookup"
       in
       ignore
         (receive
            children
-           (V2_children_outcome
-              { parent = block_uuid
-              ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
-              ; scope_revision = "target-children-1"
-              ; items = []
-              ; next_cursor = None
-              }));
+           ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(block_uuid) ~revision_scope:(Worker_pure_data.V2_children_revision block_uuid) ~scope_revision:("target-children-1") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))));
       let command =
         if kind = Delete_conflict
         then
@@ -1401,10 +1324,9 @@ module Target_fixture = struct
 
   let send (Pending pending) outcome =
     let request_id=W.request_id pending.original in
-    ignore(I.request session ~request_id pending.operation |> Result.get_ok);
-    let response=S.Graph_response(Protocol.V2_response{api_version=Protocol.api_version;
-      request_id=pending.original;outcome}) in
-    let reply=match I.reply session ~request_id pending.operation response with
+    let source=I.request session ~request_id pending.operation |> Result.get_ok in
+    let reply_response=outcome source in
+    let reply=match I.reply session ~request_id pending.operation reply_response with
       |Ok reply->reply|Error error->W.Answered(Error error) in
     pending.deliver reply
 
@@ -1443,9 +1365,7 @@ module Target_fixture = struct
     query runtime (only "post-rejection typed target read" output.requests)
 
   let summary pending page lookup children next_cursor revision =
-    send pending (Protocol.V2_block_summary_outcome
-      {lookup;page=Some(Worker_pure_data.V2_present_page{page;revision="page-1"});items=children;
-       next_cursor;scope_revision="target-children-1";generation="graph-1";projection_revision=revision})
+    send pending ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.block_summary ~lookup:(lookup) ~page:(Some(Worker_pure_data.V2_present_page{page;revision="page-1"})) ~items:(children) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(next_cursor)) ~scope_revision:("target-children-1") ~generation:("graph-1") ~projection_revision:(revision)) in match query with |Read.Block_summary _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
 
   let next runtime (Pending previous) label output=query ?proof:previous.proof runtime (only label output.Production_runtime.requests)
   let original(Pending pending)=pending.original
@@ -1472,7 +1392,9 @@ let check_target_summary (Target_fixture.Pending pending) cursor =
   |W.Query _->
     (match Target_fixture.I.request Target_fixture.session
       ~request_id:(W.request_id pending.original) pending.operation with
-     |Ok(Target_fixture.S.Coordination_query{request={command=V2_get_outline_block_summary{block;limit;cursor=actual};_};_})->
+     |Ok(Target_fixture.S.Coordination_query{read=Read.Read_query(budget,(Read.Block_summary{block;after=_;_} as query));_})->
+      let limit=Read.For_worker.read_budget_maximum_items budget in
+      let actual=Read.query_cursor (Read.For_worker.read_budget_owner budget) budget query |> Result.get_ok in
        Alcotest.(check bool) "target identity" true(Graph.Uuid.equal block block_uuid);
        Alcotest.(check int) "bounded target children" Worker_pure_data.default_page_size limit;
        Alcotest.(check bool) "target children cursor" true(actual=cursor)
@@ -1504,16 +1426,16 @@ let test_paged_mutation_refresh kind result =
              None
              "projection-2"
       | Cursor_failed when kind=Task_change ->
-        Target_fixture.send refresh (Protocol.V2_failed{code="staleReadCursor";message="Concurrent target change"})
+        Target_fixture.send refresh ((failed_sample (Read.Stale_read ("Concurrent target change"))))
       | Cursor_failed ->
         let current = ref refresh in
         for _ = 1 to 2 do
           current := Target_fixture.send !current
-            (Protocol.V2_failed{code="staleReadCursor";message="Concurrent target change"})
+            ((failed_sample (Read.Stale_read ("Concurrent target change"))))
             |> Target_fixture.next runtime !current "bounded canonical retry"
         done;
         Target_fixture.send !current
-          (Protocol.V2_failed{code="staleReadCursor";message="Concurrent target change"})
+          ((failed_sample (Read.Stale_read ("Concurrent target change"))))
     in
     if kind=Task_change && result=Cursor_failed then (
       Alcotest.(check bool) "failed confirmation retains original intent" true
@@ -1557,9 +1479,7 @@ let test_ordinary_delete_readback committed paged () =
   let request=if committed then request else Target_fixture.original(Target_fixture.rejected runtime request) in
   let target={record with block={block with page=page.uuid;parent=page.uuid;title="Ordinary canonical target"}} in
   let lookup=Worker_pure_data.V2_present_block{value=target;revision="canonical-current"} in
-  let summary request_id cursor=Protocol.V2_response{api_version=Protocol.api_version;request_id;
-    outcome=V2_block_summary_outcome{lookup;page=Some(Worker_pure_data.V2_present_page{page;revision="page-2"});items=[];
-      next_cursor=cursor;scope_revision="ordinary-children";generation="generation:v1:1:1";projection_revision="projection:v1:2"}} in
+  let summary _ cursor=(query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.block_summary ~lookup:(lookup) ~page:(Some(Worker_pure_data.V2_present_page{page;revision="page-2"})) ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(cursor)) ~scope_revision:("ordinary-children") ~generation:("generation:v1:1:1") ~projection_revision:("projection:v1:2")) in match query with |Read.Block_summary _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")) in
   let output=if committed then (
     let session=Worker_producer.session in
     let presentation=Option.get(W.selected Worker_producer.projection) in
@@ -1567,7 +1487,7 @@ let test_ordinary_delete_readback committed paged () =
     let mutation_id=W.mutation_intent_id intent in
     Alcotest.(check bool) "ordinary mutation business owner bound" true
       (Production_runtime.bind_mutation runtime request ~presentation ~intent:(W.Mutation_intent intent));
-    let receipt=(let (Protocol.V2_response receipt_packet as packet) = (response request(V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
+    let receipt=(let (Protocol.V2_response receipt_packet as packet) = (durable_response request (V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
         before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"})) in
       match I.reply session ~request_id:(W.request_id request) (W.Mutate intent)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
@@ -1575,19 +1495,15 @@ let test_ordinary_delete_readback committed paged () =
            outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
       | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected") in
-    let confirmation=(let (Protocol.V2_response confirmation_packet as packet) = (summary request(if paged then Some(Graph.Cursor.of_string "ordinary-more" |> Result.get_ok) else None)) in
-      match I.reply session ~request_id:(W.request_id confirmation_packet.request_id)
-        (W.Confirm(presentation,receipt))
-        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response packet) with
-      | Ok(W.Answered(Ok(W.Confirmed proof))) -> proof
-      | _ -> failwith "Production confirmation was rejected") in
+    let confirmation=confirmed_sample Worker_producer.issuer session presentation receipt request
+      (summary request(if paged then Some(Graph.Cursor.of_string "ordinary-more" |> Result.get_ok) else None)) in
     let output=Production_runtime.receive_mutation runtime request(W.Confirmed confirmation) in
     if paged then (
       Alcotest.(check bool) "ordinary More cannot settle before final DTO" false
         (List.exists(fun r->match r.Production_runtime.payload with Mutation_settled _->true|_->false)output.responses);
       let more=only "ordinary canonical More remains typed" output.requests in
-      Worker_producer.receive runtime more(summary more None)) else output)
-    else Worker_producer.receive runtime request(summary request None) in
+      Worker_producer.deliver runtime more(summary more None)) else output)
+    else Worker_producer.deliver runtime request(summary request None) in
   let current=List.find_map(fun response->match response.Runtime.payload with
     | Mutation_settled(_,_,Delete_reappeared{block;timeline_entry_update=None}) when committed->Some block
     | Mutation_settled(_,_,Delete_conflict{block;timeline_entry_update=None}) when not committed->Some block
@@ -1802,7 +1718,7 @@ let test_target_terminal kind terminal =
   let output=match terminal with
     |`Missing->Target_fixture.summary target page
       (Worker_pure_data.V2_missing_block{uuid=block_uuid;revision="missing"}) [] None "projection-2"
-    |`Failure->Target_fixture.send target (Protocol.V2_failed{code="closedSession";message="read unavailable"})
+    |`Failure->Target_fixture.send target ((failed_sample (Read.Db_error(Logseq_db_worker.Error.create ~code:Closed_session ~message:("read unavailable") ~details:[]|>Result.get_ok))))
     |`Reset->Runtime.reset runtime;Target_fixture.summary target page
       (Worker_pure_data.V2_missing_block{uuid=block_uuid;revision="missing"}) [] None "projection-2" in
   match terminal with
@@ -1946,7 +1862,7 @@ let test_target_stale_recovery_is_bounded () =
     (Some(Graph.Cursor.of_string "stale-target-more" |> Result.get_ok)) "projection-2" in
   let current=ref(Target_fixture.next runtime confirmation "first typed canonical More" prefix) in
   let stale request=Target_fixture.send request
-    (Protocol.V2_failed{code="staleReadCursor";message="Concurrent projection"}) in
+    ((failed_sample (Read.Stale_read ("Concurrent projection")))) in
   for _=1 to 2 do
     let output=stale !current in
     Alcotest.(check int) "retry does not prematurely complete Status" 0(List.length output.responses);
@@ -1976,12 +1892,12 @@ let test_target_newer_confirmation_fences_old () =
   let updates=changed runtime(window ~blocks:[block_uuid]()) in
   let point=only "remote change owns its point read" (hydration_requests runtime updates) in
   let newer={record with block={block with title="Newer remote value";page=page.uuid;parent=page.uuid}} in
-  let applied=Worker_producer.receive runtime point
-    (response point(Protocol.V2_block_outcome(Worker_pure_data.V2_present_block{value=newer;revision="canonical-3"}))) in
+  let applied=deliver_sample runtime
+    (sample point((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block{value=newer;revision="canonical-3"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   let applied=match applied.requests with
     |[]->applied
-    |[context]->Worker_producer.receive runtime context
-      (response context(Protocol.V2_page_outcome(Worker_pure_data.V2_present_page{page;revision="page-3"})))
+    |[context]->deliver_sample runtime
+      (sample context((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page{page;revision="page-3"})) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |_->Alcotest.fail "remote confirmation fence requested unrelated context" in
   Alcotest.(check bool) "newer remote point is actually applied first" true
     (List.exists(fun response->match Target_fixture.payload response with
@@ -2115,23 +2031,19 @@ let test_target_confirmation_retains_child_mutation_context () =
 ;;
 
 let tree_page request items next_cursor =
-  response
+  sample
     request
-    (Protocol.V2_page_tree_outcome
-       { page = page_uuid; maximum_depth = 0; items; next_cursor })
+    ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:((items : Worker_pure_data.tree_member list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(next_cursor))) in match query with |Read.Tree _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
 ;;
 
 let initial_tree runtime =
   set_calendar runtime;
   let journals = load_feed runtime in
-  Runtime.receive
+  deliver_sample
     runtime
-    (response
+    (sample
        journals
-       (Protocol.V2_journals_outcome
-          { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
-          ; next_cursor = None
-          }))
+       ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([ { page; journal_day = 20260901; revision = "page-1" } ] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   |> fun output -> only "initial tree" output.requests
 ;;
 
@@ -2142,7 +2054,9 @@ let check_tree_continuation runtime output cursor =
     (List.length output.Runtime.responses);
   let request = only "one sequential continuation" output.requests in
   (match Worker_producer.transport runtime request with
-   | Ok(Worker_producer.S.Coordination_query{request={command=V2_get_page_tree{page=actual;maximum_depth;cursor=Some actual_cursor;limit;_};_};_})->
+   | Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Tree{page=actual;maximum_depth=maximum_depth;after=_;_} as query));_})->
+      let actual_cursor=Read.query_cursor (Read.For_worker.read_budget_owner budget) budget query |> Result.get_ok |> Option.get in
+      let limit=Read.For_worker.read_budget_maximum_items budget in
      Alcotest.(check bool) "same page" true (Graph.Uuid.equal page_uuid actual);
      Alcotest.(check int) "root-only depth" 0 maximum_depth;
      Alcotest.(check int) "same page budget" 4 limit;
@@ -2162,7 +2076,7 @@ let test_child_only_day_pages outcome =
     { value = record; revision = "root-1"; depth = 0; parent = page_uuid }
   in
   let initial =
-    (Runtime.receive runtime (tree_page tree [root] (Some cursor)) |>finish_previews runtime ~children:[])
+    (deliver_sample runtime (tree_page tree [root] (Some cursor)) |>finish_previews runtime ~children:[])
   in
   let after =
     List.find_map
@@ -2187,7 +2101,7 @@ let test_child_only_day_pages outcome =
            Graph.Cursor.of_string (Printf.sprintf "children-after-%d" (first + 3))
            |> Result.get_ok
          in
-         Runtime.receive runtime (tree_page request [] (Some cursor))
+         deliver_sample runtime (tree_page request [] (Some cursor))
          |> fun output -> check_tree_continuation runtime output cursor)
       request
       [ 4; 8 ]
@@ -2202,16 +2116,13 @@ let test_child_only_day_pages outcome =
   in
   if outcome = `Reset then Runtime.reset runtime;
   let completed =
-    Runtime.receive
+    deliver_sample
       runtime
       (if outcome = `Stale
        then
-         response
+         sample
            request
-           (Protocol.V2_failed
-              { code = Logseq_db_worker.Error.code_string Stale_read_cursor
-              ; message = "Changed graph"
-              })
+           ((failed_sample (Read.Db_error(Logseq_db_worker.Error.create ~code:Stale_read_cursor ~message:"Changed graph" ~details:[] |> Result.get_ok))))
        else
          tree_page
            request
@@ -2257,12 +2168,12 @@ let test_feed_with_blank_root_continues () =
   in
   let cursor = Graph.Cursor.of_string "blank-root-children" |> Result.get_ok in
   let request =
-    (Runtime.receive runtime (tree_page tree [blank] (Some cursor)) |>finish_previews runtime ~children:[])
+    (deliver_sample runtime (tree_page tree [blank] (Some cursor)) |>finish_previews runtime ~children:[])
     |> fun output -> check_tree_continuation runtime output cursor
   in
   let cursor = Graph.Cursor.of_string "blank-root-children-next" |> Result.get_ok in
   let request =
-    Runtime.receive runtime (tree_page request [] (Some cursor))
+    deliver_sample runtime (tree_page request [] (Some cursor))
     |> fun output -> check_tree_continuation runtime output cursor
   in
   let visible =
@@ -2274,7 +2185,7 @@ let test_feed_with_blank_root_continues () =
         }
     }
   in
-  let completed = (Runtime.receive runtime (tree_page request [ visible ] None) |>finish_previews runtime ~children:[]) in
+  let completed = (deliver_sample runtime (tree_page request [ visible ] None) |>finish_previews runtime ~children:[]) in
   Alcotest.(check int) "feed read complete" 0 (List.length completed.requests);
   match (only "visible feed" completed.responses).payload with
   | Feed_loaded { request_generation; feed; complete } ->
@@ -2291,26 +2202,20 @@ let test_feed_with_blank_root_continues () =
   | _ -> Alcotest.fail "lost initial feed"
 ;;
 
-let graph_info_outcome ~journal_title_format =
-  Protocol.V2_graph_info_outcome
-    { graph_uuid = Worker_producer.W.graph_id Worker_producer.session
-    ; graph_name = "Journal"
-    ; schema = { major = 65; minor = 33 }
-    ; admission_facts = []
-    ; journal_title_format
-    ; limits =
-        { response_budget_bytes = 4_096
+let graph_info_sample ~projection_revision ~journal_title_format =
+  (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.graph_info ~graph_uuid:(Worker_producer.W.graph_id Worker_producer.session) ~graph_name:("Journal") ~schema:({ major = 65; minor = 33 }) ~admission_facts:([]) ~journal_title_format:(journal_title_format) ~limits:({ response_budget_bytes = 4_096
         ; outbox_max_records = 4_096
         ; outbox_max_bytes = 8 * 1_024 * 1_024
         ; change_max_items = 4_096
         ; change_max_bytes = 4 * 1_024 * 1_024
         ; dispatcher_capacity = 32
         ; wire_batch_max_bytes = 4 * 1_024 * 1_024
-        }
-    ; generation = "generation-1"
-    ; projection_revision = "projection-1"
-    }
+        }) ~generation:("generation-1") ~projection_revision) in match query with |Read.Graph_info->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
 ;;
+let graph_info_outcome ~journal_title_format =
+  graph_info_sample ~projection_revision:"projection-1" ~journal_title_format
+;;
+
 
 let create_journal_title ~journal_day ~journal_title_format =
   Logseq_db_types.Journal_title.for_journal_day ~pattern:journal_title_format journal_day |> Option.get
@@ -2375,42 +2280,32 @@ let reference_feed runtime source =
   set_calendar runtime;
   let journals = load_feed runtime in
   let tree =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          journals
-         (Protocol.V2_journals_outcome
-            { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
-            ; next_cursor = None
-            }))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([ { page; journal_day = 20260901; revision = "page-1" } ] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun output -> only "reference page tree" output.requests
   in
-  Runtime.receive
+  deliver_sample
     runtime
-    (response
+    (sample
        tree
-       (Protocol.V2_page_tree_outcome
-          { page = page_uuid
-          ; maximum_depth = 0
-          ; items =
-              [ { value = { record with block = { block with title = source } }
+       ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([ { value = { record with block = { block with title = source } }
                 ; revision = "block-1"
                 ; depth = 0
                 ; parent = page_uuid
                 }
-              ]
-          ; next_cursor = None
-          })) |> finish_previews runtime ~children:[]
+              ] : Worker_pure_data.tree_member list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Tree _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) |> finish_previews runtime ~children:[]
 ;;
 
 let target_response request title =
-  response
+  sample
     request
-    (Protocol.V2_block_outcome
-       (Worker_pure_data.V2_present_block
+    ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block
           { value = { record with block = { block with uuid = target_uuid; title } }
           ; revision = title
-          }))
+          })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
 ;;
 
 let reference_updates output =
@@ -2425,8 +2320,7 @@ let reference_updates output =
 let outline_after_page_miss runtime request =
   match Runtime.worker_read runtime request with
   | Some(Runtime.Read{query=W.Page {uuid=page;_};_}) ->
-    Runtime.receive runtime (response request (Protocol.V2_page_outcome
-      (Worker_pure_data.V2_missing_page {uuid=page;revision="page-absent"})))
+    deliver_sample runtime (sample request ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_page {uuid=page;revision="page-absent"})) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun output -> only "outline lookup after page absence" output.requests
   | Some(Runtime.Read{query=W.Outline_block _;_}) -> request
   | _ -> Alcotest.fail "not a reference lookup"
@@ -2448,7 +2342,7 @@ let test_reference_hydration_and_changes () =
     reference_feed runtime (reference ^ " " ^ reference ^ " [[page]]")
     |> check_target_request runtime
   in
-  let resolved = Runtime.receive runtime (target_response request "Referenced content") in
+  let resolved = deliver_sample runtime (target_response request "Referenced content") in
   Alcotest.(check (option string))
     "target is shared with UI"
     (Some "Referenced content")
@@ -2462,7 +2356,7 @@ let test_reference_hydration_and_changes () =
     |> check_target_request runtime
   in
   let updated =
-    Runtime.receive runtime (target_response changed_request "Edited content")
+    deliver_sample runtime (target_response changed_request "Edited content")
   in
   Alcotest.(check (option string))
     "target edit reaches UI"
@@ -2472,12 +2366,11 @@ let test_reference_hydration_and_changes () =
     changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
   in
   let deleted =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          deleted_request
-         (Protocol.V2_block_outcome
-            (Worker_pure_data.V2_missing_block { uuid = target_uuid; revision = "deleted" })))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = target_uuid; revision = "deleted" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   Alcotest.(check bool)
     "missing target clears cached source"
@@ -2486,7 +2379,7 @@ let test_reference_hydration_and_changes () =
   let recreated_request =
     changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
   in
-  ignore (Runtime.receive runtime (target_response recreated_request "Recreated"));
+  ignore (deliver_sample runtime (target_response recreated_request "Recreated"));
   let resync =
     Runtime.reconcile_signal
       runtime
@@ -2507,14 +2400,14 @@ let test_reference_hydration_and_changes () =
     "reset discards old completion"
     0
     (List.length
-       (Runtime.receive runtime (target_response request "Old graph")).responses)
+       (deliver_sample runtime (target_response request "Old graph")).responses)
 ;;
 
 let test_reference_cycle_and_failure () =
   let runtime = Runtime.create () in
   let request = reference_feed runtime reference |> check_target_request runtime in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
       (target_response request ("[[" ^ Graph.Uuid.to_string block_uuid ^ "]]"))
   in
@@ -2526,12 +2419,11 @@ let test_reference_cycle_and_failure () =
     changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
   in
   let failed =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          changed_request
-         (Protocol.V2_failed
-            { code = "InvalidRequest"; message = "temporary read failure" }))
+         ((failed_sample (Read.Service_failed (("InvalidRequest")^": "^("temporary read failure"))))))
   in
   Alcotest.(check bool)
     "failed target clears stale content"
@@ -2551,14 +2443,13 @@ let test_reference_invalidation_during_read () =
          0
          (List.length (hydration_requests runtime changed));
        let stale =
-         Runtime.receive
+         deliver_sample
            runtime
            (if fail
             then
-              response
+              sample
                 request
-                (Protocol.V2_failed
-                   { code = "InvalidRequest"; message = "old snapshot failed" })
+                ((failed_sample (Read.Service_failed (("InvalidRequest")^": "^("old snapshot failed")))))
             else target_response request "Stale")
        in
        Alcotest.(check bool)
@@ -2566,7 +2457,7 @@ let test_reference_invalidation_during_read () =
          true
          (not (List.mem (target_id, Some "Stale") (reference_updates stale)));
        let fresh = check_target_request runtime stale in
-       let result = Runtime.receive runtime (target_response fresh "Fresh") in
+       let result = deliver_sample runtime (target_response fresh "Fresh") in
        Alcotest.(check (option string))
          "newest content wins"
          (Some "Fresh")
@@ -2597,7 +2488,7 @@ let test_abandoned_reference_can_refresh () =
        if fail
        then ignore (Runtime.fail_request runtime request ~message:"Worker interrupted")
        else Runtime.abandon runtime request;
-       let late = Runtime.receive runtime (target_response request "Late completion") in
+       let late = deliver_sample runtime (target_response request "Late completion") in
        Alcotest.(check int)
          "interrupted completion is unowned"
          0
@@ -2605,7 +2496,7 @@ let test_abandoned_reference_can_refresh () =
        let fresh =
          changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
        in
-       ignore (Runtime.receive runtime (target_response fresh "Recovered"));
+       ignore (deliver_sample runtime (target_response fresh "Recovered"));
        let duplicate = Runtime.fail_request runtime request ~message:"Late terminal" in
        Alcotest.(check int)
          "duplicate old terminal is unowned"
@@ -2622,18 +2513,17 @@ let test_shorter_reference_path_discovers_nested_targets () =
   for n = 1 to Journal_model.maximum_reference_depth do
     let request = only "chain point read" !output.requests |> outline_after_page_miss runtime in
     output
-    := Runtime.receive
+    := deliver_sample
          runtime
-         (response
+         (sample
             request
-            (Protocol.V2_block_outcome
-               (Worker_pure_data.V2_present_block
+            ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block
                   { value =
                       { record with
                         block = { block with uuid = uuid (id n); title = link (n + 1) }
                       }
                   ; revision = "chain"
-                  })))
+                  })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   done;
   Alcotest.(check int) "deep chain stops at depth bound" 0 (List.length !output.requests);
   let output = reference_feed runtime (link Journal_model.maximum_reference_depth) in
@@ -2660,18 +2550,17 @@ let test_reference_burst_is_bounded () =
     (List.length output.requests);
   let request = List.hd output.requests in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          request
-         (Protocol.V2_page_outcome
-            (Worker_pure_data.V2_missing_page
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_page
                { uuid =
                    (match Runtime.worker_read runtime request with
                     | Some(Runtime.Read{query=W.Page {uuid=page;_};_}) -> page
                     | _ -> assert false)
                ; revision = "missing"
-               })))
+               })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   Alcotest.(check int)
     "completion drains one queued lookup"
@@ -2692,14 +2581,11 @@ let begin_reference_tree runtime generation =
          })
     |> fun output -> only "reference journal request" output.requests
   in
-  Runtime.receive
+  deliver_sample
     runtime
-    (response
+    (sample
        request
-       (Protocol.V2_journals_outcome
-          { items = [ { page; journal_day = 20260901; revision = "page" } ]
-          ; next_cursor = None
-          }))
+       ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([ { page; journal_day = 20260901; revision = "page" } ] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   |> fun output -> only "reference tree request" output.requests
 ;;
 
@@ -2708,18 +2594,12 @@ let reference_tree_response request title =
   let target =
     { record with block = { block with uuid = target_uuid; title; order = "b" } }
   in
-  response
+  sample
     request
-    (Protocol.V2_page_tree_outcome
-       { page = page_uuid
-       ; maximum_depth = 0
-       ; next_cursor = None
-       ; items =
-           List.map
+    ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None)) ~items:((List.map
              (fun value ->
                 Worker_pure_data.{ value; revision = title; depth = 0; parent = page_uuid })
-             [ root; target ]
-       })
+             [ root; target ] : Worker_pure_data.tree_member list))) in match query with |Read.Tree _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
 ;;
 
 let test_stale_feed_cannot_replace_reference_source () =
@@ -2728,26 +2608,26 @@ let test_stale_feed_cannot_replace_reference_source () =
        let runtime = Runtime.create () in
        set_calendar runtime;
        let initial = begin_reference_tree runtime 7L in
-       ignore ((Runtime.receive runtime (reference_tree_response initial "Initial") |>finish_previews runtime ~children:[]));
+       ignore ((deliver_sample runtime (reference_tree_response initial "Initial") |>finish_previews runtime ~children:[]));
        let old = begin_reference_tree runtime 8L in
        let current = begin_reference_tree runtime 9L in
-       ignore ((Runtime.receive runtime (reference_tree_response current fresh_title) |>finish_previews runtime ~children:[]));
+       ignore ((deliver_sample runtime (reference_tree_response current fresh_title) |>finish_previews runtime ~children:[]));
        let changed_read =
          changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
        in
-       let stale = (Runtime.receive runtime (reference_tree_response old "Stale") |>finish_previews runtime ~children:[]) in
+       let stale = (deliver_sample runtime (reference_tree_response old "Stale") |>finish_previews runtime ~children:[]) in
        Alcotest.(check bool)
          "invalidated old snapshot cannot publish source"
          false
          (List.mem (target_id, Some "Stale") (reference_updates stale));
-       let fresh = Runtime.receive runtime (target_response changed_read fresh_title) in
+       let fresh = deliver_sample runtime (target_response changed_read fresh_title) in
        ignore fresh;
        let old = begin_reference_tree runtime 10L in
        let newer =
          changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
        in
-       ignore (Runtime.receive runtime (target_response newer fresh_title));
-       let stale = (Runtime.receive runtime (reference_tree_response old "Rollback") |>finish_previews runtime ~children:[]) in
+       ignore (deliver_sample runtime (target_response newer fresh_title));
+       let stale = (deliver_sample runtime (reference_tree_response old "Rollback") |>finish_previews runtime ~children:[]) in
        Alcotest.(check bool)
          "newer completion fences older feed, even equal title"
          false
@@ -2759,17 +2639,16 @@ let test_shared_change_failure_invalidates_reference () =
   let runtime = Runtime.create () in
   set_calendar runtime;
   let initial = begin_reference_tree runtime 7L in
-  ignore ((Runtime.receive runtime (reference_tree_response initial "Old") |>finish_previews runtime ~children:[]));
+  ignore ((deliver_sample runtime (reference_tree_response initial "Old") |>finish_previews runtime ~children:[]));
   let changed_read =
     changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
   in
   let failed =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          changed_read
-         (Protocol.V2_failed
-            { code = "InvalidRequest"; message = "temporary shared read failure" }))
+         ((failed_sample (Read.Service_failed (("InvalidRequest")^": "^("temporary shared read failure"))))))
   in
   Alcotest.(check bool)
     "shared failure removes old source"
@@ -2779,13 +2658,13 @@ let test_shared_change_failure_invalidates_reference () =
   let newer =
     changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
   in
-  ignore (Runtime.receive runtime (target_response newer "Fresh"));
+  ignore (deliver_sample runtime (target_response newer "Fresh"));
   let failed =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          old
-         (Protocol.V2_failed { code = "InvalidRequest"; message = "late failure" }))
+         ((failed_sample (Read.Service_failed (("InvalidRequest")^": "^("late failure"))))))
   in
   Alcotest.(check bool)
     "late failure cannot remove newer source"
@@ -2794,7 +2673,7 @@ let test_shared_change_failure_invalidates_reference () =
   let retry =
     changed runtime (window ~blocks:[ target_uuid ] ()) |> check_target_request runtime
   in
-  ignore (Runtime.receive runtime (target_response retry "Recovered"))
+  ignore (deliver_sample runtime (target_response retry "Recovered"))
 ;;
 
 let expect_admitted_failure description ~kind ~mutation_id ~block_id output =
@@ -2859,12 +2738,8 @@ let test_status_failure_keeps_admitted_owner () =
     |> fun output -> only "admitted status" output.requests
   in
   let followup =
-    Runtime.receive
-      runtime
-      (response
-         request
-         (Protocol.V2_failed
-            { code = Logseq_db_worker.Error.code_string Conflict; message = "Conflict" }))
+    Production_runtime.receive_worker_read runtime ~request_id:request
+             (Production_runtime.Read_failed{code=Logseq_db_worker.Error.Conflict;message="Conflict"})
     |> fun output -> only "admitted conflict refresh" output.requests
   in
   Runtime.fail_request runtime followup ~message:"Status refresh unavailable"
@@ -3002,10 +2877,8 @@ module Copy_issuer = struct
     let request=request query in
     match I.request session ~request_id:(Copy_worker.request_id id) request with
     | Error _ -> Error "Read was not admitted"
-    | Ok _ ->
-      match I.reply session ~request_id:(Copy_worker.request_id id) request
-        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response
-          (Protocol.V2_response {api_version=Protocol.api_version;request_id=id;outcome})) with
+    | Ok source ->
+      match I.reply session ~request_id:(Copy_worker.request_id id) request (outcome source) with
       | Ok (Copy_worker.Answered(Ok value)) -> Ok value
       | Error _ | Ok _ -> Error "Worker rejected the read result"
 end
@@ -3051,22 +2924,15 @@ let copy_start root =
 ;;
 
 let copy_children ?cursor ?(revision = "children-1") parent items =
-  Protocol.V2_children_outcome
-    { parent
-    ; revision_scope = Worker_pure_data.V2_children_revision parent
-    ; scope_revision = revision
-    ; items
-    ; next_cursor = cursor
-    }
+  (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(parent) ~revision_scope:(Worker_pure_data.V2_children_revision parent) ~scope_revision:(revision) ~items:(items) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(cursor))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
 ;;
 
 let copy_root state effects title =
   copy_reply
     state
     effects
-    (Protocol.V2_block_outcome
-       (Worker_pure_data.V2_present_block
-          { value = { record with block = { block with title } }; revision = "root-1" }))
+    ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block
+          { value = { record with block = { block with title } }; revision = "root-1" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
 ;;
 
 let copy_child id parent title : Worker_pure_data.child_member =
@@ -3107,7 +2973,7 @@ let test_copy_nested_paginated_text () =
      | Query (Copy_worker.Child_members _ as query) ->
        (match Copy_issuer.wire query with
         | Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_query
-            {request={command=V2_get_children {cursor=Some value;_};_};_} -> value=cursor
+            {read=Read.Read_query(_,Read.Child_members {after=Some value;_});_} -> Read.For_worker.continuation_cursor value=cursor
         | _ -> false)
      | _ -> false);
   let state, effects =
@@ -3190,14 +3056,14 @@ let copy_expect_failure state effects outcome =
 let test_copy_rejects_missing_failed_or_changed_graph () =
   let state, effects = copy_start block_uuid in
   let missing_state, missing_effects = copy_reply state effects
-    (Protocol.V2_block_outcome (Worker_pure_data.V2_missing_block {uuid=block_uuid;revision="missing"})) in
+    ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block {uuid=block_uuid;revision="missing"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))) in
   copy_expect_failure missing_state missing_effects
-    (Protocol.V2_page_outcome (Worker_pure_data.V2_missing_page {uuid=block_uuid;revision="missing"}));
+    ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_page {uuid=block_uuid;revision="missing"})) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")));
   let state, effects = copy_root state effects "Root" in
   copy_expect_failure
     state
     effects
-    (Protocol.V2_failed { code = "staleReadCursor"; message = "Changed" });
+    ((failed_sample (Read.Stale_read ("Changed"))));
   let ticket, _ = copy_read effects in
   let _, failed = Copy.step state (Copy.Read_failed (ticket, "Cancelled by Worker")) in
   Alcotest.(check bool)
@@ -3207,12 +3073,7 @@ let test_copy_rejects_missing_failed_or_changed_graph () =
      | [ Copy.Failed _ ] -> true
      | _ -> false);
   let state, effects = copy_reply state effects (copy_children block_uuid []) in
-  let changed =
-    match graph_info_outcome ~journal_title_format:None with
-    | Protocol.V2_graph_info_outcome info ->
-      Protocol.V2_graph_info_outcome { info with projection_revision = "projection-2" }
-    | _ -> assert false
-  in
+  let changed=graph_info_sample ~projection_revision:"projection-2" ~journal_title_format:None in
   copy_expect_failure state effects changed
 ;;
 
@@ -3244,14 +3105,13 @@ let test_copy_rejects_oversized_text () =
   copy_expect_failure
     state
     effects
-    (Protocol.V2_block_outcome
-       (Worker_pure_data.V2_present_block
+    ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block
           { value =
               { record with
                 block = { block with title = String.make ((256 * 1024) + 1) 'x' }
               }
           ; revision = "root-1"
-          }))
+          })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
 ;;
 
 let test_copy_result_fits_serialized_clipboard () =
@@ -3324,21 +3184,19 @@ let seed_ordinary_detail runtime =
     |> fun output -> only "ordinary detail root" output.requests
   in
   let request =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          request
-         (Protocol.V2_block_outcome
-            (Worker_pure_data.V2_present_block { value = record; revision = "root-1" })))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block { value = record; revision = "root-1" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun output -> only "ordinary detail page" output.requests
   in
   let request =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          request
-         (Protocol.V2_page_outcome
-            (Worker_pure_data.V2_present_page { page = ordinary_page; revision = "page-1" })))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page { page = ordinary_page; revision = "page-1" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun output -> only "ordinary detail children" output.requests
   in
   let child =
@@ -3347,17 +3205,11 @@ let seed_ordinary_detail runtime =
     }
   in
   ignore
-    (Runtime.receive
+    (deliver_sample
        runtime
-       (response
+       (sample
           request
-          (Protocol.V2_children_outcome
-             { parent = block_uuid
-             ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
-             ; scope_revision = "children-1"
-             ; items = [ { value = child; revision = "child-1" } ]
-             ; next_cursor = None
-             })));
+          ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(block_uuid) ~revision_scope:(Worker_pure_data.V2_children_revision block_uuid) ~scope_revision:("children-1") ~items:([ { value = child; revision = "child-1" } ]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))));
   ordinary_page, child
 ;;
 
@@ -3375,16 +3227,15 @@ let test_ordinary_detail_point_change child_changed =
        (Graph.Uuid.equal block value.block.uuid)
    | _ -> Alcotest.fail "ordinary detail did not point-read its changed identity");
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          request
-         (Protocol.V2_block_outcome
-            (Worker_pure_data.V2_present_block
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block
                { value =
                    { value with block = { value.block with title = "Updated detail" } }
                ; revision = "detail-2"
-               })))
+               })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   let published =
     List.find_map
@@ -3431,27 +3282,20 @@ let test_detail_children_uses_latest_root () =
       (hydration_requests runtime output)
   in
   ignore
-    (Runtime.receive
+    (deliver_sample
        runtime
-       (response
+       (sample
           point
-          (Protocol.V2_block_outcome
-             (Worker_pure_data.V2_present_block
+          ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block
                 { value = { record with block = { block with title = "Fresh root" }; tag_titles = [ "Fresh tags" ] }
                 ; revision = "root-2"
-                }))));
+                })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))));
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          children
-         (Protocol.V2_children_outcome
-            { parent = block_uuid
-            ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
-            ; scope_revision = "children-2"
-            ; items = []
-            ; next_cursor = None
-            }))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(block_uuid) ~revision_scope:(Worker_pure_data.V2_children_revision block_uuid) ~scope_revision:("children-2") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   match
     List.find_map
@@ -3513,16 +3357,11 @@ let seed_favorite_dependencies
     |> fun output -> only "favorites read" output.requests
   in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          read
-         (Protocol.V2_favorites_outcome
-            { favorites_page = Some favorites_page_uuid
-            ; generation = "generation-1"
-            ; projection_revision = "revision-1"
-            ; items =
-                (if negative
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.favorites ~favorites_page:(Some favorites_page_uuid) ~generation:("generation-1") ~projection_revision:("revision-1") ~items:((if negative
                  then []
                  else
                    [ { membership_uuid
@@ -3536,9 +3375,7 @@ let seed_favorite_dependencies
                            ; revision = "root-1"
                            }
                      }
-                   ])
-            ; next_cursor = None
-            }))
+                   ])) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Favorites _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   let visited = ref [] in
   let target_reads = ref 0 in
@@ -3553,21 +3390,14 @@ let seed_favorite_dependencies
           (match Production_runtime.worker_read runtime request with
            | Some (Production_runtime.Read {query=Journal_worker_coordination.Worker_api.Child_members _;_}) -> ()
            | _ -> Alcotest.fail "favorite memberships bypassed typed coordinator");
-          Protocol.V2_children_outcome
-            { parent
-            ; revision_scope = Worker_pure_data.V2_children_revision parent
-            ; scope_revision = "favorites-memberships-1"
-            ; items =
-                [ { value =
+          (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(parent) ~revision_scope:(Worker_pure_data.V2_children_revision parent) ~scope_revision:("favorites-memberships-1") ~items:([ { value =
                       { record with
                         block =
                           { block with uuid = membership_uuid; parent; page = parent }
                       }
                   ; revision = "membership-1"
                   }
-                ]
-            ; next_cursor = None
-            }
+                ]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
         | Some(Runtime.Read{query=W.Outline_block {uuid=id;_};_}) ->
           visited := Graph.Uuid.to_string id :: !visited;
           let value =
@@ -3589,13 +3419,12 @@ let seed_favorite_dependencies
               }
             else Alcotest.fail "dependency read escaped favorite ancestry"
           in
-          Protocol.V2_block_outcome
-            (Worker_pure_data.V2_present_block { value; revision = "dependency-1" })
+          (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block { value; revision = "dependency-1" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
         | Some(Runtime.Read{query=W.Page {uuid=id;_};_}) when Graph.Uuid.equal id page_uuid ->
-          Protocol.V2_page_outcome (Worker_pure_data.V2_present_page { page; revision = "page-1" })
+          (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page { page; revision = "page-1" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
         | _ -> Alcotest.fail "favorite dependency used an unbounded discovery request"
       in
-      let output = Runtime.receive runtime (response request outcome) in
+      let output = deliver_sample runtime (sample request outcome) in
       on_output output;
       let pending = rest @ output.requests in
       check_hydration_bound pending;
@@ -3663,17 +3492,11 @@ let test_favorite_changes_locality () =
   ignore (seed_favorite_dependencies runtime);
   let request = pull runtime in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          request
-         (Protocol.V2_changes
-            { generation = "generation-1"
-            ; from_exclusive = None
-            ; through = "revision-2"
-            ; windows = [ window ~blocks:[ unrelated_uuid ] () ]
-            ; next = None
-            }))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.change_batch ~change_owner:(F.read_budget_owner budget) ~generation:("generation-1") ~from_exclusive:(None) ~through:("revision-2") ~windows:([ window ~blocks:[ unrelated_uuid ] () ]) ~next:(None)) in match query with |Read.Changes _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   Alcotest.(check bool)
     "unrelated owned changes preserve favorites"
@@ -3698,26 +3521,23 @@ let test_favorite_changes_locality () =
          false
          (invalidates_favorites out);
        let read = only "bounded dependency recheck" (hydration_requests runtime out) in
-       let out = Runtime.receive runtime (response read outcome) in
+       let out = deliver_sample runtime (sample read outcome) in
        Alcotest.(check bool)
          "changed target or eligibility invalidates favorites"
          true
          (invalidates_favorites out))
     [ ( window ~blocks:[ block_uuid ] ()
-      , Protocol.V2_block_outcome
-          (Worker_pure_data.V2_present_block
+      , (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block
              { value =
                  { record with
                    block = { block with parent = ancestor_uuid; title = "Fresh favorite" }
                  }
              ; revision = "favorite-2"
-             }) )
+             })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")) )
     ; ( window ~blocks:[ ancestor_uuid ] ()
-      , Protocol.V2_block_outcome
-          (Worker_pure_data.V2_missing_block { uuid = ancestor_uuid; revision = "missing-2" }) )
+      , (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = ancestor_uuid; revision = "missing-2" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")) )
     ; ( window ~pages:[ page_uuid ] ()
-      , Protocol.V2_page_outcome
-          (Worker_pure_data.V2_present_page { page = { page with recycled = true }; revision = "page-2" })
+      , (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page { page = { page with recycled = true }; revision = "page-2" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
       )
     ]
 ;;
@@ -3744,11 +3564,11 @@ let test_favorite_sibling_structure_is_local () =
        match Runtime.worker_read runtime request with
        | Some(Runtime.Read{query=W.Page {uuid=id;_};_}) when Graph.Uuid.equal id page_uuid ->
          let output =
-           Runtime.receive
+           deliver_sample
              runtime
-             (response
+             (sample
                 request
-                (Protocol.V2_page_outcome (Worker_pure_data.V2_present_page { page; revision = "page-2" })))
+                ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page { page; revision = "page-2" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
          in
          Alcotest.(check bool)
            "unchanged live ancestor preserves Favorites"
@@ -3768,12 +3588,11 @@ let test_favorite_ancestor_title_is_local () =
     (invalidates_favorites output);
   let read = only "ancestor point read" (hydration_requests runtime output) in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          read
-         (Protocol.V2_block_outcome
-            (Worker_pure_data.V2_present_block
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block
                { value =
                    { record with
                      block =
@@ -3784,7 +3603,7 @@ let test_favorite_ancestor_title_is_local () =
                        }
                    }
                ; revision = "ancestor-2"
-               })))
+               })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   Alcotest.(check bool)
     "ancestor title does not alter favorite membership"
@@ -3803,17 +3622,11 @@ let test_favorite_dependency_limit () =
     |> fun out -> only "favorites" out.requests
   in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          read
-         (Protocol.V2_favorites_outcome
-            { favorites_page = Some favorites_page_uuid
-            ; generation = "generation-1"
-            ; projection_revision = "revision-1"
-            ; items = []
-            ; next_cursor = None
-            }))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.favorites ~favorites_page:(Some favorites_page_uuid) ~generation:("generation-1") ~projection_revision:("revision-1") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Favorites _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   let rec drain batch requests =
     if batch > 20 then Alcotest.fail "Favorite dependencies exceeded 4096 without failure";
@@ -3839,17 +3652,11 @@ let test_favorite_dependency_limit () =
       Some (Graph.Cursor.of_string (Printf.sprintf "members-%d" batch) |> Result.get_ok)
     in
     let out =
-      Runtime.receive
+      deliver_sample
         runtime
-        (response
+        (sample
            read
-           (Protocol.V2_children_outcome
-              { parent = favorites_page_uuid
-              ; revision_scope = Worker_pure_data.V2_children_revision favorites_page_uuid
-              ; scope_revision = "members-1"
-              ; items
-              ; next_cursor
-              }))
+           ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(favorites_page_uuid) ~revision_scope:(Worker_pure_data.V2_children_revision favorites_page_uuid) ~scope_revision:("members-1") ~items:(items) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(next_cursor))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     in
     if
       List.exists
@@ -3867,22 +3674,16 @@ let test_favorite_dependency_limit () =
 let test_changes_more_continues_after_ack () =
   let runtime=Runtime.create () in
   let first=pull runtime in
-  let output=Runtime.receive runtime(response first(Protocol.V2_changes
-    {generation="generation-1";from_exclusive=None;through="w1";
-     windows=[{(window ~blocks:[unrelated_uuid]()) with id="w1"}];next=Some "w1"})) in
+  let output=deliver_sample runtime(sample first((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.change_batch ~change_owner:(F.read_budget_owner budget) ~generation:("generation-1") ~from_exclusive:(None) ~through:("w1") ~windows:([{(window ~blocks:[unrelated_uuid]()) with id="w1"}]) ~next:(Some "w1")) in match query with |Read.Changes _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   let ack=only "first page waits for ACK" output.requests in
   (match Runtime.worker_read runtime ack with Some(Runtime.Acknowledge _)->()|_->Alcotest.fail "More bypassed first page application ACK");
-  let output=Runtime.receive runtime(response ack(Protocol.V2_changes_acknowledged
-    {generation="generation-1";through="w1"})) in
+  let output=deliver_sample runtime(sample ack((ack_sample ("generation-1") ("w1")))) in
   let next=only "More schedules its next page after actual ACK" output.requests in
   (match Runtime.worker_read runtime next with Some(Runtime.Read{query=W.Changes{generation="generation-1";after=Some "w1"};_})->()
    | _->Alcotest.fail "More lost its actual acknowledged cursor");
-  let output=Runtime.receive runtime(response next(Protocol.V2_changes
-    {generation="generation-1";from_exclusive=Some "w1";through="w2";
-     windows=[{(window ~blocks:[unrelated_uuid]()) with id="w2"}];next=None})) in
+  let output=deliver_sample runtime(sample next((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.change_batch ~change_owner:(F.read_budget_owner budget) ~generation:("generation-1") ~from_exclusive:(Some "w1") ~through:("w2") ~windows:([{(window ~blocks:[unrelated_uuid]()) with id="w2"}]) ~next:(None)) in match query with |Read.Changes _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   let ack=only "last page ACK" output.requests in
-  let output=Runtime.receive runtime(response ack(Protocol.V2_changes_acknowledged
-    {generation="generation-1";through="w2"})) in
+  let output=deliver_sample runtime(sample ack((ack_sample ("generation-1") ("w2")))) in
   Alcotest.(check int) "no pull loop after Complete" 0(List.length output.requests)
 ;;
 
@@ -3903,17 +3704,11 @@ let test_projection_changes_are_owned () =
   let request = only "owned changes pull" output.requests in
   let change = window ~blocks:[ unrelated_uuid ] () in
   let completion =
-    response
+    sample
       request
-      (Protocol.V2_changes
-         { generation = "generation-1"
-         ; from_exclusive = None
-         ; through = "revision-2"
-         ; windows = [ change ]
-         ; next = None
-         })
+      ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.change_batch ~change_owner:(F.read_budget_owner budget) ~generation:("generation-1") ~from_exclusive:(None) ~through:("revision-2") ~windows:([ change ]) ~next:(None)) in match query with |Read.Changes _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
   in
-  let output = Runtime.receive runtime completion in
+  let output = deliver_sample runtime completion in
   Alcotest.(check int)
     "owned changes publish once"
     1
@@ -3927,7 +3722,7 @@ let test_projection_changes_are_owned () =
   Alcotest.(check int)
     "duplicate completion publishes nothing"
     0
-    (List.length (Runtime.receive runtime completion).responses);
+    (List.length (deliver_sample runtime completion).responses);
   let output =
     Runtime.reconcile_signal
       runtime
@@ -4029,24 +3824,23 @@ let test_feed_date_budget_failure_restarts_bound_cursor () =
   in
   let more = Graph.Cursor.of_string "date-budget-after-one" |> Result.get_ok in
   let root =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response first (V2_journals_outcome { items = [ item ]; next_cursor = Some more }))
+      (sample first ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([ item ] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(Some more))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun o -> only "date roots" o.requests
   in
   let next =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          root
-         (V2_page_tree_outcome
-            { page = page_uuid; maximum_depth = 0; items = []; next_cursor = None }))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([] : Worker_pure_data.tree_member list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Tree _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun o -> only "date continuation" o.requests
   in
   let retry =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response next (V2_failed { code = "responseTooLarge"; message = "oversize" }))
+      (sample next ((failed_sample (Read.Db_error(Logseq_db_worker.Error.create ~code:Response_too_large ~message:("oversize") ~details:[]|>Result.get_ok)))))
     |> fun o -> only "smaller date restart" o.requests
   in
   match Runtime.worker_read runtime retry with
@@ -4063,25 +3857,23 @@ let test_typed_date_budget_failure_preserves_classification () =
   match Production_runtime.worker_read runtime original with
   | Some (Production_runtime.Read read) ->
     let operation = F.W.Query (F.budget read.maximum_items, read.query) in
-    ignore
-      (F.I.request F.session ~request_id:(F.W.request_id original) operation
-       |> Result.get_ok);
+    let source=F.I.request F.session ~request_id:(F.W.request_id original)operation |> Result.get_ok in
     let failure =
-      response original (V2_failed { code = "responseTooLarge"; message = "oversize" })
+      sample original ((failed_sample (Read.Db_error(Logseq_db_worker.Error.create ~code:Response_too_large ~message:("oversize") ~details:[]|>Result.get_ok))))
     in
     (match
        F.I.reply
          F.session
          ~request_id:(F.W.request_id original)
          operation
-         (F.S.Graph_response failure)
+         ((snd failure) source)
      with
      | Ok (F.W.Answered (Error (F.W.Db_error error))) ->
        Alcotest.(check bool) "recoverable database budget code" true
          (Logseq_db_worker.Error.code error=Logseq_db_worker.Error.Response_too_large);
        Alcotest.(check string) "original database budget message" "oversize"
          (Logseq_db_worker.Error.message error)
-     | _ -> Alcotest.fail "typed response discarded recoverable budget failure")
+     | _ -> Alcotest.fail "typed sample discarded recoverable budget failure")
   | _ -> Alcotest.fail "missing typed date request"
 ;;
 
@@ -4106,10 +3898,10 @@ let test_feed_window_fits_encoded_response_budget () =
     }
   in
   let encoded count =
-    response
+    sample
       request
-      (V2_journals_outcome { items = List.init count item; next_cursor = None })
-    |> Protocol.encoded_response_bytes
+      ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:((List.init count item : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
+    |> sample_bytes runtime
   in
   Alcotest.(check bool)
     "full 200-item metadata batch exceeds real byte budget"
@@ -4131,18 +3923,18 @@ let test_feed_continuation_reads_only_missing_days () =
   let first = feed_window_request runtime ~days:3 ~slots:16 in
   let cursor = Graph.Cursor.of_string "journal-after-one" |> Result.get_ok in
   let valid : Worker_pure_data.journal_item = {page;journal_day=20260901;revision="journal-first"} in
-  let output = Runtime.receive runtime (response first (V2_journals_outcome
-      {items=[valid;{valid with page={page with recycled=true}}];next_cursor=Some cursor})) in
+  let output = deliver_sample runtime (sample first ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([valid;{valid with page={page with recycled=true}}] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(Some cursor))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   let tree=only "resolve available date before fetching more metadata" output.requests in
-  let output=Runtime.receive runtime (response tree (V2_page_tree_outcome
-      {page=page_uuid;maximum_depth=0;items=[];next_cursor=None})) in
+  let output=deliver_sample runtime (sample tree ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([] : Worker_pure_data.tree_member list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Tree _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   let next=only "continue journal cursor after empty date" output.requests in
   (match Worker_producer.transport runtime next with
-   |Ok(Worker_producer.S.Coordination_query{request={command=V2_list_journals{cursor=Some actual;limit;_};_};_})->
+   |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Journals{after=_;_} as query));_})->
+      let actual=Read.query_cursor (Read.For_worker.read_budget_owner budget) budget query |> Result.get_ok |> Option.get in
+      let limit=Read.For_worker.read_budget_maximum_items budget in
      Alcotest.(check int) "metadata packet independent of root demand" 3 limit;
      Alcotest.(check bool) "opaque date cursor retained" true (actual=cursor)
    | _ -> Alcotest.fail "lost date continuation");
-  let completed=Runtime.receive runtime (response next (V2_journals_outcome {items=[];next_cursor=None})) in
+  let completed=deliver_sample runtime (sample next ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   match (only "exhausted empty dates complete" completed.responses).payload with
   | Feed_loaded {feed;complete=true;_} ->
     Alcotest.(check bool) "true exhaustion" false (Option.is_some feed.continuation);
@@ -4177,31 +3969,24 @@ let test_feed_window_bounds_and_singleton_failure () =
     }
   in
   let oversized =
-    response
+    sample
       request
-      (V2_journals_outcome
-         { items =
-             [ { page = oversized_page
+      ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([ { page = oversized_page
                ; journal_day = 20260901
                ; revision = "large-singleton"
                }
-             ]
-         ; next_cursor = None
-         })
+             ] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
   in
   Alcotest.(check bool)
     "one complete oversized item cannot fit"
     true
-    (Protocol.encoded_response_bytes oversized > Worker_pure_data.maximum_response_bytes);
+    (sample_bytes runtime oversized > Worker_pure_data.maximum_response_bytes);
   let failed =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          request
-         (V2_failed
-            { code = "responseTooLarge"
-            ; message = "The encoded read response exceeded its byte limit."
-            }))
+         ((failed_sample (Read.Db_error(Logseq_db_worker.Error.create ~code:Response_too_large ~message:("The encoded read sample exceeded its byte limit.") ~details:[]|>Result.get_ok)))))
   in
   Alcotest.(check int) "no automatic singleton retry loop" 0 (List.length failed.requests);
   match (only "visible singleton failure" failed.responses).payload with
@@ -4265,18 +4050,15 @@ let test_bounded_preview_tree_paths () =
     |> fun o -> only "preview feed journals" o.requests
   in
   let tree =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          journals
-         (Protocol.V2_journals_outcome
-            { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
-            ; next_cursor = None
-            }))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([ { page; journal_day = 20260901; revision = "page-1" } ] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun o -> only "preview feed tree" o.requests
   in
   let cursor = Graph.Cursor.of_string "preview-next-page" |> Result.get_ok in
-  let feed = (Runtime.receive runtime (tree_page tree (List.filter(fun (m:Worker_pure_data.tree_member)->m.depth=0)items) (Some cursor))
+  let feed = (deliver_sample runtime (tree_page tree (List.filter(fun (m:Worker_pure_data.tree_member)->m.depth=0)items) (Some cursor))
     |>finish_previews runtime ~children:(List.filter_map(fun (m:Worker_pure_data.tree_member)->if m.depth=1 then Some Worker_pure_data.{value=m.value;revision=m.revision}else None)items)) in
   let day =
     List.find_map
@@ -4300,10 +4082,11 @@ let test_bounded_preview_tree_paths () =
     |> fun o -> only "preview day continuation" o.requests
   in
   (match Worker_producer.transport runtime day_read with
-   |Ok(Worker_producer.S.Coordination_query{request={command=V2_get_page_tree{cursor=Some actual;_};_};_})->
+   |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Tree{after=_;_} as query));_})->
+      let actual=Read.query_cursor (Read.For_worker.read_budget_owner budget) budget query |> Result.get_ok |> Option.get in
      Alcotest.(check bool) "paging cursor unchanged" true (actual = cursor)
    | _ -> Alcotest.fail "preview cap changed day paging");
-  let day_result = (Runtime.receive runtime (tree_page day_read (List.filter(fun (m:Worker_pure_data.tree_member)->m.depth=0)items) None)
+  let day_result = (deliver_sample runtime (tree_page day_read (List.filter(fun (m:Worker_pure_data.tree_member)->m.depth=0)items) None)
     |>finish_previews runtime ~children:(List.filter_map(fun (m:Worker_pure_data.tree_member)->if m.depth=1 then Some Worker_pure_data.{value=m.value;revision=m.revision}else None)items)) in
   (match (only "preview day result" day_result.responses).payload with
    | Feed_loaded {feed;complete=true;_} -> check_preview 3 (only "day entry" (List.hd feed.days).entries)
@@ -4312,7 +4095,7 @@ let test_bounded_preview_tree_paths () =
     changed runtime (window ~scopes:[ Worker_pure_data.V2_page_tree_interest page_uuid ] ())
   in
   let refresh = only "preview remote structure" (hydration_requests runtime changed_output) in
-  let remote = (Runtime.receive runtime (tree_page refresh (List.filter(fun (m:Worker_pure_data.tree_member)->m.depth=0)items) None)
+  let remote = (deliver_sample runtime (tree_page refresh (List.filter(fun (m:Worker_pure_data.tree_member)->m.depth=0)items) None)
     |>finish_previews runtime ~children:(List.filter_map(fun (m:Worker_pure_data.tree_member)->if m.depth=1 then Some Worker_pure_data.{value=m.value;revision=m.revision}else None)items)) in
   (match (only "preview remote result" remote.responses).payload with
    | Page_tree_reconciled { value; _ } ->
@@ -4407,14 +4190,11 @@ let test_preview_preserves_full_detail_and_copy () =
     |> fun output -> only "hidden parent feed" output.requests
   in
   let tree =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          journals
-         (V2_journals_outcome
-            { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
-            ; next_cursor = None
-            }))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([ { page; journal_day = 20260901; revision = "page-1" } ] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun output -> only "hidden parent tree" output.requests
   in
   let items =
@@ -4428,7 +4208,7 @@ let test_preview_preserves_full_detail_and_copy () =
               })
          children
   in
-  let output = (Runtime.receive runtime (tree_page tree (List.filter(fun (m:Worker_pure_data.tree_member)->m.depth=0)items) None)
+  let output = (deliver_sample runtime (tree_page tree (List.filter(fun (m:Worker_pure_data.tree_member)->m.depth=0)items) None)
     |>finish_previews runtime ~children:(List.filter_map(fun (m:Worker_pure_data.tree_member)->if m.depth=1 then Some Worker_pure_data.{value=m.value;revision=m.revision}else None)items)) in
   (match (only "hidden parent projected" output.responses).payload with
    | Feed_loaded { feed; _ } ->
@@ -4449,16 +4229,15 @@ let test_preview_preserves_full_detail_and_copy () =
     |> fun o -> only "complete Detail root" o.requests
   in
   let child_read =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          root_read
-         (Protocol.V2_block_outcome
-            (Worker_pure_data.V2_present_block { value = root; revision = "root-1" })))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block { value = root; revision = "root-1" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun o -> only "complete Detail children" o.requests
   in
   let output =
-    Runtime.receive runtime (response child_read (copy_children block_uuid children))
+    deliver_sample runtime (sample child_read (copy_children block_uuid children))
   in
   (match (only "complete Detail" output.responses).payload with
    | Detail_loaded { detail; _ } ->
@@ -4672,18 +4451,15 @@ let test_parent_visibility_tree_paths () =
     |> fun o -> only "visibility feed" o.requests
   in
   let tree =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          journals
-         (V2_journals_outcome
-            { items = [ { page; journal_day = 20260901; revision = "page-1" } ]
-            ; next_cursor = None
-            }))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([ { page; journal_day = 20260901; revision = "page-1" } ] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun o -> only "visibility tree" o.requests
   in
   let cursor = Graph.Cursor.of_string "visibility-next" |> Result.get_ok in
-  let output = (Runtime.receive runtime (tree_page tree (List.filter(fun (m:Worker_pure_data.tree_member)->m.depth=0)items) (Some cursor))
+  let output = (deliver_sample runtime (tree_page tree (List.filter(fun (m:Worker_pure_data.tree_member)->m.depth=0)items) (Some cursor))
     |>finish_previews runtime ~children:(List.filter_map(fun (m:Worker_pure_data.tree_member)->if m.depth=1 then Some Worker_pure_data.{value=m.value;revision=m.revision}else None)items)) in
   let day =
     List.find_map
@@ -4706,7 +4482,7 @@ let test_parent_visibility_tree_paths () =
          })
     |> fun o -> only "visibility continuation" o.requests
   in
-  let output = (Runtime.receive runtime (tree_page read (List.filter(fun (m:Worker_pure_data.tree_member)->m.depth=0)items) None)
+  let output = (deliver_sample runtime (tree_page read (List.filter(fun (m:Worker_pure_data.tree_member)->m.depth=0)items) None)
     |>finish_previews runtime ~children:(List.filter_map(fun (m:Worker_pure_data.tree_member)->if m.depth=1 then Some Worker_pure_data.{value=m.value;revision=m.revision}else None)items)) in
   (match (only "visibility day" output.responses).payload with
    | Feed_loaded {feed;complete=true;_} -> check_parent_visibility roots (List.hd feed.days).entries
@@ -4719,7 +4495,7 @@ let test_parent_visibility_tree_paths () =
   (match
      (only
         "visibility remote output"
-        ((Runtime.receive runtime (tree_page refresh (List.filter(fun (m:Worker_pure_data.tree_member)->m.depth=0)items) None)
+        ((deliver_sample runtime (tree_page refresh (List.filter(fun (m:Worker_pure_data.tree_member)->m.depth=0)items) None)
     |>finish_previews runtime ~children:(List.filter_map(fun (m:Worker_pure_data.tree_member)->if m.depth=1 then Some Worker_pure_data.{value=m.value;revision=m.revision}else None)items))).responses)
        .payload
    with
@@ -4794,12 +4570,10 @@ let test_detail_property_reference_reads_are_deduplicated () =
   let read=Runtime.submit runtime (Journal_graph_request.Load_detail
     {block_id=Graph.Uuid.to_string block_uuid;after=None;limit=128;request_generation=91L})
     |> fun o->only "property root read" o.requests in
-  let child=Runtime.receive runtime (response read (Protocol.V2_block_outcome
-    (Worker_pure_data.V2_present_block {value=root;revision="root-with-properties"})))
+  let child=deliver_sample runtime (sample read ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block {value=root;revision="root-with-properties"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun o->only "property child read" o.requests in
-  let children=Protocol.V2_children_outcome
-    {parent=block_uuid;revision_scope=Worker_pure_data.V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None} in
-  let output=Runtime.receive runtime (response child children) in
+  let children=(query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(block_uuid) ~revision_scope:(Worker_pure_data.V2_children_revision block_uuid) ~scope_revision:("children-1") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")) in
+  let output=deliver_sample runtime (sample child children) in
   let reference=only "one deduplicated closed property reference" output.requests
     |> outline_after_page_miss runtime in
   (match Runtime.worker_read runtime reference with
@@ -4807,8 +4581,7 @@ let test_detail_property_reference_reads_are_deduplicated () =
       (Graph.Uuid.to_string unrelated_uuid) (Graph.Uuid.to_string block)
    |_ ->Alcotest.fail "property value must use the existing bounded block read");
   let closed={record with block={block with uuid=unrelated_uuid;title="Yes";properties=[]}} in
-  let output=Runtime.receive runtime (response reference (Protocol.V2_block_outcome
-    (Worker_pure_data.V2_present_block {value=closed;revision="closed-1"}))) in
+  let output=deliver_sample runtime (sample reference ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block {value=closed;revision="closed-1"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   Alcotest.(check int) "no repeated reference read" 0 (List.length output.requests);
   Alcotest.(check bool) "closed value enters reference presentation cache" true
     (List.exists (fun (r:Runtime.response)->match r.payload with
@@ -4828,9 +4601,9 @@ let test_changed_journal_detail_discovers_property_reference () =
     ; values_truncated = false } in
   let output = changed runtime (window ~blocks:[block_uuid] ()) in
   let request = only "changed active journal detail" (hydration_requests runtime output) in
-  let output = Runtime.receive runtime (response request
-    (Protocol.V2_block_outcome (Worker_pure_data.V2_present_block
-      {value={record with block={block with properties=[property]}}; revision="block-2"}))) in
+  let output = deliver_sample runtime (sample request
+    ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block
+      {value={record with block={block with properties=[property]}}; revision="block-2"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   let reference = only "new property reference after sync" output.requests in
   match Runtime.worker_read runtime reference with
    | Some(Runtime.Read{query=W.Page {uuid=block;_};_}) -> Alcotest.(check string) "new closed value"
@@ -4860,26 +4633,19 @@ let test_materialized_detail_leaf_discovers_property_reference () =
     |> fun o -> only "materialized root" o.requests
   in
   let children =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          root
-         (Protocol.V2_block_outcome
-            (Worker_pure_data.V2_present_block { value = record; revision = "root-1" })))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block { value = record; revision = "root-1" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun o -> only "materialized parent page" o.requests
   in
   ignore
-    (Runtime.receive
+    (deliver_sample
        runtime
-       (response
+       (sample
           children
-          (Protocol.V2_children_outcome
-             { parent = block_uuid
-             ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
-             ; scope_revision = "children-1"
-             ; items = [ { value = leaf; revision = "leaf-1" } ]
-             ; next_cursor = None
-             })));
+          ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(block_uuid) ~revision_scope:(Worker_pure_data.V2_children_revision block_uuid) ~scope_revision:("children-1") ~items:([ { value = leaf; revision = "leaf-1" } ]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))));
   (* This node is displayed, but no own children page is requested: exactly
      the runtime ownership state of a depth/budget boundary Detail leaf. *)
   let property : Graph.property_summary =
@@ -4897,16 +4663,15 @@ let test_materialized_detail_leaf_discovers_property_reference () =
     |> fun o -> only "materialized leaf sync" (hydration_requests runtime o)
   in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          update
-         (Protocol.V2_block_outcome
-            (Worker_pure_data.V2_present_block
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block
                { value =
                    { leaf with block = { leaf.block with properties = [ property ] } }
                ; revision = "leaf-2"
-               })))
+               })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   let read = only "displayed leaf property demand" output.requests in
   match Runtime.worker_read runtime read with
@@ -4936,15 +4701,14 @@ let test_timeline_only_property_update_does_not_hydrate () =
     |> fun o -> only "Timeline-only sync" (hydration_requests runtime o)
   in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          update
-         (Protocol.V2_block_outcome
-            (Worker_pure_data.V2_present_block
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block
                { value = { record with block = { block with properties = [ property ] } }
                ; revision = "root-2"
-               })))
+               })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   Alcotest.(check int)
     "Timeline alone must not hydrate property values"
@@ -4987,26 +4751,19 @@ let test_detail_child_property_reference_without_child_load () =
     |> fun o -> only "child property root" o.requests
   in
   let children =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          root
-         (Protocol.V2_block_outcome
-            (Worker_pure_data.V2_present_block { value = record; revision = "root-1" })))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block { value = record; revision = "root-1" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun o -> only "child property page" o.requests
   in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          children
-         (Protocol.V2_children_outcome
-            { parent = block_uuid
-            ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
-            ; scope_revision = "children-1"
-            ; items = [ { value = leaf; revision = "leaf-1" } ]
-            ; next_cursor = None
-            }))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(block_uuid) ~revision_scope:(Worker_pure_data.V2_children_revision block_uuid) ~scope_revision:("children-1") ~items:([ { value = leaf; revision = "leaf-1" } ]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   let request = only "returned child property demand" output.requests in
   match Runtime.worker_read runtime request with
@@ -5045,30 +4802,23 @@ let test_detail_page_and_class_property_uses_page_lookup () =
          |> fun o -> only "page property root" o.requests
        in
        let children =
-         Runtime.receive
+         deliver_sample
            runtime
-           (response
+           (sample
               read
-              (Protocol.V2_block_outcome
-                 (Worker_pure_data.V2_present_block
+              ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block
                     { value =
                         { record with block = { block with properties = [ property ] } }
                     ; revision = "root-1"
-                    })))
+                    })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
          |> fun o -> only "page property children" o.requests
        in
        let output =
-         Runtime.receive
+         deliver_sample
            runtime
-           (response
+           (sample
               children
-              (Protocol.V2_children_outcome
-                 { parent = block_uuid
-                 ; revision_scope = Worker_pure_data.V2_children_revision block_uuid
-                 ; scope_revision = "children-1"
-                 ; items = []
-                 ; next_cursor = None
-                 }))
+              ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(block_uuid) ~revision_scope:(Worker_pure_data.V2_children_revision block_uuid) ~scope_revision:("children-1") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
        in
        let read = only "one deduplicated page value" output.requests in
        (match Runtime.worker_read runtime read with
@@ -5079,12 +4829,11 @@ let test_detail_page_and_class_property_uses_page_lookup () =
             (Graph.Uuid.equal page unrelated_uuid)
         | _ -> Alcotest.fail "page/class property was routed to a block lookup");
        let output =
-         Runtime.receive
+         deliver_sample
            runtime
-           (response
+           (sample
               read
-              (Protocol.V2_page_outcome
-                 (Worker_pure_data.V2_present_page
+              ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page
                     { page =
                         { page with
                           uuid = unrelated_uuid
@@ -5092,7 +4841,7 @@ let test_detail_page_and_class_property_uses_page_lookup () =
                         ; kind = Class_page
                         }
                     ; revision = "page-value-1"
-                    })))
+                    })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
        in
        Alcotest.(check int) "no duplicate page read" 0 (List.length output.requests);
        Alcotest.(check bool)
@@ -5115,12 +4864,11 @@ let test_detail_page_and_class_property_uses_page_lookup () =
         | Some(Runtime.Read{query=W.Page _;_}) -> ()
         | _ -> Alcotest.fail "page value change did not invalidate the typed cache");
        let output =
-         Runtime.receive
+         deliver_sample
            runtime
-           (response
+           (sample
               update
-              (Protocol.V2_page_outcome
-                 (Worker_pure_data.V2_present_page
+              ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page
                     { page =
                         { page with
                           uuid = unrelated_uuid
@@ -5128,7 +4876,7 @@ let test_detail_page_and_class_property_uses_page_lookup () =
                         ; kind = Class_page
                         }
                     ; revision = "page-value-2"
-                    })))
+                    })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
        in
        Alcotest.(check bool)
          "updated page title published"
@@ -5154,14 +4902,13 @@ let test_page_property_promotes_prior_block_reference () =
     let title="See [[" ^ Graph.Uuid.to_string unrelated_uuid ^ "]]" in
     let root : Worker_pure_data.tree_member =
       {value={record with block={block with title}};revision="root-1";depth=0;parent=page_uuid} in
-    let first=(Runtime.receive runtime (tree_page tree [root] None) |>finish_previews runtime ~children:[])
+    let first=(deliver_sample runtime (tree_page tree [root] None) |>finish_previews runtime ~children:[])
       |> fun o -> only "initial generic page reference" o.requests
       |> outline_after_page_miss runtime in
        (match Runtime.worker_read runtime first with
         | Some(Runtime.Read{query=W.Outline_block _;_}) -> ()
         | _ -> Alcotest.fail "expected generic block lookup");
-    if not pending then ignore (Runtime.receive runtime (response first (Protocol.V2_block_outcome
-      (Worker_pure_data.V2_missing_block {uuid=unrelated_uuid;revision="missing-1"}))));
+    if not pending then ignore (deliver_sample runtime (sample first ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block {uuid=unrelated_uuid;revision="missing-1"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))));
     let property : Graph.property_summary =
       {ident="user.property/page";uuid=block_uuid;title="Actual page"
       ;schema={property_type=Page;cardinality=One;hidden=false;public=false}
@@ -5169,21 +4916,17 @@ let test_page_property_promotes_prior_block_reference () =
     let read=Runtime.submit runtime (Journal_graph_request.Load_detail
       {block_id=Graph.Uuid.to_string block_uuid;after=None;limit=128;request_generation=91L})
       |> fun o -> only "promoted Detail root" o.requests in
-    let children=Runtime.receive runtime (response read (Protocol.V2_block_outcome
-      (Worker_pure_data.V2_present_block {value={record with block={block with properties=[property]}};revision="root-2"})))
+    let children=deliver_sample runtime (sample read ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block {value={record with block={block with properties=[property]}};revision="root-2"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
       |> fun o -> only "promoted Detail children" o.requests in
-    let output=Runtime.receive runtime (response children (Protocol.V2_children_outcome
-      {parent=block_uuid;revision_scope=Worker_pure_data.V2_children_revision block_uuid;scope_revision="children-1";items=[];next_cursor=None})) in
+    let output=deliver_sample runtime (sample children ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(block_uuid) ~revision_scope:(Worker_pure_data.V2_children_revision block_uuid) ~scope_revision:("children-1") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
     let output=if pending then (
       Alcotest.(check int) "retain one pending reference read" 0 (List.length output.requests);
-      Runtime.receive runtime (response first (Protocol.V2_block_outcome
-        (Worker_pure_data.V2_missing_block {uuid=unrelated_uuid;revision="missing-1"})))) else output in
+      deliver_sample runtime (sample first ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block {uuid=unrelated_uuid;revision="missing-1"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))) else output in
     let page_read=only "page type supersedes old block missing/pending cache" output.requests in
     (match Runtime.worker_read runtime page_read with
      |Some(Runtime.Read{query=W.Page {uuid=page;_};_})->Alcotest.(check bool) "promoted UUID" true (Graph.Uuid.equal page unrelated_uuid)
      |_ -> Alcotest.fail "semantic page type did not supersede the generic block lookup");
-    let output=Runtime.receive runtime (response page_read (Protocol.V2_page_outcome
-      (Worker_pure_data.V2_present_page {page={page with uuid=unrelated_uuid;title="Actual page title";kind=Ordinary_page};revision="actual-page-1"}))) in
+    let output=deliver_sample runtime (sample page_read ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page {page={page with uuid=unrelated_uuid;title="Actual page title";kind=Ordinary_page};revision="actual-page-1"})) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
     Alcotest.(check bool) "promoted title published" true (List.exists (fun (r:Runtime.response)->match r.payload with
       |Reference_sources_changed values->List.mem (Graph.Uuid.to_string unrelated_uuid,Some "Actual page title") values
       |_ ->false) output.responses)) [false;true]
@@ -5217,14 +4960,15 @@ let test_changed_tree_all_property_slice_continues () =
     ; parent = page_uuid
     }
   in
-  let output = (Runtime.receive runtime (tree_page read [ root ] (Some cursor)) |>finish_previews runtime ~children:[]) in
+  let output = (deliver_sample runtime (tree_page read [ root ] (Some cursor)) |>finish_previews runtime ~children:[]) in
   Alcotest.(check int)
     "do not replace day with a filtered empty slice"
     0
     (List.length output.responses);
   let next = only "continue past property roots" output.requests in
   (match Worker_producer.transport runtime next with
-   |Ok(Worker_producer.S.Coordination_query{request={command=V2_get_page_tree{cursor=Some actual;_};_};_})->
+   |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Tree{after=_;_} as query));_})->
+      let actual=Read.query_cursor (Read.For_worker.read_budget_owner budget) budget query |> Result.get_ok |> Option.get in
      Alcotest.(check string)
        "same opaque cursor"
        (Graph.Cursor.to_string cursor)
@@ -5233,7 +4977,7 @@ let test_changed_tree_all_property_slice_continues () =
   let ordinary : Worker_pure_data.tree_member =
     { value = record; revision = "root-2"; depth = 0; parent = page_uuid }
   in
-  let output = (Runtime.receive runtime (tree_page next [ ordinary ] None) |>finish_previews runtime ~children:[]) in
+  let output = (deliver_sample runtime (tree_page next [ ordinary ] None) |>finish_previews runtime ~children:[]) in
   Alcotest.(check bool)
     "later ordinary root retained"
     true
@@ -5256,9 +5000,8 @@ let expect_reference_page runtime output id =
 ;;
 
 let missing_reference_page runtime request id =
-  Runtime.receive runtime
-    (response request (Protocol.V2_page_outcome
-      (Worker_pure_data.V2_missing_page { uuid = id; revision = "page-absent" })))
+  deliver_sample runtime
+    (sample request ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_page { uuid = id; revision = "page-absent" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
 ;;
 
 let expect_reference_outline runtime output id =
@@ -5269,9 +5012,8 @@ let expect_reference_outline runtime output id =
 ;;
 
 let reference_page_response ?(recycled = false) request kind title =
-  response request (Protocol.V2_page_outcome
-    (Worker_pure_data.V2_present_page { page = { page with uuid = target_uuid; kind; title; recycled }
-      ; revision = "resolved-page" }))
+  sample request ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page { page = { page with uuid = target_uuid; kind; title; recycled }
+      ; revision = "resolved-page" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
 ;;
 
 let test_reference_page_first_resolves_pages () =
@@ -5279,7 +5021,7 @@ let test_reference_page_first_resolves_pages () =
     let runtime = Runtime.create () in
     let request = reference_feed runtime (reference ^ " " ^ reference)
       |> fun output -> expect_reference_page runtime output target_uuid in
-    let resolved = Runtime.receive runtime
+    let resolved = deliver_sample runtime
       (reference_page_response request kind "2026-09-01") in
     Alcotest.(check (option string)) "actual page title is published"
       (Some "2026-09-01") (List.assoc_opt target_id (reference_updates resolved) |> Option.join);
@@ -5288,7 +5030,7 @@ let test_reference_page_first_resolves_pages () =
     Alcotest.(check int) "positive page source is reused" 0 (List.length cached.requests);
     let refresh = changed runtime (window ~pages:[target_uuid] ())
       |> fun output -> expect_reference_page runtime output target_uuid in
-    let updated = Runtime.receive runtime (reference_page_response refresh kind "Edited page") in
+    let updated = deliver_sample runtime (reference_page_response refresh kind "Edited page") in
     Alcotest.(check (option string)) "page change invalidates typed cache"
       (Some "Edited page") (List.assoc_opt target_id (reference_updates updated) |> Option.join))
     [Graph.Journal_page {journal_day=20260901}; Ordinary_page]
@@ -5304,7 +5046,7 @@ let test_reference_page_miss_then_outline () =
   let outline = expect_reference_outline runtime fallback target_uuid in
   Alcotest.(check int) "duplicate source joins pending fallback" 0
     (List.length (reference_feed runtime (reference ^ " " ^ reference)).requests);
-  let resolved = Runtime.receive runtime (target_response outline "Outline body") in
+  let resolved = deliver_sample runtime (target_response outline "Outline body") in
   Alcotest.(check (option string)) "outline source resolves after page absence"
     (Some "Outline body") (List.assoc_opt target_id (reference_updates resolved) |> Option.join);
   Alcotest.(check int) "positive outline source is reused" 0
@@ -5317,8 +5059,7 @@ let test_reference_negative_cache_requires_both_misses () =
     |> fun output -> expect_reference_page runtime output target_uuid in
   let fallback = missing_reference_page runtime page_read target_uuid in
   let outline = expect_reference_outline runtime fallback target_uuid in
-  let missing = Runtime.receive runtime (response outline (Protocol.V2_block_outcome
-    (Worker_pure_data.V2_missing_block {uuid=target_uuid;revision="outline-absent"}))) in
+  let missing = deliver_sample runtime (sample outline ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block {uuid=target_uuid;revision="outline-absent"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   Alcotest.(check bool) "both misses publish unavailable source" true
     (List.mem (target_id,None) (reference_updates missing));
   Alcotest.(check int) "both misses are cached" 0
@@ -5334,17 +5075,17 @@ let test_reference_errors_and_cancellation_retry_page_first () =
       missing_reference_page runtime first target_uuid |> fun output->expect_reference_outline runtime output target_uuid
       else first in
     let failed = match terminal with
-      | 0 -> Runtime.receive runtime (response current
-          (Protocol.V2_failed {code="StorageBusy";message="transient"}))
+      | 0 -> deliver_sample runtime (sample current
+          ((failed_sample (Read.Service_failed (("StorageBusy")^": "^("transient"))))))
       | 1 -> Runtime.fail_request runtime current ~message:"Worker cancelled"
       | _ -> Runtime.abandon runtime current; {Runtime.requests=[];responses=[]} in
     Alcotest.(check int) "failure/cancel is not page absence" 0 (List.length failed.requests);
     let retry=reference_feed runtime reference
       |> fun output->expect_reference_page runtime output target_uuid in
-    let late=Runtime.receive runtime (reference_page_response first Ordinary_page "Late") in
+    let late=deliver_sample runtime (reference_page_response first Ordinary_page "Late") in
     Alcotest.(check int) "old terminal cannot complete the retry" 0
       (List.length late.requests+List.length late.responses);
-    let fresh=Runtime.receive runtime (reference_page_response retry Ordinary_page "Recovered") in
+    let fresh=deliver_sample runtime (reference_page_response retry Ordinary_page "Recovered") in
     Alcotest.(check (option string)) "retry is not poisoned by negative cache"
       (Some "Recovered") (List.assoc_opt target_id (reference_updates fresh) |> Option.join)) [0;1;2]) [false;true]
 ;;
@@ -5357,12 +5098,12 @@ let test_reference_reset_discards_both_stages () =
       |> fun output->expect_reference_outline runtime output target_uuid else first in
     Runtime.reset runtime;
     let fresh=reference_feed runtime reference |> fun output->expect_reference_page runtime output target_uuid in
-    let late=Runtime.receive runtime
+    let late=deliver_sample runtime
       (if outline_stage then target_response old "Old graph"
        else reference_page_response old Ordinary_page "Old graph") in
     Alcotest.(check int) "reset rejects old graph completion" 0
       (List.length late.requests+List.length late.responses);
-    let result=Runtime.receive runtime (reference_page_response fresh Ordinary_page "New graph") in
+    let result=deliver_sample runtime (reference_page_response fresh Ordinary_page "New graph") in
     Alcotest.(check (option string)) "new graph owns source"
       (Some "New graph") (List.assoc_opt target_id (reference_updates result) |> Option.join)) [false;true]
 ;;
@@ -5376,14 +5117,13 @@ let test_reference_invalidation_restarts_page_phase () =
     let invalidated=changed runtime (window ~pages:[target_uuid] ()) in
     Alcotest.(check int) "in-flight invalidations coalesce" 0
       (List.length (hydration_requests runtime invalidated));
-    let stale=Runtime.receive runtime
+    let stale=deliver_sample runtime
       (if outline_stage then target_response current "Stale"
-       else response current (Protocol.V2_page_outcome
-         (Worker_pure_data.V2_missing_page {uuid=target_uuid;revision="old-page-miss"}))) in
+       else sample current ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_page {uuid=target_uuid;revision="old-page-miss"})) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
     Alcotest.(check bool) "stale phase never publishes" false
       (List.mem (target_id,Some "Stale") (reference_updates stale));
     let refresh=expect_reference_page runtime stale target_uuid in
-    let result=Runtime.receive runtime (reference_page_response refresh Ordinary_page "Fresh") in
+    let result=deliver_sample runtime (reference_page_response refresh Ordinary_page "Fresh") in
     Alcotest.(check (option string)) "invalidation restarts from page"
       (Some "Fresh") (List.assoc_opt target_id (reference_updates result) |> Option.join)) [false;true]
 ;;
@@ -5392,13 +5132,13 @@ let test_reference_fallback_keeps_original_epoch () =
   let runtime=Runtime.create () in
   let old=reference_feed runtime reference |> fun output->expect_reference_page runtime output target_uuid in
   let newer=begin_reference_tree runtime 20L in
-  let newest = (Runtime.receive runtime (reference_tree_response newer "Newer fragment") |>finish_previews runtime ~children:[]) in
+  let newest = (deliver_sample runtime (reference_tree_response newer "Newer fragment") |>finish_previews runtime ~children:[]) in
   Alcotest.(check (option string)) "newer fragment publishes source"
     (Some "Newer fragment") (List.assoc_opt target_id (reference_updates newest) |> Option.join);
   let fallback=missing_reference_page runtime old target_uuid in
   let completed=match hydration_requests runtime fallback with
     | [] -> fallback
-    | [_] -> Runtime.receive runtime (target_response
+    | [_] -> deliver_sample runtime (target_response
         (expect_reference_outline runtime fallback target_uuid) "Older fallback")
     | _ -> Alcotest.fail "duplicate fallback" in
   Alcotest.(check bool) "old two-stage lookup cannot replace a newer fragment" false
@@ -5421,13 +5161,11 @@ let test_reference_two_stage_burst_stays_bounded () =
   while not (Queue.is_empty pending) do
     let request : Graph.Uuid.t = Queue.pop pending in
     let outcome=match Runtime.worker_read runtime request with
-      | Some(Runtime.Read{query=W.Page {uuid=page;_};_})->incr pages;Protocol.V2_page_outcome
-          (Worker_pure_data.V2_missing_page {uuid=page;revision="page-missing"})
-      | Some(Runtime.Read{query=W.Outline_block {uuid=block;_};_})->incr outlines;Protocol.V2_block_outcome
-          (Worker_pure_data.V2_missing_block {uuid=block;revision="outline-missing"})
+      | Some(Runtime.Read{query=W.Page {uuid=page;_};_})->incr pages;(query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_page {uuid=page;revision="page-missing"})) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
+      | Some(Runtime.Read{query=W.Outline_block {uuid=block;_};_})->incr outlines;(query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block {uuid=block;revision="outline-missing"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
       | _->Alcotest.fail "unexpected hydration request" in
     List.iter (fun request->Queue.push request pending)
-      (Runtime.receive runtime (response request outcome)).requests;
+      (deliver_sample runtime (sample request outcome)).requests;
     Alcotest.(check bool) "both phases share four-read admission" true (Queue.length pending<=4)
   done;
   Alcotest.(check int) "one page read per UUID" 30 !pages;
@@ -5439,7 +5177,7 @@ let test_reference_two_stage_burst_stays_bounded () =
 let test_recycled_reference_page_never_falls_back () =
   let runtime=Runtime.create () in
   let first=reference_feed runtime reference |> fun output->expect_reference_page runtime output target_uuid in
-  let hidden=Runtime.receive runtime (reference_page_response ~recycled:true first Ordinary_page "Hidden") in
+  let hidden=deliver_sample runtime (reference_page_response ~recycled:true first Ordinary_page "Hidden") in
   Alcotest.(check int) "existing recycled page is not a missing page" 0 (List.length hidden.requests);
   Alcotest.(check bool) "recycled title is never shown" false
     (List.mem (target_id,Some "Hidden") (reference_updates hidden));
@@ -5456,7 +5194,7 @@ let test_reference_failed_read_retains_epoch_fence () =
       |> fun output->expect_reference_page runtime output target_uuid in
     if abandon then Runtime.abandon runtime retry
     else ignore (Runtime.fail_request runtime retry ~message:"transient failure");
-    let late=(Runtime.receive runtime (reference_tree_response old_fragment "Rollback") |>finish_previews runtime ~children:[]) in
+    let late=(deliver_sample runtime (reference_tree_response old_fragment "Rollback") |>finish_previews runtime ~children:[]) in
     Alcotest.(check bool) "failure/cancel preserves its epoch fence" false
       (List.mem (target_id,Some "Rollback") (reference_updates late));
     let retry_output =
@@ -5473,11 +5211,11 @@ let test_reference_abandon_preserves_newer_source () =
   let old=reference_feed runtime reference |> fun output->expect_reference_page runtime output target_uuid in
   let older_fragment=begin_reference_tree runtime 12L in
   let current_fragment=begin_reference_tree runtime 13L in
-  let fresh=(Runtime.receive runtime (reference_tree_response current_fragment "Current") |>finish_previews runtime ~children:[]) in
+  let fresh=(deliver_sample runtime (reference_tree_response current_fragment "Current") |>finish_previews runtime ~children:[]) in
   Alcotest.(check bool) "fresh fragment published" true
     (List.mem (target_id,Some "Current") (reference_updates fresh));
   Runtime.abandon runtime old;
-  let rollback=(Runtime.receive runtime (reference_tree_response older_fragment "Rollback") |>finish_previews runtime ~children:[]) in
+  let rollback=(deliver_sample runtime (reference_tree_response older_fragment "Rollback") |>finish_previews runtime ~children:[]) in
   Alcotest.(check bool) "abandon cannot delete a newer source fence" false
     (List.mem (target_id,Some "Rollback") (reference_updates rollback));
   Alcotest.(check int) "newer source remains cached" 0
@@ -5488,7 +5226,7 @@ let test_reference_shared_failure_can_retry_discovery () =
   let runtime=Runtime.create () in
   set_calendar runtime;
   let initial=begin_reference_tree runtime 14L in
-  ignore ((Runtime.receive runtime (reference_tree_response initial "Loaded") |>finish_previews runtime ~children:[]));
+  ignore ((deliver_sample runtime (reference_tree_response initial "Loaded") |>finish_previews runtime ~children:[]));
   let update=changed runtime (window ~blocks:[target_uuid] ())
     |> check_target_request runtime in
   ignore (Runtime.fail_request runtime update ~message:"shared point-read failed");
@@ -5498,11 +5236,10 @@ let test_reference_shared_failure_can_retry_discovery () =
 let test_reference_page_survives_unrelated_outline_miss () =
   let runtime=Runtime.create () in
   let first=reference_feed runtime reference |> fun output->expect_reference_page runtime output target_uuid in
-  ignore (Runtime.receive runtime (reference_page_response first Ordinary_page "Actual page"));
+  ignore (deliver_sample runtime (reference_page_response first Ordinary_page "Actual page"));
   let wrong_projection=Runtime.submit runtime (Journal_graph_request.Find_block target_id)
     |> fun output->only "independent outline request" output.requests in
-  let missing=Runtime.receive runtime (response wrong_projection (Protocol.V2_block_outcome
-    (Worker_pure_data.V2_missing_block {uuid=target_uuid;revision="not-an-outline"}))) in
+  let missing=deliver_sample runtime (sample wrong_projection ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block {uuid=target_uuid;revision="not-an-outline"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   Alcotest.(check bool) "outline miss does not invalidate an existing page" false
     (List.mem (target_id,None) (reference_updates missing));
   Alcotest.(check int) "existing page stays positively cached" 0
@@ -5512,12 +5249,11 @@ let test_reference_page_survives_unrelated_outline_miss () =
 let test_reference_shared_page_miss_is_not_negative_cache () =
   let runtime=Runtime.create () in
   let first=reference_feed runtime reference |> fun output->expect_reference_page runtime output target_uuid in
-  ignore (Runtime.receive runtime (reference_page_response first Ordinary_page "Actual page"));
+  ignore (deliver_sample runtime (reference_page_response first Ordinary_page "Actual page"));
   let root=Runtime.submit runtime (Journal_graph_request.Load_detail
     {block_id=Graph.Uuid.to_string block_uuid;after=None;limit=128;request_generation=22L})
     |> fun output->only "unretained owning page root" output.requests in
-  let owning=Runtime.receive runtime (response root (Protocol.V2_block_outcome
-    (Worker_pure_data.V2_present_block {value={record with block={block with page=target_uuid;parent=target_uuid}};revision="owning"})))
+  let owning=deliver_sample runtime (sample root ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block {value={record with block={block with page=target_uuid;parent=target_uuid}};revision="owning"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun output->only "owning page metadata read" output.requests in
   ignore (missing_reference_page runtime owning target_uuid);
   ignore (reference_feed runtime reference |> fun output->expect_reference_page runtime output target_uuid)
@@ -5533,17 +5269,15 @@ let test_typed_metadata_preserves_newer_reference_fence () =
   let root=Runtime.submit runtime (Journal_graph_request.Load_detail
     {block_id=Graph.Uuid.to_string block_uuid;after=None;limit=128;request_generation=31L})
     |> fun output->only "old typed Detail root" output.requests in
-  let children=Runtime.receive runtime (response root (Protocol.V2_block_outcome
-    (Worker_pure_data.V2_present_block {value={record with block={block with properties=[property]}};revision="typed"})))
+  let children=deliver_sample runtime (sample root ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block {value={record with block={block with properties=[property]}};revision="typed"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun output->only "old typed Detail children" output.requests in
   let middle=begin_reference_tree runtime 32L in
   ignore (changed runtime (window ~pages:[target_uuid] ()));
   let fresh=missing_reference_page runtime first target_uuid
     |> fun output->expect_reference_page runtime output target_uuid in
   ignore (Runtime.fail_request runtime fresh ~message:"newer failure fence");
-  ignore (Runtime.receive runtime (response children (Protocol.V2_children_outcome
-    {parent=block_uuid;revision_scope=Worker_pure_data.V2_children_revision block_uuid;scope_revision="typed";items=[];next_cursor=None})));
-  let late=(Runtime.receive runtime (reference_tree_response middle "Rollback") |>finish_previews runtime ~children:[]) in
+  ignore (deliver_sample runtime (sample children ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(block_uuid) ~revision_scope:(Worker_pure_data.V2_children_revision block_uuid) ~scope_revision:("typed") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))));
+  let late=(deliver_sample runtime (reference_tree_response middle "Rollback") |>finish_previews runtime ~children:[]) in
   Alcotest.(check bool) "old typed metadata cannot lower a newer fence" false
     (List.mem (target_id,Some "Rollback") (reference_updates late))
 ;;
@@ -5552,12 +5286,11 @@ let test_dirty_abandon_keeps_reference_retryable () =
   List.iter (fun positive ->
     let runtime=Runtime.create () in
     let first=reference_feed runtime reference |> fun output->expect_reference_page runtime output target_uuid in
-    if positive then ignore (Runtime.receive runtime (reference_page_response first Ordinary_page "Before"))
+    if positive then ignore (deliver_sample runtime (reference_page_response first Ordinary_page "Before"))
     else (
       let outline=missing_reference_page runtime first target_uuid
         |> fun output->expect_reference_outline runtime output target_uuid in
-      ignore (Runtime.receive runtime (response outline (Protocol.V2_block_outcome
-        (Worker_pure_data.V2_missing_block {uuid=target_uuid;revision="missing"})))));
+      ignore (deliver_sample runtime (sample outline ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block {uuid=target_uuid;revision="missing"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))));
     let pending=changed runtime (window ~pages:[target_uuid] ())
       |> fun output->expect_reference_page runtime output target_uuid in
     ignore (changed runtime (window ~pages:[target_uuid] ()));
@@ -5575,19 +5308,17 @@ let page_detail_seed runtime children =
   let root = match Runtime.worker_read runtime root with
     | Some(Runtime.Read{query=W.Page {uuid=id;_};_}) when Graph.Uuid.equal id page_uuid -> root
     | Some(Runtime.Read{query=W.Outline_block _;_}) ->
-      Runtime.receive runtime (response root (Protocol.V2_block_outcome
-        (Worker_pure_data.V2_missing_block {uuid=page_uuid; revision="absent-outline"})))
+      deliver_sample runtime (sample root ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block {uuid=page_uuid; revision="absent-outline"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
       |> fun out -> only "outline miss must resolve page" out.requests
     | _ -> Alcotest.fail "unexpected root lookup" in
   Alcotest.(check bool) "page root is resolved as a page" true
     ((match Runtime.worker_read runtime root with Some(Runtime.Read{query=W.Page{uuid;revision=None};_})->uuid=page_uuid|_->false));
-  let child_read = Runtime.receive runtime (response root (Protocol.V2_page_outcome
-    (Worker_pure_data.V2_present_page {page; revision="page-1"})))
+  let child_read = deliver_sample runtime (sample root ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page {page; revision="page-1"})) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun out -> only "page root children" out.requests in
   (match Runtime.worker_read runtime child_read with
    | Some(Runtime.Read{query=W.Child_members {parent;_};maximum_items=128;_}) when Graph.Uuid.equal parent page_uuid -> ()
    | _ -> Alcotest.fail "page children escaped selected page");
-  let out = Runtime.receive runtime (response child_read (copy_children page_uuid children)) in
+  let out = deliver_sample runtime (sample child_read (copy_children page_uuid children)) in
   out.responses |> List.find_map (fun r -> match r.Runtime.payload with
     | Detail_loaded {detail;_} -> Some detail | _ -> None) |> Option.get
 ;;
@@ -5627,7 +5358,7 @@ let test_page_detail_root_and_append () =
     let mutation_id=W.mutation_intent_id intent in
     Alcotest.(check bool) "page insertion bound to typed owner" true
       (Runtime.bind_mutation runtime request ~presentation ~intent:(W.Mutation_intent intent));
-    let receipt=(let (Protocol.V2_response receipt_packet as packet) = (response request (V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
+    let receipt=(let (Protocol.V2_response receipt_packet as packet) = (durable_response request (V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
         before_projection_revision="projection:v1:1";after_projection_revision="projection:v1:2"})) in
       match I.reply Worker_producer.session ~request_id:(W.request_id request) (W.Mutate intent)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
@@ -5636,20 +5367,12 @@ let test_page_detail_root_and_append () =
       | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected") in
     let child=copy_child unrelated_uuid page_uuid command.source in
-    let confirmation=(let (Protocol.V2_response confirmation_packet as packet) = (response request(V2_block_summary_outcome{lookup=Worker_pure_data.V2_present_block{value=child.value;revision=child.revision};
-        page=Some(Worker_pure_data.V2_present_page{page;revision="page-2"});items=[];next_cursor=None;
-        scope_revision="children-1";generation="generation:v1:1:1";projection_revision="projection:v1:2"})) in
-      match I.reply Worker_producer.session ~request_id:(W.request_id confirmation_packet.request_id)
-        (W.Confirm(presentation,receipt))
-        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response packet) with
-      | Ok(W.Answered(Ok(W.Confirmed proof))) -> proof
-      | _ -> failwith "Production confirmation was rejected") in
+    let confirmation=confirmed_sample Worker_producer.issuer Worker_producer.session presentation receipt request (((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.block_summary ~lookup:(Worker_pure_data.V2_present_block{value=child.value;revision=child.revision}) ~page:(Some(Worker_pure_data.V2_present_page{page;revision="page-2"})) ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None)) ~scope_revision:("children-1") ~generation:("generation:v1:1:1") ~projection_revision:("projection:v1:2")) in match query with |Read.Block_summary _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
     let parent_read=Runtime.receive_mutation runtime request(W.Confirmed confirmation)
       |> fun out->only "confirm selected page parent" out.requests in
     Alcotest.(check bool) "confirm page through page API" true
       ((match Runtime.worker_read runtime parent_read with Some(Runtime.Read{query=W.Page{uuid;revision=None};_})->uuid=page_uuid|_->false));
-    let done_=Runtime.receive runtime (response parent_read (Protocol.V2_page_outcome
-      (Worker_pure_data.V2_present_page {page;revision="page-2"}))) in
+    let done_=deliver_sample runtime (sample parent_read ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page {page;revision="page-2"})) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
     let child,parent=done_.responses |> List.find_map (fun r -> match r.Runtime.payload with
       | Child_projection_ready {result=Child_created{child;parent;_};_}->Some(child,parent)
       | _->None) |> Option.get in
@@ -5663,8 +5386,7 @@ let test_recycled_page_root_is_removed () =
   ignore (page_detail_seed runtime []);
   let request=changed runtime (window ~pages:[page_uuid] ())
     |> fun out->only "page recycle refresh" (hydration_requests runtime out) in
-  let out=Runtime.receive runtime (response request (Protocol.V2_page_outcome
-    (Worker_pure_data.V2_present_page {page={page with recycled=true};revision="recycled"}))) in
+  let out=deliver_sample runtime (sample request ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page {page={page with recycled=true};revision="recycled"})) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   Alcotest.(check bool) "recycled page root becomes unavailable" true
     (List.exists (fun r->match r.Runtime.payload with
       | Block_removed {block_id}->block_id=Graph.Uuid.to_string page_uuid | _->false) out.responses)
@@ -5685,8 +5407,7 @@ let test_page_root_refresh_and_resync () =
   ignore (page_detail_seed runtime []);
   let fresh=changed runtime (window ~pages:[page_uuid] ())
     |> fun out->only "one owned page refresh" (hydration_requests runtime out) in
-  let result=Runtime.receive runtime (response fresh (Protocol.V2_page_outcome
-    (Worker_pure_data.V2_present_page {page={page with title="Renamed page"};revision="page-2"}))) in
+  let result=deliver_sample runtime (sample fresh ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page {page={page with title="Renamed page"};revision="page-2"})) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   let detail=result.responses |> List.find_map (fun r-> match r.Runtime.payload with
     | Children_reconciled detail -> Some detail | _->None) |> Option.get in
   Alcotest.(check string) "renamed page root reconciles" "Renamed page" (Journal_model.source detail.root);
@@ -5713,14 +5434,13 @@ let test_page_property_refresh_discovers_references () =
       |> List.filter (fun (request:Graph.Uuid.t) ->
         (match Runtime.worker_read runtime request with Some(Runtime.Read{query=W.Page{uuid;revision=None};_})->uuid=page_uuid|_->false))
       |> only "one owning page refresh" in
-    let complete request = Runtime.receive runtime (response request (Protocol.V2_page_outcome
-      (Worker_pure_data.V2_present_page {page={page with properties=[property;hidden]};revision="page-2"}))) in
+    let complete request = deliver_sample runtime (sample request ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page {page={page with properties=[property;hidden]};revision="page-2"})) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
     let out=complete (refresh ()) in
     if page_root then (
       let reference=expect_reference_page runtime out target_uuid in
       Alcotest.(check int) "duplicate values share one read; hidden properties have no demand"
         1 (List.length out.requests);
-      let resolved=Runtime.receive runtime (reference_page_response reference Ordinary_page "Linked title") in
+      let resolved=deliver_sample runtime (reference_page_response reference Ordinary_page "Linked title") in
       Alcotest.(check (option string)) "new page property reference resolves"
         (Some "Linked title") (List.assoc_opt target_id (reference_updates resolved) |> Option.join);
       Alcotest.(check int) "unchanged property reuses shared cache" 0
@@ -5733,10 +5453,8 @@ let favorites_reference_source runtime title =
   let request : Journal_graph_request.favorites_request =
     {graph_generation=1;request_generation=802L;limit=50;cursor=None} in
   let read=Runtime.submit runtime (Load_favorites request) |> fun out->only "favorite list" out.requests in
-  Runtime.receive runtime (response read (Protocol.V2_favorites_outcome
-    {favorites_page=None;generation="g";projection_revision="p";next_cursor=None;
-     items=[{membership_uuid;membership_order="a";membership_revision="m";
-       target=Worker_pure_data.V2_favorite_block {uuid=block_uuid;title;task_status=None;revision="b"}}]}))
+  deliver_sample runtime (sample read ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.favorites ~favorites_page:(None) ~generation:("g") ~projection_revision:("p") ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None)) ~items:([{membership_uuid;membership_order="a";membership_revision="m";
+       target=Worker_pure_data.V2_favorite_block {uuid=block_uuid;title;task_status=None;revision="b"}}])) in match query with |Read.Favorites _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
 ;;
 
 let test_favorites_share_reference_cache () =
@@ -5745,7 +5463,7 @@ let test_favorites_share_reference_cache () =
   let out=favorites_reference_source runtime (reference ^ " " ^ reference) in
   let page_read=out.requests |> List.filter (fun (r:Graph.Uuid.t)->
     (match Runtime.worker_read runtime r with Some(Runtime.Read{query=W.Page{uuid;revision=None};_})->uuid=target_uuid|_->false)) |> only "duplicate favorite reference uses one page read" in
-  let out=Runtime.receive runtime (reference_page_response page_read
+  let out=deliver_sample runtime (reference_page_response page_read
     (Graph.Journal_page {journal_day=20260901}) "Tuesday, September 1st, 2026") in
   Alcotest.(check (option string)) "favorite journal page keeps actual date title"
     (Some "Tuesday, September 1st, 2026")
@@ -5757,7 +5475,7 @@ let test_favorites_share_reference_cache () =
   let old=favorites_reference_source late_runtime reference in
   let old_read=old.requests |> List.find (fun (r:Graph.Uuid.t)->(match Runtime.worker_read late_runtime r with Some(Runtime.Read{query=W.Page{uuid;revision=None};_})->uuid=target_uuid|_->false)) in
   Runtime.reset late_runtime;
-  let late=Runtime.receive late_runtime (reference_page_response old_read Ordinary_page "Old graph") in
+  let late=deliver_sample late_runtime (reference_page_response old_read Ordinary_page "Old graph") in
   Alcotest.(check int) "late Favorites reference is fenced by graph reset" 0 (List.length late.responses)
 ;;
 
@@ -5769,8 +5487,7 @@ let test_favorites_outline_and_missing_reference () =
       (match Runtime.worker_read runtime r with Some(Runtime.Read{query=W.Page{uuid;revision=None};_})->uuid=target_uuid|_->false)) in
     let fallback=missing_reference_page runtime page_read target_uuid in
     let outline=expect_reference_outline runtime fallback target_uuid in
-    let out=Runtime.receive runtime (if missing then response outline (Protocol.V2_block_outcome
-      (Worker_pure_data.V2_missing_block {uuid=target_uuid;revision="absent"})) else target_response outline "Outline title") in
+    let out=deliver_sample runtime (if missing then sample outline ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block {uuid=target_uuid;revision="absent"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))) else target_response outline "Outline title") in
     Alcotest.(check (option string)) "Favorites shares outline and missing source results"
       (if missing then None else Some "Outline title")
       (List.assoc_opt target_id (reference_updates out) |> Option.join)) [false;true]
@@ -5801,16 +5518,13 @@ let scheduling_favorites runtime count generation =
   in
   let read = Runtime.submit runtime (Load_favorites request)
     |> fun out -> only "Favorite list demand" out.requests in
-  Runtime.receive runtime (response read (Protocol.V2_favorites_outcome
-    { favorites_page = None; generation = "g"; projection_revision = "p"
-    ; next_cursor = None
-    ; items = List.init count (fun n ->
+  deliver_sample runtime (sample read ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.favorites ~favorites_page:(None) ~generation:("g") ~projection_revision:("p") ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None)) ~items:(List.init count (fun n ->
         let value = scheduling_block n in
         { Worker_pure_data.membership_uuid = scheduling_uuid 7000 n
         ; membership_order = string_of_int n; membership_revision = "m"
         ; target = Worker_pure_data.V2_favorite_block
             { uuid = value.block.uuid; title = value.block.title
-            ; task_status = None; revision = "b" } }) }))
+            ; task_status = None; revision = "b" } }))) in match query with |Read.Favorites _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
 ;;
 
 let scheduling_reply runtime (request : Graph.Uuid.t) =
@@ -5818,17 +5532,16 @@ let scheduling_reply runtime (request : Graph.Uuid.t) =
   | Some(Runtime.Read{query=W.Outline_block {uuid=requested;_};_}) ->
     let n = List.find (fun n -> Graph.Uuid.equal requested (scheduling_uuid 9000 n))
       (List.init 12 Fun.id) in
-    response request (Protocol.V2_block_outcome
-      (Worker_pure_data.V2_present_block { value = scheduling_block n; revision = "b" }))
+    sample request ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block { value = scheduling_block n; revision = "b" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
   | Some(Runtime.Read{query=W.Page {uuid=requested;_};_}) ->
-    response request (Protocol.V2_page_outcome (Worker_pure_data.V2_present_page
+    sample request ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page
       { page = { page with uuid = requested; kind = Ordinary_page
                 ; title =
                     (if Graph.Uuid.equal requested target_uuid
                      then "Resolved"
                      else "Parent")
                 }
-      ; revision = "p" }))
+      ; revision = "p" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
   | _ -> Alcotest.fail "unexpected scheduling demand"
 ;;
 
@@ -5853,8 +5566,8 @@ let drain_scheduling ?(cancel_count = 0) runtime output =
       let reply=scheduling_reply runtime request in
       let next = if completed < cancel_count then
           Runtime.fail_request runtime request ~message:"Worker cancelled"
-        else Runtime.receive runtime reply in
-      let duplicate = Runtime.receive runtime reply in
+        else deliver_sample runtime reply in
+      let duplicate = deliver_sample runtime reply in
       Alcotest.(check int) "late or repeated completion cannot dispatch" 0
         (List.length duplicate.requests);
       Alcotest.(check int) "late or repeated completion cannot publish" 0
@@ -5864,7 +5577,7 @@ let drain_scheduling ?(cancel_count = 0) runtime output =
   in
   loop 0 output.requests;
   Alcotest.(check int) "queued target page is delivered exactly once" 1 !target_reads;
-  Alcotest.(check (option string)) "target response reaches shared cache"
+  Alcotest.(check (option string)) "target sample reaches shared cache"
     (Some "Resolved") (List.assoc_opt target_id !updates |> Option.join);
   let fresh = scheduling_favorites runtime 4 902L in
   Alcotest.(check int) "all four slots are free after draining" 4
@@ -5898,7 +5611,7 @@ let test_favorite_scope_discards_queued_reads () =
   let pending_replies=List.map(scheduling_reply runtime) old.requests in
   Runtime.reset runtime;
   List.iter (fun reply ->
-    let late = Runtime.receive runtime reply in
+    let late = deliver_sample runtime reply in
     Alcotest.(check int) "old scope cannot dispatch queued reads" 0
       (List.length late.requests);
     Alcotest.(check int) "old scope cannot publish sources" 0
@@ -5914,7 +5627,7 @@ let test_favorite_epoch_preserves_new_queue () =
   Alcotest.(check int) "new epoch shares the outstanding window" 0
     (List.length current.requests);
   let resumed = List.fold_left (fun (out : Runtime.output) request ->
-    let next = Runtime.receive runtime (scheduling_reply runtime request) in
+    let next = deliver_sample runtime (scheduling_reply runtime request) in
     { Runtime.requests = out.requests @ next.requests
     ; responses = out.responses @ next.responses }) current old.requests in
   drain_scheduling runtime resumed
@@ -5934,7 +5647,7 @@ let test_rejected_delivery_retires_unsent_queue () =
     Alcotest.(check int) "refusal is never retried" 1 !attempts;
     Alcotest.(check bool) "refusal remains explicit" true (Option.is_some delivery.error);
     List.iter (fun reply ->
-      let late = Runtime.receive runtime reply in
+      let late = deliver_sample runtime reply in
       Alcotest.(check int) "rejected request cannot publish late response" 0
         (List.length late.responses)) pending_replies;
     drain_scheduling runtime (scheduling_favorites runtime 8 901L))
@@ -5948,15 +5661,12 @@ let test_favorite_page_title_discovers_reference () =
     { graph_generation = 1; request_generation = 903L; limit = 50; cursor = None } in
   let read = Runtime.submit runtime (Load_favorites request)
     |> fun out -> only "Favorite page list" out.requests in
-  let out = Runtime.receive runtime (response read (Protocol.V2_favorites_outcome
-    { favorites_page = None; generation = "g"; projection_revision = "p"
-    ; next_cursor = None
-    ; items = [{ Worker_pure_data.membership_uuid; membership_order = "a"; membership_revision = "m"
-        ; target = Worker_pure_data.V2_favorite_page { uuid = page_uuid; title = reference; revision = "p" } }] })) in
+  let out = deliver_sample runtime (sample read ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.favorites ~favorites_page:(None) ~generation:("g") ~projection_revision:("p") ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None)) ~items:([{ Worker_pure_data.membership_uuid; membership_order = "a"; membership_revision = "m"
+        ; target = Worker_pure_data.V2_favorite_page { uuid = page_uuid; title = reference; revision = "p" } }])) in match query with |Read.Favorites _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   let reference_read = out.requests |> List.filter (fun (r : Graph.Uuid.t) ->
     (match Runtime.worker_read runtime r with Some(Runtime.Read{query=W.Page{uuid;revision=None};_})->uuid=target_uuid|_->false))
     |> only "Favorite page title demands page-first reference" in
-  let resolved = Runtime.receive runtime
+  let resolved = deliver_sample runtime
     (reference_page_response reference_read Ordinary_page "Resolved") in
   Alcotest.(check (option string)) "Favorite page source is accepted" (Some "Resolved")
     (List.assoc_opt target_id (reference_updates resolved) |> Option.join)
@@ -5969,24 +5679,20 @@ let test_page_detail_root_title_discovers_reference () =
     { block_id = Graph.Uuid.to_string page_uuid; after = None
     ; limit = 50; request_generation = 904L })
     |> fun out -> only "detail root" out.requests in
-  let page_read = Runtime.receive runtime (response root (Protocol.V2_block_outcome
-    (Worker_pure_data.V2_missing_block { uuid = page_uuid; revision = "no-outline" })))
+  let page_read = deliver_sample runtime (sample root ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = page_uuid; revision = "no-outline" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     |> fun out -> only "detail page fallback" out.requests in
-  let out = Runtime.receive runtime (response page_read (Protocol.V2_page_outcome
-    (Worker_pure_data.V2_present_page { page = { page with kind = Ordinary_page; title = reference }
-    ; revision = "p" }))) in
+  let out = deliver_sample runtime (sample page_read ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page { page = { page with kind = Ordinary_page; title = reference }
+    ; revision = "p" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   let children = out.requests |> List.find (fun (r : Graph.Uuid.t) ->
       match Runtime.worker_read runtime r with
       | Some(Runtime.Read{query=W.Child_members _;_}) -> true
       | _ -> false)
   in
-  let loaded = Runtime.receive runtime (response children (Protocol.V2_children_outcome
-    { parent = page_uuid; revision_scope = Worker_pure_data.V2_children_revision page_uuid
-    ; scope_revision = "c"; items = []; next_cursor = None })) in
+  let loaded = deliver_sample runtime (sample children ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(page_uuid) ~revision_scope:(Worker_pure_data.V2_children_revision page_uuid) ~scope_revision:("c") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   let refs = out.requests @ loaded.requests |> List.filter (fun (r : Graph.Uuid.t) ->
     (match Runtime.worker_read runtime r with Some(Runtime.Read{query=W.Page{uuid;revision=None};_})->uuid=target_uuid|_->false)) in
   let ref_read = only "empty page detail root demands reference" refs in
-  let resolved = Runtime.receive runtime
+  let resolved = deliver_sample runtime
     (reference_page_response ref_read Ordinary_page "Resolved") in
   let lookup id = List.assoc_opt id (reference_updates resolved) |> Option.join in
   let runs = Journal_model.Title.render ~lookup reference in
@@ -5999,14 +5705,12 @@ let test_page_detail_root_title_discovers_reference () =
 let test_copy_page_root () =
   List.iter (fun populated ->
     let state,effects=copy_start page_uuid in
-    let state,effects=copy_reply state effects (Protocol.V2_block_outcome
-      (Worker_pure_data.V2_missing_block {uuid=page_uuid;revision="no-outline"})) in
+    let state,effects=copy_reply state effects ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block {uuid=page_uuid;revision="no-outline"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))) in
     Alcotest.(check bool) "copy resolves exact page" true
       (match snd(copy_read effects) with
        | Query(Copy_worker.Page {uuid;revision=None}) -> Graph.Uuid.equal uuid page_uuid
        | _ -> false);
-    let state,effects=copy_reply state effects (Protocol.V2_page_outcome
-      (Worker_pure_data.V2_present_page {page;revision="page-1"})) in
+    let state,effects=copy_reply state effects ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page {page;revision="page-1"})) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))) in
     copy_parent effects page_uuid;
     let state,effects=copy_reply state effects (copy_children page_uuid
       (if populated then [copy_child block_uuid page_uuid "Child"] else [])) in
@@ -6080,21 +5784,20 @@ let test_catalog_and_lookup_cross_fences () =
     let runtime = Runtime.create () in
     let started = Runtime.start runtime in
     let output =
-      Runtime.receive
+      deliver_sample
         runtime
-        (response started (graph_info_outcome ~journal_title_format:None))
+        (sample started (graph_info_outcome ~journal_title_format:None))
     in
     runtime, find_catalog runtime output.requests
   in
   let catalog items next_cursor =
-    Protocol.V2_task_statuses_outcome
-      { property_uuid = Some page_uuid; default_status = None; items; next_cursor }
+    (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.task_status_catalog ~property_uuid:(Some page_uuid) ~default_status:(None) ~items:(items) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(next_cursor))) in match query with |Read.Task_statuses _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
   in
   let runtime, first = start () in
   let page2 =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          first
          (catalog [] (Some (Graph.Cursor.of_string "next" |> Result.get_ok))))
     |> fun out -> find_catalog runtime out.requests
@@ -6110,10 +5813,10 @@ let test_catalog_and_lookup_cross_fences () =
       out.requests
   in
   ignore
-    (Runtime.receive
+    (deliver_sample
        runtime
-       (response delta (V2_task_status_definitions_outcome [ None ])));
-  let done_ = Runtime.receive runtime (response page2 (catalog [ definition ] None)) in
+       (sample delta ((query_sample(fun(Read.Read_query(budget,query))->match query with |Read.Task_status_definitions _->Read.For_worker.answer budget query(Ok([ None ]))|_->failwith "Expected task definitions")))));
+  let done_ = deliver_sample runtime (sample page2 (catalog [ definition ] None)) in
   Alcotest.(check bool)
     "late page cannot restore deleted status"
     true
@@ -6124,7 +5827,7 @@ let test_catalog_and_lookup_cross_fences () =
           | _ -> false)
        done_.responses);
   let runtime, first = start () in
-  ignore (Runtime.receive runtime (response first (catalog [ definition ] None)));
+  ignore (deliver_sample runtime (sample first (catalog [ definition ] None)));
   let delta =
     changed runtime (window ~blocks:[ unrelated_uuid ] ())
     |> fun out ->
@@ -6138,11 +5841,11 @@ let test_catalog_and_lookup_cross_fences () =
   let reload =
     Runtime.submit runtime Load_task_statuses |> fun out -> find_catalog runtime out.requests
   in
-  ignore (Runtime.receive runtime (response reload (catalog [] None)));
+  ignore (deliver_sample runtime (sample reload (catalog [] None)));
   let stale =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response delta (V2_task_status_definitions_outcome [ Some definition ]))
+      (sample delta ((query_sample(fun(Read.Read_query(budget,query))->match query with |Read.Task_status_definitions _->Read.For_worker.answer budget query(Ok([ Some definition ]))|_->failwith "Expected task definitions"))))
   in
   Alcotest.(check int)
     "old lookup cannot restore catalog deletion"
@@ -6200,7 +5903,7 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
     else (
       let child=uuid "a1000000-0000-4000-9000-000000000081" in
       let target={record with block={block with uuid=child;title="Stable child";parent=block_uuid};task_status=None} in
-      let receipt=(let (Protocol.V2_response receipt_packet as packet) = (response insert(V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
+      let receipt=(let (Protocol.V2_response receipt_packet as packet) = (durable_response insert (V2_mutation_committed{mutation_id;status=Worker_pure_data.V2_applied;generation="generation:v1:1:1";
           before_projection_revision="projection:v1:0";after_projection_revision="projection:v1:1"})) in
       match I.reply session ~request_id:(W.request_id insert) (W.Mutate original)
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
@@ -6208,18 +5911,11 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
            outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed packet}) with
       | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected") in
-      let summary=Protocol.V2_block_summary_outcome{lookup=Worker_pure_data.V2_present_block{value=target;revision="original-child-precondition"};
-        page=Some(Worker_pure_data.V2_present_page{page;revision="page-original"});items=[];next_cursor=None;
-        scope_revision="original-child-scope";generation="generation:v1:1:1";projection_revision="projection:v1:1"} in
-      let proof=(let (Protocol.V2_response confirmation_packet as packet) = (response insert summary) in
-      match I.reply session ~request_id:(W.request_id confirmation_packet.request_id)
-        (W.Confirm(presentation,receipt))
-        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response packet) with
-      | Ok(W.Answered(Ok(W.Confirmed proof))) -> proof
-      | _ -> failwith "Production confirmation was rejected") in
+      let summary=(query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.block_summary ~lookup:(Worker_pure_data.V2_present_block{value=target;revision="original-child-precondition"}) ~page:(Some(Worker_pure_data.V2_present_page{page;revision="page-original"})) ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None)) ~scope_revision:("original-child-scope") ~generation:("generation:v1:1:1") ~projection_revision:("projection:v1:1")) in match query with |Read.Block_summary _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")) in
+      let proof=confirmed_sample issuer session presentation receipt insert (summary) in
       let parent=Production_runtime.receive_mutation runtime insert(W.Confirmed proof)
         |> fun output->only "canonical Child parent" output.Runtime.requests in
-      let output=Worker_producer.receive runtime parent (response parent(V2_block_outcome(Worker_pure_data.V2_present_block{value=record;revision="new-parent-state"}))) in
+      let output=deliver_sample runtime (sample parent((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block{value=record;revision="new-parent-state"})) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
       let root,round=List.find_map(fun response->match response.Runtime.payload with
         | Child_projection_ready{root;round;_}->Some(root,round)|_->None)output.responses |> Option.get in
       let ack=Production_runtime.child_projection_applied runtime ~root ~round ~presentation
@@ -6331,14 +6027,8 @@ let test_child_error_continuations_retire () =
 let test_task_catalog_generation_and_deltas () =
   let runtime = Runtime.create () in
   let initial = Runtime.start runtime in
-  let raw =
-    Yojson.Safe.from_string
-      {|["V2_response",{"api_version":2,"request_id":"00000000-0000-4000-8000-000000000001","outcome":["V2_graph_info_outcome",{"graph_uuid":"98000000-0000-4000-8000-000000000001","graph_name":"Synthetic","schema":{"major":65,"minor":33},"admission_facts":[],"journal_title_format":null,"generation":"generation-1","projection_revision":"revision-1","limits":{"response_budget_bytes":1048576,"outbox_max_records":100,"outbox_max_bytes":1048576,"change_max_items":256,"change_max_bytes":1048576,"dispatcher_capacity":100,"wire_batch_max_bytes":1048576}}]}]|}
-  in
-  let (Protocol.V2_response { outcome; _ }) =
-    Protocol.response_of_yojson raw |> Result.get_ok
-  in
-  let output = Runtime.receive runtime (response initial outcome) in
+  let outcome=graph_info_outcome ~journal_title_format:None in
+  let output = deliver_sample runtime (sample initial outcome) in
   let catalog =
     List.find
       (fun (r : Graph.Uuid.t) ->
@@ -6357,16 +6047,11 @@ let test_task_catalog_generation_and_deltas () =
   in
   let choices = List.init 12 (fun n -> definition n "Same name") in
   let output =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          catalog
-         (V2_task_statuses_outcome
-            { property_uuid = Some page_uuid
-            ; default_status = None
-            ; items = choices
-            ; next_cursor = None
-            }))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.task_status_catalog ~property_uuid:(Some page_uuid) ~default_status:(None) ~items:(choices) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Task_statuses _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   Alcotest.(check bool)
     "catalog published"
@@ -6397,11 +6082,11 @@ let test_task_catalog_generation_and_deltas () =
           | _ -> false)
        output.requests);
   let renamed =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          delta
-         (V2_task_status_definitions_outcome [ Some (definition 0 "Renamed") ]))
+         ((query_sample(fun(Read.Read_query(budget,query))->match query with |Read.Task_status_definitions _->Read.For_worker.answer budget query(Ok([ Some (definition 0 "Renamed") ]))|_->failwith "Expected task definitions"))))
   in
   Alcotest.(check bool)
     "rename changes label while retaining UUID"
@@ -6428,38 +6113,28 @@ let test_task_catalog_generation_and_deltas () =
     |> fun output -> only "newer catalog retry" output.requests
   in
   ignore
-    (Runtime.receive
+    (deliver_sample
        runtime
-       (response
+       (sample
           newer
-          (V2_task_statuses_outcome
-             { property_uuid = Some page_uuid
-             ; default_status = None
-             ; items = [ definition 0 "Newest" ]
-             ; next_cursor = None
-             })));
+          ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.task_status_catalog ~property_uuid:(Some page_uuid) ~default_status:(None) ~items:([ definition 0 "Newest" ]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Task_statuses _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))));
   let stale =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          reload
-         (V2_task_statuses_outcome
-            { property_uuid = Some page_uuid
-            ; default_status = None
-            ; items = [ definition 0 "Stale" ]
-            ; next_cursor = None
-            }))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.task_status_catalog ~property_uuid:(Some page_uuid) ~default_status:(None) ~items:([ definition 0 "Stale" ]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Task_statuses _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   Alcotest.(check int)
     "older catalog completion is ignored"
     0
     (List.length stale.responses);
   let old_failure =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          failing
-         (V2_failed { code = "invalid-request"; message = "Old catalog error" }))
+         ((failed_sample (Read.Service_failed (("invalid-request")^": "^("Old catalog error"))))))
   in
   Alcotest.(check int)
     "old catalog failure is ignored"
@@ -6476,7 +6151,7 @@ let test_task_catalog_generation_and_deltas () =
   let graph =
     List.find (fun (r : Graph.Uuid.t) -> (match Runtime.worker_read runtime r with Some(Runtime.Read{query=W.Graph_info;_})->true|_->false)) resync.requests
   in
-  let refreshed = Runtime.receive runtime (response graph outcome) in
+  let refreshed = deliver_sample runtime (sample graph outcome) in
   Alcotest.(check bool)
     "resync refreshes status catalog"
     true
@@ -6488,11 +6163,11 @@ let test_task_catalog_generation_and_deltas () =
        (resync.requests @ refreshed.requests));
   Runtime.reset runtime;
   let late =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          delta
-         (V2_task_status_definitions_outcome [ Some (definition 0 "Renamed") ]))
+         ((query_sample(fun(Read.Read_query(budget,query))->match query with |Read.Task_status_definitions _->Read.For_worker.answer budget query(Ok([ Some (definition 0 "Renamed") ]))|_->failwith "Expected task definitions"))))
   in
   Alcotest.(check int) "old graph catalog ignored" 0 (List.length late.responses)
 ;;
@@ -6591,14 +6266,16 @@ let drive_root_output ?(split_bytes = false) ?(filter_omitted = false) runtime f
     if !ticks > 1000 then Alcotest.fail "initial feed did not converge";
     let request : Graph.Uuid.t = Queue.pop queue in
     seen := Runtime.worker_read runtime request :: !seen;
-    let outcome : Protocol.v2_outcome =
+    let outcome =
       match Worker_producer.transport runtime request with
-      |Ok(Worker_producer.S.Coordination_query{request={command=V2_list_journals{cursor;from_day;through_day;limit;_};_};_})->
+      |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Journals{after=_;from_day=sealed_from_day;through_day=sealed_through_day;_} as query));_})->
+      let cursor=Read.query_cursor (Read.For_worker.read_budget_owner budget) budget query |> Result.get_ok in
+      let from_day=Read.For_worker.journal_day_value sealed_from_day in
+      let through_day=Read.For_worker.journal_day_value sealed_through_day in
+      let limit=Read.For_worker.read_budget_maximum_items budget in
         let fixtures = List.filter (fun f -> match f.owner.kind with Journal_page {journal_day} -> from_day <= journal_day && journal_day <= through_day | _ -> false) fixtures in
         let selected, next_cursor = root_slice fixtures limit cursor in
-        V2_journals_outcome
-          { items =
-              List.map
+        (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:((List.map
                 (fun f ->
                    let journal_day =
                      match f.owner.kind with
@@ -6606,60 +6283,49 @@ let drive_root_output ?(split_bytes = false) ?(filter_omitted = false) runtime f
                      | _ -> assert false
                    in
                    Worker_pure_data.{ page = f.owner; journal_day; revision = "page-1" })
-                selected
-          ; next_cursor
-          }
-      |Ok(Worker_producer.S.Coordination_query{request={command=V2_get_page_tree{page;maximum_depth;cursor;limit;_};_};_})->
+                selected : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(next_cursor))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
+      |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Tree{page=page;maximum_depth=maximum_depth;after=_;_} as query));_})->
+      let cursor=Read.query_cursor (Read.For_worker.read_budget_owner budget) budget query |> Result.get_ok in
+      let limit=Read.For_worker.read_budget_maximum_items budget in
         (match Production_runtime.worker_read runtime request with
          | Some (Production_runtime.Read {query=Journal_worker_coordination.Worker_api.Tree _;_})->()
          | _->Alcotest.fail "feed roots bypassed typed coordinator");
         Alcotest.(check int) "roots do not consume child budget" 0 maximum_depth;
         if split_bytes && limit > 2
         then
-          V2_failed { code = "responseTooLarge"; message = "Fixture encoded byte limit" }
+          (failed_sample (Read.Db_error(Logseq_db_worker.Error.create ~code:Response_too_large ~message:("Fixture encoded byte limit") ~details:[]|>Result.get_ok)))
         else (
           let fixture =
             List.find (fun f -> Graph.Uuid.equal page f.owner.uuid) fixtures
           in
           let selected, next_cursor = root_slice fixture.roots limit cursor in
-          V2_page_tree_outcome
-            { page
-            ; maximum_depth
-            ; items =
-                List.map
+          (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:((List.map
                   (fun value ->
                      Worker_pure_data.{ value; revision = "root-1"; depth = 0; parent = page })
-                  (if filter_omitted then List.filter (fun (value:Worker_pure_data.block_record)->value.block.title<>"__pbt-omitted-root__") selected else selected)
-            ; next_cursor
-            })
-      |Ok(Worker_producer.S.Coordination_query{request={command=V2_get_children{parent;cursor;limit;_};_};_})->
+                  (if filter_omitted then List.filter (fun (value:Worker_pure_data.block_record)->value.block.title<>"__pbt-omitted-root__") selected else selected) : Worker_pure_data.tree_member list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(next_cursor))) in match query with |Read.Tree _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
+      |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Child_members{parent=parent;after=_;_} as query));_})->
+      let cursor=Read.query_cursor (Read.For_worker.read_budget_owner budget) budget query |> Result.get_ok in
+      let limit=Read.For_worker.read_budget_maximum_items budget in
         (match Production_runtime.worker_read runtime request with
          | Some (Production_runtime.Read {query=Journal_worker_coordination.Worker_api.Child_members _;_}) -> ()
          | _ -> Alcotest.fail "feed preview bypassed typed coordinator");
         Alcotest.(check bool) "preview requests stay bounded" true (limit <= 3);
         if split_bytes && limit > 1
         then
-          V2_failed { code = "responseTooLarge"; message = "Fixture preview byte limit" }
+          (failed_sample (Read.Db_error(Logseq_db_worker.Error.create ~code:Response_too_large ~message:("Fixture preview byte limit") ~details:[]|>Result.get_ok)))
         else (
           let values = Option.value (List.assoc_opt parent children) ~default:[] in
           let selected, next_cursor = root_slice values limit cursor in
-          V2_children_outcome
-            { parent
-            ; revision_scope = Worker_pure_data.V2_children_revision parent
-            ; scope_revision = "children-1"
-            ; items =
-                List.map (fun value -> Worker_pure_data.{ value; revision = "child-1" }) selected
-            ; next_cursor
-            })
-      |Ok(Worker_producer.S.Coordination_query{request={command=V2_ack_changes _;_};_})->
-        V2_changes_acknowledged { generation = "generation-1"; through = "revision-2" }
+          (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(parent) ~revision_scope:(Worker_pure_data.V2_children_revision parent) ~scope_revision:("children-1") ~items:(List.map (fun value -> Worker_pure_data.{ value; revision = "child-1" }) selected) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(next_cursor))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))
+      |Ok(Worker_producer.S.Coordination_acknowledge_changes _)->
+        (ack_sample ("generation-1") ("revision-2"))
       | _ -> Alcotest.fail "unexpected initial feed query"
     in
-    let delivered = Runtime.receive runtime (response request outcome) in
+    let delivered = deliver_sample runtime (sample request outcome) in
     Alcotest.(check int)
       "duplicate completion is ignored"
       0
-      (List.length (Runtime.receive runtime (response request outcome)).responses);
+      (List.length (deliver_sample runtime (sample request outcome)).responses);
     outputs := !outputs @ delivered.responses;
     List.iter (fun r -> Queue.push r queue) delivered.requests
   done;
@@ -6735,19 +6401,15 @@ let test_empty_today_sync_retires_initial_feed () =
        and older = normal_journal_fixture 30 1 0 in
        let dates = only "initial Today query" (initial_roots runtime 7L).requests in
        let tree =
-         Runtime.receive runtime
-           (response dates
-              (Protocol.V2_journals_outcome
-                 { items = [ { page = today.owner; journal_day = 20260901; revision = "page-1" } ]
-                 ; next_cursor = Some (root_cursor 1)
-                 }))
+         deliver_sample runtime
+           (sample dates
+              ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([ { page = today.owner; journal_day = 20260901; revision = "page-1" } ] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(Some (root_cursor 1)))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
          |> fun output -> only "empty Today roots" output.requests
        in
        let history =
-         Runtime.receive runtime
-           (response tree
-              (Protocol.V2_page_tree_outcome
-                 { page = today.owner.uuid; maximum_depth = 0; items = []; next_cursor = None }))
+         deliver_sample runtime
+           (sample tree
+              ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([] : Worker_pure_data.tree_member list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Tree _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
          |> fun output -> only "held initial history query" output.requests
        in
        let refresh =
@@ -7172,14 +6834,12 @@ let test_today_date_traversal_survives_recovery () =
                 let root =
                   only "one continued root read" (Runtime.submit runtime command).requests
                 in
-                let code = if mode = "retry" then "unavailable" else "staleReadCursor" in
                 let failed =
-                  Runtime.receive
+                  deliver_sample
                     runtime
-                    (response
+                    (sample
                        root
-                       (V2_failed
-                          { code; message = "Normal remote structure revision changed" }))
+                       ((failed_sample ((if mode="retry" then Read.Service_failed "Normal remote structure revision changed" else Read.Stale_read "Normal remote structure revision changed")))))
                 in
                 List.iter
                   (fun (r : Runtime.response) ->
@@ -7309,11 +6969,11 @@ let test_changed_point_ownership () =
       output.requests
   in
   let complete runtime request value =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          request
-         (V2_block_outcome (Worker_pure_data.V2_present_block { value; revision = "changed-block" })))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block { value; revision = "changed-block" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   let context_request runtime output page =
     List.find_opt
@@ -7375,12 +7035,11 @@ let test_changed_point_ownership () =
                   0
                   (List.length (updates first));
                 let request = require_context runtime first target.owner.uuid in
-                Runtime.receive
+                deliver_sample
                   runtime
-                  (response
+                  (sample
                      request
-                     (V2_page_outcome
-                        (Worker_pure_data.V2_present_page { page = target.owner; revision = "new-page" }))))
+                     ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page { page = target.owner; revision = "new-page" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))))
             in
             let block = only "one correctly contextualized update" (updates output) in
             Alcotest.(check string)
@@ -7447,12 +7106,11 @@ let test_changed_point_ownership () =
     in
     ignore (only "new source observation" (updates back));
     let late =
-      Runtime.receive
+      deliver_sample
         runtime
-        (response
+        (sample
            lookup
-           (V2_page_outcome
-              (Worker_pure_data.V2_present_page { page = target.owner; revision = "old-target-page" })))
+           ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page { page = target.owner; revision = "old-target-page" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     in
     Alcotest.(check int)
       "late context cannot resurrect old move"
@@ -7469,12 +7127,11 @@ let test_changed_point_ownership () =
     let unresolved = complete runtime (point runtime before.block.uuid) value in
     let lookup = require_context runtime unresolved target.owner.uuid in
     let missing =
-      Runtime.receive
+      deliver_sample
         runtime
-        (response
+        (sample
            lookup
-           (V2_page_outcome
-              (Worker_pure_data.V2_missing_page { uuid = target.owner.uuid; revision = "missing-page" })))
+           ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_page { uuid = target.owner.uuid; revision = "missing-page" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     in
     Alcotest.(check int)
       "missing context never becomes a Timeline model"
@@ -7498,11 +7155,11 @@ let test_resync_retires_changed_points () =
       output.Runtime.responses
   in
   let complete runtime request value =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          request
-         (V2_block_outcome (Worker_pure_data.V2_present_block { value; revision = "point-before-resync" })))
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_block { value; revision = "point-before-resync" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   let point ?(generation = "generation-1") runtime block_id =
     let pull =
@@ -7512,17 +7169,11 @@ let test_resync_retires_changed_points () =
         (Worker_pure_data.Changes_available { generation; through = "revision-2" })
     in
     let output =
-      Runtime.receive
+      deliver_sample
         runtime
-        (response
+        (sample
            (only "point change pull" pull.requests)
-           (Protocol.V2_changes
-              { generation
-              ; from_exclusive = None
-              ; through = "revision-2"
-              ; windows = [ window ~blocks:[ block_id ] () ]
-              ; next = None
-              }))
+           ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.change_batch ~change_owner:(F.read_budget_owner budget) ~generation:(generation) ~from_exclusive:(None) ~through:("revision-2") ~windows:([ window ~blocks:[ block_id ] () ]) ~next:(None)) in match query with |Read.Changes _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
     in
     List.find
       (fun (r : Graph.Uuid.t) ->
@@ -7597,10 +7248,9 @@ let test_resync_retires_changed_points () =
             |Some(Production_runtime.Read read)->
               let operation=W.Query(Worker_producer.budget read.maximum_items,read.query) in
               let request_id=W.request_id request in
-              ignore(I.request Worker_producer.session ~request_id operation |> Result.get_ok);
+              let source=I.request Worker_producer.session ~request_id operation |> Result.get_ok in
               (match I.reply Worker_producer.session ~request_id operation
-                (Worker_producer.S.Graph_response(response request
-                  (Protocol.V2_resync_required{generation="generation-2";reason="retention overflow"}))) with
+                (failed_sample (Read.Resync_required "retention overflow") source) with
                |Ok(W.Answered(Error(W.Resync_required reason)))->
                  Production_runtime.receive_worker_read ~resync_generation:802L runtime
                    ~request_id:request (Production_runtime.Changes_resync reason)
@@ -7650,13 +7300,12 @@ let test_resync_retires_changed_points () =
     let late =
       if pending_context
       then
-        Runtime.receive
+        deliver_sample
           runtime
-          (response
+          (sample
              held
-             (V2_page_outcome
-                (Worker_pure_data.V2_present_page
-                   { page = target.owner; revision = "valid-late-page-metadata" })))
+             ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page
+                   { page = target.owner; revision = "valid-late-page-metadata" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
       else complete runtime held moved
     in
     Alcotest.(check int)
@@ -7752,7 +7401,9 @@ let test_initial_thirty_roots () =
          })
   in
   match Worker_producer.transport runtime (only "later roots read" output.requests) with
-  |Ok(Worker_producer.S.Coordination_query{request={command=V2_get_page_tree{maximum_depth;cursor;limit;_};_};_})->
+  |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Tree{maximum_depth=maximum_depth;after=_;_} as query));_})->
+      let cursor=Read.query_cursor (Read.For_worker.read_budget_owner budget) budget query |> Result.get_ok in
+      let limit=Read.For_worker.read_budget_maximum_items budget in
     Alcotest.(check int) "continuation retains original ten-item budget" 10 limit;
     Alcotest.(check int) "root cursor keeps root shape" 0 maximum_depth;
     Alcotest.(check int) "same-day cursor follows tenth root" 10 (root_offset cursor)
@@ -7814,11 +7465,9 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
          | _ -> assert false
        in
        let dates request fixtures next_cursor =
-         Runtime.receive runtime (response request (V2_journals_outcome
-             { items = List.map (fun f -> ({ page = f.owner; journal_day = day f
+         deliver_sample runtime (sample request ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:((List.map (fun f -> ({ page = f.owner; journal_day = day f
                                             ; revision = "page-1" } : Worker_pure_data.journal_item))
-                   fixtures
-             ; next_cursor }))
+                   fixtures : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(next_cursor))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
        in
        let listing ?(quiet = true) (output : Production_runtime.output) cursor through =
          if quiet then
@@ -7826,7 +7475,10 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
              (List.length output.responses);
          let request = only "one date catalog read" output.requests in
          (match Worker_producer.transport runtime request with
-          |Ok(Worker_producer.S.Coordination_query{request={command=V2_list_journals{cursor=actual;through_day;limit;_};_};_})->
+          |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Journals{after=_;through_day=sealed_through_day;_} as query));_})->
+      let actual=Read.query_cursor (Read.For_worker.read_budget_owner budget) budget query |> Result.get_ok in
+      let through_day=Read.For_worker.journal_day_value sealed_through_day in
+      let limit=Read.For_worker.read_budget_maximum_items budget in
             Alcotest.(check bool) "date continuation" true (actual = cursor);
             Alcotest.(check int) "date query bound" through through_day;
             Alcotest.(check int) "bounded metadata packet" 1 limit
@@ -7842,22 +7494,15 @@ let test_date_cursor_recovery_is_bounded_and_owned () =
           | _ -> Alcotest.fail "expected root query");
          let root = only "fixture root" fixture.roots in
          let preview =
-           Runtime.receive runtime (response tree (V2_page_tree_outcome
-               { page = fixture.owner.uuid; maximum_depth = 0
-               ; items = [ { value = root; revision = "root-1"; depth = 0
-                           ; parent = fixture.owner.uuid } ]
-               ; next_cursor = None }))
+           deliver_sample runtime (sample tree ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([ { value = root; revision = "root-1"; depth = 0
+                           ; parent = fixture.owner.uuid } ] : Worker_pure_data.tree_member list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Tree _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
            |> fun output -> only "root preview" output.requests
          in
-         let output = Runtime.receive runtime (response preview (V2_children_outcome
-             { parent = root.block.uuid
-             ; revision_scope = Worker_pure_data.V2_children_revision root.block.uuid
-             ; scope_revision = "children-1"; items = []; next_cursor = None })) in
+         let output = deliver_sample runtime (sample preview ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(root.block.uuid) ~revision_scope:(Worker_pure_data.V2_children_revision root.block.uuid) ~scope_revision:("children-1") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
          listing ~quiet:false output next_cursor through
        in
        let stale request =
-         Runtime.receive runtime (response request (V2_failed
-             { code = "staleReadCursor"; message = "The read continuation is no longer current." }))
+         deliver_sample runtime (sample request ((failed_sample (Read.Stale_read ("The read continuation is no longer current.")))))
        in
        (* Recovery rereads the oldest observed date inclusively. *)
        let recover request =
@@ -7919,13 +7564,12 @@ let test_later_date_cursor_no_progress_settles () =
   let root=Runtime.submit runtime (Journal_graph_request.Load_day_blocks
       {day=day.page.day;after=day.continuation;limit=30;request_generation=78L})
     |> fun o->only "later tail query" o.requests in
-  let output=Runtime.receive runtime (response root (V2_page_tree_outcome
-      {page=fixture.owner.uuid;maximum_depth=0;items=[];next_cursor=None})) in
+  let output=deliver_sample runtime (sample root ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([] : Worker_pure_data.tree_member list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Tree _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   let listing=only "older date query" output.requests in
   let cursor=root_cursor 1 in
-  let output=Runtime.receive runtime (response listing (V2_journals_outcome {items=[];next_cursor=Some cursor})) in
+  let output=deliver_sample runtime (sample listing ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(Some cursor))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   let repeated=only "next date packet" output.requests in
-  let output=Runtime.receive runtime (response repeated (V2_journals_outcome {items=[];next_cursor=Some cursor})) in
+  let output=deliver_sample runtime (sample repeated ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(Some cursor))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
   match (only "visible terminal failure" output.responses).payload with
   | Day_blocks_failed {request_generation=78L;day=20260930;_}->()
   | _ -> Alcotest.fail "date cursor failure lost its continuation owner"
@@ -8058,9 +7702,9 @@ let test_initial_reset_and_later_quota () =
   let old = only "initial listing" (initial_roots runtime 77L).requests in
   Runtime.reset runtime;
   let delivered =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response old (V2_journals_outcome { items = []; next_cursor = None }))
+      (sample old ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   Alcotest.(check int) "reset fences old result" 0 (List.length delivered.responses);
   let start =
@@ -8204,13 +7848,12 @@ let load_ninety_roots runtime fixture =
 
 let fixture_root_tree runtime fixture (request : Graph.Uuid.t) =
   match Worker_producer.transport runtime request with
-  |Ok(Worker_producer.S.Coordination_query{request={command=V2_get_page_tree{page;maximum_depth;cursor;limit;_};_};_})->
+  |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(budget,(Read.Tree{page=page;maximum_depth=_;after=_;_} as query));_})->
+      let cursor=Read.query_cursor (Read.For_worker.read_budget_owner budget) budget query |> Result.get_ok in
+      let limit=Read.For_worker.read_budget_maximum_items budget in
     let selected, next_cursor = root_slice fixture.roots limit cursor in
-    Protocol.V2_page_tree_outcome
-      { page; maximum_depth
-      ; items = List.map (fun value ->
-          Worker_pure_data.{ value; revision = "root-1"; depth = 0; parent = page }) selected
-      ; next_cursor }
+    (query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:((List.map (fun value ->
+          Worker_pure_data.{ value; revision = "root-1"; depth = 0; parent = page }) selected : Worker_pure_data.tree_member list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(next_cursor))) in match query with |Read.Tree _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
   | _ -> Alcotest.fail "expected a retained root read"
 ;;
 
@@ -8243,7 +7886,7 @@ let test_prefix_preserves_reconciliation ~resync stage () =
   let held = match stage with
     | `Root -> { Runtime.requests = [tree]; responses = [] }
     | `Preview | `Continuation ->
-      Runtime.receive runtime (response tree (fixture_root_tree runtime fresh tree))
+      deliver_sample runtime (sample tree (fixture_root_tree runtime fresh tree))
   in
   let held = match stage with
     | `Root | `Preview -> held
@@ -8253,10 +7896,8 @@ let test_prefix_preserves_reconciliation ~resync stage () =
         match Runtime.worker_read runtime request with
         | Some(Runtime.Read{query=W.Tree _;_}) -> output
         | Some(Runtime.Read{query=W.Child_members {parent;_};_}) ->
-          finish_previews (Runtime.receive runtime (response request
-              (Protocol.V2_children_outcome
-                 { parent; revision_scope = Worker_pure_data.V2_children_revision parent
-                 ; scope_revision = "children-1"; items = []; next_cursor = None })))
+          finish_previews (deliver_sample runtime (sample request
+              ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.children ~parent:(parent) ~revision_scope:(Worker_pure_data.V2_children_revision parent) ~scope_revision:("children-1") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Child_members _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))))
         | _ -> Alcotest.fail "unexpected reconciliation request"
       in
       finish_previews held
@@ -8291,13 +7932,13 @@ let test_newer_reconciliation_fences_old_results () =
   Alcotest.(check int) "newer reconciliation publishes once" 1
     (List.length (List.filter (fun (r : Runtime.response) -> match r.payload with
          | Page_tree_reconciled _ -> true | _ -> false) fresh));
-  let late = Runtime.receive runtime (response old (fixture_root_tree runtime fixture old)) in
+  let late = deliver_sample runtime (sample old (fixture_root_tree runtime fixture old)) in
   Alcotest.(check int) "older reconciliation cannot publish" 0 (List.length late.responses);
   Alcotest.(check int) "older reconciliation cannot continue" 0 (List.length late.requests);
   let old_graph = only "held retired graph reconciliation" (hydration_requests runtime (refresh ())) in
-  let retired_packet=response old_graph (fixture_root_tree runtime fixture old_graph) in
+  let retired_packet=sample old_graph (fixture_root_tree runtime fixture old_graph) in
   Runtime.reset runtime;
-  let retired = Runtime.receive runtime retired_packet in
+  let retired = deliver_sample runtime retired_packet in
   Alcotest.(check int) "retired graph cannot publish" 0 (List.length retired.responses);
   Alcotest.(check int) "retired graph cannot continue" 0 (List.length retired.requests)
 ;;
@@ -8312,27 +7953,27 @@ let test_initial_reconciliation_restarts_prefix () =
   let rec hold_roots output =
     let request=only "initial date/root request" output.Runtime.requests in
     match Worker_producer.transport runtime request with
-    |Ok(Worker_producer.S.Coordination_query{request={command=V2_get_page_tree _;_};_})->request
-    |Ok(Worker_producer.S.Coordination_query{request={command=V2_list_journals{from_day;through_day;_};_};_})->
+    |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(_,Read.Tree _);_})->
+      request
+    |Ok(Worker_producer.S.Coordination_query{read=Read.Read_query(_,Read.Journals{from_day=sealed_from_day;through_day=sealed_through_day;_});_})->
+      let from_day=Read.For_worker.journal_day_value sealed_from_day in
+      let through_day=Read.For_worker.journal_day_value sealed_through_day in
       let items=if from_day<=day && day<=through_day then
         [Worker_pure_data.{page=fixture.owner;journal_day=day;revision="page-1"}] else [] in
-      hold_roots(Runtime.receive runtime(response request(V2_journals_outcome{items;next_cursor=None})))
+      hold_roots(deliver_sample runtime(sample request((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:((items : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))))
     | _->Alcotest.fail "unexpected initial query"
   in
   let old=hold_roots(initial_roots runtime 77L)in
   let refreshed=changed runtime(window ~scopes:[Worker_pure_data.V2_page_tree_interest fixture.owner.uuid]())in
   ignore(drive_root_output runtime[fixture]refreshed);
-  let packet=response old(Protocol.V2_page_tree_outcome
-    {page=fixture.owner.uuid;maximum_depth=0;
-     items=List.take 30 fixture.roots |> List.map(fun value->Worker_pure_data.{value;revision="old";depth=0;parent=fixture.owner.uuid});
-     next_cursor=Some(root_cursor 30)})in
-  let restarted=Runtime.receive runtime packet in
+  let packet=sample old((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:((List.take 30 fixture.roots |> List.map(fun value->Worker_pure_data.{value;revision="old";depth=0;parent=fixture.owner.uuid}) : Worker_pure_data.tree_member list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(Some(root_cursor 30)))) in match query with |Read.Tree _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))in
+  let restarted=deliver_sample runtime packet in
   Alcotest.(check bool) "reconciliation restarts the initial prefix without user failure"true
     (restarted.requests<>[] && not(List.exists(fun r->match r.Runtime.payload with Feed_failed _->true|_->false)restarted.responses));
   let feed,_=drive_roots runtime[fixture]restarted in
   Alcotest.(check int) "restart preserves the original visible root budget"30
     (List.fold_left(fun n (day:Journal_graph_projection.day_feed)->n+List.length day.entries)0 feed.days);
-  let duplicate=Runtime.receive runtime packet in
+  let duplicate=deliver_sample runtime packet in
   Alcotest.(check bool) "retired prefix cannot restart or publish twice"true
     (duplicate.requests=[] && duplicate.responses=[])
 ;;
@@ -8362,20 +8003,14 @@ let test_initial_later_read_superseded () =
   ignore (drive_root_output runtime [ fixture ] fresh);
   let values = List.take 30 (List.drop 30 fixture.roots) in
   let stale =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          old
-         (V2_page_tree_outcome
-            { page = fixture.owner.uuid
-            ; maximum_depth = 0
-            ; items =
-                List.map
+         ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:((List.map
                   (fun value ->
                      Worker_pure_data.{ value; revision = "old"; depth = 0; parent = fixture.owner.uuid })
-                  values
-            ; next_cursor = Some (root_cursor 60)
-            }))
+                  values : Worker_pure_data.tree_member list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(Some (root_cursor 60)))) in match query with |Read.Tree _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   Alcotest.(check bool)
     "superseded later request settles rather than wedging pagination"
@@ -8394,9 +8029,9 @@ let test_initial_superseded_and_singleton () =
   let old = only "old listing" (initial_roots runtime 77L).requests in
   let fresh = initial_roots runtime 78L in
   let out =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response old (V2_journals_outcome { items = []; next_cursor = None }))
+      (sample old ((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))))
   in
   Alcotest.(check int)
     "superseded initial generation is ignored"
@@ -8406,22 +8041,22 @@ let test_initial_superseded_and_singleton () =
   let runtime = Runtime.create () in
   let listing = only "singleton listing" (initial_roots runtime 77L).requests in
   let out =
-    Runtime.receive
+    deliver_sample
       runtime
-      (response
+      (sample
          listing
-         (V2_failed { code = "responseTooLarge"; message = "oversized metadata" }))
+         ((failed_sample (Read.Db_error(Logseq_db_worker.Error.create ~code:Response_too_large ~message:("oversized metadata") ~details:[]|>Result.get_ok)))))
   in
   let rec exhaust output =
     match output.Runtime.requests with
     | [] -> output.responses
     | request :: _ ->
       exhaust
-        (Runtime.receive
+        (deliver_sample
            runtime
-           (response
+           (sample
               request
-              (V2_failed { code = "responseTooLarge"; message = "oversized singleton" })))
+              ((failed_sample (Read.Db_error(Logseq_db_worker.Error.create ~code:Response_too_large ~message:("oversized singleton") ~details:[]|>Result.get_ok))))))
   in
   let results = exhaust out in
   Alcotest.(check bool)

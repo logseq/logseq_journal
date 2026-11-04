@@ -3218,6 +3218,11 @@ let host_sessions state change =
   let values=Graphs.fold(fun _ saved values->add saved.source_owner values)state.facts.imports values in
   Rrbvec.of_seq(Sessions.to_seq values)
 ;;
+let terminal_bootstrap_error facts = match facts.bootstrap_state with
+  |Worker.Bootstrap_failed error|Binding_revoked error->Some error
+  |Awaiting_baseline|Bootstrap_not_ready _|Ready _->None
+;;
+
 let progress_host_handoff ?(capacity=false) transition =
   let state=transition.next in
   match state.active_handoff with
@@ -3234,6 +3239,8 @@ let progress_host_handoff ?(capacity=false) transition =
     |Some _->transition
     |None->
     match handoff state.facts id,state.host_plan,state.host_candidate with
+    |Some(Worker.Quiescing change),_,_ when Option.is_some(terminal_bootstrap_error state.facts)->
+      fail change (Option.get(terminal_bootstrap_error state.facts))
     |Some(Worker.Quiescing change),_,_ when state.lifecycle<>Running->fail change Worker.Revoked_session
     |Some(Worker.Safe_to_proceed receipt),_,_ when state.lifecycle<>Running->fail(Worker.handoff_change receipt)Worker.Revoked_session
     |Some(Worker.Quiescing change),Some plan,_
@@ -3962,6 +3969,8 @@ let prepare_host_change ?(legacy_pending=false) state change =
   let state={state with facts={state.facts with handoffs=[];restartable_handoffs=[]}} in
   if state.binding = None || state.lifecycle <> Running
   then Error Worker.Revoked_session
+  else if Option.is_some(terminal_bootstrap_error state.facts)
+  then Error(Option.get(terminal_bootstrap_error state.facts))
   else if state.next = Int64.max_int
   then Error (Worker.Invalid_input "Handoff request counter exhausted")
   else (

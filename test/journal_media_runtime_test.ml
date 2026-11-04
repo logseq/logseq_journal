@@ -2,7 +2,7 @@ module R = Journal_media_runtime
 module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module A = Logseq_db_types.Asset_descriptor
 module G = Logseq_db_types.Graph_types
-module P = Logseq_db_worker.Protocol
+module Read = Worker_pure_read
 
 let check condition message = if not condition then failwith message
 
@@ -73,16 +73,18 @@ let released_handle = function
      |Ok(S.Release_asset_file{handle;_})->Some handle|_->failwith "actual release factory rejected its original lease")
   |_->None
 
-let answer runtime (R.Read request as original) outcome =
+let answer runtime (R.Read request as original) produce =
   let issuer, session = Lazy.force producer in
   let module I = (val issuer : Worker_effect_authority.ISSUER) in
   let budget = W.read_budget session ~maximum_items:request.maximum_items
     ~maximum_bytes:65536 |> Result.get_ok in
   let operation = W.Query (budget, request.query) in
   let id = R.read_request_id original in
-  ignore (I.request session ~request_id:(W.request_id id) operation |> Result.get_ok);
-  let response = P.V2_response { api_version = P.api_version; request_id = id; outcome } in
-  match I.reply session ~request_id:(W.request_id id) operation (S.Graph_response response) with
+  let response=match I.request session ~request_id:(W.request_id id)operation|>Result.get_ok with
+    |S.Coordination_query source->S.Coordination_queried{registration=source.registration;owner=source.owner;
+      request_id=source.request_id;answer=produce source.read}
+    |_->failwith "Media fixture did not issue the original query"in
+  match I.reply session ~request_id:(W.request_id id)operation response with
   | Ok (W.Answered (Ok value)) -> ignore (R.receive_read runtime (request.outcome value))
   | _ -> failwith "fixture response did not decode to the spec query value"
 ;;
@@ -90,8 +92,7 @@ let answer runtime (R.Read request as original) outcome =
 let reject_read runtime (R.Read request) = R.reject_read runtime request.ticket
 
 let reply runtime request ?next_cursor items =
-  answer runtime request (P.V2_assets_outcome
-    { generation = "g"; projection_revision = "p"; items; next_cursor })
+  answer runtime request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("p") ~items:(items) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(next_cursor))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
 ;;
 
 let test_equal_media_notices_keep_effects () =
@@ -444,15 +445,14 @@ let raw_page recycled : G.page =
 let reply_page runtime sent recycled =
   match take_read sent with
   | (R.Read { query = W.Page { uuid = page; _ }; _ } as request) when page = uuid 900 ->
-    answer runtime request (P.V2_page_outcome
-      (Worker_pure_data.V2_present_page { page = raw_page recycled; revision = "p" }))
+    answer runtime request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page { page = raw_page recycled; revision = "p" })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
   | _ -> failwith "page liveness must use one bounded owned Page query"
 ;;
 
 let reply_block runtime sent (block : G.block) =
   match take_read sent with
   | (R.Read { query = W.Outline_block { uuid; _ }; _ } as request) when uuid = block.G.uuid ->
-    answer runtime request (P.V2_block_outcome (block_value block))
+    answer runtime request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((block_value block)) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
   | _ -> failwith "holder/liveness must use its owned bounded Outline_block query"
 ;;
 
@@ -481,8 +481,7 @@ let membership_change runtime n target =
 let reply_missing runtime sent n =
   match take_read sent with
   | (R.Read { query = W.Outline_block { uuid = block; _ }; _ } as request) when block = uuid n ->
-    answer runtime request (P.V2_block_outcome
-      (Worker_pure_data.V2_missing_block { uuid = block; revision = "deleted" }))
+    answer runtime request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = block; revision = "deleted" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
   | _ -> failwith "deletion must complete its owned bounded block lookup"
 ;;
 
@@ -875,7 +874,7 @@ let () =
             match take_read q with
             | (R.Read { query = W.Outline_block { uuid = block; _ }; _ } as request)
               when block = uuid 60 ->
-              answer r request (P.V2_block_outcome (block_value (raw_block 60 61)))
+              answer r request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((block_value (raw_block 60 61))) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
             | _ -> failwith "unknown ancestor requires a bounded Outline_block query"
           in
           if Queue.is_empty q then change r [ 61 ];

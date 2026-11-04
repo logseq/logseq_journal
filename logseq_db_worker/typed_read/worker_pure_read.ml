@@ -200,6 +200,34 @@ type _ query =
       }
       -> change_batch query
 
+type packed_query = Read_query : read_budget * 'a query -> packed_query
+
+type answer = Query_answer : read_budget * 'a query * ('a,error) result -> answer
+
+type (_, _) equality = Refl : ('a, 'a) equality
+
+let query_result_equality : type a b. a query -> b query -> (a, b) equality option =
+  fun a b ->
+  match a, b with
+  | Graph_info, Graph_info -> Some Refl
+  | Admission, Admission -> Some Refl
+  | Journal _, Journal _ -> Some Refl
+  | Journals _, Journals _ -> Some Refl
+  | Page _, Page _ -> Some Refl
+  | Outline_block _, Outline_block _ -> Some Refl
+  | Block_summary _, Block_summary _ -> Some Refl
+  | Children _, Children _ -> Some Refl
+  | Child_members _, Child_members _ -> Some Refl
+  | Tree _, Tree _ -> Some Refl
+  | Favorites _, Favorites _ -> Some Refl
+  | Task_statuses _, Task_statuses _ -> Some Refl
+  | Task_status_definitions _, Task_status_definitions _ -> Some Refl
+  | Asset_descriptors _, Asset_descriptors _ -> Some Refl
+  | Assets _, Assets _ -> Some Refl
+  | Changes _, Changes _ -> Some Refl
+  | _ -> None
+;;
+
 let binding_incarnation (b : binding) = b.incarnation
 
 let equal_binding (a : binding) (b : binding) =
@@ -296,6 +324,8 @@ let change_ack_generation (a : change_ack) = a.generation
 let change_ack_through (a : change_ack) = a.through
 
 module For_worker = struct
+  let pack_query budget query = Read_query(budget,query)
+  let answer budget query value = Query_answer(budget,query,value)
   let worker_incarnation_runtime_epoch (value:worker_incarnation) = value.runtime_epoch
   let worker_incarnation_worker_generation (value:worker_incarnation) = value.worker_generation
   let binding ~serial ~incarnation ~origin ~user : binding = { serial; incarnation; origin; user }
@@ -332,3 +362,188 @@ module For_worker = struct
   let change_ack ~ack_owner ~generation ~through : change_ack = { ack_owner; generation; through }
   let journal_day_value (day:journal_day) = day
 end
+
+(* These are encoded query identities and byte accounting, never another
+   business command representation. The original typed query reaches its owner. *)
+let query_json : type a. read_budget -> a query -> Graph.Cursor.t option -> Yojson.Safe.t =
+  fun budget query cursor ->
+  let optional encode = function None->`Null|Some value->encode value in
+  let text value=`String value and integer value=`Int value in
+  let ids values=`List(List.map Uuid.to_yojson values) in
+  let revision value=optional text value in
+  let cursor=optional Graph.Cursor.to_yojson cursor in
+  let page fields=("maximum_items",integer budget.maximum_items)::("cursor",cursor)::fields in
+  let kind,fields=match query with
+    |Graph_info->"Graph_info",[]
+    |Admission->"Admission",[]
+    |Journal day->"Journal",["day",integer day]
+    |Journals{from_day;through_day;revision=version;_}->"Journals",page["from_day",integer from_day;"through_day",integer through_day;"revision",revision version]
+    |Page{uuid;revision=version}->"Page",["uuid",Uuid.to_yojson uuid;"revision",revision version]
+    |Outline_block{uuid;revision=version}->"Outline_block",["uuid",Uuid.to_yojson uuid;"revision",revision version]
+    |Block_summary{block;_}->"Block_summary",page["block",Uuid.to_yojson block]
+    |Children{parent;_}->"Children",page["parent",Uuid.to_yojson parent]
+    |Child_members{parent;revision=version;_}->"Child_members",page["parent",Uuid.to_yojson parent;"revision",revision version]
+    |Tree{page=root;maximum_depth;revision=version;_}->"Tree",page["page",Uuid.to_yojson root;"maximum_depth",integer maximum_depth;"revision",revision version]
+    |Favorites _->"Favorites",page[]
+    |Task_statuses _->"Task_statuses",page[]
+    |Task_status_definitions statuses->"Task_status_definitions",["statuses",ids statuses]
+    |Asset_descriptors assets->"Asset_descriptors",["assets",ids assets]
+    |Assets{recursive;roots;_}->"Assets",page["recursive",`Bool recursive;"roots",ids roots]
+    |Changes{generation;after}->"Changes",["generation",text generation;"after",revision after;"maximum_items",integer budget.maximum_items]
+  in
+  `Assoc["query",`List[`String kind;`Assoc fields];"maximum_bytes",integer budget.maximum_bytes]
+;;
+
+let query_key budget query = Yojson.Safe.to_string(query_json budget query None)
+
+let query_cursor : type a. session -> read_budget -> a query -> (Graph.Cursor.t option,error)result =
+  fun session budget query ->
+  let check = function
+    |None->Ok None
+    |Some next when equal_session session next.owner && next.key=query_key budget query
+        && next.budget.maximum_items=budget.maximum_items && next.budget.maximum_bytes=budget.maximum_bytes->Ok(Some next.cursor)
+    |Some _->Error(Invalid_input "Continuation does not belong to this query, session and budget") in
+  if not(equal_session session budget.owner) then Error Revoked_session else
+  match query with
+  |Journals{after;_}->check after
+  |Block_summary{after;_}->check after
+  |Children{after;_}->check after
+  |Child_members{after;_}->check after
+  |Tree{after;_}->check after
+  |Favorites after->check after
+  |Task_statuses after->check after
+  |Assets{after;_}->check after
+  |_->Ok None
+;;
+
+let checked_query : type a. session -> read_budget -> a query -> (Graph.Cursor.t option,error)result =
+  fun session budget query ->
+  let invalid message=Error(Db_error(Logseq_db_worker_contract.Error.create
+    ~code:Invalid_request ~message ~details:[] |> Result.get_ok)) in
+  let count=match query with Task_status_definitions ids|Asset_descriptors ids->List.length ids|_->1 in
+  if not(equal_session session budget.owner) then Error Revoked_session
+  else if count>budget.maximum_items then Error(Invalid_input "Lookup exceeds item budget") else
+  let valid=match query with
+    |Assets{roots;_}->List.compare_length_with roots Data.maximum_filter_values<=0
+    |Tree{maximum_depth;_}->maximum_depth>=0 && maximum_depth<=Data.maximum_tree_depth
+    |_->true in
+  if not valid then invalid "request exceeds domain bounds" else
+  Result.bind(query_cursor session budget query)(fun cursor->
+    let json=query_json budget query cursor in
+    match Logseq_db_types.Json_codec.validate json with
+    |Error message->invalid message
+    |Ok()->if String.length(Yojson.Safe.to_string json)>Data.maximum_request_bytes
+      then invalid "JSON exceeds byte budget" else Ok cursor)
+;;
+
+let observable : type a. a query -> bool = function
+  |Graph_info|Journal _|Asset_descriptors _|Task_status_definitions _->true
+  |Journals{after=None;revision=None;_}|Page{revision=None;_}|Outline_block{revision=None;_}
+  |Block_summary{after=None;_}|Children{after=None;_}|Child_members{after=None;revision=None;_}
+  |Tree{after=None;revision=None;_}|Favorites None|Task_statuses None|Assets{after=None;_}->true
+  |_->false
+;;
+
+let validate_query session budget query = Result.map (fun _->()) (checked_query session budget query)
+
+let json_optional encode = function None->`Null|Some value->encode value
+let json_list encode values = `List(List.map encode values)
+let continuation_json next = json_optional(fun next->Graph.Cursor.to_yojson next.cursor)next
+let page_json (value:page)=`Assoc["data",Graph.page_to_yojson value.data;"revision",`String value.revision]
+let block_json (value:block)=`Assoc["data",Data.block_record_to_yojson value.data;"revision",`String value.revision]
+let slice_json encode (value:'a slice)=`Assoc["items",json_list encode value.items;"next",continuation_json value.next]
+let asset_listing_json (value:asset_listing)=`Assoc[
+  "generation",`String value.generation;"projection_revision",`String value.projection_revision;
+  "items",json_list Logseq_db_types.Asset_descriptor.to_yojson value.items;"next",continuation_json value.next]
+let value_json : type a. a query -> a -> Yojson.Safe.t = fun query value->
+  match query with
+  |Graph_info->`Assoc[
+    "graph_uuid",Uuid.to_yojson value.graph_uuid;"graph_name",`String value.graph_name;
+    "schema",Graph.schema_version_to_yojson value.schema;"admission_facts",json_list Graph.admission_fact_to_yojson value.admission_facts;
+    "journal_title_format",json_optional(fun text->`String text)value.journal_title_format;
+    "limits",Data.capability_limits_to_yojson value.limits;"generation",`String value.generation;"projection_revision",`String value.projection_revision]
+  |Admission->Data.admission_inspection_to_yojson value
+  |Journal _->json_optional page_json value
+  |Journals _->slice_json Data.journal_item_to_yojson value
+  |Page _->Data.page_lookup_to_yojson value
+  |Outline_block _->Data.block_lookup_to_yojson value
+  |Block_summary _->`Assoc[
+    "lookup",Data.block_lookup_to_yojson value.lookup;"page",json_optional Data.page_lookup_to_yojson value.page;
+    "items",json_list Data.child_member_to_yojson value.items;"next",continuation_json value.next;
+    "scope_revision",`String value.scope_revision;"generation",`String value.generation;"projection_revision",`String value.projection_revision]
+  |Children _->slice_json block_json value
+  |Child_members _->`Assoc[
+    "parent",Uuid.to_yojson value.parent;"revision_scope",Data.revision_scope_to_yojson value.revision_scope;
+    "scope_revision",`String value.scope_revision;"items",json_list Data.child_member_to_yojson value.items;"next",continuation_json value.next]
+  |Tree _->slice_json Data.tree_member_to_yojson value
+  |Favorites _->`Assoc[
+    "favorites_page",json_optional Uuid.to_yojson value.favorites_page;"generation",`String value.generation;
+    "projection_revision",`String value.projection_revision;"items",json_list Data.favorite_item_to_yojson value.items;"next",continuation_json value.next]
+  |Task_statuses _->`Assoc[
+    "property_uuid",json_optional Uuid.to_yojson value.property_uuid;"default_status",json_optional Uuid.to_yojson value.default_status;
+    "items",json_list Graph.task_status_definition_to_yojson value.items;"next",continuation_json value.next]
+  |Task_status_definitions _->json_list(json_optional Graph.task_status_definition_to_yojson)value
+  |Asset_descriptors _->asset_listing_json value
+  |Assets _->asset_listing_json value
+  |Changes _->`Assoc[
+    "generation",`String value.generation;"from_exclusive",json_optional(fun text->`String text)value.from_exclusive;
+    "through",`String value.through;"windows",json_list Data.change_window_to_yojson value.windows;"next",json_optional(fun text->`String text)value.next]
+;;
+let encoded_value_bytes query value = String.length(Yojson.Safe.to_string(value_json query value))
+
+let validate_value : type a. session -> read_budget -> a query -> a -> (unit,error) result =
+  fun session budget query value ->
+  let count=match query with
+    |Journals _->List.length value.items
+    |Block_summary _->List.length value.items
+    |Children _->List.length value.items
+    |Child_members _->List.length value.items
+    |Tree _->List.length value.items
+    |Favorites _->List.length value.items
+    |Task_statuses _->List.length value.items
+    |Task_status_definitions _->List.length value
+    |Asset_descriptors _->List.length value.items
+    |Assets _->List.length value.items
+    |Changes _->List.length value.windows
+    |_->1 in
+  let block_matches uuid = function Data.V2_present_block{value;_}->Uuid.equal uuid value.block.uuid|V2_missing_block{uuid=actual;_}->Uuid.equal uuid actual in
+  let page_matches uuid = function Data.V2_present_page{page;_}->Uuid.equal uuid page.uuid|V2_missing_page{uuid=actual;_}->Uuid.equal uuid actual in
+  let matches=match query with
+    |Graph_info->Uuid.equal session.graph value.graph_uuid
+    |Page{uuid;_}->page_matches uuid value
+    |Outline_block{uuid;_}->block_matches uuid value
+    |Block_summary{block;_}->block_matches block value.lookup
+    |Child_members{parent;_}->Uuid.equal parent value.parent && value.revision_scope=Data.V2_children_revision parent
+    |Task_status_definitions ids->List.length ids=List.length value
+    |Changes{generation;after}->
+      let module Seen=Set.Make(String) in
+      let rec chain seen previous = function
+        |[]->true
+        |(window:Data.change_window)::rest->window.id<>"" && window.predecessor<>"" && window.successor<>""
+          && not(Seen.mem window.id seen)
+          && Option.fold ~none:true ~some:(String.equal window.predecessor) previous
+          && chain (Seen.add window.id seen) (Some window.successor) rest in
+      let through=match List.rev value.windows with
+        |last::_->value.through=last.Data.id
+        |[]->Option.fold ~none:(value.through<>"") ~some:(String.equal value.through) after in
+      equal_session session value.change_owner && generation<>"" && generation=value.generation
+      && after=value.from_exclusive && through && chain Seen.empty None value.windows
+      && (match value.next with None->true|Some next->next=value.through && value.windows<>[])
+    |_->true in
+  if not(equal_session session budget.owner) then Error Revoked_session
+  else if count>budget.maximum_items then Error Response_budget_exceeded
+  else if not matches then Error(Protocol_mismatch "Response does not match the typed query")
+  else let json=value_json query value in
+    match Logseq_db_types.Json_codec.validate json with
+    |Error _->Error(Protocol_mismatch "The typed query result is not valid JSON data")
+    |Ok()->if String.length(Yojson.Safe.to_string json)>budget.maximum_bytes
+      then Error Response_budget_exceeded else Ok()
+;;
+
+let equal_packed_query left right =
+  left==right || match left,right with Read_query(lb,lq),Read_query(rb,rq)->
+    equal_session lb.owner rb.owner && lb.maximum_items=rb.maximum_items && lb.maximum_bytes=rb.maximum_bytes
+    && match query_cursor lb.owner lb lq,query_cursor rb.owner rb rq with
+      |Ok lc,Ok rc->query_json lb lq lc=query_json rb rq rc
+      |_->false
+;;

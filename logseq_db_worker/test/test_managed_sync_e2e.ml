@@ -11,7 +11,7 @@ module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Core = Service
 module Worker = Logseq_db_worker_lui.Journal_worker
 module Worker_runtime = Logseq_db_worker_lui.Journal_worker_runtime
-module Protocol = Logseq_db_worker.Protocol
+module W = Journal_worker_coordination.Worker_api
 module Support = Managed_sync_e2e_support
 module Probe = Managed_sync_protocol_probe
 module Sync_protocol = Logseq_sync_pure_reducer.Sync_protocol
@@ -167,6 +167,9 @@ let sync_error_kind = function
 type client_context =
   { label : string
   ; client : (Service.request, Service.response, Service.push) Worker.client
+  ; issuer : (module Worker_effect_authority.ISSUER)
+  ; mutable projection : W.projection option
+  ; mutable coordination_started : bool
   ; credentials : Support.credentials
   ; cognito : Support.cognito_session
   ; token_requests : (string, unit) Hashtbl.t
@@ -283,7 +286,19 @@ let handle_public_state context state =
 
 let handle_graph_state context state =
   context.graph_phase <- state.Logseq_db_worker.phase;
-  context.last_event <- "graph-state"
+  context.last_event <- "graph-state";
+  if state.phase=Logseq_db_worker.Graph_open && not context.coordination_started then (
+    let module I=(val context.issuer:Worker_effect_authority.ISSUER)in
+    context.coordination_started<-true;
+    ignore(send context(I.bootstrap_request()|>Result.get_ok)))
+;;
+
+let accept_baseline context value =
+  let module I=(val context.issuer:Worker_effect_authority.ISSUER)in
+  match I.bootstrap(Service.Coordination_registered value)with
+  |Ok(W.Ready projection)->context.projection<-Some projection
+  |Ok(W.Awaiting_baseline|W.Bootstrap_not_ready _)->context.projection<-None
+  |_->fail_worker context "coordination-bootstrap" "invalid-authoritative-baseline"
 ;;
 
 let handle_push context = function
@@ -304,7 +319,8 @@ let handle_push context = function
   | Graph_push _ | Graph_pushes _ -> context.last_event <- "graph-push"
   | Graph_states states -> List.iter (fun (_,state)->handle_graph_state context state) states
   | Session_states _ -> ()
-  | Coordination_updates _ | Coordination_observations _ -> ()
+  | Coordination_updates updates->List.iter(function Service.Coordination_snapshot value->accept_baseline context value|_->())updates
+  | Coordination_observations _ -> ()
 ;;
 
 let handle_event context = function
@@ -317,15 +333,15 @@ let handle_event context = function
   | Response { outcome = Completed (Service.Local_copy_inspected _); _ }
   | Response { outcome = Completed (Service.Local_copy_deleted _); _ } ->
     fail_worker context "local-copy" "unexpected local-copy response"
-  | Response { outcome = Completed (Service.Coordination_asset_demand_finalized _ | Coordination_observation_finalized _ | Coordination_registered _ | Coordination_released _ | Coordination_mutation_result _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _ | Coordination_imported _ | Coordination_writers_quiesced _ | Coordination_host_prepared _ | Coordination_host_applied _ | Coordination_host_confirmed _ | Coordination_import_inputs_recovered _ | Coordination_import_input_confirmed _ | Coordination_import_input_acknowledged _); _ } ->
+  | Response { outcome = Completed (Service.Coordination_asset_demand_finalized _ | Coordination_observation_finalized _ | Coordination_confirmed _ | Coordination_changes_acknowledged _ | Coordination_released _ | Coordination_observed _ | Coordination_observation_released _ | Coordination_mutations_recovered _ | Coordination_mutation_acknowledged _ | Coordination_asset_demand_accepted _ | Coordination_asset_demand_released _ | Coordination_imported _ | Coordination_writers_quiesced _ | Coordination_host_prepared _ | Coordination_host_applied _ | Coordination_host_confirmed _ | Coordination_import_inputs_recovered _ | Coordination_import_input_confirmed _ | Coordination_import_input_acknowledged _); _ } ->
     fail_worker context "coordination" "unexpected unowned coordination response"
   | Response { outcome = Completed Service.Client_command_completed; _ } -> None
   | Response { outcome = Completed (Service.Graph_state state); _ } ->
     handle_graph_state context state;
     None
-  | Response { request_id; outcome = Completed (Service.Graph_response response); _ } ->
-    context.last_event <- "graph-response";
-    Some (request_id, response)
+  |Response{outcome=Completed(Service.Coordination_registered value);_}->accept_baseline context value;None
+  |Response{request_id;outcome=Completed((Service.Coordination_queried _|Coordination_mutation_result _)as response);_}->
+    context.last_event<-"typed-response";Some(request_id,response)
   | Response { outcome = Failed _; _ } -> fail_worker context "worker-request" "failed"
   | Response { outcome = Cancelled; _ } ->
     fail_worker context "worker-request" "cancelled"
@@ -340,7 +356,7 @@ let drain context =
 
 let timeout_at seconds = Unix.gettimeofday () +. seconds
 
-let await_graph_response context ~phase request_id =
+let await_response context ~phase request_id =
   let deadline = timeout_at 45. in
   let rec loop () =
     if Unix.gettimeofday () >= deadline then fail_worker context phase "timeout";
@@ -365,6 +381,7 @@ let opening_complete context =
     && context.saw_bootstrap
     && context.saw_opening_pull
     && context.graph_phase = Graph_open
+    && Option.exists(fun projection->List.exists(fun resident->resident.W.phase=W.Open)(W.residents projection))context.projection
   | None -> false
 ;;
 
@@ -373,7 +390,7 @@ let await_opening_current ?(timeout_seconds = 300.) context =
   let rec loop () =
     if Unix.gettimeofday () >= deadline
     then fail_worker context "cold-bootstrap" "timeout";
-    ignore (drain context : (ID.Worker.Request_id.t * Protocol.response) list);
+    ignore (drain context : (ID.Worker.Request_id.t * Service.response) list);
     if opening_complete context
     then (
       match context.last_state, context.selected_graph with
@@ -390,7 +407,7 @@ let await_authoritative_current context ~after_server_t phase =
   let deadline = timeout_at 180. in
   let rec loop () =
     if Unix.gettimeofday () >= deadline then fail_worker context phase "timeout";
-    ignore (drain context : (ID.Worker.Request_id.t * Protocol.response) list);
+    ignore (drain context : (ID.Worker.Request_id.t * Service.response) list);
     match context.last_state with
     | Some state ->
       (match state.snapshot.sync_phase, state.snapshot.applied_server_t with
@@ -406,41 +423,40 @@ let await_authoritative_current context ~after_server_t phase =
   loop ()
 ;;
 
-let graph_request context command =
-  let request = Protocol.{ api_version; request_id = fresh_uuid (); command } in
-  let worker_request_id = send context (Service.Graph_request request) in
-  await_graph_response context ~phase:"graph-request" worker_request_id
+let current_session context =
+  match context.projection,context.selected_graph with
+  |Some projection,Some graph->
+    (match List.find_opt(fun resident->resident.W.phase=W.Open && W.graph_id resident.session=graph.graph_id)(W.residents projection)with
+     |Some resident->resident.session|None->fail_worker context "typed-request" "graph-session-unavailable")
+  |_->fail_worker context "typed-request" "bootstrap-not-ready"
 ;;
-
+let execute :type a. client_context -> W.session -> a W.request -> a = fun context session operation->
+  let module I=(val context.issuer:Worker_effect_authority.ISSUER)in
+  let request_id=W.request_id(fresh_uuid())in
+  let request=match I.request session ~request_id operation with
+    |Ok value->value|Error _->fail_worker context "typed-request" "admission-rejected"in
+  let response=await_response context ~phase:"typed-request" (send context request)in
+  match I.reply session ~request_id operation response with
+  |Ok(W.Answered(Ok value))->value
+  |_->fail_worker context "typed-request" "response-rejected"
+;;
+let query :type a. ?maximum_items:int -> client_context -> a W.query -> a =
+  fun ?(maximum_items=200) context query->
+    let session=current_session context in
+    let budget=W.read_budget session ~maximum_items ~maximum_bytes:Worker_pure_data.maximum_response_bytes|>Result.get_ok in
+    execute context session(W.Query(budget,query))
+;;
 let journal_parent context =
-  match
-    graph_request
-      context
-      (V2_list_journals
-         { from_day = 0
-         ; through_day = 99_999_999
-         ; limit = 50
-         ; cursor = None
-         ; revision = None
-         })
-  with
-  | V2_response { outcome = V2_journals_outcome { items; _ }; _ } ->
-    (match
-       List.find_opt
-         (fun (item : Worker_pure_data.journal_item) -> not item.page.recycled)
-         items
-     with
-     | Some item -> item.page.uuid
-     | None -> fail_worker context "journal-read" "no-active-journal")
-  | V2_response _ -> fail_worker context "journal-read" "unexpected-response"
+  let result=query ~maximum_items:50 context(W.Journals{
+    from_day=W.journal_day 10101|>Result.get_ok;through_day=W.journal_day 99991231|>Result.get_ok;
+    revision=None;after=None})in
+  match List.find_opt(fun(item:Worker_pure_data.journal_item)->not item.page.recycled)result.items with
+  |Some item->item.page.uuid
+  |None->fail_worker context "journal-read" "no-active-journal"
 ;;
-
-let read_block context block_uuid =
-  match graph_request context (V2_get_outline_block { block = block_uuid; revision = None }) with
-  | V2_response { outcome = V2_block_outcome (Worker_pure_data.V2_present_block { value; revision }); _ }
-    -> Ok (value, revision)
-  | V2_response { outcome = V2_block_outcome (Worker_pure_data.V2_missing_block _); _ } -> Error ()
-  | V2_response _ -> fail_worker context "block-read" "unexpected-response"
+let read_block context block_uuid=match query context(W.Outline_block{uuid=block_uuid;revision=None})with
+  |Worker_pure_data.V2_present_block{value;revision}->Ok(value,revision)
+  |V2_missing_block _->Error()
 ;;
 
 let require_block context ~block_uuid ~parent_uuid ~title =
@@ -456,76 +472,39 @@ let require_block context ~block_uuid ~parent_uuid ~title =
     block, basis
 ;;
 
-let run_mutation ?(on_applied = fun () -> ()) context ~after_server_t phase command =
-  report_phase (phase ^ "-request");
-  let request = Protocol.{ api_version; request_id = fresh_uuid (); command } in
-  let worker_request_id = send context (Service.Graph_request request) in
-  (match await_graph_response context ~phase worker_request_id with
-   | V2_response { outcome = V2_mutation_committed { status = Worker_pure_data.V2_applied; _ }; _ } ->
-     report_phase (phase ^ "-local-commit");
-     on_applied ()
-   | V2_response { outcome = V2_failed { code; message }; _ } ->
-     fail_worker context phase (Printf.sprintf "mutation-failed:%s:%s" code message)
-   | V2_response _ -> fail_worker context phase "mutation-not-applied");
-  let cursor = await_authoritative_current context ~after_server_t phase in
-  report_phase (phase ^ "-authoritative");
-  cursor
+let run_mutation ?(on_applied=fun()->()) context ~after_server_t phase ~mutation_id command =
+  report_phase(phase^"-request");
+  let session=current_session context in
+  let intent=W.mutation_intent session ~mutation_id command|>Result.get_ok in
+  (match execute context session(W.Mutate intent)with
+   |W.Committed_pending_presentation receipt->
+     let _,before,after=W.receipt_revisions receipt in
+     if before=after then fail_worker context phase "mutation-not-applied";
+     report_phase(phase^"-local-commit");on_applied()
+   |_->fail_worker context phase "mutation-not-applied");
+  let cursor=await_authoritative_current context ~after_server_t phase in
+  report_phase(phase^"-authoritative");cursor
 ;;
-
 let insert_preconditions context parent =
-  let page_revision =
-    match graph_request context (V2_get_page { page = parent; revision = None }) with
-    | V2_response { outcome = V2_page_outcome (Worker_pure_data.V2_present_page { revision; _ }); _ } ->
-      revision
-    | V2_response _ -> fail_worker context "insert-precondition" "parent-page-missing"
-  in
-  let scope_revision =
-    match
-      graph_request
-        context
-        (V2_get_children { parent; limit = 200; cursor = None; revision = None })
-    with
-    | V2_response { outcome = V2_children_outcome { scope_revision; _ }; _ } ->
-      scope_revision
-    | V2_response _ -> fail_worker context "insert-precondition" "children-missing"
-  in
-  Worker_pure_data.{ blocks = []
-    ; pages = [ parent, page_revision ]
-    ; scopes = [ Worker_pure_data.V2_children_scope parent, scope_revision ]
-    }
+  let page_revision=match query context(W.Page{uuid=parent;revision=None})with
+    |Worker_pure_data.V2_present_page{revision;_}->revision
+    |_->fail_worker context "insert-precondition" "parent-page-missing"in
+  let children=query context(W.Child_members{parent;revision=None;after=None})in
+  Worker_pure_data.{blocks=[];pages=[parent,page_revision];
+    scopes=[V2_children_scope parent,children.scope_revision]}
 ;;
-
 let insert_block context ~block_uuid ~parent_uuid ~title ~after_server_t ~on_applied =
-  run_mutation
-    ~on_applied
-    context
-    ~after_server_t
-    "insert-block"
-    (V2_insert_blocks
-       { mutation_id = fresh_uuid ()
-       ; parent = parent_uuid
-       ; roots = [ { uuid = block_uuid; title; children = [] } ]
-       ; preconditions = insert_preconditions context parent_uuid
-       })
+  run_mutation ~on_applied context ~after_server_t "insert-block" ~mutation_id:(fresh_uuid())
+    (W.Insert_blocks{parent=parent_uuid;roots=[{uuid=block_uuid;title;children=[]}];
+      preconditions=insert_preconditions context parent_uuid})
 ;;
-
 let delete_block context ~block_uuid ~after_server_t =
   report_phase "delete-precondition-start";
-  let _, revision =
-    match read_block context block_uuid with
-    | Ok value -> value
-    | Error () -> fail_worker context "delete-precondition" "block-missing"
-  in
+  let _,revision=match read_block context block_uuid with
+    |Ok value->value|Error()->fail_worker context "delete-precondition" "block-missing"in
   report_phase "delete-precondition-complete";
-  run_mutation
-    context
-    ~after_server_t
-    "delete-block"
-    (V2_delete_blocks
-       { mutation_id = fresh_uuid ()
-       ; root = block_uuid
-       ; preconditions = { blocks = [ block_uuid, revision ]; pages = []; scopes = [] }
-       })
+  run_mutation context ~after_server_t "delete-block" ~mutation_id:(fresh_uuid())
+    (W.Delete_blocks{root=block_uuid;preconditions={blocks=[block_uuid,revision];pages=[];scopes=[]}})
 ;;
 
 let raw_transaction ~mutation_id ~operation operations =
@@ -1015,9 +994,14 @@ let with_client ~label ~support ~credentials ~cognito f =
       client
     | Error _ -> fail "client=%s phase=start reason=failed" label
   in
+  let issuer=Worker_effect_authority.issuer ~managed_origin:base_url ~user_id:cognito.Support.user_id
+    ~runtime_epoch:(Worker.runtime_epoch client) ~worker_generation:(Worker.worker_generation client)|>Result.get_ok in
   let context =
     { label
     ; client
+    ; issuer
+    ; projection=None
+    ; coordination_started=false
     ; credentials
     ; cognito
     ; token_requests = Hashtbl.create 8

@@ -141,7 +141,6 @@ type 'a observation =
   ; observation_query : 'a query
   }
 
-type (_, _) equality = Refl : ('a, 'a) equality
 
 type 'a observed =
   { observation : 'a observation
@@ -464,28 +463,6 @@ let observation_id value = value.observation_key
 let observation_budget value = value.observation_budget
 let observation_query value = value.observation_query
 
-let query_result_equality : type a b. a query -> b query -> (a, b) equality option =
-  fun a b ->
-  match a, b with
-  | Graph_info, Graph_info -> Some Refl
-  | Admission, Admission -> Some Refl
-  | Journal _, Journal _ -> Some Refl
-  | Journals _, Journals _ -> Some Refl
-  | Page _, Page _ -> Some Refl
-  | Outline_block _, Outline_block _ -> Some Refl
-  | Block_summary _, Block_summary _ -> Some Refl
-  | Children _, Children _ -> Some Refl
-  | Child_members _, Child_members _ -> Some Refl
-  | Tree _, Tree _ -> Some Refl
-  | Favorites _, Favorites _ -> Some Refl
-  | Task_statuses _, Task_statuses _ -> Some Refl
-  | Task_status_definitions _, Task_status_definitions _ -> Some Refl
-  | Asset_descriptors _, Asset_descriptors _ -> Some Refl
-  | Assets _, Assets _ -> Some Refl
-  | Changes _, Changes _ -> Some Refl
-  | _ -> None
-;;
-
 let same_observation : type a b. a observation -> b observation -> (a, b) equality option =
   fun a b ->
   match query_result_equality a.observation_query b.observation_query with
@@ -673,95 +650,11 @@ let valid_handoff_receipt plan receipt=
     index+1,ok && scope=Rrbvec.nth actual.expected index)(0,true)plan.plan_wire.expected)
 ;;
 
-let query_command
-  : type a. read_budget -> a query -> Graph.Cursor.t option -> Protocol.command
-  =
-  fun budget query cursor ->
-  let limit = (For_worker.read_budget_maximum_items budget) in
-  match query with
-  | Graph_info -> V2_graph_info
-  | Admission -> V2_inspect_admission
-  | Journal day ->
-    V2_list_journals
-      { from_day = For_worker.journal_day_value day; through_day = For_worker.journal_day_value day; limit = 1; cursor = None; revision = None }
-  | Journals { from_day; through_day; revision; _ } ->
-    V2_list_journals { from_day=For_worker.journal_day_value from_day; through_day=For_worker.journal_day_value through_day; revision; limit; cursor }
-  | Page { uuid; revision } -> V2_get_page { page = uuid; revision }
-  | Outline_block { uuid; revision } -> V2_get_outline_block { block = uuid; revision }
-  | Block_summary { block; _ } -> V2_get_outline_block_summary { block; limit; cursor }
-  | Children { parent; _ } -> V2_get_children { parent; limit; cursor; revision = None }
-  | Child_members { parent; revision; _ } ->
-    V2_get_children { parent; limit; cursor; revision }
-  | Tree { page; maximum_depth; revision; _ } ->
-    V2_get_page_tree { page; maximum_depth; limit; cursor; revision }
-  | Favorites _ -> V2_list_favorites { limit; cursor }
-  | Task_statuses _ -> V2_list_task_statuses { limit; cursor }
-  | Task_status_definitions statuses -> V2_get_task_status_definitions { statuses }
-  | Asset_descriptors assets -> V2_get_asset_descriptors { assets }
-  | Assets { recursive; roots; _ } -> V2_list_assets { recursive; roots; limit; cursor }
-  | Changes { generation; after } -> V2_pull_changes { generation; after; limit }
-;;
-
-let dummy_id = Uuid.of_string "00000000-0000-4000-8000-000000000001" |> Result.get_ok
-
-let query_key budget query =
-  Protocol.request_to_yojson
-    { api_version = Protocol.api_version
-    ; request_id = dummy_id
-    ; command = query_command budget query None
-    }
-  |> Yojson.Safe.to_string
-;;
-
-let checked_command
-  : type a. session -> read_budget -> a query -> (Protocol.command, error) result
-  =
-  fun session budget query ->
-  let key = query_key budget query in
-  let check after =
-    match after with
-    | None -> Ok None
-    | Some next
-      when equal_session (For_worker.continuation_owner next) session
-           && (For_worker.continuation_key next) = key
-           && (For_worker.read_budget_maximum_items (For_worker.continuation_budget next)) = (For_worker.read_budget_maximum_items budget)
-           && (For_worker.read_budget_maximum_bytes (For_worker.continuation_budget next)) = (For_worker.read_budget_maximum_bytes budget) -> Ok (Some (For_worker.continuation_cursor next))
-    | Some _ ->
-      Error
-        (Invalid_input "Continuation does not belong to this query, session and budget")
-  in
-  let cursor =
-    match query with
-    | Journals { after; _ } -> check after
-    | Block_summary { after; _ } -> check after
-    | Children { after; _ } -> check after
-    | Child_members { after; _ } -> check after
-    | Tree { after; _ } -> check after
-    | Favorites after -> check after
-    | Task_statuses after -> check after
-    | Assets { after; _ } -> check after
-    | _ -> Ok None
-  in
-  let count =
-    match query with
-    | Task_status_definitions ids -> List.length ids
-    | Asset_descriptors ids -> List.length ids
-    | _ -> 1
-  in
-  if not (equal_session (For_worker.read_budget_owner budget) session)
-  then Error Revoked_session
-  else if count > (For_worker.read_budget_maximum_items budget)
-  then Error (Invalid_input "Lookup exceeds item budget")
-  else Result.map (query_command budget query) cursor
-;;
-
 let supports_observation session query =
-  let budget =
-    (For_worker.read_budget ~owner:(session) ~maximum_items:(Worker_pure_data.maximum_page_size) ~maximum_bytes:((For_worker.session_limits session).response_budget_bytes))
-  in
-  match checked_command session budget query with
-  | Ok command -> Protocol.is_observable_read command
-  | Error _ -> false
+  let budget=For_worker.read_budget ~owner:session
+    ~maximum_items:Worker_pure_data.maximum_page_size
+    ~maximum_bytes:(For_worker.session_limits session).response_budget_bytes in
+  observable query && Result.is_ok(validate_query session budget query)
 ;;
 
 let equal_prepared_import_source a b=equal_session a.prepared_owner b.prepared_owner
@@ -863,200 +756,32 @@ let rec validate_request : type a. session -> a request -> (unit, error) result 
     then Error Revoked_session
     else if file.source_handle="" then Error(Protocol_mismatch "Ready asset omitted its file capability") else Ok()
   | Retry_upload operation->if equal_session session operation.upload_owner then Ok() else Error Revoked_session
-  | Query (budget, query) ->
-    Result.bind (checked_command session budget query) (fun command ->
-      Protocol.request_of_yojson
-        (Protocol.request_to_yojson
-           { api_version = Protocol.api_version; request_id = dummy_id; command })
-      |> Result.map (fun _ -> ())
-      |> Result.map_error (fun error -> Db_error error))
+  | Query (budget, query) -> validate_query session budget query
   | _ -> .
 ;;
 
-let decode
-  : type a. session -> read_budget -> a query -> Protocol.v2_outcome -> (a, error) result
-  =
-  fun session budget query outcome ->
-  let next cursor =
-    Option.map
-      (fun cursor -> (For_worker.continuation ~owner:(session) ~budget ~key:(query_key budget query) ~cursor))
-      cursor
-  in
-  let bounded items =
-    if List.length items > (For_worker.read_budget_maximum_items budget)
-    then Error Response_budget_exceeded
-    else Ok items
-  in
-  let mismatch () = Error (Protocol_mismatch "Response does not match the typed query") in
-  let page_matches uuid = function
-    | Worker_pure_data.V2_present_page { page; _ } -> Uuid.equal page.uuid uuid
-    | Worker_pure_data.V2_missing_page { uuid = actual; _ } -> Uuid.equal actual uuid
-  in
-  let block_matches uuid = function
-    | Worker_pure_data.V2_present_block { value; _ } -> Uuid.equal value.block.uuid uuid
-    | Worker_pure_data.V2_missing_block { uuid = actual; _ } -> Uuid.equal actual uuid
-  in
-  match outcome with
-  | Protocol.V2_failed { code; message } ->
-    Error
-      (if code = "staleReadCursor"
-       then Stale_read message
-       else match Logseq_db_worker.Error.code_of_string code with
-         | Some code ->
-           (match Logseq_db_worker.Error.create ~code ~message ~details:[] with
-            | Ok error -> Db_error error
-            | Error _ -> Invalid_input "The query failure was not a valid database error.")
-         | None -> Service_failed (code ^ ": " ^ message))
-  | V2_resync_required { reason; _ } -> Error (Resync_required reason)
-  | _ ->
-    (match query, outcome with
-     | Graph_info, Protocol.V2_graph_info_outcome i
-       when Uuid.equal (graph_id session) i.graph_uuid ->
-       Ok
-         (For_worker.graph_info ~graph_uuid:(i.graph_uuid) ~graph_name:(i.graph_name) ~schema:(i.schema) ~admission_facts:(i.admission_facts) ~journal_title_format:(i.journal_title_format) ~limits:(i.limits) ~generation:(i.generation) ~projection_revision:(i.projection_revision))
-     | Admission, V2_admission_outcome inspection -> Ok inspection
-     | Journal day, V2_journals_outcome { items; next_cursor = None } ->
-       (match items with
-        | [] -> Ok None
-        | [ item ] when item.journal_day = For_worker.journal_day_value day ->
-          Ok (Some (For_worker.page ~data:(item.page) ~revision:(item.revision)))
-        | _ -> mismatch ())
-     | Journals _, V2_journals_outcome { items; next_cursor } ->
-       Result.map (fun items -> ((For_worker.slice ~items ~next:(next next_cursor)) : _ slice)) (bounded items)
-     | Page { uuid; _ }, V2_page_outcome lookup when page_matches uuid lookup -> Ok lookup
-     | Outline_block { uuid; _ }, V2_block_outcome lookup when block_matches uuid lookup
-       -> Ok lookup
-     | Block_summary { block; _ }, V2_block_summary_outcome s
-       when block_matches block s.lookup ->
-       Result.map
-         (fun items ->
-            (For_worker.block_summary ~lookup:(s.lookup) ~page:(s.page) ~items ~next:(next s.next_cursor) ~scope_revision:(s.scope_revision) ~generation:(s.generation) ~projection_revision:(s.projection_revision)))
-         (bounded s.items)
-     | Children { parent; _ }, V2_children_outcome c
-       when Uuid.equal parent c.parent && c.revision_scope = Worker_pure_data.V2_children_revision parent
-       ->
-       Result.map
-         (fun items ->
-            ((For_worker.slice ~items:(List.map
-                  (fun (i : Worker_pure_data.child_member) ->
-                     (For_worker.block ~data:(i.value) ~revision:(i.revision)))
-                  items) ~next:(next c.next_cursor)) : block slice))
-         (bounded c.items)
-     | Child_members { parent; _ }, V2_children_outcome c
-       when Uuid.equal parent c.parent && c.revision_scope = Worker_pure_data.V2_children_revision parent
-       ->
-       Result.map
-         (fun items ->
-            (For_worker.children ~parent ~revision_scope:(c.revision_scope) ~scope_revision:(c.scope_revision) ~items ~next:(next c.next_cursor)))
-         (bounded c.items)
-     | Tree { page; maximum_depth; _ }, V2_page_tree_outcome t
-       when Uuid.equal page t.page && maximum_depth = t.maximum_depth ->
-       Result.map (fun items -> ((For_worker.slice ~items ~next:(next t.next_cursor)) : _ slice)) (bounded t.items)
-     | Favorites _, V2_favorites_outcome f ->
-       Result.map
-         (fun items ->
-            (For_worker.favorites ~favorites_page:(f.favorites_page) ~generation:(f.generation) ~projection_revision:(f.projection_revision) ~items ~next:(next f.next_cursor)))
-         (bounded f.items)
-     | Task_statuses _, V2_task_statuses_outcome s ->
-       Result.map
-         (fun items ->
-            (For_worker.task_status_catalog ~property_uuid:(s.property_uuid) ~default_status:(s.default_status) ~items ~next:(next s.next_cursor)))
-         (bounded s.items)
-     | Task_status_definitions ids, V2_task_status_definitions_outcome items
-       when List.length ids = List.length items -> bounded items
-     | Asset_descriptors _, V2_assets_outcome a when a.next_cursor = None ->
-       Result.map
-         (fun items ->
-            (For_worker.asset_listing ~generation:(a.generation) ~projection_revision:(a.projection_revision) ~items ~next:(None)))
-         (bounded a.items)
-     | Assets _, V2_assets_outcome a ->
-       Result.map
-         (fun items ->
-            (For_worker.asset_listing ~generation:(a.generation) ~projection_revision:(a.projection_revision) ~items ~next:(next a.next_cursor)))
-         (bounded a.items)
-     | Changes { generation; after }, V2_changes b
-       when generation = b.generation && after = b.from_exclusive ->
-       let rec chain seen previous = function
-         | [] -> true
-         | (window : Worker_pure_data.change_window) :: rest ->
-           window.id <> ""
-           && window.predecessor <> ""
-           && window.successor <> ""
-           && (not (List.mem window.id seen))
-           && Option.fold ~none:true ~some:(String.equal window.predecessor) previous
-           && chain (window.id :: seen) (Some window.successor) rest
-       in
-       let through_matches =
-         match List.rev b.windows with
-         | last :: _ -> b.through = last.Worker_pure_data.id
-         | [] -> Option.fold ~none:(b.through <> "") ~some:(String.equal b.through) after
-       in
-       if
-         generation = ""
-         || (not through_matches)
-         || (not (chain [] None b.windows))
-         ||
-         match b.next with
-         | None -> false
-         | Some next -> next <> b.through || b.windows = []
-       then Error (Protocol_mismatch "Changefeed window chain or continuation mismatch")
-       else
-         Result.map
-           (fun windows ->
-              (For_worker.change_batch ~change_owner:(session) ~generation ~from_exclusive:(b.from_exclusive) ~through:(b.through) ~windows ~next:(b.next)))
-           (bounded b.windows)
-     | _ -> mismatch ())
+let confirmation_read session (receipt:receipt) =
+  let budget=For_worker.read_budget ~owner:session ~maximum_items:Worker_pure_data.default_page_size
+    ~maximum_bytes:(For_worker.session_limits session).response_budget_bytes in
+  match Wire.readback_target(durable_wire receipt.intent) with
+  |`Page uuid->For_worker.pack_query budget (Page{uuid;revision=None})
+  |`Block block->For_worker.pack_query budget (Block_summary{block;after=None})
 ;;
 
-let decode_confirmation session ~presentation receipt response =
-  Result.bind (validate_confirmation session presentation receipt) (fun () ->
-    let budget =
-      (For_worker.read_budget ~owner:(session) ~maximum_items:(Worker_pure_data.default_page_size) ~maximum_bytes:((For_worker.session_limits session).response_budget_bytes))
-    in
-    let response_size = Protocol.encoded_response_bytes response in
-    if response_size > (For_worker.read_budget_maximum_bytes budget)
-    then Error Response_budget_exceeded
-    else (
-      match response with
-      | Protocol.V2_response { api_version; outcome; _ }
-        when api_version = Protocol.api_version ->
-        let target =
-          match Wire.command (durable_wire receipt.intent) with
-          | Protocol.V2_create_journal_page { page; _ } ->
-            decode session budget (Page { uuid = page; revision = None }) outcome
-            |> Result.map (fun page -> Confirmed_page page)
-          | command ->
-            let primary =
-              match command with
-              | Protocol.V2_append_journal{root;_}->root.block_id
-              | Protocol.V2_insert_blocks { roots = root :: _; _ } -> root.uuid
-              | V2_save_block { block; _ }
-              | V2_set_task_status { block; _ }
-              | V2_clear_task_status { block; _ }
-              | V2_set_asset_reference { block; _ } -> block
-              | V2_delete_blocks { root; _ } -> root
-              | _ -> assert false
-            in
-            decode
-              session
-              budget
-              (Block_summary { block = primary; after = None })
-              outcome
-            |> Result.map (fun summary ->
-              match summary.lookup with
-              | Worker_pure_data.V2_missing_block { uuid; revision } ->
-                Confirmed_absence
-                  { uuid
-                  ; revision
-                  ; generation = summary.generation
-                  ; projection_revision = summary.projection_revision
-                  }
-              | _ -> Confirmed_block summary)
-        in
-        Result.map
-          (fun primary -> { receipt; presentation; primary; additional = Rrbvec.empty })
-          target
-      | _ -> Error (Protocol_mismatch "Invalid canonical confirmation response")))
+let decode_confirmation session ~presentation (receipt:receipt) (Worker_pure_read.Query_answer(budget,query,result)) =
+  Result.bind(validate_confirmation session presentation receipt)(fun()->
+    if not(Worker_pure_read.equal_packed_query(confirmation_read session receipt)(For_worker.pack_query budget query))
+    then Error(Protocol_mismatch "Canonical readback belongs to another query or execution")else
+    let primary : (confirmed_target,error)result = match query with
+      |Page _->Result.bind result(fun value->Result.map(fun()->Confirmed_page value)
+        (Worker_pure_read.validate_value session budget query value))
+      |Block_summary _->Result.bind result(fun summary->Result.map(fun()->
+        match summary.lookup with
+        |Worker_pure_data.V2_missing_block{uuid;revision}->Confirmed_absence{uuid;revision;
+          generation=summary.generation;projection_revision=summary.projection_revision}
+        |_->Confirmed_block summary)(Worker_pure_read.validate_value session budget query summary))
+      |_->Error(Protocol_mismatch "Invalid canonical confirmation query")in
+    Result.map(fun primary->{receipt;presentation;primary;additional=Rrbvec.empty})primary)
 ;;
 
 let validate_baseline (b : Service.coordination_baseline) =

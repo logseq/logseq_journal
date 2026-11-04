@@ -235,6 +235,12 @@ type _ query =
       -> change_batch query
 
 
+type packed_query = private Read_query : read_budget * 'a query -> packed_query
+type answer = private Query_answer : read_budget * 'a query * ('a,error) result -> answer
+
+type (_, _) equality = Refl : ('a, 'a) equality
+val query_result_equality : 'a query -> 'b query -> ('a, 'b) equality option
+
 val change_batch_session : change_batch -> session
 
 val change_ack_session : change_ack -> session
@@ -245,6 +251,8 @@ val change_ack_through : change_ack -> string
 (** Trusted construction and access to original representations. Business
     libraries depend on Worker_api and cannot name this implementation library. *)
 module For_worker : sig
+  val pack_query : read_budget -> 'a query -> packed_query
+  val answer : read_budget -> 'a query -> ('a,error) result -> answer
   val worker_incarnation_runtime_epoch : worker_incarnation -> Journal_worker_ids.Runtime.epoch
   val worker_incarnation_worker_generation : worker_incarnation -> Journal_worker_ids.Worker.generation
   val binding : serial:int64 -> incarnation:worker_incarnation -> origin:string -> user:string -> binding
@@ -281,3 +289,18 @@ module For_worker : sig
   val change_ack : ack_owner:session -> generation:string -> through:string -> change_ack
   val journal_day_value : journal_day -> int
 end
+
+(** Pure validation and ephemeral continuation identity for the original query.
+    No Protocol command, response or transport envelope is constructed. *)
+val query_key : read_budget -> 'a query -> string
+val query_cursor : session -> read_budget -> 'a query -> (Graph.Cursor.t option,error) result
+val checked_query : session -> read_budget -> 'a query -> (Graph.Cursor.t option,error) result
+val validate_query : session -> read_budget -> 'a query -> (unit,error) result
+val observable : 'a query -> bool
+
+(** Size the enriched data and cursor payload. Session/query authority is held
+    by the existing channel/interest; it is never encoded again as DTO fields. *)
+val encoded_value_bytes : 'a query -> 'a -> int
+val validate_value : session -> read_budget -> 'a query -> 'a -> (unit,error) result
+
+val equal_packed_query : packed_query -> packed_query -> bool

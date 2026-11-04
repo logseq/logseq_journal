@@ -12,6 +12,20 @@ let client = uuid "98000000-0000-4000-8000-000000000002"
 
 let fixture = Coordination_test_fixture.fixture
 
+module Read=Worker_pure_read
+let typed_query_answer session request_id budget query result =
+  let module F=Read.For_worker in
+  S.Coordination_queried{registration=F.binding_serial(F.session_binding session);
+    owner=F.session_scope session;request_id;answer=F.answer budget query result}
+let changes_answer session request_id budget ~generation ~after ~through ~windows ~next =
+  typed_query_answer session request_id budget (Read.Changes{generation;after})
+    (Ok(Read.For_worker.change_batch ~change_owner:session ~generation ~from_exclusive:after ~through ~windows ~next))
+let changes_ack_answer session request_id batch =
+  let module F=Read.For_worker in
+  S.Coordination_changes_acknowledged{registration=F.binding_serial(F.session_binding session);
+    owner=F.session_scope session;request_id;
+    result=Ok(F.change_ack ~ack_owner:session ~generation:batch.W.generation ~through:batch.through)}
+
 let ready binding projection =
   let state = (C.step (C.initial ~client_id:client) (C.Worker_bound binding)).next in
   (C.step state (C.Bootstrap_received (binding, W.Ready projection))).next
@@ -811,7 +825,30 @@ let test_determined_failed_handoff_retires_when_user_retries () =
       check(C.handoff(C.view failed.next)id=Some(W.Handoff_failed(change,error)))
         "cleanup failure disappeared before its observer";
       state:=failed.next;previous:=Some id
-    done)[false;true]
+    done)[false;true];
+  let bound=(C.step(C.initial ~client_id:(uuid "98000000-0000-4000-8000-000000009876"))
+    (C.Worker_bound I.binding)).next in
+  let change=W.Connection_will_stop in
+  let error=W.Service_failed "Synthetic registration terminated before its first baseline" in
+  List.iter(fun terminal->
+    let stopped=(C.step bound(C.Bootstrap_received(I.binding,terminal))).next in
+    check(C.prepare_host_change stopped change=Error error)
+      "terminal registration without Ready admitted an unfinishable host handoff";
+    let id,waiting=C.prepare_host_change ~legacy_pending:true bound change |> Result.get_ok in
+    check(not(List.exists(function C.Quiesce _->true|_->false)waiting.instructions))
+      "Awaiting registration fabricated an authoritative host plan";
+    let failed=C.step waiting.next(C.Bootstrap_received(I.binding,terminal)) in
+    check(C.handoff(C.view failed.next)id=Some(W.Handoff_failed(change,error)))
+      "registration terminal left an existing quit handoff Quiescing forever";
+    check(not(List.exists(function C.Quiesce _|Consume_handoff _->true|_->false)failed.instructions))
+      "registration failure fabricated a cleanup ACK or host permission")
+    [W.Bootstrap_failed error;W.Binding_revoked error];
+  let id,waiting=C.prepare_host_change bound change |> Result.get_ok in
+  let resumed=C.step waiting.next(C.Bootstrap_received(I.binding,W.Ready projection)) in
+  check(C.handoff(C.view resumed.next)id=Some(W.Quiescing change)
+    && List.exists(function C.Quiesce _->true|_->false)resumed.instructions)
+    "a healthy delayed first baseline could not complete its original handoff plan"
+
 ;;
 
 let test_account_host_unknown_requires_original_consumption_readback () =
@@ -2000,15 +2037,10 @@ let test_committed_ack_requires_current_confirmation () =
     "reconciliation rewrote a known committed intent";
   check(C.intent_progress(C.view state)(W.Mutation_intent intent)=Some(W.Committed_pending_presentation receipt))
     "reconciliation mutated its previous state";
-  let confirmation=(let (P.V2_response confirmation_packet as packet) = (P.V2_response
-    {api_version=P.api_version;request_id;outcome=V2_block_summary_outcome
-      {lookup=Worker_pure_data.V2_missing_block{uuid=graph;revision="block-state:v1:missing"};page=None;items=[];next_cursor=None;
-       scope_revision="scope-revision:v1:missing";generation="generation:v1:1:1";projection_revision="projection:v1:1"}}) in
-      match I.reply session ~request_id:(W.request_id confirmation_packet.request_id)
-        (W.Confirm(presentation,receipt))
-        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response packet) with
-      | Ok(W.Answered(Ok(W.Confirmed proof))) -> proof
-      | _ -> failwith "Production confirmation was rejected") in
+  let confirmation=Coordination_test_fixture.confirmed_summary issuer session presentation receipt (W.request_id request_id)
+    ~lookup:(Worker_pure_data.V2_missing_block{uuid=graph;revision="block-state:v1:missing"})
+    ~page:None ~items:[] ~scope_revision:"scope-revision:v1:missing" ~generation:"generation:v1:1:1"
+    ~projection_revision:"projection:v1:1" in
   let confirm,planned=C.request state session(W.Confirm(presentation,receipt)) |> Result.get_ok in
   let state=(C.step planned.next(C.Admitted(confirm,Id.Worker.Request_id.of_int64 21L))).next in
   let state=(C.step state(C.Completed(confirm,W.Answered(Ok(W.Confirmed confirmation))))).next in
@@ -2034,15 +2066,10 @@ let test_committed_ack_requires_current_confirmation () =
         C.Send(_,_,W.Confirm(actual,proof))->actual=latest && W.receipt_revisions proof=W.receipt_revisions receipt
         | _->false)transition.instructions|_->false)
     "cleanup retry across focus did not re-confirm original proof";
-  let next_confirmation=(let (P.V2_response confirmation_packet as packet) = (P.V2_response
-    {api_version=P.api_version;request_id;outcome=V2_block_summary_outcome
-      {lookup=Worker_pure_data.V2_missing_block{uuid=graph;revision="block-state:v1:missing"};page=None;items=[];next_cursor=None;
-       scope_revision="scope-revision:v1:missing";generation="generation:v1:1:1";projection_revision="projection:v1:1"}}) in
-      match I.reply session ~request_id:(W.request_id confirmation_packet.request_id)
-        (W.Confirm(latest,receipt))
-        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response packet) with
-      | Ok(W.Answered(Ok(W.Confirmed proof))) -> proof
-      | _ -> failwith "Production confirmation was rejected") in
+  let next_confirmation=Coordination_test_fixture.confirmed_summary issuer session latest receipt (W.request_id request_id)
+    ~lookup:(Worker_pure_data.V2_missing_block{uuid=graph;revision="block-state:v1:missing"})
+    ~page:None ~items:[] ~scope_revision:"scope-revision:v1:missing" ~generation:"generation:v1:1:1"
+    ~projection_revision:"projection:v1:1" in
   let next_ticket,next_plan=C.request focused session(W.Confirm(latest,receipt)) |> Result.get_ok in
   let next_admitted=(C.step next_plan.next(C.Admitted(next_ticket,Id.Worker.Request_id.of_int64 24L))).next in
   let next_state=(C.step next_admitted(C.Completed(next_ticket,W.Answered(Ok(W.Confirmed next_confirmation))))).next in
@@ -2287,38 +2314,23 @@ let test_observation_planning_is_pure () =
 
 let pure_observation_response issuer raw session ticket operation epoch revision =
   let module I = (val issuer : Worker_effect_authority.ISSUER) in
-  let registration, owner, observation_id, request_id =
-    match
-      I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok
-    with
-    | S.Coordination_observe value ->
-      value.registration, value.owner, value.observation_id, value.request.request_id
-    | Coordination_refresh_observation value ->
-      value.registration, value.owner, value.observation_id, value.request_id
-    | _ -> failwith "expected a real observation codec request"
-  in
-  S.Coordination_observed
-    { registration
-    ; owner
-    ; observation_id
-    ; epoch
-    ; response =
-        P.V2_response
-          { api_version = P.api_version
-          ; request_id
-          ; outcome =
-              V2_graph_info_outcome
-                { graph_uuid = graph
-                ; graph_name = "Pure observation"
-                ; schema = { major = 1; minor = 0 }
-                ; admission_facts = []
-                ; journal_title_format = None
-                ; limits = raw.S.limits
-                ; generation = "generation:v1:synthetic"
-                ; projection_revision = revision
-                }
-          }
-    }
+  let registration, owner, observation_id, request_id, read =
+    match I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok with
+    |S.Coordination_observe value->value.registration,value.owner,value.observation_id,value.request_id,value.read
+    |Coordination_refresh_observation value->
+      (match operation with
+       |W.Refresh handle->value.registration,value.owner,value.observation_id,value.request_id,
+          Worker_pure_read.For_worker.pack_query (W.observation_budget handle) (W.observation_query handle)
+       |_->assert false)
+    |_->failwith "expected a real observation request" in
+  let Worker_pure_read.Read_query(budget,query)=read in
+  let answer=match query with
+    |Worker_pure_read.Graph_info->Worker_pure_read.For_worker.answer budget query
+      (Ok(Worker_pure_read.For_worker.graph_info ~graph_uuid:graph ~graph_name:"Pure observation"
+        ~schema:{major=1;minor=0} ~admission_facts:[] ~journal_title_format:None ~limits:raw.S.limits
+        ~generation:"generation:v1:synthetic" ~projection_revision:revision))
+    |_->failwith "this source fixture owns only Graph_info samples" in
+  S.Coordination_observed{registration;owner;observation_id;request_id;epoch;answer}
 ;;
 
 let test_host_candidate_waits_for_own_observation_ack () =
@@ -3528,7 +3540,7 @@ let test_changes_serial_and_ack_capacity () =
     match
       I.request session ~request_id:(C.ticket_id second) operation |> Result.get_ok
     with
-    | S.Coordination_query value -> value.request.request_id
+    | S.Coordination_query value -> value.request_id
     | _ -> assert false
   in
   let batch =
@@ -3537,19 +3549,7 @@ let test_changes_serial_and_ack_capacity () =
         session
         ~request_id:(C.ticket_id second)
         operation
-        (S.Graph_response
-           (P.V2_response
-              { api_version = P.api_version
-              ; request_id
-              ; outcome =
-                  P.V2_changes
-                    { generation = "g"
-                    ; from_exclusive = None
-                    ; through = "zero"
-                    ; windows = []
-                    ; next = None
-                    }
-              }))
+        ((changes_answer session (request_id) budget ~generation:("g") ~after:(None) ~through:("zero") ~windows:([]) ~next:(None)))
     with
     | Ok (W.Answered (Ok value)) -> value
     | _ -> failwith "serial Changes fixture"
@@ -3639,25 +3639,12 @@ let test_changefeed_ack_requires_owned_delivered_batch () =
     }
   in
   let response =
-    S.Graph_response
-      (P.V2_response
-         { api_version = P.api_version
-         ; request_id =
-             (match
+    (changes_answer session ((match
                 I.request session ~request_id:(C.ticket_id ticket) operation
                 |> Result.get_ok
               with
-              | S.Coordination_query v -> v.request.request_id
-              | _ -> assert false)
-         ; outcome =
-             P.V2_changes
-               { generation = "generation:v1:synthetic"
-               ; from_exclusive = None
-               ; through = "window-1"
-               ; windows = [ window ]
-               ; next = None
-               }
-         })
+              | S.Coordination_query v -> v.request_id
+              | _ -> assert false)) budget ~generation:("generation:v1:synthetic") ~after:(None) ~through:("window-1") ~windows:([ window ]) ~next:(None))
   in
   let batch =
     match I.reply session ~request_id:(C.ticket_id ticket) operation response with
@@ -3764,36 +3751,12 @@ let test_changefeed_ack_requires_owned_delivered_batch () =
           session
           (W.Query (budget, W.Changes { generation = "fresh-generation"; after = None }))))
     "ACK resync retained an old batch and blocked a fresh baseline";
-  let _, ack_command =
-    match
-      I.request session ~request_id:(C.ticket_id ack) (W.Acknowledge_changes batch)
-      |> Result.get_ok
-    with
-    | S.Coordination_query v -> v.request.request_id, v.request.command
-    | _ -> assert false
-  in
-  let response =
-    match ack_command with
-    | P.V2_ack_changes value ->
-      S.Graph_response
-        (P.V2_response
-           { api_version = P.api_version
-           ; request_id =
-               (match
-                  I.request
-                    session
-                    ~request_id:(C.ticket_id ack)
-                    (W.Acknowledge_changes batch)
-                  |> Result.get_ok
-                with
-                | S.Coordination_query v -> v.request.request_id
-                | _ -> assert false)
-           ; outcome =
-               P.V2_changes_acknowledged
-                 { generation = value.generation; through = value.through }
-           })
-    | _ -> failwith "ACK codec used a non-ACK command"
-  in
+  let response=match I.request session ~request_id:(C.ticket_id ack) (W.Acknowledge_changes batch)
+    |> Result.get_ok with
+    |S.Coordination_acknowledge_changes value->
+      check(value.batch=batch) "ACK changed the original delivered batch";
+      changes_ack_answer session value.request_id batch
+    |_->failwith "ACK did not use the original delivered batch" in
   let receipt =
     match
       I.reply session ~request_id:(C.ticket_id ack) (W.Acknowledge_changes batch) response
@@ -3845,7 +3808,7 @@ let test_empty_change_batch_ack_retires_old_reads () =
       match
         I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok
       with
-      | S.Coordination_query value -> value.request.request_id
+      | S.Coordination_query value -> value.request_id
       | _ -> assert false
     in
     let batch =
@@ -3854,19 +3817,7 @@ let test_empty_change_batch_ack_retires_old_reads () =
           session
           ~request_id:(C.ticket_id ticket)
           operation
-          (S.Graph_response
-             (P.V2_response
-                { api_version = P.api_version
-                ; request_id
-                ; outcome =
-                    P.V2_changes
-                      { generation = "g"
-                      ; from_exclusive = after
-                      ; through
-                      ; windows
-                      ; next = None
-                      }
-                }))
+          ((changes_answer session (request_id) budget ~generation:("g") ~after:(after) ~through:(through) ~windows:(windows) ~next:(None)))
       with
       | Ok (W.Answered (Ok value)) -> value
       | _ -> failwith "empty batch fixture"
@@ -3892,7 +3843,7 @@ let test_empty_change_batch_ack_retires_old_reads () =
         I.request session ~request_id:(C.ticket_id ticket) (W.Acknowledge_changes batch)
         |> Result.get_ok
       with
-      | S.Coordination_query value -> value.request.request_id
+      | S.Coordination_acknowledge_changes value -> value.request_id
       | _ -> assert false
     in
     let receipt =
@@ -3901,14 +3852,7 @@ let test_empty_change_batch_ack_retires_old_reads () =
           session
           ~request_id:(C.ticket_id ticket)
           (W.Acknowledge_changes batch)
-          (S.Graph_response
-             (P.V2_response
-                { api_version = P.api_version
-                ; request_id
-                ; outcome =
-                    P.V2_changes_acknowledged
-                      { generation = batch.W.generation; through = batch.through }
-                }))
+          ((changes_ack_answer session (request_id) batch))
       with
       | Ok (W.Answered (Ok value)) -> value
       | _ -> failwith "empty batch ACK fixture"
@@ -4097,7 +4041,7 @@ let test_change_application_properties () =
     match
       I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok
     with
-    | S.Coordination_query value -> value.request.request_id
+    | S.Coordination_query value -> value.request_id
     | _ -> assert false
   in
   let batch =
@@ -4106,27 +4050,14 @@ let test_change_application_properties () =
         session
         ~request_id:(C.ticket_id ticket)
         operation
-        (S.Graph_response
-           (P.V2_response
-              { api_version = P.api_version
-              ; request_id
-              ; outcome =
-                  P.V2_changes
-                    { generation = "g"
-                    ; from_exclusive = None
-                    ; through = "w"
-                    ; next = None
-                    ; windows =
-                        [ { id = "w"
+        ((changes_answer session (request_id) budget ~generation:("g") ~after:(None) ~through:("w") ~windows:([ { id = "w"
                           ; predecessor = "p0"
                           ; successor = "p1"
                           ; block_uuids = [ graph ]
                           ; page_uuids = []
                           ; structure_interests = []
                           }
-                        ]
-                    }
-              }))
+                        ]) ~next:(None)))
     with
     | Ok (W.Answered (Ok value)) -> value
     | _ -> failwith "application property batch fixture"

@@ -271,8 +271,8 @@ type request =
       { registration : int64
       ; owner : timeline_scope
       ; observation_id : Logseq_db_types.Graph_types.Uuid.t
-      ; request : Logseq_db_worker.Protocol.request
-      ; maximum_bytes : int
+      ; request_id : Logseq_db_types.Graph_types.Uuid.t
+      ; read : Worker_pure_read.packed_query
       }
   | Coordination_refresh_observation of
       { registration : int64
@@ -288,15 +288,16 @@ type request =
   | Register_coordination of int64
   | Release_coordination of int64
   | Coordination_query of
-      { registration : int64; owner : timeline_scope; request : Logseq_db_worker.Protocol.request; response_budget_bytes : int }
+      { registration : int64; owner : timeline_scope; request_id : Logseq_db_types.Graph_types.Uuid.t; read : Worker_pure_read.packed_query }
+  | Coordination_acknowledge_changes of
+      { registration : int64; owner : timeline_scope; request_id : Logseq_db_types.Graph_types.Uuid.t; batch : Worker_pure_read.change_batch }
   | Coordination_mutation of
       { registration : int64; owner : timeline_scope;
         request_id : Logseq_db_types.Graph_types.Uuid.t; intent : string }
   | Coordination_confirm of
       { registration : int64; owner : timeline_scope; presentation : int64;
         request_id : Logseq_db_types.Graph_types.Uuid.t; intent : string;
-        original : string * string * string }
-  | Graph_request_at of timeline_scope * Logseq_db_worker.Protocol.request
+        original : string * string * string; read : Worker_pure_read.packed_query }
   | Coordination_recover_mutations of
       { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
         after:int64 option; maximum_items:int; maximum_bytes:int }
@@ -314,7 +315,6 @@ type request =
       ; source : Logseq_db_types.Asset_import.t
       }
   | Client_command of client_command
-  | Graph_request of Logseq_db_worker.Protocol.request
   | Get_graph_state
   | Asset_command of
       { graph_generation : int
@@ -361,12 +361,22 @@ type response =
       { request_id:Logseq_db_types.Graph_types.Uuid.t;
         page:Logseq_db_worker_contract.Mutation_pure_wire.recovery_page }
   | Coordination_mutation_acknowledged of {request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_confirmed of
+      {registration:int64;owner:timeline_scope;presentation:int64;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       answer:Worker_pure_read.answer}
+  | Coordination_queried of
+      { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
+        answer:Worker_pure_read.answer }
+  | Coordination_changes_acknowledged of
+      { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
+        result:(Worker_pure_read.change_ack,Worker_pure_read.error)result }
   | Coordination_observed of
       { registration : int64
       ; owner : timeline_scope
       ; observation_id : Logseq_db_types.Graph_types.Uuid.t
       ; epoch : int64
-      ; response : Logseq_db_worker.Protocol.response
+      ; request_id : Logseq_db_types.Graph_types.Uuid.t
+      ; answer : Worker_pure_read.answer
       }
   | Coordination_observation_released of
       { registration : int64
@@ -383,7 +393,6 @@ type response =
   | Asset_imported of (Logseq_db_worker.import_receipt, string) result
   | Client_command_completed
   | Asset_file of (string * string) option
-  | Graph_response of Logseq_db_worker.Protocol.response
   | Graph_state of Logseq_db_worker.graph_state
 
 type asset_notice_batch

@@ -431,44 +431,34 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
               ; owner
               ; observation_id
               ; epoch
-              ; response = Protocol.V2_response raw
+              ; request_id = actual_request
+              ; answer = _
               }
             when equal_binding (For_worker.session_binding session) binding
                  && registration = (For_worker.binding_serial binding)
                  && matches_scope session owner
                  && equal_request_id observation_id observation.observation_key
-                 && raw.api_version = Protocol.api_version
-                 && equal_request_id raw.request_id request_id
+                 && equal_request_id actual_request request_id
                  && epoch >= 0L -> Ok (observation, epoch)
           | _ ->
             Error
               (Protocol_mismatch "Observation registration/epoch/correlation mismatch"))
       ;;
 
-      let observation session ~request_id observation response =
-        if not (live session)
-        then Error Revoked_session
-        else
-          Result.bind
-            (observation_registration session ~request_id (Refresh observation) response)
-            (fun (actual, epoch) ->
-               match same_observation observation actual, response with
-               | ( Some Refl
-                 , Service.Coordination_observed
-                     { response = Protocol.V2_response raw as packet; _ } ) ->
-                 if
-                   Protocol.encoded_response_bytes packet
-                   > (For_worker.read_budget_maximum_bytes observation.observation_budget)
-                 then Error Response_budget_exceeded
-                 else
-                   Result.map
-                     (fun value -> { observation; epoch; value })
-                     (decode
-                        session
-                        observation.observation_budget
-                        observation.observation_query
-                        raw.outcome)
-               | _ -> Error (Protocol_mismatch "Observation value owner mismatch"))
+      let observation : type a. session -> request_id:request_id -> a observation -> Service.response -> (a observed,error) result =
+        fun session ~request_id observation response ->
+        if not(live session) then Error Revoked_session else
+        Result.bind(observation_registration session ~request_id (Refresh observation) response)(fun(actual,epoch)->(
+          match same_observation observation actual,response with
+          |Some Refl,Service.Coordination_observed{answer=Worker_pure_read.Query_answer(budget,query,result);_}->
+            (match query_result_equality observation.observation_query query with
+             |Some Refl when Worker_pure_read.equal_packed_query
+               (For_worker.pack_query observation.observation_budget observation.observation_query)
+               (For_worker.pack_query budget query)->
+               Result.bind result(fun value->Result.map(fun()->{observation;epoch;value})
+                 (Worker_pure_read.validate_value session observation.observation_budget observation.observation_query value))
+             |_->Error(Protocol_mismatch "Observation value owner mismatch"))
+          |_->Error(Protocol_mismatch "Observation value owner mismatch") : (a observed,error) result))
       ;;
 
       let observation_notices = function
@@ -596,21 +586,10 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
           else (
             match operation with
             | Observe (budget, query) ->
-              Result.bind (validate_request session operation) (fun () ->
-                Result.map
-                  (fun command ->
-                     Service.Coordination_observe
-                       { registration = (For_worker.binding_serial binding)
-                       ; owner = (For_worker.session_scope session)
-                       ; observation_id = request_id
-                       ; request =
-                           { Protocol.api_version = Protocol.api_version
-                           ; request_id
-                           ; command
-                           }
-                       ; maximum_bytes = (For_worker.read_budget_maximum_bytes budget)
-                       })
-                  (checked_command session budget query))
+              Result.map (fun()->Service.Coordination_observe
+                {registration=For_worker.binding_serial binding;owner=For_worker.session_scope session;
+                 observation_id=request_id;request_id;read=For_worker.pack_query budget query})
+                (validate_request session operation)
             | Refresh observation ->
               Result.map
                 (fun () ->
@@ -621,37 +600,14 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                      ; request_id
                      })
                 (validate_request session operation)
-            | Query (budget, query) ->
-              Result.bind (validate_request session operation) (fun () ->
-                Result.bind (checked_command session budget query) (fun command ->
-                  let request =
-                    { Protocol.api_version = Protocol.api_version; request_id; command }
-                  in
-                  Protocol.request_of_yojson (Protocol.request_to_yojson request)
-                  |> Result.map_error (fun e -> Db_error e)
-                  |> Result.map (fun request ->
-                    Service.Coordination_query
-                      { registration = (For_worker.binding_serial binding)
-                      ; owner = (For_worker.session_scope session)
-                      ; request
-                      ; response_budget_bytes = (For_worker.read_budget_maximum_bytes budget)
-                      })))
-            | Acknowledge_changes batch ->
-              Result.map
-                (fun () ->
-                   Service.Coordination_query
-                     { registration = (For_worker.binding_serial binding)
-                     ; owner = (For_worker.session_scope session)
-                     ; response_budget_bytes = (For_worker.session_limits session).response_budget_bytes
-                     ; request =
-                         { Protocol.api_version = Protocol.api_version
-                         ; request_id
-                         ; command =
-                             Protocol.V2_ack_changes
-                               { generation = batch.generation; through = batch.through }
-                         }
-                     })
-                (validate_request session operation)
+            | Query (budget,query)->
+              Result.map(fun()->Service.Coordination_query{
+                registration=For_worker.binding_serial binding;owner=For_worker.session_scope session;
+                request_id;read=For_worker.pack_query budget query})(validate_request session operation)
+            | Acknowledge_changes batch->
+              Result.map(fun()->Service.Coordination_acknowledge_changes{
+                registration=For_worker.binding_serial binding;owner=For_worker.session_scope session;
+                request_id;batch})(validate_request session operation)
             | Confirm (presentation, receipt) ->
               if not (presentation_live presentation)
               then Error Revoked_session
@@ -665,6 +621,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                        ; request_id
                        ; intent = Bytes.to_string(encode_durable_intent receipt.intent)
                        ; original = receipt_revisions receipt
+                       ; read = confirmation_read session receipt
                        })
                   (validate_confirmation session presentation receipt)
             | Mutate intent ->
@@ -814,49 +771,32 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
               when value.request_id=request_id->Ok(Answered(Ok()))
             | Retry_asset _,Service.Client_command_completed->Ok(Answered(Ok()))
             | Retry_upload _,Service.Client_command_completed->Ok(Answered(Ok()))
-            | ( Query (budget, query)
-              , Service.Graph_response (Protocol.V2_response r as response) )
-              when r.api_version = Protocol.api_version
-                   && Uuid.equal request_id r.request_id ->
-              if
-                String.length
-                  (Yojson.Safe.to_string (Protocol.response_to_yojson response))
-                > (For_worker.read_budget_maximum_bytes budget)
-              then Ok (Answered (Error Response_budget_exceeded))
-              else Ok (Answered (decode session budget query r.outcome))
-            | ( Acknowledge_changes batch
-              , Service.Graph_response (Protocol.V2_response raw as packet) )
-              when raw.api_version = Protocol.api_version
-                   && equal_request_id raw.request_id request_id
-                   && equal_session session batch.change_owner ->
-              if
-                Protocol.encoded_response_bytes packet
-                > (For_worker.session_limits session).response_budget_bytes
-              then Ok (Answered (Error Response_budget_exceeded))
-              else (
-                match raw.outcome with
-                | Protocol.V2_changes_acknowledged ack
-                  when ack.generation = batch.generation && ack.through = batch.through ->
-                  Ok
-                    (Answered
-                       (Ok
-                          (For_worker.change_ack ~ack_owner:(session) ~generation:(ack.generation) ~through:(ack.through))))
-                | V2_resync_required { reason; _ } ->
-                  Ok (Answered (Error (Resync_required reason)))
-                | V2_failed { code; message } ->
-                  Ok (Answered (Error (Service_failed (code ^ ": " ^ message))))
-                | _ ->
-                  Error
-                    (Protocol_mismatch "Changefeed ACK owner/generation/window mismatch"))
-            | ( Confirm (presentation, receipt)
-              , Service.Graph_response (Protocol.V2_response response as raw) )
-              when response.api_version = Protocol.api_version
-                   && Uuid.equal response.request_id request_id ->
-              if not (presentation_live presentation)
-              then Error Revoked_session
-              else
-                decode_confirmation session ~presentation receipt raw
-                |> Result.map (fun confirmation -> Answered (Ok (Confirmed confirmation)))
+            | Query(budget,query),Service.Coordination_queried value
+              when value.registration=For_worker.binding_serial binding
+                && value.owner=For_worker.session_scope session && value.request_id=request_id ->
+              let Worker_pure_read.Query_answer(source_budget,source_query,result)=value.answer in
+              (match Worker_pure_read.query_result_equality query source_query with
+               |None->Error(Protocol_mismatch "The typed answer belongs to another query")
+               |Some Worker_pure_read.Refl->
+                 if not(Worker_pure_read.equal_packed_query (For_worker.pack_query budget query)
+                   (For_worker.pack_query source_budget source_query))
+                 then Error(Protocol_mismatch "The typed answer belongs to another execution")
+                 else Ok(Answered(Result.bind result(fun result->
+                   Result.map(fun()->result)(Worker_pure_read.validate_value session budget query result)))))
+            | Acknowledge_changes batch,Service.Coordination_changes_acknowledged value
+              when value.registration=For_worker.binding_serial binding
+                && value.owner=For_worker.session_scope session && value.request_id=request_id ->
+              let result=Result.bind value.result(fun ack->
+                if equal_session session (change_ack_session ack)
+                  && change_ack_generation ack=batch.generation && change_ack_through ack=batch.through
+                then Ok ack else Error(Protocol_mismatch "Changefeed ACK owner/generation/window mismatch")) in
+              Ok(Answered result)
+            |Confirm(presentation,receipt),Service.Coordination_confirmed value
+              when value.registration=For_worker.binding_serial binding && value.owner=For_worker.session_scope session
+                && value.presentation=presentation.generation && value.request_id=request_id->
+              if not(presentation_live presentation)then Error Revoked_session else
+              decode_confirmation session ~presentation receipt value.answer
+              |> Result.map(fun confirmation->Answered(Ok(Confirmed confirmation)))
             | (Recover_mutations {after;maximum_items;maximum_bytes},
                Service.Coordination_mutations_recovered{request_id=actual;page})
               when Uuid.equal actual request_id->

@@ -120,6 +120,15 @@ let mutation_id intent = intent.mutation_id
 let command intent = intent.command
 let targets intent = intent.targets
 
+let readback_target intent = match intent.command with
+  |Protocol.V2_create_journal_page{page;_}->`Page page
+  |V2_append_journal{root;_}->`Block root.block_id
+  |V2_insert_blocks{roots=[root];_}->`Block root.uuid
+  |V2_save_block{block;_}|V2_set_task_status{block;_}|V2_clear_task_status{block;_}|V2_set_asset_reference{block;_}->`Block block
+  |V2_delete_blocks{root;_}->`Block root
+  |_->assert false
+;;
+
 type outcome =
   | Committed of Protocol.response
   | Rejected of Protocol.response

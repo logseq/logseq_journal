@@ -353,7 +353,7 @@ let config_and_disabled () =
 
 module Runtime = Journal_asset_runtime
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
-module Wire = Logseq_db_worker.Protocol
+module Read = Worker_pure_read
 module W = Journal_worker_coordination.Worker_api
 
 type outgoing = Read of Runtime.read_request | Command of unit W.request
@@ -369,7 +369,7 @@ let release_port sent consumer=Queue.add(Command(W.Release_asset_demand consumer
 let consumer_name consumer=Hashtbl.to_seq resources.Resources.demands |>Seq.find_map(fun(name,(actual,_,_))->
   if W.equal_asset_consumer consumer actual then Some name else None) |>Option.get
 
-let respond r (Runtime.Read request) outcome =
+let respond r (Runtime.Read request) produce =
   check (Runtime.owns_read r request.request_id) "runtime must retain the terminal owner";
   let issuer, session = Lazy.force producer in
   let module I = (val issuer : Worker_effect_authority.ISSUER) in
@@ -377,9 +377,11 @@ let respond r (Runtime.Read request) outcome =
     ~maximum_bytes:65536 |> Result.get_ok in
   let operation = W.Query (budget, request.query) in
   let id = W.request_id request.request_id in
-  ignore (I.request session ~request_id:id operation |> Result.get_ok);
-  let response = Wire.V2_response { api_version = 2; request_id = request.request_id; outcome } in
-  match I.reply session ~request_id:id operation (Service.Graph_response response) with
+  let response=match I.request session ~request_id:id operation|>Result.get_ok with
+    |Service.Coordination_query source->Service.Coordination_queried{registration=source.registration;owner=source.owner;
+      request_id=source.request_id;answer=produce source.read}
+    |_->failwith "Asset fixture did not issue the original query"in
+  match I.reply session ~request_id:id operation response with
   | Ok (W.Answered (Ok value)) ->
     check (Runtime.receive_read r ~request_id:request.request_id (request.outcome value))
       "runtime must retain the typed terminal owner"
@@ -390,7 +392,7 @@ let respond r (Runtime.Read request) outcome =
 (* Runtime, unlike Policy, owns accepted Worker request IDs and queued IO. *)
 let runtime_same_configuration () =
   let module R = Journal_asset_runtime in
-  let module Wire = Logseq_db_worker.Protocol in
+  let module Read = Worker_pure_read in
   let sent = Queue.create () in
   let r =
     R.create
@@ -405,7 +407,7 @@ let runtime_same_configuration () =
   R.refresh r ~graph_generation:1 ~today:20260301 ~settings:P.default_settings;
   check (Queue.is_empty sent) "adapter must retain tickets on unchanged lifecycle refresh";
   let request = match first with Read request -> request | _ -> assert false in
-  respond r request (Wire.V2_journals_outcome { items = []; next_cursor = None })
+  respond r request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.slice ~items:(([] : Worker_pure_data.journal_item list)) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Journals _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
 
 ;;
 
@@ -552,7 +554,7 @@ let block_value (block : G.block) : Worker_pure_data.block_lookup =
     {value={block;task_status=None;rendered_page_title="page";tag_titles=[]};revision="r"}
 ;;
 
-let present block = Wire.V2_block_outcome (block_value block)
+let present block = (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((block_value block)) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")
 
 let raw r n (block : G.block) =
   let query = W.Outline_block { uuid = block.uuid; revision = None } in
@@ -591,13 +593,7 @@ let runtime_fixture
   respond
     r
     roots
-    (Wire.V2_favorites_outcome
-       { favorites_page = Some (uuid 9)
-       ; generation = "g"
-       ; projection_revision = "r"
-       ; next_cursor = None
-       ; items =
-           [ { membership_uuid = uuid 10
+    ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.favorites ~favorites_page:(Some (uuid 9)) ~generation:("g") ~projection_revision:("r") ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None)) ~items:([ { membership_uuid = uuid 10
              ; membership_order = "a0"
              ; membership_revision = "r"
              ; target =
@@ -611,8 +607,7 @@ let runtime_fixture
                       }
                   else Worker_pure_data.V2_favorite_page { uuid = uuid 1; title = "page"; revision = "r" })
              }
-           ]
-       });
+           ])) in match query with |Read.Favorites _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"));
   while not (Queue.is_empty sent) do
     match Queue.take sent with
     | Command(W.Replace_asset_demand(bound,_,_)) ->
@@ -625,18 +620,12 @@ let runtime_fixture
          respond
            r
            request
-           (V2_assets_outcome
-              { generation = "g"
-              ; projection_revision = "r"
-              ; items = initial_assets
-              ; next_cursor = None
-              })
+           ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:(initial_assets) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
        | Runtime.Read { query = W.Page { uuid = page; _ }; _ } ->
          respond
            r
            request
-           (V2_page_outcome
-              (Worker_pure_data.V2_present_page
+           ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page
                  { page =
                      G.
                        { uuid = page
@@ -650,7 +639,7 @@ let runtime_fixture
                        ; recycled = false
                        }
                  ; revision = "r"
-                 }))
+                 })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
        | Runtime.Read { query = W.Outline_block { uuid = target; _ }; _ } ->
          respond
            r
@@ -659,7 +648,7 @@ let runtime_fixture
             then present (block 2 root_parent 1 [])
             else if G.Uuid.equal target (uuid 3)
             then present (block 3 1 1 [])
-            else V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = target; revision = "r" }))
+            else (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = target; revision = "r" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
        | _ -> failwith "unexpected initial dependency")
     | _ -> ()
   done;
@@ -748,7 +737,7 @@ let runtime_unknown_unrelated () =
           request
           (if G.Uuid.equal target (uuid 99)
            then present (block 99 98 98 [])
-           else V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = target; revision = "r" }))
+           else (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = target; revision = "r" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
       | _ -> failwith "55 unknown unrelated deltas must not issue an asset/index read"
     done
   done
@@ -777,8 +766,7 @@ let runtime_refs_delta () =
   respond
     r
     request
-    (V2_assets_outcome
-       { generation = "g"; projection_revision = "r"; items = []; next_cursor = None });
+    ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"));
   check (Queue.is_empty sent) "raw ref replacement settles"
 ;;
 
@@ -794,7 +782,7 @@ let runtime_sibling_structure () =
   respond
     r
     request
-    (V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = uuid 98; revision = "r" }));
+    ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = uuid 98; revision = "r" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"));
   check
     (Queue.is_empty sent)
     "unrelated unknown children scope point read never becomes an offline assets/index \
@@ -813,7 +801,7 @@ let runtime_unknown_ancestor () =
   respond
     r
     request
-    (V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = uuid 4; revision = "r" }));
+    ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = uuid 4; revision = "r" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"));
   let fresh =
     match Queue.take sent with
     | Read request -> request
@@ -822,7 +810,7 @@ let runtime_unknown_ancestor () =
   respond
     r
     fresh
-    (V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = uuid 4; revision = "r" }));
+    ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = uuid 4; revision = "r" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"));
   let request =
     match Queue.take sent with
     | Read request -> request
@@ -870,9 +858,11 @@ let runtime_known_asset_immutable () =
   let module I=(val issuer : Worker_effect_authority.ISSUER) in
   let budget=W.read_budget session ~maximum_items:32 ~maximum_bytes:65536 |> Result.get_ok in
   let operation=W.Query(budget,query) in
-  ignore(I.request session ~request_id:(W.request_id id) operation |> Result.get_ok);
-  let response=Service.Graph_response(Wire.V2_response{api_version=2;request_id=id;
-    outcome=V2_assets_outcome{generation="g";projection_revision="r";items=[asset 50];next_cursor=None}}) in
+  let response=match I.request session ~request_id:(W.request_id id)operation|>Result.get_ok with
+    |Service.Coordination_query source->Service.Coordination_queried{registration=source.registration;owner=source.owner;
+      request_id=source.request_id;answer=Read.For_worker.answer budget query(Ok(Read.For_worker.asset_listing
+        ~generation:"g" ~projection_revision:"r" ~items:[asset 50] ~next:None))}
+    |_->failwith "descriptor fixture changed its query"in
   let value=match I.reply session ~request_id:(W.request_id id) operation response with
     | Ok(W.Answered(Ok value))->value|_->failwith "invalid descriptor fixture" in
   Runtime.observe_query_result r ~request_id:id query value;
@@ -907,8 +897,7 @@ let runtime_real_capture_sibling () =
         respond
           r
           request
-          (V2_page_outcome
-             (Worker_pure_data.V2_present_page
+          ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_present_page
                 { page =
                     G.
                       { uuid = page
@@ -922,7 +911,7 @@ let runtime_real_capture_sibling () =
                       ; recycled = false
                       }
                 ; revision = "r"
-                }))
+                })) in match query with |Read.Page _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
       | _ ->
         failwith
           "55 actual Capture page/tree windows must not reread a sibling favorite \
@@ -955,13 +944,7 @@ let runtime_registry_capacity () =
   respond
     r
     request
-    (V2_favorites_outcome
-       { favorites_page = Some (uuid 9)
-       ; generation = "g"
-       ; projection_revision = "r"
-       ; items = []
-       ; next_cursor = None
-       });
+    ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.favorites ~favorites_page:(Some (uuid 9)) ~generation:("g") ~projection_revision:("r") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Favorites _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"));
   check (Queue.is_empty sent) "bounded registry preserves real resync terminal ownership"
 ;;
 
@@ -1046,18 +1029,13 @@ let runtime_hidden_holder_fanout () =
          then present (block 50 99 99 [])
          else if G.Uuid.equal target (uuid 2)
          then present (block 2 1 1 [ 50 ])
-         else V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = target; revision = "r" }))
+         else (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = target; revision = "r" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
     | Read (Runtime.Read { query = W.Assets { roots; _ }; _ } as request) ->
       queried := roots = [ uuid 1 ];
       respond
         r
         request
-        (V2_assets_outcome
-           { generation = "g"
-           ; projection_revision = "r"
-           ; items = [ asset 50 ]
-           ; next_cursor = None
-           })
+        ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:([ asset 50 ]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
     | Command(W.Replace_asset_demand(bound,_,_)) ->
       Runtime.notice r (Resources.notice resources(Service.Asset_demand_accepted(consumer_name bound)))
     | _ -> ()
@@ -1160,14 +1138,13 @@ let runtime_unknown_old_parent () =
          then present (block 4 7 1 [])
          else if G.Uuid.equal target (uuid 3)
          then present (block 3 2 1 [])
-         else V2_block_outcome (Worker_pure_data.V2_missing_block { uuid = target; revision = "r" }))
+         else (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok((Worker_pure_data.V2_missing_block { uuid = target; revision = "r" })) in match query with |Read.Outline_block _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
     | Read (Runtime.Read { query = W.Assets { roots; _ }; _ } as request) ->
       queried := roots = [ uuid 2 ];
       respond
         r
         request
-        (V2_assets_outcome
-           { generation = "g"; projection_revision = "r"; items = []; next_cursor = None })
+        ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
     | Command(W.Release_asset_demand bound) ->
       released := Some(consumer_name bound) = !old
     | _ -> ()
@@ -1192,7 +1169,7 @@ let runtime_dependency_failure rejected () =
   if rejected
   then Runtime.reject r ~request_id:(request_id request)
   else
-    respond r request (V2_failed { code = "storage"; message = "unavailable" });
+    respond r request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in F.answer budget query (Error(Read.Service_failed (("storage")^": "^("unavailable"))))));
   check
     (!status = P.Failed && Queue.is_empty sent)
     "owned dependency failure must expose Failed without retrying or preserving false \

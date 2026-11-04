@@ -1,7 +1,7 @@
 (library
  (name coordination_test_fixture)
  (modules coordination_test_fixture)
- (libraries logseq_db_worker.identity datascript_ocaml journal_worker_coordination_impl logseq_journal.worker_coordination uri
+ (libraries logseq_db_worker.typed_read logseq_db_worker.identity datascript_ocaml journal_worker_coordination_impl logseq_journal.worker_coordination uri
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.lui
@@ -101,10 +101,11 @@
  (name journal_graph_runtime_locality_test)
  (modules journal_graph_runtime_locality_test)
  (libraries
+  datascript-ocaml-native
+  logseq_db_worker.typed_read
   coordination_test_fixture
   alcotest
   app
-  datascript-ocaml-native
   datascript_ocaml
   datascript_ocaml.types
   logseq_db_types
@@ -122,7 +123,7 @@
 (test
  (name application_view_test)
  (modules application_view_test)
- (libraries logseq_db_worker.identity coordination_test_fixture alcotest app
+ (libraries datascript-ocaml-native logseq_db_worker.typed_read logseq_db_worker.identity coordination_test_fixture alcotest app
   logseq_journal.worker_coordination worker_effect_authority
   eio
   logseq_db_types
@@ -146,7 +147,7 @@
 (test
  (name logseq_db_worker_application_integration_test)
  (modules logseq_db_worker_application_integration_test)
- (libraries coordination_test_fixture alcotest app
+ (libraries datascript-ocaml-native logseq_db_worker.typed_read coordination_test_fixture alcotest app
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.contract
@@ -183,7 +184,7 @@
 (test
  (name journal_routes_test)
  (modules journal_routes_test)
- (libraries logseq_db_worker.identity app coordination_test_fixture
+ (libraries datascript-ocaml-native logseq_db_worker.typed_read logseq_db_worker.identity app coordination_test_fixture
   logseq_db_types
   logseq_db_worker
   logseq_db_worker.contract
@@ -220,7 +221,7 @@
 (test
  (name journal_asset_policy_test)
  (modules journal_asset_policy_test)
- (libraries app coordination_test_fixture logseq_journal.worker_coordination
+ (libraries datascript-ocaml-native logseq_db_worker.typed_read app coordination_test_fixture logseq_journal.worker_coordination
   journal_worker_coordination_impl worker_effect_authority
   logseq_db_types
   logseq_db_worker
@@ -238,7 +239,7 @@
 (test
  (name journal_media_runtime_test)
  (modules journal_media_runtime_test)
- (libraries app uri coordination_test_fixture logseq_journal.worker_coordination
+ (libraries datascript-ocaml-native logseq_db_worker.typed_read app uri coordination_test_fixture logseq_journal.worker_coordination
   journal_worker_coordination_impl worker_effect_authority
   logseq_db_types
   logseq_db_worker
@@ -305,7 +306,7 @@
 (test
  (name worker_coordination_runtime_test)
  (modules worker_coordination_runtime_test)
- (libraries logseq_db_worker.identity logseq_db_storage datascript-ocaml-native app journal_worker_coordination_impl logseq_journal.worker_coordination
+ (libraries datascript-ocaml-native logseq_db_worker.typed_read logseq_db_worker.identity logseq_db_storage app journal_worker_coordination_impl logseq_journal.worker_coordination
   logseq_overlay_db_test_support logseq_db_worker_test_support
   logseq_sync.effect_runner logseq_sync.pure_reducer digestif
   datascript_ocaml
@@ -328,7 +329,7 @@
 (test
  (name worker_coordination_pure_test)
  (modules worker_coordination_pure_test)
- (libraries logseq_db_worker.identity coordination_test_fixture datascript_ocaml journal_worker_coordination_impl logseq_journal.worker_coordination
+ (libraries datascript-ocaml-native logseq_db_worker.typed_read logseq_db_worker.identity coordination_test_fixture datascript_ocaml journal_worker_coordination_impl logseq_journal.worker_coordination
   logseq_db_worker logseq_sync.pure_reducer uri
   logseq_db_types
   logseq_db_worker.contract

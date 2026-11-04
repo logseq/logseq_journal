@@ -78,9 +78,9 @@ val report_asset_diagnostic
 val await_reply
   :  t
   -> id:Logseq_db_worker_pure_reducer.Core.request_id
-  -> request:Logseq_db_worker_contract.Protocol.request
+  -> read:Worker_pure_read.packed_query
   -> post:(unit -> unit)
-  -> Logseq_db_worker_contract.Protocol.response
+  -> Worker_pure_read.answer
 
 val shutdown : t -> unit
 
@@ -141,9 +141,9 @@ val durable_mutation : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
 
 (** Read-only original-proof lookup and one bounded canonical snapshot read. *)
 val confirm_mutation : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> request_id:Logseq_db_types.Graph_types.Uuid.t -> intent:string
+  -> read:Worker_pure_read.packed_query -> intent:string
   -> original:(string * string * string) -> current:(unit -> bool)
-  -> Logseq_db_worker_contract.Protocol.response
+  -> Worker_pure_read.answer
 
 (** Read-only item/byte bounded recovery. Complete immutable intent bytes and
     original proofs are returned; pending work remains Unknown and is not run. *)
@@ -171,19 +171,17 @@ val register_observation
   -> registration:int64
   -> id:Logseq_db_types.Graph_types.Uuid.t
   -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> request:Logseq_db_worker_contract.Protocol.request
-  -> maximum_bytes:int
+  -> read:Worker_pure_read.packed_query
   -> current:(unit -> bool)
   -> notify:(epoch:int64 -> unit)
-  -> (int64 * Logseq_db_worker_contract.Protocol.response, string) result
+  -> (int64 * Worker_pure_read.answer, string) result
 
 val refresh_observation
   :  t
   -> registration:int64
   -> id:Logseq_db_types.Graph_types.Uuid.t
   -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> request_id:Logseq_db_types.Graph_types.Uuid.t
-  -> (int64 * Logseq_db_worker_contract.Protocol.response, string) result
+  -> (int64 * Worker_pure_read.answer, string) result
 
 val release_observation
   :  t
@@ -215,12 +213,11 @@ val observation_scope
   -> id:Logseq_db_types.Graph_types.Uuid.t
   -> Logseq_sync_pure_reducer.Core.graph_scope option
 
-(** Exclusive registered Changes/ACK on the actual scoped database. A pull retains
-    its exact bounded batch until a matching physical ACK; legacy access is fenced. *)
-val coordinated_changefeed
-  : t -> registration:int64 -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> request:Logseq_db_worker_contract.Protocol.request -> maximum_bytes:int
-  -> current:(unit -> bool) -> (Logseq_db_worker_contract.Protocol.response,string) result
+(** Match the original delivered batch and release the actual physical windows. *)
+val acknowledge_change_batch : t -> registration:int64 -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> batch:Worker_pure_read.change_batch -> current:(unit -> bool)
+  -> (Worker_pure_read.change_ack,Worker_pure_read.error) result
+
 val retire_changefeed : t -> registration:int64 -> unit
 
 (** Permanently stop new physical graph-operation admission for this incarnation,

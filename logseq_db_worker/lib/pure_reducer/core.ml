@@ -1,3 +1,4 @@
+module Read = Worker_pure_read
 module Protocol = Logseq_db_worker_contract.Protocol
 
 type graph_phase =
@@ -55,10 +56,9 @@ type sync_worker_result =
 type _ runner_request =
   | Execute_request :
       { database : database_handle
-      ; request : Logseq_db_worker_contract.Protocol.request
-      ; response_budget_bytes : int option
+      ; read : Worker_pure_read.packed_query
       }
-      -> Logseq_db_worker_contract.Protocol.response runner_request
+      -> Worker_pure_read.answer runner_request
   | Close_database : database_handle -> unit runner_request
   | Handle_sync_worker_effect :
       Logseq_sync_pure_reducer.Core.worker_effect
@@ -69,7 +69,7 @@ type effect_error = Logseq_db_worker_contract.Error.t
 
 type runner_completion =
   | Execute_request_completed of
-      ticket * (Logseq_db_worker_contract.Protocol.response, effect_error) result
+      ticket * (Worker_pure_read.answer, effect_error) result
   | Close_database_completed of ticket * (unit, effect_error) result
   | Sync_worker_effect_completed of ticket * (sync_worker_result, effect_error) result
 
@@ -93,7 +93,7 @@ type asset_notice =
 
 type output =
   | Asset_notice of Logseq_sync_pure_reducer.Core.graph_scope * asset_notice
-  | Reply of request_id * Logseq_db_worker_contract.Protocol.response
+  | Reply of request_id * Worker_pure_read.answer
   | Graph_push of Logseq_db_worker_contract.Protocol.push
   | Sync_output of Logseq_sync_pure_reducer.Core.output
   | Graph_state_changed of graph_state
@@ -191,7 +191,7 @@ type view =
   }
 
 type pending =
-  | Pending_execute of request_id * Logseq_db_worker_contract.Protocol.request * ticket
+  | Pending_execute of request_id * Read.packed_query * ticket
   | Pending_sync_worker of ticket * Sync.worker_effect
 
 type graph_session =
@@ -294,8 +294,7 @@ type event =
   | Graph_request_for_scope of
       { scope : Logseq_sync_pure_reducer.Core.graph_scope
       ; id : request_id
-      ; request : Logseq_db_worker_contract.Protocol.request
-      ; response_budget_bytes : int option
+      ; read : Worker_pure_read.packed_query
       }
   | Projection_push_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_worker_contract.Protocol.push
   | Asset_requested_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_sync_pure_reducer.Asset_transfer.event
@@ -303,8 +302,7 @@ type event =
   | Start
   | Graph_request of
       { id : request_id
-      ; request : Logseq_db_worker_contract.Protocol.request
-      ; response_budget_bytes : int option
+      ; read : Worker_pure_read.packed_query
       }
   | Sync_event of Sync.event
   | Projection_push of Logseq_db_worker_contract.Protocol.push
@@ -336,14 +334,10 @@ let has_pending id values =
   List.exists (fun pending -> Int64.equal id (pending_id pending)) values
 ;;
 
-let worker_error ~code ~message =
-  Logseq_db_worker_contract.Error.create ~code ~message ~details:[] |> Result.get_ok
+let failed_read (Read.Read_query(budget,query)) error =
+  Read.For_worker.answer budget query (Error error)
 ;;
-
-let unavailable_response request message =
-  Logseq_db_worker_contract.Protocol.failed
-    ~request_id:request.Logseq_db_worker_contract.Protocol.request_id
-    (worker_error ~code:Closed_session ~message)
+let unavailable_response read message = failed_read read (Read.Service_failed message)
 ;;
 
 
@@ -475,36 +469,13 @@ let apply_lifecycle state = function
 ;;
 
 let execute_completion state ticket result =
-  let pending =
-    List.find_map
-      (function
-        | Pending_execute (id, request, candidate) when Int64.equal candidate.id ticket.id
-          -> Some (id, request)
-        | Pending_execute _ | Pending_sync_worker _ -> None)
-      state.pending
-  in
-  match pending with
+  match List.find_map (function
+    | Pending_execute(id,read,candidate) when candidate.id=ticket.id -> Some(id,read)
+    | _ -> None) state.pending with
   | None -> no_effects state
-  | Some (id, request) ->
-    let state = { state with pending = remove_pending ticket.id state.pending } in
-    let response =
-      match result with
-      | Ok response -> response
-      | Error error ->
-        Logseq_db_worker_contract.Protocol.failed ~request_id:request.request_id error
-    in
-    let transitioned =
-      match response with
-      | Logseq_db_worker_contract.Protocol.V2_response
-          { outcome = V2_mutation_committed _; _ } ->
-        translate_sync (Sync.step state.sync_core (match state.active_scope with
-          | Some scope when state.resident_mode -> Sync.Local_graph_outbox_changed scope
-          | _ -> Sync.Local_outbox_changed)) state
-      | V2_response _ -> no_effects state
-    in
-    { next = transitioned.next
-    ; effects = Publish (Reply (id, response)) :: transitioned.effects
-    }
+  | Some(id,read) ->
+    let response=match result with Ok answer->answer|Error error->failed_read read (Read.Db_error error) in
+    {next={state with pending=remove_pending ticket.id state.pending};effects=[Publish(Reply(id,response))]}
 ;;
 
 let failure_diagnostic error =
@@ -559,28 +530,17 @@ let step state event =
         && Sync.admitted_graph_scope state.sync_core <> None
       then { next = state; effects = [ Publish (Graph_push push) ] }
       else no_effects state
-    | Graph_request { id; request; response_budget_bytes } ->
-      if Option.exists (fun value->value<=0 || value>Worker_pure_data.maximum_response_bytes || not (Protocol.is_snapshot_read request.command)) response_budget_bytes
-      then {next=state;effects=[Publish (Reply (id,Protocol.V2_response
-        {api_version=Protocol.api_version;request_id=request.request_id;
-         outcome=V2_failed {code="invalidRequest";message="Invalid read response byte budget"}}))]}
-      else (match state.graph.phase, state.database with
-       | Graph_open, Some database ->
-         let ticket, state = fresh_ticket state in
-         { next =
-             { state with
-               pending = Pending_execute (id, request, ticket) :: state.pending
-             }
-         ; effects =
-             [ Run_worker (Request (ticket, Execute_request { database; request; response_budget_bytes })) ]
-         }
-       | (Graph_closed | Graph_opening | Graph_closing | Graph_failed), _
-       | Graph_open, None ->
-         { next = state
-         ; effects =
-             [ Publish (Reply (id, unavailable_response request "The graph is not open."))
-             ]
-         })
+    | Graph_request { id; read } ->
+      let Read.Read_query(budget,query)=read in
+      let owner=Read.For_worker.read_budget_owner budget in
+      (match Read.validate_query owner budget query with
+       | Error error -> {next=state;effects=[Publish(Reply(id,failed_read read error))]}
+       | Ok () -> match state.graph.phase,state.database with
+         | Graph_open,Some database ->
+           let ticket,state=fresh_ticket state in
+           {next={state with pending=Pending_execute(id,read,ticket)::state.pending};
+            effects=[Run_worker(Request(ticket,Execute_request{database;read}))]}
+         | _ -> {next=state;effects=[Publish(Reply(id,unavailable_response read "The graph is not open."))]})
     | Sync_event event -> translate_sync (Sync.step state.sync_core event) state
     | Set_foreground foreground ->
       let lifecycle_generation = Int64.succ state.lifecycle_generation in
@@ -1198,17 +1158,17 @@ let step state event =
     || List.exists(fun session->session.owner=scope) state.graph_sessions then Some scope else None) in
   let state=match owner with Some scope when known->load_graph state scope | _->state in
   let event=match event with
-    | Graph_request_for_scope {scope;id;request;response_budget_bytes} ->
+    | Graph_request_for_scope {scope;id;read} ->
       if Sync.scope_for_graph state.sync_core ~graph_id:scope.graph_id = Some scope
-      then Graph_request {id;request;response_budget_bytes}
-      else Graph_request_for_scope {scope;id;request;response_budget_bytes}
+      then Graph_request {id;read}
+      else Graph_request_for_scope {scope;id;read}
     | Asset_requested_for_scope (scope,event) when admitted scope -> Asset_requested {graph_generation=scope.graph_generation;event}
     | Upload_requested_for_scope (scope,operation,event) when admitted scope -> Upload_requested {graph_generation=scope.graph_generation;operation;event}
     | Projection_push_for_scope (scope,push) when Sync.scope_for_graph state.sync_core ~graph_id:scope.graph_id=Some scope -> Projection_push push
     | event -> event in
   let transition=match event with
-    | Graph_request_for_scope {id;request;_} ->
-      {next=state;effects=[Publish (Reply (id,unavailable_response request "The graph scope is no longer open."))]}
+    | Graph_request_for_scope {id;read;_} ->
+      {next=state;effects=[Publish (Reply (id,unavailable_response read "The graph scope is no longer open."))]}
     | _ -> step_session state event in
   let transition=match event with
     | Set_foreground _ | Shutdown when known ->
@@ -1286,8 +1246,7 @@ module Observation_registry = struct
 
   type live =
     { scope : S.graph_scope
-    ; command : Protocol.command
-    ; maximum_bytes : int
+    ; read : Worker_pure_read.packed_query
     ; epoch : int64
     }
 
@@ -1343,13 +1302,19 @@ module Observation_registry = struct
     && a.startup.account_generation = b.startup.account_generation
   ;;
 
-  let reserve state ~registration ~id ~scope ~command ~maximum_bytes =
+  let reserve state ~registration ~id ~scope ~read =
+    let Worker_pure_read.Read_query(budget,query)=read in
+    let owner=Worker_pure_read.For_worker.read_budget_owner budget in
+    let maximum_bytes=Worker_pure_read.For_worker.read_budget_maximum_bytes budget in
     let key = registration, id in
     if
       registration <= 0L
       || maximum_bytes <= 0
       || maximum_bytes > Worker_pure_data.maximum_response_bytes
-      || not (Protocol.is_observable_read command)
+      || not (Worker_pure_read.observable query)
+      || not (Worker_pure_read.matches_asset_scope owner scope)
+      || Worker_pure_read.For_worker.binding_serial(Worker_pure_read.For_worker.session_binding owner)<>registration
+      || Result.is_error(Worker_pure_read.validate_query owner budget query)
     then state, Invalid
     else if registration<=state.closed then state,Retired else (
       match Entries.find_opt key state.entries with
@@ -1361,8 +1326,7 @@ module Observation_registry = struct
         ( state
         , if
             same_scope scope old.scope
-            && old.command = command
-            && old.maximum_bytes = maximum_bytes
+            && Worker_pure_read.equal_packed_query old.read read
           then Existing
           else Mismatch )
       | None when Entries.mem key state.finished -> state,Retired
@@ -1371,7 +1335,7 @@ module Observation_registry = struct
         ( { state with entries =
               Entries.add
                 key
-                (Live { scope; command; maximum_bytes; epoch = 0L })
+                (Live { scope; read; epoch = 0L })
                 state.entries
           ; active = state.active + 1
           ; retained = state.retained + 1
@@ -1505,139 +1469,48 @@ module Observation_registry = struct
 end
 
 module Changefeed_owner = struct
-  type ownership =
-    | Legacy
-    | Registered of int64
-    | Retired of int64
-
-  type retained =
-    { command : Protocol.command
-    ; maximum_bytes : int
-    ; response : Protocol.response
-    }
-
-  type t =
-    { owner : ownership
-    ; pending : retained option
-    ; acknowledged : (string * string) option
-    ; resync : bool
-    ; windows : int
-    ; bytes : int
-    }
-
-  type pull =
-    | Read
-    | Cached of Protocol.response
-    | Refused
-
-  let empty =
-    { owner = Legacy
-    ; pending = None
-    ; acknowledged = None
-    ; resync = false
-    ; windows = 0
-    ; bytes = 0
-    }
-  ;;
-
-  let legacy state = state.owner = Legacy
-  let needs_resync state = state.resync
-  let owns state registration = state.owner = Registered registration
-
+  type ownership = Unclaimed | Registered of int64 | Retired of int64
+  type retained = { read : Read.packed_query; batch : Read.change_batch }
+  type t = {owner:ownership;pending:retained option;acknowledged:(string*string)option;
+    resync:bool;windows:int;bytes:int}
+  type pull = Read | Cached of Read.change_batch | Refused
+  let empty={owner=Unclaimed;pending=None;acknowledged=None;resync=false;windows=0;bytes=0}
+  let unclaimed state=state.owner=Unclaimed
+  let needs_resync state=state.resync
+  let owns state registration=state.owner=Registered registration
   let claim state ~registration =
-    if registration <= 0L
-    then state, false
-    else (
-      match state.owner with
-      | Legacy -> { state with owner = Registered registration }, true
-      | Registered actual -> state, actual = registration
-      | Retired previous when registration > previous ->
-        ( { state with
-            owner = Registered registration
-          ; pending = None
-          ; acknowledged = None
-          ; resync = false
-          }
-        , true )
-      | Retired _ -> state, false)
-  ;;
-
-  let pull state ~registration ~(request : Protocol.request) ~maximum_bytes =
-    if
-      (not (owns state registration))
-      || maximum_bytes <= 0
-      || maximum_bytes > Worker_pure_data.maximum_response_bytes
-    then Refused
-    else (
-      match request.command, state.pending with
-      | Protocol.V2_pull_changes _, None -> Read
-      | Protocol.V2_pull_changes _, Some retained
-        when request.command = retained.command && maximum_bytes = retained.maximum_bytes
-        ->
-        let (Protocol.V2_response response) = retained.response in
-        Cached (Protocol.V2_response { response with request_id = request.request_id })
-      | _ -> Refused)
-  ;;
-
-  let remember state ~registration ~(request : Protocol.request) ~maximum_bytes response =
-    match pull state ~registration ~request ~maximum_bytes, request.command, response with
-    | Read, Protocol.V2_pull_changes query, Protocol.V2_response raw
-      when raw.api_version = Protocol.api_version
-           && raw.request_id = request.request_id
-           && Protocol.encoded_response_bytes response <= maximum_bytes ->
-      (match raw.outcome with
-       | Protocol.V2_changes batch
-         when batch.generation = query.generation
-              && batch.from_exclusive = query.after
-              && List.length batch.windows <= query.limit ->
-         Ok
-           { state with
-             pending = Some { command = request.command; maximum_bytes; response }
-           ; resync = false
-           }
-       | _ -> Error "Changefeed response does not match its retained pull")
-    | _ -> Error "Changefeed ownership or retained response mismatch"
-  ;;
-
-  let pending_matches state generation through =
-    match state.pending with
-    | Some
-        { response = Protocol.V2_response { outcome = Protocol.V2_changes batch; _ }; _ }
-      -> batch.generation = generation && batch.through = through
-    | _ -> false
-  ;;
-
-  let may_ack state ~registration ~generation ~through =
-    owns state registration
-    && (pending_matches state generation through
-        || state.acknowledged = Some (generation, through))
-  ;;
-
-  let acknowledged state ~registration ~(request : Protocol.request) response =
-    match request.command, response with
-    | Protocol.V2_ack_changes query, Protocol.V2_response raw
-      when raw.api_version = Protocol.api_version && raw.request_id = request.request_id
-      ->
-      (match raw.outcome with
-       | Protocol.V2_changes_acknowledged ack
-         when ack.generation = query.generation
-              && ack.through = query.through
-              && may_ack
-                   state
-                   ~registration
-                   ~generation:ack.generation
-                   ~through:ack.through ->
-         { state with
-           acknowledged = Some (ack.generation, ack.through)
-         ; pending =
-             (if pending_matches state ack.generation ack.through
-              then None
-              else state.pending)
-         }
-       | _ -> state)
-    | _ -> state
-  ;;
-
+    if registration<=0L then state,false else match state.owner with
+    |Unclaimed->{state with owner=Registered registration},true
+    |Registered actual->state,actual=registration
+    |Retired previous when registration>previous->
+      {state with owner=Registered registration;pending=None;acknowledged=None;resync=false},true
+    |Retired _->state,false
+  let pull state ~registration ~read =
+    if not(owns state registration) then Refused else
+    let Read.Read_query(budget,query)=read in
+    match query with
+    |Read.Changes _->(match Read.validate_query (Read.For_worker.read_budget_owner budget) budget query,state.pending with
+      |Ok(),None->Read
+      |Ok(),Some retained when Read.equal_packed_query read retained.read->Cached retained.batch
+      |_->Refused)
+    |_->Refused
+  let remember state ~registration ~read (batch:Read.change_batch) =
+    let Read.Read_query(budget,query)=read in
+    match pull state ~registration ~read,query with
+    |Read,Read.Changes _->
+      (match Read.validate_value (Read.For_worker.read_budget_owner budget) budget query batch with
+       |Ok()->Ok{state with pending=Some{read;batch};resync=false}
+       |Error _->Error "Changefeed response does not match its retained pull")
+    |_->Error "Changefeed ownership or retained response mismatch"
+  let pending_matches state generation through=match state.pending with
+    |Some{batch;_}->batch.generation=generation && batch.through=through
+    |None->false
+  let may_ack state ~registration ~generation ~through=owns state registration &&
+    (pending_matches state generation through || state.acknowledged=Some(generation,through))
+  let acknowledged state ~registration ~generation ~through =
+    if not(may_ack state ~registration ~generation ~through) then state else
+    {state with acknowledged=Some(generation,through);
+      pending=(if pending_matches state generation through then None else state.pending)}
   let invalidate state =
     { state with
       pending = None

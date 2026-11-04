@@ -12,6 +12,37 @@ module SR = Logseq_sync_effect_runner.Effect_runner
 
 let require condition message = if not condition then failwith message
 let uuid value = W.Uuid.of_string value |> Result.get_ok
+module Read=Worker_pure_read
+
+(* This Service-side source uses the real client's incarnation and its atomic
+   baseline. It exercises the backend contract rather than fabricating an ACK. *)
+let observation_read client baseline (owner:Service.timeline_scope) registration ?(maximum_items=1) ?(maximum_bytes=16384) query =
+  let module F=Read.For_worker in
+  let baseline=Option.get baseline in
+  let scope=List.find_map(fun((scope:Sync.graph_scope),_)->
+    if scope.Logseq_sync_pure_reducer.Core.graph_id=owner.graph_id
+      && scope.graph_generation=owner.graph_generation
+      && scope.account.account_generation=owner.startup.account_generation then Some scope else None)
+    baseline.Service.baseline.state.residents |> Option.get in
+  let binding=F.binding ~serial:registration
+    ~incarnation:(Read.worker_incarnation ~runtime_epoch:(Mailbox.runtime_epoch client) ~worker_generation:(Mailbox.worker_generation client))
+    ~origin:(Uri.to_string scope.account.managed_sync_origin) ~user:scope.account.user_id in
+  let session=F.session ~binding ~graph:scope.graph_id ~account:scope.account.account_generation
+    ~lifecycle:scope.account.lifecycle_generation ~generation:scope.graph_generation ~scope:owner ~asset_scope:scope ~limits:baseline.limits in
+  let budget=Read.read_budget session ~maximum_items ~maximum_bytes |> Result.get_ok in
+  F.pack_query budget query
+;;
+
+let query_request client baseline owner registration request_id ?maximum_items ?maximum_bytes query =
+  Service.Coordination_query{registration;owner;request_id;
+    read=observation_read client baseline owner registration ?maximum_items ?maximum_bytes query}
+let mutation_request client baseline owner registration ~request_id ~mutation_id command =
+  let Read.Read_query(budget,_)=observation_read client baseline owner registration Read.Graph_info in
+  let session=Read.For_worker.read_budget_owner budget in
+  let intent=W.mutation_intent session ~mutation_id command |> Result.get_ok in
+  Service.Coordination_mutation{registration;owner;request_id;
+    intent=Bytes.to_string(W.encode_durable_intent(W.Mutation_intent intent))}
+
 let second_graph = uuid "9c000000-0000-4000-8000-000000000003"
 let client_id = uuid "9c000000-0000-4000-8000-000000000001"
 
@@ -1337,62 +1368,6 @@ let test_client_to_typed_read () =
       | W.Answered (Ok { lookup = Worker_pure_data.V2_present_block { revision; _ }; _ }) -> revision
       | _ -> assert false
     in
-    let mutation_request : P.request =
-      { api_version = P.api_version
-      ; request_id = uuid "9c000000-0000-4000-8000-000000000004"
-      ; command =
-          V2_save_block
-            { mutation_id = uuid "9c000000-0000-4000-8000-000000000005"
-            ; block = Test_support.authoritative_block_uuid
-            ; title = "Read capability must not write"
-            ; preconditions =
-                { blocks = [ Test_support.authoritative_block_uuid, revision ]
-                ; pages = []
-                ; scopes = []
-                }
-            }
-      }
-    in
-    let actual =
-      match
-        Mailbox.send
-          client
-          (Service.Coordination_query
-             { response_budget_bytes=Worker_pure_data.maximum_response_bytes; registration = baseline.registration
-             ; owner = Option.get baseline.baseline.state.sync.selected
-             ; request = mutation_request
-             })
-      with
-      | Accepted id -> id
-      | _ -> failwith "negative test transport was not admitted"
-    in
-    let outcome () =
-      List.find_map
-        (function
-          | Mailbox.Response { request_id; outcome; _ }, _
-            when Id.Worker.Request_id.equal request_id actual -> Some outcome
-          | _ -> None)
-        !deliveries
-    in
-    wait (fun () -> Option.is_some (outcome ()));
-    require
-      (match outcome () with
-       | Some (Mailbox.Failed _) -> true
-       | _ -> false)
-      "backend accepted a mutation through a read-only registration";
-    let _, unchanged =
-      request
-        (W.Query
-           ( budget
-           , W.Outline_block
-               { uuid = Test_support.authoritative_block_uuid; revision = None } ))
-    in
-    (match unchanged with
-     | W.Answered (Ok (Worker_pure_data.V2_present_block { value; _ })) ->
-       require
-         (value.block.title = "Authoritative block")
-         "rejected read capability altered storage"
-     | _ -> failwith "guard verification read failed");
     let intent =
       W.mutation_intent
         session
@@ -1722,7 +1697,7 @@ let test_client_to_typed_read () =
       "late cancelled read revived a forgotten consumer")
 ;;
 
-let test_read_completion_rechecks_graph_owner ?(durable = false) () =
+let test_read_completion_rechecks_graph_owner () =
   let armed = Atomic.make false
   and entered = Atomic.make false
   and release = Atomic.make false in
@@ -1788,27 +1763,13 @@ let test_read_completion_rechecks_graph_owner ?(durable = false) () =
            ; command
            }
          in
-         let read =
-           send
-             (Service.Coordination_query
-                { response_budget_bytes=Worker_pure_data.maximum_response_bytes; registration
-                ; owner
-                ; request =
-                    req
-                      "000000000001"
-                      (P.V2_get_outline_block
-                         { block = Test_support.authoritative_block_uuid
-                         ; revision = None
-                         })
-                })
-         in
+         let read=send(query_request client !baseline owner registration
+           (uuid "99000000-0000-4000-8000-000000000001") ~maximum_bytes:Worker_pure_data.maximum_response_bytes
+           (Read.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None})) in
          wait (fun () -> Hashtbl.mem responses read);
          let revision =
            match Hashtbl.find responses read with
-           | Completed
-               (Service.Graph_response
-                  (P.V2_response
-                     { outcome = V2_block_outcome (Worker_pure_data.V2_present_block { revision; _ }); _ }))
+           |Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_present_block{revision;_}));_})
              -> revision
            | _ -> failwith "race fixture block missing"
          in
@@ -1836,34 +1797,16 @@ let test_read_completion_rechecks_graph_owner ?(durable = false) () =
              mutation_request.command
            |> Result.get_ok
          in
-         let writer =
-           send
-             (if durable
-              then
-                Service.Coordination_mutation
-                  { registration
-                  ; owner
-                  ; request_id = mutation_request.request_id
-                  ; intent = Wire.encode wire
-                  }
-              else Service.Graph_request_at (owner, mutation_request))
-         in
+         let writer=send(Service.Coordination_mutation{registration;owner;
+           request_id=mutation_request.request_id;intent=Wire.encode wire})in
          wait (fun () -> Atomic.get entered);
-         let read =
-           send
-             (Service.Coordination_query
-                { response_budget_bytes=Worker_pure_data.maximum_response_bytes; registration; owner; request = req "000000000004" P.V2_graph_info })
-         in
+         let read=send(query_request client !baseline owner registration
+           (uuid "99000000-0000-4000-8000-000000000004") Read.Graph_info)in
          (* Cancelling the outer writer releases its Service lane, not its
             accepted durable DB operation. Keep that operation held while the
             second lane is waiting on the real snapshot mutex. *)
          Mailbox.cancel client ~request_id:writer;
-         if not durable
-         then (
-           wait (fun () -> Hashtbl.mem responses writer);
-           require
-             (Hashtbl.find responses writer = Mailbox.Cancelled)
-             "held legacy writer cancellation did not release its outer lane");
+
          wait (fun () ->
            (Mailbox.Private.metrics (Mailbox.Private.pack_client client))
              .active_request_fibers
@@ -1883,8 +1826,7 @@ let test_read_completion_rechecks_graph_owner ?(durable = false) () =
             | Failed _ -> true
             | _ -> false)
            "retired graph read completion still crossed Service's authority gate";
-         if durable
-         then (
+         (
            wait (fun () -> Hashtbl.mem responses writer);
            require
              (Hashtbl.find responses writer = Mailbox.Cancelled)
@@ -2576,8 +2518,7 @@ let test_changefeed_business_waits_for_ui_application () =
       | ( Mailbox.Response
             { outcome =
                 Completed
-                  (Service.Graph_response
-                     (P.V2_response { outcome = P.V2_changes_acknowledged _; _ }))
+                  (Service.Coordination_changes_acknowledged{result=Ok _;_})
             ; _
             }
         , R.Consumed ) -> incr acks
@@ -2675,7 +2616,7 @@ let test_changefeed_business_waits_for_ui_application () =
           if !fail_budget_once && application <> None
           then (
             fail_budget_once := false;
-            64)
+            1)
           else 65536
         in
         let maximum_items =
@@ -2856,10 +2797,7 @@ let test_changefeed_business_waits_for_ui_application () =
     fail_budget_once := true;
     write 4 "Business change D";
     wait (fun () ->
-      !saw_failure
-      && Option.exists
-           (fun value -> C.change_application_error (Host.view host) value <> None)
-           !batch);
+      !saw_failure && Option.exists(fun value->C.change_application_error(Host.view host)value<>None)!batch);
     require (!acks = before) "an actual failed read acknowledged its unapplied window";
     active := false;
     ui_title := None;
@@ -2929,15 +2867,15 @@ let with_observation_service ?epoch_ms ?prepare ?(observe_push=fun _->()) f =
    Db -> runner -> registry call after the actual unregister joins. Exercise that
    public Service boundary without injecting cleanup ACKs or registry state. *)
 let test_service_binding_retirement_reclaims_observation_history () =
-  with_observation_service(fun _ ~call ~send:_ ~wait:_ ~replies ~notices:_ ~baseline:_ ~owner ~registration ->
+  with_observation_service(fun client ~call ~send:_ ~wait:_ ~replies ~notices:_ ~baseline ~owner ~registration ->
     for round=0 to 8199 do
       let registration=Int64.add registration(Int64.of_int round) in
       if round>0 then require(match call(Service.Register_coordination registration) with
         |Completed(Service.Coordination_registered _)->true|_->false)
         "actual observation binding could not be registered again";
       let id=uuid(Printf.sprintf "9d000000-0000-4000-8000-%012d" (100000+round)) in
-      require(match call(Service.Coordination_observe{registration;owner;observation_id=id;maximum_bytes=16384;
-        request={P.api_version=P.api_version;request_id=id;command=P.V2_graph_info}}) with
+      require(match call(Service.Coordination_observe{registration;owner;observation_id=id;request_id=id;
+        read=observation_read client !baseline owner registration Read.Graph_info}) with
         |Completed(Service.Coordination_observed _)->true|_->false)
         (Printf.sprintf "actual binding retirement exhausted observation history at round %d" (round+1));
       require(call(Service.Release_coordination registration)=Completed(Service.Coordination_released registration))
@@ -2956,12 +2894,11 @@ let test_service_writer_fence_waits_for_canceled_protected_commit () =
     with_observation_service ~epoch_ms(fun client ~call ~send ~wait ~replies ~notices:_ ~baseline ~owner ~registration->
       let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
       let id n=uuid(Printf.sprintf "9f000000-0000-4000-8000-%012d" (9000+n)) in
-      let read owner n=call(Service.Coordination_query{registration;owner;response_budget_bytes=16384;
-        request={P.api_version=P.api_version;request_id=id n;command=V2_get_outline_block
-          {block=Test_support.authoritative_block_uuid;revision=None}}}) in
+      let read owner n=call(query_request client !baseline owner registration(id n)
+        (Read.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None}))in
       let revision=match read owner 1 with
-        |Mailbox.Completed(Service.Graph_response(P.V2_response{outcome=V2_block_outcome(Worker_pure_data.V2_present_block{revision;_});_}))->revision
-        |_->failwith "writer fence source read failed" in
+        |Mailbox.Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_present_block{revision;_}));_})->revision
+        |_->failwith "writer fence source read failed"in
       let intent n title=Wire.create ~origin:(Uri.of_string "https://api.logseq.io") ~user:"user-1" ~graph:owner.graph_id
         (P.V2_save_block{mutation_id=id n;block=Test_support.authoritative_block_uuid;title;
           preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}) |> Result.get_ok in
@@ -2984,7 +2921,7 @@ let test_service_writer_fence_waits_for_canceled_protected_commit () =
           value.registration=registration && value.owner=scope && value.request_id=id 4
         |_->false) "writer fence failed to join actual protected I/O and callback barrier";
       require(match read owner 7 with Mailbox.Failed _->true
-        |Completed(Service.Graph_response(P.V2_response{outcome=V2_failed _;_}))->true|_->false)
+        |Completed(Service.Coordination_queried{answer=Read.Query_answer(_,_,Error _);_})->true|_->false)
         "old graph incarnation resumed admission after writer fence";
       ignore(call(Service.Client_command Return_to_graph_picker));
       ignore(call(Service.Client_command(Select_graph owner.graph_id)));
@@ -2993,7 +2930,7 @@ let test_service_writer_fence_waits_for_canceled_protected_commit () =
         (Option.get !baseline).baseline.state.residents);
       let fresh=Option.get(Option.get !baseline).baseline.state.sync.selected in
       require(match read fresh 8 with
-        |Mailbox.Completed(Service.Graph_response(P.V2_response{outcome=V2_block_outcome(Worker_pure_data.V2_present_block{value;_});_}))->
+        |Mailbox.Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_present_block{value;_}));_})->
           value.block.title="Protected writer actually committed"
         |_->false) "new incarnation lost actual canceled commit or inherited the old admission fence"))
 ;;
@@ -3174,26 +3111,16 @@ let test_service_observation_lifecycle () =
   with_observation_service
     (fun client ~call ~send:_ ~wait ~replies:_ ~notices ~baseline ~owner ~registration ->
        let logical = uuid "9d000000-0000-4000-8000-000000000001" in
-       let req n command =
-         P.
-           { api_version
-           ; request_id = uuid (Printf.sprintf "9d000000-0000-4000-8000-%012d" n)
-           ; command
-           }
-       in
-       let source =
-         req
-           2
-           (P.V2_get_outline_block
-              { block = Test_support.authoritative_block_uuid; revision = None })
-       in
+       let rid n=uuid(Printf.sprintf "9d000000-0000-4000-8000-%012d" n) in
+       let source=observation_read client !baseline owner registration
+         (Read.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None}) in
        let observe =
          Service.Coordination_observe
            { registration
            ; owner
            ; observation_id = logical
-           ; request = source
-           ; maximum_bytes = 16384
+           ; request_id=rid 2
+           ; read=source
            }
        in
        let revision =
@@ -3201,9 +3128,7 @@ let test_service_observation_lifecycle () =
          | Completed
              (Service.Coordination_observed
                 { epoch = 0L
-                ; response =
-                    V2_response
-                      { outcome = V2_block_outcome (Worker_pure_data.V2_present_block { revision; _ }); _ }
+                ; answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_present_block { revision; _ }))
                 ; _
                 }) -> revision
          | _ -> failwith "real initial observation did not sample its predecessor"
@@ -3213,12 +3138,11 @@ let test_service_observation_lifecycle () =
           | Completed (Service.Coordination_observed { epoch = 0L; _ }) -> true
           | _ -> false)
          "duplicate Observe did not retain original registration";
-       let retry_source={source with P.request_id=(req 10 P.V2_graph_info).request_id} in
+       let retry_request=rid 10 in
        require
          (match call(Service.Coordination_observe {registration;owner;observation_id=logical;
-           request=retry_source;maximum_bytes=16384}) with
-          | Completed(Service.Coordination_observed {epoch=0L;response=V2_response
-              {request_id;_};_})->request_id=retry_source.request_id
+           request_id=retry_request;read=source}) with
+          | Completed(Service.Coordination_observed {epoch=0L;request_id;_})->request_id=retry_request
           | _->false)
          "retried Observe lost current RPC correlation";
        require
@@ -3254,43 +3178,24 @@ let test_service_observation_lifecycle () =
                  { registration
                  ; owner
                  ; observation_id = logical
-                 ; request_id = (req 9 P.V2_graph_info).request_id
+                 ; request_id = (rid 9)
                  })
           with
           | Completed
               (Service.Coordination_observed
-                 { response =
-                     V2_response
-                       { outcome =
-                           V2_block_outcome (Worker_pure_data.V2_present_block { revision = actual; _ })
-                       ; _
-                       }
+                 { answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_present_block { revision = actual; _ }))
                  ; _
                  }) -> actual = revision
           | _ -> false)
          "focus retired a surviving resident observation";
        let write n revision title =
-         call
-           (Service.Graph_request_at
-              ( owner
-              , req
-                  n
-                  (P.V2_save_block
-                     { mutation_id = (req (n + 100) P.V2_graph_info).request_id
-                     ; block = Test_support.authoritative_block_uuid
-                     ; title
-                     ; preconditions =
-                         { blocks = [ Test_support.authoritative_block_uuid, revision ]
-                         ; pages = []
-                         ; scopes = []
-                         }
-                     }) ))
-       in
+         call(mutation_request client !baseline owner registration ~request_id:(rid n) ~mutation_id:(rid(n+100))
+           (W.Save_block{block=Test_support.authoritative_block_uuid;title;
+             preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}})) in
        require
          (match write 3 revision "Observed write" with
           | Completed
-              (Service.Graph_response
-                 (V2_response { outcome = V2_mutation_committed _; _ })) -> true
+              (Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed _;_}) -> true
           | _ -> false)
          "observation synthetic mutation failed";
        wait (fun () ->
@@ -3308,7 +3213,7 @@ let test_service_observation_lifecycle () =
               { registration
               ; owner
               ; observation_id = logical
-              ; request_id = (req 4 P.V2_graph_info).request_id
+              ; request_id = (rid 4)
               })
        in
        let current_revision =
@@ -3316,11 +3221,7 @@ let test_service_observation_lifecycle () =
          | Completed
              (Service.Coordination_observed
                 { epoch
-                ; response =
-                    V2_response
-                      { outcome = V2_block_outcome (Worker_pure_data.V2_present_block { value; revision })
-                      ; _
-                      }
+                ; answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_present_block { value; revision }))
                 ; _
                 }) ->
            require
@@ -3360,8 +3261,7 @@ let test_service_observation_lifecycle () =
        require
          (match write 5 current_revision "After observation release" with
           | Completed
-              (Service.Graph_response
-                 (V2_response { outcome = V2_mutation_committed _; _ })) -> true
+              (Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed _;_}) -> true
           | _ -> false)
          "post-release synthetic write did not commit";
        for _ = 1 to 12 do
@@ -3388,8 +3288,8 @@ let test_service_observation_lifecycle () =
                  { registration
                  ; owner
                  ; observation_id = cancelled
-                 ; request = source
-                 ; maximum_bytes = 16384
+                 ; request_id=rid 2
+                 ; read=source
                  })
           with
           | Failed _ -> true
@@ -3407,22 +3307,15 @@ let test_service_empty_observation_is_retained () =
          ~wait
          ~replies:_
          ~notices
-         ~baseline:_
+         ~baseline
          ~owner
          ~registration
        ->
        let target = uuid "9d000000-0000-4000-8000-000000005000" in
        let logical = uuid "9d000000-0000-4000-8000-000000005001" in
-       let req n command =
-         P.
-           { api_version
-           ; request_id = uuid (Printf.sprintf "9d000000-0000-4000-8000-%012d" n)
-           ; command
-           }
-       in
-       let point =
-         req 5002 (P.V2_get_outline_block { block = target; revision = None })
-       in
+       let rid n=uuid(Printf.sprintf "9d000000-0000-4000-8000-%012d" n) in
+       let point=observation_read _client !baseline owner registration
+         (Read.Outline_block{uuid=target;revision=None}) in
        require
          (match
             call
@@ -3430,70 +3323,31 @@ let test_service_empty_observation_is_retained () =
                  { registration
                  ; owner
                  ; observation_id = logical
-                 ; request = point
-                 ; maximum_bytes = 16384
+                 ; request_id=rid 5002
+                 ; read=point
                  })
           with
           | Completed
               (Service.Coordination_observed
-                 { response =
-                     V2_response
-                       { outcome = V2_block_outcome (Worker_pure_data.V2_missing_block { uuid; _ }); _ }
+                 { answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_missing_block { uuid; _ }))
                  ; _
                  }) -> uuid = target
           | _ -> false)
          "empty initial sample was not observable";
-       let read n command = call (Service.Graph_request_at (owner, req n command)) in
-       let page_revision =
-         match
-           read 5003 (P.V2_get_page { page = Test_support.page_uuid; revision = None })
-         with
-         | Completed
-             (Service.Graph_response
-                (V2_response
-                   { outcome = V2_page_outcome (Worker_pure_data.V2_present_page { revision; _ }); _ })) ->
-           revision
-         | _ -> failwith "observation insert page revision unavailable"
-       in
-       let scope_revision =
-         match
-           read
-             5004
-             (P.V2_get_children
-                { parent = Test_support.page_uuid
-                ; limit = 1
-                ; cursor = None
-                ; revision = None
-                })
-         with
-         | Completed
-             (Service.Graph_response
-                (V2_response { outcome = V2_children_outcome { scope_revision; _ }; _ }))
-           -> scope_revision
-         | _ -> failwith "observation insert children revision unavailable"
-       in
-       require
-         (match
-            read
-              5005
-              (P.V2_insert_blocks
-                 { mutation_id = (req 5006 P.V2_graph_info).request_id
-                 ; parent = Test_support.page_uuid
-                 ; roots =
-                     [ { uuid = target; title = "First observed block"; children = [] } ]
-                 ; preconditions =
-                     { blocks = []
-                     ; pages = [ Test_support.page_uuid, page_revision ]
-                     ; scopes =
-                         [ Worker_pure_data.V2_children_scope Test_support.page_uuid, scope_revision ]
-                     }
-                 })
-          with
-          | Completed
-              (Service.Graph_response
-                 (V2_response { outcome = V2_mutation_committed _; _ })) -> true
-          | _ -> false)
-         "synthetic first insertion did not commit";
+       let read n query=call(query_request _client !baseline owner registration (rid n) query) in
+       let page_revision=match read 5003(Read.Page{uuid=Test_support.page_uuid;revision=None})with
+         |Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Page _,Ok(Worker_pure_data.V2_present_page{revision;_}));_})->revision
+         |_->failwith "observation insert page revision unavailable" in
+       let scope_revision=match read 5004(Read.Child_members{parent=Test_support.page_uuid;revision=None;after=None})with
+         |Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Child_members _,Ok children);_})->children.scope_revision
+         |_->failwith "observation insert children revision unavailable" in
+       require(match call(mutation_request _client !baseline owner registration ~request_id:(rid 5005) ~mutation_id:(rid 5006)
+         (W.Insert_blocks{parent=Test_support.page_uuid;
+           roots=[{uuid=target;title="First observed block";children=[]}];
+           preconditions={blocks=[];pages=[Test_support.page_uuid,page_revision];
+             scopes=[Worker_pure_data.V2_children_scope Test_support.page_uuid,scope_revision]}})) with
+         |Completed(Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed _;_})->true
+         |_->false) "synthetic first insertion did not commit";
        wait (fun () ->
          Rrbvec.exists
            (function
@@ -3507,14 +3361,12 @@ let test_service_empty_observation_is_retained () =
                  { registration
                  ; owner
                  ; observation_id = logical
-                 ; request_id = (req 5007 P.V2_graph_info).request_id
+                 ; request_id = (rid 5007)
                  })
           with
           | Completed
               (Service.Coordination_observed
-                 { response =
-                     V2_response
-                       { outcome = V2_block_outcome (Worker_pure_data.V2_present_block { value; _ }); _ }
+                 { answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_present_block { value; _ }))
                  ; _
                  }) ->
             value.block.uuid = target && value.block.title = "First observed block"
@@ -3532,71 +3384,28 @@ let test_service_observation_read_failure_retains_interest () =
          ~wait
          ~replies:_
          ~notices
-         ~baseline:_
+         ~baseline
          ~owner
          ~registration
        ->
        let logical = uuid "9e000000-0000-4000-8000-000000000001" in
-       let req n command =
-         P.
-           { api_version
-           ; request_id = uuid (Printf.sprintf "9e000000-0000-4000-8000-%012d" n)
-           ; command
-           }
-       in
-       let point n =
-         req
-           n
-           (P.V2_get_outline_block
-              { block = Test_support.authoritative_block_uuid; revision = None })
-       in
-       let read n =
-         match
-           call
-             (Service.Coordination_query
-                { registration
-                ; owner
-                ; request = point n
-                ; response_budget_bytes = Worker_pure_data.maximum_response_bytes
-                })
-         with
-         | Completed
-             (Service.Graph_response
-                (P.V2_response
-                   { outcome = V2_block_outcome (Worker_pure_data.V2_present_block { revision; _ }); _ } as
-                 raw)) -> revision, raw
-         | _ -> failwith "observation recovery source read failed"
-       in
-       let _, raw = read 2 in
-       let budget = P.encoded_response_bytes raw + 128 in
-       require (budget < 60000) "recovery fixture envelope unexpectedly large";
-       let write n title =
-         let revision, _ = read (n + 100) in
-         require
-           (match
-              call
-                (Service.Graph_request_at
-                   ( owner
-                   , req
-                       n
-                       (P.V2_save_block
-                          { mutation_id = (req (n + 200) P.V2_graph_info).request_id
-                          ; block = Test_support.authoritative_block_uuid
-                          ; title
-                          ; preconditions =
-                              { blocks =
-                                  [ Test_support.authoritative_block_uuid, revision ]
-                              ; pages = []
-                              ; scopes = []
-                              }
-                          }) ))
-            with
-            | Completed
-                (Service.Graph_response
-                   (V2_response { outcome = V2_mutation_committed _; _ })) -> true
-            | _ -> false)
-           "synthetic observation recovery write failed"
-       in
+       let rid n=uuid(Printf.sprintf "9e000000-0000-4000-8000-%012d" n) in
+       let query=Read.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None} in
+       let read n=match call(query_request _client !baseline owner registration (rid n)
+         ~maximum_bytes:Worker_pure_data.maximum_response_bytes query)with
+         |Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_present_block{revision;_} as value));_})->
+           revision,Read.encoded_value_bytes query value
+         |_->failwith "observation recovery source read failed" in
+       let _,encoded_bytes=read 2 in
+       let budget=encoded_bytes+128 in
+       require(budget<60000) "recovery fixture envelope unexpectedly large";
+       let write n title=
+         let revision,_=read(n+100)in
+         require(match call(mutation_request _client !baseline owner registration ~request_id:(rid n) ~mutation_id:(rid(n+200))
+           (W.Save_block{block=Test_support.authoritative_block_uuid;title;
+             preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}))with
+           |Completed(Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed _;_})->true
+           |_->false) "synthetic observation recovery write failed" in
        let too_large = String.make (budget + 1024) 'L' in
        write 3 too_large;
        let initial =
@@ -3605,17 +3414,16 @@ let test_service_observation_read_failure_retains_interest () =
               { registration
               ; owner
               ; observation_id = logical
-              ; request = point 4
-              ; maximum_bytes = budget
+              ; request_id=rid 4
+              ; read=observation_read _client !baseline owner registration ~maximum_bytes:budget
+                  (Read.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None})
               })
        in
        require
          (match initial with
           | Completed
               (Service.Coordination_observed
-                 { response =
-                     V2_response
-                       { outcome = V2_failed { code = "responseTooLarge"; _ }; _ }
+                 { answer=Read.Query_answer(_,Read.Outline_block _,Error Read.Response_budget_exceeded)
                  ; _
                  }) -> true
           | _ -> false)
@@ -3626,7 +3434,7 @@ let test_service_observation_read_failure_retains_interest () =
               { registration
               ; owner
               ; observation_id = logical
-              ; request_id = (point n).request_id
+              ; request_id = rid n
               })
        in
        let recover n text =
@@ -3642,9 +3450,7 @@ let test_service_observation_read_failure_retains_interest () =
            (match refresh (n + 10) with
             | Completed
                 (Service.Coordination_observed
-                   { response =
-                       V2_response
-                         { outcome = V2_block_outcome (Worker_pure_data.V2_present_block { value; _ }); _ }
+                   { answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_present_block { value; _ }))
                    ; _
                    }) -> value.block.title = text
             | _ -> false)
@@ -3656,9 +3462,7 @@ let test_service_observation_read_failure_retains_interest () =
          (match refresh 17 with
           | Completed
               (Service.Coordination_observed
-                 { response =
-                     V2_response
-                       { outcome = V2_failed { code = "responseTooLarge"; _ }; _ }
+                 { answer=Read.Query_answer(_,Read.Outline_block _,Error Read.Response_budget_exceeded)
                  ; _
                  }) -> true
           | _ -> false)
@@ -3667,7 +3471,7 @@ let test_service_observation_read_failure_retains_interest () =
        ignore (call (Service.Release_coordination registration)))
 ;;
 let test_service_unallocated_observation_cleanup_after_close () =
-  with_observation_service(fun _ ~call ~send:_ ~wait ~replies:_ ~notices:_ ~baseline ~owner ~registration ->
+  with_observation_service(fun client ~call ~send:_ ~wait ~replies:_ ~notices:_ ~baseline ~owner ~registration ->
     let logical=uuid "9d000000-0000-4000-8000-000000000990" in
     ignore(call(Service.Client_command Return_to_graph_picker));
     wait(fun ()->match !baseline with
@@ -3683,8 +3487,8 @@ let test_service_unallocated_observation_cleanup_after_close () =
       | _ -> false);
     let reopened=Option.get(Option.get !baseline).baseline.state.sync.selected in
     let observe observation_id request_id=Service.Coordination_observe
-      {registration;owner=reopened;observation_id;maximum_bytes=16384;
-       request={P.api_version=P.api_version;request_id;command=P.V2_graph_info}} in
+      {registration;owner=reopened;observation_id;request_id;
+       read=observation_read client !baseline reopened registration Read.Graph_info} in
     require(match call(observe logical (uuid "9d000000-0000-4000-8000-000000000991")) with
       | Failed _->true|_->false) "canceled logical ID allocated in a reopened generation";
     require(match call(observe (uuid "9d000000-0000-4000-8000-000000000992")
@@ -3726,7 +3530,7 @@ let test_service_unknown_recovery_is_read_only ?(large=false) () =
         "large recovery fixture must be a valid intent exceeding the ordinary read cap";
       let expected=D.write_precondition ~blocks:[Test_support.authoritative_block_uuid,revision] ~pages:[] ~scopes:[] |> Result.get_ok in
       ignore(D.persist_local_intent database ~namespace:(Wire.namespace wire) ~payload: !encoded ~expected mutation |> Result.get_ok)))) in
-  with_observation_service ~prepare (fun _ ~call ~send:_ ~wait:_ ~replies:_ ~notices:_ ~baseline ~owner ~registration->
+  with_observation_service ~prepare (fun client ~call ~send:_ ~wait:_ ~replies:_ ~notices:_ ~baseline ~owner ~registration->
     let request_id=uuid "9f000000-0000-4000-8000-000000000901" in
     let recover()=match call(Service.Coordination_recover_mutations{registration;owner;request_id;
       after=None;maximum_items=8;maximum_bytes=(if large then Wire.maximum_recovery_bytes else 16384)}) with
@@ -3739,25 +3543,23 @@ let test_service_unknown_recovery_is_read_only ?(large=false) () =
       presentation=(Option.get !baseline).baseline.presentation;intent= !encoded;original=None}) with
       | Mailbox.Failed _->true|_->false) "Unknown intent could be acknowledged away";
     require(Rrbvec.length(recover()).items=1) "Unknown ACK or recovery dropped pending identity";
-    require(match call(Service.Coordination_query{registration;owner;
-      request={P.api_version=P.api_version;request_id;command=V2_get_outline_block{block=Test_support.authoritative_block_uuid;revision=None}};
-      response_budget_bytes=16384}) with
-      | Mailbox.Completed(Service.Graph_response(V2_response{outcome=V2_block_outcome(Worker_pure_data.V2_present_block{value;_});_}))->
+    require(match call(query_request client !baseline owner registration request_id
+      (Read.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None}))with
+      |Mailbox.Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_present_block{value;_}));_})->
         value.block.title<>"Never automatically replay"
-      | _->false) "recovery automatically executed Unknown intent")
+      |_->false) "recovery automatically executed Unknown intent")
 ;;
 
 let test_service_durable_recovery_and_ack () =
   let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
-  with_observation_service(fun _ ~call ~send:_ ~wait ~replies:_ ~notices:_ ~baseline ~owner ~registration->
+  with_observation_service(fun client ~call ~send:_ ~wait ~replies:_ ~notices:_ ~baseline ~owner ~registration->
     let id n=uuid(Printf.sprintf "9f000000-0000-4000-8000-%012d" n) in
     let owner=ref owner in
     let presentation ()=(Option.get !baseline).Service.baseline.presentation in
-    let read n=match call(Service.Coordination_query{registration;owner= !owner;
-      request={P.api_version=P.api_version;request_id=id n;command=V2_get_outline_block
-        {block=Test_support.authoritative_block_uuid;revision=None}};response_budget_bytes=16384}) with
-      | Mailbox.Completed(Service.Graph_response(V2_response{outcome=V2_block_outcome(Worker_pure_data.V2_present_block{revision;value});_}))->revision,value.block.title
-      | _->failwith "durable lifecycle source read failed" in
+    let read n=match call(query_request client !baseline !owner registration(id n)
+      (Read.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None}))with
+      |Mailbox.Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_present_block{revision;value}));_})->revision,value.block.title
+      |_->failwith "durable lifecycle source read failed"in
     let recover ?(maximum_bytes=16384) ?(maximum_items=1) n after=call(Service.Coordination_recover_mutations
       {registration;owner= !owner;request_id=id n;after;maximum_items;maximum_bytes}) in
     let page n after=match recover n after with
@@ -3832,8 +3634,11 @@ let test_service_durable_recovery_and_ack () =
       "wrong immutable proof acknowledged intent";
     require(Rrbvec.length(collect 70)=3) "invalid ACK removed recovery ownership";
     require(match call(Service.Coordination_confirm{registration;owner= !owner;presentation=presentation();
-      request_id=id 80;intent=Wire.encode first;original=proof}) with
-      | Mailbox.Completed(Service.Graph_response(V2_response{outcome=V2_block_summary_outcome _;_}))->true|_->false)
+      request_id=id 80;intent=Wire.encode first;original=proof;
+      read=observation_read client !baseline !owner registration ~maximum_items:Worker_pure_data.default_page_size
+        ~maximum_bytes:(Option.get !baseline).limits.response_budget_bytes
+        (Read.Block_summary{block=Test_support.authoritative_block_uuid;after=None})}) with
+      | Mailbox.Completed(Service.Coordination_confirmed{answer=Read.Query_answer(_,Read.Block_summary _,Ok _);_})->true|_->false)
       "reopened intent could not confirm its original proof";
     let acknowledged n result=require(match result with
       | Mailbox.Completed(Service.Coordination_mutation_acknowledged{request_id})->request_id=id n|_->false)
@@ -3851,257 +3656,74 @@ let test_service_durable_recovery_and_ack () =
 ;;
 
 let test_service_changefeed_has_one_owner () =
-  let pushes = ref Rrbvec.empty
-  and pulses = ref 0
-  and resyncs = ref 0 in
-  let observe_push payload =
-    (match payload with
-     | Service.Graph_push (P.V2_changes_available _ | V2_resync_required_push _)
-     | Graph_pushes _ -> incr pulses
-     | _ -> ());
-    match payload with
-    | Service.Graph_push (P.V2_changes_available value) ->
-      pushes := Rrbvec.push_back !pushes value.through
-    | Service.Graph_pushes values ->
-      List.iter
-        (function
-          | _, P.V2_changes_available value ->
-            pushes := Rrbvec.push_back !pushes value.through
-          | _, P.V2_resync_required_push _ -> incr resyncs)
-        values
-    | _ -> ()
-  in
-  with_observation_service
-    ~observe_push
-    (fun _ ~call ~send:_ ~wait ~replies:_ ~notices:_ ~baseline:_ ~owner ~registration ->
-       let id n = uuid (Printf.sprintf "9d000000-0000-4000-8000-%012d" (6000 + n)) in
-       let wire n command =
-         { P.api_version = P.api_version; request_id = id n; command }
-       in
-       let legacy request = call (Service.Graph_request_at (owner, request)) in
-       let generation =
-         match legacy (wire 0 P.V2_graph_info) with
-         | Completed
-             (Service.Graph_response
-                (P.V2_response { outcome = P.V2_graph_info_outcome info; _ })) ->
-           info.generation
-         | _ -> failwith "changefeed fixture graph info"
-       in
-       let coordinated registration n command =
-         call
-           (Service.Coordination_query
-              { registration
-              ; owner
-              ; request = wire n command
-              ; response_budget_bytes = 16384
-              })
-       in
-       let pull = P.V2_pull_changes { generation; after = None; limit = 32 } in
-       let write n title =
-         let revision =
-           match
-             legacy
-               (wire
-                  (n + 100)
-                  (P.V2_get_outline_block
-                     { block = Test_support.authoritative_block_uuid; revision = None }))
-           with
-           | Completed
-               (Service.Graph_response
-                  (P.V2_response
-                     { outcome = P.V2_block_outcome (Worker_pure_data.V2_present_block { revision; _ })
-                     ; _
-                     })) -> revision
-           | _ -> failwith "changefeed write revision"
-         in
-         let before = !pulses in
-         require
-           (match
-              legacy
-                (wire
-                   n
-                   (P.V2_save_block
-                      { mutation_id = id n
-                      ; block = Test_support.authoritative_block_uuid
-                      ; title
-                      ; preconditions =
-                          { blocks = [ Test_support.authoritative_block_uuid, revision ]
-                          ; pages = []
-                          ; scopes = []
-                          }
-                      }))
-            with
-            | Completed
-                (Service.Graph_response
-                   (P.V2_response { outcome = P.V2_mutation_committed _; _ })) -> true
-            | _ -> false)
-           "real changefeed write failed";
-         wait (fun () -> !pulses > before)
-       in
-       write 20 "Owned change window A";
-       let first =
-         match coordinated registration 1 pull with
-         | Completed
-             (Service.Graph_response (P.V2_response { outcome = P.V2_changes batch; _ }))
-           -> batch.through, batch.windows, batch.next
-         | _ -> failwith "scoped coordinated changefeed pull is not implemented"
-       in
-       require
-         (let _, windows, _ = first in
-          windows <> [])
-         "actual write produced no retained change window";
-       write 21 "Owned change window B";
-       require
-         (match
-            legacy
-              (wire
-                 2
-                 (P.V2_ack_changes
-                    { generation
-                    ; through =
-                        (let through, _, _ = first in
-                         through)
-                    }))
-          with
-          | Completed
-              (Service.Graph_response (P.V2_response { outcome = P.V2_failed _; _ })) ->
-            true
-          | _ -> false)
-         "legacy ACK could consume the coordinator's window";
-       require
-         (match legacy (wire 3 pull) with
-          | Completed
-              (Service.Graph_response (P.V2_response { outcome = P.V2_failed _; _ })) ->
-            true
-          | _ -> false)
-         "legacy pull remained an active second changefeed owner";
-       require
-         (match coordinated registration 4 pull with
-          | Completed
-              (Service.Graph_response
-                 (P.V2_response { request_id; outcome = P.V2_changes batch; _ })) ->
-            request_id = id 4 && (batch.through, batch.windows, batch.next) = first
-          | _ -> false)
-         "unapplied batch was lost or duplicate RPC kept an old ID";
-       require
-         (match
-            coordinated
-              registration
-              5
-              (P.V2_ack_changes { generation; through = "unowned-window" })
-          with
-          | Failed _
-          | Completed
-              (Service.Graph_response (P.V2_response { outcome = P.V2_failed _; _ })) ->
-            true
-          | _ -> false)
-         "unknown window received a fabricated acknowledgement";
-       require
-         (match
-            coordinated
-              registration
-              7
-              (P.V2_ack_changes
-                 { generation = "retired-generation"
-                 ; through =
-                     (let through, _, _ = first in
-                      through)
-                 })
-          with
-          | Completed
-              (Service.Graph_response
-                 (P.V2_response { outcome = P.V2_resync_required value; _ })) ->
-            value.generation = generation
-          | _ -> false)
-         "stale generation ACK did not return the actual resync baseline";
-       let through, _, _ = first in
-       require
-         (match coordinated registration 6 (P.V2_ack_changes { generation; through }) with
-          | Completed
-              (Service.Graph_response
-                 (P.V2_response { outcome = P.V2_changes_acknowledged ack; _ })) ->
-            ack.generation = generation && ack.through = through
-          | _ -> false)
-         "owned applied window did not receive an actual ACK";
-       let second =
-         match
-           coordinated
-             registration
-             8
-             (P.V2_pull_changes { generation; after = Some through; limit = 32 })
-         with
-         | Completed
-             (Service.Graph_response (P.V2_response { outcome = P.V2_changes batch; _ }))
-           -> batch.through, batch.windows, batch.next
-         | _ -> failwith "actual change continuation failed"
-       in
-       require
-         (let second_through, windows, _ = second in
-          second_through <> through && windows <> [])
-         "ACK lost the second actual write window";
-       ignore (call (Service.Release_coordination registration));
-       let replacement = Int64.succ registration in
-       require
-         (match call (Service.Register_coordination replacement) with
-          | Completed (Service.Coordination_registered _) -> true
-          | _ -> false)
-         "replacement binding did not register";
-       require
-         (match coordinated replacement 9 pull with
-          | Completed
-              (Service.Graph_response (P.V2_response { outcome = P.V2_changes batch; _ }))
-            -> (batch.through, batch.windows, batch.next) = second
-          | _ -> false)
-         "binding retirement discarded an unapplied physical window";
-       let second_through, _, _ = second in
-       require
-         (match
-            coordinated
-              registration
-              10
-              (P.V2_ack_changes { generation; through = second_through })
-          with
-          | Failed _ -> true
-          | _ -> false)
-         "old binding consumed the replacement's retained window";
-       require
-         (match
-            coordinated
-              replacement
-              11
-              (P.V2_ack_changes { generation; through = second_through })
-          with
-          | Completed
-              (Service.Graph_response
-                 (P.V2_response { outcome = P.V2_changes_acknowledged value; _ })) ->
-            value.through = second_through
-          | _ -> false)
-         "replacement could not apply and ACK the retained window";
-       write 3000 "held retention window";
-       let held =
-         match coordinated replacement 3001 pull with
-         | Completed
-             (Service.Graph_response (P.V2_response { outcome = P.V2_changes batch; _ }))
-           -> batch.through
-         | _ -> failwith "retention fixture pull"
-       in
-       for n = 3002 to 3258 do
-         write n (Printf.sprintf "retention change %d" n)
-       done;
-       require
-         (!resyncs > 0)
-         "unacknowledged physical change windows grew without an explicit retention \
-          resync";
-       require
-         (match
-            coordinated replacement 3260 (P.V2_ack_changes { generation; through = held })
-          with
-          | Completed
-              (Service.Graph_response
-                 (P.V2_response { outcome = P.V2_resync_required _; _ })) -> true
-          | _ -> false)
-         "retention overflow fabricated ACK of discarded physical history";
-       ignore (call (Service.Release_coordination replacement)))
+  let pulses=ref 0 and resyncs=ref 0 in
+  let observe_push=function
+    |Service.Graph_push(P.V2_changes_available _)->incr pulses
+    |Graph_push(V2_resync_required_push _)->incr pulses;incr resyncs
+    |Graph_pushes values->List.iter(function
+      |_,P.V2_changes_available _->incr pulses
+      |_,P.V2_resync_required_push _->incr pulses;incr resyncs)values
+    |_->() in
+  with_observation_service ~observe_push
+    (fun client ~call ~send:_ ~wait ~replies:_ ~notices:_ ~baseline ~owner ~registration ->
+      let id n=uuid(Printf.sprintf "9d000000-0000-4000-8000-%012d" (6000+n)) in
+      let active=ref registration in
+      let query registration n query=call(query_request client !baseline owner registration(id n) ~maximum_items:32 query)in
+      let generation=match query registration 0 Read.Graph_info with
+        |Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Graph_info,Ok info);_})->info.generation
+        |_->failwith "changefeed fixture graph info"in
+      let write n title=
+        let revision=match query !active (n+100)(Read.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None})with
+          |Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_present_block{revision;_}));_})->revision
+          |_->failwith "changefeed write revision"in
+        let before= !pulses in
+        require(match call(mutation_request client !baseline owner !active ~request_id:(id n) ~mutation_id:(id n)
+          (W.Save_block{block=Test_support.authoritative_block_uuid;title;
+            preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}))with
+          |Completed(Service.Coordination_mutation_result{outcome=Logseq_db_worker_contract.Mutation_pure_wire.Committed _;_})->true
+          |_->false) "real changefeed write failed";
+        wait(fun()-> !pulses>before)in
+      let pull registration n after : Read.change_batch = match query registration n(Read.Changes{generation;after})with
+        |Completed(Service.Coordination_queried{request_id;answer=Read.Query_answer(_,Read.Changes _,Ok batch);_})->
+          require(request_id=id n) "cached Changes kept an old RPC correlation";batch
+        |_->failwith "scoped coordinated changefeed pull failed"in
+      let ack registration n batch=call(Service.Coordination_acknowledge_changes{registration;owner;request_id=id n;batch})in
+      let acknowledged registration n batch=require(match ack registration n batch with
+        |Completed(Service.Coordination_changes_acknowledged{request_id;result=Ok value;_})->
+          request_id=id n && Read.change_ack_generation value=batch.W.generation && Read.change_ack_through value=batch.through
+        |_->false) "owned applied window did not receive its actual ACK"in
+      let data(batch:W.change_batch)=batch.through,batch.windows,batch.next in
+      write 20 "Owned change window A";
+      let first=pull registration 1 None in
+      require(first.windows<>[]) "actual write produced no retained change window";
+      write 21 "Owned change window B";
+      require(data(pull registration 4 None)=data first) "unapplied batch was replaced";
+      let foreign=Int64.succ registration in
+      require(match query foreign 5(Read.Changes{generation;after=None})with Failed _->true|_->false)
+        "another binding remained an active second changefeed owner";
+      acknowledged registration 6 first;
+      acknowledged registration 7 first;
+      let second=pull registration 8(Some first.through)in
+      require(second.through<>first.through && second.windows<>[]) "ACK lost the second actual write window";
+      ignore(call(Service.Release_coordination registration));
+      let replacement=Int64.succ registration in
+      require(match call(Service.Register_coordination replacement)with
+        |Completed(Service.Coordination_registered _)->true|_->false) "replacement binding did not register";
+      active:=replacement;
+      let adopted=pull replacement 9 None in
+      require(data adopted=data second) "binding retirement discarded an unapplied physical window";
+      require(match ack registration 10 second with Failed _->true|_->false) "old binding consumed the replacement window";
+      acknowledged replacement 11 adopted;
+      write 3000 "held retention window";
+      let held=pull replacement 3001 None in
+      for n=3002 to 3258 do write n(Printf.sprintf "retention change %d" n)done;
+      require(!resyncs>0) "unacknowledged physical change windows grew without explicit resync";
+      require(match ack replacement 3260 held with
+        |Completed(Service.Coordination_changes_acknowledged{result=Error(Read.Resync_required _);_})->true
+        |_->false) "retention overflow fabricated ACK of discarded physical history";
+      let recovered=pull replacement 3261 None in
+      acknowledged replacement 3262 recovered;
+      ignore(call(Service.Release_coordination replacement)))
 ;;
 
 (* Only the real Mailbox allocates the interleaved physical IDs. Core's public
@@ -4218,6 +3840,8 @@ let test_host_recovers_only_pending_import_sources () =
 ;;
 
 let () =
+  if Array.mem "--changes-application-only" Sys.argv then (
+    test_changefeed_business_waits_for_ui_application(); print_endline "Real typed Changes application barrier passed"; exit 0);
   if Array.mem "--source-recovery-only" Sys.argv then (
     test_host_recovers_only_pending_import_sources();print_endline "Exact pending source evidence recovery passed";exit 0);
   test_host_recovers_only_pending_import_sources();
@@ -4254,8 +3878,7 @@ let () =
     test_changefeed_business_waits_for_ui_application ();
     test_host_preserves_query_origin_before_forget ();
     test_client_to_typed_read ();
-    test_read_completion_rechecks_graph_owner ();
-    test_read_completion_rechecks_graph_owner ~durable:true ());
+    test_read_completion_rechecks_graph_owner ());
   print_endline
     (if observations_only
      then "Worker coordination real observation Service passed"

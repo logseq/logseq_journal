@@ -510,13 +510,6 @@ let delete_local_copy t ~account_generation ~graph_id =
   delete_local_copy_internal t ~account_generation ~graph_id
 ;;
 
-let request t request =
-  let id = Pure_reducer.request_id_of_int64 t.next_request_id in
-  t.next_request_id <- Int64.succ t.next_request_id;
-  Effect_runner.await_reply t.runner ~id ~request ~post:(fun () ->
-    post t (Pure_reducer.Graph_request { id; request; response_budget_bytes=None }))
-;;
-
 let shutdown t =
   if not t.stopped
   then (
@@ -643,19 +636,19 @@ let retain_imported_file t ~scope ~operation =
   else Effect_runner.retain_imported_file t.runner ~scope ~operation
 ;;
 
-let request_for_scope ?response_budget_bytes t ~scope request =
+let read_for_scope t ~scope read =
   let id=Pure_reducer.request_id_of_int64 t.next_request_id in
-  t.next_request_id <- Int64.succ t.next_request_id;
-  Effect_runner.await_reply t.runner ~id ~request ~post:(fun () ->
-    post t (Pure_reducer.Graph_request_for_scope {scope;id;request;response_budget_bytes}))
+  t.next_request_id<-Int64.succ t.next_request_id;
+  Effect_runner.await_reply t.runner ~id ~read ~post:(fun()->
+    post t(Pure_reducer.Graph_request_for_scope{scope;id;read}))
+;;
 let register_observation
       t
       ~registration
       ~id
       ~scope
-      ~request
-      ~maximum_bytes
-      ~current
+      ~read
+            ~current
       ~notify
   =
   let current () =
@@ -673,16 +666,15 @@ let register_observation
     ~registration
     ~id
     ~scope
-    ~request
-    ~maximum_bytes
-    ~current
+    ~read
+        ~current
     ~notify
 ;;
 
-let refresh_observation t ~registration ~id ~scope ~request_id =
+let refresh_observation t ~registration ~id ~scope  =
   if not (coordination_current t ~registration)
   then Error "Observation binding retired"
-  else Effect_runner.refresh_observation t.runner ~registration ~id ~scope ~request_id
+  else Effect_runner.refresh_observation t.runner ~registration ~id ~scope
 ;;
 
 let observation_scope t ~registration ~id =
@@ -721,13 +713,13 @@ let coordination_presentation_current t ~registration ~presentation ~(owner:Sync
     selected.startup.account_generation=owner.startup.account_generation)
     t.coordination.state.sync.selected
 ;;
-let confirm_mutation_for_scope t ~scope ~request_id ~intent ~original ~current =
+let confirm_mutation_for_scope t ~scope ~read ~intent ~original ~current =
   let current ()=not t.stopped && current () &&
     (match Pure_reducer.graph_state_for_scope !(t.state) scope with
      | Some{phase=Graph_open;graph_id=Some id;generation;_}->
        id=scope.Sync.graph_id && generation=scope.graph_generation
      | _->false) in
-  Effect_runner.confirm_mutation t.runner ~scope ~request_id ~intent ~original ~current
+  Effect_runner.confirm_mutation t.runner ~scope ~read ~intent ~original ~current
 ;;
 
 let recover_mutations_for_scope t ~scope ~request_id ~after ~maximum_items ~maximum_bytes ~current =
@@ -746,14 +738,13 @@ let acknowledge_mutation_for_scope t ~scope ~intent ~original ~current =
   Effect_runner.acknowledge_mutation t.runner ~scope ~intent ~original ~current
 ;;
 
-let coordinated_changefeed t ~registration ~scope ~request ~maximum_bytes ~current =
-  let current ()=coordination_current t ~registration && current () &&
+let acknowledge_change_batch t ~registration ~scope ~batch ~current =
+  let current ()=coordination_current t ~registration && current() &&
     match Pure_reducer.graph_state_for_scope !(t.state) scope with
-    | Some {phase=Graph_open;graph_id=Some id;generation;_}->id=scope.Sync.graph_id && generation=scope.graph_generation
-    | _ -> false in
-  Effect_runner.coordinated_changefeed t.runner ~registration ~scope ~request ~maximum_bytes ~current
+    |Some{phase=Graph_open;graph_id=Some id;generation;_}->id=scope.Sync.graph_id && generation=scope.graph_generation
+    |_->false in
+  Effect_runner.acknowledge_change_batch t.runner ~registration ~scope ~batch ~current
 ;;
-
 let quiesce_writers t ~registration ~scope =
   if not(coordination_current t ~registration)
      || not(List.exists(fun actual->Pure_reducer.Writer_fence.same_incarnation scope actual)(Pure_reducer.graph_scopes !(t.state)))

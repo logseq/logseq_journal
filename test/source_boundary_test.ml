@@ -544,7 +544,7 @@ let test_injected_logseq_sync_api_boundary root =
     ; "module Sync_runner = Logseq_sync_effect_runner.Effect_runner"
     ; "Db.create"
     ; "Db.post"
-    ; "Db.request"
+    ; "Db.read_for_scope"
     ];
   forbid_text
     root
@@ -1045,11 +1045,11 @@ let test_deployed_managed_sync_e2e_boundary root =
     [ "https://api.logseq.io"
     ; "Service.service"
     ; "Worker_runtime.start"
-    ; "Service.Graph_request"
-    ; "V2_list_journals"
-    ; "V2_insert_blocks"
-    ; "V2_get_outline_block"
-    ; "V2_delete_blocks"
+    ; "W.Query"
+    ; "W.Journals"
+    ; "W.Insert_blocks"
+    ; "W.Outline_block"
+    ; "W.Delete_blocks"
     ; "swift/JournalE2EECrypto.swift"
     ; "LOGSEQ_JOURNAL_E2EE_TEST_FILE_KEYCHAIN"
     ; "DYLD_INSERT_LIBRARIES"
@@ -1887,7 +1887,7 @@ let () =
   require_text
     root
     "logseq_db_worker/lib/effect_runner/effect_runner.ml"
-    [ "Database.inspect_admission"; "V2_admission_outcome" ];
+    [ "Database.inspect_admission"; "|Admission->checked" ];
   forbid_text root "app/application.ml" [ "Database.inspect_admission" ];
   require_text
     root

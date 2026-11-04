@@ -1,3 +1,4 @@
+module Read = Worker_pure_read
 (* Secondary warnings must preserve the operation result and finish cleanup. *)
 let report_warning message =
   try output_string stderr message; flush stderr with _ -> ()
@@ -326,8 +327,8 @@ type dependency_error = Invalid_dependency of string
 type create_error = Invalid_create of string
 
 type waiter =
-  { request : Protocol.request
-  ; resolve : Protocol.response Eio.Promise.u
+  { read : Read.packed_query
+  ; resolve : Read.answer Eio.Promise.u
   }
 
 type asset_waiter =
@@ -374,15 +375,14 @@ type database_session =
   ; mutable changefeed : Core.Changefeed_owner.t
   }
 
-type observation_result = (int64 * Protocol.response, string) result
+type observation_result = (int64 * Worker_pure_read.answer, string) result
 
 type observation_slot =
   { registration : int64
   ; logical_id : Graph.Uuid.t
   ; observation_scope : Sync.graph_scope
   ; database_id : string
-  ; request : Protocol.request
-  ; maximum_bytes : int
+  ; read : Worker_pure_read.packed_query
   ; current : unit -> bool
   ; notify : epoch:int64 -> unit
   ; initial : observation_result Eio.Promise.t
@@ -1412,473 +1412,164 @@ let committed_outcome (commit : Overlay.local_commit) =
     }
 ;;
 
-let execute_mutation database request command =
-  match local_mutation command with
-  | Error message -> failure request Unsupported_semantics message
-  | Ok (raw_preconditions, mutation) ->
-    (match parse_preconditions raw_preconditions with
-     | Error message -> failure request Conflict message
-     | Ok expected ->
-       (match Database.commit_local database ~expected mutation with
-        | Error error -> Protocol.failed ~request_id:request.Protocol.request_id (local_commit_error error)
-        | Ok (Overlay.Local_existing (Overlay.Existing_applied commit)) ->
-          response request (committed_outcome commit)
-        | Ok (Local_existing _) ->
-          failure request Conflict "The mutation ID already has a terminal outcome."
-        | Ok (Local_committed commit) -> response request (committed_outcome commit)))
-;;
-
-let inspect_admission database request =
-  match Database.inspect_admission database with
-  | Error _ -> failure request Closed_session "Admission information is unavailable."
-  | Ok inspection ->
-    response
-      request
-      (Protocol.V2_admission_outcome
-         { active_records = inspection.active_records
-         ; active_bytes = inspection.active_bytes
-         ; protected_wire_bytes = inspection.protected_wire_bytes
-         ; retained_origin_evidence_bytes = inspection.retained_origin_evidence_bytes
-         ; maximum_records = inspection.maximum_records
-         ; maximum_bytes = inspection.maximum_bytes
-         })
-;;
-
-let read_failure ?code request error =
-  let fail default message = failure request (Option.value code ~default) message in
-  let safe_message reason source =
-    Logseq_db_types.Failure_diagnostic.of_source
-      ~operation:"workerOperation"
-      ~reason
-      source
-    |> Logseq_db_types.Failure_diagnostic.message
-  in
+let typed_read_error ?code error =
+  let fail code message = Read.Db_error(Logseq_db_worker_contract.Error.create ~code ~message ~details:[] |> Result.get_ok) in
+  let safe reason source=Logseq_db_types.Failure_diagnostic.of_source ~operation:"workerOperation" ~reason source
+    |> Logseq_db_types.Failure_diagnostic.message in
   match error with
-  | Overlay.Stale_read_cursor ->
-    fail Stale_read_cursor "The read continuation is no longer current."
-  | Invalid_read_request source -> fail Invalid_request (safe_message "invalidRequest" source)
-  | Read_limit_exceeded ->
-    fail Response_too_large "The read exceeded its resource limit."
-  | Database_closed | Snapshot_released | Snapshot_generation_invalidated ->
-    fail Closed_session "The read snapshot is no longer available."
-  | Fatal_read_state source -> fail Corrupt_storage (safe_message "fatalState" source)
+  |Overlay.Stale_read_cursor->(match code with
+    |None->Read.Stale_read "The read continuation is no longer current."
+    |Some code->fail code "The read continuation is no longer current.")
+  |Invalid_read_request source->fail (Option.value code ~default:Logseq_db_worker_contract.Error.Invalid_request) (safe "invalidRequest" source)
+  |Read_limit_exceeded->fail (Option.value code ~default:Logseq_db_worker_contract.Error.Response_too_large) "The read exceeded its resource limit."
+  |Database_closed|Snapshot_released|Snapshot_generation_invalidated->fail (Option.value code ~default:Logseq_db_worker_contract.Error.Closed_session) "The read snapshot is no longer available."
+  |Fatal_read_state source->fail (Option.value code ~default:Logseq_db_worker_contract.Error.Corrupt_storage) (safe "fatalState" source)
 ;;
 
-let read_snapshot ?snapshot ?(release_snapshot=true) ~on_enrichment_error ~response_budget_bytes database request command =
-  match (match snapshot with Some snapshot->Ok snapshot | None->Database.current_snapshot database) with
-  | Error _ -> failure request Closed_session "The graph snapshot is unavailable."
-  | Ok snapshot ->
-    Fun.protect
-      ~finally:(fun () -> if release_snapshot then Database.release_snapshot snapshot)
-      (fun () ->
-         let query_evidence query ?target items has_continuation =
-           try
-             let version = Database.snapshot_version snapshot in
-             let fields =
-               [ "stage", `String "worker-query"; "query", `String query
-               ; "request", `String (Graph.Uuid.to_string request.request_id)
-               ; "generation", `String (Overlay.Generation.to_string version.generation)
-               ; "projection", `String (Overlay.Projection_revision.to_string version.projection_revision)
-               ; "itemCount", `Int (List.length items)
-               ; "items", `List (List.take 16 items |> List.map (fun u -> `String (Graph.Uuid.to_string u)))
-               ; "hasContinuation", `Bool has_continuation
-               ; "truncated", `Bool (List.length items > 16)
-               ] @ Option.fold ~none:[] ~some:(fun u -> ["target", `String (Graph.Uuid.to_string u)]) target in
-             report_warning ("journal-timeline: " ^ Yojson.Safe.to_string (`Assoc fields) ^ "\n")
-           with _ -> ()
-         in
-         let page_read_evidence result uuid =
-           try
-             let version = Database.snapshot_version snapshot in
-             report_warning
-               ("journal-page-read: "
-                ^ Yojson.Safe.to_string
-                    (`Assoc
-                       [ "result", `String result
-                       ; "request", `String (Graph.Uuid.to_string request.request_id)
-                       ; "target", `String (Graph.Uuid.to_string uuid)
-                       ; "generation", `String (Overlay.Generation.to_string version.generation)
-                       ; "projection", `String
-                           (Overlay.Projection_revision.to_string version.projection_revision)
-                       ])
-                ^ "\n")
-           with _ -> ()
-         in
-         let titles = Hashtbl.create 16 in
-         let block_record (value : Overlay.block_record) =
-           let missing =
-             List.filter
-               (fun uuid -> not (Hashtbl.mem titles (Graph.Uuid.to_string uuid)))
-               value.block.tags
-           in
-           if missing <> []
-           then (
-             match Database.get_pages snapshot missing with
-             | Ok pages ->
-               List.iter
-                 (function
-                   | Overlay.Present_page { value; _ } ->
-                     Hashtbl.replace
-                       titles
-                       (Graph.Uuid.to_string value.page.uuid)
-                       (Some value.page.title)
-                   | Overlay.Missing_page { uuid; _ } ->
-                     Hashtbl.replace titles (Graph.Uuid.to_string uuid) None)
-                 pages
-             | Error _ -> on_enrichment_error ());
-           let tag_titles =
-             List.filter_map
-               (fun uuid ->
-                  Option.join (Hashtbl.find_opt titles (Graph.Uuid.to_string uuid)))
-               value.block.tags
-           in
-           block_record ~tag_titles value
-         in
-         let read command = match command with
-         | Protocol.V2_graph_info ->
-           (match Database.graph_info snapshot with
-            | Error error -> read_failure ~code:Corrupt_storage request error
-            | Ok info ->
-              let limits = info.Overlay.limits in
-              response
-                request
-                (Protocol.V2_graph_info_outcome
-                   { graph_uuid = info.graph_uuid
-                   ; graph_name = info.graph_name
-                   ; schema = info.schema
-                   ; admission_facts = info.admission_facts
-                   ; journal_title_format = info.journal_title_format
-                   ; limits =
-                       { response_budget_bytes = limits.response_budget_bytes
-                       ; outbox_max_records = limits.outbox_max_records
-                       ; outbox_max_bytes = limits.outbox_max_bytes
-                       ; change_max_items = limits.change_max_items
-                       ; change_max_bytes = limits.change_max_bytes
-                       ; dispatcher_capacity = limits.dispatcher_capacity
-                       ; wire_batch_max_bytes = limits.wire_batch_max_bytes
-                       }
-                   ; generation = Overlay.Generation.to_string info.version.generation
-                   ; projection_revision =
-                       Overlay.Projection_revision.to_string
-                         info.version.projection_revision
-                   }))
-         | V2_inspect_admission ->
-           failure request Invalid_request "The command is not a snapshot read."
-         | V2_list_task_statuses { limit; cursor } ->
-           (match Database.get_task_statuses snapshot ~limit ~cursor with
-            | Error error -> read_failure request error
-            | Ok result ->
-              response
-                request
-                (Protocol.V2_task_statuses_outcome
-                   { property_uuid = result.property_uuid
-                   ; default_status = result.default_status
-                   ; items = result.items
-                   ; next_cursor = result.next_cursor
-                   }))
-         | V2_get_task_status_definitions { statuses } ->
-           (match Database.get_task_status_definitions snapshot statuses with
-            | Error error -> read_failure request error
-            | Ok result ->
-              response request (Protocol.V2_task_status_definitions_outcome result))
-         | V2_list_favorites { limit; cursor } ->
-           (match Database.get_favorites snapshot ~limit ~cursor with
-            | Error error -> read_failure request error
-            | Ok result ->
-              let items =
-                List.map
-                  (fun (item : Overlay.favorite_item) ->
-                     let target =
-                       match item.target with
-                       | Overlay.Favorite_page { uuid; title; revision } ->
-                         Worker_pure_data.V2_favorite_page
-                           { uuid
-                           ; title
-                           ; revision = Overlay.Page_state_revision.to_string revision
-                           }
-                       | Overlay.Favorite_block { uuid; title; task_status; revision } ->
-                         Worker_pure_data.V2_favorite_block
-                           { uuid
-                           ; title
-                           ; task_status = Option.map task_status_to_protocol task_status
-                           ; revision = Overlay.Block_state_revision.to_string revision
-                           }
-                     in
-                     Worker_pure_data.{ membership_uuid = item.membership_uuid
-                       ; membership_order = item.membership_order
-                       ; membership_revision =
-                           Overlay.Block_state_revision.to_string item.membership_revision
-                       ; target
-                       })
-                  result.items
-              in
-              response
-                request
-                (Protocol.V2_favorites_outcome
-                   { favorites_page = result.favorites_page
-                   ; generation = Overlay.Generation.to_string result.version.generation
-                   ; projection_revision =
-                       Overlay.Projection_revision.to_string
-                         result.version.projection_revision
-                   ; items
-                   ; next_cursor = result.next_cursor
-                   }))
-         | V2_get_asset_descriptors { assets } ->
-           (match Database.get_asset_descriptors snapshot assets with
-            | Error error -> read_failure request error
-            | Ok items ->
-              let version = Database.snapshot_version snapshot in
-              response
-                request
-                (Protocol.V2_assets_outcome
-                   { items
-                   ; next_cursor = None
-                   ; generation = Overlay.Generation.to_string version.generation
-                   ; projection_revision =
-                       Overlay.Projection_revision.to_string version.projection_revision
-                   }))
-         | V2_list_assets { recursive; roots; limit; cursor } ->
-           (match
-              Database.get_assets_under_roots snapshot ~recursive ~roots ~limit ~cursor
-            with
-            | Error error -> read_failure request error
-            | Ok result ->
-              let version = Database.snapshot_version snapshot in
-              response
-                request
-                (Protocol.V2_assets_outcome
-                   { items = result.assets
-                   ; next_cursor = result.next_cursor
-                   ; generation = Overlay.Generation.to_string version.generation
-                   ; projection_revision =
-                       Overlay.Projection_revision.to_string version.projection_revision
-                   }))
-         | V2_list_journals { from_day; through_day; limit; cursor; _ } ->
-           (match
-              Database.get_journals snapshot ~from_day ~through_day ~limit ~cursor
-            with
-            | Error error -> read_failure request error
-            | Ok result ->
-              query_evidence "journals"
-                (List.map (fun (item : Overlay.journal_item) -> item.page.page.uuid) result.items)
-                (Option.is_some result.next_cursor);
-              let items =
-                result.items
-                |> List.map (fun (item : Overlay.journal_item) ->
-                  Worker_pure_data.{ page = item.page.page
-                    ; journal_day = item.journal_day
-                    ; revision = Overlay.Page_state_revision.to_string item.revision
-                    })
-              in
-              response
-                request
-                (Protocol.V2_journals_outcome { items; next_cursor = result.next_cursor }))
-         | V2_get_page { page; _ } ->
-           (match Database.get_pages snapshot [ page ] with
-            | Ok [ Overlay.Present_page { value; revision } ] ->
-              page_read_evidence "present" value.page.uuid;
-              response
-                request
-                (Protocol.V2_page_outcome
-                   (Worker_pure_data.V2_present_page
-                      { page = value.page
-                      ; revision = Overlay.Page_state_revision.to_string revision
-                      }))
-            | Ok [ Missing_page { uuid; revision } ] ->
-              page_read_evidence "missing" uuid;
-              response
-                request
-                (Protocol.V2_page_outcome
-                   (Worker_pure_data.V2_missing_page
-                      { uuid; revision = Overlay.Page_state_revision.to_string revision }))
-            | Error error -> read_failure ~code:Corrupt_storage request error
-            | Ok _ -> failure request Corrupt_storage "The page lookup failed.")
-         | V2_get_outline_block { block; _ } ->
-           (match Database.get_outline_blocks snapshot [ block ] with
-            | Ok [ Overlay.Present_block { value; revision } ] ->
-              response
-                request
-                (Protocol.V2_block_outcome
-                   (Worker_pure_data.V2_present_block
-                      { value = block_record value
-                      ; revision = Overlay.Block_state_revision.to_string revision
-                      }))
-            | Ok [ Missing_block { uuid; revision } ] ->
-              response
-                request
-                (Protocol.V2_block_outcome
-                   (Worker_pure_data.V2_missing_block
-                      { uuid; revision = Overlay.Block_state_revision.to_string revision }))
-            | Error error -> read_failure ~code:Corrupt_storage request error
-            | Ok _ -> failure request Corrupt_storage "The block lookup failed.")
-         | V2_get_outline_block_summary { block; limit; cursor } ->
-           let version = Database.snapshot_version snapshot in
-           let summary lookup page scope_revision items next_cursor =
-             response
-               request
-               (Protocol.V2_block_summary_outcome
-                  { lookup
-                  ; page
-                  ; scope_revision
-                  ; items
-                  ; next_cursor
-                  ; generation = Overlay.Generation.to_string version.generation
-                  ; projection_revision =
-                      Overlay.Projection_revision.to_string version.projection_revision
-                  })
-           in
-           if limit < 1 || limit > Worker_pure_data.maximum_page_size
-           then failure request Invalid_request "Invalid block summary limit."
-           else (
-             match Database.get_outline_blocks snapshot [ block ] with
-             | Ok [ Overlay.Missing_block { uuid; revision } ] ->
-               summary
-                 (Worker_pure_data.V2_missing_block
-                    { uuid; revision = Overlay.Block_state_revision.to_string revision })
-                 None
-                 ""
-                 []
-                 None
-             | Ok [ Overlay.Present_block { value; revision } ] ->
-               let lookup =
-                 Worker_pure_data.V2_present_block
-                   { value = block_record value
-                   ; revision = Overlay.Block_state_revision.to_string revision
-                   }
-               in
-               (match Database.get_pages snapshot [ value.block.page ] with
-                | Ok [ Overlay.Present_page { value = page; revision } ] ->
-                  let page =
-                    Some
-                      (Worker_pure_data.V2_present_page
-                         { page = page.page
-                         ; revision = Overlay.Page_state_revision.to_string revision
-                         })
-                  in
-                  (match
-                     Database.get_structure
-                       snapshot
-                       (Overlay.Children { parent = block; limit; cursor })
-                   with
-                   | Ok
-                       (Overlay.Children_result { scope_revision; items; next_cursor; _ })
-                     ->
-                     summary
-                       lookup
-                       page
-                       (Overlay.Scope_revision.to_string scope_revision)
-                       (List.map
-                          (fun (item : Overlay.child_member) ->
-                             Worker_pure_data.{ value = block_record item.block
-                               ; revision =
-                                   Overlay.Block_state_revision.to_string item.revision
-                               })
-                          items)
-                       next_cursor
-                   | Error error -> read_failure request error
-                   | Ok (Page_tree_result _) ->
-                     failure
-                       request
-                       Invalid_request
-                       "The target children query returned a page tree.")
-                | Ok [ Missing_page { uuid; revision } ] ->
-                  summary
-                    lookup
-                    (Some
-                       (Worker_pure_data.V2_missing_page
-                          { uuid
-                          ; revision = Overlay.Page_state_revision.to_string revision
-                          }))
-                    ""
-                    []
-                    None
-                | Error error -> read_failure ~code:Corrupt_storage request error
-                | Ok _ ->
-                  failure request Corrupt_storage "The target page lookup failed.")
-             | Error error -> read_failure request error
-             | Ok _ -> failure request Corrupt_storage "The target block lookup failed.")
-         | V2_get_children { parent; limit; cursor; _ } ->
-           (match
-              Database.get_structure snapshot (Overlay.Children { parent; limit; cursor })
-            with
-            | Ok
-                (Overlay.Children_result
-                   { parent; revision_scope; scope_revision; items; next_cursor }) ->
-              query_evidence "children" ~target:parent
-                (List.map (fun (item : Overlay.child_member) -> item.block.block.uuid) items)
-                (Option.is_some next_cursor);
-              response
-                request
-                (Protocol.V2_children_outcome
-                   { parent
-                   ; revision_scope = revision_scope_to_protocol revision_scope
-                   ; scope_revision = Overlay.Scope_revision.to_string scope_revision
-                   ; items =
-                       List.map
-                         (fun (item : Overlay.child_member) ->
-                            Worker_pure_data.{ value = block_record item.Overlay.block
-                              ; revision =
-                                  Overlay.Block_state_revision.to_string item.revision
-                              })
-                         items
-                   ; next_cursor
-                   })
-            | Error error -> read_failure request error
-            | Ok (Page_tree_result _) ->
-              failure request Invalid_request "The children query returned a page tree.")
-         | V2_get_page_tree { page; maximum_depth; limit; cursor; _ } ->
-           (match
-              Database.get_structure
-                snapshot
-                (Overlay.Page_tree { page; maximum_depth; limit; cursor })
-            with
-            | Ok (Overlay.Page_tree_result { page; maximum_depth; items; next_cursor }) ->
-              query_evidence "page-tree" ~target:page
-                (List.map (fun (item : Overlay.tree_member) -> item.block.block.uuid) items)
-                (Option.is_some next_cursor);
-              response
-                request
-                (Protocol.V2_page_tree_outcome
-                   { page
-                   ; maximum_depth
-                   ; items =
-                       List.map
-                         (fun (item : Overlay.tree_member) ->
-                            Worker_pure_data.{ value = block_record item.Overlay.block
-                              ; revision =
-                                  Overlay.Block_state_revision.to_string item.revision
-                              ; depth = item.depth
-                              ; parent = item.parent
-                              })
-                         items
-                   ; next_cursor
-                   })
-            | Error error -> read_failure request error
-            | Ok (Children_result _) ->
-              failure request Invalid_request "The page-tree query returned children.")
-         | V2_set_asset_reference _
-         | V2_save_block _
-         | V2_insert_blocks _
-         | V2_append_journal _
-         | V2_delete_blocks _
-         | V2_create_journal_page _
-         | V2_set_task_status _
-         | V2_clear_task_status _
-         | V2_pull_changes _
-         | V2_ack_changes _ ->
-           failure request Invalid_request "The command is not a snapshot read."
-         in
-         let budget=min response_budget_bytes Worker_pure_data.maximum_response_bytes in
-         (* Reuse this pinned snapshot and enrichment cache across bounded
-            attempts. The client budget and query identity stay unchanged;
-            storage returns a shorter complete page with its true next cursor. *)
-         let rec fit command =
-           let result=read command in
-           if Protocol.encoded_response_bytes result<=budget then result
-           else match Protocol.smaller_read_page command with
-             | Some smaller -> fit smaller
-             | None -> failure request Response_too_large "The encoded read singleton exceeded its byte limit."
-         in fit command)
+(* A single pinned snapshot supplies each canonical value, including enrichment
+   and every summary member. Changes retain their separate physical owner. *)
+let read_typed
+  : type a. ?snapshot:Database.snapshot -> ?release_snapshot:bool
+    -> maximum_bytes:int -> changes:(generation:string -> after:string option -> limit:int -> (Read.change_batch,Read.error)result)
+    -> on_enrichment_error:(unit -> unit) -> Database.t -> Read.read_budget -> a Read.query -> (a,Read.error)result
+  = fun ?snapshot ?(release_snapshot=true) ~maximum_bytes ~changes ~on_enrichment_error database budget query ->
+  let module F=Read.For_worker in
+  let owner=F.read_budget_owner budget in
+  let limit=F.read_budget_maximum_items budget in
+  let next cursor=Option.map(fun cursor->F.continuation ~owner ~budget ~key:(Read.query_key budget query) ~cursor)cursor in
+  let fail code message=Error(Read.Db_error(Logseq_db_worker_contract.Error.create ~code ~message ~details:[] |> Result.get_ok)) in
+  let checked value=Result.bind value(fun value->Result.map(fun()->value)(Read.validate_value owner budget query value)) in
+  let fit ~paged read =
+    let rec loop limit=match read limit with
+      |Ok value when Read.encoded_value_bytes query value>min maximum_bytes(F.read_budget_maximum_bytes budget)->
+        if paged && limit>1 then loop(max 1(limit/2))
+        else Error Read.Response_budget_exceeded
+      |value->checked value in
+    loop limit in
+  let with_snapshot ~paged read =
+    match (match snapshot with Some value->Ok value|None->Database.current_snapshot database) with
+    |Error _->fail Closed_session "The graph snapshot is unavailable."
+    |Ok snapshot->Fun.protect ~finally:(fun()->if release_snapshot then Database.release_snapshot snapshot)(fun()->
+      let exception Enrichment_failed of Read.error in
+      let titles=Hashtbl.create 16 in
+      let record (value:Overlay.block_record)=
+        let missing=List.filter(fun uuid->not(Hashtbl.mem titles(Graph.Uuid.to_string uuid)))value.block.tags in
+        if missing<>[] then (match Database.get_pages snapshot missing with
+          |Error error->on_enrichment_error();raise(Enrichment_failed(typed_read_error error))
+          |Ok pages->List.iter(function
+            |Overlay.Present_page{value;_}->Hashtbl.replace titles(Graph.Uuid.to_string value.page.uuid)(Some value.page.title)
+            |Missing_page{uuid;_}->Hashtbl.replace titles(Graph.Uuid.to_string uuid)None)pages);
+        let tag_titles=List.filter_map(fun uuid->Option.join(Hashtbl.find_opt titles(Graph.Uuid.to_string uuid)))value.block.tags in
+        block_record ~tag_titles value in
+      try fit ~paged (read snapshot record) with Enrichment_failed error->Error error) in
+  Result.bind(Read.checked_query owner budget query)(fun cursor->(
+    let page_lookup = function
+      |Overlay.Present_page{value;revision}->Worker_pure_data.V2_present_page{page=value.page;revision=Overlay.Page_state_revision.to_string revision}
+      |Missing_page{uuid;revision}->V2_missing_page{uuid;revision=Overlay.Page_state_revision.to_string revision} in
+    let block_lookup record = function
+      |Overlay.Present_block{value;revision}->Worker_pure_data.V2_present_block{value=record value;revision=Overlay.Block_state_revision.to_string revision}
+      |Missing_block{uuid;revision}->V2_missing_block{uuid;revision=Overlay.Block_state_revision.to_string revision} in
+    match query with
+    |Read.Changes{generation;after}->fit ~paged:true (fun limit->changes ~generation ~after ~limit)
+    |Admission->checked(match Database.inspect_admission database with
+      |Error _->fail Closed_session "Admission information is unavailable."
+      |Ok value->Ok Worker_pure_data.{active_records=value.active_records;active_bytes=value.active_bytes;
+        protected_wire_bytes=value.protected_wire_bytes;retained_origin_evidence_bytes=value.retained_origin_evidence_bytes;
+        maximum_records=value.maximum_records;maximum_bytes=value.maximum_bytes})
+    |Graph_info->with_snapshot ~paged:false (fun snapshot _ _->match Database.graph_info snapshot with
+      |Error error->Error(typed_read_error ~code:Corrupt_storage error)
+      |Ok info->let limits=info.Overlay.limits in Ok(F.graph_info ~graph_uuid:info.graph_uuid ~graph_name:info.graph_name
+        ~schema:info.schema ~admission_facts:info.admission_facts ~journal_title_format:info.journal_title_format
+        ~limits:Worker_pure_data.{response_budget_bytes=limits.response_budget_bytes;outbox_max_records=limits.outbox_max_records;
+          outbox_max_bytes=limits.outbox_max_bytes;change_max_items=limits.change_max_items;change_max_bytes=limits.change_max_bytes;
+          dispatcher_capacity=limits.dispatcher_capacity;wire_batch_max_bytes=limits.wire_batch_max_bytes}
+        ~generation:(Overlay.Generation.to_string info.version.generation)
+        ~projection_revision:(Overlay.Projection_revision.to_string info.version.projection_revision)))
+    |Journal day->with_snapshot ~paged:false (fun snapshot _ _->
+      let day=F.journal_day_value day in match Database.get_journals snapshot ~from_day:day ~through_day:day ~limit:1 ~cursor:None with
+      |Error error->Error(typed_read_error error)
+      |Ok{items=[];next_cursor=None}->Ok None
+      |Ok{items=[item];next_cursor=None} when item.journal_day=day->Ok(Some(F.page ~data:item.page.page ~revision:(Overlay.Page_state_revision.to_string item.revision)))
+      |Ok _->Error(Read.Protocol_mismatch "Response does not match the typed query"))
+    |Journals{from_day;through_day;_}->with_snapshot ~paged:true (fun snapshot _ limit->
+      Database.get_journals snapshot ~from_day:(F.journal_day_value from_day) ~through_day:(F.journal_day_value through_day) ~limit ~cursor
+      |> Result.map_error typed_read_error
+      |> Result.map(fun (result:Overlay.journal_list_result)->F.slice ~items:(List.map(fun(item:Overlay.journal_item)->Worker_pure_data.{page=item.page.page;
+        journal_day=item.journal_day;revision=Overlay.Page_state_revision.to_string item.revision})result.items) ~next:(next result.next_cursor)))
+    |Page{uuid;_}->with_snapshot ~paged:false (fun snapshot _ _->match Database.get_pages snapshot[uuid]with
+      |Error error->Error(typed_read_error ~code:Corrupt_storage error)
+      |Ok[value]->Ok(page_lookup value)
+      |Ok _->fail Corrupt_storage "The page lookup failed.")
+    |Outline_block{uuid;_}->with_snapshot ~paged:false (fun snapshot record _->match Database.get_outline_blocks snapshot[uuid]with
+      |Error error->Error(typed_read_error ~code:Corrupt_storage error)
+      |Ok[value]->Ok(block_lookup record value)
+      |Ok _->fail Corrupt_storage "The block lookup failed.")
+    |Block_summary{block;_}->with_snapshot ~paged:true(fun snapshot record limit->
+      let version=Database.snapshot_version snapshot in
+      let summary lookup page scope_revision items next_cursor=Ok(F.block_summary ~lookup ~page ~scope_revision ~items ~next:(next next_cursor)
+        ~generation:(Overlay.Generation.to_string version.generation) ~projection_revision:(Overlay.Projection_revision.to_string version.projection_revision))in
+      match Database.get_outline_blocks snapshot[block]with
+      |Error error->Error(typed_read_error error)
+      |Ok[Overlay.Missing_block _ as value]->summary(block_lookup record value)None "" [] None
+      |Ok[Present_block{value;_}as original]->
+        let lookup=block_lookup record original in
+        (match Database.get_pages snapshot[value.block.page]with
+         |Error error->Error(typed_read_error ~code:Corrupt_storage error)
+         |Ok[Missing_page _ as page]->summary lookup(Some(page_lookup page))""[]None
+         |Ok[Present_page _ as page]->
+           (match Database.get_structure snapshot(Overlay.Children{parent=block;limit;cursor})with
+            |Error error->Error(typed_read_error error)
+            |Ok(Page_tree_result _)->fail Invalid_request "The target children query returned a page tree."
+            |Ok(Children_result{scope_revision;items;next_cursor;_})->summary lookup(Some(page_lookup page))
+              (Overlay.Scope_revision.to_string scope_revision)
+              (List.map(fun(item:Overlay.child_member)->Worker_pure_data.{value=record item.block;revision=Overlay.Block_state_revision.to_string item.revision})items)next_cursor)
+         |Ok _->fail Corrupt_storage "The target page lookup failed.")
+      |Ok _->fail Corrupt_storage "The target block lookup failed.")
+    |Children{parent;_}->with_snapshot ~paged:true(fun snapshot record limit->
+      match Database.get_structure snapshot(Overlay.Children{parent;limit;cursor})with
+      |Error error->Error(typed_read_error error)
+      |Ok(Page_tree_result _)->fail Invalid_request "The children query returned a page tree."
+      |Ok(Children_result{items;next_cursor;_})->Ok(F.slice
+        ~items:(List.map(fun(item:Overlay.child_member)->F.block ~data:(record item.block) ~revision:(Overlay.Block_state_revision.to_string item.revision))items)
+        ~next:(next next_cursor)))
+    |Child_members{parent;_}->with_snapshot ~paged:true(fun snapshot record limit->
+      match Database.get_structure snapshot(Overlay.Children{parent;limit;cursor})with
+      |Error error->Error(typed_read_error error)
+      |Ok(Page_tree_result _)->fail Invalid_request "The children query returned a page tree."
+      |Ok(Children_result{parent;revision_scope;scope_revision;items;next_cursor})->Ok(F.children ~parent
+        ~revision_scope:(revision_scope_to_protocol revision_scope) ~scope_revision:(Overlay.Scope_revision.to_string scope_revision)
+        ~items:(List.map(fun(item:Overlay.child_member)->Worker_pure_data.{value=record item.block;revision=Overlay.Block_state_revision.to_string item.revision})items)
+        ~next:(next next_cursor)))
+    |Tree{page;maximum_depth;_}->with_snapshot ~paged:true(fun snapshot record limit->
+      match Database.get_structure snapshot(Overlay.Page_tree{page;maximum_depth;limit;cursor})with
+      |Error error->Error(typed_read_error error)
+      |Ok(Children_result _)->fail Invalid_request "The page-tree query returned children."
+      |Ok(Page_tree_result{items;next_cursor;_})->Ok(F.slice
+        ~items:(List.map(fun(item:Overlay.tree_member)->Worker_pure_data.{value=record item.block;revision=Overlay.Block_state_revision.to_string item.revision;
+          depth=item.depth;parent=item.parent})items) ~next:(next next_cursor)))
+    |Favorites _->with_snapshot ~paged:true(fun snapshot _ limit->
+      Database.get_favorites snapshot ~limit ~cursor |>Result.map_error typed_read_error |>Result.map(fun (result:Overlay.favorites_result)->
+        let items=List.map(fun(item:Overlay.favorite_item)->
+          let target=match item.target with
+            |Overlay.Favorite_page{uuid;title;revision}->Worker_pure_data.V2_favorite_page{uuid;title;revision=Overlay.Page_state_revision.to_string revision}
+            |Favorite_block{uuid;title;task_status;revision}->V2_favorite_block{uuid;title;task_status=Option.map task_status_to_protocol task_status;
+              revision=Overlay.Block_state_revision.to_string revision}in
+          Worker_pure_data.{membership_uuid=item.membership_uuid;membership_order=item.membership_order;
+            membership_revision=Overlay.Block_state_revision.to_string item.membership_revision;target})result.items in
+        F.favorites ~favorites_page:result.favorites_page ~items ~next:(next result.next_cursor)
+          ~generation:(Overlay.Generation.to_string result.version.generation) ~projection_revision:(Overlay.Projection_revision.to_string result.version.projection_revision)))
+    |Task_statuses _->with_snapshot ~paged:true(fun snapshot _ limit->
+      Database.get_task_statuses snapshot ~limit ~cursor |>Result.map_error typed_read_error |>Result.map(fun (result:Overlay.task_status_catalog_result)->
+        F.task_status_catalog ~property_uuid:result.property_uuid ~default_status:result.default_status ~items:result.items ~next:(next result.next_cursor)))
+    |Task_status_definitions ids->with_snapshot ~paged:false(fun snapshot _ _->Database.get_task_status_definitions snapshot ids |>Result.map_error typed_read_error)
+    |Asset_descriptors ids->with_snapshot ~paged:false(fun snapshot _ _->
+      Database.get_asset_descriptors snapshot ids |>Result.map_error typed_read_error |>Result.map(fun items->
+        let version=Database.snapshot_version snapshot in F.asset_listing ~items ~next:None
+          ~generation:(Overlay.Generation.to_string version.generation) ~projection_revision:(Overlay.Projection_revision.to_string version.projection_revision)))
+    |Assets{recursive;roots;_}->with_snapshot ~paged:true(fun snapshot _ limit->
+      Database.get_assets_under_roots snapshot ~recursive ~roots ~limit ~cursor |>Result.map_error typed_read_error |>Result.map(fun (result:Database.asset_page)->
+        let version=Database.snapshot_version snapshot in F.asset_listing ~items:result.assets ~next:(next result.next_cursor)
+          ~generation:(Overlay.Generation.to_string version.generation) ~projection_revision:(Overlay.Projection_revision.to_string version.projection_revision))) : (a,Read.error)result))
 ;;
 
 let index_after session cursor =
@@ -1898,101 +1589,27 @@ let index_after session cursor =
       session.windows)
 ;;
 
-let cursor_resync session request reason =
-  response
-    request
-    (Protocol.V2_resync_required { generation = session.generation; reason })
-;;
-
-let pull_changes session request generation after limit =
-  if not (String.equal generation session.generation)
-  then cursor_resync session request "generationChanged"
-  else (
-    let start =
-      match after with
-      | None -> Some 0
-      | Some cursor -> index_after session cursor
-    in
-    match start with
-    | None -> cursor_resync session request "changeCursorUnavailable"
-    | Some start ->
-      let available = Rrbvec.length session.windows - start in
-      let count = min (max 0 limit) available in
-      let selected = Rrbvec.subvec session.windows start (start + count) |> Option.get in
-      let through =
-        match Rrbvec.peek_back_opt selected with
-        | Some window -> window.id
-        | None -> Option.value after ~default:session.acknowledged_through
-      in
-      let next = if count < available then Some through else None in
-      response
-        request
-        (Protocol.V2_changes
-           { generation
-           ; from_exclusive = after
-           ; through
-           ; next
-           ; windows =
-               Rrbvec.fold_right
-                 (fun (window : change_window) rest ->
-                    Worker_pure_data.{ id = window.id
-                      ; predecessor = window.predecessor
-                      ; successor = window.successor
-                      ; block_uuids = window.block_uuids
-                      ; page_uuids = window.page_uuids
-                      ; structure_interests = window.structure_interests
-                      }
-                    :: rest)
-                 selected
-                 []
-           }))
-;;
-
-let acknowledge_changes session request generation through =
-  if not (String.equal generation session.generation)
-  then cursor_resync session request "generationChanged"
-  else (
-    match index_after session through with
-    | None -> cursor_resync session request "changeCursorUnavailable"
-    | Some start ->
-      let removed=Rrbvec.subvec session.windows 0 start |> Option.get in
-      let encoded_bytes=Rrbvec.fold_left(fun total window->total+window.encoded_bytes)0 removed in
-      session.changefeed<-Core.Changefeed_owner.release_windows session.changefeed ~count:start ~encoded_bytes;
-      session.windows
-      <- Rrbvec.subvec session.windows start (Rrbvec.length session.windows) |> Option.get;
-      session.acknowledged_through <- through;
-      response request (Protocol.V2_changes_acknowledged { generation; through }))
-;;
-
-let execute_database ~on_enrichment_error session ~response_budget_bytes request =
-  match request.Protocol.command with
-  | Protocol.V2_pull_changes { generation; after; limit } ->
-    if Core.Changefeed_owner.legacy session.changefeed then pull_changes session request generation after limit
-    else failure request Invalid_request "The changefeed is owned by the registered coordinator."
-  | V2_ack_changes { generation; through } ->
-    if Core.Changefeed_owner.legacy session.changefeed then acknowledge_changes session request generation through
-    else failure request Invalid_request "The changefeed is owned by the registered coordinator."
-  | V2_append_journal _ ->
-    failure request Unsupported_semantics "Atomic Append requires a registered durable intent."
-  | V2_inspect_admission ->
-    let result=inspect_admission session.database request in
-    if Protocol.encoded_response_bytes result<=min response_budget_bytes Worker_pure_data.maximum_response_bytes
-    then result else failure request Response_too_large "The encoded admission result exceeded its byte limit."
-  | ( V2_set_asset_reference _
-    | V2_save_block _
-    | V2_insert_blocks _
-    | V2_delete_blocks _
-    | V2_create_journal_page _
-    | V2_set_task_status _
-    | V2_clear_task_status _ ) as command ->
-    execute_mutation session.database request command
-  | command ->
-    read_snapshot ~on_enrichment_error ~response_budget_bytes session.database request command
+let pull_typed_changes session owner ~generation ~after ~limit =
+  if generation<>session.generation then Error(Read.Resync_required "generationChanged") else
+  let start=match after with None->Some 0|Some cursor->index_after session cursor in
+  match start with
+  |None->Error(Read.Resync_required "changeCursorUnavailable")
+  |Some start->
+    let available=Rrbvec.length session.windows-start in
+    let count=min limit available in
+    let windows=Rrbvec.subvec session.windows start(start+count) |> Option.get in
+    let through=match Rrbvec.peek_back_opt windows with
+      |Some window->window.id|None->Option.value after ~default:session.acknowledged_through in
+    let items=Rrbvec.fold_right(fun(window:change_window) rest->Worker_pure_data.{id=window.id;
+      predecessor=window.predecessor;successor=window.successor;block_uuids=window.block_uuids;
+      page_uuids=window.page_uuids;structure_interests=window.structure_interests}::rest)windows [] in
+    Ok(Read.For_worker.change_batch ~change_owner:owner ~generation ~from_exclusive:after ~through
+      ~windows:items ~next:(if count<available then Some through else None))
 ;;
 
 let observation_alive t slot = (not t.stopped) && (not slot.closing) && slot.current ()
 
-let sample_observation ?snapshot t slot request =
+let sample_observation ?snapshot t slot =
   Fun.protect
     ~finally:(fun () -> Option.iter Database.release_snapshot snapshot)
     (fun () ->
@@ -2002,17 +1619,11 @@ let sample_observation ?snapshot t slot request =
          if not (observation_alive t slot)
          then Error "Observation execution was retired"
          else (
-           let response =
-             read_snapshot
-               ?snapshot
-               ~release_snapshot:(Option.is_none snapshot)
-               ~on_enrichment_error:(fun _ -> ())
-               ~response_budget_bytes:
-                 (min slot.maximum_bytes t.dependencies.config.response_budget_bytes)
-               session.database
-               request
-               request.Protocol.command
-           in
+           let Read.Read_query(budget,query)=slot.read in
+           let owner=Read.For_worker.read_budget_owner budget in
+           let response=Read.For_worker.answer budget query (read_typed ?snapshot
+             ~release_snapshot:(Option.is_none snapshot) ~maximum_bytes:t.dependencies.config.response_budget_bytes
+             ~changes:(pull_typed_changes session owner) ~on_enrichment_error:(fun()->()) session.database budget query) in
            if observation_alive t slot
            then Ok response
            else Error "Observation execution was retired"))
@@ -2036,15 +1647,13 @@ let register_observation
       ~registration
       ~id
       ~scope
-      ~request
-      ~maximum_bytes
+      ~read
       ~current
       ~notify
   =
   if
     t.stopped
     || (not (current ()))
-    || request.Protocol.api_version <> Protocol.api_version
   then Error "Observation execution is not current"
   else (
     let next, decision =
@@ -2053,8 +1662,7 @@ let register_observation
         ~registration
         ~id
         ~scope
-        ~command:request.command
-        ~maximum_bytes
+        ~read
     in
     t.observation_registry <- next;
     match decision with
@@ -2062,8 +1670,6 @@ let register_observation
       (match Hashtbl.find_opt t.observation_slots (registration, id) with
        | Some slot ->
          Eio.Promise.await slot.initial
-         |> Result.map (fun (epoch, Protocol.V2_response response) ->
-           epoch, Protocol.V2_response { response with request_id = request.request_id })
        | None -> Error "Observation allocation is unavailable")
     | Retired | Mismatch | Full | Invalid -> Error "Observation registration was refused"
     | Start ->
@@ -2078,8 +1684,7 @@ let register_observation
            ; logical_id = id
            ; observation_scope = scope
            ; database_id
-           ; request
-           ; maximum_bytes
+           ; read
            ; current
            ; notify
            ; initial
@@ -2115,7 +1720,7 @@ let register_observation
                          | Error _ -> Error "Observation listener could not register"
                          | Ok (subscription, snapshot) ->
                            slot.subscription <- Some subscription;
-                           (match sample_observation ~snapshot t slot request with
+                           (match sample_observation ~snapshot t slot with
                             | Error _ as error -> error
                             | Ok response ->
                               (match
@@ -2129,7 +1734,7 @@ let register_observation
                     | _ -> Error "Observation registration failed");
                 !result))))
 ;;
-let refresh_observation t ~registration ~id ~scope ~request_id =
+let refresh_observation t ~registration ~id ~scope =
   match Hashtbl.find_opt t.observation_slots (registration, id) with
   | None -> Error "Observation registration is not active"
   | Some slot ->
@@ -2139,8 +1744,7 @@ let refresh_observation t ~registration ~id ~scope ~request_id =
         ~registration
         ~id
         ~scope
-        ~command:slot.request.command
-        ~maximum_bytes:slot.maximum_bytes
+        ~read:slot.read
     in
     if decision <> Core.Observation_registry.Existing
     then Error "Observation owner mismatch"
@@ -2163,7 +1767,7 @@ let refresh_observation t ~registration ~id ~scope ~request_id =
              ~finally:(fun () -> observation_work_finish slot)
              (fun () ->
                 let outcome =
-                  sample_observation t slot { slot.request with request_id }
+                  sample_observation t slot
                 in
                 match outcome with
                 | Ok response
@@ -2186,49 +1790,59 @@ let attached_session t scope =
 let retire_changefeed t ~registration =
   Hashtbl.iter(fun _ session->session.changefeed<-Core.Changefeed_owner.retire session.changefeed ~registration) t.databases
 ;;
-let coordinated_changefeed t ~registration ~scope ~request ~maximum_bytes ~current =
-  if t.stopped || not(current ()) || request.Protocol.api_version<>Protocol.api_version
-      || maximum_bytes<=0 || maximum_bytes>Worker_pure_data.maximum_response_bytes
-  then Error "The registered changefeed execution is unavailable"
-  else match attached_session t scope with
-  | None -> Error "The scoped changefeed database is no longer attached"
-  | Some session ->
-    let state,claimed=Core.Changefeed_owner.claim session.changefeed ~registration in
-    session.changefeed<-state;
-    if not claimed then Error "Another registration still owns the changefeed" else
-    let generation=match request.command with
-      | Protocol.V2_pull_changes query->Some query.generation
-      | V2_ack_changes query->Some query.generation
-      | _->None in
-    if Option.exists(fun generation->generation<>session.generation) generation
-    then Ok(cursor_resync session request "generationChanged") else
-    match request.command with
-    | Protocol.V2_pull_changes query ->
-      if query.generation<>session.generation then Ok(cursor_resync session request "generationChanged") else
-      (match Core.Changefeed_owner.pull state ~registration ~request ~maximum_bytes with
-       | Refused->Error "The pending changefeed batch must be applied and acknowledged first"
-       | Cached response->Ok response
-       | Read ->
-         let rec fit limit =
-           let response=pull_changes session request query.generation query.after limit in
-           if Protocol.encoded_response_bytes response<=maximum_bytes then response
-           else if limit>1 then fit(max 1(limit/2)) else
-             failure request Response_too_large "The change window exceeds its encoded-byte budget" in
-         let response=fit query.limit in
-         (match response with
-          | Protocol.V2_response{outcome=Protocol.V2_changes _;_}->
-            Result.map(fun state->session.changefeed<-state;response)
-              (Core.Changefeed_owner.remember state ~registration ~request ~maximum_bytes response)
-          | _ -> Ok response))
-    | V2_ack_changes _ when Core.Changefeed_owner.needs_resync state ->
-      Ok(cursor_resync session request "changeHistoryInvalidated")
-    | V2_ack_changes query when Core.Changefeed_owner.may_ack state ~registration
-        ~generation:query.generation ~through:query.through ->
-      let response=acknowledge_changes session request query.generation query.through in
-      session.changefeed<-Core.Changefeed_owner.acknowledged session.changefeed ~registration ~request response;
-      Ok response
-    | V2_ack_changes _ -> Error "The changefeed ACK is not backed by this owner's delivered batch"
-    | _ -> Error "This operation is not Changes or its ACK"
+let execute_typed_read t session (Read.Read_query(budget,query) as read) =
+  let owner=Read.For_worker.read_budget_owner budget in
+  let registration=Read.For_worker.binding_serial(Read.For_worker.session_binding owner) in
+  let execute : type a. a Read.query -> (a,Read.error)result = fun query ->
+    if not(Read.matches_asset_scope owner session.graph_scope) then Error Read.Revoked_session
+    else match Read.validate_query owner budget query with
+    |Error error->Error error
+    |Ok()->
+      let changes ~generation ~after ~limit = pull_typed_changes session owner ~generation ~after ~limit in
+      let perform ()=read_typed ~maximum_bytes:t.dependencies.config.response_budget_bytes ~changes
+        ~on_enrichment_error:(fun()->report_current_graph t session.graph_scope "worker.readTagTitles")
+        session.database budget query in
+      match query with
+      |Read.Changes _->
+        let state,claimed=Core.Changefeed_owner.claim session.changefeed ~registration in
+        session.changefeed<-state;
+        if not claimed then Error(Read.Service_failed "Another registration still owns the changefeed") else
+        (match Core.Changefeed_owner.pull state ~registration ~read with
+         |Refused->Error(Read.Service_failed "The pending changefeed batch must be applied and acknowledged first")
+         |Cached batch->Ok batch
+         |Read->Result.bind(perform())(fun batch->
+           match Core.Changefeed_owner.remember state ~registration ~read batch with
+           |Ok next->session.changefeed<-next;Ok batch
+           |Error message->Error(Read.Protocol_mismatch message)))
+      |_->perform() in
+  Read.For_worker.answer budget query (execute query)
+;;
+let acknowledge_change_batch t ~registration ~scope ~(batch:Read.change_batch) ~current =
+  let owner=Read.change_batch_session batch in
+  if t.stopped || not(current()) || not(Read.matches_asset_scope owner scope)
+     || Read.For_worker.binding_serial(Read.For_worker.session_binding owner)<>registration
+  then Error Read.Revoked_session else
+  match reserve_writer t scope with
+  |Error message->Error(Read.Service_failed message)
+  |Ok job->Fun.protect ~finally:(fun()->finish_writer t job)(fun()->match attached_session t scope with
+    |None->Error Read.Revoked_session
+    |Some session->
+      let state=session.changefeed in
+      if batch.generation<>session.generation then Error(Read.Resync_required "generationChanged")
+      else if Core.Changefeed_owner.needs_resync state then Error(Read.Resync_required "changeHistoryInvalidated")
+      else if not(Core.Changefeed_owner.may_ack state ~registration ~generation:batch.generation ~through:batch.through)
+      then Error(Read.Service_failed "The changefeed ACK is not backed by this owner's delivered batch")
+      else match index_after session batch.through with
+      |None->Error(Read.Resync_required "changeCursorUnavailable")
+      |Some start->
+        let removed=Rrbvec.subvec session.windows 0 start |> Option.get in
+        let encoded_bytes=Rrbvec.fold_left(fun total window->total+window.encoded_bytes)0 removed in
+        session.changefeed<-Core.Changefeed_owner.release_windows state ~count:start ~encoded_bytes;
+        session.windows<-Rrbvec.subvec session.windows start(Rrbvec.length session.windows)|>Option.get;
+        session.acknowledged_through<-batch.through;
+        session.changefeed<-Core.Changefeed_owner.acknowledged session.changefeed ~registration
+          ~generation:batch.generation ~through:batch.through;
+        Ok(Read.For_worker.change_ack ~ack_owner:owner ~generation:batch.generation ~through:batch.through))
 ;;
 
 let run_durable_mutation t ~(scope:Sync.graph_scope) ~request_id ~intent ~current =
@@ -2316,91 +1930,43 @@ let durable_mutation t ~scope ~request_id ~intent ~current =
         Eio.Promise.await promise)
 ;;
 
-let confirm_mutation_unfenced t ~(scope : Sync.graph_scope) ~request_id ~intent ~original ~current =
-  let module Wire = Logseq_db_worker_contract.Mutation_pure_wire in
-  let request command =
-    { Protocol.api_version = Protocol.api_version; request_id; command }
-  in
-  let fail message = failure (request Protocol.V2_graph_info) Conflict message in
-  match
-    Wire.restore
-      ~origin:scope.account.managed_sync_origin
-      ~user:scope.account.user_id
-      ~graph:scope.graph_id
-      intent
-  with
-  | Error message -> fail message
-  | Ok wire ->
-    if t.stopped || not (current ())
-    then fail "The confirmation presentation retired."
-    else (
-      match attached_session t scope with
-      | None -> fail "The scoped database is no longer attached."
-      | Some session ->
-        let checked =
-          Result.bind
-            (Database.find_local_intent
-               session.database
-               ~namespace:(Wire.namespace wire)
-               ~mutation_id:(Wire.mutation_id wire))
-            (function
-              | None -> Error Overlay.Mutation_identity_conflict
-              | Some prepared when Database.local_intent_payload prepared <> intent ->
-                Error Overlay.Mutation_identity_conflict
-              | Some prepared -> Database.inspect_local_intent session.database prepared)
-        in
-        (match checked with
-         | Ok (Database.Intent_committed proof) ->
-           let commit = Database.intent_commit_outcome proof in
-           let actual =
-             ( Overlay.Generation.to_string commit.generation
-             , Overlay.Projection_revision.to_string commit.before_projection_revision
-             , Overlay.Projection_revision.to_string commit.after_projection_revision )
-           in
-           if actual <> original || not (current ())
-           then fail "The original commit evidence does not match."
-           else (
-             let command =
-               match Wire.command wire with
-               | Protocol.V2_append_journal{root;_}->
-                 Protocol.V2_get_outline_block_summary{block=root.block_id;limit=Worker_pure_data.default_page_size;cursor=None}
-               | Protocol.V2_create_journal_page { page; _ } ->
-                 Protocol.V2_get_page { page; revision = None }
-               | V2_insert_blocks { roots = root :: _; _ } ->
-                 V2_get_outline_block_summary
-                   { block = root.uuid
-                   ; limit = Worker_pure_data.default_page_size
-                   ; cursor = None
-                   }
-               | V2_save_block { block; _ }
-               | V2_set_task_status { block; _ }
-               | V2_clear_task_status { block; _ }
-               | V2_set_asset_reference { block; _ } ->
-                 V2_get_outline_block_summary
-                   { block; limit = Worker_pure_data.default_page_size; cursor = None }
-               | V2_delete_blocks { root; _ } ->
-                 V2_get_outline_block_summary
-                   { block = root; limit = Worker_pure_data.default_page_size; cursor = None }
-               | _ -> assert false
-             in
-             let result =
-               execute_database
-                 ~on_enrichment_error:(fun _ -> ())
-                 session
-                 ~response_budget_bytes:t.dependencies.config.response_budget_bytes
-                 (request command)
-             in
-             if current ()
-             then result
-             else fail "The confirmation presentation retired during readback.")
-         | _ -> fail "No immutable original commit evidence is available."))
+let confirm_mutation_unfenced t ~(scope:Sync.graph_scope) ~read:(Read.Read_query(budget,query) as read) ~intent ~original ~current =
+  let module Wire=Logseq_db_worker_contract.Mutation_pure_wire in
+  let fail message=Read.For_worker.answer budget query(Error(Read.Db_error
+    (Logseq_db_worker_contract.Error.create ~code:Conflict ~message ~details:[]|>Result.get_ok)))in
+  match Wire.restore ~origin:scope.account.managed_sync_origin ~user:scope.account.user_id ~graph:scope.graph_id intent with
+  |Error message->fail message
+  |Ok wire->
+    if t.stopped || not(current())then fail "The confirmation presentation retired."else
+    match attached_session t scope with
+    |None->fail "The scoped database is no longer attached."
+    |Some session->
+      let target_matches=match Wire.readback_target wire,query with
+        |`Page target,Read.Page{uuid;revision=None}->target=uuid
+        |`Block target,Read.Block_summary{block;after=None}->target=block
+        |_->false in
+      if not target_matches then fail "The canonical readback target does not match the intent."else
+      let checked=Result.bind(Database.find_local_intent session.database ~namespace:(Wire.namespace wire)
+        ~mutation_id:(Wire.mutation_id wire))(function
+        |None->Error Overlay.Mutation_identity_conflict
+        |Some prepared when Database.local_intent_payload prepared<>intent->Error Overlay.Mutation_identity_conflict
+        |Some prepared->Database.inspect_local_intent session.database prepared)in
+      match checked with
+      |Ok(Database.Intent_committed proof)->
+        let commit=Database.intent_commit_outcome proof in
+        let actual=Overlay.Generation.to_string commit.generation,
+          Overlay.Projection_revision.to_string commit.before_projection_revision,
+          Overlay.Projection_revision.to_string commit.after_projection_revision in
+        if actual<>original || not(current())then fail "The original commit evidence does not match."else
+        let answer=execute_typed_read t session read in
+        if current()then answer else fail "The confirmation presentation retired during readback."
+      |_->fail "No immutable original commit evidence is available."
 ;;
-
-let confirm_mutation t ~scope ~request_id ~intent ~original ~current =
+let confirm_mutation t ~scope ~read:(Read.Read_query(budget,query) as read) ~intent ~original ~current =
   match reserve_writer t scope with
-  |Error message->failure {Protocol.api_version=Protocol.api_version;request_id;command=Protocol.V2_graph_info} Conflict message
+  |Error message->Read.For_worker.answer budget query(Error(Read.Service_failed message))
   |Ok job->Fun.protect ~finally:(fun()->finish_writer t job)
-    (fun()->confirm_mutation_unfenced t ~scope ~request_id ~intent ~original ~current)
+    (fun()->confirm_mutation_unfenced t ~scope ~read ~intent ~original ~current)
 ;;
 
 let recover_mutations_unfenced t ~(scope:Sync.graph_scope) ~request_id ~after ~maximum_items ~maximum_bytes ~current =
@@ -3230,18 +2796,10 @@ let run_request t (type a) (request : a Core.runner_request)
   : (a, Core.effect_error) result
   =
   match request with
-  | Core.Execute_request { database; request; response_budget_bytes } ->
+  | Core.Execute_request { database; read } ->
     (match Hashtbl.find_opt t.databases (Core.database_handle_id database) with
      | None -> Error (effect_error "The overlay database is unavailable.")
-     | Some session ->
-       Ok
-         (execute_database
-            ~on_enrichment_error:(fun () ->
-              report_current_graph t session.graph_scope "worker.readTagTitles")
-            session
-            ~response_budget_bytes:(Option.fold ~none:t.dependencies.config.response_budget_bytes
-              ~some:(min t.dependencies.config.response_budget_bytes) response_budget_bytes)
-            request))
+     | Some session -> Ok(execute_typed_read t session read))
   | Close_database database -> close_database_by_id t (Core.database_handle_id database)
   | Handle_sync_worker_effect worker_effect -> handle_sync_worker_effect t worker_effect
 ;;
@@ -3978,11 +3536,11 @@ let submit t = function
   | Publish output -> if not t.stopped then t.dependencies.publish output
 ;;
 
-let await_reply t ~id ~request ~post =
+let await_reply t ~id ~read ~post =
   let promise, resolve = Eio.Promise.create () in
   let key = Core.request_id_to_int64 id in
   Eio.Mutex.use_rw ~protect:true t.waiter_lock (fun () ->
-    Hashtbl.replace t.waiters key { request; resolve });
+    Hashtbl.replace t.waiters key { read; resolve });
   post ();
   let response = Eio.Promise.await promise in
   Eio.Mutex.use_rw ~protect:true t.waiter_lock (fun () -> Hashtbl.remove t.waiters key);
@@ -4016,7 +3574,8 @@ let shutdown t =
     Eio.Mutex.use_rw ~protect:true t.waiter_lock (fun () ->
       Hashtbl.iter
         (fun _ (waiter : waiter) ->
-           let response = failure waiter.request Closed_session "The Worker stopped." in
+           let Read.Read_query(budget,query)=waiter.read in
+           let response=Read.For_worker.answer budget query (Error(Read.Service_failed "The Worker stopped.")) in
            Eio.Promise.resolve waiter.resolve response)
         t.waiters;
       Hashtbl.clear t.waiters))

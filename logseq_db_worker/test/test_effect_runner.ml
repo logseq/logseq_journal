@@ -2801,28 +2801,27 @@ let test_authoritative_rejection_diagnostics kind () =
                  ((Core.view !state).sync.snapshot.applied_server_t = Some (cursor 0L));
                (match kind with
                 | `Integrity ->
-                  let module P = Logseq_db_worker.Protocol in
-                  drive
-                    (Core.Graph_request
-                       { id = Core.request_id_of_int64 3L
-                       ; response_budget_bytes = None
-                       ; request =
-                           { P.api_version = P.api_version
-                           ; request_id =
-                               G.Uuid.of_string "94000000-0000-4000-8000-000000000710"
-                               |> Result.get_ok
-                           ; command = P.V2_inspect_admission
-                           }
-                       });
+                  let module Read=Worker_pure_read in
+                  let module F=Read.For_worker in
+                  let scope=List.hd(Core.graph_scopes !state) in
+                  let binding=F.binding ~serial:1L ~incarnation:(Read.worker_incarnation
+                    ~runtime_epoch:(Journal_worker_ids.Runtime.Epoch.of_int64 1L)
+                    ~worker_generation:(Journal_worker_ids.Worker.Generation.of_int64 1L))
+                    ~origin:(Uri.to_string scope.account.managed_sync_origin) ~user:scope.account.user_id in
+                  let owner:Sync.timeline_scope={startup={account_generation=scope.account.account_generation;
+                    presentation_generation=scope.account.presentation_generation};graph_id=scope.graph_id;graph_generation=scope.graph_generation}in
+                  let limits:Worker_pure_data.capability_limits={response_budget_bytes=fixture.config.response_budget_bytes;
+                    outbox_max_records=4096;outbox_max_bytes=8388608;change_max_items=4096;change_max_bytes=1048576;
+                    dispatcher_capacity=256;wire_batch_max_bytes=262144}in
+                  let session=F.session ~binding ~graph:scope.graph_id ~account:scope.account.account_generation
+                    ~lifecycle:scope.account.lifecycle_generation ~generation:scope.graph_generation ~scope:owner ~asset_scope:scope ~limits in
+                  let budget=Read.read_budget session ~maximum_items:1 ~maximum_bytes:limits.response_budget_bytes|>Result.get_ok in
+                  drive(Core.Graph_request_for_scope{scope;id=Core.request_id_of_int64 3L;
+                    read=F.pack_query budget Read.Admission});
                   let active =
                     List.find_map
                       (function
-                        | Core.Reply
-                            ( _
-                            , P.V2_response
-                                { outcome = V2_admission_outcome { active_records; _ }
-                                ; _
-                                } ) -> Some active_records
+                        |Core.Reply(_,Read.Query_answer(_,Read.Admission,Ok inspection))->Some inspection.active_records
                         | _ -> None)
                       !emitted
                     |> Option.get

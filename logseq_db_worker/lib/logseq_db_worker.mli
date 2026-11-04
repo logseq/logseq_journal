@@ -51,7 +51,6 @@ val delete_local_copy
   -> graph_id:Logseq_db_types.Graph_types.Uuid.t
   -> (unit, string) result
 
-val request : t -> Protocol.request -> Protocol.response
 val shutdown : t -> unit
 
 val retain_asset_file
@@ -110,10 +109,8 @@ val retain_imported_file
   -> operation:Logseq_db_types.Graph_types.Uuid.t
   -> (string * string) option
 
-(** Optional byte overrides apply only to ordinary snapshot reads and are capped
-    by the configured limit. Invalid budgets or effect commands with an override
-    fail before dispatch; legacy callers without an override retain their path. *)
-val request_for_scope : ?response_budget_bytes:int -> t -> scope:Logseq_sync_pure_reducer.Core.graph_scope -> Protocol.request -> Protocol.response
+val read_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> Worker_pure_read.packed_query -> Worker_pure_read.answer
 val durable_mutation_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
   -> request_id:Logseq_db_types.Graph_types.Uuid.t -> intent:string
   -> current:(unit -> bool) -> Logseq_db_worker_contract.Mutation_pure_wire.outcome
@@ -140,8 +137,8 @@ val revoke_coordination : t -> unit
 val coordination_presentation_current : t -> registration:int64 -> presentation:int64
   -> owner:Logseq_sync_pure_reducer.Core.timeline_scope -> bool
 val confirm_mutation_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> request_id:Logseq_db_types.Graph_types.Uuid.t -> intent:string
-  -> original:(string * string * string) -> current:(unit -> bool) -> Protocol.response
+  -> read:Worker_pure_read.packed_query -> intent:string
+  -> original:(string * string * string) -> current:(unit -> bool) -> Worker_pure_read.answer
 
 val recover_mutations_for_scope : t -> scope:Logseq_sync_pure_reducer.Core.graph_scope
   -> request_id:Logseq_db_types.Graph_types.Uuid.t -> after:int64 option
@@ -160,19 +157,17 @@ val register_observation
   -> registration:int64
   -> id:Logseq_db_types.Graph_types.Uuid.t
   -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> request:Protocol.request
-  -> maximum_bytes:int
+  -> read:Worker_pure_read.packed_query
   -> current:(unit -> bool)
   -> notify:(epoch:int64 -> unit)
-  -> (int64 * Protocol.response, string) result
+  -> (int64 * Worker_pure_read.answer, string) result
 
 val refresh_observation
   :  t
   -> registration:int64
   -> id:Logseq_db_types.Graph_types.Uuid.t
   -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> request_id:Logseq_db_types.Graph_types.Uuid.t
-  -> (int64 * Protocol.response, string) result
+  -> (int64 * Worker_pure_read.answer, string) result
 
 val release_observation
   :  t
@@ -197,12 +192,10 @@ val observation_scope
   -> id:Logseq_db_types.Graph_types.Uuid.t
   -> Logseq_sync_pure_reducer.Core.graph_scope option
 
-(** Exclusive registered Changes/ACK on the actual scoped database. A pull retains
-    its exact bounded batch until a matching physical ACK; legacy access is fenced. *)
-val coordinated_changefeed
-  : t -> registration:int64 -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-  -> request:Logseq_db_worker_contract.Protocol.request -> maximum_bytes:int
-  -> current:(unit -> bool) -> (Logseq_db_worker_contract.Protocol.response,string) result
+(** Match the original delivered batch and release the actual physical windows. *)
+val acknowledge_change_batch : t -> registration:int64 -> scope:Logseq_sync_pure_reducer.Core.graph_scope
+  -> batch:Worker_pure_read.change_batch -> current:(unit -> bool)
+  -> (Worker_pure_read.change_ack,Worker_pure_read.error) result
 
 (** Writer-only actual I/O/callback barrier. No resource settlement or host permit
     is implied; the scope remains fenced until its execution incarnation retires. *)

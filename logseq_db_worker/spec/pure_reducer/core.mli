@@ -51,10 +51,9 @@ type sync_worker_result =
 type _ runner_request =
   | Execute_request :
       { database : database_handle
-      ; request : Logseq_db_worker_contract.Protocol.request
-      ; response_budget_bytes : int option
+      ; read : Worker_pure_read.packed_query
       }
-      -> Logseq_db_worker_contract.Protocol.response runner_request
+      -> Worker_pure_read.answer runner_request
   | Close_database : database_handle -> unit runner_request
   | Handle_sync_worker_effect :
       Logseq_sync_pure_reducer.Core.worker_effect
@@ -65,7 +64,7 @@ type effect_error = Logseq_db_worker_contract.Error.t
 
 type runner_completion =
   | Execute_request_completed of
-      ticket * (Logseq_db_worker_contract.Protocol.response, effect_error) result
+      ticket * (Worker_pure_read.answer, effect_error) result
   | Close_database_completed of ticket * (unit, effect_error) result
   | Sync_worker_effect_completed of ticket * (sync_worker_result, effect_error) result
 
@@ -89,7 +88,7 @@ type asset_notice =
 
 type output =
   | Asset_notice of Logseq_sync_pure_reducer.Core.graph_scope * asset_notice
-  | Reply of request_id * Logseq_db_worker_contract.Protocol.response
+  | Reply of request_id * Worker_pure_read.answer
   | Graph_push of Logseq_db_worker_contract.Protocol.push
   | Sync_output of Logseq_sync_pure_reducer.Core.output
   | Graph_state_changed of graph_state
@@ -166,8 +165,7 @@ type event =
   | Graph_request_for_scope of
       { scope : Logseq_sync_pure_reducer.Core.graph_scope
       ; id : request_id
-      ; request : Logseq_db_worker_contract.Protocol.request
-      ; response_budget_bytes : int option
+      ; read : Worker_pure_read.packed_query
       }
   | Projection_push_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_db_worker_contract.Protocol.push
   | Asset_requested_for_scope of Logseq_sync_pure_reducer.Core.graph_scope * Logseq_sync_pure_reducer.Asset_transfer.event
@@ -175,8 +173,7 @@ type event =
   | Start
   | Graph_request of
       { id : request_id
-      ; request : Logseq_db_worker_contract.Protocol.request
-      ; response_budget_bytes : int option
+      ; read : Worker_pure_read.packed_query
       }
   | Sync_event of Logseq_sync_pure_reducer.Core.event
   | Projection_push of Logseq_db_worker_contract.Protocol.push
@@ -193,7 +190,7 @@ val step : state -> event -> transition
 
 val complete_execute
   :  runner_effect
-  -> (Logseq_db_worker_contract.Protocol.response, effect_error) result
+  -> (Worker_pure_read.answer, effect_error) result
   -> event option
 
 val asset_ticket_current : state -> Logseq_sync_pure_reducer.Asset_transfer.ticket -> bool
@@ -246,8 +243,7 @@ module Observation_registry : sig
     -> registration:int64
     -> id:Logseq_db_types.Graph_types.Uuid.t
     -> scope:Logseq_sync_pure_reducer.Core.graph_scope
-    -> command:Logseq_db_worker_contract.Protocol.command
-    -> maximum_bytes:int
+    -> read:Worker_pure_read.packed_query
     -> t * decision
 
   val release
@@ -326,27 +322,25 @@ module Changefeed_owner : sig
 
   type pull =
     | Read
-    | Cached of Logseq_db_worker_contract.Protocol.response
+    | Cached of Worker_pure_read.change_batch
     | Refused
 
   val empty : t
-  val legacy : t -> bool
+  val unclaimed : t -> bool
   val needs_resync : t -> bool
   val claim : t -> registration:int64 -> t * bool
 
   val pull
     :  t
     -> registration:int64
-    -> request:Logseq_db_worker_contract.Protocol.request
-    -> maximum_bytes:int
+    -> read:Worker_pure_read.packed_query
     -> pull
 
   val remember
     :  t
     -> registration:int64
-    -> request:Logseq_db_worker_contract.Protocol.request
-    -> maximum_bytes:int
-    -> Logseq_db_worker_contract.Protocol.response
+    -> read:Worker_pure_read.packed_query
+    -> Worker_pure_read.change_batch
     -> (t, string) result
 
   val may_ack : t -> registration:int64 -> generation:string -> through:string -> bool
@@ -354,8 +348,8 @@ module Changefeed_owner : sig
   val acknowledged
     :  t
     -> registration:int64
-    -> request:Logseq_db_worker_contract.Protocol.request
-    -> Logseq_db_worker_contract.Protocol.response
+    -> generation:string
+    -> through:string
     -> t
 
   (** Physical history has at most 256 windows and one maximum response's

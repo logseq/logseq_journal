@@ -4367,7 +4367,7 @@ module Detail_observation_fixture = struct
   module M=Journal_detail.Pure_observation
   module W=Journal_worker_coordination.Worker_api
   module C=Journal_worker_coordination.Worker_pure_coordinator
-  module P=Logseq_db_worker.Protocol
+  module Read=Worker_pure_read
   module S=Logseq_db_worker_lui.Logseq_db_worker_lui_service
   module Id=Journal_worker_ids
   let root=W.Uuid.of_string "70000000-0000-4000-a000-000000005540" |> Result.get_ok
@@ -4380,18 +4380,21 @@ module Detail_observation_fixture = struct
     let operation=W.Observe(budget,W.Outline_block{uuid=root;revision=None}) in
     let ticket,planned=C.request ready session operation |> Result.get_ok in
     let wire=I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok in
-    let registration,owner,observation_id,request=match wire with S.Coordination_observe value->
-      value.registration,value.owner,value.observation_id,value.request|_->assert false in
-    let response=S.Coordination_observed{registration;owner;observation_id;epoch=0L;
-      response=P.V2_response{api_version=P.api_version;request_id=request.request_id;
-        outcome=V2_block_outcome(Worker_pure_data.V2_missing_block{uuid=root;revision="missing-0"})}} in
+    let registration,owner,observation_id,request_id,read=match wire with S.Coordination_observe value->
+      value.registration,value.owner,value.observation_id,value.request_id,value.read|_->assert false in
+    let Read.Read_query(source_budget,source_query)=read in
+    let answer=match source_query with
+      |Read.Outline_block _->Read.For_worker.answer source_budget source_query
+        (Ok(Worker_pure_data.V2_missing_block{uuid=root;revision="missing-0"}))
+      |_->assert false in
+    let response=S.Coordination_observed{registration;owner;observation_id;request_id;epoch=0L;answer} in
     let handle,epoch=I.observation_registration session ~request_id:(C.ticket_id ticket) operation response |> Result.get_ok in
     let admitted=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
     let registered=(C.step admitted(C.Observation_registered(ticket,handle,epoch))).next in
     let reply=if failed then W.Answered(Error W.Response_budget_exceeded) else I.reply session
       ~request_id:(C.ticket_id ticket) operation response |> Result.get_ok in
     let completed=(C.step registered(C.Completed(ticket,reply))).next in
-    let context:M.context={entry_id="detail-observation-fixture";request_generation=1L;root;owner;original=request.request_id;maximum_children=128} in
+    let context:M.context={entry_id="detail-observation-fixture";request_generation=1L;root;owner;original=request_id;maximum_children=128} in
     context,ticket,handle,planned.next,completed,issuer,session,raw
   let refresh issuer session handle state =
     let module I=(val issuer:Worker_effect_authority.ISSUER) in
@@ -4400,9 +4403,12 @@ module Detail_observation_fixture = struct
     let registration,owner,observation_id,request_id=match I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok with
       | S.Coordination_refresh_observation value->value.registration,value.owner,value.observation_id,value.request_id
       | _->assert false in
-    let response=S.Coordination_observed{registration;owner;observation_id;epoch=1L;
-      response=P.V2_response{api_version=P.api_version;request_id;
-        outcome=V2_block_outcome(Worker_pure_data.V2_missing_block{uuid=root;revision="missing-1"})}} in
+    let query=W.observation_query handle in
+    let answer=match query with
+      |W.Outline_block _->Read.For_worker.answer (W.observation_budget handle) query
+        (Ok(Worker_pure_data.V2_missing_block{uuid=root;revision="missing-1"}))
+      |_-> . in
+    let response=S.Coordination_observed{registration;owner;observation_id;request_id;epoch=1L;answer} in
     let value=match I.reply session ~request_id:(C.ticket_id ticket) operation response |> Result.get_ok with
       | W.Answered(Ok value)->value|_->assert false in
     let admitted=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.of_int64 2L))).next in
@@ -4620,16 +4626,10 @@ module Child_chain_fixture = struct
         created_at_ms=1L;updated_at_ms=1L;refs=[];tags=[];properties=[]} in
       (* Equal visible status is deliberately insufficient to prove a status sub-operation. *)
       let value:Worker_pure_data.block_record={block;task_status=resolved_status;rendered_page_title=page.title;tag_titles=[]} in
-      let confirmation=(let (P.V2_response confirmation_packet as packet) = (P.V2_response
-        {api_version=P.api_version;request_id=id;outcome=V2_block_summary_outcome
-          {lookup=Worker_pure_data.V2_present_block{value;revision=Printf.sprintf "child-state:v1:%d" index};
-           page=Some(Worker_pure_data.V2_present_page{page;revision="page-state:v1:1"});items=[];next_cursor=None;
-           scope_revision="children-state:v1:1";generation="generation:v1:1:1";projection_revision=after}}) in
-      match I.reply session ~request_id:(W.request_id confirmation_packet.request_id)
-        (W.Confirm(presentation,receipt))
-        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response packet) with
-      | Ok(W.Answered(Ok(W.Confirmed proof))) -> proof
-      | _ -> failwith "Production confirmation was rejected") in
+      let confirmation=Coordination_test_fixture.confirmed_summary issuer session presentation receipt (W.request_id id)
+        ~lookup:(Worker_pure_data.V2_present_block{value;revision=Printf.sprintf "child-state:v1:%d" index})
+        ~page:(Some(Worker_pure_data.V2_present_page{page;revision="page-state:v1:1"})) ~items:[]
+        ~scope_revision:"children-state:v1:1" ~generation:"generation:v1:1:1" ~projection_revision:after in
       W.Confirmed confirmation in
     {initial;action;command;session;presentation;projection;binding=I.binding;confirm}
   let write fixture state = function
@@ -5311,12 +5311,17 @@ let () =
     |Some(R.Read read)->
       let budget=F.W.read_budget catalog_session ~maximum_items:read.maximum_items ~maximum_bytes:65536 |> Result.get_ok in
       let operation=F.W.Query(budget,read.query) in
-      ignore(I.request catalog_session ~request_id:(F.W.request_id request) operation |> Result.get_ok);
-      (match I.reply catalog_session ~request_id:(F.W.request_id request) operation
-        (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Graph_response
-          (F.P.V2_response{api_version=F.P.api_version;request_id=request;
-            outcome=V2_task_statuses_outcome{property_uuid=None;default_status=Some status;
-              items=[item status_a;item status_b];next_cursor=None}})) with
+      let response=match I.request catalog_session ~request_id:(F.W.request_id request) operation |> Result.get_ok with
+        |Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_query source->
+          let answer=match read.query with
+            |F.W.Task_statuses _->Worker_pure_read.For_worker.answer budget read.query
+              (Ok(Worker_pure_read.For_worker.task_status_catalog ~property_uuid:None ~default_status:(Some status)
+                ~items:[item status_a;item status_b] ~next:None))
+            |_->failwith "catalog fixture changed query"in
+          Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_queried{registration=source.registration;
+            owner=source.owner;request_id=source.request_id;answer}
+        |_->failwith "catalog fixture changed request"in
+      (match I.reply catalog_session ~request_id:(F.W.request_id request) operation response with
        |Ok(F.W.Answered(Ok value))->ignore(R.receive_worker_read runtime ~request_id:request (R.Query_result(read.query,value)))
        |_->failwith "catalog fixture rejected its typed value")
     |_->failwith "catalog fixture lost its typed query" in

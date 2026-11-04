@@ -21,6 +21,7 @@ val namespace : t -> string
 val mutation_id : t -> Graph_types.Uuid.t
 val command : t -> Protocol.command
 val targets : t -> Graph_types.Uuid.t Rrbvec.t
+val readback_target : t -> [ `Page of Graph_types.Uuid.t | `Block of Graph_types.Uuid.t ]
 
 type outcome =
   | Committed of Protocol.response

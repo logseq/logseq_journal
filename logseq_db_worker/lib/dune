@@ -8,6 +8,7 @@
   eio
   rrbvec
   logseq_db_types
+  logseq_db_worker.typed_read
   logseq_db_worker.contract
   logseq_db_worker.effect_runner
   logseq_db_worker.pure_reducer

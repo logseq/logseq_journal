@@ -4,4 +4,4 @@
  (wrapped false)
  (modules worker_pure_read)
  (libraries logseq_db_worker.identity logseq_db_types logseq_db_worker.typed_data
-  logseq_db_worker.contract logseq_sync.pure_reducer uri))
+  logseq_db_worker.contract logseq_sync.pure_reducer uri yojson))

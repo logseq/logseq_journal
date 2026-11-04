@@ -13,6 +13,7 @@
   eio.unix
   eio_posix
   logseq_db_worker
+  logseq_db_worker.typed_read
   logseq_db_worker.contract
   logseq_db_worker.pure_reducer
   logseq_db_types

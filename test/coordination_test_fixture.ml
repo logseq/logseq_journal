@@ -1,5 +1,5 @@
 module W = Journal_worker_coordination.Worker_api
-module P = Logseq_db_worker.Protocol
+module Read = Worker_pure_read
 module S = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Id = Journal_worker_ids
 module Sync = Logseq_sync_pure_reducer.Core
@@ -126,26 +126,37 @@ let child_continuation token =
   let request_id = uuid "98000000-0000-4000-8000-000000006100" in
   ignore
     (I.request session ~request_id:(W.request_id request_id) operation |> Result.get_ok);
-  let response =
-    S.Graph_response
-      (P.V2_response
-         { api_version = P.api_version
-         ; request_id
-         ; outcome =
-             V2_children_outcome
-               { parent = graph
-               ; revision_scope = Worker_pure_data.V2_children_revision graph
-               ; scope_revision = "fixture"
-               ; items = []
-               ; next_cursor =
-                   Some
-                     (Logseq_db_types.Graph_types.Cursor.of_string token |> Result.get_ok)
-               }
-         })
-  in
+  let source_query=W.Child_members{parent=graph;revision=None;after=None} in
+  let cursor=Read.For_worker.continuation ~owner:session ~key:(Read.query_key budget source_query) ~budget
+    ~cursor:(Logseq_db_types.Graph_types.Cursor.of_string token|>Result.get_ok) in
+  let value=Read.For_worker.children ~parent:graph ~revision_scope:(Worker_pure_data.V2_children_revision graph)
+    ~scope_revision:"fixture" ~items:[] ~next:(Some cursor) in
+  let response=match I.request session ~request_id:(W.request_id request_id) operation|>Result.get_ok with
+    |S.Coordination_query request->S.Coordination_queried{registration=request.registration;owner=request.owner;
+      request_id=request.request_id;answer=Read.For_worker.answer budget source_query(Ok value)}
+    |_->assert false in
   match I.reply session ~request_id:(W.request_id request_id) operation response with
   | Ok (W.Answered (Ok children)) -> Option.get children.next
   | _ -> failwith "valid route continuation rejected"
+;;
+
+let confirmed_summary issuer session presentation receipt request_id
+    ~lookup ~page ~items ~scope_revision ~generation ~projection_revision =
+  let module I=(val issuer:Worker_effect_authority.ISSUER)in
+  let operation=W.Confirm(presentation,receipt)in
+  match I.request session ~request_id operation |> Result.get_ok with
+  |S.Coordination_confirm request->
+    let Read.Read_query(budget,query)=request.read in
+    let answer=match query with
+      |Read.Block_summary _->Read.For_worker.answer budget query(Ok(Read.For_worker.block_summary
+        ~lookup ~page ~items ~next:None ~scope_revision ~generation ~projection_revision))
+      |_->failwith "Expected the original summary confirmation"in
+    let response=S.Coordination_confirmed{registration=request.registration;owner=request.owner;
+      presentation=request.presentation;request_id=request.request_id;answer}in
+    (match I.reply session ~request_id operation response with
+     |Ok(W.Answered(Ok(W.Confirmed proof)))->proof
+     |_->failwith "Production confirmation was rejected")
+  |_->failwith "Confirmation did not use the typed boundary"
 ;;
 
 let favorites_sources = Hashtbl.create 2
@@ -169,22 +180,19 @@ let favorites
       let budget = W.read_budget session ~maximum_items:50 ~maximum_bytes:65536 |> Result.get_ok in
       let request_id = W.request_id graph in
       let produce after next wire_next favorites_page generation projection_revision items =
-        let next_cursor = match wire_next with
-          | Some _ -> wire_next
-          | None -> Option.bind next (fun cursor ->
-            match I.request session ~request_id (W.Query (budget, W.Favorites (Some cursor))) with
-            | Ok (S.Coordination_query { request = { command = P.V2_list_favorites { cursor; _ }; _ }; _ }) -> cursor
-            | _ -> failwith "Favorites fixture continuation is not owned by its producer") in
-        let query = W.Query (budget, W.Favorites after) in
-        ignore (I.request session ~request_id query |> Result.get_ok);
-        let response = P.V2_response
-          { api_version = P.api_version; request_id = graph
-          ; outcome = V2_favorites_outcome
-              { favorites_page; generation; projection_revision; items; next_cursor }
-          } in
-        match I.reply session ~request_id query (S.Graph_response response) with
-        | Ok (W.Answered (Ok result)) -> result
-        | _ -> failwith "Favorites fixture did not produce a checked spec value"
+        let source_query=W.Favorites after in
+        let next=match wire_next with
+          |None->next
+          |Some cursor->Some(Read.For_worker.continuation ~owner:session ~key:(Read.query_key budget source_query) ~budget ~cursor) in
+        let value=Read.For_worker.favorites ~favorites_page ~generation ~projection_revision ~items ~next in
+        let operation=W.Query(budget,source_query) in
+        let response=match I.request session ~request_id operation|>Result.get_ok with
+          |S.Coordination_query request->S.Coordination_queried{registration=request.registration;owner=request.owner;
+            request_id=request.request_id;answer=Read.For_worker.answer budget source_query(Ok value)}
+          |_->assert false in
+        match I.reply session ~request_id operation response with
+        |Ok(W.Answered(Ok result))->result
+        |_->failwith "Favorites fixture did not produce a checked spec value"
       in
       Hashtbl.add favorites_sources graph_generation produce;
       produce

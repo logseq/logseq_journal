@@ -1,3 +1,4 @@
+module Read = Worker_pure_read
 module Db = Logseq_db_worker
 module Pure = Logseq_db_worker_pure_reducer.Core
 module Worker_runner = Logseq_db_worker_effect_runner.Effect_runner
@@ -306,7 +307,6 @@ let coordination_network (baseline:coordination_baseline) (scope:asset_scope) =
     baseline.baseline.state.sync.residents
 ;;
 
-let coordination_read = Protocol.is_snapshot_read
 
 type observation_invalidation =
   { registration_id : int64
@@ -348,8 +348,8 @@ type request =
       { registration : int64
       ; owner : timeline_scope
       ; observation_id : Logseq_db_types.Graph_types.Uuid.t
-      ; request : Logseq_db_worker.Protocol.request
-      ; maximum_bytes : int
+      ; request_id : Logseq_db_types.Graph_types.Uuid.t
+      ; read : Worker_pure_read.packed_query
       }
   | Coordination_refresh_observation of
       { registration : int64
@@ -365,15 +365,16 @@ type request =
   | Register_coordination of int64
   | Release_coordination of int64
   | Coordination_query of
-      { registration : int64; owner : timeline_scope; request : Logseq_db_worker.Protocol.request; response_budget_bytes : int }
+      { registration : int64; owner : timeline_scope; request_id : Logseq_db_types.Graph_types.Uuid.t; read : Worker_pure_read.packed_query }
+  | Coordination_acknowledge_changes of
+      { registration : int64; owner : timeline_scope; request_id : Logseq_db_types.Graph_types.Uuid.t; batch : Worker_pure_read.change_batch }
   | Coordination_mutation of
       { registration : int64; owner : timeline_scope;
         request_id : Logseq_db_types.Graph_types.Uuid.t; intent : string }
   | Coordination_confirm of
       { registration : int64; owner : timeline_scope; presentation : int64;
         request_id : Logseq_db_types.Graph_types.Uuid.t; intent : string;
-        original : string * string * string }
-  | Graph_request_at of timeline_scope * Logseq_db_worker.Protocol.request
+        original : string * string * string; read : Worker_pure_read.packed_query }
   | Coordination_recover_mutations of
       { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
         after:int64 option; maximum_items:int; maximum_bytes:int }
@@ -391,7 +392,6 @@ type request =
       ; source : Logseq_db_types.Asset_import.t
       }
   | Client_command of client_command
-  | Graph_request of Protocol.request
   | Get_graph_state
   | Asset_command of
       { graph_generation : int
@@ -438,12 +438,22 @@ type response =
       { request_id:Logseq_db_types.Graph_types.Uuid.t;
         page:Logseq_db_worker_contract.Mutation_pure_wire.recovery_page }
   | Coordination_mutation_acknowledged of {request_id:Logseq_db_types.Graph_types.Uuid.t}
+  | Coordination_confirmed of
+      {registration:int64;owner:timeline_scope;presentation:int64;request_id:Logseq_db_types.Graph_types.Uuid.t;
+       answer:Worker_pure_read.answer}
+  | Coordination_queried of
+      { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
+        answer:Worker_pure_read.answer }
+  | Coordination_changes_acknowledged of
+      { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
+        result:(Worker_pure_read.change_ack,Worker_pure_read.error)result }
   | Coordination_observed of
       { registration : int64
       ; owner : timeline_scope
       ; observation_id : Logseq_db_types.Graph_types.Uuid.t
       ; epoch : int64
-      ; response : Logseq_db_worker.Protocol.response
+      ; request_id : Logseq_db_types.Graph_types.Uuid.t
+      ; answer : Worker_pure_read.answer
       }
   | Coordination_observation_released of
       { registration : int64
@@ -460,7 +470,6 @@ type response =
   | Asset_imported of (Logseq_db_worker.import_receipt, string) result
   | Client_command_completed
   | Asset_file of (string * string) option
-  | Graph_response of Protocol.response
   | Graph_state of Db.graph_state
 
 type asset_fact =
@@ -1291,7 +1300,7 @@ let create ~(dependencies : dependencies) =
         if not(typed_asset_consumer_owner registration owner consumer) then Error "The asset cleanup namespace does not match its owner." else
         Db.release_coordinated_asset_demand session.worker ~registration ~scope:owner ~consumer
         |> Result.map(fun()->Coordination_asset_demand_released{registration;owner;request_id;consumer})
-      | Coordination_observe { registration; owner; observation_id; request; maximum_bytes }
+      | Coordination_observe { registration; owner; observation_id; request_id; read }
         ->
         (match resolve owner with
          | None -> Error "Observation graph session is not open"
@@ -1311,15 +1320,14 @@ let create ~(dependencies : dependencies) =
              ~registration
              ~id:observation_id
              ~scope
-             ~request
-             ~maximum_bytes
+             ~read
              ~current
              ~notify:(fun ~epoch ->
                session.emit_observation
                  (Observation_invalidated
                     { registration_id = registration; owner; observation_id; epoch }))
-           |> Result.map (fun (epoch, response) ->
-             Coordination_observed { registration; owner; observation_id; epoch; response }))
+           |> Result.map (fun (epoch, answer) ->
+             Coordination_observed { registration; owner; observation_id; request_id; epoch; answer }))
       | Coordination_refresh_observation { registration; owner; observation_id; request_id }
         ->
         (match resolve owner with
@@ -1330,9 +1338,8 @@ let create ~(dependencies : dependencies) =
              ~registration
              ~id:observation_id
              ~scope
-             ~request_id
-           |> Result.map (fun (epoch, response) ->
-             Coordination_observed { registration; owner; observation_id; epoch; response }))
+           |> Result.map (fun (epoch, answer) ->
+             Coordination_observed { registration; owner; observation_id; request_id; epoch; answer }))
       | Coordination_release_observation { registration; owner; observation_id } ->
         let result=match Db.observation_scope session.worker ~registration ~id:observation_id with
         | Some scope when scope.graph_id=owner.graph_id && scope.graph_generation=owner.graph_generation
@@ -1359,29 +1366,34 @@ let create ~(dependencies : dependencies) =
           (match session.coordination_registration with
            | Some id when id<=registration -> session.coordination_registration<-None | _ -> ());
           Coordination_released registration)(Db.release_coordination session.worker ~registration)
-      | Coordination_query {registration;owner;request;response_budget_bytes} ->
-        let current ()=Db.coordination_current session.worker ~registration in
-        let changefeed=match request.command with Protocol.V2_pull_changes _|V2_ack_changes _->true|_->false in
-        if not(coordination_read request.command || changefeed) then
-          Error "This registration supports scoped reads and owned Changes/ACK, not mutation commands."
-        else if response_budget_bytes<=0 || response_budget_bytes>Worker_pure_data.maximum_response_bytes
-        then Error "Invalid coordination read byte budget"
-        else if not(current ()) then Error "Coordination binding retired"
+      | Coordination_query {registration;owner;request_id;read} ->
+        let Read.Read_query(budget,query)=read in
+        let source=Read.For_worker.read_budget_owner budget in
+        if Read.For_worker.binding_serial(Read.For_worker.session_binding source)<>registration
+           || not(Read.matches_scope source owner)
+        then Error "The query belongs to another coordination session"
+        else if not(Db.coordination_current session.worker ~registration) then Error "Coordination binding retired"
         else (match resolve owner with
-          | None -> Error "The graph session is no longer open."
-          | Some scope ->
-            let authorized ()=current () && resolve owner=Some scope &&
-              (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) &&
-              (match Db.graph_state_for_scope session.worker ~scope with
-               | Some {phase=Db.Graph_open;graph_id=Some id;generation;_} ->
-                 id=scope.graph_id && generation=scope.graph_generation
-               | _ -> false) in
-            if not(authorized ()) then Error "Coordination account authority changed" else
-            let result=if changefeed then Db.coordinated_changefeed session.worker ~registration ~scope ~request
-              ~maximum_bytes:response_budget_bytes ~current:authorized
-            else Ok(Db.request_for_scope ~response_budget_bytes session.worker ~scope request) in
-            Result.bind result(fun response->
-              if authorized () then Ok(Graph_response response) else Error "Coordination binding retired"))
+          |None->Error "The graph session is no longer open."
+          |Some scope->
+            let authorized ()=Db.coordination_current session.worker ~registration && resolve owner=Some scope
+              && (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+            if not(authorized()) then Error "Coordination account authority changed" else
+            (match Read.validate_query source budget query with
+             |Error _->Error "Invalid coordination query"
+             |Ok()->let answer=Db.read_for_scope session.worker ~scope read in
+               if authorized() then Ok(Coordination_queried{registration;owner;request_id;answer})
+               else Error "Coordination binding retired"))
+      | Coordination_acknowledge_changes {registration;owner;request_id;batch} ->
+        (match resolve owner with
+         |None->Error "The graph session is no longer open."
+         |Some scope->
+           let authorized ()=Db.coordination_current session.worker ~registration && resolve owner=Some scope
+             && (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
+           if not(authorized()) then Error "Coordination account authority changed" else
+           let result=Db.acknowledge_change_batch session.worker ~registration ~scope ~batch ~current:authorized in
+           if authorized() then Ok(Coordination_changes_acknowledged{registration;owner;request_id;result})
+           else Error "Coordination binding retired")
       | Coordination_mutation {registration;owner;request_id;intent} ->
         let current ()=Db.coordination_current session.worker ~registration in
         if not(current ()) then Error "Coordination binding retired"
@@ -1398,7 +1410,7 @@ let create ~(dependencies : dependencies) =
             let response=Db.durable_mutation_for_scope session.worker ~scope ~request_id ~intent
               ~current:authorized in
             if authorized () then Ok(Coordination_mutation_result{request_id;outcome=response}) else Error "Coordination binding retired")
-      | Coordination_confirm {registration;owner;presentation;request_id;intent;original} ->
+      | Coordination_confirm {registration;owner;presentation;request_id;intent;original;read} ->
         (match resolve owner with
          | None -> Error "The graph session is no longer open."
          | Some scope ->
@@ -1407,14 +1419,10 @@ let create ~(dependencies : dependencies) =
              (not !(session.auth_seen) || !(session.authenticated_user)=Some scope.account.user_id) in
            if not(current ()) then Error "The confirmation presentation retired."
            else
-             let response=Db.confirm_mutation_for_scope session.worker ~scope ~request_id
+             let response=Db.confirm_mutation_for_scope session.worker ~scope ~read
                ~intent ~original ~current in
-             if current () then Ok(Graph_response response)
+             if current () then Ok(Coordination_confirmed{registration;owner;presentation;request_id;answer=response})
              else Error "The confirmation presentation retired.")
-      | Graph_request_at (owner,request) ->
-        (match resolve owner with
-         | Some scope -> Ok (Graph_response (Db.request_for_scope session.worker ~scope request))
-         | None -> Error "The graph session is no longer open.")
       | Coordination_recover_mutations {registration;owner;request_id;after;maximum_items;maximum_bytes} ->
         (match resolve owner with
          | None -> Error "The graph session is no longer open."
@@ -1553,7 +1561,7 @@ let create ~(dependencies : dependencies) =
         (match command with Submit_e2ee_password _ -> unlock_queue_log context | _ -> ());
         Db.post session.worker (client_event command);
         Ok Client_command_completed
-      | Graph_request request -> Ok (Graph_response (Db.request session.worker request)))
+      )
     ~shutdown:(fun session ->
       Worker_runner.shutdown_id_token_cache session.token_cache;
       Db.shutdown session.worker)

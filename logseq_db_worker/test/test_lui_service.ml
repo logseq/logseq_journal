@@ -66,22 +66,6 @@ let with_client config run =
   Fun.protect ~finally:(fun () -> Worker_runtime.stop client) (fun () -> run client)
 ;;
 
-let v2_graph_info_request () =
-  let json =
-    `Assoc
-      [ "api_version", `Int 2
-      ; "request_id", `String "00000000-0000-4000-8000-000000000001"
-      ; "command", `List [ `String "V2_graph_info" ]
-      ]
-  in
-  match P.request_of_yojson json with
-  | Ok request -> request
-  | Error error ->
-    T.fail
-      "unable to build v2 graph-info request: %s"
-      (Logseq_db_worker.Error.message error)
-;;
-
 let test_coordination_registration () =
   T.with_managed (fun fixture ->
     let config={fixture.config with response_budget_bytes=4096} in
@@ -175,27 +159,18 @@ let test_host_handoff_real_service_single_use () =
       |None->Worker.For_testing.await_output client;terminal() in terminal()))
 ;;
 
-let test_managed_worker_starts_closed_and_replies_with_v2_envelope () =
-  T.with_managed (fun fixture ->
-    with_client fixture.config (fun client ->
-      let request = v2_graph_info_request () in
-      let id = Worker.send client (Service.Graph_request request) |> accepted in
-      match await_response client id with
-      | Service.Graph_response response ->
-        (match P.response_to_yojson response with
-         | `List
-             [ `String "V2_response"
-             ; `Assoc
-                 [ ("api_version", `Int 2)
-                 ; ("request_id", `String "00000000-0000-4000-8000-000000000001")
-                 ; ("outcome", `List [ `String "V2_failed"; `Assoc _ ])
-                 ]
-             ] -> ()
-         | json ->
-           T.fail
-             "pre-selection v2 request did not return a v2 failure envelope: %s"
-             (Yojson.Safe.to_string json))
-      | _ -> T.fail "managed worker returned the wrong response kind"))
+let test_managed_worker_starts_without_query_authority () =
+  T.with_managed(fun fixture->with_client fixture.config(fun client->
+    let id=Worker.send client Service.Get_graph_state |>accepted in
+    (match await_response client id with
+     |Service.Graph_state{phase=Logseq_db_worker.Graph_closed;graph_id=None;_}->()
+     |_->T.fail "managed worker opened a graph before account selection");
+    let id=Worker.send client(Service.Register_coordination 19L)|>accepted in
+    match await_response client id with
+    |Service.Coordination_registered baseline->
+      T.require(baseline.baseline.state.sync.account=None && baseline.baseline.state.residents=[])
+        "cold bootstrap invented execution authority before account selection"
+    |_->T.fail "managed worker did not publish its authoritative cold baseline"))
 ;;
 
 let test_managed_client_command_is_accepted () =
@@ -1971,8 +1946,8 @@ let () =
     ; T.case "pending asset facts are bounded" test_pending_asset_facts_have_hard_bound
     ; T.case "snapshot topics still replace" test_snapshot_topics_still_replace
     ; T.case
-        "managed worker starts closed with a v2 envelope"
-        test_managed_worker_starts_closed_and_replies_with_v2_envelope
+        "managed worker starts without query authority"
+        test_managed_worker_starts_without_query_authority
     ; T.case "ignored unlock is diagnosed without secrets" test_unlock_ignored_logging
     ; T.case "managed client command is accepted" test_managed_client_command_is_accepted
     ]
