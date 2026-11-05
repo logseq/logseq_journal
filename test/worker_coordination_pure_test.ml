@@ -547,6 +547,121 @@ let test_completed_imports_release_active_recovery_capacity () =
   check(Result.is_error(C.request !state session(W.Import changed))) "completed import history allowed operation payload substitution"
 ;;
 
+let test_rejected_imports_release_capacity_after_fresh_readback () =
+  let issuer,raw,projection,session=fixture 1890L in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
+  let state=ref(ready I.binding projection) in
+  let id n=uuid(Printf.sprintf "97000000-0000-4000-8000-%012d" n) in
+  let source n=
+    {Logseq_db_types.Asset_import.operation=id(4*n);asset=id(4*n+1);target=graph;replace_reference=None;
+     local_mutation=id(4*n+2);metadata_mutation=id(4*n+3);source_file="/tmp/synthetic-oversized.bin";
+     title="Synthetic oversized input";file_type="bin"} in
+  let intent n=W.asset_import_intent session(source n) |> Result.get_ok in
+  let scope,_=List.hd raw.baseline.state.residents in
+  let readback ticket original prepared=
+    let operation=W.Confirm_import_source original in
+    let request_id=match I.request session ~request_id:(C.ticket_id ticket)operation |> Result.get_ok with
+      |S.Coordination_confirm_import_input{request_id;_}->request_id|_->assert false in
+    I.reply session ~request_id:(C.ticket_id ticket)operation
+      (S.Coordination_import_input_confirmed{registration=raw.registration;owner=scope;request_id;
+       input=Some{Logseq_db_types.Asset_import.Recovery.sequence=1L;
+         input=Bytes.to_string(W.encode_asset_import_intent original);prepared;acknowledged=false}}) |> Result.get_ok in
+  let apply event=state:=(C.step !state event).next in
+  let request operation=let ticket,planned=C.request !state session operation |> Result.get_ok in
+    state:=planned.next;ticket in
+  let complete : type a. a C.ticket -> a W.reply -> unit=fun ticket reply->
+    apply(C.Admitted(ticket,Id.Worker.Request_id.one));apply(C.Completed(ticket,reply)) in
+  let failure=W.Answered(Error(W.Service_failed "Synthetic pre-Prepared failure")) in
+  for n=1 to 130 do
+    let original=intent n in
+    let ticket=try request(W.Import original) with _->failwith(Printf.sprintf "terminal rejected imports exhausted capacity at %d" n) in
+    complete ticket failure;apply(C.Forget ticket);
+    let read=request(W.Confirm_import_source original) in
+    complete read(if n mod 2=0 then W.Answered(Ok None)else readback read original None);apply(C.Forget read);
+    check(not(C.import_source_pending(C.view !state) ~operation:(W.asset_import_intent_id original)))
+      "fresh absent readback after terminal failure retained a failed source"
+  done;
+  for n=131 to 260 do
+    let ticket=request(W.Import(intent n)) in
+    apply(C.Admission_refused(ticket,W.Not_ready));apply(C.Forget ticket)
+  done;
+  let original=intent 261 in
+  let ticket=request(W.Import original) in
+  complete ticket(W.Interrupted W.Transport_lost);apply(C.Forget ticket);
+  let read=request(W.Confirm_import_source original) in
+  complete read(W.Answered(Ok None));apply(C.Forget read);
+  check(C.import_source_pending(C.view !state) ~operation:(W.asset_import_intent_id original))
+    "absent readback after an interrupted handler discarded Unknown";
+  let original=intent 262 in
+  let ticket=request(W.Import original) in
+  apply(C.Admitted(ticket,Id.Worker.Request_id.one));
+  let old_read=request(W.Confirm_import_source original) in
+  apply(C.Completed(ticket,failure));apply(C.Forget ticket);
+  complete old_read(W.Answered(Ok None));apply(C.Forget old_read);
+  check(C.import_source_pending(C.view !state) ~operation:(W.asset_import_intent_id original))
+    "readback planned before terminal failure discarded possible Prepared";
+  let read=request(W.Confirm_import_source original) in
+  let retry=request(W.Import original) in
+  complete retry failure;apply(C.Forget retry);
+  complete read(W.Answered(Ok None));apply(C.Forget read);
+  check(C.import_source_pending(C.view !state) ~operation:(W.asset_import_intent_id original))
+    "old absent readback consumed a newer completed Import attempt";
+  let read=request(W.Confirm_import_source original) in
+  complete read(W.Answered(Ok None));apply(C.Forget read);
+  check(not(C.import_source_pending(C.view !state) ~operation:(W.asset_import_intent_id original)))
+    "new failed attempt could not obtain its own rejection readback";
+  let original=intent 263 in
+  let ticket=request(W.Import original) in
+  complete ticket failure;apply(C.Forget ticket);
+  let read=request(W.Confirm_import_source original) in
+  let prepared_source=source 263 in
+  let prepared=Logseq_db_types.Asset_upload_intent.prepare ~operation_id:prepared_source.operation
+    ~origin:(Uri.to_string scope.account.managed_sync_origin) ~account:scope.account.user_id ~graph:scope.graph_id
+    ~asset:prepared_source.asset ~version:(Logseq_db_types.Asset_descriptor.version ~checksum:(String.make 64 'a') ~file_type:"bin" |> Result.get_ok)
+    ~title:prepared_source.title ~size:4L ~staged_file:"synthetic-prepared.bin" ~replace_reference:None ~target:prepared_source.target
+    ~local_mutation:prepared_source.local_mutation ~metadata_mutation:prepared_source.metadata_mutation |> Result.get_ok in
+  let late_absent=request(W.Confirm_import_source original) in
+  complete read(readback read original(Some(Logseq_db_types.Asset_upload_intent.Pure_codec.encode prepared)));
+  apply(C.Forget read);
+  check(C.import_progress(C.view !state)original=Some W.Import_unknown
+    && C.import_source_proof(C.view !state)original<>None)
+    "normal handler error after Prepared was mistaken for a rejected import";
+  complete late_absent(W.Answered(Ok None));apply(C.Forget late_absent);
+  check(C.import_progress(C.view !state)original=Some W.Import_unknown
+    && C.import_source_proof(C.view !state)original<>None)
+    "late absent readback overrode already adopted Prepared evidence";
+  List.iteri(fun i outcome->
+    let original=intent(264+i) in
+    let ticket=request(W.Import original) in
+    complete ticket outcome;apply(C.Forget ticket);
+    let read=request(W.Confirm_import_source original) in
+    complete read(W.Answered(Ok None));apply(C.Forget read);
+    check(C.import_source_pending(C.view !state) ~operation:(W.asset_import_intent_id original))
+      "cancel, shutdown or protocol mismatch was treated as a terminal handler rejection")
+    [W.Interrupted W.Cancelled;W.Interrupted W.Worker_stopped;
+     W.Answered(Error(W.Protocol_mismatch "Synthetic unmatched response"))];
+  let original=intent 268 in
+  let ticket=request(W.Import original) in
+  complete ticket failure;apply(C.Forget ticket);
+  let substituted=W.asset_import_intent session{(source 268)with target=client} |> Result.get_ok in
+  let read=request(W.Confirm_import_source substituted) in
+  complete read(W.Answered(Ok None));apply(C.Forget read);
+  check(C.import_source_pending(C.view !state) ~operation:(W.asset_import_intent_id original))
+    "same UUID with a different immutable input retired the original source";
+  let original=intent 269 in
+  let first=request(W.Import original) in
+  complete first failure;
+  let read=request(W.Confirm_import_source original) in
+  complete read(W.Answered(Ok None));apply(C.Forget read);
+  check((match C.import_progress(C.view !state)original with Some(W.Import_rejected _)->true|_->false))
+    "first terminal failure did not become an actual rejection";
+  let retry=request(W.Import original) in
+  complete retry failure;apply(C.Forget retry);apply(C.Forget first);
+  check(C.import_progress(C.view !state)original=Some W.Import_unknown
+    && C.import_source_pending(C.view !state) ~operation:(W.asset_import_intent_id original))
+    "new Import attempt inherited a live previous ticket's rejection"
+;;
+
 let test_new_host_source_proof_retires_only_identical_unknown () =
   let first,_,projection,session=fixture 891L in
   let module I=(val first:Worker_effect_authority.ISSUER) in
@@ -4542,6 +4657,7 @@ let test_returned_files_reuse_capacity () =
 
 let () =
   if Array.mem "--retry-release-error-only" Sys.argv then (test_retry_binding_release_error_is_observable();exit 0);
+  if Array.mem "--import-rejection-only" Sys.argv then (test_rejected_imports_release_capacity_after_fresh_readback();exit 0);
   if Array.mem "--import-proof-return-only" Sys.argv then (test_completed_imports_release_active_recovery_capacity();exit 0);
   if Array.mem "--file-return-only" Sys.argv then (test_returned_files_reuse_capacity();exit 0);
   test_returned_observations_reuse_capacity ();
@@ -4556,6 +4672,7 @@ let () =
   test_import_preview_late_result_is_cleanup_owned ();
   test_import_cancelled_preview_properties ();
   test_completed_imports_release_active_recovery_capacity ();
+  test_rejected_imports_release_capacity_after_fresh_readback ();
   test_new_host_source_proof_retires_only_identical_unknown ();
   test_import_proof_consumption_properties ();
   test_atomic_append_intent_and_admission ();

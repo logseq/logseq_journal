@@ -24,7 +24,7 @@ type _ kind =
   | Mutation : Worker.mutation_progress kind
   | Recovery : Worker.mutation_recovery kind
   | Import_inputs : Worker.import_input_recovery kind
-  | Import_source : Worker.recovered_import_input option kind
+  | Import_source : Worker.request_id option -> Worker.recovered_import_input option kind
   | Import : Worker.import_progress kind
   | Lease : Worker.file_lease option kind
   | Info : Worker.graph_info kind
@@ -74,7 +74,7 @@ let rec same_kind : type a b. a kind -> b kind -> (a, b) Worker.equality option 
   | Mutation, Mutation -> Some Refl
   | Recovery, Recovery -> Some Refl
   | Import_inputs, Import_inputs -> Some Refl
-  | Import_source, Import_source -> Some Refl
+  | Import_source _, Import_source _ -> Some Refl
   | Import, Import -> Some Refl
   | Lease, Lease -> Some Refl
   | Info, Info -> Some Refl
@@ -161,7 +161,8 @@ type 'a observation_state =
 
 type observation_entry = Observing : 'a observation_state -> observation_entry
 
-type import_registration={import_intent:Worker.asset_import_intent;source_owner:Worker.session;source_adopted:bool;progress:Worker.import_progress option}
+type import_registration={import_intent:Worker.asset_import_intent;source_owner:Worker.session;source_adopted:bool;
+  progress:Worker.import_progress option;failed_attempt:(Worker.request_id * Worker.error) option}
 
 type cleanup_resource=Demand_resource of Worker.asset_consumer | Lease_resource of Worker.file_lease
 
@@ -344,7 +345,8 @@ let intent_progress view intent = Intents.find_opt (intent_key intent) view.inte
 let adopt_import_source facts proof =
   let id=Worker.import_source_proof_id proof in
   let imports=match Graphs.find_opt id facts.imports with
-    |Some saved when Worker.import_source_proof_matches saved.import_intent proof->Graphs.add id{saved with source_adopted=true}facts.imports
+    |Some saved when Worker.import_source_proof_matches saved.import_intent proof->
+      Graphs.add id{saved with source_adopted=true;failed_attempt=None}facts.imports
     |_->facts.imports in
   let import_history=if Graphs.mem id facts.import_history || Graphs.cardinal facts.import_history<8192
     then Graphs.add id proof facts.import_history else facts.import_history in
@@ -1975,11 +1977,27 @@ let adopt_file_result : type a. t -> a slot -> a Worker.reply -> t =
         Option.fold ~none:state.facts ~some:(adopt state.facts)(Worker.import_preview imported)|_->state.facts in
       let source_owner=match Graphs.find_opt key facts.imports with Some saved->saved.source_owner
         |None->(match slot.ticket.target with Direct session->session|_->assert false) in
-      let imports=Graphs.add key {import_intent=intent;source_owner;progress;source_adopted=(match progress with Some(Worker.Imported _)->true
+      let failed_attempt=match result,progress with
+        |Worker.Answered(Error(Worker.Service_failed _ as error)),Some Worker.Import_unknown
+          when slot.admitted<>None && not slot.cancelled->Some(slot.ticket.id,error)
+        |_->None in
+      let imports=Graphs.add key {import_intent=intent;source_owner;progress;failed_attempt;source_adopted=(match progress with Some(Worker.Imported _)->true
           |_->Option.exists(fun saved->saved.source_adopted)(Graphs.find_opt key facts.imports))}facts.imports in
       {facts with imports}
-    |Operation(Worker.Confirm_import_source _),Worker.Answered(Ok(Some recovered))->
-      Option.fold ~none:state.facts ~some:(fun proof->adopt_import_source state.facts(Worker.prepared_import_adoption proof))recovered.prepared
+    |Operation(Worker.Confirm_import_source intent),Worker.Answered(Ok recovered)->
+      (match Option.bind recovered(fun recovered->recovered.Worker.prepared) with
+       |Some proof->adopt_import_source state.facts(Worker.prepared_import_adoption proof)
+       |None->
+         let key=import_key intent in
+         (match slot.ticket.kind,Graphs.find_opt key state.facts.imports with
+          |Import_source(Some sampled),Some({failed_attempt=Some(attempt,error);_}as saved)
+            when Worker.equal_request_id sampled attempt
+              && not saved.source_adopted
+              && Worker.encode_asset_import_intent intent=Worker.encode_asset_import_intent saved.import_intent
+              && not(Slots.exists(fun _ (Entry active)->active.result=None && match active.ticket.query with
+                |Operation(Worker.Import pending)->Worker.Uuid.equal(import_key pending)key|_->false)state.facts.entries)->
+            {state.facts with imports=Graphs.add key{saved with progress=Some(Worker.Import_rejected error);failed_attempt=None}state.facts.imports}
+          |_->state.facts))
     |Operation(Worker.Recover_import_inputs _),Worker.Answered(Ok page)->
       Rrbvec.fold_left(fun facts (recovered:Worker.recovered_import_input)->
         Option.fold ~none:facts ~some:(fun proof->adopt_import_source facts(Worker.prepared_import_adoption proof))recovered.prepared)
@@ -2472,7 +2490,7 @@ let step_base state event =
     let id=Worker.import_source_proof_id proof in
     (match Graphs.find_opt id state.facts.imports with
      |Some saved when not saved.source_adopted && Worker.import_source_proof_matches saved.import_intent proof->
-       let imports=Graphs.add id {saved with source_adopted=true}state.facts.imports in
+       let imports=Graphs.add id {saved with source_adopted=true;failed_attempt=None}state.facts.imports in
        changed{state with facts={state.facts with imports}}[]
      |_->unchanged state)
   | Worker_bound binding when state.binding = None || state.lifecycle = Rebinding ->
@@ -2668,6 +2686,7 @@ let step_base state event =
               let source_owner=match Graphs.find_opt key state.facts.imports with Some saved->saved.source_owner
                 |None->(match slot.ticket.target with Direct session->session|_->assert false) in
               Graphs.add key{import_intent=intent;source_owner;progress=Some progress;
+                failed_attempt=None;
                 source_adopted=Option.exists(fun saved->saved.source_adopted)(Graphs.find_opt key state.facts.imports)}state.facts.imports
             |_->state.facts.imports in
           let facts={state.facts with observations;imports} in
@@ -3198,6 +3217,7 @@ let retire_completed_imports transition =
           (Worker.import_preview imported)
       |_->true in
     match saved.progress with
+    |None|Some(Worker.Import_rejected _) when not live_ticket->Graphs.remove id active,history
     |Some(Worker.Imported imported) when not live_ticket && not leased->
       Graphs.remove id active,Graphs.add id(Worker.import_source_proof imported)history
     |_->active,history)facts.imports(facts.imports,facts.import_history) in
@@ -3487,7 +3507,10 @@ let plan_import state session intent operation =
   then Error(Worker.Invalid_input "Import recovery capacity is full")
   else
     let state=if Graphs.mem key state.facts.imports then state else
-      {state with facts={state.facts with imports=Graphs.add key{import_intent=intent;source_owner=session;source_adopted=false;progress=None}state.facts.imports}} in
+      {state with facts={state.facts with imports=Graphs.add key{import_intent=intent;source_owner=session;source_adopted=false;progress=None;failed_attempt=None}state.facts.imports}} in
+    let state={state with facts={state.facts with imports=Graphs.update key
+      (Option.map(fun saved->{saved with failed_attempt=None;
+        progress=(match saved.progress with Some(Worker.Import_rejected _)->None|_->saved.progress)}))state.facts.imports}} in
     match import_progress state.facts intent with
     |Some(Worker.Imported imported as progress) when Worker.equal_session session(Worker.imported_session imported)->
       Result.map(fun((ticket:Worker.import_progress ticket),planned)->
@@ -3747,7 +3770,13 @@ let request
               if Slots.exists(fun _ (Entry slot)->match slot.ticket.query with Operation(Worker.Recover_import_inputs _)->true|_->false)state.facts.entries
               then Error(Worker.Invalid_input "Release the previous import recovery ticket before paging")
               else plan_intent_lifecycle state session operation Import_inputs(Direct session)None
-            | Worker.Confirm_import_source _->plan_intent_lifecycle state session operation Import_source(Direct session)None
+            | Worker.Confirm_import_source intent->
+              (* Only a read planned after an actual terminal handler failure
+                 can establish that its original input never became Prepared. *)
+              let failed=Option.bind(Graphs.find_opt(import_key intent)state.facts.imports)(fun saved->
+                if Worker.encode_asset_import_intent intent=Worker.encode_asset_import_intent saved.import_intent
+                then Option.map fst saved.failed_attempt else None) in
+              plan_intent_lifecycle state session operation (Import_source failed)(Direct session)None
             | Worker.Acknowledge_import_source _->
               if state.facts.import_input_epoch=Int64.max_int then Error(Worker.Invalid_input "Source lifecycle counter exhausted")
               else plan_intent_lifecycle state session operation Unit(Direct session)None
