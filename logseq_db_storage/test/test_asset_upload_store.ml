@@ -124,7 +124,7 @@ let scoped_cleanup () =
              true
              (get (S.read db ~operation:i.I.operation_id) = Some i))
         [ b; c; d ];
-      get (S.delete_account db ~origin:b.origin ~account:b.account));
+      get (S.delete_account db ~origin:b.origin ~account:b.account ~input_namespaces:Seq.empty));
     with_db path (fun db ->
       Alcotest.(check bool)
         "account cleanup survives restart"
@@ -286,6 +286,79 @@ let source_input ?(source_file="/isolated-picker/source.png") ?(namespace=String
     target=prepared.target;replace_reference=prepared.replace_reference;local_mutation=prepared.local_mutation;
     metadata_mutation=prepared.metadata_mutation;source_file;title=prepared.title;file_type=prepared.version.file_type} in
   Logseq_db_types.Asset_import.Pure_intent.create ~namespace source |> Result.get_ok
+;;
+
+(* Account retirement is owned by this SQLite store; a pure reducer cannot
+   reproduce which durable input rows survive deleting an account. *)
+let account_cleanup_retires_complete_inputs () =
+  let module R = S.Inputs in
+  fixture (fun path ->
+    let a = intent 900 and b = intent ~graph:(uuid 8) 901
+    and c = intent ~account:"other" 902
+    and d = intent ~origin:"https://other.example" 903
+    and pending = intent ~graph:(uuid 9) 904
+    and foreign_pending = intent ~account:"other" ~graph:(uuid 10) 905 in
+    let owner namespace (prepared : I.t) : R.owner =
+      {namespace=String.make 64 namespace;origin=prepared.origin;
+       account=prepared.account;graph=prepared.graph} in
+    let entries = List.map (fun (namespace, prepared) ->
+      let owner = owner namespace prepared in
+      owner, source_input ~namespace:owner.namespace prepared, prepared)
+      ['a',a; 'b',b; 'c',c; 'd',d; 'e',pending; 'f',foreign_pending] in
+    with_db path (fun db ->
+      List.iter (fun (owner, input, prepared) ->
+        ignore (get (R.reserve db ~owner ~input));
+        if prepared.I.operation_id <> pending.operation_id
+           && prepared.operation_id <> foreign_pending.operation_id then
+          ignore (get (R.commit_prepared db ~owner ~input prepared))) entries;
+      let owner, input, _ = List.nth entries 1 in
+      let proof = get (R.read db ~owner ~operation:b.operation_id)
+        |> Option.get |> fun row -> Option.get row.evidence in
+      get (R.acknowledge db ~owner ~input ~evidence:proof);
+      get (S.delete_account db ~origin:a.origin ~account:a.account
+        ~input_namespaces:(List.to_seq [String.make 64 'a';String.make 64 'b';String.make 64 'e']));
+      List.iter (fun (owner, _, prepared) ->
+        let removed = prepared.I.origin=a.origin && prepared.account=a.account in
+        Alcotest.(check bool) "account input retirement is exact" removed
+          (get (R.read db ~owner ~operation:prepared.operation_id)=None);
+        Alcotest.(check bool) "checkpoint follows the same account retirement" removed
+          (get (S.read db ~operation:prepared.operation_id)=None))
+        (List.filter (fun (_,_,prepared)->prepared.I.operation_id<>pending.operation_id
+          && prepared.operation_id<>foreign_pending.operation_id) entries);
+      let owner,_,_ = List.nth entries 4 in
+      Alcotest.(check bool) "unprepared source retires with its account" true
+        (get (R.read db ~owner ~operation:pending.operation_id)=None);
+      get (S.delete_account db ~origin:a.origin ~account:a.account
+        ~input_namespaces:(List.to_seq [String.make 64 'a';String.make 64 'b';String.make 64 'e'])));
+    with_db path (fun db ->
+      List.iter (fun (owner,_,prepared) ->
+        let removed = prepared.I.origin=a.origin && prepared.account=a.account in
+        Alcotest.(check bool) "account input cleanup survives restart" removed
+          (get (R.read db ~owner ~operation:prepared.operation_id)=None)) entries))
+;;
+
+let account_cleanup_rolls_back_on_checkpoint_failure () =
+  let module R = S.Inputs in
+  fixture (fun path -> with_db path (fun db ->
+    let prepared = intent 906 in
+    let owner = input_owner () in
+    let input = source_input prepared in
+    ignore (get (R.reserve db ~owner ~input));
+    ignore (get (R.commit_prepared db ~owner ~input prepared));
+    Alcotest.(check bool) "invalid namespace cannot partially retire inputs" true
+      (Result.is_error (S.delete_account db ~origin:prepared.origin ~account:prepared.account
+        ~input_namespaces:(List.to_seq [owner.namespace; "invalid"])));
+    Alcotest.(check bool) "namespace validation rolls back earlier input deletes" true
+      (Option.is_some (get (R.read db ~owner ~operation:prepared.operation_id)));
+    Sqlite3.Rc.check (Sqlite3.exec db
+      "CREATE TRIGGER deny_checkpoint_delete BEFORE DELETE ON asset_upload_intents BEGIN SELECT RAISE(FAIL,'synthetic delete failure'); END");
+    Alcotest.(check bool) "account cleanup reports SQLite failure" true
+      (Result.is_error (S.delete_account db ~origin:prepared.origin ~account:prepared.account
+        ~input_namespaces:(Seq.return owner.namespace)));
+    Alcotest.(check bool) "failed account cleanup preserves checkpoint" true
+      (S.read db ~operation:prepared.operation_id=Ok (Some prepared));
+    Alcotest.(check bool) "failed account cleanup preserves input and proof" true
+      (Option.is_some (get (R.read db ~owner ~operation:prepared.operation_id)))))
 ;;
 
 let input_reservation_restart_conflict_and_unknown_ack () =
@@ -461,7 +534,9 @@ let () =
     [ ( "SQLite"
       , List.map
           (fun (n, f) -> Alcotest.test_case n `Quick f)
-          [ "foreign persisted input evidence rejected", input_persisted_foreign_evidence_is_not_adoption
+          [ "account cleanup rollback", account_cleanup_rolls_back_on_checkpoint_failure
+          ; "account cleanup retires complete inputs", account_cleanup_retires_complete_inputs
+          ; "foreign persisted input evidence rejected", input_persisted_foreign_evidence_is_not_adoption
           ; "legacy manifest preserves new source records", legacy_capture_never_captures_new_input_rows
           ; "input exact retirement and changed ACK", input_retirement_exact_snapshot_and_changed_ack
           ; "input read never initializes schema", input_reads_do_not_initialize_schema

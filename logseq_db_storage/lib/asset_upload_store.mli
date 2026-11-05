@@ -21,10 +21,14 @@ val list
   -> limit:int
   -> (Logseq_db_types.Asset_upload_intent.t list, string) result
 
+(** Retires checkpoints and complete inputs atomically. The caller supplies
+    namespaces derived from this account and its existing graph identities;
+    source bytes cannot establish account ownership on their own. *)
 val delete_account
   :  Sqlite3.db
   -> origin:string
   -> account:string
+  -> input_namespaces:string Seq.t
   -> (unit, string) result
 
 (** Immutable complete source input and original Prepared proof share this

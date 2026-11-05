@@ -150,13 +150,31 @@ let list db ~origin ~account ~graph ~after ~limit =
          rows [])
 ;;
 
-let delete_account db ~origin ~account =
-  statement
-    db
-    "DELETE FROM asset_upload_intents WHERE origin=? AND account=?"
-    (fun stmt ->
-       bind stmt [ TEXT origin; TEXT account ];
-       check db (Sqlite3.step stmt))
+let transact db action =
+  let* () = check db (Sqlite3.exec db "BEGIN IMMEDIATE") in
+  match protect action with
+  | Ok value ->
+    (match check db (Sqlite3.exec db "COMMIT") with
+     | Ok () -> Ok value
+     | Error _ as error -> ignore (Sqlite3.exec db "ROLLBACK"); error)
+  | Error _ as error -> ignore (Sqlite3.exec db "ROLLBACK"); error
+;;
+
+let delete_account db ~origin ~account ~input_namespaces =
+  let valid namespace = String.length namespace=64
+    && String.for_all (function '0'..'9'|'a'..'f' -> true | _ -> false) namespace in
+  transact db (fun () ->
+    let* () = statement db "DELETE FROM overlay_intents_v1 WHERE namespace=?" (fun stmt ->
+      Seq.fold_left (fun result namespace ->
+        let* () = result in
+        let* () = if valid namespace then Ok ()
+          else Error "Account input retirement has an invalid namespace" in
+        let* () = check db (Sqlite3.reset stmt) in
+        bind stmt [TEXT namespace];
+        check db (Sqlite3.step stmt)) (Ok ()) input_namespaces) in
+    statement db "DELETE FROM asset_upload_intents WHERE origin=? AND account=?" (fun stmt ->
+      bind stmt [TEXT origin; TEXT account];
+      check db (Sqlite3.step stmt)))
 ;;
 
 module Inputs = struct
@@ -197,12 +215,7 @@ module Inputs = struct
       (match checkpoint with None->Ok()|Some _->Error "The legacy upload has no complete original input; it cannot be rebound to a new source") in
     let* row=error(Store.prepare db ~namespace ~mutation_id ~payload:(Input.encode input)) in
     decode_record ~owner row
-  let transact db action=
-    let* ()=check db(Sqlite3.exec db "BEGIN IMMEDIATE") in
-    let result=protect action in
-    match result with
-    |Ok value->(match check db(Sqlite3.exec db "COMMIT")with Ok()->Ok value|Error _ as error->ignore(Sqlite3.exec db "ROLLBACK");error)
-    |Error _ as error->ignore(Sqlite3.exec db "ROLLBACK");error
+  let transact = transact
   let commit_prepared db ~owner ~input prepared=
     if prepared.Intent.phase<>Prepared || prepared.revision<>0 || not(matches owner input prepared)
     then Error "Only an exact original Prepared checkpoint can prove input adoption" else

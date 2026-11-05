@@ -722,6 +722,56 @@ let with_staging_lock t action =
          raise error)
 ;;
 
+let local_retirement_account_directory t (account : Sync.account_scope) =
+  let identity = Digest.to_hex (Digest.string
+    (Uri.to_string account.managed_sync_origin ^ "\000" ^ account.user_id)) in
+  Filename.concat t.dependencies.config.application_support_directory
+    (Filename.concat "logseq-db-worker/local-copy-retirements" identity)
+;;
+
+let account_input_namespaces t (account : Sync.account_scope) =
+  let graph_directories path graphs =
+    let directory = try Ok (Some (Unix.opendir path)) with
+      | Unix.Unix_error (Unix.ENOENT,_,_) -> Ok None
+      | error -> Error (Printexc.to_string error) in
+    Result.bind directory (function None -> Ok graphs | Some directory ->
+      Fun.protect ~finally:(fun () -> Unix.closedir directory) (fun () ->
+        let rec collect graphs =
+          match Unix.readdir directory with
+          | entry ->
+            (match Graph.Uuid.of_string entry with
+             | Error _ -> collect graphs
+             | Ok graph ->
+               let stat = Unix.lstat (Filename.concat path entry) in
+               if stat.st_kind=Unix.S_DIR
+               then collect (Authorized_graphs.add (Graph.Uuid.to_string graph) graphs)
+               else collect graphs)
+          | exception End_of_file -> Ok graphs in
+        try collect graphs with error -> Error (Printexc.to_string error))) in
+  let mirrors = Filename.concat t.dependencies.config.application_support_directory
+    "logseq-db-worker/synced-graphs" in
+  let (let*) = Result.bind in
+  let* graphs = graph_directories mirrors Authorized_graphs.empty in
+  (* A committed mirror rename can precede source-input cleanup. Its existing
+     retirement directory still supplies the graph identity, including Unknown. *)
+  let* graphs = graph_directories (Filename.concat mirrors ".mirror-deletions") graphs in
+  let* graphs = graph_directories (local_retirement_account_directory t account) graphs in
+  Ok (Authorized_graphs.to_seq graphs |> Rrbvec.of_seq |> Rrbvec.map (fun graph ->
+    Logseq_db_worker_contract.Worker_pure_mutation.namespace_for_owner
+      ~origin:account.managed_sync_origin ~user:account.user_id
+      ~graph:(Graph.Uuid.of_string graph |> Result.get_ok)))
+;;
+
+let cleanup_account_uploads ?(wait=true) t (account : Sync.account_scope) =
+  let cleanup () = Result.bind (account_input_namespaces t account) (fun input_namespaces ->
+    with_upload_store t (fun db -> Logseq_db_storage.Asset_upload_store.delete_account db
+      ~origin:(Uri.to_string account.managed_sync_origin) ~account:account.user_id ~input_namespaces:(Rrbvec.to_seq input_namespaces))) in
+  if wait then with_staging_lock t cleanup
+  else if Eio.Mutex.try_lock t.upload_staging_lock then
+    Fun.protect ~finally:(fun () -> Eio.Mutex.unlock t.upload_staging_lock) cleanup
+  else Error "Account attachment preparation has not settled."
+;;
+
 let reconcile_staging t (scope : Sync.graph_scope) ~current =
   if (not (current ())) || t.stopped
   then Error "Stale staging recovery"
@@ -2236,11 +2286,8 @@ let rec make_retirement_directory path =
 ;;
 
 let local_retirement_directory t (scope : Sync.graph_scope) =
-  let identity = Digest.to_hex (Digest.string
-    (Uri.to_string scope.account.managed_sync_origin ^ "\000" ^ scope.account.user_id)) in
-  Filename.concat t.dependencies.config.application_support_directory
-    (Filename.concat "logseq-db-worker/local-copy-retirements"
-       (Filename.concat identity (Graph.Uuid.to_string scope.graph_id)))
+  Filename.concat (local_retirement_account_directory t scope.account)
+    (Graph.Uuid.to_string scope.graph_id)
 ;;
 
 let fresh_retirement () =
@@ -3235,7 +3282,9 @@ let settle_host_scope t ~(scope:Sync.graph_scope) =
               Ok()))))))
 ;;
 
-let retire_account t ~account=t.dependencies.sync_runner.retire_account ~account
+let retire_account t ~account=
+  Result.bind (cleanup_account_uploads t account) (fun () ->
+    t.dependencies.sync_runner.retire_account ~account)
 ;;
 
 let start_asset_cleanup_job ?parent ?(prepare=(fun _->())) t ~scope work =
@@ -3457,11 +3506,9 @@ let submit t = function
     if not t.stopped
     then (
       match
-        with_upload_store t (fun db ->
-          Logseq_db_storage.Asset_upload_store.delete_account
-            db
-            ~origin:(Uri.to_string account.managed_sync_origin)
-            ~account:account.user_id)
+        (* This is the serial consumer: never await a staging owner whose asset
+           completion must return through this same consumer. *)
+        cleanup_account_uploads ~wait:false t account
       with
       | Ok () -> t.dependencies.sync_runner.submit sync_effect
       | Error message ->
