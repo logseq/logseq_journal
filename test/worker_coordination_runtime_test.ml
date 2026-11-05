@@ -11,6 +11,15 @@ module SR = Logseq_sync_effect_runner.Effect_runner
 
 let require condition message = if not condition then failwith message
 let uuid value = W.Uuid.of_string value |> Result.get_ok
+
+(* Registration replies and later live pushes can be drained in one batch.
+   Consuming a retained reply must not replace a newer snapshot already seen. *)
+let remember_baseline baseline (value : Service.coordination_baseline) =
+  match !baseline with
+  | Some current when current.Service.registration = value.registration
+      && current.baseline.version > value.baseline.version -> ()
+  | _ -> baseline := Some value
+;;
 module Read=Worker_pure_read
 
 (* This Service-side source uses the real client's incarnation and its atomic
@@ -1723,32 +1732,39 @@ let test_read_completion_rechecks_graph_owner () =
            | Push { payload = Service.Coordination_updates updates; _ } ->
              List.iter
                (function
-                 | Service.Coordination_snapshot value -> baseline := Some value
+                 | Service.Coordination_snapshot value -> remember_baseline baseline value
                  | _ -> ())
                updates
            | _ -> ());
-         let wait predicate =
+         let wait stage predicate =
            let deadline = Unix.gettimeofday () +. 4. in
            while (not (predicate ())) && Unix.gettimeofday () < deadline do
              Mailbox.Private.deliver client ~max_events:64;
              Thread.delay 0.001
            done;
-           require (predicate ()) "Service completion ownership race did not settle"
+           require (predicate ()) ("Service completion ownership race did not settle: " ^ stage)
          in
          let send request =
            match Mailbox.send client request with
            | Accepted id -> id
            | _ -> failwith "race request not admitted"
          in
-         ignore
-           (send (Service.Client_command (Restore_local_account { user_id = "user-1" })));
          let registration = 900000L in
          let id = send (Service.Register_coordination registration) in
-         wait (fun () -> Hashtbl.mem responses id);
+         wait "registration" (fun () -> Hashtbl.mem responses id);
+         ignore
+           (send (Service.Client_command (Restore_local_account { user_id = "user-1" })));
+         (* The worker can publish Open before this test consumes the retained
+            registration result. Exercise that real delivery order explicitly. *)
+         wait "live graph open before retained registration" (fun () ->
+           Option.exists (fun value ->
+             List.exists (fun (_, state) ->
+               state.Logseq_db_worker.phase = Logseq_db_worker.Graph_open)
+               value.Service.baseline.state.residents) !baseline);
          (match Hashtbl.find responses id with
-          | Completed (Service.Coordination_registered value) -> baseline := Some value
+          | Completed (Service.Coordination_registered value) -> remember_baseline baseline value
           | _ -> assert false);
-         wait (fun () ->
+         wait "initial graph open" (fun () ->
            match !baseline with
            | Some value ->
              List.exists
@@ -1760,7 +1776,7 @@ let test_read_completion_rechecks_graph_owner () =
          let read=send(query_request client !baseline owner registration
            (uuid "99000000-0000-4000-8000-000000000001") ~maximum_bytes:Worker_pure_data.maximum_response_bytes
            (Read.Outline_block{uuid=Test_support.authoritative_block_uuid;revision=None})) in
-         wait (fun () -> Hashtbl.mem responses read);
+         wait "initial block read" (fun () -> Hashtbl.mem responses read);
          let revision =
            match Hashtbl.find responses read with
            |Completed(Service.Coordination_queried{answer=Read.Query_answer(_,Read.Outline_block _,Ok(Worker_pure_data.V2_present_block{revision;_}));_})
@@ -1777,7 +1793,7 @@ let test_read_completion_rechecks_graph_owner () =
            |>Result.get_ok |>fun intent->Wire.Mutation_intent intent in
          let writer=send(Service.Coordination_mutation{registration;owner;
            request_id=uuid "99000000-0000-4000-8000-000000000002";intent=wire})in
-         wait (fun () -> Atomic.get entered);
+         wait "writer entered DB gate" (fun () -> Atomic.get entered);
          let read=send(query_request client !baseline owner registration
            (uuid "99000000-0000-4000-8000-000000000004") Read.Graph_info)in
          (* Cancelling the outer writer releases its Service lane, not its
@@ -1785,7 +1801,7 @@ let test_read_completion_rechecks_graph_owner () =
             second lane is waiting on the real snapshot mutex. *)
          Mailbox.cancel client ~request_id:writer;
 
-         wait (fun () ->
+         wait "read request fiber started" (fun () ->
            (Mailbox.Private.metrics (Mailbox.Private.pack_client client))
              .active_request_fibers
            > 0);
@@ -1793,25 +1809,25 @@ let test_read_completion_rechecks_graph_owner () =
            (not (Hashtbl.mem responses read))
            "read did not wait behind actual writer";
          ignore (send (Service.Client_command Return_to_graph_picker));
-         wait (fun () ->
+         wait "graph picker published" (fun () ->
            match !baseline with
            | Some value -> value.baseline.state.sync.selected = None
            | _ -> false);
          Atomic.set release true;
-         wait (fun () -> Hashtbl.mem responses read);
+         wait "retired read completion" (fun () -> Hashtbl.mem responses read);
          require
            (match Hashtbl.find responses read with
             | Failed _ -> true
             | _ -> false)
            "retired graph read completion still crossed Service's authority gate";
          (
-           wait (fun () -> Hashtbl.mem responses writer);
+           wait "cancelled writer completion" (fun () -> Hashtbl.mem responses writer);
            require
              (Hashtbl.find responses writer = Mailbox.Cancelled)
              "cancelled durable attempt was reported as known rollback";
            Atomic.set armed false;
            ignore (send (Service.Client_command (Select_graph Test_support.graph_uuid)));
-           wait (fun () ->
+           wait "replacement graph open" (fun () ->
              match !baseline with
              | Some value ->
                Option.is_some value.baseline.state.sync.selected
@@ -1834,7 +1850,7 @@ let test_read_completion_rechecks_graph_owner () =
                   ; intent = wire
                   })
            in
-           wait (fun () -> Hashtbl.mem responses retry);
+           wait "same intent reconciliation" (fun () -> Hashtbl.mem responses retry);
            match Hashtbl.find responses retry with
            | Completed
                (Service.Coordination_mutation_result
@@ -2880,7 +2896,7 @@ let with_observation_service ?epoch_ms ?prepare ?change_max_items ?(observe_push
       | Push { payload = Service.Coordination_updates updates; _ } ->
         List.iter
           (function
-            | Service.Coordination_snapshot value -> baseline := Some value
+            | Service.Coordination_snapshot value -> remember_baseline baseline value
             | _ -> ())
           updates
       | Push { payload = Service.Coordination_observations updates; _ } ->
@@ -2907,7 +2923,7 @@ let with_observation_service ?epoch_ms ?prepare ?change_max_items ?(observe_push
     ignore (call (Service.Client_command (Restore_local_account { user_id = "user-1" })));
     let registration = 910000L in
     (match call (Service.Register_coordination registration) with
-     | Completed (Service.Coordination_registered value) -> baseline := Some value
+     | Completed (Service.Coordination_registered value) -> remember_baseline baseline value
      | _ -> failwith "observation baseline registration failed");
     wait (fun () ->
       match !baseline with
@@ -3229,7 +3245,7 @@ let test_service_import_rejects_retired_registration () =
     let replies=Hashtbl.create 16 and baseline=ref None in
     Mailbox.on_event client(function
       |Mailbox.Response{request_id;outcome;_}->Hashtbl.replace replies request_id outcome
-      |Push{payload=Service.Coordination_updates updates;_}->List.iter(function Service.Coordination_snapshot value->baseline:=Some value|_->())updates
+      |Push{payload=Service.Coordination_updates updates;_}->List.iter(function Service.Coordination_snapshot value->remember_baseline baseline value|_->())updates
       |_->());
     let wait predicate=
       let deadline=Unix.gettimeofday()+.4. in
@@ -3242,7 +3258,7 @@ let test_service_import_rejects_retired_registration () =
       ~runtime_epoch:(Mailbox.runtime_epoch client) ~worker_generation:(Mailbox.worker_generation client) |> Result.get_ok in
     let module I=(val issuer:Worker_effect_authority.ISSUER) in
     (match call(I.bootstrap_request() |> Result.get_ok)with
-      |Completed(Service.Coordination_registered value)->baseline:=Some value|_->failwith "typed Import baseline request failed");
+      |Completed(Service.Coordination_registered value)->remember_baseline baseline value|_->failwith "typed Import baseline request failed");
     wait(fun()->Option.exists(fun value->List.exists(fun(_,graph)->graph.Logseq_db_worker.phase=Graph_open)value.Service.baseline.state.residents)!baseline);
     let raw=Option.get !baseline in
     let projection=match I.bootstrap(Service.Coordination_registered raw)with Ok(W.Ready value)->value|_->failwith "typed Import baseline invalid" in
@@ -3272,7 +3288,7 @@ let test_revoked_hidden_lease_blocks_unregister_ack () =
     Mailbox.on_event client(function
       |Mailbox.Response{request_id;outcome;_}->Hashtbl.replace replies request_id outcome
       |Push{payload=Service.Coordination_updates updates;_}->List.iter(function
-        |Service.Coordination_snapshot value->baseline:=Some value|_->())updates
+        |Service.Coordination_snapshot value->remember_baseline baseline value|_->())updates
       |Push{payload=Service.Client_state_changed value;_}->manager:=Some value.snapshot
       |_->());
     let wait label predicate=let deadline=Unix.gettimeofday()+.4. in
@@ -3282,7 +3298,7 @@ let test_revoked_hidden_lease_blocks_unregister_ack () =
       wait "actual retirement command did not settle"(fun()->Hashtbl.mem replies id);Hashtbl.find replies id in
     ignore(call(Service.Client_command(Restore_local_account{user_id="user-1"})));
     (match call(Service.Register_coordination 7991L)with
-     |Completed(Service.Coordination_registered value)->baseline:=Some value|_->failwith "retirement baseline");
+     |Completed(Service.Coordination_registered value)->remember_baseline baseline value|_->failwith "retirement baseline");
     ignore(call(Service.Client_command(Configure_resident_graphs[Test_support.graph_uuid;second_graph])));
     wait "two retirement residents did not open"(fun()->Option.exists(fun value->
       List.length value.Service.baseline.state.residents=2 && List.for_all(fun(_,state)->state.Logseq_db_worker.phase=Graph_open)
@@ -3333,7 +3349,7 @@ let test_prepared_import_survives_worker_lifetime () =
         Mailbox.on_event client(function
           |Mailbox.Response{request_id;outcome;_}->Hashtbl.replace replies request_id outcome
           |Push{payload=Service.Coordination_updates updates;_}->
-            List.iter(function Service.Coordination_snapshot value->baseline:=Some value|_->())updates
+            List.iter(function Service.Coordination_snapshot value->remember_baseline baseline value|_->())updates
           |_->());
         let wait predicate=
           let deadline=Unix.gettimeofday()+.5. in
@@ -3348,7 +3364,7 @@ let test_prepared_import_survives_worker_lifetime () =
           ~runtime_epoch:(Mailbox.runtime_epoch client) ~worker_generation:(Mailbox.worker_generation client) |> Result.get_ok in
         let module I=(val issuer:Worker_effect_authority.ISSUER) in
         (match call(I.bootstrap_request() |> Result.get_ok)with
-         |Completed(Service.Coordination_registered value)->baseline:=Some value
+         |Completed(Service.Coordination_registered value)->remember_baseline baseline value
          |_->failwith "restarted Import bootstrap failed");
         wait(fun()->Option.exists(fun value->List.exists(fun(_,graph)->
           graph.Logseq_db_worker.phase=Graph_open)value.Service.baseline.state.residents)!baseline);
@@ -4211,6 +4227,9 @@ let test_host_recovers_only_pending_import_sources () =
 ;;
 
 let () =
+  if Array.mem "--read-owner-only" Sys.argv then (
+    test_read_completion_rechecks_graph_owner ();
+    print_endline "Real Service read completion owner race passed"; exit 0);
   if Array.mem "--change-owner-only" Sys.argv then (
     test_service_changefeed_has_one_owner();print_endline "Real Service changefeed owner cases passed";exit 0);
   if Array.mem "--read-boundaries-only" Sys.argv then (
