@@ -7311,8 +7311,9 @@ let test_graph_picker_controls scenario () =
   let reordered=scenario=`Reordered_open || scenario=`Reordered_full in
   let automatic_auth=List.mem scenario [`Automatic_auth;`Automatic_direct;`Automatic_stop] in
   let during_delete=List.mem scenario [`During_delete;`Terminate_during_delete] in
-  let held_close=List.mem scenario[`Remove_reopen;`Remove_select;`Remove_cancel;`Remove_failure;`Remove_sign_out] in
-  let resident_scenario=List.mem scenario [`Current;`Remove;`Remove_current;`Remove_reopen;`Remove_select;`Remove_cancel;`Remove_failure;`Remove_sign_out;`Replace;`Sign_out;`Terminate;`Automatic_auth;`Automatic_direct;`Automatic_stop] in
+  let retry_close=List.mem scenario [`Remove_retry;`Remove_retry_reopen;`Remove_retry_generation;`Remove_retry_sign_out;`Remove_retry_terminate;`Remove_retry_registration_failure] in
+  let held_close=retry_close || List.mem scenario[`Remove_reopen;`Remove_select;`Remove_cancel;`Remove_failure;`Remove_sign_out] in
+  let resident_scenario=retry_close || List.mem scenario [`Remove_queued_sign_out] || List.mem scenario [`Current;`Remove;`Remove_current;`Remove_reopen;`Remove_select;`Remove_cancel;`Remove_failure;`Remove_sign_out;`Replace;`Sign_out;`Terminate;`Automatic_auth;`Automatic_direct;`Automatic_stop] in
   let module W = Logseq_db_worker_lui.Journal_worker in
   let uuid n = Logseq_db_types.Graph_types.Uuid.of_string
       (Printf.sprintf "94000000-0000-4000-8000-%012d" n) |> Result.get_ok in
@@ -7348,6 +7349,9 @@ let test_graph_picker_controls scenario () =
   let host_prepared=Atomic.make 0 and host_applied=Atomic.make 0 in
   let prepare_held=Atomic.make false and release_prepare=Atomic.make false in
   let prepare_failed=Atomic.make false and registration_count=Atomic.make 0 in
+  let rebind_held=Atomic.make false and release_rebind=Atomic.make false in
+  let prepare_attempts=Atomic.make [] in
+  let registration_deliveries=ref 0 in
   let legacy_deletions=Atomic.make 0 in
   let failed_registration=Atomic.make None in
   let termination_ready=ref 0 and native_sign_outs=ref 0 in
@@ -7405,10 +7409,11 @@ let test_graph_picker_controls scenario () =
           | _->None in
         match request with
         | Coordination_prepare_host_change plan ->
+          Atomic.set prepare_attempts(plan.id::Atomic.get prepare_attempts);
           if held_close then (
             Atomic.set prepare_held true;
             while not(Atomic.get release_prepare)do Eio.Fiber.yield()done);
-          if scenario=`Remove_failure && not(Atomic.exchange prepare_failed true)then
+          if (scenario=`Remove_failure || retry_close) && not(Atomic.exchange prepare_failed true)then
             Error "Synthetic close preparation failed"
           else let baseline=picker_baseline ~version:(Int64.of_int(Atomic.get coordination_version))
             (Atomic.get current) plan.registration in
@@ -7473,6 +7478,11 @@ let test_graph_picker_controls scenario () =
         | Register_coordination registration ->
           Atomic.incr registration_count;
           Atomic.set coordination_registration(Some registration);
+          if retry_close && Atomic.get registration_count=2 then (
+            Atomic.set rebind_held true;
+            while not(Atomic.get release_rebind)do Eio.Fiber.yield()done);
+          if scenario=`Remove_retry_registration_failure && Atomic.get registration_count=2
+          then Error "Synthetic fresh registration failed" else
           Ok(Service.Coordination_registered(picker_baseline
             ~version:(Int64.of_int(Atomic.get coordination_version)) (Atomic.get current) registration))
         | Release_coordination registration ->
@@ -7499,6 +7509,8 @@ let test_graph_picker_controls scenario () =
         | Service.Delete_local_copy request ->
           Atomic.incr legacy_deletions;
           Ok(Service.Local_copy_deleted(request,delete_copy request))
+        | Service.Get_graph_state_at scope when retry_close ->
+          Ok(Service.Graph_state{generation=scope.graph_generation;graph_id=Some scope.graph_id;phase=Graph_open;error=None})
         | Service.Get_graph_state | Get_graph_state_at _ ->
           let value = Atomic.get current in
           Ok (Service.Graph_state { generation = value.snapshot.startup.graph_generation
@@ -7513,7 +7525,7 @@ let test_graph_picker_controls scenario () =
              publish{previous with snapshot={previous.snapshot with selected_graph=None;resident_graphs=[];resident_scopes=[];
                startup={previous.snapshot.startup with authenticated=user_id<>None;awaiting_selection=user_id<>None;
                  account_generation=previous.snapshot.startup.account_generation+1}}}
-           | Reconcile_authenticated_user{user_id=None} when scenario=`Sign_out ->
+           | Reconcile_authenticated_user{user_id=None} when scenario=`Sign_out || scenario=`Remove_retry_sign_out || scenario=`Remove_queued_sign_out ->
              if Atomic.get host_applied<>1 then failwith "Sign out bypassed its actual old owner permit";
              publish{previous with snapshot={previous.snapshot with selected_graph=None;resident_graphs=[];resident_scopes=[];
                startup={previous.snapshot.startup with authenticated=false;awaiting_selection=false;
@@ -7616,6 +7628,7 @@ let test_graph_picker_controls scenario () =
         | W.Response { request_id; outcome = Cancelled; _ } ->
           incr inspection_terminals;
           if Atomic.get graph_read_worker = Some request_id then incr graph_read_cancellations
+        | W.Response {outcome=Completed(Service.Coordination_registered _);_}->incr registration_deliveries
         | W.Response { outcome = Completed (Service.Local_copy_inspected _); _ } ->
           incr inspection_terminals
         | _ -> ())) service in
@@ -7677,6 +7690,7 @@ let test_graph_picker_controls scenario () =
   Fun.protect ~finally:(fun () ->
     Atomic.set unregister_allowed true;
     Atomic.set release_prepare true;
+    Atomic.set release_rebind true;
     Atomic.set release_refresh true;
     Atomic.set finish_deletion true;
     Atomic.set release_automatic_inspection true;
@@ -7834,6 +7848,62 @@ let test_graph_picker_controls scenario () =
         Alcotest.(check int) "replacement prepares exactly once" 1(Atomic.get host_prepared);
         Alcotest.(check bool) "replacement preserves other slots" true
           ((Atomic.get current).snapshot.resident_graphs=[first;uuid 4;uuid 3])
+      | `Remove_queued_sign_out ->
+        press(node("graph-resident-remove:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        press(Option.get(find "text" "Sign out"));
+        wait "new account intent cancels an unstarted graph close" (fun()-> !native_sign_outs=1);
+        Alcotest.(check int) "only the account/stop prepare reaches the Service" 1(List.length(Atomic.get prepare_attempts));
+        Alcotest.(check int) "only the newer host permission is applied" 1(Atomic.get host_applied)
+      | `Remove_retry | `Remove_retry_reopen | `Remove_retry_generation | `Remove_retry_sign_out | `Remove_retry_terminate | `Remove_retry_registration_failure ->
+        (* Root_navigation does not own host retry/rebinding or manager pushes.
+           Hold the mounted Service at the real registration boundary. *)
+        press(node("graph-resident-remove:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        wait "first close preparation is held" (fun()->Atomic.get prepare_held);
+        Atomic.set release_prepare true;
+        wait "failed close waits for a fresh actual binding" (fun()->Atomic.get rebind_held);
+        if scenario=`Remove_retry_reopen then
+          press(node("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+        if scenario=`Remove_retry_generation then (
+          let configure ids=match W.send(Option.get !client)(Service.Client_command(Configure_resident_graphs ids))with
+            |W.Accepted _->()|_->Alcotest.fail "concurrent provider command refused" in
+          configure[first;uuid 3];
+          wait "original graph generation is removed" (fun()->not(List.mem second(Atomic.get current).snapshot.resident_graphs));
+          configure[first;second;uuid 3];
+          wait "provider admits a fresh generation of the same graph" (fun()->
+            List.exists(fun(scope:Service.asset_scope)->scope.graph_id=second && scope.graph_generation=4)
+              (Atomic.get current).snapshot.resident_scopes));
+        if scenario=`Remove_retry_sign_out then press(Option.get(find "text" "Sign out"));
+        if scenario=`Remove_retry_terminate then (
+          let packet=Bytes.make 32 '\000' in Bytes.blit_string "LJP2" 0 packet 0 4;
+          Bytes.set_uint16_le packet 4 2;Bytes.set_uint16_le packet 6 12;
+          hooks.platform_event(Bytes.to_string packet));
+        Atomic.set release_rebind true;
+        if scenario=`Remove_retry_registration_failure then (
+          wait "terminal fresh binding failure is visible" (fun()->Option.is_some(find "text" "Synthetic fresh registration failed"));
+          Alcotest.(check int) "failed new authority cannot close a graph" 1(List.length(Atomic.get prepare_attempts));
+          Alcotest.(check int) "failed new authority never applies a close" 0(Atomic.get host_applied))
+        else if scenario=`Remove_retry_sign_out || scenario=`Remove_retry_terminate then (
+          wait "account/stop outranks a close waiting for its fresh baseline" (fun()->
+            if scenario=`Remove_retry_sign_out then !native_sign_outs=1 else !termination_ready=1);
+          Alcotest.(check int) "old graph retry cannot interrupt account handoff" 2(List.length(Atomic.get prepare_attempts));
+          Alcotest.(check int) "only account host permission is applied" 1(Atomic.get host_applied))
+        else if scenario=`Remove_retry then (
+          wait "one rebind retries and closes the original owner" (fun()->Atomic.get host_applied=1
+            && not(List.mem second(Atomic.get current).snapshot.resident_graphs));
+          Alcotest.(check int) "one rejected prepare and one fresh attempt" 2(List.length(Atomic.get prepare_attempts));
+          Alcotest.(check bool) "retry uses a distinct original permission identity" true
+            (match Atomic.get prepare_attempts with [fresh;old]->fresh<>old|_->false))
+        else (
+          if scenario=`Remove_retry_reopen then
+            wait "one later click focuses the reopened owner" (fun()->(Atomic.get current).snapshot.selected_graph=Some second)
+          else wait "fresh registration reply and its rebind callbacks drain" (fun()-> !registration_deliveries>=2);
+          Alcotest.(check int) "later reopen or generation cannot retry the old close" 1(List.length(Atomic.get prepare_attempts));
+          Alcotest.(check int) "new owner is never closed" 0(Atomic.get host_applied);
+          Alcotest.(check bool) "new owner stays resident" true(List.mem second(Atomic.get current).snapshot.resident_graphs);
+          if scenario=`Remove_retry_generation then (
+            press(node("graph-picker:" ^ Logseq_db_types.Graph_types.Uuid.to_string second));
+            wait "new graph generation remains interactive" (fun()->(Atomic.get current).snapshot.selected_graph=Some second
+              && (Atomic.get current).snapshot.startup.graph_generation=4)))
       | `Remove_reopen | `Remove_select | `Remove_cancel | `Remove_failure | `Remove_sign_out ->
         (* Application owns manager command admission; its public pure route
            reducer has no handoff completion input. Exercise the mounted owner. *)
@@ -8383,6 +8453,13 @@ let () =
         Alcotest.test_case "manual sign out settles original account before revocation" `Quick (test_graph_picker_controls `Sign_out);
         Alcotest.test_case "termination consumes actual stop permission before native Ready" `Quick (test_graph_picker_controls `Terminate);
         Alcotest.test_case "resident replacement closes old owner before new admission" `Quick (test_graph_picker_controls `Replace);
+        Alcotest.test_case "fresh binding failure releases close intent visibly" `Quick (test_graph_picker_controls `Remove_retry_registration_failure);
+        Alcotest.test_case "failed close retries original owner after fresh binding" `Quick (test_graph_picker_controls `Remove_retry);
+        Alcotest.test_case "later reopen cancels close waiting for fresh binding" `Quick (test_graph_picker_controls `Remove_retry_reopen);
+        Alcotest.test_case "sign out cancels a graph close before queued prepare" `Quick (test_graph_picker_controls `Remove_queued_sign_out);
+        Alcotest.test_case "termination outranks close waiting for fresh binding" `Quick (test_graph_picker_controls `Remove_retry_terminate);
+        Alcotest.test_case "sign out outranks close waiting for fresh binding" `Quick (test_graph_picker_controls `Remove_retry_sign_out);
+        Alcotest.test_case "fresh graph generation cannot inherit old close retry" `Quick (test_graph_picker_controls `Remove_retry_generation);
         Alcotest.test_case "failed close round releases navigation after real rebind" `Quick (test_graph_picker_controls `Remove_failure);
         Alcotest.test_case "sign out cancels selection waiting for close" `Quick (test_graph_picker_controls `Remove_sign_out);
         Alcotest.test_case "closing picker cancels selection waiting for close" `Quick (test_graph_picker_controls `Remove_cancel);

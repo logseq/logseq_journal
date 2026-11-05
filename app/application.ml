@@ -2017,7 +2017,7 @@ module Root_navigation = struct
           manager=state.manager;graph_catalog=state.graph_catalog;local_copies=state.local_copies;
           local_copy_check=state.local_copy_check;local_copy_deleting=state.local_copy_deleting;
           local_copy_message=state.local_copy_message;graph_picker_open=state.graph_picker_open;
-          graph_preview=None;graph_preview_revision=state.graph_preview_revision+1}
+          resident_replacement=state.resident_replacement;graph_preview=None;graph_preview_revision=state.graph_preview_revision+1}
       | Graph_replaced { generation; graph_id } ->
         let state = replace_graph ~discard state generation graph_id in
         { state with graph_state = { state.graph_state with graph_id } }
@@ -3305,6 +3305,9 @@ let start
   let active_runtime = ref None in
   let owner_key (owner:Graph_service.timeline_scope) =
     string_of_int owner.startup.account_generation ^ ":" ^ Logseq_db_types.Graph_types.Uuid.to_string owner.graph_id ^ ":" ^ string_of_int owner.graph_generation in
+  (* Keep one original graph owner fenced while a fresh binding retries its
+     close intent; no old business callback can revive it between attempts. *)
+  let graph_handoff_owner=ref None in
   let coordination_owner_allowed=ref(fun (_:Graph_service.timeline_scope)->true) in
   let runtime_owner_is_live state owner=
     runtime_owner_is_live state owner && !coordination_owner_allowed owner in
@@ -3403,7 +3406,8 @@ let start
     | None-> !retired_coordination_hosts
     | Some(_,host)->Rrbvec.push_back !retired_coordination_hosts host in
   coordination_owner_allowed:=(fun owner->
-    not(Rrbvec.exists(fun host->Coordination_host.host_change_blocks host ~owner)(all_coordination_hosts())));
+    not(Option.exists(fun(_,closing)->owner_key closing=owner_key owner)!graph_handoff_owner)
+    && not(Rrbvec.exists(fun host->Coordination_host.host_change_blocks host ~owner)(all_coordination_hosts())));
   let reconcile_import_sources () =
     let hosts=all_coordination_hosts() in
     let pending=Rrbvec.fold_left(fun pending recipient->
@@ -4094,6 +4098,10 @@ let start
       let current=startup_scope !state_ref in
       let live=owner=current || (owner.account_generation=current.account_generation &&
         match command with Graph_service.Configure_resident_graphs _ | Focus_resident_graph _ -> true | _->false) in
+      (* An account match cannot keep a closed graph's old ACK/recovery alive. *)
+      let live=live && (match command with
+        |Graph_service.Acknowledge_timeline_presented scope|Begin_online_recovery scope->runtime_owner_is_live !state_ref scope
+        |_->true) in
       if live then Some (send_manager command) else None) commands)
   in
   let local_copy_requests = Hashtbl.create 2 in
@@ -4817,6 +4825,8 @@ let start
         set_state_and_effect
         (graph_state : Logseq_db_worker.graph_state)
     =
+    if Option.exists(fun owner->not(runtime_owner_is_live !state_ref owner))(current_owner())
+    then Effect.ignore else
     let update =
       set_state (fun state ->
         let state =
@@ -5082,18 +5092,82 @@ let start
   let set_root_state_and_effect transition : unit Effect.t = fun()->send_action(Update transition) in
   let set_root_state transition : unit Effect.t =
     set_root_state_and_effect(fun state->transition state,Effect.ignore) in
-  let begin_host_change ?host change ~f = Effect.of_thunk(fun()->
+  let sign_out_in_flight = ref false in
+  let pending_graph_handoff_retry=ref(fun()->()) in
+  let rec begin_host_change ?host ?graph_ticket ?(retries=1) change ~f = Effect.of_thunk(fun()->
+    (match change with
+     |Wc.Account_will_change|Connection_will_stop->
+       pending_graph_handoff_retry:=(fun()->());graph_handoff_owner:=None
+     |_->());
+    if Option.exists(fun ticket->not(Option.exists(fun(actual,_)->actual==ticket)!graph_handoff_owner))graph_ticket
+    then ()else
     match (match host with Some host->Ok host|None->ensure_coordination()) with
     |Error message->Effect.run(f(Error(Wc.Service_failed message)))
     |Ok host->
+      let closing=match change,!state_ref.manager with
+        |Wc.Graph_will_close graph,Some manager->
+          List.find_opt(fun(scope:Graph_service.asset_scope)->scope.graph_id=graph)manager.resident_scopes
+          |> Option.map timeline_owner_of_scope
+        |_->None in
+      let blocked=closing<>None && !graph_handoff_owner<>None && graph_ticket=None in
+      if blocked then Effect.run(f(Error Wc.Host_change_in_progress))else
+      let ticket=Option.value graph_ticket ~default:(ref()) in
+      let closing=match graph_ticket,!graph_handoff_owner with
+        |Some actual,Some(original,owner)when actual==original->Some owner
+        |_->closing in
+      let owner_changed()=Option.exists(fun(owner:Graph_service.timeline_scope)->
+        Option.exists(fun(manager:Graph_service.snapshot)->
+          List.exists(fun(scope:Graph_service.asset_scope)->scope.graph_id=owner.graph_id
+            && owner_key(timeline_owner_of_scope scope)<>owner_key owner)manager.resident_scopes)!state_ref.manager)closing in
+      if owner_changed() then (graph_handoff_owner:=None;Effect.run(f(Error Wc.Revoked_session)))else (
+      Option.iter(fun owner->graph_handoff_owner:=Some(ticket,owner))closing;
+      let owns_ticket()=Option.exists(fun(actual,_)->actual==ticket)!graph_handoff_owner in
+      let release()=match !graph_handoff_owner with
+        |Some(actual,_)when actual==ticket->graph_handoff_owner:=None
+        |_->() in
       let account=(startup_scope !state_ref).account_generation in
       Journal_pump.enqueue pump(fun()->
         let current()=(startup_scope !state_ref).account_generation=account
           && Option.exists(fun(_,active)->active==host)!coordination_host in
-        let finish result=if current()then Effect.run(f result) in
-        if not(current())then () else
+        let finish result=let valid=current() && (closing=None || owns_ticket()) in
+          let result=if owner_changed()then Error Wc.Revoked_session else result in
+          release();if valid then Effect.run(f result) in
+        let failed error=
+          let reopen()=match !pending_resident_selection,closing with
+            |Some(_,value),Some owner->value=Logseq_db_types.Graph_types.Uuid.to_string owner.graph_id
+            |_->false in
+          if closing=None then finish(Error error)else
+          if not(owns_ticket())then ()else
+          if retries>0 && closing<>None && not(reopen()) && current() then (
+            let previous=Option.map Wc.projection_binding(Coordination.projection(Coordination_host.view host)) in
+            let retry_started=ref false in
+            let retry_job()=
+              if not(current()) || !sign_out_in_flight || !termination_in_flight
+              then (pending_graph_handoff_retry:=(fun()->());release())else
+              match Coordination.bootstrap(Coordination_host.view host)with
+              |Wc.Ready projection when !retry_started && not(Option.exists(Wc.equal_binding(Wc.projection_binding projection))previous)->
+                pending_graph_handoff_retry:=(fun()->());
+                if reopen()then finish(Error error)else
+                if owner_changed()then finish(Error Wc.Revoked_session)else
+                let owner=Option.get closing in
+                let residents=Wc.residents projection in
+                if List.exists(fun(resident:Wc.resident)->Wc.matches_scope resident.session owner)residents then
+                  Effect.run(begin_host_change ~host ~graph_ticket:ticket ~retries:(retries-1) change ~f)
+                else if List.exists(fun(resident:Wc.resident)->Wc.graph_id resident.session=owner.graph_id)residents then
+                  finish(Error Wc.Revoked_session)
+                else finish(Ok())
+              |Wc.Bootstrap_failed failure|Binding_revoked failure when !retry_started->
+                pending_graph_handoff_retry:=(fun()->());finish(Error failure)
+              |_->() in
+            pending_graph_handoff_retry:=retry_job;
+            retry_failed_graph_handoff host;
+            Journal_pump.enqueue pump(fun()->if !pending_graph_handoff_retry==retry_job then (
+              retry_started:=true;retry_job())))
+          else (finish(Error error);if current()then retry_failed_graph_handoff host) in
+        if not(current()) || (closing<>None && not(owns_ticket()))then release() else
+        if owner_changed()then finish(Error Wc.Revoked_session)else
         match Coordination_host.prepare_host_change ~legacy_pending:true host change with
-        |Error error->finish(Error error)
+        |Error error->(match change with Wc.Graph_will_close _->failed error|_->finish(Error error))
         |Ok id->
           (match change with Wc.Graph_will_close _->
             manager_residency_handoff:=Some(account,host,id)|_->());
@@ -5111,13 +5185,14 @@ let start
               finish(Ok());
               if current()then Effect.run(!resume_resident_selection())
             |Wc.Handoff_failed(_,error)->
-              finish(Error error);
-              (if current() && ((match change with Wc.Graph_will_close _|Graph_will_remove _->true|_->false)
-                || Coordination.handoff_restartable(Coordination_host.view host)id)then retry_failed_graph_handoff host)
+              (match change with
+               |Wc.Graph_will_close _->failed error
+               |_->finish(Error error);
+                 if current() && ((match change with Wc.Graph_will_remove _->true|_->false)
+                   || Coordination.handoff_restartable(Coordination_host.view host)id)then retry_failed_graph_handoff host)
             |Wc.Quiescing _|Wc.Applying_host_change _->() in
           Coordination_host.watch_handoff host id ~f:watch;
-          progress_legacy_host_joins())) in
-  let sign_out_in_flight = ref false in
+          progress_legacy_host_joins()))) in
   let pending_termination_start=ref None in
   let termination_requires_host=ref false and termination_host_completed=ref false in
   let deletion_busy ()=local_deletion_active !state_ref || !state_ref.local_copy_deleting<>None in
@@ -5136,6 +5211,7 @@ let start
     else Effect.ignore in
   coordination_lifecycle_changed:=(fun()->
     progress_legacy_host_joins();prune_retired_coordination_hosts();
+    !pending_graph_handoff_retry();
     !account_lifecycle_changed();
     if not(residency_navigation_blocked())then Effect.run(!resume_resident_selection());
     Effect.run(finish_termination()));
@@ -6545,8 +6621,9 @@ let start
              then false else state.graph_picker_open);
            resident_replacement=None;local_copy_message=None}))
            ~f:(fun()->begin_host_change(Wc.Graph_will_close graph) ~f:(fun result->
-             set_root_state(fun state->{state with local_copy_message=
-               match result with Ok()->None|Error error->Some(coordinated_error_message error)}))))
+             set_root_state(fun state->{state with
+               graph_picker_open=(if Result.is_error result then true else state.graph_picker_open);
+               local_copy_message=match result with Ok()->None|Error error->Some(coordinated_error_message error)}))))
     | Move_resident (index,direction) ->
       let ids=Option.fold ~none:[] ~some:(fun (m:Graph_service.snapshot)->m.resident_graphs) snapshot.manager in
       let target=index+direction in
@@ -6563,7 +6640,8 @@ let start
             let index=List.find_index((=)old_graph)original |> Option.value ~default:0 in
             Effect.bind(set_root_state(fun state->{state with graph_picker_open=false;local_copy_message=None}))
               ~f:(fun()->begin_host_change(Wc.Graph_will_close old_graph) ~f:(function
-                |Error error->set_root_state(fun state->{state with local_copy_message=Some(coordinated_error_message error)})
+                |Error error->set_root_state(fun state->{state with graph_picker_open=true;
+                    local_copy_message=Some(coordinated_error_message error)})
                 |Ok()->
                   let current= !state_ref in
                   if current.resident_replacement<>Some replacement then Effect.ignore else
@@ -7086,6 +7164,10 @@ let start
      fires when it differs from the previous post-update value. *)
   let prev_detail_observation_routes=graph_ref(fun()->None) in
   let run_edge_callbacks model =
+    (* A root manager push can still describe the graph being closed. Its
+       physical retirement resets these cells; do not restart business work. *)
+    if Option.exists(fun owner->not(runtime_owner_is_live model owner))(timeline_scope model)
+    then model else (
     (if not(Option.fold ~none:false ~some:(fun previous->previous==model.routes)!prev_detail_observation_routes) then (
       prev_detail_observation_routes:=Some model.routes;
       !detail_observations_changed()));
@@ -7177,7 +7259,7 @@ let start
        match key with
        | None -> incr sync_error_timer_generation
        | Some sequence -> arm_sync_error_timer sequence));
-    model
+    model)
   in
   let graph_model root (owner:Graph_service.timeline_scope) =
     let key=Logseq_db_types.Graph_types.Uuid.to_string owner.graph_id ^ ":" ^ string_of_int owner.graph_generation in
@@ -8196,18 +8278,13 @@ let start
         Hashtbl.remove worker_owners request_id;
         (match owner with
          | Some owner when not(runtime_owner_is_live !state_ref owner) ->
-           let key=owner_key owner in
-           (match Hashtbl.find_opt retired_runtimes key with
-            | None -> ()
-            | Some(_,restore) ->
-              let current=snapshot_cells () and active= !active_runtime and previous= !processing_owner in
-              List.iter(fun restore->restore ()) restore;active_runtime:=Some key;processing_owner:=Some owner;
-              Effect.run(deliver event);save_runtime ();
-              if not(Hashtbl.to_seq_values worker_owners |> Seq.exists(fun scope->owner_key scope=key))
-                 && Journal_media_runtime.idle (!media_runtime_cell)
-                 && Journal_asset_runtime.idle (!asset_runtime_cell) && not(import_sources_pending owner) then (
-                release_runtime_staging ();Hashtbl.remove retired_runtimes key);
-              List.iter(fun restore->restore ()) current;active_runtime:=active;processing_owner:=previous)
+           (* Only legacy graph-state/Timeline commands enter worker_owners.
+              Their terminal releases the I/O ledger above, but their old data
+              must not reconfigure a retired runtime. The shared retirement
+              pump below still joins and releases its real resources. Shared
+              queue capacity must still wake the current owner's deferred work. *)
+           Effect.run(Effect.bind (drain_startup_commands()) ~f:(fun()->
+             Effect.bind (drain_focus_refresh()) ~f:finish_termination))
          | _ -> run_owned owner (fun () -> deliver event))
       | Worker.Push ({payload=Graph_service.Graph_states states;_} as envelope) ->
         List.iter (fun (scope,state) -> let owner=owner_of_scope scope in

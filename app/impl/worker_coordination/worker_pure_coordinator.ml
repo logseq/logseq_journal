@@ -2600,6 +2600,9 @@ let step_base state event =
                  (if state.lifecycle = Stopping
                   then Shutdown_failed error
                   else state.facts.shutdown)
+             ; bootstrap_state =
+                 (if state.lifecycle=Retrying then Worker.Bootstrap_failed error
+                  else state.facts.bootstrap_state)
              }
          }
          [])

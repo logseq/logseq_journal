@@ -291,12 +291,13 @@ let prepare_atomic_append_fixture support =
          add "block/journal-day" (J.Int 20261103);add "block/tags" (J.Keyword "logseq.class/Journal")])))
 ;;
 
-let with_client_sessions
+let with_service_fixture
       ?(epoch_ms = fun () -> 1_700_000_000_000L)
       ?(favorites = false)
       ?(assets = false)
       ?(statuses = false)
       ?change_max_items
+      ?(extra_graphs = [])
       ?(prepare = fun _ -> ())
       f
   =
@@ -305,6 +306,7 @@ let with_client_sessions
     let first_path = Test_support.seed_mirror root in
     if favorites then seed_coordination_read_data ~assets first_path;
     ignore (Test_support.seed_mirror ~graph_id:second_graph root);
+    List.iter(fun graph_id->ignore(Test_support.seed_mirror ~graph_id root))extra_graphs;
     if statuses then seed_status_catalog root;
     prepare root;
     let graph : Sync.graph =
@@ -328,12 +330,12 @@ let with_client_sessions
            (Sync.catalog_cache
               ~user_id:"user-1"
               ~graphs:
-                [ graph
+                ([ graph
                 ; { graph with
                     graph_id = second_graph
                   ; name = "Second coordination synthetic"
                   }
-                ]
+                ] @ List.map(fun graph_id->{graph with graph_id;name="Extra synthetic graph"})extra_graphs)
               ~selected_graph:(Some graph.graph_id)
             |> Sync.encode_catalog_cache));
     let deps =
@@ -349,13 +351,18 @@ let with_client_sessions
         ~secrets
         ~tls_authenticator:(SR.system_tls_authenticator () |> Result.get_ok)
     in
+    f deps fixture.config)
+;;
+
+let with_client_sessions ?epoch_ms ?favorites ?assets ?statuses ?change_max_items ?prepare f =
+  with_service_fixture ?epoch_ms ?favorites ?assets ?statuses ?change_max_items ?prepare (fun deps config ->
     let current = ref None and epoch = ref 8999L in
     let stop () = Option.iter Runtime.stop !current; current := None in
     let start () =
       stop ();
       epoch := Int64.succ !epoch;
       let client = Runtime.start ~runtime_epoch:(Id.Runtime.Epoch.of_int64 !epoch)
-          (Service.create ~dependencies:deps) fixture.config |> Result.get_ok in
+          (Service.create ~dependencies:deps) config |> Result.get_ok in
       current := Some client;
       client
     in
@@ -365,6 +372,130 @@ let with_client_sessions
 let with_client ?epoch_ms ?favorites ?assets ?statuses ?change_max_items ?prepare f =
   with_client_sessions ?epoch_ms ?favorites ?assets ?statuses ?change_max_items ?prepare
     (fun start -> f (start ()))
+;;
+
+(* The pure route reducer has no manager push or host handoff input.
+   Drive public mounted hooks over the actual Service, DB and resource owners. *)
+let test_application_current_close ~replacement () =
+  let third=uuid "9c000000-0000-4000-8000-000000000004"
+  and fourth=uuid "9c000000-0000-4000-8000-000000000005" in
+  let prepare root=List.iter(fun graph_id->
+    let path=Filename.concat root("logseq-db-worker/synced-graphs/" ^ W.Uuid.to_string graph_id ^ "/db.sqlite") in
+    seed_coordination_read_data ~assets:true path)[second_graph;third;fourth] in
+  with_service_fixture ~favorites:true ~assets:true ~extra_graphs:[third;fourth] ~prepare (fun deps config ->
+    let client=ref None and requests=Queue.create() in
+    let calendar_sampler=Journal_calendar.Sampler.create ~clock:(fun()->1788048000.) ~localtime:Unix.gmtime () in
+    let hooks=Application.For_testing.app_with_service ~calendar_sampler ~on_client:(fun value->client:=Some value)
+      ~on_platform_request:(fun packet->Queue.add(Bytes.copy packet)requests)
+      (Service.create ~dependencies:deps) in
+    Fun.protect ~finally:(fun()->ignore(hooks.dispose());Option.iter Runtime.stop !client)(fun()->
+      let controls=Hashtbl.create 128 and parents=Hashtbl.create 128 and appearances=Queue.create() in
+      let selected=ref None and residents=ref [] in
+      let rec drop id=
+        Hashtbl.to_seq parents |> List.of_seq |> List.iter(fun(child,parent)->if parent=id then drop child);
+        Hashtbl.remove parents id;Hashtbl.remove controls id in
+      let patch_path=Filename.concat config.Logseq_db_worker.Config.application_support_directory "mounted-ui-patch.json" in
+      let consume source=if source<>"" then (
+        Out_channel.with_open_bin patch_path (fun out->output_string out source);
+        let fields=function `Assoc fields->fields|_->failwith "invalid UI patch object" in
+        let int=function `Int value->value|_->failwith "invalid UI patch node" in
+        let ops=match List.assoc "ops" (fields(T.read_json patch_path))with
+          |`List ops->ops|_->failwith "invalid UI patch operations" in
+        List.iter(fun op->let fields=fields op in let get name=List.assoc name fields in
+          match get "op" with
+          |`String "create-extension"->
+            Hashtbl.replace controls(int(get "id"))["_extension",(match get "identifier" with `String value->value|_->"")]
+          |`String("drop-node"|"drop-extension"|"detach-subtree")->drop(int(get "id"))
+          |`String("insert-child"|"move-child")->Hashtbl.replace parents(int(get "child"))(int(get "parent"))
+          |`String"remove-child"->Hashtbl.remove parents(int(get "child"))
+          |`String("set-prop"|"set-extension-prop")->
+            let id=int(get "id") in
+            (match get "property",get "value" with
+             |`String "appear-enabled",`Bool true->Queue.add id appearances
+             |`String key,`Bool value->
+               let old=Option.value(Hashtbl.find_opt controls id) ~default:[] in
+               Hashtbl.replace controls id ((key,string_of_bool value)::List.remove_assoc key old)
+             |`String key,`String value->
+               let old=Option.value(Hashtbl.find_opt controls id) ~default:[] in
+               Hashtbl.replace controls id ((key,value)::List.remove_assoc key old)
+             |_->())
+          |_->())ops) in
+      let rec mounted id= id=hooks.root_node() || match Hashtbl.find_opt parents id with None->false|Some parent->mounted parent in
+      let find key value=Hashtbl.fold(fun id fields found->
+        if mounted id && List.assoc_opt key fields=Some value then Some(max id(Option.value found ~default:0))else found)controls None in
+      let native_authenticated=ref false and token_requested=ref false and registrations=ref 0 in
+      let packet tag json=let packet=Bytes.make(32+String.length json)'\000' in
+        Bytes.blit_string "LJP2" 0 packet 0 4;Bytes.set_uint16_le packet 4 2;
+        Bytes.set_uint16_le packet 6 tag;Bytes.set_int32_le packet 24(Int32.of_int(String.length json));
+        Bytes.blit_string json 0 packet 32(String.length json);Bytes.to_string packet in
+      let answer_native ()=while not(Queue.is_empty requests)do
+        let request=Queue.take requests in
+        let response=match Bytes.get_uint16_le request 6 with
+          |20->Some(21,"{\"userId\":\"user-1\",\"managedSyncOrigin\":\"https://api.logseq.io\"}")
+          |6->Some(7,"{\"userId\":\"user-1\"}")
+          |22->
+            if not !native_authenticated then (
+              native_authenticated:=true;
+              let scope=Bytes.sub_string request 32 (Bytes.length request-32) in
+              hooks.platform_event(packet 7("{\"userId\":\"user-1\",\"startupScope\":" ^ scope ^ "}")));
+            Some(23,"{\"presented\":true}")
+          |_->None in
+        Option.iter(fun(tag,json)->hooks.platform_response(packet tag json))response
+      done in
+      let wait label predicate=
+        let deadline=Unix.gettimeofday()+.5. in
+        while not(predicate()) && Unix.gettimeofday()<deadline do answer_native();
+          while not(Queue.is_empty appearances)do consume(hooks.dispatch(Appear(Queue.take appearances)))done;
+          consume(hooks.pump());Thread.delay 0.001 done;
+        require(predicate())label in
+      let contains source part=let rec loop n= n+String.length part<=String.length source
+        && (String.sub source n (String.length part)=part || loop(n+1)) in loop 0 in
+      let rec current_host id=
+        let fields=Option.value(Hashtbl.find_opt controls id)~default:[] in
+        match List.assoc_opt "payload" fields with
+        |Some payload when String.starts_with ~prefix:"{\"mode\":\"timeline-host\"" payload ->
+          Option.fold ~none:false ~some:(fun graph->contains payload(W.Uuid.to_string graph))!selected
+        |_->match Hashtbl.find_opt parents id with None->true|Some parent->current_host parent in
+      let press key value=
+        let clickable ()=Hashtbl.fold(fun id fields found->
+          if mounted id && current_host id && List.assoc_opt key fields=Some value && List.assoc_opt "press-enabled" fields=Some "true"
+          then Some id else found)controls None in
+        wait ("missing control: " ^ value)(fun()->Option.is_some(clickable()));
+        consume(hooks.dispatch(Press(Option.get(clickable())))) in
+      consume(hooks.init 2 2 (Journal_startup.encode config |> Result.get_ok |> Bytes.to_string));
+      let worker=Option.get !client in
+      Mailbox.on_event worker(function Mailbox.Push{payload=Service.Client_state_changed state;_}->
+        selected:=state.snapshot.selected_graph;residents:=state.snapshot.resident_graphs
+        |Mailbox.Push{payload=Service.Need_id_token _;_}->token_requested:=true
+        |Mailbox.Response{outcome=Completed(Service.Coordination_registered _);_}->incr registrations|_->());
+      let send command=match Mailbox.send worker(Service.Client_command command)with
+        |Mailbox.Accepted _->()|_->failwith "real app fixture command refused" in
+      wait "real app restores first graph" (fun()-> !selected=Some Test_support.graph_uuid);
+      send(Configure_resident_graphs[Test_support.graph_uuid;second_graph;third]);
+      wait "real app admits three resident scopes" (fun()->List.length !residents=3);
+      press "accessibility-label" "Favorites";
+      press "text" "Switch graph";
+      wait "native identity reaches the deliberately blocked token request" (fun()-> !token_requested);
+      wait "same-user authentication rebind completes before the close action" (fun()-> !registrations>=2);
+      if Option.is_none(find "accessibility-identifier" "graph-picker-list")then press "text" "Switch graph";
+      List.iter(fun graph_id->
+        press "accessibility-identifier" ("graph-picker:" ^ W.Uuid.to_string graph_id);
+        wait "user selection becomes current" (fun()-> !selected=Some graph_id);
+        wait "selection closes picker" (fun()->Option.is_none(find "accessibility-identifier" "graph-picker-list"));
+        press "text" "Switch graph";
+        wait "selected graph opens picker" (fun()->Option.is_some(find "accessibility-identifier" "graph-picker-list")))[second_graph;third];
+      if replacement then (
+        press "accessibility-identifier" ("graph-picker:" ^ W.Uuid.to_string fourth);
+        press "accessibility-identifier" ("graph-resident-replace:" ^ W.Uuid.to_string third))
+      else press "accessibility-identifier" ("graph-resident-remove:" ^ W.Uuid.to_string third);
+      let target=if replacement then fourth else Test_support.graph_uuid in
+      wait "real current close settles and selects retained/replacement graph" (fun()-> !selected=Some target && not(List.mem third !residents));
+      press "text" "Switch graph";
+      wait "retained graph responds to picker after retirement" (fun()->Option.is_some(find "accessibility-identifier" "graph-picker-list"));
+      press "accessibility-identifier" "graph-picker-close";
+      press "accessibility-label" "Journals";
+      press "accessibility-identifier" "journal-capture-open";
+      wait "current graph opens a real Capture editor after retirement" (fun()->Option.is_some(find "accessibility-identifier" "field.composer"))))
 ;;
 
 (* Actual Service/DB/Sync ownership is not expressible by injecting Core
@@ -4227,6 +4358,9 @@ let test_host_recovers_only_pending_import_sources () =
 ;;
 
 let () =
+  if Array.mem "--application-close-only" Sys.argv then (test_application_current_close ~replacement:false();test_application_current_close ~replacement:true();exit 0);
+  test_application_current_close ~replacement:false();
+  test_application_current_close ~replacement:true();
   if Array.mem "--read-owner-only" Sys.argv then (
     test_read_completion_rechecks_graph_owner ();
     print_endline "Real Service read completion owner race passed"; exit 0);

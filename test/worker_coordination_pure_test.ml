@@ -1252,6 +1252,24 @@ let test_pure_properties () =
   done
 ;;
 
+let test_retry_binding_release_error_is_observable () =
+  let issuer,_,projection,_=fixture 504L in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
+  let retry=(C.step(ready I.binding projection)C.Retry_bootstrap).next in
+  let error=W.Service_failed "Synthetic registration cleanup failed" in
+  let failed=C.step retry(C.Binding_release_completed(I.binding,Error error)) in
+  check(C.bootstrap(C.view failed.next)=W.Bootstrap_failed error)
+    "retry binding cleanup failure remained silently Awaiting_baseline";
+  check(not(List.exists(function C.Bind_replacement->true|_->false)failed.instructions))
+    "failed physical cleanup fabricated a replacement binding";
+  let explicit=C.step failed.next C.Retry_bootstrap in
+  check(List.exists(function C.Release_binding binding->W.equal_binding binding I.binding|_->false)explicit.instructions)
+    "explicit retry lost the original binding cleanup obligation";
+  let acknowledged=C.step explicit.next(C.Binding_release_completed(I.binding,Ok())) in
+  check(List.exists(function C.Bind_replacement->true|_->false)acknowledged.instructions)
+    "actual original cleanup ACK did not allow a fresh binding"
+;;
+
 let test_cleanup_admission_edges () =
   let issuer, _, projection, session = fixture 500L in
   let module I = (val issuer : Worker_effect_authority.ISSUER) in
@@ -4523,6 +4541,7 @@ let test_returned_files_reuse_capacity () =
 ;;
 
 let () =
+  if Array.mem "--retry-release-error-only" Sys.argv then (test_retry_binding_release_error_is_observable();exit 0);
   if Array.mem "--import-proof-return-only" Sys.argv then (test_completed_imports_release_active_recovery_capacity();exit 0);
   if Array.mem "--file-return-only" Sys.argv then (test_returned_files_reuse_capacity();exit 0);
   test_returned_observations_reuse_capacity ();
@@ -4575,6 +4594,7 @@ let () =
   test_durable_mutation_properties ();
   test_durable_mutation_properties ~append:true ();
   test_bootstrap_validation ();
+  test_retry_binding_release_error_is_observable();
   test_cleanup_admission_edges ();
   test_pure_properties ();
   test_reads_wait_for_verified_baseline ();
