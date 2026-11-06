@@ -364,6 +364,8 @@ type response =
   | Coordination_confirmed of
       {registration:int64;owner:timeline_scope;presentation:int64;request_id:Logseq_db_types.Graph_types.Uuid.t;
        answer:Worker_pure_read.answer}
+  | Coordination_query_revoked of
+      {registration:int64;owner:timeline_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_queried of
       { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
         answer:Worker_pure_read.answer }

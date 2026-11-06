@@ -4178,7 +4178,10 @@ let test_service_changefeed_has_one_owner () =
       write 21 "Owned change window B";
       require(data(pull registration 4 None)=data first) "unapplied batch was replaced";
       let foreign=Int64.succ registration in
-      require(match query foreign 5(Read.Changes{generation;after=None})with Failed _->true|_->false)
+      require(match query foreign 5(Read.Changes{generation;after=None})with
+        |Completed(Service.Coordination_query_revoked value)->
+          value.registration=foreign && value.owner=owner && value.request_id=id 5
+        |_->false)
         "another binding remained an active second changefeed owner";
       acknowledged registration 6 first;
       acknowledged registration 7 first;
@@ -4357,7 +4360,52 @@ let test_host_recovers_only_pending_import_sources () =
       ignore(Host.shutdown current);wait "source provider registration did not release" (fun()->C.shutdown_state(Host.view current)=C.Stopped)))
 ;;
 
+(* The real Service owns the authority proof. Core-only events cannot establish
+   that response-first Mailbox delivery carries a checked revocation. *)
+let test_retired_query_has_correlated_response () =
+  with_client(fun client->
+    let send request =
+      let id=match Mailbox.send client request with Accepted id->id|_->failwith "revocation request admission" in
+      let result=ref None in
+      let deadline=Unix.gettimeofday()+.6. in
+      while !result=None && Unix.gettimeofday()<deadline do
+        Mailbox.For_testing.drain_events client ~max_events:64 |> List.iter(function
+          |Mailbox.Response{request_id;outcome;_}when Id.Worker.Request_id.equal id request_id->result:=Some outcome
+          |_->());Thread.delay 0.001
+      done;
+      Option.get !result in
+    ignore(send(Service.Client_command(Restore_local_account{user_id="user-1"})));
+    let issuer=Worker_effect_authority.issuer ~managed_origin:"https://api.logseq.io" ~user_id:"user-1"
+      ~runtime_epoch:(Mailbox.runtime_epoch client) ~worker_generation:(Mailbox.worker_generation client) |> Result.get_ok in
+    let module I=(val issuer:Worker_effect_authority.ISSUER) in
+    let current()=match send(I.bootstrap_request() |> Result.get_ok)with
+      |Mailbox.Completed response->(match I.bootstrap response with
+        |Ok(W.Ready p)->List.find_map(fun r->if r.W.phase=W.Open then Some r.session else None)(W.residents p)
+        |_->None)
+      |_->None in
+    let session=ref None in
+    let deadline=Unix.gettimeofday()+.6. in
+    while !session=None && Unix.gettimeofday()<deadline do session:=current();Thread.delay 0.001 done;
+    let session=Option.get !session in
+    let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
+    let id=W.request_id(uuid "9c000000-0000-4000-8000-000000009901") in
+    let request=I.request session ~request_id:id(W.Query(budget,W.Graph_info)) |> Result.get_ok in
+    ignore(send(Service.Client_command(Reconcile_authenticated_user{user_id=Some "user-1"})));
+    let response=match send request with
+      |Mailbox.Completed response->response
+      |_->failwith "retired query used an uncorrelated transport failure instead of an owned authority result" in
+    require(I.reply session ~request_id:id(W.Query(budget,W.Graph_info))response=Ok(W.Answered(Error W.Revoked_session)))
+      "authority result did not retain original query owner";
+    let other=W.request_id(uuid "9c000000-0000-4000-8000-000000009902") in
+    require(match I.reply session ~request_id:other(W.Query(budget,W.Graph_info))response with
+      |Error(W.Protocol_mismatch _)->true|_->false) "foreign request forged a binding retirement proof";
+    I.revoke();
+    require(match I.reply session ~request_id:other(W.Query(budget,W.Graph_info))response with
+      |Error(W.Protocol_mismatch _)->true|_->false) "revoked local issuer bypassed exact proof correlation")
+;;
+
 let () =
+  if Array.mem "--read-revocation-only" Sys.argv then (test_retired_query_has_correlated_response();exit 0);
   if Array.mem "--application-close-only" Sys.argv then (test_application_current_close ~replacement:false();test_application_current_close ~replacement:true();exit 0);
   test_application_current_close ~replacement:false();
   test_application_current_close ~replacement:true();
@@ -4399,6 +4447,7 @@ let () =
   test_offline_asset_scans_use_typed_reads ();
   test_dependency_point_reads_use_typed_owner ();
   test_live_authority_invalidation_rebinds ();
+  test_retired_query_has_correlated_response ();
   test_service_changefeed_has_one_owner ();
   test_service_unallocated_observation_cleanup_after_close ();
   test_service_observation_read_failure_retains_interest ();

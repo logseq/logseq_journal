@@ -440,6 +440,8 @@ type response =
   | Coordination_confirmed of
       {registration:int64;owner:timeline_scope;presentation:int64;request_id:Logseq_db_types.Graph_types.Uuid.t;
        answer:Worker_pure_read.answer}
+  | Coordination_query_revoked of
+      {registration:int64;owner:timeline_scope;request_id:Logseq_db_types.Graph_types.Uuid.t}
   | Coordination_queried of
       { registration:int64; owner:timeline_scope; request_id:Logseq_db_types.Graph_types.Uuid.t;
         answer:Worker_pure_read.answer }
@@ -1371,7 +1373,8 @@ let create ~(dependencies : dependencies) =
         if Read.For_worker.binding_serial(Read.For_worker.session_binding source)<>registration
            || not(Read.matches_scope source owner)
         then Error "The query belongs to another coordination session"
-        else if not(Db.coordination_current session.worker ~registration) then Error "Coordination binding retired"
+        else if not(Db.coordination_current session.worker ~registration) then
+          Ok(Coordination_query_revoked{registration;owner;request_id})
         else (match resolve owner with
           |None->Error "The graph session is no longer open."
           |Some scope->
@@ -1382,7 +1385,9 @@ let create ~(dependencies : dependencies) =
              |Error _->Error "Invalid coordination query"
              |Ok()->let answer=Db.read_for_scope session.worker ~scope read in
                if authorized() then Ok(Coordination_queried{registration;owner;request_id;answer})
-               else Error "Coordination binding retired"))
+               else if not(Db.coordination_current session.worker ~registration) then
+                 Ok(Coordination_query_revoked{registration;owner;request_id})
+               else Error "The graph session is no longer open."))
       | Coordination_acknowledge_changes {registration;owner;request_id;batch} ->
         (match resolve owner with
          |None->Error "The graph session is no longer open."

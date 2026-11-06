@@ -4655,7 +4655,124 @@ let test_returned_files_reuse_capacity () =
   done
 ;;
 
+(* Expected-owner reads survive a live authority handover, but their old
+   execution attempts do not. All transitions here are public Core events. *)
+let test_live_binding_replans_ordinary_reads () =
+  let run mode =
+    let old_issuer,raw,projection,session=fixture (Int64.add 9300L (Int64.of_int mode)) in
+    let next_issuer,_,next_projection,next_session=fixture (Int64.add 9400L (Int64.of_int mode)) in
+    let module Old=(val old_issuer:Worker_effect_authority.ISSUER) in
+    let module Next=(val next_issuer:Worker_effect_authority.ISSUER) in
+    let owner=Option.get raw.S.baseline.state.sync.selected in
+    let ticket,planned=C.plan_query (ready Old.binding projection) ~owner
+      ~maximum_items:1 ~maximum_bytes:65536 W.Graph_info |> Result.get_ok in
+    let first=Id.Worker.Request_id.of_int64 1L in
+    let admitted=(C.step planned.next(C.Admitted(ticket,first))).next in
+    let old_failure=W.Answered(Error(W.Service_failed "Coordination binding retired")) in
+    let before=if mode=1 then (C.step admitted(C.Completed(ticket,old_failure))).next
+      else if mode=2 then (C.step planned.next(C.Completed(ticket,old_failure))).next else admitted in
+    let invalidated=C.step before(C.Binding_invalidated Old.binding) in
+    check(C.reply(C.view invalidated.next)ticket=None)
+      "ordinary live-owner read leaked a retired attempt instead of awaiting a verified replacement";
+    check(C.validate_session invalidated.next session=Error W.Revoked_session)
+      "holding a read revived its old execution";
+    let released=C.step invalidated.next(C.Binding_release_completed(Old.binding,Ok())) in
+    let settled=if mode=1 then released else (
+      check(not(List.exists(function C.Bind_replacement->true|_->false)released.instructions))
+        "binding replaced before old read actually settled";
+      C.step released.next(if mode=2 then C.Admitted(ticket,first) else C.Completed(ticket,old_failure))) in
+    check(List.exists(function C.Bind_replacement->true|_->false)settled.instructions)
+      "settled read obligation blocked actual replacement";
+    let bound=C.step settled.next(C.Worker_bound Next.binding) in
+    check(C.reply(C.view bound.next)ticket=None) "read completed without a fresh baseline";
+    let resumed=C.step bound.next(C.Bootstrap_received(Next.binding,W.Ready next_projection)) in
+    check(match C.query_origin(C.view resumed.next)ticket with
+      |Some(actual,budget)->W.equal_session actual next_session
+        && W.validate_request actual(W.Query(budget,W.Graph_info))=Ok()
+      |None->false) "ordinary read was not resampled from the replacement's exact session and budget";
+    let read_event (make : W.graph_info C.ticket -> C.event) = resumed.instructions |> List.find_map(function
+      |C.Send(actual,_,W.Query(_,W.Graph_info))->Some(make actual)
+      |_->None) |> Option.get in
+    let admitted_event=read_event(fun actual->C.Admitted(actual,Id.Worker.Request_id.of_int64 2L)) in
+    let fresh=(C.step resumed.next admitted_event).next in
+    let stale=(C.step fresh(C.Completed(ticket,old_failure))).next in
+    check(C.reply(C.view stale)ticket=None) "late old completion poisoned a fresh admitted attempt";
+    let stale=(C.step stale(C.Admission_failed(ticket,W.Revoked_session))).next in
+    check(C.reply(C.view stale)ticket=None) "late old admission failure poisoned a fresh attempt";
+    let value=Read.For_worker.graph_info ~graph_uuid:graph ~graph_name:"Replacement read"
+      ~schema:{major=1;minor=0} ~admission_facts:[] ~journal_title_format:None ~limits:raw.limits
+      ~generation:"fresh-generation" ~projection_revision:"fresh-revision" in
+    let completed=read_event(fun actual->C.Completed(actual,W.Answered(Ok value))) in
+    let final=(C.step stale completed).next in
+    check(C.reply(C.view final)ticket=Some(W.Answered(Ok value)))
+      "fresh authorized read did not complete the original business ticket";
+    check(C.query_origin(C.view final)ticket<>None) "fresh result lost original send provenance";
+    let failed=(C.step (C.step resumed.next admitted_event).next
+      (read_event(fun actual->C.Completed(actual,W.Answered(Error(W.Service_failed "genuine read failure")))))).next in
+    check(C.reply(C.view failed)ticket=Some(W.Answered(Error(W.Service_failed "genuine read failure"))))
+      "handover recovery hid a genuine error from the replacement execution"
+  in
+  List.iter run [0;1;2]
+;;
+
+let test_live_binding_read_owner_and_cancellation_fences () =
+  List.iter(fun mode->
+    let old_issuer,raw,projection,_=fixture (Int64.add 9500L (Int64.of_int mode)) in
+    let next_issuer,_,next_projection,_=fixture ~graph_generation:(if mode=0 then 8 else 7)
+      (Int64.add 9600L (Int64.of_int mode)) in
+    let module Old=(val old_issuer:Worker_effect_authority.ISSUER) in
+    let module Next=(val next_issuer:Worker_effect_authority.ISSUER) in
+    let owner=Option.get raw.S.baseline.state.sync.selected in
+    let ticket,planned=C.plan_query(ready Old.binding projection) ~owner ~maximum_items:1
+      ~maximum_bytes:65536 W.Graph_info |> Result.get_ok in
+    let admitted=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
+    let invalidated=C.step admitted(C.Binding_invalidated Old.binding) in
+    let state=if mode=1 then (C.step invalidated.next(C.Cancel ticket)).next
+      else if mode=2 then (C.step invalidated.next(C.Forget ticket)).next else invalidated.next in
+    let settled=C.step (C.step state(C.Completed(ticket,W.Interrupted W.Cancelled))).next
+      (C.Binding_release_completed(Old.binding,Ok())) in
+    let bound=C.step settled.next(C.Worker_bound Next.binding) in
+    let fresh=C.step bound.next(C.Bootstrap_received(Next.binding,W.Ready next_projection)) in
+    check(not(List.exists(function C.Send(_,_,W.Query _)->true|_->false)fresh.instructions))
+      "foreign graph incarnation or canceled/forgotten owner replayed a read";
+    if mode=0 then check(C.reply(C.view fresh.next)ticket=Some(W.Answered(Error W.Revoked_session)))
+      "replacement graph incarnation failed to terminate the old business request") [0;1;2];
+  let issuer,_,projection,session=fixture 9700L in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
+  let budget=W.read_budget session ~maximum_items:1 ~maximum_bytes:65536 |> Result.get_ok in
+  let ticket,planned=C.request(ready I.binding projection)session(W.Query(budget,W.Graph_info)) |> Result.get_ok in
+  let admitted=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
+  let invalidated=C.step admitted(C.Binding_invalidated I.binding) in
+  let settled=C.step invalidated.next(C.Completed(ticket,W.Interrupted W.Cancelled)) in
+  check(C.reply(C.view settled.next)ticket=Some(W.Answered(Error W.Revoked_session)))
+    "an explicitly sealed read was silently rebound to another execution"
+;;
+
+let test_binding_rebind_queued_read_and_failure () =
+  let old_issuer,raw,projection,_=fixture 9800L in
+  let next_issuer,_,next_projection,_=fixture 9801L in
+  let module Old=(val old_issuer:Worker_effect_authority.ISSUER) in
+  let module Next=(val next_issuer:Worker_effect_authority.ISSUER) in
+  let owner=Option.get raw.S.baseline.state.sync.selected in
+  let ticket,planned=C.plan_query_when_available(ready Old.binding projection) ~owner
+    ~maximum_items:1 ~maximum_bytes:65536 W.Graph_info |> Result.get_ok in
+  let queued=(C.step planned.next(C.Admission_refused(ticket,W.Full))).next in
+  let invalidated=C.step queued(C.Binding_invalidated Old.binding) in
+  check(C.reply(C.view invalidated.next)ticket=None) "queued dependency read was discarded at handover";
+  let released=C.step invalidated.next(C.Binding_release_completed(Old.binding,Ok())) in
+  check(List.exists(function C.Bind_replacement->true|_->false)released.instructions)
+    "logical waiting prevented physical binding settlement";
+  let bound=(C.step released.next(C.Worker_bound Next.binding)).next in
+  let failed=(C.step bound(C.Bootstrap_received(Next.binding,W.Bootstrap_failed(W.Service_failed "fresh bootstrap failed")))).next in
+  check(C.reply(C.view failed)ticket=Some(W.Answered(Error(W.Service_failed "fresh bootstrap failed"))))
+    "replacement bootstrap failure left retained read silently waiting";
+  let ready=C.step bound(C.Bootstrap_received(Next.binding,W.Ready next_projection)) in
+  check(List.exists(function C.Send(_,_,W.Query _)->true|_->false)ready.instructions)
+    "fresh baseline did not resume queued dependency read"
+;;
+
 let () =
+  if Array.mem "--live-read-rebind-only" Sys.argv then (test_live_binding_replans_ordinary_reads(); test_live_binding_read_owner_and_cancellation_fences();test_binding_rebind_queued_read_and_failure();exit 0);
   if Array.mem "--retry-release-error-only" Sys.argv then (test_retry_binding_release_error_is_observable();exit 0);
   if Array.mem "--import-rejection-only" Sys.argv then (test_rejected_imports_release_capacity_after_fresh_readback();exit 0);
   if Array.mem "--import-proof-return-only" Sys.argv then (test_completed_imports_release_active_recovery_capacity();exit 0);
@@ -4682,6 +4799,9 @@ let () =
   test_durable_recovery_ack_properties ();
   test_dependency_read_waits_for_capacity ();
   test_live_binding_invalidation_is_pure ();
+  test_binding_rebind_queued_read_and_failure ();
+  test_live_binding_replans_ordinary_reads ();
+  test_live_binding_read_owner_and_cancellation_fences ();
   test_changes_serial_and_ack_capacity ();
   test_changefeed_planning_owns_its_typed_ticket ();
   test_changefeed_ack_requires_owned_delivered_batch ();

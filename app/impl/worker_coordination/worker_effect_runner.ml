@@ -281,6 +281,10 @@ let on_event t event =
                 | Cancelled -> Worker.Interrupted Worker.Cancelled
                 | Shutdown -> Worker.Interrupted Worker.Worker_stopped
               in
+              (match outcome,result with
+               | Completed(Service.Coordination_query_revoked _),Worker.Answered(Error Worker.Revoked_session) ->
+                 I.revoke();t.post(Core.Binding_invalidated I.binding)
+               | _ -> ());
               t.post (Core.Completed (ticket, result))
             | Unobserve (issuer, session, id) ->
               let module I = (val issuer : Worker_effect_authority.ISSUER) in

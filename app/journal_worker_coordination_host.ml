@@ -62,17 +62,18 @@ let apply state runner transition =
 
 let flush host =
   let view = Core.view !(host.state) in
-  let callbacks = ref [] in
+  let callbacks = ref [] and reads = ref Rrbvec.empty in
   host.watches
   := Rrbvec.fold_left
        (fun retained (Watch (ticket, callback) as watch) ->
           match Core.reply view ticket with
           | None -> Rrbvec.push_back retained watch
           | Some result ->
-            let origin = Core.query_origin view ticket in
-            host.enqueue (fun () ->
-              apply host.state host.runner (Core.step !(host.state) (Core.Forget ticket)));
-            callbacks := (fun () -> callback origin (Core.revalidate_reply (Core.view !(host.state)) ticket result)) :: !callbacks;
+            let origin=Core.query_origin view ticket in
+            reads := Rrbvec.push_back !reads (fun () ->
+              apply host.state host.runner
+                (Core.step !(host.state)(Core.Forget ticket));
+              callback origin (Core.revalidate_reply (Core.view !(host.state)) ticket result));
             retained)
        Rrbvec.empty
        !(host.watches);
@@ -81,6 +82,10 @@ let flush host =
     |Some(Worker.Safe_to_proceed _|Host_change_applied _|Handoff_failed _ as outcome)->
       callbacks:=(fun()->callback outcome)::!callbacks;retained
     |_->Rrbvec.push_back retained watch)Rrbvec.empty !(host.host_watches);
+  (* Publish already runs on the shared serial pump. Deliver after committing
+     the watch lists, without an extra queue gap in which its logical result
+     could be retired/replanned before a captured callback is applied. *)
+  Rrbvec.iter (fun deliver -> deliver ()) !reads;
   List.iter host.enqueue (List.rev !callbacks)
 ;;
 
@@ -94,8 +99,8 @@ let create ~client ~client_id ~managed_origin ~user_id ~enqueue ~changed =
   in
   Runner.create ~client ~managed_origin ~user_id ~post ~publish:(fun view ->
     enqueue (fun () ->
-      Option.iter flush !host;
-      changed view))
+      changed view;
+      Option.iter flush !host))
   |> Result.map (fun value ->
     runner := Some value;
     let value = { state; runner = value; enqueue; watches = ref Rrbvec.empty;host_watches=ref Rrbvec.empty;source_reads=ref Pure_source_recovery.empty } in

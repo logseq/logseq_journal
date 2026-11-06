@@ -110,6 +110,7 @@ type query_target =
 type 'a ticket =
   { id : Worker.request_id
   ; serial : int64
+  ; attempt : int
   ; kind : 'a kind
   ; query : 'a planned
   ; target : query_target
@@ -131,6 +132,7 @@ type 'a slot =
   ; cancelled : bool
   ; forgotten : bool
   ; retired_by_ack : bool
+  ; rebind_pending : bool
   }
 
 type entry = Entry : 'a slot -> entry
@@ -437,6 +439,11 @@ let same_ticket : type a b. a ticket -> b ticket -> (a, b) Worker.equality optio
   | _ -> None
 ;;
 
+(* Business handles stay stable; asynchronous envelopes belong to one send. *)
+let same_attempt : type a b. a ticket -> b ticket -> (a,b) Worker.equality option =
+  fun a b -> if a.attempt=b.attempt then same_ticket a b else None
+;;
+
 let reply : type a. view -> a ticket -> a Worker.reply option =
   fun v ticket ->
   match Slots.find_opt ticket.serial v.entries with
@@ -581,7 +588,9 @@ let equal_observation_entry (Observing a) (Observing b) =
 let equal_entry (Entry a) (Entry b) =
   match same_ticket a.ticket b.ticket with
   | Some Worker.Refl ->
-    a.wait_for_capacity = b.wait_for_capacity
+    a.ticket.attempt = b.ticket.attempt
+    && a.rebind_pending = b.rebind_pending
+    && a.wait_for_capacity = b.wait_for_capacity
     && a.dispatched = b.dispatched
     && a.admitted = b.admitted
     && a.change_version = b.change_version
@@ -810,7 +819,8 @@ let identity client serial =
 ;;
 
 let outstanding state =
-  Slots.exists (fun _ (Entry slot) -> slot.result = None) state.facts.entries
+  Slots.exists (fun _ (Entry slot) -> slot.result = None
+    && (slot.dispatched || not slot.rebind_pending)) state.facts.entries
 ;;
 
 let settle state instructions =
@@ -1002,14 +1012,14 @@ let dispatch_waiting ?(publish = false) ?(retry_full = false) state instructions
                    | Error error->reject error
                    | Ok ()->
                      sends:=Send(slot.ticket,session,operation)::!sends;
-                     Entry{slot with dispatched=true;early=None})
+                     Entry{slot with dispatched = true;early=None})
                 | _->reject Worker.Revoked_session)
              | Operation (Worker.Confirm_import_source _ as operation) ->
                (match slot.ticket.target with
                 |Direct session->(match validate_session state session with
                   |Error error->reject error
                   |Ok()->sends:=Send(slot.ticket,session,operation)::!sends;
-                    Entry{slot with dispatched=true;early=None})
+                    Entry{slot with dispatched = true;early=None})
                 |_->reject Worker.Revoked_session)
              | Operation (Worker.Acknowledge_changes batch) ->
                let session = Worker.change_batch_session batch in
@@ -1133,6 +1143,7 @@ let dispatch_waiting ?(publish = false) ?(retry_full = false) state instructions
                         Entry
                           { slot with
                             dispatched = true
+                          ; rebind_pending = false
                           ; early = None
                           ; origin
                           ; change_version = change_version state.facts session
@@ -1162,10 +1173,10 @@ let plan_intent_lifecycle
   = fun state session operation kind target acknowledgement ->
   if state.next=Int64.max_int then Error(Worker.Invalid_input "Request counter exhausted") else
   let serial=Int64.succ state.next in
-  let ticket={id=Worker.request_id(identity state.client serial);serial;kind;query=Operation operation;target;
+  let ticket={id=Worker.request_id(identity state.client serial);serial;attempt=0;kind;query=Operation operation;target;
     planned_intent_epoch=state.facts.intent_epoch;planned_source_epoch=state.facts.import_input_epoch;acknowledgement} in
-  let slot={ticket;wait_for_capacity=false;dispatched=true;admitted=None;change_version=0L;
-    sample_epoch=None;origin=None;result=None;early=None;cancelled=false;forgotten=false;retired_by_ack=false} in
+  let slot={ticket;wait_for_capacity=false;dispatched = true;admitted=None;change_version=0L;
+    sample_epoch=None;origin=None;result=None;early=None;cancelled=false;forgotten=false;retired_by_ack=false;rebind_pending=false} in
   let facts={state.facts with entries=Slots.add serial(Entry slot)state.facts.entries} in
   Ok(ticket,changed{state with next=serial;facts}[Send(ticket,session,operation)])
 ;;
@@ -1258,8 +1269,28 @@ let progress_asset_cleanup ?(capacity=false) transition =
     changed !next(non_publications transition.instructions @ List.rev !effects)
 ;;
 
-let retire state lifecycle =
+let restart_read (slot : 'a slot) =
+  { slot with ticket={slot.ticket with attempt=slot.ticket.attempt+1};
+    dispatched=false;admitted=None;early=None;origin=None;result=None;
+    cancelled=false;rebind_pending=true }
+;;
+
+let retire ?(retry_reads=false) state lifecycle =
   let facts, instructions = cancel_entries (fun _ -> true) state.facts in
+  (* A binding handover retires an execution, not an otherwise-current business
+     read. Keep its logical owner; resample only after old physical settlement.
+     Sealed/session operations and effectful requests never enter this queue. *)
+  let facts=if not retry_reads then facts else
+    let entries=Slots.fold(fun serial (Entry slot) entries->
+      let eligible=not slot.forgotten && not slot.cancelled && slot.ticket.attempt<max_int
+        && match slot.ticket.target,slot.ticket.query with
+          |Expected _,Read(Worker.Changes _)->false
+          |Expected _,Read _->true|_->false in
+      if not eligible then entries else
+      let slot=if not slot.dispatched || slot.result<>None then restart_read slot
+        else {slot with cancelled=true;rebind_pending=true} in
+      Slots.add serial(Entry slot)entries)state.facts.entries facts.entries in
+    {facts with entries} in
   let facts=Asset_consumers.fold(fun _ (entry:asset_registration) facts->queue_asset_cleanup facts entry.consumer ())facts.asset_consumers facts in
   let facts=Observation_ids.fold(fun _ lease facts->queue_file_cleanup facts lease ())facts.file_leases facts in
   let facts =
@@ -2012,7 +2043,7 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
   fun state ticket result require_admission ->
   match Slots.find_opt ticket.serial state.facts.entries with
   | Some (Entry slot) ->
-    (match same_ticket ticket slot.ticket with
+    (match same_attempt ticket slot.ticket with
      | Some Worker.Refl
        when slot.result = None
             && (slot.early = None || not require_admission)
@@ -2136,7 +2167,8 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
            else
              Slots.add
                ticket.serial
-               (Entry { slot with result = Some result; early = None })
+               (Entry (if slot.rebind_pending && state.lifecycle=Retrying
+                  then restart_read slot else {slot with result=Some result;early=None}))
                previous_entries
          in
          settle { state with facts = { state.facts with entries; intents; intent_epoch;import_input_epoch } } [])
@@ -2328,7 +2360,7 @@ let cancel : type a. t -> a ticket -> bool -> transition =
          else
            Slots.add
              ticket.serial
-             (Entry { slot with cancelled = true; forgotten })
+             (Entry { slot with cancelled = true; forgotten; rebind_pending=false })
              state.facts.entries
        in
        changed { state with facts = { state.facts with entries } } instructions
@@ -2527,7 +2559,7 @@ let step_base state event =
       [ Bootstrap ]
   | Worker_bound _ -> unchanged state
   | Binding_invalidated binding when is_binding state binding && state.lifecycle = Running
-    -> retire state Retrying
+    -> retire ~retry_reads:true state Retrying
   | Binding_invalidated _ -> unchanged state
   | Retry_bootstrap when state.lifecycle = Running -> retire state Retrying
   | Retry_bootstrap
@@ -2663,7 +2695,7 @@ let step_base state event =
   | Admitted (ticket, id) ->
     (match Slots.find_opt ticket.serial state.facts.entries with
      | Some (Entry slot) ->
-       (match same_ticket ticket slot.ticket with
+       (match same_attempt ticket slot.ticket with
         | Some Worker.Refl
           when slot.dispatched && slot.admitted = None && slot.result = None ->
           let early = slot.early in
@@ -2711,7 +2743,7 @@ let step_base state event =
   | Admission_refused (ticket, Worker.Full) ->
     (match Slots.find_opt ticket.serial state.facts.entries with
      | Some (Entry slot) ->
-       (match same_ticket ticket slot.ticket with
+       (match same_attempt ticket slot.ticket with
         | Some Worker.Refl
           when (slot.wait_for_capacity
                 ||
@@ -3067,6 +3099,7 @@ let plan_refresh ?(internal = false) (state : t) session handle =
       let ticket =
         { id = Worker.request_id (identity state.client serial)
         ; serial
+        ; attempt = 0
         ; kind = Observed (kind owned.obs_query)
         ; planned_intent_epoch = state.facts.intent_epoch
         ; planned_source_epoch = state.facts.import_input_epoch
@@ -3087,7 +3120,7 @@ let plan_refresh ?(internal = false) (state : t) session handle =
         ; early = None
         ; cancelled = false
         ; forgotten = internal
-        ; retired_by_ack = false
+        ; retired_by_ack = false;rebind_pending=false
         }
       in
       let facts =
@@ -3357,6 +3390,7 @@ let plan_mutation
     let ticket =
       { id = Worker.request_id (identity state.client serial)
       ; serial
+        ; attempt = 0
       ; kind = Mutation
       ; planned_intent_epoch = state.facts.intent_epoch
         ; planned_source_epoch = state.facts.import_input_epoch
@@ -3376,7 +3410,7 @@ let plan_mutation
       ; result = None
       ; early = None
       ; cancelled = false
-      ; retired_by_ack = false
+      ; retired_by_ack = false;rebind_pending=false
       ; forgotten = false
       }
     in
@@ -3556,6 +3590,7 @@ let plan_observation (state : t) session budget query =
     let ticket =
       { id = Worker.request_id (identity state.client serial)
       ; serial
+        ; attempt = 0
       ; kind = Observed (kind query)
       ; planned_intent_epoch = state.facts.intent_epoch
         ; planned_source_epoch = state.facts.import_input_epoch
@@ -3575,7 +3610,7 @@ let plan_observation (state : t) session budget query =
       ; result = None
       ; early = None
       ; cancelled = false
-      ; retired_by_ack = false
+      ; retired_by_ack = false;rebind_pending=false
       ; forgotten = false
       }
     in
@@ -3642,6 +3677,7 @@ let plan_release state session handle =
     let ticket =
       { id = Worker.request_id (identity state.client serial)
       ; serial
+        ; attempt = 0
       ; kind = Unit
       ; planned_intent_epoch = state.facts.intent_epoch
         ; planned_source_epoch = state.facts.import_input_epoch
@@ -3661,7 +3697,7 @@ let plan_release state session handle =
       ; result = (if acknowledged then Some (Worker.Answered (Ok ())) else None)
       ; early = None
       ; cancelled = false
-      ; retired_by_ack = false
+      ; retired_by_ack = false;rebind_pending=false
       ; forgotten = false
       }
     in
@@ -3700,6 +3736,7 @@ let plan_change_ack state session batch =
     let ticket =
       { id = Worker.request_id (identity state.client serial)
       ; serial
+        ; attempt = 0
       ; kind = Change_ack
       ; planned_intent_epoch = state.facts.intent_epoch
         ; planned_source_epoch = state.facts.import_input_epoch
@@ -3719,7 +3756,7 @@ let plan_change_ack state session batch =
       ; result = None
       ; early = None
       ; cancelled = false
-      ; retired_by_ack = false
+      ; retired_by_ack = false;rebind_pending=false
       ; forgotten = false
       }
     in
@@ -3793,6 +3830,7 @@ let request
                      let ticket =
                        { id = Worker.request_id (identity state.client serial)
                        ; serial
+        ; attempt = 0
                        ; kind = kind query
                        ; planned_intent_epoch = state.facts.intent_epoch
         ; planned_source_epoch = state.facts.import_input_epoch
@@ -3820,7 +3858,7 @@ let request
                        ; result = None
                        ; early = None
                        ; cancelled = false
-                       ; retired_by_ack = false
+                       ; retired_by_ack = false;rebind_pending=false
                        ; forgotten = false
                        }
                      in
@@ -3955,6 +3993,7 @@ let plan_query_internal
     let ticket =
       { id = Worker.request_id (identity state.client serial)
       ; serial
+        ; attempt = 0
       ; kind = kind query
       ; planned_intent_epoch = state.facts.intent_epoch
         ; planned_source_epoch = state.facts.import_input_epoch
@@ -3974,7 +4013,7 @@ let plan_query_internal
       ; result = None
       ; early = None
       ; cancelled = false
-      ; retired_by_ack = false
+      ; retired_by_ack = false;rebind_pending=false
       ; forgotten = false
       }
     in

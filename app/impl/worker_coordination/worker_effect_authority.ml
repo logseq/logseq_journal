@@ -662,7 +662,16 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
           -> (a reply, error) result
         =
         fun session ~request_id operation response ->
-        match operation with
+        match operation,response with
+        | Query _,Service.Coordination_query_revoked value ->
+          if equal_binding(For_worker.session_binding session)binding
+            && value.registration=For_worker.binding_serial binding
+            && value.owner=For_worker.session_scope session && value.request_id=request_id
+          then Ok(Answered(Error Revoked_session))
+          else Error(Protocol_mismatch "The revoked query belongs to another binding, owner or request")
+        | _,Service.Coordination_query_revoked _ ->
+          Error(Protocol_mismatch "Only a query can carry a binding revocation")
+        | _,_ -> match operation with
         | Release_file lease->
           if not(equal_binding (For_worker.session_binding session) binding) || not(equal_session session lease.lease_owner) then Error Revoked_session else
           (match response with Service.Client_command_completed->Ok(Answered(Ok()))

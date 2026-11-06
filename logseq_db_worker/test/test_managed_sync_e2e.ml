@@ -340,7 +340,7 @@ let handle_event context = function
     handle_graph_state context state;
     None
   |Response{outcome=Completed(Service.Coordination_registered value);_}->accept_baseline context value;None
-  |Response{request_id;outcome=Completed((Service.Coordination_queried _|Coordination_mutation_result _)as response);_}->
+  |Response{request_id;outcome=Completed((Service.Coordination_queried _|Coordination_query_revoked _|Coordination_mutation_result _)as response);_}->
     context.last_event<-"typed-response";Some(request_id,response)
   | Response { outcome = Failed _; _ } -> fail_worker context "worker-request" "failed"
   | Response { outcome = Cancelled; _ } ->
