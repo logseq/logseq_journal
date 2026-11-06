@@ -1578,7 +1578,12 @@ let read_typed
     |Task_status_definitions ids->with_snapshot(fun snapshot _ _->Database.get_task_status_definitions snapshot ids |>Result.map_error typed_read_error)
     |Asset_descriptors ids->with_snapshot(fun snapshot _ _->
       Database.get_asset_descriptors snapshot ids |>Result.map_error typed_read_error |>Result.map(fun items->
-        let version=Database.snapshot_version snapshot in F.asset_listing ~items ~next:None
+        let module Asset_ids=Map.Make(Graph.Uuid) in
+        let descriptors=List.fold_left (fun found descriptor->
+          Asset_ids.add descriptor.Logseq_db_types.Asset_descriptor.uuid descriptor found)
+          Asset_ids.empty items in
+        let items=List.map (fun uuid->Asset_ids.find_opt uuid descriptors) ids in
+        let version=Database.snapshot_version snapshot in F.asset_lookup_result ~items
           ~generation:(Overlay.Generation.to_string version.generation) ~projection_revision:(Overlay.Projection_revision.to_string version.projection_revision)))
     |Assets{recursive;roots;_}->with_snapshot(fun snapshot _ limit->
       Database.get_assets_under_roots snapshot ~recursive ~roots ~limit ~cursor |>Result.map_error typed_read_error |>Result.map(fun (result:Database.asset_page)->

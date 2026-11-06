@@ -3,6 +3,9 @@ module Asset = Logseq_db_types.Asset_descriptor
 type ticket
 
 module Worker = Journal_worker_coordination.Worker_api
+module Coordination = Journal_worker_coordination.Worker_pure_coordinator
+
+type demand_registration = Worker.asset_demand Coordination.ticket * Worker.asset_demand option
 
 type read_result
 
@@ -37,11 +40,11 @@ type t
     Transport IDs and continuation construction stay with the coordinator SDK. *)
 val create
   :  release_file:(Worker.file_lease -> bool)
-  -> release_consumer:(Worker.asset_consumer -> bool)
+  -> release_consumer:(demand_registration -> bool)
   -> ?read_planned:(Logseq_db_types.Graph_types.Uuid.t -> unit)
   -> ?read_retired:(Logseq_db_types.Graph_types.Uuid.t -> unit)
   -> read:(read_request -> bool)
-  -> demand:(graph_generation:int -> name:string -> Worker.asset_priority -> Asset.t list -> Worker.asset_consumer option)
+  -> demand:(graph_generation:int -> name:string -> Worker.asset_priority -> Asset.t list -> Worker.asset_demand Coordination.ticket option)
   -> acquire:(ticket -> Worker.asset_file -> bool)
   -> retry_asset:(graph_generation:int -> Worker.Uuid.t -> bool)
   -> changed:(string -> view -> unit)
@@ -91,7 +94,7 @@ val forget_request : t -> Logseq_db_types.Graph_types.Uuid.t -> unit
 val changes : t -> Worker_pure_data.change_window list -> unit
 val resync : t -> unit
 val notice : t -> Worker.asset_notice -> unit
-val demand_backpressured : t -> string -> unit
+val demand_backpressured : ?ticket:Worker.asset_demand Coordination.ticket -> t -> string -> unit
 val pump : t -> unit
 val imported : t -> current:bool -> Worker.imported -> unit
 val idle : t -> bool
@@ -113,3 +116,6 @@ val change_application_error : t -> Worker_pure_data.change_window list -> strin
 (** Only failed DTO/dependency reads, excluding download/lease/import status. An
     actual queued listing retry remains an obligation rather than a final error. *)
 val projection_read_error : t -> root:string -> string option
+
+(** Retain a checked acknowledgement only for the still-owned replacement ticket. *)
+val receive_demand : t -> Worker.asset_demand Coordination.ticket -> Worker.asset_demand -> bool

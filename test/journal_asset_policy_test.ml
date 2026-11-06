@@ -356,16 +356,21 @@ module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Read = Worker_pure_read
 module W = Journal_worker_coordination.Worker_api
 
-type outgoing = Read of Runtime.read_request | Command of unit W.request
+type outgoing = Read of Runtime.read_request | Command : 'a W.request -> outgoing
 
 let request_id (Runtime.Read request) = request.request_id
 module Resources=Coordination_test_fixture.Resources
 let resources=Resources.create ~graph:(uuid 3) ~graph_generation:1 8200L
 let producer=lazy(resources.Resources.issuer,resources.session)
 let demand_port sent ~graph_generation ~name priority assets =
-  Option.map(fun consumer->Queue.add(Command(W.Replace_asset_demand(consumer,priority,assets)))sent;consumer)
-    (Resources.demand resources ~graph_generation ~name priority assets)
-let release_port sent consumer=Queue.add(Command(W.Release_asset_demand consumer))sent;true
+  Option.map(fun ticket->
+    let consumer=W.asset_consumer resources.session ~name |> Result.get_ok in
+    Queue.add(Command(W.Replace_asset_demand(consumer,priority,assets)))sent;ticket)
+    (Resources.demand_ticket resources ~graph_generation ~name priority assets)
+let release_port sent (ticket,demand)=
+  (match demand with
+   |Some demand->Queue.add(Command(W.Release_asset_demand demand))sent
+   |None->Resources.cancel_demand resources ticket);true
 let consumer_name consumer=Hashtbl.to_seq resources.Resources.demands |>Seq.find_map(fun(name,(actual,_,_))->
   if W.equal_asset_consumer consumer actual then Some name else None) |>Option.get
 
@@ -620,7 +625,7 @@ let runtime_fixture
          respond
            r
            request
-           ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:(initial_assets) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
+           ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:(initial_assets) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors ids->let listing=Result.get_ok value in F.answer budget query (Ok(F.asset_lookup_result ~generation:listing.generation ~projection_revision:listing.projection_revision ~items:(List.map(fun uuid->List.find_opt(fun descriptor->Read.Uuid.equal uuid descriptor.Logseq_db_types.Asset_descriptor.uuid) listing.items)ids))) |_->failwith "Synthetic sample query family mismatch"))
        | Runtime.Read { query = W.Page { uuid = page; _ }; _ } ->
          respond
            r
@@ -766,7 +771,7 @@ let runtime_refs_delta () =
   respond
     r
     request
-    ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"));
+    ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors ids->let listing=Result.get_ok value in F.answer budget query (Ok(F.asset_lookup_result ~generation:listing.generation ~projection_revision:listing.projection_revision ~items:(List.map(fun uuid->List.find_opt(fun descriptor->Read.Uuid.equal uuid descriptor.Logseq_db_types.Asset_descriptor.uuid) listing.items)ids))) |_->failwith "Synthetic sample query family mismatch"));
   check (Queue.is_empty sent) "raw ref replacement settles"
 ;;
 
@@ -860,8 +865,8 @@ let runtime_known_asset_immutable () =
   let operation=W.Query(budget,query) in
   let response=match I.request session ~request_id:(W.request_id id)operation|>Result.get_ok with
     |Service.Coordination_query source->Service.Coordination_queried{registration=source.registration;owner=source.owner;
-      request_id=source.request_id;answer=Read.For_worker.answer budget query(Ok(Read.For_worker.asset_listing
-        ~generation:"g" ~projection_revision:"r" ~items:[asset 50] ~next:None))}
+      request_id=source.request_id;answer=Read.For_worker.answer budget query(Ok(Read.For_worker.asset_lookup_result
+        ~generation:"g" ~projection_revision:"r" ~items:[Some(asset 50)]))}
     |_->failwith "descriptor fixture changed its query"in
   let value=match I.reply session ~request_id:(W.request_id id) operation response with
     | Ok(W.Answered(Ok value))->value|_->failwith "invalid descriptor fixture" in
@@ -1035,7 +1040,7 @@ let runtime_hidden_holder_fanout () =
       respond
         r
         request
-        ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:([ asset 50 ]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
+        ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:([ asset 50 ]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors ids->let listing=Result.get_ok value in F.answer budget query (Ok(F.asset_lookup_result ~generation:listing.generation ~projection_revision:listing.projection_revision ~items:(List.map(fun uuid->List.find_opt(fun descriptor->Read.Uuid.equal uuid descriptor.Logseq_db_types.Asset_descriptor.uuid) listing.items)ids))) |_->failwith "Synthetic sample query family mismatch"))
     | Command(W.Replace_asset_demand(bound,_,_)) ->
       Runtime.notice r (Resources.notice resources(Service.Asset_demand_accepted(consumer_name bound)))
     | _ -> ()
@@ -1144,9 +1149,9 @@ let runtime_unknown_old_parent () =
       respond
         r
         request
-        ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
+        ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("r") ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors ids->let listing=Result.get_ok value in F.answer budget query (Ok(F.asset_lookup_result ~generation:listing.generation ~projection_revision:listing.projection_revision ~items:(List.map(fun uuid->List.find_opt(fun descriptor->Read.Uuid.equal uuid descriptor.Logseq_db_types.Asset_descriptor.uuid) listing.items)ids))) |_->failwith "Synthetic sample query family mismatch"))
     | Command(W.Release_asset_demand bound) ->
-      released := Some(consumer_name bound) = !old
+      released := Some(consumer_name(W.asset_demand_consumer bound)) = !old
     | _ -> ()
   done;
   check

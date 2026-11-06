@@ -186,6 +186,56 @@ let descriptor_validation () =
     ]
 ;;
 
+(* The typed read validator owns slot identity and byte accounting; these are
+   pure boundary checks, not injected reducer completions. *)
+let exact_asset_lookup () =
+  let module F = Read.For_worker in
+  let missing = Logseq_db_types.Graph_types.Uuid.of_string
+    "78000000-0000-4000-8000-000000000002" |> Result.get_ok in
+  let descriptor = A.create ~uuid:target ~source:(External "https://example.invalid/a.png")
+    ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
+  let query = Read.Asset_descriptors [target; missing; target] in
+  let value = F.asset_lookup_result ~generation:"g" ~projection_revision:"p"
+    ~items:[Some descriptor; None; Some descriptor] in
+  let json = `Assoc ["generation", `String "g"; "projection_revision", `String "p";
+    "items", `List [A.to_yojson descriptor; `Null; A.to_yojson descriptor]] in
+  let bytes = String.length (Yojson.Safe.to_string json) in
+  Alcotest.(check int) "exact wire bytes include null slots and no cursor"
+    bytes (Read.encoded_value_bytes query value);
+  let budget maximum_bytes = Read.read_budget owner ~maximum_items:3 ~maximum_bytes |> Result.get_ok in
+  Alcotest.(check bool) "missing and repeated UUID slots accepted" true
+    (Read.validate_value owner (budget bytes) query value = Ok ());
+  Alcotest.(check bool) "whole exact lookup fails one byte below full result" true
+    (Read.validate_value owner (budget (bytes - 1)) query value = Error Read.Response_budget_exceeded);
+  List.iter (fun items ->
+    let malformed = F.asset_lookup_result ~generation:"g" ~projection_revision:"p" ~items in
+    Alcotest.(check bool) "dropped or misordered exact slot rejected" true
+      (match Read.validate_value owner (budget 4096) query malformed with
+       | Error (Read.Protocol_mismatch _) -> true | _ -> false))
+    [[Some descriptor; Some descriptor]; [None; Some descriptor; Some descriptor]];
+  let empty = F.asset_lookup_result ~generation:"g" ~projection_revision:"p" ~items:[] in
+  Alcotest.(check bool) "empty lookup succeeds" true
+    (Read.validate_value owner (budget 4096) (Read.Asset_descriptors []) empty = Ok ());
+  Alcotest.(check bool) "exact lookup cannot silently paginate" true
+    (Read.smaller_page_size query 3 = None)
+;;
+
+let original_continuation_budget () =
+  let module F = Read.For_worker in
+  let budget = Read.read_budget owner ~maximum_items:7 ~maximum_bytes:1379 |> Result.get_ok in
+  let query = Read.Assets {recursive=true; roots=[target]; after=None} in
+  let cursor = Logseq_db_types.Graph_types.Cursor.of_string "original-snapshot" |> Result.get_ok in
+  let next = F.continuation ~owner ~budget ~key:(Read.query_key budget query) ~cursor in
+  let restored = Read.continuation_budget next in
+  Alcotest.(check bool) "accessor returns exact stored budget" true (restored == budget);
+  let resumed = Read.Assets {recursive=true; roots=[target]; after=Some next} in
+  Alcotest.(check bool) "original nondefault budget resumes query" true
+    (Read.validate_query owner restored resumed = Ok ());
+  let changed = Read.read_budget owner ~maximum_items:7 ~maximum_bytes:1380 |> Result.get_ok in
+  Alcotest.(check bool) "changed budget cannot resume original cursor" true
+    (Result.is_error (Read.validate_query owner changed resumed))
+;;
+
 let () =
   Alcotest.run
     "asset protocol"
@@ -195,6 +245,8 @@ let () =
         ; Alcotest.test_case "queries" `Quick roundtrip
         ; Alcotest.test_case "descriptors" `Quick response
         ; Alcotest.test_case "bounds" `Quick limits
+        ; Alcotest.test_case "exact lookup slots and bytes" `Quick exact_asset_lookup
+        ; Alcotest.test_case "original continuation budget" `Quick original_continuation_budget
         ] )
     ]
 ;;

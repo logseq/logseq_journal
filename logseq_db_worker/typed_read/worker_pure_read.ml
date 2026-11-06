@@ -106,6 +106,12 @@ type task_status_catalog =
   ; next : Graph.task_status_definition continuation option
   }
 
+type asset_lookup_result =
+  { generation : string
+  ; projection_revision : string
+  ; items : Logseq_db_types.Asset_descriptor.t option list
+  }
+
 type asset_listing =
   { generation : string
   ; projection_revision : string
@@ -187,7 +193,7 @@ type _ query =
   | Task_status_definitions :
       Uuid.t list
       -> Graph.task_status_definition option list query
-  | Asset_descriptors : Uuid.t list -> asset_listing query
+  | Asset_descriptors : Uuid.t list -> asset_lookup_result query
   | Assets :
       { recursive : bool
       ; roots : Uuid.t list
@@ -298,6 +304,8 @@ let journal_day day = Logseq_db_worker_contract.Worker_pure_day.create day
   |> Result.map_error(fun message->Invalid_input message)
 ;;
 
+let continuation_budget (value : 'a continuation) = value.budget
+
 let page_uuid (p : page) = p.data.uuid
 let page_title (p : page) = p.data.title
 let page_data (p : page) = p.data
@@ -344,6 +352,7 @@ module For_worker = struct
   let block_summary ~lookup ~page ~items ~next ~scope_revision ~generation ~projection_revision : block_summary = { lookup; page; items; next; scope_revision; generation; projection_revision }
   let favorites ~favorites_page ~generation ~projection_revision ~items ~next : favorites = { favorites_page; generation; projection_revision; items; next }
   let task_status_catalog ~property_uuid ~default_status ~items ~next : task_status_catalog = { property_uuid; default_status; items; next }
+  let asset_lookup_result ~generation ~projection_revision ~items : asset_lookup_result = { generation; projection_revision; items }
   let asset_listing ~generation ~projection_revision ~items ~next : asset_listing = { generation; projection_revision; items; next }
   let children ~parent ~revision_scope ~scope_revision ~items ~next : children = { parent; revision_scope; scope_revision; items; next }
   let change_batch ~change_owner ~generation ~from_exclusive ~through ~windows ~next : change_batch = { change_owner; generation; from_exclusive; through; windows; next }
@@ -478,7 +487,9 @@ let value_json : type a. a query -> a -> Yojson.Safe.t = fun query value->
     "property_uuid",json_optional Uuid.to_yojson value.property_uuid;"default_status",json_optional Uuid.to_yojson value.default_status;
     "items",json_list Graph.task_status_definition_to_yojson value.items;"next",continuation_json value.next]
   |Task_status_definitions _->json_list(json_optional Graph.task_status_definition_to_yojson)value
-  |Asset_descriptors _->asset_listing_json value
+  |Asset_descriptors _->`Assoc[
+    "generation",`String value.generation;"projection_revision",`String value.projection_revision;
+    "items",json_list(json_optional Logseq_db_types.Asset_descriptor.to_yojson)value.items]
   |Assets _->asset_listing_json value
   |Changes _->`Assoc[
     "generation",`String value.generation;"from_exclusive",json_optional(fun text->`String text)value.from_exclusive;
@@ -510,6 +521,9 @@ let validate_value : type a. session -> read_budget -> a query -> a -> (unit,err
     |Block_summary{block;_}->block_matches block value.lookup
     |Child_members{parent;_}->Uuid.equal parent value.parent && value.revision_scope=Data.V2_children_revision parent
     |Task_status_definitions ids->List.length ids=List.length value
+    |Asset_descriptors ids->List.length ids=List.length value.items
+      && List.for_all2 (fun uuid item->Option.fold ~none:true
+        ~some:(fun descriptor->Uuid.equal uuid descriptor.Logseq_db_types.Asset_descriptor.uuid) item) ids value.items
     |Changes{generation;after}->
       let module Seen=Set.Make(String) in
       let rec chain seen previous = function

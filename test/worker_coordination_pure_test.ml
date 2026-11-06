@@ -57,6 +57,17 @@ let checked_import_reply issuer session ticket intent receipt =
   I.reply session ~request_id:(C.ticket_id ticket)(W.Import intent)response |> Result.get_ok
 ;;
 
+let checked_demand issuer session ticket consumer assets =
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
+  let operation=W.Replace_asset_demand(consumer,W.Foreground,assets) in
+  let request_id=match I.request session ~request_id:(C.ticket_id ticket)operation |> Result.get_ok with
+    |S.Coordination_asset_demand{request_id;_}->request_id|_->assert false in
+  match I.reply session ~request_id:(C.ticket_id ticket)operation
+    (S.Coordination_asset_demand_accepted{request_id}) |> Result.get_ok with
+  |W.Answered(Ok demand)->demand
+  |_->failwith "checked demand fixture rejected matching ACK"
+;;
+
 let test_asset_demand_notice_has_one_registered_owner () =
   let issuer,raw,projection,session=fixture 881L in
   let module I=(val issuer:Worker_effect_authority.ISSUER) in
@@ -79,15 +90,16 @@ let test_asset_demand_notice_has_one_registered_owner () =
     | _->failwith "typed asset demand did not use the existing scoped Service command" in
   check(wire_name<>"media:synthetic-owner") "asset demand was not isolated by binding/session";
   let notice=I.asset_notice session(S.Asset_demand_accepted wire_name) |> Result.get_ok in
+  let demand=W.asset_notice_demand notice |> Option.get in
   let announced=(C.step planned.next(C.Asset_received(notice,Id.Worker.Push_sequence.of_int64 1L))).next in
-  let values=C.asset_notices(C.view announced)consumer in
+  let values=C.asset_notices(C.view announced)demand in
   check(Rrbvec.to_list(C.asset_updates ~previous:(Some(C.view planned.next))(C.view announced))=[notice])
     "accepted asset notice did not leave the original typed outlet";
   check(not(C.equal_view(C.view announced)(C.view planned.next))) "asset fact update was hidden by view equality";
   check(List.length values=1) "registered consumer did not own its exact acceptance notice";
   check(Option.exists(W.equal_asset_consumer consumer)(W.asset_notice_consumer(List.hd values))) "notice guessed a different consumer association";
   let duplicate=(C.step announced(C.Asset_received(notice,Id.Worker.Push_sequence.of_int64 1L))).next in
-  check(C.asset_notices(C.view duplicate)consumer=values) "duplicate acceptance accumulated an event log";
+  check(C.asset_notices(C.view duplicate)demand=values) "duplicate acceptance accumulated an event log";
   check(Rrbvec.length(C.asset_updates ~previous:(Some(C.view announced))(C.view duplicate))=0)
     "duplicate sequence escaped the typed outlet";
   let capacity=I.asset_notice session S.Asset_capacity_available |> Result.get_ok in
@@ -104,7 +116,7 @@ let test_asset_demand_notice_has_one_registered_owner () =
   let latest=(C.step duplicate(C.Asset_received(asset_notice,Id.Worker.Push_sequence.of_int64 3L))).next in
   let old=I.asset_notice session(S.Asset_availability{consumer=wire_name;asset=asset.uuid;descriptor=asset;availability=Downloading}) |> Result.get_ok in
   let older=(C.step latest(C.Asset_received(old,Id.Worker.Push_sequence.of_int64 2L))).next in
-  check(List.exists(fun notice->Option.is_some(W.ready_asset_file notice))(C.asset_notices(C.view older)consumer))
+  check(List.exists(fun notice->Option.is_some(W.ready_asset_file notice))(C.asset_notices(C.view older)demand))
     "out-of-order notice rolled a Ready capability backwards";
   check(Rrbvec.length(C.asset_updates ~previous:(Some(C.view latest))(C.view older))=0)
     "stale Ready replacement escaped the typed outlet";
@@ -116,17 +128,17 @@ let test_asset_demand_notice_has_one_registered_owner () =
   let replacement=Logseq_db_types.Asset_descriptor.create ~uuid:asset.uuid ~source:(Managed(Some version))
     ~current_checksum:(Some version.checksum) ~size:None ~dimensions:None |> Result.get_ok in
   let replacement_ticket,replaced=C.request older session(W.Replace_asset_demand(consumer,W.Foreground,[replacement])) |> Result.get_ok in
-  let old_consumer=W.bind_asset_consumer consumer ~round:(C.ticket_id ticket) in
-  let _,late_release=C.request replaced.next session(W.Release_asset_demand old_consumer) |> Result.get_ok in
+  let _,late_release=C.request replaced.next session(W.Release_asset_demand demand) |> Result.get_ok in
   let new_wire=match I.request session ~request_id:(C.ticket_id replacement_ticket)
     (W.Replace_asset_demand(consumer,W.Foreground,[replacement])) |> Result.get_ok with
     |S.Coordination_asset_demand{consumer;_}->consumer|_->assert false in
   let new_notice=I.asset_notice session(S.Asset_demand_accepted new_wire) |> Result.get_ok in
+  let new_demand=W.asset_notice_demand new_notice |> Option.get in
   let after_late_release=(C.step late_release.next(C.Asset_received(new_notice,Id.Worker.Push_sequence.of_int64 5L))).next in
-  check(C.asset_notices(C.view after_late_release)consumer<>[])
+  check(C.asset_notices(C.view after_late_release)new_demand<>[])
     "queued old-round release retired its replacement consumer";
   let old_ready=(C.step replaced.next(C.Asset_received(asset_notice,Id.Worker.Push_sequence.of_int64 4L))).next in
-  check(not(List.exists(fun notice->Option.is_some(W.ready_asset_file notice))(C.asset_notices(C.view old_ready)consumer)))
+  check(not(List.exists(fun notice->Option.is_some(W.ready_asset_file notice))(C.asset_notices(C.view old_ready)demand)))
     "old demand Ready capability survived a descriptor replacement round";
   let focused=match I.bootstrap(S.Coordination_registered{raw with limits={raw.limits with response_budget_bytes=32768};
     baseline={raw.baseline with version=2L;presentation=2L}}) with
@@ -136,11 +148,11 @@ let test_asset_demand_notice_has_one_registered_owner () =
   check(W.equal_asset_consumer consumer focused_consumer && W.compare_asset_consumer consumer focused_consumer=0)
     "consumer identity changed with presentation/read metadata";
   let focused_state=(C.step older(C.Projection_received focused)).next in
-  check(C.asset_notices(C.view focused_state)focused_consumer<>[])
+  check(C.asset_notices(C.view focused_state)demand<>[])
     "pure consumer registry did not preserve execution across focus/metadata updates";
-  let _,releasing=C.request focused_state focused_session(W.Release_asset_demand focused_consumer) |> Result.get_ok in
+  let _,releasing=C.request focused_state focused_session(W.Release_asset_demand demand) |> Result.get_ok in
   let late=(C.step releasing.next(C.Asset_received(notice,Id.Worker.Push_sequence.of_int64 1L))).next in
-  check(C.asset_notices(C.view late)consumer=[]) "late demand notice revived a retired consumer";
+  check(C.asset_notices(C.view late)demand=[]) "late demand notice revived a retired consumer";
   check(Rrbvec.length(C.asset_updates ~previous:(Some(C.view releasing.next))(C.view late))=0)
     "retired consumer notice escaped the typed outlet";
   let foreign,_,_,foreign_session=fixture 882L in
@@ -151,15 +163,15 @@ let test_asset_demand_notice_has_one_registered_owner () =
 
 let asset_release_tickets instructions =
   let release : C.instruction -> unit C.ticket option = function
-    | C.Send(ticket,_,W.Release_asset_demand _)->Some ticket
+    | C.Release_asset_demand_registration(ticket,_)->Some ticket
     | _->None in
   List.filter_map release instructions
 ;;
 
 let asset_finalize_tickets instructions =
-  List.filter_map(function C.Finalize_asset_demand(ticket,_,_)->Some ticket|_->None)instructions
+  List.filter_map(function C.Finalize_asset_demand(ticket,_)->Some ticket|_->None)instructions
 ;;
-let complete_demand state ticket =
+let complete_unit state ticket =
   let admitted=(C.step state(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
   let completed=(C.step admitted(C.Completed(ticket,W.Answered(Ok())))).next in
   (C.step completed(C.Forget ticket)).next
@@ -173,8 +185,11 @@ let test_asset_cleanup_ack_and_shutdown_retry () =
   let asset=Logseq_db_types.Asset_descriptor.create ~uuid:graph ~source:(Managed None)
     ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
   let creator,planned=C.request initial session(W.Replace_asset_demand(consumer,W.Foreground,[asset])) |> Result.get_ok in
-  let created=complete_demand planned.next creator in
-  let waiter,releasing=C.request created session(W.Release_asset_demand consumer) |> Result.get_ok in
+  let demand=checked_demand issuer session creator consumer [asset] in
+  let admitted=(C.step planned.next(C.Admitted(creator,Id.Worker.Request_id.one))).next in
+  let created=(C.step admitted(C.Completed(creator,W.Answered(Ok demand)))).next in
+  let created=(C.step created(C.Forget creator)).next in
+  let waiter,releasing=C.request created session(W.Release_asset_demand demand) |> Result.get_ok in
   let cleanup=List.hd(asset_release_tickets releasing.instructions) in
   let forged=(C.step releasing.next(C.Completed(waiter,W.Answered(Ok())))).next in
   check(C.reply(C.view forged)waiter=None) "public release waiter accepted a fabricated transport ACK";
@@ -188,11 +203,14 @@ let test_asset_cleanup_ack_and_shutdown_retry () =
   let finalized=C.step early(C.Admitted(cleanup,Id.Worker.Request_id.one)) in
   check(C.reply(C.view finalized.next)waiter=None) "physical release bypassed registry finalization";
   let finalizer=List.hd(asset_finalize_tickets finalized.instructions) in
-  let done_state=complete_demand finalized.next finalizer in
+  let done_state=complete_unit finalized.next finalizer in
   check(C.reply(C.view done_state)waiter=Some(W.Answered(Ok()))) "actual release ACK did not settle waiter";
   check(C.validate_session initial session=Ok()) "cleanup mutated a preceding pure state";
   let creator,planned=C.request done_state session(W.Replace_asset_demand(consumer,W.Foreground,[asset])) |> Result.get_ok in
-  let stopping=C.step (complete_demand planned.next creator) C.Shutdown_requested in
+  let demand=checked_demand issuer session creator consumer [asset] in
+  let admitted=(C.step planned.next(C.Admitted(creator,Id.Worker.Request_id.one))).next in
+  let created=(C.step admitted(C.Completed(creator,W.Answered(Ok demand)))).next in
+  let stopping=C.step (C.step created(C.Forget creator)).next C.Shutdown_requested in
   let cleanup=List.hd(asset_release_tickets stopping.instructions) in
   let admitted=(C.step stopping.next(C.Admitted(cleanup,Id.Worker.Request_id.of_int64 2L))).next in
   let failed=(C.step admitted(C.Completed(cleanup,W.Answered(Error(W.Service_failed "synthetic physical failure"))))).next in
@@ -208,24 +226,81 @@ let test_asset_cleanup_ack_and_shutdown_retry () =
   check(List.length(asset_release_tickets retried.instructions)=1) "explicit shutdown retry stranded the failed resource obligation"
 ;;
 
+let test_unconfirmed_asset_registration_cleanup () =
+  List.iter(fun mode->
+    let issuer,_,projection,session=fixture(Int64.add 885L(Int64.of_int mode)) in
+    let module I=(val issuer:Worker_effect_authority.ISSUER) in
+    let consumer=W.asset_consumer session ~name:"unconfirmed-cleanup" |> Result.get_ok in
+    let ticket,planned=C.request(ready I.binding projection)session
+      (W.Replace_asset_demand(consumer,W.Foreground,[])) |> Result.get_ok in
+    let demand=checked_demand issuer session ticket consumer [] in
+    let pending=if mode=1 then C.step planned.next(C.Cancel ticket)
+      else if mode=2 then C.step planned.next(C.Forget ticket) else planned in
+    if mode=1 || mode=2 then check(asset_release_tickets pending.instructions=[])
+      "pending creator was physically released before terminal completion";
+    let admitted=(C.step pending.next(C.Admitted(ticket,Id.Worker.Request_id.one))).next in
+    let completed=C.step admitted(C.Completed(ticket,
+      if mode=0 then W.Answered(Error(W.Service_failed "accepted demand lost its ACK"))
+      else W.Answered(Ok demand))) in
+    let releases=asset_release_tickets completed.instructions in
+    check(releases<>[]) "failed or canceled registration did not plan exact physical cleanup";
+    let release=List.hd releases in
+    check(List.exists(function C.Release_asset_demand_registration(actual,registration)->
+      W.equal_request_id(C.ticket_id actual)(C.ticket_id release)
+      && W.equal_request_id registration.round(C.ticket_id ticket)
+      && W.equal_asset_consumer registration.consumer consumer|_->false)completed.instructions)
+      "unconfirmed cleanup retargeted another round";
+    check(C.asset_notices(C.view completed.next)demand=[])
+      "unconfirmed retired demand retained data authority";
+    let forgotten=(C.step completed.next(C.Forget ticket)).next in
+    if mode=0 then check(C.revalidate_reply(C.view forgotten)ticket
+      (W.Answered(Error(W.Service_failed "accepted demand lost its ACK")))
+      =W.Answered(Error(W.Service_failed "accepted demand lost its ACK")))
+      "cleanup retirement masked the original failure from its callback";
+    let canceled=(C.step forgotten(C.Cancel ticket)).next in
+    let admitted=(C.step canceled(C.Admitted(release,Id.Worker.Request_id.of_int64 2L))).next in
+    let released=C.step admitted(C.Completed(release,W.Answered(Ok()))) in
+    let finalizer=List.hd(asset_finalize_tickets released.instructions) in
+    ignore(complete_unit released.next finalizer)) [0;1;2];
+  let issuer,_,projection,session=fixture 889L in
+  let module I=(val issuer:Worker_effect_authority.ISSUER) in
+  let consumer=W.asset_consumer session ~name:"never-admitted" |> Result.get_ok in
+  let initial=ready I.binding projection in
+  let ticket,planned=C.request initial session(W.Replace_asset_demand(consumer,W.Foreground,[])) |> Result.get_ok in
+  let refused=C.step planned.next(C.Admission_refused(ticket,W.Full)) in
+  check(asset_release_tickets refused.instructions=[])
+    "never-admitted demand fabricated a physical cleanup";
+  let retried=C.request (C.step refused.next(C.Forget ticket)).next session
+    (W.Replace_asset_demand(consumer,W.Foreground,[])) |> Result.get_ok in
+  check(asset_release_tickets(snd retried).instructions=[])
+    "never-created demand persisted an unnecessary release obligation"
+;;
+
 let test_asset_cleanup_round_properties () =
   let run actions =
     let issuer,_,projection,session=fixture 884L in
     let module I=(val issuer:Worker_effect_authority.ISSUER) in
     let consumer=W.asset_consumer session ~name:"round-properties" |> Result.get_ok in
     let first,one=C.request(ready I.binding projection)session(W.Replace_asset_demand(consumer,W.Foreground,[])) |> Result.get_ok in
-    let second,two=C.request (complete_demand one.next first) session(W.Replace_asset_demand(consumer,W.Foreground,[])) |> Result.get_ok in
+    let first_demand=checked_demand issuer session first consumer [] in
+    let admitted=(C.step one.next(C.Admitted(first,Id.Worker.Request_id.one))).next in
+    let first_state=(C.step admitted(C.Completed(first,W.Answered(Ok first_demand)))).next in
+    let first_state=(C.step first_state(C.Forget first)).next in
+    let second,two=C.request first_state session(W.Replace_asset_demand(consumer,W.Foreground,[])) |> Result.get_ok in
     let old=List.hd(asset_release_tickets two.instructions) in
-    let created=complete_demand two.next second in
-    let waiter,release=C.request created session(W.Release_asset_demand consumer) |> Result.get_ok in
+    let demand=checked_demand issuer session second consumer [] in
+    let admitted=(C.step two.next(C.Admitted(second,Id.Worker.Request_id.one))).next in
+    let created=(C.step admitted(C.Completed(second,W.Answered(Ok demand)))).next in
+    let created=(C.step created(C.Forget second)).next in
+    let waiter,release=C.request created session(W.Release_asset_demand demand) |> Result.get_ok in
     let current=List.hd(asset_release_tickets release.instructions) in
     let state=ref release.next in
     let admitted=Array.make 4 false and answered=Array.make 4 false in
     let tickets=Array.make 4 None in tickets.(0)<-Some old;tickets.(1)<-Some current;
     let apply event=
       let tr=C.step !state event in state:=tr.next;
-      List.iter(function C.Finalize_asset_demand(ticket,_,consumer)->
-        let which=if W.asset_consumer_round consumer=Some(C.ticket_id first) then 2 else 3 in
+      List.iter(function C.Finalize_asset_demand(ticket,registration)->
+        let which=if W.equal_request_id registration.round (C.ticket_id first) then 2 else 3 in
         tickets.(which)<-Some ticket |_->())tr.instructions in
     (* Four genuine flights: two old/current physical releases, then their
        metadata finalizers. Callbacks may arrive before admission, once each. *)
@@ -239,7 +314,7 @@ let test_asset_cleanup_round_properties () =
        |_->());
       check((C.reply(C.view !state)waiter=Some(W.Answered(Ok())))=(admitted.(3)&&answered.(3)))
         "current waiter borrowed another round or skipped finalization";
-      check(C.asset_notices(C.view !state)consumer=[]) "retired consumer regained notification authority")actions
+      check(C.asset_notices(C.view !state)demand=[]) "retired consumer regained notification authority")actions
   in
   let fails actions=try run actions;false with _->true in
   let rec shrink actions=
@@ -1885,7 +1960,7 @@ let test_durable_mutation_properties ?(append=false) () =
          | 5 -> with_ticket n (fun ticket -> apply (C.Admission_refused (ticket, W.Full)))
          | 6 ->
            with_ticket n (fun ticket ->
-             apply (C.Completed (ticket, W.Answered (Ok W.Outcome_unknown))))
+             apply (C.Completed (ticket, W.Answered (Ok W.Submission_unknown))))
          | 7 | 9 | 10 ->
            with_ticket n (fun ticket ->
              let receipt_intent =
@@ -1922,12 +1997,12 @@ let test_durable_mutation_properties ?(append=false) () =
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
           {request_id=request_id;
            outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed packet}) with
-      | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
+      | Ok(W.Answered(Ok(W.Submission_committed proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected")
              in
              apply
                (C.Completed
-                  (ticket, W.Answered (Ok (W.Committed_pending_presentation receipt))));
+                  (ticket, W.Answered (Ok (W.Submission_committed receipt))));
              match C.intent_progress (C.view !state) intent with
              | Some (W.Committed_pending_presentation _ | W.Confirmed _) ->
                committed := true
@@ -1937,7 +2012,7 @@ let test_durable_mutation_properties ?(append=false) () =
              apply
                (C.Completed
                   ( ticket
-                  , W.Answered (Ok (W.Rejected (W.Invalid_input "known rejection"))) ))))
+                  , W.Answered (Ok (W.Submission_rejected (W.Invalid_input "known rejection"))) ))))
       trace
   in
   let prefixes =
@@ -2142,10 +2217,10 @@ let test_committed_ack_requires_current_confirmation () =
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
           {request_id=request_id;
            outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed packet}) with
-      | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
+      | Ok(W.Answered(Ok(W.Submission_committed proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected") in
   let state=(C.step planned.next(C.Admitted(ticket,Id.Worker.Request_id.of_int64 20L))).next in
-  let state=(C.step state(C.Completed(ticket,W.Answered(Ok(W.Committed_pending_presentation receipt))))).next in
+  let state=(C.step state(C.Completed(ticket,W.Answered(Ok(W.Submission_committed receipt))))).next in
   check(Result.is_error(C.request state session(W.Acknowledge_intent(W.Mutation_intent intent)))) "unconfirmed commit admitted ACK";
   let _,resumed=C.reconcile_mutation state ~presentation (W.Mutation_intent intent) |> Result.get_ok in
   check(List.exists(function C.Send(_,_,W.Confirm(actual,proof))->
@@ -2159,8 +2234,8 @@ let test_committed_ack_requires_current_confirmation () =
     ~projection_revision:"projection:v1:1" in
   let confirm,planned=C.request state session(W.Confirm(presentation,receipt)) |> Result.get_ok in
   let state=(C.step planned.next(C.Admitted(confirm,Id.Worker.Request_id.of_int64 21L))).next in
-  let state=(C.step state(C.Completed(confirm,W.Answered(Ok(W.Confirmed confirmation))))).next in
-  let captured=W.Answered(Ok(W.Confirmed confirmation)) in
+  let state=(C.step state(C.Completed(confirm,W.Answered(Ok confirmation)))).next in
+  let captured=W.Answered(Ok confirmation) in
   let forgotten=(C.step state(C.Forget confirm)).next in
   check(C.revalidate_reply(C.view forgotten)confirm captured=captured)
     "Forget alone revoked a valid queued confirmation";
@@ -2188,7 +2263,7 @@ let test_committed_ack_requires_current_confirmation () =
     ~projection_revision:"projection:v1:1" in
   let next_ticket,next_plan=C.request focused session(W.Confirm(latest,receipt)) |> Result.get_ok in
   let next_admitted=(C.step next_plan.next(C.Admitted(next_ticket,Id.Worker.Request_id.of_int64 24L))).next in
-  let next_state=(C.step next_admitted(C.Completed(next_ticket,W.Answered(Ok(W.Confirmed next_confirmation))))).next in
+  let next_state=(C.step next_admitted(C.Completed(next_ticket,W.Answered(Ok next_confirmation)))).next in
   check(match C.settle_applied_mutation next_state ~presentation:latest ~applied_presentation:presentation (W.Mutation_intent intent) with
     | Ok(C.Reconciliation _,_)->true|_->false)
     "new first DTO ACKed using old presentation's applied proof";
@@ -2279,13 +2354,13 @@ let test_committed_ack_requires_current_confirmation () =
   let state=(C.step state(C.Admitted(old_ack,Id.Worker.Request_id.of_int64 28L))).next in
   let state=(C.step state(C.Admitted(ack,Id.Worker.Request_id.of_int64 26L))).next in
   let acknowledged=(C.step state(C.Completed(ack,W.Answered(Ok())))).next in
-  let late=(C.step acknowledged(C.Completed(retry,W.Answered(Ok(W.Committed_pending_presentation receipt))))).next in
+  let late=(C.step acknowledged(C.Completed(retry,W.Answered(Ok(W.Submission_committed receipt))))).next in
   check(C.intent_progress(C.view late)(W.Mutation_intent intent)=None) "pre-ACK mutation completion resurrected settled intent";
   check(match C.reply(C.view late)retry with Some(W.Answered(Error _))->true|_->false)
     "pre-ACK mutation completion was published as fresh ownership";
   let late=(C.step acknowledged(C.Completed(retry,W.Interrupted W.Transport_lost))).next in
   check(C.intent_progress(C.view late)(W.Mutation_intent intent)=None) "pre-ACK interruption resurrected Unknown intent";
-  let late=(C.step acknowledged(C.Completed(again,W.Answered(Ok(W.Confirmed confirmation))))).next in
+  let late=(C.step acknowledged(C.Completed(again,W.Answered(Ok confirmation)))).next in
   check(C.intent_progress(C.view late)(W.Mutation_intent intent)=None) "pre-ACK confirmation resurrected settled intent";
   let request_id=match I.request session ~request_id:(C.ticket_id independent)(W.Mutate other) with
     | Ok(S.Coordination_mutation{request_id;_})->request_id|_->assert false in
@@ -2294,14 +2369,14 @@ let test_committed_ack_requires_current_confirmation () =
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
           {request_id=request_id;
            outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed packet}) with
-      | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
+      | Ok(W.Answered(Ok(W.Submission_committed proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected") in
-  let other_done=(C.step acknowledged(C.Completed(independent,W.Answered(Ok(W.Committed_pending_presentation other_receipt))))).next in
+  let other_done=(C.step acknowledged(C.Completed(independent,W.Answered(Ok(W.Submission_committed other_receipt))))).next in
   check(match C.intent_progress(C.view other_done)(W.Mutation_intent other) with Some(W.Committed_pending_presentation _)->true|_->false)
     "ACK of another intent discarded an independent accepted write";
   let fresh,planned=C.request acknowledged session(W.Mutate intent) |> Result.get_ok in
   let fresh_admitted=(C.step planned.next(C.Admitted(fresh,Id.Worker.Request_id.of_int64 27L))).next in
-  let fresh_done=(C.step fresh_admitted(C.Completed(fresh,W.Answered(Ok(W.Committed_pending_presentation receipt))))).next in
+  let fresh_done=(C.step fresh_admitted(C.Completed(fresh,W.Answered(Ok(W.Submission_committed receipt))))).next in
   check(C.intent_progress(C.view fresh_done)(W.Mutation_intent intent)<>None) "explicit request planned after ACK was confused with an old completion";
   let stale_ack=(C.step fresh_done(C.Completed(old_ack,W.Answered(Ok())))).next in
   check(C.intent_progress(C.view stale_ack)(W.Mutation_intent intent)<>None) "old ACK retired a newly reconciled intent lifecycle";
@@ -2311,16 +2386,16 @@ let test_committed_ack_requires_current_confirmation () =
     let state=ref fresh_done in
     List.iter(fun action->
       let event=match action with
-        | 0->C.Completed(retry,W.Answered(Ok(W.Committed_pending_presentation receipt)))
+        | 0->C.Completed(retry,W.Answered(Ok(W.Submission_committed receipt)))
         | 1->C.Completed(retry,W.Interrupted W.Transport_lost)
         | 2->C.Cancel retry | 3->C.Forget retry
-        | 4->C.Completed(again,W.Answered(Ok(W.Confirmed confirmation)))
+        | 4->C.Completed(again,W.Answered(Ok confirmation))
         | 5->C.Completed(again,W.Interrupted W.Transport_lost)
         | 6->C.Cancel again | 7->C.Forget again
         | 8->C.Completed(old_ack,W.Answered(Ok()))
         | 9->C.Completed(old_ack,W.Interrupted W.Transport_lost)
         | 10->C.Cancel old_ack | 11->C.Forget old_ack
-        | 12->C.Completed(independent,W.Answered(Ok(W.Committed_pending_presentation other_receipt)))
+        | 12->C.Completed(independent,W.Answered(Ok(W.Submission_committed other_receipt)))
         | _->C.Drain in
       let before=C.view !state in
       let first=C.step !state event and second=C.step !state event in
@@ -3842,7 +3917,7 @@ let test_changefeed_ack_requires_owned_delivered_batch () =
          | _ -> false)
        applied.instructions)
     "queued ACK did not wait for the actual consumer application barrier";
-  let forgotten = { forgotten with C.next = applied.next } in
+  let forgotten = applied in
   let ack, ack_plan =
     match C.request forgotten.next session (W.Acknowledge_changes batch) with
     | Ok value -> value
@@ -4630,7 +4705,8 @@ let test_returned_files_reuse_capacity () =
   let ticket,planned=C.request !state session operation |> Result.get_ok in state:=planned.next;
   let wire=match I.request session ~request_id:(C.ticket_id ticket) operation |> Result.get_ok with
     |S.Coordination_asset_demand{consumer;_}->consumer|_->assert false in
-  ignore(step(C.Admitted(ticket,Id.Worker.Request_id.one)));ignore(step(C.Completed(ticket,W.Answered(Ok()))));ignore(step(C.Forget ticket));
+  let demand=checked_demand issuer session ticket consumer [asset] in
+  ignore(step(C.Admitted(ticket,Id.Worker.Request_id.one)));ignore(step(C.Completed(ticket,W.Answered(Ok demand))));ignore(step(C.Forget ticket));
   let notice=I.asset_notice session(S.Asset_availability{consumer=wire;asset=asset.uuid;descriptor=asset;availability=Ready "current-file"}) |> Result.get_ok in
   ignore(step(C.Asset_received(notice,Id.Worker.Push_sequence.one)));
   let file=W.ready_asset_file notice |> Option.get in
@@ -4772,6 +4848,7 @@ let test_binding_rebind_queued_read_and_failure () =
 ;;
 
 let () =
+  if Array.mem "--unconfirmed-demand-only" Sys.argv then (test_unconfirmed_asset_registration_cleanup();exit 0);
   if Array.mem "--live-read-rebind-only" Sys.argv then (test_live_binding_replans_ordinary_reads(); test_live_binding_read_owner_and_cancellation_fences();test_binding_rebind_queued_read_and_failure();exit 0);
   if Array.mem "--retry-release-error-only" Sys.argv then (test_retry_binding_release_error_is_observable();exit 0);
   if Array.mem "--import-rejection-only" Sys.argv then (test_rejected_imports_release_capacity_after_fresh_readback();exit 0);
@@ -4783,6 +4860,7 @@ let () =
   test_asset_demand_notice_has_one_registered_owner ();
   test_asset_cleanup_ack_and_shutdown_retry ();
   test_asset_cleanup_round_properties ();
+  test_unconfirmed_asset_registration_cleanup ();
   test_import_source_recovery_owner_cursor_and_ack ();
   test_import_recovery_pure_original_proof_owner ();
   test_import_intent_preserves_complete_source ();

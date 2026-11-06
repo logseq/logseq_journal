@@ -304,7 +304,11 @@ let test_status_conflict_refreshes_authoritative_block () =
       outcome=Logseq_db_worker_contract.Worker_pure_mutation.Rejected
         (Logseq_db_worker.Error.create ~code:Conflict
           ~message:"The mutation precondition did not match." ~details:[]|>Result.get_ok)}) with
-    |Ok(W.Answered(Ok progress))->progress|_->Alcotest.fail "known conflict proof was not decoded" in
+    |Ok(W.Answered(Ok submission))->(match submission with
+      |W.Submission_rejected error->W.Rejected error
+      |Submission_unknown->W.Outcome_unknown
+      |Submission_committed receipt->W.Committed_pending_presentation receipt)
+    |_->Alcotest.fail "known conflict proof was not decoded" in
   let refresh = Runtime.receive_mutation runtime mutation progress
     |> fun output -> only "status conflict refresh" output.requests
   in

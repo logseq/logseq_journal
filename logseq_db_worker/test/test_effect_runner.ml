@@ -1029,6 +1029,20 @@ let test_observation_release_waits_for_initial_snapshot () =
           dispatcher_capacity=256;wire_batch_max_bytes=262144}in
         let session=F.session ~binding ~graph:scope.graph_id ~account:scope.account.account_generation
           ~lifecycle:scope.account.lifecycle_generation ~generation:scope.graph_generation ~scope:owner ~asset_scope:scope ~limits in
+        (* Slot reconstruction is performed by the physical snapshot reader,
+           not Core.step, so exercise it through the existing public Db fixture. *)
+        let missing=Fixture.mutation_uuid 29001 in
+        let lookup=Read.Asset_descriptors [missing; missing] in
+        let lookup_read=F.pack_query
+          (Read.read_budget session ~maximum_items:2 ~maximum_bytes:16384 |> Result.get_ok) lookup in
+        let lookup_id=Fixture.mutation_uuid 29002 in
+        let _,lookup_answer=Db.register_observation db ~registration:801L ~id:lookup_id
+          ~scope ~read:lookup_read ~current:(fun()->true) ~notify:(fun ~epoch:_->()) |> Result.get_ok in
+        require (match lookup_answer with
+          | Read.Query_answer(_,Read.Asset_descriptors _,Ok value)->value.items=[None;None]
+          | _->false) "physical snapshot keeps every repeated missing asset slot";
+        require (Db.release_observation db ~registration:801L ~id:lookup_id ~scope=Ok())
+          "exact lookup observation releases";
         let read=F.pack_query(Read.read_budget session ~maximum_items:1 ~maximum_bytes:16384 |> Result.get_ok)Read.Graph_info in
     let entered, enter = Eio.Promise.create ()
     and gate, release_gate = Eio.Promise.create () in

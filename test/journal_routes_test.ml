@@ -4612,7 +4612,7 @@ module Child_chain_fixture = struct
           (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
             {request_id=id;
              outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed packet}) with
-        | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
+        | Ok(W.Answered(Ok(W.Submission_committed proof))) -> proof
         | _ -> failwith "Production mutation receipt was rejected") in
       let block:G.block={uuid=child;title=command.source;parent;page=page.uuid;order="a";
         created_at_ms=1L;updated_at_ms=1L;refs=[];tags=[];properties=[]} in
@@ -4954,7 +4954,7 @@ let test_child_chain_sdk_capacity_progress () =
   let state=ref fixture.initial and action=ref fixture.action in
   for n=1 to 70 do
     let bound,index,round,intent=F.bind fixture !state !action in
-    run(match intent with F.W.Append_intent intent->F.W.Append intent|Mutation_intent intent->F.W.Mutate intent)F.W.Outcome_unknown;
+    run(match intent with F.W.Append_intent intent->F.W.Append intent|Mutation_intent intent->F.W.Mutate intent)F.W.Submission_unknown;
     let unknown,_=B.receive bound ~index ~round F.W.Outcome_unknown in
     let selected=if n mod 2=0 then child_status_a else child_status_b in
     let resolved=match selected with Journal_model.Status id->Some(F.G.Uuid.of_string id |> Result.get_ok)|_->None in
@@ -4966,8 +4966,8 @@ let test_child_chain_sdk_capacity_progress () =
     let progress=fixture.confirm index intent fixture.presentation in
     let confirmation=match progress with F.W.Confirmed value->value|_->assert false in
     let receipt=F.W.confirmation_receipt confirmation in
-    run(match intent with F.W.Append_intent intent->F.W.Append intent|Mutation_intent intent->F.W.Mutate intent)(F.W.Committed_pending_presentation receipt);
-    run(F.W.Confirm(fixture.presentation,receipt))progress;
+    run(match intent with F.W.Append_intent intent->F.W.Append intent|Mutation_intent intent->F.W.Mutate intent)(F.W.Submission_committed receipt);
+    run(F.W.Confirm(fixture.presentation,receipt))confirmation;
     let next,out=B.receive bound ~index ~round progress in
     let rec drain fuel state action =
       require(fuel>0) "child prefix settlement did not terminate";

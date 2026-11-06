@@ -88,8 +88,8 @@ type pending =
   | Children of W.page * W.block W.slice C.ticket
   | Summary of W.block_summary C.ticket
   | Observe of W.page option W.observed C.ticket
-  | Write of W.mutation_progress C.ticket
-  | Confirm of W.mutation_progress C.ticket
+  | Write of W.submission_outcome C.ticket
+  | Confirm of W.confirmation C.ticket
   | Releasing of unit C.ticket
   | Finished
 type rendering =
@@ -178,7 +178,7 @@ let advance t =
      | None -> ())
   | Some(session,_),Write ticket ->
     (match C.reply view ticket with
-     | Some(W.Answered(Ok(W.Committed_pending_presentation receipt))) ->
+     | Some(W.Answered(Ok(W.Submission_committed receipt))) ->
        forget t ticket;
        (match Option.bind (C.projection view) W.selected with
         | None -> release t session

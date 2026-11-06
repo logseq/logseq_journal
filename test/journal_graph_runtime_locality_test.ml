@@ -128,7 +128,7 @@ let confirmed_sample issuer session presentation receipt request_id produce =
   let operation=W.Confirm(presentation,receipt)in
   let source=I.request session ~request_id:(W.request_id request_id)operation |> Result.get_ok in
   match I.reply session ~request_id:(W.request_id request_id)operation (produce source)with
-  |Ok(W.Answered(Ok(W.Confirmed proof)))->proof
+  |Ok(W.Answered(Ok proof))->proof
   |_->failwith "Production confirmation was rejected"
 ;;
 
@@ -1310,7 +1310,7 @@ module Target_fixture = struct
          && presentation=read.presentation);
       let complete result=Production_runtime.receive_worker_read runtime ~request_id:original result in
       Pending{original;operation=W.Confirm(read.presentation,receipt);proof;deliver=(function
-        |W.Answered(Ok(W.Confirmed confirmation))->
+        |W.Answered(Ok confirmation)->
           (match W.confirmation_primary confirmation with
            |Confirmed_block value->complete(Production_runtime.Query_result(read.query,value))
            |_->complete(Production_runtime.Read_failed{code=Logseq_db_worker.Error.Invalid_request;message="The canonical mutation target is unavailable."}))
@@ -1335,7 +1335,10 @@ module Target_fixture = struct
     ignore(I.request session ~request_id operation |> Result.get_ok);
     match I.reply session ~request_id operation
       (S.Coordination_mutation_result{request_id=original;outcome}) with
-    |Ok(W.Answered(Ok progress))->intent,progress
+    |Ok(W.Answered(Ok submission))->intent,(match submission with
+      |W.Submission_rejected error->W.Rejected error
+      |Submission_unknown->W.Outcome_unknown
+      |Submission_committed receipt->W.Committed_pending_presentation receipt)
     |_->failwith "Original typed mutation proof was rejected"
 
   let committed runtime original =
@@ -1345,7 +1348,7 @@ module Target_fixture = struct
         ((Logseq_db_worker_contract.Worker_pure_mutation.For_worker.commit ~mutation_id:(mutation_id) ~status:(Worker_pure_data.V2_applied) ~generation:("generation:v1:1:1") ~before:("projection:v1:1") ~after:("projection:v1:2")))) in
     let receipt=match progress with W.Committed_pending_presentation receipt->receipt|_->assert false in
     Pending{original;operation=W.Confirm(presentation,receipt);proof=Some(presentation,receipt);deliver=(function
-      |W.Answered(Ok progress)->Production_runtime.receive_mutation runtime original progress
+      |W.Answered(Ok confirmation)->Production_runtime.receive_mutation runtime original (W.Confirmed confirmation)
       |Answered(Error error)->let _,message=failure error in Production_runtime.mutation_waiting runtime original message
       |_->Production_runtime.mutation_waiting runtime original "Original confirmation is pending.")}
 
@@ -1484,7 +1487,7 @@ let test_ordinary_delete_readback committed paged () =
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
           {request_id=receipt_request_id;
            outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed packet}) with
-      | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
+      | Ok(W.Answered(Ok(W.Submission_committed proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected") in
     let confirmation=confirmed_sample Worker_producer.issuer session presentation receipt request
       (summary request(if paged then Some(Graph.Cursor.of_string "ordinary-more" |> Result.get_ok) else None)) in
@@ -5354,7 +5357,7 @@ let test_page_detail_root_and_append () =
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
           {request_id=receipt_request_id;
            outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed packet}) with
-      | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
+      | Ok(W.Answered(Ok(W.Submission_committed proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected") in
     let child=copy_child unrelated_uuid page_uuid command.source in
     let confirmation=confirmed_sample Worker_producer.issuer Worker_producer.session presentation receipt request (((query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.block_summary ~lookup:(Worker_pure_data.V2_present_block{value=child.value;revision=child.revision}) ~page:(Some(Worker_pure_data.V2_present_page{page;revision="page-2"})) ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None)) ~scope_revision:("children-1") ~generation:("generation:v1:1:1") ~projection_revision:("projection:v1:2")) in match query with |Read.Block_summary _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")))) in
@@ -5898,7 +5901,7 @@ let test_child_unknown_wire_survives_reset ?(status=false) () =
         (Logseq_db_worker_lui.Logseq_db_worker_lui_service.Coordination_mutation_result
           {request_id=receipt_request_id;
            outcome=Logseq_db_worker_contract.Worker_pure_mutation.Committed packet}) with
-      | Ok(W.Answered(Ok(W.Committed_pending_presentation proof))) -> proof
+      | Ok(W.Answered(Ok(W.Submission_committed proof))) -> proof
       | _ -> failwith "Production mutation receipt was rejected") in
       let summary=(query_sample (fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.block_summary ~lookup:(Worker_pure_data.V2_present_block{value=target;revision="original-child-precondition"}) ~page:(Some(Worker_pure_data.V2_present_page{page;revision="page-original"})) ~items:([]) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(None)) ~scope_revision:("original-child-scope") ~generation:("generation:v1:1:1") ~projection_revision:("projection:v1:1")) in match query with |Read.Block_summary _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch")) in
       let proof=confirmed_sample issuer session presentation receipt insert (summary) in

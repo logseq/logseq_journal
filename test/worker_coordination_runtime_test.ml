@@ -79,21 +79,26 @@ let secrets =
   |> Result.get_ok
 ;;
 
-let host_asset_demand host ~(owner:Service.timeline_scope) ~graph_generation ~name priority assets =
+let host_asset_demand host ~receive ~(owner:Service.timeline_scope) ~graph_generation ~name priority assets =
   let module H=Journal_worker_coordination_host in
   match Option.bind(C.projection(H.view host))(fun projection->List.find_map(fun resident->
     if resident.W.phase=W.Open && W.matches_scope resident.session owner then Some resident.session else None)(W.residents projection)) with
   |Some session when owner.graph_generation=graph_generation->
     (match W.asset_consumer session ~name with Error _->None|Ok consumer->
       match H.request host session(W.Replace_asset_demand(consumer,priority,assets)) with
-      |Error _->None|Ok ticket->H.watch host ticket ~f:(fun _->());
-        Some(W.bind_asset_consumer consumer ~round:(C.ticket_id ticket)))
+      |Error _->None|Ok ticket->H.watch host ticket ~f:(function
+          |W.Answered(Ok demand)->receive ticket demand
+          |_->());
+        Some ticket)
   |_->None
 
-let host_asset_release host consumer =
+let host_asset_release host (ticket,demand) =
   let module H=Journal_worker_coordination_host in
-  match H.request host (W.asset_consumer_session consumer)(W.Release_asset_demand consumer) with
-  |Error _->false|Ok ticket->H.watch host ticket ~f:(fun _->());true
+  match demand with
+  |None->H.post host(C.Cancel ticket);true
+  |Some demand->
+    match H.request host (W.asset_demand_session demand)(W.Release_asset_demand demand) with
+    |Error _->false|Ok ticket->H.watch host ticket ~f:(fun _->());true
 
 let favorite_page_id = uuid "9c000000-0000-4000-8000-000000000100"
 let favorite_member n = uuid (Printf.sprintf "9c000000-0000-4000-8000-%012d" (100 + n))
@@ -664,19 +669,20 @@ let test_client_to_typed_read () =
       ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
     let before_demand=C.view !state in
     let demand_ticket,demand_reply=request(W.Replace_asset_demand(asset_consumer,W.Foreground,[asset])) in
-    require(demand_reply=W.Answered(Ok())) "actual Service rejected typed scoped asset demand";
+    let asset_demand=match demand_reply with W.Answered(Ok demand)->demand
+      |_->failwith "actual Service rejected typed scoped asset demand" in
     wait(fun()->List.exists(fun notice->match W.asset_notice_data notice with
       | Service.Asset_demand_accepted name->name="runtime-synthetic-demand"
-      | _->false)(C.asset_notices(C.view !state)asset_consumer));
+      | _->false)(C.asset_notices(C.view !state)asset_demand));
     require(List.for_all(fun notice->Option.exists(W.equal_asset_consumer asset_consumer)(W.asset_notice_consumer notice))
-      (C.asset_notices(C.view !state)asset_consumer)) "actual asset push crossed consumer identity";
+      (C.asset_notices(C.view !state)asset_demand)) "actual asset push crossed consumer identity";
     require(Rrbvec.exists(fun notice->match W.asset_notice_data notice with
       |Service.Asset_demand_accepted name->name="runtime-synthetic-demand"|_->false)
       (C.asset_updates ~previous:(Some before_demand)(C.view !state)))
       "actual Service acceptance did not reach the typed asset outlet";
-    let release_demand,released_demand=request(W.Release_asset_demand asset_consumer) in
+    let release_demand,released_demand=request(W.Release_asset_demand asset_demand) in
     require(released_demand=W.Answered(Ok())) "actual scoped asset demand retirement failed";
-    require(C.asset_notices(C.view !state)asset_consumer=[]) "retired actual asset demand retained data authority";
+    require(C.asset_notices(C.view !state)asset_demand=[]) "retired actual asset demand retained data authority";
     apply(C.step !state(C.Forget demand_ticket));apply(C.step !state(C.Forget release_demand));
     let info_ticket, info = request (W.Query (budget, W.Graph_info)) in
     (match info with
@@ -1549,7 +1555,7 @@ let test_client_to_typed_read () =
     let mutation_ticket, mutation_reply = request (W.Mutate intent) in
     let receipt =
       match mutation_reply with
-      | W.Answered (Ok (W.Committed_pending_presentation receipt)) -> receipt
+      | W.Answered (Ok (W.Submission_committed receipt)) -> receipt
       | _ -> failwith "real durable mutation did not return commit evidence"
     in
     wait(fun ()->match C.observed(C.view !state) observed_block.observation with
@@ -1588,7 +1594,7 @@ let test_client_to_typed_read () =
       "forgetting ticket erased durable outcome";
     let _, again = request (match restored with W.Mutation_intent intent->W.Mutate intent|Append_intent intent->W.Append intent) in
     (match again with
-     | W.Answered (Ok (W.Committed_pending_presentation repeated)) ->
+     | W.Answered (Ok (W.Submission_committed repeated)) ->
        require
          (W.receipt_revisions repeated = original)
          "retry replaced original commit revision"
@@ -1613,7 +1619,7 @@ let test_client_to_typed_read () =
       request (W.Confirm (presentation, receipt))
     in
     (match confirmation_reply with
-     | W.Answered (Ok (W.Confirmed confirmation)) ->
+     | W.Answered (Ok confirmation) ->
        require
          (W.receipt_revisions (W.confirmation_receipt confirmation) = original)
          "confirmation replaced original commit point";
@@ -1693,7 +1699,7 @@ let test_client_to_typed_read () =
     let current_presentation = selected () |> Option.get in
     let _, reconfirmed = request (W.Confirm (current_presentation, receipt)) in
     (match reconfirmed with
-     | W.Answered (Ok (W.Confirmed _)) -> ()
+     | W.Answered (Ok _) -> ()
      | _ -> failwith "new explicit Confirm could not use preserved receipt");
     let source_file=Filename.temp_file "journal-coordination-synthetic-import-" ".png" in
     Out_channel.with_open_bin source_file(fun output->output_string output "file");
@@ -1711,8 +1717,10 @@ let test_client_to_typed_read () =
         |_->failwith "actual typed import did not return its durable source receipt" in
       let ordinary_consumer=W.asset_consumer session ~name:"media:actual-imported-bytes" |> Result.get_ok in
       let demand,demand_reply=request(W.Replace_asset_demand(ordinary_consumer,W.Foreground,[(W.import_data imported).asset])) in
-      require(demand_reply=W.Answered(Ok())) "ordinary typed demand did not reach the actual Service";
-      let ordinary_file()=List.find_map W.ready_asset_file(C.asset_notices(C.view !state)ordinary_consumer) in
+      let ordinary_handle=match demand_reply with W.Answered(Ok demand)->demand
+        |_->failwith "ordinary typed demand did not reach the actual Service" in
+      let active_handle=ref ordinary_handle in
+      let ordinary_file()=List.find_map W.ready_asset_file(C.asset_notices(C.view !state) !active_handle) in
       wait(fun()->Option.is_some(ordinary_file()));
       let ordinary_acquire,ordinary_reply=request(W.Acquire_asset_file(Option.get(ordinary_file()))) in
       let ordinary_lease=match ordinary_reply with W.Answered(Ok(Some lease))->lease
@@ -1726,18 +1734,21 @@ let test_client_to_typed_read () =
       let changed=Descriptor.create ~uuid:source.asset ~source:(Managed(Some remote_version))
         ~current_checksum:None ~size:None ~dimensions:None |> Result.get_ok in
       let replacement_demand,replacement_reply=request(W.Replace_asset_demand(ordinary_consumer,W.Foreground,[changed])) in
-      require(replacement_reply=W.Answered(Ok())) "same-UUID remote version did not replace its typed demand";
+      let replacement_handle=match replacement_reply with W.Answered(Ok demand)->demand
+        |_->failwith "same-UUID remote version did not replace its typed demand" in
+      active_handle:=replacement_handle;
       wait(fun()->List.exists(fun notice->match W.asset_notice_data notice with
         |Service.Asset_availability{descriptor;_}->descriptor=changed|_->false)
-        (C.asset_notices(C.view !state)ordinary_consumer));
+        (C.asset_notices(C.view !state)replacement_handle));
       require(ordinary_file()=None) "new remote version incorrectly adopted the cached old Ready";
       require(In_channel.with_open_bin(W.file_path ordinary_lease)In_channel.input_all="file")
         "replacing the transfer version released the renderer's independent old lease";
       let ordinary_release,ordinary_released=request(W.Release_file ordinary_lease) in
       require(ordinary_released=W.Answered(Ok())) "ordinary display lease did not acknowledge its physical release";
-      let demand_release,demand_released=request(W.Release_asset_demand ordinary_consumer) in
+      let demand_release,demand_released=request(W.Release_asset_demand replacement_handle) in
       require(demand_released=W.Answered(Ok())) "ordinary demand did not settle its physical transfer owner";
-      List.iter(fun ticket->apply(C.step !state(C.Forget ticket)))[demand;replacement_demand;ordinary_release;demand_release];
+      apply(C.step !state(C.Forget demand));apply(C.step !state(C.Forget replacement_demand));
+      apply(C.step !state(C.Forget ordinary_release));apply(C.step !state(C.Forget demand_release));
       apply(C.step !state(C.Forget ordinary_acquire));
       let preview=W.import_preview imported |> Option.get in
       require(Sys.file_exists(W.file_path preview)) "actual imported preview did not own staged bytes";
@@ -2036,14 +2047,14 @@ let test_host_durable_recovery_confirmation_ack () =
     let intent=W.mutation_intent session ~mutation_id:(uuid "9f000000-0000-4000-8000-000000001000")
       (W.Save_block{block=Test_support.authoritative_block_uuid;title="Typed applied readback";
         preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}) |> Result.get_ok in
-    let receipt=match value(call(W.Mutate intent)) with W.Committed_pending_presentation receipt->receipt|_->failwith "typed write lost proof" in
+    let receipt=match value(call(W.Mutate intent)) with W.Submission_committed receipt->receipt|_->failwith "typed write lost proof" in
     require(Result.is_error(Host.request host session(W.Acknowledge_intent(W.Mutation_intent intent)))) "typed unconfirmed commit admitted ACK";
     let recover()=value(call(W.Recover_mutations{after=None;maximum_items=8;maximum_bytes=W.maximum_mutation_recovery_bytes})) in
     let page=recover() in
     require(Rrbvec.length page.items=1) "typed recovery lost the persisted intent";
     require(match(Rrbvec.nth page.items 0).progress with W.Committed_pending_presentation actual->
       W.receipt_revisions actual=W.receipt_revisions receipt|_->false) "typed recovery replaced original proof";
-    let confirmation=match value(call(W.Confirm(presentation,receipt))) with W.Confirmed value->value|_->failwith "typed confirmation failed" in
+    let confirmation=value(call(W.Confirm(presentation,receipt))) in
     let ui_applied=match W.confirmation_primary confirmation with
       | W.Confirmed_block{lookup=Worker_pure_data.V2_present_block{value;_};_}->value.block.title="Typed applied readback"
       | _->false in
@@ -2052,7 +2063,7 @@ let test_host_durable_recovery_confirmation_ack () =
     require(C.intent_progress(Host.view host)(W.Mutation_intent intent)=None) "actual typed ACK did not retire pure ownership";
     require(Rrbvec.is_empty(recover()).items) "actual typed ACK did not settle database recovery entry";
     let before=read() in
-    require(match value(call(W.Mutate intent)) with W.Committed_pending_presentation original->
+    require(match value(call(W.Mutate intent)) with W.Submission_committed original->
       W.receipt_revisions original=W.receipt_revisions receipt|_->false) "typed ACK removed original idempotency proof";
     require(read()=before) "typed same-intent reconciliation executed a second write";
     let revision=match read() with Worker_pure_data.V2_present_block{revision;_}->revision|_->assert false in
@@ -2061,9 +2072,8 @@ let test_host_durable_recovery_confirmation_ack () =
       (W.Set_task_status{block=Test_support.authoritative_block_uuid;status;
         preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}) |> Result.get_ok in
     let status_receipt=match value(call(W.Mutate status_intent)) with
-      | W.Committed_pending_presentation receipt->receipt|_->failwith "real typed status commit failed" in
-    let status_confirmation=match value(call(W.Confirm(presentation,status_receipt))) with
-      | W.Confirmed value->value|_->failwith "real typed status canonical readback failed" in
+      | W.Submission_committed receipt->receipt|_->failwith "real typed status commit failed" in
+    let status_confirmation=value(call(W.Confirm(presentation,status_receipt))) in
     require(match W.confirmation_primary status_confirmation with
       | W.Confirmed_block{lookup=Worker_pure_data.V2_present_block{value;_};_}->value.task_status=Some status
       | _->false) "real canonical DTO lost committed status UUID";
@@ -2078,10 +2088,9 @@ let test_host_durable_recovery_confirmation_ack () =
         ~task_status:(Some status) ~children:(Rrbvec.singleton Worker_pure_data.{block_id=child_id;title="Atomic Service child";
           task_status=Some(Test_support.status_uuid 3);children=Rrbvec.empty}) |> Result.get_ok in
       let receipt=match value(call(W.Append append)) with
-        | W.Committed_pending_presentation receipt->receipt|_->failwith "actual Append did not commit atomically" in
+        | W.Submission_committed receipt->receipt|_->failwith "actual Append did not commit atomically" in
       require(Rrbvec.length(W.receipt_targets receipt)=2) "Append receipt lost complete immutable targets";
-      let confirmation=match value(call(W.Confirm(presentation,receipt))) with
-        | W.Confirmed value->value|_->failwith "actual Append did not confirm" in
+      let confirmation=value(call(W.Confirm(presentation,receipt))) in
       let summary=match W.confirmation_primary confirmation with W.Confirmed_block summary->summary
         |_->failwith "Append canonical primary was not the admitted root" in
       require(match summary.lookup,summary.page with
@@ -2097,7 +2106,7 @@ let test_host_durable_recovery_confirmation_ack () =
       ignore(value(call(W.Acknowledge_intent(W.receipt_intent receipt))));
       require(Rrbvec.is_empty(recover()).items) "actual Append ACK did not settle its durable recovery item";
       require(match value(call((match W.restore_durable_intent session(W.encode_durable_intent(W.Append_intent append)) |> Result.get_ok with W.Append_intent intent->W.Append intent|Mutation_intent _->failwith "stored Append lost its family"))) with
-        | W.Committed_pending_presentation again->W.receipt_revisions again=W.receipt_revisions receipt
+        | W.Submission_committed again->W.receipt_revisions again=W.receipt_revisions receipt
         |_->false) "Append retry lost the original commit proof";
       require(value(call(W.Query(budget,W.Block_summary{block=root_id;after=None})))=summary)
         "Append retry duplicated or changed the complete canonical tree";
@@ -2107,7 +2116,7 @@ let test_host_durable_recovery_confirmation_ack () =
       ~block_id:Test_support.authoritative_block_uuid
       ~day:(W.journal_day 20261102 |> Result.get_ok) ~title:"Conflicting existing block"
       ~task_status:None ~children:Rrbvec.empty |> Result.get_ok in
-    require(match value(call(W.Append rejected_append)) with W.Rejected _->true|_->false)
+    require(match value(call(W.Append rejected_append)) with W.Submission_rejected _->true|_->false)
       "existing block Append conflict was not a known non-commit";
     require(match C.intent_progress(Host.view host)(W.Append_intent rejected_append) with
       |Some(W.Rejected _)->true|_->false) "Rejected Append lost its original lifecycle family";
@@ -2149,9 +2158,9 @@ let test_host_durable_recovery_confirmation_ack () =
           let intent=match durable with W.Mutation_intent intent->intent|_->assert false in
           let state=Child.bind state ~index ~round ~intent:(W.Mutation_intent intent) ~presentation |> Option.get in
           let receipt=match value(call(W.Mutate intent)) with
-            | W.Committed_pending_presentation receipt->receipt|_->failwith "real Child lost durable commit" in
+            | W.Submission_committed receipt->receipt|_->failwith "real Child lost durable commit" in
           proofs:=(intent,receipt):: !proofs;
-          Child.receive state ~index ~round(value(call(W.Confirm(presentation,receipt))))
+          Child.receive state ~index ~round(W.Confirmed(value(call(W.Confirm(presentation,receipt)))))
         | Read_child round ->
           Child.read_child state ~round(value(call(W.Query(budget,W.Block_summary{block=child;after=None}))))
         | Read_parent(round,summary) ->
@@ -2182,7 +2191,7 @@ let test_host_durable_recovery_confirmation_ack () =
       "real Child chain did not preserve source/status";
     List.iter(fun(intent,receipt)->
       require(match value(call(W.Mutate intent)) with
-        | W.Committed_pending_presentation original->W.receipt_revisions original=W.receipt_revisions receipt
+        | W.Submission_committed original->W.receipt_revisions original=W.receipt_revisions receipt
         | _->false) "Child ACK removed original commit proof") !proofs;
     require(value(call(W.Query(budget,W.Outline_block{uuid=child;revision=None})))=final)
       "Child original-intent reconciliation wrote a duplicate";
@@ -2192,16 +2201,15 @@ let test_host_durable_recovery_confirmation_ack () =
       (W.Delete_blocks{root=Test_support.authoritative_block_uuid;
         preconditions={blocks=[Test_support.authoritative_block_uuid,revision];pages=[];scopes=[]}}) |> Result.get_ok in
     let deleted_receipt=match value(call(W.Mutate deletion)) with
-      | W.Committed_pending_presentation receipt->receipt|_->failwith "real typed deletion failed" in
-    let deleted_confirmation=match value(call(W.Confirm(presentation,deleted_receipt))) with
-      | W.Confirmed value->value|_->failwith "real typed deletion confirmation failed" in
+      | W.Submission_committed receipt->receipt|_->failwith "real typed deletion failed" in
+    let deleted_confirmation=value(call(W.Confirm(presentation,deleted_receipt))) in
     require(match W.confirmation_primary deleted_confirmation with
       | W.Confirmed_absence{uuid;_}->W.Uuid.equal uuid Test_support.authoritative_block_uuid
       | _->false) "typed deletion did not deliver exact canonical absence";
     ignore(value(call(W.Acknowledge_intent(W.Mutation_intent deletion))));
     require(Rrbvec.is_empty(recover()).items) "real deletion ACK retained pending recovery entry";
     require(match value(call(W.Mutate deletion)) with
-      | W.Committed_pending_presentation original->W.receipt_revisions original=W.receipt_revisions deleted_receipt
+      | W.Submission_committed original->W.receipt_revisions original=W.receipt_revisions deleted_receipt
       | _->false) "deletion reconciliation lost its original idempotent proof";
     require(match read() with Worker_pure_data.V2_missing_block{uuid;_}->W.Uuid.equal uuid Test_support.authoritative_block_uuid|_->false)
       "same-intent deletion reconciliation changed canonical absence";
@@ -2221,11 +2229,10 @@ let test_host_durable_recovery_confirmation_ack () =
     Rrbvec.iter(fun(bytes,original,root_id,summary)->
       let append=match W.restore_durable_intent fresh bytes |> Result.get_ok with W.Append_intent intent->intent|Mutation_intent _->failwith "recovered Append lost its family" in
       let receipt=match value(call_in fresh(W.Append append)) with
-        | W.Committed_pending_presentation receipt->receipt|_->failwith "reopened Append did not reconcile" in
+        | W.Submission_committed receipt->receipt|_->failwith "reopened Append did not reconcile" in
       require(W.receipt_revisions receipt=W.receipt_revisions original)
         "reopened Append replaced original evidence with the new read generation";
-      let confirmation=match value(call_in fresh(W.Confirm(current,receipt))) with
-        | W.Confirmed value->value|_->failwith "reopened Append failed current presentation readback" in
+      let confirmation=value(call_in fresh(W.Confirm(current,receipt))) in
       require(match W.confirmation_primary confirmation with
         | W.Confirmed_block value->value.lookup=summary.W.lookup && value.page=summary.page && value.items=summary.items
         | _->false) "reopened Append changed the original complete source/status tree";
@@ -2355,7 +2362,8 @@ let test_visible_media_listing_uses_typed_reads () =
           | _ -> ignore (Media.receive_read (Option.get !runtime) result))
         | _->failwith "real typed media listing failed");true in
     let media=Media.create ~read
-      ~demand:(host_asset_demand host ~owner)
+      ~demand:(host_asset_demand host ~owner
+        ~receive:(fun ticket demand->ignore(Media.receive_demand(Option.get !runtime)ticket demand)))
       ~release_consumer:(host_asset_release host)
       ~acquire:(fun _ _->failwith "metadata listing unexpectedly acquired a rendered file")
       ~release_file:(fun _->failwith "metadata listing unexpectedly released a rendered file")
@@ -2418,7 +2426,8 @@ let test_offline_asset_scans_use_typed_reads () =
             "typed scan consumed the same result twice"
         | _->failwith "real typed offline asset read failed");true in
     let assets=Assets.create ~read
-      ~demand:(host_asset_demand host ~owner)
+      ~demand:(host_asset_demand host ~owner
+        ~receive:(fun ticket demand->ignore(Assets.receive_demand(Option.get !runtime)ticket demand)))
       ~release_consumer:(host_asset_release host)
       ~changed:(fun _ recent favorites->status:=Some(recent,favorites)) () in
     runtime:=Some assets;
@@ -2793,22 +2802,31 @@ let test_changefeed_business_waits_for_ui_application () =
           | W.Answered (Ok value) -> finished request None origin (Business.Changes_acknowledged value)
           | _ -> failwith "real typed Changes business ACK failed")
       | Some (Business.Confirm_readback read) ->
-        let ticket=Host.reconcile_mutation host ~presentation:read.presentation read.intent |> Result.get_ok in
-        Host.watch_read host ticket ~f:(fun origin->function
-          | W.Answered(Ok(W.Confirmed confirmation))->
-            (match W.confirmation_primary confirmation with
-             | W.Confirmed_block summary->finished request application origin(Business.Query_result(read.query,summary))
-             | _->failwith "business confirmation target missing")
-          | _->failwith "business canonical read failed")
+        (match Host.reconcile_mutation host ~presentation:read.presentation read.intent |> Result.get_ok with
+         |C.Submission_ticket _->failwith "business readback unexpectedly resubmitted its committed intent"
+         |C.Confirmation_ticket ticket->
+           Host.watch_read host ticket ~f:(fun origin->function
+             |W.Answered(Ok confirmation)->
+               (match W.confirmation_primary confirmation with
+                |W.Confirmed_block summary->finished request application origin(Business.Query_result(read.query,summary))
+                |_->failwith "business confirmation target missing")
+             |_->failwith "business canonical read failed"))
       | None ->
         let presentation=Option.get(Option.bind(C.projection(Host.view host))W.selected) in
         let intent=Business.worker_intent business request session |> Result.get_ok in
         require(Business.bind_mutation business request ~presentation ~intent) "business intent did not bind";
-        let rec watch ticket=Host.watch host ticket ~f:(function
-          | W.Answered(Ok(W.Committed_pending_presentation _))->
-            watch(Host.reconcile_mutation host ~presentation intent |> Result.get_ok)
-          | W.Answered(Ok progress)->deliver(Business.receive_mutation business request progress)
-          | _->failwith "actual business mutation did not settle") in
+        let rec watch = function
+          |C.Submission_ticket ticket->Host.watch host ticket ~f:(function
+            |W.Answered(Ok(W.Submission_committed _))->
+              watch(Host.reconcile_mutation host ~presentation intent |> Result.get_ok)
+            |W.Answered(Ok(W.Submission_rejected error))->
+              deliver(Business.receive_mutation business request(W.Rejected error))
+            |W.Answered(Ok W.Submission_unknown)->
+              deliver(Business.receive_mutation business request W.Outcome_unknown)
+            |_->failwith "actual business mutation did not settle")
+          |C.Confirmation_ticket ticket->Host.watch host ticket ~f:(function
+            |W.Answered(Ok confirmation)->deliver(Business.receive_mutation business request(W.Confirmed confirmation))
+            |_->failwith "actual business mutation did not confirm") in
         watch(Host.reconcile_mutation host ~presentation intent |> Result.get_ok)
     and finished request application origin result =
       let application, discard =
@@ -2923,7 +2941,7 @@ let test_changefeed_business_waits_for_ui_application () =
       let done_ = ref false in
       let ticket = Host.request host session (W.Mutate intent) |> Result.get_ok in
       Host.watch host ticket ~f:(function
-        | W.Answered (Ok (W.Committed_pending_presentation _)) -> done_ := true
+        | W.Answered (Ok (W.Submission_committed _)) -> done_ := true
         | _ -> failwith "business window write failed");
       wait (fun () -> !done_)
     in
@@ -2957,7 +2975,7 @@ let test_changefeed_business_waits_for_ui_application () =
     let append=W.append_intent session ~mutation_id:(uuid "9d000000-0000-4000-8000-000000008001")
       ~block_id:target ~day:(W.journal_day 20260902 |> Result.get_ok) ~title:"Captured regression block"
       ~task_status:None ~children:Rrbvec.empty |> Result.get_ok in
-    let receipt=match operation(W.Append append)with W.Committed_pending_presentation value->value|_->failwith "capture seed failed" in
+    let receipt=match operation(W.Append append)with W.Submission_committed value->value|_->failwith "capture seed failed" in
     let presentation=Option.get(Option.bind(C.projection(Host.view host))W.selected)in
     ignore(operation(W.Confirm(presentation,receipt)));
     ignore(operation(W.Acknowledge_intent(W.Append_intent append)));
@@ -2969,7 +2987,7 @@ let test_changefeed_business_waits_for_ui_application () =
         |Worker_pure_data.V2_present_block value->value.revision|_->failwith "captured target missing" in
       let intent=W.mutation_intent session ~mutation_id:(uuid(Printf.sprintf "9d000000-0000-4000-8000-%012d" n))
         (W.Save_block{block=target;title;preconditions={blocks=[target,revision];pages=[];scopes=[]}}) |> Result.get_ok in
-      match operation(W.Mutate intent)with W.Committed_pending_presentation _->()|_->failwith "concurrent target save failed" in
+      match operation(W.Mutate intent)with W.Submission_committed _->()|_->failwith "concurrent target save failed" in
     save_target 8002 "Reconciled capture";
     wait(fun()->Journal_model.source(Hashtbl.find latest_blocks target_id)="Reconciled capture");
     let reconciled=Hashtbl.find latest_blocks target_id in

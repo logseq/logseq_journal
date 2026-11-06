@@ -63,8 +63,10 @@ module type ISSUER = sig
 
   val finalize_observation_registration : session -> observation_id:request_id -> (Service.request,error)result
   val observation_registration_finalized : session -> observation_id:request_id -> Service.response -> (unit,error)result
-  val finalize_asset_demand : session -> request_id:request_id -> asset_consumer -> (Service.request,error)result
-  val asset_demand_finalized : session -> request_id:request_id -> asset_consumer -> Service.response -> (unit,error)result
+  val release_asset_demand_registration : session -> request_id:request_id -> consumer:asset_consumer -> round:request_id -> (Service.request,error)result
+  val asset_demand_registration_released : session -> request_id:request_id -> consumer:asset_consumer -> round:request_id -> Service.response -> (unit,error)result
+  val finalize_asset_demand : session -> request_id:request_id -> consumer:asset_consumer -> round:request_id -> (Service.request,error)result
+  val asset_demand_finalized : session -> request_id:request_id -> consumer:asset_consumer -> round:request_id -> Service.response -> (unit,error)result
 
   val release_observation_registration
     :  session
@@ -368,16 +370,32 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
             && matches_scope session owner && equal_request_id actual observation_id->Ok()
         |_->Error(Protocol_mismatch "Observation finalization acknowledgement mismatch")
       ;;
-      let finalize_asset_demand (session:session) ~request_id (consumer:asset_consumer) =
+      let release_asset_demand_registration (session:session) ~request_id ~(consumer:asset_consumer) ~round =
         if not(equal_binding (For_worker.session_binding session) binding) || not(equal_session consumer.session session) then Error Revoked_session
-        else Result.map(fun consumer->Service.Coordination_finalize_asset_demand{
-          registration=(For_worker.binding_serial binding);owner=(For_worker.session_asset_scope session);request_id;consumer})(asset_consumer_wire consumer)
+        else Ok(Service.Coordination_release_asset_demand{
+          registration=For_worker.binding_serial binding;owner=For_worker.session_asset_scope session;
+          request_id;consumer=asset_consumer_wire consumer ~round})
       ;;
-      let asset_demand_finalized (session:session) ~request_id (consumer:asset_consumer) response =
-        match response,asset_consumer_wire consumer with
-        |Service.Coordination_asset_demand_finalized{registration;owner;request_id=actual;consumer=wire},Ok expected
-          when equal_binding (For_worker.session_binding session) binding && registration=(For_worker.binding_serial binding)
-            && matches_asset_scope session owner && equal_request_id actual request_id && wire=expected->Ok()
+      let asset_demand_registration_released (session:session) ~request_id ~(consumer:asset_consumer) ~round response =
+        match response with
+        |Service.Coordination_asset_demand_released{registration;owner;request_id=actual;consumer=wire}
+          when equal_binding (For_worker.session_binding session) binding && equal_session consumer.session session
+            && registration=For_worker.binding_serial binding && matches_asset_scope session owner
+            && equal_request_id actual request_id && wire=asset_consumer_wire consumer ~round -> Ok()
+        |_->Error(Protocol_mismatch "Asset release acknowledgement mismatch")
+      ;;
+      let finalize_asset_demand (session:session) ~request_id ~(consumer:asset_consumer) ~round =
+        if not(equal_binding (For_worker.session_binding session) binding) || not(equal_session consumer.session session) then Error Revoked_session
+        else Ok(Service.Coordination_finalize_asset_demand{
+          registration=For_worker.binding_serial binding;owner=For_worker.session_asset_scope session;
+          request_id;consumer=asset_consumer_wire consumer ~round})
+      ;;
+      let asset_demand_finalized (session:session) ~request_id ~(consumer:asset_consumer) ~round response =
+        match response with
+        |Service.Coordination_asset_demand_finalized{registration;owner;request_id=actual;consumer=wire}
+          when equal_binding (For_worker.session_binding session) binding && equal_session consumer.session session
+            && registration=For_worker.binding_serial binding && matches_asset_scope session owner
+            && equal_request_id actual request_id && wire=asset_consumer_wire consumer ~round -> Ok()
         |_->Error(Protocol_mismatch "Asset finalization acknowledgement mismatch")
       ;;
 
@@ -554,12 +572,8 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
         | Release_file lease->
           if not(equal_binding (For_worker.session_binding session) binding) || not(equal_session session lease.lease_owner)
           then Error Revoked_session else Ok(Service.Release_asset_file{scope=(For_worker.session_asset_scope session);handle=lease.lease_handle})
-        | Release_asset_demand consumer->
-          if not(equal_binding (For_worker.session_binding session) binding) then Error Revoked_session else
-          Result.bind(validate_request session operation)(fun()->
-            Result.map(fun consumer->Service.Coordination_release_asset_demand
-              {registration=(For_worker.binding_serial binding);owner=(For_worker.session_asset_scope session);request_id;consumer})
-              (asset_consumer_wire consumer))
+        | Release_asset_demand demand->
+          release_asset_demand_registration session ~request_id ~consumer:demand.consumer ~round:demand.round
         | Release observation ->
           Result.bind (validate_request session operation) (fun () ->
             release_observation_registration
@@ -626,11 +640,10 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
             | Acquire_imported_file imported->Result.map(fun()->Service.Acquire_imported_file{scope=(For_worker.session_asset_scope session);operation=imported.import_receipt.operation})
                 (validate_request session operation)
             | Replace_asset_demand(consumer,priority,assets)->
-              Result.bind(validate_request session operation)(fun()->
-              Result.map(fun consumer->Service.Coordination_asset_demand
-                {registration=(For_worker.binding_serial binding);owner=(For_worker.session_scope session);request_id;consumer;
+              Result.map(fun ()->Service.Coordination_asset_demand
+                {registration=(For_worker.binding_serial binding);owner=(For_worker.session_scope session);request_id;consumer=asset_consumer_wire consumer ~round:request_id;
                  priority=(match priority with Foreground->Service.Asset.Foreground|Background->Background);
-                 assets})(asset_consumer_wire(bind_asset_consumer consumer ~round:request_id)))
+                 assets})(validate_request session operation)
             | Retry_asset asset->Ok(Service.Asset_command_at((For_worker.session_scope session),Retry_asset asset))
             | Retry_upload upload->Result.map(fun()->Service.Asset_command_at((For_worker.session_scope session),Retry_upload upload.operation))
                 (validate_request session operation)
@@ -732,14 +745,9 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
            | Service.Asset_file(Some(handle,path)) when handle<>"" && path<>""->
              Ok(Answered(Ok(Some{lease_owner=session;lease_id=request_id;lease_handle=handle;lease_path=path;lease_type=imported.import_receipt.file_type})))
            | _->Error(Protocol_mismatch "Imported acquire omitted its actual lease capability"))
-        | Release_asset_demand consumer->
-          if not(equal_binding (For_worker.session_binding session) binding)
-             || not(equal_asset_consumer consumer {consumer with session}) then Error Revoked_session else
-          (match response,asset_consumer_wire consumer with
-           | Service.Coordination_asset_demand_released value,Ok expected
-             when value.registration=(For_worker.binding_serial binding) && value.request_id=request_id
-               && value.consumer=expected && matches_asset_scope session value.owner->Ok(Answered(Ok()))
-           | _->Error(Protocol_mismatch "Asset cleanup did not acknowledge actual scoped settlement"))
+        | Release_asset_demand demand->
+          asset_demand_registration_released session ~request_id ~consumer:demand.consumer ~round:demand.round response
+          |> Result.map(fun ()->Answered(Ok()))
         | Release observation ->
           observation_registration_released
             session
@@ -761,8 +769,10 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                 (fun (handle, _) ->
                    Answered (observation session ~request_id handle response))
                 (observation_registration session ~request_id operation response)
-            | Replace_asset_demand _,Service.Coordination_asset_demand_accepted value
-              when value.request_id=request_id->Ok(Answered(Ok()))
+            | Replace_asset_demand (consumer,_,_),Service.Coordination_asset_demand_accepted value
+              when equal_request_id value.request_id request_id ->
+              Result.map(fun ()->Answered(Ok {consumer;round=request_id}))
+                (validate_request session operation)
             | Retry_asset _,Service.Client_command_completed->Ok(Answered(Ok()))
             | Retry_upload _,Service.Client_command_completed->Ok(Answered(Ok()))
             | Query(budget,query),Service.Coordination_queried value
@@ -790,7 +800,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
                 && value.presentation=presentation.generation && value.request_id=request_id->
               if not(presentation_live presentation)then Error Revoked_session else
               decode_confirmation session ~presentation receipt value.answer
-              |> Result.map(fun confirmation->Answered(Ok(Confirmed confirmation)))
+              |> Result.map(fun confirmation->Answered(Ok confirmation))
             | (Recover_mutations {after;maximum_items;maximum_bytes},
                Service.Coordination_mutations_recovered{request_id=actual;page})
               when Uuid.equal actual request_id->
@@ -801,20 +811,20 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
             | ( Mutate intent
               , Service.Coordination_mutation_result { request_id = actual; outcome } )
               when Uuid.equal request_id actual ->
-              decode_mutation_progress session ~intent:(Mutation_intent intent) outcome
+              decode_submission_outcome session ~intent:(Mutation_intent intent) outcome
               |> Result.map(fun progress->Answered(Ok progress))
             | ( Append intent
               , Service.Coordination_mutation_result { request_id = actual; outcome } )
               when Uuid.equal request_id actual ->
-              decode_mutation_progress session ~intent:(Append_intent intent) outcome
+              decode_submission_outcome session ~intent:(Append_intent intent) outcome
               |> Result.map(fun progress->Answered(Ok progress))
             | _ -> Error (Protocol_mismatch "Unexpected owned query receipt"))
       ;;
 
       let asset_notice session data =
         if not(live session) then Error Revoked_session else
-        let consumer wire make=Result.map(fun consumer->
-          {notice_owner=session;notice_consumer=Some consumer;notice_data=make consumer.name})
+        let consumer wire make=Result.map(fun demand->
+          {notice_owner=session;notice_demand=Some demand;notice_data=make demand.consumer.name})
           (decode_asset_consumer session wire) in
         match data with
         | Service.Asset_availability value->consumer value.consumer(fun name->
@@ -822,7 +832,7 @@ let issuer ~managed_origin ~user_id ~runtime_epoch ~worker_generation =
         | Asset_demand_accepted wire->consumer wire(fun name->Service.Asset_demand_accepted name)
         | Asset_backpressure wire->consumer wire(fun name->Service.Asset_backpressure name)
         | Asset_capacity_available|Upload_status _->
-          Ok{notice_owner=session;notice_consumer=None;notice_data=data}
+          Ok{notice_owner=session;notice_demand=None;notice_data=data}
     end
     in
     Ok (module I : ISSUER))

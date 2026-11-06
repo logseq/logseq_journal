@@ -33,20 +33,24 @@ let resource_source=Resources.create ~graph:(uuid 3) ~graph_generation:1 8100L
 let producer=lazy(resource_source.Resources.issuer,resource_source.session)
 
 type resource_ports =
-  { demand : graph_generation:int -> name:string -> W.asset_priority -> A.t list -> W.asset_consumer option
+  { demand : graph_generation:int -> name:string -> W.asset_priority -> A.t list -> W.asset_demand R.Coordination.ticket option
   ; acquire : R.ticket -> W.asset_file -> bool
   ; release_file : W.file_lease -> bool
-  ; release_consumer : W.asset_consumer -> bool
+  ; release_consumer : R.demand_registration -> bool
   ; retry_asset : graph_generation:int -> W.Uuid.t -> bool }
 
 let resource_ports sent accepted =
   let submit request=if accepted() then (Queue.add request sent;true)else false in
   {demand=(fun ~graph_generation ~name priority assets -> if not(accepted())then None else
-     Option.map(fun consumer->Queue.add(Command(None,W.Replace_asset_demand(consumer,priority,assets)))sent;consumer)
-       (Resources.demand resource_source ~graph_generation ~name priority assets));
+     Option.map(fun ticket->
+       let consumer=W.asset_consumer resource_source.session ~name |> Result.get_ok in
+       Queue.add(Command(None,W.Replace_asset_demand(consumer,priority,assets)))sent;ticket)
+       (Resources.demand_ticket resource_source ~graph_generation ~name priority assets));
    acquire=(fun ticket file->submit(Command(Some ticket,W.Acquire_asset_file file)));
    release_file=(fun file->submit(Command(None,W.Release_file file)));
-   release_consumer=(fun consumer->submit(Command(None,W.Release_asset_demand consumer)));
+   release_consumer=(fun (ticket,demand)->match demand with
+     |Some demand->submit(Command(None,W.Release_asset_demand demand))
+     |None->if accepted() then (Resources.cancel_demand resource_source ticket;true)else false);
    retry_asset=(fun ~graph_generation asset->graph_generation=resource_source.scope.graph_generation && submit(Command(None,W.Retry_asset asset)))}
 
 let consumer_name consumer =
@@ -92,7 +96,7 @@ let answer runtime (R.Read request as original) produce =
 let reject_read runtime (R.Read request) = R.reject_read runtime request.ticket
 
 let reply runtime request ?next_cursor items =
-  answer runtime request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("p") ~items:(items) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(next_cursor))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors _->F.answer budget query value |_->failwith "Synthetic sample query family mismatch"))
+  answer runtime request ((fun (Read.Read_query(budget,query))->let module F=Read.For_worker in let value=Ok(F.asset_listing ~generation:("g") ~projection_revision:("p") ~items:(items) ~next:(Option.map(fun cursor->F.continuation ~owner:(F.read_budget_owner budget) ~budget ~key:(Read.query_key budget query) ~cursor)(next_cursor))) in match query with |Read.Assets _->F.answer budget query value |Read.Asset_descriptors ids->let listing=Result.get_ok value in F.answer budget query (Ok(F.asset_lookup_result ~generation:listing.generation ~projection_revision:listing.projection_revision ~items:(List.map(fun uuid->List.find_opt(fun descriptor->Read.Uuid.equal uuid descriptor.Logseq_db_types.Asset_descriptor.uuid) listing.items)ids))) |_->failwith "Synthetic sample query family mismatch"))
 ;;
 
 let test_equal_media_notices_keep_effects () =

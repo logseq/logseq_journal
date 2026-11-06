@@ -5,6 +5,9 @@ module G = Logseq_db_types.Graph_types
 module Owners = Set.Make (String)
 
 module Worker = Journal_worker_coordination.Worker_api
+module Coordination = Journal_worker_coordination.Worker_pure_coordinator
+
+type demand_registration = Worker.asset_demand Coordination.ticket * Worker.asset_demand option
 
 type fact_ticket =
   { block : string
@@ -97,7 +100,7 @@ type outgoing_request =
   | Retry_asset of {graph_generation:int;asset:G.Uuid.t}
   | Perform_read of read_request
   | Release_preview of Worker.file_lease
-  | Release_consumer of Worker.asset_consumer
+  | Release_consumer of demand_registration
 
 type outgoing =
   { request : outgoing_request
@@ -117,13 +120,13 @@ type page_fact =
 
 type t =
   { release_file : Worker.file_lease -> bool
-  ; release_consumer : Worker.asset_consumer -> bool
-  ; bound_consumers : (string,Worker.asset_consumer)Hashtbl.t
+  ; release_consumer : demand_registration -> bool
+  ; bound_consumers : (string,demand_registration)Hashtbl.t
   ; mutable resource_binding : Worker.binding option
   ; read_port : read_request -> bool
   ; read_planned : G.Uuid.t -> unit
   ; read_retired : G.Uuid.t -> unit
-  ; demand : graph_generation:int -> name:string -> Worker.asset_priority -> Asset.t list -> Worker.asset_consumer option
+  ; demand : graph_generation:int -> name:string -> Worker.asset_priority -> Asset.t list -> Worker.asset_demand Coordination.ticket option
   ; acquire : ticket -> Worker.asset_file -> bool
   ; retry_asset : graph_generation:int -> G.Uuid.t -> bool
   ; changed : string -> view -> unit
@@ -345,7 +348,7 @@ let rec pump t =
       match next.request with
       | Demand {graph_generation;consumer;priority;assets}->
         (match t.demand ~graph_generation ~name:consumer priority assets with
-         |None->false|Some bound->Hashtbl.replace t.bound_consumers consumer bound;true)
+         |None->false|Some bound->Hashtbl.replace t.bound_consumers consumer (bound,None);true)
       | Acquire(ticket,file)->t.acquire ticket file
       | Retry_asset{graph_generation;asset}->t.retry_asset ~graph_generation asset
       | Perform_read request -> t.read_port request
@@ -1372,12 +1375,41 @@ let receive_file t (Lease{root;epoch;consumer;ticket}) result =
    |_->release_stale t result);
   recover_failed_reads t;pump t
 ;;
-let demand_backpressured t consumer =
-  Option.iter(fun(g,c)->dispatch t g c P.Demand_backpressured)
+let demand_backpressured ?ticket t consumer =
+  let current=match ticket,Hashtbl.find_opt t.bound_consumers consumer with
+    |None,_->true
+    |Some ticket,Some(pending,_)->Worker.equal_request_id (Coordination.ticket_id pending)(Coordination.ticket_id ticket)
+    |Some _,None->false in
+  if current then Option.iter(fun(g,c)->dispatch t g c P.Demand_backpressured)
     (Hashtbl.find_opt t.consumers consumer)
 ;;
 
+(* A ticket is pending authority only. Checked ACKs/notices establish the exact
+   demand round; late results cannot replace a newer consumer registration. *)
+let retain_demand t consumer demand =
+  match Hashtbl.find_opt t.bound_consumers consumer with
+  | Some(ticket,previous) when Worker.equal_request_id (Coordination.ticket_id ticket)(Worker.asset_demand_round demand) ->
+    (match previous with
+     | Some previous -> Worker.equal_asset_demand previous demand
+     | None -> Hashtbl.replace t.bound_consumers consumer (ticket,Some demand);true)
+  | _ -> false
+
+let receive_demand t ticket demand =
+  if not(Worker.equal_request_id (Coordination.ticket_id ticket)(Worker.asset_demand_round demand)) then false else
+  let consumer=Hashtbl.to_seq t.bound_consumers |> Seq.find_map(fun(consumer,(pending,_))->
+    if Worker.equal_request_id (Coordination.ticket_id pending)(Coordination.ticket_id ticket)
+    then Some consumer else None) in
+  Option.fold ~none:false ~some:(fun consumer->retain_demand t consumer demand)consumer
+
+let current_demand_notice t notice =
+  match Worker.asset_notice_demand notice,Worker.asset_notice_data notice with
+  | Some demand,(Service.Asset_availability{consumer;_}|Asset_demand_accepted consumer|Asset_backpressure consumer) ->
+    retain_demand t consumer demand
+  | None,(Service.Upload_status _|Asset_capacity_available) -> true
+  | _ -> false
+
 let notice t notice =
+  if current_demand_notice t notice then
   let scope=Worker.asset_notice_scope notice in
   match Worker.asset_notice_data notice with
   | Service.Asset_availability { consumer; asset; _ } ->

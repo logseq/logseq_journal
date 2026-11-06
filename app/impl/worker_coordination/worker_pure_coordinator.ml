@@ -8,7 +8,8 @@ module Sessions=Set.Make(struct type t=Worker.session let compare=Worker.compare
 module Asset_consumers=Map.Make(struct type t=Worker.asset_consumer let compare=Worker.compare_asset_consumer end)
 type asset_creation = Awaiting_admission | Creating | Finished | Not_created
 type cleanup_phase = Releasing_resource | Finalizing_resource
-type asset_registration={consumer:Worker.asset_consumer;assets:Logseq_db_types.Asset_descriptor.t list;
+type asset_demand_registration = { consumer : Worker.asset_consumer; round : Worker.request_id }
+type asset_registration={registration:asset_demand_registration;assets:Logseq_db_types.Asset_descriptor.t list;
   creation:asset_creation;active:bool;notices:(Worker.asset_notice * Id.push_sequence) list}
 
 module Observation_ids = Map.Make (struct
@@ -21,7 +22,9 @@ type _ kind =
   | Change_ack : Worker.change_ack kind
   | Unit : unit kind
   | Observed : 'a kind -> 'a Worker.observed kind
-  | Mutation : Worker.mutation_progress kind
+  | Submission : Worker.submission_outcome kind
+  | Confirmation : Worker.confirmation kind
+  | Demand : Worker.asset_demand kind
   | Recovery : Worker.mutation_recovery kind
   | Import_inputs : Worker.import_input_recovery kind
   | Import_source : Worker.request_id option -> Worker.recovered_import_input option kind
@@ -40,6 +43,7 @@ type _ kind =
   | Favorites : Worker.favorites kind
   | Statuses : Worker.task_status_catalog kind
   | Definitions : Worker.Graph.task_status_definition option list kind
+  | Asset_lookup : Worker.asset_lookup_result kind
   | Assets : Worker.asset_listing kind
   | Changes : Worker.change_batch kind
 
@@ -57,7 +61,7 @@ let kind : type a. a Worker.query -> a kind = function
   | Favorites _ -> Favorites
   | Task_statuses _ -> Statuses
   | Task_status_definitions _ -> Definitions
-  | Asset_descriptors _ -> Assets
+  | Asset_descriptors _ -> Asset_lookup
   | Assets _ -> Assets
   | Changes _ -> Changes
 ;;
@@ -71,7 +75,9 @@ let rec same_kind : type a b. a kind -> b kind -> (a, b) Worker.equality option 
      | None -> None)
   | Change_ack, Change_ack -> Some Refl
   | Unit, Unit -> Some Refl
-  | Mutation, Mutation -> Some Refl
+  | Submission, Submission -> Some Refl
+  | Confirmation, Confirmation -> Some Refl
+  | Demand, Demand -> Some Refl
   | Recovery, Recovery -> Some Refl
   | Import_inputs, Import_inputs -> Some Refl
   | Import_source _, Import_source _ -> Some Refl
@@ -90,6 +96,7 @@ let rec same_kind : type a b. a kind -> b kind -> (a, b) Worker.equality option 
   | Favorites, Favorites -> Some Refl
   | Statuses, Statuses -> Some Refl
   | Definitions, Definitions -> Some Refl
+  | Asset_lookup, Asset_lookup -> Some Refl
   | Assets, Assets -> Some Refl
   | Changes, Changes -> Some Refl
   | _ -> None
@@ -98,6 +105,7 @@ let rec same_kind : type a b. a kind -> b kind -> (a, b) Worker.equality option 
 type _ planned =
   | Read : 'a Worker.query -> 'a planned
   | Operation : 'a Worker.request -> 'a planned
+  | Asset_cleanup : asset_demand_registration -> unit planned
 
 type query_target =
   | Cleanup of Worker.session
@@ -166,7 +174,7 @@ type observation_entry = Observing : 'a observation_state -> observation_entry
 type import_registration={import_intent:Worker.asset_import_intent;source_owner:Worker.session;source_adopted:bool;
   progress:Worker.import_progress option;failed_attempt:(Worker.request_id * Worker.error) option}
 
-type cleanup_resource=Demand_resource of Worker.asset_consumer | Lease_resource of Worker.file_lease
+type cleanup_resource=Demand_resource of asset_demand_registration | Lease_resource of Worker.file_lease
 
 type asset_cleanup =
   { resource:cleanup_resource
@@ -416,10 +424,11 @@ let handoff v id =
 
 let handoff_restartable view id=List.exists(Worker.equal_handoff_id id)view.restartable_handoffs
 
-let asset_notices facts consumer =
-  if not(current_session facts(Worker.asset_consumer_session consumer)) then [] else
+let asset_notices facts demand =
+  let consumer=Worker.asset_demand_consumer demand in
+  if not(current_session facts(Worker.asset_demand_session demand)) then [] else
   match Asset_consumers.find_opt consumer facts.asset_consumers with
-  | Some entry when entry.active->List.map fst entry.notices
+  | Some entry when entry.active && Worker.equal_request_id entry.registration.round (Worker.asset_demand_round demand)->List.map fst entry.notices
   | _->[]
 let session_asset_notices facts session =
   if not(current_session facts session) then [] else
@@ -691,7 +700,8 @@ type instruction =
   | Release_binding of Worker.binding
   | Release_observation_registration of Worker.session * Worker.request_id
   | Finalize_observation_registration of Worker.session * Worker.request_id
-  | Finalize_asset_demand of unit ticket * Worker.session * Worker.asset_consumer
+  | Release_asset_demand_registration of unit ticket * asset_demand_registration
+  | Finalize_asset_demand of unit ticket * asset_demand_registration
   | Bind_replacement
   | Send : 'a ticket * Worker.session * 'a Worker.request -> instruction
   | Cancel_request : 'a ticket -> instruction
@@ -771,13 +781,13 @@ let current_presentation ?owner facts presentation =
 
 let asset_round_current facts consumer round =
   match Asset_consumers.find_opt consumer facts.asset_consumers with
-  |Some entry->entry.active && Worker.asset_consumer_round entry.consumer=Some round
+  |Some entry->entry.active && Worker.equal_request_id entry.registration.round round
   |None->false
 ;;
 
 let revalidate_reply : type a. view -> a ticket -> a Worker.reply -> a Worker.reply =
   fun facts ticket reply ->
-  if (match ticket.query with Operation(Worker.Replace_asset_demand(consumer,_,_))->
+  if (match ticket.query,reply with Operation(Worker.Replace_asset_demand(consumer,_,_)),Worker.Answered(Ok _)->
     not(asset_round_current facts consumer ticket.id)|_->false)
   then Worker.Answered(Error Worker.Revoked_session) else match ticket.target,reply with
   | Presentation presentation,Worker.Answered(Ok _)
@@ -1117,7 +1127,7 @@ let dispatch_waiting ?(publish = false) ?(retry_full = false) state instructions
                                      (Worker.validate_request
                                         session
                                         (Worker.Query (budget, query))))
-                            | Operation _ ->
+                            | Operation _ | Asset_cleanup _ ->
                               Error
                                 (Worker.Invalid_input "An effect cannot wait as a read"))
                      in
@@ -1166,21 +1176,26 @@ let dispatch_waiting ?(publish = false) ?(retry_full = false) state instructions
   else unchanged next
 ;;
 
-let plan_intent_lifecycle
-  : type a. t -> Worker.session -> a Worker.request -> a kind -> query_target
+let plan_lifecycle
+  : type a. t -> a kind -> query_target -> a planned
     -> (Worker.presentation * Worker.receipt option) option
+    -> (a ticket -> instruction)
     -> (a ticket * transition,Worker.error) result
-  = fun state session operation kind target acknowledgement ->
+  = fun state kind target query acknowledgement instruction ->
   if state.next=Int64.max_int then Error(Worker.Invalid_input "Request counter exhausted") else
   let serial=Int64.succ state.next in
-  let ticket={id=Worker.request_id(identity state.client serial);serial;attempt=0;kind;query=Operation operation;target;
+  let ticket={id=Worker.request_id(identity state.client serial);serial;attempt=0;kind;query;target;
     planned_intent_epoch=state.facts.intent_epoch;planned_source_epoch=state.facts.import_input_epoch;acknowledgement} in
   let slot={ticket;wait_for_capacity=false;dispatched = true;admitted=None;change_version=0L;
     sample_epoch=None;origin=None;result=None;early=None;cancelled=false;forgotten=false;retired_by_ack=false;rebind_pending=false} in
   let facts={state.facts with entries=Slots.add serial(Entry slot)state.facts.entries} in
-  Ok(ticket,changed{state with next=serial;facts}[Send(ticket,session,operation)])
+  Ok(ticket,changed{state with next=serial;facts}[instruction ticket])
 ;;
 
+let plan_intent_lifecycle state session operation kind target acknowledgement =
+  plan_lifecycle state kind target (Operation operation) acknowledgement
+    (fun ticket->Send(ticket,session,operation))
+;;
 
 let non_publications instructions=List.filter(function Publish _->false|_->true)instructions
 
@@ -1194,23 +1209,21 @@ let complete_asset_waiters facts waiters (result:unit Worker.reply) =
     | _->entries)facts.entries waiters in
   {facts with entries}
 ;;
-let queue_asset_cleanup facts consumer ?waiter () =
-  match Worker.asset_consumer_round consumer with
-  | None->facts
-  | Some round->
-    let cleanup=match Observation_ids.find_opt round facts.asset_cleanup with
-      | Some old->
-        let retained=List.filter(fun serial->match Slots.find_opt serial facts.entries with
-          | Some(Entry slot)->slot.result=None && not slot.forgotten && not slot.cancelled
-          | None->false)old.waiters in
-        {old with error=None;wait_for_capacity=false;
-          waiters=(match waiter with None->retained|Some serial->serial::retained)}
-      | None->
-        let creation=match Asset_consumers.find_opt consumer facts.asset_consumers with
-          |Some entry when Worker.asset_consumer_round entry.consumer=Some round->entry.creation
-          |_->Finished in
-        {resource=Demand_resource consumer;creation;phase=Releasing_resource;returned=true;attempt=None;waiters=Option.to_list waiter;wait_for_capacity=false;error=None} in
-    {facts with asset_cleanup=Observation_ids.add round cleanup facts.asset_cleanup}
+let queue_asset_cleanup facts (registration:asset_demand_registration) ?waiter () =
+  let consumer=registration.consumer and round=registration.round in
+  let cleanup=match Observation_ids.find_opt round facts.asset_cleanup with
+    | Some old->
+      let retained=List.filter(fun serial->match Slots.find_opt serial facts.entries with
+        | Some(Entry slot)->slot.result=None && not slot.forgotten && not slot.cancelled
+        | None->false)old.waiters in
+      {old with error=None;wait_for_capacity=false;
+        waiters=(match waiter with None->retained|Some serial->serial::retained)}
+    | None->
+      let creation=match Asset_consumers.find_opt consumer facts.asset_consumers with
+        |Some entry when Worker.equal_request_id entry.registration.round round->entry.creation
+        |_->Finished in
+      {resource=Demand_resource registration;creation;phase=Releasing_resource;returned=true;attempt=None;waiters=Option.to_list waiter;wait_for_capacity=false;error=None} in
+  {facts with asset_cleanup=Observation_ids.add round cleanup facts.asset_cleanup}
 ;;
 
 let queue_file_cleanup facts lease ?waiter ?(returned=false) () =
@@ -1223,14 +1236,27 @@ let queue_file_cleanup facts lease ?waiter ?(returned=false) () =
     |None->{resource=Lease_resource lease;creation=Finished;phase=Releasing_resource;returned;attempt=None;waiters=Option.to_list waiter;wait_for_capacity=false;error=None} in
   {facts with asset_cleanup=Observation_ids.add key cleanup facts.asset_cleanup}
 ;;
-let resource_release = function
-  | Demand_resource consumer->Worker.asset_consumer_session consumer,Worker.Release_asset_demand consumer
-  | Lease_resource lease->Worker.file_lease_session lease,Worker.Release_file lease
+let resource_session = function
+  | Demand_resource registration->Worker.asset_consumer_session registration.consumer
+  | Lease_resource lease->Worker.file_lease_session lease
+;;
+
+let plan_resource_cleanup state cleanup =
+  match cleanup.resource with
+  | Demand_resource registration ->
+    let session=Worker.asset_consumer_session registration.consumer in
+    plan_lifecycle state Unit (Cleanup session) (Asset_cleanup registration) None
+      (fun ticket -> match cleanup.phase with
+        | Releasing_resource -> Release_asset_demand_registration(ticket,registration)
+        | Finalizing_resource -> Finalize_asset_demand(ticket,registration))
+  | Lease_resource lease ->
+    let session=Worker.file_lease_session lease in
+    plan_intent_lifecycle state session (Worker.Release_file lease) Unit (Cleanup session) None
 ;;
 
 let asset_creator facts consumer round creation =
   let asset_consumers=match Asset_consumers.find_opt consumer facts.asset_consumers with
-    |Some entry when Worker.asset_consumer_round entry.consumer=Some round->
+    |Some entry when Worker.equal_request_id entry.registration.round round->
       Asset_consumers.add consumer {entry with creation} facts.asset_consumers
     |_->facts.asset_consumers in
   let asset_cleanup=match Observation_ids.find_opt round facts.asset_cleanup with
@@ -1245,14 +1271,13 @@ let progress_asset_cleanup ?(capacity=false) transition =
     if cleanup.attempt=None && cleanup.creation=Not_created then (
       let facts=complete_asset_waiters !next.facts cleanup.waiters (Worker.Answered(Ok())) in
       let asset_consumers=match cleanup.resource with
-        |Demand_resource consumer->(match Asset_consumers.find_opt consumer facts.asset_consumers with
-          |Some entry when Worker.asset_consumer_round entry.consumer=Some round && not entry.active->Asset_consumers.remove consumer facts.asset_consumers
+        |Demand_resource registration->(match Asset_consumers.find_opt registration.consumer facts.asset_consumers with
+          |Some entry when Worker.equal_request_id entry.registration.round round && not entry.active->Asset_consumers.remove registration.consumer facts.asset_consumers
           |_->facts.asset_consumers)
         |Lease_resource _->facts.asset_consumers in
       next:={!next with facts={facts with asset_consumers;asset_cleanup=Observation_ids.remove round facts.asset_cleanup}})
     else if cleanup.creation=Finished && cleanup.attempt=None && cleanup.error=None && (capacity || not cleanup.wait_for_capacity) then
-      let session,operation=resource_release cleanup.resource in
-      match plan_intent_lifecycle !next session operation Unit(Cleanup session)None with
+      match plan_resource_cleanup !next cleanup with
       | Error error->next:={!next with facts={!next.facts with asset_cleanup=Observation_ids.add round {cleanup with error=Some error} !next.facts.asset_cleanup}}
       | Ok(ticket,planned)->
         let entries=match Slots.find_opt ticket.serial planned.next.facts.entries with
@@ -1260,9 +1285,7 @@ let progress_asset_cleanup ?(capacity=false) transition =
           | None->assert false in
         next:={planned.next with facts={planned.next.facts with entries;
           asset_cleanup=Observation_ids.add round {cleanup with attempt=Some ticket.id;wait_for_capacity=false}planned.next.facts.asset_cleanup}};
-        let commands=match cleanup.phase,cleanup.resource with
-          |Finalizing_resource,Demand_resource consumer->[Finalize_asset_demand(ticket,session,consumer)]
-          |_->non_publications planned.instructions in
+        let commands=non_publications planned.instructions in
         effects:=List.rev_append commands !effects)
     transition.next.facts.asset_cleanup;
   if !next==transition.next then transition else
@@ -1291,7 +1314,7 @@ let retire ?(retry_reads=false) state lifecycle =
         else {slot with cancelled=true;rebind_pending=true} in
       Slots.add serial(Entry slot)entries)state.facts.entries facts.entries in
     {facts with entries} in
-  let facts=Asset_consumers.fold(fun _ (entry:asset_registration) facts->queue_asset_cleanup facts entry.consumer ())facts.asset_consumers facts in
+  let facts=Asset_consumers.fold(fun _ (entry:asset_registration) facts->queue_asset_cleanup facts entry.registration ())facts.asset_consumers facts in
   let facts=Observation_ids.fold(fun _ lease facts->queue_file_cleanup facts lease ())facts.file_leases facts in
   let facts =
     { facts with
@@ -1408,13 +1431,13 @@ let apply_baseline state binding incoming =
           facts
       in
       let facts=Asset_consumers.fold(fun _ (entry:asset_registration) facts->
-        if entry.active && not(current_session facts(Worker.asset_consumer_session entry.consumer))
-        then queue_asset_cleanup facts entry.consumer () else facts)facts.asset_consumers facts in
+        if entry.active && not(current_session facts(Worker.asset_consumer_session entry.registration.consumer))
+        then queue_asset_cleanup facts entry.registration () else facts)facts.asset_consumers facts in
       let facts=Observation_ids.fold(fun _ lease facts->
         if not(current_session facts(Worker.file_lease_session lease)) then queue_file_cleanup facts lease () else facts)
         facts.file_leases facts in
       let asset_consumers=Asset_consumers.map(fun (entry:asset_registration)->
-        if not(current_session facts(Worker.asset_consumer_session entry.consumer))
+        if not(current_session facts(Worker.asset_consumer_session entry.registration.consumer))
         then {entry with active=false;notices=[]}else entry)facts.asset_consumers in
       dispatch_waiting ~publish:true { state with facts={facts with asset_consumers}; retired } instructions))
 ;;
@@ -1436,11 +1459,13 @@ let receipt_agrees facts key receipt =
        (known_receipt facts key)
 ;;
 
-let retain_submission_result intents ~key ~admitted (result : Worker.mutation_progress Worker.reply) =
+let retain_submission_result intents ~key ~admitted (result : Worker.submission_outcome Worker.reply) =
   let previous = Intents.find_opt key intents in
   let progress : Worker.mutation_progress option =
     match result with
-    | Worker.Answered (Ok progress) -> Some progress
+    | Worker.Answered (Ok (Worker.Submission_rejected error)) -> Some (Worker.Rejected error)
+    | Worker.Answered (Ok Worker.Submission_unknown) -> Some Worker.Outcome_unknown
+    | Worker.Answered (Ok (Worker.Submission_committed receipt)) -> Some (Worker.Committed_pending_presentation receipt)
     | Worker.Not_admitted _ when not admitted -> previous
     | _ ->
       (match previous with
@@ -1511,6 +1536,11 @@ let checked_result : type a. view -> a ticket -> a Worker.reply -> a Worker.repl
   match ticket.query, result with
   |Operation(Worker.Replace_asset_demand(consumer,_,_)),_
     when not(asset_round_current facts consumer ticket.id)->Worker.Answered(Error Worker.Revoked_session)
+  | Operation(Worker.Replace_asset_demand(consumer,_,_)),Worker.Answered(Ok demand)->
+    if Worker.equal_asset_consumer consumer (Worker.asset_demand_consumer demand)
+      && Worker.equal_session (Worker.asset_consumer_session consumer) (Worker.asset_demand_session demand)
+      && Worker.equal_request_id ticket.id (Worker.asset_demand_round demand)
+    then result else Worker.Answered(Error(Worker.Protocol_mismatch "Asset demand does not match its replacement round"))
   | Operation(Worker.Recover_import_inputs _),Worker.Answered(Ok _)
       when ticket.planned_source_epoch<>facts.import_input_epoch->
     Worker.Answered(Error(Worker.Stale_read "Source recovery predates a settled source acknowledgement"))
@@ -1623,14 +1653,12 @@ let checked_result : type a. view -> a ticket -> a Worker.reply -> a Worker.repl
          (Error
             (Worker.Protocol_mismatch "Refreshed value does not match its owned interest")))
   | ( Operation (Worker.Mutate intent)
-    , Worker.Answered (Ok (Worker.Committed_pending_presentation receipt)) ) ->
+    , Worker.Answered (Ok (Worker.Submission_committed receipt)) ) ->
     if receipt_agrees facts (intent_key(Worker.Mutation_intent intent)) receipt then result else mismatch ()
-  | Operation (Worker.Mutate _), Worker.Answered (Ok (Worker.Confirmed _)) -> mismatch ()
-  | Operation (Worker.Append intent), Worker.Answered (Ok (Worker.Committed_pending_presentation receipt)) ->
+  | Operation (Worker.Append intent), Worker.Answered (Ok (Worker.Submission_committed receipt)) ->
     if receipt_agrees facts (intent_key(Worker.Append_intent intent)) receipt then result else mismatch ()
-  | Operation (Worker.Append _), Worker.Answered (Ok (Worker.Confirmed _)) -> mismatch ()
   | ( Operation (Worker.Confirm (presentation, receipt))
-    , Worker.Answered (Ok (Worker.Confirmed confirmation)) ) ->
+    , Worker.Answered (Ok confirmation) ) ->
     if
       Worker.confirmation_presentation confirmation = presentation
       && Worker.receipt_revisions receipt
@@ -1960,8 +1988,8 @@ let finish_resource_release state (ticket:unit ticket) (result:unit Worker.reply
           let facts=complete_asset_waiters state.facts cleanup.waiters
             (match error with None->Worker.Answered(Ok())|Some error->Worker.Answered(Error error)) in
           let asset_consumers=match cleanup.resource with
-            |Demand_resource consumer->(match Asset_consumers.find_opt consumer facts.asset_consumers with
-              | Some entry when success && not entry.active && Worker.asset_consumer_round entry.consumer=Some round->Asset_consumers.remove consumer facts.asset_consumers
+            |Demand_resource registration->(match Asset_consumers.find_opt registration.consumer facts.asset_consumers with
+              | Some entry when success && not entry.active && Worker.equal_request_id entry.registration.round round->Asset_consumers.remove registration.consumer facts.asset_consumers
               | _->facts.asset_consumers)
             |Lease_resource _->facts.asset_consumers in
           let file_leases=if success then Observation_ids.remove round facts.file_leases else facts.file_leases in
@@ -1975,7 +2003,8 @@ let finish_resource_release state (ticket:unit ticket) (result:unit Worker.reply
 ;;
 let retain_asset_command_result : type a. t -> a ticket -> a Worker.reply -> t =
   fun state ticket result->match ticket.query with
-  | Operation(Worker.Release_asset_demand consumer)->finish_resource_release state ticket result(Worker.asset_consumer_round consumer)
+  | Asset_cleanup registration->finish_resource_release state ticket result(Some registration.round)
+  | Operation(Worker.Release_asset_demand demand)->finish_resource_release state ticket result(Some(Worker.asset_demand_round demand))
   | Operation(Worker.Release_file lease)->finish_resource_release state ticket result(Some(Worker.file_lease_id lease))
   | _->state
 ;;
@@ -1983,7 +2012,7 @@ let retain_asset_command_result : type a. t -> a ticket -> a Worker.reply -> t =
 let asset_file_current facts file =
   let consumer=Worker.asset_file_consumer file in
   match Asset_consumers.find_opt consumer facts.asset_consumers with
-  |Some entry when entry.active && Worker.asset_consumer_round consumer=Worker.asset_consumer_round entry.consumer->
+  |Some entry when entry.active && Worker.equal_request_id (Worker.asset_demand_round(Worker.asset_file_demand file)) entry.registration.round->
     List.exists(fun(notice,_)->Worker.ready_asset_file notice=Some file)entry.notices
   |_->false
 ;;
@@ -2039,6 +2068,17 @@ let adopt_file_result : type a. t -> a slot -> a Worker.reply -> t =
   {state with facts}
 ;;
 
+let retire_asset_replacement : type a. view -> a ticket -> view =
+  fun facts ticket -> match ticket.query with
+  | Operation(Worker.Replace_asset_demand(consumer,_,_))->
+    (match Asset_consumers.find_opt consumer facts.asset_consumers with
+     |Some entry when Worker.equal_request_id entry.registration.round ticket.id ->
+       let asset_consumers=Asset_consumers.add consumer {entry with active=false;notices=[]}facts.asset_consumers in
+       queue_asset_cleanup {facts with asset_consumers} entry.registration ()
+     |_->facts)
+  |_->facts
+;;
+
 let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
   fun state ticket result require_admission ->
   match Slots.find_opt ticket.serial state.facts.entries with
@@ -2091,7 +2131,10 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
                  obs_releasing=value.obs_releasing || slot.cancelled || value.obs_handle=None})state.facts.observations
              |None->state.facts.observations) |> fun observations->{state.facts with observations}
            |Operation(Worker.Replace_asset_demand(consumer,_,_))->
-             asset_creator state.facts consumer ticket.id (if slot.admitted=None then Not_created else Finished)
+             let facts=asset_creator state.facts consumer ticket.id (if slot.admitted=None then Not_created else Finished) in
+             (match result with
+              |Worker.Answered(Ok _) when not slot.cancelled && not slot.forgotten->facts
+              |_->retire_asset_replacement facts ticket)
            |_->state.facts in
          let state={state with facts} in
          let state=adopt_file_result state slot result in
@@ -2109,7 +2152,7 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
            | Operation (Worker.Confirm (presentation, receipt)) ->
              let key = intent_key (Worker.receipt_intent receipt) in
              (match result with
-              | Worker.Answered (Ok (Worker.Confirmed confirmation))
+              | Worker.Answered (Ok confirmation)
                 when current_target state.facts (Presentation presentation) ->
                 Intents.add key (Worker.Confirmed confirmation) state.facts.intents
               | _ ->
@@ -2145,7 +2188,7 @@ let finish : type a. t -> a ticket -> a Worker.reply -> bool -> transition =
          let result =
            let cancelled_observe =
              match ticket.query with
-             | Operation (Worker.Observe _ | Worker.Import _ | Worker.Acquire_asset_file _ | Worker.Acquire_imported_file _) -> slot.cancelled
+             | Operation (Worker.Observe _ | Worker.Replace_asset_demand _ | Worker.Import _ | Worker.Acquire_asset_file _ | Worker.Acquire_imported_file _) -> slot.cancelled
              | _ -> false
            in
            if cancelled_observe
@@ -2246,7 +2289,7 @@ let retain_registration
         Worker.equal_request_id ticket.id value.obs_initial.id
       | Operation (Worker.Refresh original) ->
         Worker.same_observation original handle <> None
-      | _ -> .
+      | _ -> false
     in
     if not matches
     then unchanged state
@@ -2337,6 +2380,7 @@ let release_observation_result state session id result =
   | _ -> unchanged state
 ;;
 
+
 let cancel : type a. t -> a ticket -> bool -> transition =
   fun state ticket forget ->
   match Slots.find_opt ticket.serial state.facts.entries with
@@ -2363,7 +2407,9 @@ let cancel : type a. t -> a ticket -> bool -> transition =
              (Entry { slot with cancelled = true; forgotten; rebind_pending=false })
              state.facts.entries
        in
-       changed { state with facts = { state.facts with entries } } instructions
+       let facts={state.facts with entries} in
+       let facts=if not forget || slot.result=None then retire_asset_replacement facts ticket else facts in
+       changed { state with facts } instructions
      | None -> unchanged state)
   | None -> unchanged state
 ;;
@@ -2409,7 +2455,7 @@ let asset_updates ~previous facts =
   let updates = Asset_consumers.fold (fun consumer entry updates ->
     if not entry.active then updates else
     let previous = match Option.bind previous (fun view -> Asset_consumers.find_opt consumer view.asset_consumers) with
-      | Some old when old.active && Worker.asset_consumer_round old.consumer = Worker.asset_consumer_round entry.consumer -> old.notices
+      | Some old when old.active && Worker.equal_request_id old.registration.round entry.registration.round -> old.notices
       | _ -> [] in
     changed previous entry.notices updates) facts.asset_consumers Rrbvec.empty in
   let updates = Graphs.fold (fun graph values updates ->
@@ -2428,10 +2474,11 @@ let retain_asset_notice state notice sequence =
     let previous=List.find_opt(fun(old,_)->asset_fact_key old=key)values in
     if Option.exists(fun(_,seen)->Id.Push_sequence.compare sequence seen<=0)previous then None
     else Some((notice,sequence)::List.filter(fun(old,_)->asset_fact_key old<>key)values) in
-  match Worker.asset_notice_consumer notice with
-  | Some consumer->
+  match Worker.asset_notice_demand notice with
+  | Some demand->
+    let consumer=Worker.asset_demand_consumer demand in
     (match Asset_consumers.find_opt consumer state.facts.asset_consumers with
-     | Some entry when entry.active && Worker.asset_consumer_round consumer=Worker.asset_consumer_round entry.consumer->
+     | Some entry when entry.active && Worker.equal_request_id (Worker.asset_demand_round demand) entry.registration.round->
        let owned=match Worker.asset_notice_data notice with
          | Logseq_db_worker_lui.Logseq_db_worker_lui_service.Asset_availability{asset;descriptor;_}->
            List.exists(fun expected->expected.Logseq_db_types.Asset_descriptor.uuid=asset
@@ -3268,9 +3315,9 @@ let host_sessions state change =
       |Presentation value->Some(Worker.presentation_session value)|Expected _->Option.map fst slot.origin in
     Option.fold ~none:values ~some:(fun session->add session values)session)state.facts.entries values in
   let values=Observation_ids.fold(fun _ (Observing value) values->add value.obs_session values)state.facts.observations values in
-  let values=Asset_consumers.fold(fun _ entry values->add(Worker.asset_consumer_session entry.consumer)values)state.facts.asset_consumers values in
+  let values=Asset_consumers.fold(fun _ entry values->add(Worker.asset_consumer_session entry.registration.consumer)values)state.facts.asset_consumers values in
   let values=Observation_ids.fold(fun _ lease values->add(Worker.file_lease_session lease)values)state.facts.file_leases values in
-  let values=Observation_ids.fold(fun _ cleanup values->add(fst(resource_release cleanup.resource))values)state.facts.asset_cleanup values in
+  let values=Observation_ids.fold(fun _ cleanup values->add(resource_session cleanup.resource)values)state.facts.asset_cleanup values in
   let values=Graphs.fold(fun _ saved values->add saved.source_owner values)state.facts.imports values in
   Rrbvec.of_seq(Sessions.to_seq values)
 ;;
@@ -3329,7 +3376,7 @@ let progress_host_handoff ?(capacity=false) transition =
        && Option.exists(Worker.valid_handoff_projection plan)state.facts.current->
       let pending=Observation_ids.exists(fun _ (Observing value)->not value.obs_release_done && affected value.obs_session change)state.facts.observations
         || Observation_ids.exists(fun _ lease->affected(Worker.file_lease_session lease)change)state.facts.file_leases
-        || Observation_ids.exists(fun _ cleanup->affected(fst(resource_release cleanup.resource))change)state.facts.asset_cleanup in
+        || Observation_ids.exists(fun _ cleanup->affected(resource_session cleanup.resource)change)state.facts.asset_cleanup in
       if pending then transition else changed{state with host_candidate=None;
         facts={state.facts with handoffs=(id,Worker.Safe_to_proceed receipt)::
           List.filter(fun(old,_)->not(Worker.equal_handoff_id old id))state.facts.handoffs}}(non_publications transition.instructions)
@@ -3356,12 +3403,9 @@ let step state event =
 ;;
 
 let plan_mutation
-      state
-      session
-      (operation : Worker.mutation_progress Worker.request)
-      key
-      target
-  =
+  : type a. t -> Worker.session -> a Worker.request -> a kind -> string -> query_target
+    -> (a ticket * transition,Worker.error) result
+  = fun state session operation result_kind key target ->
   let bytes = Intents.fold (fun key _ n -> n + String.length key) state.facts.intents 0 in
   let valid =
     match operation with
@@ -3391,7 +3435,7 @@ let plan_mutation
       { id = Worker.request_id (identity state.client serial)
       ; serial
         ; attempt = 0
-      ; kind = Mutation
+      ; kind = result_kind
       ; planned_intent_epoch = state.facts.intent_epoch
         ; planned_source_epoch = state.facts.import_input_epoch
       ; acknowledgement = None
@@ -3423,7 +3467,7 @@ let plan_mutation
           (match operation with
            | Worker.Mutate _ | Worker.Append _ -> Worker.Outcome_unknown
            | Worker.Confirm (_, receipt) -> Worker.Committed_pending_presentation receipt
-           | _ -> .)
+           | _ -> assert false)
           state.facts.intents
     in
     let facts =
@@ -3441,8 +3485,7 @@ let plan_mutation
 let asset_round_count facts =
   let rounds=Observation_ids.map(fun _->())facts.asset_cleanup in
   let rounds=Asset_consumers.fold(fun _ (entry:asset_registration) rounds->
-    match Worker.asset_consumer_round entry.consumer with
-    | None->rounds|Some round->Observation_ids.add round ()rounds)facts.asset_consumers rounds in
+    Observation_ids.add entry.registration.round ()rounds)facts.asset_consumers rounds in
   Observation_ids.cardinal rounds
 ;;
 
@@ -3451,52 +3494,47 @@ let plan_asset_command state session operation consumer assets =
   then Error(Worker.Invalid_input "Settle asset demand rounds before admitting another replacement") else
   let facts=match Asset_consumers.find_opt consumer state.facts.asset_consumers with
     | None->state.facts
-    | Some previous->queue_asset_cleanup state.facts previous.consumer () in
+    | Some previous->queue_asset_cleanup state.facts previous.registration () in
   Result.map(fun(ticket,transition)->
-    let bound=Worker.bind_asset_consumer consumer ~round:ticket.id in
-    let entry={consumer=bound;assets;creation=Awaiting_admission;active=true;notices=[]} in
+    let registration={consumer;round=ticket.id} in
+    let entry={registration;assets;creation=Awaiting_admission;active=true;notices=[]} in
     let next={transition.next with facts={transition.next.facts with
       asset_consumers=Asset_consumers.add consumer entry transition.next.facts.asset_consumers}} in
     progress_asset_cleanup(changed next(non_publications transition.instructions)) |> fun transition->ticket,transition)
-    (plan_intent_lifecycle {state with facts} session operation Unit(Direct session)None)
+    (plan_intent_lifecycle {state with facts} session operation Demand(Direct session)None)
 ;;
 
-let plan_asset_release state session consumer =
-  if not(Worker.equal_session session(Worker.asset_consumer_session consumer))
+let plan_asset_release state session demand =
+  let consumer=Worker.asset_demand_consumer demand in
+  let round=Worker.asset_demand_round demand in
+  if not(Worker.equal_session session(Worker.asset_demand_session demand))
   then Error Worker.Revoked_session
   else if Slots.cardinal state.facts.entries>=512
   then Error(Worker.Invalid_input "Release completed cleanup tickets before adding another waiter") else
-  let same_round bound=Worker.equal_asset_consumer consumer bound
-    && (Worker.asset_consumer_round consumer=None || Worker.asset_consumer_round consumer=Worker.asset_consumer_round bound) in
-  let bound=match Asset_consumers.find_opt consumer state.facts.asset_consumers with
-    |Some entry when same_round entry.consumer->Some entry.consumer
-    |_->Observation_ids.fold(fun _ cleanup found->match found with Some _->found|None->
-        match cleanup.resource with Demand_resource bound when same_round bound->Some bound|_->None)
-        state.facts.asset_cleanup None in
-  if bound=None && Worker.asset_consumer_round consumer<>None then Error Worker.Revoked_session else
-  let operation=Worker.Release_asset_demand(Option.value bound ~default:consumer) in
-  Result.map(fun((ticket:unit ticket),planned)->
-    let entries=match Slots.find_opt ticket.serial planned.next.facts.entries with
-      | Some(Entry slot)->(match same_ticket ticket slot.ticket with
-        | Some Worker.Refl->Slots.add ticket.serial(Entry{slot with dispatched=false;
-            result=(if bound=None then Some(Worker.Answered(Ok())) else None)})planned.next.facts.entries
-        | None->assert false)
-      | None->assert false in
-    let facts={planned.next.facts with entries} in
-    let facts=match bound with
-      | None->facts
-      | Some bound->
-        let asset_consumers=match Asset_consumers.find_opt consumer facts.asset_consumers with
-          | Some entry when Worker.asset_consumer_round entry.consumer=Worker.asset_consumer_round bound->
-            Asset_consumers.add consumer {entry with active=false;notices=[]}facts.asset_consumers
-          | None|Some _->facts.asset_consumers in
-        let asset_cleanup=Observation_ids.map(fun cleanup->
-          match cleanup.resource with Demand_resource actual when Worker.equal_asset_consumer actual bound
-            && Worker.asset_consumer_round actual=Worker.asset_consumer_round bound->{cleanup with error=None;wait_for_capacity=false}
-          |_->cleanup)facts.asset_cleanup in
-        queue_asset_cleanup {facts with asset_consumers;asset_cleanup} bound ~waiter:ticket.serial () in
-    ticket,progress_asset_cleanup(changed {planned.next with facts}[]))
-    (plan_intent_lifecycle state session operation Unit(Cleanup session)None)
+  let same_round (registration:asset_demand_registration)=Worker.equal_asset_consumer consumer registration.consumer
+    && Worker.equal_request_id round registration.round in
+  let registration=match Asset_consumers.find_opt consumer state.facts.asset_consumers with
+    |Some entry when same_round entry.registration->Some entry.registration
+    |_->Option.bind(Observation_ids.find_opt round state.facts.asset_cleanup)(fun cleanup->
+        match cleanup.resource with Demand_resource registration when same_round registration->Some registration|_->None) in
+  match registration with
+  |None->Error Worker.Revoked_session
+  |Some registration->
+    let operation=Worker.Release_asset_demand demand in
+    Result.map(fun((ticket:unit ticket),planned)->
+      let entries=match Slots.find_opt ticket.serial planned.next.facts.entries with
+        | Some(Entry slot)->(match same_ticket ticket slot.ticket with
+          | Some Worker.Refl->Slots.add ticket.serial(Entry{slot with dispatched=false})planned.next.facts.entries
+          | None->assert false)
+        | None->assert false in
+      let facts={planned.next.facts with entries} in
+      let asset_consumers=match Asset_consumers.find_opt consumer facts.asset_consumers with
+        | Some entry when same_round entry.registration->
+          Asset_consumers.add consumer {entry with active=false;notices=[]}facts.asset_consumers
+        | None|Some _->facts.asset_consumers in
+      let facts=queue_asset_cleanup {facts with asset_consumers} registration ~waiter:ticket.serial () in
+      ticket,progress_asset_cleanup(changed {planned.next with facts}[]))
+      (plan_intent_lifecycle state session operation Unit(Cleanup session)None)
 ;;
 
 let plan_file_release state session lease =
@@ -3874,15 +3912,16 @@ let request
                            (if ready then [ Send (ticket, session, operation) ] else [])
                        )))
             | Worker.Append intent ->
-              plan_mutation state session operation
+              plan_mutation state session operation Submission
                 (intent_key(Worker.Append_intent intent)) (Direct session)
             | Worker.Mutate intent ->
-              plan_mutation state session operation (intent_key(Worker.Mutation_intent intent)) (Direct session)
+              plan_mutation state session operation Submission (intent_key(Worker.Mutation_intent intent)) (Direct session)
             | Worker.Confirm (presentation, receipt) ->
               plan_mutation
                 state
                 session
                 operation
+                Confirmation
                 (intent_key (Worker.receipt_intent receipt))
                 (Presentation presentation)
             | _ ->
@@ -3893,22 +3932,29 @@ let request
           planned))
 ;;
 
+type mutation_reconciliation =
+  | Submission_ticket of Worker.submission_outcome ticket
+  | Confirmation_ticket of Worker.confirmation ticket
+
 let reconcile_mutation state ~presentation intent =
   let session = Worker.presentation_session presentation in
+  let submit operation = request state session operation
+    |>Result.map(fun(ticket,transition)->Submission_ticket ticket,transition) in
+  let confirm receipt = request state session (Worker.Confirm(presentation,receipt))
+    |>Result.map(fun(ticket,transition)->Confirmation_ticket ticket,transition) in
   match Option.bind state.facts.current Worker.selected with
   | Some current when current = presentation ->
-    let operation = match intent_progress (view state) intent with
-      | Some (Worker.Committed_pending_presentation receipt) -> Worker.Confirm (presentation, receipt)
-      | Some (Worker.Confirmed confirmation) ->
-        Worker.Confirm (presentation, Worker.confirmation_receipt confirmation)
-      | None | Some (Worker.Outcome_unknown | Worker.Rejected _) -> (match intent with Worker.Append_intent intent->Worker.Append intent|Mutation_intent intent->Worker.Mutate intent) in
-    request state session operation
+    (match intent_progress (view state) intent with
+      | Some (Worker.Committed_pending_presentation receipt) -> confirm receipt
+      | Some (Worker.Confirmed confirmation) -> confirm(Worker.confirmation_receipt confirmation)
+      | None | Some (Worker.Outcome_unknown | Worker.Rejected _) ->
+        match intent with Worker.Append_intent intent->submit(Worker.Append intent)|Mutation_intent intent->submit(Worker.Mutate intent))
   | _ -> Error Worker.Revoked_session
 ;;
 
 type mutation_settlement =
   | Acknowledgement of unit ticket
-  | Reconciliation of Worker.mutation_progress ticket
+  | Reconciliation of mutation_reconciliation
 
 let settle_applied_mutation state ~presentation ~applied_presentation intent =
   let current=applied_presentation=presentation && current_presentation (view state) presentation in
@@ -4056,12 +4102,12 @@ let prepare_host_change ?(legacy_pending=false) state change =
       cancel_entries (fun target -> affected_target target change) facts
     in
     let facts=Asset_consumers.fold(fun _ (entry:asset_registration) facts->
-      if affected(Worker.asset_consumer_session entry.consumer)change
-      then queue_asset_cleanup facts entry.consumer () else facts)facts.asset_consumers facts in
+      if affected(Worker.asset_consumer_session entry.registration.consumer)change
+      then queue_asset_cleanup facts entry.registration () else facts)facts.asset_consumers facts in
     let facts=Observation_ids.fold(fun _ lease facts->
       if affected(Worker.file_lease_session lease)change then queue_file_cleanup facts lease () else facts)facts.file_leases facts in
     let facts={facts with asset_consumers=Asset_consumers.map(fun (entry:asset_registration)->
-      if affected(Worker.asset_consumer_session entry.consumer)change then {entry with active=false;notices=[]}else entry)facts.asset_consumers} in
+      if affected(Worker.asset_consumer_session entry.registration.consumer)change then {entry with active=false;notices=[]}else entry)facts.asset_consumers} in
     Ok
       ( id
       , progress_host_handoff(progress_asset_cleanup(progress_observations

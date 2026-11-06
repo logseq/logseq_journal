@@ -3779,7 +3779,9 @@ let start
        capacity/error refusal keeps the presentation's queued cleanup intact. *)
     admitted<>None || not !retry in
   let release_coordinated_file lease=release_coordinated_resource ~returned:(Coordination.File_lease_returned lease)(Wc.file_lease_session lease)(Wc.Release_file lease) in
-  let release_coordinated_consumer consumer=release_coordinated_resource(Wc.asset_consumer_session consumer)(Wc.Release_asset_demand consumer) in
+  let release_coordinated_consumer (ticket,demand) = match demand with
+    |Some demand->release_coordinated_resource(Wc.asset_demand_session demand)(Wc.Release_asset_demand demand)
+    |None->Rrbvec.iter(fun host->Coordination_host.post host(Coordination.Cancel ticket))(all_coordination_hosts());true in
   let media_runtime_cell = graph_ref (fun () ->
     let graph= !graph_runtime_cell and changes= !media_changes_cell in
     Journal_media_runtime.create
@@ -3911,14 +3913,19 @@ let start
          match Coordination_host.request host session(Wc.Replace_asset_demand(consumer,priority,assets)) with
          |Error _->None
          |Ok ticket->
-           let bound=Wc.bind_asset_consumer consumer ~round:(Coordination.ticket_id ticket) in
+           let media_runtime= !media_runtime_cell and asset_runtime= !asset_runtime_cell in
            Coordination_host.watch host ticket ~f:(function
-             |Wc.Answered(Ok())|Answered(Error Revoked_session)|Interrupted Cancelled|Interrupted Worker_stopped->()
+             |Wc.Answered(Ok demand)->
+               let media=Journal_media_runtime.receive_demand media_runtime ticket demand
+               and assets=Journal_asset_runtime.receive_demand asset_runtime ticket demand in
+               if not(media || assets) then
+                 ignore(release_coordinated_consumer(ticket,Some demand):bool)
+             |Answered(Error Revoked_session)|Interrupted Cancelled|Interrupted Worker_stopped->()
              |_->if runtime_owner_is_live !state_ref owner then
                run_owned(Some owner)(fun()->Effect.of_thunk(fun()->
-                 Journal_media_runtime.demand_backpressured (!media_runtime_cell) name;
-                 Journal_asset_runtime.demand_backpressured (!asset_runtime_cell) name)));
-           Some bound)
+                 Journal_media_runtime.demand_backpressured ~ticket media_runtime name;
+                 Journal_asset_runtime.demand_backpressured ~ticket asset_runtime name)));
+           Some ticket)
     |_->None);
   asset_retry := (fun ~graph_generation asset ->
     match coordinated_asset_context() with
@@ -4203,6 +4210,20 @@ let start
   in
   let coordinated_read_finished = ref (fun (_:Graph_service.timeline_scope)
       (_:Wc.Uuid.t) (_:Coordination.change_application option) (_: (Wc.session * Wc.read_budget) option) (_:(Journal_graph_runtime.worker_read_result,string) result) -> ()) in
+  let watch_mutation_result host reconciliation ~f =
+    let map_reply map = function
+      |Wc.Answered result->Wc.Answered(Result.map map result)
+      |Not_admitted reason->Wc.Not_admitted reason
+      |Interrupted reason->Wc.Interrupted reason in
+    match reconciliation with
+    |Coordination.Submission_ticket ticket->
+      Coordination_host.watch host ticket ~f:(fun reply->f(map_reply(function
+        |Wc.Submission_rejected error->Wc.Rejected error
+        |Submission_unknown->Wc.Outcome_unknown
+        |Submission_committed receipt->Wc.Committed_pending_presentation receipt)reply))
+    |Confirmation_ticket ticket->
+      Coordination_host.watch host ticket ~f:(fun reply->f(map_reply(fun confirmation->Wc.Confirmed confirmation)reply))
+  in
   let send_coordinated_read request read =
     match current_owner(),ensure_coordination() with
     | Some owner,Ok host ->
@@ -4276,12 +4297,13 @@ let start
          (match Coordination_host.reconcile_mutation host ~presentation:read.presentation read.intent with
           | Ok ticket->
             observe_projection_query ~request_id:request read.query;
-            watch (Some(Wc.presentation_session read.presentation)) ticket (function
-              | Wc.Confirmed confirmation ->
-                (match Wc.confirmation_primary confirmation with
-                 | Confirmed_block value->Journal_graph_runtime.Query_result(read.query,value)
-                 | _->Read_failed{code=Logseq_db_worker.Error.Invalid_request;message="The canonical mutation target is unavailable."})
-              | _->Read_failed{code=Logseq_db_worker.Error.Invalid_request;message="The change is awaiting confirmation."});
+            let confirmed confirmation = match Wc.confirmation_primary confirmation with
+              | Wc.Confirmed_block value->Journal_graph_runtime.Query_result(read.query,value)
+              | _->Read_failed{code=Logseq_db_worker.Error.Invalid_request;message="The canonical mutation target is unavailable."} in
+            (match ticket with
+             |Coordination.Confirmation_ticket ticket->watch (Some(Wc.presentation_session read.presentation)) ticket confirmed
+             |Submission_ticket ticket->watch (Some(Wc.presentation_session read.presentation)) ticket (fun _->
+               Journal_graph_runtime.Read_failed{code=Logseq_db_worker.Error.Invalid_request;message="The change is awaiting confirmation."}));
             Journal_graph_transport.Accepted
           | Error _->Journal_graph_transport.Not_ready)
        | Acknowledge read ->
@@ -4303,7 +4325,7 @@ let start
          (match Journal_graph_runtime.worker_intent (!graph_runtime_cell) request session with
           | Ok intent when Journal_graph_runtime.bind_mutation (!graph_runtime_cell)request ~presentation ~intent ->
             let rec watch ticket =
-              Coordination_host.watch host ticket ~f:(fun reply->
+              watch_mutation_result host ticket ~f:(fun reply->
                 match reply with
                 | Wc.Answered(Ok(Wc.Committed_pending_presentation _))->
                   (match Coordination_host.reconcile_mutation host ~presentation intent with
@@ -4349,7 +4371,7 @@ let start
             Journal_graph_transport.Accepted
           | Ok(Coordination.Reconciliation ticket)->
             let bound=Journal_graph_runtime.rebind_child_ack (!graph_runtime_cell)request ~presentation in
-            let rec watch ticket=Coordination_host.watch host ticket ~f:(fun reply->
+            let rec watch ticket=watch_mutation_result host ticket ~f:(fun reply->
               match reply with
               | Wc.Answered(Ok(Wc.Committed_pending_presentation _)) when bound ->
                 (match Coordination_host.reconcile_mutation host ~presentation intent with
@@ -4449,7 +4471,7 @@ let start
             Journal_graph_runtime.finish_mutation_acknowledgement (!graph_runtime_cell)intent;
             (match Journal_graph_runtime.pending_mutation (!graph_runtime_cell)
                 ~mutation_id:(Logseq_db_types.Graph_types.Uuid.to_string(Wc.durable_intent_id intent)) with
-             | None->Coordination_host.watch host ticket ~f:(fun _->failed ())
+             | None->watch_mutation_result host ticket ~f:(fun _->failed ())
              | Some request->
                Effect.run(set_state(fun state->match state.pending_status with
                  | Some pending when pending.settled_intent=Some(intent,applied_presentation)->
@@ -4460,7 +4482,7 @@ let start
                    | _->state)));
                ignore(Journal_graph_runtime.bind_mutation (!graph_runtime_cell)request ~presentation ~intent);
                let finish result=Option.iter(fun owner-> !coordinated_mutation_finished owner request result)owner in
-               let rec watch ticket=Coordination_host.watch host ticket ~f:(function
+               let rec watch ticket=watch_mutation_result host ticket ~f:(function
                  | Wc.Answered(Ok(Wc.Committed_pending_presentation _))->
                    (match Coordination_host.reconcile_mutation host ~presentation intent with
                     | Ok ticket->watch ticket
@@ -5047,9 +5069,9 @@ let start
            let current()=match !coordination_host with
              |Some(_,actual) when actual==host->
                Coordination_host.validate_session ~owner actual (Wc.asset_notice_session notice)=Ok()
-               && (match Wc.asset_notice_consumer notice with
+               && (match Wc.asset_notice_demand notice with
                  |None->true
-                 |Some consumer->List.mem notice (Coordination.asset_notices (Coordination_host.view actual) consumer))
+                 |Some demand->List.mem notice (Coordination.asset_notices (Coordination_host.view actual) demand))
              |_->false in
            let apply()=if not(current()) then false else (
              Journal_media_runtime.notice (!media_runtime_cell) notice;

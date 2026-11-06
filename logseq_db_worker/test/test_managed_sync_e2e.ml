@@ -477,7 +477,7 @@ let run_mutation ?(on_applied=fun()->()) context ~after_server_t phase ~mutation
   let session=current_session context in
   let intent=W.mutation_intent session ~mutation_id command|>Result.get_ok in
   (match execute context session(W.Mutate intent)with
-   |W.Committed_pending_presentation receipt->
+   |W.Submission_committed receipt->
      let _,before,after=W.receipt_revisions receipt in
      if before=after then fail_worker context phase "mutation-not-applied";
      report_phase(phase^"-local-commit");on_applied()

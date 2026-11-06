@@ -154,7 +154,7 @@ let confirmed_summary issuer session presentation receipt request_id
     let response=S.Coordination_confirmed{registration=request.registration;owner=request.owner;
       presentation=request.presentation;request_id=request.request_id;answer}in
     (match I.reply session ~request_id operation response with
-     |Ok(W.Answered(Ok(W.Confirmed proof)))->proof
+     |Ok(W.Answered(Ok proof))->proof
      |_->failwith "Production confirmation was rejected")
   |_->failwith "Confirmation did not use the typed boundary"
 ;;
@@ -203,18 +203,23 @@ let favorites
 (* Private resource capabilities for the existing business reducers are issued
    through the actual Service request/reply boundary, never record construction. *)
 module Resources = struct
+  module C = Journal_worker_coordination.Worker_pure_coordinator
   type t =
     { issuer : (module Worker_effect_authority.ISSUER)
     ; session : W.session
     ; scope : S.asset_scope
     ; mutable next : int
+    ; mutable core : C.t
     ; demands : (string, W.asset_consumer * string * Logseq_db_types.Asset_descriptor.t list) Hashtbl.t
     }
 
   let create ?graph ?graph_generation epoch =
-    let issuer,raw,_,session=fixture ?graph ?graph_generation epoch in
+    let issuer,raw,projection,session=fixture ?graph ?graph_generation epoch in
+    let module I=(val issuer:Worker_effect_authority.ISSUER) in
+    let core=(C.step(C.initial ~client_id:(W.graph_id session))(C.Worker_bound I.binding)).next in
+    let core=(C.step core(C.Bootstrap_received(I.binding,W.Ready projection))).next in
     let scope=fst(List.hd raw.baseline.state.residents) in
-    {issuer;session;scope;next=1;demands=Hashtbl.create 8}
+    {issuer;session;scope;core;next=1;demands=Hashtbl.create 8}
 
   let id t =
     let id=uuid(Printf.sprintf "97000000-0000-4000-8000-%012d" t.next) in
@@ -228,9 +233,62 @@ module Resources = struct
     match I.request t.session ~request_id:(W.request_id request_id)
       (W.Replace_asset_demand(consumer,priority,assets)) with
     |Ok(S.Coordination_asset_demand{consumer=wire;_})->
-      let consumer=W.bind_asset_consumer consumer ~round:(W.request_id request_id) in
-      Hashtbl.replace t.demands name(consumer,wire,assets);Some consumer
+      let demand=match I.reply t.session ~request_id:(W.request_id request_id)
+          (W.Replace_asset_demand(consumer,priority,assets))
+          (S.Coordination_asset_demand_accepted{request_id}) with
+        |Ok(W.Answered(Ok demand))->demand
+        |_->failwith "resource fixture rejected its matching demand acknowledgement" in
+      Hashtbl.replace t.demands name(consumer,wire,assets);Some demand
     |_->failwith "resource fixture rejected its original typed demand"
+
+  let rec settle_cleanup t (transition:C.transition) =
+    t.core<-transition.next;
+    List.iter(function
+      |C.Release_asset_demand_registration(ticket,registration)->
+        settle_registration t ticket registration false
+      |C.Finalize_asset_demand(ticket,registration)->
+        settle_registration t ticket registration true
+      |_->())transition.instructions
+  and settle_registration t ticket (registration:C.asset_demand_registration) finalize =
+    let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
+    let session=W.asset_consumer_session registration.consumer in
+    let request_id=C.ticket_id ticket in
+    let make,check=if finalize then I.finalize_asset_demand,I.asset_demand_finalized
+      else I.release_asset_demand_registration,I.asset_demand_registration_released in
+    let response=match make session ~request_id ~consumer:registration.consumer ~round:registration.round |> Result.get_ok with
+      |S.Coordination_release_asset_demand value->S.Coordination_asset_demand_released{
+        registration=value.registration;owner=value.owner;request_id=value.request_id;consumer=value.consumer}
+      |S.Coordination_finalize_asset_demand value->S.Coordination_asset_demand_finalized{
+        registration=value.registration;owner=value.owner;request_id=value.request_id;consumer=value.consumer}
+      |_->failwith "fixture cleanup did not use the planned registration" in
+    let result=check session ~request_id ~consumer:registration.consumer ~round:registration.round response in
+    let mailbox=Id.Worker.Request_id.of_int64(Int64.of_int t.next) in
+    t.next<-t.next+1;
+    settle_cleanup t (C.step t.core(C.Admitted(ticket,mailbox)));
+    settle_cleanup t (C.step t.core(C.Completed(ticket,W.Answered result)))
+
+  let demand_ticket t ~graph_generation ~name priority assets =
+    if graph_generation<>t.scope.graph_generation then None else
+    let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
+    let consumer=W.asset_consumer t.session ~name |> Result.get_ok in
+    let operation=W.Replace_asset_demand(consumer,priority,assets) in
+    let ticket,transition=C.request t.core t.session operation |> Result.get_ok in
+    settle_cleanup t transition;
+    let request_id=C.ticket_id ticket in
+    let wire,wire_request_id=match I.request t.session ~request_id operation |> Result.get_ok with
+      |S.Coordination_asset_demand value->value.consumer,value.request_id
+      |_->failwith "resource fixture did not plan an asset replacement" in
+    let reply=I.reply t.session ~request_id operation
+      (S.Coordination_asset_demand_accepted{request_id=wire_request_id}) |> Result.get_ok in
+    t.core<-(C.step t.core(C.Admitted(ticket,Id.Worker.Request_id.of_int64(Int64.of_int t.next)))).next;
+    t.next<-t.next+1;
+    settle_cleanup t (C.step t.core(C.Completed(ticket,reply)));
+    Hashtbl.replace t.demands name(consumer,wire,assets);
+    Some ticket
+
+  let cancel_demand t ticket =
+    settle_cleanup t (C.step t.core(C.Cancel ticket));
+    settle_cleanup t (C.step t.core(C.Forget ticket))
 
   let notice t notice =
     let wire name=let _,wire,_=Hashtbl.find t.demands name in wire in

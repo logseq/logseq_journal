@@ -13,7 +13,8 @@ type flight =
       -> flight
   | Unobserve of (module Worker_effect_authority.ISSUER) * Worker.session * Worker.request_id
   | Finalize_observation of (module Worker_effect_authority.ISSUER) * Worker.session * Worker.request_id
-  | Finalize_demand of (module Worker_effect_authority.ISSUER) * unit Core.ticket * Worker.session * Worker.asset_consumer
+  | Release_demand of (module Worker_effect_authority.ISSUER) * unit Core.ticket * Core.asset_demand_registration
+  | Finalize_demand of (module Worker_effect_authority.ISSUER) * unit Core.ticket * Core.asset_demand_registration
   | Unregister of (module Worker_effect_authority.ISSUER)
   | Handoff of (module Worker_effect_authority.ISSUER) * Worker.handoff_plan
   | Consume of (module Worker_effect_authority.ISSUER) * Worker.handoff_receipt * Worker.request_id
@@ -110,11 +111,22 @@ let submit t = function
      |Ok request->match admit t request(Finalize_observation(t.issuer,session,id)) with
        |Accepted _->()
        |result->t.post(Core.Observation_finalize_not_admitted(session,id,refused result)))
-  | Finalize_asset_demand(ticket,session,consumer)->
+  | Release_asset_demand_registration(ticket,registration)->
     let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
-    (match I.finalize_asset_demand session ~request_id:(Core.ticket_id ticket) consumer with
+    let session=Worker.asset_consumer_session registration.consumer in
+    (match I.release_asset_demand_registration session ~request_id:(Core.ticket_id ticket)
+       ~consumer:registration.consumer ~round:registration.round with
      |Error error->t.post(Core.Admission_failed(ticket,error))
-     |Ok request->match admit t request(Finalize_demand(t.issuer,ticket,session,consumer)) with
+     |Ok request->match admit t request(Release_demand(t.issuer,ticket,registration)) with
+       |Accepted id->t.post(Core.Admitted(ticket,id))
+       |result->t.post(Core.Admission_refused(ticket,refused result)))
+  | Finalize_asset_demand(ticket,registration)->
+    let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
+    let session=Worker.asset_consumer_session registration.consumer in
+    (match I.finalize_asset_demand session ~request_id:(Core.ticket_id ticket)
+       ~consumer:registration.consumer ~round:registration.round with
+     |Error error->t.post(Core.Admission_failed(ticket,error))
+     |Ok request->match admit t request(Finalize_demand(t.issuer,ticket,registration)) with
        |Accepted id->t.post(Core.Admitted(ticket,id))
        |result->t.post(Core.Admission_refused(ticket,refused result)))
   | Release_binding binding ->
@@ -303,10 +315,21 @@ let on_event t event =
               let result=match outcome with Completed response->I.observation_registration_finalized session ~observation_id:id response
                 |_->Error(Worker.Service_failed "Observation finalization was not acknowledged") in
               t.post(Core.Observation_finalize_completed(session,id,result))
-            |Finalize_demand(issuer,ticket,session,consumer)->
+            |Release_demand(issuer,ticket,registration)->
               let module I=(val issuer:Worker_effect_authority.ISSUER) in
+              let session=Worker.asset_consumer_session registration.consumer in
               let result=match outcome with
-                |Completed response->Worker.Answered(I.asset_demand_finalized session ~request_id:(Core.ticket_id ticket) consumer response)
+                |Completed response->Worker.Answered(I.asset_demand_registration_released session
+                    ~request_id:(Core.ticket_id ticket) ~consumer:registration.consumer ~round:registration.round response)
+                |Failed message->Worker.Answered(Error(Worker.Service_failed message))
+                |Cancelled->Worker.Interrupted Worker.Cancelled|Shutdown->Worker.Interrupted Worker.Worker_stopped in
+              t.post(Core.Completed(ticket,result))
+            |Finalize_demand(issuer,ticket,registration)->
+              let module I=(val issuer:Worker_effect_authority.ISSUER) in
+              let session=Worker.asset_consumer_session registration.consumer in
+              let result=match outcome with
+                |Completed response->Worker.Answered(I.asset_demand_finalized session
+                    ~request_id:(Core.ticket_id ticket) ~consumer:registration.consumer ~round:registration.round response)
                 |Failed message->Worker.Answered(Error(Worker.Service_failed message))
                 |Cancelled->Worker.Interrupted Worker.Cancelled|Shutdown->Worker.Interrupted Worker.Worker_stopped in
               t.post(Core.Completed(ticket,result))
@@ -404,14 +427,6 @@ let on_event t event =
     in
     t.post Core.Capacity_available;
     { disposition; error = !error })
-;;
-
-let authorize_host_change t receipt ~attempt =
-  let module I=(val t.issuer:Worker_effect_authority.ISSUER) in
-  Result.bind(I.consume_handoff_request receipt)(fun request->
-    match admit t request(Consume(t.issuer,receipt,attempt))with
-    |Accepted id->Ok id
-    |_->Error(Worker.Service_failed "Host action was not admitted; no consumption ACK"))
 ;;
 
 type shutdown_state =

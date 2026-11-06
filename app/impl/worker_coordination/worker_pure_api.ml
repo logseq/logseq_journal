@@ -95,6 +95,11 @@ type confirmation =
   ; additional : confirmed_target Rrbvec.t
   }
 
+type submission_outcome =
+  | Submission_rejected of error
+  | Submission_unknown
+  | Submission_committed of receipt
+
 type mutation_progress =
   | Rejected of error
   | Outcome_unknown
@@ -157,10 +162,11 @@ type observation_notice =
 type asset_consumer =
   { session : session
   ; name : string
-  ; round : request_id option
   }
 
-type asset_file = { asset_owner:session; asset_consumer:asset_consumer; asset:Uuid.t; descriptor:Logseq_db_types.Asset_descriptor.t; source_handle:string }
+type asset_demand = { consumer : asset_consumer; round : request_id }
+
+type asset_file = { asset_owner:session; asset_demand:asset_demand; asset:Uuid.t; descriptor:Logseq_db_types.Asset_descriptor.t; source_handle:string }
 type file_lease = {lease_owner:session;lease_id:request_id;lease_handle:string;lease_path:string;lease_type:string}
 type upload_operation = { upload_owner:session; operation:Uuid.t }
 type import_source_proof={source_operation:Uuid.t;source_fingerprint:string}
@@ -181,16 +187,16 @@ type asset_priority =
   | Foreground
   | Background
 
-type asset_notice = { notice_owner:session; notice_consumer:asset_consumer option; notice_data:Service.asset_notice }
+type asset_notice = { notice_owner:session; notice_demand:asset_demand option; notice_data:Service.asset_notice }
 
 type _ request =
   | Query : read_budget * 'a query -> 'a request
   | Observe : read_budget * 'a query -> 'a observed request
   | Refresh : 'a observation -> 'a observed request
   | Release : 'a observation -> unit request
-  | Append : append_intent -> mutation_progress request
-  | Mutate : mutation_intent -> mutation_progress request
-  | Confirm : presentation * receipt -> mutation_progress request
+  | Append : append_intent -> submission_outcome request
+  | Mutate : mutation_intent -> submission_outcome request
+  | Confirm : presentation * receipt -> confirmation request
   | Recover_mutations :
       { after : mutation_recovery_cursor option; maximum_items : int; maximum_bytes : int }
       -> mutation_recovery request
@@ -203,8 +209,8 @@ type _ request =
 
   | Replace_asset_demand :
       asset_consumer * asset_priority * Logseq_db_types.Asset_descriptor.t list
-      -> unit request
-  | Release_asset_demand : asset_consumer -> unit request
+      -> asset_demand request
+  | Release_asset_demand : asset_demand -> unit request
   | Retry_asset : Uuid.t -> unit request
   | Retry_upload : upload_operation -> unit request
   | Acquire_asset_file : asset_file -> file_lease option request
@@ -392,15 +398,23 @@ let validate_recovery session ~after ~maximum_items ~maximum_bytes =
   | Some _->Ok()
 ;;
 
-let decode_mutation_progress session ~intent outcome =
+let decode_submission_outcome session ~intent outcome =
   Result.bind(validate_intent session intent)(fun()->match outcome with
-    |Mutation.Unknown->Ok Outcome_unknown
+    |Mutation.Unknown->Ok Submission_unknown
     |Mutation.Committed proof->decode_mutation_receipt session ~intent proof
-      |>Result.map(fun receipt->Committed_pending_presentation receipt)
+      |>Result.map(fun receipt->Submission_committed receipt)
     |Mutation.Rejected error->
       if String.length(Yojson.Safe.to_string(Logseq_db_worker.Error.to_yojson error))
         >(For_worker.session_limits session).response_budget_bytes
-      then Error Response_budget_exceeded else Ok(Rejected(Db_error error)))
+      then Error Response_budget_exceeded else Ok(Submission_rejected(Db_error error)))
+;;
+
+let decode_mutation_progress session ~intent outcome =
+  decode_submission_outcome session ~intent outcome
+  |> Result.map (function
+    | Submission_rejected error -> Rejected error
+    | Submission_unknown -> Outcome_unknown
+    | Submission_committed receipt -> Committed_pending_presentation receipt)
 ;;
 
 module Mutation_ids=Set.Make(Uuid)
@@ -445,7 +459,7 @@ let same_observation : type a b. a observation -> b observation -> (a, b) equali
 let asset_consumer session ~name =
   if name = "" || String.length name > 128
   then Error (Invalid_input "Invalid asset consumer name")
-  else Ok { session; name;round=None }
+  else Ok { session; name }
 ;;
 
 let asset_consumer_session (c : asset_consumer) = c.session
@@ -462,11 +476,13 @@ let asset_consumer_prefix (session:session) =
     (For_worker.binding_serial (For_worker.session_binding session)) (For_worker.session_account session) (For_worker.session_lifecycle session) (Uuid.to_string (graph_id session)) (For_worker.session_generation session)
 let asset_consumer_key (consumer:asset_consumer)=asset_consumer_prefix consumer.session^consumer.name
 let compare_asset_consumer a b=String.compare(asset_consumer_key a)(asset_consumer_key b)
-let bind_asset_consumer consumer ~round={consumer with round=Some round}
-let asset_consumer_round consumer=consumer.round
-let asset_consumer_wire (consumer:asset_consumer)=match consumer.round with
-  | Some round->Ok(asset_consumer_prefix consumer.session^Uuid.to_string round^":"^consumer.name)
-  | None->Error(Invalid_input "Asset demand must use its pure registered round")
+let asset_demand_consumer (demand:asset_demand)=demand.consumer
+let asset_demand_session (demand:asset_demand)=demand.consumer.session
+let asset_demand_round (demand:asset_demand)=demand.round
+let equal_asset_demand (a:asset_demand) (b:asset_demand)=
+  equal_asset_consumer a.consumer b.consumer && equal_request_id a.round b.round
+let asset_consumer_wire (consumer:asset_consumer) ~round =
+  asset_consumer_prefix consumer.session^Uuid.to_string round^":"^consumer.name
 let decode_asset_consumer session wire =
   let prefix=asset_consumer_prefix session in
   if not(String.starts_with ~prefix wire) then Error Revoked_session else
@@ -474,10 +490,11 @@ let decode_asset_consumer session wire =
     if String.length suffix<38 || suffix.[36]<>':' then Error(Protocol_mismatch "Asset demand round is absent") else
       match Uuid.of_string(String.sub suffix 0 36) with
       | Error _->Error(Protocol_mismatch "Asset demand round is invalid")
-      | Ok round->Result.map(fun consumer->bind_asset_consumer consumer ~round)
+      | Ok round->Result.map(fun consumer->{consumer;round})
           (asset_consumer session ~name:(String.sub suffix 37(String.length suffix-37)))
 
-let asset_file_consumer (file:asset_file)=file.asset_consumer
+let asset_file_consumer (file:asset_file)=file.asset_demand.consumer
+let asset_file_demand (file:asset_file)=file.asset_demand
 let asset_file_asset (file:asset_file)=file.asset
 
 let file_lease_session lease=lease.lease_owner
@@ -510,11 +527,12 @@ let asset_notice_scope (x:asset_notice)=(For_worker.session_asset_scope x.notice
 
 let asset_notice_data (x:asset_notice)=x.notice_data
 
-let asset_notice_consumer (x:asset_notice)=x.notice_consumer
+let asset_notice_demand (x:asset_notice)=x.notice_demand
+let asset_notice_consumer (x:asset_notice)=Option.map asset_demand_consumer x.notice_demand
 
-let ready_asset_file (x:asset_notice)=match x.notice_consumer,x.notice_data with
-  | Some consumer,Service.Asset_availability{asset;descriptor;availability=Ready handle;_}->
-    Some{asset_owner=x.notice_owner;asset_consumer=consumer;asset;descriptor;source_handle=handle}
+let ready_asset_file (x:asset_notice)=match x.notice_demand,x.notice_data with
+  | Some demand,Service.Asset_availability{asset;descriptor;availability=Ready handle;_}->
+    Some{asset_owner=x.notice_owner;asset_demand=demand;asset;descriptor;source_handle=handle}
   | _->None
 ;;
 
@@ -717,10 +735,10 @@ let rec validate_request : type a. session -> a request -> (unit, error) result 
       let bytes=List.fold_left(fun bytes asset->if bytes>limit then bytes else
         bytes+1+String.length(Yojson.Safe.to_string(Logseq_db_types.Asset_descriptor.to_yojson asset)))2 assets in
       if bytes>limit then Error(Invalid_input "Asset demand exceeds the encoded payload bound") else Ok()
-  | Release_asset_demand consumer->if equal_session session consumer.session then Ok() else Error Revoked_session
+  | Release_asset_demand demand->if equal_session session (asset_demand_session demand) then Ok() else Error Revoked_session
   | Retry_asset _->Ok()
   | Acquire_asset_file file->
-    if not(equal_session session file.asset_owner) || not(equal_session session file.asset_consumer.session)
+    if not(equal_session session file.asset_owner) || not(equal_session session (asset_demand_session file.asset_demand))
     then Error Revoked_session
     else if file.source_handle="" then Error(Protocol_mismatch "Ready asset omitted its file capability") else Ok()
   | Retry_upload operation->if equal_session session operation.upload_owner then Ok() else Error Revoked_session

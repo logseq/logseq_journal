@@ -235,10 +235,10 @@ let retry_upload session notice = Option.map(fun operation ->
   request(session,W.Retry_upload operation)) (W.upload_operation notice)
 let notice view consumer = C.asset_notices view consumer
 let facts view session first second =
-  let for_consumer consumer = List.filter(fun notice ->
-    match W.asset_notice_consumer notice with
-    | Some owner -> W.equal_asset_consumer owner consumer
-    | None -> false) (C.asset_notices view consumer) in
+  let for_consumer demand = List.filter(fun notice ->
+    match W.asset_notice_demand notice with
+    | Some owner -> W.equal_asset_demand owner demand
+    | None -> false) (C.asset_notices view demand) in
   let session_facts = List.filter(fun notice -> W.asset_notice_consumer notice=None)
       (C.session_asset_notices view session) in
   for_consumer first,for_consumer second,
@@ -255,7 +255,7 @@ let host_can_proceed view id =
 let authorize state receipt =
   W.handoff_receipt_id receipt,W.handoff_binding receipt,W.handoff_sessions receipt,
   C.authorize_host_change state receipt
-let send_consume runner receipt attempt = R.authorize_host_change runner receipt ~attempt
+let send_planned runner (transition:C.transition) = List.iter (R.submit runner) transition.instructions
 let stop runner =
   match R.shutdown runner with
   | R.Draining -> `Pump_again
@@ -330,6 +330,51 @@ NEGATIVE.update({
     "handoff_id_is_not_request_id": (
       "let wrong view (id:W.request_id) = C.handoff view id",
       ("W.request_id", "Worker_effect_authority.handoff_id")),
+})
+
+POSITIVE.update({
+    "operation_specific_mutation_outcomes": """
+let submitted (reply:W.submission_outcome W.reply) = match reply with
+ |W.Answered(Ok(W.Submission_committed receipt))->Some receipt
+ |W.Answered(Ok(W.Submission_rejected _ | W.Submission_unknown))
+ |W.Answered(Error _) |W.Interrupted _ |W.Not_admitted _ -> None
+let confirmed (reply:W.confirmation W.reply) = match reply with
+ |W.Answered(Ok proof)->Some(W.confirmation_receipt proof)
+ |W.Answered(Error _) |W.Interrupted _ |W.Not_admitted _ ->None
+let reconcile = function
+ |C.Submission_ticket ticket -> ignore (ticket:W.submission_outcome C.ticket)
+ |C.Confirmation_ticket ticket -> ignore (ticket:W.confirmation C.ticket)
+""",
+    "checked_asset_rounds_and_private_instruction_matches": """
+let release (demand:W.asset_demand) = W.Release_asset_demand demand
+let identities demand = W.asset_demand_consumer demand,W.asset_demand_session demand,W.asset_demand_round demand
+let inspect = function
+ |C.Send(_,_,request)->ignore request
+ |C.Release_asset_demand_registration(_,registration)
+ |C.Finalize_asset_demand(_,registration)->ignore(registration.consumer,registration.round)
+ |_->()
+let transition (value:C.transition)=value.next,value.instructions
+"""
+})
+NEGATIVE.update({
+    "instruction_cannot_be_constructed": (
+        "let wrong : C.instruction = C.Bootstrap", ("private",)),
+    "instruction_cannot_retarget_ticket": (
+        "let wrong ticket session operation = C.Send(ticket,session,operation)", ("private",)),
+    "transition_cannot_be_constructed": (
+        "let wrong state : C.transition = {next=state;instructions=[]}", ("private",)),
+    "logical_consumer_cannot_release_a_round": (
+        "let wrong (consumer:W.asset_consumer) = W.Release_asset_demand consumer",
+        ("W.asset_consumer", "W.asset_demand")),
+    "demand_cannot_be_constructed": (
+        "let wrong : W.asset_demand = ()", ("W.asset_demand",)),
+    "submission_cannot_report_presentation_confirmation": (
+        "let wrong confirmation : W.submission_outcome = W.Confirmed confirmation", ("W.submission_outcome",)),
+    "append_cannot_return_lifecycle_progress": (
+        "let wrong intent : W.mutation_progress W.request = W.Append intent", ("W.mutation_progress", "submission_outcome")),
+    "confirm_cannot_return_lifecycle_progress": (
+        "let wrong presentation receipt : W.mutation_progress W.request = W.Confirm(presentation,receipt)",
+        ("W.mutation_progress", "confirmation")),
 })
 
 def main():

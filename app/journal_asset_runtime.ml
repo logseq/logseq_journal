@@ -2,6 +2,9 @@ module Policy = Journal_asset_policy
 module Graph = Logseq_db_types.Graph_types
 module Service = Logseq_db_worker_lui.Logseq_db_worker_lui_service
 module Worker = Journal_worker_coordination.Worker_api
+module Coordination = Journal_worker_coordination.Worker_pure_coordinator
+
+type demand_registration = Worker.asset_demand Coordination.ticket * Worker.asset_demand option
 
 type scan_cursor =
   | Journals_cursor of Worker_pure_data.journal_item Worker.continuation
@@ -58,13 +61,13 @@ type dependency =
 
 type t =
   { read_port : read_request -> bool
-  ; release_consumer : Worker.asset_consumer -> bool
-  ; bound_consumers : (string,Worker.asset_consumer)Hashtbl.t
+  ; release_consumer : demand_registration -> bool
+  ; bound_consumers : (string,demand_registration)Hashtbl.t
   ; mutable resource_binding : Worker.binding option
   ; mutable resume_configuration : (int*int*Policy.settings)option
   ; read_planned : Graph.Uuid.t -> unit
   ; read_retired : Graph.Uuid.t -> unit
-  ; demand : graph_generation:int -> name:string -> Worker.asset_priority -> Logseq_db_types.Asset_descriptor.t list -> Worker.asset_consumer option
+  ; demand : graph_generation:int -> name:string -> Worker.asset_priority -> Logseq_db_types.Asset_descriptor.t list -> Worker.asset_demand Coordination.ticket option
   ; changed : int option -> Policy.offline -> Policy.offline -> unit
   ; mutable published : (int option * Policy.offline * Policy.offline) option
   ; mutable policy : scan_cursor Policy.t
@@ -155,7 +158,32 @@ let projection_read_error t =
   if t.configuration<>None && t.degraded
   then Some "Offline attachment dependencies could not be read" else None
 
+(* A ticket is pending authority only. Checked ACKs/notices establish the exact
+   demand round; late results cannot replace a newer consumer registration. *)
+let retain_demand t consumer demand =
+  match Hashtbl.find_opt t.bound_consumers consumer with
+  | Some(ticket,previous) when Worker.equal_request_id (Coordination.ticket_id ticket)(Worker.asset_demand_round demand) ->
+    (match previous with
+     | Some previous -> Worker.equal_asset_demand previous demand
+     | None -> Hashtbl.replace t.bound_consumers consumer (ticket,Some demand);true)
+  | _ -> false
+
+let receive_demand t ticket demand =
+  if not(Worker.equal_request_id (Coordination.ticket_id ticket)(Worker.asset_demand_round demand)) then false else
+  let consumer=Hashtbl.to_seq t.bound_consumers |> Seq.find_map(fun(consumer,(pending,_))->
+    if Worker.equal_request_id (Coordination.ticket_id pending)(Coordination.ticket_id ticket)
+    then Some consumer else None) in
+  Option.fold ~none:false ~some:(fun consumer->retain_demand t consumer demand)consumer
+
+let current_demand_notice t notice =
+  match Worker.asset_notice_demand notice,Worker.asset_notice_data notice with
+  | Some demand,(Service.Asset_availability{consumer;_}|Asset_demand_accepted consumer|Asset_backpressure consumer) ->
+    retain_demand t consumer demand
+  | None,(Service.Upload_status _|Asset_capacity_available) -> true
+  | _ -> false
+
 let notice_reads t notice =
+  if not(current_demand_notice t notice) then [] else
   let scope=Worker.asset_notice_scope notice and notice=Worker.asset_notice_data notice in
   if t.generation <> Some scope.graph_generation then [] else
   let event=match notice with
@@ -263,7 +291,7 @@ let execute t = function
   | Demand {consumer;priority;assets}->
     (match t.generation with None->true|Some graph_generation->
       match t.demand ~graph_generation ~name:consumer priority assets with
-      |None->false|Some bound->Hashtbl.replace t.bound_consumers consumer bound;true)
+      |None->false|Some bound->Hashtbl.replace t.bound_consumers consumer (bound,None);true)
   | Release consumer->
     (match Hashtbl.find_opt t.bound_consumers consumer with
      |None->true|Some bound->
@@ -775,7 +803,7 @@ let observe_query_result
     | Worker.Favorites _ ->
       observe_favorites t ~first_page ~favorites_page:value.favorites_page value.items
     | Assets _ -> remember_assets t value.items
-    | Asset_descriptors _ -> remember_assets t value.items
+    | Asset_descriptors _ -> List.iter (Option.iter (fun asset -> remember_assets t [asset])) value.items
     | Children _ -> List.iter (fun value ->
         let value=Worker.block_data value in
         remember_block_value t ~issuance value.block.uuid (Some value.block)) value.items
@@ -997,9 +1025,15 @@ let reject t ~request_id =
     dispatch t (Read_failed ticket)
 ;;
 
-let demand_backpressured t consumer=dispatch t(Policy.Backpressure consumer)
+let demand_backpressured ?ticket t consumer =
+  let current=match ticket,Hashtbl.find_opt t.bound_consumers consumer with
+    |None,_->true
+    |Some ticket,Some(pending,_)->Worker.equal_request_id (Coordination.ticket_id pending)(Coordination.ticket_id ticket)
+    |Some _,None->false in
+  if current then dispatch t(Policy.Backpressure consumer)
 
 let notice t notice =
+  if current_demand_notice t notice then
   let scope=Worker.asset_notice_scope notice and notice=Worker.asset_notice_data notice in
   if t.generation = Some scope.graph_generation
   then (

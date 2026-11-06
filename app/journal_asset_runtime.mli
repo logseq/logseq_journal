@@ -1,4 +1,7 @@
 module Worker = Journal_worker_coordination.Worker_api
+module Coordination = Journal_worker_coordination.Worker_pure_coordinator
+
+type demand_registration = Worker.asset_demand Coordination.ticket * Worker.asset_demand option
 
 type read_result
 
@@ -14,11 +17,11 @@ type read_request = private
 type t
 
 val create
-  :  release_consumer:(Worker.asset_consumer -> bool)
+  :  release_consumer:(demand_registration -> bool)
   -> ?read_planned:(Logseq_db_types.Graph_types.Uuid.t -> unit)
   -> ?read_retired:(Logseq_db_types.Graph_types.Uuid.t -> unit)
   -> read:(read_request -> bool)
-  -> demand:(graph_generation:int -> name:string -> Worker.asset_priority -> Logseq_db_types.Asset_descriptor.t list -> Worker.asset_consumer option)
+  -> demand:(graph_generation:int -> name:string -> Worker.asset_priority -> Logseq_db_types.Asset_descriptor.t list -> Worker.asset_demand Coordination.ticket option)
   -> changed:
        (int option
         -> Journal_asset_policy.offline
@@ -76,8 +79,11 @@ val idle : t -> bool
 val retire_coordinated_resources : t -> unit
 val bind_coordinated_resources : t -> Worker.binding -> unit
 
-val demand_backpressured : t -> string -> unit
+val demand_backpressured : ?ticket:Worker.asset_demand Coordination.ticket -> t -> string -> unit
 
 (** The original accepted query and value retain fact issuance and ownership. *)
 val observe_query : t -> request_id:Worker.Uuid.t -> 'a Worker.query -> unit
 val observe_query_result : t -> request_id:Worker.Uuid.t -> 'a Worker.query -> 'a -> unit
+
+(** Retain a checked acknowledgement only for the still-owned replacement ticket. *)
+val receive_demand : t -> Worker.asset_demand Coordination.ticket -> Worker.asset_demand -> bool

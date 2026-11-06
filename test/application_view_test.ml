@@ -7593,7 +7593,7 @@ let test_graph_picker_controls scenario () =
                 while not (Atomic.get release_graph_read) do Eio.Fiber.yield () done;
                 (Ok(F.favorites ~favorites_page:(None) ~generation:("g") ~projection_revision:("p") ~items:([]) ~next:(next (None)))))
             | Read.Favorites _ when scenario = `Late_graph_cancel -> (Ok(F.favorites ~favorites_page:(None) ~generation:("g") ~projection_revision:("p") ~items:([]) ~next:(next (None))))
-            | Read.Asset_descriptors _ -> Ok(F.asset_listing ~generation:"g" ~projection_revision:"p" ~items:[] ~next:None)
+            | Read.Asset_descriptors ids -> Ok(F.asset_lookup_result ~generation:"g" ~projection_revision:"p" ~items:(List.map (fun _ -> None) ids))
             | Read.Assets _ -> Ok(F.asset_listing ~generation:"g" ~projection_revision:"p" ~items:[] ~next:None)
             | _ -> (Error((fun code message->Read.Service_failed(code^": "^message)) ("UnusedFixtureRead") ("Unused graph-picker fixture read")))
           in Ok(Service.Coordination_queried{registration=source.registration;owner=source.owner;
