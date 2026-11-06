@@ -51,7 +51,7 @@ val import_source_proof : view -> Worker.asset_import_intent -> Worker.import_so
 val completed_import_source_proofs : view -> Worker.import_source_proof Rrbvec.t
 val import_source_proof_consumed : Worker.import_source_proof -> view Rrbvec.t -> bool
 val handoff : view -> Worker.handoff_id -> Worker.handoff_state option
-val asset_notices : view -> Worker.asset_consumer -> Worker.asset_notice list
+val asset_notices : view -> Worker.asset_demand -> Worker.asset_notice list
 val session_asset_notices : view -> Worker.session -> Worker.asset_notice list
 
 (** Exact consumer facts and session-level capacity/upload facts are separate;
@@ -178,15 +178,26 @@ type event =
   | Handoff_confirmed of Worker.handoff_id * Worker.request_id * Journal_worker_ids.Worker.request_id option * (bool,Worker.error)result
   | Drain
 
-(** Return means no presentation consumer retains the capability. It is not an
+(* Return means no presentation consumer retains the capability. It is not an
     I/O ACK: failed/in-flight cleanup and metadata finalization stay owned until
     their matching real completions. Cleanup retries remain possible while owned. *)
-type instruction =
+(** Cleanup identity allocated by Core before sending a replacement. It records
+    an obligation, not successful registration. Runner may inspect it but cannot
+    construct or retarget it; cancellation can clean up even if no handle arrived. *)
+type asset_demand_registration = private
+  { consumer : Worker.asset_consumer
+  ; round : Worker.request_id
+  }
+
+(** Only Core creates instructions. Interpreters may pattern-match them but cannot
+    attach a ticket to another request with the same result type. *)
+type instruction = private
   | Bootstrap
   | Release_binding of Worker.binding
   | Release_observation_registration of Worker.session * Worker.request_id
   | Finalize_observation_registration of Worker.session * Worker.request_id
-  | Finalize_asset_demand of unit ticket * Worker.session * Worker.asset_consumer
+  | Release_asset_demand_registration of unit ticket * asset_demand_registration
+  | Finalize_asset_demand of unit ticket * asset_demand_registration
   | Bind_replacement
   | Send : 'a ticket * Worker.session * 'a Worker.request -> instruction
   | Cancel_request : 'a ticket -> instruction
@@ -196,7 +207,10 @@ type instruction =
   | Publish of view
   | Schedule_drain
 
-type transition =
+(** The next state and its instructions are one Core-produced transition.
+    Private fields prevent recombining state from one transition with another's
+    instructions; the host must still apply each transition serially, once. *)
+type transition = private
   { next : t
   ; instructions : instruction list
   }
@@ -243,16 +257,21 @@ val request
   -> 'a Worker.request
   -> ('a ticket * transition, Worker.error) result
 
-(** Explicit business retry keeps the immutable intent. A known commit only
-    reads its original proof; Unknown reconciles using the same intent. The
-    supplied current presentation is checked before either request is planned. *)
+type mutation_reconciliation =
+  | Submission_ticket of Worker.submission_outcome ticket
+  | Confirmation_ticket of Worker.confirmation ticket
+
+(** Explicit business retry keeps the immutable intent. A known commit returns
+    Confirmation_ticket; an unknown outcome uses Submission_ticket for that same
+    intent. The current presentation is checked before either request is planned.
+    Consumers handle the operation-specific result, not arbitrary lifecycle states. *)
 val reconcile_mutation
   : t -> presentation:Worker.presentation -> Worker.durable_intent
-  -> (Worker.mutation_progress ticket * transition, Worker.error) result
+  -> (mutation_reconciliation * transition, Worker.error) result
 
 type mutation_settlement =
   | Acknowledgement of unit ticket
-  | Reconciliation of Worker.mutation_progress ticket
+  | Reconciliation of mutation_reconciliation
 
 (** Retry an applied consumer's cleanup. A current confirmation/known rejection
     needs ACK only after that exact presentation consumed its canonical DTOs;

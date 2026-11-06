@@ -104,6 +104,11 @@ val block_revision : block -> string
 
 type 'a continuation = 'a Worker_effect_authority.continuation
 
+(** Exact original budget, including continuations returned by Confirm. Reuse it
+    with the same query and continuation; this does not renew a stale session or
+    snapshot, nor permit changing query parameters. *)
+val continuation_budget : 'a continuation -> read_budget
+
 type 'a slice = 'a Worker_effect_authority.slice = private
   { items : 'a list
   ; next : 'a continuation option
@@ -151,6 +156,15 @@ type task_status_catalog = Worker_effect_authority.task_status_catalog = private
   ; default_status : Uuid.t option
   ; items : Graph.task_status_definition list
   ; next : Graph.task_status_definition continuation option
+  }
+
+(** Finite lookup, not an enumeration page. There is exactly one slot per input
+    UUID, in the same order, including duplicate UUIDs. None means missing. If the
+    complete lookup exceeds its budget, fail rather than return partial slots. *)
+type asset_lookup_result = Worker_effect_authority.asset_lookup_result = private
+  { generation : string
+  ; projection_revision : string
+  ; items : Logseq_db_types.Asset_descriptor.t option list
   }
 
 type asset_listing = Worker_effect_authority.asset_listing = private
@@ -236,7 +250,7 @@ type 'a query = 'a Worker_effect_authority.query =
   | Task_status_definitions :
       Uuid.t list
       -> Graph.task_status_definition option list query
-  | Asset_descriptors : Uuid.t list -> asset_listing query
+  | Asset_descriptors : Uuid.t list -> asset_lookup_result query
   | Assets :
       { recursive : bool
       ; roots : Uuid.t list
@@ -387,6 +401,14 @@ val confirmation_receipt : confirmation -> receipt
 
 val confirmation_presentation : confirmation -> presentation
 
+(** Result of submitting an immutable durable intent. A successful submission
+    may establish commitment, but never establishes presentation confirmation. *)
+type submission_outcome = Worker_effect_authority.submission_outcome =
+  | Submission_rejected of error
+  | Submission_unknown
+  | Submission_committed of receipt
+
+(** Lifecycle/recovery state, separate from a single operation's result. *)
 type mutation_progress = Worker_effect_authority.mutation_progress =
   | Rejected of error
   | Outcome_unknown
@@ -488,6 +510,7 @@ type observation_notice = Worker_effect_authority.observation_notice = private
   | Observations_resync of binding
 
 type asset_consumer = Worker_effect_authority.asset_consumer
+type asset_demand = Worker_effect_authority.asset_demand
 type asset_file = Worker_effect_authority.asset_file
 type file_lease = Worker_effect_authority.file_lease
 type upload_operation = Worker_effect_authority.upload_operation
@@ -498,11 +521,14 @@ val asset_consumer_session : asset_consumer -> session
 val equal_asset_consumer : asset_consumer -> asset_consumer -> bool
 val compare_asset_consumer : asset_consumer -> asset_consumer -> int
 
-(** Coordinator-owned replacement round, separate from logical consumer identity.
-    Requests and Ready facts must match this exact round; a later descriptor
-    replacement never adopts the old consumer's queued file capability. *)
-val bind_asset_consumer : asset_consumer -> round:request_id -> asset_consumer
-val asset_consumer_round : asset_consumer -> request_id option
+(** Logical consumers are not registered rounds. A demand handle is issued only
+    from a checked replacement acknowledgement or notice for that exact round.
+    There is no public constructor or rebinding operation. Before its result is
+    delivered, Cancel on the replacement ticket retires the pending demand. *)
+val asset_demand_consumer : asset_demand -> asset_consumer
+val asset_demand_session : asset_demand -> session
+val asset_demand_round : asset_demand -> request_id
+val equal_asset_demand : asset_demand -> asset_demand -> bool
 val file_lease_session : file_lease -> session
 val file_lease_id : file_lease -> request_id
 val imported_session : imported -> session
@@ -565,17 +591,19 @@ val asset_notice_session : asset_notice -> session
 val asset_notice_scope : asset_notice -> Worker_effect_authority.Service.asset_scope
 val asset_notice_data : asset_notice -> Worker_effect_authority.Service.asset_notice
 val asset_notice_consumer : asset_notice -> asset_consumer option
+val asset_notice_demand : asset_notice -> asset_demand option
 
-(** Availability/demand-accepted/backpressure notices identify the exact registered
-    consumer, not an App-reconstructed namespaced string. Capacity and Upload_status
-    are session-level facts (None); they have a separate session read outlet in
-    Core. Unknown consumer/operation names are rejected, never broadcast to every
-    consumer as a guessed association. *)
+(** Availability/demand-accepted/backpressure notices expose their exact demand
+    through asset_notice_demand. asset_notice_consumer is only its logical identity.
+    Capacity and Upload_status have neither consumer nor demand; Core exposes them
+    separately. Unknown rounds/operations are rejected, never guessed or broadcast
+    to every consumer. *)
 val ready_asset_file : asset_notice -> asset_file option
 
 (** Pure identity facts for matching a Ready capability to its still-registered
     demand. These do not expose its physical handle or grant acquire authority. *)
 val asset_file_consumer : asset_file -> asset_consumer
+val asset_file_demand : asset_file -> asset_demand
 val asset_file_asset : asset_file -> Uuid.t
 
 val upload_operation : asset_notice -> upload_operation option
@@ -596,9 +624,9 @@ type 'a request = 'a Worker_effect_authority.request =
   | Observe : read_budget * 'a query -> 'a observed request
   | Refresh : 'a observation -> 'a observed request
   | Release : 'a observation -> unit request
-  | Append : append_intent -> mutation_progress request
-  | Mutate : mutation_intent -> mutation_progress request
-  | Confirm : presentation * receipt -> mutation_progress request
+  | Append : append_intent -> submission_outcome request
+  | Mutate : mutation_intent -> submission_outcome request
+  | Confirm : presentation * receipt -> confirmation request
   | Recover_mutations :
       { after : mutation_recovery_cursor option; maximum_items : int; maximum_bytes : int }
       -> mutation_recovery request
@@ -611,8 +639,8 @@ type 'a request = 'a Worker_effect_authority.request =
 
   | Replace_asset_demand :
       asset_consumer * asset_priority * Logseq_db_types.Asset_descriptor.t list
-      -> unit request
-  | Release_asset_demand : asset_consumer -> unit request
+      -> asset_demand request
+  | Release_asset_demand : asset_demand -> unit request
   | Retry_asset : Uuid.t -> unit request
   | Retry_upload : upload_operation -> unit request
   | Acquire_asset_file : asset_file -> file_lease option request

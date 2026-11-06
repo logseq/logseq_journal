@@ -32,7 +32,7 @@ val request
 
 val reconcile_mutation
   : t -> presentation:Worker.presentation -> Worker.durable_intent
-  -> (Worker.mutation_progress Core.ticket, Worker.error) result
+  -> (Core.mutation_reconciliation, Worker.error) result
 
 val settle_applied_mutation
   : t -> presentation:Worker.presentation -> applied_presentation:Worker.presentation -> Worker.durable_intent

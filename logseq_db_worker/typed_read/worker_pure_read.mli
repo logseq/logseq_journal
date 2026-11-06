@@ -85,6 +85,8 @@ val block_revision : block -> string
 
 type 'a continuation
 
+val continuation_budget : 'a continuation -> read_budget
+
 type 'a slice = private
   { items : 'a list
   ; next : 'a continuation option
@@ -132,6 +134,12 @@ type task_status_catalog = private
   ; default_status : Uuid.t option
   ; items : Graph.task_status_definition list
   ; next : Graph.task_status_definition continuation option
+  }
+
+type asset_lookup_result = private
+  { generation : string
+  ; projection_revision : string
+  ; items : Logseq_db_types.Asset_descriptor.t option list
   }
 
 type asset_listing = private
@@ -221,7 +229,7 @@ type _ query =
   | Task_status_definitions :
       Uuid.t list
       -> Graph.task_status_definition option list query
-  | Asset_descriptors : Uuid.t list -> asset_listing query
+  | Asset_descriptors : Uuid.t list -> asset_lookup_result query
   | Assets :
       { recursive : bool
       ; roots : Uuid.t list
@@ -283,6 +291,7 @@ module For_worker : sig
   val block_summary : lookup:Worker_pure_data.block_lookup -> page:Worker_pure_data.page_lookup option -> items:Worker_pure_data.child_member list -> next:Worker_pure_data.child_member continuation option -> scope_revision:string -> generation:string -> projection_revision:string -> block_summary
   val favorites : favorites_page:Uuid.t option -> generation:string -> projection_revision:string -> items:Worker_pure_data.favorite_item list -> next:Worker_pure_data.favorite_item continuation option -> favorites
   val task_status_catalog : property_uuid:Uuid.t option -> default_status:Uuid.t option -> items:Graph.task_status_definition list -> next:Graph.task_status_definition continuation option -> task_status_catalog
+  val asset_lookup_result : generation:string -> projection_revision:string -> items:Logseq_db_types.Asset_descriptor.t option list -> asset_lookup_result
   val asset_listing : generation:string -> projection_revision:string -> items:Logseq_db_types.Asset_descriptor.t list -> next:Logseq_db_types.Asset_descriptor.t continuation option -> asset_listing
   val children : parent:Uuid.t -> revision_scope:Worker_pure_data.revision_scope -> scope_revision:string -> items:Worker_pure_data.child_member list -> next:Worker_pure_data.child_member continuation option -> children
   val change_batch : change_owner:session -> generation:string -> from_exclusive:string option -> through:string -> windows:Worker_pure_data.change_window list -> next:string option -> change_batch

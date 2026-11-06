@@ -49,6 +49,8 @@ val on_event : t -> (Logseq_db_worker_lui.Logseq_db_worker_lui_service.response,
     pump drain. All callbacks queue typed events; no recursive step. Host continues
     forwarding terminal cleanup responses after revocation and while draining. *)
 
+(** Interpret an instruction emitted by Core. Private constructors preserve
+    pattern matching but prevent callers from manufacturing a different Send. *)
 val submit : t -> Worker_pure_coordinator.instruction -> unit
 
 (** Directly submit scoped typed Service requests; never implicit-current
@@ -74,16 +76,11 @@ val submit : t -> Worker_pure_coordinator.instruction -> unit
     signs out, or stops the shared client. Host must also join legacy owners.
     Schedule_drain queues a later turn; Publish goes to host without recursive step. *)
 
-val authorize_host_change : t -> Worker.handoff_receipt -> attempt:Worker.request_id -> (Journal_worker_ids.Worker.request_id, Worker.error) result
-
-(** Transport admission only: Ok carries a Mailbox ID, never permission or an
-    action ACK. Production plans through Core.authorize_host_change; Consume_handoff
-    reports attempt-tagged admission and terminal events through the serial outlet.
-    Only matching Host_change_applied permits host UI/auth/client continuation.
-    The existing Service deletion owner executes a bound removal; the host must
-    not send another legacy Close/Delete. Unknown accepted outcomes retain their
-    original permission and cleanup owner; they are never replayed with a fresh
-    receipt. Quiesce itself neither deletes a graph nor signs out/stops a client. *)
+(* Host consumption also enters only through Core's private Consume_handoff
+    instruction. There is no public transport shortcut around its planned attempt.
+    Admission is not an action ACK: only matching Host_change_applied permits host
+    UI/auth/client continuation. Unknown outcomes retain their original permission
+    and cleanup owner; they are never replayed with a fresh receipt. *)
 
 type shutdown_state = Draining | Stopped | Shutdown_failed of Worker.error
 val shutdown : t -> shutdown_state
